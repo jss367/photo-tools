@@ -17,7 +17,7 @@ NS = {
 }
 
 
-def test_end_to_end_dry_run(capsys):
+def test_end_to_end_dry_run():
     """Dry run processes catalogs and prints stats without writing files."""
     from export_keywords import run
 
@@ -44,7 +44,7 @@ def test_end_to_end_dry_run(capsys):
         conn.commit()
         conn.close()
 
-        stats = run(catalogs=[cat_path], photos_root=photos_root, write=False)
+        stats = run(catalogs=[cat_path], write=False)
 
         assert stats["files_with_keywords"] == 2
         assert stats["sidecars_written"] == 0  # dry run
@@ -75,7 +75,7 @@ def test_end_to_end_write():
         conn.commit()
         conn.close()
 
-        stats = run(catalogs=[cat_path], photos_root=photos_root, write=True)
+        stats = run(catalogs=[cat_path], write=True)
 
         assert stats["sidecars_written"] == 2
 

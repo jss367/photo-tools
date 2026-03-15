@@ -6,7 +6,6 @@ Usage:
 
 import argparse
 import logging
-import sys
 from pathlib import Path
 
 from catalog_reader import read_catalog
@@ -19,18 +18,16 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
-def run(catalogs, photos_root, write=False):
+def run(catalogs, write=False):
     """Process catalogs and write/report XMP sidecars.
 
     Args:
         catalogs: list of paths to .lrcat files
-        photos_root: root directory of photo files (unused for path resolution
-                     but used for logging context)
         write: if True, write XMP sidecars; if False, dry-run only
 
     Returns:
         dict with stats: catalogs_processed, files_with_keywords, files_not_found,
-                         multi_catalog_files, sidecars_written
+                         multi_catalog_files, sidecars_written, sidecars_failed
     """
     # Merge keyword data from all catalogs
     merged = {}  # file_path -> {"flat_keywords": set, "hierarchical_keywords": set, "catalogs": list}
@@ -70,6 +67,7 @@ def run(catalogs, photos_root, write=False):
     # Write or report sidecars
     files_not_found = 0
     sidecars_written = 0
+    sidecars_failed = 0
 
     for file_path, entry in sorted(merged.items()):
         path = Path(file_path)
@@ -81,11 +79,16 @@ def run(catalogs, photos_root, write=False):
         xmp_path = path.with_suffix(".xmp")
 
         if write:
-            write_xmp_sidecar(
-                str(xmp_path),
-                entry["flat_keywords"],
-                entry["hierarchical_keywords"],
-            )
+            try:
+                write_xmp_sidecar(
+                    str(xmp_path),
+                    entry["flat_keywords"],
+                    entry["hierarchical_keywords"],
+                )
+            except Exception:
+                sidecars_failed += 1
+                log.warning("Failed to write sidecar: %s", xmp_path)
+                continue
             sidecars_written += 1
             if sidecars_written % 1000 == 0:
                 log.info("Progress: %d sidecars written", sidecars_written)
@@ -102,6 +105,7 @@ def run(catalogs, photos_root, write=False):
         "files_not_found": files_not_found,
         "multi_catalog_files": multi_catalog_files,
         "sidecars_written": sidecars_written,
+        "sidecars_failed": sidecars_failed,
     }
 
     log.info("--- Summary ---")
@@ -110,6 +114,7 @@ def run(catalogs, photos_root, write=False):
     log.info("Files not found:       %d", stats["files_not_found"])
     log.info("Multi-catalog files:   %d", stats["multi_catalog_files"])
     log.info("Sidecars written:      %d", stats["sidecars_written"])
+    log.info("Sidecars failed:       %d", stats["sidecars_failed"])
 
     return stats
 
@@ -138,7 +143,6 @@ def main():
 
     run(
         catalogs=args.catalogs,
-        photos_root=args.photos_root,
         write=args.write,
     )
 

@@ -44,3 +44,15 @@ def test_load_unsupported_returns_none():
         result = load_image(f.name)
         assert result is None
         os.unlink(f.name)
+
+
+def test_load_corrupt_file_returns_none():
+    """load_image returns None for a corrupt image file."""
+    from image_loader import load_image
+
+    with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as f:
+        f.write(b"not a real jpeg")
+        f.flush()
+        result = load_image(f.name)
+        assert result is None
+        os.unlink(f.name)

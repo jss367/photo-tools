@@ -33,8 +33,8 @@ def load_image(file_path, max_size=1024):
     try:
         if ext in RAW_EXTENSIONS:
             import rawpy
-            raw = rawpy.imread(str(path))
-            rgb = raw.postprocess()
+            with rawpy.imread(str(path)) as raw:
+                rgb = raw.postprocess()
             img = Image.fromarray(rgb)
         else:
             img = Image.open(str(path))

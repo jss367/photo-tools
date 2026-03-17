@@ -148,24 +148,33 @@ def download_taxonomy(output_path):
         log.info("Parsed %d taxa", len(taxa_by_id))
 
         # Parse VernacularNames (English common names)
+        # Prefer VernacularNames-english.csv, fall back to VernacularNames.csv
         vn_file = None
         for name in file_list:
-            if 'vernacularname' in name.lower():
+            if name.lower() == 'vernacularnames-english.csv':
                 vn_file = name
                 break
+        if not vn_file:
+            for name in file_list:
+                if name.lower() == 'vernacularnames.csv':
+                    vn_file = name
+                    break
 
         if vn_file:
             log.info("Parsing %s ...", vn_file)
             with zf.open(vn_file) as f:
                 reader = csv.DictReader(io.TextIOWrapper(f, encoding='utf-8'))
                 for row in reader:
-                    lang = row.get('language', '')
-                    if lang.lower() != 'en':
+                    # Language-specific files may not have a language column
+                    lang = row.get('language', 'en')
+                    if lang and lang.lower() != 'en':
                         continue
                     taxon_id = row.get('id') or row.get('taxonID')
                     if taxon_id and taxon_id in taxa_by_id:
                         common_names[taxon_id] = row.get('vernacularName', '')
             log.info("Found %d English common names", len(common_names))
+        else:
+            log.warning("No VernacularNames file found in archive")
 
     # Build lineages by walking parent chains
     def _build_lineage(taxon_id):

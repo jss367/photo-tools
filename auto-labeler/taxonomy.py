@@ -139,11 +139,18 @@ def download_taxonomy(output_path):
                 taxon_id = row.get('id') or row.get('taxonID')
                 if not taxon_id:
                     continue
+                # parentNameUsageID may be a URL like https://www.inaturalist.org/taxa/48460
+                parent_raw = row.get('parentNameUsageID', '')
+                if parent_raw and '/' in parent_raw:
+                    parent_id = parent_raw.rsplit('/', 1)[-1]
+                else:
+                    parent_id = parent_raw
+
                 taxa_by_id[taxon_id] = {
                     'taxon_id': int(taxon_id),
                     'scientific_name': row.get('scientificName', ''),
                     'rank': (row.get('taxonRank') or '').lower(),
-                    'parent_id': row.get('parentNameUsageID', ''),
+                    'parent_id': parent_id,
                 }
         log.info("Parsed %d taxa", len(taxa_by_id))
 
@@ -170,7 +177,7 @@ def download_taxonomy(output_path):
                     if lang and lang.lower() != 'en':
                         continue
                     taxon_id = row.get('id') or row.get('taxonID')
-                    if taxon_id and taxon_id in taxa_by_id:
+                    if taxon_id and taxon_id in taxa_by_id and taxon_id not in common_names:
                         common_names[taxon_id] = row.get('vernacularName', '')
             log.info("Found %d English common names", len(common_names))
         else:

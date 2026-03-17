@@ -71,11 +71,10 @@ def analyze(folder, output_dir, labels, model_str='ViT-B-16',
             stats['failed'] += 1
             continue
 
-        # Generate thumbnail
-        thumb_path = os.path.join(thumb_dir, image_path.stem + ".jpg")
-        thumb = img.copy()
-        thumb.thumbnail((thumbnail_size, thumbnail_size))
-        thumb.save(thumb_path, quality=85)
+        # Build a unique thumbnail name from the path relative to the scanned folder
+        rel_path = image_path.relative_to(folder_path)
+        thumb_name = str(rel_path).replace(os.sep, '_')
+        thumb_name = Path(thumb_name).stem + ".jpg"
 
         # Classify via temp file
         with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as tmp:
@@ -109,12 +108,18 @@ def analyze(folder, output_dir, labels, model_str='ViT-B-16',
         if category == 'match':
             continue
 
+        # Generate thumbnail only for photos that will appear in results
+        thumb_path = os.path.join(thumb_dir, thumb_name)
+        thumb = img.copy()
+        thumb.thumbnail((thumbnail_size, thumbnail_size))
+        thumb.save(thumb_path, quality=85)
+
         # Filter existing to just species for display
         existing_species = [kw for kw in existing
                            if any(kw.lower() == l.lower() for l in labels_vocab)]
 
         photos.append({
-            'filename': image_path.name,
+            'filename': thumb_name,
             'image_path': str(image_path),
             'xmp_path': str(xmp_path),
             'existing_species': existing_species,

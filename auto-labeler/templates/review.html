@@ -26,6 +26,7 @@
     z-index: 100;
   }
   .header h1 { font-size: 18px; font-weight: 600; white-space: nowrap; }
+  .header-left { display: flex; align-items: center; gap: 16px; }
   .header-right { display: flex; align-items: center; gap: 8px; }
   .stats { font-size: 13px; color: #a0a0a0; display: flex; gap: 14px; }
   .stats .stat { white-space: nowrap; }
@@ -33,14 +34,33 @@
   .stats .ref-count { color: #f0c040; }
   .stats .dis-count { color: #e74c3c; }
   .stats .accepted-count { color: #7ec8e3; }
-  .gear-btn {
-    background: none; border: none; color: #a0a0a0;
-    font-size: 22px; cursor: pointer; padding: 4px 8px;
-    line-height: 1; transition: color 0.15s;
-  }
-  .gear-btn:hover { color: #fff; }
 
-  /* ---------- Settings Panel ---------- */
+  /* Model selector */
+  .model-selector {
+    background: #0f3460;
+    color: #e0e0e0;
+    border: 1px solid #1a3a6e;
+    border-radius: 4px;
+    padding: 5px 10px;
+    font-size: 13px;
+    cursor: pointer;
+    outline: none;
+  }
+  .model-selector:hover { border-color: #4ecca3; }
+  .model-selector:focus { border-color: #4ecca3; }
+
+  /* Gear icon links to /settings */
+  .gear-link {
+    color: #a0a0a0;
+    font-size: 22px;
+    padding: 4px 8px;
+    line-height: 1;
+    transition: color 0.15s;
+    text-decoration: none;
+  }
+  .gear-link:hover { color: #fff; }
+
+  /* ---------- Settings Panel (inline quick settings) ---------- */
   .settings-panel {
     display: none;
     background: #16213e;
@@ -170,6 +190,19 @@
   .badge-refinement { background: #f0c040; color: #1a1a2e; }
   .badge-disagreement { background: #e74c3c; color: #fff; }
 
+  /* Group badge */
+  .badge-group {
+    display: inline-block;
+    font-size: 11px;
+    padding: 2px 8px;
+    border-radius: 10px;
+    font-weight: 600;
+    margin-bottom: 8px;
+    margin-left: 6px;
+    background: #0f3460;
+    color: #7ec8e3;
+  }
+
   /* Existing keywords */
   .card-existing {
     font-size: 13px;
@@ -238,6 +271,59 @@
   }
   .btn-done.skipped-btn { color: #777; }
 
+  /* Expand / collapse for group cards */
+  .group-expand-btn {
+    background: #0f3460;
+    color: #7ec8e3;
+    border: none;
+    border-radius: 4px;
+    padding: 4px 10px;
+    font-size: 12px;
+    cursor: pointer;
+    margin-bottom: 8px;
+    transition: background 0.15s;
+  }
+  .group-expand-btn:hover { background: #1a4a7e; }
+  .group-members {
+    display: none;
+    margin-top: 8px;
+    border-top: 1px solid #0f3460;
+    padding-top: 8px;
+  }
+  .group-members.open { display: block; }
+  .group-member-thumb {
+    display: inline-block;
+    width: 80px;
+    height: 54px;
+    object-fit: cover;
+    border-radius: 4px;
+    margin: 2px;
+    border: 1px solid #0f3460;
+  }
+  .group-member-list {
+    font-size: 12px;
+    color: #777;
+    margin-top: 4px;
+    line-height: 1.6;
+  }
+  .group-member-list span {
+    display: inline-block;
+    background: #0f3460;
+    padding: 1px 6px;
+    border-radius: 3px;
+    margin: 2px;
+  }
+
+  /* Individual predictions breakdown for groups */
+  .individual-preds {
+    font-size: 12px;
+    color: #888;
+    margin-bottom: 6px;
+  }
+  .individual-preds span {
+    margin-right: 10px;
+  }
+
   /* Empty state */
   .empty {
     text-align: center;
@@ -267,15 +353,18 @@
 
 <!-- Header -->
 <div class="header">
-  <h1 id="title">Photo Review</h1>
+  <div class="header-left">
+    <h1 id="title">Photo Review</h1>
+    <select class="model-selector" id="modelSelector" onchange="switchModel(this.value)" style="display:none;"></select>
+  </div>
   <div class="header-right">
     <div class="stats" id="stats"></div>
-    <button class="gear-btn" onclick="toggleSettings()" title="Settings">&#9881;</button>
+    <a class="gear-link" href="/settings" title="Settings">&#9881;</a>
   </div>
 </div>
 
-<!-- Settings Panel -->
-<div class="settings-panel" id="settingsPanel">
+<!-- Inline Quick Settings Panel -->
+<div class="settings-panel open" id="settingsPanel">
   <div class="setting-group">
     <label for="thumbSize">Thumbnail size:</label>
     <input type="range" id="thumbSize" min="200" max="800" step="20" value="400"
@@ -309,10 +398,11 @@
 
 <script>
 /* ---------- State ---------- */
-let allData = { photos: [], stats: {}, folder: '', settings: {} };
-let currentTab = 'new';
-let thumbSize = 400;
-let confThreshold = 0; // 0-100 scale for display, 0-1 for filtering
+var allData = { photos: [], stats: {}, folder: '', settings: {}, models: {} };
+var currentTab = 'new';
+var currentModel = '';
+var thumbSize = 400;
+var confThreshold = 0; // 0-100 scale for display, 0-1 for filtering
 
 /* ---------- Bootstrap ---------- */
 loadPhotos();
@@ -320,20 +410,97 @@ loadPhotos();
 /* ---------- Data Loading ---------- */
 async function loadPhotos() {
   try {
-    const resp = await fetch('/api/photos');
+    var resp = await fetch('/api/photos');
     if (!resp.ok) throw new Error('Failed to load photos');
     allData = await resp.json();
 
     // Set page title from folder name
-    const folderName = (allData.folder || '').split('/').filter(Boolean).pop() || 'Photos';
+    var folderName = (allData.folder || '').split('/').filter(Boolean).pop() || 'Photos';
     document.getElementById('title').textContent = 'Review: ' + folderName;
     document.title = 'Review: ' + folderName;
+
+    // Initialize model selector
+    initModelSelector();
 
     document.getElementById('loading').style.display = 'none';
     renderAll();
   } catch (err) {
     document.getElementById('loading').textContent = 'Error loading photos: ' + err.message;
   }
+}
+
+/* ---------- Model Selector ---------- */
+function initModelSelector() {
+  var models = allData.models || {};
+  var modelNames = Object.keys(models);
+  var sel = document.getElementById('modelSelector');
+
+  if (modelNames.length <= 1) {
+    // Single model or no models: hide selector, set default
+    sel.style.display = 'none';
+    currentModel = modelNames.length === 1 ? modelNames[0] : '';
+    return;
+  }
+
+  // Multiple models: show selector
+  sel.style.display = '';
+  sel.innerHTML = modelNames.map(function(name) {
+    return '<option value="' + escapeAttr(name) + '">' + escapeHtml(name) + '</option>';
+  }).join('');
+
+  // Default to first model if not yet set
+  if (!currentModel || modelNames.indexOf(currentModel) === -1) {
+    currentModel = modelNames[0];
+  }
+  sel.value = currentModel;
+}
+
+function switchModel(model) {
+  currentModel = model;
+  renderAll();
+}
+
+/* ---------- Prediction Helpers ---------- */
+function getPhotoPrediction(photo) {
+  // For groups: read from consensus[currentModel]
+  if (photo.group_id && photo.consensus) {
+    var cons = photo.consensus;
+    if (currentModel && cons[currentModel]) {
+      return cons[currentModel];
+    }
+    // Fallback to first model
+    var firstKey = Object.keys(cons)[0];
+    return firstKey ? cons[firstKey] : null;
+  }
+
+  // For individual photos: read from predictions[currentModel]
+  var preds = photo.predictions || {};
+  if (currentModel && preds[currentModel]) {
+    return preds[currentModel];
+  }
+  // Fallback to first model
+  var firstKey = Object.keys(preds)[0];
+  return firstKey ? preds[firstKey] : null;
+}
+
+function getPhotoCategory(photo) {
+  // Groups have top-level category
+  if (photo.group_id) {
+    return photo.category || 'new';
+  }
+  // Individual photos: category is inside the prediction for the current model
+  var pred = getPhotoPrediction(photo);
+  return pred ? (pred.category || 'new') : 'new';
+}
+
+function getPhotoConfidence(photo) {
+  var pred = getPhotoPrediction(photo);
+  return pred ? pred.confidence : 0;
+}
+
+function getPhotoPredictionText(photo) {
+  var pred = getPhotoPrediction(photo);
+  return pred ? pred.prediction : 'Unknown';
 }
 
 /* ---------- Render Helpers ---------- */
@@ -345,23 +512,25 @@ function renderAll() {
 }
 
 function countByCategory(cat) {
-  return allData.photos.filter(p => p.category === cat && p.status === 'pending').length;
+  return allData.photos.filter(function(p) {
+    return getPhotoCategory(p) === cat && p.status === 'pending';
+  }).length;
 }
 
 function countPending() {
-  return allData.photos.filter(p => p.status === 'pending').length;
+  return allData.photos.filter(function(p) { return p.status === 'pending'; }).length;
 }
 
 function countAccepted() {
-  return allData.photos.filter(p => p.status === 'accepted').length;
+  return allData.photos.filter(function(p) { return p.status === 'accepted'; }).length;
 }
 
 function renderStats() {
-  const el = document.getElementById('stats');
-  const nNew = countByCategory('new');
-  const nRef = countByCategory('refinement');
-  const nDis = countByCategory('disagreement');
-  const nAcc = countAccepted();
+  var el = document.getElementById('stats');
+  var nNew = countByCategory('new');
+  var nRef = countByCategory('refinement');
+  var nDis = countByCategory('disagreement');
+  var nAcc = countAccepted();
   el.innerHTML =
     '<span class="stat new-count">' + nNew + ' New</span>' +
     '<span class="stat ref-count">' + nRef + ' Refinements</span>' +
@@ -370,14 +539,14 @@ function renderStats() {
 }
 
 function renderTabs() {
-  const tabs = [
+  var tabs = [
     { id: 'new', label: 'New' },
     { id: 'refinement', label: 'Refinement' },
     { id: 'disagreement', label: 'Disagreement' },
     { id: 'accepted', label: 'Accepted' },
     { id: 'all', label: 'All' },
   ];
-  const el = document.getElementById('tabs');
+  var el = document.getElementById('tabs');
   el.innerHTML = tabs.map(function(t) {
     var count;
     if (t.id === 'accepted') {
@@ -404,13 +573,15 @@ function switchTab(tab) {
 function getVisiblePhotos() {
   var threshold = confThreshold / 100;
   return allData.photos.filter(function(p) {
+    var cat = getPhotoCategory(p);
+    var conf = getPhotoConfidence(p);
     // Tab filter
     if (currentTab === 'accepted') return p.status === 'accepted';
     if (currentTab === 'all') return true;
-    if (p.category !== currentTab) return false;
+    if (cat !== currentTab) return false;
     if (p.status !== 'pending') return false;
     // Confidence threshold filter
-    if (p.confidence < threshold) return false;
+    if (conf < threshold) return false;
     return true;
   });
 }
@@ -457,80 +628,203 @@ function renderGrid() {
   grid.style.setProperty('--card-width', thumbSize + 20 + 'px');
 
   grid.innerHTML = photos.map(function(p) {
-    var confPct = Math.round(p.confidence * 100);
-    var confColor = confPct >= 70 ? '#4ecca3' : confPct >= 50 ? '#f0c040' : '#e74c3c';
-    var cardClass = 'card';
-    if (p.status === 'accepted') cardClass += ' accepted';
-    if (p.status === 'skipped') cardClass += ' skipped';
-
-    // Thumbnail filename: stem + .jpg
-    var thumbName = p.filename.replace(/\.[^.]+$/, '.jpg');
-    var thumbUrl = '/thumbnails/' + encodeURIComponent(thumbName);
-
-    // Category badge
-    var badgeHtml = '<span class="badge badge-' + p.category + '">' + p.category + '</span>';
-
-    // Existing species display
-    var existingHtml = '';
-    if (p.existing_species && p.existing_species.length > 0) {
-      if (p.category === 'refinement') {
-        // For refinements, show existing -> suggested
-        existingHtml =
-          '<div class="card-existing">' +
-            '<span class="label-value">' + escapeHtml(p.existing_species.join(', ')) + '</span>' +
-            '<span class="refinement-arrow">&#x2192;</span>' +
-            '<span class="label-value" style="color:#f0c040;font-weight:600;">' + escapeHtml(p.prediction) + '</span>' +
-          '</div>';
-      } else {
-        existingHtml =
-          '<div class="card-existing">' +
-            '<span class="label-prefix">Current: </span>' +
-            '<span class="label-value">' + escapeHtml(p.existing_species.join(', ')) + '</span>' +
-          '</div>';
-      }
+    if (p.group_id) {
+      return renderGroupCard(p);
     }
+    return renderPhotoCard(p);
+  }).join('');
+}
 
-    // Prediction line (always shown, but for refinements the arrow display above is the main view)
-    var predictionHtml;
-    if (p.category === 'refinement' && p.existing_species && p.existing_species.length > 0) {
-      // Already shown in the arrow display above, so show a simpler version
-      predictionHtml = '<div class="card-prediction">' + escapeHtml(p.prediction) + '</div>';
-    } else {
-      predictionHtml = '<div class="card-prediction">' + escapeHtml(p.prediction) + '</div>';
-    }
+function renderPhotoCard(p) {
+  var prediction = getPhotoPredictionText(p);
+  var confidence = getPhotoConfidence(p);
+  var category = getPhotoCategory(p);
+  var confPct = Math.round(confidence * 100);
+  var confColor = confPct >= 70 ? '#4ecca3' : confPct >= 50 ? '#f0c040' : '#e74c3c';
+  var cardClass = 'card';
+  if (p.status === 'accepted') cardClass += ' accepted';
+  if (p.status === 'skipped') cardClass += ' skipped';
 
-    // Action buttons
-    var actionsHtml;
-    if (p.status === 'accepted') {
-      actionsHtml = '<div class="card-actions"><button class="btn-done">accepted</button></div>';
-    } else if (p.status === 'skipped') {
-      actionsHtml = '<div class="card-actions"><button class="btn-done skipped-btn">skipped</button></div>';
+  // Thumbnail filename: stem + .jpg
+  var thumbName = p.filename.replace(/\.[^.]+$/, '.jpg');
+  var thumbUrl = '/thumbnails/' + encodeURIComponent(thumbName);
+
+  // Category badge
+  var badgeHtml = '<span class="badge badge-' + category + '">' + category + '</span>';
+
+  // Existing species display
+  var existingHtml = '';
+  if (p.existing_species && p.existing_species.length > 0) {
+    if (category === 'refinement') {
+      existingHtml =
+        '<div class="card-existing">' +
+          '<span class="label-value">' + escapeHtml(p.existing_species.join(', ')) + '</span>' +
+          '<span class="refinement-arrow">&#x2192;</span>' +
+          '<span class="label-value" style="color:#f0c040;font-weight:600;">' + escapeHtml(prediction) + '</span>' +
+        '</div>';
     } else {
-      actionsHtml =
-        '<div class="card-actions">' +
-          '<button class="btn-accept" onclick="acceptPhoto(\'' + escapeAttr(p.filename) + '\')">Accept</button>' +
-          '<button class="btn-skip" onclick="skipPhoto(\'' + escapeAttr(p.filename) + '\')">Skip</button>' +
+      existingHtml =
+        '<div class="card-existing">' +
+          '<span class="label-prefix">Current: </span>' +
+          '<span class="label-value">' + escapeHtml(p.existing_species.join(', ')) + '</span>' +
         '</div>';
     }
+  }
 
-    return '<div class="' + cardClass + '" data-filename="' + escapeAttr(p.filename) + '">' +
-      '<img src="' + thumbUrl + '" loading="lazy" alt="' + escapeAttr(p.filename) + '">' +
-      '<div class="card-body">' +
-        '<div class="card-filename" title="' + escapeAttr(p.filename) + '">' + escapeHtml(p.filename) + '</div>' +
-        badgeHtml +
-        existingHtml +
-        predictionHtml +
-        '<div class="confidence-bar"><div class="confidence-fill" style="width:' + confPct + '%;background:' + confColor + '"></div></div>' +
-        '<div class="card-confidence">' + confPct + '% confidence</div>' +
-        actionsHtml +
-      '</div>' +
-    '</div>';
-  }).join('');
+  // Prediction line
+  var predictionHtml = '<div class="card-prediction">' + escapeHtml(prediction) + '</div>';
+
+  // Action buttons
+  var actionsHtml;
+  if (p.status === 'accepted') {
+    actionsHtml = '<div class="card-actions"><button class="btn-done">accepted</button></div>';
+  } else if (p.status === 'skipped') {
+    actionsHtml = '<div class="card-actions"><button class="btn-done skipped-btn">skipped</button></div>';
+  } else {
+    actionsHtml =
+      '<div class="card-actions">' +
+        '<button class="btn-accept" onclick="acceptPhoto(\'' + escapeAttr(p.filename) + '\')">Accept</button>' +
+        '<button class="btn-skip" onclick="skipPhoto(\'' + escapeAttr(p.filename) + '\')">Skip</button>' +
+      '</div>';
+  }
+
+  return '<div class="' + cardClass + '" data-filename="' + escapeAttr(p.filename) + '">' +
+    '<img src="' + thumbUrl + '" loading="lazy" alt="' + escapeAttr(p.filename) + '">' +
+    '<div class="card-body">' +
+      '<div class="card-filename" title="' + escapeAttr(p.filename) + '">' + escapeHtml(p.filename) + '</div>' +
+      badgeHtml +
+      existingHtml +
+      predictionHtml +
+      '<div class="confidence-bar"><div class="confidence-fill" style="width:' + confPct + '%;background:' + confColor + '"></div></div>' +
+      '<div class="card-confidence">' + confPct + '% confidence</div>' +
+      actionsHtml +
+    '</div>' +
+  '</div>';
+}
+
+function renderGroupCard(p) {
+  var prediction = getPhotoPredictionText(p);
+  var confidence = getPhotoConfidence(p);
+  var category = getPhotoCategory(p);
+  var confPct = Math.round(confidence * 100);
+  var confColor = confPct >= 70 ? '#4ecca3' : confPct >= 50 ? '#f0c040' : '#e74c3c';
+  var cardClass = 'card';
+  if (p.status === 'accepted') cardClass += ' accepted';
+  if (p.status === 'skipped') cardClass += ' skipped';
+
+  var members = p.members || [];
+  var memberCount = members.length;
+  var representative = p.representative || (members.length > 0 ? members[0] : p.filename || '');
+
+  // Thumbnail for the representative image
+  var thumbName = representative.replace(/\.[^.]+$/, '.jpg');
+  var thumbUrl = '/thumbnails/' + encodeURIComponent(thumbName);
+
+  // Category badge + group badge
+  var badgeHtml = '<span class="badge badge-' + category + '">' + category + '</span>';
+  badgeHtml += '<span class="badge-group">' + memberCount + ' photos</span>';
+
+  // Existing species display
+  var existingHtml = '';
+  if (p.existing_species && p.existing_species.length > 0) {
+    if (category === 'refinement') {
+      existingHtml =
+        '<div class="card-existing">' +
+          '<span class="label-value">' + escapeHtml(p.existing_species.join(', ')) + '</span>' +
+          '<span class="refinement-arrow">&#x2192;</span>' +
+          '<span class="label-value" style="color:#f0c040;font-weight:600;">' + escapeHtml(prediction) + '</span>' +
+        '</div>';
+    } else if (p.existing_species.length > 0) {
+      existingHtml =
+        '<div class="card-existing">' +
+          '<span class="label-prefix">Current: </span>' +
+          '<span class="label-value">' + escapeHtml(p.existing_species.join(', ')) + '</span>' +
+        '</div>';
+    }
+  }
+
+  // Consensus prediction
+  var predictionHtml = '<div class="card-prediction">' + escapeHtml(prediction) + '</div>';
+
+  // Individual predictions breakdown (if available)
+  var individualHtml = '';
+  var pred = getPhotoPrediction(p);
+  if (pred && pred.individual_predictions) {
+    var parts = [];
+    var ipreds = pred.individual_predictions;
+    var keys = Object.keys(ipreds).sort(function(a, b) { return ipreds[b] - ipreds[a]; });
+    keys.forEach(function(k) {
+      parts.push('<span>' + escapeHtml(k) + ': ' + ipreds[k] + '/' + memberCount + '</span>');
+    });
+    individualHtml = '<div class="individual-preds">' + parts.join('') + '</div>';
+  }
+
+  // Expand/collapse button
+  var expandBtnHtml = '<button class="group-expand-btn" onclick="toggleGroupMembers(\'' + escapeAttr(p.group_id) + '\')">Show members</button>';
+
+  // Member thumbnails (collapsed by default)
+  var memberThumbsHtml = '<div class="group-members" id="group-' + escapeAttr(p.group_id) + '">';
+  members.forEach(function(m) {
+    var mThumbName = m.replace(/\.[^.]+$/, '.jpg');
+    var mThumbUrl = '/thumbnails/' + encodeURIComponent(mThumbName);
+    memberThumbsHtml += '<img class="group-member-thumb" src="' + mThumbUrl + '" loading="lazy" alt="' + escapeAttr(m) + '" title="' + escapeAttr(m) + '">';
+  });
+  memberThumbsHtml += '<div class="group-member-list">';
+  members.forEach(function(m) {
+    memberThumbsHtml += '<span>' + escapeHtml(m) + '</span>';
+  });
+  memberThumbsHtml += '</div></div>';
+
+  // Action buttons
+  var actionsHtml;
+  if (p.status === 'accepted') {
+    actionsHtml = '<div class="card-actions"><button class="btn-done">accepted</button></div>';
+  } else if (p.status === 'skipped') {
+    actionsHtml = '<div class="card-actions"><button class="btn-done skipped-btn">skipped</button></div>';
+  } else {
+    actionsHtml =
+      '<div class="card-actions">' +
+        '<button class="btn-accept" onclick="acceptGroup(\'' + escapeAttr(p.group_id) + '\')">Accept Group</button>' +
+        '<button class="btn-skip" onclick="skipGroup(\'' + escapeAttr(p.group_id) + '\')">Skip</button>' +
+      '</div>';
+  }
+
+  return '<div class="' + cardClass + '" data-group-id="' + escapeAttr(p.group_id) + '">' +
+    '<img src="' + thumbUrl + '" loading="lazy" alt="Group: ' + escapeAttr(representative) + '">' +
+    '<div class="card-body">' +
+      '<div class="card-filename" title="Group: ' + escapeAttr(p.group_id) + '">' + escapeHtml(representative) + '</div>' +
+      badgeHtml +
+      existingHtml +
+      predictionHtml +
+      individualHtml +
+      '<div class="confidence-bar"><div class="confidence-fill" style="width:' + confPct + '%;background:' + confColor + '"></div></div>' +
+      '<div class="card-confidence">' + confPct + '% confidence (consensus)</div>' +
+      expandBtnHtml +
+      memberThumbsHtml +
+      actionsHtml +
+    '</div>' +
+  '</div>';
+}
+
+function toggleGroupMembers(groupId) {
+  var el = document.getElementById('group-' + groupId);
+  if (!el) return;
+  var isOpen = el.classList.toggle('open');
+  // Update button text
+  var card = el.closest('.card');
+  if (card) {
+    var btn = card.querySelector('.group-expand-btn');
+    if (btn) btn.textContent = isOpen ? 'Hide members' : 'Show members';
+  }
 }
 
 /* ---------- Actions ---------- */
 async function acceptPhoto(filename) {
-  var resp = await fetch('/api/accept/' + encodeURIComponent(filename), { method: 'POST' });
+  var resp = await fetch('/api/accept/' + encodeURIComponent(filename), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ model: currentModel }),
+  });
   if (!resp.ok) {
     alert('Failed to accept: ' + filename);
     return;
@@ -551,6 +845,30 @@ async function skipPhoto(filename) {
   renderAll();
 }
 
+async function acceptGroup(groupId) {
+  var resp = await fetch('/api/accept-group/' + encodeURIComponent(groupId), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ model: currentModel }),
+  });
+  if (!resp.ok) {
+    alert('Failed to accept group: ' + groupId);
+    return;
+  }
+  var photo = allData.photos.find(function(p) { return p.group_id === groupId; });
+  if (photo) photo.status = 'accepted';
+  renderAll();
+}
+
+async function skipGroup(groupId) {
+  // Skip the group entry (server doesn't have a dedicated group skip endpoint, so mark locally)
+  var photo = allData.photos.find(function(p) { return p.group_id === groupId; });
+  if (photo) {
+    photo.status = 'skipped';
+    renderAll();
+  }
+}
+
 async function acceptAllVisible() {
   var pending = getPendingVisible();
   if (pending.length === 0) return;
@@ -567,7 +885,7 @@ async function acceptAllVisible() {
     var resp = await fetch('/api/accept-batch', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ category: category, min_confidence: minConf }),
+      body: JSON.stringify({ category: category, min_confidence: minConf, model: currentModel }),
     });
     if (!resp.ok) throw new Error('Batch accept failed');
     var result = await resp.json();
@@ -584,10 +902,6 @@ async function acceptAllVisible() {
 }
 
 /* ---------- Settings ---------- */
-function toggleSettings() {
-  document.getElementById('settingsPanel').classList.toggle('open');
-}
-
 function updateThumbSize(val) {
   thumbSize = parseInt(val, 10);
   document.getElementById('thumbSizeVal').textContent = val + 'px';
@@ -603,7 +917,7 @@ function updateConfThreshold(val) {
 /* ---------- Keyboard Shortcuts ---------- */
 document.addEventListener('keydown', function(e) {
   // Don't capture if user is in an input
-  if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+  if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA' || e.target.tagName === 'SELECT') return;
 
   var pending = getPendingVisible();
   if (pending.length === 0) return;
@@ -611,10 +925,20 @@ document.addEventListener('keydown', function(e) {
   // A = accept first pending card, S = skip first pending card
   if (e.key === 'a' || e.key === 'A') {
     e.preventDefault();
-    acceptPhoto(pending[0].filename);
+    var p = pending[0];
+    if (p.group_id) {
+      acceptGroup(p.group_id);
+    } else {
+      acceptPhoto(p.filename);
+    }
   } else if (e.key === 's' || e.key === 'S') {
     e.preventDefault();
-    skipPhoto(pending[0].filename);
+    var p = pending[0];
+    if (p.group_id) {
+      skipGroup(p.group_id);
+    } else {
+      skipPhoto(p.filename);
+    }
   }
 });
 

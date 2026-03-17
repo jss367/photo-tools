@@ -10,13 +10,16 @@ import logging
 import os
 import sys
 import tempfile
+from datetime import date
 from pathlib import Path
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'lr-migration'))
 
 from classifier import Classifier
 from compare import read_xmp_keywords, categorize
+from grouping import group_by_timestamp, consensus_prediction, read_exif_timestamp
 from image_loader import load_image, SUPPORTED_EXTENSIONS
+from taxonomy import Taxonomy
 
 logging.basicConfig(
     level=logging.INFO,
@@ -25,27 +28,40 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
-def analyze(folder, output_dir, labels, model_str='ViT-B-16',
+def _model_slug(model_name, model_str):
+    """Generate a model key slug."""
+    if model_name:
+        return model_name
+    return f"bioclip-{model_str.lower().replace('/', '-')}"
+
+
+def analyze(folder, output_dir, labels, taxonomy_path,
+            model_str='ViT-B-16',
             pretrained_str='/tmp/bioclip_model/open_clip_pytorch_model.bin',
-            threshold=0.4, thumbnail_size=400, recursive=True):
+            model_name=None, threshold=0.4, thumbnail_size=400,
+            recursive=True, group_window=10):
     """Scan a folder, classify images, compare to existing keywords, write results.
 
     Args:
         folder: path to image folder
         output_dir: path to output directory for results.json and thumbnails/
-        labels: list of species labels for the classifier and vocabulary
+        labels: list of species labels for the classifier
+        taxonomy_path: path to taxonomy.json
         model_str: BioCLIP model string
         pretrained_str: path to model weights
+        model_name: optional human-readable model name (used as key in results)
         threshold: minimum confidence score
         thumbnail_size: max dimension for thumbnails
         recursive: scan subfolders
+        group_window: seconds for neighbor grouping (0 to disable)
     """
     os.makedirs(output_dir, exist_ok=True)
     thumb_dir = os.path.join(output_dir, "thumbnails")
     os.makedirs(thumb_dir, exist_ok=True)
 
+    tax = Taxonomy(taxonomy_path)
     clf = Classifier(labels=labels, model_str=model_str, pretrained_str=pretrained_str)
-    labels_vocab = set(labels)
+    slug = _model_slug(model_name, model_str)
 
     folder_path = Path(folder)
     if recursive:
@@ -61,7 +77,22 @@ def analyze(folder, output_dir, labels, model_str='ViT-B-16',
 
     log.info("Found %d images in %s", len(image_files), folder)
 
-    photos = []
+    # Load existing results if present (for multi-model merging)
+    results_path = os.path.join(output_dir, "results.json")
+    existing_results = None
+    if os.path.exists(results_path):
+        with open(results_path) as f:
+            existing_results = json.load(f)
+        log.info("Found existing results.json — will merge model '%s'", slug)
+
+    # Build a lookup of existing photo entries by image_path for merging
+    existing_photos = {}
+    if existing_results:
+        for p in existing_results.get('photos', []):
+            existing_photos[p['image_path']] = p
+
+    # Phase 1: classify all images and read timestamps
+    classified = []
     stats = {'total': len(image_files), 'new': 0, 'refinement': 0,
              'disagreement': 0, 'match': 0, 'failed': 0, 'below_threshold': 0}
 
@@ -70,11 +101,6 @@ def analyze(folder, output_dir, labels, model_str='ViT-B-16',
         if img is None:
             stats['failed'] += 1
             continue
-
-        # Build a unique thumbnail name from the path relative to the scanned folder
-        rel_path = image_path.relative_to(folder_path)
-        thumb_name = str(rel_path).replace(os.sep, '_')
-        thumb_name = Path(thumb_name).stem + ".jpg"
 
         # Classify via temp file
         with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as tmp:
@@ -96,57 +122,171 @@ def analyze(folder, output_dir, labels, model_str='ViT-B-16',
 
         top = predictions[0]
 
-        # Read existing XMP keywords
+        # Read existing XMP keywords and categorize
         xmp_path = image_path.with_suffix('.xmp')
         existing = read_xmp_keywords(str(xmp_path))
-
-        # Categorize
-        category = categorize(top['species'], existing, labels_vocab)
+        category = categorize(top['species'], existing, tax)
         stats[category] += 1
 
-        # Skip matches — only show differences
         if category == 'match':
             continue
 
-        # Generate thumbnail only for photos that will appear in results
-        thumb_path = os.path.join(thumb_dir, thumb_name)
-        thumb = img.copy()
-        thumb.thumbnail((thumbnail_size, thumbnail_size))
-        thumb.save(thumb_path, quality=85)
+        # Read EXIF timestamp for grouping
+        timestamp = None
+        if image_path.suffix.lower() in {'.jpg', '.jpeg', '.tiff', '.tif'}:
+            timestamp = read_exif_timestamp(str(image_path))
 
-        # Filter existing to just species for display
-        existing_species = [kw for kw in existing
-                           if any(kw.lower() == l.lower() for l in labels_vocab)]
+        # Build unique thumbnail name
+        rel_path = image_path.relative_to(folder_path)
+        thumb_name = str(rel_path).replace(os.sep, '_')
+        thumb_name = Path(thumb_name).stem + ".jpg"
 
-        photos.append({
-            'filename': thumb_name,
+        # Filter existing keywords to just species for display
+        existing_species = [kw for kw in existing if tax.is_taxon(kw)]
+
+        classified.append({
             'image_path': str(image_path),
             'xmp_path': str(xmp_path),
-            'existing_species': existing_species,
+            'filename': thumb_name,
             'prediction': top['species'],
             'confidence': round(top['score'], 4),
             'category': category,
-            'status': 'pending',
+            'existing_species': existing_species,
+            'timestamp': timestamp,
+            'img': img,
         })
 
         if (i + 1) % 100 == 0:
             log.info("Progress: %d/%d images", i + 1, len(image_files))
 
+    # Phase 2: group neighbors
+    photos = []
+    if group_window > 0 and classified:
+        groups = group_by_timestamp(classified, window_seconds=group_window)
+    else:
+        groups = [[c] for c in classified]
+
+    group_counter = 0
+    for group in groups:
+        if len(group) == 1:
+            item = group[0]
+            # Generate thumbnail
+            thumb_path = os.path.join(thumb_dir, item['filename'])
+            thumb = item['img'].copy()
+            thumb.thumbnail((thumbnail_size, thumbnail_size))
+            thumb.save(thumb_path, quality=85)
+
+            model_pred = {
+                'prediction': item['prediction'],
+                'confidence': item['confidence'],
+                'category': item['category'],
+            }
+
+            # Merge with existing photo entry if present
+            if item['image_path'] in existing_photos:
+                photo = existing_photos[item['image_path']]
+                photo['predictions'][slug] = model_pred
+            else:
+                photo = {
+                    'filename': item['filename'],
+                    'image_path': item['image_path'],
+                    'xmp_path': item['xmp_path'],
+                    'existing_species': item['existing_species'],
+                    'predictions': {slug: model_pred},
+                    'status': 'pending',
+                }
+            photos.append(photo)
+        else:
+            # Group of multiple photos
+            group_counter += 1
+            group_id = f"g{group_counter:04d}"
+
+            # Compute consensus
+            preds_for_consensus = [
+                {'prediction': item['prediction'], 'confidence': item['confidence']}
+                for item in group
+            ]
+            cons = consensus_prediction(preds_for_consensus)
+
+            # Use the best category from the group (prefer the consensus prediction's category)
+            # Re-categorize using the consensus prediction
+            representative = group[0]
+            cons_category = categorize(cons['prediction'], set(representative['existing_species']), tax)
+            if cons_category == 'match':
+                cons_category = representative['category']  # fallback
+
+            # Generate thumbnail for representative
+            rep_thumb = os.path.join(thumb_dir, representative['filename'])
+            thumb = representative['img'].copy()
+            thumb.thumbnail((thumbnail_size, thumbnail_size))
+            thumb.save(rep_thumb, quality=85)
+
+            # Also save individual member thumbnails
+            members = []
+            for item in group:
+                members.append(item['filename'])
+                member_thumb_path = os.path.join(thumb_dir, item['filename'])
+                if not os.path.exists(member_thumb_path):
+                    t = item['img'].copy()
+                    t.thumbnail((thumbnail_size, thumbnail_size))
+                    t.save(member_thumb_path, quality=85)
+
+            model_consensus = {
+                'prediction': cons['prediction'],
+                'confidence': cons['confidence'],
+                'individual_predictions': cons['individual_predictions'],
+            }
+
+            photo = {
+                'group_id': group_id,
+                'representative': representative['filename'],
+                'members': members,
+                'member_paths': [item['image_path'] for item in group],
+                'member_xmp_paths': [item['xmp_path'] for item in group],
+                'existing_species': representative['existing_species'],
+                'consensus': {slug: model_consensus},
+                'category': cons_category,
+                'status': 'pending',
+            }
+            photos.append(photo)
+
+    # Build final results
+    models = {}
+    if existing_results:
+        models = existing_results.get('models', {})
+    models[slug] = {
+        'model_str': model_str,
+        'pretrained_str': pretrained_str,
+        'run_date': str(date.today()),
+        'threshold': threshold,
+    }
+
+    # For photos that were in existing results but not re-classified (e.g., matches),
+    # keep them if they had predictions from other models
+    if existing_results:
+        existing_image_paths = {p.get('image_path') or '' for p in photos}
+        for p in existing_results.get('photos', []):
+            ip = p.get('image_path', '')
+            if ip and ip not in existing_image_paths:
+                photos.append(p)
+
     results = {
         'folder': str(folder),
+        'models': models,
         'settings': {
             'threshold': threshold,
             'thumbnail_size': thumbnail_size,
+            'group_window': group_window,
         },
         'stats': stats,
         'photos': photos,
     }
 
-    results_path = os.path.join(output_dir, "results.json")
     with open(results_path, 'w') as f:
         json.dump(results, f, indent=2)
 
     log.info("--- Analysis Summary ---")
+    log.info("Model:          %s", slug)
     log.info("Total images:   %d", stats['total'])
     log.info("New:            %d", stats['new'])
     log.info("Refinements:    %d", stats['refinement'])
@@ -154,6 +294,7 @@ def analyze(folder, output_dir, labels, model_str='ViT-B-16',
     log.info("Matches:        %d (hidden)", stats['match'])
     log.info("Below threshold:%d", stats['below_threshold'])
     log.info("Failed:         %d", stats['failed'])
+    log.info("Groups:         %d", group_counter)
     log.info("Results saved to %s", results_path)
 
     return results
@@ -165,10 +306,15 @@ def main():
     )
     parser.add_argument("--folder", required=True, help="Path to image folder")
     parser.add_argument("--labels-file", required=True, help="Text file with one label per line")
+    parser.add_argument("--taxonomy", default=os.path.join(os.path.dirname(__file__), "taxonomy.json"),
+                        help="Path to taxonomy.json")
     parser.add_argument("--output-dir", default="/tmp/photo-review", help="Output directory")
     parser.add_argument("--model-weights", default="/tmp/bioclip_model/open_clip_pytorch_model.bin")
+    parser.add_argument("--model-name", default=None, help="Human-readable model name")
     parser.add_argument("--threshold", type=float, default=0.4)
     parser.add_argument("--thumbnail-size", type=int, default=400)
+    parser.add_argument("--group-window", type=int, default=10,
+                        help="Seconds for neighbor grouping (0 to disable)")
     parser.add_argument("--no-recursive", action="store_true")
     args = parser.parse_args()
 
@@ -180,9 +326,12 @@ def main():
         folder=args.folder,
         output_dir=args.output_dir,
         labels=labels,
+        taxonomy_path=args.taxonomy,
         pretrained_str=args.model_weights,
+        model_name=args.model_name,
         threshold=args.threshold,
         thumbnail_size=args.thumbnail_size,
+        group_window=args.group_window,
         recursive=not args.no_recursive,
     )
 

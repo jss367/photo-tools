@@ -11,9 +11,11 @@ from PIL import Image
 def _make_test_image():
     """Create a temporary test image."""
     f = tempfile.NamedTemporaryFile(suffix='.jpg', delete=False)
+    path = f.name
+    f.close()
     img = Image.new('RGB', (224, 224), color='red')
-    img.save(f.name)
-    return f.name
+    img.save(path)
+    return path
 
 
 def test_classify_returns_predictions():

@@ -17,7 +17,10 @@ class Classifier:
 
     def __init__(self, labels=None, model_str='ViT-B-16',
                  pretrained_str='/tmp/bioclip_model/open_clip_pytorch_model.bin'):
-        if labels:
+        if labels is not None:
+            if not labels:
+                raise ValueError("labels list must not be empty")
+
             from bioclip import CustomLabelsClassifier
             self._classifier = CustomLabelsClassifier(
                 cls_ary=labels,

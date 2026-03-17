@@ -92,5 +92,6 @@ def test_threshold_filters_low_confidence():
             threshold=0.99,
         )
         assert stats['images_processed'] == 3
-        # With plain green images, high threshold should skip most
-        assert stats['images_skipped'] >= 0
+        # Plain green images with 0.99 threshold — all should be skipped
+        assert stats['images_skipped'] == 3
+        assert stats['sidecars_written'] == 0

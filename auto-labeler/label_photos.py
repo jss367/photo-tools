@@ -8,6 +8,7 @@ import argparse
 import logging
 import sys
 import os
+import tempfile
 from pathlib import Path
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'lr-migration'))
@@ -71,8 +72,7 @@ def run(folder, labels=None, model_str='ViT-B-16',
             stats['images_failed'] += 1
             continue
 
-        # Save temp jpg for classifier (BioCLIP needs a file path)
-        import tempfile
+        # Re-save as temp JPEG since image was loaded/resized by load_image
         with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as tmp:
             tmp_path = tmp.name
             img.save(tmp_path, quality=85)
@@ -80,7 +80,7 @@ def run(folder, labels=None, model_str='ViT-B-16',
         try:
             predictions = clf.classify(tmp_path, threshold=threshold)
         except Exception:
-            log.warning("Classification failed for %s", image_path)
+            log.warning("Classification failed for %s", image_path, exc_info=True)
             stats['images_failed'] += 1
             continue
         finally:
@@ -110,7 +110,7 @@ def run(folder, labels=None, model_str='ViT-B-16',
                 )
                 stats['sidecars_written'] += 1
             except Exception:
-                log.warning("Failed to write sidecar for %s", image_path)
+                log.warning("Failed to write sidecar for %s", image_path, exc_info=True)
         else:
             log.info(
                 "[DRY RUN] %s -> %s (%.2f)",

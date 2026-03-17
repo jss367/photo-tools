@@ -37,14 +37,13 @@ def read_xmp_keywords(xmp_path):
     return keywords
 
 
-def categorize(prediction, existing_keywords, labels_vocab):
-    """Categorize a prediction relative to existing keywords.
+def categorize(prediction, existing_keywords, taxonomy):
+    """Categorize a prediction relative to existing keywords using taxonomy.
 
     Args:
         prediction: the model's predicted species name
         existing_keywords: set of all dc:subject keywords from the XMP
-        labels_vocab: set of known species labels (used to filter
-                      existing keywords to just species, ignoring locations etc.)
+        taxonomy: a Taxonomy instance for looking up taxa and relationships
 
     Returns:
         'match' — prediction matches an existing species keyword
@@ -52,35 +51,30 @@ def categorize(prediction, existing_keywords, labels_vocab):
         'refinement' — prediction is more specific than an existing keyword
         'disagreement' — prediction differs from existing species keyword
     """
-    pred_lower = prediction.lower()
-
-    # Filter existing keywords to just species (those in the labels vocab)
-    existing_species = set()
+    # Filter existing keywords to just those recognized as taxa
+    existing_taxa = []
     for kw in existing_keywords:
-        for label in labels_vocab:
-            if kw.lower() == label.lower():
-                existing_species.add(kw)
-                break
+        if taxonomy.is_taxon(kw):
+            existing_taxa.append(kw)
+        else:
+            log.debug("Ignoring non-taxon keyword: %s", kw)
 
-    # No species keywords exist — this is new info
-    if not existing_species:
+    # No recognized taxa in existing keywords — this is new info
+    if not existing_taxa:
         return 'new'
 
-    # Check for exact match (case-insensitive)
-    for sp in existing_species:
-        if sp.lower() == pred_lower:
+    # Check each existing taxon against the prediction
+    for taxon_kw in existing_taxa:
+        rel = taxonomy.relationship(taxon_kw, prediction)
+
+        if rel == 'same':
+            return 'match'
+        elif rel == 'ancestor':
+            # Existing is broader, prediction is more specific → refinement
+            return 'refinement'
+        elif rel == 'descendant':
+            # Existing is more specific, prediction is broader — unusual but treat as match
             return 'match'
 
-    # Check for refinement: existing keyword is a substring of prediction
-    # or they share a significant word (e.g., "hawk" in "Red-tailed hawk")
-    for sp in existing_species:
-        sp_lower = sp.lower()
-        if sp_lower in pred_lower or pred_lower in sp_lower:
-            return 'refinement'
-        # Check shared words (ignoring short words)
-        sp_words = {w for w in sp_lower.replace('-', ' ').split() if len(w) > 2}
-        pred_words = {w for w in pred_lower.replace('-', ' ').split() if len(w) > 2}
-        if sp_words & pred_words:
-            return 'refinement'
-
+    # If we get here, existing taxa exist but none match/contain the prediction
     return 'disagreement'

@@ -1,4 +1,5 @@
 # auto-labeler/tests/test_compare.py
+import json
 import os
 import sys
 import tempfile
@@ -13,10 +14,72 @@ def _write_test_xmp(path, keywords):
     write_xmp_sidecar(path, flat_keywords=set(keywords), hierarchical_keywords=set())
 
 
+def _create_mock_taxonomy(tmpdir):
+    """Create a small taxonomy.json for testing."""
+    taxonomy = {
+        "last_updated": "2026-03-17",
+        "source": "test",
+        "taxa_by_common": {
+            "song sparrow": {
+                "taxon_id": 9135,
+                "scientific_name": "Melospiza melodia",
+                "common_name": "Song Sparrow",
+                "rank": "species",
+                "lineage_names": ["Animalia", "Chordata", "Aves", "Passeriformes", "Passerellidae", "Melospiza", "Melospiza melodia"],
+                "lineage_ranks": ["kingdom", "phylum", "class", "order", "family", "genus", "species"],
+            },
+            "sparrow": {
+                "taxon_id": 200986,
+                "scientific_name": "Passerellidae",
+                "common_name": "Sparrow",
+                "rank": "family",
+                "lineage_names": ["Animalia", "Chordata", "Aves", "Passeriformes", "Passerellidae"],
+                "lineage_ranks": ["kingdom", "phylum", "class", "order", "family"],
+            },
+            "northern cardinal": {
+                "taxon_id": 9083,
+                "scientific_name": "Cardinalis cardinalis",
+                "common_name": "Northern Cardinal",
+                "rank": "species",
+                "lineage_names": ["Animalia", "Chordata", "Aves", "Passeriformes", "Cardinalidae", "Cardinalis", "Cardinalis cardinalis"],
+                "lineage_ranks": ["kingdom", "phylum", "class", "order", "family", "genus", "species"],
+            },
+            "blue jay": {
+                "taxon_id": 8229,
+                "scientific_name": "Cyanocitta cristata",
+                "common_name": "Blue Jay",
+                "rank": "species",
+                "lineage_names": ["Animalia", "Chordata", "Aves", "Passeriformes", "Corvidae", "Cyanocitta", "Cyanocitta cristata"],
+                "lineage_ranks": ["kingdom", "phylum", "class", "order", "family", "genus", "species"],
+            },
+            "carolina wren": {
+                "taxon_id": 7581,
+                "scientific_name": "Thryothorus ludovicianus",
+                "common_name": "Carolina Wren",
+                "rank": "species",
+                "lineage_names": ["Animalia", "Chordata", "Aves", "Passeriformes", "Troglodytidae", "Thryothorus", "Thryothorus ludovicianus"],
+                "lineage_ranks": ["kingdom", "phylum", "class", "order", "family", "genus", "species"],
+            },
+            "northern house wren": {
+                "taxon_id": 7582,
+                "scientific_name": "Troglodytes aedon",
+                "common_name": "Northern House Wren",
+                "rank": "species",
+                "lineage_names": ["Animalia", "Chordata", "Aves", "Passeriformes", "Troglodytidae", "Troglodytes", "Troglodytes aedon"],
+                "lineage_ranks": ["kingdom", "phylum", "class", "order", "family", "genus", "species"],
+            },
+        },
+        "taxa_by_scientific": {},
+    }
+    path = os.path.join(tmpdir, "taxonomy.json")
+    with open(path, 'w') as f:
+        json.dump(taxonomy, f)
+    return path
+
+
 def test_read_xmp_keywords():
     """read_xmp_keywords returns dc:subject values from an XMP file."""
     from compare import read_xmp_keywords
-
     with tempfile.NamedTemporaryFile(suffix='.xmp', delete=False) as f:
         _write_test_xmp(f.name, ['Northern cardinal', '0Locations', 'Dyke Marsh'])
         result = read_xmp_keywords(f.name)
@@ -32,40 +95,69 @@ def test_read_xmp_keywords_missing_file():
 
 
 def test_categorize_match():
-    """Exact match (case-insensitive) returns 'match'."""
+    """Exact match returns 'match'."""
     from compare import categorize
-    labels = {'Northern cardinal', 'Blue jay', 'Osprey'}
-    result = categorize('Northern cardinal', {'northern cardinal', 'Dyke Marsh'}, labels)
-    assert result == 'match'
+    from taxonomy import Taxonomy
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tax = Taxonomy(_create_mock_taxonomy(tmpdir))
+        result = categorize('Northern cardinal', {'Northern cardinal', 'Dyke Marsh'}, tax)
+        assert result == 'match'
 
 
 def test_categorize_new():
     """No existing species keywords returns 'new'."""
     from compare import categorize
-    labels = {'Northern cardinal', 'Blue jay', 'Osprey'}
-    result = categorize('Northern cardinal', {'Dyke Marsh', '0Locations'}, labels)
-    assert result == 'new'
+    from taxonomy import Taxonomy
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tax = Taxonomy(_create_mock_taxonomy(tmpdir))
+        result = categorize('Northern cardinal', {'Dyke Marsh', '0Locations'}, tax)
+        assert result == 'new'
 
 
-def test_categorize_refinement():
-    """Existing keyword is substring of prediction returns 'refinement'."""
+def test_categorize_refinement_family_to_species():
+    """Existing is family, prediction is species in that family -> refinement."""
     from compare import categorize
-    labels = {'Song sparrow', 'sparrow', 'Blue jay'}
-    result = categorize('Song sparrow', {'sparrow', 'Dyke Marsh'}, labels)
-    assert result == 'refinement'
+    from taxonomy import Taxonomy
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tax = Taxonomy(_create_mock_taxonomy(tmpdir))
+        # "sparrow" mapped to family Passerellidae, "Song sparrow" is a species in that family
+        result = categorize('Song sparrow', {'sparrow', 'Dyke Marsh'}, tax)
+        assert result == 'refinement'
 
 
-def test_categorize_disagreement():
+def test_categorize_disagreement_different_species():
     """Different species returns 'disagreement'."""
     from compare import categorize
-    labels = {'Northern cardinal', 'Blue jay', 'Osprey'}
-    result = categorize('Blue jay', {'Northern cardinal', 'Dyke Marsh'}, labels)
-    assert result == 'disagreement'
+    from taxonomy import Taxonomy
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tax = Taxonomy(_create_mock_taxonomy(tmpdir))
+        result = categorize('Blue jay', {'Northern cardinal', 'Dyke Marsh'}, tax)
+        assert result == 'disagreement'
 
 
-def test_categorize_no_labels_vocab():
-    """When existing keywords has no species matches, treat as 'new'."""
+def test_categorize_disagreement_same_family_species():
+    """Two species in different genera of same family -> disagreement (not refinement)."""
     from compare import categorize
-    labels = {'Northern cardinal', 'Blue jay'}
-    result = categorize('Northern cardinal', {'8Landscape', 'Dyke Marsh'}, labels)
-    assert result == 'new'
+    from taxonomy import Taxonomy
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tax = Taxonomy(_create_mock_taxonomy(tmpdir))
+        # Carolina Wren and Northern House Wren are both species (not family->species)
+        result = categorize('Northern House Wren', {'Carolina Wren'}, tax)
+        assert result == 'disagreement'
+
+
+def test_categorize_ignores_non_taxa():
+    """Keywords not in taxonomy are ignored (locations, categories)."""
+    from compare import categorize
+    from taxonomy import Taxonomy
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tax = Taxonomy(_create_mock_taxonomy(tmpdir))
+        # "Dyke Marsh" and "0Locations" not in taxonomy -> treated as new
+        result = categorize('Northern cardinal', {'Dyke Marsh', '0Locations'}, tax)
+        assert result == 'new'

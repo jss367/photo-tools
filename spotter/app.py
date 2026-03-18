@@ -410,7 +410,26 @@ def create_app(db_path, thumb_cache_dir=None):
             job['_start_time'] = time.time()
             do_scan(root, thread_db, progress_callback=progress_cb, incremental=incremental)
             photos = thread_db.get_photos(per_page=999999)
-            return {'photos_indexed': len(photos)}
+            photo_count = len(photos)
+
+            # Auto-generate thumbnails after scan
+            from thumbnails import generate_all
+            log.info("Generating thumbnails...")
+            runner.push_event(job['id'], 'progress', {
+                'current': 0, 'total': photo_count,
+                'current_file': 'Generating thumbnails...', 'rate': 0,
+            })
+            def thumb_cb(current, total):
+                job['progress']['current'] = current
+                job['progress']['total'] = total
+                runner.push_event(job['id'], 'progress', {
+                    'current': current, 'total': total,
+                    'current_file': 'Generating thumbnails...',
+                    'rate': round(current / max(time.time() - job['_start_time'], 0.01), 1),
+                })
+            generate_all(thread_db, app.config['THUMB_CACHE_DIR'], progress_callback=thumb_cb)
+
+            return {'photos_indexed': photo_count}
 
         job_id = runner.start('scan', work, config={'root': root, 'incremental': incremental})
         return jsonify({'job_id': job_id})

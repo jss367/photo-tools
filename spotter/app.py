@@ -60,17 +60,22 @@ def create_app(db_path, thumb_cache_dir=None):
     init_db = Database(db_path)
     init_db.create_default_collections()
 
-    # Mark species keywords from taxonomy if available
-    taxonomy_path = os.path.join(os.path.dirname(__file__), 'taxonomy.json')
-    if os.path.exists(taxonomy_path):
+    # Mark species keywords from taxonomy in background (avoids slow startup)
+    import threading
+    def _mark_species():
+        taxonomy_path = os.path.join(os.path.dirname(__file__), 'taxonomy.json')
+        if not os.path.exists(taxonomy_path):
+            return
         try:
             from taxonomy import Taxonomy
             tax = Taxonomy(taxonomy_path)
-            updated = init_db.mark_species_keywords(tax)
+            bg_db = Database(db_path)
+            updated = bg_db.mark_species_keywords(tax)
             if updated:
                 log.info("Marked %d keywords as species from taxonomy", updated)
         except Exception:
             log.debug("Could not load taxonomy for species marking", exc_info=True)
+    threading.Thread(target=_mark_species, daemon=True).start()
 
     app._job_runner = JobRunner(db=init_db)
     app._log_broadcaster = LogBroadcaster(buffer_size=500)

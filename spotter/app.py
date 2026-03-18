@@ -129,6 +129,108 @@ def create_app(db_path, thumb_cache_dir=None):
         keywords = db.get_keyword_tree()
         return jsonify([dict(k) for k in keywords])
 
+    # -- Edit API routes --
+
+    @app.route('/api/photos/<int:photo_id>/rating', methods=['POST'])
+    def api_set_rating(photo_id):
+        db = _get_db()
+        body = request.get_json(silent=True) or {}
+        rating = body.get('rating', 0)
+        db.update_photo_rating(photo_id, rating)
+        db.queue_change(photo_id, 'rating', str(rating))
+        return jsonify({'ok': True})
+
+    @app.route('/api/photos/<int:photo_id>/flag', methods=['POST'])
+    def api_set_flag(photo_id):
+        db = _get_db()
+        body = request.get_json(silent=True) or {}
+        flag = body.get('flag', 'none')
+        db.update_photo_flag(photo_id, flag)
+        db.queue_change(photo_id, 'flag', flag)
+        return jsonify({'ok': True})
+
+    @app.route('/api/photos/<int:photo_id>/keywords', methods=['POST'])
+    def api_add_keyword(photo_id):
+        db = _get_db()
+        body = request.get_json(silent=True) or {}
+        name = body.get('name', '').strip()
+        if not name:
+            return jsonify({'error': 'name required'}), 400
+        kid = db.add_keyword(name)
+        db.tag_photo(photo_id, kid)
+        db.queue_change(photo_id, 'keyword_add', name)
+        return jsonify({'ok': True, 'keyword_id': kid})
+
+    @app.route('/api/photos/<int:photo_id>/keywords/<int:keyword_id>', methods=['DELETE'])
+    def api_remove_keyword(photo_id, keyword_id):
+        db = _get_db()
+        # Get keyword name for the pending change record
+        keywords = db.get_photo_keywords(photo_id)
+        kw_name = ''
+        for k in keywords:
+            if k['id'] == keyword_id:
+                kw_name = k['name']
+                break
+        db.untag_photo(photo_id, keyword_id)
+        db.queue_change(photo_id, 'keyword_remove', kw_name)
+        return jsonify({'ok': True})
+
+    @app.route('/api/sync/status')
+    def api_sync_status():
+        db = _get_db()
+        changes = db.get_pending_changes()
+        return jsonify({
+            'pending_count': len(changes),
+        })
+
+    @app.route('/api/sync/run', methods=['POST'])
+    def api_sync_run():
+        db = _get_db()
+        try:
+            from sync import sync_to_xmp
+            result = sync_to_xmp(db)
+            return jsonify(result)
+        except ImportError:
+            return jsonify({'error': 'sync module not available'}), 500
+
+    # -- Collection API routes --
+
+    @app.route('/api/collections')
+    def api_collections():
+        db = _get_db()
+        collections = db.get_collections()
+        return jsonify([dict(c) for c in collections])
+
+    @app.route('/api/collections', methods=['POST'])
+    def api_create_collection():
+        db = _get_db()
+        body = request.get_json(silent=True) or {}
+        import json
+        name = body.get('name', '').strip()
+        rules = body.get('rules', [])
+        if not name:
+            return jsonify({'error': 'name required'}), 400
+        cid = db.add_collection(name, json.dumps(rules))
+        return jsonify({'ok': True, 'id': cid})
+
+    @app.route('/api/collections/<int:collection_id>', methods=['DELETE'])
+    def api_delete_collection(collection_id):
+        db = _get_db()
+        db.delete_collection(collection_id)
+        return jsonify({'ok': True})
+
+    @app.route('/api/collections/<int:collection_id>/photos')
+    def api_collection_photos(collection_id):
+        db = _get_db()
+        page = request.args.get('page', 1, type=int)
+        per_page = request.args.get('per_page', 50, type=int)
+        photos = db.get_collection_photos(collection_id, page=page, per_page=per_page)
+        return jsonify({
+            'photos': [dict(p) for p in photos],
+            'page': page,
+            'per_page': per_page,
+        })
+
     # -- Thumbnail serving --
 
     @app.route('/thumbnails/<filename>')

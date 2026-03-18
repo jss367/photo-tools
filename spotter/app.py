@@ -12,9 +12,14 @@ import webbrowser
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'lr-migration'))
 
-from flask import Flask, jsonify, redirect, request, render_template, send_from_directory
+import json
+import queue
+import time
+
+from flask import Flask, Response, jsonify, redirect, request, render_template, send_from_directory
 
 from db import Database
+from jobs import JobRunner, LogBroadcaster
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 log = logging.getLogger(__name__)
@@ -36,6 +41,12 @@ def create_app(db_path, thumb_cache_dir=None):
         if not hasattr(app, '_db') or app._db is None:
             app._db = Database(db_path)
         return app._db
+
+    # Initialize job runner and log broadcaster
+    init_db = Database(db_path)
+    app._job_runner = JobRunner(db=init_db)
+    app._log_broadcaster = LogBroadcaster(buffer_size=500)
+    app._log_broadcaster.install()
 
     # -- Page routes --
 
@@ -323,11 +334,43 @@ def create_app(db_path, thumb_cache_dir=None):
         import_untracked(db, paths)
         return jsonify({'ok': True, 'imported': len(paths)})
 
-    # -- Scan API routes --
+    # -- Scan status (kept, non-job) --
 
-    @app.route('/api/scan', methods=['POST'])
-    def api_scan():
+    @app.route('/api/scan/status')
+    def api_scan_status():
         db = _get_db()
+        photos = db.get_photos(per_page=999999)
+        folders = db.get_folder_tree()
+        keywords = db.get_keyword_tree()
+        pending = db.get_pending_changes()
+
+        # DB file size
+        db_size = 0
+        if os.path.exists(db_path):
+            db_size = os.path.getsize(db_path)
+
+        # Thumbnail cache size
+        thumb_dir = app.config['THUMB_CACHE_DIR']
+        thumb_size = 0
+        if os.path.isdir(thumb_dir):
+            for f in os.listdir(thumb_dir):
+                fp = os.path.join(thumb_dir, f)
+                if os.path.isfile(fp):
+                    thumb_size += os.path.getsize(fp)
+
+        return jsonify({
+            'photo_count': len(photos),
+            'folder_count': len(folders),
+            'keyword_count': len(keywords),
+            'pending_changes': len(pending),
+            'db_size': db_size,
+            'thumb_cache_size': thumb_size,
+        })
+
+    # -- Job API routes --
+
+    @app.route('/api/jobs/scan', methods=['POST'])
+    def api_job_scan():
         body = request.get_json(silent=True) or {}
         root = body.get('root', '')
         incremental = body.get('incremental', False)
@@ -335,33 +378,190 @@ def create_app(db_path, thumb_cache_dir=None):
             return jsonify({'error': 'root path required'}), 400
         if not os.path.isdir(root):
             return jsonify({'error': f'directory not found: {root}'}), 400
-        from scanner import scan
-        scan(root, db, incremental=incremental)
-        photos = db.get_photos(per_page=999999)
-        return jsonify({'ok': True, 'photos_indexed': len(photos)})
 
-    @app.route('/api/scan/thumbnails', methods=['POST'])
-    def api_generate_thumbnails():
-        db = _get_db()
-        from thumbnails import generate_all
-        generate_all(db, app.config['THUMB_CACHE_DIR'])
-        return jsonify({'ok': True})
+        runner = app._job_runner
 
-    @app.route('/api/scan/status')
-    def api_scan_status():
+        def work(job):
+            from scanner import scan as do_scan
+            thread_db = Database(db_path)
+            def progress_cb(current, total):
+                job['progress']['current'] = current
+                job['progress']['total'] = total
+                runner.push_event(job['id'], 'progress', {
+                    'current': current,
+                    'total': total,
+                    'current_file': job['progress'].get('current_file', ''),
+                    'rate': round(current / max(time.time() - job['_start_time'], 0.01), 1),
+                })
+            job['_start_time'] = time.time()
+            do_scan(root, thread_db, progress_callback=progress_cb, incremental=incremental)
+            photos = thread_db.get_photos(per_page=999999)
+            return {'photos_indexed': len(photos)}
+
+        job_id = runner.start('scan', work, config={'root': root, 'incremental': incremental})
+        return jsonify({'job_id': job_id})
+
+    @app.route('/api/jobs/thumbnails', methods=['POST'])
+    def api_job_thumbnails():
+        runner = app._job_runner
+
+        def work(job):
+            from thumbnails import generate_all
+            thread_db = Database(db_path)
+            def progress_cb(current, total):
+                job['progress']['current'] = current
+                job['progress']['total'] = total
+                runner.push_event(job['id'], 'progress', {
+                    'current': current,
+                    'total': total,
+                    'rate': round(current / max(time.time() - job['_start_time'], 0.01), 1),
+                })
+            job['_start_time'] = time.time()
+            generate_all(thread_db, app.config['THUMB_CACHE_DIR'], progress_callback=progress_cb)
+            return {'ok': True}
+
+        job_id = runner.start('thumbnails', work)
+        return jsonify({'job_id': job_id})
+
+    @app.route('/api/jobs/import', methods=['POST'])
+    def api_job_import():
+        body = request.get_json(silent=True) or {}
+        catalogs = body.get('catalogs', [])
+        strategy = body.get('strategy', 'merge_all')
+        write_xmp = body.get('write_xmp', False)
+        if not catalogs:
+            return jsonify({'error': 'catalogs required'}), 400
+
+        runner = app._job_runner
+
+        def work(job):
+            from importer import execute_import
+            thread_db = Database(db_path)
+            def progress_cb(current, total):
+                job['progress']['current'] = current
+                job['progress']['total'] = total
+                runner.push_event(job['id'], 'progress', {
+                    'current': current,
+                    'total': total,
+                })
+            return execute_import(catalogs, thread_db, write_xmp=write_xmp,
+                                  strategy=strategy, progress_callback=progress_cb)
+
+        job_id = runner.start('import', work, config={'catalogs': catalogs, 'strategy': strategy})
+        return jsonify({'job_id': job_id})
+
+    @app.route('/api/jobs/sync', methods=['POST'])
+    def api_job_sync():
+        runner = app._job_runner
+
+        def work(job):
+            from sync import sync_to_xmp
+            thread_db = Database(db_path)
+            def progress_cb(current, total):
+                job['progress']['current'] = current
+                job['progress']['total'] = total
+                runner.push_event(job['id'], 'progress', {
+                    'current': current,
+                    'total': total,
+                })
+            return sync_to_xmp(thread_db, progress_callback=progress_cb)
+
+        job_id = runner.start('sync', work)
+        return jsonify({'job_id': job_id})
+
+    @app.route('/api/jobs')
+    def api_jobs_list():
+        runner = app._job_runner
         db = _get_db()
-        photos = db.get_photos(per_page=999999)
-        folders = db.get_folder_tree()
-        return jsonify({
-            'photo_count': len(photos),
-            'folder_count': len(folders),
-        })
+        active = runner.list_jobs()
+        history = runner.get_history(db, limit=10)
+        return jsonify({'active': active, 'history': history})
+
+    @app.route('/api/jobs/<job_id>')
+    def api_job_status(job_id):
+        job = app._job_runner.get(job_id)
+        if not job:
+            return jsonify({'error': 'job not found'}), 404
+        return jsonify(job)
+
+    @app.route('/api/jobs/<job_id>/stream')
+    def api_job_stream(job_id):
+        """SSE stream of job progress events."""
+        runner = app._job_runner
+        job = runner.get(job_id)
+        if not job:
+            return jsonify({'error': 'job not found'}), 404
+
+        q = runner.subscribe(job_id)
+
+        def generate():
+            try:
+                while True:
+                    try:
+                        event = q.get(timeout=1)
+                        yield f"event: {event['type']}\ndata: {json.dumps(event['data'])}\n\n"
+                        if event['type'] == 'complete':
+                            break
+                    except queue.Empty:
+                        # Send keepalive
+                        yield ": keepalive\n\n"
+                        # Check if job is done (in case we missed the complete event)
+                        j = runner.get(job_id)
+                        if j and j['status'] in ('completed', 'failed'):
+                            yield f"event: complete\ndata: {json.dumps({'status': j['status'], 'result': j['result'], 'errors': j['errors']})}\n\n"
+                            break
+            finally:
+                runner.unsubscribe(job_id, q)
+
+        return Response(generate(), mimetype='text/event-stream',
+                        headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'})
+
+    # -- Global log stream --
+
+    @app.route('/api/logs/stream')
+    def api_log_stream():
+        """SSE stream of all server log output."""
+        broadcaster = app._log_broadcaster
+        q = broadcaster.subscribe()
+
+        def generate():
+            try:
+                while True:
+                    try:
+                        record = q.get(timeout=2)
+                        yield f"event: log\ndata: {json.dumps(record)}\n\n"
+                    except queue.Empty:
+                        yield ": keepalive\n\n"
+            except GeneratorExit:
+                pass
+            finally:
+                broadcaster.unsubscribe(q)
+
+        return Response(generate(), mimetype='text/event-stream',
+                        headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'})
+
+    @app.route('/api/logs/recent')
+    def api_logs_recent():
+        count = request.args.get('count', 100, type=int)
+        return jsonify(app._log_broadcaster.get_recent(count))
+
+    @app.route('/api/jobs/history')
+    def api_job_history():
+        db = _get_db()
+        limit = request.args.get('limit', 10, type=int)
+        return jsonify(app._job_runner.get_history(db, limit=limit))
 
     # -- Thumbnail serving --
 
     @app.route('/thumbnails/<filename>')
     def serve_thumbnail(filename):
         return send_from_directory(app.config['THUMB_CACHE_DIR'], filename)
+
+    # -- Logs page --
+
+    @app.route('/logs')
+    def logs_page():
+        return render_template('logs.html')
 
     return app
 

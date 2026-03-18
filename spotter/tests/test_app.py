@@ -273,3 +273,102 @@ def test_sync_status(tmp_path):
     resp = client.get('/api/sync/status')
     data = resp.get_json()
     assert data['pending_count'] == 1
+
+
+# ---------- Job API Tests ----------
+
+def test_job_scan_returns_job_id(tmp_path):
+    """POST /api/jobs/scan starts a background scan and returns job_id."""
+    app, db = _setup_app(tmp_path)
+    client = app.test_client()
+
+    # Create a scannable directory
+    scan_dir = str(tmp_path / "scanme")
+    os.makedirs(scan_dir)
+    Image.new('RGB', (100, 100)).save(os.path.join(scan_dir, 'test.jpg'))
+
+    resp = client.post('/api/jobs/scan', json={'root': scan_dir})
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert 'job_id' in data
+    assert data['job_id'].startswith('scan-')
+
+
+def test_job_scan_invalid_root(tmp_path):
+    """POST /api/jobs/scan with invalid root returns 400."""
+    app, _ = _setup_app(tmp_path)
+    client = app.test_client()
+
+    resp = client.post('/api/jobs/scan', json={'root': '/nonexistent/path'})
+    assert resp.status_code == 400
+
+
+def test_job_status_endpoint(tmp_path):
+    """GET /api/jobs/<id> returns job status."""
+    import time
+    app, db = _setup_app(tmp_path)
+    client = app.test_client()
+
+    scan_dir = str(tmp_path / "scanme")
+    os.makedirs(scan_dir)
+    Image.new('RGB', (100, 100)).save(os.path.join(scan_dir, 'test.jpg'))
+
+    resp = client.post('/api/jobs/scan', json={'root': scan_dir})
+    job_id = resp.get_json()['job_id']
+
+    # Wait for completion
+    for _ in range(50):
+        resp = client.get(f'/api/jobs/{job_id}')
+        data = resp.get_json()
+        if data['status'] in ('completed', 'failed'):
+            break
+        time.sleep(0.1)
+
+    assert resp.status_code == 200
+    assert data['status'] == 'completed'
+
+
+def test_jobs_list(tmp_path):
+    """GET /api/jobs returns active and history lists."""
+    app, _ = _setup_app(tmp_path)
+    client = app.test_client()
+
+    resp = client.get('/api/jobs')
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert 'active' in data
+    assert 'history' in data
+
+
+def test_scan_status_includes_extended_stats(tmp_path):
+    """GET /api/scan/status includes keyword count, db_size, etc."""
+    app, _ = _setup_app(tmp_path)
+    client = app.test_client()
+
+    resp = client.get('/api/scan/status')
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert 'photo_count' in data
+    assert 'keyword_count' in data
+    assert 'db_size' in data
+    assert 'thumb_cache_size' in data
+
+
+def test_logs_recent(tmp_path):
+    """GET /api/logs/recent returns recent log entries."""
+    app, _ = _setup_app(tmp_path)
+    client = app.test_client()
+
+    resp = client.get('/api/logs/recent?count=10')
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert isinstance(data, list)
+
+
+def test_logs_page(tmp_path):
+    """GET /logs returns 200."""
+    app, _ = _setup_app(tmp_path)
+    client = app.test_client()
+
+    resp = client.get('/logs')
+    assert resp.status_code == 200

@@ -146,6 +146,22 @@ class Database:
             "SELECT * FROM photos WHERE id = ?", (photo_id,)
         ).fetchone()
 
+    def count_photos(self):
+        """Return total photo count."""
+        return self.conn.execute("SELECT COUNT(*) FROM photos").fetchone()[0]
+
+    def count_folders(self):
+        """Return total folder count."""
+        return self.conn.execute("SELECT COUNT(*) FROM folders").fetchone()[0]
+
+    def count_keywords(self):
+        """Return total keyword count."""
+        return self.conn.execute("SELECT COUNT(*) FROM keywords").fetchone()[0]
+
+    def count_pending_changes(self):
+        """Return pending changes count."""
+        return self.conn.execute("SELECT COUNT(*) FROM pending_changes").fetchone()[0]
+
     def get_photos(self, folder_id=None, page=1, per_page=50, sort='date',
                    rating_min=None, date_from=None, date_to=None, keyword=None):
         """Return paginated, filtered photo list."""
@@ -285,22 +301,24 @@ class Database:
         self.conn.commit()
 
     def get_predictions(self, photo_ids=None, model=None, status=None):
-        """Get predictions, optionally filtered."""
+        """Get predictions with photo filename, optionally filtered."""
         conditions = []
         params = []
         if photo_ids is not None:
             placeholders = ','.join('?' for _ in photo_ids)
-            conditions.append(f"photo_id IN ({placeholders})")
+            conditions.append(f"pr.photo_id IN ({placeholders})")
             params.extend(photo_ids)
         if model:
-            conditions.append("model = ?")
+            conditions.append("pr.model = ?")
             params.append(model)
         if status:
-            conditions.append("status = ?")
+            conditions.append("pr.status = ?")
             params.append(status)
         where = "WHERE " + " AND ".join(conditions) if conditions else ""
         return self.conn.execute(
-            f"SELECT * FROM predictions {where} ORDER BY confidence DESC", params
+            f"""SELECT pr.*, p.filename FROM predictions pr
+                JOIN photos p ON p.id = pr.photo_id
+                {where} ORDER BY pr.confidence DESC""", params
         ).fetchall()
 
     def update_prediction_status(self, prediction_id, status):

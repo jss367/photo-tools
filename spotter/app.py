@@ -138,19 +138,19 @@ def create_app(db_path, thumb_cache_dir=None):
             keyword=keyword,
         )
 
-        # Get total count for pagination info
-        total_photos = db.get_photos(
-            folder_id=folder_id,
-            rating_min=rating_min,
-            date_from=date_from,
-            date_to=date_to,
-            keyword=keyword,
-            per_page=999999,
-        )
+        # Total count — use count_photos for unfiltered, otherwise count the filtered set
+        if not any([folder_id, rating_min, date_from, date_to, keyword]):
+            total = db.count_photos()
+        else:
+            total = len(db.get_photos(
+                folder_id=folder_id, rating_min=rating_min,
+                date_from=date_from, date_to=date_to,
+                keyword=keyword, per_page=999999,
+            ))
 
         return jsonify({
             'photos': [dict(p) for p in photos],
-            'total': len(total_photos),
+            'total': total,
             'page': page,
             'per_page': per_page,
         })
@@ -288,15 +288,7 @@ def create_app(db_path, thumb_cache_dir=None):
             preds = db.get_predictions(photo_ids=photo_ids, status=status) if photo_ids else []
         else:
             preds = db.get_predictions(status=status)
-        # Enrich with photo info
-        result = []
-        for pred in preds:
-            photo = db.get_photo(pred['photo_id'])
-            result.append({
-                **dict(pred),
-                'filename': photo['filename'] if photo else None,
-            })
-        return jsonify(result)
+        return jsonify([dict(p) for p in preds])
 
     @app.route('/api/predictions/<int:pred_id>/accept', methods=['POST'])
     def api_accept_prediction(pred_id):
@@ -407,10 +399,6 @@ def create_app(db_path, thumb_cache_dir=None):
     @app.route('/api/scan/status')
     def api_scan_status():
         db = _get_db()
-        photos = db.get_photos(per_page=999999)
-        folders = db.get_folder_tree()
-        keywords = db.get_keyword_tree()
-        pending = db.get_pending_changes()
 
         # DB file size
         db_size = 0
@@ -427,10 +415,10 @@ def create_app(db_path, thumb_cache_dir=None):
                     thumb_size += os.path.getsize(fp)
 
         return jsonify({
-            'photo_count': len(photos),
-            'folder_count': len(folders),
-            'keyword_count': len(keywords),
-            'pending_changes': len(pending),
+            'photo_count': db.count_photos(),
+            'folder_count': db.count_folders(),
+            'keyword_count': db.count_keywords(),
+            'pending_changes': db.count_pending_changes(),
             'db_size': db_size,
             'thumb_cache_size': thumb_size,
         })
@@ -463,8 +451,7 @@ def create_app(db_path, thumb_cache_dir=None):
                 })
             job['_start_time'] = time.time()
             do_scan(root, thread_db, progress_callback=progress_cb, incremental=incremental)
-            photos = thread_db.get_photos(per_page=999999)
-            photo_count = len(photos)
+            photo_count = thread_db.count_photos()
 
             # Auto-generate thumbnails after scan
             from thumbnails import generate_all
@@ -578,11 +565,15 @@ def create_app(db_path, thumb_cache_dir=None):
             thread_db = Database(db_path)
             job['_start_time'] = time.time()
 
-            # Load labels if provided
+            # Load labels — use provided file, or fall back to taxonomy species names
             labels = None
             if labels_file and os.path.exists(labels_file):
                 with open(labels_file) as f:
                     labels = [line.strip() for line in f if line.strip()]
+            elif tax:
+                # Use species from taxonomy as labels for CustomLabelsClassifier
+                labels = list(tax._by_common.keys())[:1000]  # cap for performance
+                log.info("Using %d taxonomy species as classifier labels", len(labels))
 
             # Load taxonomy for categorization
             taxonomy_path = os.path.join(os.path.dirname(__file__), 'taxonomy.json')

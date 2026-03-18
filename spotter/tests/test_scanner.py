@@ -1,8 +1,10 @@
 # spotter/tests/test_scanner.py
 import os
 import sys
+import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'lr-migration'))
 
 from PIL import Image
 
@@ -155,3 +157,129 @@ def test_scan_updates_folder_counts(tmp_path):
     sub_folder = [f for f in folders if f['name'] == 'sub'][0]
     assert root_folder['photo_count'] == 2
     assert sub_folder['photo_count'] == 1
+
+
+def test_scan_imports_xmp_keywords(tmp_path):
+    """scan() reads XMP sidecars and imports keywords into the database."""
+    from db import Database
+    from scanner import scan
+    from xmp_writer import write_xmp_sidecar
+
+    root = str(tmp_path / "photos")
+    os.makedirs(root)
+    Image.new('RGB', (100, 100)).save(os.path.join(root, 'bird.jpg'))
+
+    # Create XMP sidecar with keywords
+    write_xmp_sidecar(
+        os.path.join(root, 'bird.xmp'),
+        flat_keywords={'Northern cardinal', 'Birds'},
+        hierarchical_keywords={'Birds|Northern cardinal'},
+    )
+
+    db = Database(str(tmp_path / "test.db"))
+    scan(root, db)
+
+    photos = db.get_photos()
+    assert len(photos) == 1
+    keywords = db.get_photo_keywords(photos[0]['id'])
+    kw_names = {k['name'] for k in keywords}
+    assert 'Northern cardinal' in kw_names
+    assert 'Birds' in kw_names
+
+
+def test_scan_imports_hierarchical_keywords(tmp_path):
+    """scan() creates keyword hierarchy from lr:hierarchicalSubject."""
+    from db import Database
+    from scanner import scan
+    from xmp_writer import write_xmp_sidecar
+
+    root = str(tmp_path / "photos")
+    os.makedirs(root)
+    Image.new('RGB', (100, 100)).save(os.path.join(root, 'bird.jpg'))
+
+    write_xmp_sidecar(
+        os.path.join(root, 'bird.xmp'),
+        flat_keywords={'Black kite'},
+        hierarchical_keywords={'Birds|Raptors|Black kite'},
+    )
+
+    db = Database(str(tmp_path / "test.db"))
+    scan(root, db)
+
+    tree = db.get_keyword_tree()
+    names = {k['name'] for k in tree}
+    assert 'Birds' in names
+    assert 'Raptors' in names
+    assert 'Black kite' in names
+
+    # Verify hierarchy: Raptors parent is Birds
+    raptors = [k for k in tree if k['name'] == 'Raptors'][0]
+    birds = [k for k in tree if k['name'] == 'Birds'][0]
+    assert raptors['parent_id'] == birds['id']
+
+
+def test_incremental_scan_skips_unchanged(tmp_path):
+    """Incremental scan skips files that haven't changed since last scan."""
+    from db import Database
+    from scanner import scan
+
+    root = str(tmp_path / "photos")
+    os.makedirs(root)
+    Image.new('RGB', (100, 100)).save(os.path.join(root, 'old.jpg'))
+
+    db = Database(str(tmp_path / "test.db"))
+    scan(root, db)
+
+    # Add a new file
+    time.sleep(0.05)
+    Image.new('RGB', (200, 200)).save(os.path.join(root, 'new.jpg'))
+
+    # Track what gets processed
+    processed = []
+    scan(root, db, incremental=True,
+         progress_callback=lambda cur, tot: processed.append(cur))
+
+    photos = db.get_photos(per_page=100)
+    filenames = {p['filename'] for p in photos}
+    assert 'old.jpg' in filenames
+    assert 'new.jpg' in filenames
+
+
+def test_incremental_scan_detects_xmp_changes(tmp_path):
+    """Incremental scan re-reads XMP when xmp_mtime changes."""
+    from db import Database
+    from scanner import scan
+    from xmp_writer import write_xmp_sidecar
+
+    root = str(tmp_path / "photos")
+    os.makedirs(root)
+    Image.new('RGB', (100, 100)).save(os.path.join(root, 'bird.jpg'))
+    write_xmp_sidecar(
+        os.path.join(root, 'bird.xmp'),
+        flat_keywords={'Sparrow'},
+        hierarchical_keywords=set(),
+    )
+
+    db = Database(str(tmp_path / "test.db"))
+    scan(root, db)
+
+    # Verify initial keyword
+    photos = db.get_photos()
+    kws = db.get_photo_keywords(photos[0]['id'])
+    assert {k['name'] for k in kws} == {'Sparrow'}
+
+    # Modify XMP - add a keyword
+    time.sleep(0.05)
+    write_xmp_sidecar(
+        os.path.join(root, 'bird.xmp'),
+        flat_keywords={'Cardinal'},
+        hierarchical_keywords=set(),
+    )
+
+    scan(root, db, incremental=True)
+
+    # Should now have both keywords (merge from XMP)
+    kws = db.get_photo_keywords(photos[0]['id'])
+    kw_names = {k['name'] for k in kws}
+    assert 'Sparrow' in kw_names
+    assert 'Cardinal' in kw_names

@@ -376,7 +376,16 @@
            oninput="updateThumbSize(this.value)">
     <span class="value" id="thumbSizeVal">400px</span>
   </div>
+  <div class="setting-group">
+    <button class="btn-batch-accept" id="classifyBtn" onclick="runClassification()" style="display:none;">Run Classification</button>
+    <button class="btn-batch-accept" id="acceptAllBtn" onclick="acceptAllPending()" style="display:none;">Accept All</button>
+    <span class="batch-info" id="classifyStatus"></span>
+  </div>
+  <span class="kbd-hint" id="kbdHint" style="display:none;">Keyboard: A = accept, S = skip</span>
 </div>
+
+<!-- Category Tabs -->
+<div class="tabs" id="tabs"></div>
 
 <!-- Photo Grid -->
 <div class="grid" id="grid"></div>
@@ -388,9 +397,11 @@
 <script>
 /* ---------- State ---------- */
 var allData = { photos: [] };
-var currentModel = '';
+var predictions = [];
 var currentCollectionId = null;
+var currentTab = 'all';
 var thumbSize = 400;
+var mode = 'browse'; // 'browse' or 'review'
 
 /* ---------- Bootstrap ---------- */
 loadCollections();
@@ -405,8 +416,6 @@ async function loadCollections() {
     collections.forEach(function(c) {
       sel.innerHTML += '<option value="' + c.id + '">' + escapeHtml(c.name) + '</option>';
     });
-
-    // Show empty state initially
     document.getElementById('empty').style.display = 'block';
   } catch(e) {}
 }
@@ -414,6 +423,8 @@ async function loadCollections() {
 function switchCollection(id) {
   if (!id) {
     allData.photos = [];
+    predictions = [];
+    mode = 'browse';
     renderAll();
     document.getElementById('empty').style.display = 'block';
     document.getElementById('empty').textContent = 'Select a collection above to load photos.';
@@ -438,6 +449,11 @@ async function loadCollectionPhotos(collectionId) {
     document.getElementById('title').textContent = 'Classify: ' + name;
     document.title = 'Spotter - Classify: ' + name;
 
+    // Check for existing predictions
+    var predResp = await fetch('/api/predictions?collection_id=' + collectionId);
+    predictions = await predResp.json();
+
+    mode = predictions.length > 0 ? 'review' : 'browse';
     document.getElementById('loading').style.display = 'none';
     renderAll();
   } catch (err) {
@@ -445,78 +461,267 @@ async function loadCollectionPhotos(collectionId) {
   }
 }
 
-function switchModel(model) {
-  currentModel = model;
-  renderAll();
+/* ---------- Classification ---------- */
+async function runClassification() {
+  if (!currentCollectionId) return;
+  var btn = document.getElementById('classifyBtn');
+  var status = document.getElementById('classifyStatus');
+  btn.disabled = true;
+  status.textContent = 'Starting classification...';
+
+  try {
+    var resp = await fetch('/api/jobs/classify', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ collection_id: currentCollectionId }),
+    });
+    if (!resp.ok) {
+      var err = await resp.json();
+      status.textContent = 'Error: ' + (err.error || 'failed');
+      btn.disabled = false;
+      return;
+    }
+    var data = await resp.json();
+    status.textContent = 'Classifying...';
+
+    var source = new EventSource('/api/jobs/' + data.job_id + '/stream');
+    source.addEventListener('progress', function(e) {
+      var p = JSON.parse(e.data);
+      if (p.total > 0) {
+        status.textContent = p.current + ' / ' + p.total + (p.current_file ? ' - ' + p.current_file : '');
+      }
+    });
+    source.addEventListener('complete', function(e) {
+      source.close();
+      var result = JSON.parse(e.data);
+      if (result.status === 'completed' && result.result) {
+        status.textContent = 'Done! ' + result.result.classified + ' classified' +
+          (result.result.failed > 0 ? ', ' + result.result.failed + ' failed' : '');
+      } else {
+        status.textContent = 'Failed: ' + (result.errors || []).join(', ');
+      }
+      btn.disabled = false;
+      // Reload predictions
+      loadCollectionPhotos(currentCollectionId);
+    });
+    source.onerror = function() {
+      source.close();
+      status.textContent = 'Connection lost.';
+      btn.disabled = false;
+    };
+  } catch(e) {
+    status.textContent = 'Error: ' + e.message;
+    btn.disabled = false;
+  }
 }
 
-/* ---------- Render Helpers ---------- */
+/* ---------- Render ---------- */
 function renderAll() {
   renderStats();
+  renderTabs();
+  renderButtons();
   renderGrid();
 }
 
 function renderStats() {
   var el = document.getElementById('stats');
-  el.innerHTML = '<span class="stat">' + allData.photos.length + ' photos</span>';
+  if (mode === 'review') {
+    var pending = predictions.filter(function(p) { return p.status === 'pending'; }).length;
+    var accepted = predictions.filter(function(p) { return p.status === 'accepted'; }).length;
+    el.innerHTML =
+      '<span class="stat new-count">' + pending + ' Pending</span>' +
+      '<span class="stat accepted-count">' + accepted + ' Accepted</span>' +
+      '<span class="stat">' + predictions.length + ' Total</span>';
+  } else {
+    el.innerHTML = '<span class="stat">' + allData.photos.length + ' photos</span>';
+  }
+}
+
+function renderTabs() {
+  var tabsEl = document.getElementById('tabs');
+  if (mode !== 'review') {
+    tabsEl.innerHTML = '';
+    return;
+  }
+  var counts = { all: predictions.length };
+  counts.pending = predictions.filter(function(p) { return p.status === 'pending'; }).length;
+  counts.accepted = predictions.filter(function(p) { return p.status === 'accepted'; }).length;
+  counts.rejected = predictions.filter(function(p) { return p.status === 'rejected'; }).length;
+
+  var tabs = [
+    { id: 'all', label: 'All' },
+    { id: 'pending', label: 'Pending' },
+    { id: 'accepted', label: 'Accepted' },
+    { id: 'rejected', label: 'Rejected' },
+  ];
+  tabsEl.innerHTML = tabs.map(function(t) {
+    var cls = currentTab === t.id ? 'tab active' : 'tab';
+    return '<div class="' + cls + '" onclick="switchTab(\'' + t.id + '\')">' +
+      t.label + '<span class="count">' + (counts[t.id] || 0) + '</span></div>';
+  }).join('');
+}
+
+function switchTab(tab) {
+  currentTab = tab;
+  renderAll();
+}
+
+function renderButtons() {
+  var classifyBtn = document.getElementById('classifyBtn');
+  var acceptAllBtn = document.getElementById('acceptAllBtn');
+  var kbdHint = document.getElementById('kbdHint');
+
+  if (currentCollectionId && mode === 'browse') {
+    classifyBtn.style.display = '';
+    acceptAllBtn.style.display = 'none';
+    kbdHint.style.display = 'none';
+  } else if (mode === 'review') {
+    classifyBtn.style.display = '';
+    var pending = predictions.filter(function(p) { return p.status === 'pending'; }).length;
+    if (pending > 0) {
+      acceptAllBtn.style.display = '';
+      acceptAllBtn.textContent = 'Accept All (' + pending + ')';
+      kbdHint.style.display = '';
+    } else {
+      acceptAllBtn.style.display = 'none';
+      kbdHint.style.display = 'none';
+    }
+  } else {
+    classifyBtn.style.display = 'none';
+    acceptAllBtn.style.display = 'none';
+    kbdHint.style.display = 'none';
+  }
 }
 
 /* ---------- Grid Rendering ---------- */
+function getVisibleItems() {
+  if (mode === 'review') {
+    if (currentTab === 'all') return predictions;
+    return predictions.filter(function(p) { return p.status === currentTab; });
+  }
+  return allData.photos;
+}
+
 function renderGrid() {
-  var photos = allData.photos;
+  var items = getVisibleItems();
   var grid = document.getElementById('grid');
   var empty = document.getElementById('empty');
 
-  if (photos.length === 0) {
+  if (items.length === 0) {
     grid.innerHTML = '';
-    if (currentCollectionId) {
-      empty.textContent = 'No photos in this collection.';
-    } else {
+    if (!currentCollectionId) {
       empty.textContent = 'Select a collection above to load photos.';
+    } else if (mode === 'review') {
+      empty.textContent = 'No predictions in this category.';
+    } else {
+      empty.textContent = 'No photos in this collection.';
     }
     empty.style.display = 'block';
     return;
   }
   empty.style.display = 'none';
-
   grid.style.setProperty('--card-width', thumbSize + 20 + 'px');
 
-  grid.innerHTML = photos.map(function(p) {
-    return renderPhotoCard(p);
-  }).join('');
+  if (mode === 'review') {
+    grid.innerHTML = items.map(function(p) { return renderPredictionCard(p); }).join('');
+  } else {
+    grid.innerHTML = items.map(function(p) { return renderPhotoCard(p); }).join('');
+  }
 }
 
 function renderPhotoCard(p) {
   var thumbUrl = '/thumbnails/' + p.id + '.jpg';
-
-  // Rating stars
   var stars = '';
-  if (p.rating > 0) {
-    for (var i = 0; i < p.rating; i++) stars += '&#9733;';
-  }
-
-  // Flag badge
+  if (p.rating > 0) { for (var i = 0; i < p.rating; i++) stars += '&#9733;'; }
   var flagHtml = '';
   if (p.flag === 'flagged') flagHtml = '<span class="badge badge-new">flagged</span>';
   else if (p.flag === 'rejected') flagHtml = '<span class="badge badge-disagreement">rejected</span>';
 
-  // Timestamp
-  var dateHtml = '';
-  if (p.timestamp) {
-    var d = p.timestamp.split('T')[0];
-    dateHtml = '<div class="card-existing"><span class="label-prefix">' + d + '</span></div>';
-  }
-
   return '<div class="card" data-id="' + p.id + '">' +
     '<img src="' + thumbUrl + '" loading="lazy" alt="' + escapeAttr(p.filename) + '">' +
     '<div class="card-body">' +
-      '<div class="card-filename" title="' + escapeAttr(p.filename) + '">' + escapeHtml(p.filename) + '</div>' +
+      '<div class="card-filename">' + escapeHtml(p.filename) + '</div>' +
       flagHtml +
-      dateHtml +
       (stars ? '<div class="card-prediction" style="color:#f0c040;font-size:14px;">' + stars + '</div>' : '') +
     '</div>' +
   '</div>';
 }
+
+function renderPredictionCard(pred) {
+  var thumbUrl = '/thumbnails/' + pred.photo_id + '.jpg';
+  var confPct = Math.round(pred.confidence * 100);
+  var confColor = confPct >= 70 ? '#4ecca3' : confPct >= 50 ? '#f0c040' : '#e74c3c';
+  var cardClass = 'card';
+  if (pred.status === 'accepted') cardClass += ' accepted';
+  if (pred.status === 'rejected') cardClass += ' skipped';
+
+  // Category badge
+  var badgeHtml = '';
+  if (pred.category && pred.category !== 'match') {
+    var badgeClass = pred.category === 'new' ? 'badge-new' : pred.category === 'refinement' ? 'badge-refinement' : 'badge-disagreement';
+    badgeHtml = '<span class="badge ' + badgeClass + '">' + pred.category + '</span>';
+  }
+
+  // Action buttons
+  var actionsHtml;
+  if (pred.status === 'accepted') {
+    actionsHtml = '<div class="card-actions"><button class="btn-done">accepted</button></div>';
+  } else if (pred.status === 'rejected') {
+    actionsHtml = '<div class="card-actions"><button class="btn-done skipped-btn">rejected</button></div>';
+  } else {
+    actionsHtml =
+      '<div class="card-actions">' +
+        '<button class="btn-accept" onclick="acceptPrediction(' + pred.id + ')">Accept</button>' +
+        '<button class="btn-skip" onclick="rejectPrediction(' + pred.id + ')">Reject</button>' +
+      '</div>';
+  }
+
+  return '<div class="' + cardClass + '" data-pred-id="' + pred.id + '">' +
+    '<img src="' + thumbUrl + '" loading="lazy" alt="' + escapeAttr(pred.filename || '') + '">' +
+    '<div class="card-body">' +
+      '<div class="card-filename">' + escapeHtml(pred.filename || '') + '</div>' +
+      badgeHtml +
+      '<div class="card-prediction">' + escapeHtml(pred.species) + '</div>' +
+      '<div class="confidence-bar"><div class="confidence-fill" style="width:' + confPct + '%;background:' + confColor + '"></div></div>' +
+      '<div class="card-confidence">' + confPct + '% confidence</div>' +
+      actionsHtml +
+    '</div>' +
+  '</div>';
+}
+
+/* ---------- Actions ---------- */
+async function acceptPrediction(predId) {
+  await fetch('/api/predictions/' + predId + '/accept', { method: 'POST' });
+  var pred = predictions.find(function(p) { return p.id === predId; });
+  if (pred) pred.status = 'accepted';
+  renderAll();
+}
+
+async function rejectPrediction(predId) {
+  await fetch('/api/predictions/' + predId + '/reject', { method: 'POST' });
+  var pred = predictions.find(function(p) { return p.id === predId; });
+  if (pred) pred.status = 'rejected';
+  renderAll();
+}
+
+async function acceptAllPending() {
+  var pending = predictions.filter(function(p) { return p.status === 'pending'; });
+  for (var i = 0; i < pending.length; i++) {
+    await fetch('/api/predictions/' + pending[i].id + '/accept', { method: 'POST' });
+    pending[i].status = 'accepted';
+  }
+  renderAll();
+}
+
+/* ---------- Keyboard Shortcuts ---------- */
+document.addEventListener('keydown', function(e) {
+  if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA' || e.target.tagName === 'SELECT') return;
+  if (mode !== 'review') return;
+  var pending = predictions.filter(function(p) { return p.status === 'pending'; });
+  if (pending.length === 0) return;
+  if (e.key === 'a' || e.key === 'A') { e.preventDefault(); acceptPrediction(pending[0].id); }
+  else if (e.key === 's' || e.key === 'S') { e.preventDefault(); rejectPrediction(pending[0].id); }
+});
 
 /* ---------- Settings ---------- */
 function updateThumbSize(val) {

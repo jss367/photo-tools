@@ -75,6 +75,18 @@ class Database:
                 created_at  TEXT DEFAULT (datetime('now'))
             );
 
+            CREATE TABLE IF NOT EXISTS predictions (
+                id          INTEGER PRIMARY KEY,
+                photo_id    INTEGER REFERENCES photos(id),
+                species     TEXT,
+                confidence  REAL,
+                model       TEXT,
+                category    TEXT,
+                status      TEXT DEFAULT 'pending',
+                created_at  TEXT DEFAULT (datetime('now')),
+                UNIQUE(photo_id, model)
+            );
+
             CREATE INDEX IF NOT EXISTS idx_photos_timestamp ON photos(timestamp);
             CREATE INDEX IF NOT EXISTS idx_photos_folder ON photos(folder_id);
             CREATE INDEX IF NOT EXISTS idx_photos_rating ON photos(rating);
@@ -259,6 +271,56 @@ class Database:
                ORDER BY k.name""",
             (photo_id,),
         ).fetchall()
+
+    # -- Predictions --
+
+    def add_prediction(self, photo_id, species, confidence, model, category='new'):
+        """Store a classification prediction for a photo."""
+        self.conn.execute(
+            """INSERT OR REPLACE INTO predictions
+               (photo_id, species, confidence, model, category, status)
+               VALUES (?, ?, ?, ?, ?, 'pending')""",
+            (photo_id, species, confidence, model, category),
+        )
+        self.conn.commit()
+
+    def get_predictions(self, photo_ids=None, model=None, status=None):
+        """Get predictions, optionally filtered."""
+        conditions = []
+        params = []
+        if photo_ids is not None:
+            placeholders = ','.join('?' for _ in photo_ids)
+            conditions.append(f"photo_id IN ({placeholders})")
+            params.extend(photo_ids)
+        if model:
+            conditions.append("model = ?")
+            params.append(model)
+        if status:
+            conditions.append("status = ?")
+            params.append(status)
+        where = "WHERE " + " AND ".join(conditions) if conditions else ""
+        return self.conn.execute(
+            f"SELECT * FROM predictions {where} ORDER BY confidence DESC", params
+        ).fetchall()
+
+    def update_prediction_status(self, prediction_id, status):
+        """Update prediction status ('pending', 'accepted', 'rejected')."""
+        self.conn.execute(
+            "UPDATE predictions SET status = ? WHERE id = ?", (status, prediction_id)
+        )
+        self.conn.commit()
+
+    def accept_prediction(self, prediction_id):
+        """Accept a prediction: mark as accepted and add species keyword to photo."""
+        pred = self.conn.execute(
+            "SELECT * FROM predictions WHERE id = ?", (prediction_id,)
+        ).fetchone()
+        if not pred:
+            return
+        self.update_prediction_status(prediction_id, 'accepted')
+        kid = self.add_keyword(pred['species'], is_species=True)
+        self.tag_photo(pred['photo_id'], kid)
+        self.queue_change(pred['photo_id'], 'keyword_add', pred['species'])
 
     # -- Pending Changes --
 

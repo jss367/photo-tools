@@ -275,6 +275,41 @@ def create_app(db_path, thumb_cache_dir=None):
             'per_page': per_page,
         })
 
+    # -- Prediction API routes --
+
+    @app.route('/api/predictions')
+    def api_predictions():
+        db = _get_db()
+        collection_id = request.args.get('collection_id', None, type=int)
+        status = request.args.get('status', None)
+        if collection_id:
+            photos = db.get_collection_photos(collection_id, per_page=999999)
+            photo_ids = [p['id'] for p in photos]
+            preds = db.get_predictions(photo_ids=photo_ids, status=status) if photo_ids else []
+        else:
+            preds = db.get_predictions(status=status)
+        # Enrich with photo info
+        result = []
+        for pred in preds:
+            photo = db.get_photo(pred['photo_id'])
+            result.append({
+                **dict(pred),
+                'filename': photo['filename'] if photo else None,
+            })
+        return jsonify(result)
+
+    @app.route('/api/predictions/<int:pred_id>/accept', methods=['POST'])
+    def api_accept_prediction(pred_id):
+        db = _get_db()
+        db.accept_prediction(pred_id)
+        return jsonify({'ok': True})
+
+    @app.route('/api/predictions/<int:pred_id>/reject', methods=['POST'])
+    def api_reject_prediction(pred_id):
+        db = _get_db()
+        db.update_prediction_status(pred_id, 'rejected')
+        return jsonify({'ok': True})
+
     # -- Import API routes --
 
     @app.route('/api/import/preview', methods=['POST'])
@@ -519,6 +554,117 @@ def create_app(db_path, thumb_cache_dir=None):
             return sync_to_xmp(thread_db, progress_callback=progress_cb)
 
         job_id = runner.start('sync', work)
+        return jsonify({'job_id': job_id})
+
+    @app.route('/api/jobs/classify', methods=['POST'])
+    def api_job_classify():
+        body = request.get_json(silent=True) or {}
+        collection_id = body.get('collection_id')
+        labels_file = body.get('labels_file')
+        model_name = body.get('model_name', 'bioclip')
+        threshold = body.get('threshold', 0.4)
+
+        if not collection_id:
+            return jsonify({'error': 'collection_id required'}), 400
+
+        runner = app._job_runner
+
+        def work(job):
+            import tempfile
+            from classifier import Classifier
+            from compare import read_xmp_keywords, categorize
+            from image_loader import load_image
+
+            thread_db = Database(db_path)
+            job['_start_time'] = time.time()
+
+            # Load labels if provided
+            labels = None
+            if labels_file and os.path.exists(labels_file):
+                with open(labels_file) as f:
+                    labels = [line.strip() for line in f if line.strip()]
+
+            # Load taxonomy for categorization
+            taxonomy_path = os.path.join(os.path.dirname(__file__), 'taxonomy.json')
+            tax = None
+            if os.path.exists(taxonomy_path):
+                from taxonomy import Taxonomy
+                tax = Taxonomy(taxonomy_path)
+
+            # Get photos from collection
+            photos = thread_db.get_collection_photos(collection_id, per_page=999999)
+            folders = {f['id']: f['path'] for f in thread_db.get_folder_tree()}
+            total = len(photos)
+            job['progress']['total'] = total
+
+            log.info("Classifying %d photos with model '%s'", total, model_name)
+
+            # Initialize classifier
+            clf = Classifier(labels=labels)
+            classified = 0
+            failed = 0
+
+            for i, photo in enumerate(photos):
+                folder_path = folders.get(photo['folder_id'], '')
+                image_path = os.path.join(folder_path, photo['filename'])
+
+                job['progress']['current'] = i + 1
+                job['progress']['current_file'] = photo['filename']
+                runner.push_event(job['id'], 'progress', {
+                    'current': i + 1,
+                    'total': total,
+                    'current_file': photo['filename'],
+                    'rate': round((i + 1) / max(time.time() - job['_start_time'], 0.01), 1),
+                })
+
+                # Load and classify
+                img = load_image(image_path)
+                if img is None:
+                    failed += 1
+                    continue
+
+                with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as tmp:
+                    tmp_path = tmp.name
+                    img.save(tmp_path, quality=85)
+
+                try:
+                    predictions = clf.classify(tmp_path, threshold=threshold)
+                except Exception:
+                    log.warning("Classification failed for %s", photo['filename'], exc_info=True)
+                    failed += 1
+                    continue
+                finally:
+                    os.unlink(tmp_path)
+
+                if not predictions:
+                    continue
+
+                top = predictions[0]
+
+                # Categorize against existing keywords
+                category = 'new'
+                if tax:
+                    xmp_path = os.path.join(folder_path, os.path.splitext(photo['filename'])[0] + '.xmp')
+                    existing = read_xmp_keywords(xmp_path)
+                    category = categorize(top['species'], existing, tax)
+
+                if category == 'match':
+                    continue
+
+                thread_db.add_prediction(
+                    photo_id=photo['id'],
+                    species=top['species'],
+                    confidence=round(top['score'], 4),
+                    model=model_name,
+                    category=category,
+                )
+                classified += 1
+
+            return {'classified': classified, 'failed': failed, 'total': total}
+
+        job_id = runner.start('classify', work, config={
+            'collection_id': collection_id, 'model_name': model_name,
+        })
         return jsonify({'job_id': job_id})
 
     @app.route('/api/jobs')

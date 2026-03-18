@@ -214,11 +214,17 @@ class LogBroadcaster(logging.Handler):
 
     def emit(self, record):
         """Called by the logging framework for each log record."""
+        message = record.getMessage()
+        # Include traceback if present
+        if record.exc_info and record.exc_info[1] is not None:
+            import traceback
+            tb = ''.join(traceback.format_exception(*record.exc_info))
+            message = message + '\n' + tb
         entry = {
             'time': record.created,
             'level': record.levelname,
             'logger': record.name,
-            'message': record.getMessage(),
+            'message': message,
         }
         with self._lock:
             self._buffer.append(entry)

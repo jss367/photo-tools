@@ -1,0 +1,160 @@
+"""Flask web app for the Spotter photo browser.
+
+Usage:
+    python spotter/app.py --db ~/.spotter/spotter.db [--port 8080]
+"""
+
+import argparse
+import logging
+import os
+import sys
+import webbrowser
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'lr-migration'))
+
+from flask import Flask, jsonify, redirect, request, render_template, send_from_directory
+
+from db import Database
+
+logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+log = logging.getLogger(__name__)
+
+
+def create_app(db_path, thumb_cache_dir=None):
+    """Create the Flask app for the Spotter photo browser.
+
+    Args:
+        db_path: path to the SQLite database
+        thumb_cache_dir: path to thumbnail cache directory
+    """
+    app = Flask(__name__, template_folder=os.path.join(os.path.dirname(__file__), 'templates'))
+    app.config['DB_PATH'] = db_path
+    app.config['THUMB_CACHE_DIR'] = thumb_cache_dir or os.path.expanduser("~/.spotter/thumbnails")
+
+    def _get_db():
+        """Get a Database instance. Creates a new connection per request."""
+        if not hasattr(app, '_db') or app._db is None:
+            app._db = Database(db_path)
+        return app._db
+
+    # -- Page routes --
+
+    @app.route('/')
+    def index():
+        return redirect('/browse')
+
+    @app.route('/browse')
+    def browse():
+        return render_template('browse.html')
+
+    @app.route('/classify')
+    def classify():
+        return render_template('review.html')
+
+    @app.route('/import')
+    def import_page():
+        return render_template('import.html')
+
+    @app.route('/audit')
+    def audit():
+        return render_template('audit.html')
+
+    @app.route('/settings')
+    def settings():
+        return render_template('settings.html')
+
+    # -- API routes --
+
+    @app.route('/api/folders')
+    def api_folders():
+        db = _get_db()
+        folders = db.get_folder_tree()
+        return jsonify([dict(f) for f in folders])
+
+    @app.route('/api/photos')
+    def api_photos():
+        db = _get_db()
+        page = request.args.get('page', 1, type=int)
+        per_page = request.args.get('per_page', 50, type=int)
+        sort = request.args.get('sort', 'date')
+        folder_id = request.args.get('folder_id', None, type=int)
+        rating_min = request.args.get('rating_min', None, type=int)
+        date_from = request.args.get('date_from', None)
+        date_to = request.args.get('date_to', None)
+        keyword = request.args.get('keyword', None)
+
+        photos = db.get_photos(
+            folder_id=folder_id,
+            page=page,
+            per_page=per_page,
+            sort=sort,
+            rating_min=rating_min,
+            date_from=date_from,
+            date_to=date_to,
+            keyword=keyword,
+        )
+
+        # Get total count for pagination info
+        total_photos = db.get_photos(
+            folder_id=folder_id,
+            rating_min=rating_min,
+            date_from=date_from,
+            date_to=date_to,
+            keyword=keyword,
+            per_page=999999,
+        )
+
+        return jsonify({
+            'photos': [dict(p) for p in photos],
+            'total': len(total_photos),
+            'page': page,
+            'per_page': per_page,
+        })
+
+    @app.route('/api/photos/<int:photo_id>')
+    def api_photo_detail(photo_id):
+        db = _get_db()
+        photo = db.get_photo(photo_id)
+        if not photo:
+            return jsonify({'error': 'not found'}), 404
+
+        result = dict(photo)
+        keywords = db.get_photo_keywords(photo_id)
+        result['keywords'] = [dict(k) for k in keywords]
+        return jsonify(result)
+
+    @app.route('/api/keywords')
+    def api_keywords():
+        db = _get_db()
+        keywords = db.get_keyword_tree()
+        return jsonify([dict(k) for k in keywords])
+
+    # -- Thumbnail serving --
+
+    @app.route('/thumbnails/<filename>')
+    def serve_thumbnail(filename):
+        return send_from_directory(app.config['THUMB_CACHE_DIR'], filename)
+
+    return app
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Spotter Photo Browser")
+    parser.add_argument("--db", default=os.path.expanduser("~/.spotter/spotter.db"),
+                        help="Path to SQLite database")
+    parser.add_argument("--thumb-dir", default=os.path.expanduser("~/.spotter/thumbnails"),
+                        help="Path to thumbnail cache directory")
+    parser.add_argument("--port", type=int, default=8080)
+    parser.add_argument("--no-browser", action="store_true")
+    args = parser.parse_args()
+
+    app = create_app(db_path=args.db, thumb_cache_dir=args.thumb_dir)
+
+    if not args.no_browser:
+        webbrowser.open(f"http://localhost:{args.port}")
+
+    app.run(host='127.0.0.1', port=args.port, debug=False)
+
+
+if __name__ == "__main__":
+    main()

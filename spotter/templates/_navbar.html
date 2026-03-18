@@ -260,7 +260,13 @@
     lpSource.addEventListener('log', function(e) {
       addLpLine(JSON.parse(e.data));
     });
-    window.addEventListener('beforeunload', function() {
+    window.addEventListener('beforeunload', function(e) {
+      // Warn if jobs are running
+      var running = activeJobs.filter(function(j) { return j.status === 'running'; });
+      if (running.length > 0) {
+        e.preventDefault();
+        e.returnValue = '';
+      }
       if (lpSource) { lpSource.close(); lpSource = null; }
     });
 

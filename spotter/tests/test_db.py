@@ -352,14 +352,64 @@ def test_collection_recent_days_rule(tmp_path):
     assert photos[0]['filename'] == 'recent.jpg'
 
 
+def test_collection_has_species_rule(tmp_path):
+    """get_collection_photos filters by has_species rule."""
+    from db import Database
+    import json
+    db = Database(str(tmp_path / "test.db"))
+    fid = db.add_folder('/photos', name='photos')
+    p1 = db.add_photo(folder_id=fid, filename='classified.jpg', extension='.jpg', file_size=100, file_mtime=1.0)
+    p2 = db.add_photo(folder_id=fid, filename='location_only.jpg', extension='.jpg', file_size=100, file_mtime=1.0)
+    p3 = db.add_photo(folder_id=fid, filename='no_tags.jpg', extension='.jpg', file_size=100, file_mtime=1.0)
+
+    k_species = db.add_keyword('Northern cardinal', is_species=True)
+    k_location = db.add_keyword('The Park', is_species=False)
+    db.tag_photo(p1, k_species)
+    db.tag_photo(p2, k_location)
+
+    # Needs classification: no species keyword
+    rules = [{"field": "has_species", "op": "equals", "value": 0}]
+    cid = db.add_collection('Needs Classification', json.dumps(rules))
+
+    photos = db.get_collection_photos(cid)
+    filenames = {p['filename'] for p in photos}
+    assert 'location_only.jpg' in filenames
+    assert 'no_tags.jpg' in filenames
+    assert 'classified.jpg' not in filenames
+
+
+def test_add_keyword_is_species(tmp_path):
+    """add_keyword with is_species=True marks the keyword."""
+    from db import Database
+    db = Database(str(tmp_path / "test.db"))
+    kid = db.add_keyword('Song sparrow', is_species=True)
+    row = db.conn.execute("SELECT is_species FROM keywords WHERE id = ?", (kid,)).fetchone()
+    assert row['is_species'] == 1
+
+
+def test_add_keyword_updates_is_species(tmp_path):
+    """add_keyword updates is_species on existing keyword if newly marked."""
+    from db import Database
+    db = Database(str(tmp_path / "test.db"))
+    kid = db.add_keyword('Song sparrow', is_species=False)
+    row = db.conn.execute("SELECT is_species FROM keywords WHERE id = ?", (kid,)).fetchone()
+    assert row['is_species'] == 0
+
+    kid2 = db.add_keyword('Song sparrow', is_species=True)
+    assert kid2 == kid
+    row = db.conn.execute("SELECT is_species FROM keywords WHERE id = ?", (kid,)).fetchone()
+    assert row['is_species'] == 1
+
+
 def test_default_collections_created(tmp_path):
-    """create_default_collections creates Untagged, Flagged, Recent Import."""
+    """create_default_collections creates default collections."""
     from db import Database
     db = Database(str(tmp_path / "test.db"))
     db.create_default_collections()
 
     colls = db.get_collections()
     names = {c['name'] for c in colls}
+    assert 'Needs Classification' in names
     assert 'Untagged' in names
     assert 'Flagged' in names
     assert 'Recent Import' in names
@@ -373,4 +423,4 @@ def test_default_collections_idempotent(tmp_path):
     db.create_default_collections()
 
     colls = db.get_collections()
-    assert len(colls) == 3
+    assert len(colls) == 4

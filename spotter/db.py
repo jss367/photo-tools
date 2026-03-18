@@ -51,6 +51,7 @@ class Database:
                 id          INTEGER PRIMARY KEY,
                 name        TEXT,
                 parent_id   INTEGER REFERENCES keywords(id),
+                is_species  INTEGER DEFAULT 0,
                 UNIQUE(name, parent_id)
             );
 
@@ -79,6 +80,11 @@ class Database:
             CREATE INDEX IF NOT EXISTS idx_photos_rating ON photos(rating);
             CREATE INDEX IF NOT EXISTS idx_keywords_name ON keywords(name);
         """)
+        # Migration: add is_species column if missing (existing databases)
+        try:
+            self.conn.execute("SELECT is_species FROM keywords LIMIT 0")
+        except Exception:
+            self.conn.execute("ALTER TABLE keywords ADD COLUMN is_species INTEGER DEFAULT 0")
 
     # -- Folders --
 
@@ -193,7 +199,7 @@ class Database:
 
     # -- Keywords --
 
-    def add_keyword(self, name, parent_id=None):
+    def add_keyword(self, name, parent_id=None, is_species=False):
         """Insert a keyword. Returns existing id if duplicate. Returns the keyword id."""
         # Check for null parent_id separately since UNIQUE(name, parent_id) treats NULLs as distinct
         if parent_id is None:
@@ -205,11 +211,18 @@ class Database:
                 "SELECT id FROM keywords WHERE name = ? AND parent_id = ?", (name, parent_id)
             ).fetchone()
         if existing:
+            # Update is_species if it wasn't set before
+            if is_species:
+                self.conn.execute(
+                    "UPDATE keywords SET is_species = 1 WHERE id = ? AND is_species = 0",
+                    (existing['id'],),
+                )
+                self.conn.commit()
             return existing['id']
 
         cur = self.conn.execute(
-            "INSERT INTO keywords (name, parent_id) VALUES (?, ?)",
-            (name, parent_id),
+            "INSERT INTO keywords (name, parent_id, is_species) VALUES (?, ?, ?)",
+            (name, parent_id, 1 if is_species else 0),
         )
         self.conn.commit()
         return cur.lastrowid
@@ -340,6 +353,17 @@ class Database:
                 if op == 'equals':
                     conditions.append("p.flag = ?")
                     params.append(value)
+            elif field == 'has_species':
+                if op == 'equals' and value is False or value == 0:
+                    conditions.append("""NOT EXISTS (
+                        SELECT 1 FROM photo_keywords pk3
+                        JOIN keywords k3 ON k3.id = pk3.keyword_id
+                        WHERE pk3.photo_id = p.id AND k3.is_species = 1)""")
+                elif op == 'equals' and value is True or value == 1:
+                    conditions.append("""EXISTS (
+                        SELECT 1 FROM photo_keywords pk3
+                        JOIN keywords k3 ON k3.id = pk3.keyword_id
+                        WHERE pk3.photo_id = p.id AND k3.is_species = 1)""")
             elif field == 'keyword_count':
                 if op == 'equals':
                     conditions.append("""(SELECT COUNT(*) FROM photo_keywords pk2
@@ -395,6 +419,22 @@ class Database:
         """)
         self.conn.commit()
 
+    def mark_species_keywords(self, taxonomy):
+        """Mark keywords that are recognized species in the taxonomy.
+
+        Args:
+            taxonomy: a Taxonomy instance with is_taxon() method
+        """
+        keywords = self.conn.execute("SELECT id, name FROM keywords WHERE is_species = 0").fetchall()
+        updated = 0
+        for kw in keywords:
+            if taxonomy.is_taxon(kw['name']):
+                self.conn.execute("UPDATE keywords SET is_species = 1 WHERE id = ?", (kw['id'],))
+                updated += 1
+        if updated:
+            self.conn.commit()
+        return updated
+
     def create_default_collections(self):
         """Create default smart collections if none exist."""
         existing = self.get_collections()
@@ -402,6 +442,7 @@ class Database:
             return
 
         defaults = [
+            ('Needs Classification', [{"field": "has_species", "op": "equals", "value": 0}]),
             ('Untagged', [{"field": "keyword_count", "op": "equals", "value": 0}]),
             ('Flagged', [{"field": "flag", "op": "equals", "value": "flagged"}]),
             ('Recent Import', [{"field": "timestamp", "op": "recent_days", "value": 30}]),

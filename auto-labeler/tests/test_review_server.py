@@ -217,3 +217,63 @@ def test_settings_page_route():
         client = app.test_client()
         resp = client.get('/settings')
         assert resp.status_code == 200
+
+
+def test_skip_group_persists():
+    """POST /api/skip-group/<group_id> marks group as skipped."""
+    from review_server import create_app
+    with tempfile.TemporaryDirectory() as tmpdir:
+        results_path = _create_group_data(tmpdir)
+        app = create_app(tmpdir)
+        client = app.test_client()
+        resp = client.post('/api/skip-group/g0001')
+        assert resp.status_code == 200
+        with open(results_path) as f:
+            data = json.load(f)
+        assert data['photos'][0]['status'] == 'skipped'
+
+
+def test_batch_accept_filters_by_category():
+    """POST /api/accept-batch with category filter accepts matching individual photos."""
+    from review_server import create_app
+    with tempfile.TemporaryDirectory() as tmpdir:
+        _create_test_review_data(tmpdir)
+        # Add a second photo with different category
+        results_path = os.path.join(tmpdir, "results.json")
+        with open(results_path) as f:
+            data = json.load(f)
+
+        from xmp_writer import write_xmp_sidecar
+        xmp2 = os.path.join(tmpdir, "bird2.xmp")
+        write_xmp_sidecar(xmp2, flat_keywords=set(), hierarchical_keywords=set())
+        data['photos'].append({
+            'filename': 'bird2.jpg',
+            'image_path': os.path.join(tmpdir, 'bird2.jpg'),
+            'xmp_path': xmp2,
+            'existing_species': ['Mallard'],
+            'predictions': {
+                'bioclip-vit-b-16': {
+                    'prediction': 'Mallard',
+                    'confidence': 0.9,
+                    'category': 'refinement',
+                }
+            },
+            'status': 'pending',
+        })
+        with open(results_path, 'w') as f:
+            json.dump(data, f)
+
+        app = create_app(tmpdir)
+        client = app.test_client()
+
+        # Batch accept only 'new' category
+        resp = client.post('/api/accept-batch', json={'category': 'new', 'min_confidence': 0.0})
+        assert resp.status_code == 200
+        result = resp.get_json()
+        assert result['accepted'] == 1
+
+        # Verify only bird1 was accepted
+        with open(results_path) as f:
+            data = json.load(f)
+        assert data['photos'][0]['status'] == 'accepted'
+        assert data['photos'][1]['status'] == 'pending'

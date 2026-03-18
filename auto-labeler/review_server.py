@@ -105,6 +105,16 @@ def create_app(data_dir):
                 return jsonify({'ok': True, 'status': 'skipped'})
         return jsonify({'error': 'not found'}), 404
 
+    @app.route('/api/skip-group/<group_id>', methods=['POST'])
+    def skip_group(group_id):
+        data = _load_results()
+        for photo in data['photos']:
+            if photo.get('group_id') == group_id:
+                photo['status'] = 'skipped'
+                _save_results(data)
+                return jsonify({'ok': True, 'status': 'skipped'})
+        return jsonify({'error': 'group not found'}), 404
+
     @app.route('/api/accept-group/<group_id>', methods=['POST'])
     def accept_group(group_id):
         body = request.get_json(silent=True) or {}
@@ -152,8 +162,22 @@ def create_app(data_dir):
         for photo in data['photos']:
             if photo['status'] != 'pending':
                 continue
-            if category and photo.get('category') != category:
-                continue
+
+            # Determine effective category for filtering
+            if category:
+                preds = photo.get('predictions', {})
+                cons = photo.get('consensus', {})
+                if preds:
+                    if model and model in preds:
+                        eff_cat = preds[model].get('category')
+                    else:
+                        eff_cat = preds[next(iter(preds))].get('category')
+                elif cons:
+                    eff_cat = photo.get('category')
+                else:
+                    eff_cat = None
+                if eff_cat != category:
+                    continue
 
             # Handle individual photos
             preds = photo.get('predictions', {})

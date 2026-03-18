@@ -861,11 +861,13 @@ async function acceptGroup(groupId) {
 }
 
 async function skipGroup(groupId) {
-  // Skip the group entry (server doesn't have a dedicated group skip endpoint, so mark locally)
-  var photo = allData.photos.find(function(p) { return p.group_id === groupId; });
-  if (photo) {
-    photo.status = 'skipped';
-    renderAll();
+  var resp = await fetch('/api/skip-group/' + encodeURIComponent(groupId), { method: 'POST' });
+  if (resp.ok) {
+    var photo = allData.photos.find(function(p) { return p.group_id === groupId; });
+    if (photo) {
+      photo.status = 'skipped';
+      renderAll();
+    }
   }
 }
 

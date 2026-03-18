@@ -15,31 +15,6 @@ body {
   flex-direction: column;
 }
 
-/* ---------- Nav Bar ---------- */
-.navbar {
-  background: #16213e;
-  padding: 0 24px;
-  display: flex;
-  align-items: center;
-  border-bottom: 1px solid #0f3460;
-  position: sticky;
-  top: 0;
-  z-index: 200;
-  height: 48px;
-  flex-shrink: 0;
-}
-.navbar .brand { font-size: 16px; font-weight: 700; color: #4ecca3; margin-right: 32px; text-decoration: none; }
-.navbar a {
-  color: #a0a0a0;
-  text-decoration: none;
-  padding: 13px 14px;
-  font-size: 13px;
-  border-bottom: 2px solid transparent;
-  transition: color 0.15s, border-color 0.15s;
-}
-.navbar a:hover { color: #fff; }
-.navbar a.active { color: #fff; border-bottom-color: #4ecca3; }
-
 /* ---------- Layout ---------- */
 .main-layout {
   display: flex;
@@ -422,15 +397,8 @@ body {
 </head>
 <body>
 
-<!-- Nav Bar -->
-<nav class="navbar">
-  <a class="brand" href="/browse">Spotter</a>
-  <a href="/browse" class="active">Browse</a>
-  <a href="/classify">Classify</a>
-  <a href="/import">Import</a>
-  <a href="/audit">Audit</a>
-  <a href="/settings">Settings</a>
-</nav>
+{% set active_page = 'browse' %}
+{% include '_navbar.html' %}
 
 <div class="main-layout">
 

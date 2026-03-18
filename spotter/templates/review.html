@@ -351,15 +351,8 @@
 </head>
 <body>
 
-<!-- Nav Bar -->
-<nav class="navbar" style="background:#16213e;padding:0 24px;display:flex;align-items:center;border-bottom:1px solid #0f3460;position:sticky;top:0;z-index:200;height:48px;">
-  <a class="brand" href="/browse" style="font-size:16px;font-weight:700;color:#4ecca3;margin-right:32px;text-decoration:none;">Spotter</a>
-  <a href="/browse" style="color:#a0a0a0;text-decoration:none;padding:13px 14px;font-size:13px;border-bottom:2px solid transparent;">Browse</a>
-  <a href="/classify" style="color:#fff;text-decoration:none;padding:13px 14px;font-size:13px;border-bottom:2px solid #4ecca3;">Classify</a>
-  <a href="/import" style="color:#a0a0a0;text-decoration:none;padding:13px 14px;font-size:13px;border-bottom:2px solid transparent;">Import</a>
-  <a href="/audit" style="color:#a0a0a0;text-decoration:none;padding:13px 14px;font-size:13px;border-bottom:2px solid transparent;">Audit</a>
-  <a href="/settings" style="color:#a0a0a0;text-decoration:none;padding:13px 14px;font-size:13px;border-bottom:2px solid transparent;">Settings</a>
-</nav>
+{% set active_page = 'classify' %}
+{% include '_navbar.html' %}
 
 <!-- Review Header -->
 <div class="header">

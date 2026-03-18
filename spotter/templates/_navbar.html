@@ -1,0 +1,32 @@
+<style>
+.navbar {
+  background: #16213e;
+  padding: 0 24px;
+  display: flex;
+  align-items: center;
+  border-bottom: 1px solid #0f3460;
+  position: sticky;
+  top: 0;
+  z-index: 200;
+  height: 48px;
+}
+.navbar .brand { font-size: 16px; font-weight: 700; color: #4ecca3; margin-right: 32px; text-decoration: none; }
+.navbar a {
+  color: #a0a0a0;
+  text-decoration: none;
+  padding: 13px 14px;
+  font-size: 13px;
+  border-bottom: 2px solid transparent;
+  transition: color 0.15s, border-color 0.15s;
+}
+.navbar a:hover { color: #fff; }
+.navbar a.active { color: #fff; border-bottom-color: #4ecca3; }
+</style>
+<nav class="navbar">
+  <a class="brand" href="/browse">Spotter</a>
+  <a href="/browse" {% if active_page == 'browse' %}class="active"{% endif %}>Browse</a>
+  <a href="/classify" {% if active_page == 'classify' %}class="active"{% endif %}>Classify</a>
+  <a href="/import" {% if active_page == 'import' %}class="active"{% endif %}>Import</a>
+  <a href="/audit" {% if active_page == 'audit' %}class="active"{% endif %}>Audit</a>
+  <a href="/settings" {% if active_page == 'settings' %}class="active"{% endif %}>Settings</a>
+</nav>

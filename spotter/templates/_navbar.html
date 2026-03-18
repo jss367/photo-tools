@@ -271,6 +271,10 @@
     });
 
     window.addEventListener('beforeunload', function(e) {
+      // Save logs to sessionStorage so they persist across page navigations
+      try {
+        sessionStorage.setItem('spotter_logs', JSON.stringify(lpLines.slice(-lpMaxLines)));
+      } catch(ex) {}
       if (lpSource) { lpSource.close(); lpSource = null; }
       // Only warn on actual tab close, not internal navigation
       if (isInternalNav) { isInternalNav = false; return; }
@@ -281,13 +285,33 @@
       }
     });
 
-    // Load recent logs
-    fetch('/api/logs/recent?count=50')
-      .then(function(r) { return r.json(); })
-      .then(function(logs) {
-        logs.forEach(function(l) { addLpLine(l, true); });
-        lpApplyFilter();
-      });
+    // Restore logs from sessionStorage (persisted across page navigations)
+    var savedLogs = [];
+    try {
+      var raw = sessionStorage.getItem('spotter_logs');
+      if (raw) savedLogs = JSON.parse(raw);
+    } catch(ex) {}
+
+    if (savedLogs.length > 0) {
+      // Use saved logs and merge with any newer server logs
+      savedLogs.forEach(function(l) { addLpLine(l, true); });
+      var lastTime = savedLogs[savedLogs.length - 1].time || 0;
+      fetch('/api/logs/recent?count=50')
+        .then(function(r) { return r.json(); })
+        .then(function(logs) {
+          logs.forEach(function(l) {
+            if (l.time > lastTime) addLpLine(l, true);
+          });
+          lpApplyFilter();
+        });
+    } else {
+      fetch('/api/logs/recent?count=50')
+        .then(function(r) { return r.json(); })
+        .then(function(logs) {
+          logs.forEach(function(l) { addLpLine(l, true); });
+          lpApplyFilter();
+        });
+    }
 
     // Poll jobs
     pollJobs();

@@ -227,15 +227,6 @@ def create_app(db_path, thumb_cache_dir=None):
             'pending_count': len(changes),
         })
 
-    @app.route('/api/sync/run', methods=['POST'])
-    def api_sync_run():
-        db = _get_db()
-        try:
-            from sync import sync_to_xmp
-            result = sync_to_xmp(db)
-            return jsonify(result)
-        except ImportError:
-            return jsonify({'error': 'sync module not available'}), 500
 
     # -- Collection API routes --
 
@@ -340,22 +331,6 @@ def create_app(db_path, thumb_cache_dir=None):
         try:
             from importer import preview_import
             result = preview_import(catalogs, db)
-            return jsonify(result)
-        except Exception as e:
-            return jsonify({'error': str(e)}), 500
-
-    @app.route('/api/import/execute', methods=['POST'])
-    def api_import_execute():
-        db = _get_db()
-        body = request.get_json(silent=True) or {}
-        catalogs = body.get('catalogs', [])
-        strategy = body.get('strategy', 'merge_all')
-        write_xmp = body.get('write_xmp', False)
-        if not catalogs:
-            return jsonify({'error': 'catalogs required'}), 400
-        try:
-            from importer import execute_import
-            result = execute_import(catalogs, db, write_xmp=write_xmp, strategy=strategy)
             return jsonify(result)
         except Exception as e:
             return jsonify({'error': str(e)}), 500

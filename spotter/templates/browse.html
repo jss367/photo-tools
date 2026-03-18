@@ -293,21 +293,7 @@ body {
   word-break: break-all;
   margin-top: 6px;
 }
-.btn-darktable {
-  display: block;
-  width: 100%;
-  padding: 8px;
-  background: #0f3460;
-  color: #7ec8e3;
-  border: 1px solid #1a3a6e;
-  border-radius: 4px;
-  font-size: 13px;
-  cursor: pointer;
-  text-align: center;
-  margin-top: 12px;
-  transition: background 0.15s;
-}
-.btn-darktable:hover { background: #1a3a6e; }
+
 
 /* ---------- Sync Status ---------- */
 .sync-bar {
@@ -505,7 +491,6 @@ body {
       <div class="detail-path" id="detailPath"></div>
     </div>
 
-    <button class="btn-darktable" onclick="openInDarktable()">Open in darktable</button>
   </div>
 </div>
 
@@ -1078,9 +1063,6 @@ async function removeKeyword(photoId, keywordId) {
   } catch(e) {}
 }
 
-function openInDarktable() {
-  // Note: this would need a backend route to shell out; placeholder for now
-}
 
 /* ---------- Sync Status ---------- */
 async function checkSyncStatus() {

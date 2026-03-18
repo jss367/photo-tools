@@ -13,13 +13,13 @@
 ### Task 1: XMP reader and comparison logic
 
 **Files:**
-- Create: `auto-labeler/compare.py`
-- Create: `auto-labeler/tests/test_compare.py`
+- Create: `spotter/compare.py`
+- Create: `spotter/tests/test_compare.py`
 
 **Step 1: Write failing tests**
 
 ```python
-# auto-labeler/tests/test_compare.py
+# spotter/tests/test_compare.py
 import os
 import sys
 import tempfile
@@ -94,13 +94,13 @@ def test_categorize_no_labels_vocab():
 
 **Step 2: Run tests to verify they fail**
 
-Run: `cd /Users/julius/git/photo-tools && python -m pytest auto-labeler/tests/test_compare.py -v`
+Run: `cd /Users/julius/git/photo-tools && python -m pytest spotter/tests/test_compare.py -v`
 Expected: FAIL — module does not exist
 
 **Step 3: Implement compare.py**
 
 ```python
-# auto-labeler/compare.py
+# spotter/compare.py
 """Read XMP keywords and compare against model predictions."""
 
 import logging
@@ -191,14 +191,14 @@ def categorize(prediction, existing_keywords, labels_vocab):
 
 **Step 4: Run tests to verify they pass**
 
-Run: `cd /Users/julius/git/photo-tools && python -m pytest auto-labeler/tests/test_compare.py -v`
+Run: `cd /Users/julius/git/photo-tools && python -m pytest spotter/tests/test_compare.py -v`
 Expected: all 7 tests PASS
 
 **Step 5: Commit**
 
 ```bash
 cd /Users/julius/git/photo-tools
-git add auto-labeler/compare.py auto-labeler/tests/test_compare.py
+git add spotter/compare.py spotter/tests/test_compare.py
 git commit -m "feat: add XMP reader and prediction comparison logic"
 ```
 
@@ -207,13 +207,13 @@ git commit -m "feat: add XMP reader and prediction comparison logic"
 ### Task 2: Analyze script — scan, classify, compare, generate thumbnails
 
 **Files:**
-- Create: `auto-labeler/analyze.py`
-- Create: `auto-labeler/tests/test_analyze.py`
+- Create: `spotter/analyze.py`
+- Create: `spotter/tests/test_analyze.py`
 
 **Step 1: Write failing tests**
 
 ```python
-# auto-labeler/tests/test_analyze.py
+# spotter/tests/test_analyze.py
 import json
 import os
 import sys
@@ -333,17 +333,17 @@ def test_analyze_filters_matches():
 
 **Step 2: Run tests to verify they fail**
 
-Run: `cd /Users/julius/git/photo-tools && python -m pytest auto-labeler/tests/test_analyze.py -v`
+Run: `cd /Users/julius/git/photo-tools && python -m pytest spotter/tests/test_analyze.py -v`
 Expected: FAIL — module does not exist
 
 **Step 3: Implement analyze.py**
 
 ```python
-# auto-labeler/analyze.py
+# spotter/analyze.py
 """Scan photos, classify, compare to existing XMP keywords, generate review data.
 
 Usage:
-    python auto-labeler/analyze.py --folder /path/to/photos --labels-file labels.txt
+    python spotter/analyze.py --folder /path/to/photos --labels-file labels.txt
 """
 
 import argparse
@@ -530,14 +530,14 @@ if __name__ == "__main__":
 
 **Step 4: Run tests to verify they pass**
 
-Run: `cd /Users/julius/git/photo-tools && python -m pytest auto-labeler/tests/test_analyze.py -v`
+Run: `cd /Users/julius/git/photo-tools && python -m pytest spotter/tests/test_analyze.py -v`
 Expected: all 3 tests PASS
 
 **Step 5: Commit**
 
 ```bash
 cd /Users/julius/git/photo-tools
-git add auto-labeler/analyze.py auto-labeler/tests/test_analyze.py
+git add spotter/analyze.py spotter/tests/test_analyze.py
 git commit -m "feat: add analyze script for photo classification and comparison"
 ```
 
@@ -546,13 +546,13 @@ git commit -m "feat: add analyze script for photo classification and comparison"
 ### Task 3: Review server — Flask API
 
 **Files:**
-- Create: `auto-labeler/review_server.py`
-- Create: `auto-labeler/tests/test_review_server.py`
+- Create: `spotter/review_server.py`
+- Create: `spotter/tests/test_review_server.py`
 
 **Step 1: Write failing tests**
 
 ```python
-# auto-labeler/tests/test_review_server.py
+# spotter/tests/test_review_server.py
 import json
 import os
 import sys
@@ -667,17 +667,17 @@ def test_skip_updates_status():
 
 **Step 2: Run tests to verify they fail**
 
-Run: `cd /Users/julius/git/photo-tools && python -m pytest auto-labeler/tests/test_review_server.py -v`
+Run: `cd /Users/julius/git/photo-tools && python -m pytest spotter/tests/test_review_server.py -v`
 Expected: FAIL — module does not exist
 
 **Step 3: Implement review_server.py**
 
 ```python
-# auto-labeler/review_server.py
-"""Flask server for reviewing auto-labeler predictions.
+# spotter/review_server.py
+"""Flask server for reviewing spotter predictions.
 
 Usage:
-    python auto-labeler/review_server.py [--data-dir /tmp/photo-review] [--port 5000]
+    python spotter/review_server.py [--data-dir /tmp/photo-review] [--port 5000]
 """
 
 import argparse
@@ -788,7 +788,7 @@ def create_app(data_dir):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Review auto-labeler predictions.")
+    parser = argparse.ArgumentParser(description="Review spotter predictions.")
     parser.add_argument("--data-dir", default="/tmp/photo-review", help="Directory with results.json")
     parser.add_argument("--port", type=int, default=5000)
     args = parser.parse_args()
@@ -804,14 +804,14 @@ if __name__ == "__main__":
 
 **Step 4: Run tests to verify they pass**
 
-Run: `cd /Users/julius/git/photo-tools && python -m pytest auto-labeler/tests/test_review_server.py -v`
+Run: `cd /Users/julius/git/photo-tools && python -m pytest spotter/tests/test_review_server.py -v`
 Expected: all 3 tests PASS
 
 **Step 5: Commit**
 
 ```bash
 cd /Users/julius/git/photo-tools
-git add auto-labeler/review_server.py auto-labeler/tests/test_review_server.py
+git add spotter/review_server.py spotter/tests/test_review_server.py
 git commit -m "feat: add Flask review server with accept/skip/batch API"
 ```
 
@@ -820,14 +820,14 @@ git commit -m "feat: add Flask review server with accept/skip/batch API"
 ### Task 4: Review UI — single-page HTML/CSS/JS
 
 **Files:**
-- Create: `auto-labeler/templates/review.html`
+- Create: `spotter/templates/review.html`
 
 **Step 1: Create the review UI**
 
 This is a single HTML file with embedded CSS and JS. No build tools needed.
 
 ```html
-<!-- auto-labeler/templates/review.html -->
+<!-- spotter/templates/review.html -->
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1076,7 +1076,7 @@ loadPhotos();
 
 **Step 2: Verify the template renders**
 
-Run: `cd /Users/julius/git/photo-tools && python -c "from auto_labeler_test_helper import *; print('ok')" || echo "Just create the file — no test needed for HTML template"`
+Run: `cd /Users/julius/git/photo-tools && python -c "from spotter_test_helper import *; print('ok')" || echo "Just create the file — no test needed for HTML template"`
 
 The HTML template is purely frontend — it gets tested via the server tests (the `test_get_photos` test already hits `/` implicitly through the Flask test client). Manual verification happens in Task 5.
 
@@ -1084,8 +1084,8 @@ The HTML template is purely frontend — it gets tested via the server tests (th
 
 ```bash
 cd /Users/julius/git/photo-tools
-mkdir -p auto-labeler/templates
-git add auto-labeler/templates/review.html
+mkdir -p spotter/templates
+git add spotter/templates/review.html
 git commit -m "feat: add review webapp UI with category tabs, settings, and batch actions"
 ```
 
@@ -1099,7 +1099,7 @@ git commit -m "feat: add review webapp UI with category tabs, settings, and batc
 
 ```bash
 cd /Users/julius/git/photo-tools
-python auto-labeler/analyze.py \
+python spotter/analyze.py \
   --folder "/Volumes/Photography/Raw Files/USA/2019/2019-03-17" \
   --labels-file /tmp/usa_labels.txt \
   --output-dir /tmp/photo-review \
@@ -1114,7 +1114,7 @@ Check that `/tmp/photo-review/thumbnails/` contains JPEG thumbnails.
 
 ```bash
 cd /Users/julius/git/photo-tools
-python auto-labeler/review_server.py --data-dir /tmp/photo-review
+python spotter/review_server.py --data-dir /tmp/photo-review
 ```
 
 Browser opens to http://localhost:5000. Verify:

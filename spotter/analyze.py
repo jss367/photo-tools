@@ -1,7 +1,7 @@
 """Scan photos, classify, compare to existing XMP keywords, generate review data.
 
 Usage:
-    python auto-labeler/analyze.py --folder /path/to/photos --labels-file labels.txt
+    python spotter/analyze.py --folder /path/to/photos --labels-file labels.txt
 """
 
 import argparse

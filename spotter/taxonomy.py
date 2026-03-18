@@ -1,7 +1,7 @@
 """iNaturalist taxonomy: download, parse, and lookup.
 
 Usage:
-    python auto-labeler/taxonomy.py --download [--output taxonomy.json]
+    python spotter/taxonomy.py --download [--output taxonomy.json]
 """
 
 import argparse

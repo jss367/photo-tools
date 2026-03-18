@@ -1,7 +1,7 @@
-"""Flask server for reviewing auto-labeler predictions.
+"""Flask server for reviewing Spotter predictions.
 
 Usage:
-    python auto-labeler/review_server.py [--data-dir /tmp/photo-review] [--port 8080]
+    python spotter/review_server.py [--data-dir /tmp/photo-review] [--port 8080]
 """
 
 import argparse
@@ -244,7 +244,7 @@ def create_app(data_dir):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Review auto-labeler predictions.")
+    parser = argparse.ArgumentParser(description="Review Spotter predictions.")
     parser.add_argument("--data-dir", default="/tmp/photo-review", help="Directory with results.json")
     parser.add_argument("--port", type=int, default=8080)
     args = parser.parse_args()

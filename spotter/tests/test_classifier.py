@@ -1,4 +1,4 @@
-# auto-labeler/tests/test_classifier.py
+# spotter/tests/test_classifier.py
 import os
 import sys
 import tempfile

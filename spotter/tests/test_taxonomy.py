@@ -1,4 +1,4 @@
-# auto-labeler/tests/test_taxonomy.py
+# spotter/tests/test_taxonomy.py
 import json
 import os
 import sys

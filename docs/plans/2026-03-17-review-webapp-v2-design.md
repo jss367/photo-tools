@@ -4,9 +4,9 @@
 
 ## 1. Taxonomy System
 
-A local file (`auto-labeler/taxonomy.json`) stores the full iNaturalist taxonomy, downloaded from their monthly DarwinCore Archive export (`inaturalist-taxonomy.dwca.zip`). The raw DWCA zip is ~100-200MB; we parse it once and store a JSON keyed by common name and scientific name for fast lookups.
+A local file (`spotter/taxonomy.json`) stores the full iNaturalist taxonomy, downloaded from their monthly DarwinCore Archive export (`inaturalist-taxonomy.dwca.zip`). The raw DWCA zip is ~100-200MB; we parse it once and store a JSON keyed by common name and scientific name for fast lookups.
 
-**`auto-labeler/taxonomy.py`** handles:
+**`spotter/taxonomy.py`** handles:
 - **`download_taxonomy()`** — fetches the DWCA zip, parses `taxa.csv` and `VernacularNames.csv`, builds the JSON. Logs stats (e.g., "Loaded 723,481 taxa, 412,309 with common names"). Stores the download date. Labels that don't match any taxon are logged (e.g., `INFO: No taxon match for "Dyke Marsh" — skipping`).
 - **`lookup(name)`** — returns the taxon record (rank, lineage) for a common name or scientific name. Returns `None` for non-taxa.
 - **`is_species(name)`** / **`is_taxon(name)`** — convenience checks.
@@ -76,7 +76,7 @@ The model key is a slug derived from the model name (e.g., `bioclip-vit-b-16`).
 
 ## 3. Neighbor Photo Grouping
 
-During the analyze step, after classification, photos are grouped by proximity. The grouping logic lives in `auto-labeler/grouping.py`.
+During the analyze step, after classification, photos are grouped by proximity. The grouping logic lives in `spotter/grouping.py`.
 
 **Grouping algorithm:**
 1. Sort images by filename (DSC_NNNN gives chronological order)
@@ -131,26 +131,26 @@ Settings are persisted to `settings.json` in the data directory alongside `resul
 **First-time setup:**
 ```bash
 # Download iNaturalist taxonomy (one-time, re-run to update)
-python auto-labeler/taxonomy.py --download
-# Creates auto-labeler/taxonomy.json
+python spotter/taxonomy.py --download
+# Creates spotter/taxonomy.json
 ```
 
 **Per-folder workflow:**
 ```bash
 # Analyze with default model
-python auto-labeler/analyze.py \
+python spotter/analyze.py \
   --folder "/Volumes/Photography/Raw Files/USA/2019/2019-03-17" \
   --output-dir /tmp/photo-review
 
 # Optional: analyze again with a different model
-python auto-labeler/analyze.py \
+python spotter/analyze.py \
   --folder "..." \
   --output-dir /tmp/photo-review \
   --model-name "bioclip-vit-l-14" \
   --model-weights /tmp/other_model.bin
 
 # Review
-python auto-labeler/review_server.py --data-dir /tmp/photo-review
+python spotter/review_server.py --data-dir /tmp/photo-review
 ```
 
 **Analyze step internals:**
@@ -166,22 +166,22 @@ python auto-labeler/review_server.py --data-dir /tmp/photo-review
 ## 6. Files Changed and Created
 
 **New files:**
-- `auto-labeler/taxonomy.py` — download/parse iNaturalist DWCA, lookup, relationship functions
-- `auto-labeler/grouping.py` — neighbor grouping by EXIF timestamp
-- `auto-labeler/templates/settings.html` — settings page UI
-- `auto-labeler/tests/test_taxonomy.py` — taxonomy lookup and relationship tests
-- `auto-labeler/tests/test_grouping.py` — grouping logic tests
+- `spotter/taxonomy.py` — download/parse iNaturalist DWCA, lookup, relationship functions
+- `spotter/grouping.py` — neighbor grouping by EXIF timestamp
+- `spotter/templates/settings.html` — settings page UI
+- `spotter/tests/test_taxonomy.py` — taxonomy lookup and relationship tests
+- `spotter/tests/test_grouping.py` — grouping logic tests
 
 **Modified files:**
-- `auto-labeler/compare.py` — replace substring heuristic with taxonomy-based categorization
-- `auto-labeler/analyze.py` — add multi-model merging, grouping step, taxonomy loading, EXIF reading
-- `auto-labeler/review_server.py` — add `/settings` route, model selector API, settings persistence
-- `auto-labeler/templates/review.html` — model dropdown, group expand/collapse, link to settings page
-- `auto-labeler/tests/test_compare.py` — update tests for taxonomy-based categorization
-- `auto-labeler/tests/test_analyze.py` — update for multi-model and grouping
-- `auto-labeler/tests/test_review_server.py` — add settings endpoint tests
+- `spotter/compare.py` — replace substring heuristic with taxonomy-based categorization
+- `spotter/analyze.py` — add multi-model merging, grouping step, taxonomy loading, EXIF reading
+- `spotter/review_server.py` — add `/settings` route, model selector API, settings persistence
+- `spotter/templates/review.html` — model dropdown, group expand/collapse, link to settings page
+- `spotter/tests/test_compare.py` — update tests for taxonomy-based categorization
+- `spotter/tests/test_analyze.py` — update for multi-model and grouping
+- `spotter/tests/test_review_server.py` — add settings endpoint tests
 
 **Unchanged:**
-- `auto-labeler/classifier.py`
-- `auto-labeler/image_loader.py`
+- `spotter/classifier.py`
+- `spotter/image_loader.py`
 - `lr-migration/xmp_writer.py`

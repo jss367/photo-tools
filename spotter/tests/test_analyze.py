@@ -1,4 +1,4 @@
-# auto-labeler/tests/test_analyze.py
+# spotter/tests/test_analyze.py
 import json
 import os
 import sys

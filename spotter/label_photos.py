@@ -1,7 +1,7 @@
 """Batch classify photos and write predictions to XMP sidecars.
 
 Usage:
-    python auto-labeler/label_photos.py --folder /path/to/photos [--write] [--threshold 0.4]
+    python spotter/label_photos.py --folder /path/to/photos [--write] [--threshold 0.4]
 """
 
 import argparse

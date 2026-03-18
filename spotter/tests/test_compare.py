@@ -1,4 +1,4 @@
-# auto-labeler/tests/test_compare.py
+# spotter/tests/test_compare.py
 import json
 import os
 import sys

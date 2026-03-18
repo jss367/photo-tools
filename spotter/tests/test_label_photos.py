@@ -1,4 +1,4 @@
-# auto-labeler/tests/test_label_photos.py
+# spotter/tests/test_label_photos.py
 import os
 import sys
 import tempfile

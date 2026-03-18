@@ -1,4 +1,4 @@
-# auto-labeler/tests/test_grouping.py
+# spotter/tests/test_grouping.py
 import os
 import sys
 from datetime import datetime

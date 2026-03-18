@@ -558,22 +558,21 @@ def create_app(db_path, thumb_cache_dir=None):
             thread_db = Database(db_path)
             job['_start_time'] = time.time()
 
+            # Load taxonomy for categorization and label fallback
+            taxonomy_path = os.path.join(os.path.dirname(__file__), 'taxonomy.json')
+            tax = None
+            if os.path.exists(taxonomy_path):
+                from taxonomy import Taxonomy
+                tax = Taxonomy(taxonomy_path)
+
             # Load labels — use provided file, or fall back to taxonomy species names
             labels = None
             if labels_file and os.path.exists(labels_file):
                 with open(labels_file) as f:
                     labels = [line.strip() for line in f if line.strip()]
             elif tax:
-                # Use species from taxonomy as labels for CustomLabelsClassifier
-                labels = list(tax._by_common.keys())[:1000]  # cap for performance
+                labels = list(tax._by_common.keys())[:1000]
                 log.info("Using %d taxonomy species as classifier labels", len(labels))
-
-            # Load taxonomy for categorization
-            taxonomy_path = os.path.join(os.path.dirname(__file__), 'taxonomy.json')
-            tax = None
-            if os.path.exists(taxonomy_path):
-                from taxonomy import Taxonomy
-                tax = Taxonomy(taxonomy_path)
 
             # Get photos from collection
             photos = thread_db.get_collection_photos(collection_id, per_page=999999)

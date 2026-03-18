@@ -95,6 +95,28 @@
     </div>
   </div>
 
+  <!-- Models -->
+  <div class="section">
+    <div class="section-title">Models</div>
+    <div id="modelsContent"><span style="color:#555;font-size:13px;">Loading...</span></div>
+    <div style="margin-top:12px; border-top:1px solid #0f3460; padding-top:12px;">
+      <div style="font-size:12px; color:#888; margin-bottom:8px;">Add custom model weights:</div>
+      <div style="display:flex; gap:8px;">
+        <input type="text" class="setting-value" id="customModelName" placeholder="Model name"
+               style="background:#0f3460;color:#e0e0e0;border:1px solid #1a3a6e;border-radius:4px;padding:6px 10px;font-size:12px;flex:1;">
+        <input type="text" class="setting-value" id="customModelPath" placeholder="/path/to/weights.bin"
+               style="background:#0f3460;color:#e0e0e0;border:1px solid #1a3a6e;border-radius:4px;padding:6px 10px;font-size:12px;flex:2;">
+        <button onclick="addCustomModel()" style="background:#0f3460;color:#c0c0c0;border:none;border-radius:4px;padding:6px 14px;font-size:12px;cursor:pointer;">Add</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Taxonomy -->
+  <div class="section">
+    <div class="section-title">Taxonomy</div>
+    <div id="taxonomyContent"><span style="color:#555;font-size:13px;">Loading...</span></div>
+  </div>
+
   <!-- Recent Jobs -->
   <div class="section">
     <div class="section-title">Recent Jobs</div>
@@ -150,6 +172,8 @@
 
 <script>
 loadDashboard();
+loadModels();
+loadTaxonomy();
 loadHistory();
 loadSystemInfo();
 
@@ -166,6 +190,139 @@ async function loadSystemInfo() {
   } catch(e) {}
 }
 
+/* ---------- Models ---------- */
+async function loadModels() {
+  try {
+    var resp = await fetch('/api/models');
+    var data = await resp.json();
+    var models = data.models || [];
+    var activeId = data.active_id;
+
+    if (models.length === 0) {
+      document.getElementById('modelsContent').innerHTML = '<span style="color:#555;font-size:13px;">No models available.</span>';
+      return;
+    }
+
+    var html = '';
+    models.forEach(function(m) {
+      var isActive = m.id === activeId;
+      var statusColor = m.downloaded ? '#4ecca3' : '#666';
+      var statusText = m.downloaded ? 'Downloaded' : 'Not downloaded';
+      var activeTag = isActive ? ' <span style="color:#4ecca3;font-size:10px;font-weight:600;">ACTIVE</span>' : '';
+
+      html += '<div style="padding:10px 0;border-bottom:1px solid #0a1a35;">';
+      html += '<div style="display:flex;align-items:center;gap:8px;margin-bottom:4px;">';
+      html += '<span style="font-size:14px;color:#e0e0e0;font-weight:600;">' + escapeHtml(m.name) + '</span>';
+      html += '<span style="font-size:11px;color:#666;">' + escapeHtml(m.model_str) + '</span>';
+      html += activeTag;
+      html += '</div>';
+      html += '<div style="font-size:12px;color:#888;margin-bottom:6px;">' + escapeHtml(m.description || '') + '</div>';
+      html += '<div style="display:flex;align-items:center;gap:8px;">';
+      html += '<span style="font-size:11px;color:' + statusColor + ';">' + statusText + '</span>';
+
+      if (m.downloaded && m.weights_path) {
+        html += '<span style="font-size:11px;color:#444;">' + escapeHtml(m.weights_path) + '</span>';
+      }
+
+      html += '<span style="margin-left:auto;display:flex;gap:6px;">';
+      if (!m.downloaded && m.source !== 'custom') {
+        html += '<button onclick="downloadModel(\'' + m.id + '\')" style="background:#4ecca3;color:#1a1a2e;border:none;border-radius:4px;padding:4px 12px;font-size:11px;cursor:pointer;">Download</button>';
+      }
+      if (m.downloaded && !isActive) {
+        html += '<button onclick="setActiveModel(\'' + m.id + '\')" style="background:#0f3460;color:#c0c0c0;border:none;border-radius:4px;padding:4px 12px;font-size:11px;cursor:pointer;">Use This</button>';
+      }
+      html += '</span>';
+      html += '</div></div>';
+    });
+    document.getElementById('modelsContent').innerHTML = html;
+  } catch(e) {
+    document.getElementById('modelsContent').innerHTML = '<span style="color:#e74c3c;font-size:13px;">Failed to load models</span>';
+  }
+}
+
+async function downloadModel(modelId) {
+  try {
+    var resp = await fetch('/api/jobs/download-model', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({model_id: modelId}),
+    });
+    var data = await resp.json();
+    // The job status will show in the Jobs panel at the bottom
+    // Reload models when done
+    var source = new EventSource('/api/jobs/' + data.job_id + '/stream');
+    source.addEventListener('complete', function() {
+      source.close();
+      loadModels();
+    });
+  } catch(e) {}
+}
+
+async function setActiveModel(modelId) {
+  await fetch('/api/models/active', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({model_id: modelId}),
+  });
+  loadModels();
+}
+
+async function addCustomModel() {
+  var name = document.getElementById('customModelName').value.trim();
+  var path = document.getElementById('customModelPath').value.trim();
+  if (!name || !path) return;
+  await fetch('/api/models/custom', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({name: name, weights_path: path}),
+  });
+  document.getElementById('customModelName').value = '';
+  document.getElementById('customModelPath').value = '';
+  loadModels();
+}
+
+/* ---------- Taxonomy ---------- */
+async function loadTaxonomy() {
+  try {
+    var resp = await fetch('/api/taxonomy/info');
+    var d = await resp.json();
+    var html = '';
+    if (d.available) {
+      html += '<div style="display:flex;align-items:center;gap:12px;">';
+      html += '<div>';
+      html += '<div style="font-size:14px;color:#e0e0e0;">iNaturalist Taxonomy</div>';
+      html += '<div style="font-size:12px;color:#888;">~' + (d.taxa_count || 0).toLocaleString() + ' taxa';
+      if (d.last_updated) html += ' &middot; Updated ' + d.last_updated;
+      if (d.file_size) html += ' &middot; ' + formatBytes(d.file_size);
+      html += '</div></div>';
+      html += '<button onclick="downloadTaxonomy()" style="margin-left:auto;background:#0f3460;color:#c0c0c0;border:none;border-radius:4px;padding:6px 14px;font-size:12px;cursor:pointer;">Re-download</button>';
+      html += '</div>';
+    } else {
+      html += '<div style="margin-bottom:8px;">';
+      html += '<div style="font-size:13px;color:#888;">No taxonomy downloaded. The taxonomy is used for species classification and keyword categorization.</div>';
+      html += '</div>';
+      html += '<button onclick="downloadTaxonomy()" style="background:#4ecca3;color:#1a1a2e;border:none;border-radius:4px;padding:8px 20px;font-size:13px;cursor:pointer;">Download iNaturalist Taxonomy</button>';
+    }
+    document.getElementById('taxonomyContent').innerHTML = html;
+  } catch(e) {
+    document.getElementById('taxonomyContent').innerHTML = '<span style="color:#e74c3c;font-size:13px;">Failed to load</span>';
+  }
+}
+
+async function downloadTaxonomy() {
+  try {
+    var resp = await fetch('/api/jobs/download-taxonomy', { method: 'POST' });
+    var data = await resp.json();
+    document.getElementById('taxonomyContent').innerHTML = '<span style="color:#888;font-size:13px;">Downloading... (check Jobs panel for progress)</span>';
+    var source = new EventSource('/api/jobs/' + data.job_id + '/stream');
+    source.addEventListener('complete', function() {
+      source.close();
+      loadTaxonomy();
+    });
+  } catch(e) {}
+}
+
+/* ---------- Dashboard ---------- */
 async function loadDashboard() {
   try {
     var resp = await fetch('/api/scan/status');

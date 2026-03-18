@@ -332,23 +332,21 @@ def create_app(db_path, thumb_cache_dir=None):
         db.update_prediction_status(pred_id, 'rejected')
         return jsonify({'ok': True})
 
-    # Cache classify config at startup (avoid re-parsing taxonomy on every request)
-    _taxonomy_path = os.path.join(os.path.dirname(__file__), 'taxonomy.json')
-    _weights_path = '/tmp/bioclip_model/open_clip_pytorch_model.bin'
-    _classify_config = {
-        'model_name': 'BioCLIP',
-        'model_str': 'ViT-B-16',
-        'weights_path': _weights_path,
-        'weights_available': os.path.exists(_weights_path),
-        'taxonomy_available': os.path.exists(_taxonomy_path),
-        'taxonomy_species_count': init_db.count_keywords(),  # fast DB count
-        'default_threshold': 0.4,
-    }
-
     @app.route('/api/classify/config')
     def api_classify_config():
-        """Return cached classifier configuration."""
-        return jsonify(_classify_config)
+        """Return classifier configuration from model registry."""
+        from models import get_active_model, get_taxonomy_info
+        active = get_active_model()
+        tax = get_taxonomy_info()
+        return jsonify({
+            'model_name': active['name'] if active else 'No model',
+            'model_str': active['model_str'] if active else '',
+            'weights_path': active['weights_path'] if active else '',
+            'weights_available': active['downloaded'] if active else False,
+            'taxonomy_available': tax['available'],
+            'taxonomy_species_count': init_db.count_keywords(),
+            'default_threshold': 0.4,
+        })
 
     # -- Import API routes --
 
@@ -427,6 +425,84 @@ def create_app(db_path, thumb_cache_dir=None):
         return jsonify({'ok': True, 'imported': len(paths)})
 
     # -- Scan status (kept, non-job) --
+
+    # -- Model & Taxonomy API routes --
+
+    @app.route('/api/models')
+    def api_models():
+        from models import get_models, get_active_model
+        active = get_active_model()
+        return jsonify({
+            'models': get_models(),
+            'active_id': active['id'] if active else None,
+        })
+
+    @app.route('/api/models/active', methods=['POST'])
+    def api_set_active_model():
+        body = request.get_json(silent=True) or {}
+        model_id = body.get('model_id')
+        if not model_id:
+            return jsonify({'error': 'model_id required'}), 400
+        from models import set_active_model
+        set_active_model(model_id)
+        return jsonify({'ok': True})
+
+    @app.route('/api/models/custom', methods=['POST'])
+    def api_add_custom_model():
+        body = request.get_json(silent=True) or {}
+        name = body.get('name', '').strip()
+        weights_path = body.get('weights_path', '').strip()
+        model_str = body.get('model_str', 'ViT-B-16')
+        if not name or not weights_path:
+            return jsonify({'error': 'name and weights_path required'}), 400
+        from models import register_model
+        model_id = 'custom-' + name.lower().replace(' ', '-')
+        register_model(model_id, name, model_str, weights_path, 'Custom model')
+        return jsonify({'ok': True, 'model_id': model_id})
+
+    @app.route('/api/jobs/download-model', methods=['POST'])
+    def api_job_download_model():
+        body = request.get_json(silent=True) or {}
+        model_id = body.get('model_id')
+        if not model_id:
+            return jsonify({'error': 'model_id required'}), 400
+
+        runner = app._job_runner
+
+        def work(job):
+            from models import download_model
+            def progress_cb(msg):
+                job['progress']['current_file'] = msg
+                runner.push_event(job['id'], 'progress', {
+                    'current': 0, 'total': 0, 'current_file': msg, 'rate': 0,
+                })
+            path = download_model(model_id, progress_callback=progress_cb)
+            return {'model_id': model_id, 'weights_path': path}
+
+        job_id = runner.start('download-model', work, config={'model_id': model_id})
+        return jsonify({'job_id': job_id})
+
+    @app.route('/api/taxonomy/info')
+    def api_taxonomy_info():
+        from models import get_taxonomy_info
+        return jsonify(get_taxonomy_info())
+
+    @app.route('/api/jobs/download-taxonomy', methods=['POST'])
+    def api_job_download_taxonomy():
+        runner = app._job_runner
+
+        def work(job):
+            from taxonomy import download_taxonomy
+            runner.push_event(job['id'], 'progress', {
+                'current': 0, 'total': 0,
+                'current_file': 'Downloading iNaturalist taxonomy...', 'rate': 0,
+            })
+            taxonomy_path = os.path.join(os.path.dirname(__file__), 'taxonomy.json')
+            download_taxonomy(taxonomy_path)
+            return {'ok': True}
+
+        job_id = runner.start('download-taxonomy', work)
+        return jsonify({'job_id': job_id})
 
     @app.route('/api/system/info')
     def api_system_info():
@@ -626,6 +702,16 @@ def create_app(db_path, thumb_cache_dir=None):
             thread_db = Database(db_path)
             job['_start_time'] = time.time()
 
+            # Resolve model from registry
+            from models import get_active_model, get_models
+            active_model = get_active_model()
+            if not active_model:
+                raise RuntimeError("No model available. Download one in Settings.")
+
+            model_str = active_model['model_str']
+            weights_path = active_model['weights_path']
+            effective_name = active_model['name']
+
             # Phase 1: Load taxonomy
             runner.push_event(job['id'], 'progress', {
                 'current': 0, 'total': 0, 'current_file': 'Loading taxonomy...', 'rate': 0,
@@ -654,15 +740,15 @@ def create_app(db_path, thumb_cache_dir=None):
             total = len(photos)
             job['progress']['total'] = total
 
-            log.info("Classifying %d photos with model '%s'", total, model_name)
+            log.info("Classifying %d photos with '%s' (%s)", total, effective_name, model_str)
 
             # Phase 4: Initialize classifier (this is the slow part ~30s)
             runner.push_event(job['id'], 'progress', {
                 'current': 0, 'total': total,
-                'current_file': 'Loading BioCLIP model and computing label embeddings...',
+                'current_file': f'Loading {effective_name} model and computing label embeddings...',
                 'rate': 0,
             })
-            clf = Classifier(labels=labels)
+            clf = Classifier(labels=labels, model_str=model_str, pretrained_str=weights_path)
             classified = 0
             failed = 0
 

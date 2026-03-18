@@ -368,7 +368,38 @@
   </div>
 </div>
 
-<!-- Inline Quick Settings Panel -->
+<!-- Classify Config Panel -->
+<div class="settings-panel" id="classifyConfig" style="display:none;">
+  <div style="display:flex; gap:24px; align-items:flex-start; flex-wrap:wrap; width:100%;">
+    <div style="flex:1; min-width:200px;">
+      <div style="font-size:11px; color:#666; text-transform:uppercase; margin-bottom:6px;">Model</div>
+      <div style="font-size:13px; color:#e0e0e0; margin-bottom:4px;" id="cfgModelName">BioCLIP ViT-B-16</div>
+      <div style="font-size:11px; color:#555;" id="cfgModelPath">/tmp/bioclip_model/open_clip_pytorch_model.bin</div>
+    </div>
+    <div style="flex:1; min-width:200px;">
+      <div style="font-size:11px; color:#666; text-transform:uppercase; margin-bottom:6px;">Labels</div>
+      <div style="font-size:13px; color:#e0e0e0; margin-bottom:4px;" id="cfgLabelsInfo">Using taxonomy species</div>
+      <div style="display:flex; gap:6px; align-items:center;">
+        <input type="text" class="model-selector" id="cfgLabelsFile" placeholder="Custom labels file (optional)"
+               style="flex:1; padding:4px 8px; font-size:12px;">
+      </div>
+    </div>
+    <div>
+      <div style="font-size:11px; color:#666; text-transform:uppercase; margin-bottom:6px;">Threshold</div>
+      <div style="display:flex; align-items:center; gap:8px;">
+        <input type="range" id="cfgThreshold" min="10" max="90" step="5" value="40"
+               style="width:120px; accent-color:#4ecca3;"
+               oninput="document.getElementById('cfgThresholdVal').textContent = this.value + '%'">
+        <span style="font-size:13px; color:#e0e0e0; min-width:36px;" id="cfgThresholdVal">40%</span>
+      </div>
+    </div>
+    <div style="display:flex; align-items:flex-end;">
+      <button class="btn-batch-accept" id="classifyBtn" onclick="runClassification()">Run Classification</button>
+    </div>
+  </div>
+</div>
+
+<!-- Action Bar -->
 <div class="settings-panel open" id="settingsPanel">
   <div class="setting-group">
     <label for="thumbSize">Thumbnail size:</label>
@@ -377,7 +408,6 @@
     <span class="value" id="thumbSizeVal">400px</span>
   </div>
   <div class="setting-group">
-    <button class="btn-batch-accept" id="classifyBtn" onclick="runClassification()" style="display:none;">Run Classification</button>
     <button class="btn-batch-accept" id="acceptAllBtn" onclick="acceptAllPending()" style="display:none;">Accept All</button>
     <span class="batch-info" id="classifyStatus"></span>
   </div>
@@ -403,10 +433,35 @@ var currentTab = 'all';
 var thumbSize = 400;
 var mode = 'browse'; // 'browse' or 'review'
 
+var classifyConfig = {};
+
 /* ---------- Bootstrap ---------- */
 loadCollections();
+loadClassifyConfig();
 
 /* ---------- Collection Loading ---------- */
+async function loadClassifyConfig() {
+  try {
+    var resp = await fetch('/api/classify/config');
+    classifyConfig = await resp.json();
+    document.getElementById('cfgModelName').textContent =
+      classifyConfig.model_name + ' ' + classifyConfig.model_str;
+    document.getElementById('cfgModelPath').textContent = classifyConfig.weights_path +
+      (classifyConfig.weights_available ? '' : ' (not found)');
+    if (classifyConfig.taxonomy_available) {
+      document.getElementById('cfgLabelsInfo').textContent =
+        classifyConfig.taxonomy_species_count.toLocaleString() + ' species from taxonomy';
+    } else {
+      document.getElementById('cfgLabelsInfo').textContent = 'No taxonomy loaded — provide a labels file';
+    }
+    if (classifyConfig.default_threshold) {
+      var pct = Math.round(classifyConfig.default_threshold * 100);
+      document.getElementById('cfgThreshold').value = pct;
+      document.getElementById('cfgThresholdVal').textContent = pct + '%';
+    }
+  } catch(e) {}
+}
+
 async function loadCollections() {
   try {
     var resp = await fetch('/api/collections');
@@ -469,11 +524,18 @@ async function runClassification() {
   btn.disabled = true;
   status.textContent = 'Starting classification...';
 
+  var threshold = parseInt(document.getElementById('cfgThreshold').value, 10) / 100;
+  var labelsFile = document.getElementById('cfgLabelsFile').value.trim() || null;
+
   try {
     var resp = await fetch('/api/jobs/classify', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ collection_id: currentCollectionId }),
+      body: JSON.stringify({
+        collection_id: currentCollectionId,
+        threshold: threshold,
+        labels_file: labelsFile,
+      }),
     });
     if (!resp.ok) {
       var err = await resp.json();
@@ -567,16 +629,16 @@ function switchTab(tab) {
 }
 
 function renderButtons() {
-  var classifyBtn = document.getElementById('classifyBtn');
+  var configPanel = document.getElementById('classifyConfig');
   var acceptAllBtn = document.getElementById('acceptAllBtn');
   var kbdHint = document.getElementById('kbdHint');
 
   if (currentCollectionId && mode === 'browse') {
-    classifyBtn.style.display = '';
+    configPanel.style.display = '';
     acceptAllBtn.style.display = 'none';
     kbdHint.style.display = 'none';
   } else if (mode === 'review') {
-    classifyBtn.style.display = '';
+    configPanel.style.display = '';
     var pending = predictions.filter(function(p) { return p.status === 'pending'; }).length;
     if (pending > 0) {
       acceptAllBtn.style.display = '';
@@ -587,7 +649,7 @@ function renderButtons() {
       kbdHint.style.display = 'none';
     }
   } else {
-    classifyBtn.style.display = 'none';
+    configPanel.style.display = 'none';
     acceptAllBtn.style.display = 'none';
     kbdHint.style.display = 'none';
   }

@@ -844,7 +844,39 @@ function setFilterRating(val) {
 }
 
 function updateFilterSummary() {
-  document.getElementById('filterSummary').textContent = totalPhotos + ' photos';
+  updateScrollPosition();
+}
+
+function updateScrollPosition() {
+  var el = document.getElementById('filterSummary');
+  if (photos.length === 0) {
+    el.textContent = totalPhotos + ' photos';
+    return;
+  }
+  // Find which cards are visible in the viewport
+  var cards = document.querySelectorAll('.grid-card');
+  if (cards.length === 0) {
+    el.textContent = totalPhotos + ' photos';
+    return;
+  }
+  var container = document.getElementById('gridContainer');
+  var scrollTop = container.scrollTop;
+  var viewHeight = container.clientHeight;
+  var first = 1;
+  var last = cards.length;
+  for (var i = 0; i < cards.length; i++) {
+    if (cards[i].offsetTop + cards[i].offsetHeight > scrollTop) {
+      first = i + 1;
+      break;
+    }
+  }
+  for (var i = cards.length - 1; i >= 0; i--) {
+    if (cards[i].offsetTop < scrollTop + viewHeight) {
+      last = i + 1;
+      break;
+    }
+  }
+  el.textContent = first + '–' + last + ' of ' + totalPhotos.toLocaleString();
 }
 
 /* ---------- Grid Rendering ---------- */
@@ -898,6 +930,13 @@ var observer = new IntersectionObserver(function(entries) {
   if (entries[0].isIntersecting) loadPhotos();
 }, { rootMargin: '200px' });
 observer.observe(document.getElementById('scrollSentinel'));
+
+/* ---------- Scroll Position Tracking ---------- */
+var scrollTimer = null;
+document.getElementById('gridContainer').addEventListener('scroll', function() {
+  if (scrollTimer) clearTimeout(scrollTimer);
+  scrollTimer = setTimeout(updateScrollPosition, 50);
+});
 
 /* ---------- Photo Selection & Detail ---------- */
 function selectPhoto(id, idx) {

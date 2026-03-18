@@ -1,6 +1,7 @@
 """SQLite database for Spotter photo browser metadata cache."""
 
 import json
+import os
 import sqlite3
 
 
@@ -12,6 +13,7 @@ class Database:
     """
 
     def __init__(self, db_path):
+        os.makedirs(os.path.dirname(db_path), exist_ok=True)
         self.conn = sqlite3.connect(db_path)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA journal_mode=WAL")

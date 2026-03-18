@@ -428,6 +428,35 @@ def create_app(db_path, thumb_cache_dir=None):
 
     # -- Scan status (kept, non-job) --
 
+    @app.route('/api/system/info')
+    def api_system_info():
+        """Return system information: GPU, Python, PyTorch."""
+        import platform
+        info = {
+            'python_version': platform.python_version(),
+            'platform': platform.platform(),
+            'device': 'CPU',
+            'device_detail': 'No GPU acceleration',
+            'torch_version': None,
+            'torch_detail': '',
+        }
+        try:
+            import torch
+            info['torch_version'] = torch.__version__
+            if torch.cuda.is_available():
+                info['device'] = 'CUDA'
+                info['device_detail'] = torch.cuda.get_device_name(0)
+            elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+                info['device'] = 'MPS'
+                info['device_detail'] = 'Apple Metal Performance Shaders'
+            else:
+                info['device'] = 'CPU'
+                info['device_detail'] = 'GPU not available — using CPU'
+            info['torch_detail'] = f"CUDA: {torch.cuda.is_available()}, MPS: {getattr(torch.backends, 'mps', None) and torch.backends.mps.is_available()}"
+        except ImportError:
+            info['torch_detail'] = 'PyTorch not installed'
+        return jsonify(info)
+
     @app.route('/api/scan/status')
     def api_scan_status():
         db = _get_db()

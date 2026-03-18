@@ -101,6 +101,32 @@
     <div id="historyContent"><span style="color:#555;font-size:13px;">Loading...</span></div>
   </div>
 
+  <!-- System Info -->
+  <div class="section">
+    <div class="section-title">System</div>
+    <div class="setting-row">
+      <div class="setting-label">
+        Compute Device
+        <small id="deviceDetail">Checking...</small>
+      </div>
+      <span class="setting-value" id="deviceName">-</span>
+    </div>
+    <div class="setting-row">
+      <div class="setting-label">
+        Python
+        <small id="pythonDetail"></small>
+      </div>
+      <span class="setting-value" id="pythonVersion">-</span>
+    </div>
+    <div class="setting-row">
+      <div class="setting-label">
+        PyTorch
+        <small id="torchDetail"></small>
+      </div>
+      <span class="setting-value" id="torchVersion">-</span>
+    </div>
+  </div>
+
   <!-- Database Info -->
   <div class="section">
     <div class="section-title">Storage</div>
@@ -125,6 +151,20 @@
 <script>
 loadDashboard();
 loadHistory();
+loadSystemInfo();
+
+async function loadSystemInfo() {
+  try {
+    var resp = await fetch('/api/system/info');
+    if (!resp.ok) return;
+    var d = await resp.json();
+    document.getElementById('deviceName').textContent = d.device;
+    document.getElementById('deviceDetail').textContent = d.device_detail;
+    document.getElementById('pythonVersion').textContent = d.python_version;
+    document.getElementById('torchVersion').textContent = d.torch_version || 'Not installed';
+    document.getElementById('torchDetail').textContent = d.torch_detail || '';
+  } catch(e) {}
+}
 
 async function loadDashboard() {
   try {

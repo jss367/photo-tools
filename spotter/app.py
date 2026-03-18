@@ -263,6 +263,66 @@ def create_app(db_path, thumb_cache_dir=None):
         except Exception as e:
             return jsonify({'error': str(e)}), 500
 
+    # -- Audit API routes --
+
+    @app.route('/api/audit/drift')
+    def api_audit_drift():
+        db = _get_db()
+        from audit import check_drift
+        return jsonify(check_drift(db))
+
+    @app.route('/api/audit/orphans')
+    def api_audit_orphans():
+        db = _get_db()
+        from audit import check_orphans
+        return jsonify(check_orphans(db))
+
+    @app.route('/api/audit/untracked')
+    def api_audit_untracked():
+        db = _get_db()
+        body = request.args.getlist('root') or []
+        from audit import check_untracked
+        return jsonify(check_untracked(db, body))
+
+    @app.route('/api/audit/resolve', methods=['POST'])
+    def api_audit_resolve():
+        db = _get_db()
+        body = request.get_json(silent=True) or {}
+        photo_id = body.get('photo_id')
+        direction = body.get('direction')
+        from audit import resolve_drift
+        resolve_drift(db, photo_id, direction)
+        return jsonify({'ok': True})
+
+    @app.route('/api/audit/resolve-all', methods=['POST'])
+    def api_audit_resolve_all():
+        db = _get_db()
+        body = request.get_json(silent=True) or {}
+        direction = body.get('direction')
+        from audit import check_drift, resolve_drift
+        drifts = check_drift(db)
+        for d in drifts:
+            resolve_drift(db, d['photo_id'], direction)
+        return jsonify({'ok': True, 'resolved': len(drifts)})
+
+    @app.route('/api/audit/remove-orphans', methods=['POST'])
+    def api_audit_remove_orphans():
+        db = _get_db()
+        body = request.get_json(silent=True) or {}
+        photo_ids = body.get('photo_ids', [])
+        from audit import remove_orphans
+        remove_orphans(db, photo_ids)
+        return jsonify({'ok': True, 'removed': len(photo_ids)})
+
+    @app.route('/api/audit/import-untracked', methods=['POST'])
+    def api_audit_import_untracked():
+        db = _get_db()
+        body = request.get_json(silent=True) or {}
+        paths = body.get('paths', [])
+        from audit import import_untracked
+        import_untracked(db, paths)
+        return jsonify({'ok': True, 'imported': len(paths)})
+
     # -- Thumbnail serving --
 
     @app.route('/thumbnails/<filename>')

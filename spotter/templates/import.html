@@ -4,8 +4,341 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Spotter - Import</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  background: #1a1a2e;
+  color: #e0e0e0;
+  min-height: 100vh;
+}
+.navbar {
+  background: #16213e;
+  padding: 0 24px;
+  display: flex;
+  align-items: center;
+  border-bottom: 1px solid #0f3460;
+  position: sticky;
+  top: 0;
+  z-index: 200;
+  height: 48px;
+}
+.navbar .brand { font-size: 16px; font-weight: 700; color: #4ecca3; margin-right: 32px; text-decoration: none; }
+.navbar a {
+  color: #a0a0a0; text-decoration: none; padding: 13px 14px;
+  font-size: 13px; border-bottom: 2px solid transparent;
+  transition: color 0.15s, border-color 0.15s;
+}
+.navbar a:hover { color: #fff; }
+.navbar a.active { color: #fff; border-bottom-color: #4ecca3; }
+
+.content { max-width: 900px; margin: 0 auto; padding: 32px 24px; }
+
+.section {
+  background: #16213e; border: 1px solid #0f3460;
+  border-radius: 8px; padding: 24px; margin-bottom: 24px;
+}
+.section-title {
+  font-size: 16px; font-weight: 600; margin-bottom: 16px; color: #fff;
+  padding-bottom: 8px; border-bottom: 1px solid #0f3460;
+}
+
+.input-group { display: flex; gap: 8px; margin-bottom: 12px; }
+.path-input {
+  flex: 1; background: #0f3460; color: #e0e0e0; border: 1px solid #1a3a6e;
+  border-radius: 4px; padding: 8px 12px; font-size: 13px; outline: none;
+}
+.path-input:focus { border-color: #4ecca3; }
+.btn {
+  padding: 8px 20px; border: none; border-radius: 4px;
+  cursor: pointer; font-size: 13px; font-weight: 500; transition: background 0.15s;
+}
+.btn-primary { background: #4ecca3; color: #1a1a2e; }
+.btn-primary:hover { background: #3db890; }
+.btn-primary:disabled { background: #2a5a4a; color: #555; cursor: default; }
+.btn-secondary { background: #0f3460; color: #c0c0c0; }
+.btn-secondary:hover { background: #1a3a6e; }
+.btn-danger { background: #e74c3c; color: #fff; }
+.btn-small { padding: 4px 12px; font-size: 12px; }
+
+.catalog-list { margin-bottom: 12px; }
+.catalog-item {
+  display: flex; align-items: center; gap: 8px; padding: 6px 0;
+  font-size: 13px; color: #c0c0c0;
+}
+.catalog-item .remove-btn {
+  color: #666; cursor: pointer; font-size: 16px;
+}
+.catalog-item .remove-btn:hover { color: #e74c3c; }
+
+/* Preview table */
+.preview-table {
+  width: 100%; border-collapse: collapse; font-size: 13px; margin-top: 12px;
+}
+.preview-table th {
+  text-align: left; padding: 8px 12px; color: #888;
+  font-weight: 500; border-bottom: 1px solid #0f3460;
+}
+.preview-table td {
+  padding: 8px 12px; border-bottom: 1px solid #0a1a35; color: #c0c0c0;
+}
+
+/* Conflicts */
+.conflict-item {
+  background: #0f3460; border-radius: 4px; padding: 10px 14px;
+  margin-bottom: 8px; font-size: 12px;
+}
+.conflict-file { font-weight: 600; color: #f0c040; margin-bottom: 4px; }
+.conflict-cat { color: #999; margin-left: 8px; }
+
+/* Progress */
+.progress-bar {
+  height: 6px; background: #0f3460; border-radius: 3px; overflow: hidden;
+  margin: 12px 0;
+}
+.progress-fill {
+  height: 100%; background: #4ecca3; border-radius: 3px; transition: width 0.3s;
+  width: 0;
+}
+
+/* Strategy selector */
+.strategy-group { display: flex; gap: 12px; margin: 12px 0; }
+.strategy-option {
+  display: flex; align-items: center; gap: 6px;
+  font-size: 13px; color: #c0c0c0; cursor: pointer;
+}
+.strategy-option input { accent-color: #4ecca3; }
+
+.import-options { display: flex; gap: 16px; align-items: center; margin: 12px 0; }
+.import-options label { font-size: 13px; color: #c0c0c0; display: flex; align-items: center; gap: 6px; cursor: pointer; }
+
+.result-summary { font-size: 14px; line-height: 1.8; }
+.result-summary .ok { color: #4ecca3; }
+.result-summary .skip { color: #f0c040; }
+.result-summary .fail { color: #e74c3c; }
+
+.status-msg { font-size: 13px; color: #888; margin-top: 8px; }
+
+/* Phases */
+.phase { display: none; }
+.phase.active { display: block; }
+</style>
 </head>
 <body>
-<h1>Import</h1>
+
+<nav class="navbar">
+  <a class="brand" href="/browse">Spotter</a>
+  <a href="/browse">Browse</a>
+  <a href="/classify">Classify</a>
+  <a href="/import" class="active">Import</a>
+  <a href="/audit">Audit</a>
+  <a href="/settings">Settings</a>
+</nav>
+
+<div class="content">
+  <h2 style="margin-bottom: 20px; font-size: 20px;">Lightroom Import</h2>
+
+  <!-- Phase 1: Select Catalogs -->
+  <div class="phase active" id="phase1">
+    <div class="section">
+      <div class="section-title">Select Catalogs</div>
+      <p style="font-size: 13px; color: #888; margin-bottom: 12px;">
+        Enter paths to .lrcat catalog files. Keywords will be imported into the Spotter database.
+      </p>
+      <div class="input-group">
+        <input type="text" class="path-input" id="catalogInput" placeholder="/path/to/catalog.lrcat"
+               onkeydown="if(event.key==='Enter')addCatalog()">
+        <button class="btn btn-secondary" onclick="addCatalog()">Add</button>
+      </div>
+      <div class="catalog-list" id="catalogList"></div>
+      <button class="btn btn-primary" id="previewBtn" onclick="previewImport()" disabled>Preview Import</button>
+      <span class="status-msg" id="previewStatus"></span>
+    </div>
+  </div>
+
+  <!-- Phase 2: Preview -->
+  <div class="phase" id="phase2">
+    <div class="section">
+      <div class="section-title">Preview</div>
+      <table class="preview-table" id="previewTable">
+        <thead><tr><th>Catalog</th><th>Files</th><th>Found</th><th>Missing</th><th>Keywords</th></tr></thead>
+        <tbody id="previewBody"></tbody>
+      </table>
+    </div>
+
+    <div class="section" id="conflictSection" style="display:none;">
+      <div class="section-title">Conflicts (<span id="conflictCount">0</span> files in multiple catalogs)</div>
+      <div id="conflictList"></div>
+    </div>
+
+    <div class="section">
+      <div class="section-title">Options</div>
+      <div class="strategy-group">
+        <label class="strategy-option">
+          <input type="radio" name="strategy" value="merge_all" checked> Merge all keywords
+        </label>
+        <label class="strategy-option">
+          <input type="radio" name="strategy" value="prefer_first"> Prefer first catalog
+        </label>
+        <label class="strategy-option">
+          <input type="radio" name="strategy" value="prefer_last"> Prefer last catalog
+        </label>
+      </div>
+      <div class="import-options">
+        <label><input type="checkbox" id="writeXmp"> Also write XMP sidecars</label>
+      </div>
+      <div style="display:flex; gap:12px; margin-top:16px;">
+        <button class="btn btn-secondary" onclick="backToPhase1()">Back</button>
+        <button class="btn btn-primary" id="importBtn" onclick="executeImport()">Import</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Phase 3: Progress / Results -->
+  <div class="phase" id="phase3">
+    <div class="section">
+      <div class="section-title">Import Progress</div>
+      <div class="progress-bar"><div class="progress-fill" id="progressFill"></div></div>
+      <div class="status-msg" id="importStatus">Importing...</div>
+      <div class="result-summary" id="resultSummary" style="display:none;"></div>
+      <button class="btn btn-primary" id="doneBtn" onclick="resetImport()" style="display:none; margin-top:16px;">Done</button>
+    </div>
+  </div>
+</div>
+
+<script>
+var catalogs = [];
+var previewData = null;
+
+function addCatalog() {
+  var input = document.getElementById('catalogInput');
+  var path = input.value.trim();
+  if (!path || catalogs.indexOf(path) !== -1) return;
+  catalogs.push(path);
+  input.value = '';
+  renderCatalogs();
+}
+
+function removeCatalog(idx) {
+  catalogs.splice(idx, 1);
+  renderCatalogs();
+}
+
+function renderCatalogs() {
+  var html = '';
+  catalogs.forEach(function(c, i) {
+    html += '<div class="catalog-item">' +
+      '<span class="remove-btn" onclick="removeCatalog(' + i + ')">&times;</span>' +
+      '<span>' + escapeHtml(c) + '</span></div>';
+  });
+  document.getElementById('catalogList').innerHTML = html;
+  document.getElementById('previewBtn').disabled = catalogs.length === 0;
+}
+
+async function previewImport() {
+  var status = document.getElementById('previewStatus');
+  status.textContent = 'Loading preview...';
+  document.getElementById('previewBtn').disabled = true;
+
+  try {
+    var resp = await fetch('/api/import/preview', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({catalogs: catalogs}),
+    });
+    previewData = await resp.json();
+
+    // Render preview table
+    var html = '';
+    (previewData.catalogs || []).forEach(function(c) {
+      html += '<tr><td>' + escapeHtml(c.catalog) + '</td><td>' + c.total_files + '</td>' +
+        '<td>' + c.matched_files + '</td><td>' + c.unmatched_files + '</td>' +
+        '<td>' + c.keyword_count + '</td></tr>';
+    });
+    document.getElementById('previewBody').innerHTML = html;
+
+    // Render conflicts
+    if (previewData.conflict_count > 0) {
+      document.getElementById('conflictSection').style.display = '';
+      document.getElementById('conflictCount').textContent = previewData.conflict_count;
+      var chtml = '';
+      (previewData.conflicts || []).slice(0, 50).forEach(function(c) {
+        chtml += '<div class="conflict-item"><div class="conflict-file">' + escapeHtml(c.file_path) + '</div>';
+        for (var cat in c.keywords_by_catalog) {
+          chtml += '<div><span class="conflict-cat">' + escapeHtml(cat) + ':</span> ' +
+            escapeHtml(c.keywords_by_catalog[cat].join(', ')) + '</div>';
+        }
+        chtml += '</div>';
+      });
+      document.getElementById('conflictList').innerHTML = chtml;
+    } else {
+      document.getElementById('conflictSection').style.display = 'none';
+    }
+
+    showPhase(2);
+    status.textContent = '';
+  } catch(e) {
+    status.textContent = 'Error: ' + e.message;
+  }
+  document.getElementById('previewBtn').disabled = false;
+}
+
+async function executeImport() {
+  showPhase(3);
+  document.getElementById('progressFill').style.width = '50%';
+  document.getElementById('importStatus').textContent = 'Importing...';
+
+  var strategy = document.querySelector('input[name=strategy]:checked').value;
+  var writeXmp = document.getElementById('writeXmp').checked;
+
+  try {
+    var resp = await fetch('/api/import/execute', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        catalogs: catalogs,
+        strategy: strategy,
+        write_xmp: writeXmp,
+      }),
+    });
+    var result = await resp.json();
+
+    document.getElementById('progressFill').style.width = '100%';
+    document.getElementById('importStatus').textContent = 'Complete';
+    document.getElementById('resultSummary').style.display = '';
+    document.getElementById('resultSummary').innerHTML =
+      '<span class="ok">Imported: ' + result.imported + '</span><br>' +
+      '<span class="skip">Skipped: ' + result.skipped + '</span><br>' +
+      '<span class="fail">Failed: ' + result.failed + '</span>';
+    document.getElementById('doneBtn').style.display = '';
+  } catch(e) {
+    document.getElementById('importStatus').textContent = 'Error: ' + e.message;
+  }
+}
+
+function showPhase(n) {
+  document.querySelectorAll('.phase').forEach(function(el) { el.classList.remove('active'); });
+  document.getElementById('phase' + n).classList.add('active');
+}
+
+function backToPhase1() { showPhase(1); }
+
+function resetImport() {
+  catalogs = [];
+  previewData = null;
+  renderCatalogs();
+  document.getElementById('progressFill').style.width = '0';
+  document.getElementById('resultSummary').style.display = 'none';
+  document.getElementById('doneBtn').style.display = 'none';
+  showPhase(1);
+}
+
+function escapeHtml(str) {
+  if (str == null) return '';
+  var div = document.createElement('div');
+  div.appendChild(document.createTextNode(String(str)));
+  return div.innerHTML;
+}
+</script>
 </body>
 </html>

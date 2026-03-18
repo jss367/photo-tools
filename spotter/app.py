@@ -231,6 +231,38 @@ def create_app(db_path, thumb_cache_dir=None):
             'per_page': per_page,
         })
 
+    # -- Import API routes --
+
+    @app.route('/api/import/preview', methods=['POST'])
+    def api_import_preview():
+        db = _get_db()
+        body = request.get_json(silent=True) or {}
+        catalogs = body.get('catalogs', [])
+        if not catalogs:
+            return jsonify({'error': 'catalogs required'}), 400
+        try:
+            from importer import preview_import
+            result = preview_import(catalogs, db)
+            return jsonify(result)
+        except Exception as e:
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/api/import/execute', methods=['POST'])
+    def api_import_execute():
+        db = _get_db()
+        body = request.get_json(silent=True) or {}
+        catalogs = body.get('catalogs', [])
+        strategy = body.get('strategy', 'merge_all')
+        write_xmp = body.get('write_xmp', False)
+        if not catalogs:
+            return jsonify({'error': 'catalogs required'}), 400
+        try:
+            from importer import execute_import
+            result = execute_import(catalogs, db, write_xmp=write_xmp, strategy=strategy)
+            return jsonify(result)
+        except Exception as e:
+            return jsonify({'error': str(e)}), 500
+
     # -- Thumbnail serving --
 
     @app.route('/thumbnails/<filename>')

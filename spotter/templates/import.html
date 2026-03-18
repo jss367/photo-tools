@@ -259,14 +259,16 @@ async function previewImport() {
 
 async function executeImport() {
   showPhase(3);
-  document.getElementById('progressFill').style.width = '50%';
-  document.getElementById('importStatus').textContent = 'Importing...';
+  var fill = document.getElementById('progressFill');
+  var status = document.getElementById('importStatus');
+  fill.style.width = '0%';
+  status.textContent = 'Starting import...';
 
   var strategy = document.querySelector('input[name=strategy]:checked').value;
   var writeXmp = document.getElementById('writeXmp').checked;
 
   try {
-    var resp = await fetch('/api/import/execute', {
+    var resp = await fetch('/api/jobs/import', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({
@@ -275,18 +277,48 @@ async function executeImport() {
         write_xmp: writeXmp,
       }),
     });
-    var result = await resp.json();
+    if (!resp.ok) {
+      var err = await resp.json();
+      status.textContent = 'Error: ' + (err.error || 'failed');
+      return;
+    }
+    var data = await resp.json();
+    var jobId = data.job_id;
+    status.textContent = 'Importing...';
 
-    document.getElementById('progressFill').style.width = '100%';
-    document.getElementById('importStatus').textContent = 'Complete';
-    document.getElementById('resultSummary').style.display = '';
-    document.getElementById('resultSummary').innerHTML =
-      '<span class="ok">Imported: ' + result.imported + '</span><br>' +
-      '<span class="skip">Skipped: ' + result.skipped + '</span><br>' +
-      '<span class="fail">Failed: ' + result.failed + '</span>';
-    document.getElementById('doneBtn').style.display = '';
+    var source = new EventSource('/api/jobs/' + jobId + '/stream');
+
+    source.addEventListener('progress', function(e) {
+      var p = JSON.parse(e.data);
+      if (p.total > 0) {
+        fill.style.width = Math.round((p.current / p.total) * 100) + '%';
+        status.textContent = p.current.toLocaleString() + ' / ' + p.total.toLocaleString() + ' files';
+      }
+    });
+
+    source.addEventListener('complete', function(e) {
+      source.close();
+      var result = JSON.parse(e.data);
+      fill.style.width = '100%';
+      if (result.status === 'completed' && result.result) {
+        status.textContent = 'Complete' + (result.duration ? ' (' + result.duration + 's)' : '');
+        document.getElementById('resultSummary').style.display = '';
+        document.getElementById('resultSummary').innerHTML =
+          '<span class="ok">Imported: ' + (result.result.imported || 0) + '</span><br>' +
+          '<span class="skip">Skipped: ' + (result.result.skipped || 0) + '</span><br>' +
+          '<span class="fail">Failed: ' + (result.result.failed || 0) + '</span>';
+      } else {
+        status.textContent = 'Failed: ' + (result.errors || []).join(', ');
+      }
+      document.getElementById('doneBtn').style.display = '';
+    });
+
+    source.onerror = function() {
+      source.close();
+      status.textContent = 'Connection lost.';
+    };
   } catch(e) {
-    document.getElementById('importStatus').textContent = 'Error: ' + e.message;
+    status.textContent = 'Error: ' + e.message;
   }
 }
 

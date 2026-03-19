@@ -135,6 +135,43 @@ def register_model(model_id, name, model_str, weights_path, description=''):
     _save_config(config)
 
 
+def _hf_download_with_retry(repo_id, filename, local_dir, progress_callback=None, max_retries=3):
+    """Download from HuggingFace with retry on connection failures."""
+    from huggingface_hub import hf_hub_download
+
+    for attempt in range(max_retries):
+        try:
+            if progress_callback:
+                size_hint = ''
+                if attempt > 0:
+                    size_hint = f' (retry {attempt}/{max_retries - 1})'
+                progress_callback(f'Downloading {filename} from {repo_id}...{size_hint}')
+
+            log.info("Downloading %s from %s (attempt %d/%d)",
+                     filename, repo_id, attempt + 1, max_retries)
+
+            path = hf_hub_download(
+                repo_id=repo_id,
+                filename=filename,
+                local_dir=local_dir,
+            )
+
+            log.info("Download complete: %s", path)
+            return path
+
+        except Exception as e:
+            log.warning("Download attempt %d failed: %s", attempt + 1, e)
+            if attempt == max_retries - 1:
+                raise RuntimeError(
+                    f"Download failed after {max_retries} attempts: {e}\n"
+                    f"This is a 1.7GB file — check your network connection and try again."
+                ) from e
+            if progress_callback:
+                progress_callback(f'Download interrupted, retrying ({attempt + 2}/{max_retries})...')
+            import time
+            time.sleep(2)
+
+
 def download_model(model_id, progress_callback=None):
     """Download a known model. Returns the weights path."""
     known = {m['id']: m for m in KNOWN_MODELS}
@@ -145,32 +182,25 @@ def download_model(model_id, progress_callback=None):
     os.makedirs(DEFAULT_MODELS_DIR, exist_ok=True)
 
     try:
-        from huggingface_hub import hf_hub_download
+        from huggingface_hub import hf_hub_download  # noqa: F401
     except ImportError:
         raise RuntimeError("huggingface_hub not installed. Run: pip install huggingface_hub")
 
     if model_id == 'bioclip-vit-b-16':
-        if progress_callback:
-            progress_callback('Downloading BioCLIP weights from HuggingFace...')
-        path = hf_hub_download(
-            repo_id='imageomics/bioclip',
-            filename='open_clip_pytorch_model.bin',
-            local_dir=os.path.join(DEFAULT_MODELS_DIR, 'bioclip'),
+        path = _hf_download_with_retry(
+            'imageomics/bioclip', 'open_clip_pytorch_model.bin',
+            os.path.join(DEFAULT_MODELS_DIR, 'bioclip'),
+            progress_callback=progress_callback,
         )
         register_model(model_id, km['name'], km['model_str'], path, km['description'])
         return path
 
     elif model_id == 'bioclip-2':
-        if progress_callback:
-            progress_callback('Downloading BioCLIP-2 weights from HuggingFace...')
-        # BioCLIP-2 stores weights in a different format — download the checkpoint
-        local_dir = os.path.join(DEFAULT_MODELS_DIR, 'bioclip-2')
-        path = hf_hub_download(
-            repo_id='imageomics/bioclip-2',
-            filename='open_clip_pytorch_model.bin',
-            local_dir=local_dir,
+        path = _hf_download_with_retry(
+            'imageomics/bioclip-2', 'open_clip_pytorch_model.bin',
+            os.path.join(DEFAULT_MODELS_DIR, 'bioclip-2'),
+            progress_callback=progress_callback,
         )
-        # BioCLIP-2 uses hf-hub model_str for open_clip to find the config
         register_model(model_id, km['name'], 'hf-hub:imageomics/bioclip-2',
                        path, km['description'])
         return path

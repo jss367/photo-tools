@@ -45,6 +45,11 @@ class Database:
                 flag        TEXT DEFAULT 'none',
                 thumb_path  TEXT,
                 sharpness   REAL,
+                detection_box TEXT,
+                detection_conf REAL,
+                subject_sharpness REAL,
+                subject_size REAL,
+                quality_score REAL,
                 UNIQUE(folder_id, filename)
             );
 
@@ -113,6 +118,14 @@ class Database:
             self.conn.execute("SELECT sharpness FROM photos LIMIT 0")
         except Exception:
             self.conn.execute("ALTER TABLE photos ADD COLUMN sharpness REAL")
+        try:
+            self.conn.execute("SELECT quality_score FROM photos LIMIT 0")
+        except Exception:
+            self.conn.execute("ALTER TABLE photos ADD COLUMN detection_box TEXT")
+            self.conn.execute("ALTER TABLE photos ADD COLUMN detection_conf REAL")
+            self.conn.execute("ALTER TABLE photos ADD COLUMN subject_sharpness REAL")
+            self.conn.execute("ALTER TABLE photos ADD COLUMN subject_size REAL")
+            self.conn.execute("ALTER TABLE photos ADD COLUMN quality_score REAL")
 
     # -- Folders --
 
@@ -219,6 +232,7 @@ class Database:
             'rating': 'p.rating DESC',
             'sharpness': 'p.sharpness DESC',
             'sharpness_asc': 'p.sharpness ASC',
+            'quality': 'p.quality_score DESC',
         }
         order = sort_map.get(sort, 'p.timestamp ASC')
 
@@ -247,6 +261,21 @@ class Database:
     def update_photo_sharpness(self, photo_id, sharpness):
         """Set photo sharpness score."""
         self.conn.execute("UPDATE photos SET sharpness = ? WHERE id = ?", (sharpness, photo_id))
+        self.conn.commit()
+
+    def update_photo_quality(self, photo_id, detection_box=None, detection_conf=None,
+                             subject_sharpness=None, subject_size=None, quality_score=None,
+                             sharpness=None):
+        """Update all quality-related scores for a photo."""
+        import json as _json
+        self.conn.execute(
+            """UPDATE photos SET detection_box=?, detection_conf=?,
+               subject_sharpness=?, subject_size=?, quality_score=?, sharpness=?
+               WHERE id=?""",
+            (_json.dumps(detection_box) if detection_box else None,
+             detection_conf, subject_sharpness, subject_size, quality_score,
+             sharpness, photo_id),
+        )
         self.conn.commit()
 
     # -- Keywords --

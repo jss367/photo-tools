@@ -1342,6 +1342,7 @@ def create_app(db_path, thumb_cache_dir=None):
                 raw_results.append({
                     'photo': photo,
                     'folder_path': folder_path,
+                    'image_path': image_path,
                     'prediction': top['species'],
                     'confidence': top['score'],
                     'timestamp': timestamp,
@@ -1425,9 +1426,86 @@ def create_app(db_path, thumb_cache_dir=None):
 
             log.info("Classification done: %d classified, %d groups, %d failed",
                      classified, group_count, failed)
+
+            # Phase 7: Detection and quality scoring
+            detected = 0
+            try:
+                from detector import detect_animals, get_primary_detection
+                from sharpness import compute_sharpness
+
+                runner.push_event(job['id'], 'progress', {
+                    'current': 0, 'total': len(raw_results),
+                    'current_file': 'Loading MegaDetector...', 'rate': 0,
+                })
+
+                for qi, item in enumerate(raw_results):
+                    runner.push_event(job['id'], 'progress', {
+                        'current': qi + 1, 'total': len(raw_results),
+                        'current_file': f'Detecting: {item["filename"]}',
+                        'rate': round((qi + 1) / max(time.time() - job['_start_time'], 0.01), 1),
+                    })
+
+                    image_path = item['image_path']
+                    photo = item['photo']
+
+                    # Detect
+                    detections = detect_animals(image_path)
+                    primary = get_primary_detection(detections)
+
+                    # Score
+                    overall_sharpness = compute_sharpness(image_path)
+                    subject_sharpness = None
+                    subject_size = None
+                    quality = 0
+                    det_box = None
+                    det_conf = None
+
+                    if primary:
+                        detected += 1
+                        det_box = primary['box']
+                        det_conf = primary['confidence']
+                        subject_size = det_box['w'] * det_box['h']
+
+                        # Compute sharpness within the bounding box
+                        try:
+                            img = Image.open(image_path)
+                            iw, ih = img.size
+                            px = int(det_box['x'] * iw)
+                            py = int(det_box['y'] * ih)
+                            pw = int(det_box['w'] * iw)
+                            ph = int(det_box['h'] * ih)
+                            subject_sharpness = compute_sharpness(image_path, region=(px, py, pw, ph))
+                        except Exception:
+                            subject_sharpness = overall_sharpness
+
+                        # Combined quality score
+                        if subject_sharpness is not None and subject_size is not None:
+                            # Normalize: sharpness varies widely, log scale helps
+                            import math
+                            norm_sharp = min(1.0, math.log1p(subject_sharpness) / 10.0)
+                            norm_size = min(1.0, subject_size * 4)  # 25% of frame = 1.0
+                            quality = round(0.7 * norm_sharp + 0.3 * norm_size, 4)
+
+                    thread_db.update_photo_quality(
+                        photo['id'],
+                        detection_box=det_box,
+                        detection_conf=det_conf,
+                        subject_sharpness=subject_sharpness,
+                        subject_size=subject_size,
+                        quality_score=quality,
+                        sharpness=overall_sharpness,
+                    )
+
+                log.info("Detection done: %d animals detected out of %d photos", detected, len(raw_results))
+            except ImportError:
+                log.info("PytorchWildlife not installed — skipping detection and quality scoring")
+            except Exception:
+                log.warning("Detection/scoring failed (non-fatal)", exc_info=True)
+
             return {
                 'classified': classified,
                 'groups': group_count,
+                'detected': detected,
                 'failed': failed,
                 'total': total,
             }

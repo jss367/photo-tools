@@ -44,6 +44,7 @@ class Database:
                 rating      INTEGER DEFAULT 0,
                 flag        TEXT DEFAULT 'none',
                 thumb_path  TEXT,
+                sharpness   REAL,
                 UNIQUE(folder_id, filename)
             );
 
@@ -108,6 +109,10 @@ class Database:
             self.conn.execute("ALTER TABLE predictions ADD COLUMN vote_count INTEGER")
             self.conn.execute("ALTER TABLE predictions ADD COLUMN total_votes INTEGER")
             self.conn.execute("ALTER TABLE predictions ADD COLUMN individual TEXT")
+        try:
+            self.conn.execute("SELECT sharpness FROM photos LIMIT 0")
+        except Exception:
+            self.conn.execute("ALTER TABLE photos ADD COLUMN sharpness REAL")
 
     # -- Folders --
 
@@ -212,6 +217,8 @@ class Database:
             'name': 'p.filename ASC',
             'name_desc': 'p.filename DESC',
             'rating': 'p.rating DESC',
+            'sharpness': 'p.sharpness DESC',
+            'sharpness_asc': 'p.sharpness ASC',
         }
         order = sort_map.get(sort, 'p.timestamp ASC')
 
@@ -235,6 +242,11 @@ class Database:
     def update_photo_flag(self, photo_id, flag):
         """Set photo flag ('none', 'flagged', 'rejected')."""
         self.conn.execute("UPDATE photos SET flag = ? WHERE id = ?", (flag, photo_id))
+        self.conn.commit()
+
+    def update_photo_sharpness(self, photo_id, sharpness):
+        """Set photo sharpness score."""
+        self.conn.execute("UPDATE photos SET sharpness = ? WHERE id = ?", (sharpness, photo_id))
         self.conn.commit()
 
     # -- Keywords --

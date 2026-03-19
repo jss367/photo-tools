@@ -414,6 +414,8 @@ body {
         <option value="name">Filename (A-Z)</option>
         <option value="name_desc">Filename (Z-A)</option>
         <option value="rating">Rating (highest)</option>
+        <option value="sharpness">Sharpness (sharpest)</option>
+        <option value="sharpness_asc">Sharpness (softest)</option>
       </select>
       <label style="display:flex;align-items:center;gap:4px;" title="Thumbnail size">
         <input type="range" id="thumbSizeSlider" min="120" max="400" step="20" value="220"
@@ -927,6 +929,7 @@ function renderGrid() {
         '<div class="grid-card-meta">' +
           (stars ? '<span class="grid-card-rating">' + stars + '</span>' : '') +
           flagHtml +
+          (p.sharpness != null ? '<span style="font-size:10px;color:var(--text-ghost,#555);" title="Sharpness score">' + Math.round(p.sharpness) + '</span>' : '') +
         '</div>' +
       '</div>' +
     '</div>';

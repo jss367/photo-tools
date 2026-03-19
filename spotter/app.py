@@ -1148,6 +1148,53 @@ def create_app(db_path, thumb_cache_dir=None):
         job_id = runner.start('sync', work)
         return jsonify({'job_id': job_id})
 
+    @app.route('/api/jobs/sharpness', methods=['POST'])
+    def api_job_sharpness():
+        body = request.get_json(silent=True) or {}
+        collection_id = body.get('collection_id')
+
+        runner = app._job_runner
+
+        def work(job):
+            from sharpness import score_collection_photos
+            thread_db = Database(db_path)
+            job['_start_time'] = time.time()
+
+            def progress_cb(current, total, msg):
+                job['progress']['current'] = current
+                job['progress']['total'] = total
+                job['progress']['current_file'] = msg
+                runner.push_event(job['id'], 'progress', {
+                    'current': current, 'total': total,
+                    'current_file': msg,
+                    'rate': round(current / max(time.time() - job['_start_time'], 0.01), 1),
+                })
+
+            result = score_collection_photos(
+                thread_db, collection_id, progress_callback=progress_cb,
+            )
+
+            # Save scores to database
+            for r in result['results']:
+                thread_db.update_photo_sharpness(r['photo_id'], r['sharpness'])
+
+            # Auto-flag: flag best in each group, suggest reject for worst
+            best_count = 0
+            for r in result['results']:
+                if r['group_size'] > 1 and r['is_best']:
+                    thread_db.update_photo_flag(r['photo_id'], 'flagged')
+                    best_count += 1
+
+            result['auto_flagged'] = best_count
+            # Don't return the full results list (could be huge)
+            del result['results']
+            return result
+
+        job_id = runner.start('sharpness', work, config={
+            'collection_id': collection_id,
+        })
+        return jsonify({'job_id': job_id})
+
     @app.route('/api/jobs/classify', methods=['POST'])
     def api_job_classify():
         import config as cfg

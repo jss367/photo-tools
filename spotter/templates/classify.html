@@ -145,8 +145,9 @@ select.picker:focus { border-color: #4ecca3; }
       </div>
     </div>
 
-    <div style="display:flex;gap:12px;align-items:center;">
+    <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap;">
       <button class="btn btn-primary" id="runBtn" onclick="runClassification()" disabled>Run Classification</button>
+      <button class="btn btn-secondary" id="sharpnessBtn" onclick="runSharpness()" disabled>Score Sharpness</button>
       <span class="status-msg" id="runStatus"></span>
     </div>
 
@@ -260,6 +261,7 @@ async function loadPastRuns() {
 function updateRunButton() {
   var collId = document.getElementById('collectionPicker').value;
   document.getElementById('runBtn').disabled = !collId;
+  document.getElementById('sharpnessBtn').disabled = !collId;
   if (collId) {
     loadCollectionPreview(collId);
   } else {
@@ -342,6 +344,61 @@ async function runClassification() {
         status.className = 'status-msg ok';
         // Show the review banner
         loadPendingCount();
+        loadPastRuns();
+      } else {
+        status.textContent = 'Failed: ' + (result.errors || []).join(', ');
+      }
+      btn.disabled = false;
+    });
+    source.onerror = function() { source.close(); status.textContent = 'Connection lost'; btn.disabled = false; };
+  } catch(e) {
+    status.textContent = 'Error: ' + e.message;
+    btn.disabled = false;
+  }
+}
+
+async function runSharpness() {
+  var collId = document.getElementById('collectionPicker').value;
+  if (!collId) return;
+
+  var btn = document.getElementById('sharpnessBtn');
+  var status = document.getElementById('runStatus');
+  btn.disabled = true;
+  status.textContent = 'Scoring sharpness...';
+  status.className = 'status-msg';
+
+  try {
+    var resp = await fetch('/api/jobs/sharpness', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({collection_id: parseInt(collId)}),
+    });
+    if (!resp.ok) {
+      var err = await resp.json();
+      status.textContent = 'Error: ' + (err.error || 'failed');
+      btn.disabled = false;
+      return;
+    }
+    var data = await resp.json();
+
+    var source = new EventSource('/api/jobs/' + data.job_id + '/stream');
+    source.addEventListener('progress', function(e) {
+      var p = JSON.parse(e.data);
+      if (p.total > 0 && p.current > 0) {
+        status.textContent = p.current + ' / ' + p.total + (p.current_file ? ' — ' + p.current_file : '');
+      } else if (p.current_file) {
+        status.textContent = p.current_file;
+      }
+    });
+    source.addEventListener('complete', function(e) {
+      source.close();
+      var result = JSON.parse(e.data);
+      if (result.status === 'completed' && result.result) {
+        var r = result.result;
+        status.textContent = 'Done! ' + r.scored_count + ' scored, ' +
+          r.group_count + ' burst groups, ' + (r.auto_flagged || 0) + ' best shots auto-flagged' +
+          (result.duration ? ' (' + result.duration + 's)' : '');
+        status.className = 'status-msg ok';
         loadPastRuns();
       } else {
         status.textContent = 'Failed: ' + (result.errors || []).join(', ');

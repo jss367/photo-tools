@@ -135,7 +135,7 @@ def register_model(model_id, name, model_str, weights_path, description=''):
     _save_config(config)
 
 
-def _hf_download_with_retry(repo_id, filename, local_dir, progress_callback=None, max_retries=5):
+def _hf_download_with_retry(repo_id, filename, local_dir, progress_callback=None, max_retries=50):
     """Download from HuggingFace with retry on connection failures.
 
     Uses the HF cache (not local_dir) for reliable resume on large files,
@@ -182,9 +182,9 @@ def _hf_download_with_retry(repo_id, filename, local_dir, progress_callback=None
                     f"Download failed after {max_retries} attempts: {e}\n"
                     f"Try again — the download will resume from where it left off."
                 ) from e
-            wait = 5 * (attempt + 1)
+            wait = min(5, 2 * (attempt + 1))  # 2s, 4s, 5s, 5s, ...
             if progress_callback:
-                progress_callback(f'Connection lost, retrying in {wait}s (attempt {attempt + 2}/{max_retries})...')
+                progress_callback(f'Connection lost, retrying in {wait}s (attempt {attempt + 2})...')
             _time.sleep(wait)
 
 

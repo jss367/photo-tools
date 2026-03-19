@@ -398,13 +398,16 @@
   </div>
 </div>
 
-<!-- Action Bar -->
-<div class="settings-panel open" id="settingsPanel">
+<!-- Action Bar (visible during review) -->
+<div class="settings-panel" id="reviewBar">
   <div class="setting-group">
     <button class="btn-batch-accept" id="acceptAllBtn" onclick="acceptAllPending()" style="display:none;">Accept All</button>
     <span class="batch-info" id="classifyStatus"></span>
   </div>
   <span class="kbd-hint" id="kbdHint" style="display:none;">Keyboard: A = accept, S = skip</span>
+  <span style="margin-left:auto;">
+    <button onclick="showConfig()" style="background:none;border:none;color:#555;font-size:12px;cursor:pointer;">Re-classify</button>
+  </span>
 </div>
 
 <!-- Category Tabs -->
@@ -630,15 +633,20 @@ function switchTab(tab) {
 
 function renderButtons() {
   var configPanel = document.getElementById('classifyConfig');
+  var reviewBar = document.getElementById('reviewBar');
   var acceptAllBtn = document.getElementById('acceptAllBtn');
   var kbdHint = document.getElementById('kbdHint');
 
   if (currentCollectionId && mode === 'browse') {
+    // Show full config — no predictions yet
     configPanel.classList.add('open');
+    reviewBar.classList.remove('open');
     acceptAllBtn.style.display = 'none';
     kbdHint.style.display = 'none';
   } else if (mode === 'review') {
-    configPanel.classList.add('open');
+    // Collapse config, show review bar
+    configPanel.classList.remove('open');
+    reviewBar.classList.add('open');
     var pending = predictions.filter(function(p) { return p.status === 'pending'; }).length;
     if (pending > 0) {
       acceptAllBtn.style.display = '';
@@ -650,6 +658,7 @@ function renderButtons() {
     }
   } else {
     configPanel.classList.remove('open');
+    reviewBar.classList.remove('open');
     acceptAllBtn.style.display = 'none';
     kbdHint.style.display = 'none';
   }
@@ -820,6 +829,11 @@ document.addEventListener('keydown', function(e) {
 });
 
 /* ---------- Settings ---------- */
+function showConfig() {
+  mode = 'browse';
+  renderAll();
+}
+
 function updateThumbSize(val) {
   thumbSize = parseInt(val, 10);
   document.getElementById('thumbSizeVal').textContent = val + 'px';

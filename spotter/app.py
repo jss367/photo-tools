@@ -413,6 +413,91 @@ def create_app(db_path, thumb_cache_dir=None):
                 entries.append({'file': f, 'size': size})
         return jsonify({'entries': entries, 'total_size': total_size})
 
+    @app.route('/api/embedding-matrix')
+    def api_embedding_matrix():
+        """Return which model+labels combinations have cached embeddings."""
+        from classifier import _embedding_cache_path
+        from models import get_models
+        from labels import get_saved_labels
+
+        models = [m for m in get_models() if m['downloaded']]
+        label_sets = get_saved_labels()
+
+        matrix = []
+        for ls in label_sets:
+            labels_file = ls.get('labels_file', '')
+            if not labels_file or not os.path.exists(labels_file):
+                continue
+            with open(labels_file) as f:
+                labels = [line.strip() for line in f if line.strip()]
+            row = {
+                'labels_name': ls.get('name', ''),
+                'labels_file': labels_file,
+                'species_count': len(labels),
+                'models': {},
+            }
+            for m in models:
+                cache_path = _embedding_cache_path(labels, m['model_str'])
+                row['models'][m['id']] = {
+                    'cached': os.path.exists(cache_path),
+                    'model_name': m['name'],
+                }
+            matrix.append(row)
+
+        return jsonify({
+            'models': [{'id': m['id'], 'name': m['name']} for m in models],
+            'matrix': matrix,
+        })
+
+    @app.route('/api/jobs/precompute-embeddings', methods=['POST'])
+    def api_job_precompute_embeddings():
+        body = request.get_json(silent=True) or {}
+        model_id = body.get('model_id')
+        labels_file = body.get('labels_file')
+        if not model_id or not labels_file:
+            return jsonify({'error': 'model_id and labels_file required'}), 400
+
+        runner = app._job_runner
+
+        def work(job):
+            from models import get_models
+            from classifier import Classifier
+
+            # Find the model
+            models = get_models()
+            model = None
+            for m in models:
+                if m['id'] == model_id:
+                    model = m
+                    break
+            if not model or not model['downloaded']:
+                raise RuntimeError(f"Model {model_id} not found or not downloaded")
+
+            runner.push_event(job['id'], 'progress', {
+                'current': 0, 'total': 0,
+                'current_file': f'Loading {model["name"]} and computing embeddings...',
+                'rate': 0,
+            })
+
+            with open(labels_file) as f:
+                labels = [line.strip() for line in f if line.strip()]
+
+            log.info("Pre-computing embeddings: %d labels with %s", len(labels), model['name'])
+
+            # This will compute and cache the embeddings
+            Classifier(
+                labels=labels,
+                model_str=model['model_str'],
+                pretrained_str=model['weights_path'],
+            )
+
+            return {'labels': len(labels), 'model': model['name']}
+
+        job_id = runner.start('precompute-embeddings', work, config={
+            'model_id': model_id, 'labels_file': labels_file,
+        })
+        return jsonify({'job_id': job_id})
+
     @app.route('/api/embedding-cache', methods=['DELETE'])
     def api_embedding_cache_clear():
         """Clear all cached label embeddings."""
@@ -676,6 +761,26 @@ def create_app(db_path, thumb_cache_dir=None):
                 raise RuntimeError("No species found for this region and taxa selection")
             labels_path = save_labels(name, place_id, place_name, taxon_groups, species)
             set_active_labels(labels_path)
+
+            # Auto-compute embeddings for the active model
+            from models import get_active_model
+            active_model = get_active_model()
+            if active_model and active_model['downloaded']:
+                try:
+                    from classifier import _embedding_cache_path
+                    cache_path = _embedding_cache_path(list(set(species)), active_model['model_str'])
+                    if not os.path.exists(cache_path):
+                        progress_cb(f'Pre-computing embeddings for {active_model["name"]}...', 0, 0)
+                        from classifier import Classifier
+                        Classifier(
+                            labels=list(set(species)),
+                            model_str=active_model['model_str'],
+                            pretrained_str=active_model['weights_path'],
+                        )
+                        progress_cb('Embeddings cached!', 0, 0)
+                except Exception:
+                    log.warning("Auto-compute embeddings failed (non-fatal)", exc_info=True)
+
             return {'species_count': len(set(species)), 'labels_file': labels_path}
 
         job_id = runner.start('fetch-labels', work, config={

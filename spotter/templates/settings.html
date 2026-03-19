@@ -268,6 +268,16 @@
     </div>
   </div>
 
+  <!-- Embedding Matrix -->
+  <div class="section">
+    <div class="section-title">Embedding Cache</div>
+    <p style="font-size:12px;color:#888;margin-bottom:12px;">
+      Each model+labels combination needs pre-computed text embeddings. Cached combinations classify instantly.
+      Uncached ones will compute on first use (~30s on CPU).
+    </p>
+    <div id="matrixContent"><span style="color:#555;font-size:13px;">Loading...</span></div>
+  </div>
+
   <!-- Scan Roots -->
   <div class="section">
     <div class="section-title">Saved Scan Roots</div>
@@ -314,6 +324,7 @@ loadHistory();
 loadSystemInfo();
 loadConfig();
 loadEmbeddingCache();
+loadEmbeddingMatrix();
 loadScanRoots();
 loadVersion();
 
@@ -783,6 +794,74 @@ function escapeHtml(str) {
 function escapeAttr(str) {
   if (str == null) return '';
   return String(str).replace(/&/g, '&amp;').replace(/'/g, '&#39;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+/* ---------- Embedding Matrix ---------- */
+async function loadEmbeddingMatrix() {
+  try {
+    var resp = await fetch('/api/embedding-matrix');
+    var data = await resp.json();
+    var models = data.models || [];
+    var matrix = data.matrix || [];
+
+    if (models.length === 0 || matrix.length === 0) {
+      document.getElementById('matrixContent').innerHTML =
+        '<span style="color:#666;font-size:13px;">Download a model and a species list to see the embedding matrix.</span>';
+      return;
+    }
+
+    var html = '<table style="width:100%;border-collapse:collapse;font-size:12px;margin-top:8px;">';
+    html += '<thead><tr><th style="text-align:left;padding:6px 10px;color:#666;font-weight:500;border-bottom:1px solid #0f3460;">Labels</th>';
+    models.forEach(function(m) {
+      html += '<th style="text-align:center;padding:6px 10px;color:#666;font-weight:500;border-bottom:1px solid #0f3460;">' + escapeHtml(m.name) + '</th>';
+    });
+    html += '</tr></thead><tbody>';
+
+    matrix.forEach(function(row) {
+      html += '<tr>';
+      html += '<td style="padding:6px 10px;border-bottom:1px solid #0a1a35;color:#c0c0c0;">';
+      html += escapeHtml(row.labels_name) + ' <span style="color:#555;">(' + row.species_count + ')</span>';
+      html += '</td>';
+      models.forEach(function(m) {
+        var cell = row.models[m.id];
+        html += '<td style="text-align:center;padding:6px 10px;border-bottom:1px solid #0a1a35;">';
+        if (cell && cell.cached) {
+          html += '<span style="color:#4ecca3;">cached</span>';
+        } else {
+          html += '<button onclick="precomputeEmbeddings(\'' + escapeAttr(m.id) + '\',\'' + escapeAttr(row.labels_file) + '\')" ' +
+            'style="background:#0f3460;color:#c0c0c0;border:none;border-radius:3px;padding:3px 10px;font-size:11px;cursor:pointer;">Compute</button>';
+        }
+        html += '</td>';
+      });
+      html += '</tr>';
+    });
+    html += '</tbody></table>';
+    document.getElementById('matrixContent').innerHTML = html;
+  } catch(e) {
+    document.getElementById('matrixContent').innerHTML = '<span style="color:#e74c3c;font-size:13px;">Failed to load</span>';
+  }
+}
+
+async function precomputeEmbeddings(modelId, labelsFile) {
+  try {
+    var resp = await fetch('/api/jobs/precompute-embeddings', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({model_id: modelId, labels_file: labelsFile}),
+    });
+    if (!resp.ok) {
+      var err = await resp.json();
+      alert('Error: ' + (err.error || 'failed'));
+      return;
+    }
+    var data = await resp.json();
+    // Watch for completion and refresh matrix
+    var source = new EventSource('/api/jobs/' + data.job_id + '/stream');
+    source.addEventListener('complete', function() {
+      source.close();
+      loadEmbeddingMatrix();
+    });
+  } catch(e) {}
 }
 
 /* ---------- Embedding Cache ---------- */

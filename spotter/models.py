@@ -144,30 +144,36 @@ def download_model(model_id, progress_callback=None):
     km = known[model_id]
     os.makedirs(DEFAULT_MODELS_DIR, exist_ok=True)
 
+    try:
+        from huggingface_hub import hf_hub_download
+    except ImportError:
+        raise RuntimeError("huggingface_hub not installed. Run: pip install huggingface_hub")
+
     if model_id == 'bioclip-vit-b-16':
-        # Download BioCLIP v1 weights
-        try:
-            from huggingface_hub import hf_hub_download
-            if progress_callback:
-                progress_callback('Downloading BioCLIP weights from HuggingFace...')
-            path = hf_hub_download(
-                repo_id='imageomics/bioclip',
-                filename='open_clip_pytorch_model.bin',
-                local_dir=os.path.join(DEFAULT_MODELS_DIR, 'bioclip'),
-            )
-            register_model(model_id, km['name'], km['model_str'], path, km['description'])
-            return path
-        except ImportError:
-            raise RuntimeError("huggingface_hub not installed. Run: pip install huggingface_hub")
+        if progress_callback:
+            progress_callback('Downloading BioCLIP weights from HuggingFace...')
+        path = hf_hub_download(
+            repo_id='imageomics/bioclip',
+            filename='open_clip_pytorch_model.bin',
+            local_dir=os.path.join(DEFAULT_MODELS_DIR, 'bioclip'),
+        )
+        register_model(model_id, km['name'], km['model_str'], path, km['description'])
+        return path
 
     elif model_id == 'bioclip-2':
-        # BioCLIP-2 uses HF hub directly via open_clip
         if progress_callback:
-            progress_callback('BioCLIP-2 will be downloaded on first use via HuggingFace Hub.')
-        # Register with the hub identifier — open_clip downloads on demand
-        register_model(model_id, km['name'], km['model_str'],
-                       'hf-hub:imageomics/bioclip-2', km['description'])
-        return 'hf-hub:imageomics/bioclip-2'
+            progress_callback('Downloading BioCLIP-2 weights from HuggingFace...')
+        # BioCLIP-2 stores weights in a different format — download the checkpoint
+        local_dir = os.path.join(DEFAULT_MODELS_DIR, 'bioclip-2')
+        path = hf_hub_download(
+            repo_id='imageomics/bioclip-2',
+            filename='open_clip_pytorch_model.bin',
+            local_dir=local_dir,
+        )
+        # BioCLIP-2 uses hf-hub model_str for open_clip to find the config
+        register_model(model_id, km['name'], 'hf-hub:imageomics/bioclip-2',
+                       path, km['description'])
+        return path
 
     raise ValueError(f"No download handler for {model_id}")
 

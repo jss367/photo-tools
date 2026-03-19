@@ -39,6 +39,20 @@ _file_handler.setFormatter(logging.Formatter(
 ))
 logging.getLogger().addHandler(_file_handler)
 
+# Suppress noisy werkzeug request logs for polling endpoints
+class _QuietRequestFilter(logging.Filter):
+    """Filter out repetitive GET requests from werkzeug logs."""
+    _quiet_paths = {'/api/jobs', '/api/logs/stream', '/api/logs/recent'}
+
+    def filter(self, record):
+        msg = record.getMessage()
+        for path in self._quiet_paths:
+            if f'GET {path}' in msg and '200' in msg:
+                return False
+        return True
+
+logging.getLogger('werkzeug').addFilter(_QuietRequestFilter())
+
 
 def create_app(db_path, thumb_cache_dir=None):
     """Create the Flask app for the Spotter photo browser.

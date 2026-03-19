@@ -367,6 +367,9 @@
 <!-- Action Bar -->
 <div class="settings-panel open" id="reviewBar">
   <div class="setting-group">
+    <select class="model-selector" id="modelFilter" onchange="switchModel(this.value)" style="display:none;">
+      <option value="all">All models</option>
+    </select>
     <button class="btn-batch-accept" id="acceptAllBtn" onclick="acceptAllPending()" style="display:none;">Accept All</button>
   </div>
   <span class="kbd-hint">Keyboard: A = accept, S = skip</span>
@@ -389,6 +392,8 @@
 /* ---------- State ---------- */
 var predictions = [];
 var currentTab = 'all';
+var currentModel = 'all';  // model filter
+var availableModels = [];
 var thumbSize = 400;
 var mode = 'review';
 
@@ -400,13 +405,17 @@ async function loadPredictions() {
   document.getElementById('empty').style.display = 'none';
 
   try {
-    var resp = await fetch('/api/predictions?status=pending');
-    var pending = await resp.json();
-
-    // Also load accepted/rejected for tab counts
     var allResp = await fetch('/api/predictions');
     predictions = await allResp.json();
 
+    // Extract unique models
+    var modelSet = {};
+    predictions.forEach(function(p) {
+      if (p.model && !modelSet[p.model]) modelSet[p.model] = true;
+    });
+    availableModels = Object.keys(modelSet);
+
+    var pending = predictions.filter(function(p) { return p.status === 'pending'; });
     mode = predictions.length > 0 ? 'review' : 'browse';
 
     document.getElementById('title').textContent =
@@ -422,10 +431,31 @@ async function loadPredictions() {
 
 /* ---------- Render ---------- */
 function renderAll() {
+  renderModelFilter();
   renderStats();
   renderTabs();
   renderButtons();
   renderGrid();
+}
+
+function renderModelFilter() {
+  var sel = document.getElementById('modelFilter');
+  if (availableModels.length <= 1) {
+    sel.style.display = 'none';
+    return;
+  }
+  sel.style.display = '';
+  sel.innerHTML = '<option value="all">All models (' + availableModels.length + ')</option>';
+  availableModels.forEach(function(m) {
+    var count = predictions.filter(function(p) { return p.model === m; }).length;
+    var selected = currentModel === m ? ' selected' : '';
+    sel.innerHTML += '<option value="' + escapeAttr(m) + '"' + selected + '>' + escapeHtml(m) + ' (' + count + ')</option>';
+  });
+}
+
+function switchModel(model) {
+  currentModel = model;
+  renderAll();
 }
 
 function renderStats() {
@@ -485,9 +515,17 @@ function renderButtons() {
 /* ---------- Grid Rendering ---------- */
 function getVisibleItems() {
   var filtered = predictions;
-  if (currentTab !== 'all') {
-    filtered = predictions.filter(function(p) { return p.status === currentTab; });
+
+  // Filter by model
+  if (currentModel !== 'all') {
+    filtered = filtered.filter(function(p) { return p.model === currentModel; });
   }
+
+  // Filter by status tab
+  if (currentTab !== 'all') {
+    filtered = filtered.filter(function(p) { return p.status === currentTab; });
+  }
+
   // Deduplicate groups — show only the first photo per group
   var seenGroups = {};
   return filtered.filter(function(p) {
@@ -571,15 +609,39 @@ function renderPredictionCard(pred) {
       '</div>';
   }
 
+  // Model badge
+  var modelHtml = '';
+  if (availableModels.length > 1) {
+    modelHtml = '<span style="font-size:10px;background:#0f3460;color:#7ec8e3;padding:1px 6px;border-radius:3px;margin-left:4px;">' + escapeHtml(pred.model || '') + '</span>';
+  }
+
+  // Other models' predictions for the same photo
+  var otherModelsHtml = '';
+  if (availableModels.length > 1) {
+    var others = predictions.filter(function(p) {
+      return p.photo_id === pred.photo_id && p.model !== pred.model;
+    });
+    if (others.length > 0) {
+      var parts = [];
+      others.forEach(function(o) {
+        var oPct = Math.round(o.confidence * 100);
+        var oColor = o.species === pred.species ? '#4ecca3' : '#f0c040';
+        parts.push('<span style="color:' + oColor + '">' + escapeHtml(o.model) + ': ' + escapeHtml(o.species) + ' (' + oPct + '%)</span>');
+      });
+      otherModelsHtml = '<div class="individual-preds" style="margin-top:4px;border-top:1px solid #0f3460;padding-top:4px;">' + parts.join('') + '</div>';
+    }
+  }
+
   return '<div class="' + cardClass + '" data-pred-id="' + pred.id + '">' +
     '<img src="' + thumbUrl + '" loading="lazy" alt="' + escapeAttr(pred.filename || '') + '">' +
     '<div class="card-body">' +
-      '<div class="card-filename">' + escapeHtml(pred.filename || '') + '</div>' +
+      '<div class="card-filename">' + escapeHtml(pred.filename || '') + modelHtml + '</div>' +
       badgeHtml + groupHtml +
       '<div class="card-prediction">' + escapeHtml(pred.species) + '</div>' +
       voteHtml +
       '<div class="confidence-bar"><div class="confidence-fill" style="width:' + confPct + '%;background:' + confColor + '"></div></div>' +
       '<div class="card-confidence">' + confPct + '% confidence' + (pred.group_id ? ' (consensus)' : '') + '</div>' +
+      otherModelsHtml +
       actionsHtml +
     '</div>' +
   '</div>';

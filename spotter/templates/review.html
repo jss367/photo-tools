@@ -347,6 +347,94 @@
     margin-left: auto;
     white-space: nowrap;
   }
+
+  /* ---------- Group Review Modal ---------- */
+  .grm-overlay {
+    display: none;
+    position: fixed;
+    top: 0; left: 0; right: 0; bottom: 0;
+    background: rgba(0,0,0,0.8);
+    z-index: 500;
+    flex-direction: column;
+  }
+  .grm-overlay.open { display: flex; }
+
+  .grm-header {
+    padding: 12px 20px;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    border-bottom: 1px solid var(--border-primary, #0f3460);
+    background: var(--bg-secondary, #16213e);
+    flex-shrink: 0;
+  }
+  .grm-header h3 { font-size: 15px; color: var(--text-primary, #e0e0e0); }
+  .grm-close {
+    margin-left: auto;
+    background: none; border: none; color: var(--text-muted, #888);
+    font-size: 20px; cursor: pointer;
+  }
+
+  .grm-zone {
+    padding: 10px 20px;
+    min-height: 80px;
+    border-bottom: 1px solid var(--border-primary, #0f3460);
+  }
+  .grm-zone-label {
+    font-size: 10px; text-transform: uppercase; letter-spacing: 0.1em;
+    margin-bottom: 6px; font-weight: 600;
+  }
+  .grm-picks .grm-zone-label { color: var(--accent, #4ecca3); }
+  .grm-candidates { flex: 1; overflow-x: auto; overflow-y: hidden; }
+  .grm-candidates .grm-zone-label { color: var(--text-dim, #888); }
+  .grm-rejects .grm-zone-label { color: var(--danger, #e74c3c); }
+
+  .grm-strip {
+    display: flex;
+    gap: 10px;
+    padding: 4px 0;
+    min-height: 60px;
+    flex-wrap: nowrap;
+  }
+
+  .grm-card {
+    flex-shrink: 0;
+    width: 180px;
+    background: var(--bg-tertiary, #0f3460);
+    border-radius: 6px;
+    overflow: hidden;
+    cursor: pointer;
+    border: 2px solid transparent;
+    transition: border-color 0.15s;
+  }
+  .grm-card:hover { border-color: var(--text-ghost, #555); }
+  .grm-card.selected { border-color: var(--accent, #4ecca3); }
+  .grm-card.ai-best { border-color: var(--warning, #f0c040); }
+  .grm-card img {
+    width: 100%;
+    aspect-ratio: 3/2;
+    object-fit: cover;
+    display: block;
+  }
+  .grm-card-info {
+    padding: 6px 8px;
+    font-size: 11px;
+    line-height: 1.5;
+  }
+  .grm-card-species { color: var(--text-primary, #e0e0e0); font-weight: 600; }
+  .grm-card-scores { color: var(--text-dim, #888); }
+  .grm-card-scores .score-val { color: var(--text-secondary, #c0c0c0); }
+  .grm-card-ai { color: var(--warning, #f0c040); font-size: 10px; font-weight: 600; }
+
+  .grm-footer {
+    padding: 12px 20px;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    background: var(--bg-secondary, #16213e);
+    flex-shrink: 0;
+  }
+  .grm-footer .grm-hint { font-size: 11px; color: var(--text-ghost, #555); flex: 1; }
 </style>
 </head>
 <body>
@@ -675,28 +763,15 @@ function renderPredictionCard(pred) {
 function groupMembersHtml(pred) {
   if (!pred.group_id) return '';
 
-  // Find all predictions in this group
   var members = predictions.filter(function(p) {
     return p.group_id === pred.group_id && p.model === pred.model;
   });
   if (members.length <= 1) return '';
 
-  var gid = escapeAttr(pred.group_id + '-' + pred.model);
-  var html = '<button class="group-expand-btn" onclick="toggleGroupMembers(\'' + gid + '\')" style="background:#0f3460;color:#7ec8e3;border:none;border-radius:4px;padding:3px 8px;font-size:11px;cursor:pointer;margin-top:4px;">' +
-    members.length + ' photos in group — show</button>';
-  html += '<div class="group-members" id="group-' + gid + '" style="display:none;margin-top:6px;border-top:1px solid #0f3460;padding-top:6px;">';
-  members.forEach(function(m) {
-    html += '<img src="/thumbnails/' + m.photo_id + '.jpg" loading="lazy" title="' + escapeAttr(m.filename || '') + '" ' +
-      'style="display:inline-block;width:60px;height:40px;object-fit:cover;border-radius:3px;margin:2px;border:1px solid #0f3460;">';
-  });
-  html += '</div>';
-  return html;
+  return '<button onclick="openGroupReview(\'' + escapeAttr(pred.group_id) + '\',\'' + escapeAttr(pred.model || '') + '\')" ' +
+    'style="background:var(--bg-tertiary,#0f3460);color:var(--info,#7ec8e3);border:none;border-radius:4px;padding:4px 10px;font-size:11px;cursor:pointer;margin-top:4px;width:100%;">' +
+    'Review ' + members.length + ' photos in group</button>';
 }
-
-function toggleGroupMembers(gid) {
-  var el = document.getElementById('group-' + gid);
-  if (!el) return;
-  var isOpen = el.style.display === 'none';
   el.style.display = isOpen ? 'block' : 'none';
   // Update button text
   var btn = el.previousElementSibling;
@@ -759,6 +834,204 @@ function escapeAttr(str) {
   if (str == null) return '';
   return String(str).replace(/&/g, '&amp;').replace(/'/g, '&#39;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
+
+/* ==================== Group Review Modal ==================== */
+var grmState = { groupId: null, model: null, items: [], picks: new Set(), rejects: new Set(), removed: new Set(), selected: null };
+
+function openGroupReview(groupId, model) {
+  grmState = { groupId: groupId, model: model, items: [], picks: new Set(), rejects: new Set(), removed: new Set(), selected: null };
+  document.getElementById('grmOverlay').classList.add('open');
+  loadGroupData(groupId);
+}
+
+function closeGroupReview() {
+  document.getElementById('grmOverlay').classList.remove('open');
+}
+
+async function loadGroupData(groupId) {
+  try {
+    var resp = await fetch('/api/predictions/group/' + encodeURIComponent(groupId));
+    grmState.items = await resp.json();
+
+    // Auto-pick the AI best (highest quality score)
+    var best = null;
+    grmState.items.forEach(function(item) {
+      if (!best || (item.quality_score || 0) > (best.quality_score || 0)) best = item;
+    });
+    if (best) grmState.picks.add(best.photo_id);
+
+    // Auto-reject the lowest quality
+    if (grmState.items.length > 2) {
+      var sorted = grmState.items.slice().sort(function(a, b) { return (a.quality_score || 0) - (b.quality_score || 0); });
+      var worstThird = Math.max(1, Math.floor(sorted.length / 3));
+      for (var i = 0; i < worstThird; i++) {
+        if (!grmState.picks.has(sorted[i].photo_id)) {
+          grmState.rejects.add(sorted[i].photo_id);
+        }
+      }
+    }
+
+    renderGroupModal();
+  } catch(e) {
+    console.error('Failed to load group:', e);
+  }
+}
+
+function renderGroupModal() {
+  var items = grmState.items.filter(function(it) { return !grmState.removed.has(it.id); });
+
+  // Find AI best
+  var bestId = null;
+  var bestScore = -1;
+  items.forEach(function(it) {
+    if ((it.quality_score || 0) > bestScore) { bestScore = it.quality_score || 0; bestId = it.photo_id; }
+  });
+
+  function renderCard(it) {
+    var isBest = it.photo_id === bestId;
+    var isSelected = it.photo_id === grmState.selected;
+    var cls = 'grm-card' + (isSelected ? ' selected' : '') + (isBest ? ' ai-best' : '');
+    var qScore = it.quality_score != null ? Math.round(it.quality_score * 100) : '-';
+    var sharp = it.subject_sharpness != null ? Math.round(it.subject_sharpness) : (it.sharpness != null ? Math.round(it.sharpness) : '-');
+    var confPct = Math.round((it.confidence || 0) * 100);
+
+    return '<div class="' + cls + '" data-photo-id="' + it.photo_id + '" data-pred-id="' + it.id + '" onclick="grmSelect(' + it.photo_id + ')">' +
+      '<img src="/thumbnails/' + it.photo_id + '.jpg" loading="lazy">' +
+      '<div class="grm-card-info">' +
+        '<div class="grm-card-species">' + escapeHtml(it.species || '') + ' <span style="font-weight:400;color:var(--text-dim,#888);">' + confPct + '%</span></div>' +
+        '<div class="grm-card-scores">Q: <span class="score-val">' + qScore + '</span> S: <span class="score-val">' + sharp + '</span></div>' +
+        (isBest ? '<div class="grm-card-ai">AI BEST</div>' : '') +
+      '</div>' +
+    '</div>';
+  }
+
+  // Picks
+  var pickItems = items.filter(function(it) { return grmState.picks.has(it.photo_id); });
+  var candidateItems = items.filter(function(it) { return !grmState.picks.has(it.photo_id) && !grmState.rejects.has(it.photo_id); });
+  var rejectItems = items.filter(function(it) { return grmState.rejects.has(it.photo_id); });
+
+  document.getElementById('grmPicks').innerHTML = pickItems.map(renderCard).join('') || '<span style="font-size:12px;color:var(--text-ghost,#555);">Drag or press ↑ to add picks</span>';
+  document.getElementById('grmCandidates').innerHTML = candidateItems.map(renderCard).join('') || '<span style="font-size:12px;color:var(--text-ghost,#555);">All sorted</span>';
+  document.getElementById('grmRejects').innerHTML = rejectItems.map(renderCard).join('') || '<span style="font-size:12px;color:var(--text-ghost,#555);">Drag or press ↓ to reject</span>';
+
+  // Species input — use the consensus
+  if (!document.getElementById('grmSpecies').value && items.length > 0) {
+    document.getElementById('grmSpecies').value = items[0].species || '';
+  }
+
+  document.getElementById('grmCount').textContent = pickItems.length + ' picks, ' + rejectItems.length + ' rejects, ' + candidateItems.length + ' unsorted';
+}
+
+function grmSelect(photoId) {
+  grmState.selected = (grmState.selected === photoId) ? null : photoId;
+  renderGroupModal();
+}
+
+function grmMovePick() {
+  if (!grmState.selected) return;
+  grmState.rejects.delete(grmState.selected);
+  grmState.picks.add(grmState.selected);
+  renderGroupModal();
+}
+
+function grmMoveReject() {
+  if (!grmState.selected) return;
+  grmState.picks.delete(grmState.selected);
+  grmState.rejects.add(grmState.selected);
+  renderGroupModal();
+}
+
+function grmMoveCandidate() {
+  if (!grmState.selected) return;
+  grmState.picks.delete(grmState.selected);
+  grmState.rejects.delete(grmState.selected);
+  renderGroupModal();
+}
+
+function grmRemoveFromGroup() {
+  if (!grmState.selected) return;
+  // Find the prediction id
+  var item = grmState.items.find(function(it) { return it.photo_id === grmState.selected; });
+  if (item) grmState.removed.add(item.id);
+  grmState.picks.delete(grmState.selected);
+  grmState.rejects.delete(grmState.selected);
+  grmState.selected = null;
+  renderGroupModal();
+}
+
+async function grmApply() {
+  var species = document.getElementById('grmSpecies').value.trim();
+  try {
+    await fetch('/api/predictions/group/apply', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        picks: Array.from(grmState.picks),
+        rejects: Array.from(grmState.rejects),
+        removed: Array.from(grmState.removed),
+        species: species,
+      }),
+    });
+    closeGroupReview();
+    loadPredictions();
+  } catch(e) {
+    console.error('Apply failed:', e);
+  }
+}
+
+// Keyboard handling for the modal
+document.addEventListener('keydown', function(e) {
+  if (!document.getElementById('grmOverlay').classList.contains('open')) return;
+  if (e.target.tagName === 'INPUT') return;
+
+  if (e.key === 'Escape') { closeGroupReview(); e.preventDefault(); return; }
+  if (e.key === 'ArrowUp') { grmMovePick(); e.preventDefault(); return; }
+  if (e.key === 'ArrowDown') { grmMoveReject(); e.preventDefault(); return; }
+  if (e.key === 'ArrowLeft') {
+    // Select previous card
+    var items = grmState.items.filter(function(it) { return !grmState.removed.has(it.id); });
+    var idx = items.findIndex(function(it) { return it.photo_id === grmState.selected; });
+    if (idx > 0) { grmState.selected = items[idx - 1].photo_id; renderGroupModal(); }
+    e.preventDefault(); return;
+  }
+  if (e.key === 'ArrowRight') {
+    var items = grmState.items.filter(function(it) { return !grmState.removed.has(it.id); });
+    var idx = items.findIndex(function(it) { return it.photo_id === grmState.selected; });
+    if (idx < items.length - 1) { grmState.selected = items[idx + 1].photo_id; renderGroupModal(); }
+    e.preventDefault(); return;
+  }
+  if (e.key === 'Delete' || e.key === 'Backspace') { grmRemoveFromGroup(); e.preventDefault(); return; }
+  if (e.key === ' ') { grmMoveCandidate(); e.preventDefault(); return; }
+});
 </script>
+
+<!-- Group Review Modal -->
+<div class="grm-overlay" id="grmOverlay">
+  <div class="grm-header">
+    <h3>Review Burst Group</h3>
+    <span id="grmCount" style="font-size:12px;color:var(--text-dim,#888);"></span>
+    <button class="grm-close" onclick="closeGroupReview()">&times;</button>
+  </div>
+  <div class="grm-zone grm-picks">
+    <div class="grm-zone-label">PICKS (↑)</div>
+    <div class="grm-strip" id="grmPicks"></div>
+  </div>
+  <div class="grm-zone grm-candidates">
+    <div class="grm-zone-label">CANDIDATES</div>
+    <div class="grm-strip" id="grmCandidates"></div>
+  </div>
+  <div class="grm-zone grm-rejects">
+    <div class="grm-zone-label">REJECTS (↓)</div>
+    <div class="grm-strip" id="grmRejects"></div>
+  </div>
+  <div class="grm-footer">
+    <label style="font-size:12px;color:var(--text-muted,#888);">Species:</label>
+    <input type="text" id="grmSpecies" style="background:var(--bg-input,#0f3460);color:var(--text-primary,#e0e0e0);border:1px solid var(--border-secondary,#1a3a6e);border-radius:4px;padding:6px 10px;font-size:13px;width:200px;">
+    <button onclick="grmRemoveFromGroup()" style="background:var(--bg-tertiary,#0f3460);color:var(--text-muted,#888);border:none;border-radius:4px;padding:6px 12px;font-size:12px;cursor:pointer;">Remove from group</button>
+    <span class="grm-hint">↑ pick &nbsp; ↓ reject &nbsp; Space = unsort &nbsp; ←→ navigate &nbsp; Del = remove from group</span>
+    <button onclick="grmApply()" class="btn-batch-accept" style="margin-left:auto;padding:8px 20px;border:none;border-radius:4px;font-size:13px;font-weight:600;cursor:pointer;">Apply & Close</button>
+  </div>
+</div>
+
 </body>
 </html>

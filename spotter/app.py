@@ -532,6 +532,66 @@ def create_app(db_path, thumb_cache_dir=None):
         db.update_prediction_status(pred_id, 'rejected')
         return jsonify({'ok': True})
 
+    @app.route('/api/predictions/group/<group_id>')
+    def api_prediction_group(group_id):
+        """Get all predictions and photo data for a burst group."""
+        db = _get_db()
+        preds = db.conn.execute(
+            """SELECT pr.*, p.filename, p.timestamp, p.sharpness,
+                      p.quality_score, p.subject_sharpness, p.subject_size,
+                      p.detection_conf, p.rating, p.flag
+               FROM predictions pr
+               JOIN photos p ON p.id = pr.photo_id
+               WHERE pr.group_id = ?
+               ORDER BY p.quality_score DESC""",
+            (group_id,),
+        ).fetchall()
+        return jsonify([dict(p) for p in preds])
+
+    @app.route('/api/predictions/group/apply', methods=['POST'])
+    def api_prediction_group_apply():
+        """Apply pick/reject decisions and species to a burst group."""
+        db = _get_db()
+        body = request.get_json(silent=True) or {}
+        picks = body.get('picks', [])       # list of photo_ids
+        rejects = body.get('rejects', [])   # list of photo_ids
+        removed = body.get('removed', [])   # list of prediction_ids to ungroup
+        species = body.get('species', '')
+
+        # Flag picks and add species keyword
+        if species:
+            kid = db.add_keyword(species, is_species=True)
+            for pid in picks:
+                db.update_photo_flag(pid, 'flagged')
+                db.tag_photo(pid, kid)
+                db.queue_change(pid, 'keyword_add', species)
+
+        # Reject rejects
+        for pid in rejects:
+            db.update_photo_flag(pid, 'rejected')
+
+        # Mark all predictions in this group as accepted
+        for pid in picks:
+            db.conn.execute(
+                "UPDATE predictions SET status = 'accepted' WHERE photo_id = ?",
+                (pid,),
+            )
+        for pid in rejects:
+            db.conn.execute(
+                "UPDATE predictions SET status = 'rejected' WHERE photo_id = ?",
+                (pid,),
+            )
+
+        # Remove predictions from group
+        for pred_id in removed:
+            db.conn.execute(
+                "UPDATE predictions SET group_id = NULL WHERE id = ?",
+                (pred_id,),
+            )
+
+        db.conn.commit()
+        return jsonify({'ok': True})
+
     @app.route('/api/classify/config')
     def api_classify_config():
         """Return classifier configuration from model registry."""

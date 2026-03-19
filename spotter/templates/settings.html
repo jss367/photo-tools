@@ -117,6 +117,45 @@
     <div id="taxonomyContent"><span style="color:#555;font-size:13px;">Loading...</span></div>
   </div>
 
+  <!-- Labels -->
+  <div class="section">
+    <div class="section-title">Species Labels</div>
+    <p style="font-size:13px;color:#888;margin-bottom:12px;">
+      Download a regional species list from iNaturalist for classification.
+      The classifier compares photos against these labels — a focused list gives much better results than a generic one.
+    </p>
+
+    <!-- Saved labels -->
+    <div id="labelsContent"><span style="color:#555;font-size:13px;">Loading...</span></div>
+
+    <!-- Download new labels -->
+    <div style="margin-top:16px; border-top:1px solid #0f3460; padding-top:16px;">
+      <div style="font-size:13px; color:#e0e0e0; margin-bottom:10px; font-weight:600;">Download species list</div>
+
+      <div style="margin-bottom:8px;">
+        <div style="font-size:12px; color:#888; margin-bottom:4px;">Region (search iNaturalist places):</div>
+        <div style="display:flex; gap:8px;">
+          <input type="text" id="placeSearch" placeholder="e.g. California, Virginia, Costa Rica"
+                 style="flex:1;background:#0f3460;color:#e0e0e0;border:1px solid #1a3a6e;border-radius:4px;padding:6px 10px;font-size:12px;outline:none;"
+                 oninput="searchPlacesDebounced()">
+        </div>
+        <div id="placeResults" style="margin-top:4px;"></div>
+        <div id="selectedPlace" style="margin-top:6px;font-size:13px;color:#4ecca3;display:none;"></div>
+      </div>
+
+      <div style="margin-bottom:10px;">
+        <div style="font-size:12px; color:#888; margin-bottom:4px;">Include:</div>
+        <div id="taxonCheckboxes" style="display:flex;flex-wrap:wrap;gap:8px;"></div>
+      </div>
+
+      <button id="fetchLabelsBtn" onclick="fetchLabels()" disabled
+              style="background:#4ecca3;color:#1a1a2e;border:none;border-radius:4px;padding:8px 20px;font-size:13px;cursor:pointer;font-weight:500;">
+        Download Species List
+      </button>
+      <span id="fetchLabelsStatus" style="font-size:12px;color:#888;margin-left:8px;"></span>
+    </div>
+  </div>
+
   <!-- Recent Jobs -->
   <div class="section">
     <div class="section-title">Recent Jobs</div>
@@ -188,6 +227,158 @@ async function loadSystemInfo() {
     document.getElementById('torchVersion').textContent = d.torch_version || 'Not installed';
     document.getElementById('torchDetail').textContent = d.torch_detail || '';
   } catch(e) {}
+}
+
+/* ---------- Labels ---------- */
+var selectedPlaceId = null;
+var selectedPlaceName = '';
+var searchTimer = null;
+
+loadLabels();
+loadTaxonGroups();
+
+async function loadLabels() {
+  try {
+    var resp = await fetch('/api/labels');
+    var data = await resp.json();
+    var labels = data.labels || [];
+    var active = data.active;
+
+    if (labels.length === 0) {
+      document.getElementById('labelsContent').innerHTML = '<span style="color:#666;font-size:13px;">No species lists downloaded yet. Use the form below to download one.</span>';
+      return;
+    }
+
+    var html = '';
+    labels.forEach(function(l) {
+      var isActive = active && active.labels_file === l.labels_file;
+      var activeTag = isActive ? ' <span style="color:#4ecca3;font-size:10px;font-weight:600;">ACTIVE</span>' : '';
+      var groups = (l.taxon_groups || []).map(function(g) { return g.charAt(0).toUpperCase() + g.slice(1); }).join(', ');
+
+      html += '<div style="padding:8px 0;border-bottom:1px solid #0a1a35;display:flex;align-items:center;gap:8px;">';
+      html += '<div style="flex:1;">';
+      html += '<span style="font-size:13px;color:#e0e0e0;font-weight:600;">' + escapeHtml(l.name) + '</span>' + activeTag;
+      html += '<div style="font-size:11px;color:#888;">' + (l.species_count || 0) + ' species &middot; ' + groups + '</div>';
+      html += '</div>';
+      if (!isActive) {
+        html += '<button onclick="setActiveLabels(\'' + escapeAttr(l.labels_file) + '\')" style="background:#0f3460;color:#c0c0c0;border:none;border-radius:4px;padding:4px 12px;font-size:11px;cursor:pointer;">Use This</button>';
+      }
+      html += '</div>';
+    });
+    document.getElementById('labelsContent').innerHTML = html;
+  } catch(e) {
+    document.getElementById('labelsContent').innerHTML = '<span style="color:#e74c3c;font-size:13px;">Failed to load</span>';
+  }
+}
+
+async function setActiveLabels(path) {
+  await fetch('/api/labels/active', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({labels_file: path}),
+  });
+  loadLabels();
+}
+
+async function loadTaxonGroups() {
+  try {
+    var resp = await fetch('/api/labels/taxon-groups');
+    var groups = await resp.json();
+    var html = '';
+    groups.forEach(function(g, i) {
+      var checked = (g.key === 'birds') ? ' checked' : '';
+      html += '<label style="font-size:12px;color:#c0c0c0;display:flex;align-items:center;gap:4px;cursor:pointer;">' +
+        '<input type="checkbox" class="taxon-cb" value="' + g.key + '"' + checked + ' style="accent-color:#4ecca3;"> ' +
+        g.name + '</label>';
+    });
+    document.getElementById('taxonCheckboxes').innerHTML = html;
+  } catch(e) {}
+}
+
+function searchPlacesDebounced() {
+  if (searchTimer) clearTimeout(searchTimer);
+  searchTimer = setTimeout(searchPlaces, 300);
+}
+
+async function searchPlaces() {
+  var q = document.getElementById('placeSearch').value.trim();
+  if (q.length < 2) {
+    document.getElementById('placeResults').innerHTML = '';
+    return;
+  }
+  try {
+    var resp = await fetch('/api/labels/search-places?q=' + encodeURIComponent(q));
+    var places = await resp.json();
+    var html = '';
+    places.slice(0, 8).forEach(function(p) {
+      html += '<div onclick="selectPlace(' + p.id + ',\'' + escapeAttr(p.display_name) + '\')" ' +
+        'style="padding:4px 8px;font-size:12px;color:#c0c0c0;cursor:pointer;border-radius:3px;" ' +
+        'onmouseover="this.style.background=\'#0f3460\'" onmouseout="this.style.background=\'\'">' +
+        escapeHtml(p.display_name) + '</div>';
+    });
+    document.getElementById('placeResults').innerHTML = html;
+  } catch(e) {}
+}
+
+function selectPlace(id, name) {
+  selectedPlaceId = id;
+  selectedPlaceName = name;
+  document.getElementById('placeResults').innerHTML = '';
+  document.getElementById('placeSearch').value = '';
+  document.getElementById('selectedPlace').style.display = '';
+  document.getElementById('selectedPlace').textContent = 'Selected: ' + name;
+  document.getElementById('fetchLabelsBtn').disabled = false;
+}
+
+async function fetchLabels() {
+  if (!selectedPlaceId) return;
+  var groups = [];
+  document.querySelectorAll('.taxon-cb:checked').forEach(function(cb) {
+    groups.push(cb.value);
+  });
+  if (groups.length === 0) { alert('Select at least one taxon group'); return; }
+
+  var btn = document.getElementById('fetchLabelsBtn');
+  var status = document.getElementById('fetchLabelsStatus');
+  btn.disabled = true;
+  status.textContent = 'Starting download...';
+
+  try {
+    var resp = await fetch('/api/jobs/fetch-labels', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        place_id: selectedPlaceId,
+        place_name: selectedPlaceName,
+        taxon_groups: groups,
+      }),
+    });
+    var data = await resp.json();
+    status.textContent = 'Fetching species...';
+
+    var source = new EventSource('/api/jobs/' + data.job_id + '/stream');
+    source.addEventListener('progress', function(e) {
+      var p = JSON.parse(e.data);
+      if (p.current_file) status.textContent = p.current_file;
+    });
+    source.addEventListener('complete', function(e) {
+      source.close();
+      var result = JSON.parse(e.data);
+      if (result.status === 'completed' && result.result) {
+        status.textContent = 'Done! ' + result.result.species_count + ' species downloaded.';
+        status.style.color = '#4ecca3';
+      } else {
+        status.textContent = 'Failed: ' + (result.errors || []).join(', ');
+        status.style.color = '#e74c3c';
+      }
+      btn.disabled = false;
+      loadLabels();
+    });
+    source.onerror = function() { source.close(); status.textContent = 'Connection lost'; btn.disabled = false; };
+  } catch(e) {
+    status.textContent = 'Error: ' + e.message;
+    btn.disabled = false;
+  }
 }
 
 /* ---------- Models ---------- */

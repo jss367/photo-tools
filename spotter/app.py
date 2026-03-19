@@ -504,6 +504,77 @@ def create_app(db_path, thumb_cache_dir=None):
         job_id = runner.start('download-taxonomy', work)
         return jsonify({'job_id': job_id})
 
+    # -- Labels API routes --
+
+    @app.route('/api/labels/search-places')
+    def api_labels_search_places():
+        q = request.args.get('q', '')
+        if len(q) < 2:
+            return jsonify([])
+        from labels import search_places
+        return jsonify(search_places(q))
+
+    @app.route('/api/labels/taxon-groups')
+    def api_labels_taxon_groups():
+        from labels import TAXON_GROUPS
+        return jsonify([
+            {'key': k, 'name': v['name']} for k, v in TAXON_GROUPS.items()
+        ])
+
+    @app.route('/api/labels')
+    def api_labels_list():
+        from labels import get_saved_labels, get_active_labels
+        saved = get_saved_labels()
+        active = get_active_labels()
+        return jsonify({
+            'labels': saved,
+            'active': active,
+        })
+
+    @app.route('/api/labels/active', methods=['POST'])
+    def api_set_active_labels():
+        body = request.get_json(silent=True) or {}
+        labels_file = body.get('labels_file')
+        if not labels_file:
+            return jsonify({'error': 'labels_file required'}), 400
+        from labels import set_active_labels
+        set_active_labels(labels_file)
+        return jsonify({'ok': True})
+
+    @app.route('/api/jobs/fetch-labels', methods=['POST'])
+    def api_job_fetch_labels():
+        body = request.get_json(silent=True) or {}
+        place_id = body.get('place_id')
+        place_name = body.get('place_name', '')
+        taxon_groups = body.get('taxon_groups', ['birds'])
+        name = body.get('name', '')
+        if not place_id:
+            return jsonify({'error': 'place_id required'}), 400
+        if not name:
+            group_names = ', '.join(g.title() for g in taxon_groups)
+            name = f"{place_name} {group_names}".strip()
+
+        runner = app._job_runner
+
+        def work(job):
+            from labels import fetch_species_list, save_labels, set_active_labels
+            def progress_cb(msg):
+                job['progress']['current_file'] = msg
+                runner.push_event(job['id'], 'progress', {
+                    'current': 0, 'total': 0, 'current_file': msg, 'rate': 0,
+                })
+            species = fetch_species_list(place_id, taxon_groups, progress_callback=progress_cb)
+            if not species:
+                raise RuntimeError("No species found for this region and taxa selection")
+            labels_path = save_labels(name, place_id, place_name, taxon_groups, species)
+            set_active_labels(labels_path)
+            return {'species_count': len(set(species)), 'labels_file': labels_path}
+
+        job_id = runner.start('fetch-labels', work, config={
+            'place_id': place_id, 'place_name': place_name, 'taxon_groups': taxon_groups,
+        })
+        return jsonify({'job_id': job_id})
+
     @app.route('/api/system/info')
     def api_system_info():
         """Return system information: GPU, Python, PyTorch."""
@@ -729,9 +800,22 @@ def create_app(db_path, thumb_cache_dir=None):
             if labels_file and os.path.exists(labels_file):
                 with open(labels_file) as f:
                     labels = [line.strip() for line in f if line.strip()]
-            elif tax:
-                labels = list(tax._by_common.keys())[:1000]
-                log.info("Using %d taxonomy species as classifier labels", len(labels))
+                log.info("Using %d labels from file: %s", len(labels), labels_file)
+            else:
+                # Try active labels from the labels manager
+                from labels import get_active_labels
+                active_labels = get_active_labels()
+                if active_labels and os.path.exists(active_labels.get('labels_file', '')):
+                    with open(active_labels['labels_file']) as f:
+                        labels = [line.strip() for line in f if line.strip()]
+                    log.info("Using %d labels from: %s",
+                             len(labels), active_labels.get('name', active_labels['labels_file']))
+
+            if not labels:
+                raise RuntimeError(
+                    "No labels available. Go to Settings > Labels and download a "
+                    "species list for your region, or provide a custom labels file."
+                )
 
             # Phase 3: Get photos from collection
             runner.push_event(job['id'], 'progress', {

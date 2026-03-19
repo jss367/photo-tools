@@ -441,12 +441,17 @@ async function loadClassifyConfig() {
       classifyConfig.model_name + ' ' + classifyConfig.model_str;
     document.getElementById('cfgModelPath').textContent = classifyConfig.weights_path +
       (classifyConfig.weights_available ? '' : ' (not found)');
-    if (classifyConfig.taxonomy_available) {
-      document.getElementById('cfgLabelsInfo').textContent =
-        classifyConfig.taxonomy_species_count.toLocaleString() + ' species from taxonomy';
-    } else {
-      document.getElementById('cfgLabelsInfo').textContent = 'No taxonomy loaded — provide a labels file';
-    }
+    // Load active labels info
+    fetch('/api/labels').then(function(r) { return r.json(); }).then(function(data) {
+      var el = document.getElementById('cfgLabelsInfo');
+      if (data.active && data.active.name) {
+        el.textContent = data.active.species_count + ' species — ' + data.active.name;
+        el.style.color = '#4ecca3';
+      } else {
+        el.textContent = 'No labels set — go to Settings > Labels to download';
+        el.style.color = '#f0c040';
+      }
+    }).catch(function() {});
     if (classifyConfig.default_threshold) {
       var pct = Math.round(classifyConfig.default_threshold * 100);
       document.getElementById('cfgThreshold').value = pct;

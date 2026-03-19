@@ -132,15 +132,12 @@
     <div style="margin-top:16px; border-top:1px solid #0f3460; padding-top:16px;">
       <div style="font-size:13px; color:#e0e0e0; margin-bottom:10px; font-weight:600;">Download species list</div>
 
-      <div style="margin-bottom:8px;">
+      <div style="margin-bottom:8px;position:relative;">
         <div style="font-size:12px; color:#888; margin-bottom:4px;">Region (search iNaturalist places):</div>
-        <div style="display:flex; gap:8px;">
-          <input type="text" id="placeSearch" placeholder="e.g. California, Virginia, Costa Rica"
-                 style="flex:1;background:#0f3460;color:#e0e0e0;border:1px solid #1a3a6e;border-radius:4px;padding:6px 10px;font-size:12px;outline:none;"
-                 oninput="searchPlacesDebounced()">
-        </div>
-        <div id="placeResults" style="margin-top:4px;"></div>
-        <div id="selectedPlace" style="margin-top:6px;font-size:13px;color:#4ecca3;display:none;"></div>
+        <input type="text" id="placeSearch" placeholder="e.g. California, Virginia, Costa Rica"
+               style="width:100%;background:#0f3460;color:#e0e0e0;border:1px solid #1a3a6e;border-radius:4px;padding:8px 10px;font-size:13px;outline:none;"
+               oninput="searchPlacesDebounced()" onfocus="showPlaceDropdown()" autocomplete="off">
+        <div id="placeDropdown" style="display:none;position:absolute;left:0;right:0;top:100%;background:#0f3460;border:1px solid #1a3a6e;border-top:none;border-radius:0 0 4px 4px;max-height:200px;overflow-y:auto;z-index:10;"></div>
       </div>
 
       <div style="margin-bottom:10px;">
@@ -296,39 +293,66 @@ async function loadTaxonGroups() {
 }
 
 function searchPlacesDebounced() {
+  // Clear selection if user is typing something new
+  if (selectedPlaceId) {
+    selectedPlaceId = null;
+    selectedPlaceName = '';
+    document.getElementById('fetchLabelsBtn').disabled = true;
+    document.getElementById('placeSearch').style.borderColor = '#1a3a6e';
+  }
   if (searchTimer) clearTimeout(searchTimer);
   searchTimer = setTimeout(searchPlaces, 300);
 }
 
+function showPlaceDropdown() {
+  var q = document.getElementById('placeSearch').value.trim();
+  if (q.length >= 2) searchPlaces();
+}
+
 async function searchPlaces() {
   var q = document.getElementById('placeSearch').value.trim();
+  var dropdown = document.getElementById('placeDropdown');
   if (q.length < 2) {
-    document.getElementById('placeResults').innerHTML = '';
+    dropdown.style.display = 'none';
     return;
   }
   try {
     var resp = await fetch('/api/labels/search-places?q=' + encodeURIComponent(q));
     var places = await resp.json();
+    if (places.length === 0) {
+      dropdown.innerHTML = '<div style="padding:8px 10px;font-size:12px;color:#555;">No places found</div>';
+      dropdown.style.display = '';
+      return;
+    }
     var html = '';
     places.slice(0, 8).forEach(function(p) {
       html += '<div onclick="selectPlace(' + p.id + ',\'' + escapeAttr(p.display_name) + '\')" ' +
-        'style="padding:4px 8px;font-size:12px;color:#c0c0c0;cursor:pointer;border-radius:3px;" ' +
-        'onmouseover="this.style.background=\'#0f3460\'" onmouseout="this.style.background=\'\'">' +
+        'style="padding:8px 10px;font-size:13px;color:#c0c0c0;cursor:pointer;border-bottom:1px solid #1a3a6e;" ' +
+        'onmouseover="this.style.background=\'#16213e\'" onmouseout="this.style.background=\'\'">' +
         escapeHtml(p.display_name) + '</div>';
     });
-    document.getElementById('placeResults').innerHTML = html;
-  } catch(e) {}
+    dropdown.innerHTML = html;
+    dropdown.style.display = '';
+  } catch(e) {
+    dropdown.style.display = 'none';
+  }
 }
 
 function selectPlace(id, name) {
   selectedPlaceId = id;
   selectedPlaceName = name;
-  document.getElementById('placeResults').innerHTML = '';
-  document.getElementById('placeSearch').value = '';
-  document.getElementById('selectedPlace').style.display = '';
-  document.getElementById('selectedPlace').textContent = 'Selected: ' + name;
+  document.getElementById('placeDropdown').style.display = 'none';
+  document.getElementById('placeSearch').value = name;
+  document.getElementById('placeSearch').style.borderColor = '#4ecca3';
   document.getElementById('fetchLabelsBtn').disabled = false;
 }
+
+// Close dropdown when clicking outside
+document.addEventListener('click', function(e) {
+  if (!e.target.closest('#placeSearch') && !e.target.closest('#placeDropdown')) {
+    document.getElementById('placeDropdown').style.display = 'none';
+  }
+});
 
 async function fetchLabels() {
   if (!selectedPlaceId) return;

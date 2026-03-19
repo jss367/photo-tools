@@ -205,6 +205,9 @@ def _hf_download_with_retry(repo_id, filename, local_dir, progress_callback=None
             return dest_path
 
         except Exception as e:
+            err_str = str(e)
+            is_metadata_error = 'cannot find the requested files in the local cache' in err_str
+
             # Check if we made progress since last attempt
             current_size = _get_cache_file_size(repo_id, filename)
             if current_size > last_progress:
@@ -212,16 +215,19 @@ def _hf_download_with_retry(repo_id, filename, local_dir, progress_callback=None
                          current_size // (1024 * 1024))
                 stalled_count = 0
                 last_progress = current_size
+            elif is_metadata_error:
+                # Metadata check failures are transient — don't count as stalls
+                log.info("Attempt %d: HF metadata check failed (transient), retrying...", attempt)
             else:
                 stalled_count += 1
-                log.warning("Download attempt %d failed with no progress (%d/%d stalled): %s",
+                log.warning("Download attempt %d: no progress (%d/%d stalled): %s",
                             attempt, stalled_count, max_stalled, e)
 
             if stalled_count >= max_stalled:
                 raise RuntimeError(
-                    f"Download stalled after {attempt} attempts with no progress. "
+                    f"Download stalled after {attempt} attempts with no new data. "
                     f"Downloaded {last_progress // (1024 * 1024)} MB so far. "
-                    f"Try again later — the download will resume from where it left off."
+                    f"Try again — the download will resume from where it left off."
                 ) from e
 
             wait = 3

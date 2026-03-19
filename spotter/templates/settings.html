@@ -603,6 +603,11 @@ function escapeHtml(str) {
   div.appendChild(document.createTextNode(String(str)));
   return div.innerHTML;
 }
+
+function escapeAttr(str) {
+  if (str == null) return '';
+  return String(str).replace(/&/g, '&amp;').replace(/'/g, '&#39;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
 </script>
 </body>
 </html>

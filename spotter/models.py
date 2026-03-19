@@ -138,14 +138,15 @@ def register_model(model_id, name, model_str, weights_path, description=''):
 def _hf_download_with_retry(repo_id, filename, local_dir, progress_callback=None, max_retries=5):
     """Download from HuggingFace with retry on connection failures.
 
-    hf_hub_download automatically resumes partial downloads from cache,
-    so retries pick up where they left off rather than starting over.
+    Uses the HF cache (not local_dir) for reliable resume on large files,
+    then copies the result to local_dir.
     """
     from huggingface_hub import hf_hub_download
+    import shutil
     import time as _time
 
     # Increase HF timeout for large files
-    os.environ.setdefault('HF_HUB_DOWNLOAD_TIMEOUT', '120')
+    os.environ.setdefault('HF_HUB_DOWNLOAD_TIMEOUT', '300')
 
     for attempt in range(max_retries):
         try:
@@ -153,30 +154,38 @@ def _hf_download_with_retry(repo_id, filename, local_dir, progress_callback=None
                 if attempt == 0:
                     progress_callback(f'Downloading {filename} from {repo_id}...')
                 else:
-                    progress_callback(f'Resuming download ({attempt + 1}/{max_retries})...')
+                    progress_callback(f'Resuming download (attempt {attempt + 1}/{max_retries})...')
 
             log.info("Downloading %s from %s (attempt %d/%d)",
                      filename, repo_id, attempt + 1, max_retries)
 
-            path = hf_hub_download(
+            # Use default HF cache for reliable resume, not local_dir
+            # The cache handles partial downloads properly
+            cached_path = hf_hub_download(
                 repo_id=repo_id,
                 filename=filename,
-                local_dir=local_dir,
             )
 
-            log.info("Download complete: %s", path)
-            return path
+            # Copy from cache to our models directory
+            os.makedirs(local_dir, exist_ok=True)
+            dest_path = os.path.join(local_dir, filename)
+            if cached_path != dest_path:
+                shutil.copy2(cached_path, dest_path)
+
+            log.info("Download complete: %s", dest_path)
+            return dest_path
 
         except Exception as e:
             log.warning("Download attempt %d failed: %s", attempt + 1, e)
             if attempt == max_retries - 1:
                 raise RuntimeError(
                     f"Download failed after {max_retries} attempts: {e}\n"
-                    f"The download will resume from where it left off if you try again."
+                    f"Try again — the download will resume from where it left off."
                 ) from e
+            wait = 5 * (attempt + 1)
             if progress_callback:
-                progress_callback(f'Connection lost, resuming in {5 * (attempt + 1)}s...')
-            _time.sleep(5 * (attempt + 1))  # increasing backoff: 5s, 10s, 15s, 20s
+                progress_callback(f'Connection lost, retrying in {wait}s (attempt {attempt + 2}/{max_retries})...')
+            _time.sleep(wait)
 
 
 def download_model(model_id, progress_callback=None):

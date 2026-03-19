@@ -423,7 +423,9 @@ async function loadModels() {
       html += '<div style="padding:10px 0;border-bottom:1px solid #0a1a35;">';
       html += '<div style="display:flex;align-items:center;gap:8px;margin-bottom:4px;">';
       html += '<span style="font-size:14px;color:#e0e0e0;font-weight:600;">' + escapeHtml(m.name) + '</span>';
-      html += '<span style="font-size:11px;color:#666;">' + escapeHtml(m.model_str) + '</span>';
+      html += '<span style="font-size:11px;color:#666;">' + escapeHtml(m.architecture || m.model_str) + '</span>';
+      if (m.parameters) html += '<span style="font-size:11px;color:#666;">' + escapeHtml(m.parameters) + ' params</span>';
+      if (m.size_mb) html += '<span style="font-size:11px;color:#666;">' + (m.size_mb >= 1000 ? (m.size_mb / 1000).toFixed(1) + ' GB' : m.size_mb + ' MB') + '</span>';
       html += activeTag;
       html += '</div>';
       html += '<div style="font-size:12px;color:#888;margin-bottom:6px;">' + escapeHtml(m.description || '') + '</div>';

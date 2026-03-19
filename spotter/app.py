@@ -57,10 +57,14 @@ def create_app(db_path, thumb_cache_dir=None):
         request._start_time = time.time()
 
     @app.after_request
-    def _log_slow_requests(response):
+    def _log_requests(response):
         if hasattr(request, '_start_time'):
             elapsed = time.time() - request._start_time
-            if elapsed > 0.5:
+            # Log all POST/DELETE actions (user-initiated) and slow requests
+            if request.method in ('POST', 'DELETE'):
+                log.info("Action: %s %s → %s (%.1fs)",
+                         request.method, request.path, response.status_code, elapsed)
+            elif elapsed > 0.5:
                 log.warning("Slow request: %s %s took %.1fs",
                             request.method, request.path, elapsed)
         return response

@@ -35,9 +35,11 @@ def search_places(query):
     """
     params = urllib.parse.urlencode({'q': query})
     url = f"{INAT_API}/places/autocomplete?{params}"
+    log.info("Searching iNaturalist places: %s", query)
 
     try:
-        with urllib.request.urlopen(url, timeout=10) as resp:
+        req = urllib.request.Request(url, headers={'User-Agent': 'Spotter/1.0'})
+        with urllib.request.urlopen(req, timeout=10) as resp:
             data = json.loads(resp.read())
     except Exception:
         log.warning("Failed to search iNaturalist places for '%s'", query, exc_info=True)
@@ -50,6 +52,7 @@ def search_places(query):
             'name': r.get('name', ''),
             'display_name': r.get('display_name', r.get('name', '')),
         })
+    log.info("Found %d places for '%s'", len(results), query)
     return results
 
 
@@ -92,7 +95,8 @@ def fetch_species_list(place_id, taxon_groups, progress_callback=None):
             url = f"{INAT_API}/observations/species_counts?{params}"
 
             try:
-                with urllib.request.urlopen(url, timeout=30) as resp:
+                req = urllib.request.Request(url, headers={'User-Agent': 'Spotter/1.0'})
+                with urllib.request.urlopen(req, timeout=30) as resp:
                     data = json.loads(resp.read())
             except Exception:
                 log.warning("Failed to fetch page %d of %s", page, group_name, exc_info=True)

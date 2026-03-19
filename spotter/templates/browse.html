@@ -432,6 +432,7 @@ body {
       <button onclick="batchSetFlag('flagged')" style="background:#0f3460;color:#4ecca3;border:none;border-radius:3px;padding:4px 8px;font-size:12px;cursor:pointer;">Flag</button>
       <button onclick="batchSetFlag('rejected')" style="background:#0f3460;color:#e74c3c;border:none;border-radius:3px;padding:4px 8px;font-size:12px;cursor:pointer;">Reject</button>
       <button onclick="batchAddKeyword()" style="background:#0f3460;color:#c0c0c0;border:none;border-radius:3px;padding:4px 8px;font-size:12px;cursor:pointer;">+ Keyword</button>
+      <button onclick="addToCollection()" style="background:#0f3460;color:#7ec8e3;border:none;border-radius:3px;padding:4px 8px;font-size:12px;cursor:pointer;">+ Collection</button>
       <button onclick="clearSelection()" style="background:none;color:#666;border:none;padding:4px 8px;font-size:12px;cursor:pointer;margin-left:auto;">Clear</button>
     </div>
 
@@ -1028,6 +1029,37 @@ async function batchAddKeyword() {
   showUndoToast();
 }
 
+async function addToCollection() {
+  if (selectedPhotos.size === 0) return;
+  var name = prompt('Collection name for ' + selectedPhotos.size + ' photos:\n\n(This tags all selected photos with this name and creates a matching collection.)');
+  if (!name) return;
+  name = name.trim();
+  if (!name) return;
+
+  var ids = Array.from(selectedPhotos);
+
+  // Tag all selected photos with this keyword
+  await fetch('/api/batch/keyword', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({photo_ids: ids, name: name}),
+  });
+
+  // Create a collection that matches this keyword
+  await fetch('/api/collections', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({
+      name: name,
+      rules: [{"field": "keyword", "op": "contains", "value": name}],
+    }),
+  });
+
+  showToast('Created collection "' + name + '" with ' + ids.length + ' photos');
+  loadCollections();
+  clearSelection();
+}
+
 function clearSelection() {
   selectedPhotos.clear();
   document.querySelectorAll('.grid-card').forEach(function(el) {
@@ -1193,6 +1225,15 @@ document.addEventListener('keydown', function(e) {
   if ((e.ctrlKey || e.metaKey) && e.key === 'z') {
     e.preventDefault();
     undoLast();
+    return;
+  }
+
+  // Ctrl+A / Cmd+A: select all visible photos
+  if ((e.ctrlKey || e.metaKey) && e.key === 'a') {
+    e.preventDefault();
+    photos.forEach(function(p) { selectedPhotos.add(p.id); });
+    renderGrid();
+    updateBatchBar();
     return;
   }
 

@@ -457,7 +457,16 @@
         html += '<div class="bp-job-detail">' + detail + '</div>';
       } else if (j.status === 'completed' && j.result) {
         var parts = [];
-        for (var k in j.result) parts.push(k + ': ' + j.result[k]);
+        for (var k in j.result) {
+          var v = j.result[k];
+          if (v && typeof v === 'object') {
+            var sub = [];
+            for (var sk in v) sub.push(sk + ': ' + v[sk]);
+            parts.push(k + ' (' + sub.join(', ') + ')');
+          } else {
+            parts.push(k + ': ' + v);
+          }
+        }
         html += '<div class="bp-job-detail">' + bpEscape(parts.join(', ')) + '</div>';
       } else if (j.status === 'failed' && j.errors && j.errors.length > 0) {
         html += '<div class="bp-job-detail" style="color:#e74c3c;">' + bpEscape(j.errors[0]) + '</div>';
@@ -485,6 +494,8 @@
     if (j.progress && j.progress.total > 0) {
       var pct = Math.round((j.progress.current / j.progress.total) * 100);
       text += ' ' + j.progress.current.toLocaleString() + ' / ' + j.progress.total.toLocaleString() + ' (' + pct + '%)';
+    } else if (j.progress && j.progress.current_file) {
+      text += ' — ' + j.progress.current_file;
     }
     if (running.length > 1) {
       text += ' + ' + (running.length - 1) + ' more';

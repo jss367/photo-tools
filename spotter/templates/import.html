@@ -63,6 +63,7 @@ body {
 .progress-detail .rate { color: #4ecca3; }
 .status-msg { font-size: 13px; color: #888; margin-top: 8px; }
 .status-msg.ok { color: #4ecca3; }
+.status-msg.warning { color: #f0c040; }
 .status-msg.error { color: #e74c3c; }
 
 .help-text { font-size: 13px; color: #888; margin-bottom: 12px; line-height: 1.5; }
@@ -134,9 +135,9 @@ body {
       import any existing XMP sidecar keywords, and generate thumbnails for browsing.
     </p>
     <div class="input-group">
-      <input type="text" class="path-input" id="scanRoot"
-             placeholder="/Volumes/Photography/Raw Files"
-             value="/Volumes/Photography/Raw Files">
+      <input type="text" class="path-input" id="scanRoot" list="scanRootList"
+             placeholder="/Volumes/Photography/Raw Files">
+      <datalist id="scanRootList"></datalist>
       <button class="btn btn-primary" id="scanBtn" onclick="startScanJob()">Scan</button>
       <button class="btn btn-secondary" id="rescanBtn" onclick="startScanJob(true)">Scan for changes</button>
     </div>
@@ -236,6 +237,25 @@ body {
 </div>
 
 <script>
+/* ==================== Load saved scan roots ==================== */
+(async function() {
+  try {
+    var resp = await fetch('/api/config');
+    if (!resp.ok) return;
+    var cfg = await resp.json();
+    var roots = cfg.scan_roots || [];
+    var list = document.getElementById('scanRootList');
+    roots.forEach(function(r) {
+      var opt = document.createElement('option');
+      opt.value = r;
+      list.appendChild(opt);
+    });
+    if (roots.length > 0) {
+      document.getElementById('scanRoot').value = roots[0];
+    }
+  } catch(e) {}
+})();
+
 /* ==================== Scan Job ==================== */
 async function startScanJob(incremental) {
   var root = document.getElementById('scanRoot').value.trim();
@@ -301,9 +321,21 @@ async function startJob(url, body, progressId, fillId, detailId, statusId, fileI
       fill.style.width = '100%';
       if (result.status === 'completed') {
         var parts = [];
-        if (result.result) { for (var k in result.result) parts.push(k + ': ' + result.result[k]); }
+        if (result.result) {
+          for (var k in result.result) {
+            var v = result.result[k];
+            if (v && typeof v === 'object') {
+              var sub = [];
+              for (var sk in v) sub.push(sk + ': ' + v[sk]);
+              parts.push(k + ' (' + sub.join(', ') + ')');
+            } else {
+              parts.push(k + ': ' + v);
+            }
+          }
+        }
+        var thumbFailed = result.result && result.result.thumbnails && result.result.thumbnails.failed > 0;
         status.textContent = 'Complete! ' + parts.join(', ') + (result.duration ? ' (' + result.duration + 's)' : '');
-        status.className = 'status-msg ok';
+        status.className = thumbFailed ? 'status-msg warning' : 'status-msg ok';
       } else {
         status.textContent = 'Failed: ' + (result.errors || []).join(', ');
         status.className = 'status-msg error';

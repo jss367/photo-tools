@@ -44,6 +44,6 @@ def load_image(file_path, max_size=1024):
             img.thumbnail((max_size, max_size))
 
         return img
-    except Exception:
-        log.warning("Failed to load image: %s", file_path)
+    except Exception as e:
+        log.warning("Failed to load image: %s — %s", file_path, e)
         return None

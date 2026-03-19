@@ -18,13 +18,19 @@ KNOWN_MODELS = [
         'model_str': 'ViT-B-16',
         'source': 'hf-hub:imageomics/bioclip',
         'description': 'BioCLIP v1 — trained on TreeOfLife-10M. Good general-purpose species classifier.',
+        'size_mb': 400,
+        'architecture': 'ViT-B/16',
+        'parameters': '150M',
     },
     {
         'id': 'bioclip-2',
         'name': 'BioCLIP-2',
         'model_str': 'hf-hub:imageomics/bioclip-2',
         'source': 'hf-hub:imageomics/bioclip-2',
-        'description': 'BioCLIP v2 — improved accuracy, requires HuggingFace download.',
+        'description': 'BioCLIP v2 — improved accuracy, larger model. Best quality but slower on CPU.',
+        'size_mb': 1500,
+        'architecture': 'ViT-L/14',
+        'parameters': '428M',
     },
 ]
 

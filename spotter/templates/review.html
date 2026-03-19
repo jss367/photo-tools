@@ -609,11 +609,8 @@ function renderPredictionCard(pred) {
       '</div>';
   }
 
-  // Model badge
-  var modelHtml = '';
-  if (availableModels.length > 1) {
-    modelHtml = '<span style="font-size:10px;background:#0f3460;color:#7ec8e3;padding:1px 6px;border-radius:3px;margin-left:4px;">' + escapeHtml(pred.model || '') + '</span>';
-  }
+  // Model badge — always show
+  var modelHtml = '<span style="font-size:10px;background:#0f3460;color:#7ec8e3;padding:1px 6px;border-radius:3px;margin-left:4px;">' + escapeHtml(pred.model || '') + '</span>';
 
   // Other models' predictions for the same photo
   var otherModelsHtml = '';
@@ -642,9 +639,44 @@ function renderPredictionCard(pred) {
       '<div class="confidence-bar"><div class="confidence-fill" style="width:' + confPct + '%;background:' + confColor + '"></div></div>' +
       '<div class="card-confidence">' + confPct + '% confidence' + (pred.group_id ? ' (consensus)' : '') + '</div>' +
       otherModelsHtml +
+      groupMembersHtml(pred) +
       actionsHtml +
     '</div>' +
   '</div>';
+}
+
+function groupMembersHtml(pred) {
+  if (!pred.group_id) return '';
+
+  // Find all predictions in this group
+  var members = predictions.filter(function(p) {
+    return p.group_id === pred.group_id && p.model === pred.model;
+  });
+  if (members.length <= 1) return '';
+
+  var gid = escapeAttr(pred.group_id + '-' + pred.model);
+  var html = '<button class="group-expand-btn" onclick="toggleGroupMembers(\'' + gid + '\')" style="background:#0f3460;color:#7ec8e3;border:none;border-radius:4px;padding:3px 8px;font-size:11px;cursor:pointer;margin-top:4px;">' +
+    members.length + ' photos in group — show</button>';
+  html += '<div class="group-members" id="group-' + gid + '" style="display:none;margin-top:6px;border-top:1px solid #0f3460;padding-top:6px;">';
+  members.forEach(function(m) {
+    html += '<img src="/thumbnails/' + m.photo_id + '.jpg" loading="lazy" title="' + escapeAttr(m.filename || '') + '" ' +
+      'style="display:inline-block;width:60px;height:40px;object-fit:cover;border-radius:3px;margin:2px;border:1px solid #0f3460;">';
+  });
+  html += '</div>';
+  return html;
+}
+
+function toggleGroupMembers(gid) {
+  var el = document.getElementById('group-' + gid);
+  if (!el) return;
+  var isOpen = el.style.display === 'none';
+  el.style.display = isOpen ? 'block' : 'none';
+  // Update button text
+  var btn = el.previousElementSibling;
+  if (btn) {
+    var count = el.querySelectorAll('img').length;
+    btn.textContent = count + ' photos in group — ' + (isOpen ? 'hide' : 'show');
+  }
 }
 
 /* ---------- Actions ---------- */

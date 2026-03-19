@@ -1,8 +1,19 @@
 """BioCLIP classifier wrapper for species-level classification."""
 
+import hashlib
 import logging
+import os
 
 log = logging.getLogger(__name__)
+
+CACHE_DIR = os.path.expanduser("~/.spotter/embedding_cache")
+
+
+def _embedding_cache_path(labels, model_str):
+    """Build a cache file path based on a hash of the labels and model."""
+    key = model_str + "\n" + "\n".join(labels)
+    digest = hashlib.sha256(key.encode()).hexdigest()[:16]
+    return os.path.join(CACHE_DIR, f"{digest}.pt")
 
 
 class Classifier:
@@ -22,18 +33,41 @@ class Classifier:
                 raise ValueError("labels list must not be empty")
 
             from bioclip import CustomLabelsClassifier
-            self._classifier = CustomLabelsClassifier(
-                cls_ary=labels,
-                model_str=model_str,
-                pretrained_str=pretrained_str,
-            )
+
+            cache_path = _embedding_cache_path(labels, model_str)
+
+            if os.path.exists(cache_path):
+                log.info("Loading cached label embeddings for %d labels...", len(labels))
+                import torch
+                self._classifier = CustomLabelsClassifier(
+                    cls_ary=["_placeholder"],
+                    model_str=model_str,
+                    pretrained_str=pretrained_str,
+                )
+                self._classifier.classes = [cls.strip() for cls in labels]
+                self._classifier.txt_embeddings = torch.load(cache_path, weights_only=True)
+                log.info("Label embeddings loaded from cache")
+            else:
+                log.info("Computing label embeddings for %d labels (this may take a while on CPU)...", len(labels))
+                self._classifier = CustomLabelsClassifier(
+                    cls_ary=labels,
+                    model_str=model_str,
+                    pretrained_str=pretrained_str,
+                )
+                os.makedirs(CACHE_DIR, exist_ok=True)
+                import torch
+                torch.save(self._classifier.txt_embeddings, cache_path)
+                log.info("Label embeddings computed and cached to disk")
+
             self._mode = 'custom'
         else:
+            log.info("Loading TreeOfLife classifier...")
             from bioclip import TreeOfLifeClassifier, Rank
             self._classifier = TreeOfLifeClassifier(
                 model_str=model_str,
                 pretrained_str=pretrained_str,
             )
+            log.info("TreeOfLife classifier ready")
             self._mode = 'tol'
             self._rank = Rank.SPECIES
 

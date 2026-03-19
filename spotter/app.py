@@ -723,9 +723,9 @@ def create_app(db_path, thumb_cache_dir=None):
                     'current_file': 'Generating thumbnails...',
                     'rate': round(current / max(time.time() - job['_start_time'], 0.01), 1),
                 })
-            generate_all(thread_db, app.config['THUMB_CACHE_DIR'], progress_callback=thumb_cb)
+            thumb_result = generate_all(thread_db, app.config['THUMB_CACHE_DIR'], progress_callback=thumb_cb)
 
-            return {'photos_indexed': photo_count}
+            return {'photos_indexed': photo_count, 'thumbnails': thumb_result}
 
         job_id = runner.start('scan', work, config={'root': root, 'incremental': incremental})
         return jsonify({'job_id': job_id})
@@ -746,8 +746,7 @@ def create_app(db_path, thumb_cache_dir=None):
                     'rate': round(current / max(time.time() - job['_start_time'], 0.01), 1),
                 })
             job['_start_time'] = time.time()
-            generate_all(thread_db, app.config['THUMB_CACHE_DIR'], progress_callback=progress_cb)
-            return {'ok': True}
+            return generate_all(thread_db, app.config['THUMB_CACHE_DIR'], progress_callback=progress_cb)
 
         job_id = runner.start('thumbnails', work)
         return jsonify({'job_id': job_id})

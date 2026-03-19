@@ -63,6 +63,7 @@ body {
 .progress-detail .rate { color: #4ecca3; }
 .status-msg { font-size: 13px; color: #888; margin-top: 8px; }
 .status-msg.ok { color: #4ecca3; }
+.status-msg.warning { color: #f0c040; }
 .status-msg.error { color: #e74c3c; }
 
 .help-text { font-size: 13px; color: #888; margin-bottom: 12px; line-height: 1.5; }
@@ -301,9 +302,21 @@ async function startJob(url, body, progressId, fillId, detailId, statusId, fileI
       fill.style.width = '100%';
       if (result.status === 'completed') {
         var parts = [];
-        if (result.result) { for (var k in result.result) parts.push(k + ': ' + result.result[k]); }
+        if (result.result) {
+          for (var k in result.result) {
+            var v = result.result[k];
+            if (v && typeof v === 'object') {
+              var sub = [];
+              for (var sk in v) sub.push(sk + ': ' + v[sk]);
+              parts.push(k + ' (' + sub.join(', ') + ')');
+            } else {
+              parts.push(k + ': ' + v);
+            }
+          }
+        }
+        var thumbFailed = result.result && result.result.thumbnails && result.result.thumbnails.failed > 0;
         status.textContent = 'Complete! ' + parts.join(', ') + (result.duration ? ' (' + result.duration + 's)' : '');
-        status.className = 'status-msg ok';
+        status.className = thumbFailed ? 'status-msg warning' : 'status-msg ok';
       } else {
         status.textContent = 'Failed: ' + (result.errors || []).join(', ');
         status.className = 'status-msg error';

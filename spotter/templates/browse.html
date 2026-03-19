@@ -423,6 +423,18 @@ body {
       <span class="filter-summary" id="filterSummary"></span>
     </div>
 
+    <!-- Batch Action Bar -->
+    <div id="batchBar" style="display:none;background:#16213e;padding:8px 20px;border-bottom:1px solid #0f3460;align-items:center;gap:10px;flex-shrink:0;">
+      <span id="batchCount" style="font-size:12px;color:#4ecca3;font-weight:600;"></span>
+      <button onclick="batchSetRating(1)" style="background:#0f3460;color:#f0c040;border:none;border-radius:3px;padding:4px 8px;font-size:12px;cursor:pointer;">&#9733;1</button>
+      <button onclick="batchSetRating(3)" style="background:#0f3460;color:#f0c040;border:none;border-radius:3px;padding:4px 8px;font-size:12px;cursor:pointer;">&#9733;3</button>
+      <button onclick="batchSetRating(5)" style="background:#0f3460;color:#f0c040;border:none;border-radius:3px;padding:4px 8px;font-size:12px;cursor:pointer;">&#9733;5</button>
+      <button onclick="batchSetFlag('flagged')" style="background:#0f3460;color:#4ecca3;border:none;border-radius:3px;padding:4px 8px;font-size:12px;cursor:pointer;">Flag</button>
+      <button onclick="batchSetFlag('rejected')" style="background:#0f3460;color:#e74c3c;border:none;border-radius:3px;padding:4px 8px;font-size:12px;cursor:pointer;">Reject</button>
+      <button onclick="batchAddKeyword()" style="background:#0f3460;color:#c0c0c0;border:none;border-radius:3px;padding:4px 8px;font-size:12px;cursor:pointer;">+ Keyword</button>
+      <button onclick="clearSelection()" style="background:none;color:#666;border:none;padding:4px 8px;font-size:12px;cursor:pointer;margin-left:auto;">Clear</button>
+    </div>
+
     <!-- Grid -->
     <div class="grid-container" id="gridContainer">
       <div class="grid" id="grid"></div>
@@ -501,6 +513,7 @@ var loading = false;
 var allLoaded = false;
 var selectedPhotoId = null;
 var selectedIndex = -1;
+var selectedPhotos = new Set(); // multi-select
 var filterRating = 0;
 var activeFolderId = null;
 var activeKeyword = null;
@@ -896,7 +909,7 @@ function renderGrid() {
 
   var html = '';
   photos.forEach(function(p, idx) {
-    var selectedClass = p.id === selectedPhotoId ? ' selected' : '';
+    var selectedClass = (p.id === selectedPhotoId || selectedPhotos.has(p.id)) ? ' selected' : '';
     var stars = '';
     if (p.rating > 0) {
       for (var i = 0; i < p.rating; i++) stars += '&#9733;';
@@ -905,7 +918,7 @@ function renderGrid() {
     if (p.flag === 'flagged') flagHtml = '<span class="grid-card-flag flag-flagged">P</span>';
     else if (p.flag === 'rejected') flagHtml = '<span class="grid-card-flag flag-rejected">X</span>';
 
-    html += '<div class="grid-card' + selectedClass + '" data-id="' + p.id + '" data-idx="' + idx + '" onclick="selectPhoto(' + p.id + ',' + idx + ')">' +
+    html += '<div class="grid-card' + selectedClass + '" data-id="' + p.id + '" data-idx="' + idx + '" onclick="selectPhoto(event,' + p.id + ',' + idx + ')">' +
       '<img src="/thumbnails/' + p.id + '.jpg" loading="lazy" alt="' + escapeAttr(p.filename) + '">' +
       '<div class="grid-card-info">' +
         '<div class="grid-card-name" title="' + escapeAttr(p.filename) + '">' + escapeHtml(p.filename) + '</div>' +
@@ -933,16 +946,125 @@ document.getElementById('gridContainer').addEventListener('scroll', function() {
 });
 
 /* ---------- Photo Selection & Detail ---------- */
-function selectPhoto(id, idx) {
-  selectedPhotoId = id;
-  selectedIndex = idx;
+function selectPhoto(e, id, idx) {
+  if (e.shiftKey && selectedIndex >= 0) {
+    // Shift-click: range select
+    var start = Math.min(selectedIndex, idx);
+    var end = Math.max(selectedIndex, idx);
+    for (var i = start; i <= end; i++) {
+      if (photos[i]) selectedPhotos.add(photos[i].id);
+    }
+  } else if (e.metaKey || e.ctrlKey) {
+    // Cmd/Ctrl-click: toggle in selection
+    if (selectedPhotos.has(id)) {
+      selectedPhotos.delete(id);
+    } else {
+      selectedPhotos.add(id);
+    }
+  } else {
+    // Normal click: single select
+    selectedPhotos.clear();
+    selectedPhotoId = id;
+    selectedIndex = idx;
+    loadDetail(id);
+  }
 
-  // Highlight in grid
+  // Update highlights
   document.querySelectorAll('.grid-card').forEach(function(el) {
-    el.classList.toggle('selected', parseInt(el.dataset.id) === id);
+    var cardId = parseInt(el.dataset.id);
+    el.classList.toggle('selected', cardId === selectedPhotoId || selectedPhotos.has(cardId));
   });
 
-  loadDetail(id);
+  updateBatchBar();
+}
+
+function updateBatchBar() {
+  var bar = document.getElementById('batchBar');
+  if (!bar) return;
+  if (selectedPhotos.size > 1) {
+    bar.style.display = 'flex';
+    document.getElementById('batchCount').textContent = selectedPhotos.size + ' selected';
+  } else {
+    bar.style.display = 'none';
+  }
+}
+
+async function batchSetRating(rating) {
+  var ids = Array.from(selectedPhotos);
+  await fetch('/api/batch/rating', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({photo_ids: ids, rating: rating}),
+  });
+  ids.forEach(function(id) {
+    var p = photos.find(function(x) { return x.id === id; });
+    if (p) p.rating = rating;
+  });
+  renderGrid();
+  showUndoToast();
+}
+
+async function batchSetFlag(flag) {
+  var ids = Array.from(selectedPhotos);
+  await fetch('/api/batch/flag', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({photo_ids: ids, flag: flag}),
+  });
+  ids.forEach(function(id) {
+    var p = photos.find(function(x) { return x.id === id; });
+    if (p) p.flag = flag;
+  });
+  renderGrid();
+  showUndoToast();
+}
+
+async function batchAddKeyword() {
+  var name = prompt('Keyword to add to ' + selectedPhotos.size + ' photos:');
+  if (!name) return;
+  var ids = Array.from(selectedPhotos);
+  await fetch('/api/batch/keyword', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({photo_ids: ids, name: name.trim()}),
+  });
+  showUndoToast();
+}
+
+function clearSelection() {
+  selectedPhotos.clear();
+  document.querySelectorAll('.grid-card').forEach(function(el) {
+    el.classList.remove('selected');
+  });
+  updateBatchBar();
+}
+
+/* ---------- Undo ---------- */
+async function undoLast() {
+  try {
+    var resp = await fetch('/api/undo', { method: 'POST' });
+    if (!resp.ok) return;
+    var data = await resp.json();
+    showToast('Undone: ' + data.undone);
+    // Refresh grid
+    resetAndLoad();
+  } catch(e) {}
+}
+
+function showUndoToast() {
+  fetch('/api/undo/status').then(function(r) { return r.json(); }).then(function(data) {
+    if (data.available) showToast(data.description + ' — Ctrl+Z to undo');
+  });
+}
+
+function showToast(msg) {
+  var toast = document.getElementById('undoToast');
+  if (!toast) return;
+  toast.textContent = msg;
+  toast.style.display = 'block';
+  toast.style.opacity = '1';
+  clearTimeout(toast._timer);
+  toast._timer = setTimeout(function() {
+    toast.style.opacity = '0';
+    setTimeout(function() { toast.style.display = 'none'; }, 300);
+  }, 4000);
 }
 
 async function loadDetail(id) {
@@ -1067,8 +1189,16 @@ async function removeKeyword(photoId, keywordId) {
 document.addEventListener('keydown', function(e) {
   if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA' || e.target.tagName === 'SELECT') return;
 
+  // Ctrl+Z / Cmd+Z: undo
+  if ((e.ctrlKey || e.metaKey) && e.key === 'z') {
+    e.preventDefault();
+    undoLast();
+    return;
+  }
+
   if (e.key === 'Escape') {
     closeDetail();
+    clearSelection();
     return;
   }
 
@@ -1076,13 +1206,13 @@ document.addEventListener('keydown', function(e) {
   if (e.key === 'ArrowRight' || e.key === 'ArrowDown') {
     e.preventDefault();
     if (selectedIndex < photos.length - 1) {
-      selectPhoto(photos[selectedIndex + 1].id, selectedIndex + 1);
+      selectPhoto(e, photos[selectedIndex + 1].id, selectedIndex + 1);
       scrollToCard(selectedIndex);
     }
   } else if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') {
     e.preventDefault();
     if (selectedIndex > 0) {
-      selectPhoto(photos[selectedIndex - 1].id, selectedIndex - 1);
+      selectPhoto(e, photos[selectedIndex - 1].id, selectedIndex - 1);
       scrollToCard(selectedIndex);
     }
   }
@@ -1118,5 +1248,11 @@ function escapeAttr(str) {
   return String(str).replace(/&/g, '&amp;').replace(/'/g, '&#39;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 </script>
+
+<!-- Undo Toast -->
+<div id="undoToast" style="display:none;position:fixed;bottom:40px;left:50%;transform:translateX(-50%);
+  background:#16213e;color:#e0e0e0;border:1px solid #0f3460;border-radius:6px;padding:10px 20px;
+  font-size:13px;z-index:400;transition:opacity 0.3s;box-shadow:0 4px 12px rgba(0,0,0,0.3);"></div>
+
 </body>
 </html>

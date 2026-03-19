@@ -236,6 +236,15 @@ def create_app(db_path, thumb_cache_dir=None):
         keywords = db.get_keyword_tree()
         return jsonify([dict(k) for k in keywords])
 
+    # -- Undo stack (in-memory, session-only) --
+    _undo_stack = []
+    _max_undo = 50
+
+    def _push_undo(action):
+        _undo_stack.append(action)
+        if len(_undo_stack) > _max_undo:
+            _undo_stack.pop(0)
+
     # -- Edit API routes --
 
     @app.route('/api/photos/<int:photo_id>/rating', methods=['POST'])
@@ -243,8 +252,13 @@ def create_app(db_path, thumb_cache_dir=None):
         db = _get_db()
         body = request.get_json(silent=True) or {}
         rating = body.get('rating', 0)
+        old = db.get_photo(photo_id)
+        old_rating = old['rating'] if old else 0
         db.update_photo_rating(photo_id, rating)
         db.queue_change(photo_id, 'rating', str(rating))
+        _push_undo({'type': 'rating', 'photo_ids': [photo_id],
+                    'old_value': old_rating, 'new_value': rating,
+                    'description': f'Set rating to {rating}'})
         return jsonify({'ok': True})
 
     @app.route('/api/photos/<int:photo_id>/flag', methods=['POST'])
@@ -252,8 +266,13 @@ def create_app(db_path, thumb_cache_dir=None):
         db = _get_db()
         body = request.get_json(silent=True) or {}
         flag = body.get('flag', 'none')
+        old = db.get_photo(photo_id)
+        old_flag = old['flag'] if old else 'none'
         db.update_photo_flag(photo_id, flag)
         db.queue_change(photo_id, 'flag', flag)
+        _push_undo({'type': 'flag', 'photo_ids': [photo_id],
+                    'old_value': old_flag, 'new_value': flag,
+                    'description': f'Set flag to {flag}'})
         return jsonify({'ok': True})
 
     @app.route('/api/photos/<int:photo_id>/keywords', methods=['POST'])
@@ -266,12 +285,14 @@ def create_app(db_path, thumb_cache_dir=None):
         kid = db.add_keyword(name)
         db.tag_photo(photo_id, kid)
         db.queue_change(photo_id, 'keyword_add', name)
+        _push_undo({'type': 'keyword_add', 'photo_ids': [photo_id],
+                    'keyword_id': kid, 'keyword_name': name,
+                    'description': f'Added keyword "{name}"'})
         return jsonify({'ok': True, 'keyword_id': kid})
 
     @app.route('/api/photos/<int:photo_id>/keywords/<int:keyword_id>', methods=['DELETE'])
     def api_remove_keyword(photo_id, keyword_id):
         db = _get_db()
-        # Get keyword name for the pending change record
         keywords = db.get_photo_keywords(photo_id)
         kw_name = ''
         for k in keywords:
@@ -280,7 +301,158 @@ def create_app(db_path, thumb_cache_dir=None):
                 break
         db.untag_photo(photo_id, keyword_id)
         db.queue_change(photo_id, 'keyword_remove', kw_name)
+        _push_undo({'type': 'keyword_remove', 'photo_ids': [photo_id],
+                    'keyword_id': keyword_id, 'keyword_name': kw_name,
+                    'description': f'Removed keyword "{kw_name}"'})
         return jsonify({'ok': True})
+
+    # -- Batch operations --
+
+    @app.route('/api/batch/rating', methods=['POST'])
+    def api_batch_rating():
+        db = _get_db()
+        body = request.get_json(silent=True) or {}
+        photo_ids = body.get('photo_ids', [])
+        rating = body.get('rating', 0)
+        if not photo_ids:
+            return jsonify({'error': 'photo_ids required'}), 400
+        old_values = {}
+        for pid in photo_ids:
+            old = db.get_photo(pid)
+            if old:
+                old_values[pid] = old['rating']
+                db.update_photo_rating(pid, rating)
+                db.queue_change(pid, 'rating', str(rating))
+        _push_undo({'type': 'batch_rating', 'photo_ids': photo_ids,
+                    'old_values': old_values, 'new_value': rating,
+                    'description': f'Set rating to {rating} on {len(photo_ids)} photos'})
+        return jsonify({'ok': True, 'updated': len(old_values)})
+
+    @app.route('/api/batch/flag', methods=['POST'])
+    def api_batch_flag():
+        db = _get_db()
+        body = request.get_json(silent=True) or {}
+        photo_ids = body.get('photo_ids', [])
+        flag = body.get('flag', 'none')
+        if not photo_ids:
+            return jsonify({'error': 'photo_ids required'}), 400
+        old_values = {}
+        for pid in photo_ids:
+            old = db.get_photo(pid)
+            if old:
+                old_values[pid] = old['flag']
+                db.update_photo_flag(pid, flag)
+                db.queue_change(pid, 'flag', flag)
+        _push_undo({'type': 'batch_flag', 'photo_ids': photo_ids,
+                    'old_values': old_values, 'new_value': flag,
+                    'description': f'Set flag to {flag} on {len(photo_ids)} photos'})
+        return jsonify({'ok': True, 'updated': len(old_values)})
+
+    @app.route('/api/batch/keyword', methods=['POST'])
+    def api_batch_keyword():
+        db = _get_db()
+        body = request.get_json(silent=True) or {}
+        photo_ids = body.get('photo_ids', [])
+        name = body.get('name', '').strip()
+        if not photo_ids or not name:
+            return jsonify({'error': 'photo_ids and name required'}), 400
+        kid = db.add_keyword(name)
+        for pid in photo_ids:
+            db.tag_photo(pid, kid)
+            db.queue_change(pid, 'keyword_add', name)
+        _push_undo({'type': 'batch_keyword_add', 'photo_ids': photo_ids,
+                    'keyword_id': kid, 'keyword_name': name,
+                    'description': f'Added "{name}" to {len(photo_ids)} photos'})
+        return jsonify({'ok': True, 'updated': len(photo_ids)})
+
+    # -- Undo --
+
+    @app.route('/api/undo', methods=['POST'])
+    def api_undo():
+        if not _undo_stack:
+            return jsonify({'error': 'nothing to undo'}), 400
+        db = _get_db()
+        action = _undo_stack.pop()
+
+        if action['type'] == 'rating':
+            for pid in action['photo_ids']:
+                db.update_photo_rating(pid, action['old_value'])
+        elif action['type'] == 'flag':
+            for pid in action['photo_ids']:
+                db.update_photo_flag(pid, action['old_value'])
+        elif action['type'] == 'keyword_add':
+            for pid in action['photo_ids']:
+                db.untag_photo(pid, action['keyword_id'])
+        elif action['type'] == 'keyword_remove':
+            for pid in action['photo_ids']:
+                db.tag_photo(pid, action['keyword_id'])
+        elif action['type'] == 'batch_rating':
+            for pid, old_val in action['old_values'].items():
+                db.update_photo_rating(int(pid), old_val)
+        elif action['type'] == 'batch_flag':
+            for pid, old_val in action['old_values'].items():
+                db.update_photo_flag(int(pid), old_val)
+        elif action['type'] == 'batch_keyword_add':
+            for pid in action['photo_ids']:
+                db.untag_photo(pid, action['keyword_id'])
+
+        return jsonify({'ok': True, 'undone': action['description']})
+
+    @app.route('/api/undo/status')
+    def api_undo_status():
+        if not _undo_stack:
+            return jsonify({'available': False, 'description': ''})
+        return jsonify({
+            'available': True,
+            'description': _undo_stack[-1]['description'],
+            'count': len(_undo_stack),
+        })
+
+    # -- Statistics --
+
+    @app.route('/api/stats')
+    def api_stats():
+        db = _get_db()
+        # Top keywords by photo count
+        top_keywords = db.conn.execute("""
+            SELECT k.name, k.is_species, COUNT(pk.photo_id) as photo_count
+            FROM keywords k
+            JOIN photo_keywords pk ON pk.keyword_id = k.id
+            GROUP BY k.id
+            ORDER BY photo_count DESC
+            LIMIT 30
+        """).fetchall()
+
+        # Photos by month
+        photos_by_month = db.conn.execute("""
+            SELECT substr(timestamp, 1, 7) as month, COUNT(*) as count
+            FROM photos
+            WHERE timestamp IS NOT NULL
+            GROUP BY month
+            ORDER BY month
+        """).fetchall()
+
+        # Rating distribution
+        rating_dist = db.conn.execute("""
+            SELECT rating, COUNT(*) as count
+            FROM photos
+            GROUP BY rating
+            ORDER BY rating
+        """).fetchall()
+
+        # Flag distribution
+        flag_dist = db.conn.execute("""
+            SELECT flag, COUNT(*) as count
+            FROM photos
+            GROUP BY flag
+        """).fetchall()
+
+        return jsonify({
+            'top_keywords': [dict(r) for r in top_keywords],
+            'photos_by_month': [dict(r) for r in photos_by_month],
+            'rating_distribution': [dict(r) for r in rating_dist],
+            'flag_distribution': [dict(r) for r in flag_dist],
+        })
 
     @app.route('/api/sync/status')
     def api_sync_status():
@@ -1318,6 +1490,10 @@ def create_app(db_path, thumb_cache_dir=None):
     @app.route('/logs')
     def logs_page():
         return render_template('logs.html')
+
+    @app.route('/stats')
+    def stats_page():
+        return render_template('stats.html')
 
     return app
 

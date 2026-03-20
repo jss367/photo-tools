@@ -8,19 +8,19 @@
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body {
     font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-    background: #1a1a2e;
-    color: #e0e0e0;
+    background: #0A1F2E;
+    color: #E0F0F0;
     min-height: 100vh;
   }
 
   /* ---------- Header ---------- */
   .header {
-    background: #16213e;
+    background: #0E2A3D;
     padding: 14px 24px;
     display: flex;
     justify-content: space-between;
     align-items: center;
-    border-bottom: 1px solid #0f3460;
+    border-bottom: 1px solid #14374E;
     position: sticky;
     top: 0;
     z-index: 100;
@@ -30,24 +30,24 @@
   .header-right { display: flex; align-items: center; gap: 8px; }
   .stats { font-size: 13px; color: #a0a0a0; display: flex; gap: 14px; }
   .stats .stat { white-space: nowrap; }
-  .stats .new-count { color: #4ecca3; }
+  .stats .new-count { color: #24E5CA; }
   .stats .ref-count { color: #f0c040; }
   .stats .dis-count { color: #e74c3c; }
   .stats .accepted-count { color: #7ec8e3; }
 
   /* Model selector */
   .model-selector {
-    background: #0f3460;
-    color: #e0e0e0;
-    border: 1px solid #1a3a6e;
+    background: #14374E;
+    color: #E0F0F0;
+    border: 1px solid #1A4560;
     border-radius: 4px;
     padding: 5px 10px;
     font-size: 13px;
     cursor: pointer;
     outline: none;
   }
-  .model-selector:hover { border-color: #4ecca3; }
-  .model-selector:focus { border-color: #4ecca3; }
+  .model-selector:hover { border-color: #24E5CA; }
+  .model-selector:focus { border-color: #24E5CA; }
 
   /* Gear icon links to /settings */
   .gear-link {
@@ -63,9 +63,9 @@
   /* ---------- Settings Panel (inline quick settings) ---------- */
   .settings-panel {
     display: none;
-    background: #16213e;
+    background: #0E2A3D;
     padding: 14px 24px;
-    border-bottom: 1px solid #0f3460;
+    border-bottom: 1px solid #14374E;
   }
   .settings-panel.open {
     display: flex;
@@ -77,22 +77,22 @@
   .setting-group label { font-size: 13px; color: #a0a0a0; white-space: nowrap; }
   .setting-group input[type=range] {
     width: 180px;
-    accent-color: #4ecca3;
+    accent-color: #24E5CA;
     cursor: pointer;
   }
   .setting-group .value {
     font-size: 13px;
     min-width: 48px;
-    color: #e0e0e0;
+    color: #E0F0F0;
     font-variant-numeric: tabular-nums;
   }
 
   /* ---------- Category Tabs ---------- */
   .tabs {
     display: flex;
-    background: #16213e;
+    background: #0E2A3D;
     padding: 0 24px;
-    border-bottom: 1px solid #0f3460;
+    border-bottom: 1px solid #14374E;
     overflow-x: auto;
   }
   .tab {
@@ -106,11 +106,11 @@
     user-select: none;
   }
   .tab:hover { color: #fff; }
-  .tab.active { color: #fff; border-bottom-color: #4ecca3; }
+  .tab.active { color: #fff; border-bottom-color: #24E5CA; }
   .tab .count {
     margin-left: 6px;
     font-size: 11px;
-    background: #0f3460;
+    background: #14374E;
     padding: 2px 7px;
     border-radius: 10px;
     font-variant-numeric: tabular-nums;
@@ -119,8 +119,8 @@
   /* ---------- Batch Action Bar ---------- */
   .batch-bar {
     padding: 10px 24px;
-    background: #1a1a2e;
-    border-bottom: 1px solid #0f3460;
+    background: #0A1F2E;
+    border-bottom: 1px solid #14374E;
     display: flex;
     gap: 12px;
     align-items: center;
@@ -135,8 +135,8 @@
     font-weight: 500;
     transition: background 0.15s;
   }
-  .btn-batch-accept { background: #4ecca3; color: #1a1a2e; }
-  .btn-batch-accept:hover { background: #3db890; }
+  .btn-batch-accept { background: #24E5CA; color: #0A1F2E; }
+  .btn-batch-accept:hover { background: #5AF0DA; }
   .btn-batch-accept:disabled { background: #2a5a4a; color: #555; cursor: default; }
   .batch-info { font-size: 13px; color: #a0a0a0; }
 
@@ -150,10 +150,10 @@
 
   /* ---------- Photo Card ---------- */
   .card {
-    background: #16213e;
+    background: #0E2A3D;
     border-radius: 8px;
     overflow: hidden;
-    border: 1px solid #0f3460;
+    border: 1px solid #14374E;
     transition: opacity 0.25s, transform 0.15s;
   }
   .card:hover { transform: translateY(-2px); }
@@ -164,7 +164,7 @@
     aspect-ratio: 3/2;
     object-fit: cover;
     display: block;
-    background: #0f3460;
+    background: #14374E;
   }
   .card-body { padding: 12px 14px; }
   .card-filename {
@@ -186,8 +186,8 @@
     margin-bottom: 8px;
     text-transform: capitalize;
   }
-  .badge-new { background: #4ecca3; color: #1a1a2e; }
-  .badge-refinement { background: #f0c040; color: #1a1a2e; }
+  .badge-new { background: #24E5CA; color: #0A1F2E; }
+  .badge-refinement { background: #f0c040; color: #0A1F2E; }
   .badge-disagreement { background: #e74c3c; color: #fff; }
 
   /* Group badge */
@@ -199,7 +199,7 @@
     font-weight: 600;
     margin-bottom: 8px;
     margin-left: 6px;
-    background: #0f3460;
+    background: #14374E;
     color: #7ec8e3;
   }
 
@@ -210,7 +210,7 @@
     line-height: 1.4;
   }
   .card-existing .label-prefix { color: #777; }
-  .card-existing .label-value { color: #c0c0c0; }
+  .card-existing .label-value { color: #B0CCCC; }
 
   /* Arrow for refinement */
   .refinement-arrow {
@@ -230,7 +230,7 @@
   /* Confidence bar */
   .confidence-bar {
     height: 4px;
-    background: #0f3460;
+    background: #14374E;
     border-radius: 2px;
     margin-bottom: 4px;
     overflow: hidden;
@@ -259,13 +259,13 @@
     font-weight: 500;
     transition: background 0.15s;
   }
-  .btn-accept { background: #4ecca3; color: #1a1a2e; }
-  .btn-accept:hover { background: #3db890; }
+  .btn-accept { background: #24E5CA; color: #0A1F2E; }
+  .btn-accept:hover { background: #5AF0DA; }
   .btn-skip { background: #2a2a3e; color: #a0a0a0; }
   .btn-skip:hover { background: #3a3a4e; }
   .btn-done {
-    background: #0f3460;
-    color: #4ecca3;
+    background: #14374E;
+    color: #24E5CA;
     cursor: default;
     text-transform: capitalize;
   }
@@ -273,7 +273,7 @@
 
   /* Expand / collapse for group cards */
   .group-expand-btn {
-    background: #0f3460;
+    background: #14374E;
     color: #7ec8e3;
     border: none;
     border-radius: 4px;
@@ -287,7 +287,7 @@
   .group-members {
     display: none;
     margin-top: 8px;
-    border-top: 1px solid #0f3460;
+    border-top: 1px solid #14374E;
     padding-top: 8px;
   }
   .group-members.open { display: block; }
@@ -298,7 +298,7 @@
     object-fit: cover;
     border-radius: 4px;
     margin: 2px;
-    border: 1px solid #0f3460;
+    border: 1px solid #14374E;
   }
   .group-member-list {
     font-size: 12px;
@@ -308,7 +308,7 @@
   }
   .group-member-list span {
     display: inline-block;
-    background: #0f3460;
+    background: #14374E;
     padding: 1px 6px;
     border-radius: 3px;
     margin: 2px;
@@ -364,11 +364,11 @@
     display: flex;
     align-items: center;
     gap: 12px;
-    border-bottom: 1px solid var(--border-primary, #0f3460);
-    background: var(--bg-secondary, #16213e);
+    border-bottom: 1px solid var(--border-primary, #14374E);
+    background: var(--bg-secondary, #0E2A3D);
     flex-shrink: 0;
   }
-  .grm-header h3 { font-size: 15px; color: var(--text-primary, #e0e0e0); }
+  .grm-header h3 { font-size: 15px; color: var(--text-primary, #E0F0F0); }
   .grm-close {
     margin-left: auto;
     background: none; border: none; color: var(--text-muted, #888);
@@ -378,13 +378,13 @@
   .grm-zone {
     padding: 10px 20px;
     min-height: 80px;
-    border-bottom: 1px solid var(--border-primary, #0f3460);
+    border-bottom: 1px solid var(--border-primary, #14374E);
   }
   .grm-zone-label {
     font-size: 10px; text-transform: uppercase; letter-spacing: 0.1em;
     margin-bottom: 6px; font-weight: 600;
   }
-  .grm-picks .grm-zone-label { color: var(--accent, #4ecca3); }
+  .grm-picks .grm-zone-label { color: var(--accent, #24E5CA); }
   .grm-candidates { flex: 1; overflow-x: auto; overflow-y: hidden; }
   .grm-candidates .grm-zone-label { color: var(--text-dim, #888); }
   .grm-rejects .grm-zone-label { color: var(--danger, #e74c3c); }
@@ -400,7 +400,7 @@
   .grm-card {
     flex-shrink: 0;
     width: 180px;
-    background: var(--bg-tertiary, #0f3460);
+    background: var(--bg-tertiary, #14374E);
     border-radius: 6px;
     overflow: hidden;
     cursor: pointer;
@@ -408,7 +408,7 @@
     transition: border-color 0.15s;
   }
   .grm-card:hover { border-color: var(--text-ghost, #555); }
-  .grm-card.selected { border-color: var(--accent, #4ecca3); }
+  .grm-card.selected { border-color: var(--accent, #24E5CA); }
   .grm-card.ai-best { border-color: var(--warning, #f0c040); }
   .grm-card img {
     width: 100%;
@@ -421,9 +421,9 @@
     font-size: 11px;
     line-height: 1.5;
   }
-  .grm-card-species { color: var(--text-primary, #e0e0e0); font-weight: 600; }
+  .grm-card-species { color: var(--text-primary, #E0F0F0); font-weight: 600; }
   .grm-card-scores { color: var(--text-dim, #888); }
-  .grm-card-scores .score-val { color: var(--text-secondary, #c0c0c0); }
+  .grm-card-scores .score-val { color: var(--text-secondary, #B0CCCC); }
   .grm-card-ai { color: var(--warning, #f0c040); font-size: 10px; font-weight: 600; }
 
   .grm-footer {
@@ -431,7 +431,7 @@
     display: flex;
     align-items: center;
     gap: 12px;
-    background: var(--bg-secondary, #16213e);
+    background: var(--bg-secondary, #0E2A3D);
     flex-shrink: 0;
   }
   .grm-footer .grm-hint { font-size: 11px; color: var(--text-ghost, #555); flex: 1; }
@@ -452,8 +452,8 @@
   .grm-loupe {
     width: 45%;
     min-width: 300px;
-    background: var(--bg-primary, #1a1a2e);
-    border-left: 1px solid var(--border-primary, #0f3460);
+    background: var(--bg-primary, #0A1F2E);
+    border-left: 1px solid var(--border-primary, #14374E);
     display: flex;
     flex-direction: column;
     overflow: hidden;
@@ -474,7 +474,7 @@
     padding: 8px 12px;
     font-size: 11px;
     color: var(--text-dim, #888);
-    border-top: 1px solid var(--border-primary, #0f3460);
+    border-top: 1px solid var(--border-primary, #14374E);
     text-align: center;
   }
   .grm-loupe-crosshair {
@@ -535,6 +535,13 @@
       <option value="date_desc">Date (newest)</option>
     </select>
     <button class="btn-batch-accept" id="acceptAllBtn" onclick="acceptAllPending()" style="display:none;">Accept All</button>
+    <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--text-muted,#888);margin-left:12px;">
+      Min confidence:
+      <input type="range" id="confFilter" min="0" max="90" step="5" value="0"
+             style="width:80px;accent-color:var(--accent,#24E5CA);"
+             oninput="document.getElementById('confFilterVal').textContent=this.value+'%'; setMinConfidence(this.value/100)">
+      <span id="confFilterVal" style="min-width:28px;">0%</span>
+    </label>
   </div>
   <span class="kbd-hint">Keyboard: A = accept, S = skip</span>
   <span style="margin-left:auto;">
@@ -543,9 +550,9 @@
 </div>
 
 <!-- Sync reminder -->
-<div id="syncBanner" style="display:none;background:var(--bg-tertiary,#0f3460);padding:10px 20px;border-bottom:1px solid var(--border-primary,#0f3460);font-size:13px;align-items:center;gap:12px;">
+<div id="syncBanner" style="display:none;background:var(--bg-tertiary,#14374E);padding:10px 20px;border-bottom:1px solid var(--border-primary,#14374E);font-size:13px;align-items:center;gap:12px;">
   <span id="syncBannerText" style="color:var(--warning,#f0c040);"></span>
-  <button onclick="runSync()" style="background:var(--accent,#4ecca3);color:var(--bg-primary,#1a1a2e);border:none;border-radius:4px;padding:5px 14px;font-size:12px;cursor:pointer;font-weight:500;">Sync to XMP</button>
+  <button onclick="runSync()" style="background:var(--accent,#24E5CA);color:var(--bg-primary,#0A1F2E);border:none;border-radius:4px;padding:5px 14px;font-size:12px;cursor:pointer;font-weight:500;">Sync to XMP</button>
   <span id="syncStatus" style="font-size:12px;color:var(--text-dim,#888);"></span>
 </div>
 
@@ -565,9 +572,15 @@ var predictions = [];
 var currentTab = 'all';
 var currentModel = 'all';
 var currentSort = 'confidence_desc';
+var minConfidence = 0;
 var availableModels = [];
 var thumbSize = 400;
 var mode = 'review';
+
+function setMinConfidence(val) {
+  minConfidence = val;
+  renderAll();
+}
 
 /* ---------- Bootstrap ---------- */
 loadPredictions();
@@ -646,7 +659,7 @@ async function runSync() {
       var result = JSON.parse(e.data);
       if (result.status === 'completed') {
         status.textContent = 'Synced!';
-        status.style.color = 'var(--accent,#4ecca3)';
+        status.style.color = 'var(--accent,#24E5CA)';
         setTimeout(checkPendingSync, 1000);
       } else {
         status.textContent = 'Failed';
@@ -741,6 +754,11 @@ function renderButtons() {
 function getVisibleItems() {
   var filtered = predictions.slice(); // copy for sorting
 
+  // Filter by minimum confidence
+  if (minConfidence > 0) {
+    filtered = filtered.filter(function(p) { return p.confidence >= minConfidence; });
+  }
+
   // Filter by model
   if (currentModel !== 'all') {
     filtered = filtered.filter(function(p) { return p.model === currentModel; });
@@ -798,7 +816,7 @@ function renderGrid() {
 function renderPredictionCard(pred) {
   var thumbUrl = '/thumbnails/' + pred.photo_id + '.jpg';
   var confPct = Math.round(pred.confidence * 100);
-  var confColor = confPct >= 70 ? '#4ecca3' : confPct >= 50 ? '#f0c040' : '#e74c3c';
+  var confColor = confPct >= 70 ? '#24E5CA' : confPct >= 50 ? '#f0c040' : '#e74c3c';
   var cardClass = 'card';
   if (pred.status === 'accepted') cardClass += ' accepted';
   if (pred.status === 'rejected') cardClass += ' skipped';
@@ -851,7 +869,7 @@ function renderPredictionCard(pred) {
   }
 
   // Model badge — always show
-  var modelHtml = '<span style="font-size:10px;background:#0f3460;color:#7ec8e3;padding:1px 6px;border-radius:3px;margin-left:4px;">' + escapeHtml(pred.model || '') + '</span>';
+  var modelHtml = '<span style="font-size:10px;background:#14374E;color:#7ec8e3;padding:1px 6px;border-radius:3px;margin-left:4px;">' + escapeHtml(pred.model || '') + '</span>';
 
   // Other models' predictions for the same photo
   var otherModelsHtml = '';
@@ -863,10 +881,10 @@ function renderPredictionCard(pred) {
       var parts = [];
       others.forEach(function(o) {
         var oPct = Math.round(o.confidence * 100);
-        var oColor = o.species === pred.species ? '#4ecca3' : '#f0c040';
+        var oColor = o.species === pred.species ? '#24E5CA' : '#f0c040';
         parts.push('<span style="color:' + oColor + '">' + escapeHtml(o.model) + ': ' + escapeHtml(o.species) + ' (' + oPct + '%)</span>');
       });
-      otherModelsHtml = '<div class="individual-preds" style="margin-top:4px;border-top:1px solid #0f3460;padding-top:4px;">' + parts.join('') + '</div>';
+      otherModelsHtml = '<div class="individual-preds" style="margin-top:4px;border-top:1px solid #14374E;padding-top:4px;">' + parts.join('') + '</div>';
     }
   }
 
@@ -895,7 +913,7 @@ function groupMembersHtml(pred) {
   if (members.length <= 1) return '';
 
   return '<button onclick="openGroupReview(\'' + escapeAttr(pred.group_id) + '\',\'' + escapeAttr(pred.model || '') + '\')" ' +
-    'style="background:var(--bg-tertiary,#0f3460);color:var(--info,#7ec8e3);border:none;border-radius:4px;padding:4px 10px;font-size:11px;cursor:pointer;margin-top:4px;width:100%;">' +
+    'style="background:var(--bg-tertiary,#14374E);color:var(--info,#7ec8e3);border:none;border-radius:4px;padding:4px 10px;font-size:11px;cursor:pointer;margin-top:4px;width:100%;">' +
     'Review ' + members.length + ' photos in group</button>';
 }
 
@@ -1244,8 +1262,8 @@ document.addEventListener('keydown', function(e) {
   </div>
   <div class="grm-footer">
     <label style="font-size:12px;color:var(--text-muted,#888);">Species:</label>
-    <input type="text" id="grmSpecies" style="background:var(--bg-input,#0f3460);color:var(--text-primary,#e0e0e0);border:1px solid var(--border-secondary,#1a3a6e);border-radius:4px;padding:6px 10px;font-size:13px;width:200px;">
-    <button onclick="grmRemoveFromGroup()" style="background:var(--bg-tertiary,#0f3460);color:var(--text-muted,#888);border:none;border-radius:4px;padding:6px 12px;font-size:12px;cursor:pointer;">Remove from group</button>
+    <input type="text" id="grmSpecies" style="background:var(--bg-input,#14374E);color:var(--text-primary,#E0F0F0);border:1px solid var(--border-secondary,#1A4560);border-radius:4px;padding:6px 10px;font-size:13px;width:200px;">
+    <button onclick="grmRemoveFromGroup()" style="background:var(--bg-tertiary,#14374E);color:var(--text-muted,#888);border:none;border-radius:4px;padding:6px 12px;font-size:12px;cursor:pointer;">Remove from group</button>
     <span class="grm-hint">↑↓ move zone &nbsp; ←→ navigate &nbsp; Space = unsort &nbsp; Del = remove &nbsp; Hover preview to compare sharpness</span>
     <button onclick="grmApply()" class="btn-batch-accept" style="margin-left:auto;padding:8px 20px;border:none;border-radius:4px;font-size:13px;font-weight:600;cursor:pointer;">Apply & Close</button>
   </div>

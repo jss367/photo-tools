@@ -8,8 +8,8 @@
 * { box-sizing: border-box; margin: 0; padding: 0; }
 body {
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-  background: #1a1a2e;
-  color: #e0e0e0;
+  background: #0A1F2E;
+  color: #E0F0F0;
   height: 100vh;
   display: flex;
   flex-direction: column;
@@ -28,8 +28,8 @@ body {
 .sidebar {
   width: 260px;
   min-width: 260px;
-  background: #16213e;
-  border-right: 1px solid #0f3460;
+  background: #0E2A3D;
+  border-right: 1px solid #14374E;
   overflow-y: auto;
   padding: 12px 0;
   flex-shrink: 0;
@@ -42,21 +42,21 @@ body {
   color: #666;
   margin-bottom: 8px;
   padding-bottom: 4px;
-  border-bottom: 1px solid #0f3460;
+  border-bottom: 1px solid #14374E;
 }
 .tree-item {
   display: flex;
   align-items: center;
   padding: 4px 8px;
   font-size: 13px;
-  color: #c0c0c0;
+  color: #B0CCCC;
   cursor: pointer;
   border-radius: 4px;
   transition: background 0.1s;
   user-select: none;
 }
-.tree-item:hover { background: #0f3460; }
-.tree-item.active { background: #0f3460; color: #4ecca3; }
+.tree-item:hover { background: #14374E; }
+.tree-item.active { background: #14374E; color: #24E5CA; }
 .tree-item .count {
   margin-left: auto;
   font-size: 11px;
@@ -85,29 +85,29 @@ body {
 
 /* ---------- Filter Bar ---------- */
 .filter-bar {
-  background: #1a1a2e;
+  background: #0A1F2E;
   padding: 10px 20px;
   display: flex;
   gap: 12px;
   align-items: center;
   flex-wrap: wrap;
-  border-bottom: 1px solid #0f3460;
+  border-bottom: 1px solid #14374E;
   flex-shrink: 0;
 }
 .filter-bar input[type=text], .filter-bar input[type=date] {
-  background: #0f3460;
-  color: #e0e0e0;
-  border: 1px solid #1a3a6e;
+  background: #14374E;
+  color: #E0F0F0;
+  border: 1px solid #1A4560;
   border-radius: 4px;
   padding: 6px 10px;
   font-size: 13px;
   outline: none;
 }
-.filter-bar input:focus { border-color: #4ecca3; }
+.filter-bar input:focus { border-color: #24E5CA; }
 .filter-bar select {
-  background: #0f3460;
-  color: #e0e0e0;
-  border: 1px solid #1a3a6e;
+  background: #14374E;
+  color: #E0F0F0;
+  border: 1px solid #1A4560;
   border-radius: 4px;
   padding: 6px 10px;
   font-size: 13px;
@@ -142,15 +142,15 @@ body {
   gap: 12px;
 }
 .grid-card {
-  background: #16213e;
+  background: #0E2A3D;
   border-radius: 6px;
   overflow: hidden;
-  border: 1px solid #0f3460;
+  border: 1px solid #14374E;
   cursor: pointer;
   transition: transform 0.1s, border-color 0.15s;
 }
-.grid-card:hover { transform: translateY(-1px); border-color: #4ecca3; }
-.grid-card.selected { border-color: #4ecca3; box-shadow: 0 0 0 1px #4ecca3; }
+.grid-card:hover { transform: translateY(-1px); border-color: #24E5CA; }
+.grid-card.selected { border-color: #24E5CA; box-shadow: 0 0 0 1px #24E5CA; }
 .grid-card-img-wrap {
   position: relative;
   width: 100%;
@@ -161,11 +161,11 @@ body {
   height: 100%;
   object-fit: cover;
   display: block;
-  background: #0f3460;
+  background: #14374E;
 }
 .det-box {
   position: absolute;
-  border: 2px solid #4ecca3;
+  border: 2px solid #24E5CA;
   border-radius: 2px;
   pointer-events: none;
   box-shadow: 0 0 4px rgba(78, 204, 163, 0.4);
@@ -204,15 +204,15 @@ body {
   border-radius: 3px;
   font-weight: 600;
 }
-.flag-flagged { background: #4ecca3; color: #1a1a2e; }
+.flag-flagged { background: #24E5CA; color: #0A1F2E; }
 .flag-rejected { background: #e74c3c; color: #fff; }
 
 /* ---------- Detail Panel ---------- */
 .detail-panel {
   width: 340px;
   min-width: 340px;
-  background: #16213e;
-  border-left: 1px solid #0f3460;
+  background: #0E2A3D;
+  border-left: 1px solid #14374E;
   overflow-y: auto;
   padding: 16px;
   display: none;
@@ -266,21 +266,21 @@ body {
 .detail-flags { display: flex; gap: 6px; margin-bottom: 8px; }
 .detail-flag-btn {
   padding: 5px 14px;
-  border: 1px solid #0f3460;
+  border: 1px solid #14374E;
   border-radius: 4px;
-  background: #0f3460;
-  color: #c0c0c0;
+  background: #14374E;
+  color: #B0CCCC;
   font-size: 12px;
   cursor: pointer;
   transition: background 0.15s, border-color 0.15s;
 }
-.detail-flag-btn:hover { border-color: #4ecca3; }
-.detail-flag-btn.active-flag { background: #4ecca3; color: #1a1a2e; border-color: #4ecca3; }
+.detail-flag-btn:hover { border-color: #24E5CA; }
+.detail-flag-btn.active-flag { background: #24E5CA; color: #0A1F2E; border-color: #24E5CA; }
 .detail-flag-btn.active-reject { background: #e74c3c; color: #fff; border-color: #e74c3c; }
 .keyword-tag {
   display: inline-block;
-  background: #0f3460;
-  color: #c0c0c0;
+  background: #14374E;
+  color: #B0CCCC;
   padding: 3px 8px;
   border-radius: 3px;
   font-size: 12px;
@@ -294,9 +294,9 @@ body {
 }
 .keyword-tag .remove-kw:hover { color: #e74c3c; }
 .add-kw-input {
-  background: #0f3460;
-  color: #e0e0e0;
-  border: 1px solid #1a3a6e;
+  background: #14374E;
+  color: #E0F0F0;
+  border: 1px solid #1A4560;
   border-radius: 4px;
   padding: 4px 8px;
   font-size: 12px;
@@ -304,7 +304,7 @@ body {
   margin-top: 6px;
   outline: none;
 }
-.add-kw-input:focus { border-color: #4ecca3; }
+.add-kw-input:focus { border-color: #24E5CA; }
 .detail-exif {
   font-size: 12px;
   color: #999;
@@ -348,8 +348,8 @@ body {
 }
 .modal-overlay.open { display: flex; }
 .modal {
-  background: #16213e;
-  border: 1px solid #0f3460;
+  background: #0E2A3D;
+  border: 1px solid #14374E;
   border-radius: 8px;
   padding: 24px;
   width: 460px;
@@ -359,22 +359,22 @@ body {
 .modal h3 { font-size: 16px; margin-bottom: 16px; }
 .modal-input {
   width: 100%;
-  background: #0f3460;
-  color: #e0e0e0;
-  border: 1px solid #1a3a6e;
+  background: #14374E;
+  color: #E0F0F0;
+  border: 1px solid #1A4560;
   border-radius: 4px;
   padding: 6px 10px;
   font-size: 13px;
   margin-bottom: 12px;
   outline: none;
 }
-.modal-input:focus { border-color: #4ecca3; }
+.modal-input:focus { border-color: #24E5CA; }
 .rule-row { display: flex; gap: 6px; align-items: center; margin-bottom: 8px; }
 .rule-row select, .rule-row input {
-  background: #0f3460; color: #e0e0e0; border: 1px solid #1a3a6e;
+  background: #14374E; color: #E0F0F0; border: 1px solid #1A4560;
   border-radius: 4px; padding: 5px 8px; font-size: 12px; outline: none;
 }
-.rule-row select:focus, .rule-row input:focus { border-color: #4ecca3; }
+.rule-row select:focus, .rule-row input:focus { border-color: #24E5CA; }
 .rule-row .remove-rule { color: #666; cursor: pointer; font-size: 16px; }
 .rule-row .remove-rule:hover { color: #e74c3c; }
 .modal-actions { display: flex; gap: 8px; margin-top: 16px; }
@@ -382,8 +382,8 @@ body {
   padding: 7px 18px; border: none; border-radius: 4px;
   cursor: pointer; font-size: 13px; font-weight: 500;
 }
-.modal-btn-primary { background: #4ecca3; color: #1a1a2e; }
-.modal-btn-cancel { background: #0f3460; color: #c0c0c0; }
+.modal-btn-primary { background: #24E5CA; color: #0A1F2E; }
+.modal-btn-cancel { background: #14374E; color: #B0CCCC; }
 .modal-preview { font-size: 12px; color: #888; margin-top: 8px; }
 </style>
 </head>
@@ -408,7 +408,7 @@ body {
       <div class="sidebar-title">Collections</div>
       <div id="collectionList"></div>
       <div style="margin-top:6px;">
-        <button onclick="showCollectionModal()" style="background:#0f3460;color:#7ec8e3;border:none;border-radius:4px;padding:4px 10px;font-size:11px;cursor:pointer;">+ New Collection</button>
+        <button onclick="showCollectionModal()" style="background:#14374E;color:#7ec8e3;border:none;border-radius:4px;padding:4px 10px;font-size:11px;cursor:pointer;">+ New Collection</button>
       </div>
     </div>
   </aside>
@@ -443,27 +443,27 @@ body {
       </select>
       <label style="display:flex;align-items:center;gap:4px;" title="Thumbnail size">
         <input type="range" id="thumbSizeSlider" min="120" max="400" step="20" value="220"
-               style="width:80px;accent-color:var(--accent, #4ecca3);"
+               style="width:80px;accent-color:var(--accent, #24E5CA);"
                oninput="updateThumbSize(this.value)">
         <span style="font-size:10px;color:var(--text-faint, #666);">&#9638;</span>
       </label>
       <button id="detBoxToggle" onclick="toggleDetectionBoxes()" title="Show/hide detection boxes"
-              style="background:var(--bg-tertiary,#0f3460);color:var(--text-muted,#a0a0a0);border:1px solid var(--border-secondary,#1a3a6e);border-radius:4px;padding:3px 8px;font-size:11px;cursor:pointer;">
+              style="background:var(--bg-tertiary,#14374E);color:var(--text-muted,#a0a0a0);border:1px solid var(--border-secondary,#1A4560);border-radius:4px;padding:3px 8px;font-size:11px;cursor:pointer;">
         &#9634; Boxes
       </button>
       <span class="filter-summary" id="filterSummary"></span>
     </div>
 
     <!-- Batch Action Bar -->
-    <div id="batchBar" style="display:none;background:#16213e;padding:8px 20px;border-bottom:1px solid #0f3460;align-items:center;gap:10px;flex-shrink:0;">
-      <span id="batchCount" style="font-size:12px;color:#4ecca3;font-weight:600;"></span>
-      <button onclick="batchSetRating(1)" style="background:#0f3460;color:#f0c040;border:none;border-radius:3px;padding:4px 8px;font-size:12px;cursor:pointer;">&#9733;1</button>
-      <button onclick="batchSetRating(3)" style="background:#0f3460;color:#f0c040;border:none;border-radius:3px;padding:4px 8px;font-size:12px;cursor:pointer;">&#9733;3</button>
-      <button onclick="batchSetRating(5)" style="background:#0f3460;color:#f0c040;border:none;border-radius:3px;padding:4px 8px;font-size:12px;cursor:pointer;">&#9733;5</button>
-      <button onclick="batchSetFlag('flagged')" style="background:#0f3460;color:#4ecca3;border:none;border-radius:3px;padding:4px 8px;font-size:12px;cursor:pointer;">Flag</button>
-      <button onclick="batchSetFlag('rejected')" style="background:#0f3460;color:#e74c3c;border:none;border-radius:3px;padding:4px 8px;font-size:12px;cursor:pointer;">Reject</button>
-      <button onclick="batchAddKeyword()" style="background:#0f3460;color:#c0c0c0;border:none;border-radius:3px;padding:4px 8px;font-size:12px;cursor:pointer;">+ Keyword</button>
-      <button onclick="addToCollection()" style="background:#0f3460;color:#7ec8e3;border:none;border-radius:3px;padding:4px 8px;font-size:12px;cursor:pointer;">+ Collection</button>
+    <div id="batchBar" style="display:none;background:#0E2A3D;padding:8px 20px;border-bottom:1px solid #14374E;align-items:center;gap:10px;flex-shrink:0;">
+      <span id="batchCount" style="font-size:12px;color:#24E5CA;font-weight:600;"></span>
+      <button onclick="batchSetRating(1)" style="background:#14374E;color:#f0c040;border:none;border-radius:3px;padding:4px 8px;font-size:12px;cursor:pointer;">&#9733;1</button>
+      <button onclick="batchSetRating(3)" style="background:#14374E;color:#f0c040;border:none;border-radius:3px;padding:4px 8px;font-size:12px;cursor:pointer;">&#9733;3</button>
+      <button onclick="batchSetRating(5)" style="background:#14374E;color:#f0c040;border:none;border-radius:3px;padding:4px 8px;font-size:12px;cursor:pointer;">&#9733;5</button>
+      <button onclick="batchSetFlag('flagged')" style="background:#14374E;color:#24E5CA;border:none;border-radius:3px;padding:4px 8px;font-size:12px;cursor:pointer;">Flag</button>
+      <button onclick="batchSetFlag('rejected')" style="background:#14374E;color:#e74c3c;border:none;border-radius:3px;padding:4px 8px;font-size:12px;cursor:pointer;">Reject</button>
+      <button onclick="batchAddKeyword()" style="background:#14374E;color:#B0CCCC;border:none;border-radius:3px;padding:4px 8px;font-size:12px;cursor:pointer;">+ Keyword</button>
+      <button onclick="addToCollection()" style="background:#14374E;color:#7ec8e3;border:none;border-radius:3px;padding:4px 8px;font-size:12px;cursor:pointer;">+ Collection</button>
       <button onclick="clearSelection()" style="background:none;color:#666;border:none;padding:4px 8px;font-size:12px;cursor:pointer;margin-left:auto;">Clear</button>
     </div>
 
@@ -478,7 +478,7 @@ body {
           To get started, import your photos. You can scan a folder of images
           (with or without existing XMP sidecars), or import keywords from a Lightroom catalog.
         </p>
-        <a href="/import" style="display:inline-block;background:#4ecca3;color:#1a1a2e;padding:10px 28px;border-radius:4px;font-size:14px;font-weight:600;text-decoration:none;">Import Photos</a>
+        <a href="/import" style="display:inline-block;background:#24E5CA;color:#0A1F2E;padding:10px 28px;border-radius:4px;font-size:14px;font-weight:600;text-decoration:none;">Import Photos</a>
       </div>
       <div class="loading-state" id="loadingState">Loading...</div>
     </div>
@@ -522,10 +522,10 @@ body {
     </div>
 
     <div class="detail-section" style="display:flex;gap:8px;">
-      <button onclick="findSimilar(window._detailPhotoId)" style="flex:1;background:var(--bg-tertiary,#0f3460);color:var(--info,#7ec8e3);border:1px solid var(--border-secondary,#1a3a6e);border-radius:4px;padding:8px;font-size:12px;cursor:pointer;">
+      <button onclick="findSimilar(window._detailPhotoId)" style="flex:1;background:var(--bg-tertiary,#14374E);color:var(--info,#7ec8e3);border:1px solid var(--border-secondary,#1A4560);border-radius:4px;padding:8px;font-size:12px;cursor:pointer;">
         Find Similar
       </button>
-      <button onclick="openPipeline(window._detailPhotoId)" style="flex:1;background:var(--bg-tertiary,#0f3460);color:var(--accent,#4ecca3);border:1px solid var(--border-secondary,#1a3a6e);border-radius:4px;padding:8px;font-size:12px;cursor:pointer;">
+      <button onclick="openPipeline(window._detailPhotoId)" style="flex:1;background:var(--bg-tertiary,#14374E);color:var(--accent,#24E5CA);border:1px solid var(--border-secondary,#1A4560);border-radius:4px;padding:8px;font-size:12px;cursor:pointer;">
         Inspect Pipeline
       </button>
     </div>
@@ -539,7 +539,7 @@ body {
     <h3>New Smart Collection</h3>
     <input class="modal-input" id="collectionName" placeholder="Collection name">
     <div id="ruleRows"></div>
-    <button onclick="addRuleRow()" style="background:#0f3460;color:#7ec8e3;border:none;border-radius:4px;padding:4px 10px;font-size:11px;cursor:pointer;margin-bottom:8px;">+ Add Rule</button>
+    <button onclick="addRuleRow()" style="background:#14374E;color:#7ec8e3;border:none;border-radius:4px;padding:4px 10px;font-size:11px;cursor:pointer;margin-bottom:8px;">+ Add Rule</button>
     <div class="modal-preview" id="rulePreview"></div>
     <div class="modal-actions">
       <button class="modal-btn modal-btn-primary" onclick="saveCollection()">Save</button>
@@ -907,8 +907,8 @@ function updateThumbSize(val) {
 function toggleDetectionBoxes() {
   showDetectionBoxes = !showDetectionBoxes;
   var btn = document.getElementById('detBoxToggle');
-  btn.style.color = showDetectionBoxes ? 'var(--accent, #4ecca3)' : 'var(--text-muted, #a0a0a0)';
-  btn.style.borderColor = showDetectionBoxes ? 'var(--accent, #4ecca3)' : 'var(--border-secondary, #1a3a6e)';
+  btn.style.color = showDetectionBoxes ? 'var(--accent, #24E5CA)' : 'var(--text-muted, #a0a0a0)';
+  btn.style.borderColor = showDetectionBoxes ? 'var(--accent, #24E5CA)' : 'var(--border-secondary, #1A4560)';
   renderGrid();
 }
 
@@ -1221,19 +1221,19 @@ function renderDetail(photo) {
     var xmpHtml = '';
     photo.xmp_keywords.forEach(function(kw) {
       var inDb = dbKwNames.indexOf(kw.toLowerCase()) !== -1;
-      var color = inDb ? 'var(--accent,#4ecca3)' : 'var(--warning,#f0c040)';
+      var color = inDb ? 'var(--accent,#24E5CA)' : 'var(--warning,#f0c040)';
       var title = inDb ? 'In sync with database' : 'In XMP but not in database';
-      xmpHtml += '<span style="display:inline-block;background:var(--bg-tertiary,#0f3460);padding:2px 6px;border-radius:3px;margin:2px;font-size:11px;border:1px solid ' + color + ';color:' + color + ';" title="' + title + '">' + escapeHtml(kw) + '</span>';
+      xmpHtml += '<span style="display:inline-block;background:var(--bg-tertiary,#14374E);padding:2px 6px;border-radius:3px;margin:2px;font-size:11px;border:1px solid ' + color + ';color:' + color + ';" title="' + title + '">' + escapeHtml(kw) + '</span>';
     });
     // Check for DB keywords not in XMP
     var xmpLower = photo.xmp_keywords.map(function(k) { return k.toLowerCase(); });
     (photo.keywords || []).forEach(function(k) {
       if (xmpLower.indexOf(k.name.toLowerCase()) === -1) {
-        xmpHtml += '<span style="display:inline-block;background:var(--bg-tertiary,#0f3460);padding:2px 6px;border-radius:3px;margin:2px;font-size:11px;border:1px solid var(--info,#7ec8e3);color:var(--info,#7ec8e3);" title="In database but not in XMP (pending sync)">+ ' + escapeHtml(k.name) + '</span>';
+        xmpHtml += '<span style="display:inline-block;background:var(--bg-tertiary,#14374E);padding:2px 6px;border-radius:3px;margin:2px;font-size:11px;border:1px solid var(--info,#7ec8e3);color:var(--info,#7ec8e3);" title="In database but not in XMP (pending sync)">+ ' + escapeHtml(k.name) + '</span>';
       }
     });
     xmpHtml += '<div style="margin-top:4px;font-size:10px;color:var(--text-ghost,#555);">' +
-      '<span style="color:var(--accent,#4ecca3);">&#9632;</span> synced ' +
+      '<span style="color:var(--accent,#24E5CA);">&#9632;</span> synced ' +
       '<span style="color:var(--warning,#f0c040);">&#9632;</span> XMP only ' +
       '<span style="color:var(--info,#7ec8e3);">&#9632;</span> DB only (pending sync)</div>';
     xmpEl.innerHTML = xmpHtml;
@@ -1395,7 +1395,7 @@ function escapeAttr(str) {
 
 <!-- Undo Toast -->
 <div id="undoToast" style="display:none;position:fixed;bottom:40px;left:50%;transform:translateX(-50%);
-  background:#16213e;color:#e0e0e0;border:1px solid #0f3460;border-radius:6px;padding:10px 20px;
+  background:#0E2A3D;color:#E0F0F0;border:1px solid #14374E;border-radius:6px;padding:10px 20px;
   font-size:13px;z-index:400;transition:opacity 0.3s;box-shadow:0 4px 12px rgba(0,0,0,0.3);"></div>
 
 </body>

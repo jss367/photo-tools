@@ -8,26 +8,26 @@
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body {
     font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-    background: #1a1a2e;
-    color: #e0e0e0;
+    background: #0A1F2E;
+    color: #E0F0F0;
     min-height: 100vh;
     padding-bottom: 36px;
   }
   .content { max-width: 800px; margin: 0 auto; padding: 32px 24px; }
   .section {
-    background: #16213e; border: 1px solid #0f3460;
+    background: #0E2A3D; border: 1px solid #14374E;
     border-radius: 8px; padding: 24px; margin-bottom: 24px;
   }
   .section-title {
     font-size: 16px; font-weight: 600; margin-bottom: 16px; color: #fff;
-    padding-bottom: 8px; border-bottom: 1px solid #0f3460;
+    padding-bottom: 8px; border-bottom: 1px solid #14374E;
   }
   .setting-row {
     display: flex; align-items: center; justify-content: space-between;
-    padding: 12px 0; border-bottom: 1px solid #0a1a35;
+    padding: 12px 0; border-bottom: 1px solid #0E2A3D;
   }
   .setting-row:last-child { border-bottom: none; }
-  .setting-label { font-size: 14px; color: #c0c0c0; flex: 1; }
+  .setting-label { font-size: 14px; color: #B0CCCC; flex: 1; }
   .setting-label small { display: block; font-size: 12px; color: #666; margin-top: 2px; }
   .setting-value { font-size: 13px; color: #888; font-variant-numeric: tabular-nums; }
 
@@ -36,10 +36,10 @@
     gap: 12px; margin-bottom: 16px;
   }
   .stat-card {
-    background: #0f3460; border-radius: 6px; padding: 14px 16px; text-align: center;
+    background: #14374E; border-radius: 6px; padding: 14px 16px; text-align: center;
   }
   .stat-number {
-    font-size: 24px; font-weight: 700; color: #4ecca3; font-variant-numeric: tabular-nums;
+    font-size: 24px; font-weight: 700; color: #24E5CA; font-variant-numeric: tabular-nums;
   }
   .stat-label { font-size: 11px; color: #888; margin-top: 4px; }
 
@@ -48,12 +48,12 @@
   }
   .history-table th {
     text-align: left; padding: 6px 10px; color: #666;
-    font-weight: 500; border-bottom: 1px solid #0f3460;
+    font-weight: 500; border-bottom: 1px solid #14374E;
   }
   .history-table td {
-    padding: 6px 10px; border-bottom: 1px solid #0a1a35; color: #999;
+    padding: 6px 10px; border-bottom: 1px solid #0E2A3D; color: #999;
   }
-  .history-table .status-completed { color: #4ecca3; }
+  .history-table .status-completed { color: #24E5CA; }
   .history-table .status-failed { color: #e74c3c; }
 </style>
 </head>
@@ -99,20 +99,20 @@
   <div class="section">
     <div class="section-title">Models</div>
     <div id="modelsContent"><span style="color:#555;font-size:13px;">Loading...</span></div>
-    <div style="margin-top:12px; border-top:1px solid #0f3460; padding-top:12px;">
+    <div style="margin-top:12px; border-top:1px solid #14374E; padding-top:12px;">
       <div style="font-size:12px; color:#888; margin-bottom:8px;">Add from HuggingFace:</div>
       <div style="display:flex; gap:8px; margin-bottom:10px;">
         <input type="text" id="hfRepoId" placeholder="e.g. imageomics/bioclip-2.5-vith14"
-               style="background:#0f3460;color:#e0e0e0;border:1px solid #1a3a6e;border-radius:4px;padding:6px 10px;font-size:12px;flex:1;">
-        <button onclick="addHfModel()" style="background:#4ecca3;color:#1a1a2e;border:none;border-radius:4px;padding:6px 14px;font-size:12px;cursor:pointer;font-weight:500;">Download</button>
+               style="background:#14374E;color:#E0F0F0;border:1px solid #1A4560;border-radius:4px;padding:6px 10px;font-size:12px;flex:1;">
+        <button onclick="addHfModel()" style="background:#24E5CA;color:#0A1F2E;border:none;border-radius:4px;padding:6px 14px;font-size:12px;cursor:pointer;font-weight:500;">Download</button>
       </div>
       <div style="font-size:12px; color:#888; margin-bottom:8px;">Or add local weights file:</div>
       <div style="display:flex; gap:8px;">
         <input type="text" id="customModelName" placeholder="Model name"
-               style="background:#0f3460;color:#e0e0e0;border:1px solid #1a3a6e;border-radius:4px;padding:6px 10px;font-size:12px;flex:1;">
+               style="background:#14374E;color:#E0F0F0;border:1px solid #1A4560;border-radius:4px;padding:6px 10px;font-size:12px;flex:1;">
         <input type="text" id="customModelPath" placeholder="/path/to/weights.bin"
-               style="background:#0f3460;color:#e0e0e0;border:1px solid #1a3a6e;border-radius:4px;padding:6px 10px;font-size:12px;flex:2;">
-        <button onclick="addCustomModel()" style="background:#0f3460;color:#c0c0c0;border:none;border-radius:4px;padding:6px 14px;font-size:12px;cursor:pointer;">Add</button>
+               style="background:#14374E;color:#E0F0F0;border:1px solid #1A4560;border-radius:4px;padding:6px 10px;font-size:12px;flex:2;">
+        <button onclick="addCustomModel()" style="background:#14374E;color:#B0CCCC;border:none;border-radius:4px;padding:6px 14px;font-size:12px;cursor:pointer;">Add</button>
       </div>
     </div>
     <span id="modelActionStatus" style="font-size:12px;color:#888;margin-top:6px;display:block;"></span>
@@ -136,15 +136,15 @@
     <div id="labelsContent"><span style="color:#555;font-size:13px;">Loading...</span></div>
 
     <!-- Download new labels -->
-    <div style="margin-top:16px; border-top:1px solid #0f3460; padding-top:16px;">
-      <div style="font-size:13px; color:#e0e0e0; margin-bottom:10px; font-weight:600;">Download species list</div>
+    <div style="margin-top:16px; border-top:1px solid #14374E; padding-top:16px;">
+      <div style="font-size:13px; color:#E0F0F0; margin-bottom:10px; font-weight:600;">Download species list</div>
 
       <div style="margin-bottom:8px;">
         <div style="font-size:12px; color:#888; margin-bottom:4px;">Region (search iNaturalist places):</div>
         <input type="text" id="placeSearch" placeholder="e.g. California, Virginia, Costa Rica"
-               style="width:100%;background:#0f3460;color:#e0e0e0;border:1px solid #1a3a6e;border-radius:4px;padding:8px 10px;font-size:13px;outline:none;"
+               style="width:100%;background:#14374E;color:#E0F0F0;border:1px solid #1A4560;border-radius:4px;padding:8px 10px;font-size:13px;outline:none;"
                oninput="searchPlacesDebounced()" autocomplete="off">
-        <div id="placeDropdown" style="background:#0a1530;border:1px solid #1a3a6e;border-top:none;border-radius:0 0 4px 4px;max-height:200px;overflow-y:auto;"></div>
+        <div id="placeDropdown" style="background:#0a1530;border:1px solid #1A4560;border-top:none;border-radius:0 0 4px 4px;max-height:200px;overflow-y:auto;"></div>
       </div>
 
       <div style="margin-bottom:10px;">
@@ -153,12 +153,12 @@
       </div>
 
       <button id="fetchLabelsBtn" onclick="fetchLabels()" disabled
-              style="background:#4ecca3;color:#1a1a2e;border:none;border-radius:4px;padding:8px 20px;font-size:13px;cursor:pointer;font-weight:500;">
+              style="background:#24E5CA;color:#0A1F2E;border:none;border-radius:4px;padding:8px 20px;font-size:13px;cursor:pointer;font-weight:500;">
         Download Species List
       </button>
       <span id="fetchLabelsStatus" style="font-size:12px;color:#888;margin-left:8px;"></span>
       <div id="fetchLabelsProgress" style="display:none;margin-top:6px;">
-        <div style="height:4px;background:#0f3460;border-radius:2px;overflow:hidden;"><div id="fetchLabelsFill" style="height:100%;background:#4ecca3;border-radius:2px;width:0%;transition:width 0.3s;"></div></div>
+        <div style="height:4px;background:#14374E;border-radius:2px;overflow:hidden;"><div id="fetchLabelsFill" style="height:100%;background:#24E5CA;border-radius:2px;width:0%;transition:width 0.3s;"></div></div>
       </div>
     </div>
   </div>
@@ -173,9 +173,9 @@
       </div>
       <div style="display:flex;align-items:center;gap:8px;">
         <input type="range" id="cfgThreshold" min="10" max="90" step="5" value="40"
-               style="width:120px;accent-color:#4ecca3;"
+               style="width:120px;accent-color:#24E5CA;"
                oninput="document.getElementById('cfgThresholdVal').textContent = this.value + '%'; saveConfig()">
-        <span style="font-size:13px;color:#e0e0e0;min-width:36px;" id="cfgThresholdVal">40%</span>
+        <span style="font-size:13px;color:#E0F0F0;min-width:36px;" id="cfgThresholdVal">40%</span>
       </div>
     </div>
     <div class="setting-row">
@@ -185,7 +185,7 @@
       </div>
       <div style="display:flex;align-items:center;gap:8px;">
         <input type="number" id="cfgGroupingWindow" min="1" max="120" value="10"
-               style="width:60px;background:#0f3460;color:#e0e0e0;border:1px solid #1a3a6e;border-radius:4px;padding:4px 8px;font-size:13px;text-align:center;"
+               style="width:60px;background:#14374E;color:#E0F0F0;border:1px solid #1A4560;border-radius:4px;padding:4px 8px;font-size:13px;text-align:center;"
                onchange="saveConfig()">
         <span style="font-size:13px;color:#888;">seconds</span>
       </div>
@@ -200,7 +200,7 @@
                style="width:100px;"
                oninput="document.getElementById('cfgSimilarityVal').textContent=this.value+'%'"
                onchange="saveConfig()">
-        <span id="cfgSimilarityVal" style="font-size:13px;color:#e0e0e0;min-width:30px;">85%</span>
+        <span id="cfgSimilarityVal" style="font-size:13px;color:#E0F0F0;min-width:30px;">85%</span>
       </div>
     </div>
   </div>
@@ -211,11 +211,11 @@
     <div class="setting-row">
       <div class="setting-label">
         Access token
-        <small>Optional. Enables faster downloads and access to gated models. Get one at <span style="color:#4ecca3;">huggingface.co/settings/tokens</span></small>
+        <small>Optional. Enables faster downloads and access to gated models. Get one at <span style="color:#24E5CA;">huggingface.co/settings/tokens</span></small>
       </div>
       <div style="display:flex;align-items:center;gap:8px;">
         <input type="text" id="cfgHfToken" placeholder="hf_..."
-               style="width:220px;background:#0f3460;color:#e0e0e0;border:1px solid #1a3a6e;border-radius:4px;padding:6px 10px;font-size:12px;font-family:monospace;"
+               style="width:220px;background:#14374E;color:#E0F0F0;border:1px solid #1A4560;border-radius:4px;padding:6px 10px;font-size:12px;font-family:monospace;"
                onchange="saveConfig()">
       </div>
     </div>
@@ -251,6 +251,13 @@
       </div>
       <span class="setting-value" id="torchVersion">-</span>
     </div>
+    <div class="setting-row">
+      <div class="setting-label">
+        MegaDetector
+        <small id="megadetectorDetail">Checking...</small>
+      </div>
+      <span class="setting-value" id="megadetectorStatus">-</span>
+    </div>
   </div>
 
   <!-- Storage Management -->
@@ -260,21 +267,21 @@
     <!-- Usage bar chart -->
     <div id="storageChart" style="margin-bottom:16px;"></div>
     <div style="font-size:12px;color:var(--text-dim,#888);margin-bottom:16px;">
-      Total: <b id="storageTotalSize" style="color:var(--text-primary,#e0e0e0);">-</b>
+      Total: <b id="storageTotalSize" style="color:var(--text-primary,#E0F0F0);">-</b>
     </div>
 
     <!-- Storage rows -->
     <div id="storageRows"></div>
 
     <!-- Preview settings -->
-    <div style="margin-top:16px;padding-top:12px;border-top:1px solid var(--border-primary,#0f3460);">
+    <div style="margin-top:16px;padding-top:12px;border-top:1px solid var(--border-primary,#14374E);">
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
         <div>
-          <span style="font-size:13px;color:var(--text-primary,#e0e0e0);font-weight:500;">Preview Quality</span>
+          <span style="font-size:13px;color:var(--text-primary,#E0F0F0);font-weight:500;">Preview Quality</span>
           <div style="font-size:11px;color:var(--text-dim,#888);">Controls the resolution of cached preview images for the lightbox viewer.</div>
         </div>
         <select id="cfgPreviewSize" onchange="saveConfig()"
-                style="background:var(--bg-input,#0f3460);color:var(--text-primary,#e0e0e0);border:1px solid var(--border-secondary,#1a3a6e);border-radius:4px;padding:4px 8px;font-size:12px;">
+                style="background:var(--bg-input,#14374E);color:var(--text-primary,#E0F0F0);border:1px solid var(--border-secondary,#1A4560);border-radius:4px;padding:4px 8px;font-size:12px;">
           <option value="1280">1280px (fast, small)</option>
           <option value="1920" selected>1920px (default)</option>
           <option value="2560">2560px (high quality)</option>
@@ -283,11 +290,11 @@
         </select>
       </div>
       <div style="display:flex;gap:8px;align-items:center;">
-        <button onclick="generatePreviews()" style="background:var(--accent,#4ecca3);color:var(--bg-primary,#1a1a2e);border:none;border-radius:4px;padding:6px 16px;font-size:12px;cursor:pointer;font-weight:500;">Generate Previews</button>
+        <button onclick="generatePreviews()" style="background:var(--accent,#24E5CA);color:var(--bg-primary,#0A1F2E);border:none;border-radius:4px;padding:6px 16px;font-size:12px;cursor:pointer;font-weight:500;">Generate Previews</button>
         <span id="previewJobStatus" style="font-size:12px;color:var(--text-dim,#888);"></span>
       </div>
       <div id="previewProgress" style="display:none;margin-top:6px;">
-        <div style="height:4px;background:var(--border-primary,#0f3460);border-radius:2px;overflow:hidden;"><div id="previewProgressFill" style="height:100%;background:var(--accent,#4ecca3);border-radius:2px;width:0%;transition:width 0.3s;"></div></div>
+        <div style="height:4px;background:var(--border-primary,#14374E);border-radius:2px;overflow:hidden;"><div id="previewProgressFill" style="height:100%;background:var(--accent,#24E5CA);border-radius:2px;width:0%;transition:width 0.3s;"></div></div>
       </div>
     </div>
   </div>
@@ -311,13 +318,25 @@
     <div id="scanRootsContent"><span style="color:#555;font-size:13px;">Loading...</span></div>
   </div>
 
+  <!-- Theme -->
+  <div class="section">
+    <div class="section-title">Appearance</div>
+    <div class="setting-row">
+      <div class="setting-label">
+        Theme
+        <small>Change the look and feel of the app. You can also click the icon in the nav bar to cycle through themes.</small>
+      </div>
+      <div id="themePicker" style="display:flex;gap:6px;flex-wrap:wrap;"></div>
+    </div>
+  </div>
+
   <!-- Keyboard Shortcuts -->
   <div class="section">
     <div class="section-title">Keyboard Shortcuts</div>
     <p style="font-size:12px;color:#888;margin-bottom:10px;">Available on the Classify page when reviewing predictions.</p>
     <div class="setting-row">
       <div class="setting-label">Accept prediction</div>
-      <span class="setting-value" style="color:#4ecca3;font-family:monospace;font-size:14px;">A</span>
+      <span class="setting-value" style="color:#24E5CA;font-family:monospace;font-size:14px;">A</span>
     </div>
     <div class="setting-row">
       <div class="setting-label">Skip / reject prediction</div>
@@ -334,7 +353,7 @@
     </div>
     <div style="font-size:12px;color:#666;margin-top:8px;">
       AI-powered wildlife photo organizer.
-      <a href="https://github.com/jss367/vireo" style="color:#4ecca3;text-decoration:none;">GitHub</a>
+      <a href="https://github.com/jss367/vireo" style="color:#24E5CA;text-decoration:none;">GitHub</a>
     </div>
   </div>
 
@@ -350,6 +369,7 @@ loadConfig();
 loadEmbeddingMatrix();
 loadScanRoots();
 loadVersion();
+loadThemePicker();
 
 var _saveTimer = null;
 async function loadConfig() {
@@ -403,6 +423,21 @@ async function loadSystemInfo() {
     document.getElementById('pythonVersion').textContent = d.python_version;
     document.getElementById('torchVersion').textContent = d.torch_version || 'Not installed';
     document.getElementById('torchDetail').textContent = d.torch_detail || '';
+    var mdStatus = document.getElementById('megadetectorStatus');
+    var mdDetail = document.getElementById('megadetectorDetail');
+    if (d.megadetector === 'installed') {
+      mdStatus.textContent = 'Installed';
+      mdStatus.style.color = '#24E5CA';
+      mdDetail.textContent = d.megadetector_detail;
+    } else if (d.megadetector === 'not installed') {
+      mdStatus.textContent = 'Not installed';
+      mdStatus.style.color = '#f0c040';
+      mdDetail.textContent = 'Subject detection disabled — ' + d.megadetector_detail;
+    } else {
+      mdStatus.textContent = 'Error';
+      mdStatus.style.color = '#e74c3c';
+      mdDetail.textContent = d.megadetector_detail;
+    }
   } catch(e) {}
 }
 
@@ -429,16 +464,16 @@ async function loadLabels() {
     var html = '';
     labels.forEach(function(l) {
       var isActive = active && active.labels_file === l.labels_file;
-      var activeTag = isActive ? ' <span style="color:#4ecca3;font-size:10px;font-weight:600;">ACTIVE</span>' : '';
+      var activeTag = isActive ? ' <span style="color:#24E5CA;font-size:10px;font-weight:600;">ACTIVE</span>' : '';
       var groups = (l.taxon_groups || []).map(function(g) { return g.charAt(0).toUpperCase() + g.slice(1); }).join(', ');
 
-      html += '<div style="padding:8px 0;border-bottom:1px solid #0a1a35;display:flex;align-items:center;gap:8px;">';
+      html += '<div style="padding:8px 0;border-bottom:1px solid #0E2A3D;display:flex;align-items:center;gap:8px;">';
       html += '<div style="flex:1;">';
-      html += '<span style="font-size:13px;color:#e0e0e0;font-weight:600;">' + escapeHtml(l.name) + '</span>' + activeTag;
+      html += '<span style="font-size:13px;color:#E0F0F0;font-weight:600;">' + escapeHtml(l.name) + '</span>' + activeTag;
       html += '<div style="font-size:11px;color:#888;">' + (l.species_count || 0) + ' species &middot; ' + groups + '</div>';
       html += '</div>';
       if (!isActive) {
-        html += '<button onclick="setActiveLabels(\'' + escapeAttr(l.labels_file) + '\')" style="background:#0f3460;color:#c0c0c0;border:none;border-radius:4px;padding:4px 12px;font-size:11px;cursor:pointer;">Use This</button>';
+        html += '<button onclick="setActiveLabels(\'' + escapeAttr(l.labels_file) + '\')" style="background:#14374E;color:#B0CCCC;border:none;border-radius:4px;padding:4px 12px;font-size:11px;cursor:pointer;">Use This</button>';
       }
       html += '</div>';
     });
@@ -464,8 +499,8 @@ async function loadTaxonGroups() {
     var html = '';
     groups.forEach(function(g, i) {
       var checked = (g.key === 'birds') ? ' checked' : '';
-      html += '<label style="font-size:12px;color:#c0c0c0;display:flex;align-items:center;gap:4px;cursor:pointer;">' +
-        '<input type="checkbox" class="taxon-cb" value="' + g.key + '"' + checked + ' style="accent-color:#4ecca3;"> ' +
+      html += '<label style="font-size:12px;color:#B0CCCC;display:flex;align-items:center;gap:4px;cursor:pointer;">' +
+        '<input type="checkbox" class="taxon-cb" value="' + g.key + '"' + checked + ' style="accent-color:#24E5CA;"> ' +
         g.name + '</label>';
     });
     document.getElementById('taxonCheckboxes').innerHTML = html;
@@ -478,7 +513,7 @@ function searchPlacesDebounced() {
     selectedPlaceId = null;
     selectedPlaceName = '';
     document.getElementById('fetchLabelsBtn').disabled = true;
-    document.getElementById('placeSearch').style.borderColor = '#1a3a6e';
+    document.getElementById('placeSearch').style.borderColor = '#1A4560';
   }
   if (searchTimer) clearTimeout(searchTimer);
   searchTimer = setTimeout(searchPlaces, 300);
@@ -501,8 +536,8 @@ async function searchPlaces() {
     var html = '';
     places.slice(0, 8).forEach(function(p) {
       var dn = p.display_name || p.name || '';
-      html += '<div style="padding:8px 10px;font-size:13px;color:#c0c0c0;cursor:pointer;border-bottom:1px solid #1a3a6e;" ' +
-        'onmouseover="this.style.background=\'#16213e\'" onmouseout="this.style.background=\'\'" ' +
+      html += '<div style="padding:8px 10px;font-size:13px;color:#B0CCCC;cursor:pointer;border-bottom:1px solid #1A4560;" ' +
+        'onmouseover="this.style.background=\'#0E2A3D\'" onmouseout="this.style.background=\'\'" ' +
         'data-place-id="' + p.id + '" data-place-name="' + escapeAttr(dn) + '" ' +
         'onclick="selectPlace(this.dataset.placeId, this.dataset.placeName)">' +
         escapeHtml(dn) + '</div>';
@@ -518,7 +553,7 @@ function selectPlace(id, name) {
   selectedPlaceName = name;
   document.getElementById('placeDropdown').innerHTML = '';
   document.getElementById('placeSearch').value = name;
-  document.getElementById('placeSearch').style.borderColor = '#4ecca3';
+  document.getElementById('placeSearch').style.borderColor = '#24E5CA';
   document.getElementById('fetchLabelsBtn').disabled = false;
 }
 
@@ -565,7 +600,7 @@ async function fetchLabels() {
       var result = JSON.parse(e.data);
       if (result.status === 'completed' && result.result) {
         status.textContent = 'Done! ' + result.result.species_count + ' species downloaded.';
-        status.style.color = '#4ecca3';
+        status.style.color = '#24E5CA';
         progressFill.style.width = '100%';
       } else {
         status.textContent = 'Failed: ' + (result.errors || []).join(', ');
@@ -598,13 +633,13 @@ async function loadModels() {
     var html = '';
     models.forEach(function(m) {
       var isActive = m.id === activeId;
-      var statusColor = m.downloaded ? '#4ecca3' : '#666';
+      var statusColor = m.downloaded ? '#24E5CA' : '#666';
       var statusText = m.downloaded ? 'Downloaded' : 'Not downloaded';
-      var activeTag = isActive ? ' <span style="color:#4ecca3;font-size:10px;font-weight:600;">ACTIVE</span>' : '';
+      var activeTag = isActive ? ' <span style="color:#24E5CA;font-size:10px;font-weight:600;">ACTIVE</span>' : '';
 
-      html += '<div style="padding:10px 0;border-bottom:1px solid #0a1a35;">';
+      html += '<div style="padding:10px 0;border-bottom:1px solid #0E2A3D;">';
       html += '<div style="display:flex;align-items:center;gap:8px;margin-bottom:4px;">';
-      html += '<span style="font-size:14px;color:#e0e0e0;font-weight:600;">' + escapeHtml(m.name) + '</span>';
+      html += '<span style="font-size:14px;color:#E0F0F0;font-weight:600;">' + escapeHtml(m.name) + '</span>';
       html += '<span style="font-size:11px;color:#666;">' + escapeHtml(m.architecture || m.model_str) + '</span>';
       if (m.parameters) html += '<span style="font-size:11px;color:#666;">' + escapeHtml(m.parameters) + ' params</span>';
       if (m.size_mb) html += '<span style="font-size:11px;color:#666;">' + (m.size_mb >= 1000 ? (m.size_mb / 1000).toFixed(1) + ' GB' : m.size_mb + ' MB') + '</span>';
@@ -620,10 +655,10 @@ async function loadModels() {
 
       html += '<span style="margin-left:auto;display:flex;gap:6px;">';
       if (!m.downloaded && m.source !== 'custom') {
-        html += '<button onclick="downloadModel(\'' + m.id + '\')" style="background:#4ecca3;color:#1a1a2e;border:none;border-radius:4px;padding:4px 12px;font-size:11px;cursor:pointer;">Download</button>';
+        html += '<button onclick="downloadModel(\'' + m.id + '\')" style="background:#24E5CA;color:#0A1F2E;border:none;border-radius:4px;padding:4px 12px;font-size:11px;cursor:pointer;">Download</button>';
       }
       if (m.downloaded && !isActive) {
-        html += '<button onclick="setActiveModel(\'' + m.id + '\')" style="background:#0f3460;color:#c0c0c0;border:none;border-radius:4px;padding:4px 12px;font-size:11px;cursor:pointer;">Use This</button>';
+        html += '<button onclick="setActiveModel(\'' + m.id + '\')" style="background:#14374E;color:#B0CCCC;border:none;border-radius:4px;padding:4px 12px;font-size:11px;cursor:pointer;">Use This</button>';
       }
       if (m.downloaded) {
         html += '<button onclick="removeModel(\'' + m.id + '\')" style="background:none;color:var(--danger,#e74c3c);border:1px solid var(--danger,#e74c3c);border-radius:4px;padding:4px 12px;font-size:11px;cursor:pointer;">Remove</button>';
@@ -632,7 +667,7 @@ async function loadModels() {
       html += '</div>';
       // Progress bar (hidden until download starts)
       html += '<div id="modelProgress-' + m.id + '" style="display:none;margin-top:6px;">';
-      html += '<div style="height:4px;background:#0f3460;border-radius:2px;overflow:hidden;margin-bottom:4px;"><div id="modelProgressFill-' + m.id + '" style="height:100%;background:#4ecca3;border-radius:2px;width:0%;transition:width 0.3s;"></div></div>';
+      html += '<div style="height:4px;background:#14374E;border-radius:2px;overflow:hidden;margin-bottom:4px;"><div id="modelProgressFill-' + m.id + '" style="height:100%;background:#24E5CA;border-radius:2px;width:0%;transition:width 0.3s;"></div></div>';
       html += '<div id="modelProgressText-' + m.id + '" style="font-size:11px;color:#888;"></div>';
       html += '</div>';
       html += '</div>';
@@ -740,7 +775,7 @@ async function addHfModel() {
       var result = JSON.parse(e.data);
       if (result.status === 'completed') {
         status.textContent = 'Downloaded! Model ready to use.';
-        status.style.color = '#4ecca3';
+        status.style.color = '#24E5CA';
         document.getElementById('hfRepoId').value = '';
       } else {
         status.textContent = 'Failed: ' + (result.errors || []).join(', ');
@@ -778,18 +813,18 @@ async function loadTaxonomy() {
     if (d.available) {
       html += '<div style="display:flex;align-items:center;gap:12px;">';
       html += '<div>';
-      html += '<div style="font-size:14px;color:#e0e0e0;">iNaturalist Taxonomy</div>';
+      html += '<div style="font-size:14px;color:#E0F0F0;">iNaturalist Taxonomy</div>';
       html += '<div style="font-size:12px;color:#888;">~' + (d.taxa_count || 0).toLocaleString() + ' taxa';
       if (d.last_updated) html += ' &middot; Updated ' + d.last_updated;
       if (d.file_size) html += ' &middot; ' + formatBytes(d.file_size);
       html += '</div></div>';
-      html += '<button onclick="downloadTaxonomy()" style="margin-left:auto;background:#0f3460;color:#c0c0c0;border:none;border-radius:4px;padding:6px 14px;font-size:12px;cursor:pointer;">Re-download</button>';
+      html += '<button onclick="downloadTaxonomy()" style="margin-left:auto;background:#14374E;color:#B0CCCC;border:none;border-radius:4px;padding:6px 14px;font-size:12px;cursor:pointer;">Re-download</button>';
       html += '</div>';
     } else {
       html += '<div style="margin-bottom:8px;">';
       html += '<div style="font-size:13px;color:#888;">No taxonomy downloaded. The taxonomy is used for species classification and keyword categorization.</div>';
       html += '</div>';
-      html += '<button onclick="downloadTaxonomy()" style="background:#4ecca3;color:#1a1a2e;border:none;border-radius:4px;padding:8px 20px;font-size:13px;cursor:pointer;">Download iNaturalist Taxonomy</button>';
+      html += '<button onclick="downloadTaxonomy()" style="background:#24E5CA;color:#0A1F2E;border:none;border-radius:4px;padding:8px 20px;font-size:13px;cursor:pointer;">Download iNaturalist Taxonomy</button>';
     }
     document.getElementById('taxonomyContent').innerHTML = html;
   } catch(e) {
@@ -908,25 +943,25 @@ async function loadEmbeddingMatrix() {
     }
 
     var html = '<table style="width:100%;border-collapse:collapse;font-size:12px;margin-top:8px;">';
-    html += '<thead><tr><th style="text-align:left;padding:6px 10px;color:#666;font-weight:500;border-bottom:1px solid #0f3460;">Labels</th>';
+    html += '<thead><tr><th style="text-align:left;padding:6px 10px;color:#666;font-weight:500;border-bottom:1px solid #14374E;">Labels</th>';
     models.forEach(function(m) {
-      html += '<th style="text-align:center;padding:6px 10px;color:#666;font-weight:500;border-bottom:1px solid #0f3460;">' + escapeHtml(m.name) + '</th>';
+      html += '<th style="text-align:center;padding:6px 10px;color:#666;font-weight:500;border-bottom:1px solid #14374E;">' + escapeHtml(m.name) + '</th>';
     });
     html += '</tr></thead><tbody>';
 
     matrix.forEach(function(row) {
       html += '<tr>';
-      html += '<td style="padding:6px 10px;border-bottom:1px solid #0a1a35;color:#c0c0c0;">';
+      html += '<td style="padding:6px 10px;border-bottom:1px solid #0E2A3D;color:#B0CCCC;">';
       html += escapeHtml(row.labels_name) + ' <span style="color:#555;">(' + row.species_count + ')</span>';
       html += '</td>';
       models.forEach(function(m) {
         var cell = row.models[m.id];
-        html += '<td style="text-align:center;padding:6px 10px;border-bottom:1px solid #0a1a35;">';
+        html += '<td style="text-align:center;padding:6px 10px;border-bottom:1px solid #0E2A3D;">';
         if (cell && cell.cached) {
-          html += '<span style="color:#4ecca3;">cached</span>';
+          html += '<span style="color:#24E5CA;">cached</span>';
         } else {
           html += '<button onclick="precomputeEmbeddings(\'' + escapeAttr(m.id) + '\',\'' + escapeAttr(row.labels_file) + '\')" ' +
-            'style="background:#0f3460;color:#c0c0c0;border:none;border-radius:3px;padding:3px 10px;font-size:11px;cursor:pointer;">Compute</button>';
+            'style="background:#14374E;color:#B0CCCC;border:none;border-radius:3px;padding:3px 10px;font-size:11px;cursor:pointer;">Compute</button>';
         }
         html += '</td>';
       });
@@ -1019,7 +1054,7 @@ async function generatePreviews() {
       if (result.status === 'completed' && result.result) {
         var r = result.result;
         status.textContent = 'Done! ' + r.generated + ' generated, ' + r.skipped + ' already cached';
-        status.style.color = '#4ecca3';
+        status.style.color = '#24E5CA';
         progressFill.style.width = '100%';
       } else {
         status.textContent = 'Failed';
@@ -1043,12 +1078,12 @@ async function loadStoragePanel() {
 
     // Build bar chart
     var categories = [
-      {name: 'Database', size: s.database.size, color: '#4ecca3', type: null},
-      {name: 'Thumbnails', size: s.thumbnails.size, color: '#7ec8e3', count: s.thumbnails.count, type: 'thumbnails'},
-      {name: 'Previews', size: s.previews.size, color: '#f0c040', count: s.previews.count, type: 'previews'},
-      {name: 'Embeddings', size: s.embeddings.size, color: '#e74c3c', count: s.embeddings.count, type: 'embeddings'},
-      {name: 'Models', size: s.models.size, color: '#9b59b6', type: null},
-      {name: 'HF Cache', size: s.hf_cache.size, color: '#3498db', type: null},
+      {name: 'Database', size: s.database.size, color: '#24E5CA', type: null},
+      {name: 'Thumbnails', size: s.thumbnails.size, color: '#12C3B5', count: s.thumbnails.count, type: 'thumbnails'},
+      {name: 'Previews', size: s.previews.size, color: '#038A96', count: s.previews.count, type: 'previews'},
+      {name: 'Embeddings', size: s.embeddings.size, color: '#0D5B79', count: s.embeddings.count, type: 'embeddings'},
+      {name: 'Models', size: s.models.size, color: '#0A2F4D', type: null},
+      {name: 'HF Cache', size: s.hf_cache.size, color: '#14374E', type: null},
     ];
 
     // Bar chart
@@ -1059,10 +1094,10 @@ async function loadStoragePanel() {
       var pct = Math.max(1, Math.round((c.size / maxSize) * 100));
       chartHtml += '<div style="display:flex;align-items:center;gap:8px;margin-bottom:4px;font-size:12px;">' +
         '<span style="width:80px;color:var(--text-muted,#a0a0a0);text-align:right;">' + c.name + '</span>' +
-        '<div style="flex:1;height:16px;background:var(--bg-primary,#1a1a2e);border-radius:3px;overflow:hidden;">' +
+        '<div style="flex:1;height:16px;background:var(--bg-primary,#0A1F2E);border-radius:3px;overflow:hidden;">' +
           '<div style="height:100%;width:' + pct + '%;background:' + c.color + ';border-radius:3px;transition:width 0.3s;"></div>' +
         '</div>' +
-        '<span style="width:70px;color:var(--text-secondary,#c0c0c0);font-variant-numeric:tabular-nums;">' + formatBytes(c.size) + '</span>' +
+        '<span style="width:70px;color:var(--text-secondary,#B0CCCC);font-variant-numeric:tabular-nums;">' + formatBytes(c.size) + '</span>' +
       '</div>';
     });
     document.getElementById('storageChart').innerHTML = chartHtml;
@@ -1071,13 +1106,13 @@ async function loadStoragePanel() {
     var rowsHtml = '';
     categories.forEach(function(c) {
       if (c.size === 0 && !c.type) return;
-      rowsHtml += '<div style="display:flex;justify-content:space-between;align-items:center;padding:6px 0;border-bottom:1px solid var(--border-subtle,#0a1a35);font-size:12px;">' +
+      rowsHtml += '<div style="display:flex;justify-content:space-between;align-items:center;padding:6px 0;border-bottom:1px solid var(--border-subtle,#0E2A3D);font-size:12px;">' +
         '<div>' +
-          '<span style="color:var(--text-primary,#e0e0e0);">' + c.name + '</span>' +
+          '<span style="color:var(--text-primary,#E0F0F0);">' + c.name + '</span>' +
           (c.count != null ? ' <span style="color:var(--text-dim,#888);">(' + c.count.toLocaleString() + ' files)</span>' : '') +
         '</div>' +
         '<div style="display:flex;align-items:center;gap:8px;">' +
-          '<span style="color:var(--text-secondary,#c0c0c0);font-variant-numeric:tabular-nums;">' + formatBytes(c.size) + '</span>';
+          '<span style="color:var(--text-secondary,#B0CCCC);font-variant-numeric:tabular-nums;">' + formatBytes(c.size) + '</span>';
 
       if (c.type) {
         rowsHtml += '<button onclick="clearStorageCache(\'' + c.type + '\')" ' +
@@ -1118,8 +1153,8 @@ async function loadScanRoots() {
     }
     var html = '';
     roots.forEach(function(r, i) {
-      html += '<div style="display:flex;align-items:center;gap:8px;padding:6px 0;border-bottom:1px solid #0a1a35;">';
-      html += '<span style="font-size:13px;color:#c0c0c0;flex:1;font-family:monospace;">' + escapeHtml(r) + '</span>';
+      html += '<div style="display:flex;align-items:center;gap:8px;padding:6px 0;border-bottom:1px solid #0E2A3D;">';
+      html += '<span style="font-size:13px;color:#B0CCCC;flex:1;font-family:monospace;">' + escapeHtml(r) + '</span>';
       html += '<button onclick="removeScanRoot(' + i + ')" style="background:none;border:none;color:#666;font-size:14px;cursor:pointer;padding:2px 6px;" title="Remove">&times;</button>';
       html += '</div>';
     });
@@ -1151,6 +1186,28 @@ async function loadVersion() {
     var d = await resp.json();
     document.getElementById('appVersion').textContent = 'v' + d.version;
   } catch(e) {}
+}
+
+/* ---------- Theme Picker ---------- */
+function loadThemePicker() {
+  var themes = window.getThemeList ? window.getThemeList() : [];
+  var current = document.documentElement.getAttribute('data-theme') || 'vireo-dark';
+  var picker = document.getElementById('themePicker');
+  if (!picker || themes.length === 0) return;
+
+  var html = '';
+  themes.forEach(function(t) {
+    var isActive = t.id === current;
+    var borderColor = isActive ? 'var(--accent)' : 'var(--border-secondary)';
+    var bg = isActive ? 'var(--bg-tertiary)' : 'var(--bg-input)';
+    html += '<button onclick="setTheme(\'' + t.id + '\'); loadThemePicker();" ' +
+      'style="background:' + bg + ';color:var(--text-primary);border:2px solid ' + borderColor + ';' +
+      'border-radius:6px;padding:8px 14px;font-size:12px;cursor:pointer;min-width:100px;text-align:center;">' +
+      '<span style="font-size:18px;display:block;margin-bottom:2px;">' + t.icon + '</span>' +
+      t.name +
+    '</button>';
+  });
+  picker.innerHTML = html;
 }
 </script>
 </body>

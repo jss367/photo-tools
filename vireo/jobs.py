@@ -113,39 +113,46 @@ class JobRunner:
         """Persist job to history table using a thread-local connection."""
         if not self._db_path:
             return
-        try:
-            import sqlite3
 
-            conn = sqlite3.connect(self._db_path, timeout=10)
+        import sqlite3
 
-            # For failed jobs, store the error message in result
-            result_data = job["result"]
-            if job["status"] == "failed" and job["errors"]:
-                result_data = {"error": job["errors"][0]}
+        result_data = job["result"]
+        if job["status"] == "failed" and job["errors"]:
+            result_data = {"error": job["errors"][0]}
 
-            conn.execute(
-                """INSERT OR REPLACE INTO job_history
-                   (id, type, status, started_at, finished_at, duration,
-                    result, error_count, config)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    job["id"],
-                    job["type"],
-                    job["status"],
-                    job["started_at"],
-                    job["finished_at"],
-                    round(duration, 1),
-                    json.dumps(result_data),
-                    len(job["errors"]),
-                    json.dumps(job["config"]),
-                ),
-            )
-            conn.commit()
-            conn.close()
-        except Exception:
-            log.warning(
-                "Failed to persist job history for %s", job["id"], exc_info=True
-            )
+        params = (
+            job["id"],
+            job["type"],
+            job["status"],
+            job["started_at"],
+            job["finished_at"],
+            round(duration, 1),
+            json.dumps(result_data),
+            len(job["errors"]),
+            json.dumps(job["config"]),
+        )
+
+        for attempt in range(3):
+            try:
+                conn = sqlite3.connect(self._db_path, timeout=30)
+                conn.execute(
+                    """INSERT OR REPLACE INTO job_history
+                       (id, type, status, started_at, finished_at, duration,
+                        result, error_count, config)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    params,
+                )
+                conn.commit()
+                conn.close()
+                return
+            except sqlite3.OperationalError:
+                if attempt < 2:
+                    time.sleep(2)
+                else:
+                    log.warning(
+                        "Failed to persist job history for %s after 3 attempts",
+                        job["id"],
+                    )
 
     def get(self, job_id):
         """Get a job by id."""

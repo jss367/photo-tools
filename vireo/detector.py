@@ -32,7 +32,9 @@ def _get_detector():
             "Loading MegaDetector on %s (weights download automatically on first use)...",
             device,
         )
-        _detector = pw_detection.MegaDetectorV6(device=device, pretrained=True)
+        _detector = pw_detection.MegaDetectorV6(
+            device=device, pretrained=True, version="MDV6-yolov9-c"
+        )
         log.info("MegaDetector loaded")
         return _detector
 

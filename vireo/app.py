@@ -767,8 +767,13 @@ def create_app(db_path, thumb_cache_dir=None):
                 label_name = active.get("name", "")
                 label_count = active.get("species_count", 0)
             else:
-                use_tol = True
-                label_name = "Tree of Life (all species)"
+                tol_models = {"hf-hub:imageomics/bioclip", "hf-hub:imageomics/bioclip-2"}
+                model_str_check = model.get("model_str", "") if model else ""
+                if model_str_check in tol_models:
+                    use_tol = True
+                    label_name = "Tree of Life (all species)"
+                else:
+                    label_name = "No labels — download a species list in Settings"
 
         # Check embedding cache
         embeddings_cached = False
@@ -1490,6 +1495,20 @@ def create_app(db_path, thumb_cache_dir=None):
             )
         except ImportError:
             info["torch_detail"] = "PyTorch not installed"
+
+        # MegaDetector status
+        try:
+            from PytorchWildlife.models import detection as pw_detection  # noqa: F401
+
+            info["megadetector"] = "installed"
+            info["megadetector_detail"] = "MegaDetector V6 (YOLOv9-c) — subject detection for crop-based classification"
+        except ImportError:
+            info["megadetector"] = "not installed"
+            info["megadetector_detail"] = "pip install PytorchWildlife"
+        except Exception as e:
+            info["megadetector"] = "error"
+            info["megadetector_detail"] = str(e)
+
         return jsonify(info)
 
     @app.route("/api/scan/status")
@@ -1860,7 +1879,7 @@ def create_app(db_path, thumb_cache_dir=None):
         collection_id = body.get("collection_id")
         labels_file = body.get("labels_file")
         model_id = body.get("model_id")
-        model_name = body.get("model_name", "bioclip")
+        model_name = body.get("model_name")  # Will be set to effective_name in work()
         threshold = body.get("threshold", user_cfg["classification_threshold"])
         grouping_window = body.get(
             "grouping_window", user_cfg["grouping_window_seconds"]
@@ -1913,6 +1932,10 @@ def create_app(db_path, thumb_cache_dir=None):
             model_str = active_model["model_str"]
             weights_path = active_model["weights_path"]
             effective_name = active_model["name"]
+            # Use effective name for storing predictions if not explicitly set
+            nonlocal model_name
+            if not model_name:
+                model_name = effective_name
 
             # Phase 1: Load taxonomy
             runner.push_event(
@@ -1955,12 +1978,39 @@ def create_app(db_path, thumb_cache_dir=None):
                         active_labels.get("name", active_labels["labels_file"]),
                     )
 
-            use_tol = False
-            if not labels:
+            # Log what we're using
+            if labels:
                 log.info(
-                    "No regional labels available — using Tree of Life classifier (all species)"
+                    "Classification config: model=%s, labels=%d from %s, threshold=%.0f%%",
+                    effective_name,
+                    len(labels),
+                    labels_file or "active labels",
+                    threshold * 100,
                 )
-                use_tol = True
+            else:
+                log.info(
+                    "Classification config: model=%s, no labels selected, threshold=%.0f%%",
+                    effective_name,
+                    threshold * 100,
+                )
+
+            use_tol = False
+            tol_supported_models = {
+                "hf-hub:imageomics/bioclip",
+                "hf-hub:imageomics/bioclip-2",
+            }
+            if not labels:
+                if model_str in tol_supported_models:
+                    log.info(
+                        "No regional labels available — using Tree of Life classifier (all species)"
+                    )
+                    use_tol = True
+                else:
+                    raise RuntimeError(
+                        f"No labels available and Tree of Life mode is not supported "
+                        f"for {effective_name}. Go to Settings > Labels and download "
+                        f"a species list for your region."
+                    )
 
             # Phase 3: Get photos from collection
             runner.push_event(
@@ -2142,9 +2192,12 @@ def create_app(db_path, thumb_cache_dir=None):
             if not reclassify:
                 rows = thread_db.conn.execute(
                     "SELECT DISTINCT photo_id FROM predictions WHERE model = ?",
-                    (effective_name,),
+                    (model_name,),
                 ).fetchall()
                 existing_preds = {r["photo_id"] for r in rows}
+                if existing_preds:
+                    log.info("Skipping %d photos with existing predictions (model=%s)",
+                             len(existing_preds), model_name)
 
             raw_results = []
             failed = 0
@@ -2229,20 +2282,8 @@ def create_app(db_path, thumb_cache_dir=None):
                 if not all_preds:
                     continue
 
-                top_pred = all_preds[0]
-                preds = [p for p in all_preds if p["score"] >= threshold]
-
-                if not preds:
-                    log.info(
-                        '%s: "%s" at %.0f%% (below %.0f%% threshold — skipped)',
-                        photo["filename"],
-                        top_pred["species"],
-                        top_pred["score"] * 100,
-                        threshold * 100,
-                    )
-                    continue
-
-                top = preds[0]
+                # Always store the top prediction — threshold is applied at display time
+                top = all_preds[0]
                 log.info(
                     '%s: "%s" at %.0f%%',
                     photo["filename"],
@@ -2327,7 +2368,7 @@ def create_app(db_path, thumb_cache_dir=None):
                 else:
                     # Group — compute consensus
                     group_count += 1
-                    gid = f"g{group_count:04d}"
+                    gid = f"g{job['id'][-6:]}-{group_count:04d}"
                     cons_input = [
                         {
                             "prediction": item["prediction"],
@@ -2378,13 +2419,12 @@ def create_app(db_path, thumb_cache_dir=None):
                         )
                     predictions_stored += len(group)
 
-            below_threshold = total - len(raw_results) - failed - skipped_existing
             singles = len([g for g in groups if len(g) == 1])
             grouped_photos = sum(len(g) for g in groups if len(g) > 1)
             log.info(
                 "Classification complete: %d photos processed, %d predictions stored "
                 "(%d singles, %d in %d burst groups), %d already classified, "
-                "%d already labeled, %d below threshold, %d failed",
+                "%d already labeled, %d failed",
                 total,
                 predictions_stored,
                 singles,
@@ -2392,7 +2432,6 @@ def create_app(db_path, thumb_cache_dir=None):
                 group_count,
                 skipped_existing,
                 skipped_match,
-                below_threshold,
                 failed,
             )
 
@@ -2402,7 +2441,6 @@ def create_app(db_path, thumb_cache_dir=None):
                 "burst_groups": group_count,
                 "already_classified": skipped_existing,
                 "already_labeled": skipped_match,
-                "below_threshold": below_threshold,
                 "detected": detected,
                 "failed": failed,
             }
@@ -2517,6 +2555,14 @@ def create_app(db_path, thumb_cache_dir=None):
         return jsonify(app._job_runner.get_history(db, limit=limit))
 
     # -- Image serving --
+
+    @app.route("/favicon.ico")
+    def favicon():
+        return send_from_directory(
+            os.path.join(os.path.dirname(__file__), "static"),
+            "favicon.png",
+            mimetype="image/png",
+        )
 
     @app.route("/thumbnails/<filename>")
     def serve_thumbnail(filename):

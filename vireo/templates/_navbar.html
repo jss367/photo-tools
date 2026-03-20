@@ -1,6 +1,60 @@
 <style>
-/* ---------- Theme Variables ---------- */
-:root {
+/* ---------- Themes ---------- */
+
+/* Vireo Dark (default) — matches the teal/navy logo */
+:root, :root[data-theme="vireo-dark"] {
+  --bg-primary: #0A1F2E;
+  --bg-secondary: #0E2A3D;
+  --bg-tertiary: #14374E;
+  --bg-input: #12304A;
+  --bg-panel: #071822;
+  --border-primary: #14374E;
+  --border-secondary: #1A4560;
+  --border-subtle: #0E2A3D;
+  --text-primary: #E0F0F0;
+  --text-secondary: #B0CCCC;
+  --text-muted: #7FAAB0;
+  --text-dim: #5A8890;
+  --text-faint: #3D6670;
+  --text-ghost: #2D5058;
+  --text-invisible: #1E3E48;
+  --accent: #24E5CA;
+  --accent-hover: #5AF0DA;
+  --accent-dim: #0A4A42;
+  --accent-text: #0A1F2E;
+  --warning: #F0C040;
+  --danger: #E74C3C;
+  --info: #12C3B5;
+}
+
+/* Vireo Light — clean, airy complement to the dark theme */
+:root[data-theme="vireo-light"] {
+  --bg-primary: #F0F6F6;
+  --bg-secondary: #FAFFFE;
+  --bg-tertiary: #E4EDED;
+  --bg-input: #FAFFFE;
+  --bg-panel: #EAF2F2;
+  --border-primary: #C8D8D8;
+  --border-secondary: #A8C0C0;
+  --border-subtle: #D8E4E4;
+  --text-primary: #0A1F2E;
+  --text-secondary: #1A3A4E;
+  --text-muted: #3D6670;
+  --text-dim: #5A8890;
+  --text-faint: #7FAAB0;
+  --text-ghost: #A0C4C8;
+  --text-invisible: #C8DCDC;
+  --accent: #038A96;
+  --accent-hover: #026E78;
+  --accent-dim: #D0F0F0;
+  --accent-text: #FAFFFE;
+  --warning: #B8860B;
+  --danger: #C0392B;
+  --info: #0D5B79;
+}
+
+/* Classic Dark (original teal/navy) */
+:root[data-theme="classic-dark"] {
   --bg-primary: #1a1a2e;
   --bg-secondary: #16213e;
   --bg-tertiary: #0f3460;
@@ -19,12 +73,39 @@
   --accent: #4ecca3;
   --accent-hover: #3db890;
   --accent-dim: #2a5a4a;
+  --accent-text: #1a1a2e;
   --warning: #f0c040;
   --danger: #e74c3c;
   --info: #7ec8e3;
 }
 
-/* Global overrides — these apply theme variables to common patterns across all pages */
+/* High Contrast */
+:root[data-theme="high-contrast"] {
+  --bg-primary: #000000;
+  --bg-secondary: #111111;
+  --bg-tertiary: #222222;
+  --bg-input: #1a1a1a;
+  --bg-panel: #0a0a0a;
+  --border-primary: #444444;
+  --border-secondary: #555555;
+  --border-subtle: #333333;
+  --text-primary: #ffffff;
+  --text-secondary: #e0e0e0;
+  --text-muted: #cccccc;
+  --text-dim: #aaaaaa;
+  --text-faint: #888888;
+  --text-ghost: #666666;
+  --text-invisible: #444444;
+  --accent: #FFE800;
+  --accent-hover: #FFFF44;
+  --accent-dim: #554400;
+  --accent-text: #000000;
+  --warning: #FFB800;
+  --danger: #FF4444;
+  --info: #44BBFF;
+}
+
+/* ---------- Global Overrides ---------- */
 body { background: var(--bg-primary) !important; color: var(--text-primary) !important; }
 .section, .card, .grid-card { background: var(--bg-secondary) !important; border-color: var(--border-primary) !important; }
 .section-title { color: var(--text-primary) !important; border-bottom-color: var(--border-primary) !important; }
@@ -38,9 +119,9 @@ body { background: var(--bg-primary) !important; color: var(--text-primary) !imp
 .setting-row { border-color: var(--border-subtle) !important; }
 .setting-label { color: var(--text-secondary) !important; }
 .setting-label small { color: var(--text-faint) !important; }
-.btn-batch-accept { background: var(--accent) !important; }
+.btn-batch-accept { background: var(--accent) !important; color: var(--accent-text) !important; }
 .btn-batch-accept:hover { background: var(--accent-hover) !important; }
-.badge-new { background: var(--accent) !important; }
+.badge-new { background: var(--accent) !important; color: var(--accent-text) !important; }
 .badge-disagreement { background: var(--danger) !important; }
 .badge-refinement { background: var(--warning) !important; }
 .grid-card img { background: var(--bg-tertiary) !important; }
@@ -54,30 +135,6 @@ input[type=text], input[type=date], select, .path-input, .text-input, .model-sel
 .detail-panel { background: var(--bg-secondary) !important; border-color: var(--border-primary) !important; }
 .log-panel-content, .bp-logs-content, .log-container { background: var(--bg-panel) !important; }
 .bp-tabs { border-color: var(--border-primary) !important; }
-
-:root[data-theme="light"] {
-  --bg-primary: #f5f5f7;
-  --bg-secondary: #ffffff;
-  --bg-tertiary: #e8eaed;
-  --bg-input: #ffffff;
-  --bg-panel: #f0f0f2;
-  --border-primary: #d0d0d0;
-  --border-secondary: #c0c0c0;
-  --border-subtle: #e0e0e0;
-  --text-primary: #1a1a2e;
-  --text-secondary: #333;
-  --text-muted: #555;
-  --text-dim: #777;
-  --text-faint: #999;
-  --text-ghost: #aaa;
-  --text-invisible: #ccc;
-  --accent: #0d8a6a;
-  --accent-hover: #0a7058;
-  --accent-dim: #c8efe4;
-  --warning: #b8860b;
-  --danger: #c0392b;
-  --info: #2980b9;
-}
 
 .navbar {
   background: var(--bg-secondary);
@@ -818,31 +875,49 @@ function closeSimilar() {
   var activeJobs = [];
   var currentBpTab = 'jobs';
 
-  // Theme: restore on load (before init to avoid flash)
+  // Theme system
+  var THEMES = [
+    {id: 'vireo-dark', name: 'Vireo Dark', icon: '\u2600'},
+    {id: 'vireo-light', name: 'Vireo Light', icon: '\u263D'},
+    {id: 'classic-dark', name: 'Classic Dark', icon: '\u2605'},
+    {id: 'high-contrast', name: 'High Contrast', icon: '\u25C9'},
+  ];
+
+  window.getThemeList = function() { return THEMES; };
+
+  // Restore theme on load (before init to avoid flash)
   (function() {
-    var saved = localStorage.getItem('vireo_theme') || 'dark';
-    if (saved === 'light') document.documentElement.setAttribute('data-theme', 'light');
-    updateThemeIcon();
+    var saved = localStorage.getItem('vireo_theme') || 'vireo-dark';
+    // Migrate old values
+    if (saved === 'dark') saved = 'vireo-dark';
+    if (saved === 'light') saved = 'vireo-light';
+    applyTheme(saved, true);
   })();
 
-  window.toggleTheme = function() {
-    var current = document.documentElement.getAttribute('data-theme');
-    var next = current === 'light' ? 'dark' : 'light';
-    if (next === 'dark') {
-      document.documentElement.removeAttribute('data-theme');
-    } else {
-      document.documentElement.setAttribute('data-theme', 'light');
-    }
-    localStorage.setItem('vireo_theme', next);
+  function applyTheme(themeId, skipSave) {
+    document.documentElement.setAttribute('data-theme', themeId);
+    if (!skipSave) localStorage.setItem('vireo_theme', themeId);
     updateThemeIcon();
+  }
+
+  window.setTheme = function(themeId) {
+    applyTheme(themeId);
+  };
+
+  window.toggleTheme = function() {
+    var current = document.documentElement.getAttribute('data-theme') || 'vireo-dark';
+    var idx = THEMES.findIndex(function(t) { return t.id === current; });
+    var next = THEMES[(idx + 1) % THEMES.length];
+    applyTheme(next.id);
   };
 
   function updateThemeIcon() {
     var btn = document.getElementById('themeToggle');
     if (!btn) return;
-    var isLight = document.documentElement.getAttribute('data-theme') === 'light';
-    btn.textContent = isLight ? '\u263D' : '\u2600';
-    btn.title = isLight ? 'Switch to dark mode' : 'Switch to light mode';
+    var current = document.documentElement.getAttribute('data-theme') || 'vireo-dark';
+    var theme = THEMES.find(function(t) { return t.id === current; }) || THEMES[0];
+    btn.textContent = theme.icon;
+    btn.title = 'Theme: ' + theme.name + ' (click to cycle)';
   }
 
   function init() {

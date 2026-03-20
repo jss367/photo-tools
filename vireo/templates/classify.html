@@ -8,19 +8,19 @@
 * { box-sizing: border-box; margin: 0; padding: 0; }
 body {
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-  background: var(--bg-primary, #1a1a2e);
-  color: var(--text-primary, #e0e0e0);
+  background: var(--bg-primary, #0A1F2E);
+  color: var(--text-primary, #E0F0F0);
   min-height: 100vh;
   padding-bottom: 36px;
 }
 .content { max-width: 800px; margin: 0 auto; padding: 32px 24px; }
 .section {
-  background: var(--bg-secondary, #16213e); border: 1px solid var(--border-primary, #0f3460);
+  background: var(--bg-secondary, #0E2A3D); border: 1px solid var(--border-primary, #14374E);
   border-radius: 8px; padding: 24px; margin-bottom: 24px;
 }
 .section-title {
   font-size: 16px; font-weight: 600; margin-bottom: 16px; color: var(--text-primary, #fff);
-  padding-bottom: 8px; border-bottom: 1px solid var(--border-primary, #0f3460);
+  padding-bottom: 8px; border-bottom: 1px solid var(--border-primary, #14374E);
 }
 .config-row {
   display: flex; align-items: flex-start; gap: 24px; flex-wrap: wrap; margin-bottom: 16px;
@@ -29,30 +29,30 @@ body {
 .config-label {
   font-size: 11px; color: var(--text-faint, #666); text-transform: uppercase; margin-bottom: 6px;
 }
-.config-value { font-size: 13px; color: var(--text-primary, #e0e0e0); margin-bottom: 4px; }
+.config-value { font-size: 13px; color: var(--text-primary, #E0F0F0); margin-bottom: 4px; }
 .config-detail { font-size: 11px; color: var(--text-ghost, #555); }
 
 select.picker {
-  background: var(--bg-input, #0f3460); color: var(--text-primary, #e0e0e0);
-  border: 1px solid var(--border-secondary, #1a3a6e);
+  background: var(--bg-input, #14374E); color: var(--text-primary, #E0F0F0);
+  border: 1px solid var(--border-secondary, #1A4560);
   border-radius: 4px; padding: 8px 12px; font-size: 13px; width: 100%;
   cursor: pointer; outline: none;
 }
-select.picker:focus { border-color: var(--accent, #4ecca3); }
+select.picker:focus { border-color: var(--accent, #24E5CA); }
 
 .btn {
   border: none; border-radius: 4px; padding: 10px 24px;
   font-size: 14px; font-weight: 600; cursor: pointer; transition: background 0.15s;
 }
 .btn:disabled { cursor: default; }
-.btn-primary { background: var(--accent, #4ecca3); color: var(--bg-primary, #1a1a2e); }
-.btn-primary:hover { background: var(--accent-hover, #3db890); }
+.btn-primary { background: var(--accent, #24E5CA); color: var(--bg-primary, #0A1F2E); }
+.btn-primary:hover { background: var(--accent-hover, #5AF0DA); }
 .btn-primary:disabled { background: var(--accent-dim, #2a5a4a); color: var(--text-ghost, #555); }
-.btn-secondary { background: var(--bg-tertiary, #0f3460); color: var(--text-secondary, #c0c0c0); }
-.btn-secondary:hover { background: var(--border-secondary, #1a3a6e); }
+.btn-secondary { background: var(--bg-tertiary, #14374E); color: var(--text-secondary, #B0CCCC); }
+.btn-secondary:hover { background: var(--border-secondary, #1A4560); }
 
 .status-msg { font-size: 13px; color: var(--text-dim, #888); margin-top: 12px; }
-.status-msg.ok { color: var(--accent, #4ecca3); }
+.status-msg.ok { color: var(--accent, #24E5CA); }
 
 /* Past runs */
 .run-table {
@@ -60,23 +60,23 @@ select.picker:focus { border-color: var(--accent, #4ecca3); }
 }
 .run-table th {
   text-align: left; padding: 6px 10px; color: var(--text-faint, #666);
-  font-weight: 500; border-bottom: 1px solid var(--border-primary, #0f3460);
+  font-weight: 500; border-bottom: 1px solid var(--border-primary, #14374E);
 }
 .run-table td {
-  padding: 6px 10px; border-bottom: 1px solid var(--border-subtle, #0a1a35);
+  padding: 6px 10px; border-bottom: 1px solid var(--border-subtle, #0E2A3D);
   color: var(--text-dim, #999);
 }
-.run-table .status-completed { color: var(--accent, #4ecca3); }
+.run-table .status-completed { color: var(--accent, #24E5CA); }
 .run-table .status-failed { color: var(--danger, #e74c3c); }
 
 .pending-banner {
-  background: var(--bg-tertiary, #0f3460); border-radius: 6px; padding: 14px 20px;
+  background: var(--bg-tertiary, #14374E); border-radius: 6px; padding: 14px 20px;
   display: flex; align-items: center; gap: 12px; margin-bottom: 16px;
 }
 .pending-count {
   font-size: 24px; font-weight: 700; color: var(--warning, #f0c040); font-variant-numeric: tabular-nums;
 }
-.pending-text { font-size: 13px; color: var(--text-secondary, #c0c0c0); flex: 1; }
+.pending-text { font-size: 13px; color: var(--text-secondary, #B0CCCC); flex: 1; }
 
 /* Photo preview grid */
 .preview-grid {
@@ -92,7 +92,7 @@ select.picker:focus { border-color: var(--accent, #4ecca3); }
   object-fit: cover;
   width: 100%;
   border-radius: 4px;
-  background: #0f3460;
+  background: #14374E;
 }
 .preview-summary {
   font-size: 12px; color: #888; margin-top: 8px;
@@ -144,15 +144,15 @@ select.picker:focus { border-color: var(--accent, #4ecca3); }
         <div class="config-label" title="Minimum confidence to include a prediction. Photos below this threshold are skipped.">Threshold</div>
         <div style="display:flex;align-items:center;gap:8px;">
           <input type="range" id="cfgThreshold" min="10" max="90" step="5" value="40"
-                 style="width:120px;accent-color:#4ecca3;"
+                 style="width:120px;accent-color:#24E5CA;"
                  oninput="document.getElementById('cfgThresholdVal').textContent = this.value + '%'">
-          <span style="font-size:13px;color:#e0e0e0;" id="cfgThresholdVal">40%</span>
+          <span style="font-size:13px;color:#E0F0F0;" id="cfgThresholdVal">40%</span>
         </div>
       </div>
     </div>
 
     <!-- Readiness checklist -->
-    <div id="readinessPanel" style="margin-bottom:12px;padding:10px 14px;background:var(--bg-primary,#1a1a2e);border-radius:6px;border:1px solid var(--border-primary,#0f3460);font-size:12px;display:none;"></div>
+    <div id="readinessPanel" style="margin-bottom:12px;padding:10px 14px;background:var(--bg-primary,#0A1F2E);border-radius:6px;border:1px solid var(--border-primary,#14374E);font-size:12px;display:none;"></div>
 
     <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap;">
       <button class="btn btn-primary" id="runBtn" onclick="runClassification(false)" disabled>Classify & Score</button>
@@ -263,7 +263,7 @@ async function updateReadiness() {
 
     // Model status
     if (r.model_ready) {
-      items.push('<span style="color:var(--accent,#4ecca3);">&#10003;</span> Model: <b>' + r.model_name + '</b> — ready');
+      items.push('<span style="color:var(--accent,#24E5CA);">&#10003;</span> Model: <b>' + r.model_name + '</b> — ready');
     } else if (r.needs_download) {
       items.push('<span style="color:var(--warning,#f0c040);">&#9679;</span> Model: <b>' + r.model_name + '</b> — will download <b>' + (r.model_size_mb >= 1000 ? (r.model_size_mb / 1000).toFixed(1) + ' GB' : r.model_size_mb + ' MB') + '</b> on first run');
     } else {
@@ -274,13 +274,13 @@ async function updateReadiness() {
     if (r.use_tol) {
       items.push('<span style="color:var(--info,#7ec8e3);">&#9679;</span> Labels: <b>Tree of Life</b> — classifying against all species (slower, less accurate than regional labels)');
     } else if (r.labels_count > 0) {
-      items.push('<span style="color:var(--accent,#4ecca3);">&#10003;</span> Labels: <b>' + r.labels_name + '</b> — ' + r.labels_count.toLocaleString() + ' species');
+      items.push('<span style="color:var(--accent,#24E5CA);">&#10003;</span> Labels: <b>' + r.labels_name + '</b> — ' + r.labels_count.toLocaleString() + ' species');
     }
 
     // Embeddings status
     if (!r.use_tol) {
       if (r.embeddings_cached) {
-        items.push('<span style="color:var(--accent,#4ecca3);">&#10003;</span> Embeddings: precomputed — classification will start immediately');
+        items.push('<span style="color:var(--accent,#24E5CA);">&#10003;</span> Embeddings: precomputed — classification will start immediately');
       } else if (r.labels_count > 0) {
         items.push('<span style="color:var(--warning,#f0c040);">&#9679;</span> Embeddings: not cached — will compute for ' + r.labels_count.toLocaleString() + ' labels on first run (~1-3 min)');
       }
@@ -435,7 +435,6 @@ async function runClassification(reclassify) {
         if (r.burst_groups) parts.push(r.burst_groups + ' burst groups');
         if (r.already_classified) parts.push(r.already_classified + ' already classified (skipped)');
         if (r.already_labeled) parts.push(r.already_labeled + ' already labeled');
-        if (r.below_threshold) parts.push(r.below_threshold + ' below threshold');
         if (r.failed) parts.push(r.failed + ' failed');
         if (result.duration) parts.push('(' + result.duration + 's)');
         status.textContent = parts.join(', ');

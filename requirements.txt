@@ -1,4 +1,6 @@
 flask
+numpy
 Pillow
 pybioclip
+PytorchWildlife
 rawpy

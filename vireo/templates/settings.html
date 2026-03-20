@@ -3,6 +3,8 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+<link rel="icon" type="image/png" href="/favicon.ico">
+<link rel="apple-touch-icon" href="/static/apple-touch-icon.png">
 <title>Vireo - Settings</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -883,7 +885,7 @@ async function loadHistory() {
     rows.forEach(function(r) {
       var cls = r.status === 'completed' ? 'status-completed' : r.status === 'failed' ? 'status-failed' : '';
       var started = r.started_at ? new Date(r.started_at).toLocaleString() : '-';
-      var duration = r.duration != null ? r.duration.toFixed(1) + 's' : '-';
+      var duration = r.duration != null ? formatDuration(r.duration) : '-';
       var result = '-';
       if (r.result) {
         try {

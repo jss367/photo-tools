@@ -3,6 +3,8 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+<link rel="icon" type="image/png" href="/favicon.ico">
+<link rel="apple-touch-icon" href="/static/apple-touch-icon.png">
 <title>Vireo - Classify</title>
 <style>
 * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -319,7 +321,7 @@ async function loadPastRuns() {
     classifyRuns.forEach(function(r) {
       var cls = r.status === 'completed' ? 'status-completed' : r.status === 'failed' ? 'status-failed' : '';
       var started = r.started_at ? new Date(r.started_at).toLocaleString() : '-';
-      var duration = r.duration != null ? r.duration.toFixed(1) + 's' : '-';
+      var duration = r.duration != null ? formatDuration(r.duration) : '-';
       var result = '-';
       if (r.result) {
         try {
@@ -436,7 +438,7 @@ async function runClassification(reclassify) {
         if (r.already_classified) parts.push(r.already_classified + ' already classified (skipped)');
         if (r.already_labeled) parts.push(r.already_labeled + ' already labeled');
         if (r.failed) parts.push(r.failed + ' failed');
-        if (result.duration) parts.push('(' + result.duration + 's)');
+        if (result.duration) parts.push(formatDuration(result.duration));
         status.textContent = parts.join(', ');
         status.className = 'status-msg ok';
         // Show the review banner

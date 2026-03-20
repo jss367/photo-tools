@@ -2228,6 +2228,38 @@ def create_app(db_path, thumb_cache_dir=None):
 
                 if photo["id"] in existing_preds:
                     skipped_existing += 1
+                    # Load existing prediction into raw_results for grouping
+                    pred_row = thread_db.conn.execute(
+                        "SELECT species, confidence FROM predictions WHERE photo_id = ? AND model = ?",
+                        (photo["id"], model_name),
+                    ).fetchone()
+                    if pred_row:
+                        timestamp = None
+                        if photo["timestamp"]:
+                            try:
+                                timestamp = dt.fromisoformat(photo["timestamp"])
+                            except Exception:
+                                pass
+                        emb_row = thread_db.conn.execute(
+                            "SELECT embedding FROM photos WHERE id = ?",
+                            (photo["id"],),
+                        ).fetchone()
+                        embedding = None
+                        if emb_row and emb_row["embedding"]:
+                            import numpy as np
+                            embedding = np.frombuffer(emb_row["embedding"], dtype=np.float32)
+                        raw_results.append({
+                            "photo": photo,
+                            "folder_path": folder_path,
+                            "image_path": image_path,
+                            "prediction": pred_row["species"],
+                            "confidence": pred_row["confidence"],
+                            "timestamp": timestamp,
+                            "filename": photo["filename"],
+                            "embedding": embedding,
+                            "taxonomy": None,
+                            "_existing": True,
+                        })
                     continue
 
                 img = load_image(image_path, max_size=None)
@@ -2405,18 +2437,28 @@ def create_app(db_path, thumb_cache_dir=None):
 
                     # Store prediction for each photo in the group
                     for item in group:
-                        thread_db.add_prediction(
-                            photo_id=item["photo"]["id"],
-                            species=cons["prediction"],
-                            confidence=round(cons["confidence"], 4),
-                            model=model_name,
-                            category=category,
-                            group_id=gid,
-                            vote_count=cons["vote_count"],
-                            total_votes=cons["total_votes"],
-                            individual=individual_json,
-                            taxonomy=cons_hierarchy,
-                        )
+                        if item.get("_existing"):
+                            # Update group info on existing prediction
+                            thread_db.conn.execute(
+                                """UPDATE predictions SET group_id=?, vote_count=?, total_votes=?, individual=?
+                                   WHERE photo_id=? AND model=?""",
+                                (gid, cons["vote_count"], cons["total_votes"],
+                                 individual_json, item["photo"]["id"], model_name),
+                            )
+                            thread_db.conn.commit()
+                        else:
+                            thread_db.add_prediction(
+                                photo_id=item["photo"]["id"],
+                                species=cons["prediction"],
+                                confidence=round(cons["confidence"], 4),
+                                model=model_name,
+                                category=category,
+                                group_id=gid,
+                                vote_count=cons["vote_count"],
+                                total_votes=cons["total_votes"],
+                                individual=individual_json,
+                                taxonomy=cons_hierarchy,
+                            )
                     predictions_stored += len(group)
 
             singles = len([g for g in groups if len(g) == 1])

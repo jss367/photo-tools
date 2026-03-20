@@ -32,6 +32,16 @@ KNOWN_MODELS = [
         'architecture': 'ViT-L/14',
         'parameters': '428M',
     },
+    {
+        'id': 'bioclip-2.5-vith14',
+        'name': 'BioCLIP-2.5',
+        'model_str': 'hf-hub:imageomics/bioclip-2.5-vith14',
+        'source': 'hf-hub:imageomics/bioclip-2.5-vith14',
+        'description': 'BioCLIP v2.5 — latest model with ViT-H/14 backbone. Best accuracy, largest model.',
+        'size_mb': 3900,
+        'architecture': 'ViT-H/14',
+        'parameters': '986M',
+    },
 ]
 
 
@@ -267,6 +277,17 @@ def download_model(model_id, progress_callback=None):
             progress_callback=progress_callback,
         )
         register_model(model_id, km['name'], 'hf-hub:imageomics/bioclip-2',
+                       path, km['description'])
+        return path
+
+    elif model_id == 'bioclip-2.5-vith14':
+        # BioCLIP-2.5 uses safetensors format
+        path = _hf_download_with_retry(
+            'imageomics/bioclip-2.5-vith14', 'open_clip_model.safetensors',
+            os.path.join(DEFAULT_MODELS_DIR, 'bioclip-2.5-vith14'),
+            progress_callback=progress_callback,
+        )
+        register_model(model_id, km['name'], 'hf-hub:imageomics/bioclip-2.5-vith14',
                        path, km['description'])
         return path
 

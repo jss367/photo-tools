@@ -11,6 +11,8 @@ from xmp_writer import write_xmp_sidecar
 log = logging.getLogger(__name__)
 
 NS_RDF = "http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+NS_DC = "http://purl.org/dc/elements/1.1/"
+NS_LR = "http://ns.adobe.com/lightroom/1.0/"
 NS_XMP = "http://ns.adobe.com/xap/1.0/"
 
 # Register xmp namespace so writes preserve it
@@ -49,6 +51,52 @@ def _write_rating_to_xmp(xmp_path, rating):
         desc.set(f"{{{NS_XMP}}}Rating", str(rating))
         ET.indent(tree, space="  ")
         tree.write(xmp_path, xml_declaration=True, encoding="unicode")
+
+
+def _remove_keywords_from_xmp(xmp_path, keywords_to_remove):
+    """Remove keywords from dc:subject and lr:hierarchicalSubject in an XMP file.
+
+    Args:
+        xmp_path: path to the .xmp sidecar
+        keywords_to_remove: set of keyword strings to remove
+    """
+    from pathlib import Path
+
+    path = Path(xmp_path)
+    if not path.exists():
+        return
+
+    try:
+        tree = ET.parse(path)
+    except ET.ParseError:
+        log.warning("Corrupt XMP file, cannot remove keywords: %s", xmp_path)
+        return
+
+    root = tree.getroot()
+    remove_lower = {kw.lower() for kw in keywords_to_remove}
+    removed = []
+
+    # Remove from dc:subject bag
+    for bag in root.findall(f".//{{{NS_DC}}}subject/{{{NS_RDF}}}Bag"):
+        for li in bag.findall(f"{{{NS_RDF}}}li"):
+            if li.text and li.text.lower() in remove_lower:
+                removed.append(li.text)
+                bag.remove(li)
+
+    # Remove from lr:hierarchicalSubject bag (matches if any segment matches)
+    for bag in root.findall(f".//{{{NS_LR}}}hierarchicalSubject/{{{NS_RDF}}}Bag"):
+        for li in bag.findall(f"{{{NS_RDF}}}li"):
+            if li.text:
+                # Hierarchical keywords use pipe-delimited paths like "Animals|Birds|Hawk"
+                segments = {s.lower() for s in li.text.split("|")}
+                if segments & remove_lower:
+                    removed.append(li.text)
+                    bag.remove(li)
+
+    if removed:
+        ET.indent(tree, space="  ")
+        tree.write(xmp_path, xml_declaration=True, encoding="unicode")
+        log.info("Removed keywords from %s: %s", xmp_path, removed)
 
 
 def sync_to_xmp(db, progress_callback=None):
@@ -114,16 +162,9 @@ def sync_to_xmp(db, progress_callback=None):
                     xmp_path, flat_keywords=keywords_to_add, hierarchical_keywords=set()
                 )
 
-            # Handle keyword removals: read current, remove, rewrite
+            # Handle keyword removals: remove matching li elements from bags
             if keywords_to_remove:
-                current = read_xmp_keywords(xmp_path)
-                remaining = current - keywords_to_remove
-                # Rewrite the XMP with remaining keywords only
-                # For now, we just log — full removal requires rewriting the bag
-                log.info(
-                    "Keyword removal from XMP not yet implemented for: %s",
-                    keywords_to_remove,
-                )
+                _remove_keywords_from_xmp(xmp_path, keywords_to_remove)
 
             # Write rating
             if new_rating is not None:

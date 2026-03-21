@@ -1,12 +1,32 @@
 """BioCLIP classifier wrapper for species-level classification."""
 
 import hashlib
+import json
 import logging
 import os
 
 log = logging.getLogger(__name__)
 
 CACHE_DIR = os.path.expanduser("~/.vireo/embedding_cache")
+_MANIFEST_PATH = os.path.join(CACHE_DIR, "manifest.json")
+
+
+def _load_manifest():
+    """Load the embedding cache manifest."""
+    if os.path.exists(_MANIFEST_PATH):
+        try:
+            with open(_MANIFEST_PATH) as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+
+def _save_manifest(manifest):
+    """Save the embedding cache manifest."""
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    with open(_MANIFEST_PATH, "w") as f:
+        json.dump(manifest, f, indent=2)
 
 
 def _embedding_cache_path(labels, model_str):
@@ -110,6 +130,15 @@ class Classifier:
                 )
                 os.makedirs(CACHE_DIR, exist_ok=True)
                 torch.save(self._classifier.txt_embeddings, cache_path)
+                # Update manifest with human-readable metadata
+                from datetime import datetime
+                manifest = _load_manifest()
+                manifest[os.path.basename(cache_path)] = {
+                    "model": model_str,
+                    "label_count": len(labels),
+                    "created": datetime.now().isoformat(timespec="seconds"),
+                }
+                _save_manifest(manifest)
                 log.info("Label embeddings computed and cached to disk")
 
             self._mode = "custom"

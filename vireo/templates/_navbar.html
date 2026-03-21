@@ -379,7 +379,10 @@ input[type=text], input[type=date], select, .path-input, .text-input, .model-sel
 .lightbox-img-wrap.zoomed img {
   max-width: none;
   max-height: none;
-  cursor: zoom-out;
+  cursor: grab;
+}
+.lightbox-img-wrap.zoomed:active img {
+  cursor: grabbing;
 }
 .lightbox-zoom-badge {
   position: absolute;
@@ -609,6 +612,7 @@ input[type=text], input[type=date], select, .path-input, .text-input, .model-sel
   <a href="/dashboard" {% if active_page == 'dashboard' %}class="active"{% endif %}>Dashboard</a>
   <a href="/settings" {% if active_page == 'settings' %}class="active"{% endif %}>Settings</a>
   <span class="nav-spacer"></span>
+  <span class="nav-icon" onclick="toggleDevMode()" title="Toggle developer mode" id="devModeToggle" style="opacity:0.4;">&#9881;</span>
   <span class="nav-icon" onclick="toggleTheme()" title="Toggle light/dark mode" id="themeToggle">&#9788;</span>
   <span class="nav-icon" onclick="toggleBottomPanel()" title="Toggle panel">
     &#9638;
@@ -622,7 +626,7 @@ input[type=text], input[type=date], select, .path-input, .text-input, .model-sel
   <span class="lightbox-close" onclick="closeLightbox(event)">&times;</span>
   <div onclick="event.stopPropagation(); lightboxNav(-1);" style="position:absolute;left:12px;top:50%;transform:translateY(-50%);font-size:36px;color:rgba(255,255,255,0.5);cursor:pointer;padding:16px;user-select:none;z-index:10001;" title="Previous (←)">&#9664;</div>
   <div onclick="event.stopPropagation(); lightboxNav(1);" style="position:absolute;right:12px;top:50%;transform:translateY(-50%);font-size:36px;color:rgba(255,255,255,0.5);cursor:pointer;padding:16px;user-select:none;z-index:10001;" title="Next (→)">&#9654;</div>
-  <div class="lightbox-img-wrap" id="lightboxWrap" onclick="event.stopPropagation(); toggleLightboxZoom(event);">
+  <div class="lightbox-img-wrap" id="lightboxWrap" onclick="event.stopPropagation(); if (!this.classList.contains('zoomed')) toggleLightboxZoom(event);">
     <span class="lightbox-zoom-badge" id="lightboxZoomBadge" style="display:none;">1:1</span>
     <img id="lightboxImg" src="" alt="">
   </div>
@@ -723,15 +727,17 @@ function toggleLightboxZoom(e) {
   }
 }
 
-// Drag to pan when zoomed
+// Drag to pan when zoomed; single click (no drag) zooms out
 (function() {
-  var wrap, dragging = false, startX, startY, scrollStartX, scrollStartY;
+  var wrap, dragging = false, didDrag = false, startX, startY, scrollStartX, scrollStartY;
+  var DRAG_THRESHOLD = 5; // px of movement before it counts as a drag
 
   document.addEventListener('mousedown', function(e) {
     wrap = document.getElementById('lightboxWrap');
     if (!wrap || !wrap.classList.contains('zoomed')) return;
     if (e.target.tagName === 'BUTTON' || e.target.closest('button')) return;
     dragging = true;
+    didDrag = false;
     startX = e.clientX;
     startY = e.clientY;
     scrollStartX = wrap.scrollLeft;
@@ -741,12 +747,22 @@ function toggleLightboxZoom(e) {
 
   document.addEventListener('mousemove', function(e) {
     if (!dragging) return;
-    wrap.scrollLeft = scrollStartX - (e.clientX - startX);
-    wrap.scrollTop = scrollStartY - (e.clientY - startY);
+    var dx = e.clientX - startX;
+    var dy = e.clientY - startY;
+    if (Math.abs(dx) > DRAG_THRESHOLD || Math.abs(dy) > DRAG_THRESHOLD) {
+      didDrag = true;
+    }
+    wrap.scrollLeft = scrollStartX - dx;
+    wrap.scrollTop = scrollStartY - dy;
   });
 
-  document.addEventListener('mouseup', function() {
+  document.addEventListener('mouseup', function(e) {
+    if (!dragging) return;
     dragging = false;
+    // Single click without dragging = zoom out
+    if (!didDrag && wrap && wrap.classList.contains('zoomed')) {
+      toggleLightboxZoom(e);
+    }
   });
 })();
 
@@ -1125,6 +1141,28 @@ function formatDuration(seconds) {
     btn.textContent = theme.icon;
     btn.title = 'Theme: ' + theme.name + ' (click to cycle)';
   }
+
+  // Dev mode system
+  (function() {
+    var on = localStorage.getItem('vireo_dev_mode') === 'true';
+    document.documentElement.setAttribute('data-dev-mode', on ? 'true' : 'false');
+    var btn = document.getElementById('devModeToggle');
+    if (btn) { btn.style.opacity = on ? '1' : '0.4'; btn.title = 'Developer mode: ' + (on ? 'ON' : 'OFF'); }
+  })();
+
+  window.isDevMode = function() {
+    return document.documentElement.getAttribute('data-dev-mode') === 'true';
+  };
+
+  window.toggleDevMode = function() {
+    var on = !isDevMode();
+    document.documentElement.setAttribute('data-dev-mode', on ? 'true' : 'false');
+    localStorage.setItem('vireo_dev_mode', on ? 'true' : 'false');
+    var btn = document.getElementById('devModeToggle');
+    if (btn) { btn.style.opacity = on ? '1' : '0.4'; btn.title = 'Developer mode: ' + (on ? 'ON' : 'OFF'); }
+    // Notify pages that may want to re-render
+    window.dispatchEvent(new Event('devmodechange'));
+  };
 
   function init() {
     // Restore panel state and height

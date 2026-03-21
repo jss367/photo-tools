@@ -126,6 +126,24 @@ body {
   cursor: text;
 }
 
+.dev-connector {
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  width: 48px;
+  font-size: 9px;
+  line-height: 1.4;
+  color: var(--text-dim, #888);
+  gap: 2px;
+}
+.dev-connector .dev-label { color: var(--text-ghost, #555); text-transform: uppercase; letter-spacing: 0.05em; }
+.dev-connector .dev-val { font-weight: 600; font-variant-numeric: tabular-nums; }
+.dev-connector .dev-val.similar { color: var(--accent, #24E5CA); }
+.dev-connector .dev-val.different { color: var(--danger, #e74c3c); }
+.dev-connector .dev-val.mid { color: #d4a843; }
+
 .action-bar {
   display: flex;
   gap: 12px;
@@ -154,7 +172,7 @@ body {
   <h2 style="margin-bottom:8px;font-size:20px;">Cull Photos</h2>
   <p style="font-size:13px;color:var(--text-dim,#888);margin-bottom:20px;">
     AI analyzes your photos to find redundant shots and suggest the best keepers.
-    Photos are grouped by species and pose — you keep the best of each unique moment.
+    Photos are grouped by species and scene — you keep the best of each unique moment.
   </p>
 
   <div class="action-bar">
@@ -176,6 +194,34 @@ body {
       <div>
         Don't compare across file types
         <div style="font-size:11px;color:var(--text-dim,#888);margin-top:2px;">RAW and JPEG of the same scene are culled separately. A JPEG usually means someone has processed it, so it shouldn't compete with the RAW original.</div>
+      </div>
+    </label>
+
+    <div style="margin-top:14px;font-size:13px;color:var(--text-secondary,#B0CCCC);">
+      <div style="display:flex;align-items:center;gap:12px;margin-bottom:4px;">
+        <label for="cullTimeWindow">Time window</label>
+        <input type="range" id="cullTimeWindow" min="5" max="600" value="60" step="5"
+          style="flex:1;max-width:200px;accent-color:var(--accent,#24E5CA);">
+        <span id="cullTimeValue" style="font-size:12px;min-width:60px;">60s</span>
+      </div>
+      <div style="font-size:11px;color:var(--text-dim,#888);">Photos taken within this window are grouped as the same scene.</div>
+    </div>
+
+    <div style="margin-top:14px;font-size:13px;color:var(--text-secondary,#B0CCCC);">
+      <div style="display:flex;align-items:center;gap:12px;margin-bottom:4px;">
+        <label for="cullPhashThreshold">Scene similarity</label>
+        <input type="range" id="cullPhashThreshold" min="0" max="32" value="19" step="1"
+          style="flex:1;max-width:200px;accent-color:var(--accent,#24E5CA);">
+        <span id="cullPhashValue" style="font-size:12px;min-width:80px;">Loose (19)</span>
+      </div>
+      <div style="font-size:11px;color:var(--text-dim,#888);">How visually similar photos must be to belong to the same scene. Lower = stricter matching, higher = more lenient.</div>
+    </div>
+
+    <label style="display:flex;align-items:start;gap:8px;font-size:13px;color:var(--text-secondary,#B0CCCC);cursor:pointer;margin-top:14px;">
+      <input type="checkbox" id="cullCrossBucket" style="accent-color:var(--accent,#24E5CA);margin-top:2px;">
+      <div>
+        Merge scenes that look similar even if taken far apart
+        <div style="font-size:11px;color:var(--text-dim,#888);margin-top:2px;">When enabled, scenes with visually similar photos are merged even if they were taken outside the time window (e.g. bird returned to same perch).</div>
       </div>
     </label>
   </div>
@@ -208,6 +254,278 @@ body {
 })();
 
 var cullData = null;
+// Track which species sections are expanded
+var expandedSpecies = {};
+
+// Update time window slider label
+document.getElementById('cullTimeWindow').addEventListener('input', function() {
+  var v = parseInt(this.value);
+  if (v >= 60) {
+    var m = Math.floor(v / 60), s = v % 60;
+    document.getElementById('cullTimeValue').textContent = s ? m + 'm ' + s + 's' : m + 'm';
+  } else {
+    document.getElementById('cullTimeValue').textContent = v + 's';
+  }
+});
+
+// Update phash slider label
+document.getElementById('cullPhashThreshold').addEventListener('input', function() {
+  var v = parseInt(this.value);
+  var label;
+  if (v === 0) label = 'Exact (0)';
+  else if (v <= 5) label = 'Strict (' + v + ')';
+  else if (v <= 12) label = 'Normal (' + v + ')';
+  else if (v <= 20) label = 'Loose (' + v + ')';
+  else label = 'Very loose (' + v + ')';
+  document.getElementById('cullPhashValue').textContent = label;
+});
+
+// --- pHash Hamming distance in JS ---
+function hexToBits(hex) {
+  // Convert hex string to array of 0/1 bits
+  var bits = [];
+  for (var i = 0; i < hex.length; i++) {
+    var nibble = parseInt(hex[i], 16);
+    bits.push((nibble >> 3) & 1, (nibble >> 2) & 1, (nibble >> 1) & 1, nibble & 1);
+  }
+  return bits;
+}
+
+function phashDistance(hexA, hexB) {
+  if (!hexA || !hexB || hexA.length !== hexB.length) return 999;
+  var dist = 0;
+  for (var i = 0; i < hexA.length; i++) {
+    var xor = parseInt(hexA[i], 16) ^ parseInt(hexB[i], 16);
+    // Count bits in the xor nibble
+    while (xor) { dist += xor & 1; xor >>= 1; }
+  }
+  return dist;
+}
+
+// --- Client-side scene grouping ---
+function regroupScenes() {
+  if (!cullData || !cullData.species_groups) return;
+
+  var timeWindow = parseInt(document.getElementById('cullTimeWindow').value) || 60;
+  var phashThreshold = parseInt(document.getElementById('cullPhashThreshold').value);
+  var crossBucket = document.getElementById('cullCrossBucket').checked;
+
+  var totalKeepers = 0, totalRejects = 0;
+
+  cullData.species_groups.forEach(function(sg) {
+    if (!sg.photos_data || !sg.redundancy_clusters) return;
+
+    var photos = sg.photos_data;
+    var pids = photos.map(function(p) { return p.photo_id; });
+
+    // Build lookups
+    var photoById = {};
+    photos.forEach(function(p) { photoById[p.photo_id] = p; });
+
+    // Carry over server-enriched fields (quality_score, sharpness) from existing scene_groups
+    var groups = sg.scene_groups || sg.pose_groups || [];
+    groups.forEach(function(g) {
+      g.photos.forEach(function(p) {
+        if (photoById[p.photo_id]) {
+          if (p.quality_score != null) photoById[p.photo_id].quality_score = p.quality_score;
+          if (p.sharpness != null) photoById[p.photo_id].sharpness = p.sharpness;
+        }
+      });
+    });
+
+    // Step 1: Time bucketing (single-linkage)
+    var withTs = photos
+      .filter(function(p) { return p.timestamp; })
+      .map(function(p) { return { pid: p.photo_id, ts: new Date(p.timestamp).getTime() / 1000 }; })
+      .sort(function(a, b) { return a.ts - b.ts; });
+
+    var withoutTs = photos.filter(function(p) { return !p.timestamp; }).map(function(p) { return p.photo_id; });
+
+    var timeBuckets = [];
+    if (withTs.length > 0) {
+      var curBucket = [withTs[0].pid];
+      var curTimes = [withTs[0].ts];
+      for (var i = 1; i < withTs.length; i++) {
+        var ts = withTs[i].ts;
+        var minGap = Infinity;
+        for (var j = 0; j < curTimes.length; j++) {
+          var gap = Math.abs(ts - curTimes[j]);
+          if (gap < minGap) minGap = gap;
+        }
+        if (minGap <= timeWindow) {
+          curBucket.push(withTs[i].pid);
+          curTimes.push(ts);
+        } else {
+          timeBuckets.push(curBucket);
+          curBucket = [withTs[i].pid];
+          curTimes = [ts];
+        }
+      }
+      timeBuckets.push(curBucket);
+    }
+    withoutTs.forEach(function(pid) { timeBuckets.push([pid]); });
+
+    // Step 2: pHash merge within each time bucket (single-linkage)
+    var mergedBuckets = [];
+    timeBuckets.forEach(function(bucket) {
+      var clusters = phashMerge(bucket, photoById, phashThreshold);
+      clusters.forEach(function(c) { mergedBuckets.push(c); });
+    });
+
+    // Step 3: Cross-bucket merge by pHash
+    if (crossBucket && mergedBuckets.length > 1) {
+      mergedBuckets = mergeBucketsByPhash(mergedBuckets, photoById, phashThreshold);
+    }
+
+    // Build scene groups with keep/reject from redundancy clusters
+    var rcMap = {};  // pid -> cluster index
+    sg.redundancy_clusters.forEach(function(cluster, ci) {
+      cluster.forEach(function(pid) { rcMap[pid] = ci; });
+    });
+
+    var sceneGroups = [];
+    var sgKeepers = 0, sgRejects = 0;
+
+    mergedBuckets.forEach(function(scenePids, sceneId) {
+      // Group by redundancy cluster within this scene
+      var rcGroups = {};
+      scenePids.forEach(function(pid) {
+        var rc = rcMap[pid] !== undefined ? rcMap[pid] : 'solo_' + pid;
+        if (!rcGroups[rc]) rcGroups[rc] = [];
+        rcGroups[rc].push(pid);
+      });
+
+      var photosInScene = [];
+      Object.keys(rcGroups).forEach(function(rc) {
+        var ranked = rcGroups[rc].sort(function(a, b) {
+          return (photoById[b] ? photoById[b].quality : 0) - (photoById[a] ? photoById[a].quality : 0);
+        });
+        ranked.forEach(function(pid, idx) {
+          var p = photoById[pid] || {};
+          photosInScene.push({
+            photo_id: pid,
+            quality: p.quality || 0,
+            quality_score: p.quality_score != null ? p.quality_score : null,
+            sharpness: p.sharpness != null ? p.sharpness : null,
+            filename: p.filename || '',
+            action: idx === 0 ? 'keep' : 'reject',
+            redundant_with: idx > 0 ? ranked[0] : null,
+          });
+        });
+      });
+
+      // Sort by filename for burst order
+      photosInScene.sort(function(a, b) { return (a.filename || '').localeCompare(b.filename || ''); });
+
+      // Build label
+      var label = buildSceneLabel(sceneId, scenePids, photoById);
+
+      sceneGroups.push({ scene_id: sceneId, label: label, photos: photosInScene });
+      sgKeepers += photosInScene.filter(function(p) { return p.action === 'keep'; }).length;
+      sgRejects += photosInScene.filter(function(p) { return p.action === 'reject'; }).length;
+    });
+
+    sg.scene_groups = sceneGroups;
+    sg.keepers = sgKeepers;
+    sg.rejects = sgRejects;
+    totalKeepers += sgKeepers;
+    totalRejects += sgRejects;
+  });
+
+  cullData.suggested_keepers = totalKeepers;
+  cullData.suggested_rejects = totalRejects;
+  renderCulling();
+}
+
+function phashMerge(pids, photoById, threshold) {
+  if (pids.length <= 1) return [pids];
+  var clusters = [[pids[0]]];
+  for (var i = 1; i < pids.length; i++) {
+    var pid = pids[i];
+    var ph = photoById[pid] ? photoById[pid].phash : null;
+    if (!ph) { clusters.push([pid]); continue; }
+    var placed = false;
+    for (var ci = 0; ci < clusters.length; ci++) {
+      for (var mi = 0; mi < clusters[ci].length; mi++) {
+        var mph = photoById[clusters[ci][mi]] ? photoById[clusters[ci][mi]].phash : null;
+        if (!mph) continue;
+        if (phashDistance(ph, mph) <= threshold) {
+          clusters[ci].push(pid);
+          placed = true;
+          break;
+        }
+      }
+      if (placed) break;
+    }
+    if (!placed) clusters.push([pid]);
+  }
+  return clusters;
+}
+
+function mergeBucketsByPhash(buckets, photoById, threshold) {
+  var parent = [];
+  for (var i = 0; i < buckets.length; i++) parent.push(i);
+  function find(x) { while (parent[x] !== x) { parent[x] = parent[parent[x]]; x = parent[x]; } return x; }
+  function union(a, b) { var ra = find(a), rb = find(b); if (ra !== rb) parent[rb] = ra; }
+
+  for (var i = 0; i < buckets.length; i++) {
+    for (var j = i + 1; j < buckets.length; j++) {
+      if (find(i) === find(j)) continue;
+      var matched = false;
+      for (var ai = 0; ai < buckets[i].length && !matched; ai++) {
+        var phi = photoById[buckets[i][ai]] ? photoById[buckets[i][ai]].phash : null;
+        if (!phi) continue;
+        for (var bj = 0; bj < buckets[j].length; bj++) {
+          var phj = photoById[buckets[j][bj]] ? photoById[buckets[j][bj]].phash : null;
+          if (!phj) continue;
+          if (phashDistance(phi, phj) <= threshold) {
+            union(i, j);
+            matched = true;
+            break;
+          }
+        }
+      }
+    }
+  }
+
+  var groups = {};
+  for (var i = 0; i < buckets.length; i++) {
+    var root = find(i);
+    if (!groups[root]) groups[root] = [];
+    buckets[i].forEach(function(pid) { groups[root].push(pid); });
+  }
+  return Object.keys(groups).map(function(k) { return groups[k]; });
+}
+
+function buildSceneLabel(sceneId, pids, photoById) {
+  var times = [];
+  pids.forEach(function(pid) {
+    var p = photoById[pid];
+    if (p && p.timestamp) times.push(new Date(p.timestamp));
+  });
+  times.sort(function(a, b) { return a - b; });
+  var num = sceneId + 1;
+  var count = pids.length;
+  if (times.length > 0) {
+    var fmt = function(d) { return d.toTimeString().split(' ')[0]; };
+    var start = fmt(times[0]);
+    var end = fmt(times[times.length - 1]);
+    if (start === end) return 'Scene ' + num + ' \u2014 ' + start + ' (' + count + ' photos)';
+    return 'Scene ' + num + ' \u2014 ' + start + ' to ' + end + ' (' + count + ' photos)';
+  }
+  return 'Scene ' + num + ' (' + count + ' photos)';
+}
+
+// --- Wire up settings to live-regroup ---
+var _regroupTimer = null;
+function debouncedRegroup() {
+  clearTimeout(_regroupTimer);
+  _regroupTimer = setTimeout(regroupScenes, 150);
+}
+document.getElementById('cullTimeWindow').addEventListener('input', debouncedRegroup);
+document.getElementById('cullPhashThreshold').addEventListener('input', debouncedRegroup);
+document.getElementById('cullCrossBucket').addEventListener('change', regroupScenes);
+window.addEventListener('devmodechange', function() { if (cullData) renderCulling(); });
 
 function toggleCullSettings() {
   var panel = document.getElementById('cullSettings');
@@ -227,6 +545,9 @@ async function runCulling() {
       body: JSON.stringify({
         collection_id: collId ? parseInt(collId) : null,
         separate_file_types: separateTypes,
+        time_window: parseInt(document.getElementById('cullTimeWindow').value) || 60,
+        phash_threshold: parseInt(document.getElementById('cullPhashThreshold').value),
+        cross_bucket_merge: document.getElementById('cullCrossBucket').checked,
       }),
     });
     var data = await resp.json();
@@ -294,12 +615,15 @@ function renderCulling() {
     html += '<span class="species-reject">' + rejectCount + ' reject</span>';
     html += '</span></div>';
 
-    html += '<div class="species-body" id="speciesBody' + si + '" style="display:none;">';
+    var isExpanded = expandedSpecies[si];
+    html += '<div class="species-body" id="speciesBody' + si + '" style="display:' + (isExpanded ? '' : 'none') + ';">';
 
-    sg.pose_groups.forEach(function(pg, pi) {
+    var groups = sg.scene_groups || sg.pose_groups || [];
+    groups.forEach(function(pg, pi) {
       html += '<div class="pose-group">';
-      if (sg.pose_groups.length > 1) {
-        html += '<div class="pose-label">Pose ' + (pi + 1) + ' (' + pg.photos.length + ' photos)</div>';
+      if (groups.length > 1) {
+        var groupLabel = pg.label || ('Scene ' + (pi + 1) + ' (' + pg.photos.length + ' photos)');
+        html += '<div class="pose-label">' + escapeHtml(groupLabel) + '</div>';
       }
 
       // Store photo list for lightbox navigation
@@ -307,7 +631,36 @@ function renderCulling() {
       window[poseKey] = pg.photos.map(function(p) { return {id: p.photo_id, filename: p.filename || ''}; });
 
       html += '<div class="pose-strip">';
-      pg.photos.forEach(function(photo) {
+      var devMode = typeof isDevMode === 'function' && isDevMode();
+      var photoById = {};
+      if (devMode && sg.photos_data) {
+        sg.photos_data.forEach(function(p) { photoById[p.photo_id] = p; });
+      }
+      var embSims = sg.embedding_sims || {};
+
+      pg.photos.forEach(function(photo, photoIdx) {
+        // Dev mode: show similarity connector between adjacent cards
+        if (devMode && photoIdx > 0) {
+          var prevId = pg.photos[photoIdx - 1].photo_id;
+          var curId = photo.photo_id;
+          var pA = photoById[prevId], pB = photoById[curId];
+          // pHash distance
+          var phDist = '-';
+          if (pA && pB && pA.phash && pB.phash) {
+            phDist = phashDistance(pA.phash, pB.phash);
+          }
+          // Embedding similarity
+          var embKey = Math.min(prevId, curId) + '-' + Math.max(prevId, curId);
+          var embSim = embSims[embKey] != null ? embSims[embKey] : '-';
+          // Color classes
+          var phClass = phDist === '-' ? '' : (phDist <= 10 ? 'similar' : phDist >= 20 ? 'different' : 'mid');
+          var emClass = embSim === '-' ? '' : (embSim >= 0.88 ? 'similar' : embSim <= 0.7 ? 'different' : 'mid');
+          html += '<div class="dev-connector">' +
+            '<div class="dev-label">pH</div><div class="dev-val ' + phClass + '">' + phDist + '</div>' +
+            '<div class="dev-label">emb</div><div class="dev-val ' + emClass + '">' + (typeof embSim === 'number' ? embSim.toFixed(2) : embSim) + '</div>' +
+          '</div>';
+        }
+
         var cardClass = 'cull-card ' + photo.action;
         if (photo.action === 'keep' && photo.quality === pg.photos[0].quality) {
           cardClass += ' best';
@@ -337,20 +690,22 @@ function renderCulling() {
 
   document.getElementById('cullContent').innerHTML = html;
 
-  // Auto-expand first species
-  if (cullData.species_groups.length > 0) {
-    toggleSpecies(0);
+  // Auto-expand first species if nothing expanded yet
+  if (Object.keys(expandedSpecies).length === 0 && cullData.species_groups.length > 0) {
+    expandedSpecies[0] = true;
   }
 }
 
 function toggleSpecies(idx) {
+  expandedSpecies[idx] = !expandedSpecies[idx];
   var body = document.getElementById('speciesBody' + idx);
   body.style.display = body.style.display === 'none' ? '' : 'none';
 }
 
 function toggleCullAction(speciesIdx, poseIdx, photoId) {
   var sg = cullData.species_groups[speciesIdx];
-  var pg = sg.pose_groups[poseIdx];
+  var groups = sg.scene_groups || sg.pose_groups || [];
+  var pg = groups[poseIdx];
   var photo = pg.photos.find(function(p) { return p.photo_id === photoId; });
   if (!photo) return;
 
@@ -377,7 +732,8 @@ async function applyCulling() {
   var keepers = [];
   var rejects = [];
   cullData.species_groups.forEach(function(sg) {
-    sg.pose_groups.forEach(function(pg) {
+    var groups = sg.scene_groups || sg.pose_groups || [];
+    groups.forEach(function(pg) {
       pg.photos.forEach(function(p) {
         if (p.action === 'keep') keepers.push(p.photo_id);
         else if (p.action === 'reject') rejects.push(p.photo_id);

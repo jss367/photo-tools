@@ -64,7 +64,7 @@ body {
   font-size: 24px; font-weight: 700; color: #24E5CA; font-variant-numeric: tabular-nums;
 }
 .stat-label { font-size: 11px; color: #888; margin-top: 4px; }
-#pendingCard:hover { background: #1A4560; }
+#pendingCard:hover, #folderCard:hover { background: #1A4560; }
 
 .modal-overlay {
   display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%;
@@ -128,9 +128,9 @@ body {
         <div class="stat-number" id="photoCount">-</div>
         <div class="stat-label">Photos</div>
       </div>
-      <div class="stat-card">
+      <div class="stat-card" id="folderCard" style="cursor:pointer;" onclick="toggleFolderDetail()">
         <div class="stat-number" id="folderCount">-</div>
-        <div class="stat-label">Folders</div>
+        <div class="stat-label">Folders &#9662;</div>
       </div>
       <div class="stat-card">
         <div class="stat-number" id="keywordCount">-</div>
@@ -141,6 +141,7 @@ body {
         <div class="stat-label">Pending Sync &#9662;</div>
       </div>
     </div>
+    <div id="folderDetail" style="display:none;margin-top:16px;border-top:1px solid #14374E;padding-top:16px;"></div>
     <div id="pendingDetail" style="display:none;margin-top:16px;border-top:1px solid #14374E;padding-top:16px;"></div>
   </div>
 
@@ -490,6 +491,42 @@ async function loadDashboard() {
   } catch(e) {}
 }
 
+var folderOpen = false;
+async function toggleFolderDetail() {
+  var panel = document.getElementById('folderDetail');
+  if (folderOpen) {
+    panel.style.display = 'none';
+    folderOpen = false;
+    return;
+  }
+  panel.style.display = 'block';
+  panel.innerHTML = '<span style="color:#555;font-size:13px;">Loading...</span>';
+  folderOpen = true;
+  try {
+    var resp = await fetch('/api/folders');
+    var folders = await resp.json();
+    if (folders.length === 0) {
+      panel.innerHTML = '<span style="color:#555;font-size:13px;">No folders scanned yet.</span>';
+      return;
+    }
+    var html = '';
+    folders.forEach(function(f) {
+      if (f.photo_count === 0) return;
+      html += '<div style="display:flex;justify-content:space-between;align-items:center;padding:6px 0;border-bottom:1px solid #14374E;font-size:12px;">' +
+        '<span style="color:#B0CCCC;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;margin-right:12px;" title="' + escapeHtml(f.path) + '">' + escapeHtml(f.path) + '</span>' +
+        '<span style="color:#888;font-variant-numeric:tabular-nums;flex-shrink:0;">' + f.photo_count.toLocaleString() + ' photos</span>' +
+      '</div>';
+    });
+    if (!html) {
+      panel.innerHTML = '<span style="color:#555;font-size:13px;">No folders with photos.</span>';
+      return;
+    }
+    panel.innerHTML = html;
+  } catch(e) {
+    panel.innerHTML = '<span style="color:#e74c3c;font-size:12px;">Failed to load folders.</span>';
+  }
+}
+
 var pendingOpen = false;
 async function togglePendingDetail() {
   var panel = document.getElementById('pendingDetail');
@@ -607,9 +644,17 @@ async function openStorageModal(type) {
 
     var html = '';
     _modalFiles.forEach(function(f, i) {
+      var displayName = escapeHtml(f.name);
+      if (f.meta) {
+        displayName = escapeHtml(f.meta.model || 'Unknown model') +
+          ' <span style="color:#666;">\u00b7 ' + (f.meta.label_count || '?') + ' labels</span>';
+        if (f.meta.created) {
+          displayName += ' <span style="color:#555;">\u00b7 ' + escapeHtml(f.meta.created.split('T')[0]) + '</span>';
+        }
+      }
       html += '<li class="file-item">' +
         '<input type="checkbox" id="fc' + i + '" onchange="updateSelectedInfo()">' +
-        '<label for="fc' + i + '">' + escapeHtml(f.name) + '</label>' +
+        '<label for="fc' + i + '">' + displayName + '</label>' +
         '<span class="file-size">' + formatBytes(f.size) + '</span>' +
       '</li>';
     });

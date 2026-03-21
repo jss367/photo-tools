@@ -54,6 +54,7 @@ class Database:
                 embedding BLOB,
                 latitude REAL,
                 longitude REAL,
+                phash TEXT,
                 UNIQUE(folder_id, filename)
             );
 
@@ -149,6 +150,10 @@ class Database:
         except Exception:
             self.conn.execute("ALTER TABLE photos ADD COLUMN latitude REAL")
             self.conn.execute("ALTER TABLE photos ADD COLUMN longitude REAL")
+        try:
+            self.conn.execute("SELECT phash FROM photos LIMIT 0")
+        except Exception:
+            self.conn.execute("ALTER TABLE photos ADD COLUMN phash TEXT")
         try:
             self.conn.execute("SELECT taxonomy_kingdom FROM predictions LIMIT 0")
         except Exception:

@@ -1,6 +1,7 @@
 backports.tarfile
 flask
 huggingface_hub
+imagehash
 lightning
 numpy
 omegaconf

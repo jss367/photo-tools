@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 from xml.etree import ElementTree as ET
 
+import imagehash
 from PIL import Image
 
 from compare import read_xmp_keywords
@@ -185,6 +186,14 @@ def scan(root, db, progress_callback=None, incremental=False):
         except Exception:
             log.debug("Could not read dimensions from %s", image_path)
 
+        # Compute perceptual hash
+        phash = None
+        try:
+            with Image.open(str(image_path)) as img:
+                phash = str(imagehash.phash(img))
+        except Exception:
+            log.debug("Could not compute pHash for %s", image_path)
+
         # Read EXIF timestamp
         timestamp = None
         try:
@@ -226,11 +235,20 @@ def scan(root, db, progress_callback=None, incremental=False):
             height=height,
         )
 
-        # Store GPS if found
+        # Store GPS and pHash if found
+        updates = []
+        update_params = []
         if latitude is not None:
+            updates.extend(["latitude=?", "longitude=?"])
+            update_params.extend([latitude, longitude])
+        if phash is not None:
+            updates.append("phash=?")
+            update_params.append(phash)
+        if updates:
+            update_params.append(photo_id)
             db.conn.execute(
-                "UPDATE photos SET latitude=?, longitude=? WHERE id=?",
-                (latitude, longitude, photo_id),
+                f"UPDATE photos SET {', '.join(updates)} WHERE id=?",
+                update_params,
             )
             db.conn.commit()
 

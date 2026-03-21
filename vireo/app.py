@@ -1186,14 +1186,21 @@ def create_app(db_path, thumb_cache_dir=None):
         if not cache_dir:
             return jsonify({"error": "Unknown cache type"}), 400
 
+        # Load embedding manifest for display names
+        manifest = {}
+        if cache_type == "embeddings":
+            from classifier import _load_manifest
+            manifest = _load_manifest()
+
         files = []
         if os.path.isdir(cache_dir):
             for f in sorted(os.listdir(cache_dir)):
                 fp = os.path.join(cache_dir, f)
-                if os.path.isfile(fp):
-                    files.append(
-                        {"name": f, "size": os.path.getsize(fp)}
-                    )
+                if os.path.isfile(fp) and f != "manifest.json":
+                    entry = {"name": f, "size": os.path.getsize(fp)}
+                    if f in manifest:
+                        entry["meta"] = manifest[f]
+                    files.append(entry)
         return jsonify({"type": cache_type, "path": cache_dir, "files": files})
 
     @app.route("/api/storage/clear", methods=["POST"])
@@ -1926,8 +1933,8 @@ def create_app(db_path, thumb_cache_dir=None):
 
         import config as cfg
 
-        tmp_prefix = tempfile.gettempdir()
-        if not root.startswith(tmp_prefix):
+        tmp_prefix = os.path.realpath(tempfile.gettempdir())
+        if not os.path.realpath(root).startswith(tmp_prefix):
             user_cfg = cfg.load()
             roots = user_cfg.get("scan_roots", [])
             if root not in roots:
@@ -1963,6 +1970,7 @@ def create_app(db_path, thumb_cache_dir=None):
             do_scan(
                 root, thread_db, progress_callback=progress_cb, incremental=incremental
             )
+            photo_count = job["progress"].get("total", 0)
 
             # Auto-generate thumbnails for new photos only
             from thumbnails import generate_all
@@ -3153,6 +3161,9 @@ def create_app(db_path, thumb_cache_dir=None):
         body = request.get_json(silent=True) or {}
         collection_id = body.get("collection_id")
         separate_file_types = body.get("separate_file_types", True)
+        time_window = body.get("time_window", 60)
+        phash_threshold = body.get("phash_threshold", 19)
+        cross_bucket_merge = body.get("cross_bucket_merge", False)
 
         runner = app._job_runner
 
@@ -3160,22 +3171,30 @@ def create_app(db_path, thumb_cache_dir=None):
             from culling import analyze_for_culling
 
             thread_db = Database(db_path)
-            runner.push_event(
-                job["id"],
-                "progress",
-                {
-                    "current": 0,
-                    "total": 0,
-                    "current_file": "Analyzing photos for culling...",
-                    "rate": 0,
-                    "phase": "Culling analysis",
-                },
-            )
+
+            def progress_cb(msg):
+                runner.push_event(
+                    job["id"],
+                    "progress",
+                    {
+                        "current": 0,
+                        "total": 0,
+                        "current_file": msg,
+                        "rate": 0,
+                        "phase": "Culling analysis",
+                    },
+                )
+
+            progress_cb("Analyzing photos for culling...")
 
             result = analyze_for_culling(
                 thread_db,
                 collection_id=collection_id,
                 separate_file_types=separate_file_types,
+                time_window=time_window,
+                phash_threshold=phash_threshold,
+                cross_bucket_merge=cross_bucket_merge,
+                progress_callback=progress_cb,
             )
 
             # Store culling results in a temporary cache for the UI
@@ -3212,7 +3231,7 @@ def create_app(db_path, thumb_cache_dir=None):
         # Enrich with photo metadata for the UI
         db = _get_db()
         for sg in results["species_groups"]:
-            for pg in sg["pose_groups"]:
+            for pg in sg.get("scene_groups", sg.get("pose_groups", [])):
                 for photo in pg["photos"]:
                     p = db.get_photo(photo["photo_id"])
                     if p:

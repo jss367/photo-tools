@@ -913,8 +913,11 @@ class Database:
     def mark_species_keywords(self, taxonomy):
         """Mark keywords that are recognized species in the taxonomy.
 
+        Tries local taxonomy first, then falls back to the iNaturalist API
+        for alternate/regional names (e.g. "Grey Plover" -> "Black-bellied Plover").
+
         Args:
-            taxonomy: a Taxonomy instance with is_taxon() method
+            taxonomy: a Taxonomy instance with is_taxon() and api_lookup() methods
         """
         keywords = self.conn.execute(
             "SELECT id, name FROM keywords WHERE is_species = 0"
@@ -926,8 +929,16 @@ class Database:
                     "UPDATE keywords SET is_species = 1 WHERE id = ?", (kw["id"],)
                 )
                 updated += 1
+            elif hasattr(taxonomy, "api_lookup") and taxonomy.api_lookup(kw["name"]):
+                self.conn.execute(
+                    "UPDATE keywords SET is_species = 1 WHERE id = ?", (kw["id"],)
+                )
+                updated += 1
         if updated:
             self.conn.commit()
+        # Persist any newly discovered alternate names
+        if hasattr(taxonomy, "save"):
+            taxonomy.save()
         return updated
 
     def create_default_collections(self):

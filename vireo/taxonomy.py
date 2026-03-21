@@ -10,6 +10,7 @@ import io
 import json
 import logging
 import os
+import urllib.parse
 import zipfile
 from datetime import date
 
@@ -38,10 +39,12 @@ class Taxonomy:
     """
 
     def __init__(self, taxonomy_path):
+        self._path = taxonomy_path
         with open(taxonomy_path) as f:
             data = json.load(f)
         self._by_common = data.get("taxa_by_common", {})
         self._by_scientific = data.get("taxa_by_scientific", {})
+        self._api_misses = set(data.get("api_misses", []))
         self.last_updated = data.get("last_updated")
         self.taxa_count = len(self._by_common) + len(self._by_scientific)
         # Build normalized index for fuzzy lookups (handles hyphens, etc.)
@@ -50,6 +53,8 @@ class Taxonomy:
             nk = self._normalize(key)
             if nk not in self._by_common_normalized:
                 self._by_common_normalized[nk] = val
+        # Track whether new data was added (for save)
+        self._dirty = False
         log.info(
             "Loaded taxonomy: %d entries (updated %s)",
             self.taxa_count,
@@ -87,6 +92,75 @@ class Taxonomy:
     def is_taxon(self, name):
         """Check if a name is a recognized taxon."""
         return self.lookup(name) is not None
+
+    def api_lookup(self, name):
+        """Look up a name via the iNaturalist API (handles alternate/regional names).
+
+        Queries the autocomplete endpoint which matches against all known
+        common names, not just the preferred one. If a match is found, the
+        alternate name is cached locally so future lookups are instant.
+        Names that don't match are also cached to avoid repeated API calls.
+
+        Returns:
+            taxon dict (same shape as lookup()), or None
+        """
+        # Skip names we've already tried and failed to resolve
+        norm_name = self._normalize(name)
+        if norm_name in self._api_misses:
+            return None
+
+        import urllib.request
+
+        try:
+            q = urllib.parse.quote(name)
+            url = f"https://api.inaturalist.org/v1/taxa/autocomplete?q={q}&per_page=5&rank=species,subspecies,genus,family,order,class,phylum,kingdom"
+            req = urllib.request.Request(url)
+            req.add_header("User-Agent", "vireo-taxonomy/1.0")
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read())
+        except Exception:
+            log.debug("iNat API lookup failed for '%s'", name, exc_info=True)
+            return None
+
+        # Find a result where the matched_term matches our query
+        for result in data.get("results", []):
+            matched = result.get("matched_term", "")
+            if self._normalize(matched) != norm_name:
+                continue
+            # Found a match — look up by the taxon's scientific name first
+            sci = result.get("name", "").lower()
+            existing = self._by_scientific.get(sci)
+            if existing:
+                # Cache this alternate name for future lookups
+                alt_key = name.lower().strip()
+                self._by_common[alt_key] = existing
+                self._by_common_normalized[norm_name] = existing
+                self._dirty = True
+                log.info(
+                    "Resolved alternate name '%s' -> '%s' (%s) via iNat API",
+                    name,
+                    existing.get("common_name"),
+                    existing.get("scientific_name"),
+                )
+                return existing
+
+        # No match — remember this so we don't ask again
+        self._api_misses.add(norm_name)
+        self._dirty = True
+        return None
+
+    def save(self):
+        """Persist any newly discovered alternate names and misses back to taxonomy.json."""
+        if not self._dirty:
+            return
+        with open(self._path) as f:
+            data = json.load(f)
+        data["taxa_by_common"] = self._by_common
+        data["api_misses"] = sorted(self._api_misses)
+        with open(self._path, "w") as f:
+            json.dump(data, f)
+        self._dirty = False
+        log.info("Saved updated taxonomy with new alternate names")
 
     def get_hierarchy(self, name):
         """Look up a species and return its full hierarchy as a flat dict.

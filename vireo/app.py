@@ -634,12 +634,64 @@ def create_app(db_path, thumb_cache_dir=None):
         """
         ).fetchall()
 
+        # Classification status breakdown
+        prediction_status = db.conn.execute(
+            """
+            SELECT status, COUNT(*) as count
+            FROM predictions
+            GROUP BY status
+        """
+        ).fetchall()
+
+        # Unclassified photos (no prediction at all)
+        total_photos = db.count_photos()
+        classified_count = db.conn.execute(
+            "SELECT COUNT(DISTINCT photo_id) FROM predictions"
+        ).fetchone()[0]
+
+        # Photos by hour of day
+        photos_by_hour = db.conn.execute(
+            """
+            SELECT CAST(substr(timestamp, 12, 2) AS INTEGER) as hour, COUNT(*) as count
+            FROM photos
+            WHERE timestamp IS NOT NULL AND length(timestamp) >= 13
+            GROUP BY hour
+            ORDER BY hour
+        """
+        ).fetchall()
+
+        # Quality score distribution (buckets of 0.1)
+        quality_dist = db.conn.execute(
+            """
+            SELECT
+                CASE
+                    WHEN quality_score IS NULL THEN -1
+                    ELSE CAST(quality_score * 10 AS INTEGER)
+                END as bucket,
+                COUNT(*) as count
+            FROM photos
+            GROUP BY bucket
+            ORDER BY bucket
+        """
+        ).fetchall()
+
+        # Subject detection coverage
+        detected_count = db.conn.execute(
+            "SELECT COUNT(*) FROM photos WHERE detection_conf IS NOT NULL AND detection_conf > 0"
+        ).fetchone()[0]
+
         return jsonify(
             {
                 "top_keywords": [dict(r) for r in top_keywords],
                 "photos_by_month": [dict(r) for r in photos_by_month],
                 "rating_distribution": [dict(r) for r in rating_dist],
                 "flag_distribution": [dict(r) for r in flag_dist],
+                "prediction_status": [dict(r) for r in prediction_status],
+                "classified_count": classified_count,
+                "total_photos": total_photos,
+                "photos_by_hour": [dict(r) for r in photos_by_hour],
+                "quality_distribution": [dict(r) for r in quality_dist],
+                "detected_count": detected_count,
             }
         )
 

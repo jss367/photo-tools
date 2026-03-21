@@ -548,7 +548,7 @@
       <span id="confFilterVal" style="min-width:28px;">0%</span>
     </label>
   </div>
-  <span class="kbd-hint">Keyboard: A = accept, S = skip</span>
+  <span class="kbd-hint" id="kbdHintReview">Keyboard: A = accept, S = skip</span>
   <span style="margin-left:auto;">
     <a href="/classify" style="color:#555;font-size:12px;text-decoration:none;">Back to Classify</a>
   </span>
@@ -585,6 +585,20 @@ var availableModels = [];
 var collectionPhotoIds = null;  // null = no filter
 var thumbSize = 400;
 var mode = 'review';
+
+var _shortcuts = null;
+(async function() {
+  try {
+    var resp = await fetch('/api/config');
+    var cfg = await resp.json();
+    _shortcuts = (cfg.keyboard_shortcuts || {}).review || {accept: 'a', skip: 's'};
+    window._vireoShortcuts = cfg.keyboard_shortcuts || {};
+    var el = document.getElementById('kbdHintReview');
+    if (el && _shortcuts) el.textContent = 'Keyboard: ' + formatShortcut(_shortcuts.accept) + ' = accept, ' + formatShortcut(_shortcuts.skip) + ' = skip';
+  } catch(e) {
+    _shortcuts = {accept: 'a', skip: 's'};
+  }
+})();
 
 function setMinConfidence(val) {
   minConfidence = val;
@@ -1018,10 +1032,11 @@ async function acceptAllPending() {
 document.addEventListener('keydown', function(e) {
   if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA' || e.target.tagName === 'SELECT') return;
   if (mode !== 'review') return;
+  if (!_shortcuts) return;
   var pending = predictions.filter(function(p) { return p.status === 'pending'; });
   if (pending.length === 0) return;
-  if (e.key === 'a' || e.key === 'A') { e.preventDefault(); acceptPrediction(pending[0].id); }
-  else if (e.key === 's' || e.key === 'S') { e.preventDefault(); rejectPrediction(pending[0].id); }
+  if (matchesShortcut(e, _shortcuts.accept)) { e.preventDefault(); acceptPrediction(pending[0].id); }
+  else if (matchesShortcut(e, _shortcuts.skip)) { e.preventDefault(); rejectPrediction(pending[0].id); }
 });
 
 /* ---------- Settings ---------- */

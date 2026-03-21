@@ -122,6 +122,8 @@ body {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  user-select: text;
+  cursor: text;
 }
 
 .action-bar {
@@ -160,10 +162,22 @@ body {
       <option value="">All photos</option>
     </select>
     <button class="btn btn-primary" onclick="runCulling()">Analyze for Culling</button>
+    <button class="btn btn-secondary" onclick="toggleCullSettings()" id="cullSettingsBtn" style="font-size:12px;">Settings &#9662;</button>
     <span id="cullStatus" style="font-size:12px;color:var(--text-dim,#888);"></span>
     <button class="btn btn-primary" id="applyBtn" onclick="applyCulling()" style="display:none;margin-left:auto;">
       Apply Culling Decisions
     </button>
+  </div>
+
+  <div id="cullSettings" style="display:none;background:var(--bg-secondary,#0E2A3D);border:1px solid var(--border-primary,#14374E);border-radius:8px;padding:16px;margin-bottom:16px;">
+    <div style="font-size:13px;color:var(--text-primary,#E0F0F0);font-weight:500;margin-bottom:12px;">Culling Settings</div>
+    <label style="display:flex;align-items:start;gap:8px;font-size:13px;color:var(--text-secondary,#B0CCCC);cursor:pointer;">
+      <input type="checkbox" id="cullSeparateTypes" checked style="accent-color:var(--accent,#24E5CA);margin-top:2px;">
+      <div>
+        Don't compare across file types
+        <div style="font-size:11px;color:var(--text-dim,#888);margin-top:2px;">RAW and JPEG of the same scene are culled separately. A JPEG usually means someone has processed it, so it shouldn't compete with the RAW original.</div>
+      </div>
+    </label>
   </div>
 
   <div id="cullSummary" style="display:none;"></div>
@@ -195,8 +209,14 @@ body {
 
 var cullData = null;
 
+function toggleCullSettings() {
+  var panel = document.getElementById('cullSettings');
+  panel.style.display = panel.style.display === 'none' ? '' : 'none';
+}
+
 async function runCulling() {
   var collId = document.getElementById('cullCollection').value;
+  var separateTypes = document.getElementById('cullSeparateTypes').checked;
   var status = document.getElementById('cullStatus');
   status.textContent = 'Analyzing...';
 
@@ -204,7 +224,10 @@ async function runCulling() {
     var resp = await fetch('/api/jobs/cull', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({collection_id: collId ? parseInt(collId) : null}),
+      body: JSON.stringify({
+        collection_id: collId ? parseInt(collId) : null,
+        separate_file_types: separateTypes,
+      }),
     });
     var data = await resp.json();
 
@@ -302,7 +325,7 @@ function renderCulling() {
           '<img src="/thumbnails/' + photo.photo_id + '.jpg" loading="lazy">' +
           '<div class="cull-card-info">' +
             '<div class="cull-quality">Q: ' + qScore + '</div>' +
-            '<div class="cull-filename">' + escapeHtml(photo.filename || '') + '</div>' +
+            '<div class="cull-filename" onclick="event.stopPropagation()" onmousedown="event.stopPropagation()">' + escapeHtml(photo.filename || '') + '</div>' +
           '</div>' +
         '</div>';
       });

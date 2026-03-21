@@ -567,6 +567,21 @@ var filterRating = 0;
 var activeFolderId = null;
 var activeKeyword = null;
 
+var _shortcuts = null;
+(async function() {
+  try {
+    var resp = await fetch('/api/config');
+    var cfg = await resp.json();
+    _shortcuts = (cfg.keyboard_shortcuts || {}).browse || {
+      rate_0:'0',rate_1:'1',rate_2:'2',rate_3:'3',rate_4:'4',rate_5:'5',
+      flag:'p',reject:'x',unflag:'u',undo:'ctrl+z',select_all:'ctrl+a',zoom:'z'};
+    window._vireoShortcuts = cfg.keyboard_shortcuts || {};
+  } catch(e) {
+    _shortcuts = {rate_0:'0',rate_1:'1',rate_2:'2',rate_3:'3',rate_4:'4',rate_5:'5',
+      flag:'p',reject:'x',unflag:'u',undo:'ctrl+z',select_all:'ctrl+a',zoom:'z'};
+  }
+})();
+
 /* ---------- Bootstrap ---------- */
 bootstrapBrowse();
 
@@ -1350,15 +1365,23 @@ async function removeKeyword(photoId, keywordId) {
 document.addEventListener('keydown', function(e) {
   if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA' || e.target.tagName === 'SELECT') return;
 
-  // Ctrl+Z / Cmd+Z: undo
-  if ((e.ctrlKey || e.metaKey) && e.key === 'z') {
+  if (e.key === 'Escape') {
+    closeDetail();
+    clearSelection();
+    return;
+  }
+
+  if (!_shortcuts) return;
+
+  // Undo
+  if (matchesShortcut(e, _shortcuts.undo)) {
     e.preventDefault();
     undoLast();
     return;
   }
 
-  // Ctrl+A / Cmd+A: select all visible photos
-  if ((e.ctrlKey || e.metaKey) && e.key === 'a') {
+  // Select all
+  if (matchesShortcut(e, _shortcuts.select_all)) {
     e.preventDefault();
     photos.forEach(function(p) { selectedPhotos.add(p.id); });
     renderGrid();
@@ -1366,13 +1389,7 @@ document.addEventListener('keydown', function(e) {
     return;
   }
 
-  if (e.key === 'Escape') {
-    closeDetail();
-    clearSelection();
-    return;
-  }
-
-  // Arrow keys: navigate grid
+  // Arrow keys: navigate grid (not configurable)
   if (e.key === 'ArrowRight' || e.key === 'ArrowDown') {
     e.preventDefault();
     if (selectedIndex < photos.length - 1) {
@@ -1387,16 +1404,18 @@ document.addEventListener('keydown', function(e) {
     }
   }
 
-  // Rating: 0-5
-  if (selectedPhotoId && e.key >= '0' && e.key <= '5') {
-    setRating(selectedPhotoId, parseInt(e.key));
+  // Ratings: 0-5
+  if (selectedPhotoId) {
+    for (var r = 0; r <= 5; r++) {
+      if (matchesShortcut(e, _shortcuts['rate_' + r])) { setRating(selectedPhotoId, r); return; }
+    }
   }
 
-  // P = flag, X = reject, U = unflag
+  // Flag, reject, unflag
   if (selectedPhotoId) {
-    if (e.key === 'p' || e.key === 'P') setFlag('flagged');
-    else if (e.key === 'x' || e.key === 'X') setFlag('rejected');
-    else if (e.key === 'u' || e.key === 'U') setFlag('none');
+    if (matchesShortcut(e, _shortcuts.flag)) { e.preventDefault(); setFlag('flagged'); }
+    else if (matchesShortcut(e, _shortcuts.reject)) { e.preventDefault(); setFlag('rejected'); }
+    else if (matchesShortcut(e, _shortcuts.unflag)) { e.preventDefault(); setFlag('none'); }
   }
 });
 

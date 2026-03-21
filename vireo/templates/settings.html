@@ -57,6 +57,43 @@
   }
   .history-table .status-completed { color: #24E5CA; }
   .history-table .status-failed { color: #e74c3c; }
+
+  .shortcut-context-title {
+    font-size: 13px; font-weight: 600; color: #B0CCCC;
+    margin: 16px 0 8px 0; padding-bottom: 6px;
+    border-bottom: 1px solid #14374E;
+    display: flex; justify-content: space-between; align-items: center;
+  }
+  .shortcut-context-title:first-child { margin-top: 0; }
+  .shortcut-row {
+    display: flex; align-items: center; padding: 8px 0;
+    border-bottom: 1px solid rgba(20,55,78,0.5);
+  }
+  .shortcut-row:last-child { border-bottom: none; }
+  .shortcut-action { flex: 1; font-size: 13px; color: #B0CCCC; }
+  .shortcut-key-btn {
+    background: #14374E; color: #24E5CA; border: 1px solid #1A4560;
+    border-radius: 4px; padding: 4px 14px; font-size: 13px;
+    font-family: monospace; cursor: pointer; min-width: 70px;
+    text-align: center; transition: border-color 0.2s;
+  }
+  .shortcut-key-btn:hover { border-color: #24E5CA; }
+  .shortcut-key-btn.capturing {
+    border-color: #f0c040; color: #f0c040; animation: pulse 1s infinite;
+  }
+  .shortcut-default-hint {
+    font-size: 11px; color: #555; margin-left: 8px; min-width: 80px;
+  }
+  .shortcut-reset-btn {
+    background: none; border: none; color: #555; cursor: pointer;
+    font-size: 14px; margin-left: 6px; padding: 2px 6px;
+  }
+  .shortcut-reset-btn:hover { color: #e74c3c; }
+  .shortcut-conflict { font-size: 11px; color: #e74c3c; margin-left: 8px; }
+  @keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.5; }
+  }
 </style>
 </head>
 <body>
@@ -213,19 +250,9 @@
       <select id="cfgKeywordCase" onchange="saveConfig()"
               style="background:var(--bg-input,#14374E);color:var(--text-primary,#E0F0F0);border:1px solid var(--border-secondary,#1A4560);border-radius:4px;padding:4px 8px;font-size:13px;">
         <option value="auto">Auto-detect</option>
-        <option value="title">Title Case (Black Phoebe)</option>
-        <option value="lower">Sentence case (Black phoebe)</option>
+        <option value="title">Title Case (House Finch)</option>
+        <option value="lower">Sentence case (House fench)</option>
       </select>
-    </div>
-    <div class="setting-row" style="display:flex;justify-content:space-between;align-items:center;padding:8px 0;">
-      <div class="setting-label">
-        Clean up keywords
-        <small>Merge duplicate keywords that differ only in capitalization (e.g. "House Finch" and "House finch").</small>
-      </div>
-      <div style="display:flex;align-items:center;gap:8px;">
-        <button onclick="cleanKeywords()" style="background:var(--bg-tertiary,#14374E);color:var(--text-secondary,#B0CCCC);border:none;border-radius:4px;padding:6px 14px;font-size:12px;cursor:pointer;">Clean Keywords</button>
-        <span id="cleanKeywordsStatus" style="font-size:12px;color:var(--text-dim,#888);"></span>
-      </div>
     </div>
   </div>
 
@@ -319,14 +346,28 @@
   <!-- Keyboard Shortcuts -->
   <div class="section">
     <div class="section-title">Keyboard Shortcuts</div>
-    <p style="font-size:12px;color:#888;margin-bottom:10px;">Available on the Classify page when reviewing predictions.</p>
-    <div class="setting-row">
-      <div class="setting-label">Accept prediction</div>
-      <span class="setting-value" style="color:#24E5CA;font-family:monospace;font-size:14px;">A</span>
+    <p style="font-size:12px;color:#888;margin-bottom:10px;">Click a key to change it. Shortcuts are grouped by page context.</p>
+    <div id="shortcutsEditor">
+      <span style="color:#555;font-size:13px;">Loading...</span>
     </div>
-    <div class="setting-row">
-      <div class="setting-label">Skip / reject prediction</div>
-      <span class="setting-value" style="color:#f0c040;font-family:monospace;font-size:14px;">S</span>
+  </div>
+
+  <!-- Advanced -->
+  <div class="section">
+    <div class="section-title" style="cursor:pointer;" onclick="document.getElementById('advancedContent').style.display = document.getElementById('advancedContent').style.display === 'none' ? '' : 'none'; this.querySelector('span').textContent = document.getElementById('advancedContent').style.display === 'none' ? '\u25B6' : '\u25BC';">
+      Advanced <span style="font-size:12px;color:var(--text-dim,#888);">&#9654;</span>
+    </div>
+    <div id="advancedContent" style="display:none;">
+      <div class="setting-row" style="display:flex;justify-content:space-between;align-items:center;padding:8px 0;">
+        <div class="setting-label">
+          Clean up keywords
+          <small>Merge duplicate keywords that differ only in capitalization (e.g. "House Finch" and "House finch").</small>
+        </div>
+        <div style="display:flex;align-items:center;gap:8px;">
+          <button onclick="cleanKeywords()" style="background:var(--bg-tertiary,#14374E);color:var(--text-secondary,#B0CCCC);border:none;border-radius:4px;padding:6px 14px;font-size:12px;cursor:pointer;">Clean Keywords</button>
+          <span id="cleanKeywordsStatus" style="font-size:12px;color:var(--text-dim,#888);"></span>
+        </div>
+      </div>
     </div>
   </div>
 
@@ -372,6 +413,9 @@ async function loadConfig() {
     document.getElementById('cfgSimilarityVal').textContent = simPct + '%';
     document.getElementById('cfgHfToken').value = cfg.hf_token || '';
     document.getElementById('cfgKeywordCase').value = cfg.keyword_case || 'auto';
+    // Load keyboard shortcuts
+    currentShortcuts = cfg.keyboard_shortcuts || JSON.parse(JSON.stringify(SHORTCUT_DEFAULTS));
+    renderShortcutsEditor();
   } catch(e) {}
 }
 
@@ -397,6 +441,156 @@ function saveConfig() {
       });
     } catch(e) {}
   }, 500);
+}
+
+/* ---------- Keyboard Shortcuts Editor ---------- */
+var SHORTCUT_LABELS = {
+  review: {
+    _title: 'Review (Classify page)',
+    accept: 'Accept prediction',
+    skip: 'Skip / reject prediction',
+  },
+  browse: {
+    _title: 'Browse',
+    rate_0: 'Rate 0 (clear)',
+    rate_1: 'Rate 1',
+    rate_2: 'Rate 2',
+    rate_3: 'Rate 3',
+    rate_4: 'Rate 4',
+    rate_5: 'Rate 5',
+    flag: 'Flag photo',
+    reject: 'Reject photo',
+    unflag: 'Unflag photo',
+    undo: 'Undo last action',
+    select_all: 'Select all photos',
+    zoom: 'Toggle zoom (lightbox)',
+  },
+};
+
+var SHORTCUT_DEFAULTS = {
+  review: { accept: 'a', skip: 's' },
+  browse: {
+    rate_0: '0', rate_1: '1', rate_2: '2', rate_3: '3',
+    rate_4: '4', rate_5: '5',
+    flag: 'p', reject: 'x', unflag: 'u',
+    undo: 'ctrl+z', select_all: 'ctrl+a', zoom: 'z',
+  },
+};
+
+var currentShortcuts = null;
+var capturingBtn = null;
+
+function renderShortcutsEditor() {
+  if (!currentShortcuts) return;
+  var html = '';
+  for (var ctx in SHORTCUT_LABELS) {
+    var labels = SHORTCUT_LABELS[ctx];
+    var values = currentShortcuts[ctx] || {};
+    var defaults = SHORTCUT_DEFAULTS[ctx] || {};
+    html += '<div class="shortcut-context-title">' + labels._title +
+      '<button onclick="resetContext(\'' + ctx + '\')" ' +
+      'style="background:none;border:1px solid #555;color:#888;border-radius:4px;padding:2px 10px;font-size:11px;cursor:pointer;">Reset All</button></div>';
+    for (var action in labels) {
+      if (action === '_title') continue;
+      var current = values[action] || defaults[action] || '';
+      var isDefault = current === defaults[action];
+      var conflict = findConflict(ctx, action, current);
+      html += '<div class="shortcut-row">';
+      html += '<span class="shortcut-action">' + labels[action] + '</span>';
+      html += '<button class="shortcut-key-btn" onclick="startCapture(this, \'' + ctx + '\', \'' + action + '\')">' +
+        formatShortcut(current) + '</button>';
+      html += '<span class="shortcut-default-hint">' + (isDefault ? '' : 'default: ' + formatShortcut(defaults[action])) + '</span>';
+      if (!isDefault) {
+        html += '<button class="shortcut-reset-btn" onclick="resetShortcut(\'' + ctx + '\', \'' + action + '\')" title="Reset to default">&times;</button>';
+      }
+      if (conflict) {
+        html += '<span class="shortcut-conflict">Conflict: ' + SHORTCUT_LABELS[ctx][conflict] + '</span>';
+      }
+      html += '</div>';
+    }
+  }
+  document.getElementById('shortcutsEditor').innerHTML = html;
+}
+
+function findConflict(ctx, action, keyStr) {
+  if (!currentShortcuts[ctx]) return null;
+  for (var other in currentShortcuts[ctx]) {
+    if (other === action) continue;
+    if (currentShortcuts[ctx][other] === keyStr) return other;
+  }
+  return null;
+}
+
+function startCapture(btn, ctx, action) {
+  if (capturingBtn) capturingBtn.classList.remove('capturing');
+  capturingBtn = btn;
+  btn.classList.add('capturing');
+  btn.textContent = 'Press a key...';
+
+  function onKey(e) {
+    e.preventDefault();
+    e.stopPropagation();
+    if (['Control', 'Shift', 'Alt', 'Meta'].indexOf(e.key) !== -1) return;
+
+    var parts = [];
+    if (e.ctrlKey || e.metaKey) parts.push('ctrl');
+    if (e.shiftKey) parts.push('shift');
+    if (e.altKey) parts.push('alt');
+    parts.push(e.key.toLowerCase());
+    var keyStr = parts.join('+');
+
+    var conflict = findConflict(ctx, action, keyStr);
+    if (conflict) {
+      btn.classList.remove('capturing');
+      capturingBtn = null;
+      document.removeEventListener('keydown', onKey, true);
+      btn.textContent = 'Conflict: ' + SHORTCUT_LABELS[ctx][conflict];
+      btn.style.borderColor = '#e74c3c';
+      btn.style.color = '#e74c3c';
+      setTimeout(function() { renderShortcutsEditor(); }, 1500);
+      return;
+    }
+
+    currentShortcuts[ctx][action] = keyStr;
+    btn.classList.remove('capturing');
+    capturingBtn = null;
+    document.removeEventListener('keydown', onKey, true);
+    renderShortcutsEditor();
+    saveShortcuts();
+  }
+
+  document.addEventListener('keydown', onKey, true);
+
+  function onBlur() {
+    if (capturingBtn === btn) {
+      btn.classList.remove('capturing');
+      capturingBtn = null;
+      document.removeEventListener('keydown', onKey, true);
+      renderShortcutsEditor();
+    }
+    btn.removeEventListener('blur', onBlur);
+  }
+  btn.addEventListener('blur', onBlur);
+}
+
+function resetShortcut(ctx, action) {
+  currentShortcuts[ctx][action] = SHORTCUT_DEFAULTS[ctx][action];
+  renderShortcutsEditor();
+  saveShortcuts();
+}
+
+function resetContext(ctx) {
+  currentShortcuts[ctx] = JSON.parse(JSON.stringify(SHORTCUT_DEFAULTS[ctx]));
+  renderShortcutsEditor();
+  saveShortcuts();
+}
+
+function saveShortcuts() {
+  fetch('/api/config', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({ keyboard_shortcuts: currentShortcuts }),
+  });
 }
 
 async function loadSystemInfo() {

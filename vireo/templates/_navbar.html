@@ -777,7 +777,8 @@ document.addEventListener('keydown', function(e) {
   if (!document.getElementById('lightboxOverlay').classList.contains('active')) return;
   if (e.key === 'ArrowRight') { lightboxNav(1); e.preventDefault(); }
   if (e.key === 'ArrowLeft') { lightboxNav(-1); e.preventDefault(); }
-  if (e.key === 'z' || e.key === 'Z') {
+  var zoomKey = (window._vireoShortcuts && window._vireoShortcuts.browse) ? window._vireoShortcuts.browse.zoom : 'z';
+  if (matchesShortcut(e, zoomKey)) {
     // Zoom toggle — simulate a click in the center
     var wrap = document.getElementById('lightboxWrap');
     var rect = wrap.getBoundingClientRect();
@@ -785,6 +786,34 @@ document.addEventListener('keydown', function(e) {
     e.preventDefault();
   }
 });
+
+/* ---------- Keyboard Shortcut Helpers (global) ---------- */
+function parseShortcut(str) {
+  var parts = str.toLowerCase().split('+');
+  var key = parts.pop();
+  var mods = {ctrl: false, meta: false, shift: false, alt: false};
+  parts.forEach(function(m) { if (m in mods) mods[m] = true; });
+  return {key: key, ctrl: mods.ctrl, meta: mods.meta, shift: mods.shift, alt: mods.alt};
+}
+
+function matchesShortcut(e, shortcutStr) {
+  if (!shortcutStr) return false;
+  var sc = parseShortcut(shortcutStr);
+  if (e.key.toLowerCase() !== sc.key) return false;
+  var wantCtrl = sc.ctrl || sc.meta;
+  var hasCtrl = e.ctrlKey || e.metaKey;
+  if (wantCtrl !== hasCtrl) return false;
+  if (sc.shift !== e.shiftKey) return false;
+  if (sc.alt !== e.altKey) return false;
+  return true;
+}
+
+function formatShortcut(str) {
+  if (!str) return '';
+  return str.split('+').map(function(p) {
+    return p.charAt(0).toUpperCase() + p.slice(1);
+  }).join('+');
+}
 </script>
 
 <!-- Pipeline Inspector -->

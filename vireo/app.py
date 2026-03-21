@@ -996,7 +996,26 @@ def create_app(db_path, thumb_cache_dir=None):
 
         body = request.get_json(silent=True) or {}
         current = cfg.load()
+
+        # Handle keyboard_shortcuts with validation
+        if "keyboard_shortcuts" in body:
+            shortcuts = body["keyboard_shortcuts"]
+            if isinstance(shortcuts, dict):
+                valid_contexts = cfg.DEFAULTS["keyboard_shortcuts"]
+                validated = {}
+                for ctx_name, actions in shortcuts.items():
+                    if ctx_name in valid_contexts and isinstance(actions, dict):
+                        validated[ctx_name] = {}
+                        for action, key_str in actions.items():
+                            if action in valid_contexts[ctx_name] and isinstance(key_str, str):
+                                validated[ctx_name][action] = key_str.strip().lower()
+                current["keyboard_shortcuts"] = cfg._deep_merge(
+                    cfg.DEFAULTS["keyboard_shortcuts"], validated
+                )
+
         for key in body:
+            if key == "keyboard_shortcuts":
+                continue
             if key in cfg.DEFAULTS:
                 current[key] = body[key]
         # Apply HF token to environment immediately

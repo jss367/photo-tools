@@ -18,7 +18,38 @@ DEFAULTS = {
     "inat_token": "",
     "hf_token": "",
     "scan_roots": [],
+    "keyboard_shortcuts": {
+        "review": {
+            "accept": "a",
+            "skip": "s",
+        },
+        "browse": {
+            "rate_0": "0",
+            "rate_1": "1",
+            "rate_2": "2",
+            "rate_3": "3",
+            "rate_4": "4",
+            "rate_5": "5",
+            "flag": "p",
+            "reject": "x",
+            "unflag": "u",
+            "undo": "ctrl+z",
+            "select_all": "ctrl+a",
+            "zoom": "z",
+        },
+    },
 }
+
+
+def _deep_merge(base, override):
+    """Merge override into base recursively so nested dicts are merged, not replaced."""
+    result = dict(base)
+    for k, v in override.items():
+        if k in result and isinstance(result[k], dict) and isinstance(v, dict):
+            result[k] = _deep_merge(result[k], v)
+        else:
+            result[k] = v
+    return result
 
 
 def load():
@@ -27,7 +58,7 @@ def load():
     if os.path.exists(CONFIG_PATH):
         try:
             with open(CONFIG_PATH) as f:
-                config.update(json.load(f))
+                config = _deep_merge(config, json.load(f))
         except Exception:
             log.warning("Failed to read config, using defaults")
     return config

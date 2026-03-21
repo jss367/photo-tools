@@ -590,7 +590,8 @@ async function loadLabels() {
     var resp = await fetch('/api/labels');
     var data = await resp.json();
     var labels = data.labels || [];
-    var active = data.active;
+    var active = data.active || [];
+    var activePaths = new Set(active.map(function(a) { return a.labels_file; }));
 
     if (labels.length === 0) {
       document.getElementById('labelsContent').innerHTML = '<span style="color:#666;font-size:13px;">No species lists downloaded yet. Use the form below to download one.</span>';
@@ -599,31 +600,44 @@ async function loadLabels() {
 
     var html = '';
     labels.forEach(function(l) {
-      var isActive = active && active.labels_file === l.labels_file;
-      var activeTag = isActive ? ' <span style="color:#24E5CA;font-size:10px;font-weight:600;">ACTIVE</span>' : '';
+      var isActive = activePaths.has(l.labels_file);
       var groups = (l.taxon_groups || []).map(function(g) { return g.charAt(0).toUpperCase() + g.slice(1); }).join(', ');
 
       html += '<div style="padding:8px 0;border-bottom:1px solid #0E2A3D;display:flex;align-items:center;gap:8px;">';
-      html += '<div style="flex:1;">';
-      html += '<span style="font-size:13px;color:#E0F0F0;font-weight:600;">' + escapeHtml(l.name) + '</span>' + activeTag;
+      html += '<label style="display:flex;align-items:center;gap:8px;flex:1;cursor:pointer;">';
+      html += '<input type="checkbox" class="label-active-cb" value="' + escapeAttr(l.labels_file) + '"' +
+              (isActive ? ' checked' : '') + ' onchange="updateActiveLabels()" style="accent-color:#24E5CA;">';
+      html += '<div>';
+      html += '<span style="font-size:13px;color:#E0F0F0;font-weight:600;">' + escapeHtml(l.name) + '</span>';
       html += '<div style="font-size:11px;color:#888;">' + (l.species_count || 0) + ' species &middot; ' + groups + '</div>';
       html += '</div>';
-      if (!isActive) {
-        html += '<button onclick="setActiveLabels(\'' + escapeAttr(l.labels_file) + '\')" style="background:#14374E;color:#B0CCCC;border:none;border-radius:4px;padding:4px 12px;font-size:11px;cursor:pointer;">Use This</button>';
-      }
+      html += '</label>';
       html += '</div>';
     });
+
+    // Summary line
+    var totalSpecies = active.reduce(function(sum, a) { return sum + (a.species_count || 0); }, 0);
+    if (active.length > 0) {
+      html += '<div style="padding:8px 0;font-size:12px;color:#24E5CA;">' +
+              active.length + ' label set' + (active.length > 1 ? 's' : '') + ' active &middot; ~' +
+              totalSpecies.toLocaleString() + ' species</div>';
+    }
+
     document.getElementById('labelsContent').innerHTML = html;
   } catch(e) {
     document.getElementById('labelsContent').innerHTML = '<span style="color:#e74c3c;font-size:13px;">Failed to load</span>';
   }
 }
 
-async function setActiveLabels(path) {
+async function updateActiveLabels() {
+  var paths = [];
+  document.querySelectorAll('.label-active-cb:checked').forEach(function(cb) {
+    paths.push(cb.value);
+  });
   await fetch('/api/labels/active', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({labels_file: path}),
+    body: JSON.stringify({labels_files: paths}),
   });
   loadLabels();
 }

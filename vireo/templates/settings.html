@@ -33,18 +33,6 @@
   .setting-label small { display: block; font-size: 12px; color: #666; margin-top: 2px; }
   .setting-value { font-size: 13px; color: #888; font-variant-numeric: tabular-nums; }
 
-  .stats-grid {
-    display: grid; grid-template-columns: repeat(auto-fill, minmax(130px, 1fr));
-    gap: 12px; margin-bottom: 16px;
-  }
-  .stat-card {
-    background: #14374E; border-radius: 6px; padding: 14px 16px; text-align: center;
-  }
-  .stat-number {
-    font-size: 24px; font-weight: 700; color: #24E5CA; font-variant-numeric: tabular-nums;
-  }
-  .stat-label { font-size: 11px; color: #888; margin-top: 4px; }
-
   .history-table {
     width: 100%; border-collapse: collapse; font-size: 12px; margin-top: 12px;
   }
@@ -102,37 +90,6 @@
 {% include '_navbar.html' %}
 
 <div class="content">
-
-  <!-- Dashboard -->
-  <div class="section">
-    <div class="section-title">Dashboard</div>
-    <div class="stats-grid">
-      <div class="stat-card">
-        <div class="stat-number" id="photoCount">-</div>
-        <div class="stat-label">Photos</div>
-      </div>
-      <div class="stat-card">
-        <div class="stat-number" id="folderCount">-</div>
-        <div class="stat-label">Folders</div>
-      </div>
-      <div class="stat-card">
-        <div class="stat-number" id="keywordCount">-</div>
-        <div class="stat-label">Keywords</div>
-      </div>
-      <div class="stat-card">
-        <div class="stat-number" id="pendingCount">-</div>
-        <div class="stat-label">Pending Sync</div>
-      </div>
-      <div class="stat-card">
-        <div class="stat-number" id="dbSize">-</div>
-        <div class="stat-label">DB Size</div>
-      </div>
-      <div class="stat-card">
-        <div class="stat-number" id="thumbSize">-</div>
-        <div class="stat-label">Thumb Cache</div>
-      </div>
-    </div>
-  </div>
 
   <!-- Models -->
   <div class="section">
@@ -387,7 +344,6 @@
 </div>
 
 <script>
-loadDashboard();
 loadModels();
 loadTaxonomy();
 loadHistory();
@@ -1026,20 +982,6 @@ async function downloadTaxonomy() {
 }
 
 /* ---------- Dashboard ---------- */
-async function loadDashboard() {
-  try {
-    var resp = await fetch('/api/scan/status');
-    if (!resp.ok) return;
-    var d = await resp.json();
-    document.getElementById('photoCount').textContent = d.photo_count.toLocaleString();
-    document.getElementById('folderCount').textContent = d.folder_count.toLocaleString();
-    document.getElementById('keywordCount').textContent = d.keyword_count.toLocaleString();
-    document.getElementById('pendingCount').textContent = d.pending_changes.toLocaleString();
-    document.getElementById('dbSize').textContent = formatBytes(d.db_size);
-    document.getElementById('thumbSize').textContent = formatBytes(d.thumb_cache_size);
-  } catch(e) {}
-
-}
 
 function formatBytes(b) {
   if (b == null || b === 0) return '0';

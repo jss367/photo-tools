@@ -49,6 +49,18 @@ body {
 .stat-big { text-align: center; padding: 16px; }
 .stat-big .number { font-size: 36px; font-weight: 700; color: #24E5CA; }
 .stat-big .label { font-size: 12px; color: #888; margin-top: 4px; }
+
+.stats-grid {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(130px, 1fr));
+  gap: 12px;
+}
+.stat-card {
+  background: #14374E; border-radius: 6px; padding: 14px 16px; text-align: center;
+}
+.stat-number {
+  font-size: 24px; font-weight: 700; color: #24E5CA; font-variant-numeric: tabular-nums;
+}
+.stat-label { font-size: 11px; color: #888; margin-top: 4px; }
 </style>
 </head>
 <body>
@@ -58,6 +70,36 @@ body {
 
 <div class="content">
   <h2 style="margin-bottom:20px;font-size:20px;">Dashboard</h2>
+
+  <!-- Overview Stats -->
+  <div class="section">
+    <div class="stats-grid">
+      <div class="stat-card">
+        <div class="stat-number" id="photoCount">-</div>
+        <div class="stat-label">Photos</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-number" id="folderCount">-</div>
+        <div class="stat-label">Folders</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-number" id="keywordCount">-</div>
+        <div class="stat-label">Keywords</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-number" id="pendingCount">-</div>
+        <div class="stat-label">Pending Sync</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-number" id="dbSize">-</div>
+        <div class="stat-label">DB Size</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-number" id="thumbSize">-</div>
+        <div class="stat-label">Thumb Cache</div>
+      </div>
+    </div>
+  </div>
 
   <!-- Top Species -->
   <div class="section">
@@ -99,6 +141,7 @@ body {
 <script>
 loadStats();
 loadStoragePanel();
+loadDashboard();
 
 async function loadStats() {
   try {
@@ -213,6 +256,20 @@ function formatBytes(bytes) {
   var sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
   var i = Math.floor(Math.log(bytes) / Math.log(k));
   return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i];
+}
+
+async function loadDashboard() {
+  try {
+    var resp = await fetch('/api/scan/status');
+    if (!resp.ok) return;
+    var d = await resp.json();
+    document.getElementById('photoCount').textContent = d.photo_count.toLocaleString();
+    document.getElementById('folderCount').textContent = d.folder_count.toLocaleString();
+    document.getElementById('keywordCount').textContent = d.keyword_count.toLocaleString();
+    document.getElementById('pendingCount').textContent = d.pending_changes.toLocaleString();
+    document.getElementById('dbSize').textContent = formatBytes(d.db_size);
+    document.getElementById('thumbSize').textContent = formatBytes(d.thumb_cache_size);
+  } catch(e) {}
 }
 
 async function loadStoragePanel() {

@@ -128,6 +128,14 @@ def create_app(db_path, thumb_cache_dir=None):
                     request.path,
                     elapsed,
                 )
+            if request.path.startswith("/api/"):
+                log.info(
+                    "API: %s %s → %s (%.3fs)",
+                    request.method,
+                    request.path,
+                    response.status_code,
+                    elapsed,
+                )
         return response
 
     # Catch uncaught exceptions so they don't disappear silently
@@ -160,7 +168,10 @@ def create_app(db_path, thumb_cache_dir=None):
         os.environ["HF_TOKEN"] = startup_cfg["hf_token"]
 
     # Initialize job runner, log broadcaster, and default collections
+    _t0 = time.time()
     init_db = Database(db_path)
+    log.info("Database init took %.2fs (workspace: %s)", time.time() - _t0,
+             init_db.get_workspace(init_db._active_workspace_id)["name"])
     init_db.create_default_collections()
 
     # Mark species keywords from taxonomy in background (avoids slow startup)
@@ -3151,7 +3162,7 @@ def create_app(db_path, thumb_cache_dir=None):
     def api_log_stream():
         """SSE stream of all server log output.
 
-        Auto-closes after 30s of inactivity to prevent stale connections
+        Auto-closes after 6s of inactivity to prevent stale connections
         from exhausting Flask's thread pool during page navigation.
         The browser's EventSource will auto-reconnect.
         """
@@ -3169,8 +3180,8 @@ def create_app(db_path, thumb_cache_dir=None):
                     except queue.Empty:
                         idle_count += 1
                         yield ": keepalive\n\n"
-                        # Close after ~30s idle to free the thread
-                        if idle_count >= 15:
+                        # Close after ~6s idle to free the thread
+                        if idle_count >= 3:
                             return
             except GeneratorExit:
                 pass

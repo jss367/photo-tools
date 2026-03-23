@@ -1,3 +1,5 @@
+import json
+
 import pytest
 
 
@@ -170,3 +172,68 @@ def test_add_prediction_without_active_workspace_raises(db):
     photo_id = db.add_photo(folder_id, "bird.jpg", ".jpg", 1000, 1.0)
     with pytest.raises(RuntimeError):
         db.add_prediction(photo_id, "Robin", 0.95, "bioclip")
+
+
+# -- Task 5: Workspace-scoped collections --
+
+
+def test_add_collection_uses_workspace(db_with_workspace):
+    db, ws_id, _, _ = db_with_workspace
+    cid = db.add_collection("Flagged", '[{"field":"flag","op":"equals","value":"flagged"}]')
+    row = db.conn.execute(
+        "SELECT workspace_id FROM collections WHERE id = ?", (cid,)
+    ).fetchone()
+    assert row["workspace_id"] == ws_id
+
+
+def test_get_collections_scoped(db_with_workspace):
+    db, ws_id, _, _ = db_with_workspace
+    db.add_collection("WS1 Collection", "[]")
+    ws2 = db.create_workspace("Other")
+    db.set_active_workspace(ws2)
+    db.add_collection("WS2 Collection", "[]")
+    # Each workspace sees only its own
+    assert len(db.get_collections()) == 1
+    assert db.get_collections()[0]["name"] == "WS2 Collection"
+    db.set_active_workspace(ws_id)
+    assert len(db.get_collections()) == 1
+    assert db.get_collections()[0]["name"] == "WS1 Collection"
+
+
+def test_create_default_collections_per_workspace(db_with_workspace):
+    db, ws_id, _, _ = db_with_workspace
+    db.create_default_collections()
+    count_ws1 = len(db.get_collections())
+    ws2 = db.create_workspace("Other")
+    db.set_active_workspace(ws2)
+    db.create_default_collections()
+    count_ws2 = len(db.get_collections())
+    assert count_ws1 == count_ws2
+    # Both workspaces have their own copies
+    total = db.conn.execute("SELECT COUNT(*) FROM collections").fetchone()[0]
+    assert total == count_ws1 + count_ws2
+
+
+def test_cascade_delete_removes_collections(db_with_workspace):
+    db, ws_id, _, _ = db_with_workspace
+    db.add_collection("Test", "[]")
+    db.delete_workspace(ws_id)
+    count = db.conn.execute("SELECT COUNT(*) FROM collections").fetchone()[0]
+    assert count == 0
+
+
+def test_get_collection_photos_prediction_join_scoped(db_with_workspace):
+    """Taxonomy rules in collection filter should use workspace-scoped predictions."""
+    db, ws_id, folder_id, photo_id = db_with_workspace
+    db.add_prediction(photo_id, "Robin", 0.95, "bioclip",
+                      taxonomy={"order": "Passeriformes"})
+    rules = json.dumps([{"field": "taxonomy_order", "op": "equals", "value": "Passeriformes"}])
+    cid = db.add_collection("Passerines", rules)
+    photos = db.get_collection_photos(cid, per_page=100)
+    assert len(photos) == 1
+    # Switch workspace — same collection rule should find nothing
+    ws2 = db.create_workspace("Empty")
+    db.set_active_workspace(ws2)
+    cid2 = db.add_collection("Passerines", rules)
+    photos2 = db.get_collection_photos(cid2, per_page=100)
+    assert len(photos2) == 0

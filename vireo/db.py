@@ -917,16 +917,17 @@ class Database:
     def add_collection(self, name, rules_json):
         """Insert a smart collection. Returns the collection id."""
         cur = self.conn.execute(
-            "INSERT INTO collections (name, rules) VALUES (?, ?)",
-            (name, rules_json),
+            "INSERT INTO collections (name, rules, workspace_id) VALUES (?, ?, ?)",
+            (name, rules_json, self._ws_id()),
         )
         self.conn.commit()
         return cur.lastrowid
 
     def get_collections(self):
-        """Return all collections."""
+        """Return all collections for the active workspace."""
         return self.conn.execute(
-            "SELECT id, name, rules FROM collections ORDER BY name"
+            "SELECT id, name, rules FROM collections WHERE workspace_id = ? ORDER BY name",
+            (self._ws_id(),),
         ).fetchall()
 
     def delete_collection(self, collection_id):
@@ -1081,7 +1082,12 @@ class Database:
             join_clause += " JOIN photo_keywords pk ON pk.photo_id = p.id"
             join_clause += " JOIN keywords k ON k.id = pk.keyword_id"
         if need_prediction_join:
-            join_clause += " JOIN predictions pred ON pred.photo_id = p.id"
+            join_clause += (
+                " JOIN predictions pred ON pred.photo_id = p.id"
+                " AND pred.workspace_id = ?"
+            )
+            # Insert workspace param before the existing condition params
+            params.insert(0, self._ws_id())
 
         # Always join folders for folder-under rules
         folder_join = " LEFT JOIN folders f ON f.id = p.folder_id"

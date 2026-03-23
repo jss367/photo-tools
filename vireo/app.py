@@ -3426,7 +3426,7 @@ def create_app(db_path, thumb_cache_dir=None):
             import json as _json
 
             cache_path = os.path.join(
-                os.path.dirname(db_path), "culling_results.json"
+                os.path.dirname(db_path), f"culling_results_ws{active_ws}.json"
             )
             with open(cache_path, "w") as f:
                 _json.dump(result, f)
@@ -3539,8 +3539,9 @@ def create_app(db_path, thumb_cache_dir=None):
 
     @app.route("/api/culling/results")
     def api_culling_results():
-        """Return the most recent culling analysis results."""
-        cache_path = os.path.join(os.path.dirname(db_path), "culling_results.json")
+        """Return the most recent culling analysis results for the active workspace."""
+        db = _get_db()
+        cache_path = os.path.join(os.path.dirname(db_path), f"culling_results_ws{db._active_workspace_id}.json")
         if not os.path.exists(cache_path):
             return jsonify({"error": "No culling analysis found. Run one first."}), 404
 

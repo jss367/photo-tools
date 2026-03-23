@@ -66,12 +66,16 @@
     <div class="section-title">Folders</div>
     <div id="wsFoldersContent"><span style="color:#555;font-size:13px;">Loading...</span></div>
     <div style="margin-top:12px;border-top:1px solid var(--border,#14374E);padding-top:12px;">
+      <div style="font-size:12px;color:#888;margin-bottom:6px;">Add a folder by path:</div>
       <div style="display:flex;gap:8px;">
-        <select id="addFolderSelect" style="flex:1;background:var(--bg-tertiary,#14374E);color:var(--text-primary,#E0F0F0);border:1px solid var(--border,#14374E);border-radius:4px;padding:6px 10px;font-size:13px;">
-          <option value="">Add a folder...</option>
-        </select>
-        <button onclick="addFolderToWorkspace()" style="background:var(--accent,#24E5CA);color:#0A1F2E;border:none;border-radius:4px;padding:6px 14px;font-size:12px;cursor:pointer;font-weight:500;">Add</button>
+        <input type="text" id="addFolderPath" placeholder="/Volumes/Photography/Raw Files"
+               style="flex:1;background:var(--bg-tertiary,#14374E);color:var(--text-primary,#E0F0F0);border:1px solid var(--border,#14374E);border-radius:4px;padding:6px 10px;font-size:13px;font-family:monospace;"
+               list="scanRootHints"
+               onkeydown="if(event.key==='Enter')scanAndAddFolder()">
+        <datalist id="scanRootHints"></datalist>
+        <button id="addFolderBtn" onclick="scanAndAddFolder()" style="background:var(--accent,#24E5CA);color:#0A1F2E;border:none;border-radius:4px;padding:6px 14px;font-size:12px;cursor:pointer;font-weight:500;white-space:nowrap;">Scan &amp; Add</button>
       </div>
+      <div id="addFolderStatus" style="font-size:12px;margin-top:6px;display:none;"></div>
     </div>
   </div>
 
@@ -163,50 +167,111 @@ function escapeAttr(str) {
 
 /* ---------- Folders ---------- */
 async function loadWsFolders() {
-  var resp = await fetch('/api/workspaces/active');
-  var ws = await resp.json();
-  var container = document.getElementById('wsFoldersContent');
-  if (!ws.folders || ws.folders.length === 0) {
-    container.innerHTML = '<span style="color:#555;font-size:13px;">No folders in this workspace</span>';
-    loadAllFolders(ws);
-    return;
-  }
-  var html = '';
-  ws.folders.forEach(function(f) {
-    html += '<div class="setting-row">';
-    html += '<div class="setting-label">' + escapeHtml(f.path) + '</div>';
-    html += '<button onclick="removeFolderFromWs(' + ws.id + ', ' + f.id + ')" style="background:none;border:none;color:var(--danger,#e74c3c);cursor:pointer;font-size:16px;" title="Remove from workspace">&times;</button>';
-    html += '</div>';
-  });
-  container.innerHTML = html;
-  loadAllFolders(ws);
-}
-
-async function loadAllFolders(ws) {
-  var resp = await fetch('/api/folders');
-  var allFolders = await resp.json();
-  var wsIds = new Set((ws.folders || []).map(function(f) { return f.id; }));
-  var select = document.getElementById('addFolderSelect');
-  select.innerHTML = '<option value="">Add a folder...</option>';
-  allFolders.forEach(function(f) {
-    if (!wsIds.has(f.id)) {
-      select.innerHTML += '<option value="' + f.id + '">' + escapeHtml(f.path) + '</option>';
+  try {
+    var resp = await fetch('/api/workspaces/active');
+    var ws = await resp.json();
+    var container = document.getElementById('wsFoldersContent');
+    if (!ws.folders || ws.folders.length === 0) {
+      container.innerHTML = '<span style="color:#555;font-size:13px;">No folders in this workspace. Add one below.</span>';
+    } else {
+      var html = '';
+      ws.folders.forEach(function(f) {
+        html += '<div class="setting-row">';
+        html += '<div class="setting-label" style="font-family:monospace;font-size:13px;">' + escapeHtml(f.path) + '</div>';
+        html += '<button onclick="removeFolderFromWs(' + ws.id + ', ' + f.id + ')" style="background:none;border:none;color:var(--danger,#e74c3c);cursor:pointer;font-size:16px;" title="Remove from workspace">&times;</button>';
+        html += '</div>';
+      });
+      container.innerHTML = html;
     }
-  });
+    // Load scan root hints for autocomplete
+    loadScanRootHints();
+  } catch(e) {}
 }
 
-async function addFolderToWorkspace() {
-  var select = document.getElementById('addFolderSelect');
-  var folderId = parseInt(select.value);
-  if (!folderId) return;
-  var resp = await fetch('/api/workspaces/active');
-  var ws = await resp.json();
-  await fetch('/api/workspaces/' + ws.id + '/folders', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({ folder_id: folderId })
-  });
-  loadWsFolders();
+async function loadScanRootHints() {
+  try {
+    var resp = await fetch('/api/config');
+    var cfg = await resp.json();
+    var roots = cfg.scan_roots || [];
+    var list = document.getElementById('scanRootHints');
+    list.innerHTML = '';
+    roots.forEach(function(r) {
+      var opt = document.createElement('option');
+      opt.value = r;
+      list.appendChild(opt);
+    });
+  } catch(e) {}
+}
+
+async function scanAndAddFolder() {
+  var input = document.getElementById('addFolderPath');
+  var path = input.value.trim();
+  if (!path) return;
+
+  var btn = document.getElementById('addFolderBtn');
+  var status = document.getElementById('addFolderStatus');
+  btn.disabled = true;
+  btn.textContent = 'Scanning...';
+  status.style.display = 'block';
+  status.style.color = 'var(--text-muted, #888)';
+  status.textContent = 'Starting scan...';
+
+  try {
+    var resp = await fetch('/api/jobs/scan', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ root: path })
+    });
+    if (!resp.ok) {
+      var err = await resp.json();
+      status.style.color = 'var(--danger, #e74c3c)';
+      status.textContent = err.error || 'Failed to start scan';
+      btn.disabled = false;
+      btn.textContent = 'Scan & Add';
+      return;
+    }
+    var data = await resp.json();
+    var jobId = data.job_id;
+
+    // Stream progress via SSE
+    var source = new EventSource('/api/jobs/' + jobId + '/stream');
+    source.addEventListener('progress', function(e) {
+      var p = JSON.parse(e.data);
+      if (p.total > 0) {
+        status.textContent = 'Scanning: ' + p.current + '/' + p.total + (p.current_file ? ' — ' + p.current_file : '');
+      } else if (p.current_file) {
+        status.textContent = 'Scanning: ' + p.current_file;
+      }
+    });
+    source.addEventListener('complete', function(e) {
+      source.close();
+      var result = JSON.parse(e.data);
+      if (result.status === 'completed') {
+        status.style.color = 'var(--accent, #24E5CA)';
+        status.textContent = 'Done! Folder added to workspace.';
+        input.value = '';
+        loadWsFolders();
+      } else {
+        status.style.color = 'var(--danger, #e74c3c)';
+        status.textContent = 'Scan failed' + (result.errors && result.errors.length ? ': ' + result.errors[0] : '');
+      }
+      btn.disabled = false;
+      btn.textContent = 'Scan & Add';
+      setTimeout(function() { status.style.display = 'none'; }, 5000);
+    });
+    source.onerror = function() {
+      source.close();
+      status.style.color = 'var(--danger, #e74c3c)';
+      status.textContent = 'Connection lost';
+      btn.disabled = false;
+      btn.textContent = 'Scan & Add';
+    };
+  } catch(e) {
+    status.style.color = 'var(--danger, #e74c3c)';
+    status.textContent = 'Error: ' + e.message;
+    btn.disabled = false;
+    btn.textContent = 'Scan & Add';
+  }
 }
 
 async function removeFolderFromWs(wsId, folderId) {

@@ -91,6 +91,15 @@
 
 <div class="content">
 
+  <!-- Workspaces -->
+  <div class="section">
+    <div class="section-title">Workspaces</div>
+    <div id="workspacesContent"><span style="color:#555;font-size:13px;">Loading...</span></div>
+    <div style="margin-top:12px; border-top:1px solid var(--border,#14374E); padding-top:12px;">
+      <button onclick="showCreateWorkspaceModal()" style="background:var(--accent,#24E5CA);color:#0A1F2E;border:none;border-radius:4px;padding:6px 14px;font-size:12px;cursor:pointer;font-weight:500;">+ New Workspace</button>
+    </div>
+  </div>
+
   <!-- Models -->
   <div class="section">
     <div class="section-title">Models</div>
@@ -394,6 +403,7 @@
 </div>
 
 <script>
+loadWorkspaces();
 loadModels();
 loadTaxonomy();
 loadHistory();
@@ -1123,6 +1133,112 @@ async function loadHistory() {
     document.getElementById('historyContent').innerHTML = html;
   } catch(e) {
     document.getElementById('historyContent').innerHTML = '<span style="color:#e74c3c;font-size:13px;">Failed to load</span>';
+  }
+}
+
+/* ---------- Workspaces ---------- */
+async function loadWorkspaces() {
+  try {
+    var resp = await fetch('/api/workspaces');
+    var workspaces = await resp.json();
+    var activeResp = await fetch('/api/workspaces/active');
+    var active = await activeResp.json();
+    var container = document.getElementById('workspacesContent');
+
+    if (workspaces.length === 0) {
+      container.innerHTML = '<span style="color:#555;font-size:13px;">No workspaces</span>';
+      return;
+    }
+
+    var html = '';
+    workspaces.forEach(function(ws) {
+      var isActive = ws.id === active.id;
+      var folderCount = ws.folder_count || 0;
+      html += '<div class="setting-row" style="gap:8px;">';
+      html += '  <div class="setting-label" style="display:flex;align-items:center;gap:8px;">';
+      html += '    <input type="text" value="' + escapeAttr(ws.name) + '" '
+            + 'onchange="renameWorkspace(' + ws.id + ', this.value)" '
+            + 'style="background:transparent;border:1px solid transparent;color:var(--text-primary,#E0F0F0);'
+            + 'font-size:14px;padding:2px 6px;border-radius:3px;width:200px;" '
+            + 'onfocus="this.style.borderColor=\'var(--border,#14374E)\'" '
+            + 'onblur="this.style.borderColor=\'transparent\'">';
+      if (isActive) {
+        html += '    <span style="font-size:11px;color:var(--accent,#24E5CA);background:rgba(36,229,202,0.1);'
+              + 'padding:2px 8px;border-radius:3px;">Active</span>';
+      }
+      html += '  </div>';
+      html += '  <div style="display:flex;align-items:center;gap:6px;">';
+      if (!isActive) {
+        html += '    <button onclick="activateWorkspace(' + ws.id + ')" '
+              + 'style="background:none;border:1px solid var(--border,#14374E);color:var(--text-secondary,#B0CCCC);'
+              + 'border-radius:4px;padding:4px 10px;font-size:11px;cursor:pointer;" '
+              + 'title="Switch to this workspace">Switch</button>';
+      }
+      if (!isActive && workspaces.length > 1) {
+        html += '    <button onclick="deleteWorkspaceConfirm(' + ws.id + ', \'' + escapeAttr(ws.name) + '\')" '
+              + 'style="background:none;border:1px solid var(--border,#14374E);color:var(--danger,#e74c3c);'
+              + 'border-radius:4px;padding:4px 10px;font-size:11px;cursor:pointer;" '
+              + 'title="Delete this workspace">Delete</button>';
+      }
+      html += '  </div>';
+      html += '</div>';
+    });
+    container.innerHTML = html;
+  } catch(e) {
+    document.getElementById('workspacesContent').innerHTML = '<span style="color:#e74c3c;font-size:13px;">Error loading workspaces</span>';
+  }
+}
+
+async function renameWorkspace(wsId, newName) {
+  newName = newName.trim();
+  if (!newName) return;
+  try {
+    var resp = await fetch('/api/workspaces/' + wsId, {
+      method: 'PUT',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ name: newName })
+    });
+    if (!resp.ok) {
+      var data = await resp.json();
+      alert(data.error || 'Failed to rename');
+      loadWorkspaces();
+    }
+    // Update navbar if this is the active workspace
+    var activeResp = await fetch('/api/workspaces/active');
+    var active = await activeResp.json();
+    if (wsId === active.id) {
+      var btn = document.getElementById('wsCurrentBtn');
+      if (btn) btn.firstChild.textContent = newName + ' ';
+    }
+  } catch(e) {
+    alert('Error: ' + e.message);
+    loadWorkspaces();
+  }
+}
+
+async function activateWorkspace(wsId) {
+  try {
+    await fetch('/api/workspaces/' + wsId + '/activate', { method: 'POST' });
+    window.location.reload();
+  } catch(e) {
+    alert('Error: ' + e.message);
+  }
+}
+
+async function deleteWorkspaceConfirm(wsId, name) {
+  if (!confirm('Delete workspace "' + name + '"? This will remove all its predictions, collections, and pending changes. Photos and keywords are not affected.')) {
+    return;
+  }
+  try {
+    var resp = await fetch('/api/workspaces/' + wsId, { method: 'DELETE' });
+    if (resp.ok) {
+      loadWorkspaces();
+    } else {
+      var data = await resp.json();
+      alert(data.error || 'Failed to delete');
+    }
+  } catch(e) {
+    alert('Error: ' + e.message);
   }
 }
 

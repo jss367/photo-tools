@@ -788,6 +788,7 @@ function removeRule(idx) {
 
 function updateRule(idx, key, val) {
   collectionRules[idx][key] = val;
+  if (key === 'field') renderRules();
 }
 
 function renderRules() {
@@ -812,7 +813,7 @@ function renderRules() {
         '<option value="under"' + (r.op==='under'?' selected':'') + '>under</option>' +
         '<option value="not_under"' + (r.op==='not_under'?' selected':'') + '>not under</option>' +
       '</select>' +
-      '<input type="text" value="' + escapeAttr(String(r.value)) + '" onchange="updateRule(' + i + ',\'value\',this.value)" placeholder="value" style="flex:1;">' +
+      '<input type="' + (r.field === 'timestamp' ? 'date' : 'text') + '" value="' + escapeAttr(String(r.value)) + '" onchange="updateRule(' + i + ',\'value\',this.value)" placeholder="value" style="flex:1;">' +
       '<span class="remove-rule" onclick="removeRule(' + i + ')">&times;</span>' +
     '</div>';
   });

@@ -13,6 +13,10 @@ def _setup_app(tmp_path):
     """Create a test app with sample data."""
     from db import Database
     from app import create_app
+    import config as cfg
+
+    # Isolate config so tests don't pollute ~/.vireo/config.json
+    cfg.CONFIG_PATH = str(tmp_path / "config.json")
 
     db_path = str(tmp_path / "test.db")
     thumb_dir = str(tmp_path / "thumbs")

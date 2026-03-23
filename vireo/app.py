@@ -652,15 +652,17 @@ def create_app(db_path, thumb_cache_dir=None):
         prediction_status = db.conn.execute(
             """
             SELECT status, COUNT(*) as count
-            FROM predictions
+            FROM predictions WHERE workspace_id = ?
             GROUP BY status
-        """
+        """,
+            (db._active_workspace_id,),
         ).fetchall()
 
         # Unclassified photos (no prediction at all)
         total_photos = db.count_photos()
         classified_count = db.conn.execute(
-            "SELECT COUNT(DISTINCT photo_id) FROM predictions"
+            "SELECT COUNT(DISTINCT photo_id) FROM predictions WHERE workspace_id = ?",
+            (db._active_workspace_id,),
         ).fetchone()[0]
 
         # Photos by hour of day
@@ -992,9 +994,9 @@ def create_app(db_path, thumb_cache_dir=None):
                       p.detection_conf, p.rating, p.flag
                FROM predictions pr
                JOIN photos p ON p.id = pr.photo_id
-               WHERE pr.group_id = ?
+               WHERE pr.group_id = ? AND pr.workspace_id = ?
                ORDER BY p.quality_score DESC""",
-            (group_id,),
+            (group_id, db._active_workspace_id),
         ).fetchall()
         return jsonify([dict(p) for p in preds])
 
@@ -1023,20 +1025,20 @@ def create_app(db_path, thumb_cache_dir=None):
         # Mark all predictions in this group as accepted
         for pid in picks:
             db.conn.execute(
-                "UPDATE predictions SET status = 'accepted' WHERE photo_id = ?",
-                (pid,),
+                "UPDATE predictions SET status = 'accepted' WHERE photo_id = ? AND workspace_id = ?",
+                (pid, db._active_workspace_id),
             )
         for pid in rejects:
             db.conn.execute(
-                "UPDATE predictions SET status = 'rejected' WHERE photo_id = ?",
-                (pid,),
+                "UPDATE predictions SET status = 'rejected' WHERE photo_id = ? AND workspace_id = ?",
+                (pid, db._active_workspace_id),
             )
 
         # Remove predictions from group
         for pred_id in removed:
             db.conn.execute(
-                "UPDATE predictions SET group_id = NULL WHERE id = ?",
-                (pred_id,),
+                "UPDATE predictions SET group_id = NULL WHERE id = ? AND workspace_id = ?",
+                (pred_id, db._active_workspace_id),
             )
 
         db.conn.commit()
@@ -1922,8 +1924,8 @@ def create_app(db_path, thumb_cache_dir=None):
 
         # Get species prediction
         pred = db.conn.execute(
-            "SELECT species, scientific_name, confidence FROM predictions WHERE photo_id = ?",
-            (photo_id,),
+            "SELECT species, scientific_name, confidence FROM predictions WHERE photo_id = ? AND workspace_id = ?",
+            (photo_id, db._active_workspace_id),
         ).fetchone()
 
         species = pred["species"] if pred else ""
@@ -2064,11 +2066,13 @@ def create_app(db_path, thumb_cache_dir=None):
                 cfg.save(user_cfg)
 
         runner = app._job_runner
+        active_ws = _get_db()._active_workspace_id
 
         def work(job):
             from scanner import scan as do_scan
 
             thread_db = Database(db_path)
+            thread_db.set_active_workspace(active_ws)
 
             def progress_cb(current, total):
                 job["progress"]["current"] = current
@@ -2140,11 +2144,13 @@ def create_app(db_path, thumb_cache_dir=None):
     @app.route("/api/jobs/thumbnails", methods=["POST"])
     def api_job_thumbnails():
         runner = app._job_runner
+        active_ws = _get_db()._active_workspace_id
 
         def work(job):
             from thumbnails import generate_all
 
             thread_db = Database(db_path)
+            thread_db.set_active_workspace(active_ws)
 
             def progress_cb(current, total):
                 job["progress"]["current"] = current
@@ -2174,12 +2180,14 @@ def create_app(db_path, thumb_cache_dir=None):
         body = request.get_json(silent=True) or {}
         collection_id = body.get("collection_id")
         runner = app._job_runner
+        active_ws = _get_db()._active_workspace_id
 
         def work(job):
             import config as cfg
             from image_loader import load_image
 
             thread_db = Database(db_path)
+            thread_db.set_active_workspace(active_ws)
             max_size = cfg.get("preview_max_size") or 1920
             if max_size == 0:
                 max_size = None  # Full resolution
@@ -2240,11 +2248,13 @@ def create_app(db_path, thumb_cache_dir=None):
             return jsonify({"error": "catalogs required"}), 400
 
         runner = app._job_runner
+        active_ws = _get_db()._active_workspace_id
 
         def work(job):
             from importer import execute_import
 
             thread_db = Database(db_path)
+            thread_db.set_active_workspace(active_ws)
 
             def progress_cb(current, total):
                 job["progress"]["current"] = current
@@ -2274,11 +2284,13 @@ def create_app(db_path, thumb_cache_dir=None):
     @app.route("/api/jobs/sync", methods=["POST"])
     def api_job_sync():
         runner = app._job_runner
+        active_ws = _get_db()._active_workspace_id
 
         def work(job):
             from sync import sync_to_xmp
 
             thread_db = Database(db_path)
+            thread_db.set_active_workspace(active_ws)
 
             def progress_cb(current, total):
                 job["progress"]["current"] = current
@@ -2303,11 +2315,13 @@ def create_app(db_path, thumb_cache_dir=None):
         collection_id = body.get("collection_id")
 
         runner = app._job_runner
+        active_ws = _get_db()._active_workspace_id
 
         def work(job):
             from sharpness import score_collection_photos
 
             thread_db = Database(db_path)
+            thread_db.set_active_workspace(active_ws)
             job["_start_time"] = time.time()
 
             def progress_cb(current, total, msg):
@@ -2393,6 +2407,7 @@ def create_app(db_path, thumb_cache_dir=None):
             return jsonify({"error": "collection_id required"}), 400
 
         runner = app._job_runner
+        active_ws = _get_db()._active_workspace_id
 
         def work(job):
             import tempfile
@@ -2409,6 +2424,7 @@ def create_app(db_path, thumb_cache_dir=None):
             from image_loader import load_image
 
             thread_db = Database(db_path)
+            thread_db.set_active_workspace(active_ws)
             job["_start_time"] = time.time()
 
             # Resolve model from registry
@@ -2696,8 +2712,8 @@ def create_app(db_path, thumb_cache_dir=None):
             existing_preds = set()
             if not reclassify:
                 rows = thread_db.conn.execute(
-                    "SELECT DISTINCT photo_id FROM predictions WHERE model = ?",
-                    (model_name,),
+                    "SELECT DISTINCT photo_id FROM predictions WHERE model = ? AND workspace_id = ?",
+                    (model_name, thread_db._active_workspace_id),
                 ).fetchall()
                 existing_preds = {r["photo_id"] for r in rows}
                 if existing_preds:
@@ -2735,8 +2751,8 @@ def create_app(db_path, thumb_cache_dir=None):
                     skipped_existing += 1
                     # Load existing prediction into raw_results for grouping
                     pred_row = thread_db.conn.execute(
-                        "SELECT species, confidence FROM predictions WHERE photo_id = ? AND model = ?",
-                        (photo["id"], model_name),
+                        "SELECT species, confidence FROM predictions WHERE photo_id = ? AND model = ? AND workspace_id = ?",
+                        (photo["id"], model_name, thread_db._active_workspace_id),
                     ).fetchone()
                     if pred_row:
                         timestamp = None
@@ -2948,9 +2964,10 @@ def create_app(db_path, thumb_cache_dir=None):
                             thread_db.conn.execute(
                                 """UPDATE predictions
                                    SET group_id=?, vote_count=?, total_votes=?, individual=?
-                                   WHERE photo_id=? AND model=?""",
+                                   WHERE photo_id=? AND model=? AND workspace_id=?""",
                                 (gid, cons["vote_count"], cons["total_votes"],
-                                 individual_json, item["photo"]["id"], model_name),
+                                 individual_json, item["photo"]["id"], model_name,
+                                 thread_db._active_workspace_id),
                             )
                             thread_db.conn.commit()
                         else:
@@ -3157,8 +3174,8 @@ def create_app(db_path, thumb_cache_dir=None):
                       pr.confidence, pr.taxonomy_order, pr.taxonomy_family
                FROM predictions pr
                JOIN photos p ON p.id = pr.photo_id
-               WHERE pr.species = ? AND p.embedding IS NOT NULL""",
-            (species_name,),
+               WHERE pr.species = ? AND pr.workspace_id = ? AND p.embedding IS NOT NULL""",
+            (species_name, db._active_workspace_id),
         ).fetchall()
 
         if len(rows) < 2:
@@ -3268,9 +3285,10 @@ def create_app(db_path, thumb_cache_dir=None):
                       taxonomy_order, taxonomy_family, taxonomy_genus,
                       scientific_name
                FROM predictions
-               WHERE status != 'rejected'
+               WHERE status != 'rejected' AND workspace_id = ?
                GROUP BY species
-               ORDER BY photo_count DESC"""
+               ORDER BY photo_count DESC""",
+            (db._active_workspace_id,),
         ).fetchall()
         return jsonify([dict(r) for r in rows])
 
@@ -3287,11 +3305,13 @@ def create_app(db_path, thumb_cache_dir=None):
         cross_bucket_merge = body.get("cross_bucket_merge", False)
 
         runner = app._job_runner
+        active_ws = _get_db()._active_workspace_id
 
         def work(job):
             from culling import analyze_for_culling
 
             thread_db = Database(db_path)
+            thread_db.set_active_workspace(active_ws)
 
             def progress_cb(msg):
                 runner.push_event(
@@ -3360,13 +3380,13 @@ def create_app(db_path, thumb_cache_dir=None):
         width = body.get("width")
 
         runner = app._job_runner
+        active_ws = _get_db()._active_workspace_id
 
         def work(job):
             from develop import develop_photo, output_path_for_photo
 
             thread_db = Database(db_path)
-            ws_id = thread_db.ensure_default_workspace()
-            thread_db.set_active_workspace(ws_id)
+            thread_db.set_active_workspace(active_ws)
 
             photos = []
             for pid in photo_ids:
@@ -3561,9 +3581,9 @@ def create_app(db_path, thumb_cache_dir=None):
         preds = db.conn.execute(
             """SELECT species, confidence, model, category, status,
                       group_id, vote_count, total_votes, individual
-               FROM predictions WHERE photo_id = ?
+               FROM predictions WHERE photo_id = ? AND workspace_id = ?
                ORDER BY confidence DESC""",
-            (photo_id,),
+            (photo_id, db._active_workspace_id),
         ).fetchall()
         result["predictions"] = [dict(p) for p in preds]
 

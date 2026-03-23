@@ -393,23 +393,36 @@ class Database:
     # -- Folders --
 
     def add_folder(self, path, name=None, parent_id=None):
-        """Insert a folder. Returns the folder id."""
+        """Insert a folder. Automatically links it to the active workspace.
+
+        Returns the folder id.
+        """
         cur = self.conn.execute(
             "INSERT OR IGNORE INTO folders (path, name, parent_id) VALUES (?, ?, ?)",
             (path, name, parent_id),
         )
         self.conn.commit()
         if cur.lastrowid:
-            return cur.lastrowid
-        row = self.conn.execute(
-            "SELECT id FROM folders WHERE path = ?", (path,)
-        ).fetchone()
-        return row["id"]
+            folder_id = cur.lastrowid
+        else:
+            row = self.conn.execute(
+                "SELECT id FROM folders WHERE path = ?", (path,)
+            ).fetchone()
+            folder_id = row["id"]
+        # Auto-link to active workspace
+        if self._active_workspace_id is not None:
+            self.add_workspace_folder(self._active_workspace_id, folder_id)
+        return folder_id
 
     def get_folder_tree(self):
-        """Return all folders as a list of Row objects."""
+        """Return folders for the active workspace."""
         return self.conn.execute(
-            "SELECT id, path, name, parent_id, photo_count FROM folders ORDER BY path"
+            """SELECT f.id, f.path, f.name, f.parent_id, f.photo_count
+               FROM folders f
+               JOIN workspace_folders wf ON wf.folder_id = f.id
+               WHERE wf.workspace_id = ?
+               ORDER BY f.path""",
+            (self._ws_id(),),
         ).fetchall()
 
     # -- Photos --
@@ -466,12 +479,22 @@ class Database:
         ).fetchone()
 
     def count_photos(self):
-        """Return total photo count."""
-        return self.conn.execute("SELECT COUNT(*) FROM photos").fetchone()[0]
+        """Return photo count for the active workspace."""
+        return self.conn.execute(
+            """SELECT COUNT(*) FROM photos p
+               JOIN workspace_folders wf ON wf.folder_id = p.folder_id
+               WHERE wf.workspace_id = ?""",
+            (self._ws_id(),),
+        ).fetchone()[0]
 
     def count_folders(self):
-        """Return total folder count."""
-        return self.conn.execute("SELECT COUNT(*) FROM folders").fetchone()[0]
+        """Return folder count for the active workspace."""
+        return self.conn.execute(
+            """SELECT COUNT(*) FROM folders f
+               JOIN workspace_folders wf ON wf.folder_id = f.id
+               WHERE wf.workspace_id = ?""",
+            (self._ws_id(),),
+        ).fetchone()[0]
 
     def count_keywords(self):
         """Return total keyword count."""
@@ -495,9 +518,9 @@ class Database:
         date_to=None,
         keyword=None,
     ):
-        """Return paginated, filtered photo list."""
-        conditions = []
-        params = []
+        """Return paginated, filtered photo list scoped to active workspace."""
+        conditions = ["wf.workspace_id = ?"]
+        params = [self._ws_id()]
 
         if folder_id is not None:
             conditions.append("p.folder_id = ?")
@@ -512,9 +535,9 @@ class Database:
             conditions.append("p.timestamp <= ?")
             params.append(date_to)
 
-        join_clause = ""
+        join_clause = "JOIN workspace_folders wf ON wf.folder_id = p.folder_id"
         if keyword is not None:
-            join_clause = """
+            join_clause += """
                 LEFT JOIN photo_keywords pk ON pk.photo_id = p.id
                 LEFT JOIN keywords k ON k.id = pk.keyword_id
             """
@@ -522,9 +545,7 @@ class Database:
             params.append(f"%{keyword}%")
             params.append(f"%{keyword}%")
 
-        where = ""
-        if conditions:
-            where = "WHERE " + " AND ".join(conditions)
+        where = "WHERE " + " AND ".join(conditions)
 
         sort_map = {
             "date": "p.timestamp ASC",
@@ -1121,8 +1142,12 @@ class Database:
             # Insert workspace param before the existing condition params
             params.insert(0, self._ws_id())
 
-        # Always join folders for folder-under rules
-        folder_join = " LEFT JOIN folders f ON f.id = p.folder_id"
+        # Always join folders for folder-under rules, scoped to workspace
+        folder_join = " JOIN folders f ON f.id = p.folder_id"
+        folder_join += " JOIN workspace_folders wf ON wf.folder_id = f.id AND wf.workspace_id = ?"
+
+        # folder_join comes before join_clause in the query, so its param goes first
+        params.insert(0, self._ws_id())
 
         where = ""
         if conditions:

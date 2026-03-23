@@ -449,3 +449,69 @@ def test_api_workspace_folders(client):
     ws_id = resp.get_json()["id"]
     resp = client.get(f"/api/workspaces/{ws_id}/folders")
     assert resp.status_code == 200
+
+
+# -- Workspace-scoped photo and folder queries --
+
+
+def test_get_photos_scoped_to_workspace(db):
+    """Photos from folders not in workspace are not returned."""
+    ws = db.create_workspace("Test")
+    f1 = db.add_folder("/photos/kenya", name="kenya")
+    f2 = db.add_folder("/photos/usa", name="usa")
+    db.add_workspace_folder(ws, f1)
+    # f2 NOT linked to workspace
+    db.add_photo(f1, "lion.jpg", ".jpg", 1000, 1.0)
+    db.add_photo(f2, "eagle.jpg", ".jpg", 1000, 1.0)
+    db.set_active_workspace(ws)
+    photos = db.get_photos(per_page=100)
+    assert len(photos) == 1
+    assert photos[0]["filename"] == "lion.jpg"
+
+
+def test_count_photos_scoped_to_workspace(db):
+    ws = db.create_workspace("Test")
+    f1 = db.add_folder("/photos/kenya", name="kenya")
+    f2 = db.add_folder("/photos/usa", name="usa")
+    db.add_workspace_folder(ws, f1)
+    db.add_photo(f1, "lion.jpg", ".jpg", 1000, 1.0)
+    db.add_photo(f2, "eagle.jpg", ".jpg", 1000, 1.0)
+    db.set_active_workspace(ws)
+    assert db.count_photos() == 1
+
+
+def test_count_folders_scoped_to_workspace(db):
+    ws = db.create_workspace("Test")
+    f1 = db.add_folder("/photos/kenya", name="kenya")
+    f2 = db.add_folder("/photos/usa", name="usa")
+    db.add_workspace_folder(ws, f1)
+    db.set_active_workspace(ws)
+    assert db.count_folders() == 1
+
+
+def test_get_folder_tree_scoped_to_workspace(db):
+    ws = db.create_workspace("Test")
+    f1 = db.add_folder("/photos/kenya", name="kenya")
+    f2 = db.add_folder("/photos/usa", name="usa")
+    db.add_workspace_folder(ws, f1)
+    db.set_active_workspace(ws)
+    folders = db.get_folder_tree()
+    assert len(folders) == 1
+    assert folders[0]["path"] == "/photos/kenya"
+
+
+def test_get_collection_photos_scoped_to_workspace_folders(db):
+    """Collection should only return photos from workspace folders."""
+    ws = db.create_workspace("Test")
+    f1 = db.add_folder("/photos/kenya", name="kenya")
+    f2 = db.add_folder("/photos/usa", name="usa")
+    db.add_workspace_folder(ws, f1)
+    p1 = db.add_photo(f1, "lion.jpg", ".jpg", 1000, 1.0)
+    p2 = db.add_photo(f2, "eagle.jpg", ".jpg", 1000, 1.0)
+    db.update_photo_rating(p1, 5)
+    db.update_photo_rating(p2, 5)
+    db.set_active_workspace(ws)
+    cid = db.add_collection("High Rated", json.dumps([{"field": "rating", "op": ">=", "value": 4}]))
+    photos = db.get_collection_photos(cid, per_page=100)
+    assert len(photos) == 1
+    assert photos[0]["filename"] == "lion.jpg"

@@ -229,6 +229,56 @@
     </div>
   </div>
 
+  <!-- darktable Development -->
+  <div class="section">
+    <div class="section-title">RAW Development (darktable)</div>
+    <p style="font-size:12px;color:#888;margin-bottom:12px;">
+      Configure darktable-cli for developing RAW photos into JPEGs or TIFFs.
+      <a href="https://www.darktable.org/" style="color:#24E5CA;text-decoration:none;">darktable.org</a>
+    </p>
+    <div id="darktableStatus" style="margin-bottom:12px;">
+      <span style="color:#555;font-size:13px;">Checking...</span>
+    </div>
+    <div class="setting-row">
+      <div class="setting-label">
+        darktable-cli path
+        <small>Leave empty to auto-detect from PATH. Set explicitly if darktable is installed in a non-standard location.</small>
+      </div>
+      <input type="text" id="cfgDarktableBin" placeholder="auto-detect"
+             style="width:280px;background:#14374E;color:#E0F0F0;border:1px solid #1A4560;border-radius:4px;padding:6px 10px;font-size:12px;font-family:monospace;"
+             onchange="saveConfig()">
+    </div>
+    <div class="setting-row">
+      <div class="setting-label">
+        Default style
+        <small>A darktable style to apply during development (e.g. "Wildlife"). Leave empty for no style.</small>
+      </div>
+      <input type="text" id="cfgDarktableStyle" placeholder="none"
+             style="width:200px;background:#14374E;color:#E0F0F0;border:1px solid #1A4560;border-radius:4px;padding:6px 10px;font-size:12px;"
+             onchange="saveConfig()">
+    </div>
+    <div class="setting-row">
+      <div class="setting-label">
+        Output format
+        <small>File format for developed photos.</small>
+      </div>
+      <select id="cfgDarktableFormat" onchange="saveConfig()"
+              style="background:#14374E;color:#E0F0F0;border:1px solid #1A4560;border-radius:4px;padding:4px 8px;font-size:13px;">
+        <option value="jpg">JPEG</option>
+        <option value="tiff">TIFF</option>
+      </select>
+    </div>
+    <div class="setting-row">
+      <div class="setting-label">
+        Output directory
+        <small>Where developed photos are saved. Leave empty to create a "developed" subfolder next to originals.</small>
+      </div>
+      <input type="text" id="cfgDarktableOutputDir" placeholder="alongside originals"
+             style="width:280px;background:#14374E;color:#E0F0F0;border:1px solid #1A4560;border-radius:4px;padding:6px 10px;font-size:12px;font-family:monospace;"
+             onchange="saveConfig()">
+    </div>
+  </div>
+
   <!-- Recent Jobs -->
   <div class="section">
     <div class="section-title">Recent Jobs</div>
@@ -369,6 +419,12 @@ async function loadConfig() {
     document.getElementById('cfgSimilarityVal').textContent = simPct + '%';
     document.getElementById('cfgHfToken').value = cfg.hf_token || '';
     document.getElementById('cfgKeywordCase').value = cfg.keyword_case || 'auto';
+    // Load darktable settings
+    document.getElementById('cfgDarktableBin').value = cfg.darktable_bin || '';
+    document.getElementById('cfgDarktableStyle').value = cfg.darktable_style || '';
+    document.getElementById('cfgDarktableFormat').value = cfg.darktable_output_format || 'jpg';
+    document.getElementById('cfgDarktableOutputDir').value = cfg.darktable_output_dir || '';
+    loadDarktableStatus();
     // Load keyboard shortcuts
     currentShortcuts = cfg.keyboard_shortcuts || JSON.parse(JSON.stringify(SHORTCUT_DEFAULTS));
     renderShortcutsEditor();
@@ -393,6 +449,10 @@ function saveConfig() {
           similarity_threshold: similarity,
           keyword_case: keywordCase,
           hf_token: hfToken,
+          darktable_bin: document.getElementById('cfgDarktableBin').value.trim(),
+          darktable_style: document.getElementById('cfgDarktableStyle').value.trim(),
+          darktable_output_format: document.getElementById('cfgDarktableFormat').value,
+          darktable_output_dir: document.getElementById('cfgDarktableOutputDir').value.trim(),
         }),
       });
     } catch(e) {}
@@ -547,6 +607,22 @@ function saveShortcuts() {
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({ keyboard_shortcuts: currentShortcuts }),
   });
+}
+
+async function loadDarktableStatus() {
+  try {
+    var resp = await fetch('/api/darktable/status');
+    if (!resp.ok) return;
+    var data = await resp.json();
+    var el = document.getElementById('darktableStatus');
+    if (data.available) {
+      el.innerHTML = '<span style="color:#24E5CA;font-size:13px;">&#10003; darktable-cli found</span>' +
+        '<span style="color:#888;font-size:12px;margin-left:8px;">' + escapeHtml(data.bin) + '</span>';
+    } else {
+      el.innerHTML = '<span style="color:#e74c3c;font-size:13px;">&#10007; darktable-cli not found</span>' +
+        '<span style="color:#888;font-size:12px;margin-left:8px;">Install darktable or set the path below</span>';
+    }
+  } catch(e) {}
 }
 
 async function loadSystemInfo() {

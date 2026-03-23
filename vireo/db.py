@@ -22,8 +22,12 @@ class Database:
         self.conn.execute("PRAGMA foreign_keys=ON")
         self._active_workspace_id = None
         self._create_tables()
-        ws_id = self.ensure_default_workspace()
-        self.set_active_workspace(ws_id)
+        self.ensure_default_workspace()
+        # Restore last-used workspace, or fall back to Default
+        last = self.conn.execute(
+            "SELECT id FROM workspaces ORDER BY last_opened_at DESC NULLS LAST, id ASC LIMIT 1"
+        ).fetchone()
+        self.set_active_workspace(last[0])
 
     def _create_tables(self):
         self.conn.executescript(

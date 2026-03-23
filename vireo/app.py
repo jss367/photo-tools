@@ -140,8 +140,6 @@ def create_app(db_path, thumb_cache_dir=None):
         """Get a Database instance. Creates a new connection per request."""
         if not hasattr(app, "_db") or app._db is None:
             app._db = Database(db_path)
-            ws_id = app._db.ensure_default_workspace()
-            app._db.set_active_workspace(ws_id)
         return app._db
 
     @app.context_processor
@@ -163,8 +161,6 @@ def create_app(db_path, thumb_cache_dir=None):
 
     # Initialize job runner, log broadcaster, and default collections
     init_db = Database(db_path)
-    ws_id = init_db.ensure_default_workspace()
-    init_db.set_active_workspace(ws_id)
     init_db.create_default_collections()
 
     # Mark species keywords from taxonomy in background (avoids slow startup)

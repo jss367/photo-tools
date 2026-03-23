@@ -178,9 +178,10 @@ body {
             <option value="">Loading...</option>
           </select>
           <label style="font-size:12px;color:var(--text-dim,#888);">Labels:</label>
-          <select id="wizLabels" style="background:var(--bg-input,#14374E);color:var(--text-primary,#E0F0F0);border:1px solid var(--border-secondary,#1A4560);border-radius:4px;padding:2px 6px;font-size:12px;">
+          <select id="wizLabels" multiple style="background:var(--bg-input,#14374E);color:var(--text-primary,#E0F0F0);border:1px solid var(--border-secondary,#1A4560);border-radius:4px;padding:2px 6px;font-size:12px;min-height:28px;">
             <option value="">Loading...</option>
           </select>
+          <span style="font-size:11px;color:var(--text-dim,#888);">Ctrl/Cmd+click to select multiple</span>
         </div>
         <label style="display:flex;align-items:center;gap:8px;font-size:13px;color:var(--text-secondary,#B0CCCC);cursor:pointer;">
           <input type="checkbox" id="wizCull" checked style="accent-color:var(--accent,#24E5CA);">
@@ -733,7 +734,8 @@ async function wizStart() {
   var doCull = document.getElementById('wizCull').checked;
   var previewSize = parseInt(document.getElementById('wizPreviewSize').value, 10) || 1920;
   var modelId = document.getElementById('wizModel').value;
-  var labelsFile = document.getElementById('wizLabels').value;
+  var labelsSelect = document.getElementById('wizLabels');
+  var labelsFiles = Array.from(labelsSelect.selectedOptions).map(function(o) { return o.value; }).filter(Boolean);
 
   var btn = document.getElementById('wizStartBtn');
   var status = document.getElementById('wizStatus');
@@ -758,7 +760,7 @@ async function wizStart() {
     steps.push({name: 'Classify species', url: '/api/jobs/classify', body: {
       collection_id: '_needs_classification',
       model_id: modelId || undefined,
-      labels_file: labelsFile || undefined,
+      labels_files: labelsFiles.length > 0 ? labelsFiles : undefined,
     }});
   }
   if (doCull) {

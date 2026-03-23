@@ -29,7 +29,7 @@ class JobRunner:
             self._ensure_history_table(db)
 
     def _ensure_history_table(self, db):
-        db.conn.executescript(
+        db.conn.execute(
             """
             CREATE TABLE IF NOT EXISTS job_history (
                 id          TEXT PRIMARY KEY,
@@ -41,10 +41,9 @@ class JobRunner:
                 result      TEXT,
                 error_count INTEGER DEFAULT 0,
                 config      TEXT,
-                workspace_id INTEGER REFERENCES workspaces(id) ON DELETE CASCADE
-            );
-            CREATE INDEX IF NOT EXISTS idx_job_history_workspace ON job_history(workspace_id);
-        """
+                workspace_id INTEGER
+            )
+            """
         )
         # Migration: add workspace_id to existing job_history tables
         try:
@@ -53,6 +52,9 @@ class JobRunner:
             db.conn.execute(
                 "ALTER TABLE job_history ADD COLUMN workspace_id INTEGER"
             )
+        db.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_job_history_workspace ON job_history(workspace_id)"
+        )
 
     def start(self, job_type, work_fn, config=None):
         """Start a background job.

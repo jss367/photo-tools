@@ -1381,6 +1381,7 @@ function formatDuration(seconds) {
   var lpMaxLines = 200;
   var activeJobs = [];
   var currentBpTab = 'jobs';
+  var _jobPollTimer = null;
 
   // Theme system
   var THEMES = [
@@ -1467,12 +1468,15 @@ function formatDuration(seconds) {
     lpSource.addEventListener('log', function(e) {
       addLpLine(JSON.parse(e.data));
     });
-    // Track internal navigation so we don't warn on same-site clicks
+    // Close SSE and stop polling immediately on link click (before unload)
     var isInternalNav = false;
     document.addEventListener('click', function(e) {
       var link = e.target.closest('a[href]');
       if (link && link.hostname === location.hostname) {
         isInternalNav = true;
+        // Kill SSE and polling NOW so threads are freed for the next page
+        if (lpSource) { lpSource.close(); lpSource = null; }
+        if (_jobPollTimer) { clearInterval(_jobPollTimer); _jobPollTimer = null; }
       }
     });
 
@@ -1521,7 +1525,7 @@ function formatDuration(seconds) {
 
     // Poll jobs
     pollJobs();
-    setInterval(pollJobs, 2000);
+    _jobPollTimer = setInterval(pollJobs, 2000);
   }
 
   /* ---------- Tab switching ---------- */

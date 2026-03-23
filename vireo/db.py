@@ -72,10 +72,26 @@ class Database:
                 PRIMARY KEY (photo_id, keyword_id)
             );
 
+            CREATE TABLE IF NOT EXISTS workspaces (
+                id              INTEGER PRIMARY KEY,
+                name            TEXT NOT NULL UNIQUE,
+                config_overrides TEXT,
+                ui_state        TEXT,
+                created_at      TEXT DEFAULT (datetime('now')),
+                last_opened_at  TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS workspace_folders (
+                workspace_id    INTEGER REFERENCES workspaces(id) ON DELETE CASCADE,
+                folder_id       INTEGER REFERENCES folders(id),
+                PRIMARY KEY (workspace_id, folder_id)
+            );
+
             CREATE TABLE IF NOT EXISTS collections (
                 id          INTEGER PRIMARY KEY,
                 name        TEXT,
-                rules       TEXT
+                rules       TEXT,
+                workspace_id INTEGER REFERENCES workspaces(id) ON DELETE CASCADE
             );
 
             CREATE TABLE IF NOT EXISTS pending_changes (
@@ -83,7 +99,8 @@ class Database:
                 photo_id    INTEGER REFERENCES photos(id),
                 change_type TEXT,
                 value       TEXT,
-                created_at  TEXT DEFAULT (datetime('now'))
+                created_at  TEXT DEFAULT (datetime('now')),
+                workspace_id INTEGER REFERENCES workspaces(id) ON DELETE CASCADE
             );
 
             CREATE TABLE IF NOT EXISTS predictions (
@@ -106,13 +123,17 @@ class Database:
                 taxonomy_genus TEXT,
                 scientific_name TEXT,
                 created_at  TEXT DEFAULT (datetime('now')),
-                UNIQUE(photo_id, model)
+                workspace_id INTEGER REFERENCES workspaces(id) ON DELETE CASCADE,
+                UNIQUE(photo_id, model, workspace_id)
             );
 
             CREATE INDEX IF NOT EXISTS idx_photos_timestamp ON photos(timestamp);
             CREATE INDEX IF NOT EXISTS idx_photos_folder ON photos(folder_id);
             CREATE INDEX IF NOT EXISTS idx_photos_rating ON photos(rating);
             CREATE INDEX IF NOT EXISTS idx_keywords_name ON keywords(name);
+            CREATE INDEX IF NOT EXISTS idx_predictions_workspace ON predictions(workspace_id);
+            CREATE INDEX IF NOT EXISTS idx_collections_workspace ON collections(workspace_id);
+            CREATE INDEX IF NOT EXISTS idx_pending_workspace ON pending_changes(workspace_id);
         """
         )
         # Migrations for existing databases
@@ -166,6 +187,183 @@ class Database:
             self.conn.execute("ALTER TABLE predictions ADD COLUMN taxonomy_family TEXT")
             self.conn.execute("ALTER TABLE predictions ADD COLUMN taxonomy_genus TEXT")
             self.conn.execute("ALTER TABLE predictions ADD COLUMN scientific_name TEXT")
+
+        # Workspace migration for existing databases
+        try:
+            self.conn.execute("SELECT id FROM workspaces LIMIT 0")
+        except Exception:
+            # Create workspace tables
+            self.conn.execute(
+                """CREATE TABLE IF NOT EXISTS workspaces (
+                    id              INTEGER PRIMARY KEY,
+                    name            TEXT NOT NULL UNIQUE,
+                    config_overrides TEXT,
+                    ui_state        TEXT,
+                    created_at      TEXT DEFAULT (datetime('now')),
+                    last_opened_at  TEXT
+                )"""
+            )
+            self.conn.execute(
+                """CREATE TABLE IF NOT EXISTS workspace_folders (
+                    workspace_id    INTEGER REFERENCES workspaces(id) ON DELETE CASCADE,
+                    folder_id       INTEGER REFERENCES folders(id),
+                    PRIMARY KEY (workspace_id, folder_id)
+                )"""
+            )
+
+            # Create default workspace
+            self.conn.execute(
+                "INSERT INTO workspaces (name) VALUES (?)", ("Default",)
+            )
+            default_id = self.conn.execute(
+                "SELECT id FROM workspaces WHERE name = 'Default'"
+            ).fetchone()[0]
+
+            # Link all existing folders to default workspace
+            self.conn.execute(
+                "INSERT INTO workspace_folders (workspace_id, folder_id) "
+                "SELECT ?, id FROM folders", (default_id,)
+            )
+
+            # Add workspace_id to scoped tables and backfill
+            for table in ("predictions", "collections", "pending_changes"):
+                try:
+                    self.conn.execute(f"SELECT workspace_id FROM {table} LIMIT 0")
+                except Exception:
+                    self.conn.execute(
+                        f"ALTER TABLE {table} ADD COLUMN workspace_id INTEGER "
+                        f"REFERENCES workspaces(id) ON DELETE CASCADE"
+                    )
+                    self.conn.execute(
+                        f"UPDATE {table} SET workspace_id = ?", (default_id,)
+                    )
+
+            # Recreate predictions unique index for new constraint
+            # (photo_id, model) -> (photo_id, model, workspace_id)
+            self.conn.execute("DROP INDEX IF EXISTS sqlite_autoindex_predictions_1")
+            self.conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_predictions_unique "
+                "ON predictions(photo_id, model, workspace_id)"
+            )
+
+            self.conn.commit()
+
+        # Ensure workspace indexes exist (for fresh DBs that skip migration)
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_predictions_workspace "
+            "ON predictions(workspace_id)"
+        )
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_collections_workspace "
+            "ON collections(workspace_id)"
+        )
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_pending_workspace "
+            "ON pending_changes(workspace_id)"
+        )
+
+    # -- Workspaces --
+
+    _active_workspace_id = None
+
+    def set_active_workspace(self, workspace_id):
+        """Set the active workspace for scoped queries."""
+        self._active_workspace_id = workspace_id
+
+    def _ws_id(self):
+        """Return active workspace id, raising if none set."""
+        if self._active_workspace_id is None:
+            raise RuntimeError("No active workspace set")
+        return self._active_workspace_id
+
+    def create_workspace(self, name, config_overrides=None, ui_state=None):
+        """Create a new workspace. Returns the workspace id."""
+        cur = self.conn.execute(
+            """INSERT INTO workspaces (name, config_overrides, ui_state)
+               VALUES (?, ?, ?)""",
+            (name,
+             json.dumps(config_overrides) if config_overrides else None,
+             json.dumps(ui_state) if ui_state else None),
+        )
+        self.conn.commit()
+        return cur.lastrowid
+
+    def get_workspace(self, workspace_id):
+        """Return a single workspace by id, or None."""
+        return self.conn.execute(
+            "SELECT * FROM workspaces WHERE id = ?", (workspace_id,)
+        ).fetchone()
+
+    def get_workspaces(self):
+        """Return all workspaces ordered by last_opened_at desc."""
+        return self.conn.execute(
+            "SELECT * FROM workspaces ORDER BY last_opened_at DESC"
+        ).fetchall()
+
+    def update_workspace(self, workspace_id, name=None, config_overrides=None,
+                         ui_state=None, last_opened_at=None):
+        """Update workspace fields. Only non-None args are updated."""
+        updates = []
+        params = []
+        if name is not None:
+            updates.append("name = ?")
+            params.append(name)
+        if config_overrides is not None:
+            updates.append("config_overrides = ?")
+            params.append(json.dumps(config_overrides))
+        if ui_state is not None:
+            updates.append("ui_state = ?")
+            params.append(json.dumps(ui_state))
+        if last_opened_at is not None:
+            updates.append("last_opened_at = ?")
+            params.append(last_opened_at)
+        if not updates:
+            return
+        params.append(workspace_id)
+        self.conn.execute(
+            f"UPDATE workspaces SET {', '.join(updates)} WHERE id = ?", params
+        )
+        self.conn.commit()
+
+    def delete_workspace(self, workspace_id):
+        """Delete a workspace and all its scoped data (cascade)."""
+        self.conn.execute("DELETE FROM workspaces WHERE id = ?", (workspace_id,))
+        self.conn.commit()
+
+    def add_workspace_folder(self, workspace_id, folder_id):
+        """Link a folder to a workspace."""
+        self.conn.execute(
+            "INSERT OR IGNORE INTO workspace_folders (workspace_id, folder_id) VALUES (?, ?)",
+            (workspace_id, folder_id),
+        )
+        self.conn.commit()
+
+    def remove_workspace_folder(self, workspace_id, folder_id):
+        """Unlink a folder from a workspace."""
+        self.conn.execute(
+            "DELETE FROM workspace_folders WHERE workspace_id = ? AND folder_id = ?",
+            (workspace_id, folder_id),
+        )
+        self.conn.commit()
+
+    def get_workspace_folders(self, workspace_id):
+        """Return all folders linked to a workspace."""
+        return self.conn.execute(
+            """SELECT f.* FROM folders f
+               JOIN workspace_folders wf ON wf.folder_id = f.id
+               WHERE wf.workspace_id = ?
+               ORDER BY f.path""",
+            (workspace_id,),
+        ).fetchall()
+
+    def ensure_default_workspace(self):
+        """Create the Default workspace if it doesn't exist. Returns its id."""
+        row = self.conn.execute(
+            "SELECT id FROM workspaces WHERE name = 'Default'"
+        ).fetchone()
+        if row:
+            return row[0]
+        return self.create_workspace("Default")
 
     # -- Folders --
 
@@ -571,8 +769,9 @@ class Database:
                (photo_id, species, confidence, model, category, status,
                 group_id, vote_count, total_votes, individual,
                 taxonomy_kingdom, taxonomy_phylum, taxonomy_class,
-                taxonomy_order, taxonomy_family, taxonomy_genus, scientific_name)
-               VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                taxonomy_order, taxonomy_family, taxonomy_genus, scientific_name,
+                workspace_id)
+               VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 photo_id,
                 species,
@@ -590,14 +789,15 @@ class Database:
                 tax.get("family"),
                 tax.get("genus"),
                 tax.get("scientific_name"),
+                self._ws_id(),
             ),
         )
         self.conn.commit()
 
     def clear_predictions(self, model=None, collection_photo_ids=None):
         """Clear predictions, optionally filtered by model and/or photo set."""
-        conditions = []
-        params = []
+        conditions = ["workspace_id = ?"]
+        params = [self._ws_id()]
         if model:
             conditions.append("model = ?")
             params.append(model)
@@ -605,14 +805,14 @@ class Database:
             placeholders = ",".join("?" for _ in collection_photo_ids)
             conditions.append(f"photo_id IN ({placeholders})")
             params.extend(collection_photo_ids)
-        where = "WHERE " + " AND ".join(conditions) if conditions else ""
+        where = "WHERE " + " AND ".join(conditions)
         self.conn.execute(f"DELETE FROM predictions {where}", params)
         self.conn.commit()
 
     def get_predictions(self, photo_ids=None, model=None, status=None):
         """Get predictions with photo filename, optionally filtered."""
-        conditions = []
-        params = []
+        conditions = ["pr.workspace_id = ?"]
+        params = [self._ws_id()]
         if photo_ids is not None:
             placeholders = ",".join("?" for _ in photo_ids)
             conditions.append(f"pr.photo_id IN ({placeholders})")
@@ -623,7 +823,7 @@ class Database:
         if status:
             conditions.append("pr.status = ?")
             params.append(status)
-        where = "WHERE " + " AND ".join(conditions) if conditions else ""
+        where = "WHERE " + " AND ".join(conditions)
         return self.conn.execute(
             f"""SELECT pr.*, p.filename, p.timestamp FROM predictions pr
                 JOIN photos p ON p.id = pr.photo_id
@@ -667,8 +867,8 @@ class Database:
         # If grouped, accept all predictions in the group
         if pred["group_id"]:
             group_preds = self.conn.execute(
-                "SELECT * FROM predictions WHERE group_id = ? AND model = ?",
-                (pred["group_id"], pred["model"]),
+                "SELECT * FROM predictions WHERE group_id = ? AND model = ? AND workspace_id = ?",
+                (pred["group_id"], pred["model"], self._ws_id()),
             ).fetchall()
             for gp in group_preds:
                 self.update_prediction_status(gp["id"], "accepted")

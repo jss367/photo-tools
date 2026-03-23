@@ -752,12 +752,18 @@ async function loadWorkspaceMenu() {
 
 async function switchWorkspace(wsId, wsName) {
   try {
-    await fetch('/api/workspaces/' + wsId + '/activate', { method: 'POST' });
+    var resp = await fetch('/api/workspaces/' + wsId + '/activate', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ current_path: window.location.pathname })
+    });
+    var data = await resp.json();
     document.getElementById('wsCurrentBtn').firstChild.textContent = wsName + ' ';
     document.getElementById('wsMenu').classList.remove('open');
     _wsDropdownOpen = false;
     document.removeEventListener('click', closeWsDropdownOutside);
-    window.location.reload();
+    // Redirect to the workspace's saved page, or reload current
+    window.location.href = data.restore_path || window.location.pathname;
   } catch(e) {
     console.error('Failed to switch workspace', e);
   }

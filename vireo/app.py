@@ -933,9 +933,34 @@ def create_app(db_path, thumb_cache_dir=None):
         if not ws:
             return jsonify({"error": "Workspace not found"}), 404
         from datetime import datetime
+
+        # Save current page path to the outgoing workspace's ui_state
+        body = request.get_json(silent=True) or {}
+        current_path = body.get("current_path")
+        if current_path and db._active_workspace_id:
+            old_ws = db.get_workspace(db._active_workspace_id)
+            if old_ws:
+                try:
+                    ui = json.loads(old_ws["ui_state"]) if old_ws["ui_state"] else {}
+                except (json.JSONDecodeError, TypeError):
+                    ui = {}
+                ui["last_path"] = current_path
+                db.update_workspace(db._active_workspace_id, ui_state=ui)
+
+        # Activate the new workspace
         db.set_active_workspace(ws_id)
         db.update_workspace(ws_id, last_opened_at=datetime.now().isoformat())
-        return jsonify({"ok": True, "workspace": dict(ws)})
+
+        # Return the target workspace's saved page path
+        restore_path = None
+        if ws["ui_state"]:
+            try:
+                ui = json.loads(ws["ui_state"]) if isinstance(ws["ui_state"], str) else ws["ui_state"]
+                restore_path = ui.get("last_path")
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+        return jsonify({"ok": True, "workspace": dict(ws), "restore_path": restore_path})
 
     @app.route("/api/workspaces/<int:ws_id>/folders", methods=["GET"])
     def api_workspace_folders(ws_id):

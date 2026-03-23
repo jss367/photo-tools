@@ -1354,8 +1354,13 @@ async function renameWorkspace(wsId, newName) {
 
 async function activateWorkspace(wsId) {
   try {
-    await fetch('/api/workspaces/' + wsId + '/activate', { method: 'POST' });
-    window.location.reload();
+    var resp = await fetch('/api/workspaces/' + wsId + '/activate', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ current_path: window.location.pathname })
+    });
+    var data = await resp.json();
+    window.location.href = data.restore_path || window.location.pathname;
   } catch(e) {
     alert('Error: ' + e.message);
   }

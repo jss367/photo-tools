@@ -372,3 +372,15 @@ def test_logs_page(tmp_path):
 
     resp = client.get('/logs')
     assert resp.status_code == 200
+
+
+def test_api_darktable_status(tmp_path):
+    """GET /api/darktable/status returns availability info."""
+    app, _ = _setup_app(tmp_path)
+    client = app.test_client()
+    resp = client.get('/api/darktable/status')
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert 'available' in data
+    assert isinstance(data['available'], bool)
+    assert 'bin' in data

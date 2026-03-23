@@ -140,6 +140,8 @@ def create_app(db_path, thumb_cache_dir=None):
         """Get a Database instance. Creates a new connection per request."""
         if not hasattr(app, "_db") or app._db is None:
             app._db = Database(db_path)
+            ws_id = app._db.ensure_default_workspace()
+            app._db.set_active_workspace(ws_id)
         return app._db
 
     # Load user config (e.g. HF token) on startup
@@ -151,6 +153,8 @@ def create_app(db_path, thumb_cache_dir=None):
 
     # Initialize job runner, log broadcaster, and default collections
     init_db = Database(db_path)
+    ws_id = init_db.ensure_default_workspace()
+    init_db.set_active_workspace(ws_id)
     init_db.create_default_collections()
 
     # Mark species keywords from taxonomy in background (avoids slow startup)
@@ -1094,6 +1098,22 @@ def create_app(db_path, thumb_cache_dir=None):
             del os.environ["HF_TOKEN"]
         cfg.save(current)
         return jsonify({"ok": True})
+
+    @app.route("/api/darktable/status")
+    def api_darktable_status():
+        import config as cfg
+        from develop import find_darktable
+
+        configured = cfg.get("darktable_bin")
+        binary = find_darktable(configured)
+        return jsonify({
+            "available": binary is not None,
+            "bin": binary or "",
+            "configured_bin": configured,
+            "style": cfg.get("darktable_style"),
+            "output_format": cfg.get("darktable_output_format"),
+            "output_dir": cfg.get("darktable_output_dir"),
+        })
 
     @app.route("/api/storage")
     def api_storage():

@@ -40,10 +40,18 @@ class JobRunner:
                 duration    REAL,
                 result      TEXT,
                 error_count INTEGER DEFAULT 0,
-                config      TEXT
+                config      TEXT,
+                workspace_id INTEGER
             );
         """
         )
+        # Migration: add workspace_id to existing job_history tables
+        try:
+            db.conn.execute("SELECT workspace_id FROM job_history LIMIT 0")
+        except Exception:
+            db.conn.execute(
+                "ALTER TABLE job_history ADD COLUMN workspace_id INTEGER"
+            )
 
     def start(self, job_type, work_fn, config=None):
         """Start a background job.

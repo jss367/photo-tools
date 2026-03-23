@@ -283,3 +283,15 @@ def test_cascade_delete_removes_pending_changes(db_with_workspace):
     db.delete_workspace(ws_id)
     count = db.conn.execute("SELECT COUNT(*) FROM pending_changes").fetchone()[0]
     assert count == 0
+
+
+# -- Task 7: JobRunner workspace_id in job_history --
+
+
+def test_job_history_workspace_id(db_with_workspace):
+    from jobs import JobRunner
+    db, ws_id, _, _ = db_with_workspace
+    runner = JobRunner(db=db)
+    # Verify the table has workspace_id column
+    cols = [r[1] for r in db.conn.execute("PRAGMA table_info(job_history)").fetchall()]
+    assert "workspace_id" in cols

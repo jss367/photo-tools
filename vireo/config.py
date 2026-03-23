@@ -18,6 +18,10 @@ DEFAULTS = {
     "inat_token": "",
     "hf_token": "",
     "scan_roots": [],
+    "darktable_bin": "",
+    "darktable_style": "",
+    "darktable_output_format": "jpg",
+    "darktable_output_dir": "",
     "keyboard_shortcuts": {
         "review": {
             "accept": "a",

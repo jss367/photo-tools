@@ -1463,11 +1463,9 @@ function formatDuration(seconds) {
     var savedTab = localStorage.getItem('vireo_panel_tab') || 'jobs';
     switchBpTab(savedTab);
 
-    // SSE for logs
-    lpSource = new EventSource('/api/logs/stream');
-    lpSource.addEventListener('log', function(e) {
-      addLpLine(JSON.parse(e.data));
-    });
+    // SSE for logs — only connect when panel is open
+    var panelOpen = localStorage.getItem('vireo_panel_open') === 'true';
+    if (panelOpen) { startLogStream(); }
     // Close SSE and stop polling immediately on link click (before unload)
     var isInternalNav = false;
     document.addEventListener('click', function(e) {
@@ -1523,9 +1521,11 @@ function formatDuration(seconds) {
         });
     }
 
-    // Poll jobs
-    pollJobs();
-    _jobPollTimer = setInterval(pollJobs, 2000);
+    // Poll jobs — only when panel is open
+    if (panelOpen) {
+      pollJobs();
+      _jobPollTimer = setInterval(pollJobs, 2000);
+    }
   }
 
   /* ---------- Tab switching ---------- */
@@ -1551,6 +1551,14 @@ function formatDuration(seconds) {
     var h = isOpen ? (parseInt(localStorage.getItem('vireo_panel_height')) || 240) : 0;
     panel.style.height = h + 'px';
     document.body.style.paddingBottom = isOpen ? (h + 28) + 'px' : '28px';
+    // Start/stop SSE and polling based on panel visibility
+    if (isOpen) {
+      startLogStream();
+      if (!_jobPollTimer) { pollJobs(); _jobPollTimer = setInterval(pollJobs, 2000); }
+    } else {
+      stopLogStream();
+      if (_jobPollTimer) { clearInterval(_jobPollTimer); _jobPollTimer = null; }
+    }
     setTimeout(function() { panel.classList.remove('animating'); }, 200);
   };
 
@@ -1585,6 +1593,19 @@ function formatDuration(seconds) {
       localStorage.setItem('vireo_panel_height', panel.offsetHeight);
     });
   })();
+
+  /* ---------- Log stream lifecycle ---------- */
+  function startLogStream() {
+    if (lpSource) return;
+    lpSource = new EventSource('/api/logs/stream');
+    lpSource.addEventListener('log', function(e) {
+      addLpLine(JSON.parse(e.data));
+    });
+  }
+
+  function stopLogStream() {
+    if (lpSource) { lpSource.close(); lpSource = null; }
+  }
 
   /* ---------- Jobs polling ---------- */
   function pollJobs() {

@@ -254,6 +254,42 @@ def compute_crop_phash(image, mask, hash_size=8):
     return str(imagehash.phash(crop, hash_size=hash_size))
 
 
+def compute_noise_estimate(image, mask):
+    """Estimate image noise from smooth background regions.
+
+    Uses the Laplacian variance on background pixels (outside the subject mask).
+    In smooth background areas, high Laplacian variance indicates noise.
+    Lower values = cleaner image.
+
+    Args:
+        image: PIL Image
+        mask: boolean array (H, W)
+
+    Returns:
+        float — noise estimate (higher = noisier)
+    """
+    from scipy.ndimage import laplace
+
+    gray = _to_grayscale_array(image)
+
+    if gray.shape != mask.shape:
+        mask_img = Image.fromarray(mask.astype(np.uint8) * 255)
+        mask_img = mask_img.resize((gray.shape[1], gray.shape[0]), Image.NEAREST)
+        mask = np.array(mask_img) > 127
+
+    # Use background ring (not the full background — avoids bokeh blur
+    # which would artificially lower the estimate)
+    ring = _background_ring(mask, dilation_frac=0.15)
+    if not ring.any():
+        return 0.0
+
+    # Laplacian on the ring region
+    lap = laplace(gray)
+    ring_values = lap[ring]
+
+    return round(float(np.var(ring_values)), 2)
+
+
 def compute_all_quality_features(image, mask):
     """Compute all quality features for a photo in one call.
 
@@ -274,4 +310,5 @@ def compute_all_quality_features(image, mask):
         "subject_y_median": exposure["subject_y_median"],
         "bg_separation": compute_bg_separation(image, mask),
         "phash_crop": compute_crop_phash(image, mask),
+        "noise_estimate": compute_noise_estimate(image, mask),
     }

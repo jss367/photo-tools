@@ -212,6 +212,17 @@ class Database:
             self.conn.execute("ALTER TABLE photos ADD COLUMN subject_clip_low REAL")
             self.conn.execute("ALTER TABLE photos ADD COLUMN subject_y_median REAL")
             self.conn.execute("ALTER TABLE photos ADD COLUMN phash_crop TEXT")
+        # Noise estimate column
+        try:
+            self.conn.execute("SELECT noise_estimate FROM photos LIMIT 0")
+        except Exception:
+            self.conn.execute("ALTER TABLE photos ADD COLUMN noise_estimate REAL")
+        # Enhanced EXIF metadata columns
+        try:
+            self.conn.execute("SELECT focal_length FROM photos LIMIT 0")
+        except Exception:
+            self.conn.execute("ALTER TABLE photos ADD COLUMN focal_length REAL")
+            self.conn.execute("ALTER TABLE photos ADD COLUMN burst_id TEXT")
 
         # Workspace migration for existing databases
         # Check if predictions has workspace_id (detects legacy DBs even though
@@ -688,6 +699,7 @@ class Database:
         subject_clip_low=_UNSET,
         subject_y_median=_UNSET,
         phash_crop=_UNSET,
+        noise_estimate=_UNSET,
     ):
         """Update pipeline feature columns for a photo.
 
@@ -703,6 +715,7 @@ class Database:
             "subject_clip_low": subject_clip_low,
             "subject_y_median": subject_y_median,
             "phash_crop": phash_crop,
+            "noise_estimate": noise_estimate,
         }
         # Filter to only provided values
         updates = {k: v for k, v in cols.items() if v is not _UNSET}

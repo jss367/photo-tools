@@ -319,6 +319,7 @@ def test_compute_all_returns_all_keys():
         "subject_y_median",
         "bg_separation",
         "phash_crop",
+        "noise_estimate",
     }
     assert set(features.keys()) == expected_keys
 

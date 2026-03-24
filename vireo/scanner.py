@@ -203,6 +203,33 @@ def scan(root, db, progress_callback=None, incremental=False):
         except Exception:
             log.debug("Could not read EXIF timestamp from %s", image_path)
 
+        # Read EXIF focal length and burst/sequence ID
+        focal_length = None
+        burst_id = None
+        try:
+            with Image.open(str(image_path)) as img:
+                exif = img.getexif()
+                # FocalLength is EXIF tag 0x920A
+                fl = exif.get(0x920A)
+                if fl is not None:
+                    focal_length = float(fl)
+                # Check EXIF IFD for FocalLength if not in main IFD
+                if focal_length is None:
+                    exif_ifd = exif.get_ifd(0x8769)
+                    if exif_ifd:
+                        fl = exif_ifd.get(0x920A)
+                        if fl is not None:
+                            focal_length = float(fl)
+                # BurstMode / SequenceNumber from MakerNote varies by camera
+                # Try ImageUniqueID (0xA420) as a fallback burst grouping key
+                exif_ifd = exif.get_ifd(0x8769)
+                if exif_ifd:
+                    uid = exif_ifd.get(0xA420)  # ImageUniqueID
+                    if uid:
+                        burst_id = str(uid)
+        except Exception:
+            pass
+
         # Read GPS coordinates
         latitude, longitude = None, None
         try:
@@ -235,7 +262,7 @@ def scan(root, db, progress_callback=None, incremental=False):
             height=height,
         )
 
-        # Store GPS and pHash if found
+        # Store GPS, pHash, focal length, and burst ID if found
         updates = []
         update_params = []
         if latitude is not None:
@@ -244,6 +271,12 @@ def scan(root, db, progress_callback=None, incremental=False):
         if phash is not None:
             updates.append("phash=?")
             update_params.append(phash)
+        if focal_length is not None:
+            updates.append("focal_length=?")
+            update_params.append(focal_length)
+        if burst_id is not None:
+            updates.append("burst_id=?")
+            update_params.append(burst_id)
         if updates:
             update_params.append(photo_id)
             db.conn.execute(

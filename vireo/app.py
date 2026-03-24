@@ -228,6 +228,36 @@ def create_app(db_path, thumb_cache_dir=None):
     def cull_page():
         return render_template("cull.html")
 
+    @app.route("/pipeline")
+    def pipeline_page():
+        db = _get_db()
+        # Check pipeline stage status
+        has_masks = db.conn.execute(
+            """SELECT COUNT(*) FROM photos p
+               JOIN workspace_folders wf ON wf.folder_id = p.folder_id
+               WHERE wf.workspace_id = ? AND p.mask_path IS NOT NULL""",
+            (db._active_workspace_id,),
+        ).fetchone()[0]
+        has_detections = db.conn.execute(
+            """SELECT COUNT(*) FROM photos p
+               JOIN workspace_folders wf ON wf.folder_id = p.folder_id
+               WHERE wf.workspace_id = ? AND p.detection_box IS NOT NULL""",
+            (db._active_workspace_id,),
+        ).fetchone()[0]
+        total_photos = db.count_photos()
+
+        from pipeline import load_results
+        cache_dir = os.path.dirname(db_path)
+        results = load_results(cache_dir, db._active_workspace_id)
+
+        return render_template(
+            "pipeline.html",
+            total_photos=total_photos,
+            has_detections=has_detections,
+            has_masks=has_masks,
+            results=results,
+        )
+
     @app.route("/variants")
     def variants_page():
         return render_template("variants.html")
@@ -3694,6 +3724,178 @@ def create_app(db_path, thumb_cache_dir=None):
             },
         )
         return jsonify({"job_id": job_id})
+
+    @app.route("/api/jobs/regroup", methods=["POST"])
+    def api_job_regroup():
+        """Run pipeline stages 2-6 (grouping + scoring + triage) from cached features.
+
+        This is fast (seconds) — no model inference, just math on stored features.
+        Requires extract-masks to have been run first.
+        """
+        body = request.get_json(silent=True) or {}
+
+        import config as cfg
+
+        effective_cfg = _get_db().get_effective_config(cfg.load())
+        pipeline_cfg = effective_cfg.get("pipeline", {})
+
+        runner = app._job_runner
+        active_ws = _get_db()._active_workspace_id
+
+        def work(job):
+            from pipeline import (
+                load_photo_features,
+                run_full_pipeline,
+                save_results,
+            )
+
+            thread_db = Database(db_path)
+            thread_db.set_active_workspace(active_ws)
+
+            runner.push_event(
+                job["id"],
+                "progress",
+                {"phase": "Loading features from database", "current": 0, "total": 3},
+            )
+
+            photos = load_photo_features(thread_db)
+            if not photos:
+                return {"error": "No photos with pipeline features found. Run extract-masks first."}
+
+            runner.push_event(
+                job["id"],
+                "progress",
+                {"phase": "Grouping encounters and bursts", "current": 1, "total": 3},
+            )
+
+            results = run_full_pipeline(photos, config=pipeline_cfg)
+
+            runner.push_event(
+                job["id"],
+                "progress",
+                {"phase": "Saving results", "current": 2, "total": 3},
+            )
+
+            cache_dir = os.path.dirname(db_path)
+            save_results(results, cache_dir, active_ws)
+
+            return results["summary"]
+
+        job_id = runner.start("regroup", work, config={"pipeline": pipeline_cfg})
+        return jsonify({"job_id": job_id})
+
+    @app.route("/api/pipeline/results")
+    def api_pipeline_results():
+        """Return the most recent pipeline triage results for the active workspace."""
+        from pipeline import load_results
+
+        db = _get_db()
+        cache_dir = os.path.dirname(db_path)
+        results = load_results(cache_dir, db._active_workspace_id)
+        if results is None:
+            return jsonify({"error": "No pipeline results found. Run regroup first."}), 404
+        return jsonify(results)
+
+    @app.route("/api/pipeline/photo/<int:photo_id>")
+    def api_pipeline_photo_detail(photo_id):
+        """Return full pipeline feature detail for a single photo."""
+        db = _get_db()
+        row = db.conn.execute(
+            """SELECT id, filename, timestamp, width, height,
+                      mask_path, subject_tenengrad, bg_tenengrad,
+                      crop_complete, bg_separation,
+                      subject_clip_high, subject_clip_low, subject_y_median,
+                      phash_crop, subject_size, detection_box, detection_conf
+               FROM photos WHERE id = ?""",
+            (photo_id,),
+        ).fetchone()
+        if not row:
+            return jsonify({"error": "Photo not found"}), 404
+        return jsonify(dict(row))
+
+    @app.route("/masks/<filename>")
+    def serve_mask(filename):
+        """Serve mask PNG files."""
+        masks_dir = os.path.join(os.path.dirname(db_path), "masks")
+        mask_path = os.path.join(masks_dir, filename)
+        if os.path.exists(mask_path):
+            return send_from_directory(masks_dir, filename)
+        return "", 404
+
+    @app.route("/api/pipeline/reflow", methods=["POST"])
+    def api_pipeline_reflow():
+        """Re-run stages 4-6 with new scoring/selection thresholds.
+
+        Instant (milliseconds) — no model inference, no regrouping.
+        Takes threshold overrides in the request body, re-scores and
+        re-triages the existing encounter/burst grouping.
+        """
+        from pipeline import (
+            load_photo_features,
+            reflow,
+            run_grouping,
+            save_results,
+            serialize_results,
+        )
+
+        body = request.get_json(silent=True) or {}
+        overrides = body.get("config", {})
+
+        import config as cfg
+
+        db = _get_db()
+        effective_cfg = db.get_effective_config(cfg.load())
+        pipeline_cfg = {**effective_cfg.get("pipeline", {}), **overrides}
+
+        # Load features and re-group (grouping is fast, seconds)
+        # We re-group to have the full photo dicts with numpy arrays
+        # (the cached JSON doesn't have embeddings)
+        photos = load_photo_features(db)
+        if not photos:
+            return jsonify({"error": "No photos with pipeline features"}), 404
+
+        encounters = run_grouping(photos, config=pipeline_cfg)
+        results = reflow(encounters, config=pipeline_cfg)
+
+        # Save updated results
+        cache_dir = os.path.dirname(db_path)
+        save_results(results, cache_dir, db._active_workspace_id)
+
+        return jsonify(serialize_results(results))
+
+    @app.route("/api/pipeline/regroup-live", methods=["POST"])
+    def api_pipeline_regroup_live():
+        """Re-run stages 2-6 with new grouping thresholds.
+
+        Slightly slower than reflow (seconds) because it re-runs encounter
+        segmentation and burst clustering in addition to scoring/triage.
+        """
+        from pipeline import (
+            load_photo_features,
+            run_full_pipeline,
+            save_results,
+            serialize_results,
+        )
+
+        body = request.get_json(silent=True) or {}
+        overrides = body.get("config", {})
+
+        import config as cfg
+
+        db = _get_db()
+        effective_cfg = db.get_effective_config(cfg.load())
+        pipeline_cfg = {**effective_cfg.get("pipeline", {}), **overrides}
+
+        photos = load_photo_features(db)
+        if not photos:
+            return jsonify({"error": "No photos with pipeline features"}), 404
+
+        results = run_full_pipeline(photos, config=pipeline_cfg)
+
+        cache_dir = os.path.dirname(db_path)
+        save_results(results, cache_dir, db._active_workspace_id)
+
+        return jsonify(serialize_results(results))
 
     @app.route("/api/culling/results")
     def api_culling_results():

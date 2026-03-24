@@ -495,6 +495,42 @@ input[type="range"]::-moz-range-thumb {
   color: var(--text-dim, #5A8890);
   margin-bottom: 4px;
 }
+
+/* Model config dropdowns */
+.config-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+.config-label {
+  font-size: 11px;
+  color: var(--text-secondary, #B0CCCC);
+  min-width: 80px;
+  flex-shrink: 0;
+}
+.config-select {
+  flex: 1;
+  padding: 5px 8px;
+  border: 1px solid var(--border-secondary, #1A4560);
+  border-radius: 4px;
+  background: var(--bg-tertiary, #14374E);
+  color: var(--text-primary, #E0F0F0);
+  font-size: 12px;
+  cursor: pointer;
+}
+.config-select:focus { outline: 1px solid var(--accent, #24E5CA); }
+.stale-warning {
+  display: none;
+  padding: 6px 10px;
+  margin-top: 8px;
+  border-radius: 4px;
+  background: rgba(240, 192, 64, 0.15);
+  border: 1px solid var(--warning, #F0C040);
+  font-size: 11px;
+  color: var(--warning, #F0C040);
+}
+.stale-warning.show { display: block; }
 </style>
 </head>
 <body>
@@ -537,6 +573,35 @@ input[type="range"]::-moz-range-thumb {
           <span class="stage-stats" id="stageTriageStats">{% if results %}{{ results.summary.keep_count }}K / {{ results.summary.review_count }}R / {{ results.summary.reject_count }}X{% endif %}</span>
         </li>
       </ul>
+    </div>
+
+    <div class="sidebar-section">
+      <div class="sidebar-title">Model Settings</div>
+      <div class="config-row">
+        <span class="config-label">SAM2</span>
+        <select class="config-select" id="cfgSam2" onchange="onModelConfigChange()">
+          <option value="sam2-tiny" {{ 'selected' if pipeline_config.sam2_variant == 'sam2-tiny' }}>Tiny</option>
+          <option value="sam2-small" {{ 'selected' if pipeline_config.sam2_variant == 'sam2-small' }}>Small</option>
+          <option value="sam2-base-plus" {{ 'selected' if pipeline_config.sam2_variant == 'sam2-base-plus' }}>Base+</option>
+          <option value="sam2-large" {{ 'selected' if pipeline_config.sam2_variant == 'sam2-large' }}>Large</option>
+        </select>
+      </div>
+      <div class="config-row">
+        <span class="config-label">DINOv2</span>
+        <select class="config-select" id="cfgDinov2" onchange="onModelConfigChange()">
+          <option value="vit-s14" {{ 'selected' if pipeline_config.dinov2_variant == 'vit-s14' }}>ViT-S/14 (384d)</option>
+          <option value="vit-b14" {{ 'selected' if pipeline_config.dinov2_variant == 'vit-b14' }}>ViT-B/14 (768d)</option>
+          <option value="vit-l14" {{ 'selected' if pipeline_config.dinov2_variant == 'vit-l14' }}>ViT-L/14 (1024d)</option>
+        </select>
+      </div>
+      <div class="config-row">
+        <span class="config-label">Proxy res.</span>
+        <input type="range" min="1024" max="2048" value="{{ pipeline_config.proxy_longest_edge }}" step="64" id="cfgProxy" oninput="onModelConfigChange()">
+        <span class="slider-val" id="valProxy">{{ pipeline_config.proxy_longest_edge }}</span>
+      </div>
+      <div class="stale-warning" id="staleWarning">
+        Model settings changed. Re-run <strong>Extract Features</strong> to apply.
+      </div>
     </div>
 
     <div class="sidebar-section">
@@ -836,6 +901,53 @@ function setFilter(f) {
     btn.classList.toggle('active', btn.getAttribute('data-filter') === f);
   });
   renderResults();
+}
+
+// -- Model config --
+
+var _savedModelConfig = {
+  sam2_variant: '{{ pipeline_config.sam2_variant }}',
+  dinov2_variant: '{{ pipeline_config.dinov2_variant }}',
+  proxy_longest_edge: {{ pipeline_config.proxy_longest_edge }},
+};
+
+function onModelConfigChange() {
+  var proxyEl = document.getElementById('cfgProxy');
+  var valEl = document.getElementById('valProxy');
+  if (proxyEl && valEl) valEl.textContent = proxyEl.value;
+
+  var newCfg = {
+    sam2_variant: document.getElementById('cfgSam2').value,
+    dinov2_variant: document.getElementById('cfgDinov2').value,
+    proxy_longest_edge: parseInt(document.getElementById('cfgProxy').value),
+  };
+
+  // Check if anything changed from saved config
+  var changed = (newCfg.sam2_variant !== _savedModelConfig.sam2_variant ||
+                 newCfg.dinov2_variant !== _savedModelConfig.dinov2_variant ||
+                 newCfg.proxy_longest_edge !== _savedModelConfig.proxy_longest_edge);
+
+  var warning = document.getElementById('staleWarning');
+  if (warning) warning.classList.toggle('show', changed);
+
+  // Mark stage 1 dot as stale
+  var dot = document.getElementById('stageMaskDot');
+  if (dot) {
+    if (changed) { dot.className = 'stage-dot stale'; }
+    else { dot.className = 'stage-dot {{ "complete" if has_masks else "not-started" }}'; }
+  }
+
+  // Save to server
+  fetch('/api/pipeline/config', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(newCfg),
+  }).then(function(r) { return r.json(); }).then(function(data) {
+    if (data.status === 'saved') {
+      _savedModelConfig = newCfg;
+      // Keep warning visible since features need re-extraction
+    }
+  });
 }
 
 // -- Job launching --

@@ -256,7 +256,7 @@ async function updateReadiness() {
   try {
     var params = [];
     if (modelId) params.push('model_id=' + encodeURIComponent(modelId));
-    if (labelsFiles.length > 0) params.push('labels_files=' + encodeURIComponent(labelsFiles.join(',')));
+    labelsFiles.forEach(function(f) { params.push('labels_files=' + encodeURIComponent(f)); });
     var resp = await fetch('/api/classify/readiness' + (params.length ? '?' + params.join('&') : ''));
     var r = await resp.json();
 

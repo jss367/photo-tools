@@ -3,6 +3,7 @@
 import json
 import logging
 import os
+import re
 import urllib.request
 import urllib.parse
 
@@ -193,7 +194,7 @@ def save_labels(name, place_id, place_name, taxon_groups, species):
     """
     os.makedirs(LABELS_DIR, exist_ok=True)
 
-    slug = name.lower().replace(" ", "-")
+    slug = re.sub(r'[^a-z0-9]+', '-', name.lower()).strip('-')
     labels_path = os.path.join(LABELS_DIR, f"{slug}.txt")
     meta_path = os.path.join(LABELS_DIR, f"{slug}.json")
 

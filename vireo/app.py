@@ -247,8 +247,11 @@ def create_app(db_path, thumb_cache_dir=None):
         total_photos = db.count_photos()
 
         from pipeline import load_results
+        import config as cfg
         cache_dir = os.path.dirname(db_path)
         results = load_results(cache_dir, db._active_workspace_id)
+        effective_cfg = db.get_effective_config(cfg.load())
+        pipeline_cfg = effective_cfg.get("pipeline", {})
 
         return render_template(
             "pipeline.html",
@@ -256,6 +259,11 @@ def create_app(db_path, thumb_cache_dir=None):
             has_detections=has_detections,
             has_masks=has_masks,
             results=results,
+            pipeline_config={
+                "sam2_variant": pipeline_cfg.get("sam2_variant", "sam2-small"),
+                "dinov2_variant": pipeline_cfg.get("dinov2_variant", "vit-b14"),
+                "proxy_longest_edge": pipeline_cfg.get("proxy_longest_edge", 1536),
+            },
         )
 
     @app.route("/variants")
@@ -1167,8 +1175,7 @@ def create_app(db_path, thumb_cache_dir=None):
 
         model_id = request.args.get("model_id", "")
         labels_file = request.args.get("labels_file", "")
-        labels_files_raw = request.args.get("labels_files", "")
-        labels_files = [p for p in labels_files_raw.split(",") if p] if labels_files_raw else []
+        labels_files = request.args.getlist("labels_files")
 
         # Resolve model
         models = get_models()
@@ -2582,9 +2589,13 @@ def create_app(db_path, thumb_cache_dir=None):
             taxonomy_path = os.path.join(os.path.dirname(__file__), "taxonomy.json")
             tax = None
             if os.path.exists(taxonomy_path):
-                from taxonomy import Taxonomy
+                try:
+                    from taxonomy import Taxonomy
 
-                tax = Taxonomy(taxonomy_path)
+                    tax = Taxonomy(taxonomy_path)
+                except Exception as e:
+                    log.warning("Could not load taxonomy: %s — continuing without taxonomy enrichment", e)
+                    tax = None
 
             # Phase 2: Load labels
             labels = None
@@ -3896,6 +3907,45 @@ def create_app(db_path, thumb_cache_dir=None):
         save_results(results, cache_dir, db._active_workspace_id)
 
         return jsonify(serialize_results(results))
+
+    @app.route("/api/pipeline/config", methods=["GET", "POST"])
+    def api_pipeline_config():
+        """Get or update pipeline model configuration.
+
+        GET: Returns current effective pipeline config.
+        POST: Saves pipeline config to workspace overrides.
+              Accepts {sam2_variant, dinov2_variant, proxy_longest_edge}.
+        """
+        import config as cfg
+
+        db = _get_db()
+
+        if request.method == "GET":
+            effective = db.get_effective_config(cfg.load())
+            return jsonify(effective.get("pipeline", {}))
+
+        body = request.get_json(silent=True) or {}
+        allowed_keys = {"sam2_variant", "dinov2_variant", "proxy_longest_edge"}
+        pipeline_updates = {k: v for k, v in body.items() if k in allowed_keys}
+        if not pipeline_updates:
+            return jsonify({"error": "No valid pipeline config keys provided"}), 400
+
+        # Load current overrides, merge pipeline updates
+        ws = db.get_workspace(db._active_workspace_id)
+        current_overrides = {}
+        if ws and ws["config_overrides"]:
+            try:
+                current_overrides = json.loads(ws["config_overrides"]) if isinstance(ws["config_overrides"], str) else ws["config_overrides"]
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+        pipeline_section = current_overrides.get("pipeline", {})
+        pipeline_section.update(pipeline_updates)
+        current_overrides["pipeline"] = pipeline_section
+
+        db.update_workspace(db._active_workspace_id, config_overrides=current_overrides)
+
+        return jsonify({"pipeline": pipeline_section, "status": "saved"})
 
     @app.route("/api/culling/results")
     def api_culling_results():

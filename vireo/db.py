@@ -193,6 +193,25 @@ class Database:
             self.conn.execute("ALTER TABLE predictions ADD COLUMN taxonomy_family TEXT")
             self.conn.execute("ALTER TABLE predictions ADD COLUMN taxonomy_genus TEXT")
             self.conn.execute("ALTER TABLE predictions ADD COLUMN scientific_name TEXT")
+        # Pipeline feature columns (SAM2 masking + quality features)
+        try:
+            self.conn.execute("SELECT mask_path FROM photos LIMIT 0")
+        except Exception:
+            self.conn.execute("ALTER TABLE photos ADD COLUMN mask_path TEXT")
+            self.conn.execute(
+                "ALTER TABLE photos ADD COLUMN dino_subject_embedding BLOB"
+            )
+            self.conn.execute(
+                "ALTER TABLE photos ADD COLUMN dino_global_embedding BLOB"
+            )
+            self.conn.execute("ALTER TABLE photos ADD COLUMN subject_tenengrad REAL")
+            self.conn.execute("ALTER TABLE photos ADD COLUMN bg_tenengrad REAL")
+            self.conn.execute("ALTER TABLE photos ADD COLUMN crop_complete REAL")
+            self.conn.execute("ALTER TABLE photos ADD COLUMN bg_separation REAL")
+            self.conn.execute("ALTER TABLE photos ADD COLUMN subject_clip_high REAL")
+            self.conn.execute("ALTER TABLE photos ADD COLUMN subject_clip_low REAL")
+            self.conn.execute("ALTER TABLE photos ADD COLUMN subject_y_median REAL")
+            self.conn.execute("ALTER TABLE photos ADD COLUMN phash_crop TEXT")
 
         # Workspace migration for existing databases
         # Check if predictions has workspace_id (detects legacy DBs even though
@@ -646,6 +665,99 @@ class Database:
                 sharpness,
                 photo_id,
             ),
+        )
+        self.conn.commit()
+
+    def update_photo_mask(self, photo_id, mask_path):
+        """Store the mask file path for a photo."""
+        self.conn.execute(
+            "UPDATE photos SET mask_path=? WHERE id=?",
+            (mask_path, photo_id),
+        )
+        self.conn.commit()
+
+    def update_photo_pipeline_features(
+        self,
+        photo_id,
+        mask_path=_UNSET,
+        subject_tenengrad=_UNSET,
+        bg_tenengrad=_UNSET,
+        crop_complete=_UNSET,
+        bg_separation=_UNSET,
+        subject_clip_high=_UNSET,
+        subject_clip_low=_UNSET,
+        subject_y_median=_UNSET,
+        phash_crop=_UNSET,
+    ):
+        """Update pipeline feature columns for a photo.
+
+        Only updates columns whose values are explicitly provided (not _UNSET).
+        """
+        cols = {
+            "mask_path": mask_path,
+            "subject_tenengrad": subject_tenengrad,
+            "bg_tenengrad": bg_tenengrad,
+            "crop_complete": crop_complete,
+            "bg_separation": bg_separation,
+            "subject_clip_high": subject_clip_high,
+            "subject_clip_low": subject_clip_low,
+            "subject_y_median": subject_y_median,
+            "phash_crop": phash_crop,
+        }
+        # Filter to only provided values
+        updates = {k: v for k, v in cols.items() if v is not _UNSET}
+        if not updates:
+            return
+        set_clause = ", ".join(f"{k}=?" for k in updates)
+        values = list(updates.values()) + [photo_id]
+        self.conn.execute(
+            f"UPDATE photos SET {set_clause} WHERE id=?", values
+        )
+        self.conn.commit()
+
+    def get_photos_missing_masks(self, folder_ids=None):
+        """Get photos that don't have masks yet, optionally filtered by folders.
+
+        Args:
+            folder_ids: optional list of folder IDs to filter by.
+                        If None, returns all workspace photos without masks.
+        Returns:
+            list of photo rows (id, folder_id, filename, detection_box, detection_conf)
+        """
+        if folder_ids:
+            placeholders = ",".join("?" * len(folder_ids))
+            return self.conn.execute(
+                f"""SELECT id, folder_id, filename, detection_box, detection_conf
+                    FROM photos
+                    WHERE folder_id IN ({placeholders})
+                      AND mask_path IS NULL
+                      AND detection_box IS NOT NULL""",
+                folder_ids,
+            ).fetchall()
+        # All workspace photos
+        return self.conn.execute(
+            """SELECT p.id, p.folder_id, p.filename, p.detection_box, p.detection_conf
+               FROM photos p
+               JOIN workspace_folders wf ON wf.folder_id = p.folder_id
+               WHERE wf.workspace_id = ?
+                 AND p.mask_path IS NULL
+                 AND p.detection_box IS NOT NULL""",
+            (self._ws_id(),),
+        ).fetchall()
+
+    def update_photo_embeddings(
+        self, photo_id, dino_subject_embedding=None, dino_global_embedding=None
+    ):
+        """Store DINOv2 embedding BLOBs for a photo.
+
+        Args:
+            photo_id: photo ID
+            dino_subject_embedding: bytes (float32 numpy array .tobytes())
+            dino_global_embedding: bytes (float32 numpy array .tobytes())
+        """
+        self.conn.execute(
+            "UPDATE photos SET dino_subject_embedding=?, dino_global_embedding=? WHERE id=?",
+            (dino_subject_embedding, dino_global_embedding, photo_id),
         )
         self.conn.commit()
 

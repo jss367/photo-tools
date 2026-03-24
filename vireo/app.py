@@ -3537,6 +3537,164 @@ def create_app(db_path, thumb_cache_dir=None):
         )
         return jsonify({"job_id": job_id})
 
+    # -- Pipeline: SAM2 Mask Extraction --
+
+    @app.route("/api/jobs/extract-masks", methods=["POST"])
+    def api_job_extract_masks():
+        """Run SAM2 mask extraction as a background job.
+
+        Requires MegaDetector detection_box to already be computed (run classify first).
+        For each photo with a detection but no mask, loads a working-resolution proxy,
+        runs SAM2 to refine the bounding box into a pixel mask, and saves it.
+        """
+        body = request.get_json(silent=True) or {}
+        collection_id = body.get("collection_id")
+
+        import config as cfg
+
+        effective_cfg = _get_db().get_effective_config(cfg.load())
+        pipeline_cfg = effective_cfg.get("pipeline", {})
+        sam2_variant = pipeline_cfg.get("sam2_variant", "sam2-small")
+        dinov2_variant = pipeline_cfg.get("dinov2_variant", "vit-b14")
+        proxy_longest_edge = pipeline_cfg.get("proxy_longest_edge", 1536)
+
+        runner = app._job_runner
+        active_ws = _get_db()._active_workspace_id
+
+        def work(job):
+            from dinov2 import embed_global, embed_subject, embedding_to_blob
+            from masking import (
+                crop_completeness,
+                crop_subject,
+                generate_mask,
+                render_proxy,
+                save_mask,
+            )
+            from quality import compute_all_quality_features
+
+            thread_db = Database(db_path)
+            thread_db.set_active_workspace(active_ws)
+
+            masks_dir = os.path.join(os.path.dirname(db_path), "masks")
+            os.makedirs(masks_dir, exist_ok=True)
+
+            # Get photos that have detections but no masks
+            if collection_id:
+                photos = thread_db.get_collection_photos(
+                    collection_id, per_page=999999
+                )
+                photos = [
+                    p
+                    for p in photos
+                    if p["detection_box"] and not thread_db.conn.execute(
+                        "SELECT mask_path FROM photos WHERE id=?", (p["id"],)
+                    ).fetchone()[0]
+                ]
+            else:
+                photos = thread_db.get_photos_missing_masks()
+
+            folders = {f["id"]: f["path"] for f in thread_db.get_folder_tree()}
+            total = len(photos)
+            masked = 0
+            skipped = 0
+            failed = 0
+            job["_start_time"] = time.time()
+
+            for i, photo in enumerate(photos):
+                photo_id = photo["id"]
+                folder_path = folders.get(photo["folder_id"], "")
+                image_path = os.path.join(folder_path, photo["filename"])
+
+                try:
+                    # Load working-resolution proxy
+                    proxy = render_proxy(image_path, longest_edge=proxy_longest_edge)
+                    if proxy is None:
+                        skipped += 1
+                        continue
+
+                    # Parse detection box
+                    det_box = photo["detection_box"]
+                    if isinstance(det_box, str):
+                        det_box = json.loads(det_box)
+
+                    # Generate mask via SAM2
+                    mask = generate_mask(proxy, det_box, variant=sam2_variant)
+                    if mask is None:
+                        skipped += 1
+                        continue
+
+                    # Save mask PNG
+                    mask_path = save_mask(mask, masks_dir, photo_id)
+
+                    # Compute crop completeness + all quality features
+                    completeness = crop_completeness(mask)
+                    features = compute_all_quality_features(proxy, mask)
+
+                    # Compute DINOv2 embeddings
+                    subject_crop = crop_subject(proxy, mask, margin=0.15)
+                    subj_emb_blob = None
+                    global_emb_blob = None
+                    if subject_crop is not None:
+                        subj_emb = embed_subject(subject_crop, variant=dinov2_variant)
+                        subj_emb_blob = embedding_to_blob(subj_emb)
+                    global_emb = embed_global(proxy, variant=dinov2_variant)
+                    global_emb_blob = embedding_to_blob(global_emb)
+
+                    # Update DB with mask path, completeness, features, and embeddings
+                    thread_db.update_photo_pipeline_features(
+                        photo_id,
+                        mask_path=mask_path,
+                        crop_complete=completeness,
+                        **features,
+                    )
+                    thread_db.update_photo_embeddings(
+                        photo_id,
+                        dino_subject_embedding=subj_emb_blob,
+                        dino_global_embedding=global_emb_blob,
+                    )
+                    masked += 1
+
+                except Exception:
+                    failed += 1
+                    log.warning(
+                        "Mask extraction failed for photo %s", photo_id, exc_info=True
+                    )
+                    job["errors"].append(
+                        f"Photo {photo_id}: mask extraction failed"
+                    )
+
+                runner.push_event(
+                    job["id"],
+                    "progress",
+                    {
+                        "current": i + 1,
+                        "total": total,
+                        "current_file": photo["filename"]
+                        if hasattr(photo, "__getitem__") and "filename" in photo.keys()
+                        else str(photo_id),
+                        "rate": round(
+                            (i + 1)
+                            / max(time.time() - job["_start_time"], 0.01),
+                            1,
+                        ),
+                        "phase": "Extracting features (SAM2 + DINOv2)",
+                    },
+                )
+
+            return {"masked": masked, "skipped": skipped, "failed": failed, "total": total}
+
+        job_id = runner.start(
+            "extract-masks",
+            work,
+            config={
+                "collection_id": collection_id,
+                "sam2_variant": sam2_variant,
+                "dinov2_variant": dinov2_variant,
+                "proxy_longest_edge": proxy_longest_edge,
+            },
+        )
+        return jsonify({"job_id": job_id})
+
     @app.route("/api/culling/results")
     def api_culling_results():
         """Return the most recent culling analysis results for the active workspace."""

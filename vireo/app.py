@@ -1934,6 +1934,17 @@ def create_app(db_path, thumb_cache_dir=None):
             }
         )
 
+    @app.route("/api/labels", methods=["DELETE"])
+    def api_delete_labels():
+        from labels import delete_labels
+
+        body = request.get_json(silent=True) or {}
+        labels_file = body.get("labels_file")
+        if not labels_file:
+            return jsonify({"error": "labels_file required"}), 400
+        delete_labels(labels_file)
+        return jsonify({"ok": True})
+
     @app.route("/api/labels/active", methods=["POST"])
     def api_set_active_labels():
         body = request.get_json(silent=True) or {}

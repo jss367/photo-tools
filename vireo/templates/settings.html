@@ -795,6 +795,9 @@ async function loadLabels() {
       html += '<div style="font-size:11px;color:#888;">' + (l.species_count || 0) + ' species &middot; ' + groups + '</div>';
       html += '</div>';
       html += '</label>';
+      html += '<button onclick="deleteLabelSet(\'' + escapeAttr(l.labels_file) + '\',\'' + escapeAttr(l.name) + '\')" ' +
+              'style="background:none;color:#e74c3c;border:1px solid #e74c3c;border-radius:4px;padding:3px 10px;font-size:11px;cursor:pointer;white-space:nowrap;" ' +
+              'title="Delete this label set">Delete</button>';
       html += '</div>';
     });
 
@@ -823,6 +826,18 @@ async function updateActiveLabels() {
     body: JSON.stringify({labels_files: paths}),
   });
   loadLabels();
+}
+
+async function deleteLabelSet(labelsFile, name) {
+  if (!confirm('Delete label set "' + name + '"?')) return;
+  try {
+    await fetch('/api/labels', {
+      method: 'DELETE',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({labels_file: labelsFile}),
+    });
+    loadLabels();
+  } catch(e) {}
 }
 
 async function loadTaxonGroups() {

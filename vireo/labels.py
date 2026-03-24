@@ -252,6 +252,27 @@ def save_labels(name, place_id, place_name, taxon_groups, species,
     return labels_path
 
 
+def delete_labels(labels_file):
+    """Delete a label set from disk and deactivate if active.
+
+    Args:
+        labels_file: path to the .txt labels file
+    """
+    # Remove .txt and corresponding .json
+    if os.path.exists(labels_file):
+        os.remove(labels_file)
+    meta_path = labels_file.rsplit(".", 1)[0] + ".json"
+    if os.path.exists(meta_path):
+        os.remove(meta_path)
+
+    # Remove from active labels if present
+    active = get_active_labels()
+    active_paths = [a["labels_file"] for a in active if a.get("labels_file") != labels_file]
+    set_active_labels(active_paths)
+
+    log.info("Deleted label set: %s", labels_file)
+
+
 def get_saved_labels():
     """List all saved label sets.
 

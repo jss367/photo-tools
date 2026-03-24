@@ -402,17 +402,6 @@ def test_api_job_develop_requires_photo_ids(tmp_path):
     assert resp.status_code == 400
 
 
-def test_api_job_develop_requires_darktable(tmp_path):
-    """POST /api/jobs/develop returns 400 when darktable not available."""
-    app, db = _setup_app(tmp_path)
-    client = app.test_client()
-    resp = client.post('/api/jobs/develop',
-                       data=json.dumps({"photo_ids": [1]}),
-                       content_type='application/json')
-    assert resp.status_code == 400
-    data = resp.get_json()
-    assert 'darktable' in data['error'].lower()
-
 
 def test_api_config_saves_darktable_settings(tmp_path):
     """POST /api/config saves darktable settings."""

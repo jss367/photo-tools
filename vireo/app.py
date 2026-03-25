@@ -244,6 +244,12 @@ def create_app(db_path, thumb_cache_dir=None):
                WHERE wf.workspace_id = ? AND p.detection_box IS NOT NULL""",
             (db._active_workspace_id,),
         ).fetchone()[0]
+        has_sharpness = db.conn.execute(
+            """SELECT COUNT(*) FROM photos p
+               JOIN workspace_folders wf ON wf.folder_id = p.folder_id
+               WHERE wf.workspace_id = ? AND p.subject_tenengrad IS NOT NULL""",
+            (db._active_workspace_id,),
+        ).fetchone()[0]
         total_photos = db.count_photos()
 
         from pipeline import load_results
@@ -258,6 +264,7 @@ def create_app(db_path, thumb_cache_dir=None):
             total_photos=total_photos,
             has_detections=has_detections,
             has_masks=has_masks,
+            has_sharpness=has_sharpness,
             results=results,
             pipeline_config={
                 "sam2_variant": pipeline_cfg.get("sam2_variant", "sam2-small"),
@@ -2395,15 +2402,6 @@ def create_app(db_path, thumb_cache_dir=None):
                 # The model is loaded via torch.hub.load which downloads the repo
                 # Weights are auto-downloaded on first model creation
                 status = "repo cached"
-                try:
-                    total = sum(
-                        os.path.getsize(os.path.join(dp, f))
-                        for dp, _, filenames in os.walk(dinov2_hub)
-                        for f in filenames
-                    )
-                    size = round(total / 1024 / 1024, 1)
-                except Exception:
-                    pass
             if os.path.exists(hf_dinov2):
                 pt_files = glob.glob(os.path.join(hf_dinov2, "snapshots", "**", "*.bin"), recursive=True)
                 if pt_files:

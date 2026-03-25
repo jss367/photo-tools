@@ -4230,21 +4230,25 @@ def create_app(db_path, thumb_cache_dir=None):
 
         # Tag all photos and queue pending changes in a single transaction
         ws_id = db._ws_id()
-        for pid in photo_ids:
-            db.conn.execute(
-                "INSERT OR IGNORE INTO photo_keywords (photo_id, keyword_id) VALUES (?, ?)",
-                (pid, kid),
-            )
-            existing = db.conn.execute(
-                "SELECT id FROM pending_changes WHERE photo_id = ? AND change_type = ? AND value = ? AND workspace_id = ?",
-                (pid, "keyword_add", species, ws_id),
-            ).fetchone()
-            if not existing:
+        try:
+            for pid in photo_ids:
                 db.conn.execute(
-                    "INSERT INTO pending_changes (photo_id, change_type, value, workspace_id) VALUES (?, ?, ?, ?)",
-                    (pid, "keyword_add", species, ws_id),
+                    "INSERT OR IGNORE INTO photo_keywords (photo_id, keyword_id) VALUES (?, ?)",
+                    (pid, kid),
                 )
-        db.conn.commit()
+                existing = db.conn.execute(
+                    "SELECT id FROM pending_changes WHERE photo_id = ? AND change_type = ? AND value = ? AND workspace_id = ?",
+                    (pid, "keyword_add", species, ws_id),
+                ).fetchone()
+                if not existing:
+                    db.conn.execute(
+                        "INSERT INTO pending_changes (photo_id, change_type, value, workspace_id) VALUES (?, ?, ?, ?)",
+                        (pid, "keyword_add", species, ws_id),
+                    )
+            db.conn.commit()
+        except Exception:
+            db.conn.rollback()
+            raise
 
         return jsonify({
             "ok": True,

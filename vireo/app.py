@@ -3395,14 +3395,18 @@ def create_app(db_path, thumb_cache_dir=None):
                                 timestamp = dt.fromisoformat(photo["timestamp"])
                             except Exception:
                                 pass
-                        emb_row = thread_db.conn.execute(
-                            "SELECT embedding FROM photos WHERE id = ?",
-                            (photo["id"],),
-                        ).fetchone()
+                        # Load embedding for grouping refinement (BioCLIP only).
+                        # timm doesn't produce embeddings — skip to avoid using
+                        # stale BioCLIP vectors that would confuse similarity grouping.
                         embedding = None
-                        if emb_row and emb_row["embedding"]:
-                            import numpy as np
-                            embedding = np.frombuffer(emb_row["embedding"], dtype=np.float32)
+                        if model_type != "timm":
+                            emb_row = thread_db.conn.execute(
+                                "SELECT embedding FROM photos WHERE id = ?",
+                                (photo["id"],),
+                            ).fetchone()
+                            if emb_row and emb_row["embedding"]:
+                                import numpy as np
+                                embedding = np.frombuffer(emb_row["embedding"], dtype=np.float32)
                         raw_results.append({
                             "photo": photo,
                             "folder_path": folder_path,

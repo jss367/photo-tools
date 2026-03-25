@@ -349,8 +349,7 @@ function onCollectionChange() {
   fetch('/api/collections/' + collId + '/photos?per_page=1')
     .then(function(r) { return r.json(); })
     .then(function(data) {
-      var total = data.total || (data.photos ? data.photos.length : 0);
-      countEl.textContent = total + ' photos';
+      countEl.textContent = (data.total || 0) + ' photos';
     })
     .catch(function() { countEl.textContent = ''; });
   updateCardStates();
@@ -547,6 +546,9 @@ async function runClassify(reclassify) {
         // Mark downstream as stale
         markStale('extract');
         markStale('group');
+        // Enable downstream buttons
+        _pipelineState.hasDetections = true;
+        updateCardStates();
       } else {
         status.textContent = 'Failed: ' + (result.errors || []).join(', ');
         num.className = 'stage-num';
@@ -664,6 +666,9 @@ async function runExtract() {
         }
         // Mark downstream as stale
         markStale('group');
+        // Enable downstream buttons
+        _pipelineState.hasMasks = true;
+        updateCardStates();
       } else {
         status.textContent = 'Failed';
         num.className = 'stage-num';
@@ -759,6 +764,7 @@ async function runGroup() {
           a.textContent = 'View Results';
           body.appendChild(a);
         }
+        _pipelineState.hasResults = true;
       } else {
         status.textContent = 'Failed';
         num.className = 'stage-num';
@@ -786,23 +792,26 @@ function toggleCard(name) {
   if (card) card.classList.toggle('expanded');
 }
 
+// Mutable pipeline state — updated after each job completes
+var _pipelineState = {
+  hasDetections: {{ has_detections|tojson }},
+  hasMasks: {{ has_masks|tojson }},
+  hasResults: {{ 'true' if results else 'false' }},
+};
+
 function updateCardStates() {
   var collId = document.getElementById('collectionPicker').value;
   var hasCollection = !!collId;
 
-  // Enable/disable buttons based on collection selection and upstream completion
-  var hasDetections = {{ has_detections|tojson }};
-  var hasMasks = {{ has_masks|tojson }};
-
   document.getElementById('btnClassify').disabled = !hasCollection;
-  document.getElementById('btnExtract').disabled = !hasCollection || !hasDetections;
-  document.getElementById('btnGroup').disabled = !hasCollection || !hasMasks;
+  document.getElementById('btnExtract').disabled = !hasCollection || !_pipelineState.hasDetections;
+  document.getElementById('btnGroup').disabled = !hasCollection || !_pipelineState.hasMasks;
 
   // Expand completed cards
-  if (hasDetections && !{{ has_masks|tojson }}) {
+  if (_pipelineState.hasDetections && !_pipelineState.hasMasks) {
     document.getElementById('card-extract').classList.add('expanded');
   }
-  if (hasMasks && !{{ 'true' if results else 'false' }}) {
+  if (_pipelineState.hasMasks && !_pipelineState.hasResults) {
     document.getElementById('card-group').classList.add('expanded');
   }
 }

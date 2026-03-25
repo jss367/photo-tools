@@ -280,3 +280,49 @@ def test_pipeline_has_model_checkboxes(app_and_db):
     assert resp.status_code == 200
     assert b'model-checkbox' in resp.data
     assert b'id="cfgModel"' not in resp.data  # old single select removed
+
+
+def test_static_vireo_utils_served(app_and_db):
+    """vireo-utils.js is served from /static/."""
+    app, _ = app_and_db
+    client = app.test_client()
+    resp = client.get('/static/vireo-utils.js')
+    assert resp.status_code == 200
+    assert 'javascript' in resp.content_type
+    body = resp.data.decode()
+    assert 'function escapeHtml' in body
+    assert 'function escapeAttr' in body
+
+
+def test_pages_include_vireo_utils(app_and_db):
+    """Every page includes vireo-utils.js via _navbar.html."""
+    app, _ = app_and_db
+    client = app.test_client()
+    pages = ['/browse', '/import', '/audit', '/logs',
+             '/settings', '/workspace', '/pipeline', '/dashboard',
+             '/review', '/cull', '/variants', '/compare']
+    for page in pages:
+        resp = client.get(page)
+        assert resp.status_code == 200, f"{page} returned {resp.status_code}"
+        html = resp.data.decode()
+        assert 'vireo-utils.js' in html, f"{page} missing vireo-utils.js script tag"
+
+
+def test_pages_no_inline_escapeHtml(app_and_db):
+    """No page template should still define escapeHtml inline."""
+    app, _ = app_and_db
+    client = app.test_client()
+    pages = ['/browse', '/import', '/audit', '/logs',
+             '/settings', '/workspace', '/pipeline', '/dashboard',
+             '/review', '/cull', '/variants', '/compare']
+    for page in pages:
+        resp = client.get(page)
+        html = resp.data.decode()
+        # The function should exist (via vireo-utils.js) but not be
+        # defined inline in a <script> block on the page itself.
+        # We check that "function escapeHtml" does NOT appear in the
+        # page body outside of the vireo-utils.js src tag.
+        # Simple heuristic: count occurrences — should be 0 in inline script.
+        # The <script src="...vireo-utils.js"> tag won't contain the function text.
+        assert html.count('function escapeHtml') == 0, \
+            f"{page} still has inline escapeHtml definition"

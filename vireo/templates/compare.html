@@ -144,7 +144,7 @@ function renderTable(data) {
   var html = '<table class="compare-table"><thead><tr>';
   html += '<th>Photo</th>';
   data.models.forEach(function(m) {
-    html += '<th>' + escHtml(m) + '</th>';
+    html += '<th>' + escapeHtml(m) + '</th>';
   });
   html += '</tr></thead><tbody>';
 
@@ -160,13 +160,13 @@ function renderTable(data) {
     html += '<tr class="' + (disagree ? 'disagree' : '') + '">';
     html += '<td><div class="thumb-cell">';
     html += '<img src="/thumbnails/' + photo.photo_id + '.jpg" loading="lazy" alt="">';
-    html += '<span>' + escHtml(photo.filename) + '</span>';
+    html += '<span>' + escapeHtml(photo.filename) + '</span>';
     html += '</div></td>';
 
     data.models.forEach(function(m) {
       var pred = photo.predictions[m];
       if (pred) {
-        html += '<td>' + escHtml(pred.species);
+        html += '<td>' + escapeHtml(pred.species);
         html += ' <span class="conf">' + Math.round(pred.confidence * 100) + '%</span></td>';
       } else {
         html += '<td class="empty-cell">&mdash;</td>';
@@ -178,12 +178,6 @@ function renderTable(data) {
 
   html += '</tbody></table>';
   content.innerHTML = html;
-}
-
-function escHtml(s) {
-  var d = document.createElement('div');
-  d.textContent = s;
-  return d.innerHTML;
 }
 
 loadCollections();

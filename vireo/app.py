@@ -1627,11 +1627,24 @@ def create_app(db_path, thumb_cache_dir=None):
                 model["name"],
             )
 
+            def _progress(current, total):
+                runner.push_event(
+                    job["id"],
+                    "progress",
+                    {
+                        "current": current,
+                        "total": total,
+                        "current_file": f"Computing embeddings ({current}/{total} labels)…",
+                        "rate": 0,
+                    },
+                )
+
             # This will compute and cache the embeddings
             Classifier(
                 labels=labels,
                 model_str=model["model_str"],
                 pretrained_str=model["weights_path"],
+                embedding_progress_callback=_progress,
             )
 
             return {"labels": len(labels), "model": model["name"]}

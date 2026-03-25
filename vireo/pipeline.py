@@ -32,7 +32,24 @@ _PIPELINE_PHOTO_COLS = """
 """
 
 
-def load_photo_features(db):
+def _resolve_collection_photo_ids(db, collection_id):
+    """Resolve a collection to a set of photo IDs using the collection rules engine.
+
+    Uses get_collection_photos with a large page size to get all matching photos,
+    then extracts just the IDs.
+
+    Args:
+        db: Database instance with active workspace
+        collection_id: collection ID to resolve
+
+    Returns:
+        set of photo IDs (empty set if collection not found or has no photos)
+    """
+    rows = db.get_collection_photos(collection_id, page=1, per_page=1_000_000)
+    return {r["id"] for r in rows} if rows else set()
+
+
+def load_photo_features(db, collection_id=None):
     """Load all pipeline-relevant features for workspace photos from the database.
 
     Returns a list of photo dicts ready for the pipeline stages, with:

@@ -422,6 +422,12 @@ def _download_with_byte_progress(repo_id, filename, file_size,
         done.wait(2.0)
 
     if error[0]:
+        # Preserve tqdm-reported progress so the retry loop can tell
+        # whether data was flowing before the error (e.g. connection reset
+        # after partial XET transfer).
+        if not hasattr(error[0], "bytes_downloaded"):
+            with lock:
+                error[0].bytes_downloaded = state["bytes"]
         raise error[0]
     return result[0]
 

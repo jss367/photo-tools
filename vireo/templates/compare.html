@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<link rel="icon" type="image/png" href="/favicon.ico">
+<link rel="apple-touch-icon" href="/static/apple-touch-icon.png">
+<link rel="stylesheet" href="/static/vireo-base.css">
+<title>Vireo - Compare Models</title>
+<style>
+body { padding-bottom: 36px; }
+.content { max-width: 1200px; }
+
+.compare-bar {
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-primary);
+  border-radius: 8px;
+  padding: 12px 16px;
+  margin-bottom: 16px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.compare-bar label { font-size: 13px; color: var(--text-secondary); }
+.compare-bar select {
+  background: var(--bg-input); color: var(--text-primary);
+  border: 1px solid var(--border-primary); border-radius: 4px;
+  padding: 4px 8px; font-size: 13px;
+}
+
+.compare-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+.compare-table th {
+  background: var(--bg-tertiary);
+  color: var(--text-secondary);
+  padding: 8px 12px;
+  text-align: left;
+  border-bottom: 1px solid var(--border-primary);
+  position: sticky;
+  top: 0;
+  z-index: 1;
+}
+.compare-table td {
+  padding: 6px 12px;
+  border-bottom: 1px solid var(--border-subtle);
+  vertical-align: middle;
+}
+.compare-table tr:hover { background: var(--bg-tertiary); }
+.compare-table tr.disagree { background: rgba(240, 192, 64, 0.08); }
+.compare-table tr.disagree:hover { background: rgba(240, 192, 64, 0.14); }
+
+.thumb-cell {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.thumb-cell img {
+  width: 40px; height: 40px;
+  object-fit: cover;
+  border-radius: 4px;
+}
+.conf { color: var(--text-muted); font-size: 11px; }
+.empty-cell { color: var(--text-ghost); }
+
+.compare-empty {
+  text-align: center;
+  padding: 48px 16px;
+  color: var(--text-muted);
+}
+</style>
+</head>
+<body>
+
+{% set active_page = 'compare' %}
+{% include '_navbar.html' %}
+
+<div class="content">
+  <div class="compare-bar">
+    <label>Collection:</label>
+    <select id="collectionPicker" onchange="loadComparison()">
+      <option value="">Select collection...</option>
+    </select>
+    <span id="compareStatus" style="font-size:12px;color:var(--text-muted);"></span>
+  </div>
+
+  <div id="compareContent">
+    <div class="compare-empty">Select a collection to compare model predictions.</div>
+  </div>
+</div>
+
+<script>
+async function loadCollections() {
+  try {
+    var resp = await fetch('/api/collections');
+    var data = await resp.json();
+    var sel = document.getElementById('collectionPicker');
+    data.forEach(function(c) {
+      var opt = document.createElement('option');
+      opt.value = c.id;
+      opt.textContent = c.name;
+      sel.appendChild(opt);
+    });
+  } catch(e) { console.error('loadCollections error:', e); }
+}
+
+async function loadComparison() {
+  var collId = document.getElementById('collectionPicker').value;
+  var content = document.getElementById('compareContent');
+  var status = document.getElementById('compareStatus');
+
+  if (!collId) {
+    content.innerHTML = '<div class="compare-empty">Select a collection to compare model predictions.</div>';
+    return;
+  }
+
+  status.textContent = 'Loading...';
+  try {
+    var resp = await fetch('/api/predictions/compare?collection_id=' + collId);
+    var data = await resp.json();
+    status.textContent = '';
+
+    if (data.models.length === 0) {
+      content.innerHTML = '<div class="compare-empty">No predictions found for this collection. Run classification first.</div>';
+      return;
+    }
+
+    if (data.models.length < 2) {
+      content.innerHTML = '<div class="compare-empty">Only one model has predictions. Run classification with at least two models to compare.</div>';
+      return;
+    }
+
+    renderTable(data);
+  } catch(e) {
+    status.textContent = 'Error loading data';
+    console.error('loadComparison error:', e);
+  }
+}
+
+function renderTable(data) {
+  var content = document.getElementById('compareContent');
+  var html = '<table class="compare-table"><thead><tr>';
+  html += '<th>Photo</th>';
+  data.models.forEach(function(m) {
+    html += '<th>' + escapeHtml(m) + '</th>';
+  });
+  html += '</tr></thead><tbody>';
+
+  data.photos.forEach(function(photo) {
+    // Determine if models disagree
+    var species = new Set();
+    data.models.forEach(function(m) {
+      var pred = photo.predictions[m];
+      if (pred) species.add(pred.species);
+    });
+    var disagree = species.size > 1;
+
+    html += '<tr class="' + (disagree ? 'disagree' : '') + '">';
+    html += '<td><div class="thumb-cell">';
+    html += '<img src="/thumbnails/' + photo.photo_id + '.jpg" loading="lazy" alt="">';
+    html += '<span>' + escapeHtml(photo.filename) + '</span>';
+    html += '</div></td>';
+
+    data.models.forEach(function(m) {
+      var pred = photo.predictions[m];
+      if (pred) {
+        html += '<td>' + escapeHtml(pred.species);
+        html += ' <span class="conf">' + Math.round(pred.confidence * 100) + '%</span></td>';
+      } else {
+        html += '<td class="empty-cell">&mdash;</td>';
+      }
+    });
+
+    html += '</tr>';
+  });
+
+  html += '</tbody></table>';
+  content.innerHTML = html;
+}
+
+loadCollections();
+</script>
+</body>
+</html>

@@ -202,15 +202,6 @@ body { padding-bottom: 36px; }
           <div class="setting-label">Labels</div>
           <div id="labelsPicker" style="font-size:12px;max-height:100px;overflow-y:auto;"></div>
         </div>
-        <div class="setting-item">
-          <div class="setting-label">Threshold</div>
-          <div style="display:flex;align-items:center;gap:8px;">
-            <input type="range" id="cfgThreshold" min="10" max="90" step="5" value="40"
-                   style="width:120px;accent-color:var(--accent,#24E5CA);"
-                   oninput="document.getElementById('cfgThresholdVal').textContent = this.value + '%'">
-            <span style="font-size:13px;" id="cfgThresholdVal">40%</span>
-          </div>
-        </div>
       </div>
       <div class="readiness-panel" id="readinessPanel" style="display:none;"></div>
       <div class="run-row">
@@ -396,13 +387,6 @@ async function loadLabels() {
       div.innerHTML = html;
     }
 
-    // Load threshold from config
-    var cfg = await safeFetch('/api/classify/config', {}, { toast: false });
-    if (cfg.default_threshold) {
-      var pct = Math.round(cfg.default_threshold * 100);
-      document.getElementById('cfgThreshold').value = pct;
-      document.getElementById('cfgThresholdVal').textContent = pct + '%';
-    }
   } catch(e) {}
 }
 
@@ -478,7 +462,6 @@ async function runClassify(reclassify) {
   var progressWrap = document.getElementById('progressClassify');
   var fill = document.getElementById('fillClassify');
   var text = document.getElementById('textClassify');
-  var threshold = parseInt(document.getElementById('cfgThreshold').value, 10) / 100;
   var num = document.getElementById('numClassify');
 
   btn.disabled = true;
@@ -508,7 +491,6 @@ async function runClassify(reclassify) {
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({
           collection_id: parseInt(collId),
-          threshold: threshold,
           model_id: model.id,
           labels_files: labelsFiles,
           reclassify: !!reclass,

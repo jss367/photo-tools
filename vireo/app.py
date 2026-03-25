@@ -2914,7 +2914,6 @@ def create_app(db_path, thumb_cache_dir=None):
         labels_file = body.get("labels_file")
         model_id = body.get("model_id")
         model_name = body.get("model_name")  # Will be set to effective_name in work()
-        threshold = body.get("threshold", user_cfg["classification_threshold"])
         grouping_window = body.get(
             "grouping_window", user_cfg["grouping_window_seconds"]
         )

@@ -208,3 +208,48 @@ def test_pages_link_base_css(app_and_db):
         assert resp.status_code == 200, f"{page} returned {resp.status_code}"
         html = resp.data.decode()
         assert 'vireo-base.css' in html, f"{page} missing vireo-base.css link"
+
+
+def test_compare_predictions_api(app_and_db):
+    """GET /api/predictions/compare returns per-photo, per-model data."""
+    app, db = app_and_db
+
+    # Get photo IDs
+    photos = db.conn.execute("SELECT id FROM photos").fetchall()
+    photo_ids = [p["id"] for p in photos]
+
+    # Create a collection containing all photos
+    import json
+    rules = json.dumps([{"field": "photo_ids", "value": photo_ids}])
+    cid = db.add_collection("Test Collection", rules)
+
+    # Add predictions from two models
+    db.add_prediction(photo_ids[0], "Cardinal", 0.95, "model-a")
+    db.add_prediction(photo_ids[0], "Blue Jay", 0.80, "model-b")
+    db.add_prediction(photo_ids[1], "Sparrow", 0.90, "model-a")
+    db.add_prediction(photo_ids[1], "Sparrow", 0.88, "model-b")
+
+    client = app.test_client()
+    resp = client.get(f"/api/predictions/compare?collection_id={cid}")
+    assert resp.status_code == 200
+    data = resp.get_json()
+
+    assert "models" in data
+    assert set(data["models"]) == {"model-a", "model-b"}
+    assert "photos" in data
+    assert len(data["photos"]) >= 2
+
+    # Check structure of a photo entry
+    photo = data["photos"][0]
+    assert "photo_id" in photo
+    assert "filename" in photo
+    assert "predictions" in photo
+    assert isinstance(photo["predictions"], dict)  # keyed by model name
+
+
+def test_compare_predictions_api_requires_collection(app_and_db):
+    """GET /api/predictions/compare without collection_id returns 400."""
+    app, _ = app_and_db
+    client = app.test_client()
+    resp = client.get("/api/predictions/compare")
+    assert resp.status_code == 400

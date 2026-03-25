@@ -993,6 +993,40 @@ def create_app(db_path, thumb_cache_dir=None):
             results.append(d)
         return jsonify(results)
 
+    @app.route("/api/predictions/compare")
+    def api_predictions_compare():
+        db = _get_db()
+        collection_id = request.args.get("collection_id", None, type=int)
+        if not collection_id:
+            return jsonify({"error": "collection_id required"}), 400
+
+        photos = db.get_collection_photos(collection_id, per_page=999999)
+        photo_ids = [p["id"] for p in photos]
+        if not photo_ids:
+            return jsonify({"models": [], "photos": []})
+
+        preds = db.get_predictions(photo_ids=photo_ids)
+
+        # Collect distinct models and build per-photo lookup
+        models = set()
+        by_photo = {}
+        for pr in preds:
+            d = dict(pr)
+            pid = d["photo_id"]
+            model = d["model"]
+            models.add(model)
+            if pid not in by_photo:
+                by_photo[pid] = {"photo_id": pid, "filename": d["filename"], "predictions": {}}
+            by_photo[pid]["predictions"][model] = {
+                "species": d["species"],
+                "confidence": d["confidence"],
+            }
+
+        return jsonify({
+            "models": sorted(models),
+            "photos": list(by_photo.values()),
+        })
+
     @app.route("/api/predictions/<int:pred_id>/accept", methods=["POST"])
     def api_accept_prediction(pred_id):
         db = _get_db()

@@ -227,7 +227,7 @@ def test_pages_include_vireo_utils(app_and_db):
     app, _ = app_and_db
     client = app.test_client()
     pages = ['/browse', '/import', '/audit', '/logs',
-             '/settings', '/workspace', '/pipeline', '/stats',
+             '/settings', '/workspace', '/pipeline', '/dashboard',
              '/review', '/cull', '/variants']
     for page in pages:
         resp = client.get(page)
@@ -241,7 +241,7 @@ def test_pages_no_inline_escapeHtml(app_and_db):
     app, _ = app_and_db
     client = app.test_client()
     pages = ['/browse', '/import', '/audit', '/logs',
-             '/settings', '/workspace', '/pipeline', '/stats',
+             '/settings', '/workspace', '/pipeline', '/dashboard',
              '/review', '/cull', '/variants']
     for page in pages:
         resp = client.get(page)

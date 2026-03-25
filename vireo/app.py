@@ -289,6 +289,10 @@ def create_app(db_path, thumb_cache_dir=None):
     def workspace_page():
         return render_template("workspace.html")
 
+    @app.route("/compare")
+    def compare():
+        return render_template("compare.html")
+
     @app.route("/settings")
     def settings():
         return render_template("settings.html")

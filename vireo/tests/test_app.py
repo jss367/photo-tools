@@ -210,6 +210,14 @@ def test_pages_link_base_css(app_and_db):
         assert 'vireo-base.css' in html, f"{page} missing vireo-base.css link"
 
 
+def test_compare_page(app_and_db):
+    """GET /compare returns 200."""
+    app, _ = app_and_db
+    client = app.test_client()
+    resp = client.get('/compare')
+    assert resp.status_code == 200
+
+
 def test_compare_predictions_api(app_and_db):
     """GET /api/predictions/compare returns per-photo, per-model data."""
     app, db = app_and_db

@@ -1722,7 +1722,7 @@ def create_app(db_path, thumb_cache_dir=None):
         def work(job):
             from models import download_model
 
-            def progress_cb(msg, current=0, total=0):
+            def progress_cb(msg, current=0, total=0, rate=0):
                 job["progress"]["current"] = current
                 job["progress"]["total"] = total
                 job["progress"]["current_file"] = msg
@@ -1733,7 +1733,7 @@ def create_app(db_path, thumb_cache_dir=None):
                         "current": current,
                         "total": total,
                         "current_file": msg,
-                        "rate": 0,
+                        "rate": rate,
                         "phase": "Downloading model",
                     },
                 )

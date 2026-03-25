@@ -7,6 +7,7 @@
 <link rel="apple-touch-icon" href="/static/apple-touch-icon.png">
 <title>Vireo - Pipeline</title>
 <style>
+/* Base styles */
 * { box-sizing: border-box; margin: 0; padding: 0; }
 body {
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
@@ -15,1464 +16,560 @@ body {
   min-height: 100vh;
   padding-bottom: 36px;
 }
+.content { max-width: 900px; margin: 0 auto; padding: 32px 24px; }
 
-/* Layout: sidebar + main */
-.pipeline-layout {
-  display: flex;
-  min-height: calc(100vh - 44px);
-}
-
-/* -- Sidebar -- */
-.pipeline-sidebar {
-  width: 260px;
-  flex-shrink: 0;
+/* Collection picker bar */
+.collection-bar {
   background: var(--bg-secondary, #0E2A3D);
-  border-right: 1px solid var(--border-primary, #14374E);
-  padding: 20px 16px;
-  overflow-y: auto;
-}
-.sidebar-section { margin-bottom: 24px; }
-.sidebar-title {
-  font-size: 11px;
-  font-weight: 700;
-  text-transform: uppercase;
-  letter-spacing: 0.05em;
-  color: var(--text-dim, #5A8890);
-  margin-bottom: 10px;
-}
-
-/* Stage list */
-.stage-list { list-style: none; }
-.stage-item {
+  border: 1px solid var(--border-primary, #14374E);
+  border-radius: 8px;
+  padding: 16px 20px;
+  margin-bottom: 24px;
   display: flex;
   align-items: center;
-  gap: 10px;
-  padding: 8px 10px;
-  border-radius: 6px;
-  margin-bottom: 4px;
-  font-size: 13px;
-  color: var(--text-secondary, #B0CCCC);
+  gap: 16px;
 }
-.stage-dot {
-  width: 10px; height: 10px;
+.collection-bar select {
+  background: var(--bg-input, #14374E);
+  color: var(--text-primary, #E0F0F0);
+  border: 1px solid var(--border-secondary, #1A4560);
+  border-radius: 4px;
+  padding: 8px 12px;
+  font-size: 13px;
+  min-width: 250px;
+}
+.collection-bar .photo-count {
+  font-size: 12px;
+  color: var(--text-dim, #5A8890);
+}
+
+/* Stage cards */
+.stage-card {
+  background: var(--bg-secondary, #0E2A3D);
+  border: 1px solid var(--border-primary, #14374E);
+  border-radius: 8px;
+  margin-bottom: 16px;
+  overflow: hidden;
+}
+.stage-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 16px 20px;
+  cursor: pointer;
+}
+.stage-header:hover { background: rgba(255,255,255,0.02); }
+.stage-num {
+  width: 28px; height: 28px;
   border-radius: 50%;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 13px; font-weight: 700;
+  background: var(--bg-tertiary, #14374E);
+  color: var(--text-dim, #5A8890);
   flex-shrink: 0;
 }
-.stage-dot.not-started { background: var(--text-ghost, #2D5058); }
-.stage-dot.complete { background: var(--accent, #24E5CA); }
-.stage-dot.stale { background: var(--warning, #F0C040); }
-.stage-dot.running { background: var(--info, #12C3B5); animation: pulse 1.2s infinite; }
+.stage-num.complete { background: var(--accent, #24E5CA); color: #000; }
+.stage-num.running { background: var(--info, #12C3B5); color: #000; animation: pulse 1.2s infinite; }
+.stage-num.stale { background: var(--warning, #F0C040); color: #000; }
 @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
-.stage-stats {
+.stage-name { font-size: 15px; font-weight: 600; }
+.stage-summary {
   margin-left: auto;
-  font-size: 11px;
+  font-size: 12px;
   color: var(--text-dim, #5A8890);
+}
+.stage-chevron {
+  color: var(--text-ghost, #2D5058);
+  font-size: 14px;
+  transition: transform 0.15s;
+}
+.stage-card.expanded .stage-chevron { transform: rotate(90deg); }
+
+/* Stage body (expandable) */
+.stage-body {
+  display: none;
+  padding: 0 20px 20px;
+  border-top: 1px solid var(--border-primary, #14374E);
+}
+.stage-card.expanded .stage-body { display: block; }
+
+/* Settings rows inside stage body */
+.setting-row {
+  display: flex; align-items: center; gap: 16px;
+  margin-bottom: 12px; flex-wrap: wrap;
+}
+.setting-item { flex: 1; min-width: 180px; }
+.setting-label {
+  font-size: 11px; color: var(--text-faint, #5A8890);
+  text-transform: uppercase; margin-bottom: 6px;
+}
+.setting-select {
+  background: var(--bg-input, #14374E);
+  color: var(--text-primary, #E0F0F0);
+  border: 1px solid var(--border-secondary, #1A4560);
+  border-radius: 4px; padding: 8px 12px; font-size: 13px; width: 100%;
+}
+
+/* Run button row */
+.run-row {
+  display: flex; align-items: center; gap: 12px; margin-top: 16px; flex-wrap: wrap;
 }
 
 /* Buttons */
-.sidebar-btn {
-  display: block;
-  width: 100%;
+.btn {
+  border: none; border-radius: 4px; padding: 10px 24px;
+  font-size: 14px; font-weight: 600; cursor: pointer; transition: background 0.15s;
+}
+.btn:disabled { cursor: default; opacity: 0.4; }
+.btn-primary { background: var(--accent, #24E5CA); color: var(--bg-primary, #0A1F2E); }
+.btn-primary:hover { background: var(--accent-hover, #5AF0DA); }
+.btn-secondary { background: var(--bg-tertiary, #14374E); color: var(--text-secondary, #B0CCCC); }
+.btn-secondary:hover { background: var(--border-secondary, #1A4560); }
+.status-msg { font-size: 13px; color: var(--text-dim, #888); }
+.status-msg.ok { color: var(--accent, #24E5CA); }
+
+/* Readiness panel */
+.readiness-panel {
   padding: 10px 14px;
-  border: 1px solid var(--border-secondary, #1A4560);
+  background: var(--bg-primary, #0A1F2E);
   border-radius: 6px;
-  background: var(--bg-tertiary, #14374E);
-  color: var(--text-primary, #E0F0F0);
-  font-size: 13px;
-  font-weight: 600;
-  cursor: pointer;
-  text-align: center;
-  margin-bottom: 8px;
-  transition: background 0.15s;
+  border: 1px solid var(--border-primary, #14374E);
+  font-size: 12px;
+  margin-bottom: 12px;
 }
-.sidebar-btn:hover { background: var(--border-secondary, #1A4560); }
-.sidebar-btn:disabled { opacity: 0.4; cursor: not-allowed; }
-.sidebar-btn.primary {
-  background: var(--accent, #24E5CA);
-  color: #000;
-  border-color: var(--accent, #24E5CA);
-}
-.sidebar-btn.primary:hover { background: var(--accent-hover, #5AF0DA); }
 
 /* Progress bar */
-.progress-wrap {
-  display: none;
-  margin-top: 10px;
-  padding: 10px;
-  background: var(--bg-primary, #0A1F2E);
-  border-radius: 6px;
-}
+.progress-wrap { margin-top: 10px; }
 .progress-bar-track {
-  height: 4px;
-  background: var(--bg-tertiary, #14374E);
-  border-radius: 2px;
-  overflow: hidden;
-  margin-bottom: 6px;
+  height: 4px; background: var(--bg-tertiary, #14374E); border-radius: 2px; overflow: hidden;
 }
 .progress-bar-fill {
-  height: 100%;
-  background: var(--accent, #24E5CA);
-  width: 0%;
-  transition: width 0.3s;
+  height: 100%; background: var(--accent, #24E5CA); width: 0%; transition: width 0.3s;
 }
-.progress-text {
-  font-size: 11px;
-  color: var(--text-dim, #5A8890);
-}
+.progress-text { font-size: 11px; color: var(--text-dim, #5A8890); margin-top: 4px; }
 
-/* -- Main area -- */
-.pipeline-main {
-  flex: 1;
-  padding: 20px 24px;
-  overflow-y: auto;
-}
-
-/* Summary bar */
-.summary-bar {
-  display: flex;
-  gap: 24px;
-  align-items: center;
-  margin-bottom: 20px;
-  padding: 16px 20px;
-  background: var(--bg-secondary, #0E2A3D);
-  border-radius: 8px;
-  border: 1px solid var(--border-primary, #14374E);
-}
-.summary-stat { text-align: center; }
-.summary-stat .num { font-size: 28px; font-weight: 700; }
-.summary-stat .label { font-size: 11px; color: var(--text-dim, #5A8890); margin-top: 2px; }
-
-/* Empty state */
-.empty-state {
-  text-align: center;
-  padding: 80px 20px;
-  color: var(--text-muted, #7FAAB0);
-}
-.empty-state h2 { font-size: 20px; margin-bottom: 8px; color: var(--text-secondary, #B0CCCC); }
-.empty-state p { font-size: 14px; max-width: 400px; margin: 0 auto; line-height: 1.5; }
-
-/* Center progress (shown during jobs) */
-.center-progress { display: none; text-align: center; padding: 60px 20px; }
-.center-progress.active { display: block; }
-.center-progress .cp-phase {
-  font-size: 18px; font-weight: 600;
-  color: var(--text-secondary, #B0CCCC);
-  margin-bottom: 16px;
-}
-.center-progress .cp-track {
-  width: 100%; max-width: 480px; height: 8px;
-  background: var(--surface-dim, #1a2a2d); border-radius: 4px;
-  margin: 0 auto 12px; overflow: hidden;
-}
-.center-progress .cp-fill {
-  height: 100%; width: 0%; border-radius: 4px;
-  background: var(--accent, #4ecca3);
-  transition: width 0.3s ease;
-}
-.center-progress .cp-detail {
-  font-size: 14px; color: var(--text-muted, #7FAAB0);
-  font-variant-numeric: tabular-nums;
-}
-.center-progress .cp-file {
-  font-size: 13px; color: var(--text-dim, #5A8890);
-  margin-top: 6px;
-  font-family: var(--mono, monospace);
-}
-.center-progress .cp-rate {
-  font-size: 12px; color: var(--text-dim, #5A8890);
-  margin-top: 4px;
-}
-
-/* Filter bar */
-.filter-bar {
-  display: flex;
-  gap: 8px;
-  margin-bottom: 16px;
-  align-items: center;
-}
-.filter-btn {
-  padding: 6px 14px;
-  border-radius: 16px;
-  border: 1px solid var(--border-primary, #14374E);
-  background: transparent;
-  color: var(--text-secondary, #B0CCCC);
-  font-size: 12px;
-  cursor: pointer;
-  transition: all 0.15s;
-}
-.filter-btn:hover { border-color: var(--text-muted, #7FAAB0); }
-.filter-btn.active { background: var(--accent, #24E5CA); color: #000; border-color: var(--accent, #24E5CA); }
-.filter-btn .count { margin-left: 4px; opacity: 0.7; }
-
-/* Encounter cards */
-.encounter-card {
-  background: var(--bg-secondary, #0E2A3D);
-  border: 1px solid var(--border-primary, #14374E);
-  border-radius: 8px;
-  margin-bottom: 16px;
-  overflow: hidden;
-}
-.encounter-header {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  padding: 12px 16px;
-  background: var(--bg-tertiary, #14374E);
-  cursor: pointer;
-}
-.encounter-header:hover { background: var(--border-secondary, #1A4560); }
-.encounter-species { font-size: 15px; font-weight: 600; flex: 1; }
-.encounter-meta {
-  font-size: 11px;
-  color: var(--text-dim, #5A8890);
-  display: flex;
-  gap: 12px;
-}
-.encounter-body { padding: 12px 16px; }
-
-/* Burst strip */
-.burst-strip {
-  display: flex;
-  gap: 8px;
-  margin-bottom: 12px;
-  padding-bottom: 12px;
-  border-bottom: 1px solid var(--border-primary, #14374E);
-  overflow-x: auto;
-  align-items: flex-start;
-}
-.burst-strip:last-child { border-bottom: none; margin-bottom: 0; padding-bottom: 0; }
-.burst-header {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 4px;
-  flex-shrink: 0;
-  padding: 4px 0;
-}
-.burst-species-label {
-  font-size: 9px;
-  color: var(--text-dim, #5A8890);
-  writing-mode: vertical-lr;
-  text-orientation: mixed;
-  max-height: 100px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-.burst-species-label.confirmed { color: var(--accent, #24E5CA); }
-.burst-confirm-btn {
-  writing-mode: horizontal-tb;
-  padding: 2px 4px;
-  border-radius: 4px;
-  border: 1px solid var(--border-primary, #14374E);
-  background: transparent;
-  color: var(--text-dim, #5A8890);
-  font-size: 8px;
-  cursor: pointer;
-  white-space: nowrap;
-  flex-shrink: 0;
-}
-.burst-confirm-btn:hover { border-color: var(--accent, #24E5CA); color: var(--accent, #24E5CA); }
-.burst-species-panel {
-  background: var(--bg-primary, #0A1F2E);
-  border: 1px solid var(--border-primary, #14374E);
-  border-radius: 6px;
-  padding: 10px 12px;
-  margin-bottom: 12px;
-}
-.burst-species-panel .species-panel-title { font-size: 12px; margin-bottom: 8px; }
-.burst-label {
-  font-size: 10px;
-  color: var(--text-dim, #5A8890);
-  writing-mode: vertical-lr;
-  text-orientation: mixed;
-  padding: 4px 0;
-  flex-shrink: 0;
-}
-
-/* Photo cards */
-.photo-card {
-  flex-shrink: 0;
-  width: 160px;
-  border-radius: 6px;
-  overflow: hidden;
-  border: 2px solid transparent;
-  position: relative;
-  cursor: pointer;
-  transition: border-color 0.15s;
-}
-.photo-card:hover { border-color: var(--text-muted, #7FAAB0); }
-.photo-card.keep { border-color: var(--accent, #24E5CA); }
-.photo-card.review { border-color: var(--warning, #F0C040); }
-.photo-card.reject { border-color: var(--danger, #E74C3C); opacity: 0.6; }
-.photo-card img {
-  width: 100%;
-  aspect-ratio: 3/2;
-  object-fit: cover;
-  display: block;
-}
-.photo-label {
-  position: absolute;
-  top: 6px; left: 6px;
-  padding: 2px 8px;
-  border-radius: 10px;
-  font-size: 10px;
-  font-weight: 700;
-  text-transform: uppercase;
-  letter-spacing: 0.03em;
-}
-.photo-label.keep { background: var(--accent, #24E5CA); color: #000; }
-.photo-label.review { background: var(--warning, #F0C040); color: #000; }
-.photo-label.reject { background: var(--danger, #E74C3C); color: #fff; }
-.photo-rarity {
-  position: absolute;
-  top: 6px; right: 6px;
-  padding: 2px 6px;
-  border-radius: 8px;
-  font-size: 9px;
-  background: var(--warning, #F0C040);
-  color: #000;
-  font-weight: 600;
-}
-.photo-score-bar {
-  height: 3px;
-  background: var(--bg-tertiary, #14374E);
-}
-.photo-score-fill {
-  height: 100%;
-  background: var(--accent, #24E5CA);
-  transition: width 0.3s;
-}
-.photo-info {
-  padding: 4px 8px;
-  font-size: 10px;
-  color: var(--text-dim, #5A8890);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-/* Species review */
-.encounter-header-wrap {
-  display: flex;
-  flex-direction: column;
-  flex: 1;
-  min-width: 0;
-}
-.encounter-header-row {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-}
-.species-confirmed {
-  color: var(--accent, #24E5CA);
-}
-.species-confirmed::after {
-  content: ' \2713';
-  font-size: 13px;
-}
-.encounter-votes {
-  font-size: 11px;
-  color: var(--text-dim, #5A8890);
-  margin-top: 2px;
-}
-.encounter-votes .vote-item { margin-right: 10px; }
-.encounter-votes .vote-count { opacity: 0.7; }
-.btn-confirm-species {
-  padding: 3px 10px;
-  border-radius: 12px;
-  border: 1px solid var(--accent, #24E5CA);
-  background: transparent;
-  color: var(--accent, #24E5CA);
-  font-size: 10px;
-  cursor: pointer;
-  white-space: nowrap;
-  flex-shrink: 0;
-}
-.btn-confirm-species:hover { background: var(--accent, #24E5CA); color: #000; }
-.species-panel {
-  background: var(--bg-primary, #0A1F2E);
-  border-top: 1px solid var(--border-primary, #14374E);
-  padding: 14px 16px;
-  display: none;
-}
-.species-panel.open { display: block; }
-.species-panel-title {
-  font-size: 13px;
-  font-weight: 600;
-  margin-bottom: 10px;
-}
-.species-suggestions {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-  margin-bottom: 12px;
-}
-.species-btn {
-  padding: 6px 14px;
-  border-radius: 16px;
-  border: 1px solid var(--border-primary, #14374E);
-  background: var(--bg-secondary, #0E2A3D);
-  color: var(--text-secondary, #B0CCCC);
-  font-size: 12px;
-  cursor: pointer;
-  transition: all 0.15s;
-}
-.species-btn:hover { border-color: var(--accent, #24E5CA); }
-.species-btn.selected { background: var(--accent, #24E5CA); color: #000; border-color: var(--accent, #24E5CA); }
-.species-autocomplete-wrap {
-  position: relative;
-  margin-bottom: 12px;
-}
-.species-autocomplete-wrap input {
-  width: 100%;
-  max-width: 320px;
-  padding: 6px 10px;
-  border-radius: 6px;
-  border: 1px solid var(--border-primary, #14374E);
-  background: var(--bg-tertiary, #14374E);
-  color: var(--text-primary, #E0F0F0);
-  font-size: 12px;
-  outline: none;
-}
-.species-autocomplete-wrap input:focus { border-color: var(--accent, #24E5CA); }
-.species-dropdown {
-  position: absolute;
-  top: 100%;
-  left: 0;
-  width: 100%;
-  max-width: 320px;
-  max-height: 180px;
-  overflow-y: auto;
-  background: var(--bg-secondary, #0E2A3D);
-  border: 1px solid var(--border-primary, #14374E);
-  border-radius: 0 0 6px 6px;
-  z-index: 10;
-  display: none;
-}
-.species-dropdown.open { display: block; }
-.species-dropdown-item {
-  padding: 6px 10px;
-  font-size: 12px;
-  cursor: pointer;
-  color: var(--text-secondary, #B0CCCC);
-}
-.species-dropdown-item:hover { background: var(--bg-tertiary, #14374E); }
-.species-panel-actions {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  gap: 10px;
-}
-.species-panel-actions button {
-  padding: 6px 16px;
-  border-radius: 6px;
-  font-size: 12px;
-  cursor: pointer;
-  border: none;
-}
-.btn-species-cancel {
-  background: transparent;
-  color: var(--text-dim, #5A8890);
-  border: 1px solid var(--border-primary, #14374E) !important;
-}
-.btn-species-apply {
-  background: var(--accent, #24E5CA);
-  color: #000;
-  font-weight: 600;
-}
-.btn-species-apply:disabled { opacity: 0.4; cursor: not-allowed; }
-.photo-species {
-  padding: 2px 8px;
-  font-size: 9px;
-  color: var(--text-dim, #5A8890);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-.photo-card.species-disagree {
-  border-color: var(--warning, #F0C040) !important;
-  border-style: dashed;
-}
-
-/* Slider controls */
-.slider-group { margin-bottom: 16px; }
-.slider-row {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin-bottom: 6px;
-}
-.slider-label {
-  font-size: 11px;
-  color: var(--text-secondary, #B0CCCC);
-  min-width: 90px;
-  flex-shrink: 0;
-}
-.slider-val {
-  font-size: 11px;
-  color: var(--text-dim, #5A8890);
-  min-width: 32px;
-  text-align: right;
-  flex-shrink: 0;
-}
-input[type="range"] {
-  flex: 1;
-  height: 4px;
-  -webkit-appearance: none;
-  appearance: none;
-  background: var(--bg-tertiary, #14374E);
-  border-radius: 2px;
-  outline: none;
-}
-input[type="range"]::-webkit-slider-thumb {
-  -webkit-appearance: none;
-  width: 14px; height: 14px;
-  border-radius: 50%;
-  background: var(--accent, #24E5CA);
-  cursor: pointer;
-}
-input[type="range"]::-moz-range-thumb {
-  width: 14px; height: 14px;
-  border-radius: 50%;
-  background: var(--accent, #24E5CA);
-  cursor: pointer;
-  border: none;
-}
-.slider-section-header {
-  font-size: 10px;
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
-  color: var(--text-dim, #5A8890);
-  margin: 12px 0 6px;
-  padding-bottom: 4px;
-  border-bottom: 1px solid var(--border-primary, #14374E);
-}
-.reflow-indicator {
-  display: none;
-  font-size: 10px;
-  color: var(--info, #12C3B5);
-  margin-top: 4px;
-  animation: pulse 0.8s infinite;
-}
-.reset-btn {
-  display: inline-block;
-  padding: 4px 10px;
-  border: 1px solid var(--border-primary, #14374E);
-  border-radius: 4px;
-  background: transparent;
-  color: var(--text-muted, #7FAAB0);
-  font-size: 11px;
-  cursor: pointer;
-  margin-top: 8px;
-}
-.reset-btn:hover { background: var(--bg-tertiary, #14374E); }
-
-/* Inspection panel */
-.inspect-overlay {
-  display: none;
-  position: fixed;
-  top: 0; left: 0; right: 0; bottom: 0;
-  background: rgba(0,0,0,0.7);
-  z-index: 300;
-}
-.inspect-overlay.open { display: flex; justify-content: center; align-items: flex-start; padding-top: 60px; }
-.inspect-panel {
-  background: var(--bg-secondary, #0E2A3D);
-  border: 1px solid var(--border-primary, #14374E);
-  border-radius: 10px;
-  width: 720px;
-  max-height: calc(100vh - 100px);
-  overflow-y: auto;
-  padding: 24px;
-}
-.inspect-close {
-  float: right;
-  background: none;
-  border: none;
-  color: var(--text-muted, #7FAAB0);
-  font-size: 20px;
-  cursor: pointer;
-  padding: 0 4px;
-}
-.inspect-close:hover { color: var(--text-primary, #E0F0F0); }
-.inspect-title { font-size: 16px; font-weight: 600; margin-bottom: 16px; }
-.inspect-img-wrap {
-  position: relative;
-  margin-bottom: 16px;
-  border-radius: 6px;
-  overflow: hidden;
-  background: #000;
-}
-.inspect-img-wrap img { width: 100%; display: block; }
-.inspect-img-wrap .mask-overlay {
-  position: absolute;
-  top: 0; left: 0; width: 100%; height: 100%;
-  mix-blend-mode: multiply;
-  opacity: 0.5;
-  pointer-events: none;
-  display: none;
-}
-.inspect-img-wrap .mask-overlay.show { display: block; }
-.mask-toggle {
-  position: absolute;
-  top: 8px; right: 8px;
-  padding: 4px 10px;
-  border-radius: 12px;
-  border: 1px solid rgba(255,255,255,0.3);
-  background: rgba(0,0,0,0.5);
-  color: #fff;
-  font-size: 11px;
-  cursor: pointer;
-}
-.mask-toggle:hover { background: rgba(0,0,0,0.7); }
-
-/* Score waterfall */
-.score-waterfall { margin-bottom: 16px; }
-.score-waterfall-row {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin-bottom: 6px;
-}
-.score-wf-label { font-size: 12px; color: var(--text-secondary, #B0CCCC); width: 100px; flex-shrink: 0; }
-.score-wf-bar-track {
-  flex: 1;
-  height: 16px;
-  background: var(--bg-tertiary, #14374E);
-  border-radius: 3px;
-  overflow: hidden;
-  position: relative;
-}
-.score-wf-bar-fill {
-  height: 100%;
-  border-radius: 3px;
-  transition: width 0.3s;
-}
-.score-wf-bar-fill.focus { background: #24E5CA; }
-.score-wf-bar-fill.exposure { background: #F0C040; }
-.score-wf-bar-fill.composition { background: #3498DB; }
-.score-wf-bar-fill.area { background: #9B59B6; }
-.score-wf-bar-fill.noise { background: #E67E22; }
-.score-wf-val { font-size: 11px; color: var(--text-dim, #5A8890); width: 70px; text-align: right; flex-shrink: 0; }
-
-/* Triage reasoning */
-.triage-badge {
-  display: inline-block;
-  padding: 4px 12px;
-  border-radius: 12px;
-  font-size: 12px;
-  font-weight: 700;
-  margin-bottom: 12px;
-}
-.triage-badge.keep { background: var(--accent, #24E5CA); color: #000; }
-.triage-badge.review { background: var(--warning, #F0C040); color: #000; }
-.triage-badge.reject { background: var(--danger, #E74C3C); color: #fff; }
-
-.reject-reasons { margin-bottom: 12px; }
-.reject-reason {
-  font-size: 12px;
-  color: var(--danger, #E74C3C);
-  padding: 2px 0;
-}
-
-/* Feature table */
-.feature-table { width: 100%; font-size: 12px; border-collapse: collapse; }
-.feature-table td {
-  padding: 4px 8px;
-  border-bottom: 1px solid var(--border-primary, #14374E);
-}
-.feature-table td:first-child { color: var(--text-muted, #7FAAB0); width: 160px; }
-.feature-table td:last-child { color: var(--text-primary, #E0F0F0); }
-
-/* Context filmstrip */
-.context-filmstrip {
-  display: flex;
-  gap: 6px;
-  overflow-x: auto;
-  padding: 8px 0;
-  margin-bottom: 16px;
-}
-.context-filmstrip img {
-  width: 80px;
-  aspect-ratio: 3/2;
-  object-fit: cover;
-  border-radius: 4px;
-  border: 2px solid transparent;
-  cursor: pointer;
-  opacity: 0.5;
-}
-.context-filmstrip img.current { opacity: 1; border-color: var(--accent, #24E5CA); }
-.context-filmstrip img:hover { opacity: 0.8; }
-.context-label {
-  font-size: 11px;
-  color: var(--text-dim, #5A8890);
-  margin-bottom: 4px;
-}
-
-/* Model config dropdowns */
-.config-row {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin-bottom: 8px;
-}
-.config-label {
-  font-size: 11px;
-  color: var(--text-secondary, #B0CCCC);
-  min-width: 80px;
-  flex-shrink: 0;
-}
-.config-select {
-  flex: 1;
-  padding: 5px 8px;
-  border: 1px solid var(--border-secondary, #1A4560);
-  border-radius: 4px;
-  background: var(--bg-tertiary, #14374E);
-  color: var(--text-primary, #E0F0F0);
-  font-size: 12px;
-  cursor: pointer;
-}
-.config-select:focus { outline: 1px solid var(--accent, #24E5CA); }
-.stale-warning {
-  display: none;
-  padding: 6px 10px;
-  margin-top: 8px;
-  border-radius: 4px;
-  background: rgba(240, 192, 64, 0.15);
-  border: 1px solid var(--warning, #F0C040);
-  font-size: 11px;
+/* Stale indicator */
+.stale-badge {
+  font-size: 10px; font-weight: 600;
   color: var(--warning, #F0C040);
+  background: rgba(240, 192, 64, 0.15);
+  padding: 2px 8px; border-radius: 10px;
+  margin-left: 8px;
 }
-.stale-warning.show { display: block; }
+
+/* View results link */
+.view-results-btn {
+  display: inline-block;
+  margin-top: 12px;
+  padding: 10px 20px;
+  background: var(--accent, #24E5CA);
+  color: #000;
+  font-weight: 600;
+  font-size: 13px;
+  border-radius: 4px;
+  text-decoration: none;
+}
+.view-results-btn:hover { background: var(--accent-hover, #5AF0DA); }
 </style>
 </head>
 <body>
 {% set active_page = 'pipeline' %}
 {% include '_navbar.html' %}
 
-<div class="pipeline-layout">
-  <!-- Sidebar -->
-  <div class="pipeline-sidebar">
-    <div class="sidebar-section">
-      <div class="sidebar-title">Pipeline Stages</div>
-      <ul class="stage-list">
-        <li class="stage-item">
-          <span class="stage-dot {{ 'complete' if has_detections else 'not-started' }}"></span>
-          <span>1. Detection</span>
-          <span class="stage-stats">{{ has_detections }}/{{ total_photos }}</span>
-        </li>
-        <li class="stage-item">
-          <span class="stage-dot {{ 'complete' if has_masks else 'not-started' }}" id="stageMaskDot"></span>
-          <span>2. Masking + Features</span>
-          <span class="stage-stats" id="stageMaskStats">{{ has_masks }}/{{ total_photos }}</span>
-        </li>
-        <li class="stage-item">
-          <span class="stage-dot {{ 'complete' if results else 'not-started' }}" id="stageGroupDot"></span>
-          <span>3. Encounters</span>
-          <span class="stage-stats" id="stageGroupStats">{% if results %}{{ results.summary.encounter_count }}{% endif %}</span>
-        </li>
-        <li class="stage-item">
-          <span class="stage-dot {{ 'complete' if results else 'not-started' }}"></span>
-          <span>4. Bursts</span>
-          <span class="stage-stats">{% if results %}{{ results.summary.burst_count }}{% endif %}</span>
-        </li>
-        <li class="stage-item">
-          <span class="stage-dot {{ 'complete' if results else 'not-started' }}"></span>
-          <span>5. Scoring</span>
-        </li>
-        <li class="stage-item">
-          <span class="stage-dot {{ 'complete' if results else 'not-started' }}"></span>
-          <span>6. Triage</span>
-          <span class="stage-stats" id="stageTriageStats">{% if results %}{{ results.summary.keep_count }}K / {{ results.summary.review_count }}R / {{ results.summary.reject_count }}X{% endif %}</span>
-        </li>
-      </ul>
-    </div>
+<div class="content">
+  <h2 style="margin-bottom:20px;font-size:20px;">Pipeline</h2>
 
-    <div class="sidebar-section">
-      <div class="sidebar-title">Model Settings</div>
-      <div class="config-row">
-        <span class="config-label">SAM2</span>
-        <select class="config-select" id="cfgSam2" onchange="onModelConfigChange()">
-          <option value="sam2-tiny" {{ 'selected' if pipeline_config.sam2_variant == 'sam2-tiny' }}>Tiny</option>
-          <option value="sam2-small" {{ 'selected' if pipeline_config.sam2_variant == 'sam2-small' }}>Small</option>
-          <option value="sam2-base-plus" {{ 'selected' if pipeline_config.sam2_variant == 'sam2-base-plus' }}>Base+</option>
-          <option value="sam2-large" {{ 'selected' if pipeline_config.sam2_variant == 'sam2-large' }}>Large</option>
-        </select>
-      </div>
-      <div class="config-row">
-        <span class="config-label">DINOv2</span>
-        <select class="config-select" id="cfgDinov2" onchange="onModelConfigChange()">
-          <option value="vit-s14" {{ 'selected' if pipeline_config.dinov2_variant == 'vit-s14' }}>ViT-S/14 (384d)</option>
-          <option value="vit-b14" {{ 'selected' if pipeline_config.dinov2_variant == 'vit-b14' }}>ViT-B/14 (768d)</option>
-          <option value="vit-l14" {{ 'selected' if pipeline_config.dinov2_variant == 'vit-l14' }}>ViT-L/14 (1024d)</option>
-        </select>
-      </div>
-      <div class="config-row">
-        <span class="config-label">Proxy res.</span>
-        <input type="range" min="1024" max="2048" value="{{ pipeline_config.proxy_longest_edge }}" step="64" id="cfgProxy" oninput="onModelConfigChange()">
-        <span class="slider-val" id="valProxy">{{ pipeline_config.proxy_longest_edge }}</span>
-      </div>
-      <div class="stale-warning" id="staleWarning">
-        Model settings changed. Re-run <strong>Extract Features</strong> to apply.
-      </div>
-    </div>
-
-    <div class="sidebar-section">
-      <div class="sidebar-title">Actions</div>
-      <button class="sidebar-btn primary" id="btnExtract" onclick="runExtractMasks()"
-        {% if not has_detections %}disabled title="Run classification first to get detections"{% endif %}>
-        Extract Features
-      </button>
-      <button class="sidebar-btn" id="btnRegroup" onclick="runRegroup()"
-        {% if not has_masks %}disabled title="Run Extract Features first"{% endif %}>
-        Regroup + Score
-      </button>
-      <div class="progress-wrap" id="progressWrap">
-        <div class="progress-bar-track">
-          <div class="progress-bar-fill" id="progressFill"></div>
-        </div>
-        <div class="progress-text" id="progressText">Starting...</div>
-      </div>
-    </div>
-
-    {% if results %}
-    <div class="sidebar-section">
-      <div class="sidebar-title">Scoring Thresholds</div>
-      <div class="reflow-indicator" id="reflowIndicator">Recomputing...</div>
-
-      <div class="slider-section-header">Hard Reject Floors</div>
-      <div class="slider-group">
-        <div class="slider-row">
-          <span class="slider-label">Crop complete</span>
-          <input type="range" min="0" max="100" value="60" step="1" id="slRejectCrop" oninput="onScoringChange(this)">
-          <span class="slider-val" id="valRejectCrop">0.60</span>
-        </div>
-        <div class="slider-row">
-          <span class="slider-label">Focus</span>
-          <input type="range" min="0" max="100" value="35" step="1" id="slRejectFocus" oninput="onScoringChange(this)">
-          <span class="slider-val" id="valRejectFocus">0.35</span>
-        </div>
-        <div class="slider-row">
-          <span class="slider-label">Clip highlights</span>
-          <input type="range" min="0" max="100" value="30" step="1" id="slRejectClip" oninput="onScoringChange(this)">
-          <span class="slider-val" id="valRejectClip">0.30</span>
-        </div>
-        <div class="slider-row">
-          <span class="slider-label">Composite</span>
-          <input type="range" min="0" max="100" value="40" step="1" id="slRejectComposite" oninput="onScoringChange(this)">
-          <span class="slider-val" id="valRejectComposite">0.40</span>
-        </div>
-      </div>
-
-      <div class="slider-section-header">MMR Selection</div>
-      <div class="slider-group">
-        <div class="slider-row">
-          <span class="slider-label">Burst lambda</span>
-          <input type="range" min="0" max="100" value="85" step="1" id="slBurstLambda" oninput="onScoringChange(this)">
-          <span class="slider-val" id="valBurstLambda">0.85</span>
-        </div>
-        <div class="slider-row">
-          <span class="slider-label">Burst keep</span>
-          <input type="range" min="1" max="10" value="3" step="1" id="slBurstKeep" oninput="onScoringChange(this)">
-          <span class="slider-val" id="valBurstKeep">3</span>
-        </div>
-        <div class="slider-row">
-          <span class="slider-label">Enc. lambda</span>
-          <input type="range" min="0" max="100" value="70" step="1" id="slEncLambda" oninput="onScoringChange(this)">
-          <span class="slider-val" id="valEncLambda">0.70</span>
-        </div>
-        <div class="slider-row">
-          <span class="slider-label">Enc. keep</span>
-          <input type="range" min="1" max="20" value="5" step="1" id="slEncKeep" oninput="onScoringChange(this)">
-          <span class="slider-val" id="valEncKeep">5</span>
-        </div>
-      </div>
-
-      <button class="reset-btn" onclick="resetScoringDefaults()">Reset to defaults</button>
-    </div>
-
-    <div class="sidebar-section">
-      <div class="sidebar-title">Grouping Thresholds</div>
-
-      <div class="slider-section-header">Encounters</div>
-      <div class="slider-group">
-        <div class="slider-row">
-          <span class="slider-label">Cut score</span>
-          <input type="range" min="0" max="100" value="42" step="1" id="slEncCut" oninput="onGroupingChange(this)">
-          <span class="slider-val" id="valEncCut">0.42</span>
-        </div>
-        <div class="slider-row">
-          <span class="slider-label">Merge score</span>
-          <input type="range" min="0" max="100" value="62" step="1" id="slEncMerge" oninput="onGroupingChange(this)">
-          <span class="slider-val" id="valEncMerge">0.62</span>
-        </div>
-      </div>
-
-      <div class="slider-section-header">Bursts</div>
-      <div class="slider-group">
-        <div class="slider-row">
-          <span class="slider-label">Time gap (s)</span>
-          <input type="range" min="1" max="30" value="3" step="1" id="slBurstTime" oninput="onGroupingChange(this)">
-          <span class="slider-val" id="valBurstTime">3</span>
-        </div>
-        <div class="slider-row">
-          <span class="slider-label">pHash dist</span>
-          <input type="range" min="1" max="32" value="12" step="1" id="slBurstPhash" oninput="onGroupingChange(this)">
-          <span class="slider-val" id="valBurstPhash">12</span>
-        </div>
-        <div class="slider-row">
-          <span class="slider-label">Emb. cosine</span>
-          <input type="range" min="0" max="100" value="80" step="1" id="slBurstEmb" oninput="onGroupingChange(this)">
-          <span class="slider-val" id="valBurstEmb">0.80</span>
-        </div>
-      </div>
-
-      <button class="reset-btn" onclick="resetGroupingDefaults()">Reset to defaults</button>
-    </div>
-    {% endif %}
+  <!-- Collection picker -->
+  <div class="collection-bar">
+    <label style="font-size:13px;font-weight:600;">Collection</label>
+    <select id="collectionPicker" onchange="onCollectionChange()">
+      <option value="">Select a collection...</option>
+    </select>
+    <span class="photo-count" id="collectionPhotoCount"></span>
   </div>
 
-  <!-- Main area -->
-  <div class="pipeline-main" id="mainArea">
-    {% if results %}
-    <!-- Summary bar -->
-    <div class="summary-bar">
-      <div class="summary-stat">
-        <div class="num">{{ results.summary.total_photos }}</div>
-        <div class="label">Photos</div>
+  <!-- Card 1: Classify -->
+  <div class="stage-card expanded" id="card-classify">
+    <div class="stage-header" onclick="toggleCard('classify')">
+      <span class="stage-num {{ 'complete' if has_detections else '' }}" id="numClassify">1</span>
+      <span class="stage-name">Classify</span>
+      <span class="stage-summary" id="summaryClassify">
+        {% if has_detections %}{{ has_detections }} detections{% endif %}
+      </span>
+      <span class="stage-chevron">&#9656;</span>
+    </div>
+    <div class="stage-body">
+      <div class="setting-row">
+        <div class="setting-item">
+          <div class="setting-label">Model</div>
+          <select class="setting-select" id="cfgModel" onchange="updateReadiness()">
+            <option value="">Loading models...</option>
+          </select>
+        </div>
+        <div class="setting-item">
+          <div class="setting-label">Labels</div>
+          <div id="labelsPicker" style="font-size:12px;max-height:100px;overflow-y:auto;"></div>
+        </div>
+        <div class="setting-item">
+          <div class="setting-label">Threshold</div>
+          <div style="display:flex;align-items:center;gap:8px;">
+            <input type="range" id="cfgThreshold" min="10" max="90" step="5" value="40"
+                   style="width:120px;accent-color:var(--accent,#24E5CA);"
+                   oninput="document.getElementById('cfgThresholdVal').textContent = this.value + '%'">
+            <span style="font-size:13px;" id="cfgThresholdVal">40%</span>
+          </div>
+        </div>
       </div>
-      <div class="summary-stat">
-        <div class="num">{{ results.summary.encounter_count }}</div>
-        <div class="label">Encounters</div>
+      <div class="readiness-panel" id="readinessPanel" style="display:none;"></div>
+      <div class="run-row">
+        <button class="btn btn-primary" id="btnClassify" onclick="runClassify(false)" disabled>Classify</button>
+        <label style="font-size:12px;color:var(--text-secondary);cursor:pointer;">
+          <input type="checkbox" id="chkReclassify" style="accent-color:var(--accent);"> Re-classify
+        </label>
+        <span class="status-msg" id="statusClassify"></span>
       </div>
-      <div class="summary-stat">
-        <div class="num">{{ results.summary.burst_count }}</div>
-        <div class="label">Bursts</div>
+      <div class="progress-wrap" id="progressClassify" style="display:none;">
+        <div class="progress-bar-track"><div class="progress-bar-fill" id="fillClassify"></div></div>
+        <div class="progress-text" id="textClassify"></div>
       </div>
-      <div class="summary-stat">
-        <div class="num" style="color:var(--accent,#24E5CA);">{{ results.summary.keep_count }}</div>
-        <div class="label">Keep</div>
+    </div>
+  </div>
+
+  <!-- Card 2: Extract Features -->
+  <div class="stage-card" id="card-extract">
+    <div class="stage-header" onclick="toggleCard('extract')">
+      <span class="stage-num {{ 'complete' if has_masks else '' }}" id="numExtract">2</span>
+      <span class="stage-name">Extract Features</span>
+      <span class="stage-summary" id="summaryExtract">
+        {% if has_masks %}{{ has_masks }} masks{% if has_sharpness %}, {{ has_sharpness }} sharpness{% endif %}{% endif %}
+      </span>
+      <span class="stage-chevron">&#9656;</span>
+    </div>
+    <div class="stage-body">
+      <div class="setting-row">
+        <div class="setting-item">
+          <div class="setting-label">SAM2</div>
+          <select class="setting-select" id="cfgSam2" onchange="onModelConfigChange()">
+            <option value="sam2-tiny" {{ 'selected' if pipeline_config.sam2_variant == 'sam2-tiny' }}>Tiny</option>
+            <option value="sam2-small" {{ 'selected' if pipeline_config.sam2_variant == 'sam2-small' }}>Small</option>
+            <option value="sam2-base-plus" {{ 'selected' if pipeline_config.sam2_variant == 'sam2-base-plus' }}>Base+</option>
+            <option value="sam2-large" {{ 'selected' if pipeline_config.sam2_variant == 'sam2-large' }}>Large</option>
+          </select>
+        </div>
+        <div class="setting-item">
+          <div class="setting-label">DINOv2</div>
+          <select class="setting-select" id="cfgDinov2" onchange="onModelConfigChange()">
+            <option value="vit-s14" {{ 'selected' if pipeline_config.dinov2_variant == 'vit-s14' }}>ViT-S/14 (384d)</option>
+            <option value="vit-b14" {{ 'selected' if pipeline_config.dinov2_variant == 'vit-b14' }}>ViT-B/14 (768d)</option>
+            <option value="vit-l14" {{ 'selected' if pipeline_config.dinov2_variant == 'vit-l14' }}>ViT-L/14 (1024d)</option>
+          </select>
+        </div>
+        <div class="setting-item">
+          <div class="setting-label">Proxy res.</div>
+          <div style="display:flex;align-items:center;gap:8px;">
+            <input type="range" min="1024" max="2048" value="{{ pipeline_config.proxy_longest_edge }}" step="64"
+                   id="cfgProxy" oninput="onModelConfigChange()"
+                   style="width:120px;accent-color:var(--accent,#24E5CA);">
+            <span style="font-size:13px;" id="valProxy">{{ pipeline_config.proxy_longest_edge }}</span>
+          </div>
+        </div>
       </div>
-      <div class="summary-stat">
-        <div class="num" style="color:var(--warning,#F0C040);">{{ results.summary.review_count }}</div>
-        <div class="label">Review</div>
+      <div class="run-row">
+        <button class="btn btn-primary" id="btnExtract" onclick="runExtract()" disabled>Extract Features</button>
+        <span class="status-msg" id="statusExtract"></span>
       </div>
-      <div class="summary-stat">
-        <div class="num" style="color:var(--danger,#E74C3C);">{{ results.summary.reject_count }}</div>
-        <div class="label">Reject</div>
+      <div class="progress-wrap" id="progressExtract" style="display:none;">
+        <div class="progress-bar-track"><div class="progress-bar-fill" id="fillExtract"></div></div>
+        <div class="progress-text" id="textExtract"></div>
       </div>
-      {% if results.summary.rarity_protected %}
-      <div class="summary-stat">
-        <div class="num" style="color:var(--warning,#F0C040);">{{ results.summary.rarity_protected }}</div>
-        <div class="label">Protected</div>
+    </div>
+  </div>
+
+  <!-- Card 3: Group & Score -->
+  <div class="stage-card" id="card-group">
+    <div class="stage-header" onclick="toggleCard('group')">
+      <span class="stage-num {{ 'complete' if results else '' }}" id="numGroup">3</span>
+      <span class="stage-name">Group &amp; Score</span>
+      <span class="stage-summary" id="summaryGroup">
+        {% if results %}
+          {{ results.summary.encounter_count }} encounters &mdash;
+          {{ results.summary.keep_count }}K / {{ results.summary.review_count }}R / {{ results.summary.reject_count }}X
+        {% endif %}
+      </span>
+      <span class="stage-chevron">&#9656;</span>
+    </div>
+    <div class="stage-body">
+      <p style="font-size:13px;color:var(--text-secondary);margin-bottom:12px;">
+        Runs encounter segmentation, burst clustering, quality scoring, and triage.
+        Tune scoring and grouping thresholds on the
+        <a href="/pipeline/review" style="color:var(--accent);">Pipeline Review</a> page.
+      </p>
+      <div class="run-row">
+        <button class="btn btn-primary" id="btnGroup" onclick="runGroup()" disabled>Group &amp; Score</button>
+        <span class="status-msg" id="statusGroup"></span>
       </div>
+      <div class="progress-wrap" id="progressGroup" style="display:none;">
+        <div class="progress-bar-track"><div class="progress-bar-fill" id="fillGroup"></div></div>
+        <div class="progress-text" id="textGroup"></div>
+      </div>
+      {% if results %}
+      <a href="/pipeline/review" class="view-results-btn">View Results</a>
       {% endif %}
     </div>
-
-    <!-- Filter bar -->
-    <div class="filter-bar" id="filterBar">
-      <button class="filter-btn active" data-filter="all" onclick="setFilter('all')">All<span class="count" id="countAll"></span></button>
-      <button class="filter-btn" data-filter="KEEP" onclick="setFilter('KEEP')">Keep<span class="count" id="countKeep"></span></button>
-      <button class="filter-btn" data-filter="REVIEW" onclick="setFilter('REVIEW')">Review<span class="count" id="countReview"></span></button>
-      <button class="filter-btn" data-filter="REJECT" onclick="setFilter('REJECT')">Reject<span class="count" id="countReject"></span></button>
-    </div>
-
-    <!-- Encounters rendered by JS -->
-    <div id="encountersContainer"></div>
-
-    {% else %}
-    <div class="center-progress" id="centerProgress">
-      <div class="cp-phase" id="cpPhase">Starting...</div>
-      <div class="cp-track"><div class="cp-fill" id="cpFill"></div></div>
-      <div class="cp-detail" id="cpDetail"></div>
-      <div class="cp-file" id="cpFile"></div>
-      <div class="cp-rate" id="cpRate"></div>
-    </div>
-    <div class="empty-state" id="emptyState">
-      <h2>Pipeline not yet run</h2>
-      <p>
-        {% if not has_detections %}
-          Start by running <strong>Classification</strong> on the Classify page to detect animals, then come back here to extract features and run the full pipeline.
-        {% elif not has_masks %}
-          Detections found for {{ has_detections }} photos. Click <strong>Extract Features</strong> to generate masks, quality features, and embeddings.
-        {% else %}
-          Features extracted for {{ has_masks }} photos. Click <strong>Regroup + Score</strong> to run encounter segmentation, scoring, and triage.
-        {% endif %}
-      </p>
-    </div>
-    {% endif %}
   </div>
-</div>
-
-<!-- Inspection panel overlay -->
-<div class="inspect-overlay" id="inspectOverlay" onclick="if(event.target===this)closeInspect()">
-  <div class="inspect-panel" id="inspectPanel"></div>
 </div>
 
 <script>
-var pipelineResults = {{ results | tojson if results else 'null' }};
-var activeFilter = 'all';
+// -- Init --
+loadCollections();
+loadModels();
+loadLabels();
+updateCardStates();
 
-// -- Rendering --
-
-function renderResults() {
-  if (!pipelineResults) return;
-  var container = document.getElementById('encountersContainer');
-  if (!container) return;
-
-  // Build photo lookup
-  var photoMap = {};
-  pipelineResults.photos.forEach(function(p) { photoMap[p.id] = p; });
-
-  // Update filter counts
-  var counts = {all: 0, KEEP: 0, REVIEW: 0, REJECT: 0};
-  pipelineResults.photos.forEach(function(p) {
-    counts.all++;
-    if (p.label) counts[p.label] = (counts[p.label] || 0) + 1;
-  });
-  var ce = document.getElementById('countAll'); if (ce) ce.textContent = ' (' + counts.all + ')';
-  ce = document.getElementById('countKeep'); if (ce) ce.textContent = ' (' + (counts.KEEP||0) + ')';
-  ce = document.getElementById('countReview'); if (ce) ce.textContent = ' (' + (counts.REVIEW||0) + ')';
-  ce = document.getElementById('countReject'); if (ce) ce.textContent = ' (' + (counts.REJECT||0) + ')';
-
-  var html = '';
-  pipelineResults.encounters.forEach(function(enc, ei) {
-    // Derive confirmed species from photos (handles burst-level confirmations)
-    var confirmedSet = {};
-    var allConfirmed = true;
-    (enc.photo_ids || []).forEach(function(pid) {
-      var p = photoMap[pid];
-      if (p && p.confirmed_species) {
-        confirmedSet[p.confirmed_species] = true;
-      } else {
-        allConfirmed = false;
-      }
+// -- Collection picker --
+async function loadCollections() {
+  try {
+    var resp = await fetch('/api/collections');
+    var collections = await resp.json();
+    var sel = document.getElementById('collectionPicker');
+    collections.forEach(function(c) {
+      sel.innerHTML += '<option value="' + c.id + '">' + escapeHtml(c.name) + '</option>';
     });
-    var uniqueConfirmed = Object.keys(confirmedSet);
-    var confirmed = enc.confirmed_species;
-    var isMixed = false;
-    if (!confirmed && uniqueConfirmed.length > 0) {
-      if (allConfirmed && uniqueConfirmed.length === 1) {
-        confirmed = uniqueConfirmed[0];
-      } else {
-        isMixed = true;
-      }
-    }
-    var speciesName = confirmed || (enc.species ? (enc.species[0] || 'Unknown') : 'Unknown');
-    var timeRange = '';
-    if (enc.time_range && enc.time_range[0]) {
-      var t0 = enc.time_range[0].split('T')[1] || '';
-      var t1 = enc.time_range[1] ? enc.time_range[1].split('T')[1] || '' : '';
-      timeRange = t0.substring(0,8) + (t1 ? ' - ' + t1.substring(0,8) : '');
-    }
+  } catch(e) { console.error('loadCollections error:', e); }
+}
 
-    // Check if any photo in this encounter passes the filter
-    var encPhotoIds = enc.photo_ids || [];
-    var hasVisible = encPhotoIds.some(function(pid) {
-      var p = photoMap[pid];
-      return p && (activeFilter === 'all' || p.label === activeFilter);
-    });
-    if (!hasVisible) return;
+function onCollectionChange() {
+  var collId = document.getElementById('collectionPicker').value;
+  var countEl = document.getElementById('collectionPhotoCount');
+  if (!collId) {
+    countEl.textContent = '';
+    updateCardStates();
+    return;
+  }
+  fetch('/api/collections/' + collId + '/photos?per_page=1')
+    .then(function(r) { return r.json(); })
+    .then(function(data) {
+      countEl.textContent = (data.total || 0) + ' photos';
+    })
+    .catch(function() { countEl.textContent = ''; });
+  updateCardStates();
+}
 
-    // Build vote summary line
-    var votes = enc.species_votes || [];
-    var voteLine = '';
-    votes.forEach(function(v, vi) {
-      if (vi > 0) voteLine += ' &middot; ';
-      voteLine += '<span class="vote-item">' + v.species + ' <span class="vote-count">&times;' + v.count + ' (' + (v.avg_confidence * 100).toFixed(0) + '%)</span></span>';
-    });
-
-    html += '<div class="encounter-card" id="encCard' + ei + '">';
-    html += '<div class="encounter-header" onclick="toggleEncounter(' + ei + ')">';
-    html += '<div class="encounter-header-wrap">';
-    html += '<div class="encounter-header-row">';
-    if (isMixed) {
-      html += '<span class="encounter-species">' + uniqueConfirmed.join(' / ') + ' <span style="font-size:11px;opacity:0.6;">(mixed)</span></span>';
+// -- Card 1: Classify --
+async function loadModels() {
+  try {
+    var resp = await fetch('/api/models');
+    var data = await resp.json();
+    var sel = document.getElementById('cfgModel');
+    sel.innerHTML = '';
+    var downloaded = data.models.filter(function(m) { return m.downloaded; });
+    if (downloaded.length === 0) {
+      sel.innerHTML = '<option value="">No models downloaded — go to Settings</option>';
     } else {
-      html += '<span class="encounter-species' + (confirmed ? ' species-confirmed' : '') + '">' + speciesName + '</span>';
-    }
-    html += '<span class="encounter-meta">';
-    html += '<span>' + enc.photo_count + ' photos</span>';
-    if (enc.burst_count) html += '<span>' + enc.burst_count + ' bursts</span>';
-    if (timeRange) html += '<span>' + timeRange + '</span>';
-    html += '</span>';
-    if (!confirmed) {
-      html += '<button class="btn-confirm-species" onclick="event.stopPropagation(); openSpeciesPanel(' + ei + ')">Confirm species</button>';
-    } else {
-      html += '<button class="btn-confirm-species" onclick="event.stopPropagation(); openSpeciesPanel(' + ei + ')" title="Change species">&#9998;</button>';
-    }
-    html += '</div>';
-    if (voteLine) html += '<div class="encounter-votes">' + voteLine + '</div>';
-    html += '</div></div>';
-
-    // Species correction panel (hidden by default)
-    html += '<div class="species-panel" id="speciesPanel' + ei + '">';
-    html += '<div class="species-panel-title">What species is this?</div>';
-    html += '<div class="species-suggestions" id="speciesSuggestions' + ei + '">';
-    votes.forEach(function(v) {
-      html += '<button class="species-btn" onclick="selectSpeciesSuggestion(' + ei + ', this, \'' + v.species.replace(/'/g, "\\'") + '\')">';
-      html += v.species + ' &times;' + v.count + ' photos</button>';
-    });
-    html += '</div>';
-    html += '<div class="species-autocomplete-wrap">';
-    html += '<span style="font-size:11px;color:var(--text-dim,#5A8890);margin-bottom:4px;display:block;">Or type:</span>';
-    html += '<input type="text" id="speciesInput' + ei + '" placeholder="Search species..." oninput="onSpeciesSearch(' + ei + ', this.value)" onfocus="onSpeciesSearch(' + ei + ', this.value)" autocomplete="off">';
-    html += '<div class="species-dropdown" id="speciesDropdown' + ei + '"></div>';
-    html += '</div>';
-    html += '<div class="species-panel-actions">';
-    html += '<button class="btn-species-cancel" onclick="closeSpeciesPanel(' + ei + ')">Cancel</button>';
-    html += '<button class="btn-species-apply" id="speciesApply' + ei + '" disabled onclick="applySpecies(' + ei + ')">Apply to all ' + enc.photo_count + '</button>';
-    html += '</div></div>';
-
-    html += '<div class="encounter-body" id="encBody' + ei + '">';
-
-    // Encounter species for disagreement detection
-    var encSpecies = confirmed || (enc.species ? enc.species[0] : null);
-
-    if (enc.bursts && enc.bursts.length > 0) {
-      enc.bursts.forEach(function(burst, bi) {
-        var burstPhotoIds = burst;
-        // Determine burst-level confirmed species from photos
-        var burstConfirmed = null;
-        burstPhotoIds.forEach(function(pid) {
-          var p = photoMap[pid];
-          if (p && p.confirmed_species) burstConfirmed = p.confirmed_species;
-        });
-        // Burst-level vote summary from predictions
-        var burstVoteCounts = {};
-        var burstVoteConfs = {};
-        burstPhotoIds.forEach(function(pid) {
-          var p = photoMap[pid];
-          if (!p) return;
-          var top5 = p.species_top5 || [];
-          if (top5.length > 0) {
-            var sp = top5[0][0];
-            burstVoteCounts[sp] = (burstVoteCounts[sp] || 0) + 1;
-            burstVoteConfs[sp] = (burstVoteConfs[sp] || 0) + top5[0][1];
-          }
-        });
-        var burstVotes = [];
-        for (var sp in burstVoteCounts) {
-          burstVotes.push({species: sp, count: burstVoteCounts[sp], avg_confidence: burstVoteConfs[sp] / burstVoteCounts[sp]});
-        }
-        burstVotes.sort(function(a, b) { return b.count - a.count; });
-
-        var burstSpecies = burstConfirmed || (burstVotes.length > 0 ? burstVotes[0].species : encSpecies);
-        var panelKey = ei + '_' + bi;
-
-        // Check if any photo in burst passes filter
-        var burstHasVisible = burstPhotoIds.some(function(pid) {
-          var p = photoMap[pid];
-          return p && (activeFilter === 'all' || p.label === activeFilter);
-        });
-        if (!burstHasVisible) return;
-
-        // Burst species panel (above the strip)
-        html += '<div class="burst-species-panel species-panel" id="speciesPanel' + panelKey + '" style="display:none;">';
-        html += '<div class="species-panel-title">Burst ' + (bi+1) + ': What species is this?</div>';
-        html += '<div class="species-suggestions" id="speciesSuggestions' + panelKey + '">';
-        burstVotes.forEach(function(v) {
-          html += '<button class="species-btn" onclick="selectSpeciesSuggestion(\'' + panelKey + '\', this, \'' + v.species.replace(/'/g, "\\'") + '\')">';
-          html += v.species + ' &times;' + v.count + '</button>';
-        });
-        html += '</div>';
-        html += '<div class="species-autocomplete-wrap">';
-        html += '<span style="font-size:11px;color:var(--text-dim,#5A8890);margin-bottom:4px;display:block;">Or type:</span>';
-        html += '<input type="text" id="speciesInput' + panelKey + '" placeholder="Search species..." oninput="onSpeciesSearch(\'' + panelKey + '\', this.value)" onfocus="onSpeciesSearch(\'' + panelKey + '\', this.value)" autocomplete="off">';
-        html += '<div class="species-dropdown" id="speciesDropdown' + panelKey + '"></div>';
-        html += '</div>';
-        html += '<div class="species-panel-actions">';
-        html += '<button class="btn-species-cancel" onclick="closeSpeciesPanel(\'' + panelKey + '\')">Cancel</button>';
-        html += '<button class="btn-species-apply" id="speciesApply' + panelKey + '" disabled onclick="applyBurstSpecies(\'' + panelKey + '\',' + ei + ',' + bi + ')">Apply to burst ' + (bi+1) + ' (' + burstPhotoIds.length + ')</button>';
-        html += '</div></div>';
-
-        html += '<div class="burst-strip">';
-        if (enc.bursts.length > 1) {
-          html += '<div class="burst-header">';
-          html += '<span class="burst-label">B' + (bi+1) + '</span>';
-          var bsLabel = burstConfirmed || (burstVotes.length > 0 ? burstVotes[0].species : '');
-          if (bsLabel) {
-            html += '<span class="burst-species-label' + (burstConfirmed ? ' confirmed' : '') + '">' + bsLabel + (burstConfirmed ? ' \u2713' : '') + '</span>';
-          }
-          html += '<button class="burst-confirm-btn" onclick="event.stopPropagation(); openSpeciesPanel(\'' + panelKey + '\')" title="' + (burstConfirmed ? 'Change species' : 'Confirm species') + '">' + (burstConfirmed ? '\u270e' : '\u2714') + '</button>';
-          html += '</div>';
-        }
-        burst.forEach(function(pid) {
-          var p = photoMap[pid];
-          if (!p) return;
-          if (activeFilter !== 'all' && p.label !== activeFilter) return;
-          html += renderPhotoCard(p, burstSpecies);
-        });
-        html += '</div>';
-      });
-    } else {
-      // No burst data — render flat
-      encPhotoIds.forEach(function(pid) {
-        var p = photoMap[pid];
-        if (!p) return;
-        if (activeFilter !== 'all' && p.label !== activeFilter) return;
-        html += renderPhotoCard(p, encSpecies);
+      downloaded.forEach(function(m) {
+        var opt = document.createElement('option');
+        opt.value = m.id;
+        opt.textContent = m.name + ' (' + m.model_str + ')';
+        if (m.id === data.active_id) opt.selected = true;
+        sel.appendChild(opt);
       });
     }
+    updateReadiness();
+  } catch(e) { console.error('loadModels error:', e); }
+}
 
-    html += '</div></div>';
+async function loadLabels() {
+  try {
+    var resp = await fetch('/api/labels');
+    var data = await resp.json();
+    var div = document.getElementById('labelsPicker');
+    var active = data.active || [];
+    var activePaths = new Set(active.map(function(a) { return a.labels_file; }));
+
+    if (!data.labels || data.labels.length === 0) {
+      div.innerHTML = '<span style="color:#888;font-size:12px;">(Tree of Life — all species)</span>';
+    } else {
+      var html = '';
+      data.labels.forEach(function(l) {
+        var isActive = activePaths.has(l.labels_file);
+        html += '<label style="display:flex;align-items:center;gap:4px;color:#B0CCCC;cursor:pointer;padding:2px 0;">' +
+          '<input type="checkbox" class="labels-run-cb" value="' + l.labels_file.replace(/"/g, '&quot;') + '"' +
+          (isActive ? ' checked' : '') + ' onchange="updateReadiness()" style="accent-color:#24E5CA;"> ' +
+          l.name + ' (' + (l.species_count || 0) + ')</label>';
+      });
+      div.innerHTML = html;
+    }
+
+    // Load threshold from config
+    var cfgResp = await fetch('/api/classify/config');
+    var cfg = await cfgResp.json();
+    if (cfg.default_threshold) {
+      var pct = Math.round(cfg.default_threshold * 100);
+      document.getElementById('cfgThreshold').value = pct;
+      document.getElementById('cfgThresholdVal').textContent = pct + '%';
+    }
+  } catch(e) { console.error('loadLabels error:', e); }
+}
+
+async function updateReadiness() {
+  var panel = document.getElementById('readinessPanel');
+  var modelId = document.getElementById('cfgModel').value;
+  var labelsFiles = [];
+  document.querySelectorAll('.labels-run-cb:checked').forEach(function(cb) {
+    labelsFiles.push(cb.value);
   });
 
-  container.innerHTML = html;
-}
+  try {
+    var params = [];
+    if (modelId) params.push('model_id=' + encodeURIComponent(modelId));
+    labelsFiles.forEach(function(f) { params.push('labels_files=' + encodeURIComponent(f)); });
+    var resp = await fetch('/api/classify/readiness' + (params.length ? '?' + params.join('&') : ''));
+    var r = await resp.json();
 
-function renderPhotoCard(p, encSpecies) {
-  var label = (p.label || '').toLowerCase();
-  var q = p.quality_composite || 0;
-  var qPct = Math.round(q * 100);
+    var items = [];
 
-  // Per-photo species prediction
-  var top5 = p.species_top5 || [];
-  var photoSpecies = top5.length > 0 ? top5[0][0] : null;
-  var photoConf = top5.length > 0 ? (top5[0][1] * 100).toFixed(0) : '';
+    // Model status
+    if (r.model_ready) {
+      items.push('<span style="color:var(--accent,#24E5CA);">&#10003;</span> Model: <b>' + r.model_name + '</b> — ready');
+    } else if (r.needs_download) {
+      items.push('<span style="color:var(--warning,#f0c040);">&#9679;</span> Model: <b>' + r.model_name + '</b> — will download <b>' + (r.model_size_mb >= 1000 ? (r.model_size_mb / 1000).toFixed(1) + ' GB' : r.model_size_mb + ' MB') + '</b> on first run');
+    } else {
+      items.push('<span style="color:var(--danger,#e74c3c);">&#10007;</span> No model available — download one in Settings');
+    }
 
-  // Disagreement: photo's top prediction differs from encounter species
-  var disagree = false;
-  if (photoSpecies && encSpecies && photoSpecies !== encSpecies) {
-    disagree = true;
-  }
+    // Labels status
+    if (r.use_tol) {
+      items.push('<span style="color:var(--info,#7ec8e3);">&#9679;</span> Labels: <b>Tree of Life</b> — classifying against all species (slower, less accurate than regional labels)');
+    } else if (r.labels_count > 0) {
+      var labelDisplay = r.labels_name.length > 60 ? r.labels_name.substring(0, 57) + '...' : r.labels_name;
+      items.push('<span style="color:var(--accent,#24E5CA);">&#10003;</span> Labels: <b>' + labelDisplay + '</b> — ' + r.labels_count.toLocaleString() + ' species');
+    }
 
-  var html = '<div class="photo-card ' + label + (disagree ? ' species-disagree' : '') + '" onclick="openInspect(' + p.id + ')">';
-  html += '<img src="/thumbnails/' + p.id + '.jpg" loading="lazy" alt="">';
-  if (p.label) html += '<span class="photo-label ' + label + '">' + p.label + '</span>';
-  if (p.rarity_protected) html += '<span class="photo-rarity">protected</span>';
-  html += '<div class="photo-score-bar"><div class="photo-score-fill" style="width:' + qPct + '%"></div></div>';
-  html += '<div class="photo-info">' + (p.filename || '') + ' &middot; Q=' + q.toFixed(2) + '</div>';
-  if (photoSpecies) {
-    html += '<div class="photo-species">' + photoSpecies + ' ' + photoConf + '%</div>';
-  }
-  html += '</div>';
-  return html;
-}
+    // Embeddings status
+    if (!r.use_tol) {
+      if (r.embeddings_cached) {
+        items.push('<span style="color:var(--accent,#24E5CA);">&#10003;</span> Embeddings: precomputed — classification will start immediately');
+      } else if (r.labels_count > 0) {
+        items.push('<span style="color:var(--warning,#f0c040);">&#9679;</span> Embeddings: not cached — will compute for ' + r.labels_count.toLocaleString() + ' labels on first run (~1-3 min)');
+      }
+    }
 
-function toggleEncounter(idx) {
-  var body = document.getElementById('encBody' + idx);
-  if (!body) return;
-  body.style.display = body.style.display === 'none' ? '' : 'none';
-}
-
-function setFilter(f) {
-  activeFilter = f;
-  document.querySelectorAll('.filter-btn').forEach(function(btn) {
-    btn.classList.toggle('active', btn.getAttribute('data-filter') === f);
-  });
-  renderResults();
-}
-
-// -- Species correction --
-
-var _speciesSelection = {};  // { encounterIdx: speciesName }
-var _speciesSearchTimer = null;
-
-function openSpeciesPanel(ei) {
-  var panel = document.getElementById('speciesPanel' + ei);
-  if (!panel) return;
-  // Toggle visibility (handle both CSS class and inline style)
-  var isOpen = panel.classList.contains('open') || panel.style.display === 'block';
-  if (isOpen) {
-    panel.classList.remove('open');
+    panel.innerHTML = items.join('<br>');
+    panel.style.display = items.length > 0 ? '' : 'none';
+  } catch(e) {
     panel.style.display = 'none';
-  } else {
-    panel.classList.add('open');
-    panel.style.display = 'block';
   }
-  // Clear previous selection
-  _speciesSelection[ei] = null;
-  var apply = document.getElementById('speciesApply' + ei);
-  if (apply) apply.disabled = true;
-  // Clear suggestion highlights
-  var btns = document.querySelectorAll('#speciesSuggestions' + ei + ' .species-btn');
-  btns.forEach(function(b) { b.classList.remove('selected'); });
-  var input = document.getElementById('speciesInput' + ei);
-  if (input) input.value = '';
 }
 
-function closeSpeciesPanel(ei) {
-  var panel = document.getElementById('speciesPanel' + ei);
-  if (panel) { panel.classList.remove('open'); panel.style.display = 'none'; }
-  _speciesSelection[ei] = null;
-}
+async function runClassify(reclassify) {
+  var collId = document.getElementById('collectionPicker').value;
+  if (!collId) return;
 
-function selectSpeciesSuggestion(ei, btn, species) {
-  // Deselect all, select this one
-  var btns = document.querySelectorAll('#speciesSuggestions' + ei + ' .species-btn');
-  btns.forEach(function(b) { b.classList.remove('selected'); });
-  btn.classList.add('selected');
-  _speciesSelection[ei] = species;
-  var input = document.getElementById('speciesInput' + ei);
-  if (input) input.value = '';
-  var dd = document.getElementById('speciesDropdown' + ei);
-  if (dd) dd.classList.remove('open');
-  var apply = document.getElementById('speciesApply' + ei);
-  if (apply) apply.disabled = false;
-}
-
-function onSpeciesSearch(ei, query) {
-  // Deselect suggestion buttons when typing
-  var btns = document.querySelectorAll('#speciesSuggestions' + ei + ' .species-btn');
-  btns.forEach(function(b) { b.classList.remove('selected'); });
-
-  var dd = document.getElementById('speciesDropdown' + ei);
-  if (!dd) return;
-
-  if (query.trim().length < 2) {
-    dd.classList.remove('open');
-    _speciesSelection[ei] = null;
-    var apply = document.getElementById('speciesApply' + ei);
-    if (apply) apply.disabled = true;
+  var reclass = reclassify || document.getElementById('chkReclassify').checked;
+  if (reclass && !confirm('This will clear existing predictions and re-classify from scratch. Continue?')) {
     return;
   }
 
-  // Enable apply with typed value
-  _speciesSelection[ei] = query.trim();
-  var apply = document.getElementById('speciesApply' + ei);
-  if (apply) apply.disabled = false;
+  var btn = document.getElementById('btnClassify');
+  var status = document.getElementById('statusClassify');
+  var progressWrap = document.getElementById('progressClassify');
+  var fill = document.getElementById('fillClassify');
+  var text = document.getElementById('textClassify');
+  var threshold = parseInt(document.getElementById('cfgThreshold').value, 10) / 100;
 
-  // Debounced autocomplete search
-  clearTimeout(_speciesSearchTimer);
-  _speciesSearchTimer = setTimeout(function() {
-    fetch('/api/species/search?q=' + encodeURIComponent(query.trim()))
-    .then(function(r) { return r.json(); })
-    .then(function(results) {
-      if (!results || results.length === 0) {
-        dd.classList.remove('open');
-        return;
-      }
-      var html = '';
-      results.forEach(function(name) {
-        html += '<div class="species-dropdown-item" onclick="pickSpeciesDropdown(\'' + ei + '\', \'' + name.replace(/'/g, "\\'") + '\')">' + name + '</div>';
-      });
-      dd.innerHTML = html;
-      dd.classList.add('open');
-    })
-    .catch(function() { dd.classList.remove('open'); });
-  }, 200);
-}
+  btn.disabled = true;
+  status.textContent = reclass ? 'Clearing old predictions...' : 'Starting...';
+  status.className = 'status-msg';
+  progressWrap.style.display = '';
+  fill.style.width = '0%';
 
-function pickSpeciesDropdown(ei, species) {
-  var input = document.getElementById('speciesInput' + ei);
-  if (input) input.value = species;
-  _speciesSelection[ei] = species;
-  var dd = document.getElementById('speciesDropdown' + ei);
-  if (dd) dd.classList.remove('open');
-  var btns = document.querySelectorAll('#speciesSuggestions' + ei + ' .species-btn');
-  btns.forEach(function(b) { b.classList.remove('selected'); });
-  var apply = document.getElementById('speciesApply' + ei);
-  if (apply) apply.disabled = false;
-}
+  // Mark stage as running
+  var num = document.getElementById('numClassify');
+  num.className = 'stage-num running';
 
-function applySpecies(ei) {
-  var species = _speciesSelection[ei];
-  if (!species) return;
-
-  var enc = pipelineResults.encounters[ei];
-  if (!enc) return;
-
-  var apply = document.getElementById('speciesApply' + ei);
-  if (apply) { apply.disabled = true; apply.textContent = 'Applying...'; }
-
-  fetch('/api/encounters/species', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({
-      species: species,
-      photo_ids: enc.photo_ids || [],
-    }),
-  })
-  .then(function(r) { return r.json(); })
-  .then(function(data) {
-    if (data.error) {
-      if (apply) { apply.disabled = false; apply.textContent = 'Apply to all ' + enc.photo_count; }
+  try {
+    var resp = await fetch('/api/jobs/classify', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        collection_id: parseInt(collId),
+        threshold: threshold,
+        model_id: document.getElementById('cfgModel').value || undefined,
+        labels_files: (function() {
+          var files = [];
+          document.querySelectorAll('.labels-run-cb:checked').forEach(function(cb) { files.push(cb.value); });
+          return files.length > 0 ? files : undefined;
+        })(),
+        reclassify: !!reclass,
+      }),
+    });
+    if (!resp.ok) {
+      var err = await resp.json();
+      status.textContent = 'Error: ' + (err.error || 'failed');
+      btn.disabled = false;
+      num.className = 'stage-num';
+      progressWrap.style.display = 'none';
       return;
     }
-    // Update local state
-    enc.confirmed_species = species;
-    // Update photo confirmed_species in local data
-    var photoMap = {};
-    pipelineResults.photos.forEach(function(p) { photoMap[p.id] = p; });
-    (enc.photo_ids || []).forEach(function(pid) {
-      if (photoMap[pid]) photoMap[pid].confirmed_species = species;
+    var data = await resp.json();
+    status.textContent = 'Classifying...';
+
+    var source = new EventSource('/api/jobs/' + data.job_id + '/stream');
+    source.addEventListener('progress', function(e) {
+      var p = JSON.parse(e.data);
+      var pct = p.total > 0 ? Math.round(p.current / p.total * 100) : 0;
+      fill.style.width = pct + '%';
+      var parts = [];
+      if (p.phase) parts.push(p.phase);
+      if (p.total > 0 && p.current > 0) parts.push(p.current + '/' + p.total);
+      if (p.current_file) parts.push(p.current_file);
+      text.textContent = parts.join(' — ');
+      status.textContent = parts.join(' — ');
     });
-    closeSpeciesPanel(ei);
-    renderResults();
-  })
-  .catch(function() {
-    if (apply) { apply.disabled = false; apply.textContent = 'Apply to all ' + enc.photo_count; }
-  });
-}
-
-function applyBurstSpecies(panelKey, ei, bi) {
-  var species = _speciesSelection[panelKey];
-  if (!species) return;
-
-  var enc = pipelineResults.encounters[ei];
-  if (!enc || !enc.bursts || !enc.bursts[bi]) return;
-
-  var burstPhotoIds = enc.bursts[bi];
-  var apply = document.getElementById('speciesApply' + panelKey);
-  if (apply) { apply.disabled = true; apply.textContent = 'Applying...'; }
-
-  fetch('/api/encounters/species', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({
-      species: species,
-      photo_ids: burstPhotoIds,
-    }),
-  })
-  .then(function(r) { return r.json(); })
-  .then(function(data) {
-    if (data.error) {
-      if (apply) { apply.disabled = false; apply.textContent = 'Apply to burst'; }
-      return;
-    }
-    // Update confirmed_species on burst photos in local data
-    var photoMap = {};
-    pipelineResults.photos.forEach(function(p) { photoMap[p.id] = p; });
-    burstPhotoIds.forEach(function(pid) {
-      if (photoMap[pid]) photoMap[pid].confirmed_species = species;
-    });
-    // Update encounter confirmed_species: check if all bursts agree
-    var allConfirmed = true;
-    var encSpeciesSet = {};
-    (enc.photo_ids || []).forEach(function(pid) {
-      var p = photoMap[pid];
-      if (p && p.confirmed_species) {
-        encSpeciesSet[p.confirmed_species] = true;
+    source.addEventListener('complete', function(e) {
+      source.close();
+      window.dispatchEvent(new CustomEvent('vireo-job-done', {detail: {job_id: data.job_id}}));
+      var result = JSON.parse(e.data);
+      if (result.status === 'completed' && result.result) {
+        var r = result.result;
+        var parts = ['Done! ' + r.total + ' photos processed'];
+        if (r.predictions_stored) parts.push(r.predictions_stored + ' predictions');
+        if (r.burst_groups) parts.push(r.burst_groups + ' burst groups');
+        if (r.already_classified) parts.push(r.already_classified + ' already classified (skipped)');
+        if (result.duration) parts.push(formatDuration(result.duration));
+        status.textContent = parts.join(', ');
+        status.className = 'status-msg ok';
+        fill.style.width = '100%';
+        text.textContent = 'Complete';
+        num.className = 'stage-num complete';
+        document.getElementById('summaryClassify').textContent = (r.predictions_stored || r.total) + ' detections';
+        // Mark downstream as stale
+        markStale('extract');
+        markStale('group');
+        // Enable downstream buttons
+        _pipelineState.hasDetections = true;
+        updateCardStates();
       } else {
-        allConfirmed = false;
+        status.textContent = 'Failed: ' + (result.errors || []).join(', ');
+        num.className = 'stage-num';
       }
+      btn.disabled = false;
     });
-    var uniqueSpecies = Object.keys(encSpeciesSet);
-    if (allConfirmed && uniqueSpecies.length === 1) {
-      enc.confirmed_species = uniqueSpecies[0];
-    } else if (uniqueSpecies.length > 0) {
-      enc.confirmed_species = null;  // mixed — don't set encounter-level
-    }
-    closeSpeciesPanel(panelKey);
-    renderResults();
-  })
-  .catch(function() {
-    if (apply) { apply.disabled = false; apply.textContent = 'Apply to burst'; }
-  });
+    source.onerror = function() {
+      source.close();
+      status.textContent = 'Connection lost';
+      btn.disabled = false;
+      num.className = 'stage-num';
+    };
+  } catch(e) {
+    status.textContent = 'Error: ' + e.message;
+    btn.disabled = false;
+    num.className = 'stage-num';
+    progressWrap.style.display = 'none';
+  }
 }
 
-// Close dropdowns when clicking outside
-document.addEventListener('click', function(e) {
-  if (!e.target.closest('.species-autocomplete-wrap')) {
-    document.querySelectorAll('.species-dropdown').forEach(function(dd) {
-      dd.classList.remove('open');
-    });
-  }
-});
-
-// -- Model config --
+// -- Card 2: Extract Features --
 
 var _savedModelConfig = {
   sam2_variant: '{{ pipeline_config.sam2_variant }}',
@@ -1491,21 +588,6 @@ function onModelConfigChange() {
     proxy_longest_edge: parseInt(document.getElementById('cfgProxy').value),
   };
 
-  // Check if anything changed from saved config
-  var changed = (newCfg.sam2_variant !== _savedModelConfig.sam2_variant ||
-                 newCfg.dinov2_variant !== _savedModelConfig.dinov2_variant ||
-                 newCfg.proxy_longest_edge !== _savedModelConfig.proxy_longest_edge);
-
-  var warning = document.getElementById('staleWarning');
-  if (warning) warning.classList.toggle('show', changed);
-
-  // Mark stage 1 dot as stale
-  var dot = document.getElementById('stageMaskDot');
-  if (dot) {
-    if (changed) { dot.className = 'stage-dot stale'; }
-    else { dot.className = 'stage-dot {{ "complete" if has_masks else "not-started" }}'; }
-  }
-
   // Save to server
   fetch('/api/pipeline/config', {
     method: 'POST',
@@ -1514,414 +596,242 @@ function onModelConfigChange() {
   }).then(function(r) { return r.json(); }).then(function(data) {
     if (data.status === 'saved') {
       _savedModelConfig = newCfg;
-      // Keep warning visible since features need re-extraction
     }
   });
 }
 
-// -- Job launching --
+async function runExtract() {
+  var collId = document.getElementById('collectionPicker').value;
+  if (!collId) return;
 
-function showProgress(show) {
-  document.getElementById('progressWrap').style.display = show ? 'block' : 'none';
-  var cp = document.getElementById('centerProgress');
-  var es = document.getElementById('emptyState');
-  if (cp) { cp.classList.toggle('active', show); }
-  if (es) { es.style.display = show ? 'none' : ''; }
-}
-
-function updateProgress(pct, text) {
-  document.getElementById('progressFill').style.width = pct + '%';
-  document.getElementById('progressText').textContent = text;
-}
-
-function updateCenterProgress(p) {
-  var cp = document.getElementById('centerProgress');
-  if (!cp) return;
-  var phase = p.phase || 'Processing';
-  var pct = p.total > 0 ? Math.round(p.current / p.total * 100) : 0;
-  document.getElementById('cpPhase').textContent = phase;
-  document.getElementById('cpFill').style.width = pct + '%';
-  var detail = '';
-  if (p.current > 0 && p.total > 0) {
-    detail = p.current.toLocaleString() + ' / ' + p.total.toLocaleString() + '  (' + pct + '%)';
-  }
-  document.getElementById('cpDetail').textContent = detail;
-  document.getElementById('cpFile').textContent = p.current_file || '';
-  if (p.rate > 0) {
-    var eta = Math.round((p.total - p.current) / p.rate);
-    var mm = Math.floor(eta / 60), ss = eta % 60;
-    document.getElementById('cpRate').textContent = p.rate.toFixed(1) + ' photos/sec — ~' + mm + ':' + String(ss).padStart(2, '0') + ' remaining';
-  } else {
-    document.getElementById('cpRate').textContent = '';
-  }
-}
-
-function runExtractMasks() {
   var btn = document.getElementById('btnExtract');
-  btn.disabled = true;
-  showProgress(true);
-  updateProgress(0, 'Starting feature extraction...');
+  var status = document.getElementById('statusExtract');
+  var progressWrap = document.getElementById('progressExtract');
+  var fill = document.getElementById('fillExtract');
+  var text = document.getElementById('textExtract');
 
-  fetch('/api/jobs/extract-masks', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({}),
-  })
-  .then(function(r) { return r.json(); })
-  .then(function(data) {
-    if (!data.job_id) { btn.disabled = false; showProgress(false); return; }
-    var jobId = data.job_id;
-    var source = new EventSource('/api/jobs/' + jobId + '/stream');
+  btn.disabled = true;
+  status.textContent = 'Starting feature extraction...';
+  status.className = 'status-msg';
+  progressWrap.style.display = '';
+  fill.style.width = '0%';
+
+  var num = document.getElementById('numExtract');
+  num.className = 'stage-num running';
+
+  try {
+    var resp = await fetch('/api/jobs/extract-masks', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({collection_id: parseInt(collId)}),
+    });
+    var data = await resp.json();
+    if (!data.job_id) {
+      btn.disabled = false;
+      status.textContent = data.error || 'Failed to start';
+      num.className = 'stage-num';
+      progressWrap.style.display = 'none';
+      return;
+    }
+
+    var source = new EventSource('/api/jobs/' + data.job_id + '/stream');
     source.addEventListener('progress', function(e) {
       var p = JSON.parse(e.data);
       var pct = p.total > 0 ? Math.round(p.current / p.total * 100) : 0;
-      var text = (p.phase || 'Processing') + ' ' + (p.current || 0) + '/' + (p.total || '?');
-      if (p.current_file) text += ' - ' + p.current_file;
-      updateProgress(pct, text);
-      updateCenterProgress(p);
+      fill.style.width = pct + '%';
+      var parts = [];
+      if (p.phase) parts.push(p.phase);
+      if (p.total > 0 && p.current > 0) parts.push(p.current + '/' + p.total);
+      if (p.current_file) parts.push(p.current_file);
+      text.textContent = parts.join(' — ');
+      status.textContent = parts.join(' — ');
     });
     source.addEventListener('complete', function(e) {
       source.close();
-      window.dispatchEvent(new CustomEvent('vireo-job-done', {detail: {job_id: jobId}}));
+      window.dispatchEvent(new CustomEvent('vireo-job-done', {detail: {job_id: data.job_id}}));
       var result = JSON.parse(e.data);
-      updateProgress(100, result.status === 'completed' ? 'Done! Reloading...' : 'Failed');
-      updateCenterProgress({phase: result.status === 'completed' ? 'Done! Reloading...' : 'Failed', current: 1, total: 1});
-      setTimeout(function() { window.location.reload(); }, 800);
+      if (result.status === 'completed') {
+        fill.style.width = '100%';
+        text.textContent = 'Complete';
+        status.textContent = 'Done!';
+        status.className = 'status-msg ok';
+        if (result.duration) status.textContent += ' (' + formatDuration(result.duration) + ')';
+        num.className = 'stage-num complete';
+        if (result.result) {
+          var r = result.result;
+          var summary = [];
+          if (r.masks_created) summary.push(r.masks_created + ' masks');
+          if (r.scored_count) summary.push(r.scored_count + ' sharpness');
+          document.getElementById('summaryExtract').textContent = summary.join(', ');
+        }
+        // Mark downstream as stale
+        markStale('group');
+        // Enable downstream buttons
+        _pipelineState.hasMasks = true;
+        updateCardStates();
+      } else {
+        status.textContent = 'Failed';
+        num.className = 'stage-num';
+      }
+      btn.disabled = false;
     });
-  })
-  .catch(function() { btn.disabled = false; showProgress(false); });
+    source.onerror = function() {
+      source.close();
+      status.textContent = 'Connection lost';
+      btn.disabled = false;
+      num.className = 'stage-num';
+    };
+  } catch(e) {
+    status.textContent = 'Error: ' + e.message;
+    btn.disabled = false;
+    num.className = 'stage-num';
+    progressWrap.style.display = 'none';
+  }
 }
 
-function runRegroup() {
-  var btn = document.getElementById('btnRegroup');
-  btn.disabled = true;
-  showProgress(true);
-  updateProgress(0, 'Running pipeline stages 2-6...');
+// -- Card 3: Group & Score --
 
-  fetch('/api/jobs/regroup', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({}),
-  })
-  .then(function(r) { return r.json(); })
-  .then(function(data) {
-    if (!data.job_id) { btn.disabled = false; showProgress(false); return; }
-    var jobId = data.job_id;
-    var source = new EventSource('/api/jobs/' + jobId + '/stream');
+async function runGroup() {
+  var collId = document.getElementById('collectionPicker').value;
+  if (!collId) return;
+
+  var btn = document.getElementById('btnGroup');
+  var status = document.getElementById('statusGroup');
+  var progressWrap = document.getElementById('progressGroup');
+  var fill = document.getElementById('fillGroup');
+  var text = document.getElementById('textGroup');
+
+  btn.disabled = true;
+  status.textContent = 'Running pipeline...';
+  status.className = 'status-msg';
+  progressWrap.style.display = '';
+  fill.style.width = '0%';
+
+  var num = document.getElementById('numGroup');
+  num.className = 'stage-num running';
+
+  try {
+    var resp = await fetch('/api/jobs/regroup', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({collection_id: parseInt(collId)}),
+    });
+    var data = await resp.json();
+    if (!data.job_id) {
+      btn.disabled = false;
+      status.textContent = data.error || 'Failed to start';
+      num.className = 'stage-num';
+      progressWrap.style.display = 'none';
+      return;
+    }
+
+    var source = new EventSource('/api/jobs/' + data.job_id + '/stream');
     source.addEventListener('progress', function(e) {
       var p = JSON.parse(e.data);
       var pct = p.total > 0 ? Math.round(p.current / p.total * 100) : 0;
-      updateProgress(pct, p.phase || 'Processing...');
-      updateCenterProgress(p);
+      fill.style.width = pct + '%';
+      var parts = [];
+      if (p.phase) parts.push(p.phase);
+      if (p.total > 0 && p.current > 0) parts.push(p.current + '/' + p.total);
+      text.textContent = parts.join(' — ');
+      status.textContent = parts.join(' — ');
     });
     source.addEventListener('complete', function(e) {
       source.close();
-      window.dispatchEvent(new CustomEvent('vireo-job-done', {detail: {job_id: jobId}}));
+      window.dispatchEvent(new CustomEvent('vireo-job-done', {detail: {job_id: data.job_id}}));
       var result = JSON.parse(e.data);
-      updateProgress(100, result.status === 'completed' ? 'Done! Reloading...' : 'Failed');
-      updateCenterProgress({phase: result.status === 'completed' ? 'Done! Reloading...' : 'Failed', current: 1, total: 1});
-      setTimeout(function() { window.location.reload(); }, 800);
+      if (result.status === 'completed') {
+        fill.style.width = '100%';
+        text.textContent = 'Complete';
+        status.textContent = 'Done!';
+        status.className = 'status-msg ok';
+        if (result.duration) status.textContent += ' (' + formatDuration(result.duration) + ')';
+        num.className = 'stage-num complete';
+        if (result.result) {
+          var r = result.result;
+          var summary = [];
+          if (r.encounter_count != null) summary.push(r.encounter_count + ' encounters');
+          if (r.keep_count != null) summary.push(r.keep_count + 'K / ' + (r.review_count||0) + 'R / ' + (r.reject_count||0) + 'X');
+          document.getElementById('summaryGroup').textContent = summary.join(' — ');
+        }
+        // Show view results link
+        var existingLink = document.querySelector('#card-group .view-results-btn');
+        if (!existingLink) {
+          var body = document.querySelector('#card-group .stage-body');
+          var a = document.createElement('a');
+          a.href = '/pipeline/review';
+          a.className = 'view-results-btn';
+          a.textContent = 'View Results';
+          body.appendChild(a);
+        }
+        _pipelineState.hasResults = true;
+      } else {
+        status.textContent = 'Failed';
+        num.className = 'stage-num';
+      }
+      btn.disabled = false;
     });
-  })
-  .catch(function() { btn.disabled = false; showProgress(false); });
+    source.onerror = function() {
+      source.close();
+      status.textContent = 'Connection lost';
+      btn.disabled = false;
+      num.className = 'stage-num';
+    };
+  } catch(e) {
+    status.textContent = 'Error: ' + e.message;
+    btn.disabled = false;
+    num.className = 'stage-num';
+    progressWrap.style.display = 'none';
+  }
 }
 
-// -- Threshold tuning --
+// -- Shared --
 
-var _reflowTimer = null;
-var _regroupTimer = null;
+function toggleCard(name) {
+  var card = document.getElementById('card-' + name);
+  if (card) card.classList.toggle('expanded');
+}
 
-var SCORING_DEFAULTS = {
-  reject_crop_complete: 60, reject_focus: 35, reject_clip_high: 30, reject_composite: 40,
-  burst_lambda: 85, burst_max_keep: 3, encounter_lambda: 70, encounter_max_keep: 5,
+// Mutable pipeline state — updated after each job completes
+var _pipelineState = {
+  hasDetections: {{ has_detections|tojson }},
+  hasMasks: {{ has_masks|tojson }},
+  hasResults: {{ 'true' if results else 'false' }},
 };
-var GROUPING_DEFAULTS = {
-  hard_cut_score: 42, merge_score: 62,
-  burst_time_gap: 3, burst_phash_threshold: 12, burst_embedding_threshold: 80,
-};
 
-function sliderVal(id) {
-  var el = document.getElementById(id);
-  return el ? parseFloat(el.value) : 0;
-}
+function updateCardStates() {
+  var collId = document.getElementById('collectionPicker').value;
+  var hasCollection = !!collId;
 
-function updateSliderDisplay(slider) {
-  var id = slider.id;
-  var valEl = document.getElementById('val' + id.substring(2));
-  if (!valEl) return;
-  // Integer sliders (keep counts, time, phash)
-  if (['slBurstKeep','slEncKeep','slBurstTime','slBurstPhash'].indexOf(id) >= 0) {
-    valEl.textContent = slider.value;
-  } else {
-    valEl.textContent = (slider.value / 100).toFixed(2);
+  document.getElementById('btnClassify').disabled = !hasCollection;
+  document.getElementById('btnExtract').disabled = !hasCollection || !_pipelineState.hasDetections;
+  document.getElementById('btnGroup').disabled = !hasCollection || !_pipelineState.hasMasks;
+
+  // Expand completed cards
+  if (_pipelineState.hasDetections && !_pipelineState.hasMasks) {
+    document.getElementById('card-extract').classList.add('expanded');
+  }
+  if (_pipelineState.hasMasks && !_pipelineState.hasResults) {
+    document.getElementById('card-group').classList.add('expanded');
   }
 }
 
-function getScoringConfig() {
-  return {
-    reject_crop_complete: sliderVal('slRejectCrop') / 100,
-    reject_focus: sliderVal('slRejectFocus') / 100,
-    reject_clip_high: sliderVal('slRejectClip') / 100,
-    reject_composite: sliderVal('slRejectComposite') / 100,
-    burst_lambda: sliderVal('slBurstLambda') / 100,
-    burst_max_keep: Math.round(sliderVal('slBurstKeep')),
-    encounter_lambda: sliderVal('slEncLambda') / 100,
-    encounter_max_keep: Math.round(sliderVal('slEncKeep')),
-  };
-}
-
-function getGroupingConfig() {
-  return {
-    hard_cut_score: sliderVal('slEncCut') / 100,
-    merge_score: sliderVal('slEncMerge') / 100,
-    burst_time_gap: sliderVal('slBurstTime'),
-    burst_phash_threshold: Math.round(sliderVal('slBurstPhash')),
-    burst_embedding_threshold: sliderVal('slBurstEmb') / 100,
-  };
-}
-
-function onScoringChange(slider) {
-  updateSliderDisplay(slider);
-  // Debounce: wait 250ms after last change before calling reflow
-  clearTimeout(_reflowTimer);
-  var indicator = document.getElementById('reflowIndicator');
-  if (indicator) indicator.style.display = 'block';
-  _reflowTimer = setTimeout(doReflow, 250);
-}
-
-function onGroupingChange(slider) {
-  updateSliderDisplay(slider);
-  clearTimeout(_regroupTimer);
-  var indicator = document.getElementById('reflowIndicator');
-  if (indicator) { indicator.style.display = 'block'; indicator.textContent = 'Regrouping...'; }
-  _regroupTimer = setTimeout(doRegroupLive, 500);
-}
-
-function doReflow() {
-  var config = getScoringConfig();
-  fetch('/api/pipeline/reflow', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({config: config}),
-  })
-  .then(function(r) { return r.json(); })
-  .then(function(data) {
-    if (data.error) return;
-    pipelineResults = data;
-    renderResults();
-    updateSummaryBar(data.summary);
-    var indicator = document.getElementById('reflowIndicator');
-    if (indicator) indicator.style.display = 'none';
-  })
-  .catch(function() {
-    var indicator = document.getElementById('reflowIndicator');
-    if (indicator) indicator.style.display = 'none';
-  });
-}
-
-function doRegroupLive() {
-  var config = Object.assign({}, getGroupingConfig(), getScoringConfig());
-  fetch('/api/pipeline/regroup-live', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({config: config}),
-  })
-  .then(function(r) { return r.json(); })
-  .then(function(data) {
-    if (data.error) return;
-    pipelineResults = data;
-    renderResults();
-    updateSummaryBar(data.summary);
-    var indicator = document.getElementById('reflowIndicator');
-    if (indicator) indicator.style.display = 'none';
-  })
-  .catch(function() {
-    var indicator = document.getElementById('reflowIndicator');
-    if (indicator) indicator.style.display = 'none';
-  });
-}
-
-function updateSummaryBar(summary) {
-  // Update the summary stats in the bar
-  var stats = document.querySelectorAll('.summary-stat');
-  if (stats.length >= 6) {
-    stats[0].querySelector('.num').textContent = summary.total_photos;
-    stats[1].querySelector('.num').textContent = summary.encounter_count;
-    stats[2].querySelector('.num').textContent = summary.burst_count;
-    stats[3].querySelector('.num').textContent = summary.keep_count;
-    stats[4].querySelector('.num').textContent = summary.review_count;
-    stats[5].querySelector('.num').textContent = summary.reject_count;
+function markStale(name) {
+  var num = document.getElementById('num' + name.charAt(0).toUpperCase() + name.slice(1));
+  if (num && !num.classList.contains('running')) {
+    num.className = 'stage-num stale';
   }
-  // Update stage stats
-  var ts = document.getElementById('stageTriageStats');
-  if (ts) ts.textContent = summary.keep_count + 'K / ' + summary.review_count + 'R / ' + summary.reject_count + 'X';
-  var gs = document.getElementById('stageGroupStats');
-  if (gs) gs.textContent = summary.encounter_count;
-}
-
-function resetScoringDefaults() {
-  document.getElementById('slRejectCrop').value = SCORING_DEFAULTS.reject_crop_complete;
-  document.getElementById('slRejectFocus').value = SCORING_DEFAULTS.reject_focus;
-  document.getElementById('slRejectClip').value = SCORING_DEFAULTS.reject_clip_high;
-  document.getElementById('slRejectComposite').value = SCORING_DEFAULTS.reject_composite;
-  document.getElementById('slBurstLambda').value = SCORING_DEFAULTS.burst_lambda;
-  document.getElementById('slBurstKeep').value = SCORING_DEFAULTS.burst_max_keep;
-  document.getElementById('slEncLambda').value = SCORING_DEFAULTS.encounter_lambda;
-  document.getElementById('slEncKeep').value = SCORING_DEFAULTS.encounter_max_keep;
-  // Update displays
-  document.querySelectorAll('.sidebar-section input[type="range"]').forEach(function(sl) {
-    updateSliderDisplay(sl);
-  });
-  doReflow();
-}
-
-function resetGroupingDefaults() {
-  document.getElementById('slEncCut').value = GROUPING_DEFAULTS.hard_cut_score;
-  document.getElementById('slEncMerge').value = GROUPING_DEFAULTS.merge_score;
-  document.getElementById('slBurstTime').value = GROUPING_DEFAULTS.burst_time_gap;
-  document.getElementById('slBurstPhash').value = GROUPING_DEFAULTS.burst_phash_threshold;
-  document.getElementById('slBurstEmb').value = GROUPING_DEFAULTS.burst_embedding_threshold;
-  document.querySelectorAll('.sidebar-section input[type="range"]').forEach(function(sl) {
-    updateSliderDisplay(sl);
-  });
-  doRegroupLive();
-}
-
-// -- Photo inspection --
-
-function findPhotoInResults(photoId) {
-  if (!pipelineResults) return null;
-  for (var i = 0; i < pipelineResults.photos.length; i++) {
-    if (pipelineResults.photos[i].id === photoId) return pipelineResults.photos[i];
+  var summary = document.getElementById('summary' + name.charAt(0).toUpperCase() + name.slice(1));
+  if (summary && !summary.querySelector('.stale-badge')) {
+    summary.innerHTML += '<span class="stale-badge">stale</span>';
   }
-  return null;
 }
 
-function findEncounterForPhoto(photoId) {
-  if (!pipelineResults) return null;
-  for (var i = 0; i < pipelineResults.encounters.length; i++) {
-    var enc = pipelineResults.encounters[i];
-    if (enc.photo_ids && enc.photo_ids.indexOf(photoId) >= 0) return enc;
-  }
-  return null;
-}
-
-function openInspect(photoId) {
-  var photo = findPhotoInResults(photoId);
-  if (!photo) return;
-
-  var enc = findEncounterForPhoto(photoId);
-  var panel = document.getElementById('inspectPanel');
-  var overlay = document.getElementById('inspectOverlay');
-
-  var label = (photo.label || '').toLowerCase();
-  var q = photo.quality_composite || 0;
-
-  // Score components
-  var scores = [
-    {name: 'Focus', key: 'focus_score', weight: 0.45, cls: 'focus'},
-    {name: 'Exposure', key: 'exposure_score', weight: 0.20, cls: 'exposure'},
-    {name: 'Composition', key: 'composition_score', weight: 0.15, cls: 'composition'},
-    {name: 'Area', key: 'area_score', weight: 0.10, cls: 'area'},
-    {name: 'Noise', key: 'noise_score', weight: 0.10, cls: 'noise'},
-  ];
-
-  var html = '<button class="inspect-close" onclick="closeInspect()">&times;</button>';
-  html += '<div class="inspect-title">' + (photo.filename || 'Photo ' + photoId) + '</div>';
-
-  // Image with mask toggle
-  html += '<div class="inspect-img-wrap">';
-  html += '<img src="/thumbnails/' + photoId + '.jpg" alt="">';
-  html += '<img class="mask-overlay" id="maskOverlay" src="/masks/' + photoId + '.png" alt="">';
-  html += '<button class="mask-toggle" onclick="toggleMask()">Toggle Mask</button>';
-  html += '</div>';
-
-  // Triage badge + reasoning
-  html += '<span class="triage-badge ' + label + '">' + (photo.label || 'UNSCORED') + '</span>';
-  if (photo.rarity_protected) {
-    html += ' <span class="triage-badge review">Rarity Protected</span>';
-  }
-
-  if (photo.reject_reasons && photo.reject_reasons.length > 0) {
-    html += '<div class="reject-reasons">';
-    photo.reject_reasons.forEach(function(r) {
-      html += '<div class="reject-reason">&#9888; ' + r + '</div>';
-    });
-    html += '</div>';
-  }
-
-  // Score waterfall
-  html += '<div class="score-waterfall">';
-  html += '<div style="font-size:13px;font-weight:600;margin-bottom:8px;">Quality Score: ' + q.toFixed(3) + '</div>';
-  scores.forEach(function(s) {
-    var val = photo[s.key] || 0;
-    var weighted = val * s.weight;
-    var pct = Math.round(val * 100);
-    html += '<div class="score-waterfall-row">';
-    html += '<span class="score-wf-label">' + s.name + ' (' + (s.weight*100) + '%)</span>';
-    html += '<div class="score-wf-bar-track"><div class="score-wf-bar-fill ' + s.cls + '" style="width:' + pct + '%"></div></div>';
-    html += '<span class="score-wf-val">' + val.toFixed(3) + ' (' + weighted.toFixed(3) + ')</span>';
-    html += '</div>';
-  });
-  html += '</div>';
-
-  // Encounter context filmstrip
-  if (enc) {
-    var speciesName = enc.confirmed_species || (enc.species ? (enc.species[0] || 'Unknown') : 'Unknown');
-    var confirmedTag = enc.confirmed_species ? ' \u2713' : '';
-    html += '<div class="context-label">Encounter: ' + speciesName + confirmedTag + ' (' + enc.photo_count + ' photos, ' + (enc.burst_count||0) + ' bursts)</div>';
-    html += '<div class="context-filmstrip">';
-    (enc.photo_ids || []).forEach(function(pid) {
-      var isCurrent = pid === photoId ? ' current' : '';
-      html += '<img src="/thumbnails/' + pid + '.jpg" class="' + isCurrent + '" onclick="openInspect(' + pid + ')" alt="">';
-    });
-    html += '</div>';
-  }
-
-  // Raw feature table
-  html += '<table class="feature-table">';
-  var features = [
-    ['Subject Tenengrad', photo.subject_tenengrad],
-    ['Background Tenengrad', photo.bg_tenengrad],
-    ['Crop Completeness', photo.crop_complete],
-    ['Background Separation', photo.bg_separation],
-    ['Highlight Clip', photo.subject_clip_high],
-    ['Shadow Clip', photo.subject_clip_low],
-    ['Median Luminance', photo.subject_y_median],
-    ['Subject Size', photo.subject_size],
-    ['Crop pHash', photo.phash_crop],
-    ['Detection Confidence', photo.detection_conf],
-  ];
-  features.forEach(function(f) {
-    var val = f[1];
-    if (val === null || val === undefined) val = '—';
-    else if (typeof val === 'number') val = val.toFixed(4);
-    html += '<tr><td>' + f[0] + '</td><td>' + val + '</td></tr>';
-  });
-  html += '</table>';
-
-  panel.innerHTML = html;
-  overlay.classList.add('open');
-  document.addEventListener('keydown', inspectKeyHandler);
-}
-
-function closeInspect() {
-  document.getElementById('inspectOverlay').classList.remove('open');
-  document.removeEventListener('keydown', inspectKeyHandler);
-}
-
-function inspectKeyHandler(e) {
-  if (e.key === 'Escape') closeInspect();
-}
-
-function toggleMask() {
-  var overlay = document.getElementById('maskOverlay');
-  if (overlay) overlay.classList.toggle('show');
-}
-
-// -- Init --
-if (pipelineResults) {
-  renderResults();
+function escapeHtml(str) {
+  if (str == null) return '';
+  var div = document.createElement('div');
+  div.appendChild(document.createTextNode(String(str)));
+  return div.innerHTML;
 }
 </script>
 </body>

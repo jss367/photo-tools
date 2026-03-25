@@ -948,11 +948,14 @@ def create_app(db_path, thumb_cache_dir=None):
         page = request.args.get("page", 1, type=int)
         per_page = request.args.get("per_page", 50, type=int)
         photos = db.get_collection_photos(collection_id, page=page, per_page=per_page)
+        # Get total count (fetch with large limit, count results)
+        total = len(db.get_collection_photos(collection_id, page=1, per_page=1_000_000))
         return jsonify(
             {
                 "photos": [dict(p) for p in photos],
                 "page": page,
                 "per_page": per_page,
+                "total": total,
             }
         )
 

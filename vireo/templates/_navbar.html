@@ -1361,6 +1361,77 @@ function closeSimilar() {
 </div>
 
 <script>
+/* ---------- Shared Utilities ---------- */
+function escapeHtml(str) {
+  if (str == null) return '';
+  var div = document.createElement('div');
+  div.appendChild(document.createTextNode(String(str)));
+  return div.innerHTML;
+}
+
+/* ---------- Toast Notifications ---------- */
+(function() {
+  var container = document.createElement('div');
+  container.id = 'toastContainer';
+  container.style.cssText = 'position:fixed;top:16px;right:16px;z-index:100000;display:flex;flex-direction:column;gap:8px;pointer-events:none;';
+  document.body.appendChild(container);
+})();
+
+function showToast(msg, type) {
+  type = type || 'error';
+  var container = document.getElementById('toastContainer');
+  if (!container) return;
+  var toast = document.createElement('div');
+  var bg = type === 'error' ? 'var(--danger, #e74c3c)' : 'var(--accent, #24E5CA)';
+  var color = type === 'error' ? '#fff' : 'var(--accent-text, #0A1F2E)';
+  toast.style.cssText = 'pointer-events:auto;padding:10px 16px;border-radius:6px;font-size:14px;max-width:400px;word-break:break-word;background:' + bg + ';color:' + color + ';box-shadow:0 2px 8px rgba(0,0,0,0.3);opacity:0;transition:opacity 0.2s;';
+  toast.textContent = msg;
+  container.appendChild(toast);
+  requestAnimationFrame(function() { toast.style.opacity = '1'; });
+  setTimeout(function() {
+    toast.style.opacity = '0';
+    setTimeout(function() { toast.remove(); }, 200);
+  }, 5000);
+}
+
+/* ---------- Safe Fetch ---------- */
+async function safeFetch(url, opts, options) {
+  var toast = (!options || options.toast !== false);
+  var resp = await fetch(url, opts);
+  if (!resp.ok) {
+    var body = {};
+    try { body = await resp.json(); } catch(e) {}
+    var msg = body.error || 'Request failed (' + resp.status + ')';
+    if (toast) showToast(msg, 'error');
+    var err = new Error(msg);
+    err.status = resp.status;
+    err.body = body;
+    throw err;
+  }
+  var text = await resp.text();
+  if (!text) return null;
+  return JSON.parse(text);
+}
+
+/* ---------- Safe EventSource ---------- */
+function safeEventSource(url, callbacks) {
+  callbacks = callbacks || {};
+  var source = new EventSource(url);
+  source.addEventListener('progress', function(e) {
+    if (callbacks.onProgress) callbacks.onProgress(JSON.parse(e.data));
+  });
+  source.addEventListener('complete', function(e) {
+    source.close();
+    if (callbacks.onComplete) callbacks.onComplete(JSON.parse(e.data));
+  });
+  source.onerror = function() {
+    source.close();
+    showToast('Connection lost', 'error');
+    if (callbacks.onError) callbacks.onError();
+  };
+  return source;
+}
+
 /* ---------- Bottom Panel ---------- */
 function formatDuration(seconds) {
   if (seconds == null) return '-';

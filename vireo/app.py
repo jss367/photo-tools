@@ -4219,6 +4219,7 @@ def create_app(db_path, thumb_cache_dir=None):
         Requires extract-masks to have been run first.
         """
         body = request.get_json(silent=True) or {}
+        collection_id = body.get("collection_id")
 
         import config as cfg
 
@@ -4244,7 +4245,7 @@ def create_app(db_path, thumb_cache_dir=None):
                 {"phase": "Loading features from database", "current": 0, "total": 3},
             )
 
-            photos = load_photo_features(thread_db)
+            photos = load_photo_features(thread_db, collection_id=collection_id)
             if not photos:
                 return {"error": "No photos with pipeline features found. Run extract-masks first."}
 
@@ -4269,6 +4270,83 @@ def create_app(db_path, thumb_cache_dir=None):
 
         job_id = runner.start("regroup", work, config={"pipeline": pipeline_cfg})
         return jsonify({"job_id": job_id})
+
+    @app.route("/api/encounters/species", methods=["POST"])
+    def api_encounter_species():
+        """Confirm species for all photos in an encounter.
+
+        Expects JSON: {"species": "Blue Jay", "photo_ids": [1, 2, 3]}
+        Creates species keyword, tags photos, queues pending changes.
+        """
+        db = _get_db()
+        body = request.get_json(silent=True) or {}
+        species = body.get("species", "").strip()
+        photo_ids = body.get("photo_ids", [])
+
+        if not species:
+            return jsonify({"error": "species is required"}), 400
+        if not photo_ids:
+            return jsonify({"error": "photo_ids is required"}), 400
+
+        # Create or find the species keyword
+        kid = db.add_keyword(species, is_species=True)
+
+        # Tag all photos and queue pending changes
+        for pid in photo_ids:
+            db.tag_photo(pid, kid)
+            db.queue_change(pid, "keyword_add", species)
+
+        return jsonify({
+            "ok": True,
+            "species": species,
+            "keyword_id": kid,
+            "photo_count": len(photo_ids),
+        })
+
+    @app.route("/api/species/search")
+    def api_species_search():
+        """Search species names from active label sets for autocomplete."""
+        q = request.args.get("q", "").strip().lower()
+        if len(q) < 2:
+            return jsonify([])
+
+        from labels import get_active_labels
+
+        matches = []
+        seen = set()
+        for label_set in get_active_labels():
+            labels_file = label_set.get("labels_file", "")
+            if not labels_file or not os.path.exists(labels_file):
+                continue
+            try:
+                with open(labels_file) as f:
+                    for line in f:
+                        name = line.strip()
+                        if not name:
+                            continue
+                        name_lower = name.lower()
+                        if q in name_lower and name_lower not in seen:
+                            seen.add(name_lower)
+                            matches.append(name)
+                            if len(matches) >= 20:
+                                break
+            except Exception:
+                pass
+            if len(matches) >= 20:
+                break
+
+        # Also search existing species keywords in the database
+        db = _get_db()
+        kw_rows = db.conn.execute(
+            "SELECT name FROM keywords WHERE is_species = 1 AND LOWER(name) LIKE ?",
+            (f"%{q}%",),
+        ).fetchall()
+        for row in kw_rows:
+            if row["name"].lower() not in seen:
+                seen.add(row["name"].lower())
+                matches.append(row["name"])
+
+        return jsonify(matches[:20])
 
     @app.route("/api/pipeline/results")
     def api_pipeline_results():

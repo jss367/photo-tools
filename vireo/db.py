@@ -1526,6 +1526,36 @@ class Database:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    def undo_last_edit(self):
+        """Undo the most recent edit. Returns the undone entry dict, or None."""
+        entry = self.conn.execute(
+            "SELECT * FROM edit_history WHERE workspace_id = ? ORDER BY created_at DESC, id DESC LIMIT 1",
+            (self._ws_id(),),
+        ).fetchone()
+        if not entry:
+            return None
+        entry = dict(entry)
+        items = self.conn.execute(
+            "SELECT * FROM edit_history_items WHERE edit_id = ?",
+            (entry['id'],),
+        ).fetchall()
+
+        for item in items:
+            old_val = item['old_value']
+            pid = item['photo_id']
+            if entry['action_type'] == 'rating':
+                self.update_photo_rating(pid, int(old_val))
+            elif entry['action_type'] == 'flag':
+                self.update_photo_flag(pid, old_val)
+            elif entry['action_type'] == 'keyword_add':
+                self.untag_photo(pid, int(entry['new_value']))
+            elif entry['action_type'] == 'keyword_remove':
+                self.tag_photo(pid, int(entry['new_value']))
+
+        self.conn.execute("DELETE FROM edit_history WHERE id = ?", (entry['id'],))
+        self.conn.commit()
+        return entry
+
     def _prune_edit_history(self):
         """Delete oldest entries beyond the configured max."""
         import config as cfg

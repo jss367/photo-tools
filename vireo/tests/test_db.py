@@ -1018,3 +1018,87 @@ def test_get_edit_history_pagination(tmp_path):
     assert len(page2) == 2
     assert page1[0]['description'] == 'Edit 4'
     assert page2[0]['description'] == 'Edit 2'
+
+
+def test_undo_last_edit_rating(tmp_path):
+    """undo_last_edit restores photo rating and removes the history entry."""
+    db, pids = _make_db_with_photos(tmp_path)
+    pid = pids[0]
+    original_rating = db.get_photo(pid)['rating']
+
+    db.update_photo_rating(pid, 5)
+    db.record_edit('rating', 'Set rating to 5', '5',
+                   [{'photo_id': pid, 'old_value': str(original_rating), 'new_value': '5'}])
+
+    result = db.undo_last_edit()
+    assert result is not None
+    assert result['description'] == 'Set rating to 5'
+    assert db.get_photo(pid)['rating'] == original_rating
+    assert len(db.get_edit_history()) == 0
+
+
+def test_undo_last_edit_flag(tmp_path):
+    """undo_last_edit restores photo flag."""
+    db, pids = _make_db_with_photos(tmp_path)
+    pid = pids[0]
+
+    db.update_photo_flag(pid, 'flagged')
+    db.record_edit('flag', 'Set flag to flagged', 'flagged',
+                   [{'photo_id': pid, 'old_value': 'none', 'new_value': 'flagged'}])
+
+    result = db.undo_last_edit()
+    assert db.get_photo(pid)['flag'] == 'none'
+
+
+def test_undo_last_edit_keyword_add(tmp_path):
+    """undo_last_edit removes keyword that was added."""
+    db, pids = _make_db_with_photos(tmp_path)
+    pid = pids[0]
+    kid = db.add_keyword('Eagle')
+    db.tag_photo(pid, kid)
+    db.record_edit('keyword_add', 'Added keyword "Eagle"', str(kid),
+                   [{'photo_id': pid, 'old_value': '', 'new_value': str(kid)}])
+
+    db.undo_last_edit()
+    keywords = db.get_photo_keywords(pid)
+    assert not any(k['name'] == 'Eagle' for k in keywords)
+
+
+def test_undo_last_edit_keyword_remove(tmp_path):
+    """undo_last_edit re-adds keyword that was removed."""
+    db, pids = _make_db_with_photos(tmp_path)
+    pid = pids[0]
+    kid = db.add_keyword('Hawk')
+    db.tag_photo(pid, kid)
+    # Now remove it and record the edit
+    db.untag_photo(pid, kid)
+    db.record_edit('keyword_remove', 'Removed keyword "Hawk"', str(kid),
+                   [{'photo_id': pid, 'old_value': str(kid), 'new_value': ''}])
+
+    db.undo_last_edit()
+    keywords = db.get_photo_keywords(pid)
+    assert any(k['id'] == kid for k in keywords)
+
+
+def test_undo_last_edit_batch(tmp_path):
+    """undo_last_edit restores all photos in a batch operation."""
+    db, pids = _make_db_with_photos(tmp_path)
+    original_ratings = {}
+    for pid in pids[:2]:
+        original_ratings[pid] = db.get_photo(pid)['rating']
+
+    items = []
+    for pid, old_r in original_ratings.items():
+        db.update_photo_rating(pid, 5)
+        items.append({'photo_id': pid, 'old_value': str(old_r), 'new_value': '5'})
+    db.record_edit('rating', 'Set rating to 5 on 2 photos', '5', items, is_batch=True)
+
+    db.undo_last_edit()
+    for pid, old_r in original_ratings.items():
+        assert db.get_photo(pid)['rating'] == old_r
+
+
+def test_undo_last_edit_empty(tmp_path):
+    """undo_last_edit returns None when no history exists."""
+    db, pids = _make_db_with_photos(tmp_path)
+    assert db.undo_last_edit() is None

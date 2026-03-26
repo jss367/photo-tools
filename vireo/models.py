@@ -361,9 +361,9 @@ def _download_with_byte_progress(repo_id, filename, file_size,
     # Disable XET: it downloads via a content-addressed chunk-cache that
     # doesn't support resume across retries and doesn't reliably report
     # progress.  Plain HTTP writes to .incomplete files and resumes.
-    os.environ["HF_HUB_DISABLE_XET"] = "1"
-    import huggingface_hub.constants as _hf_constants
-    _hf_constants.HF_HUB_DISABLE_XET = True
+    # Patch the name where _download_to_tmp_and_move actually calls it.
+    import huggingface_hub.file_download as _hf_fd
+    _hf_fd.is_xet_available = lambda: False
     os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "300")
 
     lock = threading.Lock()
@@ -379,6 +379,9 @@ def _download_with_byte_progress(repo_id, filename, file_size,
         _last_cb = 0.0
 
         def __init__(self, *args, **kwargs):
+            # HF's _get_progress_bar_context passes name= which
+            # tqdm.std.tqdm rejects; strip it before calling super.
+            kwargs.pop("name", None)
             super().__init__(*args, **kwargs)
             _ProgressTqdm._last_cb = 0.0
             # If resuming, initial is already set by http_get

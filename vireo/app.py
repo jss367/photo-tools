@@ -4173,6 +4173,17 @@ def create_app(db_path, thumb_cache_dir=None):
         save_results_raw(results, cache_dir, db._active_workspace_id)
         return jsonify({"ok": True, "encounters": encounters, "summary": results["summary"]})
 
+    @app.route("/api/pipeline/save-cache", methods=["POST"])
+    def api_pipeline_save_cache():
+        """Save pipeline results back to cache (used by undo)."""
+        from pipeline import save_results_raw
+
+        body = request.get_json(silent=True) or {}
+        db = _get_db()
+        cache_dir = os.path.dirname(db_path)
+        save_results_raw(body, cache_dir, db._active_workspace_id)
+        return jsonify({"ok": True})
+
     @app.route("/api/pipeline/config", methods=["GET", "POST"])
     def api_pipeline_config():
         """Get or update pipeline model configuration.

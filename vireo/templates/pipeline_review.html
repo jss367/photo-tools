@@ -1371,6 +1371,95 @@ async function clearBurstOverride(event, encIdx, burstIdx) {
   renderResults();
 }
 
+// -- Detach & Undo --
+
+var undoStack = [];
+var _undoTimer = null;
+
+function showUndo(msg, undoFn) {
+  // Clear previous
+  clearTimeout(_undoTimer);
+  undoStack = [undoFn];
+
+  var toast = document.getElementById('undoToast');
+  var msgEl = document.getElementById('undoMsg');
+  if (!toast || !msgEl) return;
+  msgEl.textContent = msg;
+  toast.classList.remove('hidden');
+
+  _undoTimer = setTimeout(function() {
+    toast.classList.add('hidden');
+    undoStack = [];
+  }, 5000);
+}
+
+function undoLastAction() {
+  clearTimeout(_undoTimer);
+  var toast = document.getElementById('undoToast');
+  if (toast) toast.classList.add('hidden');
+  if (undoStack.length > 0) {
+    var fn = undoStack.pop();
+    fn();
+  }
+}
+
+async function detachBurst(encIdx, burstIdx) {
+  // Save state for undo
+  var snapshot = JSON.parse(JSON.stringify(pipelineResults));
+
+  var resp = await safeFetch('/api/pipeline/detach-burst', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ encounter_index: encIdx, burst_index: burstIdx }),
+  });
+  if (!resp || !resp.ok) return;
+
+  pipelineResults.encounters = resp.encounters;
+  if (resp.summary) pipelineResults.summary = resp.summary;
+  renderResults();
+  updateSummaryBar(pipelineResults.summary);
+
+  showUndo('Burst detached from encounter', function() {
+    // Restore from snapshot
+    pipelineResults = snapshot;
+    // Re-save to cache
+    safeFetch('/api/pipeline/save-cache', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(pipelineResults),
+    });
+    renderResults();
+    updateSummaryBar(pipelineResults.summary);
+  });
+}
+
+async function detachPhoto(encIdx, burstIdx, photoId) {
+  var snapshot = JSON.parse(JSON.stringify(pipelineResults));
+
+  var resp = await safeFetch('/api/pipeline/detach-photo', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ encounter_index: encIdx, burst_index: burstIdx, photo_id: photoId }),
+  });
+  if (!resp || !resp.ok) return;
+
+  pipelineResults.encounters = resp.encounters;
+  if (resp.summary) pipelineResults.summary = resp.summary;
+  renderResults();
+  updateSummaryBar(pipelineResults.summary);
+
+  showUndo('Photo detached from burst', function() {
+    pipelineResults = snapshot;
+    safeFetch('/api/pipeline/save-cache', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(pipelineResults),
+    });
+    renderResults();
+    updateSummaryBar(pipelineResults.summary);
+  });
+}
+
 initPipelineReviewPage();
 </script>
 </body>

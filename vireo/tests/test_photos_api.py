@@ -78,6 +78,39 @@ def test_api_photo_detail(app_and_db):
     assert 'keywords' in data
 
 
+def test_api_photos_calendar(app_and_db):
+    """GET /api/photos/calendar returns daily photo counts for a year."""
+    app, _ = app_and_db
+    client = app.test_client()
+    resp = client.get("/api/photos/calendar?year=2024")
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert data["year"] == 2024
+    assert "2024-01-15" in data["days"]
+    assert data["min_year"] == 2024
+    assert data["max_year"] == 2024
+
+
+def test_api_photos_calendar_with_filters(app_and_db):
+    """GET /api/photos/calendar respects folder_id and rating_min filters."""
+    app, db = app_and_db
+    client = app.test_client()
+    resp = client.get("/api/photos/calendar?year=2024&rating_min=4")
+    data = resp.get_json()
+    assert list(data["days"].keys()) == ["2024-06-10"]
+
+
+def test_api_photos_calendar_default_year(app_and_db):
+    """GET /api/photos/calendar defaults to current year."""
+    app, _ = app_and_db
+    client = app.test_client()
+    resp = client.get("/api/photos/calendar")
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert "year" in data
+    assert "days" in data
+
+
 def test_thumbnail_serving(app_and_db):
     """GET /thumbnails/<id>.jpg serves thumbnail from cache."""
     app, db = app_and_db

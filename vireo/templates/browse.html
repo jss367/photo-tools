@@ -1450,6 +1450,51 @@ async function developSelected() {
     showToast(e.message || 'Error starting develop job');
   }
 }
+
+/* ---------- Deep-link: scroll to photo_id if present in URL ---------- */
+(async function() {
+  var params = new URLSearchParams(window.location.search);
+  var photoId = params.get('photo_id');
+  if (!photoId) return;
+  photoId = parseInt(photoId, 10);
+  if (isNaN(photoId)) return;
+
+  try {
+    var photo = await safeFetch('/api/photos/' + photoId, {}, { toast: false });
+    if (!photo || !photo.folder_id) return;
+
+    // Navigate to the photo's folder
+    activeFolderId = photo.folder_id;
+    activeKeyword = null;
+    photos = [];
+    currentPage = 1;
+    allLoaded = false;
+    selectedPhotoId = null;
+    selectedIndex = -1;
+    closeDetail();
+    document.getElementById('grid').innerHTML = '';
+
+    // Load photos and wait for render
+    await loadPhotos();
+
+    // Update folder tree active state
+    document.querySelectorAll('#folderTree .tree-item').forEach(function(el) {
+      el.classList.toggle('active', parseInt(el.dataset.folderId) === activeFolderId);
+    });
+
+    // Find and scroll to the target photo
+    var el = document.querySelector('.grid-card[data-id="' + photoId + '"]');
+    if (el) {
+      el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      el.style.outline = '3px solid var(--accent, #24E5CA)';
+      el.style.outlineOffset = '2px';
+      setTimeout(function() {
+        el.style.outline = '';
+        el.style.outlineOffset = '';
+      }, 2000);
+    }
+  } catch(e) { /* ignore deep-link errors silently */ }
+})();
 </script>
 
 

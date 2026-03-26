@@ -2083,7 +2083,8 @@ def create_app(db_path, thumb_cache_dir=None):
     @app.route("/api/inat/validate-token", methods=["POST"])
     def api_inat_validate_token():
         """Validate an iNaturalist API token."""
-        token = request.json.get("token", "")
+        body = request.json or {}
+        token = body.get("token", "")
         if not token:
             return json_error("Token is required")
         result = inat.validate_token(token)
@@ -2101,7 +2102,7 @@ def create_app(db_path, thumb_cache_dir=None):
         if not token:
             return json_error("iNaturalist token not configured. Add it in Settings.")
 
-        data = request.json
+        data = request.json or {}
         photo_id = data.get("photo_id")
         if not photo_id:
             return json_error("photo_id is required")
@@ -2161,7 +2162,7 @@ def create_app(db_path, thumb_cache_dir=None):
         if not token:
             return json_error("iNaturalist token not configured. Add it in Settings.")
 
-        submissions = request.json.get("submissions", [])
+        submissions = (request.json or {}).get("submissions", [])
         if not submissions:
             return json_error("submissions array is required")
 

@@ -170,7 +170,6 @@ def create_app(db_path, thumb_cache_dir=None):
 
     # Load user config (e.g. HF token) on startup
     import config as cfg
-    import inat
 
     startup_cfg = cfg.load()
     if startup_cfg.get("hf_token"):
@@ -2083,6 +2082,7 @@ def create_app(db_path, thumb_cache_dir=None):
     @app.route("/api/inat/validate-token", methods=["POST"])
     def api_inat_validate_token():
         """Validate an iNaturalist API token."""
+        import inat
         body = request.json or {}
         token = body.get("token", "")
         if not token:
@@ -2096,6 +2096,7 @@ def create_app(db_path, thumb_cache_dir=None):
     def api_inat_submit():
         """Submit a single observation to iNaturalist."""
         import config as cfg
+        import inat
 
         user_cfg = cfg.load()
         token = user_cfg.get("inat_token")
@@ -2156,6 +2157,7 @@ def create_app(db_path, thumb_cache_dir=None):
     def api_inat_submit_batch():
         """Submit multiple observations to iNaturalist."""
         import config as cfg
+        import inat
 
         user_cfg = cfg.load()
         token = user_cfg.get("inat_token")

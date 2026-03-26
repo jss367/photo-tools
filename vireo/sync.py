@@ -228,18 +228,21 @@ def sync_from_xmp(db, photo_ids):
 
         # Read current XMP keywords
         xmp_keywords = read_xmp_keywords(xmp_path)
+        xmp_keywords_lower = {kw.lower(): kw for kw in xmp_keywords}
 
         # Get current DB keywords
         db_keywords = db.get_photo_keywords(photo_id)
-        db_kw_names = {k["name"] for k in db_keywords}
+        db_keywords_lower = {k["name"].lower(): k for k in db_keywords}
 
         # Reconcile DB keyword associations to match the current XMP file.
-        for kw in xmp_keywords - db_kw_names:
-            kid = db.add_keyword(kw)
+        for kw_lower, kw_name in xmp_keywords_lower.items():
+            if kw_lower in db_keywords_lower:
+                continue
+            kid = db.add_keyword(kw_name)
             db.tag_photo(photo_id, kid)
 
         for kw in db_keywords:
-            if kw["name"] not in xmp_keywords:
+            if kw["name"].lower() not in xmp_keywords_lower:
                 db.untag_photo(photo_id, kw["id"])
 
         # Update xmp_mtime

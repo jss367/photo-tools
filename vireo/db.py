@@ -3,6 +3,8 @@
 import json
 import os
 import sqlite3
+import uuid
+import uuid
 
 _UNSET = object()  # sentinel for "not provided" vs explicit None
 
@@ -109,6 +111,7 @@ class Database:
                 photo_id    INTEGER REFERENCES photos(id),
                 change_type TEXT,
                 value       TEXT,
+                change_token TEXT,
                 created_at  TEXT DEFAULT (datetime('now')),
                 workspace_id INTEGER REFERENCES workspaces(id) ON DELETE CASCADE
             );
@@ -323,6 +326,13 @@ class Database:
                         f"UPDATE {table} SET workspace_id = ?", (default_id,)
                     )
 
+            self.conn.commit()
+
+        # Ensure change_token column exists (added after workspace migration)
+        try:
+            self.conn.execute("SELECT change_token FROM pending_changes LIMIT 0")
+        except Exception:
+            self.conn.execute("ALTER TABLE pending_changes ADD COLUMN change_token TEXT")
             self.conn.commit()
 
         # Ensure workspace indexes exist (for fresh DBs that skip migration)
@@ -1422,18 +1432,23 @@ class Database:
     # -- Pending Changes --
 
     def queue_change(self, photo_id, change_type, value):
-        """Add a change to the sync queue (skips if already queued)."""
+        """Add a change to the sync queue (skips if already queued).
+
+        Returns the inserted pending change token, or None if an identical row already exists.
+        """
         existing = self.conn.execute(
             "SELECT id FROM pending_changes WHERE photo_id = ? AND change_type = ? AND value = ? AND workspace_id = ?",
             (photo_id, change_type, value, self._ws_id()),
         ).fetchone()
         if existing:
-            return
+            return None
+        change_token = str(uuid.uuid4())
         self.conn.execute(
-            "INSERT INTO pending_changes (photo_id, change_type, value, workspace_id) VALUES (?, ?, ?, ?)",
-            (photo_id, change_type, value, self._ws_id()),
+            "INSERT INTO pending_changes (photo_id, change_type, value, change_token, workspace_id) VALUES (?, ?, ?, ?, ?)",
+            (photo_id, change_type, value, change_token, self._ws_id()),
         )
         self.conn.commit()
+        return change_token
 
     def get_pending_changes(self):
         """Return all pending changes ordered by creation time."""
@@ -1456,6 +1471,17 @@ class Database:
         cur = self.conn.execute(
             f"DELETE FROM pending_changes WHERE {' AND '.join(clauses)}",
             params,
+        )
+        self.conn.commit()
+        return cur.rowcount
+
+    def remove_pending_change_token(self, change_token):
+        """Delete a single pending change by immutable token. Returns rows removed."""
+        if not change_token:
+            return 0
+        cur = self.conn.execute(
+            "DELETE FROM pending_changes WHERE change_token = ? AND workspace_id = ?",
+            (change_token, self._ws_id()),
         )
         self.conn.commit()
         return cur.rowcount

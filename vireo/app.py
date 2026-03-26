@@ -4098,7 +4098,7 @@ def create_app(db_path, thumb_cache_dir=None):
 
         # Create new encounter from detached burst
         new_enc = {
-            "species": enc.get("species") if len(bursts) > 0 else enc.get("species"),
+            "species": enc.get("species"),
             "confirmed_species": detached.get("species_override", {}).get("species") if detached.get("species_override") else None,
             "species_predictions": detached.get("species_predictions", []),
             "species_confirmed": bool(detached.get("species_override", {}).get("confirmed")) if detached.get("species_override") else False,
@@ -4179,6 +4179,8 @@ def create_app(db_path, thumb_cache_dir=None):
         from pipeline import save_results_raw
 
         body = request.get_json(silent=True) or {}
+        if not isinstance(body.get("encounters"), list) or not isinstance(body.get("photos"), list):
+            return json_error("Invalid pipeline results structure")
         db = _get_db()
         cache_dir = os.path.dirname(db_path)
         save_results_raw(body, cache_dir, db._active_workspace_id)

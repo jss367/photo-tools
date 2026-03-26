@@ -104,7 +104,7 @@ body { padding-bottom: 36px; }
   cursor: pointer;
 }
 .encounter-header:hover { background: var(--border-secondary, #1A4560); }
-.encounter-species { font-size: 15px; font-weight: 600; flex: 1; }
+/* .encounter-species replaced by .species-widget */
 .encounter-meta {
   font-size: 11px;
   color: var(--text-dim, #5A8890);
@@ -788,8 +788,6 @@ function renderResults() {
 
   var html = '';
   pipelineResults.encounters.forEach(function(enc, ei) {
-    var speciesName = enc.species ? (enc.species[0] || 'Unknown') : 'Unknown';
-    var speciesConf = enc.species && enc.species[1] ? (enc.species[1] * 100).toFixed(0) + '%' : '';
     var timeRange = '';
     if (enc.time_range && enc.time_range[0]) {
       var t0 = enc.time_range[0].split('T')[1] || '';
@@ -1380,6 +1378,12 @@ async function clearBurstOverride(event, encIdx, burstIdx) {
   var enc = pipelineResults.encounters[encIdx];
   if (!enc || !enc.bursts || !enc.bursts[burstIdx]) return;
   enc.bursts[burstIdx].species_override = null;
+  // Persist to cache
+  safeFetch('/api/pipeline/save-cache', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(pipelineResults),
+  });
   renderResults();
 }
 

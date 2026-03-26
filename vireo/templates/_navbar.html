@@ -1569,7 +1569,7 @@ function closeSimilar() {
     </div>
     <!-- History Pane -->
     <div class="bp-pane" id="bpHistory">
-      <div class="bp-history-list" id="bpHistoryList">
+      <div class="bp-history-list" id="bpHistoryList" style="overflow-y:auto;flex:1;"
         <div class="bp-history-empty" style="color:var(--text-muted);padding:12px;font-size:12px;">No edits yet</div>
       </div>
     </div>
@@ -1764,7 +1764,7 @@ function formatDuration(seconds) {
     switchBpTab(savedTab);
 
     // Infinite scroll for history pane
-    document.getElementById('bpHistory').addEventListener('scroll', function() {
+    document.getElementById('bpHistoryList').addEventListener('scroll', function() {
       var el = this;
       if (el.scrollTop + el.clientHeight >= el.scrollHeight - 20) {
         loadEditHistory(true);

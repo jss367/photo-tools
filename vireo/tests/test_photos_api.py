@@ -54,6 +54,18 @@ def test_api_photos_filter_date_range(app_and_db):
     assert len(data['photos']) == 2
 
 
+def test_api_photos_filter_single_day(app_and_db):
+    """GET /api/photos with date_to including time captures all photos on that day."""
+    app, _ = app_and_db
+    client = app.test_client()
+    # Without time suffix, a bare date like 2024-01-15 would miss timestamps
+    # like 2024-01-15T10:00:00 because string comparison puts it after the date
+    resp = client.get('/api/photos?date_from=2024-01-15&date_to=2024-01-15T23:59:59')
+    data = resp.get_json()
+    assert len(data['photos']) == 1
+    assert data['photos'][0]['filename'] == 'bird1.jpg'
+
+
 def test_api_photos_filter_keyword(app_and_db):
     """GET /api/photos?keyword= filters by keyword."""
     app, _ = app_and_db

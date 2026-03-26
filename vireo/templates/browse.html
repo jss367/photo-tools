@@ -377,7 +377,7 @@ body {
 
 .calendar-grid {
   display: grid;
-  grid-template-columns: 24px repeat(53, 1fr);
+  grid-template-columns: 24px repeat(54, 1fr);
   grid-template-rows: repeat(7, 12px);
   gap: 2px;
   grid-auto-flow: column;
@@ -1183,7 +1183,7 @@ function selectCalendarDay(dateStr, count) {
 
   // Update date inputs and reload
   document.getElementById('dateFrom').value = dateStr;
-  document.getElementById('dateTo').value = dateStr;
+  document.getElementById('dateTo').value = dateStr + 'T23:59:59';
   resetAndLoad();
   renderCalendar(); // update selected state
 }

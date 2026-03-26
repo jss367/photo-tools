@@ -693,6 +693,10 @@ var showDetectionBoxes = false;
 var filterRating = 0;
 var activeFolderId = null;
 var activeKeyword = null;
+var timelineMode = false;
+var calendarYear = new Date().getFullYear();
+var selectedDay = null;
+var calendarData = null;
 
 var _shortcuts = null;
 (async function() {
@@ -1017,7 +1021,169 @@ async function loadPhotos() {
   document.getElementById('loadingState').style.display = 'none';
 }
 
+/* ---------- Calendar Heatmap ---------- */
+function toggleTimelineMode() {
+  timelineMode = !timelineMode;
+  var btn = document.getElementById('calToggle');
+  btn.style.color = timelineMode ? 'var(--accent, #24E5CA)' : 'var(--text-muted, #a0a0a0)';
+  btn.style.borderColor = timelineMode ? 'var(--accent, #24E5CA)' : 'var(--border-secondary, #1A4560)';
+
+  var container = document.getElementById('calendarContainer');
+  if (timelineMode) {
+    container.classList.add('active');
+    loadCalendarData();
+  } else {
+    container.classList.remove('active');
+    clearCalendarSelection();
+  }
+}
+
+async function loadCalendarData() {
+  var params = new URLSearchParams();
+  params.set('year', calendarYear);
+  if (activeFolderId) params.set('folder_id', activeFolderId);
+  if (filterRating > 0) params.set('rating_min', filterRating);
+  var search = document.getElementById('searchInput').value.trim();
+  if (search) params.set('keyword', search);
+  if (activeKeyword) params.set('keyword', activeKeyword);
+
+  calendarData = await safeFetch('/api/photos/calendar?' + params.toString());
+  renderCalendar();
+}
+
+function renderCalendar() {
+  if (!calendarData) return;
+
+  document.getElementById('calYearLabel').textContent = calendarData.year;
+  document.getElementById('calYearPrev').disabled = calendarData.year <= calendarData.min_year;
+  document.getElementById('calYearNext').disabled = calendarData.year >= calendarData.max_year;
+
+  // Compute intensity thresholds from data
+  var counts = Object.values(calendarData.days);
+  var maxCount = counts.length ? Math.max(...counts) : 0;
+  var t1 = Math.max(1, Math.ceil(maxCount * 0.15));
+  var t2 = Math.max(2, Math.ceil(maxCount * 0.40));
+  var t3 = Math.max(3, Math.ceil(maxCount * 0.70));
+
+  function getLevel(count) {
+    if (!count) return 0;
+    if (count <= t1) return 1;
+    if (count <= t2) return 2;
+    if (count <= t3) return 3;
+    return 4;
+  }
+
+  // Build month labels
+  var months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  var monthLabels = document.getElementById('calMonthLabels');
+  monthLabels.innerHTML = months.map(function(m) { return '<span>' + m + '</span>'; }).join('');
+
+  // Build grid: 53 weeks x 7 days
+  var grid = document.getElementById('calGrid');
+  grid.innerHTML = '';
+
+  var dayNames = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+  for (var d = 0; d < 7; d++) {
+    var label = document.createElement('div');
+    label.className = 'day-label';
+    label.textContent = (d % 2 === 1) ? dayNames[d].charAt(0) : '';
+    label.style.gridRow = (d + 1);
+    label.style.gridColumn = 1;
+    grid.appendChild(label);
+  }
+
+  var jan1 = new Date(calendarData.year, 0, 1);
+  var startDow = jan1.getDay();
+  var isLeap = (calendarData.year % 4 === 0 && (calendarData.year % 100 !== 0 || calendarData.year % 400 === 0));
+  var daysInYear = isLeap ? 366 : 365;
+
+  for (var i = 0; i < daysInYear; i++) {
+    var dt = new Date(calendarData.year, 0, 1 + i);
+    var dow = dt.getDay();
+    var weekNum = Math.floor((i + startDow) / 7);
+    var dateStr = dt.getFullYear() + '-' +
+        String(dt.getMonth() + 1).padStart(2, '0') + '-' +
+        String(dt.getDate()).padStart(2, '0');
+    var count = calendarData.days[dateStr] || 0;
+    var level = getLevel(count);
+
+    var cell = document.createElement('div');
+    cell.className = 'day-cell' + (level ? ' level-' + level : ' empty') +
+        (selectedDay === dateStr ? ' selected' : '');
+    cell.style.gridRow = (dow + 1);
+    cell.style.gridColumn = (weekNum + 2);
+    cell.dataset.date = dateStr;
+    cell.dataset.count = count;
+
+    cell.addEventListener('click', function() {
+      var d = this.dataset.date;
+      if (selectedDay === d) {
+        clearCalendarSelection();
+      } else {
+        selectCalendarDay(d, parseInt(this.dataset.count));
+      }
+    });
+
+    cell.addEventListener('mouseenter', function(e) {
+      var tip = document.getElementById('dayTooltip');
+      var dateObj = new Date(this.dataset.date + 'T12:00:00');
+      var formatted = dateObj.toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' });
+      var c = parseInt(this.dataset.count);
+      tip.textContent = formatted + ' \u2014 ' + c + ' photo' + (c !== 1 ? 's' : '');
+      tip.style.display = 'block';
+      tip.style.left = (e.clientX + 10) + 'px';
+      tip.style.top = (e.clientY - 30) + 'px';
+    });
+
+    cell.addEventListener('mousemove', function(e) {
+      var tip = document.getElementById('dayTooltip');
+      tip.style.left = (e.clientX + 10) + 'px';
+      tip.style.top = (e.clientY - 30) + 'px';
+    });
+
+    cell.addEventListener('mouseleave', function() {
+      document.getElementById('dayTooltip').style.display = 'none';
+    });
+
+    grid.appendChild(cell);
+  }
+}
+
+function selectCalendarDay(dateStr, count) {
+  selectedDay = dateStr;
+  var dateObj = new Date(dateStr + 'T12:00:00');
+  var formatted = dateObj.toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' });
+  document.getElementById('calSelectionText').textContent = formatted + ' \u00b7 ' + count + ' photo' + (count !== 1 ? 's' : '');
+  document.getElementById('calSelection').classList.add('active');
+
+  // Update date inputs and reload
+  document.getElementById('dateFrom').value = dateStr;
+  document.getElementById('dateTo').value = dateStr;
+  resetAndLoad();
+  renderCalendar(); // update selected state
+}
+
+function clearCalendarSelection() {
+  selectedDay = null;
+  document.getElementById('calSelection').classList.remove('active');
+  document.getElementById('dateFrom').value = '';
+  document.getElementById('dateTo').value = '';
+  resetAndLoad();
+  if (calendarData) renderCalendar();
+}
+
+function calendarChangeYear(delta) {
+  calendarYear += delta;
+  selectedDay = null;
+  document.getElementById('calSelection').classList.remove('active');
+  document.getElementById('dateFrom').value = '';
+  document.getElementById('dateTo').value = '';
+  loadCalendarData();
+  resetAndLoad();
+}
+
 function applyFilters() {
+  if (timelineMode) loadCalendarData();
   resetAndLoad();
 }
 

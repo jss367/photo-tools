@@ -802,6 +802,7 @@ function filterByFolder(folderId) {
     activeFolderId = folderId;
   }
   activeKeyword = null;
+  if (timelineMode) loadCalendarData();
   resetAndLoad();
   // Update active state
   document.querySelectorAll('#folderTree .tree-item').forEach(function(el) {
@@ -856,6 +857,7 @@ function filterByKeyword(name) {
   }
   activeFolderId = null;
   document.getElementById('searchInput').value = activeKeyword || '';
+  if (timelineMode) loadCalendarData();
   resetAndLoad();
 }
 
@@ -1173,6 +1175,8 @@ function clearCalendarSelection() {
 }
 
 function calendarChangeYear(delta) {
+  if (delta < 0 && calendarData && calendarYear <= calendarData.min_year) return;
+  if (delta > 0 && calendarData && calendarYear >= calendarData.max_year) return;
   calendarYear += delta;
   selectedDay = null;
   document.getElementById('calSelection').classList.remove('active');

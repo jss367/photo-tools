@@ -2357,6 +2357,28 @@ def create_app(db_path, thumb_cache_dir=None):
             import torch
             import urllib.request
 
+            MAX_RETRIES = 3
+
+            def _retry(fn, description):
+                """Retry a download function up to MAX_RETRIES times with backoff."""
+                for attempt in range(1, MAX_RETRIES + 1):
+                    try:
+                        return fn()
+                    except Exception as exc:
+                        is_network = isinstance(exc, (OSError, ConnectionError)) or \
+                            any(name in type(exc).__name__ for name in ("ReadError", "TransportError", "TimeoutError"))
+                        if not is_network or attempt == MAX_RETRIES:
+                            raise
+                        wait = 2 ** attempt
+                        log.warning("Download attempt %d/%d for %s failed (%s), retrying in %ds...",
+                                    attempt, MAX_RETRIES, description, exc, wait)
+                        runner.push_event(job["id"], "progress", {
+                            "phase": f"Connection error, retrying in {wait}s (attempt {attempt}/{MAX_RETRIES})...",
+                            "current": 0, "total": 1,
+                        })
+                        import time
+                        time.sleep(wait)
+
             def _download_url(url, dest, label):
                 """Download a URL with byte-level progress reporting."""
                 req = urllib.request.Request(url)
@@ -2392,7 +2414,7 @@ def create_app(db_path, thumb_cache_dir=None):
                     if os.path.exists(f):
                         os.remove(f)
                 url = "https://zenodo.org/records/15398270/files/MDV6-yolov9-c.pt?download=1"
-                _download_url(url, dest, "MegaDetector V6")
+                _retry(lambda: _download_url(url, dest, "MegaDetector V6"), "MegaDetector V6")
                 runner.push_event(job["id"], "progress", {
                     "phase": "Validating weights...", "current": 1, "total": 1,
                 })
@@ -2426,7 +2448,7 @@ def create_app(db_path, thumb_cache_dir=None):
                     "phase": f"Downloading {model_id} from HuggingFace...",
                     "current": 0, "total": 1,
                 })
-                snapshot_download(hf_id)
+                _retry(lambda: snapshot_download(hf_id), model_id)
                 runner.push_event(job["id"], "progress", {
                     "phase": "Verifying model loads...", "current": 1, "total": 1,
                 })
@@ -2449,7 +2471,7 @@ def create_app(db_path, thumb_cache_dir=None):
                     "current": 0, "total": 1,
                 })
                 # torch.hub.load downloads repo + weights automatically
-                model = torch.hub.load("facebookresearch/dinov2", hub_name, trust_repo=True)
+                model = _retry(lambda: torch.hub.load("facebookresearch/dinov2", hub_name, trust_repo=True), model_id)
                 del model
                 runner.push_event(job["id"], "progress", {
                     "phase": "Model loaded and verified", "current": 1, "total": 1,

@@ -97,16 +97,16 @@ def sim_species(species_a, species_b):
     """Species similarity via Bhattacharyya coefficient on shared top-5 species.
 
     Args:
-        species_a: list of (species_name, confidence) tuples
-        species_b: list of (species_name, confidence) tuples
+        species_a: list of (species_name, confidence[, model]) tuples
+        species_b: list of (species_name, confidence[, model]) tuples
 
     Returns:
         float in [0, 1]
     """
     if not species_a or not species_b:
         return 0.0
-    dict_a = dict(species_a)
-    dict_b = dict(species_b)
+    dict_a = {s[0]: s[1] for s in species_a}
+    dict_b = {s[0]: s[1] for s in species_b}
     shared = set(dict_a.keys()) & set(dict_b.keys())
     if not shared:
         return 0.0
@@ -153,7 +153,7 @@ def compute_s_enc(photo_a, photo_b, config=None):
             - timestamp: datetime or ISO string
             - dino_subject_embedding: numpy array or None
             - dino_global_embedding: numpy array or None
-            - species_top5: list of (name, confidence) or None
+            - species_top5: list of (name, confidence[, model]) tuples or None
             - latitude, longitude: float or None
             - focal_length: float or None
             - burst_id: str or None (camera burst ID)
@@ -304,8 +304,8 @@ def _segment_mean_species(segment):
     """
     species_scores = defaultdict(list)
     for p in segment:
-        for name, conf in (p.get("species_top5") or []):
-            species_scores[name].append(conf)
+        for entry in (p.get("species_top5") or []):
+            species_scores[entry[0]].append(entry[1])
     if not species_scores:
         return []
     return sorted(
@@ -414,8 +414,8 @@ def encounter_species_label(photos):
     """
     species_weights = defaultdict(float)
     for p in photos:
-        for name, conf in (p.get("species_top5") or []):
-            species_weights[name] += conf
+        for entry in (p.get("species_top5") or []):
+            species_weights[entry[0]] += entry[1]
 
     if not species_weights:
         return (None, 0.0)

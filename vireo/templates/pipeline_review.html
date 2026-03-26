@@ -245,9 +245,16 @@ input[type="range"]::-moz-range-thumb {
   text-transform: uppercase;
   letter-spacing: 0.04em;
   color: var(--text-dim, #5A8890);
-  margin: 12px 0 6px;
+  margin: 12px 0 2px;
   padding-bottom: 4px;
   border-bottom: 1px solid var(--border-primary, #14374E);
+}
+.slider-section-hint {
+  font-size: 10px;
+  color: var(--text-dim, #5A8890);
+  opacity: 0.7;
+  margin: 0 0 6px;
+  font-style: italic;
 }
 .reflow-indicator {
   display: none;
@@ -433,48 +440,50 @@ input[type="range"]::-moz-range-thumb {
       <div class="reflow-indicator" id="reflowIndicator">Recomputing...</div>
 
       <div class="slider-section-header">Hard Reject Floors</div>
+      <div class="slider-section-hint">Auto-reject photos that fail any of these quality floors</div>
       <div class="slider-group">
         <div class="slider-row">
-          <span class="slider-label">Crop complete</span>
+          <span class="slider-label" title="Min visible subject in frame — rejects birds clipped by edges">Crop complete</span>
           <input type="range" min="0" max="100" value="60" step="1" id="slRejectCrop" oninput="onScoringChange(this)">
           <span class="slider-val" id="valRejectCrop">0.60</span>
         </div>
         <div class="slider-row">
-          <span class="slider-label">Focus</span>
+          <span class="slider-label" title="Min subject sharpness rank within the encounter">Focus</span>
           <input type="range" min="0" max="100" value="35" step="1" id="slRejectFocus" oninput="onScoringChange(this)">
           <span class="slider-val" id="valRejectFocus">0.35</span>
         </div>
         <div class="slider-row">
-          <span class="slider-label">Clip highlights</span>
+          <span class="slider-label" title="Max blown-out highlight fraction on the subject">Clip highlights</span>
           <input type="range" min="0" max="100" value="30" step="1" id="slRejectClip" oninput="onScoringChange(this)">
           <span class="slider-val" id="valRejectClip">0.30</span>
         </div>
         <div class="slider-row">
-          <span class="slider-label">Composite</span>
+          <span class="slider-label" title="Min overall quality score (focus, exposure, composition, area, noise)">Composite</span>
           <input type="range" min="0" max="100" value="40" step="1" id="slRejectComposite" oninput="onScoringChange(this)">
           <span class="slider-val" id="valRejectComposite">0.40</span>
         </div>
       </div>
 
       <div class="slider-section-header">MMR Selection</div>
+      <div class="slider-section-hint">Pick the best photos from each group while keeping variety</div>
       <div class="slider-group">
         <div class="slider-row">
-          <span class="slider-label">Burst lambda</span>
+          <span class="slider-label" title="Quality vs diversity within a burst — higher favors quality">Burst lambda</span>
           <input type="range" min="0" max="100" value="85" step="1" id="slBurstLambda" oninput="onScoringChange(this)">
           <span class="slider-val" id="valBurstLambda">0.85</span>
         </div>
         <div class="slider-row">
-          <span class="slider-label">Burst keep</span>
+          <span class="slider-label" title="Max photos to keep from each burst">Burst keep</span>
           <input type="range" min="1" max="10" value="3" step="1" id="slBurstKeep" oninput="onScoringChange(this)">
           <span class="slider-val" id="valBurstKeep">3</span>
         </div>
         <div class="slider-row">
-          <span class="slider-label">Enc. lambda</span>
+          <span class="slider-label" title="Quality vs diversity across the encounter — higher favors quality">Enc. lambda</span>
           <input type="range" min="0" max="100" value="70" step="1" id="slEncLambda" oninput="onScoringChange(this)">
           <span class="slider-val" id="valEncLambda">0.70</span>
         </div>
         <div class="slider-row">
-          <span class="slider-label">Enc. keep</span>
+          <span class="slider-label" title="Max photos to keep from each encounter">Enc. keep</span>
           <input type="range" min="1" max="20" value="5" step="1" id="slEncKeep" oninput="onScoringChange(this)">
           <span class="slider-val" id="valEncKeep">5</span>
         </div>
@@ -487,33 +496,35 @@ input[type="range"]::-moz-range-thumb {
       <div class="sidebar-title">Grouping Thresholds</div>
 
       <div class="slider-section-header">Encounters</div>
+      <div class="slider-section-hint">Control how photos are split and merged into encounters</div>
       <div class="slider-group">
         <div class="slider-row">
-          <span class="slider-label">Cut score</span>
+          <span class="slider-label" title="Similarity below this splits photos into separate encounters">Cut score</span>
           <input type="range" min="0" max="100" value="42" step="1" id="slEncCut" oninput="onGroupingChange(this)">
           <span class="slider-val" id="valEncCut">0.42</span>
         </div>
         <div class="slider-row">
-          <span class="slider-label">Merge score</span>
+          <span class="slider-label" title="Similarity above this merges neighboring segments back together">Merge score</span>
           <input type="range" min="0" max="100" value="62" step="1" id="slEncMerge" oninput="onGroupingChange(this)">
           <span class="slider-val" id="valEncMerge">0.62</span>
         </div>
       </div>
 
       <div class="slider-section-header">Bursts</div>
+      <div class="slider-section-hint">Group rapid-fire shots of the same subject within encounters</div>
       <div class="slider-group">
         <div class="slider-row">
-          <span class="slider-label">Time gap (s)</span>
+          <span class="slider-label" title="Max seconds between consecutive shots to stay in the same burst">Time gap (s)</span>
           <input type="range" min="1" max="30" value="3" step="1" id="slBurstTime" oninput="onGroupingChange(this)">
           <span class="slider-val" id="valBurstTime">3</span>
         </div>
         <div class="slider-row">
-          <span class="slider-label">pHash dist</span>
+          <span class="slider-label" title="Max perceptual hash distance — lower means more visually similar">pHash dist</span>
           <input type="range" min="1" max="32" value="12" step="1" id="slBurstPhash" oninput="onGroupingChange(this)">
           <span class="slider-val" id="valBurstPhash">12</span>
         </div>
         <div class="slider-row">
-          <span class="slider-label">Emb. cosine</span>
+          <span class="slider-label" title="Min embedding similarity to stay in the same burst">Emb. cosine</span>
           <input type="range" min="0" max="100" value="80" step="1" id="slBurstEmb" oninput="onGroupingChange(this)">
           <span class="slider-val" id="valBurstEmb">0.80</span>
         </div>

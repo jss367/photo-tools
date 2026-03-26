@@ -6,12 +6,24 @@ endpoint. The route handler in app.py parses the request and delegates here.
 
 import json
 import logging
+import math
 import os
 import time
 from dataclasses import dataclass
 from typing import Optional
 
 from labels import get_active_labels, get_saved_labels, load_merged_labels
+
+try:
+    from detector import detect_animals, get_primary_detection
+except ImportError:
+    detect_animals = None
+    get_primary_detection = None
+
+try:
+    from sharpness import compute_sharpness
+except ImportError:
+    compute_sharpness = None
 
 log = logging.getLogger(__name__)
 
@@ -111,6 +123,168 @@ def _load_labels(model_type, model_str, labels_file, labels_files):
             )
 
     return labels, use_tol
+
+
+def _detect_subjects(photos, folders, runner, job, reclassify, db):
+    """Run MegaDetector on photos, storing quality metrics.
+
+    Returns:
+        (detection_map, detected_count) where detection_map is
+        {photo_id: detection_dict} and detected_count is total detected.
+    """
+    detected = 0
+    detection_map = {}
+    total = len(photos)
+
+    try:
+        if detect_animals is None or get_primary_detection is None:
+            raise ImportError(
+                "PytorchWildlife is not installed — cannot run detection"
+            )
+
+        runner.push_event(
+            job["id"],
+            "progress",
+            {
+                "current": 0,
+                "total": total,
+                "current_file": "Loading MegaDetector...",
+                "rate": 0,
+                "phase": "Step 4/5: Detecting subjects",
+            },
+        )
+
+        start_time = job.get("_start_time", time.time())
+        skipped_det = 0
+        for i, photo in enumerate(photos):
+            folder_path = folders.get(photo["folder_id"], "")
+            image_path = os.path.join(folder_path, photo["filename"])
+
+            runner.push_event(
+                job["id"],
+                "progress",
+                {
+                    "current": i + 1,
+                    "total": total,
+                    "current_file": photo["filename"],
+                    "rate": round(
+                        (i + 1) / max(time.time() - start_time, 0.01), 1
+                    ),
+                    "phase": "Step 4/5: Detecting subjects",
+                },
+            )
+
+            # Skip if already detected (unless reclassifying)
+            if not reclassify and photo["detection_box"]:
+                det_box = photo["detection_box"]
+                if isinstance(det_box, str):
+                    det_box = json.loads(det_box)
+                detection_map[photo["id"]] = {
+                    "box": det_box,
+                    "confidence": photo["detection_conf"] or 0,
+                    "category": "animal",
+                }
+                detected += 1
+                skipped_det += 1
+                continue
+
+            detections = detect_animals(image_path)
+            primary = get_primary_detection(detections)
+
+            if primary:
+                detected += 1
+                detection_map[photo["id"]] = primary
+
+                det_box = primary["box"]
+                det_conf = primary["confidence"]
+                subject_size = det_box["w"] * det_box["h"]
+
+                overall_sharpness = compute_sharpness(image_path)
+                subject_sharpness = None
+                quality = 0
+
+                try:
+                    from PIL import Image
+
+                    img = Image.open(image_path)
+                    iw, ih = img.size
+                    px = int(det_box["x"] * iw)
+                    py = int(det_box["y"] * ih)
+                    pw = int(det_box["w"] * iw)
+                    ph = int(det_box["h"] * ih)
+                    subject_sharpness = compute_sharpness(
+                        image_path, region=(px, py, pw, ph)
+                    )
+                except Exception:
+                    subject_sharpness = overall_sharpness
+
+                if subject_sharpness is not None and subject_size is not None:
+                    norm_sharp = min(1.0, math.log1p(subject_sharpness) / 10.0)
+                    norm_size = min(1.0, subject_size * 4)
+                    quality = round(0.7 * norm_sharp + 0.3 * norm_size, 4)
+
+                db.update_photo_quality(
+                    photo["id"],
+                    detection_box=det_box,
+                    detection_conf=det_conf,
+                    subject_sharpness=subject_sharpness,
+                    subject_size=subject_size,
+                    quality_score=quality,
+                    sharpness=overall_sharpness,
+                )
+
+        log.info(
+            "Detection done: %d animals detected out of %d photos (%d skipped, already detected)",
+            detected,
+            total,
+            skipped_det,
+        )
+    except (ImportError, RuntimeError) as e:
+        msg = str(e)
+        if "PytorchWildlife" in msg:
+            log.info(
+                "PytorchWildlife not installed — skipping detection (classifying full images)"
+            )
+            runner.push_event(
+                job["id"],
+                "progress",
+                {
+                    "current": 0,
+                    "total": total,
+                    "current_file": "",
+                    "phase": "Step 4/5: Detection skipped (PytorchWildlife not installed)",
+                },
+            )
+        else:
+            log.warning("Detection unavailable: %s — classifying full images", e)
+            runner.push_event(
+                job["id"],
+                "progress",
+                {
+                    "current": 0,
+                    "total": total,
+                    "current_file": "",
+                    "phase": f"Step 4/5: Detection failed — {msg[:120]}",
+                },
+            )
+            job["errors"].append(f"Detection unavailable: {msg[:200]}")
+    except Exception as e:
+        log.warning(
+            "Detection failed (non-fatal) — classifying full images", exc_info=True
+        )
+        runner.push_event(
+            job["id"],
+            "progress",
+            {
+                "current": 0,
+                "total": total,
+                "current_file": "",
+                "phase": f"Step 4/5: Detection failed — {str(e)[:120]}",
+            },
+        )
+        job["errors"].append(f"Detection failed: {str(e)[:200]}")
+
+    return detection_map, detected
 
 
 def run_classify_job(job, runner, db_path, workspace_id, params):

@@ -3,6 +3,7 @@ import json
 import os
 
 import pytest
+from PIL import Image
 
 from classify_job import ClassifyParams, run_classify_job
 
@@ -154,3 +155,101 @@ def test_load_labels_raises_when_no_labels_unsupported_model():
                 labels_file=None,
                 labels_files=None,
             )
+
+
+# ── Task 3: _detect_subjects tests ──────────────────────────────────────────
+
+
+def test_detect_subjects_returns_detection_map(tmp_path):
+    """Phase 5: returns detection map for photos with detectable subjects."""
+    from unittest.mock import patch, MagicMock
+    from classify_job import _detect_subjects
+
+    runner = FakeRunner()
+    job = _make_job()
+
+    # Create a real test image
+    img = Image.new("RGB", (200, 200), color="green")
+    img_path = str(tmp_path / "bird.jpg")
+    img.save(img_path)
+
+    photos = [
+        {"id": 1, "filename": "bird.jpg", "folder_id": 10,
+         "detection_box": None, "detection_conf": None},
+    ]
+    folders = {10: str(tmp_path)}
+
+    fake_detection = {
+        "box": {"x": 0.1, "y": 0.1, "w": 0.5, "h": 0.5},
+        "confidence": 0.95,
+        "category": "animal",
+    }
+
+    with patch("classify_job.detect_animals", return_value=[fake_detection]), \
+         patch("classify_job.get_primary_detection", return_value=fake_detection), \
+         patch("classify_job.compute_sharpness", return_value=50.0):
+        detection_map, detected = _detect_subjects(
+            photos=photos,
+            folders=folders,
+            runner=runner,
+            job=job,
+            reclassify=False,
+            db=MagicMock(),
+        )
+
+    assert detected == 1
+    assert 1 in detection_map
+    assert detection_map[1]["confidence"] == 0.95
+
+
+def test_detect_subjects_skips_existing_detections(tmp_path):
+    """Phase 5: skips photos that already have detection_box (unless reclassify)."""
+    import json as _json
+    from unittest.mock import patch, MagicMock
+    from classify_job import _detect_subjects
+
+    runner = FakeRunner()
+    job = _make_job()
+
+    photos = [
+        {"id": 1, "filename": "bird.jpg", "folder_id": 10,
+         "detection_box": _json.dumps({"x": 0.1, "y": 0.1, "w": 0.5, "h": 0.5}),
+         "detection_conf": 0.9},
+    ]
+    folders = {10: str(tmp_path)}
+
+    # detect_animals should NOT be called since photo already has detection
+    with patch("classify_job.detect_animals") as mock_detect:
+        detection_map, detected = _detect_subjects(
+            photos=photos,
+            folders=folders,
+            runner=runner,
+            job=job,
+            reclassify=False,
+            db=MagicMock(),
+        )
+
+    mock_detect.assert_not_called()
+    assert detected == 1
+    assert 1 in detection_map
+
+
+def test_detect_subjects_graceful_on_import_error():
+    """Phase 5: returns empty map if PytorchWildlife not installed."""
+    from unittest.mock import MagicMock
+    from classify_job import _detect_subjects
+
+    runner = FakeRunner()
+    job = _make_job()
+
+    # _detect_subjects should handle ImportError gracefully
+    detection_map, detected = _detect_subjects(
+        photos=[],
+        folders={},
+        runner=runner,
+        job=job,
+        reclassify=False,
+        db=MagicMock(),
+    )
+    assert detection_map == {}
+    assert detected == 0

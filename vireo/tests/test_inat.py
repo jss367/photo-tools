@@ -2,6 +2,7 @@ import os
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'lr-migration'))
 
 import pytest
 from db import Database
@@ -126,3 +127,119 @@ def test_submit_observation_success():
             assert obs_url == "https://www.inaturalist.org/observations/88888"
             mock_create.assert_called_once()
             mock_upload.assert_called_once_with("fake-token", 88888, "/path/to/photo.jpg")
+
+
+from PIL import Image
+
+
+@pytest.fixture
+def app_and_db(tmp_path):
+    """Create a test app with sample data for iNat tests."""
+    from app import create_app
+    import config as cfg
+
+    cfg.CONFIG_PATH = str(tmp_path / "config.json")
+
+    db_path = str(tmp_path / "test.db")
+    thumb_dir = str(tmp_path / "thumbs")
+    os.makedirs(thumb_dir)
+
+    d = Database(db_path)
+    ws_id = d.ensure_default_workspace()
+    d.set_active_workspace(ws_id)
+
+    # Create a real photo file on disk so submit can read it
+    photo_dir = str(tmp_path / "photos")
+    os.makedirs(photo_dir)
+    Image.new('RGB', (100, 100)).save(os.path.join(photo_dir, 'bird.jpg'))
+
+    fid = d.add_folder(photo_dir, name='photos')
+    pid = d.add_photo(folder_id=fid, filename='bird.jpg', extension='.jpg',
+                      file_size=1000, file_mtime=1.0, timestamp='2024-06-01T10:00:00')
+
+    # Add a prediction for the photo
+    d.conn.execute(
+        "INSERT INTO predictions (photo_id, species, scientific_name, confidence, model, workspace_id) VALUES (?, ?, ?, ?, ?, ?)",
+        (pid, "Northern Cardinal", "Cardinalis cardinalis", 0.95, "test-model", ws_id),
+    )
+    d.conn.commit()
+
+    for p in [pid]:
+        Image.new('RGB', (100, 100)).save(os.path.join(thumb_dir, f"{p}.jpg"))
+
+    app = create_app(db_path=db_path, thumb_cache_dir=thumb_dir)
+    return app, d, pid
+
+
+def test_api_inat_prepare_includes_submission_status(app_and_db):
+    app, db, pid = app_and_db
+    client = app.test_client()
+    # Before submission
+    resp = client.get(f'/api/inat/prepare/{pid}')
+    data = resp.get_json()
+    assert data['already_submitted'] is False
+
+    # After submission
+    db.record_inat_submission(pid, 999, "https://www.inaturalist.org/observations/999")
+    resp = client.get(f'/api/inat/prepare/{pid}')
+    data = resp.get_json()
+    assert data['already_submitted'] is True
+    assert data['existing_observation_url'] == "https://www.inaturalist.org/observations/999"
+
+
+def test_api_inat_submit_no_token(app_and_db):
+    app, db, pid = app_and_db
+    client = app.test_client()
+    resp = client.post('/api/inat/submit', json={'photo_id': pid})
+    assert resp.status_code == 400
+    assert 'token' in resp.get_json()['error'].lower()
+
+
+def test_api_inat_submit_success(app_and_db):
+    app, db, pid = app_and_db
+    import config as cfg
+    cfg.save({"inat_token": "fake-token"})
+
+    client = app.test_client()
+    with patch("inat.submit_observation", return_value=(12345, "https://www.inaturalist.org/observations/12345")):
+        resp = client.post('/api/inat/submit', json={'photo_id': pid})
+    data = resp.get_json()
+    assert data['observation_id'] == 12345
+    assert data['observation_url'] == "https://www.inaturalist.org/observations/12345"
+
+    # Verify recorded in DB
+    subs = db.get_inat_submissions([pid])
+    assert pid in subs
+
+
+def test_api_inat_submit_batch(app_and_db):
+    app, db, pid = app_and_db
+    import config as cfg
+    cfg.save({"inat_token": "fake-token"})
+
+    client = app.test_client()
+    with patch("inat.submit_observation", return_value=(11111, "https://www.inaturalist.org/observations/11111")):
+        resp = client.post('/api/inat/submit-batch', json={
+            'submissions': [{'photo_id': pid}]
+        })
+    data = resp.get_json()
+    assert len(data['results']) == 1
+    assert data['results'][0]['observation_id'] == 11111
+
+
+def test_api_inat_submissions_lookup(app_and_db):
+    app, db, pid = app_and_db
+    db.record_inat_submission(pid, 777, "https://www.inaturalist.org/observations/777")
+    client = app.test_client()
+    resp = client.get(f'/api/inat/submissions?photo_ids={pid}')
+    data = resp.get_json()
+    assert str(pid) in data or pid in data
+
+
+def test_api_inat_validate_token(app_and_db):
+    app, db, pid = app_and_db
+    client = app.test_client()
+    with patch("inat.validate_token", return_value={"login": "birder42"}):
+        resp = client.post('/api/inat/validate-token', json={'token': 'fake'})
+    data = resp.get_json()
+    assert data['login'] == 'birder42'

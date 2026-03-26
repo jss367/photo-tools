@@ -350,3 +350,25 @@ def test_shutdown_endpoint(app_and_db):
     assert resp.status_code == 200
     data = resp.get_json()
     assert data["status"] == "shutting_down"
+
+
+def test_pipeline_page_init_api(app_and_db):
+    """GET /api/pipeline/page-init returns pipeline initialization data."""
+    app, _ = app_and_db
+    client = app.test_client()
+    resp = client.get('/api/pipeline/page-init')
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert 'total_photos' in data
+    assert 'has_detections' in data
+    assert 'has_masks' in data
+    assert 'has_sharpness' in data
+    assert 'pipeline_config' in data
+    assert 'results' in data
+    # Verify pipeline_config has expected keys
+    pc = data['pipeline_config']
+    assert 'sam2_variant' in pc
+    assert 'dinov2_variant' in pc
+    assert 'proxy_longest_edge' in pc
+    # total_photos should match our fixture data (3 photos)
+    assert data['total_photos'] == 3

@@ -85,7 +85,18 @@ pub fn start_sidecar(app: &AppHandle) -> Result<SidecarState, String> {
 }
 
 /// Send POST /api/shutdown to the sidecar for a clean exit.
+/// In dev mode (child is None), this is a no-op — we don't want to
+/// kill the developer's manually-started Flask server.
 pub fn stop_sidecar(state: &SidecarState) {
+    let has_child = state.child
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_some();
+
+    if !has_child {
+        return;
+    }
+
     let url = format!("http://127.0.0.1:{}/api/shutdown", state.port);
     let _ = ureq::post(&url)
         .set("X-Vireo-Shutdown", "1")

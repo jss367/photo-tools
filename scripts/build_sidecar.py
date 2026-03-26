@@ -27,13 +27,22 @@ def main():
     target = get_target_triple()
     print(f"Building sidecar for target: {target}")
 
+    # Platform-specific path separator for --add-data
+    sep = ";" if platform.system() == "Windows" else ":"
+    vireo_dir = os.path.join(repo_root, "vireo")
+
     # Run PyInstaller
     subprocess.run(
         [
             sys.executable, "-m", "PyInstaller",
             "--onefile",
             "--name", "vireo-server",
-            "--paths", os.path.join(repo_root, "vireo"),
+            "--paths", vireo_dir,
+            # Bundle Flask templates and static assets — destinations are
+            # relative to _MEIPASS, and Flask resolves them relative to
+            # os.path.dirname(__file__) which is _MEIPASS for the entry script.
+            "--add-data", f"{os.path.join(vireo_dir, 'templates')}{sep}templates",
+            "--add-data", f"{os.path.join(vireo_dir, 'static')}{sep}static",
             "--hidden-import", "config",
             "--hidden-import", "db",
             "--hidden-import", "jobs",

@@ -22,6 +22,17 @@ def test_create_tables(tmp_path):
     assert 'pending_changes' in table_names
 
 
+def test_edit_history_tables_exist(tmp_path):
+    """edit_history and edit_history_items tables exist after init."""
+    from db import Database
+    db = Database(str(tmp_path / "test.db"))
+    tables = [r['name'] for r in db.conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'"
+    ).fetchall()]
+    assert 'edit_history' in tables
+    assert 'edit_history_items' in tables
+
+
 def test_add_and_get_folder(tmp_path):
     """add_folder creates a folder, get_folder_tree returns it."""
     from db import Database

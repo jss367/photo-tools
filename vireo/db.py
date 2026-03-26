@@ -146,6 +146,24 @@ class Database:
                 UNIQUE(photo_id, observation_id)
             );
 
+            CREATE TABLE IF NOT EXISTS edit_history (
+                id           INTEGER PRIMARY KEY,
+                workspace_id INTEGER REFERENCES workspaces(id) ON DELETE CASCADE,
+                action_type  TEXT NOT NULL,
+                description  TEXT NOT NULL,
+                new_value    TEXT,
+                is_batch     INTEGER DEFAULT 0,
+                created_at   TEXT DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE IF NOT EXISTS edit_history_items (
+                id        INTEGER PRIMARY KEY,
+                edit_id   INTEGER NOT NULL REFERENCES edit_history(id) ON DELETE CASCADE,
+                photo_id  INTEGER NOT NULL REFERENCES photos(id),
+                old_value TEXT,
+                new_value TEXT
+            );
+
             CREATE INDEX IF NOT EXISTS idx_photos_timestamp ON photos(timestamp);
             CREATE INDEX IF NOT EXISTS idx_photos_folder ON photos(folder_id);
             CREATE INDEX IF NOT EXISTS idx_photos_rating ON photos(rating);
@@ -237,6 +255,29 @@ class Database:
         except Exception:
             self.conn.execute("ALTER TABLE photos ADD COLUMN focal_length REAL")
             self.conn.execute("ALTER TABLE photos ADD COLUMN burst_id TEXT")
+
+        # Edit history tables migration
+        try:
+            self.conn.execute("SELECT id FROM edit_history LIMIT 0")
+        except Exception:
+            self.conn.executescript("""
+                CREATE TABLE IF NOT EXISTS edit_history (
+                    id           INTEGER PRIMARY KEY,
+                    workspace_id INTEGER REFERENCES workspaces(id) ON DELETE CASCADE,
+                    action_type  TEXT NOT NULL,
+                    description  TEXT NOT NULL,
+                    new_value    TEXT,
+                    is_batch     INTEGER DEFAULT 0,
+                    created_at   TEXT DEFAULT (datetime('now'))
+                );
+                CREATE TABLE IF NOT EXISTS edit_history_items (
+                    id        INTEGER PRIMARY KEY,
+                    edit_id   INTEGER NOT NULL REFERENCES edit_history(id) ON DELETE CASCADE,
+                    photo_id  INTEGER NOT NULL REFERENCES photos(id),
+                    old_value TEXT,
+                    new_value TEXT
+                );
+            """)
 
         # Workspace migration for existing databases
         # Check if predictions has workspace_id (detects legacy DBs even though

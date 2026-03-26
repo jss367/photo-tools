@@ -326,11 +326,13 @@ class Database:
                         f"UPDATE {table} SET workspace_id = ?", (default_id,)
                     )
 
-            try:
-                self.conn.execute("SELECT change_token FROM pending_changes LIMIT 0")
-            except Exception:
-                self.conn.execute("ALTER TABLE pending_changes ADD COLUMN change_token TEXT")
+            self.conn.commit()
 
+        # Ensure change_token column exists (added after workspace migration)
+        try:
+            self.conn.execute("SELECT change_token FROM pending_changes LIMIT 0")
+        except Exception:
+            self.conn.execute("ALTER TABLE pending_changes ADD COLUMN change_token TEXT")
             self.conn.commit()
 
         # Ensure workspace indexes exist (for fresh DBs that skip migration)

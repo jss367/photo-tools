@@ -61,6 +61,7 @@ class Database:
                 subject_size REAL,
                 quality_score REAL,
                 embedding BLOB,
+                embedding_model TEXT,
                 latitude REAL,
                 longitude REAL,
                 phash TEXT,
@@ -172,6 +173,10 @@ class Database:
             self.conn.execute("SELECT embedding FROM photos LIMIT 0")
         except Exception:
             self.conn.execute("ALTER TABLE photos ADD COLUMN embedding BLOB")
+        try:
+            self.conn.execute("SELECT embedding_model FROM photos LIMIT 0")
+        except Exception:
+            self.conn.execute("ALTER TABLE photos ADD COLUMN embedding_model TEXT")
         try:
             self.conn.execute("SELECT latitude FROM photos LIMIT 0")
         except Exception:

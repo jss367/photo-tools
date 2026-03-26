@@ -716,3 +716,10 @@ def test_is_keyword_species(tmp_path):
 
     assert db.is_keyword_species(kid_species) is True
     assert db.is_keyword_species(kid_location) is False
+
+
+def test_embedding_model_column_exists(tmp_path):
+    """The photos table has an embedding_model column."""
+    from db import Database
+    db = Database(str(tmp_path / "test.db"))
+    db.conn.execute("SELECT embedding_model FROM photos LIMIT 0")

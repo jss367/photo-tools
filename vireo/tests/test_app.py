@@ -525,9 +525,9 @@ def test_pipeline_detach_burst(app_and_db):
             }
         ],
         "photos": [
-            {"id": 1, "label": "KEEP", "filename": "a.jpg"},
-            {"id": 2, "label": "KEEP", "filename": "b.jpg"},
-            {"id": 3, "label": "REVIEW", "filename": "c.jpg"},
+            {"id": 1, "label": "KEEP", "filename": "a.jpg", "species_top5": [["Robin", 0.9, "m1"]]},
+            {"id": 2, "label": "KEEP", "filename": "b.jpg", "species_top5": [["Robin", 0.85, "m1"]]},
+            {"id": 3, "label": "REVIEW", "filename": "c.jpg", "species_top5": [["Eagle", 0.8, "m1"]]},
         ],
         "summary": {"total_photos": 3, "encounter_count": 1, "burst_count": 2,
                      "keep_count": 2, "review_count": 1, "reject_count": 0, "rarity_protected": 0},
@@ -545,6 +545,13 @@ def test_pipeline_detach_burst(app_and_db):
     assert len(data["encounters"]) == 2
     assert len(data["encounters"][0]["bursts"]) == 1
     assert data["encounters"][1]["photo_ids"] == [3]
+    # Remaining encounter predictions should only reflect photos 1,2
+    remaining_species = [sp["species"] for sp in data["encounters"][0]["species_predictions"]]
+    assert "Robin" in remaining_species
+    assert "Eagle" not in remaining_species
+    # New encounter predictions should reflect photo 3
+    new_species = [sp["species"] for sp in data["encounters"][1]["species_predictions"]]
+    assert "Eagle" in new_species
 
 
 def test_pipeline_detach_photo(app_and_db):
@@ -572,9 +579,9 @@ def test_pipeline_detach_photo(app_and_db):
             }
         ],
         "photos": [
-            {"id": 1, "label": "KEEP", "filename": "a.jpg"},
-            {"id": 2, "label": "KEEP", "filename": "b.jpg"},
-            {"id": 3, "label": "REVIEW", "filename": "c.jpg"},
+            {"id": 1, "label": "KEEP", "filename": "a.jpg", "species_top5": [["Robin", 0.9, "m1"]]},
+            {"id": 2, "label": "KEEP", "filename": "b.jpg", "species_top5": [["Robin", 0.85, "m1"]]},
+            {"id": 3, "label": "REVIEW", "filename": "c.jpg", "species_top5": [["Eagle", 0.8, "m1"]]},
         ],
         "summary": {"total_photos": 3, "encounter_count": 1, "burst_count": 1,
                      "keep_count": 2, "review_count": 1, "reject_count": 0, "rarity_protected": 0},
@@ -593,3 +600,10 @@ def test_pipeline_detach_photo(app_and_db):
     assert len(enc["bursts"]) == 2
     assert enc["bursts"][0]["photo_ids"] == [1, 2]
     assert enc["bursts"][1]["photo_ids"] == [3]
+    # Source burst predictions should only reflect photos 1,2
+    src_species = [sp["species"] for sp in enc["bursts"][0]["species_predictions"]]
+    assert "Robin" in src_species
+    assert "Eagle" not in src_species
+    # New burst predictions should reflect photo 3
+    new_species = [sp["species"] for sp in enc["bursts"][1]["species_predictions"]]
+    assert "Eagle" in new_species

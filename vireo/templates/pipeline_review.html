@@ -1337,7 +1337,7 @@ async function confirmSpecies(event, encIdx, burstIdx, speciesName) {
   if (!speciesName) {
     if (burstIdx != null && enc.bursts && enc.bursts[burstIdx]) {
       var ovr = enc.bursts[burstIdx].species_override;
-      speciesName = (ovr && ovr.species) || (enc.species ? enc.species[0] : null);
+      speciesName = (ovr && ovr.species) || enc.confirmed_species || (enc.species ? enc.species[0] : null);
     } else {
       speciesName = enc.confirmed_species || (enc.species ? enc.species[0] : null);
     }

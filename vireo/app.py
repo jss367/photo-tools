@@ -4061,7 +4061,7 @@ def create_app(db_path, thumb_cache_dir=None):
     @app.route("/api/pipeline/detach-burst", methods=["POST"])
     def api_pipeline_detach_burst():
         """Detach a burst from its encounter, creating a new standalone encounter."""
-        from pipeline import load_results_raw, save_results_raw
+        from pipeline import load_results_raw, rebuild_species_predictions, save_results_raw
 
         body = request.get_json(silent=True) or {}
         enc_idx = body.get("encounter_index")
@@ -4091,16 +4091,23 @@ def create_app(db_path, thumb_cache_dir=None):
             # Last burst — remove the encounter entirely, detached becomes the encounter
             encounters.pop(enc_idx)
         else:
-            # Update encounter metadata
+            # Update encounter metadata and recalculate species predictions
             enc["photo_ids"] = [pid for pid in enc["photo_ids"] if pid not in detached_ids]
             enc["photo_count"] = len(enc["photo_ids"])
             enc["burst_count"] = len(bursts)
+            enc["species_predictions"] = rebuild_species_predictions(results, enc["photo_ids"])
+            # Recalculate remaining burst predictions too
+            for b in bursts:
+                b["species_predictions"] = rebuild_species_predictions(results, b["photo_ids"])
 
         # Create new encounter from detached burst
+        new_enc_predictions = rebuild_species_predictions(results, detached_ids)
+        # Also refresh the detached burst's own predictions
+        detached["species_predictions"] = new_enc_predictions
         new_enc = {
             "species": enc.get("species"),
             "confirmed_species": detached.get("species_override", {}).get("species") if detached.get("species_override") else None,
-            "species_predictions": detached.get("species_predictions", []),
+            "species_predictions": new_enc_predictions,
             "species_confirmed": bool(detached.get("species_override", {}).get("confirmed")) if detached.get("species_override") else False,
             "photo_count": len(detached_ids),
             "burst_count": 1,
@@ -4122,7 +4129,7 @@ def create_app(db_path, thumb_cache_dir=None):
     @app.route("/api/pipeline/detach-photo", methods=["POST"])
     def api_pipeline_detach_photo():
         """Detach a photo from its burst, creating a new single-photo burst."""
-        from pipeline import load_results_raw, save_results_raw
+        from pipeline import load_results_raw, rebuild_species_predictions, save_results_raw
 
         body = request.get_json(silent=True) or {}
         enc_idx = body.get("encounter_index")
@@ -4155,15 +4162,20 @@ def create_app(db_path, thumb_cache_dir=None):
         if len(burst["photo_ids"]) == 0:
             # Last photo — remove the empty burst
             bursts.pop(burst_idx)
+        else:
+            # Recalculate source burst predictions without the removed photo
+            burst["species_predictions"] = rebuild_species_predictions(results, burst["photo_ids"])
 
         # Create new single-photo burst in the same encounter
         new_burst = {
             "photo_ids": [photo_id],
-            "species_predictions": [],
+            "species_predictions": rebuild_species_predictions(results, [photo_id]),
             "species_override": None,
         }
         bursts.append(new_burst)
         enc["burst_count"] = len(bursts)
+        # Recalculate encounter-level predictions
+        enc["species_predictions"] = rebuild_species_predictions(results, enc["photo_ids"])
 
         # Update summary
         results["summary"]["burst_count"] = sum(

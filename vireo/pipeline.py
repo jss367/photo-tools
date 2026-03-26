@@ -470,6 +470,25 @@ def load_results_raw(cache_dir, workspace_id):
         return json.load(f)
 
 
+def rebuild_species_predictions(results, photo_ids):
+    """Rebuild species_predictions for a subset of photos from cached results.
+
+    Looks up the given photo_ids in results["photos"], extracts their
+    species_top5 data, and returns a species_predictions list in the same
+    format as serialize_results produces.
+
+    Args:
+        results: cached pipeline results dict (with "photos" list)
+        photo_ids: list of photo IDs to include
+
+    Returns:
+        list of species prediction dicts
+    """
+    id_set = set(photo_ids)
+    subset = [p for p in results.get("photos", []) if p.get("id") in id_set]
+    return _build_species_predictions(subset)
+
+
 def save_results_raw(results, cache_dir, workspace_id):
     """Save an already-serialized results dict back to the JSON cache."""
     path = os.path.join(cache_dir, f"pipeline_results_ws{workspace_id}.json")

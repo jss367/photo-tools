@@ -412,6 +412,31 @@ def create_app(db_path, thumb_cache_dir=None):
 
         return jsonify(result)
 
+    @app.route("/api/photos/geo")
+    def api_photos_geo():
+        db = _get_db()
+        folder_id = request.args.get("folder_id", None, type=int)
+        rating_min = request.args.get("rating_min", None, type=int)
+        date_from = request.args.get("date_from", None)
+        date_to = request.args.get("date_to", None)
+        keyword = request.args.get("keyword", None)
+
+        photos = db.get_geolocated_photos(
+            folder_id=folder_id,
+            rating_min=rating_min,
+            date_from=date_from,
+            date_to=date_to,
+            keyword=keyword,
+        )
+
+        total_photos = db.count_photos()
+
+        return jsonify({
+            "photos": [dict(p) for p in photos],
+            "total_geo": len(photos),
+            "total_photos": total_photos,
+        })
+
     @app.route("/api/keywords")
     def api_keywords():
         db = _get_db()
@@ -2027,7 +2052,6 @@ def create_app(db_path, thumb_cache_dir=None):
         if not photo:
             return json_error("Photo not found", 404)
 
-        # Get species prediction
         pred = db.conn.execute(
             "SELECT species, scientific_name, confidence FROM predictions WHERE photo_id = ? AND workspace_id = ?",
             (photo_id, db._active_workspace_id),
@@ -2036,8 +2060,6 @@ def create_app(db_path, thumb_cache_dir=None):
         species = pred["species"] if pred else ""
         scientific = pred["scientific_name"] if pred else ""
 
-        # Build iNaturalist upload URL for quick mode
-        # https://www.inaturalist.org/observations/upload
         params = []
         if scientific:
             params.append("taxon_name=" + scientific)
@@ -2055,7 +2077,13 @@ def create_app(db_path, thumb_cache_dir=None):
         if params:
             upload_url += "?" + "&".join(params)
 
+        # Check submission history
+        subs = db.get_inat_submissions([photo_id])
+        already = photo_id in subs
+
         user_cfg = cfg.load()
+        mode = "direct" if user_cfg.get("inat_token") else "quick"
+
         return jsonify({
             "species": species,
             "scientific_name": scientific,
@@ -2065,8 +2093,163 @@ def create_app(db_path, thumb_cache_dir=None):
             "longitude": lng,
             "filename": photo["filename"],
             "upload_url": upload_url,
-            "mode": user_cfg.get("inat_mode", "quick"),
+            "mode": mode,
+            "already_submitted": already,
+            "existing_observation_url": subs[photo_id]["observation_url"] if already else None,
         })
+
+    @app.route("/api/inat/validate-token", methods=["POST"])
+    def api_inat_validate_token():
+        """Validate an iNaturalist API token."""
+        import inat
+        body = request.json or {}
+        token = body.get("token", "")
+        if not token:
+            return json_error("Token is required")
+        result = inat.validate_token(token)
+        if result is None:
+            return json_error("Invalid or expired token", 401)
+        return jsonify(result)
+
+    @app.route("/api/inat/submit", methods=["POST"])
+    def api_inat_submit():
+        """Submit a single observation to iNaturalist."""
+        import config as cfg
+        import inat
+
+        user_cfg = cfg.load()
+        token = user_cfg.get("inat_token")
+        if not token:
+            return json_error("iNaturalist token not configured. Add it in Settings.")
+
+        data = request.json or {}
+        photo_id = data.get("photo_id")
+        if not photo_id:
+            return json_error("photo_id is required")
+
+        db = _get_db()
+        photo = db.conn.execute(
+            """SELECT p.*, f.path as folder_path FROM photos p
+               JOIN folders f ON f.id = p.folder_id WHERE p.id = ?""",
+            (photo_id,),
+        ).fetchone()
+        if not photo:
+            return json_error("Photo not found", 404)
+
+        photo_path = os.path.join(photo["folder_path"], photo["filename"])
+        if not os.path.isfile(photo_path):
+            return json_error("Photo file not found on disk", 404)
+
+        # Use overrides from request, or fall back to DB data
+        pred = db.conn.execute(
+            "SELECT species, scientific_name FROM predictions WHERE photo_id = ? AND workspace_id = ?",
+            (photo_id, db._active_workspace_id),
+        ).fetchone()
+
+        taxon = data.get("taxon_name") or (pred["scientific_name"] if pred else None) or (pred["species"] if pred else None)
+        observed_on = data.get("observed_on") or (photo["timestamp"][:10] if photo["timestamp"] else None)
+        photo_lat = photo["latitude"] if "latitude" in photo.keys() else None
+        photo_lng = photo["longitude"] if "longitude" in photo.keys() else None
+        lat = data.get("latitude") if data.get("latitude") is not None else photo_lat
+        lng = data.get("longitude") if data.get("longitude") is not None else photo_lng
+
+        try:
+            obs_id, obs_url = inat.submit_observation(
+                token=token,
+                photo_path=photo_path,
+                taxon_name=taxon,
+                observed_on=observed_on,
+                latitude=lat,
+                longitude=lng,
+                description=data.get("description"),
+                geoprivacy=data.get("geoprivacy", "open"),
+            )
+        except inat.InatAuthError as e:
+            return json_error(str(e), 401)
+        except inat.InatApiError as e:
+            return json_error(str(e), 502)
+
+        db.record_inat_submission(photo_id, obs_id, obs_url)
+        return jsonify({"observation_id": obs_id, "observation_url": obs_url})
+
+    @app.route("/api/inat/submit-batch", methods=["POST"])
+    def api_inat_submit_batch():
+        """Submit multiple observations to iNaturalist."""
+        import config as cfg
+        import inat
+
+        user_cfg = cfg.load()
+        token = user_cfg.get("inat_token")
+        if not token:
+            return json_error("iNaturalist token not configured. Add it in Settings.")
+
+        submissions = (request.json or {}).get("submissions", [])
+        if not submissions:
+            return json_error("submissions array is required")
+
+        db = _get_db()
+        results = []
+        for sub in submissions:
+            photo_id = sub.get("photo_id")
+            photo = db.conn.execute(
+                """SELECT p.*, f.path as folder_path FROM photos p
+                   JOIN folders f ON f.id = p.folder_id WHERE p.id = ?""",
+                (photo_id,),
+            ).fetchone()
+            if not photo:
+                results.append({"photo_id": photo_id, "error": "Photo not found"})
+                continue
+
+            photo_path = os.path.join(photo["folder_path"], photo["filename"])
+            if not os.path.isfile(photo_path):
+                results.append({"photo_id": photo_id, "error": "Photo file not found on disk"})
+                continue
+
+            pred = db.conn.execute(
+                "SELECT species, scientific_name FROM predictions WHERE photo_id = ? AND workspace_id = ?",
+                (photo_id, db._active_workspace_id),
+            ).fetchone()
+
+            taxon = sub.get("taxon_name") or (pred["scientific_name"] if pred else None) or (pred["species"] if pred else None)
+            observed_on = sub.get("observed_on") or (photo["timestamp"][:10] if photo["timestamp"] else None)
+            photo_lat = photo["latitude"] if "latitude" in photo.keys() else None
+            photo_lng = photo["longitude"] if "longitude" in photo.keys() else None
+            lat = sub.get("latitude") if sub.get("latitude") is not None else photo_lat
+            lng = sub.get("longitude") if sub.get("longitude") is not None else photo_lng
+
+            try:
+                obs_id, obs_url = inat.submit_observation(
+                    token=token,
+                    photo_path=photo_path,
+                    taxon_name=taxon,
+                    observed_on=observed_on,
+                    latitude=lat,
+                    longitude=lng,
+                    description=sub.get("description"),
+                    geoprivacy=sub.get("geoprivacy", "open"),
+                )
+                db.record_inat_submission(photo_id, obs_id, obs_url)
+                results.append({"photo_id": photo_id, "observation_id": obs_id, "observation_url": obs_url})
+            except (inat.InatAuthError, inat.InatApiError) as e:
+                results.append({"photo_id": photo_id, "error": str(e)})
+
+        return jsonify({"results": results})
+
+    @app.route("/api/inat/submissions")
+    def api_inat_submissions():
+        """Return submission records for a set of photo IDs."""
+        raw = request.args.get("photo_ids", "")
+        if not raw:
+            return json_error("photo_ids parameter is required")
+        try:
+            photo_ids = [int(x.strip()) for x in raw.split(",") if x.strip()]
+        except ValueError:
+            return json_error("photo_ids must be comma-separated integers")
+
+        db = _get_db()
+        subs = db.get_inat_submissions(photo_ids)
+        # Convert keys to strings for JSON
+        return jsonify({str(k): v for k, v in subs.items()})
 
     @app.route("/api/system/info")
     def api_system_info():
@@ -2351,6 +2534,29 @@ def create_app(db_path, thumb_cache_dir=None):
             import torch
             import urllib.request
 
+            MAX_RETRIES = 3
+
+            def _retry(fn, description):
+                """Retry a download function up to MAX_RETRIES times with backoff."""
+                for attempt in range(1, MAX_RETRIES + 1):
+                    try:
+                        return fn()
+                    except Exception as exc:
+                        mro_names = [cls.__name__ for cls in type(exc).__mro__]
+                        is_network = isinstance(exc, (OSError, ConnectionError)) or \
+                            any(kw in name for name in mro_names for kw in ("Timeout", "Transport", "ReadError"))
+                        if not is_network or attempt == MAX_RETRIES:
+                            raise
+                        wait = 2 ** attempt
+                        log.warning("Download attempt %d/%d for %s failed (%s), retrying in %ds...",
+                                    attempt, MAX_RETRIES, description, exc, wait)
+                        runner.push_event(job["id"], "progress", {
+                            "phase": f"Connection error, retrying in {wait}s (attempt {attempt}/{MAX_RETRIES})...",
+                            "current": 0, "total": 1,
+                        })
+                        import time
+                        time.sleep(wait)
+
             def _download_url(url, dest, label):
                 """Download a URL with byte-level progress reporting."""
                 req = urllib.request.Request(url)
@@ -2386,7 +2592,7 @@ def create_app(db_path, thumb_cache_dir=None):
                     if os.path.exists(f):
                         os.remove(f)
                 url = "https://zenodo.org/records/15398270/files/MDV6-yolov9-c.pt?download=1"
-                _download_url(url, dest, "MegaDetector V6")
+                _retry(lambda: _download_url(url, dest, "MegaDetector V6"), "MegaDetector V6")
                 runner.push_event(job["id"], "progress", {
                     "phase": "Validating weights...", "current": 1, "total": 1,
                 })
@@ -2420,7 +2626,7 @@ def create_app(db_path, thumb_cache_dir=None):
                     "phase": f"Downloading {model_id} from HuggingFace...",
                     "current": 0, "total": 1,
                 })
-                snapshot_download(hf_id)
+                _retry(lambda: snapshot_download(hf_id), model_id)
                 runner.push_event(job["id"], "progress", {
                     "phase": "Verifying model loads...", "current": 1, "total": 1,
                 })
@@ -2443,7 +2649,7 @@ def create_app(db_path, thumb_cache_dir=None):
                     "current": 0, "total": 1,
                 })
                 # torch.hub.load downloads repo + weights automatically
-                model = torch.hub.load("facebookresearch/dinov2", hub_name, trust_repo=True)
+                model = _retry(lambda: torch.hub.load("facebookresearch/dinov2", hub_name, trust_repo=True), model_id)
                 del model
                 runner.push_event(job["id"], "progress", {
                     "phase": "Model loaded and verified", "current": 1, "total": 1,
@@ -3891,6 +4097,78 @@ def create_app(db_path, thumb_cache_dir=None):
         log.info("Culling applied: %d keepers, %d rejects", len(keepers), len(rejects))
         return jsonify({"ok": True, "keepers": len(keepers), "rejects": len(rejects)})
 
+    @app.route("/api/photos/search")
+    def api_photo_text_search():
+        """Search photos by text query using CLIP cosine similarity."""
+        import numpy as np
+
+        query = request.args.get("q", "").strip()
+        if not query:
+            return json_error("Missing query parameter 'q'")
+
+        limit = request.args.get("limit", 50, type=int)
+        threshold = request.args.get("threshold", 0.15, type=float)
+
+        db = _get_db()
+
+        # Determine current model
+        from models import get_active_model
+        active_model = get_active_model()
+        if not active_model:
+            return jsonify({"results": [], "total_matches": 0, "model_used": None})
+
+        model_name = active_model["name"]
+
+        # Load embeddings for current model
+        emb_pairs = db.get_embeddings_by_model(model_name)
+        if not emb_pairs:
+            return jsonify({"results": [], "total_matches": 0, "model_used": model_name})
+
+        # Encode query text
+        from text_encoder import encode_text
+        model_str = active_model["model_str"]
+        weights_path = active_model.get("weights_path", "")
+        try:
+            query_vec = encode_text(query, model_str=model_str, pretrained_str=weights_path)
+        except Exception as e:
+            log.exception("Text encoding failed for query=%r model=%s", query, model_name)
+            return json_error(f"Text encoding failed: {e}", status=500)
+
+        # Build matrix and compute similarities
+        photo_ids = [pid for pid, _ in emb_pairs]
+        emb_matrix = np.stack(
+            [np.frombuffer(blob, dtype=np.float32) for _, blob in emb_pairs]
+        )
+        similarities = emb_matrix @ query_vec
+
+        # Filter and sort
+        mask = similarities >= threshold
+        filtered_ids = [photo_ids[i] for i in range(len(photo_ids)) if mask[i]]
+        filtered_sims = similarities[mask]
+        total_matches = len(filtered_ids)
+
+        # Top-N by similarity
+        if total_matches > 0:
+            top_indices = np.argsort(filtered_sims)[::-1][:limit]
+            results = []
+            for idx in top_indices:
+                pid = filtered_ids[idx]
+                sim = float(filtered_sims[idx])
+                photo = db.get_photo(pid)
+                if photo:
+                    results.append({
+                        "photo": dict(photo),
+                        "similarity": round(sim, 4),
+                    })
+        else:
+            results = []
+
+        return jsonify({
+            "results": results,
+            "total_matches": total_matches,
+            "model_used": model_name,
+        })
+
     @app.route("/api/photos/<int:photo_id>/similar")
     def api_photo_similar(photo_id):
         """Find photos with similar embeddings to the given photo."""
@@ -4088,6 +4366,10 @@ def create_app(db_path, thumb_cache_dir=None):
     @app.route("/logs")
     def logs_page():
         return render_template("logs.html")
+
+    @app.route("/map")
+    def map_page():
+        return render_template("map.html", active_page="map")
 
     @app.route("/dashboard")
     def dashboard_page():

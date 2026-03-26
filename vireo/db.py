@@ -61,6 +61,7 @@ class Database:
                 subject_size REAL,
                 quality_score REAL,
                 embedding BLOB,
+                embedding_model TEXT,
                 latitude REAL,
                 longitude REAL,
                 phash TEXT,
@@ -136,6 +137,15 @@ class Database:
                 UNIQUE(photo_id, model, workspace_id)
             );
 
+            CREATE TABLE IF NOT EXISTS inat_submissions (
+                id              INTEGER PRIMARY KEY,
+                photo_id        INTEGER NOT NULL REFERENCES photos(id) ON DELETE CASCADE,
+                observation_id  INTEGER NOT NULL,
+                observation_url TEXT NOT NULL,
+                submitted_at    TEXT NOT NULL DEFAULT (datetime('now')),
+                UNIQUE(photo_id, observation_id)
+            );
+
             CREATE INDEX IF NOT EXISTS idx_photos_timestamp ON photos(timestamp);
             CREATE INDEX IF NOT EXISTS idx_photos_folder ON photos(folder_id);
             CREATE INDEX IF NOT EXISTS idx_photos_rating ON photos(rating);
@@ -172,6 +182,10 @@ class Database:
             self.conn.execute("SELECT embedding FROM photos LIMIT 0")
         except Exception:
             self.conn.execute("ALTER TABLE photos ADD COLUMN embedding BLOB")
+        try:
+            self.conn.execute("SELECT embedding_model FROM photos LIMIT 0")
+        except Exception:
+            self.conn.execute("ALTER TABLE photos ADD COLUMN embedding_model TEXT")
         try:
             self.conn.execute("SELECT latitude FROM photos LIMIT 0")
         except Exception:
@@ -750,6 +764,67 @@ class Database:
         """
         return self.conn.execute(query, params).fetchall()
 
+    def get_geolocated_photos(
+        self,
+        folder_id=None,
+        rating_min=None,
+        date_from=None,
+        date_to=None,
+        keyword=None,
+    ):
+        """Return all geolocated photos with optional species, scoped to active workspace.
+
+        Returns photos that have non-null latitude and longitude. No pagination —
+        returns all matching photos for map rendering. Includes the highest-confidence
+        accepted prediction species name (or NULL if none).
+        """
+        conditions = ["wf.workspace_id = ?",
+                      "p.latitude IS NOT NULL",
+                      "p.longitude IS NOT NULL"]
+        params = [self._ws_id()]
+
+        if folder_id is not None:
+            conditions.append("p.folder_id = ?")
+            params.append(folder_id)
+        if rating_min is not None:
+            conditions.append("p.rating >= ?")
+            params.append(rating_min)
+        if date_from is not None:
+            conditions.append("p.timestamp >= ?")
+            params.append(date_from)
+        if date_to is not None:
+            conditions.append("p.timestamp <= ?")
+            params.append(date_to)
+
+        join_clause = "JOIN workspace_folders wf ON wf.folder_id = p.folder_id"
+        if keyword is not None:
+            join_clause += """
+                LEFT JOIN photo_keywords pk ON pk.photo_id = p.id
+                LEFT JOIN keywords k ON k.id = pk.keyword_id
+            """
+            conditions.append("(k.name LIKE ? OR p.filename LIKE ?)")
+            params.append(f"%{keyword}%")
+            params.append(f"%{keyword}%")
+
+        where = "WHERE " + " AND ".join(conditions)
+
+        query = f"""
+            SELECT p.id, p.latitude, p.longitude, p.thumb_path, p.filename,
+                   p.timestamp, p.rating, p.folder_id,
+                   (SELECT pr.species FROM predictions pr
+                    WHERE pr.photo_id = p.id
+                      AND pr.workspace_id = ?
+                      AND pr.status = 'accepted'
+                    ORDER BY pr.confidence DESC LIMIT 1) AS species
+            FROM photos p
+            {join_clause}
+            {where}
+            GROUP BY p.id
+            ORDER BY p.timestamp ASC
+        """
+        params.insert(0, self._ws_id())  # for the subquery
+        return self.conn.execute(query, params).fetchall()
+
     def update_photo_rating(self, photo_id, rating):
         """Set photo rating (0-5)."""
         self.conn.execute(
@@ -1211,13 +1286,28 @@ class Database:
         ).fetchone()
         return row["embedding"] if row else None
 
-    def store_photo_embedding(self, photo_id, embedding_bytes):
-        """Store an embedding blob for a photo."""
+    def store_photo_embedding(self, photo_id, embedding_bytes, model=None):
+        """Store an embedding blob for a photo, optionally with model name."""
         self.conn.execute(
-            "UPDATE photos SET embedding = ? WHERE id = ?",
-            (embedding_bytes, photo_id),
+            "UPDATE photos SET embedding = ?, embedding_model = ? WHERE id = ?",
+            (embedding_bytes, model, photo_id),
         )
         self.conn.commit()
+
+    def get_embeddings_by_model(self, model_name):
+        """Return (photo_id, embedding_blob) pairs for photos with given model.
+
+        Only returns photos in folders visible to the active workspace.
+        """
+        rows = self.conn.execute(
+            """SELECT p.id, p.embedding FROM photos p
+               JOIN workspace_folders wf ON wf.folder_id = p.folder_id
+               WHERE p.embedding IS NOT NULL
+                 AND p.embedding_model = ?
+                 AND wf.workspace_id = ?""",
+            (model_name, self._ws_id()),
+        ).fetchall()
+        return [(row["id"], row["embedding"]) for row in rows]
 
     def update_prediction_group_info(self, photo_id, model, group_id, vote_count, total_votes, individual):
         """Update group info on an existing prediction."""
@@ -1577,3 +1667,26 @@ class Database:
         for name, rules in defaults:
             if name not in existing_names:
                 self.add_collection(name, json.dumps(rules))
+
+    # ------ iNaturalist submissions ------
+
+    def record_inat_submission(self, photo_id, observation_id, observation_url):
+        """Record a successful iNaturalist submission."""
+        self.conn.execute(
+            """INSERT OR IGNORE INTO inat_submissions
+               (photo_id, observation_id, observation_url)
+               VALUES (?, ?, ?)""",
+            (photo_id, observation_id, observation_url),
+        )
+        self.conn.commit()
+
+    def get_inat_submissions(self, photo_ids):
+        """Return {photo_id: {observation_id, observation_url, submitted_at}} for given IDs."""
+        if not photo_ids:
+            return {}
+        placeholders = ",".join("?" * len(photo_ids))
+        rows = self.conn.execute(
+            f"SELECT photo_id, observation_id, observation_url, submitted_at FROM inat_submissions WHERE photo_id IN ({placeholders}) ORDER BY submitted_at DESC",
+            photo_ids,
+        ).fetchall()
+        return {r["photo_id"]: dict(r) for r in rows}

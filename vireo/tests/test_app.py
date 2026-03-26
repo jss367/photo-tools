@@ -202,7 +202,7 @@ def test_pages_link_base_css(app_and_db):
     client = app.test_client()
     pages = ['/browse', '/import', '/audit', '/logs',
              '/settings', '/workspace', '/pipeline', '/dashboard',
-             '/review', '/cull', '/pipeline/review']
+             '/review', '/cull', '/pipeline/review', '/map']
     for page in pages:
         resp = client.get(page)
         assert resp.status_code == 200, f"{page} returned {resp.status_code}"
@@ -300,12 +300,20 @@ def test_pages_include_vireo_utils(app_and_db):
     client = app.test_client()
     pages = ['/browse', '/import', '/audit', '/logs',
              '/settings', '/workspace', '/pipeline', '/dashboard',
-             '/review', '/cull', '/variants', '/compare']
+             '/review', '/cull', '/variants', '/compare', '/map']
     for page in pages:
         resp = client.get(page)
         assert resp.status_code == 200, f"{page} returned {resp.status_code}"
         html = resp.data.decode()
         assert 'vireo-utils.js' in html, f"{page} missing vireo-utils.js script tag"
+
+
+def test_map_page(app_and_db):
+    """GET /map returns 200."""
+    app, _ = app_and_db
+    client = app.test_client()
+    resp = client.get('/map')
+    assert resp.status_code == 200
 
 
 def test_pages_no_inline_escapeHtml(app_and_db):
@@ -314,7 +322,7 @@ def test_pages_no_inline_escapeHtml(app_and_db):
     client = app.test_client()
     pages = ['/browse', '/import', '/audit', '/logs',
              '/settings', '/workspace', '/pipeline', '/dashboard',
-             '/review', '/cull', '/variants', '/compare']
+             '/review', '/cull', '/variants', '/compare', '/map']
     for page in pages:
         resp = client.get(page)
         html = resp.data.decode()
@@ -420,3 +428,22 @@ def test_templates_jinja_free_except_includes():
         "Jinja2 syntax found in templates (only {% include '...' %} is allowed):\n"
         + "\n".join(violations)
     )
+
+
+def test_text_search_requires_query(app_and_db):
+    """Text search returns 400 when no query provided."""
+    app, _ = app_and_db
+    client = app.test_client()
+    resp = client.get("/api/photos/search")
+    assert resp.status_code == 400
+
+
+def test_text_search_no_active_model(app_and_db):
+    """Text search returns empty results when no model is downloaded."""
+    app, _ = app_and_db
+    client = app.test_client()
+    resp = client.get("/api/photos/search?q=bird+in+flight")
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert data["results"] == []
+    assert data["total_matches"] == 0

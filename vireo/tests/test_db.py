@@ -716,3 +716,147 @@ def test_is_keyword_species(tmp_path):
 
     assert db.is_keyword_species(kid_species) is True
     assert db.is_keyword_species(kid_location) is False
+
+
+def test_get_geolocated_photos_excludes_null_coords(tmp_path):
+    """get_geolocated_photos only returns photos with lat/lon."""
+    from db import Database
+    db = Database(str(tmp_path / "test.db"))
+    fid = db.add_folder('/photos', name='photos')
+    p1 = db.add_photo(folder_id=fid, filename='geo.jpg', extension='.jpg',
+                      file_size=100, file_mtime=1.0)
+    p2 = db.add_photo(folder_id=fid, filename='nogeo.jpg', extension='.jpg',
+                      file_size=100, file_mtime=1.0)
+    # Set GPS on p1 only
+    db.conn.execute("UPDATE photos SET latitude=37.77, longitude=-122.42 WHERE id=?", (p1,))
+    db.conn.commit()
+
+    results = db.get_geolocated_photos()
+    assert len(results) == 1
+    assert results[0]['filename'] == 'geo.jpg'
+    assert results[0]['latitude'] == 37.77
+    assert results[0]['longitude'] == -122.42
+
+
+def test_get_geolocated_photos_workspace_scoped(tmp_path):
+    """get_geolocated_photos respects workspace scoping."""
+    from db import Database
+    db = Database(str(tmp_path / "test.db"))
+    fid = db.add_folder('/photos', name='photos')
+    p1 = db.add_photo(folder_id=fid, filename='a.jpg', extension='.jpg',
+                      file_size=100, file_mtime=1.0)
+    db.conn.execute("UPDATE photos SET latitude=1.0, longitude=2.0 WHERE id=?", (p1,))
+    db.conn.commit()
+
+    # Create a second workspace without this folder
+    ws2 = db.create_workspace('Other')
+    db.set_active_workspace(ws2)
+    results = db.get_geolocated_photos()
+    assert len(results) == 0
+
+
+def test_get_geolocated_photos_filters(tmp_path):
+    """get_geolocated_photos applies rating and date filters."""
+    from db import Database
+    db = Database(str(tmp_path / "test.db"))
+    fid = db.add_folder('/photos', name='photos')
+    p1 = db.add_photo(folder_id=fid, filename='a.jpg', extension='.jpg',
+                      file_size=100, file_mtime=1.0, timestamp='2024-01-15T10:00:00')
+    p2 = db.add_photo(folder_id=fid, filename='b.jpg', extension='.jpg',
+                      file_size=100, file_mtime=1.0, timestamp='2024-06-15T10:00:00')
+    db.conn.execute("UPDATE photos SET latitude=1.0, longitude=2.0 WHERE id IN (?,?)", (p1, p2))
+    db.conn.commit()
+    db.update_photo_rating(p1, 2)
+    db.update_photo_rating(p2, 5)
+
+    # Filter by rating
+    results = db.get_geolocated_photos(rating_min=4)
+    assert len(results) == 1
+    assert results[0]['filename'] == 'b.jpg'
+
+    # Filter by date range
+    results = db.get_geolocated_photos(date_from='2024-03-01')
+    assert len(results) == 1
+    assert results[0]['filename'] == 'b.jpg'
+
+
+def test_get_geolocated_photos_with_species(tmp_path):
+    """get_geolocated_photos includes species from accepted predictions."""
+    from db import Database
+    db = Database(str(tmp_path / "test.db"))
+    fid = db.add_folder('/photos', name='photos')
+    p1 = db.add_photo(folder_id=fid, filename='hawk.jpg', extension='.jpg',
+                      file_size=100, file_mtime=1.0)
+    db.conn.execute("UPDATE photos SET latitude=37.0, longitude=-122.0 WHERE id=?", (p1,))
+    db.conn.commit()
+    db.add_prediction(p1, 'Red-tailed Hawk', 0.95, 'bioclip')
+    # Accept the prediction
+    pred = db.get_predictions(photo_ids=[p1])
+    db.conn.execute("UPDATE predictions SET status='accepted' WHERE id=?", (pred[0]['id'],))
+    db.conn.commit()
+
+    results = db.get_geolocated_photos()
+    assert len(results) == 1
+    assert results[0]['species'] == 'Red-tailed Hawk'
+
+
+def test_get_geolocated_photos_no_prediction_species_null(tmp_path):
+    """get_geolocated_photos returns species=None when no accepted prediction."""
+    from db import Database
+    db = Database(str(tmp_path / "test.db"))
+    fid = db.add_folder('/photos', name='photos')
+    p1 = db.add_photo(folder_id=fid, filename='mystery.jpg', extension='.jpg',
+                      file_size=100, file_mtime=1.0)
+    db.conn.execute("UPDATE photos SET latitude=37.0, longitude=-122.0 WHERE id=?", (p1,))
+    db.conn.commit()
+
+    results = db.get_geolocated_photos()
+    assert len(results) == 1
+    assert results[0]['species'] is None
+
+
+def test_embedding_model_column_exists(tmp_path):
+    """The photos table has an embedding_model column."""
+    from db import Database
+    db = Database(str(tmp_path / "test.db"))
+    db.conn.execute("SELECT embedding_model FROM photos LIMIT 0")
+
+
+def test_store_photo_embedding_with_model(tmp_path):
+    """store_photo_embedding saves model name alongside the embedding."""
+    import numpy as np
+    from db import Database
+    db = Database(str(tmp_path / "test.db"))
+    fid = db.conn.execute("INSERT INTO folders (path, name) VALUES ('/tmp', 'tmp')").lastrowid
+    pid = db.conn.execute("INSERT INTO photos (folder_id, filename) VALUES (?, 'a.jpg')", (fid,)).lastrowid
+    db.conn.commit()
+    emb = np.random.randn(512).astype(np.float32)
+    db.store_photo_embedding(pid, emb.tobytes(), model="BioCLIP")
+    row = db.conn.execute("SELECT embedding_model FROM photos WHERE id = ?", (pid,)).fetchone()
+    assert row["embedding_model"] == "BioCLIP"
+
+
+def test_get_embeddings_by_model(tmp_path):
+    """get_embeddings_by_model returns only photos with matching model."""
+    import numpy as np
+    from db import Database
+    db = Database(str(tmp_path / "test.db"))
+    fid = db.conn.execute("INSERT INTO folders (path, name) VALUES ('/tmp', 'tmp')").lastrowid
+    # Link folder to workspace
+    db.conn.execute(
+        "INSERT INTO workspace_folders (workspace_id, folder_id) VALUES (?, ?)",
+        (db._active_workspace_id, fid),
+    )
+    emb1 = np.random.randn(512).astype(np.float32)
+    emb2 = np.random.randn(512).astype(np.float32)
+    p1 = db.conn.execute("INSERT INTO photos (folder_id, filename) VALUES (?, 'a.jpg')", (fid,)).lastrowid
+    p2 = db.conn.execute("INSERT INTO photos (folder_id, filename) VALUES (?, 'b.jpg')", (fid,)).lastrowid
+    p3 = db.conn.execute("INSERT INTO photos (folder_id, filename) VALUES (?, 'c.jpg')", (fid,)).lastrowid
+    db.store_photo_embedding(p1, emb1.tobytes(), model="BioCLIP")
+    db.store_photo_embedding(p2, emb2.tobytes(), model="BioCLIP-2")
+    # p3 has no embedding
+    db.conn.commit()
+
+    results = db.get_embeddings_by_model("BioCLIP")
+    assert len(results) == 1
+    assert results[0][0] == p1

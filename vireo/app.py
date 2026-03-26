@@ -2365,8 +2365,9 @@ def create_app(db_path, thumb_cache_dir=None):
                     try:
                         return fn()
                     except Exception as exc:
+                        mro_names = [cls.__name__ for cls in type(exc).__mro__]
                         is_network = isinstance(exc, (OSError, ConnectionError)) or \
-                            any(name in type(exc).__name__ for name in ("ReadError", "TransportError", "TimeoutError"))
+                            any(kw in name for name in mro_names for kw in ("Timeout", "Transport", "ReadError"))
                         if not is_network or attempt == MAX_RETRIES:
                             raise
                         wait = 2 ** attempt

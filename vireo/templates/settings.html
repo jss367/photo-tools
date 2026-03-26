@@ -841,10 +841,10 @@ async function loadConfig() {
     loadDarktableStatus();
     // Load display settings
     document.getElementById('cfgPhotosPerPage').value = cfg.photos_per_page || 50;
-    var ts = cfg.thumb_size || 400;
+    var ts = cfg.thumbnail_size || 400;
     document.getElementById('cfgThumbSize').value = ts;
     document.getElementById('cfgThumbSizeVal').textContent = ts + 'px';
-    var tq = cfg.thumb_quality || 85;
+    var tq = cfg.thumbnail_quality || 85;
     document.getElementById('cfgThumbQuality').value = tq;
     document.getElementById('cfgThumbQualityVal').textContent = tq;
     var pq = cfg.preview_quality || 90;
@@ -860,7 +860,7 @@ async function loadConfig() {
     var dp = Math.round((cfg.detection_padding || 0.20) * 100);
     document.getElementById('cfgDetectionPadding').value = dp;
     document.getElementById('cfgDetectionPaddingVal').textContent = (dp / 100).toFixed(2);
-    document.getElementById('cfgTopK').value = cfg.top_k || 5;
+    document.getElementById('cfgTopK').value = cfg.top_k_predictions || 5;
     var rd = Math.round((cfg.redundancy_threshold || 0.88) * 100);
     document.getElementById('cfgRedundancy').value = rd;
     document.getElementById('cfgRedundancyVal').textContent = (rd / 100).toFixed(2);
@@ -885,13 +885,13 @@ async function loadConfig() {
     var wn = Math.round((p.w_noise != null ? p.w_noise : 0.10) * 100);
     document.getElementById('cfgWNoise').value = wn;
     document.getElementById('cfgWNoiseVal').textContent = wn + '%';
-    var rc = Math.round((p.reject_crop != null ? p.reject_crop : 0.60) * 100);
+    var rc = Math.round((p.reject_crop_complete != null ? p.reject_crop_complete : 0.60) * 100);
     document.getElementById('cfgRejectCrop').value = rc;
     document.getElementById('cfgRejectCropVal').textContent = rc + '%';
     var rf = Math.round((p.reject_focus != null ? p.reject_focus : 0.35) * 100);
     document.getElementById('cfgRejectFocus').value = rf;
     document.getElementById('cfgRejectFocusVal').textContent = rf + '%';
-    var rcl = Math.round((p.reject_clip != null ? p.reject_clip : 0.30) * 100);
+    var rcl = Math.round((p.reject_clip_high != null ? p.reject_clip_high : 0.30) * 100);
     document.getElementById('cfgRejectClip').value = rcl;
     document.getElementById('cfgRejectClipVal').textContent = rcl + '%';
     var rco = Math.round((p.reject_composite != null ? p.reject_composite : 0.40) * 100);
@@ -900,25 +900,25 @@ async function loadConfig() {
     var btg = p.burst_time_gap != null ? p.burst_time_gap : 3;
     document.getElementById('cfgBurstTimeGap').value = btg;
     document.getElementById('cfgBurstTimeGapVal').textContent = btg + 's';
-    var bph = p.burst_phash != null ? p.burst_phash : 12;
+    var bph = p.burst_phash_threshold != null ? p.burst_phash_threshold : 12;
     document.getElementById('cfgBurstPhash').value = bph;
     document.getElementById('cfgBurstPhashVal').textContent = bph;
-    var bemb = Math.round((p.burst_emb != null ? p.burst_emb : 0.80) * 100);
+    var bemb = Math.round((p.burst_embedding_threshold != null ? p.burst_embedding_threshold : 0.80) * 100);
     document.getElementById('cfgBurstEmb').value = bemb;
     document.getElementById('cfgBurstEmbVal').textContent = bemb + '%';
     var bl = Math.round((p.burst_lambda != null ? p.burst_lambda : 0.85) * 100);
     document.getElementById('cfgBurstLambda').value = bl;
     document.getElementById('cfgBurstLambdaVal').textContent = bl + '%';
     document.getElementById('cfgBurstMaxKeep').value = p.burst_max_keep || 3;
-    var el = Math.round((p.enc_lambda != null ? p.enc_lambda : 0.70) * 100);
+    var el = Math.round((p.encounter_lambda != null ? p.encounter_lambda : 0.70) * 100);
     document.getElementById('cfgEncLambda').value = el;
     document.getElementById('cfgEncLambdaVal').textContent = el + '%';
-    document.getElementById('cfgEncMaxKeep').value = p.enc_max_keep || 5;
-    document.getElementById('cfgWTime').value = p.w_time != null ? p.w_time : 35;
-    document.getElementById('cfgWSubj').value = p.w_subj != null ? p.w_subj : 35;
-    document.getElementById('cfgWGlobal').value = p.w_global != null ? p.w_global : 15;
-    document.getElementById('cfgWSpecies').value = p.w_species != null ? p.w_species : 10;
-    document.getElementById('cfgWMeta').value = p.w_meta != null ? p.w_meta : 5;
+    document.getElementById('cfgEncMaxKeep').value = p.encounter_max_keep || 5;
+    document.getElementById('cfgWTime').value = Math.round((p.w_time != null ? p.w_time : 0.35) * 100);
+    document.getElementById('cfgWSubj').value = Math.round((p.w_subj != null ? p.w_subj : 0.35) * 100);
+    document.getElementById('cfgWGlobal').value = Math.round((p.w_global != null ? p.w_global : 0.15) * 100);
+    document.getElementById('cfgWSpecies').value = Math.round((p.w_species != null ? p.w_species : 0.10) * 100);
+    document.getElementById('cfgWMeta').value = Math.round((p.w_meta != null ? p.w_meta : 0.05) * 100);
     document.getElementById('cfgHardCutTime').value = p.hard_cut_time || 180;
     var hcs = Math.round((p.hard_cut_score != null ? p.hard_cut_score : 0.42) * 100);
     document.getElementById('cfgHardCutScore').value = hcs;
@@ -962,13 +962,13 @@ function saveConfig() {
           darktable_output_format: document.getElementById('cfgDarktableFormat').value,
           darktable_output_dir: document.getElementById('cfgDarktableOutputDir').value.trim(),
           photos_per_page: parseInt(document.getElementById('cfgPhotosPerPage').value, 10) || 50,
-          thumb_size: parseInt(document.getElementById('cfgThumbSize').value, 10) || 400,
-          thumb_quality: parseInt(document.getElementById('cfgThumbQuality').value, 10) || 85,
+          thumbnail_size: parseInt(document.getElementById('cfgThumbSize').value, 10) || 400,
+          thumbnail_quality: parseInt(document.getElementById('cfgThumbQuality').value, 10) || 85,
           preview_quality: parseInt(document.getElementById('cfgPreviewQuality').value, 10) || 90,
           browse_thumb_default: parseInt(document.getElementById('cfgBrowseThumbDefault').value, 10) || 220,
           detector_confidence: parseInt(document.getElementById('cfgDetectorConf').value, 10) / 100,
           detection_padding: parseInt(document.getElementById('cfgDetectionPadding').value, 10) / 100,
-          top_k: parseInt(document.getElementById('cfgTopK').value, 10) || 5,
+          top_k_predictions: parseInt(document.getElementById('cfgTopK').value, 10) || 5,
           redundancy_threshold: parseInt(document.getElementById('cfgRedundancy').value, 10) / 100,
           cull_time_window: parseInt(document.getElementById('cfgCullTimeWindow').value, 10) || 60,
           cull_phash_threshold: parseInt(document.getElementById('cfgCullPhash').value, 10),
@@ -978,22 +978,22 @@ function saveConfig() {
             w_composition: parseInt(document.getElementById('cfgWComposition').value, 10) / 100,
             w_area: parseInt(document.getElementById('cfgWArea').value, 10) / 100,
             w_noise: parseInt(document.getElementById('cfgWNoise').value, 10) / 100,
-            reject_crop: parseInt(document.getElementById('cfgRejectCrop').value, 10) / 100,
+            reject_crop_complete: parseInt(document.getElementById('cfgRejectCrop').value, 10) / 100,
             reject_focus: parseInt(document.getElementById('cfgRejectFocus').value, 10) / 100,
-            reject_clip: parseInt(document.getElementById('cfgRejectClip').value, 10) / 100,
+            reject_clip_high: parseInt(document.getElementById('cfgRejectClip').value, 10) / 100,
             reject_composite: parseInt(document.getElementById('cfgRejectComposite').value, 10) / 100,
             burst_time_gap: parseInt(document.getElementById('cfgBurstTimeGap').value, 10),
-            burst_phash: parseInt(document.getElementById('cfgBurstPhash').value, 10),
-            burst_emb: parseInt(document.getElementById('cfgBurstEmb').value, 10) / 100,
+            burst_phash_threshold: parseInt(document.getElementById('cfgBurstPhash').value, 10),
+            burst_embedding_threshold: parseInt(document.getElementById('cfgBurstEmb').value, 10) / 100,
             burst_lambda: parseInt(document.getElementById('cfgBurstLambda').value, 10) / 100,
             burst_max_keep: parseInt(document.getElementById('cfgBurstMaxKeep').value, 10) || 3,
-            enc_lambda: parseInt(document.getElementById('cfgEncLambda').value, 10) / 100,
-            enc_max_keep: parseInt(document.getElementById('cfgEncMaxKeep').value, 10) || 5,
-            w_time: parseInt(document.getElementById('cfgWTime').value, 10),
-            w_subj: parseInt(document.getElementById('cfgWSubj').value, 10),
-            w_global: parseInt(document.getElementById('cfgWGlobal').value, 10),
-            w_species: parseInt(document.getElementById('cfgWSpecies').value, 10),
-            w_meta: parseInt(document.getElementById('cfgWMeta').value, 10),
+            encounter_lambda: parseInt(document.getElementById('cfgEncLambda').value, 10) / 100,
+            encounter_max_keep: parseInt(document.getElementById('cfgEncMaxKeep').value, 10) || 5,
+            w_time: parseInt(document.getElementById('cfgWTime').value, 10) / 100,
+            w_subj: parseInt(document.getElementById('cfgWSubj').value, 10) / 100,
+            w_global: parseInt(document.getElementById('cfgWGlobal').value, 10) / 100,
+            w_species: parseInt(document.getElementById('cfgWSpecies').value, 10) / 100,
+            w_meta: parseInt(document.getElementById('cfgWMeta').value, 10) / 100,
             hard_cut_time: parseInt(document.getElementById('cfgHardCutTime').value, 10) || 180,
             hard_cut_score: parseInt(document.getElementById('cfgHardCutScore').value, 10) / 100,
             soft_cut_score: parseInt(document.getElementById('cfgSoftCutScore').value, 10) / 100,

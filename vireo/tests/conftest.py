@@ -9,10 +9,10 @@ from PIL import Image
 
 
 @pytest.fixture
-def app_and_db(tmp_path):
+def app_and_db(tmp_path, monkeypatch):
     """Create a test app with sample data."""
     from db import Database
-    os.environ["HOME"] = str(tmp_path)
+    monkeypatch.setenv("HOME", str(tmp_path))
     from app import create_app
     import config as cfg
 

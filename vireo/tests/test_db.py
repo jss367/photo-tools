@@ -723,3 +723,17 @@ def test_embedding_model_column_exists(tmp_path):
     from db import Database
     db = Database(str(tmp_path / "test.db"))
     db.conn.execute("SELECT embedding_model FROM photos LIMIT 0")
+
+
+def test_store_photo_embedding_with_model(tmp_path):
+    """store_photo_embedding saves model name alongside the embedding."""
+    import numpy as np
+    from db import Database
+    db = Database(str(tmp_path / "test.db"))
+    fid = db.conn.execute("INSERT INTO folders (path, name) VALUES ('/tmp', 'tmp')").lastrowid
+    pid = db.conn.execute("INSERT INTO photos (folder_id, filename) VALUES (?, 'a.jpg')", (fid,)).lastrowid
+    db.conn.commit()
+    emb = np.random.randn(512).astype(np.float32)
+    db.store_photo_embedding(pid, emb.tobytes(), model="BioCLIP")
+    row = db.conn.execute("SELECT embedding_model FROM photos WHERE id = ?", (pid,)).fetchone()
+    assert row["embedding_model"] == "BioCLIP"

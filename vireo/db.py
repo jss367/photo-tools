@@ -1216,11 +1216,11 @@ class Database:
         ).fetchone()
         return row["embedding"] if row else None
 
-    def store_photo_embedding(self, photo_id, embedding_bytes):
-        """Store an embedding blob for a photo."""
+    def store_photo_embedding(self, photo_id, embedding_bytes, model=None):
+        """Store an embedding blob for a photo, optionally with model name."""
         self.conn.execute(
-            "UPDATE photos SET embedding = ? WHERE id = ?",
-            (embedding_bytes, photo_id),
+            "UPDATE photos SET embedding = ?, embedding_model = ? WHERE id = ?",
+            (embedding_bytes, model, photo_id),
         )
         self.conn.commit()
 

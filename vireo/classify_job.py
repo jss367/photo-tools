@@ -455,6 +455,138 @@ def _classify_photos(
     return raw_results, failed, skipped_existing
 
 
+def _store_grouped_predictions(
+    raw_results, job_id, model_name, grouping_window, similarity_threshold, tax, db,
+):
+    """Group results by timestamp/similarity, compute consensus, store to DB.
+
+    Returns:
+        dict with predictions_stored, burst_groups, already_labeled counts.
+    """
+    from compare import categorize, read_xmp_keywords
+    from grouping import (
+        consensus_prediction,
+        group_by_timestamp,
+        refine_groups_by_similarity,
+    )
+
+    groups = group_by_timestamp(raw_results, window_seconds=grouping_window)
+    groups = refine_groups_by_similarity(
+        groups, similarity_threshold=similarity_threshold
+    )
+    predictions_stored = 0
+    group_count = 0
+    skipped_match = 0
+
+    for group in groups:
+        if len(group) == 1:
+            item = group[0]
+            photo = item["photo"]
+            folder_path = item["folder_path"]
+
+            category = "new"
+            if tax:
+                xmp_path = os.path.join(
+                    folder_path,
+                    os.path.splitext(photo["filename"])[0] + ".xmp",
+                )
+                existing = read_xmp_keywords(xmp_path)
+                category = categorize(item["prediction"], existing, tax)
+
+            if category == "match":
+                skipped_match += 1
+                continue
+
+            tax_hierarchy = item.get("taxonomy") or (
+                tax.get_hierarchy(item["prediction"]) if tax else {}
+            )
+            db.add_prediction(
+                photo_id=photo["id"],
+                species=item["prediction"],
+                confidence=round(item["confidence"], 4),
+                model=model_name,
+                category=category,
+                taxonomy=tax_hierarchy,
+            )
+            predictions_stored += 1
+        else:
+            group_count += 1
+            gid = f"g{job_id[-6:]}-{group_count:04d}"
+            cons_input = [
+                {
+                    "prediction": item["prediction"],
+                    "confidence": item["confidence"],
+                }
+                for item in group
+            ]
+            cons = consensus_prediction(cons_input)
+            if not cons:
+                continue
+
+            representative = group[0]
+            category = "new"
+            if tax:
+                xmp_path = os.path.join(
+                    representative["folder_path"],
+                    os.path.splitext(representative["photo"]["filename"])[0] + ".xmp",
+                )
+                existing = read_xmp_keywords(xmp_path)
+                category = categorize(cons["prediction"], existing, tax)
+
+            if category == "match":
+                skipped_match += len(group)
+                continue
+
+            individual_json = json.dumps(cons["individual_predictions"])
+            rep_tax = group[0].get("taxonomy")
+            cons_hierarchy = rep_tax or (
+                tax.get_hierarchy(cons["prediction"]) if tax else {}
+            )
+
+            for item in group:
+                if item.get("_existing"):
+                    db.update_prediction_group_info(
+                        photo_id=item["photo"]["id"],
+                        model=model_name,
+                        group_id=gid,
+                        vote_count=cons["vote_count"],
+                        total_votes=cons["total_votes"],
+                        individual=individual_json,
+                    )
+                else:
+                    db.add_prediction(
+                        photo_id=item["photo"]["id"],
+                        species=item["prediction"],
+                        confidence=round(item["confidence"], 4),
+                        model=model_name,
+                        category=category,
+                        group_id=gid,
+                        vote_count=cons["vote_count"],
+                        total_votes=cons["total_votes"],
+                        individual=individual_json,
+                        taxonomy=item.get("taxonomy") or cons_hierarchy,
+                    )
+            predictions_stored += len(group)
+
+    singles = len([g for g in groups if len(g) == 1])
+    grouped_photos = sum(len(g) for g in groups if len(g) > 1)
+    log.info(
+        "Grouping complete: %d predictions stored (%d singles, %d in %d burst groups), "
+        "%d already labeled",
+        predictions_stored,
+        singles,
+        grouped_photos,
+        group_count,
+        skipped_match,
+    )
+
+    return {
+        "predictions_stored": predictions_stored,
+        "burst_groups": group_count,
+        "already_labeled": skipped_match,
+    }
+
+
 def run_classify_job(job, runner, db_path, workspace_id, params):
     """Execute classification job. Called by JobRunner in a background thread.
 

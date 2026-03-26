@@ -351,3 +351,90 @@ def test_classify_photos_skips_existing(tmp_path):
     assert len(raw_results) == 1
     assert raw_results[0]["_existing"] is True
     mock_clf.classify_with_embedding.assert_not_called()
+
+
+# ── Task 5: _store_grouped_predictions tests ─────────────────────────────────
+
+
+def test_store_grouped_predictions_single_photo():
+    """Phase 7: single-photo group stores prediction directly."""
+    from unittest.mock import MagicMock
+    from classify_job import _store_grouped_predictions
+
+    mock_db = MagicMock()
+
+    raw_results = [
+        {
+            "photo": {"id": 1, "filename": "bird.jpg"},
+            "folder_path": "/photos",
+            "prediction": "Northern Cardinal",
+            "confidence": 0.95,
+            "timestamp": None,
+            "filename": "bird.jpg",
+            "embedding": None,
+            "taxonomy": {"order": "Passeriformes", "family": "Cardinalidae"},
+        },
+    ]
+
+    result = _store_grouped_predictions(
+        raw_results=raw_results,
+        job_id="classify-test",
+        model_name="BioCLIP",
+        grouping_window=10,
+        similarity_threshold=0.85,
+        tax=None,
+        db=mock_db,
+    )
+
+    assert result["predictions_stored"] == 1
+    assert result["burst_groups"] == 0
+    mock_db.add_prediction.assert_called_once()
+    call_kwargs = mock_db.add_prediction.call_args[1]
+    assert call_kwargs["species"] == "Northern Cardinal"
+    assert call_kwargs["photo_id"] == 1
+
+
+def test_store_grouped_predictions_burst_group():
+    """Phase 7: multi-photo group computes consensus and stores for all photos."""
+    from unittest.mock import MagicMock, patch
+    from datetime import datetime
+    from classify_job import _store_grouped_predictions
+
+    mock_db = MagicMock()
+
+    raw_results = [
+        {
+            "photo": {"id": 1, "filename": "bird1.jpg"},
+            "folder_path": "/photos",
+            "prediction": "Northern Cardinal",
+            "confidence": 0.95,
+            "timestamp": datetime(2024, 1, 15, 10, 0, 0),
+            "filename": "bird1.jpg",
+            "embedding": None,
+            "taxonomy": None,
+        },
+        {
+            "photo": {"id": 2, "filename": "bird2.jpg"},
+            "folder_path": "/photos",
+            "prediction": "Northern Cardinal",
+            "confidence": 0.90,
+            "timestamp": datetime(2024, 1, 15, 10, 0, 3),
+            "filename": "bird2.jpg",
+            "embedding": None,
+            "taxonomy": None,
+        },
+    ]
+
+    result = _store_grouped_predictions(
+        raw_results=raw_results,
+        job_id="classify-test",
+        model_name="BioCLIP",
+        grouping_window=10,
+        similarity_threshold=0.85,
+        tax=None,
+        db=mock_db,
+    )
+
+    assert result["predictions_stored"] == 2
+    assert result["burst_groups"] >= 1
+    assert mock_db.add_prediction.call_count == 2

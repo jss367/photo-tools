@@ -164,6 +164,13 @@ def create_app(db_path, thumb_cache_dir=None):
 
     @app.route("/api/shutdown", methods=["POST"])
     def api_shutdown():
+        # Require a non-simple header to block cross-site POSTs.
+        # Browsers won't send custom headers cross-origin without a CORS
+        # preflight, and we don't serve permissive CORS headers, so a
+        # malicious page cannot trigger this endpoint.
+        if not request.headers.get("X-Vireo-Shutdown"):
+            return json_error("Missing X-Vireo-Shutdown header", 403)
+
         import signal
         import threading
 

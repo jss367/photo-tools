@@ -347,10 +347,15 @@ def test_shutdown_endpoint(app_and_db):
     # GET should not be allowed
     resp = client.get("/api/shutdown")
     assert resp.status_code == 405
-    # POST triggers shutdown (mock threading.Timer so SIGTERM is never sent)
+    # POST without X-Vireo-Shutdown header is rejected (CSRF protection)
+    resp = client.post("/api/shutdown")
+    assert resp.status_code == 403
+    # POST with header triggers shutdown (mock Timer so SIGTERM is never sent)
     mock_timer = MagicMock()
     with patch("threading.Timer", return_value=mock_timer) as mock_timer_cls:
-        resp = client.post("/api/shutdown")
+        resp = client.post(
+            "/api/shutdown", headers={"X-Vireo-Shutdown": "1"}
+        )
         assert resp.status_code == 200
         data = resp.get_json()
         assert data["status"] == "shutting_down"

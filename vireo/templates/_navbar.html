@@ -746,7 +746,8 @@ input[type=text], input[type=date], select, .path-input, .text-input, .model-sel
 /* ---------- Active page highlighting ---------- */
 (function() {
   var path = location.pathname;
-  var navLinks = document.querySelectorAll('.navbar > a[href]');
+  // Skip the brand anchor (.brand) — only highlight actual nav items
+  var navLinks = document.querySelectorAll('.navbar > a[href]:not(.brand)');
   var exactMatch = null;
   for (var i = 0; i < navLinks.length; i++) {
     if (path === navLinks[i].getAttribute('href')) {

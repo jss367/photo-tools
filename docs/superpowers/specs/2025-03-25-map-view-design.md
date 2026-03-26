@@ -48,7 +48,7 @@ Returns only geolocated photos with a minimal payload for map rendering.
 - Filters `WHERE latitude IS NOT NULL AND longitude IS NOT NULL`
 - Joins workspace_folders for workspace scoping
 - Applies the same filter conditions as `get_photos()` (folder, rating, date, keyword)
-- Left-joins predictions to get the top species prediction per photo (`species` is `null` when no prediction exists)
+- Left-joins predictions to get the highest-confidence accepted prediction in the active workspace per photo (`species` is `null` when no prediction exists)
 - Returns all matching photos (no pagination — map needs all points; clustering handles density). Expected to handle up to ~10K geolocated photos comfortably; this covers the vast majority of wildlife photo libraries.
 - Returns `total_geo` (geolocated count) and `total_photos` (total in workspace) for the status indicator
 
@@ -83,7 +83,7 @@ Follows the existing template pattern: extends base styles via `vireo-base.css`,
 
 ### 4. Navbar Update
 
-Add `<a href="/map">Map</a>` to `_navbar.html` between "Dashboard" and "Workspace", with the standard `active_page` highlight pattern.
+Add `<a href="/map">Map</a>` to `_navbar.html` after the "Variants" link and before the "Dashboard" link, with the standard `active_page` highlight pattern. Current nav order: Browse, Pipeline Review, Review, Import, Cull, Pipeline, Audit, Compare, Variants, **Map (new)**, Dashboard, Workspace, Settings.
 
 ## What's Excluded (YAGNI)
 
@@ -114,7 +114,7 @@ User opens /map
 ## Error Handling
 
 - No geolocated photos: show centered message "No geolocated photos found. Photos with GPS data in their EXIF metadata will appear here."
-- API fetch failure: show toast error (reuse existing `safeFetch` pattern from `vireo-utils.js`)
+- API fetch failure: show toast error (reuse the inline fetch + error toast pattern used in other page templates)
 - Photos without thumbnails: show placeholder icon in popup
 
 ## Testing

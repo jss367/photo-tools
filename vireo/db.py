@@ -1422,18 +1422,22 @@ class Database:
     # -- Pending Changes --
 
     def queue_change(self, photo_id, change_type, value):
-        """Add a change to the sync queue (skips if already queued)."""
+        """Add a change to the sync queue (skips if already queued).
+
+        Returns the inserted pending change id, or None if an identical row already exists.
+        """
         existing = self.conn.execute(
             "SELECT id FROM pending_changes WHERE photo_id = ? AND change_type = ? AND value = ? AND workspace_id = ?",
             (photo_id, change_type, value, self._ws_id()),
         ).fetchone()
         if existing:
-            return
-        self.conn.execute(
+            return None
+        cur = self.conn.execute(
             "INSERT INTO pending_changes (photo_id, change_type, value, workspace_id) VALUES (?, ?, ?, ?)",
             (photo_id, change_type, value, self._ws_id()),
         )
         self.conn.commit()
+        return cur.lastrowid
 
     def get_pending_changes(self):
         """Return all pending changes ordered by creation time."""

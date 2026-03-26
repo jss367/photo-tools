@@ -127,6 +127,29 @@ def test_sync_from_xmp_updates_db(tmp_path):
     assert 'Sparrow' not in kw_names
 
 
+def test_sync_from_xmp_preserves_keyword_when_only_case_differs(tmp_path):
+    """Case-only differences between DB and XMP keyword names should not drop the tag."""
+    from db import Database
+    from sync import sync_from_xmp
+    from xmp_writer import write_xmp_sidecar
+
+    db = Database(str(tmp_path / "test.db"))
+    ws_id = db.ensure_default_workspace()
+    db.set_active_workspace(ws_id)
+    pid, xmp_path = _setup_photo_with_xmp(tmp_path, db, keywords={'sparrow'})
+
+    kid = db.add_keyword('Sparrow')
+    db.tag_photo(pid, kid)
+
+    os.remove(xmp_path)
+    write_xmp_sidecar(xmp_path, flat_keywords={'sparrow'}, hierarchical_keywords=set())
+
+    sync_from_xmp(db, [pid])
+
+    keywords = db.get_photo_keywords(pid)
+    assert {k['name'] for k in keywords} == {'Sparrow'}
+
+
 def test_sync_to_xmp_reports_unsupported_flag_changes(tmp_path):
     """Legacy flag pending changes remain queued and are reported as unsupported."""
     from db import Database

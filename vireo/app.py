@@ -521,13 +521,14 @@ def create_app(db_path, thumb_cache_dir=None):
         old = db.get_photo(photo_id)
         old_rating = old["rating"] if old else 0
         db.update_photo_rating(photo_id, rating)
-        db.queue_change(photo_id, "rating", str(rating))
+        pending_change_id = db.queue_change(photo_id, "rating", str(rating))
         _push_undo(
             {
                 "type": "rating",
                 "photo_ids": [photo_id],
                 "old_value": old_rating,
                 "new_value": rating,
+                "pending_change_id": pending_change_id,
                 "description": f"Set rating to {rating}",
             }
         )
@@ -608,18 +609,20 @@ def create_app(db_path, thumb_cache_dir=None):
         if not photo_ids:
             return json_error("photo_ids required")
         old_values = {}
+        pending_change_ids = {}
         for pid in photo_ids:
             old = db.get_photo(pid)
             if old:
                 old_values[pid] = old["rating"]
                 db.update_photo_rating(pid, rating)
-                db.queue_change(pid, "rating", str(rating))
+                pending_change_ids[pid] = db.queue_change(pid, "rating", str(rating))
         _push_undo(
             {
                 "type": "batch_rating",
                 "photo_ids": photo_ids,
                 "old_values": old_values,
                 "new_value": rating,
+                "pending_change_ids": pending_change_ids,
                 "description": f"Set rating to {rating} on {len(photo_ids)} photos",
             }
         )
@@ -685,7 +688,8 @@ def create_app(db_path, thumb_cache_dir=None):
         if action["type"] == "rating":
             for pid in action["photo_ids"]:
                 db.update_photo_rating(pid, action["old_value"])
-                db.remove_pending_changes(pid, "rating", str(action["new_value"]))
+                if action.get("pending_change_id") is not None:
+                    db.clear_pending([action["pending_change_id"]])
         elif action["type"] == "flag":
             for pid in action["photo_ids"]:
                 db.update_photo_flag(pid, action["old_value"])
@@ -700,7 +704,11 @@ def create_app(db_path, thumb_cache_dir=None):
         elif action["type"] == "batch_rating":
             for pid, old_val in action["old_values"].items():
                 db.update_photo_rating(int(pid), old_val)
-                db.remove_pending_changes(int(pid), "rating", str(action["new_value"]))
+                pending_change_id = action.get("pending_change_ids", {}).get(pid)
+                if pending_change_id is None:
+                    pending_change_id = action.get("pending_change_ids", {}).get(str(pid))
+                if pending_change_id is not None:
+                    db.clear_pending([pending_change_id])
         elif action["type"] == "batch_flag":
             for pid, old_val in action["old_values"].items():
                 db.update_photo_flag(int(pid), old_val)

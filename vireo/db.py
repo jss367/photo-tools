@@ -159,7 +159,7 @@ class Database:
             CREATE TABLE IF NOT EXISTS edit_history_items (
                 id        INTEGER PRIMARY KEY,
                 edit_id   INTEGER NOT NULL REFERENCES edit_history(id) ON DELETE CASCADE,
-                photo_id  INTEGER NOT NULL REFERENCES photos(id),
+                photo_id  INTEGER NOT NULL REFERENCES photos(id) ON DELETE CASCADE,
                 old_value TEXT,
                 new_value TEXT
             );
@@ -273,7 +273,7 @@ class Database:
                 CREATE TABLE IF NOT EXISTS edit_history_items (
                     id        INTEGER PRIMARY KEY,
                     edit_id   INTEGER NOT NULL REFERENCES edit_history(id) ON DELETE CASCADE,
-                    photo_id  INTEGER NOT NULL REFERENCES photos(id),
+                    photo_id  INTEGER NOT NULL REFERENCES photos(id) ON DELETE CASCADE,
                     old_value TEXT,
                     new_value TEXT
                 );

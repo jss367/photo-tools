@@ -3285,7 +3285,7 @@ def create_app(db_path, thumb_cache_dir=None):
         # Cosine distance matrix (1 - similarity)
         # Embeddings are normalized, so dot product = cosine similarity
         sim_matrix = emb_matrix @ emb_matrix.T
-        dist_matrix = 1.0 - sim_matrix
+        dist_matrix = np.maximum(1.0 - sim_matrix, 0.0)
         np.fill_diagonal(dist_matrix, 0)
 
         # Agglomerative clustering

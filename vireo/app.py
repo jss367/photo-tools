@@ -3910,8 +3910,6 @@ def create_app(db_path, thumb_cache_dir=None):
         threshold = request.args.get("threshold", 0.15, type=float)
 
         db = _get_db()
-        import config as cfg
-        effective = db.get_effective_config(cfg.load())
 
         # Determine current model
         from models import get_active_model
@@ -3930,7 +3928,11 @@ def create_app(db_path, thumb_cache_dir=None):
         from text_encoder import encode_text
         model_str = active_model["model_str"]
         weights_path = active_model.get("weights_path", "")
-        query_vec = encode_text(query, model_str=model_str, pretrained_str=weights_path)
+        try:
+            query_vec = encode_text(query, model_str=model_str, pretrained_str=weights_path)
+        except Exception as e:
+            log.exception("Text encoding failed for query=%r model=%s", query, model_name)
+            return json_error(f"Text encoding failed: {e}", status=500)
 
         # Build matrix and compute similarities
         photo_ids = [pid for pid, _ in emb_pairs]

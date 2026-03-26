@@ -336,8 +336,8 @@ def test_text_search_requires_query(app_and_db):
     assert resp.status_code == 400
 
 
-def test_text_search_no_embeddings(app_and_db):
-    """Text search returns empty results when no embeddings exist."""
+def test_text_search_no_active_model(app_and_db):
+    """Text search returns empty results when no model is downloaded."""
     app, _ = app_and_db
     client = app.test_client()
     resp = client.get("/api/photos/search?q=bird+in+flight")

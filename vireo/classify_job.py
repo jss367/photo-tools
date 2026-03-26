@@ -206,7 +206,9 @@ def _detect_subjects(photos, folders, runner, job, reclassify, db):
                 skipped_det += 1
                 continue
 
-            detections = detect_animals(image_path)
+            import config as cfg
+            det_conf = cfg.load().get("detector_confidence", 0.2)
+            detections = detect_animals(image_path, confidence_threshold=det_conf)
             primary = get_primary_detection(detections)
 
             if primary:

@@ -273,9 +273,11 @@ def create_app(db_path, thumb_cache_dir=None):
     @app.route("/api/browse/init")
     def api_browse_init():
         """Combined endpoint for browse page initial load — one request instead of five."""
+        import config as cfg
         db = _get_db()
         page = request.args.get("page", 1, type=int)
-        per_page = request.args.get("per_page", 50, type=int)
+        default_per_page = cfg.load().get("photos_per_page", 50)
+        per_page = request.args.get("per_page", default_per_page, type=int)
         sort = request.args.get("sort", "date")
 
         photos = db.get_photos(page=page, per_page=per_page, sort=sort)
@@ -331,9 +333,11 @@ def create_app(db_path, thumb_cache_dir=None):
 
     @app.route("/api/photos")
     def api_photos():
+        import config as cfg
         db = _get_db()
         page = request.args.get("page", 1, type=int)
-        per_page = request.args.get("per_page", 50, type=int)
+        default_per_page = cfg.load().get("photos_per_page", 50)
+        per_page = request.args.get("per_page", default_per_page, type=int)
         sort = request.args.get("sort", "date")
         folder_id = request.args.get("folder_id", None, type=int)
         rating_min = request.args.get("rating_min", None, type=int)
@@ -784,9 +788,11 @@ def create_app(db_path, thumb_cache_dir=None):
 
     @app.route("/api/collections/<int:collection_id>/photos")
     def api_collection_photos(collection_id):
+        import config as cfg
         db = _get_db()
         page = request.args.get("page", 1, type=int)
-        per_page = request.args.get("per_page", 50, type=int)
+        default_per_page = cfg.load().get("photos_per_page", 50)
+        per_page = request.args.get("per_page", default_per_page, type=int)
         photos = db.get_collection_photos(collection_id, page=page, per_page=per_page)
         # Get total count (fetch with large limit, count results)
         total = len(db.get_collection_photos(collection_id, page=1, per_page=1_000_000))
@@ -2867,6 +2873,7 @@ def create_app(db_path, thumb_cache_dir=None):
             max_size = cfg.get("preview_max_size") or 1920
             if max_size == 0:
                 max_size = None  # Full resolution
+            preview_quality = cfg.load().get("preview_quality", 90)
             preview_dir = os.path.join(
                 os.path.dirname(app.config["THUMB_CACHE_DIR"]), "previews"
             )
@@ -2892,7 +2899,7 @@ def create_app(db_path, thumb_cache_dir=None):
                     image_path = os.path.join(folder_path, photo["filename"])
                     img = load_image(image_path, max_size=max_size)
                     if img:
-                        img.save(cache_path, format="JPEG", quality=90)
+                        img.save(cache_path, format="JPEG", quality=preview_quality)
                         generated += 1
 
                 runner.push_event(
@@ -4397,8 +4404,9 @@ def create_app(db_path, thumb_cache_dir=None):
 
         # Compute crop info if detection exists
         if result.get("detection_box"):
+            import config as cfg
             box = result["detection_box"]
-            pad = 0.2
+            pad = cfg.load().get("detection_padding", 0.2)
             result["crop_box"] = {
                 "x": max(0, box["x"] - box["w"] * pad),
                 "y": max(0, box["y"] - box["h"] * pad),
@@ -4411,6 +4419,7 @@ def create_app(db_path, thumb_cache_dir=None):
     @app.route("/photos/<int:photo_id>/crop")
     def serve_crop_preview(photo_id):
         """Serve the cropped region that would be sent to BioCLIP."""
+        import config as cfg
         from PIL import Image
         from image_loader import load_image
 
@@ -4432,8 +4441,9 @@ def create_app(db_path, thumb_cache_dir=None):
             if isinstance(det_box, str):
                 det_box = json.loads(det_box)
             iw, ih = img.size
-            pad_w = det_box["w"] * 0.2
-            pad_h = det_box["h"] * 0.2
+            padding = cfg.load().get("detection_padding", 0.2)
+            pad_w = det_box["w"] * padding
+            pad_h = det_box["h"] * padding
             x1 = max(0, int((det_box["x"] - pad_w) * iw))
             y1 = max(0, int((det_box["y"] - pad_h) * ih))
             x2 = min(iw, int((det_box["x"] + det_box["w"] + pad_w) * iw))
@@ -4445,8 +4455,9 @@ def create_app(db_path, thumb_cache_dir=None):
         img.thumbnail((800, 800), Image.LANCZOS)
         import io
 
+        preview_quality = cfg.load().get("preview_quality", 90)
         buf = io.BytesIO()
-        img.save(buf, format="JPEG", quality=90)
+        img.save(buf, format="JPEG", quality=preview_quality)
         buf.seek(0)
         return Response(buf.read(), mimetype="image/jpeg")
 
@@ -4484,7 +4495,8 @@ def create_app(db_path, thumb_cache_dir=None):
             return "Could not load image", 500
 
         os.makedirs(preview_dir, exist_ok=True)
-        img.save(cache_path, format="JPEG", quality=90)
+        preview_quality = cfg.load().get("preview_quality", 90)
+        img.save(cache_path, format="JPEG", quality=preview_quality)
         return send_file(cache_path, mimetype="image/jpeg")
 
     # -- Logs page --

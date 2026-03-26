@@ -249,30 +249,7 @@ def create_app(db_path, thumb_cache_dir=None):
 
     @app.route("/pipeline")
     def pipeline_page():
-        db = _get_db()
-        pipeline_counts = db.get_pipeline_feature_counts()
-        total_photos = db.count_photos()
-
-        from pipeline import load_results
-        import config as cfg
-        cache_dir = os.path.dirname(db_path)
-        results = load_results(cache_dir, db._active_workspace_id)
-        effective_cfg = db.get_effective_config(cfg.load())
-        pipeline_cfg = effective_cfg.get("pipeline", {})
-
-        return render_template(
-            "pipeline.html",
-            total_photos=total_photos,
-            has_detections=pipeline_counts["detections"],
-            has_masks=pipeline_counts["masks"],
-            has_sharpness=pipeline_counts["sharpness"],
-            results=results,
-            pipeline_config={
-                "sam2_variant": pipeline_cfg.get("sam2_variant", "sam2-small"),
-                "dinov2_variant": pipeline_cfg.get("dinov2_variant", "vit-b14"),
-                "proxy_longest_edge": pipeline_cfg.get("proxy_longest_edge", 1536),
-            },
-        )
+        return render_template("pipeline.html")
 
     @app.route("/pipeline/review")
     def pipeline_review_page():

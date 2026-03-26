@@ -4137,13 +4137,28 @@ def main():
     parser.add_argument("--no-browser", action="store_true")
     args = parser.parse_args()
 
+    # Resolve port: --port 0 means pick a random free port
+    port = args.port
+    if port == 0:
+        import socket
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+
+    # Write the port file when random port was requested (for Tauri to discover)
+    if args.port == 0:
+        port_file = os.path.join(os.path.expanduser("~/.vireo"), "port")
+        with open(port_file, "w") as f:
+            f.write(str(port))
+        log.info("Random port %d written to %s", port, port_file)
+
     app = create_app(db_path=args.db, thumb_cache_dir=args.thumb_dir)
 
     # Startup banner
     import config as cfg
     startup_cfg = cfg.load()
     log.info("=" * 50)
-    log.info("Vireo starting on http://localhost:%d", args.port)
+    log.info("Vireo starting on http://localhost:%d", port)
     log.info("  Database: %s", args.db)
     log.info("  Thumbnails: %s", args.thumb_dir)
     log.info("  Threshold: %.0f%%  Grouping: %ds  Similarity: %.0f%%",
@@ -4160,7 +4175,7 @@ def main():
         import urllib.request
 
         def _open_browser():
-            url = f"http://localhost:{args.port}"
+            url = f"http://localhost:{port}"
             for _ in range(50):  # try for up to 5 seconds
                 try:
                     urllib.request.urlopen(url, timeout=0.1)
@@ -4171,7 +4186,7 @@ def main():
 
         threading.Thread(target=_open_browser, daemon=True).start()
 
-    app.run(host="127.0.0.1", port=args.port, debug=False, threaded=True)
+    app.run(host="127.0.0.1", port=port, debug=False, threaded=True)
 
 
 if __name__ == "__main__":

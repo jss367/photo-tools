@@ -49,7 +49,7 @@ Returns only geolocated photos with a minimal payload for map rendering.
 - Joins workspace_folders for workspace scoping
 - Applies the same filter conditions as `get_photos()` (folder, rating, date, keyword)
 - Left-joins predictions to get the top species prediction per photo
-- Returns all matching photos (no pagination — map needs all points; clustering handles density)
+- Returns all matching photos (no pagination — map needs all points; clustering handles density). Expected to handle up to ~10K geolocated photos comfortably; this covers the vast majority of wildlife photo libraries.
 - Returns `total_geo` (geolocated count) and `total_photos` (total in workspace) for the status indicator
 
 ### 2. Route: `GET /map`
@@ -78,6 +78,10 @@ Follows the existing template pattern: extends base styles via `vireo-base.css`,
   - Filename, date, rating stars, species name
   - "View in Browse" link that navigates to `/browse?photo_id={id}`
 - Filter changes → re-fetch and replace markers
+
+**Browse page deep-link:** The browse page does not currently support a `photo_id` query parameter. The map implementation must add this: when `photo_id` is present in the browse URL, scroll to and highlight that photo in the grid after loading.
+
+**Browse page deep-link support:** The browse page does not currently handle a `photo_id` query parameter. The map implementation must add this: when `/browse?photo_id={id}` is loaded, the browse page should navigate to the folder containing that photo and scroll/highlight it in the grid.
 
 ### 4. Navbar Update
 

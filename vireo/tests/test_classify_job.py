@@ -438,3 +438,74 @@ def test_store_grouped_predictions_burst_group():
     assert result["predictions_stored"] == 2
     assert result["burst_groups"] >= 1
     assert mock_db.add_prediction.call_count == 2
+
+
+# ── Task 6: run_classify_job full pipeline test ───────────────────────────────
+
+
+def test_run_classify_job_full_pipeline(tmp_path):
+    """run_classify_job orchestrates all phases end-to-end."""
+    from unittest.mock import patch, MagicMock
+    import numpy as np
+    from classify_job import ClassifyParams, run_classify_job
+
+    runner = FakeRunner()
+    job = _make_job()
+
+    # Create test image
+    img = Image.new("RGB", (200, 200), color="blue")
+    img_path = tmp_path / "bird.jpg"
+    img.save(str(img_path))
+
+    # Set up mock DB
+    mock_db_instance = MagicMock()
+    mock_db_instance.get_collection_photos.return_value = [
+        {"id": 1, "filename": "bird.jpg", "folder_id": 10,
+         "timestamp": "2024-01-15T10:00:00",
+         "detection_box": None, "detection_conf": None},
+    ]
+    mock_db_instance.get_folder_tree.return_value = [
+        {"id": 10, "path": str(tmp_path), "name": "test"},
+    ]
+    mock_db_instance.get_existing_prediction_photo_ids.return_value = set()
+    mock_db_instance.get_photo_embedding.return_value = None
+
+    fake_model = {
+        "id": "test-model",
+        "name": "TestModel",
+        "model_str": "hf-hub:imageomics/bioclip",
+        "weights_path": "/tmp/weights.bin",
+        "model_type": "bioclip",
+        "downloaded": True,
+    }
+
+    fake_embedding = np.ones(512, dtype=np.float32)
+    fake_preds = [{"species": "Northern Cardinal", "score": 0.95, "taxonomy": None}]
+
+    mock_clf = MagicMock()
+    mock_clf.classify_with_embedding.return_value = (fake_preds, fake_embedding)
+
+    params = ClassifyParams(
+        collection_id="col-1",
+        labels_file=None,
+        labels_files=None,
+        model_id=None,
+        model_name=None,
+        grouping_window=10,
+        similarity_threshold=0.85,
+        reclassify=False,
+    )
+
+    with patch("classify_job.Database", return_value=mock_db_instance), \
+         patch("classify_job.get_active_model", return_value=fake_model), \
+         patch("classify_job.get_models", return_value=[fake_model]), \
+         patch("classify_job._load_taxonomy", return_value=None), \
+         patch("classify_job._load_labels", return_value=(["Northern Cardinal"], False)), \
+         patch("classify_job.Classifier", return_value=mock_clf), \
+         patch("classify_job._detect_subjects", return_value=({}, 0)):
+        result = run_classify_job(job, runner, str(tmp_path / "test.db"), 1, params)
+
+    assert result["total"] == 1
+    assert result["predictions_stored"] == 1
+    assert result["failed"] == 0
+    mock_db_instance.add_prediction.assert_called_once()

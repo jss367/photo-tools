@@ -30,6 +30,19 @@ try:
 except ImportError:
     load_image = None
 
+from db import Database
+from models import get_active_model, get_models
+
+try:
+    from classifier import Classifier
+except ImportError:
+    Classifier = None
+
+try:
+    from timm_classifier import TimmClassifier
+except ImportError:
+    TimmClassifier = None
+
 log = logging.getLogger(__name__)
 
 
@@ -597,4 +610,203 @@ def run_classify_job(job, runner, db_path, workspace_id, params):
         workspace_id: active workspace ID
         params: ClassifyParams with request parameters
     """
-    raise NotImplementedError("TODO: move work() body here")
+    thread_db = Database(db_path)
+    thread_db.set_active_workspace(workspace_id)
+    job["_start_time"] = time.time()
+
+    # Resolve model
+    if params.model_id:
+        all_models = get_models()
+        active_model = next(
+            (m for m in all_models if m["id"] == params.model_id and m["downloaded"]),
+            None,
+        )
+        if not active_model:
+            raise RuntimeError(
+                f"Model '{params.model_id}' not found or not downloaded."
+            )
+    else:
+        active_model = get_active_model()
+    if not active_model:
+        raise RuntimeError("No model available. Download one in Settings.")
+
+    model_str = active_model["model_str"]
+    weights_path = active_model["weights_path"]
+    effective_name = active_model["name"]
+    model_type = active_model.get("model_type", "bioclip")
+    model_name = params.model_name or effective_name
+
+    # Phase 1: Load taxonomy
+    runner.push_event(
+        job["id"],
+        "progress",
+        {
+            "current": 0,
+            "total": 0,
+            "current_file": "Loading taxonomy...",
+            "rate": 0,
+            "phase": "Step 1/5: Loading taxonomy",
+        },
+    )
+    taxonomy_path = os.path.join(os.path.dirname(__file__), "taxonomy.json")
+    tax = _load_taxonomy(taxonomy_path)
+
+    # Phase 2: Load labels
+    labels, use_tol = _load_labels(
+        model_type=model_type,
+        model_str=model_str,
+        labels_file=params.labels_file,
+        labels_files=params.labels_files,
+    )
+
+    # Phase 3: Get photos from collection
+    runner.push_event(
+        job["id"],
+        "progress",
+        {
+            "current": 0,
+            "total": 0,
+            "current_file": "Loading collection photos...",
+            "rate": 0,
+            "phase": "Step 2/5: Loading photos",
+        },
+    )
+    photos = thread_db.get_collection_photos(params.collection_id, per_page=999999)
+    folders = {f["id"]: f["path"] for f in thread_db.get_folder_tree()}
+    total = len(photos)
+    job["progress"]["total"] = total
+
+    log.info(
+        "Classifying %d photos with '%s' (%s)", total, effective_name, model_str
+    )
+
+    if params.reclassify:
+        photo_ids = [p["id"] for p in photos]
+        thread_db.clear_predictions(model=effective_name, collection_photo_ids=photo_ids)
+        log.info(
+            "Cleared existing predictions for %d photos, model=%s (re-classify)",
+            len(photo_ids),
+            effective_name,
+        )
+
+    # Phase 4: Initialize classifier
+    if model_type == "timm":
+        phase_msg = f"Loading {effective_name} timm model..."
+    elif use_tol:
+        phase_msg = f"Loading {effective_name} Tree of Life classifier..."
+    else:
+        phase_msg = f"Loading {effective_name} model and computing label embeddings..."
+
+    runner.push_event(
+        job["id"],
+        "progress",
+        {
+            "current": 0,
+            "total": total,
+            "current_file": phase_msg,
+            "rate": 0,
+            "phase": "Step 3/5: Loading model",
+        },
+    )
+
+    if model_type == "timm":
+        clf = TimmClassifier(model_str, taxonomy=tax)
+    else:
+        def _emb_progress(current, emb_total):
+            runner.push_event(
+                job["id"],
+                "progress",
+                {
+                    "current": current,
+                    "total": emb_total,
+                    "current_file": f"Computing label embeddings ({current}/{emb_total})...",
+                    "rate": 0,
+                    "phase": "Step 3/5: Computing embeddings",
+                },
+            )
+
+        clf = Classifier(
+            labels=None if use_tol else labels,
+            model_str=model_str,
+            pretrained_str=weights_path,
+            embedding_progress_callback=_emb_progress,
+        )
+
+    # Phase 5: Detect subjects
+    detection_map, detected = _detect_subjects(
+        photos=photos,
+        folders=folders,
+        runner=runner,
+        job=job,
+        reclassify=params.reclassify,
+        db=thread_db,
+    )
+
+    # Phase 6: Classify each photo
+    existing_preds = set()
+    if not params.reclassify:
+        existing_preds = thread_db.get_existing_prediction_photo_ids(model_name)
+        if existing_preds:
+            log.info(
+                "Skipping %d photos with existing predictions (model=%s)",
+                len(existing_preds),
+                model_name,
+            )
+
+    job["_start_time"] = time.time()  # reset rate timer for classification phase
+
+    raw_results, failed, skipped_existing = _classify_photos(
+        photos=photos,
+        folders=folders,
+        detection_map=detection_map,
+        existing_preds=existing_preds,
+        clf=clf,
+        model_type=model_type,
+        model_name=model_name,
+        runner=runner,
+        job=job,
+        db=thread_db,
+    )
+
+    # Phase 7: Group and store predictions
+    runner.push_event(
+        job["id"],
+        "progress",
+        {
+            "current": total,
+            "total": total,
+            "current_file": "Grouping bursts and computing consensus...",
+            "rate": 0,
+            "phase": "Finalizing results",
+        },
+    )
+
+    group_result = _store_grouped_predictions(
+        raw_results=raw_results,
+        job_id=job["id"],
+        model_name=model_name,
+        grouping_window=params.grouping_window,
+        similarity_threshold=params.similarity_threshold,
+        tax=tax,
+        db=thread_db,
+    )
+
+    log.info(
+        "Classification complete: %d photos processed, %d predictions stored, "
+        "%d already classified, %d already labeled, %d failed",
+        total,
+        group_result["predictions_stored"],
+        skipped_existing,
+        group_result["already_labeled"],
+        failed,
+    )
+
+    return {
+        "total": total,
+        "predictions_stored": group_result["predictions_stored"],
+        "burst_groups": group_result["burst_groups"],
+        "already_classified": skipped_existing,
+        "already_labeled": group_result["already_labeled"],
+        "detected": detected,
+        "failed": failed,
+    }

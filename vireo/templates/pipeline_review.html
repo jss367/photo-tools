@@ -104,7 +104,7 @@ body { padding-bottom: 36px; }
   cursor: pointer;
 }
 .encounter-header:hover { background: var(--border-secondary, #1A4560); }
-.encounter-species { font-size: 15px; font-weight: 600; flex: 1; }
+/* .encounter-species replaced by .species-widget */
 .encounter-meta {
   font-size: 11px;
   color: var(--text-dim, #5A8890);
@@ -431,6 +431,165 @@ input[type="range"]::-moz-range-thumb {
   margin-top: 12px;
 }
 .back-link:hover { color: var(--accent, #24E5CA); }
+
+/* -- Species confirmation widget -- */
+.species-widget {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  position: relative;
+}
+.species-name {
+  cursor: pointer;
+  font-size: 15px;
+  font-weight: 600;
+  transition: color 0.15s;
+}
+.species-name.unconfirmed {
+  color: var(--text-muted, #7FAAB0);
+}
+.species-name.confirmed {
+  color: var(--accent, #24E5CA);
+}
+.species-badge {
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 10px;
+  font-weight: 600;
+}
+.species-badge.unconfirmed {
+  background: rgba(127, 170, 176, 0.2);
+  color: var(--text-muted, #7FAAB0);
+}
+.species-badge.confirmed {
+  background: rgba(36, 229, 202, 0.2);
+  color: var(--accent, #24E5CA);
+}
+.species-confirm-btn {
+  background: none;
+  border: 1px solid var(--border-primary, #14374E);
+  color: var(--text-dim, #5A8890);
+  border-radius: 4px;
+  padding: 2px 6px;
+  font-size: 12px;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+.species-confirm-btn:hover {
+  border-color: var(--accent, #24E5CA);
+  color: var(--accent, #24E5CA);
+}
+
+/* Species dropdown */
+.species-dropdown {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  z-index: 100;
+  min-width: 320px;
+  max-height: 300px;
+  overflow-y: auto;
+  background: var(--bg-secondary, #0E2A3D);
+  border: 1px solid var(--border-secondary, #1A4560);
+  border-radius: 6px;
+  box-shadow: 0 8px 24px rgba(0,0,0,0.4);
+  margin-top: 4px;
+  display: none;
+}
+.species-dropdown.open { display: block; }
+.species-dropdown-item {
+  padding: 8px 12px;
+  cursor: pointer;
+  font-size: 13px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  border-bottom: 1px solid var(--border-primary, #14374E);
+}
+.species-dropdown-item:hover { background: rgba(255,255,255,0.04); }
+.species-dropdown-item:last-child { border-bottom: none; }
+.species-dropdown-item .sp-name { flex: 1; font-weight: 500; }
+.species-dropdown-item .sp-models { font-size: 11px; color: var(--text-dim, #5A8890); }
+.species-dropdown-search {
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border-secondary, #1A4560);
+}
+.species-dropdown-search input {
+  width: 100%;
+  background: var(--bg-input, #14374E);
+  color: var(--text-primary, #E0F0F0);
+  border: 1px solid var(--border-secondary, #1A4560);
+  border-radius: 4px;
+  padding: 6px 10px;
+  font-size: 12px;
+}
+
+/* Burst-level species (smaller variant) */
+.burst-species-widget {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: 8px;
+  font-size: 12px;
+}
+.burst-species-widget .species-name { font-size: 12px; }
+.burst-species-edit {
+  opacity: 0;
+  cursor: pointer;
+  font-size: 11px;
+  color: var(--text-dim, #5A8890);
+  transition: opacity 0.15s;
+}
+.burst-strip:hover .burst-species-edit { opacity: 1; }
+
+/* Detach icons */
+.detach-btn {
+  opacity: 0;
+  background: none;
+  border: none;
+  color: var(--text-dim, #5A8890);
+  cursor: pointer;
+  font-size: 12px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  transition: all 0.15s;
+}
+.detach-btn:hover {
+  color: var(--warning, #F0C040);
+  background: rgba(240, 192, 64, 0.1);
+}
+.burst-strip:hover .detach-btn { opacity: 1; }
+.photo-card:hover .detach-btn { opacity: 1; }
+
+/* Undo toast */
+.undo-toast {
+  position: fixed;
+  bottom: 60px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: var(--bg-secondary, #0E2A3D);
+  border: 1px solid var(--border-secondary, #1A4560);
+  border-radius: 8px;
+  padding: 12px 20px;
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  font-size: 13px;
+  box-shadow: 0 8px 24px rgba(0,0,0,0.4);
+  z-index: 200;
+  transition: opacity 0.3s;
+}
+.undo-toast.hidden { opacity: 0; pointer-events: none; }
+.undo-toast-btn {
+  background: var(--accent, #24E5CA);
+  color: #000;
+  border: none;
+  border-radius: 4px;
+  padding: 4px 12px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
 </style>
 </head>
 <body>
@@ -599,6 +758,11 @@ input[type="range"]::-moz-range-thumb {
   <div class="inspect-panel" id="inspectPanel"></div>
 </div>
 
+<div class="undo-toast hidden" id="undoToast">
+  <span id="undoMsg"></span>
+  <button class="undo-toast-btn" onclick="undoLastAction()">Undo</button>
+</div>
+
 <script>
 var pipelineResults = null;
 var activeFilter = 'all';
@@ -627,8 +791,6 @@ function renderResults() {
 
   var html = '';
   pipelineResults.encounters.forEach(function(enc, ei) {
-    var speciesName = enc.species ? (enc.species[0] || 'Unknown') : 'Unknown';
-    var speciesConf = enc.species && enc.species[1] ? (enc.species[1] * 100).toFixed(0) + '%' : '';
     var timeRange = '';
     if (enc.time_range && enc.time_range[0]) {
       var t0 = enc.time_range[0].split('T')[1] || '';
@@ -645,27 +807,37 @@ function renderResults() {
     if (!hasVisible) return;
 
     html += '<div class="encounter-card">';
-    html += '<div class="encounter-header" onclick="toggleEncounter(' + ei + ')">';
-    html += '<span class="encounter-species">' + speciesName + '</span>';
-    html += '<span class="encounter-meta">';
+    html += '<div class="encounter-header">';
+    html += renderSpeciesWidget(enc, ei, 'encounter', null);
+    html += '<span class="encounter-meta" onclick="toggleEncounter(' + ei + ')" style="cursor:pointer;flex:1;">';
     html += '<span>' + enc.photo_count + ' photos</span>';
     if (enc.burst_count) html += '<span>' + enc.burst_count + ' bursts</span>';
-    if (speciesConf) html += '<span>' + speciesConf + '</span>';
     if (timeRange) html += '<span>' + timeRange + '</span>';
     html += '</span></div>';
     html += '<div class="encounter-body" id="encBody' + ei + '">';
 
     if (enc.bursts && enc.bursts.length > 0) {
       enc.bursts.forEach(function(burst, bi) {
+        var burstIds = burst.photo_ids || burst;
         html += '<div class="burst-strip">';
+        html += '<div style="display:flex;align-items:center;gap:6px;margin-bottom:4px;">';
         if (enc.bursts.length > 1) {
           html += '<span class="burst-label">B' + (bi+1) + '</span>';
         }
-        burst.forEach(function(pid) {
+        // Burst-level species widget (only show if overridden or multiple bursts)
+        if (enc.bursts.length > 1 || (burst.species_override)) {
+          html += renderSpeciesWidget(enc, ei, 'burst', bi);
+        }
+        if (!burst.species_override && enc.bursts.length > 1) {
+          html += '<span class="burst-species-edit" onclick="toggleSpeciesDropdown(event,' + ei + ',' + bi + ')">&#9998;</span>';
+        }
+        html += '<button class="detach-btn" onclick="detachBurst(' + ei + ',' + bi + ')" title="Detach burst">&times;</button>';
+        html += '</div>';
+        burstIds.forEach(function(pid) {
           var p = photoMap[pid];
           if (!p) return;
           if (activeFilter !== 'all' && p.label !== activeFilter) return;
-          html += renderPhotoCard(p);
+          html += renderPhotoCard(p, ei, bi);
         });
         html += '</div>';
       });
@@ -675,7 +847,7 @@ function renderResults() {
         var p = photoMap[pid];
         if (!p) return;
         if (activeFilter !== 'all' && p.label !== activeFilter) return;
-        html += renderPhotoCard(p);
+        html += renderPhotoCard(p, null, null);
       });
     }
 
@@ -685,14 +857,17 @@ function renderResults() {
   container.innerHTML = html;
 }
 
-function renderPhotoCard(p) {
+function renderPhotoCard(p, encIdx, burstIdx) {
   var label = (p.label || '').toLowerCase();
   var q = p.quality_composite || 0;
   var qPct = Math.round(q * 100);
-  var html = '<div class="photo-card ' + label + '" onclick="openInspect(' + p.id + ')">';
-  html += '<img src="/thumbnails/' + p.id + '.jpg" loading="lazy" alt="">';
+  var html = '<div class="photo-card ' + label + '">';
+  html += '<img src="/thumbnails/' + p.id + '.jpg" loading="lazy" alt="" onclick="openInspect(' + p.id + ')">';
   if (p.label) html += '<span class="photo-label ' + label + '">' + p.label + '</span>';
   if (p.rarity_protected) html += '<span class="photo-rarity">protected</span>';
+  if (encIdx != null && burstIdx != null) {
+    html += '<button class="detach-btn" onclick="event.stopPropagation();detachPhoto(' + encIdx + ',' + burstIdx + ',' + p.id + ')" title="Detach photo" style="position:absolute;top:2px;right:2px;">&times;</button>';
+  }
   html += '<div class="photo-score-bar"><div class="photo-score-fill" style="width:' + qPct + '%"></div></div>';
   html += '<div class="photo-info">' + (p.filename || '') + ' &middot; Q=' + q.toFixed(2) + '</div>';
   html += '</div>';
@@ -954,7 +1129,7 @@ function openInspect(photoId) {
 
   // Encounter context filmstrip
   if (enc) {
-    var speciesName = enc.species ? (enc.species[0] || 'Unknown') : 'Unknown';
+    var speciesName = enc.confirmed_species || (enc.species ? (enc.species[0] || 'Unknown') : 'Unknown');
     html += '<div class="context-label">Encounter: ' + speciesName + ' (' + enc.photo_count + ' photos, ' + (enc.burst_count||0) + ' bursts)</div>';
     html += '<div class="context-filmstrip">';
     (enc.photo_ids || []).forEach(function(pid) {
@@ -1038,6 +1213,269 @@ function initPipelineReviewPage() {
     if (fb) fb.style.display = '';
 
     renderResults();
+  });
+}
+
+// -- Species confirmation --
+
+var activeDropdown = null;
+
+function renderSpeciesWidget(enc, encIdx, level, burstIdx) {
+  // level: 'encounter' or 'burst'
+  var isConfirmed, displayName, predictions;
+  if (level === 'burst') {
+    var burst = enc.bursts[burstIdx];
+    var ovr = burst.species_override;
+    isConfirmed = ovr && ovr.confirmed;
+    displayName = (ovr && ovr.species) || (enc.species ? enc.species[0] : 'Unknown');
+    predictions = burst.species_predictions || [];
+  } else {
+    isConfirmed = enc.species_confirmed;
+    displayName = enc.confirmed_species || (enc.species ? enc.species[0] : 'Unknown');
+    predictions = enc.species_predictions || [];
+  }
+
+  var cls = isConfirmed ? 'confirmed' : 'unconfirmed';
+  var badge = isConfirmed ? '&#10003;' : '?';
+  var widgetCls = level === 'burst' ? 'burst-species-widget' : 'species-widget';
+
+  var html = '<span class="' + widgetCls + '" data-enc="' + encIdx + '" data-burst="' + (burstIdx != null ? burstIdx : '') + '">';
+  html += '<span class="species-name ' + cls + '" onclick="toggleSpeciesDropdown(event, ' + encIdx + ',' + (burstIdx != null ? burstIdx : 'null') + ')">' + escapeHtml(displayName) + '</span>';
+  html += '<span class="species-badge ' + cls + '">' + badge + '</span>';
+  if (!isConfirmed) {
+    html += '<button class="species-confirm-btn" onclick="confirmSpecies(event, ' + encIdx + ',' + (burstIdx != null ? burstIdx : 'null') + ',null)" title="Confirm as ' + escapeHtml(displayName) + '">&#10003;</button>';
+  }
+
+  // Dropdown
+  html += '<div class="species-dropdown" id="spDrop_' + encIdx + '_' + (burstIdx != null ? burstIdx : 'enc') + '">';
+  html += '<div class="species-dropdown-search"><input type="text" placeholder="Search species..." oninput="searchSpecies(event, ' + encIdx + ',' + (burstIdx != null ? burstIdx : 'null') + ')"></div>';
+
+  // "Use encounter label" option for burst level
+  if (level === 'burst' && enc.species) {
+    html += '<div class="species-dropdown-item" onclick="clearBurstOverride(event, ' + encIdx + ',' + burstIdx + ')">';
+    html += '<span class="sp-name" style="color:var(--text-dim);">Use encounter label (' + escapeHtml(enc.species[0] || '') + ')</span>';
+    html += '</div>';
+  }
+
+  // Prediction rows
+  predictions.forEach(function(sp) {
+    var modelParts = (sp.models || []).map(function(m) {
+      return escapeHtml(m.model) + ' ' + (m.confidence * 100).toFixed(0) + '%';
+    });
+    html += '<div class="species-dropdown-item" onclick="confirmSpecies(event, ' + encIdx + ',' + (burstIdx != null ? burstIdx : 'null') + ',\'' + escapeHtml(sp.species).replace(/'/g, "\\'") + '\')">';
+    html += '<span class="sp-name">' + escapeHtml(sp.species) + '</span>';
+    html += '<span class="sp-models">' + modelParts.join(', ') + '</span>';
+    html += '</div>';
+  });
+
+  // Search results container
+  html += '<div id="spSearch_' + encIdx + '_' + (burstIdx != null ? burstIdx : 'enc') + '"></div>';
+  html += '</div>';
+  html += '</span>';
+  return html;
+}
+
+function toggleSpeciesDropdown(event, encIdx, burstIdx) {
+  event.stopPropagation();
+  var id = 'spDrop_' + encIdx + '_' + (burstIdx != null ? burstIdx : 'enc');
+  var el = document.getElementById(id);
+  if (!el) return;
+  var isOpen = el.classList.contains('open');
+  // Close any open dropdown
+  closeAllDropdowns();
+  if (!isOpen) {
+    el.classList.add('open');
+    activeDropdown = el;
+    var input = el.querySelector('input');
+    if (input) setTimeout(function() { input.focus(); }, 50);
+  }
+}
+
+function closeAllDropdowns() {
+  document.querySelectorAll('.species-dropdown.open').forEach(function(d) {
+    d.classList.remove('open');
+  });
+  activeDropdown = null;
+}
+
+// Close dropdown on outside click
+document.addEventListener('click', function(e) {
+  if (activeDropdown && !activeDropdown.contains(e.target) &&
+      !e.target.classList.contains('species-name')) {
+    closeAllDropdowns();
+  }
+});
+
+var _searchTimer = null;
+function searchSpecies(event, encIdx, burstIdx) {
+  var q = event.target.value.trim();
+  var targetId = 'spSearch_' + encIdx + '_' + (burstIdx != null ? burstIdx : 'enc');
+  var container = document.getElementById(targetId);
+  if (!container) return;
+  if (q.length < 2) { container.innerHTML = ''; return; }
+
+  clearTimeout(_searchTimer);
+  _searchTimer = setTimeout(async function() {
+    var results = await safeFetch('/api/species/search?q=' + encodeURIComponent(q), {}, { toast: false });
+    if (!results || !Array.isArray(results)) return;
+    var html = '';
+    results.forEach(function(name) {
+      html += '<div class="species-dropdown-item" onclick="confirmSpecies(event, ' + encIdx + ',' + (burstIdx != null ? burstIdx : 'null') + ',\'' + escapeHtml(name).replace(/'/g, "\\'") + '\')">';
+      html += '<span class="sp-name">' + escapeHtml(name) + '</span>';
+      html += '<span class="sp-models" style="color:var(--text-dim);">search</span>';
+      html += '</div>';
+    });
+    container.innerHTML = html;
+  }, 250);
+}
+
+async function confirmSpecies(event, encIdx, burstIdx, speciesName) {
+  event.stopPropagation();
+  closeAllDropdowns();
+
+  var enc = pipelineResults.encounters[encIdx];
+  if (!enc) return;
+
+  // Determine which species to confirm
+  if (!speciesName) {
+    if (burstIdx != null && enc.bursts && enc.bursts[burstIdx]) {
+      var ovr = enc.bursts[burstIdx].species_override;
+      speciesName = (ovr && ovr.species) || enc.confirmed_species || (enc.species ? enc.species[0] : null);
+    } else {
+      speciesName = enc.confirmed_species || (enc.species ? enc.species[0] : null);
+    }
+  }
+  if (!speciesName) return;
+
+  // Determine photo IDs
+  var photoIds;
+  if (burstIdx != null && enc.bursts && enc.bursts[burstIdx]) {
+    photoIds = enc.bursts[burstIdx].photo_ids;
+  } else {
+    photoIds = enc.photo_ids;
+  }
+
+  var body = { species: speciesName, photo_ids: photoIds };
+  if (burstIdx != null) body.burst_index = burstIdx;
+
+  var resp = await safeFetch('/api/encounters/species', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!resp || !resp.ok) return;
+
+  // Update local state optimistically
+  if (burstIdx != null && enc.bursts && enc.bursts[burstIdx]) {
+    enc.bursts[burstIdx].species_override = { species: speciesName, confirmed: true };
+  } else {
+    enc.species_confirmed = true;
+    enc.confirmed_species = speciesName;
+  }
+  renderResults();
+}
+
+async function clearBurstOverride(event, encIdx, burstIdx) {
+  event.stopPropagation();
+  closeAllDropdowns();
+  var enc = pipelineResults.encounters[encIdx];
+  if (!enc || !enc.bursts || !enc.bursts[burstIdx]) return;
+  enc.bursts[burstIdx].species_override = null;
+  // Persist to cache
+  safeFetch('/api/pipeline/save-cache', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(pipelineResults),
+  });
+  renderResults();
+}
+
+// -- Detach & Undo --
+
+var undoStack = [];
+var _undoTimer = null;
+
+function showUndo(msg, undoFn) {
+  // Clear previous
+  clearTimeout(_undoTimer);
+  undoStack = [undoFn];
+
+  var toast = document.getElementById('undoToast');
+  var msgEl = document.getElementById('undoMsg');
+  if (!toast || !msgEl) return;
+  msgEl.textContent = msg;
+  toast.classList.remove('hidden');
+
+  _undoTimer = setTimeout(function() {
+    toast.classList.add('hidden');
+    undoStack = [];
+  }, 5000);
+}
+
+function undoLastAction() {
+  clearTimeout(_undoTimer);
+  var toast = document.getElementById('undoToast');
+  if (toast) toast.classList.add('hidden');
+  if (undoStack.length > 0) {
+    var fn = undoStack.pop();
+    fn();
+  }
+}
+
+async function detachBurst(encIdx, burstIdx) {
+  // Save state for undo
+  var snapshot = JSON.parse(JSON.stringify(pipelineResults));
+
+  var resp = await safeFetch('/api/pipeline/detach-burst', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ encounter_index: encIdx, burst_index: burstIdx }),
+  });
+  if (!resp || !resp.ok) return;
+
+  pipelineResults.encounters = resp.encounters;
+  if (resp.summary) pipelineResults.summary = resp.summary;
+  renderResults();
+  updateSummaryBar(pipelineResults.summary);
+
+  showUndo('Burst detached from encounter', function() {
+    // Restore from snapshot
+    pipelineResults = snapshot;
+    // Re-save to cache
+    safeFetch('/api/pipeline/save-cache', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(pipelineResults),
+    });
+    renderResults();
+    updateSummaryBar(pipelineResults.summary);
+  });
+}
+
+async function detachPhoto(encIdx, burstIdx, photoId) {
+  var snapshot = JSON.parse(JSON.stringify(pipelineResults));
+
+  var resp = await safeFetch('/api/pipeline/detach-photo', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ encounter_index: encIdx, burst_index: burstIdx, photo_id: photoId }),
+  });
+  if (!resp || !resp.ok) return;
+
+  pipelineResults.encounters = resp.encounters;
+  if (resp.summary) pipelineResults.summary = resp.summary;
+  renderResults();
+  updateSummaryBar(pipelineResults.summary);
+
+  showUndo('Photo detached from burst', function() {
+    pipelineResults = snapshot;
+    safeFetch('/api/pipeline/save-cache', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(pipelineResults),
+    });
+    renderResults();
+    updateSummaryBar(pipelineResults.summary);
   });
 }
 

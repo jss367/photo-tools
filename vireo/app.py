@@ -488,15 +488,6 @@ def create_app(db_path, thumb_cache_dir=None):
         log.info("Keyword cleanup: merged %d duplicates", merged)
         return jsonify({"ok": True, "merged": merged})
 
-    # -- Undo stack (in-memory, session-only) --
-    _undo_stack = []
-    _max_undo = 50
-
-    def _push_undo(action):
-        _undo_stack.append(action)
-        if len(_undo_stack) > _max_undo:
-            _undo_stack.pop(0)
-
     def _queue_keyword_add(photo_id, keyword_name):
         """Queue a keyword add unless it cancels a pending removal."""
         db = _get_db()
@@ -521,17 +512,9 @@ def create_app(db_path, thumb_cache_dir=None):
         old = db.get_photo(photo_id)
         old_rating = old["rating"] if old else 0
         db.update_photo_rating(photo_id, rating)
-        pending_change_token = db.queue_change(photo_id, "rating", str(rating))
-        _push_undo(
-            {
-                "type": "rating",
-                "photo_ids": [photo_id],
-                "old_value": old_rating,
-                "new_value": rating,
-                "pending_change_token": pending_change_token,
-                "description": f"Set rating to {rating}",
-            }
-        )
+        db.queue_change(photo_id, "rating", str(rating))
+        db.record_edit('rating', f'Set rating to {rating}', str(rating),
+                       [{'photo_id': photo_id, 'old_value': str(old_rating), 'new_value': str(rating)}])
         return jsonify({"ok": True})
 
     @app.route("/api/photos/<int:photo_id>/flag", methods=["POST"])
@@ -542,15 +525,8 @@ def create_app(db_path, thumb_cache_dir=None):
         old = db.get_photo(photo_id)
         old_flag = old["flag"] if old else "none"
         db.update_photo_flag(photo_id, flag)
-        _push_undo(
-            {
-                "type": "flag",
-                "photo_ids": [photo_id],
-                "old_value": old_flag,
-                "new_value": flag,
-                "description": f"Set flag to {flag}",
-            }
-        )
+        db.record_edit('flag', f'Set flag to {flag}', flag,
+                       [{'photo_id': photo_id, 'old_value': old_flag, 'new_value': flag}])
         return jsonify({"ok": True})
 
     @app.route("/api/photos/<int:photo_id>/keywords", methods=["POST"])
@@ -563,15 +539,8 @@ def create_app(db_path, thumb_cache_dir=None):
         kid = db.add_keyword(name)
         db.tag_photo(photo_id, kid)
         _queue_keyword_add(photo_id, name)
-        _push_undo(
-            {
-                "type": "keyword_add",
-                "photo_ids": [photo_id],
-                "keyword_id": kid,
-                "keyword_name": name,
-                "description": f'Added keyword "{name}"',
-            }
-        )
+        db.record_edit('keyword_add', f'Added keyword "{name}"', str(kid),
+                       [{'photo_id': photo_id, 'old_value': '', 'new_value': str(kid)}])
         return jsonify({"ok": True, "keyword_id": kid})
 
     @app.route(
@@ -587,15 +556,8 @@ def create_app(db_path, thumb_cache_dir=None):
                 break
         db.untag_photo(photo_id, keyword_id)
         _queue_keyword_remove(photo_id, kw_name)
-        _push_undo(
-            {
-                "type": "keyword_remove",
-                "photo_ids": [photo_id],
-                "keyword_id": keyword_id,
-                "keyword_name": kw_name,
-                "description": f'Removed keyword "{kw_name}"',
-            }
-        )
+        db.record_edit('keyword_remove', f'Removed keyword "{kw_name}"', str(keyword_id),
+                       [{'photo_id': photo_id, 'old_value': str(keyword_id), 'new_value': ''}])
         return jsonify({"ok": True})
 
     # -- Batch operations --
@@ -609,23 +571,15 @@ def create_app(db_path, thumb_cache_dir=None):
         if not photo_ids:
             return json_error("photo_ids required")
         old_values = {}
-        pending_change_tokens = {}
         for pid in photo_ids:
             old = db.get_photo(pid)
             if old:
                 old_values[pid] = old["rating"]
                 db.update_photo_rating(pid, rating)
-                pending_change_tokens[pid] = db.queue_change(pid, "rating", str(rating))
-        _push_undo(
-            {
-                "type": "batch_rating",
-                "photo_ids": photo_ids,
-                "old_values": old_values,
-                "new_value": rating,
-                "pending_change_tokens": pending_change_tokens,
-                "description": f"Set rating to {rating} on {len(photo_ids)} photos",
-            }
-        )
+                db.queue_change(pid, "rating", str(rating))
+        items = [{'photo_id': pid, 'old_value': str(old_values[pid]), 'new_value': str(rating)} for pid in old_values]
+        db.record_edit('rating', f'Set rating to {rating} on {len(photo_ids)} photos',
+                       str(rating), items, is_batch=True)
         return jsonify({"ok": True, "updated": len(old_values)})
 
     @app.route("/api/batch/flag", methods=["POST"])
@@ -642,15 +596,9 @@ def create_app(db_path, thumb_cache_dir=None):
             if old:
                 old_values[pid] = old["flag"]
                 db.update_photo_flag(pid, flag)
-        _push_undo(
-            {
-                "type": "batch_flag",
-                "photo_ids": photo_ids,
-                "old_values": old_values,
-                "new_value": flag,
-                "description": f"Set flag to {flag} on {len(photo_ids)} photos",
-            }
-        )
+        items = [{'photo_id': pid, 'old_value': old_values[pid], 'new_value': flag} for pid in old_values]
+        db.record_edit('flag', f'Set flag to {flag} on {len(photo_ids)} photos',
+                       flag, items, is_batch=True)
         return jsonify({"ok": True, "updated": len(old_values)})
 
     @app.route("/api/batch/keyword", methods=["POST"])
@@ -665,69 +613,43 @@ def create_app(db_path, thumb_cache_dir=None):
         for pid in photo_ids:
             db.tag_photo(pid, kid)
             _queue_keyword_add(pid, name)
-        _push_undo(
-            {
-                "type": "batch_keyword_add",
-                "photo_ids": photo_ids,
-                "keyword_id": kid,
-                "keyword_name": name,
-                "description": f'Added "{name}" to {len(photo_ids)} photos',
-            }
-        )
+        items = [{'photo_id': pid, 'old_value': '', 'new_value': str(kid)} for pid in photo_ids]
+        db.record_edit('keyword_add', f'Added "{name}" to {len(photo_ids)} photos',
+                       str(kid), items, is_batch=True)
         return jsonify({"ok": True, "updated": len(photo_ids)})
 
     # -- Undo --
 
     @app.route("/api/undo", methods=["POST"])
     def api_undo():
-        if not _undo_stack:
-            return json_error("nothing to undo")
         db = _get_db()
-        action = _undo_stack.pop()
-
-        if action["type"] == "rating":
-            for pid in action["photo_ids"]:
-                db.update_photo_rating(pid, action["old_value"])
-                db.remove_pending_change_token(action.get("pending_change_token"))
-        elif action["type"] == "flag":
-            for pid in action["photo_ids"]:
-                db.update_photo_flag(pid, action["old_value"])
-        elif action["type"] == "keyword_add":
-            for pid in action["photo_ids"]:
-                db.untag_photo(pid, action["keyword_id"])
-                db.remove_pending_changes(pid, "keyword_add", action["keyword_name"])
-        elif action["type"] == "keyword_remove":
-            for pid in action["photo_ids"]:
-                db.tag_photo(pid, action["keyword_id"])
-                db.remove_pending_changes(pid, "keyword_remove", action["keyword_name"])
-        elif action["type"] == "batch_rating":
-            for pid, old_val in action["old_values"].items():
-                db.update_photo_rating(int(pid), old_val)
-                pending_change_token = action.get("pending_change_tokens", {}).get(pid)
-                if pending_change_token is None:
-                    pending_change_token = action.get("pending_change_tokens", {}).get(str(pid))
-                db.remove_pending_change_token(pending_change_token)
-        elif action["type"] == "batch_flag":
-            for pid, old_val in action["old_values"].items():
-                db.update_photo_flag(int(pid), old_val)
-        elif action["type"] == "batch_keyword_add":
-            for pid in action["photo_ids"]:
-                db.untag_photo(pid, action["keyword_id"])
-                db.remove_pending_changes(pid, "keyword_add", action["keyword_name"])
-
-        return jsonify({"ok": True, "undone": action["description"]})
+        result = db.undo_last_edit()
+        if result is None:
+            return json_error("nothing to undo")
+        return jsonify({"ok": True, "undone": result["description"]})
 
     @app.route("/api/undo/status")
     def api_undo_status():
-        if not _undo_stack:
-            return jsonify({"available": False, "description": ""})
-        return jsonify(
-            {
-                "available": True,
-                "description": _undo_stack[-1]["description"],
-                "count": len(_undo_stack),
-            }
-        )
+        db = _get_db()
+        history = db.get_edit_history(limit=1)
+        if not history:
+            return jsonify({"available": False, "description": "", "count": 0})
+        total = db.conn.execute(
+            "SELECT COUNT(*) FROM edit_history WHERE workspace_id = ?",
+            (db._ws_id(),),
+        ).fetchone()[0]
+        return jsonify({
+            "available": True,
+            "description": history[0]["description"],
+            "count": total,
+        })
+
+    @app.route("/api/edit-history")
+    def api_edit_history():
+        db = _get_db()
+        limit = request.args.get("limit", 50, type=int)
+        offset = request.args.get("offset", 0, type=int)
+        return jsonify(db.get_edit_history(limit=limit, offset=offset))
 
     # -- Statistics --
 
@@ -3375,7 +3297,7 @@ def create_app(db_path, thumb_cache_dir=None):
         # Cosine distance matrix (1 - similarity)
         # Embeddings are normalized, so dot product = cosine similarity
         sim_matrix = emb_matrix @ emb_matrix.T
-        dist_matrix = 1.0 - sim_matrix
+        dist_matrix = np.maximum(1.0 - sim_matrix, 0.0)
         np.fill_diagonal(dist_matrix, 0)
 
         # Agglomerative clustering
@@ -3889,6 +3811,33 @@ def create_app(db_path, thumb_cache_dir=None):
             db.conn.rollback()
             raise
 
+        # Update pipeline cache if it exists
+        from pipeline import load_results_raw, save_results_raw
+
+        cache_dir = os.path.dirname(db_path)
+        cached = load_results_raw(cache_dir, db._active_workspace_id)
+        if cached:
+            photo_id_set = set(photo_ids)
+            burst_index = body.get("burst_index")
+            for enc in cached.get("encounters", []):
+                enc_ids = set(enc.get("photo_ids", []))
+                if not photo_id_set.issubset(enc_ids):
+                    continue
+                if burst_index is not None and "bursts" in enc:
+                    # Burst-level confirmation
+                    if 0 <= burst_index < len(enc["bursts"]):
+                        burst = enc["bursts"][burst_index]
+                        burst["species_override"] = {
+                            "species": species,
+                            "confirmed": True,
+                        }
+                else:
+                    # Encounter-level confirmation
+                    enc["species_confirmed"] = True
+                    enc["confirmed_species"] = species
+                break
+            save_results_raw(cached, cache_dir, db._active_workspace_id)
+
         return jsonify({
             "ok": True,
             "species": species,
@@ -4053,6 +4002,146 @@ def create_app(db_path, thumb_cache_dir=None):
         save_results(results, cache_dir, db._active_workspace_id)
 
         return jsonify(serialize_results(results))
+
+    @app.route("/api/pipeline/detach-burst", methods=["POST"])
+    def api_pipeline_detach_burst():
+        """Detach a burst from its encounter, creating a new standalone encounter."""
+        from pipeline import load_results_raw, rebuild_species_predictions, save_results_raw
+
+        body = request.get_json(silent=True) or {}
+        enc_idx = body.get("encounter_index")
+        burst_idx = body.get("burst_index")
+        if enc_idx is None or burst_idx is None:
+            return json_error("encounter_index and burst_index are required")
+
+        db = _get_db()
+        cache_dir = os.path.dirname(db_path)
+        results = load_results_raw(cache_dir, db._active_workspace_id)
+        if results is None:
+            return json_error("No pipeline results found", 404)
+
+        encounters = results["encounters"]
+        if enc_idx < 0 or enc_idx >= len(encounters):
+            return json_error("Invalid encounter_index")
+        enc = encounters[enc_idx]
+        bursts = enc.get("bursts", [])
+        if burst_idx < 0 or burst_idx >= len(bursts):
+            return json_error("Invalid burst_index")
+
+        # Remove burst from encounter
+        detached = bursts.pop(burst_idx)
+        detached_ids = detached["photo_ids"]
+
+        if len(bursts) == 0:
+            # Last burst — remove the encounter entirely, detached becomes the encounter
+            encounters.pop(enc_idx)
+        else:
+            # Update encounter metadata and recalculate species predictions
+            enc["photo_ids"] = [pid for pid in enc["photo_ids"] if pid not in detached_ids]
+            enc["photo_count"] = len(enc["photo_ids"])
+            enc["burst_count"] = len(bursts)
+            enc["species_predictions"] = rebuild_species_predictions(results, enc["photo_ids"])
+            # Recalculate remaining burst predictions too
+            for b in bursts:
+                b["species_predictions"] = rebuild_species_predictions(results, b["photo_ids"])
+
+        # Create new encounter from detached burst
+        new_enc_predictions = rebuild_species_predictions(results, detached_ids)
+        # Also refresh the detached burst's own predictions
+        detached["species_predictions"] = new_enc_predictions
+        new_enc = {
+            "species": enc.get("species"),
+            "confirmed_species": detached.get("species_override", {}).get("species") if detached.get("species_override") else None,
+            "species_predictions": new_enc_predictions,
+            "species_confirmed": bool(detached.get("species_override", {}).get("confirmed")) if detached.get("species_override") else False,
+            "photo_count": len(detached_ids),
+            "burst_count": 1,
+            "time_range": [None, None],
+            "photo_ids": detached_ids,
+            "bursts": [detached],
+        }
+        encounters.append(new_enc)
+
+        # Update summary
+        results["summary"]["encounter_count"] = len(encounters)
+        results["summary"]["burst_count"] = sum(
+            e.get("burst_count", 0) for e in encounters
+        )
+
+        save_results_raw(results, cache_dir, db._active_workspace_id)
+        return jsonify({"ok": True, "encounters": encounters, "summary": results["summary"]})
+
+    @app.route("/api/pipeline/detach-photo", methods=["POST"])
+    def api_pipeline_detach_photo():
+        """Detach a photo from its burst, creating a new single-photo burst."""
+        from pipeline import load_results_raw, rebuild_species_predictions, save_results_raw
+
+        body = request.get_json(silent=True) or {}
+        enc_idx = body.get("encounter_index")
+        burst_idx = body.get("burst_index")
+        photo_id = body.get("photo_id")
+        if enc_idx is None or burst_idx is None or photo_id is None:
+            return json_error("encounter_index, burst_index, and photo_id are required")
+
+        db = _get_db()
+        cache_dir = os.path.dirname(db_path)
+        results = load_results_raw(cache_dir, db._active_workspace_id)
+        if results is None:
+            return json_error("No pipeline results found", 404)
+
+        encounters = results["encounters"]
+        if enc_idx < 0 or enc_idx >= len(encounters):
+            return json_error("Invalid encounter_index")
+        enc = encounters[enc_idx]
+        bursts = enc.get("bursts", [])
+        if burst_idx < 0 or burst_idx >= len(bursts):
+            return json_error("Invalid burst_index")
+
+        burst = bursts[burst_idx]
+        if photo_id not in burst["photo_ids"]:
+            return json_error("photo_id not in burst")
+
+        # Remove photo from burst
+        burst["photo_ids"].remove(photo_id)
+
+        if len(burst["photo_ids"]) == 0:
+            # Last photo — remove the empty burst
+            bursts.pop(burst_idx)
+        else:
+            # Recalculate source burst predictions without the removed photo
+            burst["species_predictions"] = rebuild_species_predictions(results, burst["photo_ids"])
+
+        # Create new single-photo burst in the same encounter
+        new_burst = {
+            "photo_ids": [photo_id],
+            "species_predictions": rebuild_species_predictions(results, [photo_id]),
+            "species_override": None,
+        }
+        bursts.append(new_burst)
+        enc["burst_count"] = len(bursts)
+        # Recalculate encounter-level predictions
+        enc["species_predictions"] = rebuild_species_predictions(results, enc["photo_ids"])
+
+        # Update summary
+        results["summary"]["burst_count"] = sum(
+            e.get("burst_count", 0) for e in encounters
+        )
+
+        save_results_raw(results, cache_dir, db._active_workspace_id)
+        return jsonify({"ok": True, "encounters": encounters, "summary": results["summary"]})
+
+    @app.route("/api/pipeline/save-cache", methods=["POST"])
+    def api_pipeline_save_cache():
+        """Save pipeline results back to cache (used by undo)."""
+        from pipeline import save_results_raw
+
+        body = request.get_json(silent=True) or {}
+        if not isinstance(body.get("encounters"), list) or not isinstance(body.get("photos"), list):
+            return json_error("Invalid pipeline results structure")
+        db = _get_db()
+        cache_dir = os.path.dirname(db_path)
+        save_results_raw(body, cache_dir, db._active_workspace_id)
+        return jsonify({"ok": True})
 
     @app.route("/api/pipeline/config", methods=["GET", "POST"])
     def api_pipeline_config():

@@ -372,3 +372,40 @@ def test_pipeline_page_init_api(app_and_db):
     assert 'proxy_longest_edge' in pc
     # total_photos should match our fixture data (3 photos)
     assert data['total_photos'] == 3
+
+
+def test_templates_jinja_free_except_includes():
+    """All .html templates must be free of Jinja2 syntax except {% include '...' %}."""
+    import os
+    import re
+
+    templates_dir = os.path.join(os.path.dirname(__file__), '..', 'templates')
+    templates_dir = os.path.normpath(templates_dir)
+
+    # Patterns that match Jinja2 block tags and expression tags
+    jinja_block_re = re.compile(r'\{%.*?%\}', re.DOTALL)
+    jinja_expr_re = re.compile(r'\{\{.*?\}\}', re.DOTALL)
+    # Allowed: {% include '...' %} or {% include "..." %}
+    include_re = re.compile(r"\{%\s*include\s+['\"].*?['\"]\s*%\}")
+
+    violations = []
+
+    for fname in sorted(os.listdir(templates_dir)):
+        if not fname.endswith('.html'):
+            continue
+        fpath = os.path.join(templates_dir, fname)
+        with open(fpath, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+        for lineno, line in enumerate(lines, start=1):
+            # Check for {{ ... }} expressions — never allowed
+            for m in jinja_expr_re.finditer(line):
+                violations.append(f"{fname}:{lineno}: {m.group().strip()}")
+            # Check for {% ... %} blocks — only includes are allowed
+            for m in jinja_block_re.finditer(line):
+                if not include_re.fullmatch(m.group()):
+                    violations.append(f"{fname}:{lineno}: {m.group().strip()}")
+
+    assert violations == [], (
+        "Jinja2 syntax found in templates (only {% include '...' %} is allowed):\n"
+        + "\n".join(violations)
+    )

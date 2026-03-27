@@ -517,25 +517,39 @@ def create_app(db_path, thumb_cache_dir=None):
 
     @app.route("/api/keywords/duplicates")
     def api_keyword_duplicates():
-        """Find case-insensitive duplicate keywords (preview before merge)."""
+        """Find case-insensitive duplicate keywords within current workspace."""
         db = _get_db()
+        ws = db._active_workspace_id
         dupes = db.conn.execute(
-            """SELECT LOWER(name) as lname, GROUP_CONCAT(id) as ids,
-                      GROUP_CONCAT(name, ' | ') as names, COUNT(*) as cnt
-               FROM keywords GROUP BY LOWER(name) HAVING COUNT(*) > 1"""
+            """SELECT LOWER(k.name) as lname, GROUP_CONCAT(k.id) as ids,
+                      GROUP_CONCAT(k.name, ' | ') as names, COUNT(DISTINCT k.id) as cnt
+               FROM keywords k
+               JOIN photo_keywords pk ON pk.keyword_id = k.id
+               JOIN photos p ON p.id = pk.photo_id
+               JOIN workspace_folders wf ON wf.folder_id = p.folder_id
+               WHERE wf.workspace_id = ?
+               GROUP BY LOWER(k.name) HAVING COUNT(DISTINCT k.id) > 1""",
+            (ws,),
         ).fetchall()
         results = []
         for d in dupes:
-            ids = [int(x) for x in d["ids"].split(",")]
-            names = d["names"].split(" | ")
-            # Count photos for each variant
+            ids = list(set(int(x) for x in d["ids"].split(",")))
+            # Count photos per variant within this workspace
             variants = []
-            for kid, kname in zip(ids, names):
-                count = db.conn.execute(
-                    "SELECT COUNT(*) FROM photo_keywords WHERE keyword_id = ?", (kid,)
-                ).fetchone()[0]
-                variants.append({"id": kid, "name": kname, "photo_count": count})
-            results.append({"variants": variants, "keep": variants[0]["name"]})
+            for kid in ids:
+                row = db.conn.execute(
+                    """SELECT k.name, COUNT(pk.photo_id) as cnt
+                       FROM keywords k
+                       JOIN photo_keywords pk ON pk.keyword_id = k.id
+                       JOIN photos p ON p.id = pk.photo_id
+                       JOIN workspace_folders wf ON wf.folder_id = p.folder_id
+                       WHERE k.id = ? AND wf.workspace_id = ?""",
+                    (kid, ws),
+                ).fetchone()
+                if row and row["cnt"] > 0:
+                    variants.append({"id": kid, "name": row["name"], "photo_count": row["cnt"]})
+            if len(variants) > 1:
+                results.append({"variants": variants, "keep": variants[0]["name"]})
         return jsonify(results)
 
     @app.route("/api/keywords/clean", methods=["POST"])
@@ -1199,7 +1213,13 @@ def create_app(db_path, thumb_cache_dir=None):
             names = [s.get("name", os.path.basename(s["labels_file"])) for s in active_sets]
             label_name = ", ".join(names)
         else:
-            active_sets = get_active_labels()
+            db = _get_db()
+            ws_labels = db.get_workspace_active_labels()
+            if ws_labels is not None:
+                saved_by_file = {s["labels_file"]: s for s in get_saved_labels()}
+                active_sets = [saved_by_file.get(p, {"labels_file": p}) for p in ws_labels if os.path.exists(p)]
+            else:
+                active_sets = get_active_labels()
             if active_sets:
                 labels = load_merged_labels(active_sets)
                 label_count = len(labels)
@@ -1923,10 +1943,21 @@ def create_app(db_path, thumb_cache_dir=None):
 
     @app.route("/api/labels")
     def api_labels_list():
-        from labels import get_active_labels, get_saved_labels
+        from labels import get_active_labels as get_global_active_labels, get_saved_labels
 
+        db = _get_db()
         saved = get_saved_labels()
-        active = get_active_labels()
+        ws_labels = db.get_workspace_active_labels()
+        if ws_labels is not None:
+            # Resolve workspace labels to metadata
+            saved_by_file = {s["labels_file"]: s for s in saved}
+            active = []
+            for p in ws_labels:
+                if os.path.exists(p):
+                    meta = saved_by_file.get(p, {"labels_file": p})
+                    active.append(meta)
+        else:
+            active = get_global_active_labels()
         return jsonify(
             {
                 "labels": saved,
@@ -1955,9 +1986,8 @@ def create_app(db_path, thumb_cache_dir=None):
             if not single:
                 return json_error("labels_files or labels_file required")
             labels_files = [single]
-        from labels import set_active_labels
-
-        set_active_labels(labels_files)
+        db = _get_db()
+        db.set_workspace_active_labels(labels_files)
         return jsonify({"ok": True})
 
     @app.route("/api/jobs/fetch-labels", methods=["POST"])
@@ -1982,7 +2012,7 @@ def create_app(db_path, thumb_cache_dir=None):
         active_ws = _get_db()._active_workspace_id
 
         def work(job):
-            from labels import fetch_species_list, save_labels, set_active_labels
+            from labels import fetch_species_list, save_labels
 
             def progress_cb(msg, current=None, total=None):
                 job["progress"]["current_file"] = msg
@@ -2014,7 +2044,10 @@ def create_app(db_path, thumb_cache_dir=None):
                 name, place_id, place_name, taxon_groups, species,
                 observation_filter=observation_filter,
             )
-            set_active_labels(labels_path)
+            from db import Database
+            thread_db = Database(db_path)
+            thread_db.set_active_workspace(active_ws)
+            thread_db.set_workspace_active_labels([labels_path])
 
             # Auto-compute embeddings for the active model
             from models import get_active_model

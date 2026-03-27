@@ -573,6 +573,118 @@ def test_get_folder_tree_scoped_to_workspace(db):
     assert folders[0]["path"] == "/photos/kenya"
 
 
+def test_count_keywords_scoped_by_workspace(db):
+    """count_keywords only counts keywords used by photos in the active workspace."""
+    # Workspace A with a folder and photo
+    ws_a = db.create_workspace("A")
+    fid_a = db.add_folder("/photos/a", name="a")
+    db.add_workspace_folder(ws_a, fid_a)
+    pid_a = db.add_photo(folder_id=fid_a, filename="a.jpg", extension=".jpg",
+                         file_size=100, file_mtime=1.0)
+    k1 = db.add_keyword("Robin")
+    k2 = db.add_keyword("Jay")
+    db.tag_photo(pid_a, k1)
+    db.tag_photo(pid_a, k2)
+
+    # Workspace B with a different folder and photo
+    ws_b = db.create_workspace("B")
+    fid_b = db.add_folder("/photos/b", name="b")
+    db.add_workspace_folder(ws_b, fid_b)
+    pid_b = db.add_photo(folder_id=fid_b, filename="b.jpg", extension=".jpg",
+                         file_size=100, file_mtime=1.0)
+    k3 = db.add_keyword("Hawk")
+    db.tag_photo(pid_b, k3)
+
+    db.set_active_workspace(ws_a)
+    assert db.count_keywords() == 2
+
+    db.set_active_workspace(ws_b)
+    assert db.count_keywords() == 1
+
+
+def test_count_keywords_empty_workspace(db):
+    """A workspace with no photos returns 0 keywords."""
+    ws = db.create_workspace("Empty")
+    db.add_keyword("Robin")  # global keyword, no photos in this workspace
+    db.set_active_workspace(ws)
+    assert db.count_keywords() == 0
+
+
+def test_dashboard_top_keywords_scoped_by_workspace(db):
+    """get_dashboard_stats top_keywords only includes current workspace's keywords."""
+    ws_a = db.create_workspace("A")
+    fid_a = db.add_folder("/photos/a", name="a")
+    db.add_workspace_folder(ws_a, fid_a)
+    pid_a = db.add_photo(folder_id=fid_a, filename="a.jpg", extension=".jpg",
+                         file_size=100, file_mtime=1.0, timestamp="2024-01-01T00:00:00")
+    k1 = db.add_keyword("Robin")
+    db.tag_photo(pid_a, k1)
+
+    ws_b = db.create_workspace("B")
+    fid_b = db.add_folder("/photos/b", name="b")
+    db.add_workspace_folder(ws_b, fid_b)
+    pid_b = db.add_photo(folder_id=fid_b, filename="b.jpg", extension=".jpg",
+                         file_size=100, file_mtime=1.0, timestamp="2024-01-01T00:00:00")
+    k2 = db.add_keyword("Hawk")
+    db.tag_photo(pid_b, k2)
+
+    db.set_active_workspace(ws_a)
+    stats = db.get_dashboard_stats()
+    kw_names = [kw["name"] for kw in stats["top_keywords"]]
+    assert "Robin" in kw_names
+    assert "Hawk" not in kw_names
+
+    db.set_active_workspace(ws_b)
+    stats = db.get_dashboard_stats()
+    kw_names = [kw["name"] for kw in stats["top_keywords"]]
+    assert "Hawk" in kw_names
+    assert "Robin" not in kw_names
+
+
+def test_keyword_tree_scoped_by_workspace(db):
+    """get_keyword_tree returns only keywords used by photos in the active workspace."""
+    ws_a = db.create_workspace("A")
+    fid_a = db.add_folder("/photos/a", name="a")
+    db.add_workspace_folder(ws_a, fid_a)
+    pid_a = db.add_photo(folder_id=fid_a, filename="a.jpg", extension=".jpg",
+                         file_size=100, file_mtime=1.0)
+    k1 = db.add_keyword("Robin")
+    k2 = db.add_keyword("Jay")
+    db.tag_photo(pid_a, k1)
+    db.tag_photo(pid_a, k2)
+
+    ws_b = db.create_workspace("B")
+    fid_b = db.add_folder("/photos/b", name="b")
+    db.add_workspace_folder(ws_b, fid_b)
+    pid_b = db.add_photo(folder_id=fid_b, filename="b.jpg", extension=".jpg",
+                         file_size=100, file_mtime=1.0)
+    k3 = db.add_keyword("Hawk")
+    db.tag_photo(pid_b, k3)
+
+    db.set_active_workspace(ws_a)
+    tree = db.get_keyword_tree()
+    names = [kw["name"] for kw in tree]
+    assert "Robin" in names
+    assert "Jay" in names
+    assert "Hawk" not in names
+
+    db.set_active_workspace(ws_b)
+    tree = db.get_keyword_tree()
+    names = [kw["name"] for kw in tree]
+    assert "Hawk" in names
+    assert "Robin" not in names
+    assert "Jay" not in names
+
+
+def test_keyword_tree_empty_workspace(db):
+    """Empty workspace returns no keywords even if keywords exist globally."""
+    ws = db.create_workspace("Empty")
+    db.add_keyword("Robin")
+    db.set_active_workspace(ws)
+    tree = db.get_keyword_tree()
+    assert len(tree) == 0
+
+
 def test_get_collection_photos_scoped_to_workspace_folders(db):
     """Collection should only return photos from workspace folders."""
     ws = db.create_workspace("Test")
@@ -588,3 +700,117 @@ def test_get_collection_photos_scoped_to_workspace_folders(db):
     photos = db.get_collection_photos(cid, per_page=100)
     assert len(photos) == 1
     assert photos[0]["filename"] == "lion.jpg"
+
+
+# -- Task 5: Workspace-scoped active labels helpers --
+
+
+def test_get_workspace_active_labels_default_empty(db):
+    """Workspace with no active_labels in config_overrides returns None."""
+    ws = db.create_workspace("Fresh")
+    db.set_active_workspace(ws)
+    assert db.get_workspace_active_labels() is None
+
+
+def test_set_and_get_workspace_active_labels(db):
+    """set/get workspace active labels round-trips through config_overrides."""
+    ws = db.create_workspace("Labeled")
+    db.set_active_workspace(ws)
+    paths = ["/home/user/.vireo/labels/ca-birds.txt", "/home/user/.vireo/labels/ca-reptiles.txt"]
+    db.set_workspace_active_labels(paths)
+    assert db.get_workspace_active_labels() == paths
+
+
+def test_set_workspace_active_labels_preserves_other_overrides(db):
+    """Setting active labels doesn't clobber other config_overrides."""
+    ws = db.create_workspace("WithConfig", config_overrides={"threshold": 0.5})
+    db.set_active_workspace(ws)
+    db.set_workspace_active_labels(["/path/to/labels.txt"])
+    result = db.get_workspace_active_labels()
+    assert result == ["/path/to/labels.txt"]
+    # Check threshold is still there
+    overrides = json.loads(db.get_workspace(ws)["config_overrides"])
+    assert overrides["threshold"] == 0.5
+
+
+def test_merge_duplicate_keywords_scoped_by_workspace(db):
+    """merge_duplicate_keywords only merges duplicates used in the active workspace."""
+    ws_a = db.create_workspace("A")
+    fid_a = db.add_folder("/photos/a", name="a")
+    db.add_workspace_folder(ws_a, fid_a)
+    pid_a = db.add_photo(folder_id=fid_a, filename="a.jpg", extension=".jpg",
+                         file_size=100, file_mtime=1.0)
+
+    ws_b = db.create_workspace("B")
+    fid_b = db.add_folder("/photos/b", name="b")
+    db.add_workspace_folder(ws_b, fid_b)
+    pid_b = db.add_photo(folder_id=fid_b, filename="b.jpg", extension=".jpg",
+                         file_size=100, file_mtime=1.0)
+
+    # Create case-variant duplicates via raw SQL (add_keyword dedupes)
+    db.conn.execute("INSERT INTO keywords (name) VALUES ('Cardinal')")
+    db.conn.execute("INSERT INTO keywords (name) VALUES ('cardinal')")
+    db.conn.execute("INSERT INTO keywords (name) VALUES ('Sparrow')")
+    db.conn.execute("INSERT INTO keywords (name) VALUES ('sparrow')")
+    db.conn.commit()
+
+    k_cardinal = db.conn.execute("SELECT id FROM keywords WHERE name='Cardinal'").fetchone()[0]
+    k_cardinal_lc = db.conn.execute("SELECT id FROM keywords WHERE name='cardinal'").fetchone()[0]
+    k_sparrow = db.conn.execute("SELECT id FROM keywords WHERE name='Sparrow'").fetchone()[0]
+    k_sparrow_lc = db.conn.execute("SELECT id FROM keywords WHERE name='sparrow'").fetchone()[0]
+
+    # Tag Cardinal/cardinal on photos in workspace A
+    db.tag_photo(pid_a, k_cardinal)
+    db.tag_photo(pid_a, k_cardinal_lc)
+    # Tag Sparrow/sparrow on photos in workspace B
+    db.tag_photo(pid_b, k_sparrow)
+    db.tag_photo(pid_b, k_sparrow_lc)
+
+    # Merge in workspace A — should only merge Cardinal pair
+    db.set_active_workspace(ws_a)
+    merged = db.merge_duplicate_keywords()
+    assert merged == 1  # only Cardinal/cardinal
+
+    # Sparrow/sparrow should still exist as two separate keywords
+    sparrows = db.conn.execute(
+        "SELECT COUNT(*) FROM keywords WHERE name IN ('Sparrow', 'sparrow')"
+    ).fetchone()[0]
+    assert sparrows == 2
+
+
+def test_empty_workspace_labels_does_not_fallback_to_global(db):
+    """An explicit empty active_labels [] should NOT fall back to global labels."""
+    ws = db.create_workspace("Empty Labels")
+    db.set_active_workspace(ws)
+    db.set_workspace_active_labels([])  # explicitly no labels
+
+    result = db.get_workspace_active_labels()
+    assert result == []  # should be empty list, not None
+
+    # Simulate what _load_labels does: ws_labels is not None should be True
+    ws_labels = db.get_workspace_active_labels()
+    assert ws_labels is not None  # must distinguish [] from None
+
+
+def test_keyword_tree_includes_ancestors(db):
+    """get_keyword_tree includes untagged ancestor keywords so hierarchy is navigable."""
+    ws = db.create_workspace("Hier")
+    fid = db.add_folder("/photos/h", name="h")
+    db.add_workspace_folder(ws, fid)
+    pid = db.add_photo(folder_id=fid, filename="h.jpg", extension=".jpg",
+                       file_size=100, file_mtime=1.0)
+
+    # Create hierarchy: Birds > Raptors > Red-tailed Hawk
+    birds = db.add_keyword("Birds")
+    raptors = db.add_keyword("Raptors", parent_id=birds)
+    hawk = db.add_keyword("Red-tailed Hawk", parent_id=raptors)
+
+    # Only tag the leaf (mimics scanner behavior)
+    db.tag_photo(pid, hawk)
+
+    db.set_active_workspace(ws)
+    tree = db.get_keyword_tree()
+    names = {kw["name"] for kw in tree}
+    assert "Red-tailed Hawk" in names
+    assert "Raptors" in names  # ancestor must be included
+    assert "Birds" in names    # root ancestor must be included

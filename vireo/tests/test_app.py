@@ -630,3 +630,101 @@ def test_pipeline_detach_photo(app_and_db):
     # New burst predictions should reflect photo 3
     new_species = [sp["species"] for sp in enc["bursts"][1]["species_predictions"]]
     assert "Eagle" in new_species
+
+
+def test_keyword_duplicates_scoped_by_workspace(app_and_db):
+    """Keyword duplicates endpoint only reports duplicates within the active workspace."""
+    app, db = app_and_db
+    ws = db._active_workspace_id
+
+    # Default workspace already has photos from conftest — add a case-variant keyword
+    # Must insert directly to bypass add_keyword's case-insensitive dedup
+    cur = db.conn.execute(
+        "INSERT INTO keywords (name, is_species) VALUES (?, 0)", ("cardinal",)
+    )
+    db.conn.commit()
+    k = cur.lastrowid
+    # Tag a photo in the current workspace with the variant
+    photos = db.get_photos()
+    db.tag_photo(photos[0]["id"], k)
+
+    # Create workspace B with its own folder and photo
+    ws_b = db.create_workspace("B")
+    db.set_active_workspace(ws_b)
+    fid_b = db.add_folder("/photos/b", name="b")
+    pid_b = db.add_photo(folder_id=fid_b, filename="b.jpg", extension=".jpg",
+                         file_size=100, file_mtime=1.0)
+    # Insert a case-variant of "Sparrow" directly to bypass dedup
+    cur_b = db.conn.execute(
+        "INSERT INTO keywords (name, is_species) VALUES (?, 0)", ("sparrow",)
+    )
+    db.conn.commit()
+    k_b = cur_b.lastrowid
+    db.tag_photo(pid_b, k_b)
+
+    # Switch back to default workspace for the API call
+    db.set_active_workspace(ws)
+
+    with app.test_client() as c:
+        # In workspace A, should see Cardinal/cardinal dupe but not Sparrow/sparrow
+        resp = c.get("/api/keywords/duplicates")
+        data = resp.get_json()
+        dupe_names = []
+        for d in data:
+            for v in d["variants"]:
+                dupe_names.append(v["name"])
+        assert "Cardinal" in dupe_names or "cardinal" in dupe_names
+        # sparrow dupe is only in ws_b, should not appear
+        assert "sparrow" not in dupe_names
+
+
+def test_set_active_labels_scoped_to_workspace(app_and_db, tmp_path):
+    """Setting active labels stores them in workspace config_overrides, not global file."""
+    app, db = app_and_db
+
+    # Create a fake label file
+    labels_dir = tmp_path / "labels"
+    labels_dir.mkdir(exist_ok=True)
+    label_path = str(labels_dir / "test-birds.txt")
+    with open(label_path, "w") as f:
+        f.write("Robin\nJay\n")
+
+    with app.test_client() as c:
+        resp = c.post("/api/labels/active",
+                       json={"labels_files": [label_path]},
+                       content_type="application/json")
+        assert resp.status_code == 200
+
+    # Verify it's stored in workspace config_overrides
+    result = db.get_workspace_active_labels()
+    assert result == [label_path]
+
+
+def test_labels_list_returns_workspace_active(app_and_db, tmp_path):
+    """GET /api/labels returns active labels from the workspace, not global."""
+    app, db = app_and_db
+
+    # Set workspace-specific active labels
+    labels_dir = tmp_path / "labels"
+    labels_dir.mkdir(exist_ok=True)
+    label_path = str(labels_dir / "test-birds.txt")
+    with open(label_path, "w") as f:
+        f.write("Robin\nJay\n")
+    meta_path = str(labels_dir / "test-birds.json")
+    import json as _json
+    with open(meta_path, "w") as f:
+        _json.dump({"name": "Test Birds", "labels_file": label_path, "species_count": 2}, f)
+
+    db.set_workspace_active_labels([label_path])
+
+    import labels as labels_mod
+    orig_labels_dir = labels_mod.LABELS_DIR
+    labels_mod.LABELS_DIR = str(labels_dir)
+    try:
+        with app.test_client() as c:
+            resp = c.get("/api/labels")
+            data = resp.get_json()
+            active_files = [a.get("labels_file") for a in data["active"]]
+            assert label_path in active_files
+    finally:
+        labels_mod.LABELS_DIR = orig_labels_dir

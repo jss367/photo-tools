@@ -475,6 +475,30 @@ class Database:
         except (json.JSONDecodeError, TypeError):
             return global_config
 
+    def get_workspace_active_labels(self):
+        """Return the active_labels list from workspace config_overrides, or None."""
+        ws = self.get_workspace(self._ws_id())
+        if not ws or not ws["config_overrides"]:
+            return None
+        try:
+            overrides = json.loads(ws["config_overrides"]) if isinstance(ws["config_overrides"], str) else ws["config_overrides"]
+            labels = overrides.get("active_labels")
+            return labels if isinstance(labels, list) else None
+        except (json.JSONDecodeError, TypeError):
+            return None
+
+    def set_workspace_active_labels(self, labels_files):
+        """Store active_labels in the workspace's config_overrides."""
+        ws = self.get_workspace(self._ws_id())
+        overrides = {}
+        if ws and ws["config_overrides"]:
+            try:
+                overrides = json.loads(ws["config_overrides"]) if isinstance(ws["config_overrides"], str) else ws["config_overrides"]
+            except (json.JSONDecodeError, TypeError):
+                overrides = {}
+        overrides["active_labels"] = labels_files
+        self.update_workspace(self._ws_id(), config_overrides=overrides)
+
     def delete_workspace(self, workspace_id):
         """Delete a workspace and all its scoped data (cascade)."""
         self.conn.execute("DELETE FROM workspaces WHERE id = ?", (workspace_id,))
@@ -622,8 +646,15 @@ class Database:
         ).fetchone()[0]
 
     def count_keywords(self):
-        """Return total keyword count."""
-        return self.conn.execute("SELECT COUNT(*) FROM keywords").fetchone()[0]
+        """Return count of keywords used by photos in the active workspace."""
+        return self.conn.execute(
+            """SELECT COUNT(DISTINCT pk.keyword_id)
+               FROM photo_keywords pk
+               JOIN photos p ON p.id = pk.photo_id
+               JOIN workspace_folders wf ON wf.folder_id = p.folder_id
+               WHERE wf.workspace_id = ?""",
+            (self._ws_id(),),
+        ).fetchone()[0]
 
     def count_pending_changes(self):
         """Return pending changes count."""
@@ -657,11 +688,15 @@ class Database:
 
         top_keywords = self.conn.execute(
             """SELECT k.name, k.is_species, COUNT(pk.photo_id) as photo_count
-            FROM keywords k
-            JOIN photo_keywords pk ON pk.keyword_id = k.id
-            GROUP BY k.id
-            ORDER BY photo_count DESC
-            LIMIT 30"""
+               FROM keywords k
+               JOIN photo_keywords pk ON pk.keyword_id = k.id
+               JOIN photos p ON p.id = pk.photo_id
+               JOIN workspace_folders wf ON wf.folder_id = p.folder_id
+               WHERE wf.workspace_id = ?
+               GROUP BY k.id
+               ORDER BY photo_count DESC
+               LIMIT 30""",
+            (ws,),
         ).fetchall()
 
         photos_by_month = self.conn.execute(
@@ -1171,14 +1206,23 @@ class Database:
         return cur.lastrowid
 
     def merge_duplicate_keywords(self):
-        """Find and merge case-insensitive duplicate keywords.
+        """Find and merge case-insensitive duplicate keywords in active workspace.
 
+        Only merges keywords that are used by photos in the active workspace.
         Keeps the lowest ID (earliest created), moves all photo associations,
         and deletes the duplicates. Returns count of merges performed.
         """
+        ws = self._ws_id()
         dupes = self.conn.execute(
-            """SELECT LOWER(name) as lname, MIN(id) as keep_id, GROUP_CONCAT(id) as all_ids
-               FROM keywords GROUP BY LOWER(name) HAVING COUNT(*) > 1"""
+            """SELECT LOWER(k.name) as lname, MIN(k.id) as keep_id,
+                      GROUP_CONCAT(DISTINCT k.id) as all_ids
+               FROM keywords k
+               JOIN photo_keywords pk ON pk.keyword_id = k.id
+               JOIN photos p ON p.id = pk.photo_id
+               JOIN workspace_folders wf ON wf.folder_id = p.folder_id
+               WHERE wf.workspace_id = ?
+               GROUP BY LOWER(k.name) HAVING COUNT(DISTINCT k.id) > 1""",
+            (ws,),
         ).fetchall()
 
         merged = 0
@@ -1206,9 +1250,29 @@ class Database:
         return merged
 
     def get_keyword_tree(self):
-        """Return all keywords as a list of Row objects."""
+        """Return keywords used by photos in the active workspace, plus ancestors."""
         return self.conn.execute(
-            "SELECT id, name, parent_id FROM keywords ORDER BY name"
+            """WITH RECURSIVE
+               leaf_kw AS (
+                   SELECT DISTINCT pk.keyword_id AS id
+                   FROM photo_keywords pk
+                   JOIN photos p ON p.id = pk.photo_id
+                   JOIN workspace_folders wf ON wf.folder_id = p.folder_id
+                   WHERE wf.workspace_id = ?
+               ),
+               ancestors AS (
+                   SELECT id FROM leaf_kw
+                   UNION
+                   SELECT k.parent_id
+                   FROM keywords k
+                   JOIN ancestors a ON a.id = k.id
+                   WHERE k.parent_id IS NOT NULL
+               )
+               SELECT k.id, k.name, k.parent_id
+               FROM keywords k
+               JOIN ancestors a ON a.id = k.id
+               ORDER BY k.name""",
+            (self._ws_id(),),
         ).fetchall()
 
     def tag_photo(self, photo_id, keyword_id):

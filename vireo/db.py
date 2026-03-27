@@ -622,8 +622,15 @@ class Database:
         ).fetchone()[0]
 
     def count_keywords(self):
-        """Return total keyword count."""
-        return self.conn.execute("SELECT COUNT(*) FROM keywords").fetchone()[0]
+        """Return count of keywords used by photos in the active workspace."""
+        return self.conn.execute(
+            """SELECT COUNT(DISTINCT pk.keyword_id)
+               FROM photo_keywords pk
+               JOIN photos p ON p.id = pk.photo_id
+               JOIN workspace_folders wf ON wf.folder_id = p.folder_id
+               WHERE wf.workspace_id = ?""",
+            (self._ws_id(),),
+        ).fetchone()[0]
 
     def count_pending_changes(self):
         """Return pending changes count."""

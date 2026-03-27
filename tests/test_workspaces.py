@@ -573,6 +573,43 @@ def test_get_folder_tree_scoped_to_workspace(db):
     assert folders[0]["path"] == "/photos/kenya"
 
 
+def test_count_keywords_scoped_by_workspace(db):
+    """count_keywords only counts keywords used by photos in the active workspace."""
+    # Workspace A with a folder and photo
+    ws_a = db.create_workspace("A")
+    fid_a = db.add_folder("/photos/a", name="a")
+    db.add_workspace_folder(ws_a, fid_a)
+    pid_a = db.add_photo(folder_id=fid_a, filename="a.jpg", extension=".jpg",
+                         file_size=100, file_mtime=1.0)
+    k1 = db.add_keyword("Robin")
+    k2 = db.add_keyword("Jay")
+    db.tag_photo(pid_a, k1)
+    db.tag_photo(pid_a, k2)
+
+    # Workspace B with a different folder and photo
+    ws_b = db.create_workspace("B")
+    fid_b = db.add_folder("/photos/b", name="b")
+    db.add_workspace_folder(ws_b, fid_b)
+    pid_b = db.add_photo(folder_id=fid_b, filename="b.jpg", extension=".jpg",
+                         file_size=100, file_mtime=1.0)
+    k3 = db.add_keyword("Hawk")
+    db.tag_photo(pid_b, k3)
+
+    db.set_active_workspace(ws_a)
+    assert db.count_keywords() == 2
+
+    db.set_active_workspace(ws_b)
+    assert db.count_keywords() == 1
+
+
+def test_count_keywords_empty_workspace(db):
+    """A workspace with no photos returns 0 keywords."""
+    ws = db.create_workspace("Empty")
+    db.add_keyword("Robin")  # global keyword, no photos in this workspace
+    db.set_active_workspace(ws)
+    assert db.count_keywords() == 0
+
+
 def test_get_collection_photos_scoped_to_workspace_folders(db):
     """Collection should only return photos from workspace folders."""
     ws = db.create_workspace("Test")

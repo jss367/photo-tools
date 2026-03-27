@@ -517,25 +517,39 @@ def create_app(db_path, thumb_cache_dir=None):
 
     @app.route("/api/keywords/duplicates")
     def api_keyword_duplicates():
-        """Find case-insensitive duplicate keywords (preview before merge)."""
+        """Find case-insensitive duplicate keywords within current workspace."""
         db = _get_db()
+        ws = db._active_workspace_id
         dupes = db.conn.execute(
-            """SELECT LOWER(name) as lname, GROUP_CONCAT(id) as ids,
-                      GROUP_CONCAT(name, ' | ') as names, COUNT(*) as cnt
-               FROM keywords GROUP BY LOWER(name) HAVING COUNT(*) > 1"""
+            """SELECT LOWER(k.name) as lname, GROUP_CONCAT(k.id) as ids,
+                      GROUP_CONCAT(k.name, ' | ') as names, COUNT(DISTINCT k.id) as cnt
+               FROM keywords k
+               JOIN photo_keywords pk ON pk.keyword_id = k.id
+               JOIN photos p ON p.id = pk.photo_id
+               JOIN workspace_folders wf ON wf.folder_id = p.folder_id
+               WHERE wf.workspace_id = ?
+               GROUP BY LOWER(k.name) HAVING COUNT(DISTINCT k.id) > 1""",
+            (ws,),
         ).fetchall()
         results = []
         for d in dupes:
-            ids = [int(x) for x in d["ids"].split(",")]
-            names = d["names"].split(" | ")
-            # Count photos for each variant
+            ids = list(set(int(x) for x in d["ids"].split(",")))
+            # Count photos per variant within this workspace
             variants = []
-            for kid, kname in zip(ids, names):
-                count = db.conn.execute(
-                    "SELECT COUNT(*) FROM photo_keywords WHERE keyword_id = ?", (kid,)
-                ).fetchone()[0]
-                variants.append({"id": kid, "name": kname, "photo_count": count})
-            results.append({"variants": variants, "keep": variants[0]["name"]})
+            for kid in ids:
+                row = db.conn.execute(
+                    """SELECT k.name, COUNT(pk.photo_id) as cnt
+                       FROM keywords k
+                       JOIN photo_keywords pk ON pk.keyword_id = k.id
+                       JOIN photos p ON p.id = pk.photo_id
+                       JOIN workspace_folders wf ON wf.folder_id = p.folder_id
+                       WHERE k.id = ? AND wf.workspace_id = ?""",
+                    (kid, ws),
+                ).fetchone()
+                if row and row["cnt"] > 0:
+                    variants.append({"id": kid, "name": row["name"], "photo_count": row["cnt"]})
+            if len(variants) > 1:
+                results.append({"variants": variants, "keep": variants[0]["name"]})
         return jsonify(results)
 
     @app.route("/api/keywords/clean", methods=["POST"])

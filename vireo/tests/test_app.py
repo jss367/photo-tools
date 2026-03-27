@@ -630,3 +630,49 @@ def test_pipeline_detach_photo(app_and_db):
     # New burst predictions should reflect photo 3
     new_species = [sp["species"] for sp in enc["bursts"][1]["species_predictions"]]
     assert "Eagle" in new_species
+
+
+def test_keyword_duplicates_scoped_by_workspace(app_and_db):
+    """Keyword duplicates endpoint only reports duplicates within the active workspace."""
+    app, db = app_and_db
+    ws = db._active_workspace_id
+
+    # Default workspace already has photos from conftest — add a case-variant keyword
+    # Must insert directly to bypass add_keyword's case-insensitive dedup
+    cur = db.conn.execute(
+        "INSERT INTO keywords (name, is_species) VALUES (?, 0)", ("cardinal",)
+    )
+    db.conn.commit()
+    k = cur.lastrowid
+    # Tag a photo in the current workspace with the variant
+    photos = db.get_photos()
+    db.tag_photo(photos[0]["id"], k)
+
+    # Create workspace B with its own folder and photo
+    ws_b = db.create_workspace("B")
+    db.set_active_workspace(ws_b)
+    fid_b = db.add_folder("/photos/b", name="b")
+    pid_b = db.add_photo(folder_id=fid_b, filename="b.jpg", extension=".jpg",
+                         file_size=100, file_mtime=1.0)
+    # Insert a case-variant of "Sparrow" directly to bypass dedup
+    cur_b = db.conn.execute(
+        "INSERT INTO keywords (name, is_species) VALUES (?, 0)", ("sparrow",)
+    )
+    db.conn.commit()
+    k_b = cur_b.lastrowid
+    db.tag_photo(pid_b, k_b)
+
+    # Switch back to default workspace for the API call
+    db.set_active_workspace(ws)
+
+    with app.test_client() as c:
+        # In workspace A, should see Cardinal/cardinal dupe but not Sparrow/sparrow
+        resp = c.get("/api/keywords/duplicates")
+        data = resp.get_json()
+        dupe_names = []
+        for d in data:
+            for v in d["variants"]:
+                dupe_names.append(v["name"])
+        assert "Cardinal" in dupe_names or "cardinal" in dupe_names
+        # sparrow dupe is only in ws_b, should not appear
+        assert "sparrow" not in dupe_names

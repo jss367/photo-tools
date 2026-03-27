@@ -106,3 +106,12 @@ def test_welcome_page_force_bypasses_redirect(app_and_db, monkeypatch):
     client = app.test_client()
     resp = client.get("/welcome?force=1")
     assert resp.status_code == 200
+
+
+def test_settings_page_has_setup_link(app_and_db):
+    """Settings page includes a link to re-run the welcome setup."""
+    app, _ = app_and_db
+    client = app.test_client()
+    resp = client.get("/settings")
+    assert resp.status_code == 200
+    assert b"/welcome?force=1" in resp.data

@@ -162,6 +162,37 @@ def create_app(db_path, thumb_cache_dir=None):
     def api_health():
         return jsonify({"status": "ok"})
 
+    @app.route("/api/models/status")
+    def api_models_status():
+        """Lightweight model readiness check for first-launch detection."""
+        from models import get_active_model, get_models
+
+        active = get_active_model()
+        classification_ready = bool(active and active.get("downloaded"))
+
+        all_models = get_models()
+        downloaded_ids = [m["id"] for m in all_models if m.get("downloaded")]
+
+        return jsonify({
+            "needs_setup": not classification_ready,
+            "classification": {
+                "ready": classification_ready,
+                "model_name": active["name"] if active else None,
+                "model_id": active["id"] if active else None,
+            },
+            "available_models": [
+                {
+                    "id": m["id"],
+                    "name": m["name"],
+                    "description": m.get("description", ""),
+                    "size_mb": m.get("size_mb", 0),
+                    "downloaded": m.get("downloaded", False),
+                    "model_type": m.get("model_type", "bioclip"),
+                }
+                for m in all_models
+            ],
+        })
+
     @app.route("/api/shutdown", methods=["POST"])
     def api_shutdown():
         # Require a non-simple header to block cross-site POSTs.
@@ -222,7 +253,30 @@ def create_app(db_path, thumb_cache_dir=None):
 
     @app.route("/")
     def index():
-        return redirect("/browse")
+        from models import get_active_model
+        active = get_active_model()
+        if active and active.get("downloaded"):
+            return redirect("/browse")
+        user_cfg = cfg.load()
+        if user_cfg.get("setup_complete"):
+            return redirect("/browse")
+        return redirect("/welcome")
+
+    @app.route("/welcome")
+    def welcome():
+        from models import get_active_model
+        active = get_active_model()
+        if active and active.get("downloaded") and not request.args.get("force"):
+            return redirect("/browse")
+        return render_template("welcome.html")
+
+    @app.route("/api/setup/complete", methods=["POST"])
+    def api_setup_complete():
+        """Mark first-launch setup as done (called after download or skip)."""
+        user_cfg = cfg.load()
+        user_cfg["setup_complete"] = True
+        cfg.save(user_cfg)
+        return jsonify({"ok": True})
 
     @app.route("/browse")
     def browse():

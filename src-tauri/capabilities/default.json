@@ -21,6 +21,9 @@
     "shell:allow-kill",
     "dialog:allow-open",
     "updater:default",
-    "process:allow-restart"
+    "process:allow-restart",
+    "core:tray:default",
+    "core:tray:allow-set-icon",
+    "core:tray:allow-set-tooltip"
   ]
 }

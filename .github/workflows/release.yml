@@ -1,88 +1,150 @@
-name: Release
+name: Build and Release
 
 on:
   push:
     tags:
-      - 'v*'
+      - "v*"
+
+  # Allow manual trigger for testing
+  workflow_dispatch:
 
 jobs:
-  release:
-    permissions:
-      contents: write
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - platform: macos-latest
-            args: '--target aarch64-apple-darwin'
-            rust-target: aarch64-apple-darwin
-          - platform: macos-latest
-            args: '--target x86_64-apple-darwin'
-            rust-target: x86_64-apple-darwin
-          - platform: ubuntu-22.04
-            args: ''
-            rust-target: ''
-          - platform: windows-latest
-            args: ''
-            rust-target: ''
-
-    runs-on: ${{ matrix.platform }}
+  build-macos:
+    runs-on: macos-latest
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
+      # --- Install the Apple signing certificate ---
+      - name: Install Apple certificate
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          # Create a temporary keychain
+          KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
+          KEYCHAIN_PASSWORD=$(openssl rand -base64 32)
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          # Import the certificate
+          echo "$APPLE_CERTIFICATE" | base64 --decode > $RUNNER_TEMP/certificate.p12
+          security import $RUNNER_TEMP/certificate.p12 \
+            -P "$APPLE_CERTIFICATE_PASSWORD" \
+            -A \
+            -t cert \
+            -f pkcs12 \
+            -k "$KEYCHAIN_PATH"
+
+          # Allow codesign to access the keychain without prompting
+          security set-key-partition-list -S apple-tool:,apple: \
+            -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          # Add the keychain to the search list
+          security list-keychains -d user -s "$KEYCHAIN_PATH" login.keychain-db
+
+          # Verify the certificate is available
+          security find-identity -v -p codesigning "$KEYCHAIN_PATH"
+
+      # --- Set up Python for the sidecar build ---
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: "3.12"
 
       - name: Install Python dependencies
-        run: pip install flask Pillow imagehash pyinstaller
-
-      - name: Build Python sidecar (macOS/Linux)
-        if: runner.os != 'Windows'
         run: |
-          pyinstaller --onefile --name vireo-server vireo/app.py
-          mkdir -p src-tauri/binaries
-          cp dist/vireo-server src-tauri/binaries/vireo-server-${{ matrix.rust-target || 'x86_64-unknown-linux-gnu' }}
+          pip install pyinstaller flask Pillow imagehash
 
-      - name: Build Python sidecar (Windows)
-        if: runner.os == 'Windows'
-        run: |
-          pyinstaller --onefile --name vireo-server vireo/app.py
-          mkdir -p src-tauri/binaries
-          cp dist/vireo-server.exe src-tauri/binaries/vireo-server-x86_64-pc-windows-msvc.exe
-
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.rust-target }}
-
-      - name: Install Linux dependencies
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
-
-      - name: Install Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: lts/*
-
-      - name: Install frontend dependencies
-        run: npm install
-
-      - name: Build and release
-        uses: tauri-apps/tauri-action@v0
+      # --- Build and sign the sidecar ---
+      - name: Build and sign sidecar
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: |
+          python scripts/build_sidecar.py
+
+      # --- Set up Rust and Tauri ---
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Tauri CLI
+        run: cargo install tauri-cli
+
+      # --- Build the Tauri app (signing happens automatically) ---
+      - name: Build Tauri app
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          cargo tauri build
+
+      # --- Notarize the DMG ---
+      - name: Notarize DMG
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          DMG_PATH=$(find src-tauri/target/release/bundle/dmg -name "*.dmg" | head -1)
+          echo "Notarizing: $DMG_PATH"
+
+          xcrun notarytool submit "$DMG_PATH" \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" \
+            --wait
+
+          xcrun stapler staple "$DMG_PATH"
+
+      # --- Verify ---
+      - name: Verify signature and notarization
+        run: |
+          APP_PATH="src-tauri/target/release/bundle/macos/Vireo.app"
+          DMG_PATH=$(find src-tauri/target/release/bundle/dmg -name "*.dmg" | head -1)
+
+          echo "=== App signature ==="
+          codesign --verify --deep --strict --verbose=2 "$APP_PATH"
+
+          echo ""
+          echo "=== DMG notarization ==="
+          spctl --assess --type open --context context:primary-signature --verbose=2 "$DMG_PATH"
+
+          echo ""
+          echo "=== Staple validation ==="
+          xcrun stapler validate "$DMG_PATH"
+
+      # --- Upload artifacts ---
+      - name: Upload DMG
+        uses: actions/upload-artifact@v4
         with:
-          tagName: v__VERSION__
-          releaseName: 'Vireo v__VERSION__'
-          releaseBody: 'See the assets to download and install this version.'
-          releaseDraft: true
-          prerelease: false
-          args: ${{ matrix.args }}
+          name: Vireo-macOS-dmg
+          path: src-tauri/target/release/bundle/dmg/*.dmg
+
+      # --- Create GitHub Release (only on tag push) ---
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          DMG_PATH=$(find src-tauri/target/release/bundle/dmg -name "*.dmg" | head -1)
+          TAG="${GITHUB_REF#refs/tags/}"
+
+          gh release create "$TAG" \
+            --title "Vireo $TAG" \
+            --generate-notes \
+            "$DMG_PATH"
+
+      # --- Clean up keychain ---
+      - name: Clean up keychain
+        if: always()
+        run: |
+          KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
+          if [ -f "$KEYCHAIN_PATH" ]; then
+            security delete-keychain "$KEYCHAIN_PATH"
+          fi

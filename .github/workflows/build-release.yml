@@ -57,7 +57,7 @@ jobs:
           pip install -e ".[dev]"
 
       - name: Build sidecar binary
-        run: python scripts/build_sidecar.py
+        run: python scripts/build_sidecar.py --ci
 
       # ── Static HTML frontend ──────────────────────────────
       - name: Build static frontend

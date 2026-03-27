@@ -46,8 +46,15 @@ jobs:
 
       # ── Version sync ──────────────────────────────────────
       - name: Sync version from tag
-        if: startsWith(github.ref, 'refs/tags/v')
-        run: python scripts/sync_version.py ${GITHUB_REF#refs/tags/}
+        if: startsWith(github.ref, 'refs/tags/v') || inputs.tag_name != ''
+        shell: bash
+        run: |
+          if [[ "${{ github.event_name }}" == "push" ]]; then
+            TAG="${GITHUB_REF#refs/tags/}"
+          else
+            TAG="${{ inputs.tag_name }}"
+          fi
+          python scripts/sync_version.py "$TAG"
 
       # ── Python & sidecar ──────────────────────────────────
       - name: Set up Python ${{ env.PYTHON_VERSION }}

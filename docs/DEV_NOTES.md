@@ -52,10 +52,10 @@ cd src-tauri && cargo check
 ### One-command release
 
 ```bash
-./scripts/release.sh patch              # 0.2.1 → 0.2.2, build locally
-./scripts/release.sh minor              # 0.2.1 → 0.3.0, build locally
-./scripts/release.sh major              # 0.2.1 → 1.0.0, build locally
-./scripts/release.sh 1.0.0              # explicit version, build locally
+./scripts/release.sh patch              # 1.1.1 → 1.1.2, build locally
+./scripts/release.sh minor              # 1.1.1 → 1.2.0, build locally
+./scripts/release.sh major              # 1.1.1 → 2.0.0, build locally
+./scripts/release.sh 1.2.3              # explicit version, build locally
 ./scripts/release.sh patch --publish    # bump, build, tag, upload to GitHub
 ```
 

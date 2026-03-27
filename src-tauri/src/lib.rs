@@ -1,4 +1,5 @@
 mod sidecar;
+mod updater;
 
 use sidecar::SidecarState;
 use tauri::Manager;
@@ -58,7 +59,11 @@ pub fn run() {
                 }
             }
         })
-        .invoke_handler(tauri::generate_handler![get_server_port])
+        .invoke_handler(tauri::generate_handler![
+            get_server_port,
+            updater::check_for_update,
+            updater::install_update,
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

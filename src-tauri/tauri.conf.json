@@ -35,6 +35,12 @@
     ],
     "externalBin": [
       "binaries/vireo-server"
-    ]
+    ],
+    "macOS": {
+      "entitlements": "Entitlements.plist",
+      "signingIdentity": null,
+      "providerShortName": null,
+      "minimumSystemVersion": "11.0"
+    }
   }
 }

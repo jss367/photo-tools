@@ -664,11 +664,15 @@ class Database:
 
         top_keywords = self.conn.execute(
             """SELECT k.name, k.is_species, COUNT(pk.photo_id) as photo_count
-            FROM keywords k
-            JOIN photo_keywords pk ON pk.keyword_id = k.id
-            GROUP BY k.id
-            ORDER BY photo_count DESC
-            LIMIT 30"""
+               FROM keywords k
+               JOIN photo_keywords pk ON pk.keyword_id = k.id
+               JOIN photos p ON p.id = pk.photo_id
+               JOIN workspace_folders wf ON wf.folder_id = p.folder_id
+               WHERE wf.workspace_id = ?
+               GROUP BY k.id
+               ORDER BY photo_count DESC
+               LIMIT 30""",
+            (ws,),
         ).fetchall()
 
         photos_by_month = self.conn.execute(

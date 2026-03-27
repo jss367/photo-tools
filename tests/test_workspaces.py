@@ -610,6 +610,37 @@ def test_count_keywords_empty_workspace(db):
     assert db.count_keywords() == 0
 
 
+def test_dashboard_top_keywords_scoped_by_workspace(db):
+    """get_dashboard_stats top_keywords only includes current workspace's keywords."""
+    ws_a = db.create_workspace("A")
+    fid_a = db.add_folder("/photos/a", name="a")
+    db.add_workspace_folder(ws_a, fid_a)
+    pid_a = db.add_photo(folder_id=fid_a, filename="a.jpg", extension=".jpg",
+                         file_size=100, file_mtime=1.0, timestamp="2024-01-01T00:00:00")
+    k1 = db.add_keyword("Robin")
+    db.tag_photo(pid_a, k1)
+
+    ws_b = db.create_workspace("B")
+    fid_b = db.add_folder("/photos/b", name="b")
+    db.add_workspace_folder(ws_b, fid_b)
+    pid_b = db.add_photo(folder_id=fid_b, filename="b.jpg", extension=".jpg",
+                         file_size=100, file_mtime=1.0, timestamp="2024-01-01T00:00:00")
+    k2 = db.add_keyword("Hawk")
+    db.tag_photo(pid_b, k2)
+
+    db.set_active_workspace(ws_a)
+    stats = db.get_dashboard_stats()
+    kw_names = [kw["name"] for kw in stats["top_keywords"]]
+    assert "Robin" in kw_names
+    assert "Hawk" not in kw_names
+
+    db.set_active_workspace(ws_b)
+    stats = db.get_dashboard_stats()
+    kw_names = [kw["name"] for kw in stats["top_keywords"]]
+    assert "Hawk" in kw_names
+    assert "Robin" not in kw_names
+
+
 def test_get_collection_photos_scoped_to_workspace_folders(db):
     """Collection should only return photos from workspace folders."""
     ws = db.create_workspace("Test")

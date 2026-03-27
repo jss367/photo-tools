@@ -21,7 +21,7 @@ const releaseBase = `https://github.com/jss367/vireo/releases/download/v${versio
         <DownloadButton
           platform="macos"
           label="Download for macOS"
-          href={`${releaseBase}/Vireo_${version}_universal.dmg`}
+          href={`${releaseBase}/Vireo_${version}_aarch64.dmg`}
           version={version}
         />
         <DownloadButton
@@ -37,6 +37,10 @@ const releaseBase = `https://github.com/jss367/vireo/releases/download/v${versio
           version={version}
         />
       </div>
+
+      <p class="download-hero__alt-arch">
+        macOS button is for Apple Silicon. <a href={`${releaseBase}/Vireo_${version}_x64.dmg`}>Download for Intel Mac</a>
+      </p>
 
       <p class="download-hero__releases">
         <a href="https://github.com/jss367/vireo/releases" target="_blank" rel="noopener">
@@ -153,6 +157,22 @@ const releaseBase = `https://github.com/jss367/vireo/releases/download/v${versio
     flex-wrap: wrap;
     justify-content: center;
     margin-bottom: var(--space-2xl);
+  }
+
+  .download-hero__alt-arch {
+    font-size: var(--text-sm);
+    color: var(--color-text-muted);
+    margin-bottom: var(--space-lg);
+  }
+
+  .download-hero__alt-arch a {
+    color: var(--color-text-muted);
+    text-decoration: underline;
+    transition: color var(--transition-fast);
+  }
+
+  .download-hero__alt-arch a:hover {
+    color: var(--color-accent);
   }
 
   .download-hero__releases {

@@ -35,13 +35,24 @@ while true; do
   chain+=("$current")
   echo "  Chain link: PR #${current}"
 
-  body=$(gh pr view "$current" --repo "$REPO" --json body -q .body)
+  current_json=$(gh pr view "$current" --repo "$REPO" --json body,baseRefName)
+  body=$(echo "$current_json" | jq -r .body)
+  child_base=$(echo "$current_json" | jq -r .baseRefName)
   parent=$(echo "$body" | grep -o 'Parent PR: #[0-9]*' | sed 's/Parent PR: #//' | head -1)
 
   if [[ -z "$parent" ]]; then
     echo "  Root PR: #${current} (no parent link)"
     break
   fi
+
+  # Validate: child's base branch must match parent's head branch
+  parent_head=$(gh pr view "$parent" --repo "$REPO" --json headRefName -q .headRefName)
+  if [[ "$child_base" != "$parent_head" ]]; then
+    echo "  ERROR: PR #${current} claims Parent PR: #${parent}, but base '${child_base}' != parent head '${parent_head}'." >&2
+    echo "  The Parent PR link may be incorrect. Aborting." >&2
+    exit 1
+  fi
+  echo "  Validated: base '${child_base}' matches parent #${parent} head '${parent_head}'"
 
   current="$parent"
   (( depth++ ))

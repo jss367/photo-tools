@@ -197,6 +197,30 @@ jobs:
       && contains(github.event.pull_request.labels.*.name, 'claude-agent')
     runs-on: ubuntu-latest
     steps:
+      - name: Resolve leaf PR
+        id: leaf
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Walk from the approved PR down to the latest descendant (leaf).
+          # A child PR targets the current PR's head branch and has the
+          # claude-agent label.
+          current="${{ github.event.pull_request.number }}"
+          while true; do
+            head_ref=$(gh pr view "$current" --repo "${{ github.repository }}" \
+              --json headRefName -q .headRefName)
+            child=$(gh pr list --repo "${{ github.repository }}" \
+              --base "$head_ref" --label claude-agent --state open \
+              --json number -q '.[0].number')
+            if [[ -z "$child" ]]; then
+              break
+            fi
+            echo "PR #${current} has child PR #${child}, descending..."
+            current="$child"
+          done
+          echo "Leaf PR: #${current}"
+          echo "leaf_pr=$current" >> "$GITHUB_OUTPUT"
+
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -213,7 +237,7 @@ jobs:
       - name: Run merge chain
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: bash .github/scripts/merge-chain.sh ${{ github.event.pull_request.number }}
+        run: bash .github/scripts/merge-chain.sh ${{ steps.leaf.outputs.leaf_pr }}
 
   merge-on-thumbsup:
     if: >-
@@ -226,6 +250,27 @@ jobs:
           || github.actor == 'chatgpt-codex-connector[bot]')
     runs-on: ubuntu-latest
     steps:
+      - name: Resolve leaf PR
+        id: leaf
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          current="${{ github.event.issue.number }}"
+          while true; do
+            head_ref=$(gh pr view "$current" --repo "${{ github.repository }}" \
+              --json headRefName -q .headRefName)
+            child=$(gh pr list --repo "${{ github.repository }}" \
+              --base "$head_ref" --label claude-agent --state open \
+              --json number -q '.[0].number')
+            if [[ -z "$child" ]]; then
+              break
+            fi
+            echo "PR #${current} has child PR #${child}, descending..."
+            current="$child"
+          done
+          echo "Leaf PR: #${current}"
+          echo "leaf_pr=$current" >> "$GITHUB_OUTPUT"
+
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -242,7 +287,7 @@ jobs:
       - name: Run merge chain
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: bash .github/scripts/merge-chain.sh ${{ github.event.issue.number }}
+        run: bash .github/scripts/merge-chain.sh ${{ steps.leaf.outputs.leaf_pr }}
 
   # ═══════════════════════════════════════════════════════════
   #  CONFLICT DETECTION — push to main

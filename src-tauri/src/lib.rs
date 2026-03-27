@@ -1,6 +1,7 @@
 mod menu;
 mod sidecar;
 mod tray;
+mod updater;
 
 use sidecar::SidecarState;
 use tauri::Manager;
@@ -15,6 +16,8 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
         .setup(|app| {
             if cfg!(debug_assertions) {
                 // In dev mode, don't spawn sidecar — developer runs Flask manually
@@ -88,7 +91,11 @@ pub fn run() {
                 }
             }
         })
-        .invoke_handler(tauri::generate_handler![get_server_port])
+        .invoke_handler(tauri::generate_handler![
+            get_server_port,
+            updater::check_for_update,
+            updater::install_update,
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

@@ -41,11 +41,20 @@
     "externalBin": [
       "binaries/vireo-server"
     ],
+    "createUpdaterArtifacts": true,
     "macOS": {
       "entitlements": "Entitlements.plist",
       "signingIdentity": null,
       "providerShortName": null,
       "minimumSystemVersion": "11.0"
+    }
+  },
+  "plugins": {
+    "updater": {
+      "endpoints": [
+        "https://github.com/jss367/vireo/releases/latest/download/latest.json"
+      ],
+      "pubkey": "REPLACE_WITH_PUBLIC_KEY_FROM_TASK_1"
     }
   }
 }

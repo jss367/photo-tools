@@ -291,16 +291,32 @@ async function startDownloads() {
     return;
   }
 
-  // Process downloads sequentially
+  // Process downloads sequentially, tracking success/failure
+  // If classification model was already downloaded, it won't be in the queue
+  var hasClassificationInQueue = downloadQueue.some(function(item) { return item.type === 'classification'; });
+  var classificationSucceeded = !hasClassificationInQueue; // true if already downloaded
   for (var i = 0; i < downloadQueue.length; i++) {
     var item = downloadQueue[i];
-    await downloadModel(item);
+    var success = await downloadModel(item);
+    if (success && item.type === 'classification') {
+      classificationSucceeded = true;
+    }
   }
 
-  // All done
-  await safeFetch('/api/setup/complete', { method: 'POST' }, { toast: false });
-  btn.textContent = 'Setup Complete!';
-  setTimeout(function() { window.location.href = '/browse'; }, 1000);
+  // Only mark setup complete if at least one classification model downloaded successfully
+  if (classificationSucceeded) {
+    await safeFetch('/api/setup/complete', { method: 'POST' }, { toast: false });
+    btn.textContent = 'Setup Complete!';
+    setTimeout(function() { window.location.href = '/browse'; }, 1000);
+  } else {
+    btn.disabled = false;
+    btn.textContent = 'Download & Get Started';
+    isDownloading = false;
+    var errorDiv = document.createElement('div');
+    errorDiv.style.cssText = 'margin-top:16px;padding:12px;border-radius:8px;background:rgba(231,76,60,0.1);border:1px solid var(--danger,#E74C3C);color:var(--danger,#E74C3C);font-size:13px;';
+    errorDiv.textContent = 'Classification model download failed. Please check your connection and try again.';
+    statusDiv.appendChild(errorDiv);
+  }
 }
 
 function downloadModel(item) {
@@ -326,7 +342,7 @@ function downloadModel(item) {
     }, { toast: false }).then(function(data) {
       if (!data.job_id) {
         if (labelEl) labelEl.textContent = 'Error: no job started';
-        resolve();
+        resolve(false);
         return;
       }
 
@@ -344,20 +360,21 @@ function downloadModel(item) {
           if (result.status === 'completed') {
             if (barEl) barEl.style.width = '100%';
             if (labelEl) labelEl.textContent = item.name + ' downloaded successfully';
+            resolve(true);
           } else {
             if (labelEl) {
               labelEl.textContent = 'Failed: ' + (result.errors && result.errors[0] || 'Unknown error');
               labelEl.style.color = 'var(--danger, #E74C3C)';
             }
+            resolve(false);
           }
-          resolve();
         },
         onError: function() {
           if (labelEl) {
             labelEl.textContent = 'Connection lost during download';
             labelEl.style.color = 'var(--danger, #E74C3C)';
           }
-          resolve();
+          resolve(false);
         }
       });
     }).catch(function(e) {
@@ -365,7 +382,7 @@ function downloadModel(item) {
         labelEl.textContent = 'Error: ' + e.message;
         labelEl.style.color = 'var(--danger, #E74C3C)';
       }
-      resolve();
+      resolve(false);
     });
   });
 }

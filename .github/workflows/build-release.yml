@@ -54,6 +54,7 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
 
       - name: Install PyTorch (CPU only)
         run: pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
@@ -76,6 +77,7 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: ${{ env.NODE_VERSION }}
+          cache: npm
 
       - name: Install Node.js dependencies
         run: npm ci

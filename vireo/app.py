@@ -1937,10 +1937,21 @@ def create_app(db_path, thumb_cache_dir=None):
 
     @app.route("/api/labels")
     def api_labels_list():
-        from labels import get_active_labels, get_saved_labels
+        from labels import get_active_labels as get_global_active_labels, get_saved_labels
 
+        db = _get_db()
         saved = get_saved_labels()
-        active = get_active_labels()
+        ws_labels = db.get_workspace_active_labels()
+        if ws_labels is not None:
+            # Resolve workspace labels to metadata
+            saved_by_file = {s["labels_file"]: s for s in saved}
+            active = []
+            for p in ws_labels:
+                if os.path.exists(p):
+                    meta = saved_by_file.get(p, {"labels_file": p})
+                    active.append(meta)
+        else:
+            active = get_global_active_labels()
         return jsonify(
             {
                 "labels": saved,
@@ -1969,9 +1980,8 @@ def create_app(db_path, thumb_cache_dir=None):
             if not single:
                 return json_error("labels_files or labels_file required")
             labels_files = [single]
-        from labels import set_active_labels
-
-        set_active_labels(labels_files)
+        db = _get_db()
+        db.set_workspace_active_labels(labels_files)
         return jsonify({"ok": True})
 
     @app.route("/api/jobs/fetch-labels", methods=["POST"])
@@ -1996,7 +2006,7 @@ def create_app(db_path, thumb_cache_dir=None):
         active_ws = _get_db()._active_workspace_id
 
         def work(job):
-            from labels import fetch_species_list, save_labels, set_active_labels
+            from labels import fetch_species_list, save_labels
 
             def progress_cb(msg, current=None, total=None):
                 job["progress"]["current_file"] = msg
@@ -2028,7 +2038,10 @@ def create_app(db_path, thumb_cache_dir=None):
                 name, place_id, place_name, taxon_groups, species,
                 observation_filter=observation_filter,
             )
-            set_active_labels(labels_path)
+            from db import Database
+            thread_db = Database(db_path)
+            thread_db.set_active_workspace(active_ws)
+            thread_db.set_workspace_active_labels([labels_path])
 
             # Auto-compute embeddings for the active model
             from models import get_active_model

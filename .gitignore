@@ -209,3 +209,4 @@ vireo/taxonomy.json
 /.vscode
 .worktrees/
 node_modules/
+*/.DS_Store

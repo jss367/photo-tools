@@ -97,9 +97,12 @@ async function startupUpdateCheck(cooldownHours) {
     if (elapsed < cooldownHours * 60 * 60 * 1000) return;
   }
 
-  localStorage.setItem('vireo_last_update_check', String(Date.now()));
-
   var result = await checkForAppUpdate();
+  // Save cooldown timestamp only after a successful check so that
+  // transient failures (offline, DNS error) don't block future retries.
+  if (result) {
+    localStorage.setItem('vireo_last_update_check', String(Date.now()));
+  }
   if (!result || !result.available) return;
 
   // Show a non-intrusive banner at the top of the page

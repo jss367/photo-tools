@@ -2,6 +2,8 @@ use serde::Serialize;
 use tauri::AppHandle;
 use tauri_plugin_updater::UpdaterExt;
 
+const PLACEHOLDER_PUBKEY: &str = "REPLACE_WITH_PUBLIC_KEY_FROM_TASK_1";
+
 #[derive(Serialize)]
 pub struct UpdateInfo {
     pub available: bool,
@@ -10,8 +12,31 @@ pub struct UpdateInfo {
     pub date: Option<String>,
 }
 
+/// Check whether the updater pubkey is still the placeholder value.
+/// Returns true if signing infrastructure has not been configured yet.
+fn is_pubkey_placeholder(app: &AppHandle) -> bool {
+    app.config()
+        .plugins
+        .0
+        .get("updater")
+        .and_then(|u| u.get("pubkey"))
+        .and_then(|v| v.as_str())
+        .map(|k| k == PLACEHOLDER_PUBKEY)
+        .unwrap_or(true)
+}
+
 #[tauri::command]
 pub async fn check_for_update(app: AppHandle) -> Result<UpdateInfo, String> {
+    if is_pubkey_placeholder(&app) {
+        log::warn!("Update checking not configured (signing key not set)");
+        return Ok(UpdateInfo {
+            available: false,
+            version: None,
+            notes: Some("Update checking not configured (signing key not set)".into()),
+            date: None,
+        });
+    }
+
     let updater = app.updater().map_err(|e| e.to_string())?;
     match updater.check().await {
         Ok(Some(update)) => Ok(UpdateInfo {
@@ -32,6 +57,10 @@ pub async fn check_for_update(app: AppHandle) -> Result<UpdateInfo, String> {
 
 #[tauri::command]
 pub async fn install_update(app: AppHandle) -> Result<(), String> {
+    if is_pubkey_placeholder(&app) {
+        return Err("Updater not configured (signing key not set)".into());
+    }
+
     let updater = app.updater().map_err(|e| e.to_string())?;
     let update = updater
         .check()

@@ -5,7 +5,6 @@ use tauri::{
 
 /// Menu item IDs used to match events in `on_menu_event`.
 pub mod ids {
-    // View menu — navigation
     pub const NAV_BROWSE: &str = "nav_browse";
     pub const NAV_IMPORT: &str = "nav_import";
     pub const NAV_PIPELINE: &str = "nav_pipeline";
@@ -43,11 +42,40 @@ pub fn route_for_id(id: &str) -> Option<&'static str> {
     }
 }
 
+fn build_about_metadata() -> tauri::menu::AboutMetadata<'static> {
+    AboutMetadataBuilder::new()
+        .name(Some("Vireo"))
+        .version(Some(env!("CARGO_PKG_VERSION")))
+        .comments(Some("AI-powered wildlife photo organizer"))
+        .license(Some("MIT"))
+        .build()
+}
+
 /// Build the application menu bar.
-///
-/// macOS: appears in the system menu bar (app name menu is automatic).
-/// Windows/Linux: attached to the window chrome.
 pub fn build_menu(app: &AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::Wry>> {
+    // -- macOS app submenu --
+    #[cfg(target_os = "macos")]
+    let app_menu = {
+        let about = PredefinedMenuItem::about(app, Some("About Vireo"), Some(build_about_metadata()))?;
+        let settings_item = MenuItemBuilder::with_id(ids::NAV_SETTINGS, "Settings...")
+            .accelerator("CmdOrCtrl+,")
+            .build(app)?;
+
+        SubmenuBuilder::new(app, "Vireo")
+            .item(&about)
+            .separator()
+            .item(&settings_item)
+            .separator()
+            .services()
+            .separator()
+            .hide()
+            .hide_others()
+            .show_all()
+            .separator()
+            .quit()
+            .build()?
+    };
+
     // -- File menu --
     let file_menu = SubmenuBuilder::new(app, "File")
         .close_window()
@@ -55,7 +83,7 @@ pub fn build_menu(app: &AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::Wry
         .quit()
         .build()?;
 
-    // -- Edit menu (required for Cmd+C/V/X/A/Z to work on macOS) --
+    // -- Edit menu (required for Cmd+C/V/X/A/Z on macOS) --
     let edit_menu = SubmenuBuilder::new(app, "Edit")
         .undo()
         .redo()
@@ -67,7 +95,8 @@ pub fn build_menu(app: &AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::Wry
         .build()?;
 
     // -- View menu (page navigation) --
-    let view_menu = SubmenuBuilder::new(app, "View")
+    let mut view_builder = SubmenuBuilder::new(app, "View");
+    view_builder = view_builder
         .item(
             &MenuItemBuilder::with_id(ids::NAV_BROWSE, "Browse")
                 .accelerator("CmdOrCtrl+1")
@@ -131,43 +160,56 @@ pub fn build_menu(app: &AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::Wry
                 .build(app)?,
         )
         .item(
-            &MenuItemBuilder::with_id(ids::NAV_SETTINGS, "Settings")
-                .accelerator("CmdOrCtrl+,")
-                .build(app)?,
-        )
-        .item(
             &MenuItemBuilder::with_id(ids::NAV_LOGS, "Logs")
                 .accelerator("CmdOrCtrl+Shift+L")
                 .build(app)?,
-        )
-        .build()?;
+        );
+
+    // Settings in View menu only on non-macOS (it is in the app submenu on macOS)
+    #[cfg(not(target_os = "macos"))]
+    {
+        view_builder = view_builder.separator().item(
+            &MenuItemBuilder::with_id(ids::NAV_SETTINGS, "Settings")
+                .accelerator("CmdOrCtrl+,")
+                .build(app)?,
+        );
+    }
+
+    let view_menu = view_builder.build()?;
 
     // -- Window menu --
-    let window_menu = SubmenuBuilder::new(app, "Window")
+    let mut window_builder = SubmenuBuilder::new(app, "Window")
         .minimize()
-        .maximize()
-        .separator()
-        .close_window()
-        .build()?;
+        .maximize();
+
+    #[cfg(target_os = "macos")]
+    {
+        window_builder = window_builder.fullscreen();
+    }
+
+    let window_menu = window_builder.separator().close_window().build()?;
 
     // -- Help menu --
-    let about = PredefinedMenuItem::about(
-        app,
-        Some("About Vireo"),
-        Some(
-            AboutMetadataBuilder::new()
-                .name(Some("Vireo"))
-                .version(Some(env!("CARGO_PKG_VERSION")))
-                .comments(Some("AI-powered wildlife photo organizer"))
-                .license(Some("MIT"))
-                .build(),
-        ),
-    )?;
+    #[allow(unused_mut)]
+    let mut help_builder = SubmenuBuilder::new(app, "Help");
 
-    let help_menu = SubmenuBuilder::new(app, "Help").item(&about).build()?;
+    #[cfg(not(target_os = "macos"))]
+    {
+        let about = PredefinedMenuItem::about(app, Some("About Vireo"), Some(build_about_metadata()))?;
+        help_builder = help_builder.item(&about);
+    }
 
-    // -- Assemble the full menu bar --
-    MenuBuilder::new(app)
+    let help_menu = help_builder.build()?;
+
+    // -- Assemble --
+    let mut builder = MenuBuilder::new(app);
+
+    #[cfg(target_os = "macos")]
+    {
+        builder = builder.item(&app_menu);
+    }
+
+    builder
         .item(&file_menu)
         .item(&edit_menu)
         .item(&view_menu)

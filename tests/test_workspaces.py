@@ -731,3 +731,86 @@ def test_set_workspace_active_labels_preserves_other_overrides(db):
     # Check threshold is still there
     overrides = json.loads(db.get_workspace(ws)["config_overrides"])
     assert overrides["threshold"] == 0.5
+
+
+def test_merge_duplicate_keywords_scoped_by_workspace(db):
+    """merge_duplicate_keywords only merges duplicates used in the active workspace."""
+    ws_a = db.create_workspace("A")
+    fid_a = db.add_folder("/photos/a", name="a")
+    db.add_workspace_folder(ws_a, fid_a)
+    pid_a = db.add_photo(folder_id=fid_a, filename="a.jpg", extension=".jpg",
+                         file_size=100, file_mtime=1.0)
+
+    ws_b = db.create_workspace("B")
+    fid_b = db.add_folder("/photos/b", name="b")
+    db.add_workspace_folder(ws_b, fid_b)
+    pid_b = db.add_photo(folder_id=fid_b, filename="b.jpg", extension=".jpg",
+                         file_size=100, file_mtime=1.0)
+
+    # Create case-variant duplicates via raw SQL (add_keyword dedupes)
+    db.conn.execute("INSERT INTO keywords (name) VALUES ('Cardinal')")
+    db.conn.execute("INSERT INTO keywords (name) VALUES ('cardinal')")
+    db.conn.execute("INSERT INTO keywords (name) VALUES ('Sparrow')")
+    db.conn.execute("INSERT INTO keywords (name) VALUES ('sparrow')")
+    db.conn.commit()
+
+    k_cardinal = db.conn.execute("SELECT id FROM keywords WHERE name='Cardinal'").fetchone()[0]
+    k_cardinal_lc = db.conn.execute("SELECT id FROM keywords WHERE name='cardinal'").fetchone()[0]
+    k_sparrow = db.conn.execute("SELECT id FROM keywords WHERE name='Sparrow'").fetchone()[0]
+    k_sparrow_lc = db.conn.execute("SELECT id FROM keywords WHERE name='sparrow'").fetchone()[0]
+
+    # Tag Cardinal/cardinal on photos in workspace A
+    db.tag_photo(pid_a, k_cardinal)
+    db.tag_photo(pid_a, k_cardinal_lc)
+    # Tag Sparrow/sparrow on photos in workspace B
+    db.tag_photo(pid_b, k_sparrow)
+    db.tag_photo(pid_b, k_sparrow_lc)
+
+    # Merge in workspace A — should only merge Cardinal pair
+    db.set_active_workspace(ws_a)
+    merged = db.merge_duplicate_keywords()
+    assert merged == 1  # only Cardinal/cardinal
+
+    # Sparrow/sparrow should still exist as two separate keywords
+    sparrows = db.conn.execute(
+        "SELECT COUNT(*) FROM keywords WHERE name IN ('Sparrow', 'sparrow')"
+    ).fetchone()[0]
+    assert sparrows == 2
+
+
+def test_empty_workspace_labels_does_not_fallback_to_global(db):
+    """An explicit empty active_labels [] should NOT fall back to global labels."""
+    ws = db.create_workspace("Empty Labels")
+    db.set_active_workspace(ws)
+    db.set_workspace_active_labels([])  # explicitly no labels
+
+    result = db.get_workspace_active_labels()
+    assert result == []  # should be empty list, not None
+
+    # Simulate what _load_labels does: ws_labels is not None should be True
+    ws_labels = db.get_workspace_active_labels()
+    assert ws_labels is not None  # must distinguish [] from None
+
+
+def test_keyword_tree_includes_ancestors(db):
+    """get_keyword_tree includes untagged ancestor keywords so hierarchy is navigable."""
+    ws = db.create_workspace("Hier")
+    fid = db.add_folder("/photos/h", name="h")
+    db.add_workspace_folder(ws, fid)
+    pid = db.add_photo(folder_id=fid, filename="h.jpg", extension=".jpg",
+                       file_size=100, file_mtime=1.0)
+
+    # Create hierarchy: Birds > Raptors > Red-tailed Hawk
+    birds = db.add_keyword("Birds")
+    raptors = db.add_keyword("Raptors", parent_id=birds)
+    hawk = db.add_keyword("Red-tailed Hawk", parent_id=raptors)
+
+    # Only tag the leaf (mimics scanner behavior)
+    db.tag_photo(pid, hawk)
+
+    db.set_active_workspace(ws)
+    tree = db.get_keyword_tree()
+    names = {kw["name"] for kw in tree}
+    assert "Red-tailed Hawk" in names
+    assert "Raptors" in names  # ancestor must be included
+    assert "Birds" in names    # root ancestor must be included

@@ -1206,14 +1206,23 @@ class Database:
         return cur.lastrowid
 
     def merge_duplicate_keywords(self):
-        """Find and merge case-insensitive duplicate keywords.
+        """Find and merge case-insensitive duplicate keywords in active workspace.
 
+        Only merges keywords that are used by photos in the active workspace.
         Keeps the lowest ID (earliest created), moves all photo associations,
         and deletes the duplicates. Returns count of merges performed.
         """
+        ws = self._ws_id()
         dupes = self.conn.execute(
-            """SELECT LOWER(name) as lname, MIN(id) as keep_id, GROUP_CONCAT(id) as all_ids
-               FROM keywords GROUP BY LOWER(name) HAVING COUNT(*) > 1"""
+            """SELECT LOWER(k.name) as lname, MIN(k.id) as keep_id,
+                      GROUP_CONCAT(DISTINCT k.id) as all_ids
+               FROM keywords k
+               JOIN photo_keywords pk ON pk.keyword_id = k.id
+               JOIN photos p ON p.id = pk.photo_id
+               JOIN workspace_folders wf ON wf.folder_id = p.folder_id
+               WHERE wf.workspace_id = ?
+               GROUP BY LOWER(k.name) HAVING COUNT(DISTINCT k.id) > 1""",
+            (ws,),
         ).fetchall()
 
         merged = 0
@@ -1241,14 +1250,27 @@ class Database:
         return merged
 
     def get_keyword_tree(self):
-        """Return keywords used by photos in the active workspace."""
+        """Return keywords used by photos in the active workspace, plus ancestors."""
         return self.conn.execute(
-            """SELECT DISTINCT k.id, k.name, k.parent_id
+            """WITH RECURSIVE
+               leaf_kw AS (
+                   SELECT DISTINCT pk.keyword_id AS id
+                   FROM photo_keywords pk
+                   JOIN photos p ON p.id = pk.photo_id
+                   JOIN workspace_folders wf ON wf.folder_id = p.folder_id
+                   WHERE wf.workspace_id = ?
+               ),
+               ancestors AS (
+                   SELECT id FROM leaf_kw
+                   UNION
+                   SELECT k.parent_id
+                   FROM keywords k
+                   JOIN ancestors a ON a.id = k.id
+                   WHERE k.parent_id IS NOT NULL
+               )
+               SELECT k.id, k.name, k.parent_id
                FROM keywords k
-               JOIN photo_keywords pk ON pk.keyword_id = k.id
-               JOIN photos p ON p.id = pk.photo_id
-               JOIN workspace_folders wf ON wf.folder_id = p.folder_id
-               WHERE wf.workspace_id = ?
+               JOIN ancestors a ON a.id = k.id
                ORDER BY k.name""",
             (self._ws_id(),),
         ).fetchall()

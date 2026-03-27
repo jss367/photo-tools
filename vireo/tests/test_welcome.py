@@ -44,3 +44,29 @@ def test_models_status_with_model_ready(app_and_db, monkeypatch):
     assert data["needs_setup"] is False
     assert data["classification"]["ready"] is True
     assert data["classification"]["model_name"] == "BioCLIP"
+
+
+def test_index_redirects_to_welcome_when_no_model(app_and_db, monkeypatch):
+    """GET / redirects to /welcome when no classification model is available."""
+    import models
+    monkeypatch.setattr(models, "get_active_model", lambda: None)
+
+    app, _ = app_and_db
+    client = app.test_client()
+    resp = client.get("/")
+    assert resp.status_code == 302
+    assert "/welcome" in resp.headers["Location"]
+
+
+def test_index_redirects_to_browse_when_model_ready(app_and_db, monkeypatch):
+    """GET / redirects to /browse when a classification model is downloaded."""
+    import models
+    monkeypatch.setattr(models, "get_active_model", lambda: {
+        "id": "bioclip-vit-b-16", "name": "BioCLIP", "downloaded": True
+    })
+
+    app, _ = app_and_db
+    client = app.test_client()
+    resp = client.get("/")
+    assert resp.status_code == 302
+    assert "/browse" in resp.headers["Location"]

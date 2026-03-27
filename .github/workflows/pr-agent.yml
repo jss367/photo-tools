@@ -8,6 +8,10 @@ on:
   push:
     branches: [main]
 
+concurrency:
+  group: pr-agent-${{ github.event.pull_request.number || github.event.issue.number || github.sha }}
+  cancel-in-progress: false
+
 permissions:
   contents: write
   pull-requests: write

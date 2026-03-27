@@ -68,6 +68,38 @@ jobs:
       - name: Build sidecar binary
         run: python scripts/build_sidecar.py --ci
 
+      - name: Smoke-test sidecar binary
+        shell: bash
+        run: |
+          TRIPLE=$(rustc --print host-tuple)
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            SIDECAR="src-tauri/binaries/vireo-server-${TRIPLE}.exe"
+          else
+            SIDECAR="src-tauri/binaries/vireo-server-${TRIPLE}"
+          fi
+
+          echo "Testing sidecar: $SIDECAR"
+          ls -lh "$SIDECAR"
+
+          # Start the sidecar on a random port
+          PORT=18937
+          "$SIDECAR" --port $PORT --no-browser --db ":memory:" &
+          PID=$!
+
+          # Wait for it to be ready (up to 30s)
+          for i in $(seq 1 30); do
+            if curl -sf "http://127.0.0.1:${PORT}/api/health" > /dev/null 2>&1; then
+              echo "Sidecar is healthy after ${i}s"
+              kill $PID 2>/dev/null || true
+              exit 0
+            fi
+            sleep 1
+          done
+
+          echo "ERROR: Sidecar did not become healthy within 30s"
+          kill $PID 2>/dev/null || true
+          exit 1
+
       # ── Static HTML frontend ──────────────────────────────
       - name: Build static frontend
         run: python scripts/build_static.py

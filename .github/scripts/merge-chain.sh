@@ -10,6 +10,11 @@
 #
 set -euo pipefail
 
+if [[ $# -ne 1 || -z "$1" ]]; then
+  echo "Usage: merge-chain.sh <leaf-pr-number>" >&2
+  exit 1
+fi
+
 LEAF_PR="$1"
 REPO="${GITHUB_REPOSITORY:-$(gh repo view --json nameWithOwner -q .nameWithOwner)}"
 
@@ -18,13 +23,20 @@ echo "=== Merge Chain: starting from PR #${LEAF_PR} ==="
 # -- Step 1: Build the chain (leaf -> root) --------------------
 chain=()
 current="$LEAF_PR"
+MAX_CHAIN_DEPTH=20
+depth=0
 
 while true; do
+  if (( depth >= MAX_CHAIN_DEPTH )); then
+    echo "  ERROR: Chain depth exceeded ${MAX_CHAIN_DEPTH}. Possible cycle. Aborting." >&2
+    exit 1
+  fi
+
   chain+=("$current")
   echo "  Chain link: PR #${current}"
 
   body=$(gh pr view "$current" --repo "$REPO" --json body -q .body)
-  parent=$(echo "$body" | grep -oP 'Parent PR: #\K[0-9]+' || true)
+  parent=$(echo "$body" | grep -o 'Parent PR: #[0-9]*' | sed 's/Parent PR: #//' | head -1)
 
   if [[ -z "$parent" ]]; then
     echo "  Root PR: #${current} (no parent link)"
@@ -32,6 +44,7 @@ while true; do
   fi
 
   current="$parent"
+  (( depth++ ))
 done
 
 echo ""
@@ -61,8 +74,16 @@ for pr in "${chain[@]}"; do
 
   echo "  ${head_ref} -> ${base_ref}: ${title}"
 
-  # Check for merge conflicts
-  mergeable=$(gh pr view "$pr" --repo "$REPO" --json mergeable -q .mergeable)
+  # Check for merge conflicts (retry if GitHub hasn't computed status yet)
+  for i in {1..5}; do
+    mergeable=$(gh pr view "$pr" --repo "$REPO" --json mergeable -q .mergeable)
+    if [[ "$mergeable" != "UNKNOWN" ]]; then
+      break
+    fi
+    echo "  Mergeable status unknown, waiting..."
+    sleep 5
+  done
+
   if [[ "$mergeable" == "CONFLICTING" ]]; then
     echo "  ERROR: PR #${pr} has merge conflicts. Resolve before merging chain."
     exit 1
@@ -72,7 +93,7 @@ for pr in "${chain[@]}"; do
   if [[ "$base_ref" == "main" ]]; then
     echo "  Targets main -- using auto-merge (waits for CI)..."
     gh pr merge "$pr" --repo "$REPO" --squash --auto \
-      --subject "feat: ${title} (#${pr})"
+      --subject "${title} (#${pr})"
     echo "  Auto-merge enabled. GitHub will merge when CI passes."
   else
     # Intermediate merge -- run tests first, then merge
@@ -91,7 +112,7 @@ for pr in "${chain[@]}"; do
 
     echo "  Tests passed. Squash-merging..."
     gh pr merge "$pr" --repo "$REPO" --squash \
-      --subject "fix: ${title} (#${pr})"
+      --subject "${title} (#${pr})"
 
     echo "  Merged PR #${pr}."
   fi
@@ -103,7 +124,16 @@ done
 echo "=== Cleanup ==="
 
 for pr in "${chain[@]}"; do
-  head_ref=$(gh pr view "$pr" --repo "$REPO" --json headRefName -q .headRefName 2>/dev/null || true)
+  pr_cleanup_json=$(gh pr view "$pr" --repo "$REPO" --json headRefName,baseRefName 2>/dev/null || true)
+  head_ref=$(echo "$pr_cleanup_json" | jq -r .headRefName 2>/dev/null || true)
+  base_ref=$(echo "$pr_cleanup_json" | jq -r .baseRefName 2>/dev/null || true)
+
+  # Skip branch cleanup for the root PR (targets main, uses --auto)
+  if [[ "$base_ref" == "main" ]]; then
+    echo "  Skipping branch deletion for PR #${pr} (targets main, auto-merge pending)"
+    continue
+  fi
+
   if [[ -n "$head_ref" && "$head_ref" != "main" ]]; then
     echo "  Deleting branch: ${head_ref}"
     gh api -X DELETE "repos/${REPO}/git/refs/heads/${head_ref}" 2>/dev/null || true

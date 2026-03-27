@@ -259,6 +259,14 @@ def create_app(db_path, thumb_cache_dir=None):
             return redirect("/browse")
         return redirect("/welcome")
 
+    @app.route("/welcome")
+    def welcome():
+        from models import get_active_model
+        active = get_active_model()
+        if active and active.get("downloaded") and not request.args.get("force"):
+            return redirect("/browse")
+        return render_template("welcome.html")
+
     @app.route("/browse")
     def browse():
         return render_template("browse.html")

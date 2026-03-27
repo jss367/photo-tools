@@ -70,3 +70,39 @@ def test_index_redirects_to_browse_when_model_ready(app_and_db, monkeypatch):
     resp = client.get("/")
     assert resp.status_code == 302
     assert "/browse" in resp.headers["Location"]
+
+
+def test_welcome_page_renders(app_and_db):
+    """GET /welcome returns 200."""
+    app, _ = app_and_db
+    client = app.test_client()
+    resp = client.get("/welcome")
+    assert resp.status_code == 200
+    assert b"Vireo" in resp.data
+
+
+def test_welcome_page_redirects_when_setup_done(app_and_db, monkeypatch):
+    """GET /welcome without ?force redirects to /browse if models are ready."""
+    import models
+    monkeypatch.setattr(models, "get_active_model", lambda: {
+        "id": "bioclip-vit-b-16", "name": "BioCLIP", "downloaded": True
+    })
+
+    app, _ = app_and_db
+    client = app.test_client()
+    resp = client.get("/welcome")
+    assert resp.status_code == 302
+    assert "/browse" in resp.headers["Location"]
+
+
+def test_welcome_page_force_bypasses_redirect(app_and_db, monkeypatch):
+    """GET /welcome?force=1 shows page even when models are ready."""
+    import models
+    monkeypatch.setattr(models, "get_active_model", lambda: {
+        "id": "bioclip-vit-b-16", "name": "BioCLIP", "downloaded": True
+    })
+
+    app, _ = app_and_db
+    client = app.test_client()
+    resp = client.get("/welcome?force=1")
+    assert resp.status_code == 200

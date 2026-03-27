@@ -232,3 +232,88 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: bash .github/scripts/merge-chain.sh ${{ github.event.issue.number }}
+
+  # ═══════════════════════════════════════════════════════════
+  #  CONFLICT DETECTION — push to main
+  # ═══════════════════════════════════════════════════════════
+  resolve-conflicts:
+    if: >-
+      github.event_name == 'push'
+      && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Find conflicting claude-agent PRs
+        id: conflicts
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Get all open PRs with claude-agent label
+          prs=$(gh pr list \
+            --repo ${{ github.repository }} \
+            --label claude-agent \
+            --state open \
+            --json number,headRefName,mergeable \
+            --jq '.[] | select(.mergeable == "CONFLICTING") | .number')
+
+          if [[ -z "$prs" ]]; then
+            echo "No conflicting PRs found."
+            echo "has_conflicts=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Conflicting PRs: $prs"
+            echo "has_conflicts=true" >> "$GITHUB_OUTPUT"
+            echo "pr_numbers=$prs" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v4
+        if: steps.conflicts.outputs.has_conflicts == 'true'
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        if: steps.conflicts.outputs.has_conflicts == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+          allow-prereleases: true
+
+      - name: Install test dependencies
+        if: steps.conflicts.outputs.has_conflicts == 'true'
+        run: pip install flask Pillow pytest imagehash
+
+      - name: Resolve conflicts
+        if: steps.conflicts.outputs.has_conflicts == 'true'
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          prompt: |
+            You are a conflict resolution agent for the Vireo repository.
+
+            The following PRs have merge conflicts after main was updated:
+            ${{ steps.conflicts.outputs.pr_numbers }}
+
+            For EACH conflicting PR:
+
+            1. Get the PR details:
+               gh pr view <NUMBER> --json headRefName,baseRefName,title,body
+
+            2. Check out the PR's branch:
+               git checkout <headRefName>
+
+            3. Merge the base branch:
+               git merge origin/<baseRefName>
+
+            4. Resolve ALL conflicts. Read the PR description and diff for context
+               about what the code is trying to do. Prefer keeping both changes
+               when possible.
+
+            5. Run tests:
+               python -m pytest tests/test_workspaces.py vireo/tests/test_db.py vireo/tests/test_app.py vireo/tests/test_photos_api.py vireo/tests/test_edits_api.py vireo/tests/test_jobs_api.py vireo/tests/test_darktable_api.py vireo/tests/test_config.py -v
+
+            6. Commit the resolution:
+               git add -A
+               git commit -m "fix: resolve merge conflicts with main"
+
+            7. Push:
+               git push origin <headRefName>
+
+            Handle each PR independently. If one fails, continue with the others.

@@ -26,6 +26,9 @@ jobs:
       github.event_name == 'issue_comment'
       && github.event.issue.pull_request
       && contains(github.event.comment.body, '/claude-fix')
+      && (github.event.comment.author_association == 'OWNER'
+          || github.event.comment.author_association == 'COLLABORATOR'
+          || github.actor == 'chatgpt-codex-connector[bot]')
     runs-on: ubuntu-latest
     steps:
       - name: Add claude-agent label
@@ -218,6 +221,9 @@ jobs:
       && github.event.issue.pull_request
       && contains(github.event.comment.body, '👍')
       && contains(github.event.issue.labels.*.name, 'claude-agent')
+      && (github.event.comment.author_association == 'OWNER'
+          || github.event.comment.author_association == 'COLLABORATOR'
+          || github.actor == 'chatgpt-codex-connector[bot]')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

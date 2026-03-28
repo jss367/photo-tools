@@ -147,9 +147,11 @@ def test_api_photos_geo_returns_geolocated(app_and_db):
     assert resp.status_code == 200
     data = resp.get_json()
     assert 'photos' in data
-    assert 'total_geo' in data
+    assert 'total_filtered' in data
+    assert 'total_with_gps' in data
     assert 'total_photos' in data
-    assert data['total_geo'] == 1
+    assert data['total_filtered'] == 1
+    assert data['total_with_gps'] == 1
     assert data['total_photos'] == 3
     assert len(data['photos']) == 1
     assert data['photos'][0]['latitude'] == 37.77
@@ -179,4 +181,71 @@ def test_api_photos_geo_empty(app_and_db):
     assert resp.status_code == 200
     data = resp.get_json()
     assert data['photos'] == []
-    assert data['total_geo'] == 0
+    assert data['total_filtered'] == 0
+
+
+def test_api_photos_geo_includes_gps_stats(app_and_db):
+    """GET /api/photos/geo response includes consistent global GPS stats."""
+    app, db = app_and_db
+    db.conn.execute("UPDATE photos SET latitude=37.77, longitude=-122.42 WHERE filename='bird1.jpg'")
+    db.conn.commit()
+
+    client = app.test_client()
+    resp = client.get('/api/photos/geo')
+    data = resp.get_json()
+    assert data['total_with_gps'] == 1
+    assert data['total_without_gps'] == 2
+    assert data['total_photos'] == 3
+    # Verify global stats stay consistent even with filters active
+    resp2 = client.get('/api/photos/geo?rating_min=5')
+    data2 = resp2.get_json()
+    assert data2['total_filtered'] == 0  # no rated-5 geo photos
+    assert data2['total_with_gps'] == 1  # global count unchanged
+    assert data2['total_without_gps'] == 2  # global count unchanged
+
+
+def test_api_photos_geo_species_filter(app_and_db):
+    """GET /api/photos/geo?species= filters by species."""
+    app, db = app_and_db
+    db.conn.execute("UPDATE photos SET latitude=1.0, longitude=2.0 WHERE filename IN ('bird1.jpg','bird3.jpg')")
+    db.conn.commit()
+    # Add accepted predictions
+    db.add_prediction(1, 'Cardinal', 0.9, 'bioclip')
+    db.add_prediction(3, 'Sparrow', 0.8, 'bioclip')
+    preds = db.get_predictions(photo_ids=[1, 3])
+    for pr in preds:
+        db.conn.execute("UPDATE predictions SET status='accepted' WHERE id=?", (pr['id'],))
+    db.conn.commit()
+
+    client = app.test_client()
+    resp = client.get('/api/photos/geo?species=Cardinal')
+    data = resp.get_json()
+    assert len(data['photos']) == 1
+    assert data['photos'][0]['species'] == 'Cardinal'
+
+
+def test_api_species_list(app_and_db):
+    """GET /api/species returns accepted species from geolocated photos."""
+    app, db = app_and_db
+    db.conn.execute("UPDATE photos SET latitude=37.0, longitude=-122.0 WHERE id=1")
+    db.add_prediction(1, 'Cardinal', 0.9, 'bioclip')
+    preds = db.get_predictions(photo_ids=[1])
+    db.conn.execute("UPDATE predictions SET status='accepted' WHERE id=?", (preds[0]['id'],))
+    db.conn.commit()
+
+    client = app.test_client()
+    resp = client.get('/api/species')
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert 'species' in data
+    assert 'Cardinal' in data['species']
+
+
+def test_api_species_empty(app_and_db):
+    """GET /api/species returns empty list with no accepted predictions."""
+    app, _ = app_and_db
+    client = app.test_client()
+    resp = client.get('/api/species')
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert data['species'] == []

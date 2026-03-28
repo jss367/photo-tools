@@ -1842,7 +1842,7 @@ function formatDuration(seconds) {
       // Use saved logs and merge with any newer server logs
       savedLogs.forEach(function(l) { addLpLine(l, true); });
       var lastTime = savedLogs[savedLogs.length - 1].time || 0;
-      fetch('/api/logs/recent?count=50')
+      fetch('/api/logs/recent?count=200')
         .then(function(r) { return r.json(); })
         .then(function(logs) {
           logs.forEach(function(l) {
@@ -1851,7 +1851,7 @@ function formatDuration(seconds) {
           lpApplyFilter();
         });
     } else {
-      fetch('/api/logs/recent?count=50')
+      fetch('/api/logs/recent?count=200')
         .then(function(r) { return r.json(); })
         .then(function(logs) {
           logs.forEach(function(l) { addLpLine(l, true); });

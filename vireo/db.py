@@ -908,6 +908,7 @@ class Database:
         date_from=None,
         date_to=None,
         keyword=None,
+        species=None,
     ):
         """Return all geolocated photos with optional species, scoped to active workspace.
 
@@ -945,6 +946,12 @@ class Database:
 
         where = "WHERE " + " AND ".join(conditions)
 
+        having_clause = ""
+        having_params = []
+        if species is not None:
+            having_clause = "HAVING species = ?"
+            having_params.append(species)
+
         query = f"""
             SELECT p.id, p.latitude, p.longitude, p.thumb_path, p.filename,
                    p.timestamp, p.rating, p.folder_id,
@@ -957,10 +964,43 @@ class Database:
             {join_clause}
             {where}
             GROUP BY p.id
+            {having_clause}
             ORDER BY p.timestamp ASC
         """
         params.insert(0, self._ws_id())  # for the subquery
+        params.extend(having_params)
         return self.conn.execute(query, params).fetchall()
+
+    def get_accepted_species(self):
+        """Return distinct accepted species names in the active workspace."""
+        return [
+            row[0]
+            for row in self.conn.execute(
+                """
+                SELECT DISTINCT pr.species
+                FROM predictions pr
+                JOIN photos p ON p.id = pr.photo_id
+                JOIN workspace_folders wf ON wf.folder_id = p.folder_id
+                WHERE pr.workspace_id = ? AND pr.status = 'accepted'
+                  AND wf.workspace_id = ?
+                ORDER BY pr.species ASC
+                """,
+                (self._ws_id(), self._ws_id()),
+            ).fetchall()
+        ]
+
+    def count_photos_without_gps(self):
+        """Count photos in active workspace that lack GPS coordinates."""
+        row = self.conn.execute(
+            """
+            SELECT COUNT(*) FROM photos p
+            JOIN workspace_folders wf ON wf.folder_id = p.folder_id
+            WHERE wf.workspace_id = ?
+              AND (p.latitude IS NULL OR p.longitude IS NULL)
+            """,
+            (self._ws_id(),),
+        ).fetchone()
+        return row[0]
 
     def update_photo_rating(self, photo_id, rating):
         """Set photo rating (0-5)."""

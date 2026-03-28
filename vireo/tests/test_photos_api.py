@@ -180,3 +180,62 @@ def test_api_photos_geo_empty(app_and_db):
     data = resp.get_json()
     assert data['photos'] == []
     assert data['total_geo'] == 0
+
+
+def test_api_photos_geo_includes_total_without_gps(app_and_db):
+    """GET /api/photos/geo response includes total_without_gps count."""
+    app, db = app_and_db
+    db.conn.execute("UPDATE photos SET latitude=37.77, longitude=-122.42 WHERE filename='bird1.jpg'")
+    db.conn.commit()
+
+    client = app.test_client()
+    resp = client.get('/api/photos/geo')
+    data = resp.get_json()
+    assert 'total_without_gps' in data
+    assert data['total_without_gps'] == 2  # bird2 and bird3 have no GPS
+
+
+def test_api_photos_geo_species_filter(app_and_db):
+    """GET /api/photos/geo?species= filters by species."""
+    app, db = app_and_db
+    db.conn.execute("UPDATE photos SET latitude=1.0, longitude=2.0 WHERE filename IN ('bird1.jpg','bird3.jpg')")
+    db.conn.commit()
+    # Add accepted predictions
+    db.add_prediction(1, 'Cardinal', 0.9, 'bioclip')
+    db.add_prediction(3, 'Sparrow', 0.8, 'bioclip')
+    preds = db.get_predictions(photo_ids=[1, 3])
+    for pr in preds:
+        db.conn.execute("UPDATE predictions SET status='accepted' WHERE id=?", (pr['id'],))
+    db.conn.commit()
+
+    client = app.test_client()
+    resp = client.get('/api/photos/geo?species=Cardinal')
+    data = resp.get_json()
+    assert len(data['photos']) == 1
+    assert data['photos'][0]['species'] == 'Cardinal'
+
+
+def test_api_species_list(app_and_db):
+    """GET /api/species returns accepted species."""
+    app, db = app_and_db
+    db.add_prediction(1, 'Cardinal', 0.9, 'bioclip')
+    preds = db.get_predictions(photo_ids=[1])
+    db.conn.execute("UPDATE predictions SET status='accepted' WHERE id=?", (preds[0]['id'],))
+    db.conn.commit()
+
+    client = app.test_client()
+    resp = client.get('/api/species')
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert 'species' in data
+    assert 'Cardinal' in data['species']
+
+
+def test_api_species_empty(app_and_db):
+    """GET /api/species returns empty list with no accepted predictions."""
+    app, _ = app_and_db
+    client = app.test_client()
+    resp = client.get('/api/species')
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert data['species'] == []

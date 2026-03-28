@@ -501,6 +501,7 @@ def create_app(db_path, thumb_cache_dir=None):
         date_from = request.args.get("date_from", None)
         date_to = request.args.get("date_to", None)
         keyword = request.args.get("keyword", None)
+        species = request.args.get("species", None)
 
         photos = db.get_geolocated_photos(
             folder_id=folder_id,
@@ -508,15 +509,24 @@ def create_app(db_path, thumb_cache_dir=None):
             date_from=date_from,
             date_to=date_to,
             keyword=keyword,
+            species=species,
         )
 
         total_photos = db.count_photos()
+        total_without_gps = db.count_photos_without_gps()
 
         return jsonify({
             "photos": [dict(p) for p in photos],
             "total_geo": len(photos),
             "total_photos": total_photos,
+            "total_without_gps": total_without_gps,
         })
+
+    @app.route("/api/species")
+    def api_species():
+        db = _get_db()
+        species = db.get_accepted_species()
+        return jsonify({"species": species})
 
     @app.route("/api/keywords")
     def api_keywords():

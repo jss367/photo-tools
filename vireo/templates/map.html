@@ -47,6 +47,103 @@ body { padding-bottom: 36px; }
 .map-filters input[type="text"] { width: 120px; }
 .map-filters input[type="date"] { width: 130px; }
 
+.map-body {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+}
+
+/* Sidebar */
+.map-sidebar {
+  width: 280px;
+  min-width: 280px;
+  background: var(--bg-secondary, #0a2a3a);
+  border-right: 1px solid var(--border, #1a4a5a);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.sidebar-header {
+  padding: 8px 10px;
+  font-size: 11px;
+  color: var(--text-dim, #888);
+  border-bottom: 1px solid var(--border, #1a4a5a);
+  flex-shrink: 0;
+}
+
+.sidebar-list {
+  flex: 1;
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+
+.sidebar-card {
+  display: flex;
+  gap: 8px;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--border, #1a4a5a);
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+.sidebar-card:hover {
+  background: var(--bg-tertiary, #14374E);
+}
+
+.sidebar-card.active {
+  background: var(--bg-tertiary, #14374E);
+  border-left: 3px solid var(--accent, #24E5CA);
+  padding-left: 7px;
+}
+
+.sidebar-card img {
+  width: 56px;
+  height: 56px;
+  object-fit: cover;
+  border-radius: 4px;
+  background: var(--bg-tertiary, #14374E);
+  flex-shrink: 0;
+}
+
+.sidebar-card .card-info {
+  min-width: 0;
+  flex: 1;
+}
+
+.sidebar-card .card-filename {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-primary, #E0F0F0);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sidebar-card .card-species {
+  font-size: 10px;
+  color: #24E5CA;
+  font-style: italic;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-top: 2px;
+}
+
+.sidebar-card .card-meta {
+  font-size: 10px;
+  color: var(--text-dim, #888);
+  margin-top: 2px;
+}
+
+.species-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
 #map {
   flex: 1;
   min-height: 0;
@@ -59,6 +156,12 @@ body { padding-bottom: 36px; }
   background: var(--bg-secondary, #0a2a3a);
   border-top: 1px solid var(--border, #1a4a5a);
 }
+
+.map-status a {
+  color: #7ec8e3;
+  text-decoration: none;
+}
+.map-status a:hover { text-decoration: underline; }
 
 /* Popup styling */
 .photo-popup { width: 220px; }
@@ -97,6 +200,81 @@ body { padding-bottom: 36px; }
 .photo-popup .popup-link:hover { text-decoration: underline; }
 
 .popup-stars { color: #f0c040; font-size: 11px; }
+
+/* Species legend control */
+.species-legend {
+  background: var(--bg-secondary, rgba(10, 42, 58, 0.92));
+  padding: 8px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--border, #1a4a5a);
+  font-size: 11px;
+  color: var(--text-primary, #E0F0F0);
+  max-height: 240px;
+  overflow-y: auto;
+}
+
+.species-legend .legend-title {
+  font-weight: 600;
+  margin-bottom: 4px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  cursor: pointer;
+  user-select: none;
+}
+
+.species-legend .legend-items { line-height: 1.8; }
+
+.species-legend .legend-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+}
+
+.species-legend.collapsed .legend-items { display: none; }
+
+/* Cluster preview tooltip */
+.cluster-preview {
+  background: var(--bg-secondary, rgba(10, 42, 58, 0.95));
+  border: 1px solid var(--border, #1a4a5a);
+  border-radius: 6px;
+  padding: 6px;
+  pointer-events: none;
+  z-index: 1000;
+}
+
+.cluster-preview .preview-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 56px);
+  gap: 3px;
+}
+
+.cluster-preview .preview-grid img {
+  width: 56px;
+  height: 56px;
+  object-fit: cover;
+  border-radius: 3px;
+  background: var(--bg-tertiary, #14374E);
+}
+
+.cluster-preview .preview-more {
+  font-size: 10px;
+  color: var(--text-dim, #888);
+  text-align: center;
+  margin-top: 4px;
+}
+
+/* Leaflet layer control dark theme */
+.leaflet-control-layers {
+  background: var(--bg-secondary, rgba(10, 42, 58, 0.92)) !important;
+  border: 1px solid var(--border, #1a4a5a) !important;
+  color: var(--text-primary, #E0F0F0) !important;
+  border-radius: 6px !important;
+}
+.leaflet-control-layers label {
+  color: var(--text-primary, #E0F0F0) !important;
+}
 </style>
 </head>
 <body>
@@ -117,6 +295,9 @@ body { padding-bottom: 36px; }
       <option value="5">5</option>
     </select>
 
+    <label>Species:</label>
+    <select id="filterSpecies"><option value="">All species</option></select>
+
     <label>Keyword:</label>
     <input type="text" id="filterKeyword" placeholder="Search...">
 
@@ -126,23 +307,115 @@ body { padding-bottom: 36px; }
     <input type="date" id="filterDateTo">
   </div>
 
-  <div id="map"></div>
+  <div class="map-body">
+    <div class="map-sidebar">
+      <div class="sidebar-header" id="sidebarHeader">0 photos</div>
+      <div class="sidebar-list" id="sidebarList"></div>
+    </div>
+    <div id="map"></div>
+  </div>
 
   <div class="map-status" id="mapStatus">Loading...</div>
 </div>
 
+<div class="cluster-preview" id="clusterPreview" style="display:none; position:absolute;"></div>
+
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script src="https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js"></script>
 <script>
-var map = L.map('map').setView([20, 0], 2);
-L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+/* ── Tile layers ── */
+var streetLayer = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
   attribution: '&copy; OpenStreetMap contributors',
   maxZoom: 19,
-}).addTo(map);
+});
+var satelliteLayer = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
+  attribution: '&copy; Esri',
+  maxZoom: 19,
+});
+var terrainLayer = L.tileLayer('https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png', {
+  attribution: '&copy; OpenTopoMap',
+  maxZoom: 17,
+});
 
+var map = L.map('map', { layers: [streetLayer] }).setView([20, 0], 2);
+L.control.layers({ 'Street': streetLayer, 'Satellite': satelliteLayer, 'Terrain': terrainLayer }).addTo(map);
+
+/* ── Marker cluster group ── */
 var markers = L.markerClusterGroup();
 map.addLayer(markers);
 
+/* ── Species color palette ── */
+var SPECIES_COLORS = [
+  '#e6194b', '#3cb44b', '#ffe119', '#4363d8',
+  '#f58231', '#911eb4', '#42d4f4', '#f032e6'
+];
+var NO_SPECIES_COLOR = '#5b8fa8';
+var OTHER_SPECIES_COLOR = '#888888';
+var speciesColorMap = {};
+
+function assignSpeciesColors(photos) {
+  var counts = {};
+  photos.forEach(function(p) {
+    if (p.species) counts[p.species] = (counts[p.species] || 0) + 1;
+  });
+  var sorted = Object.keys(counts).sort(function(a, b) { return counts[b] - counts[a]; });
+  speciesColorMap = {};
+  sorted.slice(0, SPECIES_COLORS.length).forEach(function(sp, i) {
+    speciesColorMap[sp] = SPECIES_COLORS[i];
+  });
+}
+
+function getSpeciesColor(species) {
+  if (!species) return NO_SPECIES_COLOR;
+  return speciesColorMap[species] || OTHER_SPECIES_COLOR;
+}
+
+function makeCircleIcon(color) {
+  return L.divIcon({
+    className: '',
+    html: '<div style="width:14px;height:14px;border-radius:50%;background:' + color
+      + ';border:2px solid #fff;box-shadow:0 1px 3px rgba(0,0,0,.4);"></div>',
+    iconSize: [14, 14],
+    iconAnchor: [7, 7],
+    popupAnchor: [0, -8],
+  });
+}
+
+/* ── Species legend control ── */
+var LegendControl = L.Control.extend({
+  options: { position: 'bottomleft' },
+  onAdd: function() {
+    this._div = L.DomUtil.create('div', 'species-legend');
+    this._div.innerHTML = '<div class="legend-title">Species</div><div class="legend-items"></div>';
+    this._div.querySelector('.legend-title').addEventListener('click', function() {
+      this._div.classList.toggle('collapsed');
+    }.bind(this));
+    L.DomEvent.disableClickPropagation(this._div);
+    L.DomEvent.disableScrollPropagation(this._div);
+    return this._div;
+  },
+  update: function(colorMap) {
+    var items = this._div.querySelector('.legend-items');
+    var html = '';
+    var entries = Object.keys(colorMap).sort();
+    entries.forEach(function(sp) {
+      html += '<div class="legend-item"><span class="species-dot" style="background:'
+        + colorMap[sp] + '"></span>' + escapeHtml(sp) + '</div>';
+    });
+    if (entries.length > 0) {
+      html += '<div class="legend-item"><span class="species-dot" style="background:'
+        + OTHER_SPECIES_COLOR + '"></span>Other</div>';
+    }
+    html += '<div class="legend-item"><span class="species-dot" style="background:'
+      + NO_SPECIES_COLOR + '"></span>No species</div>';
+    items.innerHTML = html;
+    this._div.style.display = entries.length > 0 || true ? '' : 'none';
+  },
+});
+var legendControl = new LegendControl();
+legendControl.addTo(map);
+
+/* ── Helpers ── */
 function buildStars(rating) {
   if (!rating) return '';
   var s = '';
@@ -155,16 +428,119 @@ function formatDate(ts) {
   return ts.replace('T', ' ').substring(0, 16);
 }
 
+/* ── State for bi-directional sync ── */
+var photoMarkers = {};  /* photo id -> marker */
+var activePhotoId = null;
+
+function setActiveCard(photoId) {
+  if (activePhotoId !== null) {
+    var prev = document.querySelector('.sidebar-card[data-id="' + activePhotoId + '"]');
+    if (prev) prev.classList.remove('active');
+  }
+  activePhotoId = photoId;
+  if (photoId !== null) {
+    var card = document.querySelector('.sidebar-card[data-id="' + photoId + '"]');
+    if (card) {
+      card.classList.add('active');
+      card.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+    }
+  }
+}
+
+/* ── Sidebar rendering ── */
+function renderSidebar(photos) {
+  var list = document.getElementById('sidebarList');
+  list.innerHTML = '';
+  document.getElementById('sidebarHeader').textContent = photos.length + ' photo' + (photos.length !== 1 ? 's' : '');
+
+  photos.forEach(function(p) {
+    var card = document.createElement('div');
+    card.className = 'sidebar-card';
+    card.setAttribute('data-id', p.id);
+
+    var thumbSrc = p.thumb_path ? '/thumbnails/' + encodeURIComponent(p.thumb_path) : '';
+    var color = getSpeciesColor(p.species);
+    var speciesHtml = p.species
+      ? '<div class="card-species"><span class="species-dot" style="background:' + color + '"></span>'
+        + escapeHtml(p.species) + '</div>'
+      : '';
+
+    card.innerHTML =
+      (thumbSrc ? '<img src="' + escapeAttr(thumbSrc) + '" alt="" onerror="this.style.visibility=\'hidden\'">' : '<div style="width:56px;height:56px;background:var(--bg-tertiary,#14374E);border-radius:4px;flex-shrink:0"></div>')
+      + '<div class="card-info">'
+      + '<div class="card-filename">' + escapeHtml(p.filename) + '</div>'
+      + speciesHtml
+      + '<div class="card-meta">' + escapeHtml(formatDate(p.timestamp)) + '</div>'
+      + '</div>';
+
+    card.addEventListener('click', function() {
+      var marker = photoMarkers[p.id];
+      if (marker) {
+        map.setView(marker.getLatLng(), Math.max(map.getZoom(), 14));
+        markers.zoomToShowLayer(marker, function() {
+          marker.openPopup();
+        });
+      }
+      setActiveCard(p.id);
+    });
+
+    list.appendChild(card);
+  });
+}
+
+/* ── Cluster preview ── */
+var clusterPreviewEl = document.getElementById('clusterPreview');
+
+function showClusterPreview(e) {
+  var cluster = e.layer;
+  var childMarkers = cluster.getAllChildMarkers();
+  var previewCount = Math.min(childMarkers.length, 6);
+
+  var gridHtml = '<div class="preview-grid">';
+  for (var i = 0; i < previewCount; i++) {
+    var p = childMarkers[i]._photoData;
+    if (p && p.thumb_path) {
+      gridHtml += '<img src="/thumbnails/' + encodeURIComponent(p.thumb_path)
+        + '" alt="" onerror="this.style.visibility=\'hidden\'">';
+    } else {
+      gridHtml += '<div style="width:56px;height:56px;background:var(--bg-tertiary,#14374E);border-radius:3px"></div>';
+    }
+  }
+  gridHtml += '</div>';
+  if (childMarkers.length > 6) {
+    gridHtml += '<div class="preview-more">+' + (childMarkers.length - 6) + ' more</div>';
+  }
+
+  clusterPreviewEl.innerHTML = gridHtml;
+  clusterPreviewEl.style.display = 'block';
+
+  var pt = map.latLngToContainerPoint(cluster.getLatLng());
+  var mapRect = document.getElementById('map').getBoundingClientRect();
+  clusterPreviewEl.style.left = (mapRect.left + pt.x + 20) + 'px';
+  clusterPreviewEl.style.top = (mapRect.top + pt.y - 30) + 'px';
+}
+
+function hideClusterPreview() {
+  clusterPreviewEl.style.display = 'none';
+}
+
+markers.on('clustermouseover', showClusterPreview);
+markers.on('clustermouseout', hideClusterPreview);
+markers.on('clusterclick', hideClusterPreview);
+
+/* ── Load photos ── */
 async function loadPhotos() {
   var params = new URLSearchParams();
   var folder = document.getElementById('filterFolder').value;
   var rating = document.getElementById('filterRating').value;
+  var species = document.getElementById('filterSpecies').value;
   var keyword = document.getElementById('filterKeyword').value;
   var dateFrom = document.getElementById('filterDateFrom').value;
   var dateTo = document.getElementById('filterDateTo').value;
 
   if (folder) params.set('folder_id', folder);
   if (rating) params.set('rating_min', rating);
+  if (species) params.set('species', species);
   if (keyword) params.set('keyword', keyword);
   if (dateFrom) params.set('date_from', dateFrom);
   if (dateTo) params.set('date_to', dateTo);
@@ -175,12 +551,19 @@ async function loadPhotos() {
   try {
     var data = await safeFetch(url);
     markers.clearLayers();
+    photoMarkers = {};
+    activePhotoId = null;
 
     if (data.photos.length === 0) {
+      renderSidebar([]);
       document.getElementById('mapStatus').textContent =
         'No geolocated photos found. Photos with GPS data in their EXIF metadata will appear here.';
+      legendControl.update({});
       return;
     }
+
+    assignSpeciesColors(data.photos);
+    legendControl.update(speciesColorMap);
 
     data.photos.forEach(function(p) {
       var thumbSrc = p.thumb_path ? '/thumbnails/' + encodeURIComponent(p.thumb_path) : '';
@@ -199,20 +582,40 @@ async function loadPhotos() {
         + '<a class="popup-link" href="/browse?photo_id=' + p.id + '">View in Browse &rarr;</a>'
         + '</div>';
 
-      var marker = L.marker([p.latitude, p.longitude]);
+      var color = getSpeciesColor(p.species);
+      var marker = L.marker([p.latitude, p.longitude], { icon: makeCircleIcon(color) });
       marker.bindPopup(popup);
+      marker._photoData = p;
+
+      marker.on('click', function() {
+        setActiveCard(p.id);
+      });
+
+      photoMarkers[p.id] = marker;
       markers.addLayer(marker);
     });
 
-    map.fitBounds(markers.getBounds(), {padding: [30, 30]});
-    document.getElementById('mapStatus').textContent =
-      'Showing ' + data.total_geo + ' geolocated photos (' + data.total_photos + ' total)';
+    map.fitBounds(markers.getBounds(), { padding: [30, 30] });
+    renderSidebar(data.photos);
+
+    /* GPS coverage stats */
+    var totalGeo = data.total_geo;
+    var totalPhotos = data.total_photos;
+    var missingGps = data.total_without_gps;
+    var pct = totalPhotos > 0 ? Math.round((totalGeo / totalPhotos) * 100) : 0;
+
+    var statusEl = document.getElementById('mapStatus');
+    statusEl.innerHTML = 'Showing ' + totalGeo + ' geolocated photos &mdash; '
+      + pct + '% GPS coverage'
+      + (missingGps > 0
+          ? ' &mdash; <a href="/browse?missing_gps=1">' + missingGps + ' missing GPS</a>'
+          : '');
   } catch (e) {
     document.getElementById('mapStatus').textContent = 'Failed to load photos.';
   }
 }
 
-/* Load folder list for filter dropdown */
+/* ── Load filter options ── */
 async function loadFolders() {
   try {
     var data = await safeFetch('/api/folders');
@@ -226,20 +629,34 @@ async function loadFolders() {
   } catch(e) {}
 }
 
-/* Debounce for keyword input */
+async function loadSpecies() {
+  try {
+    var data = await safeFetch('/api/species');
+    var sel = document.getElementById('filterSpecies');
+    (data.species || []).forEach(function(sp) {
+      var opt = document.createElement('option');
+      opt.value = sp;
+      opt.textContent = sp;
+      sel.appendChild(opt);
+    });
+  } catch(e) {}
+}
+
+/* ── Event listeners ── */
 var _keywordTimer;
 document.getElementById('filterKeyword').addEventListener('input', function() {
   clearTimeout(_keywordTimer);
   _keywordTimer = setTimeout(loadPhotos, 400);
 });
 
-/* Filter change handlers */
 document.getElementById('filterFolder').addEventListener('change', loadPhotos);
 document.getElementById('filterRating').addEventListener('change', loadPhotos);
+document.getElementById('filterSpecies').addEventListener('change', loadPhotos);
 document.getElementById('filterDateFrom').addEventListener('change', loadPhotos);
 document.getElementById('filterDateTo').addEventListener('change', loadPhotos);
 
 loadFolders();
+loadSpecies();
 loadPhotos();
 </script>
 </body>

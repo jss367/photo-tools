@@ -322,3 +322,267 @@ def test_edit_history_api(app_and_db):
     data = resp.get_json()
     assert len(data) == 2
     assert data[0]['new_value'] == '2'  # most recent first
+
+
+# -- History tracking for predictions, culling, labeling, species, discard --
+
+
+def test_accept_prediction_records_history(app_and_db):
+    """Accepting a prediction records prediction_accept in edit history."""
+    app, db = app_and_db
+    client = app.test_client()
+    photos = db.get_photos()
+    pid = photos[0]['id']
+
+    db.add_prediction(pid, 'Blue Jay', 0.95, 'test-model')
+    preds = db.conn.execute("SELECT id FROM predictions WHERE photo_id = ?", (pid,)).fetchall()
+    pred_id = preds[0]['id']
+
+    resp = client.post(f'/api/predictions/{pred_id}/accept')
+    assert resp.status_code == 200
+
+    history = db.get_edit_history()
+    assert len(history) == 1
+    assert history[0]['action_type'] == 'prediction_accept'
+    assert 'Blue Jay' in history[0]['description']
+
+
+def test_accept_prediction_undo_restores_status(app_and_db):
+    """Undoing an accepted prediction restores keyword, pending changes, and prediction status."""
+    app, db = app_and_db
+    client = app.test_client()
+    photos = db.get_photos()
+    pid = photos[0]['id']
+
+    db.add_prediction(pid, 'Blue Jay', 0.95, 'test-model')
+    pred = db.conn.execute("SELECT id FROM predictions WHERE photo_id = ?", (pid,)).fetchone()
+    pred_id = pred['id']
+
+    # Accept
+    resp = client.post(f'/api/predictions/{pred_id}/accept')
+    assert resp.status_code == 200
+
+    # Verify accepted state
+    pred_row = db.conn.execute("SELECT status FROM predictions WHERE id = ?", (pred_id,)).fetchone()
+    assert pred_row['status'] == 'accepted'
+    kws = {k['name'] for k in db.get_photo_keywords(pid)}
+    assert 'Blue Jay' in kws
+
+    # Undo
+    resp = client.post('/api/undo')
+    assert resp.status_code == 200
+
+    # Prediction status restored to pending
+    pred_row = db.conn.execute("SELECT status FROM predictions WHERE id = ?", (pred_id,)).fetchone()
+    assert pred_row['status'] == 'pending'
+
+    # Keyword removed
+    kws = {k['name'] for k in db.get_photo_keywords(pid)}
+    assert 'Blue Jay' not in kws
+
+    # Pending keyword change removed
+    changes = db.get_pending_changes()
+    assert not any(c['change_type'] == 'keyword_add' and c['value'] == 'Blue Jay' for c in changes)
+
+
+def test_reject_prediction_records_history(app_and_db):
+    """Rejecting a prediction records prediction_reject in edit history."""
+    app, db = app_and_db
+    client = app.test_client()
+    photos = db.get_photos()
+    pid = photos[0]['id']
+
+    db.add_prediction(pid, 'House Sparrow', 0.60, 'test-model')
+    preds = db.conn.execute("SELECT id FROM predictions WHERE photo_id = ?", (pid,)).fetchall()
+    pred_id = preds[0]['id']
+
+    resp = client.post(f'/api/predictions/{pred_id}/reject')
+    assert resp.status_code == 200
+
+    history = db.get_edit_history()
+    assert len(history) == 1
+    assert history[0]['action_type'] == 'prediction_reject'
+    assert 'House Sparrow' in history[0]['description']
+
+
+def test_prediction_group_apply_records_history(app_and_db):
+    """Group apply records separate flag and keyword_add history entries."""
+    app, db = app_and_db
+    client = app.test_client()
+    photos = db.get_photos()
+    pids = [p['id'] for p in photos[:3]]
+
+    resp = client.post('/api/predictions/group/apply',
+                       json={'picks': [pids[0], pids[1]],
+                             'rejects': [pids[2]],
+                             'species': 'Northern Cardinal'})
+    assert resp.status_code == 200
+
+    history = db.get_edit_history()
+    action_types = {h['action_type'] for h in history}
+    assert 'keyword_add' in action_types
+    assert 'flag' in action_types
+    assert len(history) == 2
+
+
+def test_culling_apply_records_history(app_and_db):
+    """Culling apply records flag changes in edit history."""
+    app, db = app_and_db
+    client = app.test_client()
+    photos = db.get_photos()
+    pids = [p['id'] for p in photos[:3]]
+
+    resp = client.post('/api/culling/apply',
+                       json={'keepers': [pids[0]], 'rejects': [pids[1], pids[2]]})
+    assert resp.status_code == 200
+
+    history = db.get_edit_history()
+    assert len(history) == 1
+    assert history[0]['action_type'] == 'flag'
+    assert history[0]['is_batch'] == 1
+    assert history[0]['item_count'] == 3
+
+
+def test_culling_apply_undo_restores_flags(app_and_db):
+    """Undoing culling restores original flag values."""
+    app, db = app_and_db
+    client = app.test_client()
+    photos = db.get_photos()
+    pid = photos[0]['id']
+    original_flag = photos[0]['flag'] or 'none'
+
+    client.post('/api/culling/apply', json={'keepers': [pid], 'rejects': []})
+    assert db.get_photo(pid)['flag'] == 'flagged'
+
+    resp = client.post('/api/undo')
+    assert resp.status_code == 200
+    assert (db.get_photo(pid)['flag'] or 'none') == original_flag
+
+
+def test_label_cluster_records_history(app_and_db):
+    """Label cluster records keyword_add in edit history."""
+    app, db = app_and_db
+    client = app.test_client()
+    photos = db.get_photos()
+    pids = [p['id'] for p in photos[:2]]
+
+    resp = client.post('/api/species/label-cluster',
+                       json={'photo_ids': pids, 'label': 'juvenile'})
+    assert resp.status_code == 200
+
+    history = db.get_edit_history()
+    assert len(history) == 1
+    assert history[0]['action_type'] == 'keyword_add'
+    assert 'juvenile' in history[0]['description']
+    assert history[0]['item_count'] == 2
+
+
+def test_encounter_species_records_history(app_and_db):
+    """Confirming encounter species records keyword_add in edit history."""
+    app, db = app_and_db
+    client = app.test_client()
+    photos = db.get_photos()
+    pids = [p['id'] for p in photos[:2]]
+
+    resp = client.post('/api/encounters/species',
+                       json={'species': 'Red-tailed Hawk', 'photo_ids': pids})
+    assert resp.status_code == 200
+
+    history = db.get_edit_history()
+    assert len(history) == 1
+    assert history[0]['action_type'] == 'keyword_add'
+    assert 'Red-tailed Hawk' in history[0]['description']
+
+
+def test_sync_discard_records_history(app_and_db):
+    """Discarding pending changes records discard in edit history."""
+    app, db = app_and_db
+    client = app.test_client()
+    photos = db.get_photos()
+    pid = photos[0]['id']
+
+    db.queue_change(pid, 'rating', '5')
+    changes = db.get_pending_changes()
+    change_ids = [c['id'] for c in changes]
+
+    resp = client.post('/api/sync/discard', json={'change_ids': change_ids})
+    assert resp.status_code == 200
+
+    history = db.get_edit_history()
+    assert len(history) == 1
+    assert history[0]['action_type'] == 'discard'
+    assert db.get_pending_changes() == []
+
+
+def test_undo_skips_non_undoable_entries(app_and_db):
+    """Undo skips prediction_reject and discard entries to reach real undoable edits."""
+    app, db = app_and_db
+    client = app.test_client()
+    photos = db.get_photos()
+    pid = photos[0]['id']
+
+    # Create an undoable edit (rating change)
+    original_rating = db.get_photo(pid)['rating']
+    client.post(f'/api/photos/{pid}/rating', json={'rating': 5})
+    assert db.get_photo(pid)['rating'] == 5
+
+    # Create a non-undoable entry (reject prediction)
+    db.add_prediction(pid, 'House Sparrow', 0.60, 'test-model')
+    pred = db.conn.execute("SELECT id FROM predictions WHERE photo_id = ?", (pid,)).fetchall()[-1]
+    client.post(f'/api/predictions/{pred["id"]}/reject')
+
+    # History has 2 entries: prediction_reject (most recent) and rating
+    history = db.get_edit_history()
+    assert len(history) == 2
+
+    # Undo should skip the prediction_reject and undo the rating
+    resp = client.post('/api/undo')
+    assert resp.status_code == 200
+    assert db.get_photo(pid)['rating'] == original_rating
+
+    # prediction_reject entry still in history, rating entry removed
+    history = db.get_edit_history()
+    assert len(history) == 1
+    assert history[0]['action_type'] == 'prediction_reject'
+
+
+def test_undo_status_skips_non_undoable(app_and_db):
+    """Undo status reports the next undoable entry, not a non-undoable one."""
+    app, db = app_and_db
+    client = app.test_client()
+    photos = db.get_photos()
+    pid = photos[0]['id']
+
+    # Create an undoable edit
+    client.post(f'/api/photos/{pid}/rating', json={'rating': 5})
+
+    # Create a non-undoable entry on top
+    db.add_prediction(pid, 'Crow', 0.50, 'test-model')
+    pred = db.conn.execute("SELECT id FROM predictions WHERE photo_id = ?", (pid,)).fetchall()[-1]
+    client.post(f'/api/predictions/{pred["id"]}/reject')
+
+    # Undo status should show the rating edit, not the reject
+    resp = client.get('/api/undo/status')
+    data = resp.get_json()
+    assert data['available'] is True
+    assert 'rating' in data['description'].lower()
+    assert data['count'] == 1  # only 1 undoable entry
+
+
+def test_undo_nothing_when_only_non_undoable(app_and_db):
+    """Undo returns error when only non-undoable entries exist."""
+    app, db = app_and_db
+    client = app.test_client()
+    photos = db.get_photos()
+    pid = photos[0]['id']
+
+    # Only non-undoable entries
+    db.add_prediction(pid, 'Robin', 0.70, 'test-model')
+    pred = db.conn.execute("SELECT id FROM predictions WHERE photo_id = ?", (pid,)).fetchone()
+    client.post(f'/api/predictions/{pred["id"]}/reject')
+
+    resp = client.post('/api/undo')
+    assert resp.status_code == 400  # "nothing to undo"
+
+    resp = client.get('/api/undo/status')
+    assert resp.get_json()['available'] is False

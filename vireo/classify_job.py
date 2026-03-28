@@ -495,7 +495,8 @@ def _store_grouped_predictions(
     Returns:
         dict with predictions_stored, burst_groups, already_labeled counts.
     """
-    from compare import categorize, read_xmp_keywords
+    from compare import categorize
+    from xmp import read_keywords
     from grouping import (
         consensus_prediction,
         group_by_timestamp,
@@ -522,7 +523,7 @@ def _store_grouped_predictions(
                     folder_path,
                     os.path.splitext(photo["filename"])[0] + ".xmp",
                 )
-                existing = read_xmp_keywords(xmp_path)
+                existing = read_keywords(xmp_path)
                 category = categorize(item["prediction"], existing, tax)
 
             if category == "match":
@@ -562,7 +563,7 @@ def _store_grouped_predictions(
                     representative["folder_path"],
                     os.path.splitext(representative["photo"]["filename"])[0] + ".xmp",
                 )
-                existing = read_xmp_keywords(xmp_path)
+                existing = read_keywords(xmp_path)
                 category = categorize(cons["prediction"], existing, tax)
 
             if category == "match":

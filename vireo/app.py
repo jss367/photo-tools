@@ -478,9 +478,9 @@ def create_app(db_path, thumb_cache_dir=None):
             xmp_keywords = []
             xmp_exists = os.path.exists(xmp_path)
             if xmp_exists:
-                from compare import read_xmp_keywords
+                from xmp import read_keywords
 
-                xmp_keywords = sorted(read_xmp_keywords(xmp_path))
+                xmp_keywords = sorted(read_keywords(xmp_path))
             result["xmp_exists"] = xmp_exists
             result["xmp_keywords"] = xmp_keywords
             result["xmp_path"] = xmp_path

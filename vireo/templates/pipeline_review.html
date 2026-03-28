@@ -945,6 +945,47 @@ input[type="range"]::-moz-range-thumb {
   <button class="undo-toast-btn" onclick="undoLastAction()">Undo</button>
 </div>
 
+<!-- Group Review Modal -->
+<div class="grm-overlay" id="grmOverlay">
+  <div class="grm-header">
+    <h3>Review Burst Group</h3>
+    <span id="grmCount" style="font-size:12px;color:var(--text-dim,#888);"></span>
+    <button class="grm-close" onclick="closeGroupReview()">&times;</button>
+  </div>
+  <div class="grm-body">
+    <div class="grm-strips">
+      <div class="grm-zone grm-picks">
+        <div class="grm-zone-label">PICKS ↑</div>
+        <div class="grm-strip" id="grmPicks"></div>
+      </div>
+      <div class="grm-zone grm-candidates">
+        <div class="grm-zone-label">CANDIDATES ↑↓</div>
+        <div class="grm-strip" id="grmCandidates"></div>
+      </div>
+      <div class="grm-zone grm-rejects">
+        <div class="grm-zone-label">REJECTS ↓</div>
+        <div class="grm-strip" id="grmRejects"></div>
+      </div>
+    </div>
+    <div class="grm-loupe" id="grmLoupe">
+      <div class="grm-loupe-img" id="grmLoupeImg" onmousemove="grmLoupeMove(event)" onmouseleave="grmLoupeReset()" onclick="grmLoupeToggleLock(event)" onwheel="grmLoupeZoom(event)">
+        <img id="grmLoupePhoto" src="" alt="">
+        <div class="grm-loupe-crosshair-h" id="grmCrosshairH"></div>
+        <div class="grm-loupe-crosshair-v" id="grmCrosshairV"></div>
+      </div>
+      <div class="grm-loupe-info" id="grmLoupeInfo">Select a photo to preview. Hover to compare sharpness across all frames.</div>
+      <div class="grm-loupe-detail" id="grmLoupeDetail"></div>
+    </div>
+  </div>
+  <div class="grm-footer">
+    <label style="font-size:12px;color:var(--text-muted,#888);">Species:</label>
+    <input type="text" id="grmSpecies" style="background:var(--bg-input,#14374E);color:var(--text-primary,#E0F0F0);border:1px solid var(--border-secondary,#1A4560);border-radius:4px;padding:6px 10px;font-size:13px;width:200px;">
+    <button onclick="grmRemoveFromGroup()" style="background:var(--bg-tertiary,#14374E);color:var(--text-muted,#888);border:none;border-radius:4px;padding:6px 12px;font-size:12px;cursor:pointer;">Remove from group</button>
+    <span class="grm-hint">↑↓ move zone &nbsp; ←→ navigate &nbsp; Space = unsort &nbsp; Del = remove &nbsp; Click preview to lock/unlock zoom</span>
+    <button onclick="grmApply()" class="btn-batch-accept" style="margin-left:auto;padding:8px 20px;border:none;border-radius:4px;font-size:13px;font-weight:600;cursor:pointer;background:var(--accent,#24E5CA);color:#000;">Apply & Close</button>
+  </div>
+</div>
+
 <script>
 var pipelineResults = null;
 var activeFilter = 'all';

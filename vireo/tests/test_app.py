@@ -401,7 +401,7 @@ def test_health_endpoint(app_and_db):
 
 def test_shutdown_endpoint(app_and_db):
     """POST /api/shutdown returns 200 and signals shutdown."""
-    from unittest.mock import patch, MagicMock
+    from unittest.mock import MagicMock, patch
 
     app, _ = app_and_db
     client = app.test_client()
@@ -466,7 +466,7 @@ def test_templates_jinja_free_except_includes():
         if not fname.endswith('.html'):
             continue
         fpath = os.path.join(templates_dir, fname)
-        with open(fpath, 'r', encoding='utf-8') as f:
+        with open(fpath, encoding='utf-8') as f:
             lines = f.readlines()
         for lineno, line in enumerate(lines, start=1):
             # Check for {{ ... }} expressions — never allowed

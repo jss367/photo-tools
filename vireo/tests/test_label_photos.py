@@ -9,7 +9,6 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'lr-migra
 
 from PIL import Image
 
-
 NS = {
     "x": "adobe:ns:meta/",
     "rdf": "http://www.w3.org/1999/02/22-rdf-syntax-ns#",

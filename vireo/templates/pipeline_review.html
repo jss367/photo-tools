@@ -2142,7 +2142,7 @@ document.addEventListener('keydown', function(e) {
 function grmApply() {
   var species = document.getElementById('grmSpecies').value.trim();
 
-  // Update local pipelineResults with pick/reject decisions
+  // Update local pipelineResults with pick/reject/candidate decisions
   var photoMap = {};
   pipelineResults.photos.forEach(function(p) { photoMap[p.id] = p; });
 
@@ -2155,6 +2155,32 @@ function grmApply() {
     var p = photoMap[pid];
     if (p) p.label = 'REJECT';
   });
+
+  // Candidates (not picked, not rejected, not removed) → REVIEW
+  grmState.items.forEach(function(item) {
+    if (!grmState.picks.has(item.id) && !grmState.rejects.has(item.id) && !grmState.removed.has(item.id)) {
+      var p = photoMap[item.id];
+      if (p) p.label = 'REVIEW';
+    }
+  });
+
+  // Detach removed photos from the burst into new single-photo bursts
+  if (grmState.removed.size > 0) {
+    var enc = pipelineResults.encounters[grmState.encIdx];
+    var burst = enc.bursts[grmState.burstIdx];
+    var burstIds = burst.photo_ids || burst;
+    grmState.removed.forEach(function(pid) {
+      var idx = burstIds.indexOf(pid);
+      if (idx >= 0) burstIds.splice(idx, 1);
+      // Add as a new single-photo burst in the same encounter
+      enc.bursts.push({ photo_ids: [pid], species_predictions: burst.species_predictions || [], species_override: null });
+    });
+    // Clean up empty burst
+    if (burstIds.length === 0) {
+      enc.bursts.splice(grmState.burstIdx, 1);
+    }
+    enc.burst_count = enc.bursts.length;
+  }
 
   // Update species if changed
   if (species) {

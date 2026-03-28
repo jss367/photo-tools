@@ -366,6 +366,14 @@ def create_app(db_path, thumb_cache_dir=None):
         effective_cfg = db.get_effective_config(cfg.load())
         pipeline_cfg = effective_cfg.get("pipeline", {})
 
+        ws = db.get_workspace(db._active_workspace_id)
+        ws_overrides = {}
+        if ws and ws["config_overrides"]:
+            try:
+                ws_overrides = json.loads(ws["config_overrides"]) if isinstance(ws["config_overrides"], str) else ws["config_overrides"]
+            except Exception:
+                pass
+
         return jsonify({
             "total_photos": total_photos,
             "has_detections": pipeline_counts["detections"],
@@ -377,6 +385,7 @@ def create_app(db_path, thumb_cache_dir=None):
                 "proxy_longest_edge": pipeline_cfg.get("proxy_longest_edge", 1536),
             },
             "results": results,
+            "workspace_overrides": ws_overrides,
         })
 
     @app.route("/api/folders")
@@ -1041,11 +1050,23 @@ def create_app(db_path, thumb_cache_dir=None):
         db = _get_db()
         body = request.get_json(silent=True) or {}
         # Only allow workspace-overridable keys
-        allowed = {"classification_threshold", "grouping_window_seconds", "similarity_threshold"}
-        overrides = {k: v for k, v in body.items() if k in allowed and v is not None}
-        # Remove keys set to null (revert to global)
-        db.update_workspace(db._active_workspace_id, config_overrides=overrides if overrides else None)
-        return jsonify({"ok": True, "overrides": overrides})
+        allowed = {"classification_threshold", "grouping_window_seconds", "similarity_threshold", "review_min_confidence"}
+        # Merge into existing overrides to preserve non-whitelisted keys
+        ws = db.get_workspace(db._active_workspace_id)
+        existing = {}
+        if ws and ws["config_overrides"]:
+            try:
+                existing = json.loads(ws["config_overrides"]) if isinstance(ws["config_overrides"], str) else ws["config_overrides"]
+            except Exception:
+                pass
+        for k, v in body.items():
+            if k in allowed:
+                if v is None:
+                    existing.pop(k, None)
+                else:
+                    existing[k] = v
+        db.update_workspace(db._active_workspace_id, config_overrides=existing if existing else None)
+        return jsonify({"ok": True, "overrides": existing})
 
     # -- Prediction API routes --
 

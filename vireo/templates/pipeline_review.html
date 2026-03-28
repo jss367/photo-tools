@@ -86,6 +86,22 @@ body { padding-bottom: 36px; }
 .filter-btn:hover { border-color: var(--text-muted, #7FAAB0); }
 .filter-btn.active { background: var(--accent, #24E5CA); color: #000; border-color: var(--accent, #24E5CA); }
 .filter-btn .count { margin-left: 4px; opacity: 0.7; }
+.confidence-slider-wrap {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: auto;
+  font-size: 12px;
+  color: var(--text-secondary, #B0CCCC);
+}
+.confidence-slider-wrap input[type="range"] {
+  width: 100px;
+  accent-color: var(--accent, #24E5CA);
+}
+.confidence-slider-wrap .slider-val {
+  min-width: 32px;
+  text-align: right;
+}
 
 /* Encounter cards */
 .encounter-card {
@@ -762,6 +778,11 @@ input[type="range"]::-moz-range-thumb {
       <button class="filter-btn" data-filter="KEEP" onclick="setFilter('KEEP')">Keep<span class="count" id="countKeep"></span></button>
       <button class="filter-btn" data-filter="REVIEW" onclick="setFilter('REVIEW')">Review<span class="count" id="countReview"></span></button>
       <button class="filter-btn" data-filter="REJECT" onclick="setFilter('REJECT')">Reject<span class="count" id="countReject"></span></button>
+      <div class="confidence-slider-wrap">
+        <label for="confSlider">Min confidence:</label>
+        <input type="range" id="confSlider" min="0" max="100" value="40" oninput="setMinConfidence(this.value)">
+        <span class="slider-val" id="confSliderVal">40%</span>
+      </div>
     </div>
 
     {% include '_sync_panel.html' %}
@@ -789,6 +810,7 @@ input[type="range"]::-moz-range-thumb {
 <script>
 var pipelineResults = null;
 var activeFilter = 'all';
+var minConfidence = 40;
 
 // -- Rendering --
 
@@ -913,6 +935,27 @@ function setFilter(f) {
     btn.classList.toggle('active', btn.getAttribute('data-filter') === f);
   });
   renderResults();
+}
+
+var _confTimer = null;
+
+function setMinConfidence(val) {
+  minConfidence = parseInt(val, 10);
+  document.getElementById('confSliderVal').textContent = minConfidence + '%';
+  clearTimeout(_confTimer);
+  _confTimer = setTimeout(function() {
+    fetch('/api/workspaces/active/config')
+      .then(function(r) { return r.json(); })
+      .then(function(existing) {
+        existing.review_min_confidence = minConfidence;
+        return fetch('/api/workspaces/active/config', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify(existing)
+        });
+      })
+      .catch(function() {});
+  }, 300);
 }
 
 // -- Threshold tuning --
@@ -1164,20 +1207,28 @@ function openInspect(photoId) {
     html += '</div>';
   }
 
-  // Species predictions
+  // Species predictions (filtered by confidence threshold)
   if (enc && enc.species_predictions && enc.species_predictions.length > 0) {
-    html += '<div class="inspect-species-predictions">';
-    html += '<div style="font-size:13px;font-weight:600;margin-bottom:6px;">Species Predictions</div>';
-    enc.species_predictions.forEach(function(sp) {
-      var modelParts = (sp.models || []).map(function(m) {
-        return escapeHtml(m.model) + ' ' + (m.confidence * 100).toFixed(0) + '%';
-      });
-      html += '<div class="inspect-species-row">';
-      html += '<span class="inspect-species-name">' + escapeHtml(sp.species) + '</span>';
-      html += '<span class="inspect-species-conf">' + modelParts.join(', ') + '</span>';
-      html += '</div>';
+    var threshold = minConfidence / 100;
+    var filtered = enc.species_predictions.filter(function(sp) {
+      return (sp.models || []).some(function(m) { return m.confidence >= threshold; });
     });
-    html += '</div>';
+    if (filtered.length > 0) {
+      html += '<div class="inspect-species-predictions">';
+      html += '<div style="font-size:13px;font-weight:600;margin-bottom:6px;">Species Predictions</div>';
+      filtered.forEach(function(sp) {
+        var modelParts = (sp.models || []).filter(function(m) {
+          return m.confidence >= threshold;
+        }).map(function(m) {
+          return escapeHtml(m.model) + ' ' + (m.confidence * 100).toFixed(0) + '%';
+        });
+        html += '<div class="inspect-species-row">';
+        html += '<span class="inspect-species-name">' + escapeHtml(sp.species) + '</span>';
+        html += '<span class="inspect-species-conf">' + modelParts.join(', ') + '</span>';
+        html += '</div>';
+      });
+      html += '</div>';
+    }
   }
 
   // Score waterfall
@@ -1264,6 +1315,12 @@ function initPipelineReviewPage() {
     if (empty) empty.style.display = 'none';
 
     pipelineResults = data.results;
+
+    if (data.workspace_overrides && data.workspace_overrides.review_min_confidence != null) {
+      minConfidence = data.workspace_overrides.review_min_confidence;
+      document.getElementById('confSlider').value = minConfidence;
+      document.getElementById('confSliderVal').textContent = minConfidence + '%';
+    }
 
     // Show sidebar sections
     var ss = document.getElementById('sidebarScoring');

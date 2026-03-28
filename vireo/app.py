@@ -11,8 +11,6 @@ import os
 import sys
 import webbrowser
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "lr-migration"))
-
 import json
 import queue
 import time

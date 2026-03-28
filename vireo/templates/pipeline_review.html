@@ -2176,7 +2176,17 @@ function grmApply() {
   // Clear the species input for next use
   document.getElementById('grmSpecies').value = '';
   renderResults();
-  updateSummaryBar(pipelineResults.summary);
+  // Recalculate summary counts from photo labels
+  var summary = pipelineResults.summary;
+  summary.keep_count = 0;
+  summary.review_count = 0;
+  summary.reject_count = 0;
+  pipelineResults.photos.forEach(function(p) {
+    if (p.label === 'KEEP') summary.keep_count++;
+    else if (p.label === 'REVIEW') summary.review_count++;
+    else if (p.label === 'REJECT') summary.reject_count++;
+  });
+  updateSummaryBar(summary);
 }
 
 initPipelineReviewPage();

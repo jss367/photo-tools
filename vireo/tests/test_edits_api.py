@@ -328,7 +328,7 @@ def test_edit_history_api(app_and_db):
 
 
 def test_accept_prediction_records_history(app_and_db):
-    """Accepting a prediction records keyword_add in edit history."""
+    """Accepting a prediction records prediction_accept in edit history."""
     app, db = app_and_db
     client = app.test_client()
     photos = db.get_photos()
@@ -343,8 +343,46 @@ def test_accept_prediction_records_history(app_and_db):
 
     history = db.get_edit_history()
     assert len(history) == 1
-    assert history[0]['action_type'] == 'keyword_add'
+    assert history[0]['action_type'] == 'prediction_accept'
     assert 'Blue Jay' in history[0]['description']
+
+
+def test_accept_prediction_undo_restores_status(app_and_db):
+    """Undoing an accepted prediction restores keyword, pending changes, and prediction status."""
+    app, db = app_and_db
+    client = app.test_client()
+    photos = db.get_photos()
+    pid = photos[0]['id']
+
+    db.add_prediction(pid, 'Blue Jay', 0.95, 'test-model')
+    pred = db.conn.execute("SELECT id FROM predictions WHERE photo_id = ?", (pid,)).fetchone()
+    pred_id = pred['id']
+
+    # Accept
+    resp = client.post(f'/api/predictions/{pred_id}/accept')
+    assert resp.status_code == 200
+
+    # Verify accepted state
+    pred_row = db.conn.execute("SELECT status FROM predictions WHERE id = ?", (pred_id,)).fetchone()
+    assert pred_row['status'] == 'accepted'
+    kws = {k['name'] for k in db.get_photo_keywords(pid)}
+    assert 'Blue Jay' in kws
+
+    # Undo
+    resp = client.post('/api/undo')
+    assert resp.status_code == 200
+
+    # Prediction status restored to pending
+    pred_row = db.conn.execute("SELECT status FROM predictions WHERE id = ?", (pred_id,)).fetchone()
+    assert pred_row['status'] == 'pending'
+
+    # Keyword removed
+    kws = {k['name'] for k in db.get_photo_keywords(pid)}
+    assert 'Blue Jay' not in kws
+
+    # Pending keyword change removed
+    changes = db.get_pending_changes()
+    assert not any(c['change_type'] == 'keyword_add' and c['value'] == 'Blue Jay' for c in changes)
 
 
 def test_reject_prediction_records_history(app_and_db):
@@ -474,3 +512,77 @@ def test_sync_discard_records_history(app_and_db):
     assert len(history) == 1
     assert history[0]['action_type'] == 'discard'
     assert db.get_pending_changes() == []
+
+
+def test_undo_skips_non_undoable_entries(app_and_db):
+    """Undo skips prediction_reject and discard entries to reach real undoable edits."""
+    app, db = app_and_db
+    client = app.test_client()
+    photos = db.get_photos()
+    pid = photos[0]['id']
+
+    # Create an undoable edit (rating change)
+    original_rating = db.get_photo(pid)['rating']
+    client.post(f'/api/photos/{pid}/rating', json={'rating': 5})
+    assert db.get_photo(pid)['rating'] == 5
+
+    # Create a non-undoable entry (reject prediction)
+    db.add_prediction(pid, 'House Sparrow', 0.60, 'test-model')
+    pred = db.conn.execute("SELECT id FROM predictions WHERE photo_id = ?", (pid,)).fetchall()[-1]
+    client.post(f'/api/predictions/{pred["id"]}/reject')
+
+    # History has 2 entries: prediction_reject (most recent) and rating
+    history = db.get_edit_history()
+    assert len(history) == 2
+
+    # Undo should skip the prediction_reject and undo the rating
+    resp = client.post('/api/undo')
+    assert resp.status_code == 200
+    assert db.get_photo(pid)['rating'] == original_rating
+
+    # prediction_reject entry still in history, rating entry removed
+    history = db.get_edit_history()
+    assert len(history) == 1
+    assert history[0]['action_type'] == 'prediction_reject'
+
+
+def test_undo_status_skips_non_undoable(app_and_db):
+    """Undo status reports the next undoable entry, not a non-undoable one."""
+    app, db = app_and_db
+    client = app.test_client()
+    photos = db.get_photos()
+    pid = photos[0]['id']
+
+    # Create an undoable edit
+    client.post(f'/api/photos/{pid}/rating', json={'rating': 5})
+
+    # Create a non-undoable entry on top
+    db.add_prediction(pid, 'Crow', 0.50, 'test-model')
+    pred = db.conn.execute("SELECT id FROM predictions WHERE photo_id = ?", (pid,)).fetchall()[-1]
+    client.post(f'/api/predictions/{pred["id"]}/reject')
+
+    # Undo status should show the rating edit, not the reject
+    resp = client.get('/api/undo/status')
+    data = resp.get_json()
+    assert data['available'] is True
+    assert 'rating' in data['description'].lower()
+    assert data['count'] == 1  # only 1 undoable entry
+
+
+def test_undo_nothing_when_only_non_undoable(app_and_db):
+    """Undo returns error when only non-undoable entries exist."""
+    app, db = app_and_db
+    client = app.test_client()
+    photos = db.get_photos()
+    pid = photos[0]['id']
+
+    # Only non-undoable entries
+    db.add_prediction(pid, 'Robin', 0.70, 'test-model')
+    pred = db.conn.execute("SELECT id FROM predictions WHERE photo_id = ?", (pid,)).fetchone()
+    client.post(f'/api/predictions/{pred["id"]}/reject')
+
+    resp = client.post('/api/undo')
+    assert resp.status_code == 400  # "nothing to undo"
+
+    resp = client.get('/api/undo/status')
+    assert resp.get_json()['available'] is False

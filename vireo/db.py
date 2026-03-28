@@ -1518,7 +1518,7 @@ class Database:
                 pass
 
         kid = self.add_keyword(species, is_species=True)
-        affected_photo_ids = []
+        affected = []  # list of {"photo_id": int, "prediction_id": int}
 
         # If grouped, accept all predictions in the group
         if pred["group_id"]:
@@ -1530,14 +1530,14 @@ class Database:
                 self.update_prediction_status(gp["id"], "accepted")
                 self.tag_photo(gp["photo_id"], kid)
                 self.queue_change(gp["photo_id"], "keyword_add", species)
-                affected_photo_ids.append(gp["photo_id"])
+                affected.append({"photo_id": gp["photo_id"], "prediction_id": gp["id"]})
         else:
             self.update_prediction_status(prediction_id, "accepted")
             self.tag_photo(pred["photo_id"], kid)
             self.queue_change(pred["photo_id"], "keyword_add", species)
-            affected_photo_ids.append(pred["photo_id"])
+            affected.append({"photo_id": pred["photo_id"], "prediction_id": prediction_id})
 
-        return {"species": species, "keyword_id": kid, "photo_ids": affected_photo_ids}
+        return {"species": species, "keyword_id": kid, "affected": affected}
 
     # -- Pending Changes --
 
@@ -1639,11 +1639,19 @@ class Database:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    # Action types that appear in history but cannot be reversed
+    _NON_UNDOABLE = ('prediction_reject', 'discard')
+
     def undo_last_edit(self):
-        """Undo the most recent edit. Returns the undone entry dict, or None."""
+        """Undo the most recent undoable edit. Returns the undone entry dict, or None.
+
+        Non-undoable entries (prediction_reject, discard) are skipped.
+        """
+        placeholders = ",".join("?" for _ in self._NON_UNDOABLE)
         entry = self.conn.execute(
-            "SELECT * FROM edit_history WHERE workspace_id = ? ORDER BY created_at DESC, id DESC LIMIT 1",
-            (self._ws_id(),),
+            f"SELECT * FROM edit_history WHERE workspace_id = ? AND action_type NOT IN ({placeholders}) "
+            "ORDER BY created_at DESC, id DESC LIMIT 1",
+            (self._ws_id(), *self._NON_UNDOABLE),
         ).fetchone()
         if not entry:
             return None
@@ -1663,12 +1671,15 @@ class Database:
                     self.queue_change(pid, 'rating', old_val)
             elif entry['action_type'] == 'flag':
                 self.update_photo_flag(pid, old_val)
-            elif entry['action_type'] == 'keyword_add':
+            elif entry['action_type'] in ('keyword_add', 'prediction_accept'):
                 self.untag_photo(pid, int(entry['new_value']))
                 kw = self.conn.execute("SELECT name FROM keywords WHERE id = ?",
                                        (int(entry['new_value']),)).fetchone()
                 if kw:
                     self.remove_pending_changes(pid, 'keyword_add', kw['name'])
+                # Restore prediction status if this was a prediction accept
+                if entry['action_type'] == 'prediction_accept' and old_val:
+                    self.update_prediction_status(int(old_val), 'pending')
             elif entry['action_type'] == 'keyword_remove':
                 self.tag_photo(pid, int(entry['new_value']))
                 kw = self.conn.execute("SELECT name FROM keywords WHERE id = ?",

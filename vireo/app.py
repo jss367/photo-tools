@@ -703,16 +703,23 @@ def create_app(db_path, thumb_cache_dir=None):
     @app.route("/api/undo/status")
     def api_undo_status():
         db = _get_db()
-        history = db.get_edit_history(limit=1)
-        if not history:
+        from db import Database
+        non_undoable = Database._NON_UNDOABLE
+        placeholders = ",".join("?" for _ in non_undoable)
+        latest = db.conn.execute(
+            f"SELECT * FROM edit_history WHERE workspace_id = ? AND action_type NOT IN ({placeholders}) "
+            "ORDER BY created_at DESC, id DESC LIMIT 1",
+            (db._ws_id(), *non_undoable),
+        ).fetchone()
+        if not latest:
             return jsonify({"available": False, "description": "", "count": 0})
         total = db.conn.execute(
-            "SELECT COUNT(*) FROM edit_history WHERE workspace_id = ?",
-            (db._ws_id(),),
+            f"SELECT COUNT(*) FROM edit_history WHERE workspace_id = ? AND action_type NOT IN ({placeholders})",
+            (db._ws_id(), *non_undoable),
         ).fetchone()[0]
         return jsonify({
             "available": True,
-            "description": history[0]["description"],
+            "description": latest["description"],
             "count": total,
         })
 
@@ -1112,13 +1119,15 @@ def create_app(db_path, thumb_cache_dir=None):
         db = _get_db()
         result = db.accept_prediction(pred_id)
         if result:
-            items = [{'photo_id': pid, 'old_value': '', 'new_value': str(result['keyword_id'])}
-                     for pid in result['photo_ids']]
-            is_batch = len(result['photo_ids']) > 1
+            items = [{'photo_id': a['photo_id'],
+                      'old_value': str(a['prediction_id']),
+                      'new_value': str(result['keyword_id'])}
+                     for a in result['affected']]
+            is_batch = len(result['affected']) > 1
             desc = f'Accepted prediction: added "{result["species"]}"'
             if is_batch:
-                desc += f' to {len(result["photo_ids"])} photos'
-            db.record_edit('keyword_add', desc, str(result['keyword_id']),
+                desc += f' to {len(result["affected"])} photos'
+            db.record_edit('prediction_accept', desc, str(result['keyword_id']),
                            items, is_batch=is_batch)
         return jsonify({"ok": True})
 

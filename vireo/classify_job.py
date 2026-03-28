@@ -450,7 +450,7 @@ def _classify_photos(
             os.unlink(tmp_path)
 
         if embedding is not None:
-            db.store_photo_embedding(photo["id"], embedding.tobytes(), model=effective_name)
+            db.store_photo_embedding(photo["id"], embedding.tobytes(), model=model_name)
 
         if not all_preds:
             continue

@@ -13,12 +13,11 @@ import tempfile
 from datetime import date
 from pathlib import Path
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "lr-migration"))
-
 from classifier import Classifier
-from compare import categorize, read_xmp_keywords
+from compare import categorize
 from grouping import consensus_prediction, group_by_timestamp, read_exif_timestamp
 from image_loader import SUPPORTED_EXTENSIONS, load_image
+from xmp import read_keywords
 from taxonomy import Taxonomy
 
 logging.basicConfig(
@@ -147,7 +146,7 @@ def analyze(
 
         # Read existing XMP keywords and categorize
         xmp_path = image_path.with_suffix(".xmp")
-        existing = read_xmp_keywords(str(xmp_path))
+        existing = read_keywords(str(xmp_path))
         category = categorize(top["species"], existing, tax)
         stats[category] += 1
 

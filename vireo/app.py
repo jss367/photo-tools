@@ -359,8 +359,8 @@ def create_app(db_path, thumb_cache_dir=None):
         pipeline_counts = db.get_pipeline_feature_counts()
         total_photos = db.count_photos()
 
-        from pipeline import load_results
         import config as cfg
+        from pipeline import load_results
         cache_dir = os.path.dirname(db_path)
         results = load_results(cache_dir, db._active_workspace_id)
         effective_cfg = db.get_effective_config(cfg.load())
@@ -2041,7 +2041,8 @@ def create_app(db_path, thumb_cache_dir=None):
 
     @app.route("/api/labels")
     def api_labels_list():
-        from labels import get_active_labels as get_global_active_labels, get_saved_labels
+        from labels import get_active_labels as get_global_active_labels
+        from labels import get_saved_labels
 
         db = _get_db()
         saved = get_saved_labels()
@@ -2447,6 +2448,7 @@ def create_app(db_path, thumb_cache_dir=None):
 
             # Check if weights are downloaded
             import glob
+
             import torch
 
             hub_dir = os.path.join(torch.hub.get_dir(), "checkpoints")
@@ -2550,7 +2552,6 @@ def create_app(db_path, thumb_cache_dir=None):
                 removed.append(f)
 
         # Clear the cached singleton so it reloads next time
-        from detector import _get_detector
         import detector
         detector._detector = None
 
@@ -2686,8 +2687,9 @@ def create_app(db_path, thumb_cache_dir=None):
         active_ws = _get_db()._active_workspace_id
 
         def work(job):
-            import torch
             import urllib.request
+
+            import torch
 
             MAX_RETRIES = 3
 
@@ -2800,7 +2802,7 @@ def create_app(db_path, thumb_cache_dir=None):
                 if not hub_name:
                     raise ValueError(f"Unknown DINOv2 variant: {model_id}")
                 runner.push_event(job["id"], "progress", {
-                    "phase": f"Downloading DINOv2 repo from torch hub...",
+                    "phase": "Downloading DINOv2 repo from torch hub...",
                     "current": 0, "total": 1,
                 })
                 # torch.hub.load downloads repo + weights automatically
@@ -4640,8 +4642,8 @@ def create_app(db_path, thumb_cache_dir=None):
     def serve_crop_preview(photo_id):
         """Serve the cropped region that would be sent to BioCLIP."""
         import config as cfg
-        from PIL import Image
         from image_loader import load_image
+        from PIL import Image
 
         db = _get_db()
         photo = db.conn.execute(

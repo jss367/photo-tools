@@ -784,7 +784,26 @@ def create_app(db_path, thumb_cache_dir=None):
         change_ids = body.get("change_ids", [])
         if not change_ids:
             return json_error("change_ids required")
+
+        # Look up changes before deleting so we can record what was discarded
+        placeholders = ",".join("?" for _ in change_ids)
+        changes = db.conn.execute(
+            f"SELECT * FROM pending_changes WHERE id IN ({placeholders}) AND workspace_id = ?",
+            list(change_ids) + [db._ws_id()],
+        ).fetchall()
+
         db.clear_pending(change_ids)
+
+        # Record discard in history (not undoable)
+        if changes:
+            items = [{'photo_id': c['photo_id'],
+                      'old_value': f'{c["change_type"]}:{c["value"]}',
+                      'new_value': ''}
+                     for c in changes]
+            db.record_edit('discard',
+                           f'Discarded {len(changes)} pending changes',
+                           '', items, is_batch=len(changes) > 1)
+
         log.info("Discarded %d pending changes", len(change_ids))
         return jsonify({"ok": True, "discarded": len(change_ids)})
 
@@ -1091,13 +1110,30 @@ def create_app(db_path, thumb_cache_dir=None):
     @app.route("/api/predictions/<int:pred_id>/accept", methods=["POST"])
     def api_accept_prediction(pred_id):
         db = _get_db()
-        db.accept_prediction(pred_id)
+        result = db.accept_prediction(pred_id)
+        if result:
+            items = [{'photo_id': pid, 'old_value': '', 'new_value': str(result['keyword_id'])}
+                     for pid in result['photo_ids']]
+            is_batch = len(result['photo_ids']) > 1
+            desc = f'Accepted prediction: added "{result["species"]}"'
+            if is_batch:
+                desc += f' to {len(result["photo_ids"])} photos'
+            db.record_edit('keyword_add', desc, str(result['keyword_id']),
+                           items, is_batch=is_batch)
         return jsonify({"ok": True})
 
     @app.route("/api/predictions/<int:pred_id>/reject", methods=["POST"])
     def api_reject_prediction(pred_id):
         db = _get_db()
+        pred = db.conn.execute(
+            "SELECT photo_id, species FROM predictions WHERE id = ?", (pred_id,)
+        ).fetchone()
         db.update_prediction_status(pred_id, "rejected")
+        if pred:
+            db.record_edit('prediction_reject',
+                           f'Rejected prediction "{pred["species"]}"',
+                           'rejected',
+                           [{'photo_id': pred['photo_id'], 'old_value': 'pending', 'new_value': 'rejected'}])
         return jsonify({"ok": True})
 
     @app.route("/api/predictions/group/<group_id>")
@@ -1117,6 +1153,14 @@ def create_app(db_path, thumb_cache_dir=None):
         removed = body.get("removed", [])  # list of prediction_ids to ungroup
         species = body.get("species", "")
 
+        # Capture old flag values before mutation
+        all_flag_pids = picks + rejects
+        old_flags = {}
+        for pid in all_flag_pids:
+            old = db.get_photo(pid)
+            if old:
+                old_flags[pid] = old["flag"] or "none"
+
         # Flag picks and add species keyword
         if species:
             kid = db.add_keyword(species, is_species=True)
@@ -1125,9 +1169,33 @@ def create_app(db_path, thumb_cache_dir=None):
                 db.tag_photo(pid, kid)
                 db.queue_change(pid, "keyword_add", species)
 
+            # Record keyword_add history for picks
+            kw_items = [{'photo_id': pid, 'old_value': '', 'new_value': str(kid)}
+                        for pid in picks]
+            if kw_items:
+                db.record_edit('keyword_add',
+                               f'Added "{species}" to {len(picks)} photos (group prediction)',
+                               str(kid), kw_items, is_batch=len(picks) > 1)
+        else:
+            # No species — still flag picks
+            for pid in picks:
+                db.update_photo_flag(pid, "flagged")
+
         # Reject rejects
         for pid in rejects:
             db.update_photo_flag(pid, "rejected")
+
+        # Record flag history for all picks + rejects
+        flag_items = []
+        for pid in picks:
+            if pid in old_flags:
+                flag_items.append({'photo_id': pid, 'old_value': old_flags[pid], 'new_value': 'flagged'})
+        for pid in rejects:
+            if pid in old_flags:
+                flag_items.append({'photo_id': pid, 'old_value': old_flags[pid], 'new_value': 'rejected'})
+        if flag_items:
+            desc = f'Group prediction: flagged {len(picks)}, rejected {len(rejects)}'
+            db.record_edit('flag', desc, 'group_apply', flag_items, is_batch=True)
 
         # Mark all predictions in this group as accepted/rejected
         for pid in picks:
@@ -3457,6 +3525,10 @@ def create_app(db_path, thumb_cache_dir=None):
             db.tag_photo(pid, kid)
             db.queue_change(pid, "keyword_add", label)
 
+        items = [{'photo_id': pid, 'old_value': '', 'new_value': str(kid)} for pid in photo_ids]
+        db.record_edit('keyword_add', f'Labeled {len(photo_ids)} photos as "{label}"',
+                       str(kid), items, is_batch=len(photo_ids) > 1)
+
         log.info("Labeled %d photos as '%s'", len(photo_ids), label)
         return jsonify({"ok": True, "updated": len(photo_ids), "keyword_id": kid})
 
@@ -3910,6 +3982,12 @@ def create_app(db_path, thumb_cache_dir=None):
             db.conn.rollback()
             raise
 
+        # Record edit history
+        items = [{'photo_id': pid, 'old_value': '', 'new_value': str(kid)} for pid in photo_ids]
+        db.record_edit('keyword_add',
+                       f'Confirmed species "{species}" on {len(photo_ids)} photos',
+                       str(kid), items, is_batch=len(photo_ids) > 1)
+
         # Update pipeline cache if it exists
         from pipeline import load_results_raw, save_results_raw
 
@@ -4314,10 +4392,30 @@ def create_app(db_path, thumb_cache_dir=None):
         keepers = body.get("keepers", [])
         rejects = body.get("rejects", [])
 
+        # Capture old flags before mutation
+        old_flags = {}
+        for pid in keepers + rejects:
+            old = db.get_photo(pid)
+            if old:
+                old_flags[pid] = old["flag"] or "none"
+
         for pid in keepers:
             db.update_photo_flag(pid, "flagged")
         for pid in rejects:
             db.update_photo_flag(pid, "rejected")
+
+        # Record flag history
+        flag_items = []
+        for pid in keepers:
+            if pid in old_flags:
+                flag_items.append({'photo_id': pid, 'old_value': old_flags[pid], 'new_value': 'flagged'})
+        for pid in rejects:
+            if pid in old_flags:
+                flag_items.append({'photo_id': pid, 'old_value': old_flags[pid], 'new_value': 'rejected'})
+        if flag_items:
+            db.record_edit('flag',
+                           f'Culling: flagged {len(keepers)}, rejected {len(rejects)}',
+                           'culling_apply', flag_items, is_batch=True)
 
         log.info("Culling applied: %d keepers, %d rejects", len(keepers), len(rejects))
         return jsonify({"ok": True, "keepers": len(keepers), "rejects": len(rejects)})

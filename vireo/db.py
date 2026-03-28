@@ -1503,7 +1503,7 @@ class Database:
             "SELECT * FROM predictions WHERE id = ?", (prediction_id,)
         ).fetchone()
         if not pred:
-            return
+            return None
 
         # For grouped predictions, derive consensus from individual votes
         species = pred["species"]
@@ -1518,6 +1518,7 @@ class Database:
                 pass
 
         kid = self.add_keyword(species, is_species=True)
+        affected_photo_ids = []
 
         # If grouped, accept all predictions in the group
         if pred["group_id"]:
@@ -1529,10 +1530,14 @@ class Database:
                 self.update_prediction_status(gp["id"], "accepted")
                 self.tag_photo(gp["photo_id"], kid)
                 self.queue_change(gp["photo_id"], "keyword_add", species)
+                affected_photo_ids.append(gp["photo_id"])
         else:
             self.update_prediction_status(prediction_id, "accepted")
             self.tag_photo(pred["photo_id"], kid)
             self.queue_change(pred["photo_id"], "keyword_add", species)
+            affected_photo_ids.append(pred["photo_id"])
+
+        return {"species": species, "keyword_id": kid, "photo_ids": affected_photo_ids}
 
     # -- Pending Changes --
 

@@ -1747,6 +1747,245 @@ async function detachPhoto(encIdx, burstIdx, photoId) {
   });
 }
 
+/* ==================== Group Review Modal ==================== */
+
+var grmState = {
+  encIdx: null,       // encounter index in pipelineResults
+  burstIdx: null,     // burst index within encounter
+  items: [],          // photo objects from pipelineResults.photos
+  picks: new Set(),
+  rejects: new Set(),
+  removed: new Set(),
+  selected: null      // photo id
+};
+
+function findBurstForPhoto(photoId) {
+  if (!pipelineResults) return null;
+  for (var ei = 0; ei < pipelineResults.encounters.length; ei++) {
+    var enc = pipelineResults.encounters[ei];
+    if (!enc.bursts) continue;
+    for (var bi = 0; bi < enc.bursts.length; bi++) {
+      var burst = enc.bursts[bi];
+      var ids = burst.photo_ids || burst;
+      if (ids.indexOf(photoId) >= 0) {
+        return { encIdx: ei, burstIdx: bi, photoIds: ids };
+      }
+    }
+  }
+  return null;
+}
+
+function openGroupReview(encIdx, burstIdx, selectPhotoId) {
+  var enc = pipelineResults.encounters[encIdx];
+  var burst = enc.bursts[burstIdx];
+  var photoIds = burst.photo_ids || burst;
+
+  // Build items array from pipelineResults.photos
+  var photoMap = {};
+  pipelineResults.photos.forEach(function(p) { photoMap[p.id] = p; });
+
+  var items = photoIds.map(function(pid) { return photoMap[pid]; }).filter(Boolean);
+
+  grmState = {
+    encIdx: encIdx,
+    burstIdx: burstIdx,
+    items: items,
+    picks: new Set(),
+    rejects: new Set(),
+    removed: new Set(),
+    selected: null
+  };
+  _grmLoupeLocked = false;
+
+  // Auto-pick the AI best (highest quality_composite)
+  var best = null;
+  items.forEach(function(p) {
+    if (!best || (p.quality_composite || 0) > (best.quality_composite || 0)) best = p;
+  });
+  if (best) grmState.picks.add(best.id);
+
+  // Auto-reject the lowest quality
+  if (items.length > 2) {
+    var sorted = items.slice().sort(function(a, b) { return (a.quality_composite || 0) - (b.quality_composite || 0); });
+    var worstThird = Math.max(1, Math.floor(sorted.length / 3));
+    for (var i = 0; i < worstThird; i++) {
+      if (!grmState.picks.has(sorted[i].id)) {
+        grmState.rejects.add(sorted[i].id);
+      }
+    }
+  }
+
+  document.getElementById('grmOverlay').classList.add('open');
+
+  // Auto-select the requested photo (or the best)
+  var initSelect = selectPhotoId || (best ? best.id : null);
+  if (initSelect) {
+    grmSelect(initSelect);
+  } else {
+    renderGroupModal();
+  }
+}
+
+function closeGroupReview() {
+  document.getElementById('grmOverlay').classList.remove('open');
+}
+
+function renderGroupModal() {
+  var items = grmState.items.filter(function(p) { return !grmState.removed.has(p.id); });
+
+  // Find AI best
+  var bestId = null;
+  var bestScore = -1;
+  items.forEach(function(p) {
+    if ((p.quality_composite || 0) > bestScore) { bestScore = p.quality_composite || 0; bestId = p.id; }
+  });
+
+  function renderCard(p) {
+    var isBest = p.id === bestId;
+    var isSelected = p.id === grmState.selected;
+    var cls = 'grm-card' + (isSelected ? ' selected' : '') + (isBest ? ' ai-best' : '');
+    var qScore = p.quality_composite != null ? Math.round(p.quality_composite * 100) : '-';
+    var sharp = p.subject_tenengrad != null ? Math.round(p.subject_tenengrad) : '-';
+
+    return '<div class="' + cls + '" data-photo-id="' + p.id + '" onclick="grmSelect(' + p.id + ')">' +
+      '<img src="/thumbnails/' + p.id + '.jpg" loading="lazy">' +
+      '<div class="grm-card-info">' +
+        '<div class="grm-card-species">' + escapeHtml(p.filename || '') + '</div>' +
+        '<div class="grm-card-scores">Q: <span class="score-val">' + qScore + '</span> S: <span class="score-val">' + sharp + '</span></div>' +
+        (isBest ? '<div class="grm-card-ai">AI BEST</div>' : '') +
+      '</div>' +
+    '</div>';
+  }
+
+  var pickItems = items.filter(function(p) { return grmState.picks.has(p.id); });
+  var candidateItems = items.filter(function(p) { return !grmState.picks.has(p.id) && !grmState.rejects.has(p.id); });
+  var rejectItems = items.filter(function(p) { return grmState.rejects.has(p.id); });
+
+  document.getElementById('grmPicks').innerHTML = pickItems.map(renderCard).join('') || '<span style="font-size:12px;color:var(--text-ghost,#555);">Press ↑ to add picks</span>';
+  document.getElementById('grmCandidates').innerHTML = candidateItems.map(renderCard).join('') || '<span style="font-size:12px;color:var(--text-ghost,#555);">All sorted</span>';
+  document.getElementById('grmRejects').innerHTML = rejectItems.map(renderCard).join('') || '<span style="font-size:12px;color:var(--text-ghost,#555);">Press ↓ to reject</span>';
+
+  // Species input
+  if (!document.getElementById('grmSpecies').value && items.length > 0) {
+    var enc = pipelineResults.encounters[grmState.encIdx];
+    document.getElementById('grmSpecies').value = enc.confirmed_species || (enc.species ? enc.species[0] : '') || '';
+  }
+
+  document.getElementById('grmCount').textContent = pickItems.length + ' picks, ' + rejectItems.length + ' rejects, ' + candidateItems.length + ' unsorted';
+}
+
+function grmSelect(photoId) {
+  grmState.selected = (grmState.selected === photoId) ? null : photoId;
+  renderGroupModal();
+
+  // Update loupe preview
+  var loupeImg = document.getElementById('grmLoupePhoto');
+  var loupeInfo = document.getElementById('grmLoupeInfo');
+  var detailEl = document.getElementById('grmLoupeDetail');
+
+  if (grmState.selected) {
+    loupeImg.src = '/photos/' + grmState.selected + '/full';
+    var photo = grmState.items.find(function(p) { return p.id === grmState.selected; });
+    if (photo) {
+      var sharp = photo.subject_tenengrad != null ? Math.round(photo.subject_tenengrad) : '?';
+      loupeInfo.textContent = (photo.filename || '') + ' — sharpness: ' + sharp + ' — move cursor to compare';
+
+      // Render pipeline metadata in detail panel
+      detailEl.innerHTML = buildPipelineMetadataHtml(photo);
+    }
+  } else {
+    loupeImg.src = '';
+    loupeInfo.textContent = 'Select a photo to preview. Hover to compare sharpness across all frames.';
+    detailEl.innerHTML = '';
+    grmLoupeReset();
+  }
+}
+
+function buildPipelineMetadataHtml(photo) {
+  var enc = pipelineResults.encounters[grmState.encIdx];
+  var label = (photo.label || '').toLowerCase();
+  var q = photo.quality_composite || 0;
+
+  var html = '';
+
+  // Triage badge
+  html += '<span class="triage-badge ' + label + '">' + (photo.label || 'UNSCORED') + '</span>';
+  if (photo.rarity_protected) {
+    html += ' <span class="triage-badge review">Rarity Protected</span>';
+  }
+
+  // Reject reasons
+  if (photo.reject_reasons && photo.reject_reasons.length > 0) {
+    html += '<div class="reject-reasons">';
+    photo.reject_reasons.forEach(function(r) {
+      html += '<div class="reject-reason">&#9888; ' + r + '</div>';
+    });
+    html += '</div>';
+  }
+
+  // Species predictions
+  if (enc && enc.species_predictions && enc.species_predictions.length > 0) {
+    html += '<div class="inspect-species-predictions">';
+    html += '<div style="font-size:13px;font-weight:600;margin-bottom:6px;">Species Predictions</div>';
+    enc.species_predictions.forEach(function(sp) {
+      var modelParts = (sp.models || []).map(function(m) {
+        return escapeHtml(m.model) + ' ' + (m.confidence * 100).toFixed(0) + '%';
+      });
+      html += '<div class="inspect-species-row">';
+      html += '<span class="inspect-species-name">' + escapeHtml(sp.species) + '</span>';
+      html += '<span class="inspect-species-conf">' + modelParts.join(', ') + '</span>';
+      html += '</div>';
+    });
+    html += '</div>';
+  }
+
+  // Score waterfall
+  var scores = [
+    {name: 'Focus', key: 'focus_score', weight: 0.45, cls: 'focus'},
+    {name: 'Exposure', key: 'exposure_score', weight: 0.20, cls: 'exposure'},
+    {name: 'Composition', key: 'composition_score', weight: 0.15, cls: 'composition'},
+    {name: 'Area', key: 'area_score', weight: 0.10, cls: 'area'},
+    {name: 'Noise', key: 'noise_score', weight: 0.10, cls: 'noise'},
+  ];
+  html += '<div class="score-waterfall">';
+  html += '<div style="font-size:13px;font-weight:600;margin-bottom:8px;">Quality Score: ' + q.toFixed(3) + '</div>';
+  scores.forEach(function(s) {
+    var val = photo[s.key] || 0;
+    var weighted = val * s.weight;
+    var pct = Math.round(val * 100);
+    html += '<div class="score-waterfall-row">';
+    html += '<span class="score-wf-label">' + s.name + ' (' + (s.weight*100) + '%)</span>';
+    html += '<div class="score-wf-bar-track"><div class="score-wf-bar-fill ' + s.cls + '" style="width:' + pct + '%"></div></div>';
+    html += '<span class="score-wf-val">' + val.toFixed(3) + ' (' + weighted.toFixed(3) + ')</span>';
+    html += '</div>';
+  });
+  html += '</div>';
+
+  // Raw feature table
+  html += '<table class="feature-table">';
+  var features = [
+    ['Subject Tenengrad', photo.subject_tenengrad],
+    ['Background Tenengrad', photo.bg_tenengrad],
+    ['Crop Completeness', photo.crop_complete],
+    ['Background Separation', photo.bg_separation],
+    ['Highlight Clip', photo.subject_clip_high],
+    ['Shadow Clip', photo.subject_clip_low],
+    ['Median Luminance', photo.subject_y_median],
+    ['Subject Size', photo.subject_size],
+    ['Crop pHash', photo.phash_crop],
+    ['Detection Confidence', photo.detection_conf],
+  ];
+  features.forEach(function(f) {
+    var val = f[1];
+    if (val === null || val === undefined) val = '—';
+    else if (typeof val === 'number') val = val.toFixed(4);
+    html += '<tr><td>' + f[0] + '</td><td>' + val + '</td></tr>';
+  });
+  html += '</table>';
+
+  return html;
+}
+
 initPipelineReviewPage();
 </script>
 </body>

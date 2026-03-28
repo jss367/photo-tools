@@ -759,3 +759,26 @@ def test_review_min_confidence_persists_in_workspace(app_and_db):
         resp = c.get("/api/workspaces/active/config")
         assert resp.status_code == 200
         assert resp.get_json()["review_min_confidence"] == 40
+
+
+def test_workspace_config_post_preserves_non_whitelisted_keys(app_and_db):
+    """POST /api/workspaces/active/config merges into existing overrides,
+    preserving keys not in the whitelist (e.g. active_labels)."""
+    app, db = app_and_db
+    # Pre-set overrides with a non-whitelisted key
+    db.update_workspace(db._active_workspace_id,
+                        config_overrides={"active_labels": ["/path/to/birds.txt"],
+                                          "classification_threshold": 0.5})
+    with app.test_client() as c:
+        # POST only review_min_confidence
+        resp = c.post("/api/workspaces/active/config",
+                       json={"review_min_confidence": 30},
+                       content_type="application/json")
+        assert resp.status_code == 200
+        overrides = resp.get_json()["overrides"]
+        # New key saved
+        assert overrides["review_min_confidence"] == 30
+        # Whitelisted key preserved
+        assert overrides["classification_threshold"] == 0.5
+        # Non-whitelisted key preserved
+        assert overrides["active_labels"] == ["/path/to/birds.txt"]

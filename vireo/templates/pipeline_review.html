@@ -1209,7 +1209,7 @@ function openInspect(photoId) {
   if (enc && enc.species_predictions && enc.species_predictions.length > 0) {
     var threshold = minConfidence / 100;
     var filtered = enc.species_predictions.filter(function(sp) {
-      return sp.models.some(function(m) { return m.confidence >= threshold; });
+      return (sp.models || []).some(function(m) { return m.confidence >= threshold; });
     });
     if (filtered.length > 0) {
       html += '<div class="inspect-species-predictions">';

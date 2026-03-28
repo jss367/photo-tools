@@ -1025,10 +1025,22 @@ def create_app(db_path, thumb_cache_dir=None):
         body = request.get_json(silent=True) or {}
         # Only allow workspace-overridable keys
         allowed = {"classification_threshold", "grouping_window_seconds", "similarity_threshold", "review_min_confidence"}
-        overrides = {k: v for k, v in body.items() if k in allowed and v is not None}
-        # Remove keys set to null (revert to global)
-        db.update_workspace(db._active_workspace_id, config_overrides=overrides if overrides else None)
-        return jsonify({"ok": True, "overrides": overrides})
+        # Merge into existing overrides to preserve non-whitelisted keys
+        ws = db.get_workspace(db._active_workspace_id)
+        existing = {}
+        if ws and ws["config_overrides"]:
+            try:
+                existing = json.loads(ws["config_overrides"]) if isinstance(ws["config_overrides"], str) else ws["config_overrides"]
+            except Exception:
+                pass
+        for k, v in body.items():
+            if k in allowed:
+                if v is None:
+                    existing.pop(k, None)
+                else:
+                    existing[k] = v
+        db.update_workspace(db._active_workspace_id, config_overrides=existing if existing else None)
+        return jsonify({"ok": True, "overrides": existing})
 
     # -- Prediction API routes --
 

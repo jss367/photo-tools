@@ -2701,6 +2701,21 @@ def _strftime_template_can_render(template_component, target):
         return True
 
 
+_LIFE_LIST_LEADING_APOSTROPHE_RE = re.compile(
+    r"^['`´ʹʻʼ‘’‛]+"
+)
+
+
+def _life_list_alphabetical_key(name):
+    """Sort key that ignores a leading Hawaiian ʻokina or apostrophe variant.
+
+    Kept in sync with ``lifeListAlphabeticalName`` in ``life_list.html`` so
+    server-side lifer numbering ties break under the same letter the client
+    displays the species under.
+    """
+    return _LIFE_LIST_LEADING_APOSTROPHE_RE.sub("", str(name or "")).lower()
+
+
 def create_app(db_path, thumb_cache_dir=None, api_token=None):
     """Create the Flask app for the Vireo photo browser.
 
@@ -11652,6 +11667,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         species_entries.sort(key=lambda e: (
             e["first_seen"] is None,
             e["first_seen"] or "",
+            _life_list_alphabetical_key(e["species"]),
             e["species"].lower(),
         ))
         for i, e in enumerate(species_entries, start=1):

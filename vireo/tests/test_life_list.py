@@ -1439,3 +1439,58 @@ def test_life_list_bucket_survives_root_repair_spelling_drift(tmp_path, monkeypa
     assert {p["id"] for p in single_data["photos"]} == {pid_hier, pid_root}
 
     db.close()
+
+
+def test_life_list_alphabetical_key_ignores_apostrophe_variants():
+    """Server-side sort key strips the same leading apostrophe variants
+    the client's ``lifeListAlphabeticalName`` does, so lifer numbering
+    tie-breaks agree with what the alphabetical view renders."""
+    from app import _life_list_alphabetical_key
+
+    for prefix in ("ʻ", "ʼ", "'", "`", "´", "ʹ", "‘", "’", "‛"):
+        assert (
+            _life_list_alphabetical_key(prefix + "Apapane") == "apapane"
+        ), f"prefix {prefix!r} (U+{ord(prefix):04X}) should be stripped"
+    assert _life_list_alphabetical_key("Hutton's Vireo") == "hutton's vireo"
+    assert _life_list_alphabetical_key("") == ""
+    assert _life_list_alphabetical_key(None) == ""
+
+
+def test_life_list_numbering_places_okina_species_under_a(life_app):
+    """When ``first_seen`` ties (or both species are undated), lifer
+    numbering must sort ``ʻApapane`` under A rather than after H, matching
+    the client-side alphabetical view. Regression for the Codex review on
+    PR #1366."""
+    app, db, ids = life_app
+
+    apapane_kw = db.add_keyword("ʻApapane", is_species=True)
+    hutton_kw = db.add_keyword("Hutton's Vireo", is_species=True)
+    # Identical timestamps make the numbering tuple fall through to the
+    # alphabetical tie-breaker, isolating the behavior under test.
+    for filename, kw in (("apapane1.jpg", apapane_kw),
+                         ("hutton1.jpg", hutton_kw)):
+        pid = db.add_photo(
+            folder_id=ids["folder"],
+            filename=filename,
+            extension=".jpg",
+            file_size=1000,
+            file_mtime=100.0,
+            timestamp="2022-01-01T00:00:00",
+        )
+        db.tag_photo(pid, kw)
+    db.conn.commit()
+
+    data = _get_life_list(app)
+    by_lower = {e["species"].lower(): e for e in data["species"]}
+    # ``add_keyword`` title-cases species names, so the stored form is
+    # ``Hutton'S Vireo``; compare case-insensitively to keep the test
+    # focused on numbering rather than the casing heuristic.
+    apapane = by_lower["ʻapapane"]
+    hutton = by_lower["hutton's vireo"]
+    assert apapane["first_seen"] == hutton["first_seen"], (
+        "test setup should tie first_seen so numbering falls to the name key"
+    )
+    assert apapane["number"] < hutton["number"], (
+        f"ʻApapane (#{apapane['number']}) must sort under A ahead of "
+        f"Hutton's Vireo (#{hutton['number']})"
+    )

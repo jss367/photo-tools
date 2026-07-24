@@ -1086,7 +1086,7 @@ def test_browse_lightbox_holds_off_center_transform_until_next_photo_is_ready(
         }"""
     )
 
-    before = page.evaluate(
+    page.evaluate(
         """() => {
             window._lbPhotoW = 4000;
             window._lbPhotoH = 2000;
@@ -1099,13 +1099,6 @@ def test_browse_lightbox_holds_off_center_transform_until_next_photo_is_ready(
                 oneToOne: true,
             });
             window._lbSaveViewportState(window._lightboxCurrentId);
-            const transform = document.getElementById('lightboxTransform');
-            return {
-                cssTransform: transform.style.transform,
-                width: transform.style.width,
-                height: transform.style.height,
-                viewport: window._lbViewportStateFromCurrent(),
-            };
         }"""
     )
     page.evaluate(
@@ -1126,11 +1119,29 @@ def test_browse_lightbox_holds_off_center_transform_until_next_photo_is_ready(
                 }
                 return window.__originalLightboxApplyTransform.apply(this, arguments);
             };
+            // Capture the outgoing bitmap at the actual navigation boundary.
+            // A layout refresh queued during lightbox setup may legitimately
+            // settle before this key event. Recording the baseline in the
+            // capture phase keeps the snapshot and lightboxNav() in the same
+            // browser task, so no timer can reflow the photo between them.
+            window.__lightboxTransformAtNavigation = null;
+            document.addEventListener('keydown', event => {
+                if (event.key !== 'ArrowRight') return;
+                const transform = document.getElementById('lightboxTransform');
+                window.__lightboxTransformAtNavigation = {
+                    cssTransform: transform.style.transform,
+                    width: transform.style.width,
+                    height: transform.style.height,
+                    viewport: window._lbViewportStateFromCurrent(),
+                };
+            }, { capture: true, once: true });
         }"""
     )
 
     page.keyboard.press("ArrowRight")
     page.wait_for_function("() => window._lbVisualTransitionPending === true")
+    before = page.evaluate("window.__lightboxTransformAtNavigation")
+    assert before is not None
     page.wait_for_function("() => window._lightboxCurrentId === window.photos[1].id")
     page.wait_for_timeout(100)
 

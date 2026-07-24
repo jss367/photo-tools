@@ -202,6 +202,35 @@ def test_sort_and_numbering_preferences_persist(live_server, page):
     expect(page.locator(".lifer-number").first).to_have_text("#1")
 
 
+def test_alphabetical_sort_ignores_leading_okina(live_server, page):
+    db = live_server["db"]
+    folder_id = live_server["data"]["folders"][0]
+
+    for i, species in enumerate(("Hutton's vireo", "\u02bbapapane", "Java sparrow")):
+        keyword_id = db.add_keyword(species, is_species=True)
+        photo_id = db.add_photo(
+            folder_id=folder_id,
+            filename=f"okina-sort-{i}.jpg",
+            extension=".jpg",
+            file_size=1000,
+            file_mtime=200.0 + i,
+            timestamp=f"2024-07-{i + 1:02d}T09:00:00",
+        )
+        db.tag_photo(photo_id, keyword_id)
+
+    page.goto(f"{live_server['url']}/life-list")
+    page.locator(".species-card").first.wait_for(state="visible")
+    page.locator("#sortSelect").select_option("alpha")
+
+    expect(page.locator(".species-name")).to_have_text([
+        "American Robin",
+        "\u02bbApapane",
+        "Hutton's vireo",
+        "Java Sparrow",
+        "Red-tailed Hawk",
+    ])
+
+
 def test_taxonomic_group_and_identification_level_filters(live_server, page):
     db = live_server["db"]
     folder_id = live_server["data"]["folders"][0]

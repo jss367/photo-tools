@@ -3273,6 +3273,24 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         try:
             if not os.path.isfile(cache_path) or os.path.getsize(cache_path) <= 0:
                 return None
+            # Same freshness gate ``serve_thumbnail`` uses. The signature
+            # hash already covers the normal invalidation case (a scan that
+            # updates ``file_mtime`` computes a different cache path), so
+            # this check is a no-op for legitimate renders — their mtime is
+            # the write time, which is by definition ``>= file_mtime``.
+            # It exists to reject a *surviving* render left over when a
+            # rowid is recycled and the new photo's signature happens to
+            # collide with a previous owner's: ``purge_cached_files_for_
+            # recycled_id`` backdates any undeletable survivor to mtime 0,
+            # and without this check ``/original`` would happily send the
+            # previous owner's pixels since the existence-and-size probe
+            # can't distinguish them from a fresh render.
+            source_mtime = photo["file_mtime"]
+            if (
+                source_mtime is not None
+                and os.path.getmtime(cache_path) < float(source_mtime)
+            ):
+                return None
         except OSError:
             return None
         return cache_path

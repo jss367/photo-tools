@@ -3275,12 +3275,54 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         every single request. ``serve_thumbnail`` already documents and
         guards this exact trap; the cost here is a full-resolution decode
         plus edit pipeline per request, so it matters more.
+
+        Use this for *signature-keyed* prepared renders only — the
+        signature already encodes the recipe and edit-math version, so
+        pegging to ``photos.file_mtime`` alone is enough. For the unedited
+        RAW display cache, use :func:`_peg_display_cache_mtime` instead;
+        that cache-hit check compares the file against
+        ``max(mtime(source), mtime(companion))``, so pegging to the row's
+        ``file_mtime`` here would fail the check on every request when a
+        paired companion has a later mtime than the RAW row.
         """
         source_mtime = photo["file_mtime"] if photo is not None else None
         if source_mtime is None:
             return
         with contextlib.suppress(OSError, TypeError, ValueError):
             os.utime(cache_path, (float(source_mtime), float(source_mtime)))
+
+    def _peg_display_cache_mtime(cache_path, source_paths):
+        """Align an unedited RAW display cache's mtime to its own hit check.
+
+        ``/photos/<id>/original`` decides the display cache is fresh when
+        its mtime is ``>= max(mtime(image_path), mtime(companion))``.
+        Renders are written with the wall clock, so if either live source
+        has a *future* mtime — clock skew, archives that preserve future
+        timestamps — the just-written cache fails the check the instant
+        it lands and every request re-decodes the RAW plus the companion
+        JPEG. And even without clock skew, pegging the display cache to
+        ``photos.file_mtime`` (the row's stored mtime for the RAW) would
+        fail the check whenever a paired companion JPEG has a later
+        filesystem mtime than the RAW row does, which is the common shape
+        for a fresh camera dump touched by any post-import step.
+
+        Peg to the same max the cache-hit check consults so a valid
+        render satisfies its own gate. Best-effort: a failed ``utime``
+        only costs the next request a re-render.
+        """
+        mtimes = []
+        for path in source_paths:
+            if not path:
+                continue
+            try:
+                mtimes.append(os.path.getmtime(path))
+            except OSError:
+                continue
+        if not mtimes:
+            return
+        peg = max(mtimes)
+        with contextlib.suppress(OSError, TypeError, ValueError):
+            os.utime(cache_path, (peg, peg))
 
     def _prepared_full_resolution_render(
         vireo_dir, photo, recipe, file_state=None,
@@ -30487,6 +30529,17 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 if extracted and tmp_path:
                     os.replace(tmp_path, wc_abs)
                     tmp_path = None
+                    # The display cache-hit check compares against
+                    # ``max(mtime(image_path), mtime(companion))``.
+                    # Leaving wall-clock mtime here fails that check
+                    # whenever either live source has a future mtime
+                    # (clock skew, archives that preserve future
+                    # timestamps), and every request re-decodes the RAW
+                    # and companion. Peg to the same max the check
+                    # consults.
+                    _peg_display_cache_mtime(
+                        wc_abs, (image_path, companion_for_extraction),
+                    )
                 return extracted
             finally:
                 if tmp_path:
@@ -30684,7 +30737,18 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         try:
             img.save(tmp_path, format="JPEG", quality=quality)
             os.replace(tmp_path, cache_path)
-            _peg_render_mtime_to_source(cache_path, photo)
+            if primary_is_raw:
+                # The unedited RAW display cache-hit check compares
+                # against ``max(mtime(image_path), mtime(companion))``.
+                # Pegging to ``photo['file_mtime']`` alone (as the
+                # signature-keyed prepared render does) would fail that
+                # check on every request when the paired companion is
+                # newer than the RAW row.
+                _peg_display_cache_mtime(
+                    cache_path, (image_path, companion_for_extraction),
+                )
+            else:
+                _peg_render_mtime_to_source(cache_path, photo)
         except Exception:
             with contextlib.suppress(OSError):
                 os.unlink(tmp_path)

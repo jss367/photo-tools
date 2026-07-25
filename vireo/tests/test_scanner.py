@@ -4647,6 +4647,64 @@ def test_recycled_id_index_does_not_confuse_id_prefixes(tmp_path):
     assert 0 not in index
 
 
+def test_recycled_id_index_falls_back_to_per_id_probe_when_dir_unreadable(
+    tmp_path, monkeypatch,
+):
+    """A derivative directory that can't be enumerated must not be
+    silently treated as empty.
+
+    ``scandir`` fails on directories that are execute-only but not
+    readable (a permissions gap, transient EIO, ACL quirk). Treating
+    that as "no cached files for any id" makes the batch index drop
+    every recycled id whose only surviving derivative lives there — and
+    ``purge_cached_files_for_recycled_id`` short-circuits on the index,
+    so a subsequent request lazily adopts the previous owner's pixels.
+
+    The exact-path probe (``os.path.exists``) works even on execute-only
+    directories, so falling back to it for uncertain lookups recovers the
+    common case (id-keyed exact filenames like ``masks/<id>.png`` or the
+    legacy ``previews/<id>.jpg``). Verify the fallback fires when
+    ``scandir`` raises.
+    """
+    from preview_cache import RecycledIdIndex
+
+    vireo_dir = tmp_path / "vireo"
+    thumb_dir = vireo_dir / "thumbnails"
+    thumb_dir.mkdir(parents=True)
+    masks_dir = vireo_dir / "masks"
+    masks_dir.mkdir()
+
+    # Only surviving derivative for id 7 is its subject mask. If the
+    # index treated an unreadable masks/ as empty, ``7 in index`` would
+    # return False and the purge would be skipped — the recycled RAW
+    # would then get another photo's mask applied to the local pass.
+    stale = masks_dir / "7.png"
+    stale.write_bytes(b"previous owner's mask")
+
+    import preview_cache
+
+    real_scandir = preview_cache.os.scandir
+    unreadable_dir = os.path.normpath(str(masks_dir))
+
+    def scandir_denied(path):
+        if os.path.normpath(str(path)) == unreadable_dir:
+            raise PermissionError(13, "Permission denied", str(path))
+        return real_scandir(path)
+
+    monkeypatch.setattr(preview_cache.os, "scandir", scandir_denied)
+
+    index = RecycledIdIndex(str(thumb_dir), vireo_dir=str(vireo_dir))
+
+    assert 7 in index, (
+        "batch index treated an unreadable derivative directory as "
+        "empty; recycled id 7 would skip the purge and the new photo "
+        "would inherit the previous owner's mask"
+    )
+    # An id with no cached derivative anywhere must still be reported
+    # absent — the fallback probe returns False, not a blanket True.
+    assert 12345 not in index
+
+
 def test_recycled_id_index_indexes_external_dng_subdirectories(tmp_path):
     """The Nikon-HE-NEF DNG cache lives at ``external-dng/<pid>/`` — the
     entries are bare-digit *directory* names rather than files with a

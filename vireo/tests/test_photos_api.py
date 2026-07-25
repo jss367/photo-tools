@@ -1758,6 +1758,107 @@ def test_unedited_raw_original_uses_camera_display_cache_not_working_copy(
     assert db.get_photo(photo_id)["working_copy_path"] == f"working/{photo_id}.jpg"
 
 
+def test_unedited_raw_display_cache_survives_when_companion_is_newer_than_raw_row(
+    app_and_db, monkeypatch, tmp_path,
+):
+    """The written display cache must satisfy its own hit check.
+
+    ``/photos/<id>/original`` treats ``originals/<id>.display.jpg`` as a
+    hit only when its mtime is ``>= max(mtime(image_path), mtime(companion))``.
+    Pegging the cache to ``photos.file_mtime`` (the row's stored RAW
+    mtime) would fail that check whenever a paired companion JPEG has a
+    later filesystem mtime than the RAW row does — the common shape for
+    any post-import step that touches the JPEG — and every request would
+    re-decode the RAW plus the companion again.
+
+    Verify that a second request reuses the cache when the companion is
+    newer than the RAW row's stored mtime.
+    """
+    import io
+    import time
+
+    import image_loader
+    from PIL import Image
+
+    app, db = app_and_db
+    client = app.test_client()
+    photo = db.get_photos()[0]
+    photo_id = photo["id"]
+
+    source_dir = tmp_path / "raw-source"
+    source_dir.mkdir()
+    raw_path = source_dir / "DSC_0001.NEF"
+    raw_path.write_bytes(b"fake raw")
+    companion_path = source_dir / "DSC_0001.JPG"
+    Image.new("RGB", (800, 600), (200, 50, 50)).save(
+        str(companion_path), "JPEG",
+    )
+
+    raw_mtime = os.path.getmtime(str(raw_path))
+    # Companion is deliberately newer than the RAW row's file_mtime — the
+    # exact case that codex flagged. Also ensure the RAW row's stored
+    # mtime is behind the companion's actual filesystem mtime.
+    later = raw_mtime + 3600
+    os.utime(str(companion_path), (later, later))
+
+    db.conn.execute(
+        "UPDATE folders SET path=? WHERE id=?",
+        (str(source_dir), photo["folder_id"]),
+    )
+    db.conn.execute(
+        """UPDATE photos
+           SET filename='DSC_0001.NEF', extension='.nef',
+               width=800, height=600,
+               companion_path='DSC_0001.JPG',
+               file_mtime=?
+           WHERE id=?""",
+        (raw_mtime, photo_id),
+    )
+    db.conn.commit()
+
+    calls = []
+
+    def camera_extract(source, output, **kwargs):
+        calls.append((os.fspath(source), os.fspath(output), kwargs))
+        Image.new("RGB", (800, 600), (220, 220, 220)).save(output, "JPEG")
+        return True
+
+    monkeypatch.setattr(image_loader, "extract_working_copy", camera_extract)
+
+    first = client.get(f"/photos/{photo_id}/original")
+    assert first.status_code == 200
+    assert len(calls) == 1
+
+    vireo_dir = os.path.dirname(app.config["THUMB_CACHE_DIR"])
+    display_path = os.path.join(
+        vireo_dir, "originals", f"{photo_id}.display.jpg",
+    )
+    assert os.path.exists(display_path)
+    display_mtime = os.path.getmtime(display_path)
+
+    # The core defect: the just-written cache must satisfy its own
+    # hit check. If it doesn't, the second request re-extracts.
+    max_source_mtime = max(
+        os.path.getmtime(str(raw_path)),
+        os.path.getmtime(str(companion_path)),
+    )
+    assert display_mtime >= max_source_mtime, (
+        f"display cache mtime {display_mtime} is behind max source "
+        f"mtime {max_source_mtime}; every /original request will "
+        "re-decode the RAW plus companion"
+    )
+
+    second = client.get(f"/photos/{photo_id}/original")
+    assert second.status_code == 200
+    assert len(calls) == 1, (
+        "second /original request re-extracted instead of reusing the "
+        "display cache — the peg to the RAW row's mtime made the cache "
+        "fail its own hit check under a newer companion"
+    )
+    with Image.open(io.BytesIO(second.data)) as rendered:
+        assert rendered.getpixel((0, 0))[0] > 200
+
+
 def test_original_trusts_raw_working_copy_even_when_smaller_than_stored_dims(
     app_and_db, monkeypatch,
 ):

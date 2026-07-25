@@ -328,6 +328,14 @@ class RecycledIdIndex:
     previews are extracted at the end of ``scan()``, and those belong to
     the new rows — a live re-read would see them and wrongly conclude the
     ids collided.
+
+    If any derivative directory can't be enumerated (execute-only but
+    unreadable, transient EIO, ACL quirk), the index remembers that and
+    falls back to the exact-path per-id probe for every lookup. Treating
+    ``scandir`` failure as "directory is empty" would silently teach the
+    purge to skip recycled ids whose only surviving derivative lives
+    there — and the exact-path probe (``os.path.exists``) still works on
+    execute-only directories, so the fallback recovers that case.
     """
 
     def __init__(self, thumb_cache_dir, vireo_dir=None):
@@ -337,21 +345,49 @@ class RecycledIdIndex:
         # that know the real cache root pass it explicitly.
         self._vireo_dir = vireo_dir or os.path.dirname(thumb_cache_dir)
         self._ids = None
+        self._incomplete = False
+
+    def _sweep(self, directory):
+        """Return the ids seen in ``directory`` or ``None`` if unreadable.
+
+        ``FileNotFoundError`` is genuinely empty (fresh install, no
+        derivatives yet). Any other ``OSError`` — permissions, EIO — is
+        an *unknown*, not an empty; the caller records the incomplete
+        sweep and the per-id probe covers it later.
+        """
+        try:
+            entries = os.scandir(directory)
+        except FileNotFoundError:
+            return set()
+        except OSError as e:
+            log.warning(
+                "Could not enumerate derivative directory %s for "
+                "recycled-rowid detection (%s); the batch index will "
+                "fall back to the exact-path probe for every lookup so "
+                "recycled ids whose only surviving cached file lives "
+                "here are still purged",
+                directory, e,
+            )
+            return None
+        found = set()
+        with entries:
+            for entry in entries:
+                photo_id = _leading_photo_id(entry.name)
+                if photo_id is not None:
+                    found.add(photo_id)
+        return found
 
     def _build(self):
         ids = set()
+        incomplete = False
         for directory in _derivative_dirs(
             self._thumb_cache_dir, self._vireo_dir,
         ):
-            try:
-                entries = os.scandir(directory)
-            except OSError:
-                continue  # dir absent on a fresh install, or unreadable
-            with entries:
-                for entry in entries:
-                    photo_id = _leading_photo_id(entry.name)
-                    if photo_id is not None:
-                        ids.add(photo_id)
+            seen = self._sweep(directory)
+            if seen is None:
+                incomplete = True
+            else:
+                ids.update(seen)
         # ``external-dng/`` isn't in ``_derivative_dirs`` because its
         # entries are per-id *subdirectories* named with bare digits
         # (``external-dng/42/``) — ``_leading_photo_id`` intentionally
@@ -359,27 +395,49 @@ class RecycledIdIndex:
         # registering as id 4, and loosening it for the file-based
         # families to accept EOL would break that guard. Handle
         # external-dng in its own sweep instead.
+        external_dng = os.path.join(self._vireo_dir, "external-dng")
         try:
-            entries = os.scandir(
-                os.path.join(self._vireo_dir, "external-dng")
-            )
-        except OSError:
+            entries = os.scandir(external_dng)
+        except FileNotFoundError:
             entries = None
+        except OSError as e:
+            log.warning(
+                "Could not enumerate %s for recycled-rowid detection "
+                "(%s); the batch index will fall back to the exact-path "
+                "probe for every lookup", external_dng, e,
+            )
+            entries = None
+            incomplete = True
         if entries is not None:
             with entries:
                 for entry in entries:
                     if entry.name.isdigit():
                         ids.add(int(entry.name))
+        self._incomplete = incomplete
         log.info(
             "Indexed %d photo ids with cached derivatives for "
-            "recycled-rowid detection", len(ids),
+            "recycled-rowid detection%s", len(ids),
+            " (incomplete — some directories were unreadable)"
+            if incomplete else "",
         )
         return ids
 
     def __contains__(self, photo_id):
         if self._ids is None:
             self._ids = self._build()
-        return photo_id in self._ids
+        if photo_id in self._ids:
+            return True
+        if self._incomplete:
+            # One of the derivative dirs couldn't be enumerated, so its
+            # absence from ``self._ids`` proves nothing. Fall back to the
+            # exact-path probe, which uses ``os.path.exists`` on specific
+            # files and works even when the containing directory is
+            # execute-only but not readable — the shape of a permissions
+            # gap that trips ``scandir`` but not ``stat``.
+            return _recycled_id_has_stale_derivative(
+                self._thumb_cache_dir, photo_id, self._vireo_dir,
+            )
+        return False
 
 
 def ensure_preview_cache_invalidations_table(db):

@@ -4969,3 +4969,42 @@ def test_recycled_id_purge_marks_surviving_previews_uncacheable(tmp_path):
         "surviving preview was only backdated; _serve_preview would still "
         "adopt it and serve the previous owner's pixels"
     )
+
+
+def test_recycled_id_purge_clears_external_edit_handoffs(tmp_path):
+    """The external-editor handoff render is id-keyed and must be purged.
+
+    ``external-edits/<id>.jpg`` is the render handed to an external editor
+    and ``<id>.json`` is its cache key — recipe, source path, source mtime,
+    edit-math version. None of those is a photo id or a content hash, so a
+    recycled id re-imported at the same path with a preserved mtime and the
+    same recipe matches the previous owner's metadata, and the editor is
+    handed the previous owner's pixels.
+    """
+    from preview_cache import (
+        RecycledIdIndex,
+        purge_cached_files_for_recycled_id,
+    )
+
+    vireo_dir = tmp_path / "vireo"
+    thumb_dir = vireo_dir / "thumbnails"
+    thumb_dir.mkdir(parents=True)
+    handoff_dir = vireo_dir / "external-edits"
+    handoff_dir.mkdir()
+    render = handoff_dir / "77.jpg"
+    meta = handoff_dir / "77.json"
+    render.write_bytes(b"previous-tenant-render")
+    meta.write_text('{"recipe": "", "source_mtime": 1.0}')
+
+    index = RecycledIdIndex(str(thumb_dir), vireo_dir=str(vireo_dir))
+    assert 77 in index, "index missed an external-edit handoff"
+
+    assert purge_cached_files_for_recycled_id(
+        str(thumb_dir), 77, vireo_dir=str(vireo_dir),
+    )
+
+    assert not render.exists(), "external-edit render outlived its photo"
+    assert not meta.exists(), (
+        "external-edit cache metadata outlived its photo; it is what makes "
+        "the stale render look valid"
+    )

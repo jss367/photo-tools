@@ -1870,3 +1870,51 @@ def test_serve_thumbnail_404s_when_both_thumbnail_and_sidecar_are_locked(
     for path, original in locked.items():
         assert open(path, "rb").read() == original
         assert os.path.getmtime(path) < photo_mtime
+
+
+def test_serve_thumbnail_sidecar_does_not_claim_coverage_for_the_stale_default(
+    tmp_path, monkeypatch,
+):
+    """A sidecar serve must not record ``<id>.jpg`` as a done thumbnail.
+
+    The real ``<id>.jpg`` is still the previous owner's locked, stale file.
+    Writing ``photos.thumb_path = '<id>.jpg'`` would tell the coverage
+    dashboard and ``backfill_thumb_paths`` this photo has a valid
+    thumbnail, so nothing regenerates it once the lock clears — a status
+    that claims work is finished when the next run would not be a no-op is
+    exactly what CORE_PHILOSOPHY forbids.
+    """
+    import app as app_module
+
+    app, db, pid, thumb_dir = _make_app_with_real_photo(tmp_path, monkeypatch)
+
+    thumb_file = os.path.join(thumb_dir, f"{pid}.jpg")
+    Image.new("RGB", (50, 50), (1, 2, 3)).save(thumb_file, "JPEG", quality=70)
+    photo_mtime = db.conn.execute(
+        "SELECT file_mtime FROM photos WHERE id=?", (pid,)
+    ).fetchone()["file_mtime"]
+    os.utime(thumb_file, (photo_mtime - 86400, photo_mtime - 86400))
+    db.conn.execute("UPDATE photos SET thumb_path=NULL WHERE id=?", (pid,))
+    db.conn.commit()
+
+    real_remove = app_module.os.remove
+
+    def failing_remove(path, *args, **kwargs):
+        if path == thumb_file:
+            raise PermissionError(13, "Permission denied", path)
+        return real_remove(path, *args, **kwargs)
+
+    monkeypatch.setattr(app_module.os, "remove", failing_remove)
+
+    client = app.test_client()
+    resp = client.get(f"/thumbnails/{pid}.jpg")
+    assert resp.status_code == 200
+
+    stored = db.conn.execute(
+        "SELECT thumb_path FROM photos WHERE id=?", (pid,)
+    ).fetchone()["thumb_path"]
+    assert stored is None, (
+        f"thumb_path was set to {stored!r} while the real thumbnail is "
+        "still the locked stale file; coverage would report this photo "
+        "done and never regenerate it"
+    )

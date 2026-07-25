@@ -24783,6 +24783,9 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             f"{photo_id}_{pair_source}.jpg" if pair_source else filename
         )
         thumb_path = os.path.join(thumb_dir, cache_filename)
+        # Set when a locked stale thumbnail forces regeneration to the
+        # ``<id>_regen.jpg`` sidecar; the real ``<id>.jpg`` stays stale.
+        served_from_regen_sidecar = False
         try:
             selected_source_mtime = (
                 os.path.getmtime(pair_source_path)
@@ -24841,6 +24844,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 # the delete cleanup already sweep it.
                 stem, ext = os.path.splitext(cache_filename)
                 cache_filename = f"{stem}_regen{ext}"
+                served_from_regen_sidecar = True
                 thumb_path = os.path.join(thumb_dir, cache_filename)
                 log.warning(
                     "Could not unlink stale thumbnail %s; regenerating to "
@@ -25090,7 +25094,17 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         # Persist on-disk presence so the dashboard's coverage query
         # (`thumb_path IS NOT NULL`) reflects this regeneration. Stored
         # value is the bare filename, matching ``thumbnails.generate_all``.
-        if not pair_source:
+        #
+        # Skipped when we fell back to the ``_regen`` sidecar: the real
+        # ``<id>.jpg`` is still the previous owner's locked, stale file.
+        # Recording it as done would tell the coverage dashboard and
+        # ``backfill_thumb_paths`` this photo has a valid thumbnail, so
+        # nothing would regenerate it once the lock clears — a pill
+        # claiming work is finished when the next run would not be a
+        # no-op is exactly what CORE_PHILOSOPHY forbids. Leaving the
+        # column NULL keeps the photo in the "needs a thumbnail" set,
+        # which is the truth.
+        if not pair_source and not served_from_regen_sidecar:
             try:
                 db.conn.execute(
                     "UPDATE photos SET thumb_path=? WHERE id=?",

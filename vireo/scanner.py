@@ -2246,6 +2246,7 @@ def scan(root, db, progress_callback=None, incremental=False, extract_full_metad
                     photo_id,
                     id_index=recycled_id_index,
                     vireo_dir=vireo_dir,
+                    db=db,
                 )
             ):
                 invalidated_photo_ids.add(photo_id)

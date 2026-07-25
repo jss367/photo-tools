@@ -4910,3 +4910,62 @@ def test_recycled_id_purge_backdates_files_inside_an_undeletable_dng_dir(
         "the external-editor freshness check would hand Darktable the "
         "previous owner's conversion"
     )
+
+
+def test_recycled_id_purge_marks_surviving_previews_uncacheable(tmp_path):
+    """Backdating a preview does not invalidate it.
+
+    ``_serve_preview``'s lazy-adoption branch tests
+    ``os.path.exists(cache_path)`` with no mtime comparison, so a sized
+    preview that outlived its owner gets adopted and re-registered
+    verbatim — the recycled photo serves the previous owner's pixels *and*
+    the LRU records them as legitimately cached. The durable
+    ``preview_cache_invalidations`` row is the only thing that branch
+    honours, so a preview we could not delete must get one.
+    """
+    import preview_cache
+    from db import Database
+    from preview_cache import purge_cached_files_for_recycled_id
+
+    vireo_dir = tmp_path / "vireo"
+    thumb_dir = vireo_dir / "thumbnails"
+    thumb_dir.mkdir(parents=True)
+    preview = vireo_dir / "previews" / "66_1920.jpg"
+    preview.parent.mkdir(parents=True)
+    preview.write_bytes(b"previous-tenant-preview")
+
+    db = Database(str(tmp_path / "test.db"))
+    fid = db.add_folder(str(tmp_path / "photos"), name="photos")
+    photo_id = db.add_photo(
+        folder_id=fid, filename="gull.jpg", extension=".jpg",
+        file_size=10, file_mtime=1.0,
+    )
+    # Rename the seeded preview onto whatever rowid we actually got, so the
+    # FK on preview_cache_invalidations is satisfiable.
+    survivor = vireo_dir / "previews" / f"{photo_id}_1920.jpg"
+    preview.rename(survivor)
+
+    real_remove = os.remove
+
+    def _locked_remove(path, *args, **kwargs):
+        if os.path.normpath(str(path)) == os.path.normpath(str(survivor)):
+            raise OSError("simulated lock")
+        return real_remove(path, *args, **kwargs)
+
+    preview_cache.os.remove = _locked_remove
+    try:
+        purge_cached_files_for_recycled_id(
+            str(thumb_dir), photo_id, vireo_dir=str(vireo_dir), db=db,
+        )
+    finally:
+        preview_cache.os.remove = real_remove
+
+    assert survivor.exists(), "test setup failed to simulate a locked preview"
+    row = db.conn.execute(
+        "SELECT 1 FROM preview_cache_invalidations WHERE photo_id=? AND size=?",
+        (photo_id, 1920),
+    ).fetchone()
+    assert row is not None, (
+        "surviving preview was only backdated; _serve_preview would still "
+        "adopt it and serve the previous owner's pixels"
+    )

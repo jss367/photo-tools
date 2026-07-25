@@ -361,6 +361,52 @@ class RecycledIdIndex:
         return photo_id in self._ids
 
 
+def ensure_preview_cache_invalidations_table(db):
+    """Create the durable "do not adopt this preview" marker table.
+
+    Shared home for the marker `app.py`'s ``_serve_preview`` consults.
+    Backdating a preview file does nothing: the lazy-adoption branch there
+    tests ``os.path.exists(cache_path)`` with no mtime comparison, so an
+    on-disk preview that outlived its owner gets adopted and re-registered
+    verbatim. Only this row keeps it out.
+    """
+    db.conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS preview_cache_invalidations (
+            photo_id INTEGER NOT NULL,
+            size INTEGER NOT NULL,
+            PRIMARY KEY (photo_id, size),
+            FOREIGN KEY (photo_id) REFERENCES photos(id) ON DELETE CASCADE
+        )
+        """,
+    )
+
+
+def mark_preview_cache_invalid(db, photo_id, size, *, commit=True):
+    """Record that ``(photo_id, size)``'s on-disk preview must not be adopted."""
+    ensure_preview_cache_invalidations_table(db)
+    db.conn.execute(
+        "INSERT OR IGNORE INTO preview_cache_invalidations (photo_id, size) "
+        "VALUES (?, ?)",
+        (photo_id, size),
+    )
+    if commit:
+        db.conn.commit()
+
+
+def _preview_size_from_path(path, photo_id):
+    """Parse ``previews/<id>_<size>.jpg`` -> ``size``, else ``None``."""
+    name = os.path.basename(path)
+    stem, ext = os.path.splitext(name)
+    if ext.lower() != ".jpg":
+        return None
+    prefix = f"{photo_id}_"
+    if not stem.startswith(prefix):
+        return None
+    suffix = stem[len(prefix):]
+    return int(suffix) if suffix.isdigit() else None
+
+
 def _surviving_derivative_paths(thumb_cache_dir, photo_id, vireo_dir=None):
     """Concrete surviving derivative **files** for ``photo_id``.
 
@@ -399,7 +445,7 @@ def _surviving_derivative_paths(thumb_cache_dir, photo_id, vireo_dir=None):
 
 
 def purge_cached_files_for_recycled_id(
-    thumb_cache_dir, photo_id, id_index=None, vireo_dir=None,
+    thumb_cache_dir, photo_id, id_index=None, vireo_dir=None, db=None,
 ):
     """Drop any cached derivative left over from a previous owner of ``photo_id``.
 
@@ -459,6 +505,13 @@ def purge_cached_files_for_recycled_id(
     # deletion isn't (the lock blocks unlink, not utime), so this recovers
     # the common case; when even that fails we say so instead of leaving a
     # silent wrong-pixels bug.
+    #
+    # Backdating is not enough for *previews*, though: ``_serve_preview``'s
+    # lazy-adoption branch tests ``os.path.exists(cache_path)`` with no
+    # mtime comparison, so a surviving ``previews/<id>_<size>.jpg`` would
+    # be adopted and re-registered verbatim. Those need the durable
+    # ``preview_cache_invalidations`` marker, which that branch does
+    # honour. Requires a ``db``; callers in the ingest path have one.
     survivors = _surviving_derivative_paths(
         thumb_cache_dir, photo_id, vireo_dir,
     )
@@ -468,6 +521,23 @@ def purge_cached_files_for_recycled_id(
             try:
                 os.utime(path, (0, 0))
             except OSError:
+                unfixable.append(path)
+                continue
+            size = _preview_size_from_path(path, photo_id)
+            if size is None:
+                continue
+            if db is None:
+                # No handle to write the marker, and mtime alone won't
+                # keep the adoption branch off it.
+                unfixable.append(path)
+                continue
+            try:
+                mark_preview_cache_invalid(db, photo_id, size)
+            except Exception:
+                log.warning(
+                    "Could not mark surviving preview %s invalid", path,
+                    exc_info=True,
+                )
                 unfixable.append(path)
         if unfixable:
             log.error(

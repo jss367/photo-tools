@@ -3198,27 +3198,16 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
 
     _invalid_preview_cache_paths = set()
 
+    # Canonical definitions live in preview_cache so the recycled-rowid
+    # purge (which runs in the scanner, outside this app factory) writes
+    # the same marker _serve_preview's lazy-adoption branch consults.
     def _ensure_preview_cache_invalidations_table(db):
-        db.conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS preview_cache_invalidations (
-                photo_id INTEGER NOT NULL,
-                size INTEGER NOT NULL,
-                PRIMARY KEY (photo_id, size),
-                FOREIGN KEY (photo_id) REFERENCES photos(id) ON DELETE CASCADE
-            )
-            """,
-        )
+        from preview_cache import ensure_preview_cache_invalidations_table
+        ensure_preview_cache_invalidations_table(db)
 
     def _mark_preview_cache_invalid(db, photo_id, size, *, commit=True):
-        _ensure_preview_cache_invalidations_table(db)
-        db.conn.execute(
-            "INSERT OR IGNORE INTO preview_cache_invalidations (photo_id, size) "
-            "VALUES (?, ?)",
-            (photo_id, size),
-        )
-        if commit:
-            db.conn.commit()
+        from preview_cache import mark_preview_cache_invalid
+        mark_preview_cache_invalid(db, photo_id, size, commit=commit)
 
     def _clear_preview_cache_invalid(db, photo_id, size, *, commit=True):
         _ensure_preview_cache_invalidations_table(db)

@@ -1450,3 +1450,94 @@ def test_import_destination_structure_hides_when_folder_browser_picks_destinatio
 
     expect(page.locator("#destInput")).to_have_value("/new-archive")
     expect(page.locator("#destStructure")).to_be_hidden()
+
+
+def test_import_folder_template_examples_retire_with_their_source(
+    live_server, page,
+):
+    """Removing the source must clear the folder-template examples.
+
+    Each preset is labelled with an example folder name taken from the files
+    being imported. Once those files are gone the example describes nothing —
+    and a label that reads "this is what my folder will be called" must never
+    outlive the data behind it. Removing the last source hides the structure
+    table without re-running the destination preview, so the reset has to live
+    on the shared invalidation path, not in the render.
+    """
+    url = live_server["url"]
+
+    def folder_preview(route):
+        route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({"files": [{"path": "/tmp/card-a/IMG_0001.jpg"}]}),
+        )
+
+    def check_duplicates(route):
+        route.fulfill(
+            status=200,
+            content_type="text/event-stream",
+            body="data: " + json.dumps({
+                "done": True, "duplicate_count": 0, "checked": 1, "total": 1,
+            }) + "\n\n",
+        )
+
+    def destination_preview(route):
+        route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({
+                "folders": [
+                    {"path": "2026/2026-07-01",
+                     "full_path": "/archive/2026/2026-07-01",
+                     "count": 1, "exists": False},
+                ],
+                "total_photos": 1,
+                "total_folders": 1,
+                "new_folders": 1,
+                "existing_folders": 0,
+                "managed_archive": None,
+                "template_samples": {
+                    "samples": {
+                        "%Y/%Y-%m-%d": "2026/2026-07-01",
+                        "%Y/%m/%d": "2026/07/01",
+                        "%Y/%m": "2026/07",
+                        "%Y": "2026",
+                        "%Y-%m-%d": "2026-07-01",
+                    },
+                    "sample_date": "2026-07-01T09:00:00",
+                    "dated_count": 1,
+                },
+            }),
+        )
+
+    page.route("**/api/import/folder-preview", folder_preview)
+    page.route("**/api/import/check-duplicates", check_duplicates)
+    page.route("**/api/import/destination-preview", destination_preview)
+    page.goto(f"{url}/import")
+
+    preset = page.locator("#folderTemplatePreset")
+    # Ships with no example: nothing is known about the files yet.
+    expect(preset.locator("option[value='%Y/%Y-%m-%d']")).to_have_text(
+        "%Y/%Y-%m-%d")
+
+    page.locator("#modeCopy").check()
+    page.locator("#sourceInput").fill("/tmp/card-a")
+    page.locator("#btnAddSource").click()
+    page.locator("#destInput").fill("/archive")
+    page.locator("#btnPreview").click()
+
+    expect(page.locator("#destStructure")).to_be_visible()
+    # The example is a folder this import really creates — the first row.
+    expect(preset.locator("option[value='%Y/%Y-%m-%d']")).to_have_text(
+        "%Y/%Y-%m-%d — 2026/2026-07-01")
+    expect(preset.locator("option[value='%Y-%m-%d']")).to_have_text(
+        "%Y-%m-%d — 2026-07-01")
+
+    # Remove the source the way a user does: the × on the source row.
+    page.locator("#sourceList button").last.click()
+
+    expect(page.locator("#destStructure")).to_be_hidden()
+    expect(preset.locator("option[value='%Y/%Y-%m-%d']")).to_have_text(
+        "%Y/%Y-%m-%d")
+    expect(preset.locator("option[value='%Y-%m-%d']")).to_have_text("%Y-%m-%d")

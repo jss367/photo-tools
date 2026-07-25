@@ -1875,6 +1875,13 @@ function useStagingAsImportSource(result) {
 
 function hideDestStructure() {
   destStructureSeq += 1;
+  // The folder-template examples describe the same file set as the structure
+  // table, so they retire with it. This is the shared invalidation path —
+  // several callers (removing the last source, a preview that finds no
+  // importable files) hide the table and never reach renderDestStructure(),
+  // and resetting only there would leave the dropdown advertising dates from
+  // a source that is no longer selected.
+  applyFolderTemplateSamples(null);
   const el = document.getElementById('destStructure');
   if (!el) return;
   el.style.display = 'none';
@@ -2117,14 +2124,13 @@ function importPreviewSignatureChanged(signature) {
 // source files that will be skipped as duplicates — excluding them keeps the
 // new/existing folder counts matching the files that actually land.
 async function renderDestStructure(excludePaths) {
+  // hideDestStructure() also drops the previous run's example folder names.
+  // Unlike the move page — where the examples depend only on the selected
+  // folder — an import's examples come from the set of source files that will
+  // actually land, which every re-render can change (sources added or
+  // removed, or more files excluded as duplicates). Bare patterns for a
+  // moment beat an example derived from files that are no longer importing.
   hideDestStructure();
-  // Drop the previous run's example folder names up front. Unlike the move
-  // page — where the examples depend only on the selected folder — an
-  // import's examples come from the set of source files that will actually
-  // land, which every re-render can change (sources added or removed, or
-  // more files excluded as duplicates). Bare patterns for a moment beat an
-  // example derived from files that are no longer being imported.
-  applyFolderTemplateSamples(null);
   const destination = resolvedCopyDestination();
   if (!destination) return null;
   const fileTypes = selectedFileTypes();

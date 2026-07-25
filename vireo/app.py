@@ -27728,6 +27728,40 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             result["detection_conf"] = None
         return jsonify(result)
 
+    def _mask_file_is_db_backed(filename, mask_path):
+        """Whether a mask file on disk is actually this photo's.
+
+        ``masks/<id>.png`` and ``masks/<id>.<variant>.png`` are keyed by
+        bare photo id, and ``photos.id`` recycles freed rowids, so file
+        existence alone does not mean the file belongs to the photo now
+        holding that id. ``photo_masks`` rows cascade away with the photo,
+        so requiring one is what distinguishes "this photo's mask" from
+        "a mask the previous owner of this rowid left behind" — and unlike
+        a timestamp check it can't be fooled by a stale file that happens
+        to be newer than the new photo's source.
+
+        Files whose name doesn't start with a photo id aren't id-keyed and
+        are served as before.
+        """
+        m = re.match(r"^(\d+)[._]", filename)
+        if not m:
+            return True
+        pid = int(m.group(1))
+        db = _get_db()
+        real = os.path.realpath(mask_path)
+        for row in db.conn.execute(
+            "SELECT path FROM photo_masks WHERE photo_id = ?", (pid,)
+        ):
+            if row["path"] and os.path.realpath(row["path"]) == real:
+                return True
+        row = db.conn.execute(
+            "SELECT mask_path FROM photos WHERE id = ?", (pid,)
+        ).fetchone()
+        return bool(
+            row and row["mask_path"]
+            and os.path.realpath(row["mask_path"]) == real
+        )
+
     @app.route("/masks/<filename>")
     def serve_mask(filename):
         """Serve mask PNG files.
@@ -27741,7 +27775,9 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         """
         masks_dir = os.path.join(os.path.dirname(db_path), "masks")
         mask_path = os.path.join(masks_dir, filename)
-        if os.path.exists(mask_path):
+        if os.path.exists(mask_path) and _mask_file_is_db_backed(
+            filename, mask_path,
+        ):
             return send_from_directory(masks_dir, filename)
 
         m = re.match(r"^(\d+)\.png$", filename)

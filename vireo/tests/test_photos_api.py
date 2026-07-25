@@ -9033,20 +9033,57 @@ def test_legacy_serve_mask_404_when_no_active_variant(app_and_db):
     assert resp.status_code == 404
 
 
-def test_legacy_serve_mask_direct_file_still_served(app_and_db):
-    """A literal ``{pid}.png`` on disk (legacy backfill) is served as-is."""
+def test_legacy_serve_mask_direct_file_served_when_db_backed(app_and_db):
+    """A literal ``{pid}.png`` is served when a ``photo_masks`` row owns it."""
+    import os as _os
+    app, db = app_and_db
+    pid = db.get_photos()[0]["id"]
+    masks_dir = _os.path.join(_os.path.dirname(db._db_path), "masks")
+    _os.makedirs(masks_dir, exist_ok=True)
+    mask_file = _os.path.join(masks_dir, f"{pid}.png")
+    with open(mask_file, "wb") as fh:
+        fh.write(b"LEGACYDIRECT")
+    db.upsert_photo_mask(
+        photo_id=pid, variant="legacy", path=mask_file,
+        detector_model="md", prompt_x=0, prompt_y=0, prompt_w=0, prompt_h=0,
+    )
+
+    client = app.test_client()
+    resp = client.get(f"/masks/{pid}.png")
+    assert resp.status_code == 200
+    assert resp.data == b"LEGACYDIRECT"
+
+
+def test_serve_mask_404s_a_file_no_db_row_claims(app_and_db):
+    """An id-keyed mask with no DB row behind it must not be served.
+
+    ``masks/<id>.png`` is keyed by bare photo id and ``photos.id`` recycles
+    freed rowids, so existence alone doesn't mean the file belongs to the
+    photo now holding that id — and ``photo_masks`` rows cascade away with
+    the deleted photo, which is exactly what makes their absence the
+    signal. Serving on existence let the inspect overlay show the previous
+    owner's mask indefinitely; an mtime check can't catch it either, since
+    a recently written mask beats an old capture's source timestamp.
+
+    This tightens the old "legacy backfill is served as-is" contract. On
+    the real library that contract was protecting stale data: of 916
+    unreferenced bare mask files, 915 belonged to dead photo ids and one
+    to a live photo.
+    """
     import os as _os
     app, db = app_and_db
     pid = db.get_photos()[0]["id"]
     masks_dir = _os.path.join(_os.path.dirname(db._db_path), "masks")
     _os.makedirs(masks_dir, exist_ok=True)
     with open(_os.path.join(masks_dir, f"{pid}.png"), "wb") as fh:
-        fh.write(b"LEGACYDIRECT")
+        fh.write(b"PREVIOUS-TENANT-MASK")
 
     client = app.test_client()
     resp = client.get(f"/masks/{pid}.png")
-    assert resp.status_code == 200
-    assert resp.data == b"LEGACYDIRECT"
+    assert resp.status_code == 404, (
+        "a mask file no DB row claims was served; a recycled rowid would "
+        "show the previous owner's mask in the inspect overlay"
+    )
 
 
 def test_api_serve_mask_rejects_path_outside_masks_dir(app_and_db, tmp_path):

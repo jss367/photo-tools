@@ -11,7 +11,7 @@ import os
 import time
 from dataclasses import dataclass
 
-from labels import get_active_labels, get_saved_labels, load_merged_labels
+from labels import get_active_labels, get_saved_labels, load_merged_labels, read_label_file
 
 try:
     from detector import detect_animals, get_primary_detection
@@ -140,8 +140,7 @@ def _load_labels(
         labels = load_merged_labels(active_sets)
         log.info("Using %d merged labels from %d sets", len(labels), len(active_sets))
     elif labels_file and os.path.exists(labels_file):
-        with open(labels_file, encoding="utf-8") as f:
-            labels = [line.strip() for line in f if line.strip()]
+        labels = read_label_file(labels_file)
         log.info("Using %d labels from file: %s", len(labels), labels_file)
     else:
         # Try workspace-scoped active labels first

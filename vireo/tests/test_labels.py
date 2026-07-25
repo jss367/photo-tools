@@ -5,7 +5,12 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from labels import get_active_labels, load_merged_labels, set_active_labels
+from labels import (
+    get_active_labels,
+    load_merged_labels,
+    read_label_file,
+    set_active_labels,
+)
 
 
 def test_get_active_labels_empty(tmp_path, monkeypatch):
@@ -264,6 +269,32 @@ def test_load_merged_labels_falls_back_to_cp1252_for_legacy_windows_files(
 
     result = load_merged_labels([{"labels_file": txt}])
 
+    assert result == ["Köhler’s Vine Snake", "Say's phoebe"], (
+        "legacy cp1252 label file did not round-trip through the fallback: "
+        f"got {result}"
+    )
+
+
+def test_read_label_file_falls_back_to_cp1252_for_legacy_windows_files(
+    tmp_path,
+):
+    """``read_label_file`` is the shared primitive used by every direct
+    label-file reader (``load_merged_labels`` and every ``labels_file``
+    branch in ``app.py``/``classify_job.py``). A legacy Windows install
+    saved label sets in cp1252 before the writer became explicit UTF-8, so
+    reading such a file strictly as UTF-8 raises ``UnicodeDecodeError`` on
+    the first non-ASCII byte -- 0xF6 for ``ö``, 0x92 for the curly right
+    single quote -- and hides the entire label set from classification.
+    The helper's fallback must keep those legacy files loadable through
+    every code path that touches label bytes, not just the merge path.
+    """
+    dir_ = str(tmp_path / "labels")
+    os.makedirs(dir_)
+    txt = os.path.join(dir_, "legacy.txt")
+    with open(txt, "wb") as f:
+        f.write("Köhler’s Vine Snake\nSay's phoebe\n".encode("cp1252"))
+
+    result = read_label_file(txt)
     assert result == ["Köhler’s Vine Snake", "Say's phoebe"], (
         "legacy cp1252 label file did not round-trip through the fallback: "
         f"got {result}"

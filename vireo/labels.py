@@ -258,6 +258,32 @@ def save_labels(name, place_id, place_name, taxon_groups, species,
     return labels_path
 
 
+def read_label_file(path):
+    """Read a label file, returning its stripped, non-empty lines.
+
+    UTF-8 with a cp1252 fallback: label files hold non-ASCII species names
+    and current writes are explicitly UTF-8, but a Windows install that
+    saved a label set before the writer became explicit stored the file in
+    the locale default (cp1252). Reading that legacy file strictly as UTF-8
+    raises ``UnicodeDecodeError`` on the first non-ASCII byte and silently
+    drops the whole active set. Any caller opening a label file directly
+    must route through here so the fallback protects every code path, not
+    just ``load_merged_labels``.
+    """
+    try:
+        with open(path, encoding="utf-8") as f:
+            lines = f.readlines()
+    except UnicodeDecodeError:
+        log.warning(
+            "Label file %s is not valid UTF-8; falling back to cp1252 "
+            "for legacy Windows-written files",
+            path,
+        )
+        with open(path, encoding="cp1252") as f:
+            lines = f.readlines()
+    return [line.strip() for line in lines if line.strip()]
+
+
 def _atomic_write_text(path, text):
     """Write text to ``path`` via a sibling temp file + os.replace().
 
@@ -423,34 +449,8 @@ def load_merged_labels(label_sets):
         if not path or not os.path.exists(path):
             log.warning("Label file missing, skipping: %s", path)
             continue
-        # encoding="utf-8": these files carry non-ASCII species names, and the
-        # platform default is cp1252 on Windows -- reading UTF-8 bytes through
-        # it silently mojibakes `Hawaiʻi ʻamakihi` into `HawaiÊ»i Ê»amakihi`
-        # (and can raise on byte sequences cp1252 leaves undefined).
-        #
-        # cp1252 fallback: _atomic_write_text() only switched to explicit
-        # UTF-8 in the same change that added the reader above, so a Windows
-        # install that saved a label set before then wrote it in cp1252 (the
-        # locale default). Reading such a legacy file strictly as UTF-8
-        # raises UnicodeDecodeError on the first non-ASCII species and
-        # silently drops the whole active set from classification. Fall back
-        # to cp1252 so those files keep working; future saves rewrite as
-        # UTF-8 via _atomic_write_text.
-        try:
-            with open(path, encoding="utf-8") as f:
-                lines = f.readlines()
-        except UnicodeDecodeError:
-            log.warning(
-                "Label file %s is not valid UTF-8; falling back to cp1252 "
-                "for legacy Windows-written files",
-                path,
-            )
-            with open(path, encoding="cp1252") as f:
-                lines = f.readlines()
-        for line in lines:
-            name = line.strip()
-            if name:
-                all_species.add(name)
+        for name in read_label_file(path):
+            all_species.add(name)
     # Group by the fold key, then collapse only the groups that actually
     # have more than one spelling. Sorting the group makes the survivor
     # deterministic regardless of label-set order.

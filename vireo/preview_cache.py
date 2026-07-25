@@ -10,6 +10,7 @@ the loop in two modules.
 import glob as _glob
 import logging
 import os
+import shutil
 
 log = logging.getLogger(__name__)
 
@@ -38,6 +39,7 @@ def cleanup_cached_files_for_deleted_photos(
     originals_dir = os.path.join(vireo_dir, "originals")
     masks_dir = os.path.join(vireo_dir, "masks")
     edit_masks_dir = os.path.join(vireo_dir, "edit-masks")
+    external_dng_dir = os.path.join(vireo_dir, "external-dng")
     # Offline-cache layout: offline/{originals,xmp,companions}/{pid}{ext}.
     # The FK cascade drops the offline_originals row when the photo is
     # deleted, so we lose the exact stored paths — glob by photo id to
@@ -137,6 +139,22 @@ def cleanup_cached_files_for_deleted_photos(
                         "— will be reclaimed by Clear Cache: %s",
                         orphan, e,
                     )
+        # ``external-dng/<pid>/<stem>.dng`` caches DNG conversions per
+        # photo id for the Nikon-HE-NEF external-editor path. The
+        # freshness check there is source-mtime-based, so a recycled id
+        # with the same basename and older source would silently reuse
+        # the previous owner's DNG. Wipe the whole per-id directory.
+        pid_external_dng = os.path.join(external_dng_dir, str(pid))
+        if os.path.isdir(pid_external_dng):
+            try:
+                shutil.rmtree(pid_external_dng)
+            except OSError as e:
+                log.warning(
+                    "Failed to remove external-dng cache directory %s "
+                    "after photo delete — will be reclaimed by Clear "
+                    "Cache: %s",
+                    pid_external_dng, e,
+                )
         if progress_callback:
             progress_callback(idx, total, f.get("filename") or str(pid))
 
@@ -156,6 +174,11 @@ def _recycled_id_probe_paths(thumb_cache_dir, photo_id):
         os.path.join(vireo_dir, "previews", f"{photo_id}.jpg"),
         os.path.join(vireo_dir, "originals", f"{photo_id}.display.jpg"),
         os.path.join(vireo_dir, "masks", f"{photo_id}.png"),
+        # ``external-dng/<pid>/`` is a per-photo-id *directory* rather than
+        # a file — ``os.path.exists`` returns True for directories, so
+        # the same machinery covers it. The batch index's directory sweep
+        # (``RecycledIdIndex._build``) also enumerates its subdirectories.
+        os.path.join(vireo_dir, "external-dng", str(photo_id)),
     )
 
 
@@ -282,6 +305,23 @@ class RecycledIdIndex:
                     photo_id = _leading_photo_id(entry.name)
                     if photo_id is not None:
                         ids.add(photo_id)
+        # ``external-dng/`` isn't in ``_derivative_dirs`` because its
+        # entries are per-id *subdirectories* named with bare digits
+        # (``external-dng/42/``) — ``_leading_photo_id`` intentionally
+        # requires a ``.``/``_`` terminator to keep ``40.jpg`` from
+        # registering as id 4, and loosening it for the file-based
+        # families to accept EOL would break that guard. Handle
+        # external-dng in its own sweep instead.
+        vireo_dir = os.path.dirname(self._thumb_cache_dir)
+        try:
+            entries = os.scandir(os.path.join(vireo_dir, "external-dng"))
+        except OSError:
+            entries = None
+        if entries is not None:
+            with entries:
+                for entry in entries:
+                    if entry.name.isdigit():
+                        ids.add(int(entry.name))
         log.info(
             "Indexed %d photo ids with cached derivatives for "
             "recycled-rowid detection", len(ids),

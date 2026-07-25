@@ -4251,7 +4251,13 @@ def test_scan_recursive_raises_permission_error_without_callback(
 
 
 def _seed_derivative_files(vireo_dir, thumb_dir, photo_id, marker=b"previous-tenant"):
-    """Write one file per id-keyed derivative family for ``photo_id``."""
+    """Write one file per id-keyed derivative family for ``photo_id``.
+
+    ``external_dng`` is a per-id *directory* (``external-dng/<pid>/``
+    holds Nikon-HE-NEF conversions the external-editor path reuses when
+    ``cached_mtime >= source_mtime``); callers check its presence the
+    same way as the file entries.
+    """
     paths = {
         "thumb": os.path.join(thumb_dir, f"{photo_id}.jpg"),
         "thumb_variant": os.path.join(thumb_dir, f"{photo_id}_raw.jpg"),
@@ -4266,6 +4272,9 @@ def _seed_derivative_files(vireo_dir, thumb_dir, photo_id, marker=b"previous-ten
         ),
         "edit_mask": os.path.join(
             vireo_dir, "edit-masks", f"{photo_id}.abcdef012345.png"
+        ),
+        "external_dng": os.path.join(
+            vireo_dir, "external-dng", str(photo_id), "gull.dng"
         ),
     }
     for path in paths.values():
@@ -4629,3 +4638,29 @@ def test_recycled_id_index_does_not_confuse_id_prefixes(tmp_path):
     assert 7 in index
     assert 4 not in index, "'40.jpg' was parsed as id 4"
     assert 0 not in index
+
+
+def test_recycled_id_index_indexes_external_dng_subdirectories(tmp_path):
+    """The Nikon-HE-NEF DNG cache lives at ``external-dng/<pid>/`` — the
+    entries are bare-digit *directory* names rather than files with a
+    ``.``/``_`` separator, so the standard ``_leading_photo_id`` parser
+    (which requires the separator) skips them. Verify the index's
+    external-dng sweep picks them up so a recycled RAW id doesn't reuse
+    the previous owner's DNG when Darktable is launched.
+    """
+    from preview_cache import RecycledIdIndex
+
+    vireo_dir = tmp_path / "vireo"
+    thumb_dir = vireo_dir / "thumbnails"
+    thumb_dir.mkdir(parents=True)
+    external_dng = vireo_dir / "external-dng"
+    (external_dng / "1234").mkdir(parents=True)
+    (external_dng / "1234" / "DSC_9999.dng").write_bytes(b"stale-conversion")
+
+    index = RecycledIdIndex(str(thumb_dir))
+
+    assert 1234 in index, (
+        "batch index missed an external-dng orphan; the recycled RAW id "
+        "would silently reuse the previous owner's DNG through the "
+        "external-editor freshness check"
+    )

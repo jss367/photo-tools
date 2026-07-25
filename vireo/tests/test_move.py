@@ -965,6 +965,33 @@ def test_plan_folder_date_moves_uses_unsorted_without_a_usable_time(tmp_path):
     assert plan[0]["relative_path"] == "unsorted"
 
 
+def test_folder_subtree_photos_reads_only_date_columns(tmp_path):
+    """Date planning must not pull whole photo rows.
+
+    ``photos`` carries two DINOv2 embedding BLOBs plus the full ``exif_data``
+    JSON. A ``SELECT p.*`` here dragged ~800MB into Python on a real
+    60k-photo subtree just to resolve one date per row — and the move
+    preflight runs this on every keystroke in the destination field.
+    """
+    from move import _folder_subtree_photos
+
+    db = Database(str(tmp_path / "test.db"))
+    ws_id = db.ensure_default_workspace()
+    db.set_active_workspace(ws_id)
+    src = tmp_path / "src"
+    src.mkdir()
+    fid = db.add_folder(str(src), name="src")
+    db.add_photo(
+        folder_id=fid, filename="photo.jpg", extension=".jpg",
+        file_size=1, file_mtime=1.0, timestamp="2026-07-12T09:30:00",
+    )
+
+    rows = _folder_subtree_photos(db, fid)
+
+    assert len(rows) == 1
+    assert set(rows[0].keys()) == {"id", "exif_data", "timestamp", "file_mtime"}
+
+
 def test_plan_folder_date_moves_normalizes_dot_components(tmp_path):
     """Rendered dot components never leak into catalog destination paths."""
     from move import plan_folder_date_moves

@@ -348,12 +348,17 @@ body { display: flex; flex-direction: column; height: 100vh; }
       </div>
       <div class="row">
         <label for="folderTemplatePreset">Folder template</label>
+        <!-- Bare patterns until applyFolderTemplateSamples() fills in real
+             example folder names from the files being imported. Never
+             hardcode a sample date: users read it as the folder they are
+             about to create, and it has to agree with the resulting-folders
+             table below. -->
         <select id="folderTemplatePreset" class="input-fixed" onchange="updateFolderTemplateControls()">
-          <option value="%Y/%Y-%m-%d" selected>%Y/%Y-%m-%d — 2026/2026-07-12</option>
-          <option value="%Y/%m/%d">%Y/%m/%d — 2026/07/12</option>
-          <option value="%Y/%m">%Y/%m — 2026/07</option>
-          <option value="%Y">%Y — 2026</option>
-          <option value="%Y-%m-%d">%Y-%m-%d — 2026-07-12</option>
+          <option value="%Y/%Y-%m-%d" selected>%Y/%Y-%m-%d</option>
+          <option value="%Y/%m/%d">%Y/%m/%d</option>
+          <option value="%Y/%m">%Y/%m</option>
+          <option value="%Y">%Y</option>
+          <option value="%Y-%m-%d">%Y-%m-%d</option>
           <option value="__custom__">Custom…</option>
         </select>
         <input type="text" id="folderTemplate" value="" placeholder="Enter a strftime format"
@@ -660,6 +665,24 @@ function updateFolderTemplateControls() {
   if (!preset || !custom) return;
   custom.style.display = preset.value === '__custom__' ? '' : 'none';
   if (preset.value === '__custom__') custom.focus();
+}
+
+// Label each folder-template preset with a folder this import would really
+// create. The examples come from the destination preview, rendered by the
+// same build_destination_path() the copy uses against the earliest capture
+// time among the source files — so the label agrees with the resulting-folders
+// table instead of contradicting it. Passing null resets to bare patterns,
+// which is what we show whenever the real dates aren't known yet: a stale or
+// invented example is worse than none.
+function applyFolderTemplateSamples(templateSamples) {
+  const preset = document.getElementById('folderTemplatePreset');
+  if (!preset) return;
+  const samples = (templateSamples && templateSamples.samples) || {};
+  Array.from(preset.options).forEach((option) => {
+    if (option.value === '__custom__') return;
+    const sample = samples[option.value];
+    option.textContent = sample ? option.value + ' — ' + sample : option.value;
+  });
 }
 
 function setFolderTemplate(template) {
@@ -2095,6 +2118,13 @@ function importPreviewSignatureChanged(signature) {
 // new/existing folder counts matching the files that actually land.
 async function renderDestStructure(excludePaths) {
   hideDestStructure();
+  // Drop the previous run's example folder names up front. Unlike the move
+  // page — where the examples depend only on the selected folder — an
+  // import's examples come from the set of source files that will actually
+  // land, which every re-render can change (sources added or removed, or
+  // more files excluded as duplicates). Bare patterns for a moment beat an
+  // example derived from files that are no longer being imported.
+  applyFolderTemplateSamples(null);
   const destination = resolvedCopyDestination();
   if (!destination) return null;
   const fileTypes = selectedFileTypes();
@@ -2130,6 +2160,9 @@ async function renderDestStructure(excludePaths) {
   ) {
     return;
   }
+  // Before the early return below: the dropdown's examples are useful even
+  // when there is no folder table to draw.
+  applyFolderTemplateSamples(data.template_samples);
   const folders = data.folders || [];
   if (!folders.length && !data.managed_archive) return data;
 

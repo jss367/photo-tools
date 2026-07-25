@@ -13893,12 +13893,15 @@ def test_import_page_offers_common_and_custom_folder_templates(app_and_db):
     html = client.get("/import").data.decode()
 
     assert 'id="folderTemplatePreset"' in html
-    assert '%Y/%m/%d — 2026/07/12' in html
-    assert '%Y/%Y-%m-%d — 2026/2026-07-12' in html
+    assert '<option value="%Y/%m/%d">%Y/%m/%d</option>' in html
     assert '<option value="__custom__">Custom…</option>' in html
     assert 'id="folderTemplate"' in html
     assert "function selectedFolderTemplate()" in html
     assert "preset.value = commonOption ? template : '__custom__'" in html
+    # No baked-in example date: the labels gain a real example from the
+    # source files once the destination preview runs.
+    assert "2026-07-12" not in html
+    assert "applyFolderTemplateSamples" in html
 
 
 def test_process_page_has_no_import_source(app_and_db):

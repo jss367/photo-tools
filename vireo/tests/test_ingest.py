@@ -1716,6 +1716,84 @@ def test_preview_destination_groups_by_date(tmp_path):
     assert destinations[str(src / "c.jpg")]["full_folder"] == str(dst / "2026" / "2026-03-26")
 
 
+def test_preview_destination_reports_template_samples_from_real_dates(tmp_path):
+    """The import page labels each folder-template preset with an example.
+
+    That example must come from the files actually being imported — it used
+    to be a hardcoded ``2026-07-12`` copied from a test fixture, which
+    contradicted the resulting-folders list rendered right below it.
+    """
+    from ingest import FOLDER_TEMPLATE_PRESETS
+
+    src = tmp_path / "sd_card"
+    dst = tmp_path / "nas"
+    src.mkdir()
+    dst.mkdir()
+
+    # Later file first: the earliest capture time must win, so the sample
+    # matches the first folder the preview lists.
+    for name, day in (("late.jpg", 26), ("early.jpg", 25)):
+        Image.new("RGB", (100, 100)).save(str(src / name))
+        mtime = datetime(2026, 3, day, 10, 0, 0).timestamp()
+        os.utime(str(src / name), (mtime, mtime))
+
+    result = preview_destination(
+        sources=[str(src)],
+        destination=str(dst),
+        folder_template="%Y/%Y-%m-%d",
+    )
+
+    samples = result["template_samples"]["samples"]
+    assert set(samples) == set(FOLDER_TEMPLATE_PRESETS)
+    assert samples["%Y/%Y-%m-%d"] == "2026/2026-03-25"
+    assert samples["%Y-%m-%d"] == "2026-03-25"
+    assert samples["%Y/%m"] == "2026/03"
+    assert samples["%Y"] == "2026"
+    # The example names a folder the import really creates, and it is the
+    # first one the preview lists.
+    assert samples["%Y/%Y-%m-%d"] == result["folders"][0]["path"]
+
+
+def test_preview_destination_template_samples_say_unsorted_when_undated(
+    tmp_path, monkeypatch
+):
+    """With no usable capture time the files go to ``unsorted`` — the label
+    says so instead of inventing a date."""
+    import ingest as ingest_module
+
+    src = tmp_path / "sd_card"
+    dst = tmp_path / "nas"
+    src.mkdir()
+    dst.mkdir()
+    Image.new("RGB", (100, 100)).save(str(src / "a.jpg"))
+
+    monkeypatch.setattr(
+        ingest_module, "_source_file_timestamps",
+        lambda files, capture_times=None: {f: None for f in files},
+    )
+
+    result = preview_destination(
+        sources=[str(src)], destination=str(dst), folder_template="%Y-%m-%d",
+    )
+
+    assert set(result["template_samples"]["samples"].values()) == {"unsorted"}
+    assert result["template_samples"]["dated_count"] == 0
+
+
+def test_folder_template_samples_skips_templates_that_cannot_render(tmp_path):
+    """An unsafe preset never yields a label rather than raising and taking
+    the whole preview down with it."""
+    from ingest import folder_template_samples
+
+    result = folder_template_samples(
+        [datetime(2026, 3, 25, 10, 0, 0)],
+        templates=("%Y-%m-%d", "../%Y"),
+    )
+
+    assert result["samples"] == {"%Y-%m-%d": "2026-03-25"}
+    assert result["sample_date"] == "2026-03-25T10:00:00"
+
+
 def test_preview_destination_uses_metadata_dates_when_lightweight_exif_fails(
     tmp_path, monkeypatch
 ):

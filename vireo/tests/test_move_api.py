@@ -29,9 +29,37 @@ def test_move_page_offers_capture_date_folder_formats(app_and_db):
     assert 'id="quickFolderMode"' in html
     assert "Organize photos by capture date" in html
     assert 'id="quickFolderTemplatePreset"' in html
-    assert "%Y-%m-%d — 2026-07-12" in html
     assert 'id="quickFolderTemplate"' in html
     assert "folder_template: templateResult.value" in html
+
+
+def test_move_page_ships_no_hardcoded_example_folder_date(app_and_db):
+    """The date-format dropdown must not bake a sample date into the page.
+
+    A frozen example — it shipped as a fixture date copied into the template —
+    is read by users as "this is what my folder will be called", and it
+    contradicted the resulting-folders panel a few inches below. The options
+    ship as bare strftime patterns; the real capture date arrives with the
+    preflight response that draws that panel.
+    """
+    import re
+
+    app, _ = app_and_db
+    html = app.test_client().get("/move").data.decode()
+
+    select = re.search(
+        r'<select[^>]*id="quickFolderTemplatePreset".*?</select>',
+        html, re.DOTALL,
+    )
+    assert select, "date-format dropdown missing"
+    labels = re.findall(r"<option[^>]*>(.*?)</option>", select.group(0))
+    assert labels, "dropdown has no options"
+    for label in labels:
+        assert not re.search(r"\d", label), (
+            f"option label {label!r} hardcodes an example date"
+        )
+    assert "%Y-%m-%d" in labels
+    assert "applyQuickDateSamples(data.template_samples)" in html
 
 
 def test_move_page_folder_browser_exposes_volumes_shortcut(app_and_db):
@@ -604,6 +632,115 @@ def test_move_folder_preflight_plans_multiple_capture_date_folders(
     assert data["destination_count"] == 2
     assert [item["relative_path"] for item in data["destinations"]] == [
         "2026-07-12", "2026-07-13",
+    ]
+
+
+def test_move_folder_preflight_samples_match_the_folders_it_reports(
+    app_and_db, tmp_path,
+):
+    """Each preset's example folder name comes from the photos being moved.
+
+    The dropdown label and the resulting-folders list are rendered from one
+    scan, so the label always names a folder this move really creates — the
+    ``%Y-%m-%d`` example is exactly the first row of the list.
+    """
+    app, db = app_and_db
+    src = tmp_path / "dated-source"
+    src.mkdir()
+    fid = db.add_folder(str(src), name="dated-source")
+    # Deliberately out of chronological order: the earliest capture time
+    # must win regardless of insertion order.
+    for index, day in enumerate(("13", "11"), start=1):
+        filename = f"bird-{index}.jpg"
+        (src / filename).write_bytes(b"bird")
+        db.add_photo(
+            folder_id=fid, filename=filename, extension=".jpg",
+            file_size=4, file_mtime=float(index),
+            timestamp=f"2026-07-{day}T10:00:00",
+        )
+
+    resp = app.test_client().post("/api/move-folder/preflight", json={
+        "folder_id": fid,
+        "destination": str(tmp_path / "archive"),
+        "folder_template": "%Y-%m-%d",
+    })
+
+    assert resp.status_code == 200
+    data = resp.get_json()
+    samples = data["template_samples"]["samples"]
+    assert samples == {
+        "%Y/%Y-%m-%d": "2026/2026-07-11",
+        "%Y/%m/%d": "2026/07/11",
+        "%Y/%m": "2026/07",
+        "%Y": "2026",
+        "%Y-%m-%d": "2026-07-11",
+    }
+    assert data["template_samples"]["dated_count"] == 2
+
+    relatives = [item["relative_path"] for item in data["destinations"]]
+    assert relatives == ["2026-07-11", "2026-07-13"]
+    assert samples["%Y-%m-%d"] == relatives[0]
+
+
+def test_move_folder_preflight_samples_say_unsorted_without_capture_dates(
+    app_and_db, tmp_path,
+):
+    """Undated photos land in ``unsorted``, so that is what the label shows —
+    not an invented date."""
+    app, db = app_and_db
+    src = tmp_path / "undated-source"
+    src.mkdir()
+    fid = db.add_folder(str(src), name="undated-source")
+    (src / "unknown.jpg").write_bytes(b"x")
+    db.add_photo(
+        folder_id=fid, filename="unknown.jpg", extension=".jpg",
+        file_size=1, file_mtime=None,
+    )
+
+    resp = app.test_client().post("/api/move-folder/preflight", json={
+        "folder_id": fid,
+        "destination": str(tmp_path / "archive"),
+        "folder_template": "%Y-%m-%d",
+    })
+
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert set(data["template_samples"]["samples"].values()) == {"unsorted"}
+    assert data["template_samples"]["dated_count"] == 0
+    assert [item["relative_path"] for item in data["destinations"]] == [
+        "unsorted",
+    ]
+
+
+def test_move_folder_preflight_samples_fall_back_to_file_mtime(
+    app_and_db, tmp_path,
+):
+    """Samples use the same EXIF-then-mtime resolution as the plan itself, so
+    a folder whose photos only have mtimes still gets a truthful example."""
+    from datetime import datetime
+
+    app, db = app_and_db
+    src = tmp_path / "mtime-source"
+    src.mkdir()
+    fid = db.add_folder(str(src), name="mtime-source")
+    (src / "bird.jpg").write_bytes(b"bird")
+    db.add_photo(
+        folder_id=fid, filename="bird.jpg", extension=".jpg",
+        file_size=4,
+        file_mtime=datetime(2026, 3, 25, 9, 0, 0).timestamp(),
+    )
+
+    resp = app.test_client().post("/api/move-folder/preflight", json={
+        "folder_id": fid,
+        "destination": str(tmp_path / "archive"),
+        "folder_template": "%Y-%m-%d",
+    })
+
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert data["template_samples"]["samples"]["%Y-%m-%d"] == "2026-03-25"
+    assert [item["relative_path"] for item in data["destinations"]] == [
+        "2026-03-25",
     ]
 
 

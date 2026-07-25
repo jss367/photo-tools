@@ -11405,7 +11405,9 @@ class Database:
         deleting the loser, migrate any workspace review rows onto the
         surviving prediction so an accepted/rejected decision on the variant
         (`prediction_review.prediction_id` uses `ON DELETE CASCADE`) is not
-        silently lost mid-migration.
+        silently lost mid-migration, and retarget any `prediction_accept`
+        edit-history references from the loser id to the winner id so
+        undo/redo can still find the prediction after the DELETE.
         """
         folded = 0
         for row in self.conn.execute(
@@ -11432,6 +11434,9 @@ class Database:
                     self._merge_prediction_review_before_delete(
                         loser_id=dup["id"], winner_id=row["id"],
                     )
+                    self._retarget_prediction_edit_history(
+                        loser_id=dup["id"], winner_id=row["id"],
+                    )
                     self.conn.execute(
                         "DELETE FROM predictions WHERE id = ?", (dup["id"],)
                     )
@@ -11441,6 +11446,9 @@ class Database:
                     )
                 else:
                     self._merge_prediction_review_before_delete(
+                        loser_id=row["id"], winner_id=dup["id"],
+                    )
+                    self._retarget_prediction_edit_history(
                         loser_id=row["id"], winner_id=dup["id"],
                     )
                     self.conn.execute(
@@ -11515,6 +11523,104 @@ class Database:
                     (lr["status"], lr["reviewed_at"], lr["individual"],
                      lr["group_id"], lr["vote_count"], lr["total_votes"],
                      winner_id, ws),
+                )
+
+    def _retarget_prediction_edit_history(self, loser_id, winner_id):
+        """Rewrite `prediction_accept` history entries from loser to winner.
+
+        `api_accept_prediction` and `api_accept_subject_species` encode the
+        accepted prediction id in `edit_history_items.old_value` on
+        `prediction_accept` rows.  The shape is one of:
+
+        - a bare-int string (single-model, changed-tag accept), or
+        - JSON `{"prediction_id": N, "no_tag": true}` (single, no-op accept),
+          or
+        - JSON `{"prediction_ids": [N, ...], "no_tag"?: true}` (accept-subject
+          collecting agreeing sibling classifier models).
+
+        When the fold migration deletes a colliding prediction row, an
+        undo/redo later would look the id up in `predictions` (see
+        `_apply_undo` in the `prediction_accept` branch) and quietly skip
+        the missing row.  On a mixed workspace this means:
+
+        - `undo` cannot restore the loser's `prediction_review.status` back
+          to `pending`, so the surviving prediction stays in the accepted
+          state even after the user reverses the edit; and
+        - a subject-accept whose sibling list contained the loser has that
+          sibling's status flip permanently anchored (no way to reset it).
+
+        Retargeting the reference from `loser_id` -> `winner_id` before the
+        DELETE keeps undo/redo sound: the two predictions differed only in
+        spelling, so any status flip captured on either applies to the same
+        (detection, model, labels_fingerprint) scope after the merge.
+        """
+        if loser_id == winner_id:
+            return
+        loser_str = str(loser_id)
+        winner_str = str(winner_id)
+        # (1) Bare-int old_value: rewrite in place.  Scoped by action_type
+        #     because `keyword_add` / `species_replace` / `keyword_remove`
+        #     store keyword ids in these columns and a blanket UPDATE would
+        #     corrupt any keyword id that happened to equal loser_id.
+        self.conn.execute(
+            """UPDATE edit_history_items
+               SET old_value = ?
+               WHERE old_value = ?
+                 AND edit_id IN (
+                     SELECT id FROM edit_history
+                     WHERE action_type = 'prediction_accept'
+                 )""",
+            (winner_str, loser_str),
+        )
+        # (2) JSON old_value: parse, rewrite `prediction_id` and every
+        #     `prediction_ids` entry that matches the loser, re-serialize.
+        #     The `LIKE '{%'` prefix skips the bare-int rows handled above
+        #     without loading them into Python.
+        json_rows = self.conn.execute(
+            """SELECT ehi.id, ehi.old_value
+               FROM edit_history_items ehi
+               JOIN edit_history eh ON eh.id = ehi.edit_id
+               WHERE eh.action_type = 'prediction_accept'
+                 AND ehi.old_value IS NOT NULL
+                 AND ehi.old_value LIKE ?""",
+            ('{%',),
+        ).fetchall()
+        for row in json_rows:
+            try:
+                data = json.loads(row["old_value"])
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(data, dict):
+                continue
+            changed = False
+            raw_pid = data.get("prediction_id")
+            if raw_pid is not None:
+                try:
+                    if int(raw_pid) == loser_id:
+                        data["prediction_id"] = winner_id
+                        changed = True
+                except (TypeError, ValueError):
+                    pass
+            raw_pids = data.get("prediction_ids")
+            if isinstance(raw_pids, list):
+                new_list = []
+                list_changed = False
+                for raw in raw_pids:
+                    try:
+                        if int(raw) == loser_id:
+                            new_list.append(winner_id)
+                            list_changed = True
+                            continue
+                    except (TypeError, ValueError):
+                        pass
+                    new_list.append(raw)
+                if list_changed:
+                    data["prediction_ids"] = new_list
+                    changed = True
+            if changed:
+                self.conn.execute(
+                    "UPDATE edit_history_items SET old_value = ? WHERE id = ?",
+                    (json.dumps(data), row["id"]),
                 )
 
     def _align_curation_species_case(self):

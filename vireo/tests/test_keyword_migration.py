@@ -1239,6 +1239,242 @@ def test_prediction_fold_preserves_review_per_workspace_independently(tmp_path):
         db.close()
 
 
+def _insert_prediction_accept_history(db, ws_id, photo_id, old_value,
+                                      new_value="42"):
+    """Insert a `prediction_accept` edit_history + edit_history_items pair
+    directly, mirroring what `record_edit` would write for an accept edit
+    without going through the full API. Returns (edit_id, item_id)."""
+    cur = db.conn.execute(
+        "INSERT INTO edit_history (workspace_id, action_type, description, "
+        "new_value) VALUES (?, 'prediction_accept', 'accept', ?)",
+        (ws_id, new_value),
+    )
+    edit_id = cur.lastrowid
+    cur = db.conn.execute(
+        "INSERT INTO edit_history_items (edit_id, photo_id, old_value, "
+        "new_value) VALUES (?, ?, ?, ?)",
+        (edit_id, photo_id, old_value, new_value),
+    )
+    return edit_id, cur.lastrowid
+
+
+def test_prediction_fold_retargets_bare_edit_history_on_loser_delete(tmp_path):
+    """The compact single-model accept encodes the prediction id as a
+    bare-int string in `edit_history_items.old_value`. When the collision-
+    merge deletes the loser, that id must be rewritten to the surviving
+    prediction id so `_apply_undo` can still restore the status flip."""
+    db, ws_id, p1, _p2 = _make_db(tmp_path)
+    try:
+        det = _insert_prediction(db, p1, "Say's phoebe", confidence=0.8)
+        db.conn.execute(
+            "INSERT INTO predictions (detection_id, classifier_model, "
+            "labels_fingerprint, species, confidence) "
+            "VALUES (?, 'm1', 'fp1', ?, ?)",
+            (det, "Say’s phoebe", 0.4),
+        )
+        loser_pid = db.conn.execute(
+            "SELECT id FROM predictions WHERE species = ?", ("Say’s phoebe",)
+        ).fetchone()["id"]
+        _, item_id = _insert_prediction_accept_history(
+            db, ws_id, p1, old_value=str(loser_pid),
+        )
+        db.conn.commit()
+
+        db._fold_prediction_species_apostrophes()
+        db.conn.commit()
+
+        survivor_pid = db.conn.execute(
+            "SELECT id FROM predictions WHERE species = ?", ("Say's phoebe",)
+        ).fetchone()["id"]
+        row = db.conn.execute(
+            "SELECT old_value FROM edit_history_items WHERE id = ?",
+            (item_id,),
+        ).fetchone()
+        assert row["old_value"] == str(survivor_pid), (
+            "loser prediction id in bare-int edit history was not retargeted"
+        )
+    finally:
+        db.close()
+
+
+def test_prediction_fold_retargets_json_prediction_id_on_loser_delete(tmp_path):
+    """`no_tag` accepts serialize `{"prediction_id": N, "no_tag": true}` as
+    the item's old_value. That id must be rewritten too — otherwise the
+    reverse-a-no-op-accept undo path silently loses the reference and the
+    prediction stays flipped."""
+    db, ws_id, p1, _p2 = _make_db(tmp_path)
+    try:
+        det = _insert_prediction(db, p1, "Say's phoebe", confidence=0.8)
+        db.conn.execute(
+            "INSERT INTO predictions (detection_id, classifier_model, "
+            "labels_fingerprint, species, confidence) "
+            "VALUES (?, 'm1', 'fp1', ?, ?)",
+            (det, "Say’s phoebe", 0.4),
+        )
+        loser_pid = db.conn.execute(
+            "SELECT id FROM predictions WHERE species = ?", ("Say’s phoebe",)
+        ).fetchone()["id"]
+        payload = json.dumps({"prediction_id": loser_pid, "no_tag": True})
+        _, item_id = _insert_prediction_accept_history(
+            db, ws_id, p1, old_value=payload,
+        )
+        db.conn.commit()
+
+        db._fold_prediction_species_apostrophes()
+        db.conn.commit()
+
+        survivor_pid = db.conn.execute(
+            "SELECT id FROM predictions WHERE species = ?", ("Say's phoebe",)
+        ).fetchone()["id"]
+        row = db.conn.execute(
+            "SELECT old_value FROM edit_history_items WHERE id = ?",
+            (item_id,),
+        ).fetchone()
+        data = json.loads(row["old_value"])
+        assert data["prediction_id"] == survivor_pid, (
+            "JSON prediction_id was not retargeted to the surviving row"
+        )
+        assert data.get("no_tag") is True, (
+            "unrelated JSON keys must survive the retarget"
+        )
+    finally:
+        db.close()
+
+
+def test_prediction_fold_retargets_prediction_ids_list_entry(tmp_path):
+    """Accept-subject records `{"prediction_ids": [pid_a, pid_b, ...]}`
+    covering agreeing sibling classifier models on one detection. If one
+    sibling is the collision loser, only that entry must be rewritten:
+    the untouched siblings must remain byte-identical so undo/redo still
+    reaches every model's scope."""
+    db, ws_id, p1, _p2 = _make_db(tmp_path)
+    try:
+        det = _insert_prediction(db, p1, "Say's phoebe", confidence=0.8)
+        db.conn.execute(
+            "INSERT INTO predictions (detection_id, classifier_model, "
+            "labels_fingerprint, species, confidence) "
+            "VALUES (?, 'm1', 'fp1', ?, ?)",
+            (det, "Say’s phoebe", 0.4),
+        )
+        loser_pid = db.conn.execute(
+            "SELECT id FROM predictions WHERE species = ?", ("Say’s phoebe",)
+        ).fetchone()["id"]
+        sibling_a = 9001
+        sibling_b = 9002
+        payload = json.dumps({
+            "prediction_ids": [sibling_a, loser_pid, sibling_b],
+        })
+        _, item_id = _insert_prediction_accept_history(
+            db, ws_id, p1, old_value=payload,
+        )
+        db.conn.commit()
+
+        db._fold_prediction_species_apostrophes()
+        db.conn.commit()
+
+        survivor_pid = db.conn.execute(
+            "SELECT id FROM predictions WHERE species = ?", ("Say's phoebe",)
+        ).fetchone()["id"]
+        row = db.conn.execute(
+            "SELECT old_value FROM edit_history_items WHERE id = ?",
+            (item_id,),
+        ).fetchone()
+        data = json.loads(row["old_value"])
+        assert data["prediction_ids"] == [sibling_a, survivor_pid, sibling_b]
+    finally:
+        db.close()
+
+
+def test_prediction_fold_retargets_edit_history_when_variant_wins_collision(
+    tmp_path,
+):
+    """Symmetric case: when the curly variant has higher confidence, the
+    migration deletes the *clean* row. A prediction_accept history item
+    that references the clean row must be retargeted to the variant id
+    (which then gets renamed onto the clean spelling in place)."""
+    db, ws_id, p1, _p2 = _make_db(tmp_path)
+    try:
+        det = _insert_prediction(db, p1, "Say's phoebe", confidence=0.4)
+        db.conn.execute(
+            "INSERT INTO predictions (detection_id, classifier_model, "
+            "labels_fingerprint, species, confidence) "
+            "VALUES (?, 'm1', 'fp1', ?, ?)",
+            (det, "Say’s phoebe", 0.8),
+        )
+        clean_pid = db.conn.execute(
+            "SELECT id FROM predictions WHERE species = ?", ("Say's phoebe",)
+        ).fetchone()["id"]
+        _, item_id = _insert_prediction_accept_history(
+            db, ws_id, p1, old_value=str(clean_pid),
+        )
+        db.conn.commit()
+
+        db._fold_prediction_species_apostrophes()
+        db.conn.commit()
+
+        survivor_pid = db.conn.execute(
+            "SELECT id FROM predictions WHERE species = ?", ("Say's phoebe",)
+        ).fetchone()["id"]
+        row = db.conn.execute(
+            "SELECT old_value FROM edit_history_items WHERE id = ?",
+            (item_id,),
+        ).fetchone()
+        assert row["old_value"] == str(survivor_pid)
+    finally:
+        db.close()
+
+
+def test_prediction_fold_only_retargets_prediction_accept_history(tmp_path):
+    """Guard against a blanket UPDATE: `keyword_add.new_value` and
+    `species_replace.new_value`/`.old_value` store keyword ids in the
+    same columns. A keyword id that numerically happens to equal a
+    deleted-prediction id must not be silently rewritten to the
+    surviving prediction id."""
+    db, ws_id, p1, _p2 = _make_db(tmp_path)
+    try:
+        det = _insert_prediction(db, p1, "Say's phoebe", confidence=0.8)
+        db.conn.execute(
+            "INSERT INTO predictions (detection_id, classifier_model, "
+            "labels_fingerprint, species, confidence) "
+            "VALUES (?, 'm1', 'fp1', ?, ?)",
+            (det, "Say’s phoebe", 0.4),
+        )
+        loser_pid = db.conn.execute(
+            "SELECT id FROM predictions WHERE species = ?", ("Say’s phoebe",)
+        ).fetchone()["id"]
+        # A `keyword_add` row whose new_value is the numeric string that
+        # matches the loser prediction id. Must survive the fold unchanged.
+        kw_edit = db.conn.execute(
+            "INSERT INTO edit_history (workspace_id, action_type, description, "
+            "new_value) VALUES (?, 'keyword_add', 'add', ?)",
+            (ws_id, str(loser_pid)),
+        ).lastrowid
+        kw_item = db.conn.execute(
+            "INSERT INTO edit_history_items (edit_id, photo_id, old_value, "
+            "new_value) VALUES (?, ?, ?, ?)",
+            (kw_edit, p1, "", str(loser_pid)),
+        ).lastrowid
+        db.conn.commit()
+
+        db._fold_prediction_species_apostrophes()
+        db.conn.commit()
+
+        row = db.conn.execute(
+            "SELECT old_value, new_value FROM edit_history_items WHERE id = ?",
+            (kw_item,),
+        ).fetchone()
+        assert row["old_value"] == "", (
+            "keyword_add.old_value was unexpectedly rewritten by the "
+            "prediction-id retarget"
+        )
+        assert row["new_value"] == str(loser_pid), (
+            "keyword_add.new_value carries a keyword id and must not be "
+            "retargeted by the prediction-id path"
+        )
+    finally:
+        db.close()
+
+
 def test_add_prediction_folds_curly_apostrophe_species(tmp_path):
     """`Database.add_prediction` is the shared choke point for the classify
     job's storage helpers (`_store_pending_detection_prediction`,

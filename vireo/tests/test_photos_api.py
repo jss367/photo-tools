@@ -1775,7 +1775,6 @@ def test_unedited_raw_display_cache_survives_when_companion_is_newer_than_raw_ro
     newer than the RAW row's stored mtime.
     """
     import io
-    import time
 
     import image_loader
     from PIL import Image

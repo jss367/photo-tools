@@ -2493,3 +2493,105 @@ def test_prediction_fold_merge_backfills_pending_group_metadata(tmp_path):
         assert review["individual"] == "ind-1"
     finally:
         db.close()
+
+
+def test_prediction_fold_merges_taxonomy_metadata_from_loser(tmp_path):
+    """When the higher-confidence row happens to be the one written by a
+    raw-classifier path that never filled in `scientific_name` or the
+    taxonomy hierarchy, the migration must backfill those fields from the
+    loser before the CASCADEd DELETE strips them. Otherwise taxonomy
+    filters and review displays that rely on `taxonomy_family` etc. show
+    the surviving prediction as unclassified. `category` also promotes
+    from the schema default `'new'` to the loser's more specific
+    `'match'`, since the two rows describe the same (detection, species)
+    pair and any classifier enrichment belongs to whichever survives."""
+    db, _ws_id, p1, _p2 = _make_db(tmp_path)
+    try:
+        det = db.conn.execute(
+            "INSERT INTO detections (photo_id, category, detector_confidence) "
+            "VALUES (?, 'animal', 0.99)",
+            (p1,),
+        ).lastrowid
+        # Winner (higher confidence, clean spelling): no taxonomy fields.
+        db.conn.execute(
+            "INSERT INTO predictions (detection_id, classifier_model, "
+            "labels_fingerprint, species, confidence, category) "
+            "VALUES (?, 'm1', 'fp1', ?, ?, 'new')",
+            (det, "Say's phoebe", 0.8),
+        )
+        # Loser (curly, lower confidence): full taxonomy.
+        db.conn.execute(
+            "INSERT INTO predictions (detection_id, classifier_model, "
+            "labels_fingerprint, species, confidence, category, "
+            "scientific_name, taxonomy_kingdom, taxonomy_phylum, "
+            "taxonomy_class, taxonomy_order, taxonomy_family, "
+            "taxonomy_genus) "
+            "VALUES (?, 'm1', 'fp1', ?, ?, 'match', ?, 'Animalia', "
+            "'Chordata', 'Aves', 'Passeriformes', 'Tyrannidae', 'Sayornis')",
+            (det, "Say’s phoebe", 0.4, "Sayornis saya"),
+        )
+        db.conn.commit()
+
+        db._fold_prediction_species_apostrophes()
+        db.conn.commit()
+
+        row = db.conn.execute(
+            "SELECT species, category, scientific_name, taxonomy_kingdom, "
+            "taxonomy_phylum, taxonomy_class, taxonomy_order, "
+            "taxonomy_family, taxonomy_genus, confidence "
+            "FROM predictions"
+        ).fetchone()
+        assert row["species"] == "Say's phoebe"
+        assert row["confidence"] == 0.8
+        assert row["scientific_name"] == "Sayornis saya"
+        assert row["taxonomy_kingdom"] == "Animalia"
+        assert row["taxonomy_phylum"] == "Chordata"
+        assert row["taxonomy_class"] == "Aves"
+        assert row["taxonomy_order"] == "Passeriformes"
+        assert row["taxonomy_family"] == "Tyrannidae"
+        assert row["taxonomy_genus"] == "Sayornis"
+        assert row["category"] == "match"
+    finally:
+        db.close()
+
+
+def test_prediction_fold_metadata_merge_does_not_clobber_winner(tmp_path):
+    """When the winning row already carries taxonomy fields, the merge
+    must not overwrite them with the loser's values. Backfill-only
+    keeps a deliberate override in place on the survivor."""
+    db, _ws_id, p1, _p2 = _make_db(tmp_path)
+    try:
+        det = db.conn.execute(
+            "INSERT INTO detections (photo_id, category, detector_confidence) "
+            "VALUES (?, 'animal', 0.99)",
+            (p1,),
+        ).lastrowid
+        db.conn.execute(
+            "INSERT INTO predictions (detection_id, classifier_model, "
+            "labels_fingerprint, species, confidence, category, "
+            "scientific_name, taxonomy_family) "
+            "VALUES (?, 'm1', 'fp1', ?, ?, 'match', 'Sayornis saya', "
+            "'Tyrannidae')",
+            (det, "Say's phoebe", 0.8),
+        )
+        db.conn.execute(
+            "INSERT INTO predictions (detection_id, classifier_model, "
+            "labels_fingerprint, species, confidence, category, "
+            "scientific_name, taxonomy_family) "
+            "VALUES (?, 'm1', 'fp1', ?, ?, 'new', 'wrong sci name', "
+            "'WrongFamily')",
+            (det, "Say’s phoebe", 0.4),
+        )
+        db.conn.commit()
+
+        db._fold_prediction_species_apostrophes()
+        db.conn.commit()
+
+        row = db.conn.execute(
+            "SELECT scientific_name, taxonomy_family, category FROM predictions"
+        ).fetchone()
+        assert row["scientific_name"] == "Sayornis saya"
+        assert row["taxonomy_family"] == "Tyrannidae"
+        assert row["category"] == "match"
+    finally:
+        db.close()

@@ -11431,6 +11431,9 @@ class Database:
             ).fetchone()
             if dup is not None:
                 if (row["confidence"] or 0) > (dup["confidence"] or 0):
+                    self._merge_prediction_metadata_before_delete(
+                        loser_id=dup["id"], winner_id=row["id"],
+                    )
                     self._merge_prediction_review_before_delete(
                         loser_id=dup["id"], winner_id=row["id"],
                     )
@@ -11445,6 +11448,9 @@ class Database:
                         (clean, row["id"]),
                     )
                 else:
+                    self._merge_prediction_metadata_before_delete(
+                        loser_id=row["id"], winner_id=dup["id"],
+                    )
                     self._merge_prediction_review_before_delete(
                         loser_id=row["id"], winner_id=dup["id"],
                     )
@@ -11547,6 +11553,75 @@ class Database:
                  chosen["total_votes"] if chosen["total_votes"] is not None
                  else other["total_votes"],
                  winner_id, ws),
+            )
+
+    def _merge_prediction_metadata_before_delete(self, loser_id, winner_id):
+        """Backfill non-null loser columns onto the winner before DELETE.
+
+        Two colliding predictions (same detection / model / fingerprint,
+        spellings that differ only by apostrophe) can hold different amounts
+        of enrichment if they were written by different code paths: the
+        classifier-with-taxonomy path fills ``category`` / ``scientific_name``
+        / ``taxonomy_*``, but a raw-classifier path (or an older insert made
+        before the taxonomy lookup existed) can leave those NULL.  When the
+        row selected as the winner (by ``confidence``) happens to be the
+        one without the enrichment, deleting the loser strips fields that
+        taxonomy filters and review displays rely on.
+
+        Backfills a column only when the winner is currently NULL, so a
+        deliberate override on the winner is preserved.  ``category`` also
+        promotes from the schema default ``'new'`` to a more specific
+        ``'match'`` / ``'change'`` when only the loser carried it, but
+        never overrides an explicit non-default winner category.  Called
+        from ``_fold_prediction_species_apostrophes`` right before the
+        CASCADEd DELETE removes the loser row.
+        """
+        if loser_id == winner_id:
+            return
+        winner = self.conn.execute(
+            """SELECT category, scientific_name,
+                      taxonomy_kingdom, taxonomy_phylum, taxonomy_class,
+                      taxonomy_order, taxonomy_family, taxonomy_genus
+               FROM predictions WHERE id = ?""",
+            (winner_id,),
+        ).fetchone()
+        loser = self.conn.execute(
+            """SELECT category, scientific_name,
+                      taxonomy_kingdom, taxonomy_phylum, taxonomy_class,
+                      taxonomy_order, taxonomy_family, taxonomy_genus
+               FROM predictions WHERE id = ?""",
+            (loser_id,),
+        ).fetchone()
+        if winner is None or loser is None:
+            return
+        updates = []
+        values = []
+        winner_cat = winner["category"]
+        loser_cat = loser["category"]
+        if (
+            loser_cat
+            and loser_cat != "new"
+            and (winner_cat is None or winner_cat == "new")
+        ):
+            updates.append("category = ?")
+            values.append(loser_cat)
+        for field in (
+            "scientific_name",
+            "taxonomy_kingdom",
+            "taxonomy_phylum",
+            "taxonomy_class",
+            "taxonomy_order",
+            "taxonomy_family",
+            "taxonomy_genus",
+        ):
+            if winner[field] is None and loser[field] is not None:
+                updates.append(f"{field} = ?")
+                values.append(loser[field])
+        if updates:
+            values.append(winner_id)
+            self.conn.execute(
+                "UPDATE predictions SET " + ", ".join(updates) + " WHERE id = ?",
+                values,
             )
 
     def _retarget_prediction_edit_history(self, loser_id, winner_id):

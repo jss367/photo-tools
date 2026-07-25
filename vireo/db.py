@@ -11401,7 +11401,11 @@ class Database:
         ``predictions`` has UNIQUE(detection_id, classifier_model,
         labels_fingerprint, species); when folding would collide with a row
         that already holds the clean spelling, keep the higher-confidence
-        row and drop the variant instead of failing the migration.
+        row and drop the variant instead of failing the migration.  Before
+        deleting the loser, migrate any workspace review rows onto the
+        surviving prediction so an accepted/rejected decision on the variant
+        (`prediction_review.prediction_id` uses `ON DELETE CASCADE`) is not
+        silently lost mid-migration.
         """
         folded = 0
         for row in self.conn.execute(
@@ -11425,6 +11429,9 @@ class Database:
             ).fetchone()
             if dup is not None:
                 if (row["confidence"] or 0) > (dup["confidence"] or 0):
+                    self._merge_prediction_review_before_delete(
+                        loser_id=dup["id"], winner_id=row["id"],
+                    )
                     self.conn.execute(
                         "DELETE FROM predictions WHERE id = ?", (dup["id"],)
                     )
@@ -11433,6 +11440,9 @@ class Database:
                         (clean, row["id"]),
                     )
                 else:
+                    self._merge_prediction_review_before_delete(
+                        loser_id=row["id"], winner_id=dup["id"],
+                    )
                     self.conn.execute(
                         "DELETE FROM predictions WHERE id = ?", (row["id"],)
                     )
@@ -11443,6 +11453,71 @@ class Database:
                 )
             folded += 1
         return folded
+
+    def _merge_prediction_review_before_delete(self, loser_id, winner_id):
+        """Move per-workspace review rows from ``loser_id`` onto ``winner_id``.
+
+        ``prediction_review.prediction_id`` is ``ON DELETE CASCADE``, so a
+        bare ``DELETE FROM predictions`` silently drops any accepted /
+        rejected user decision (and its group metadata) attached to the
+        losing row.  Called from ``_fold_prediction_species_apostrophes``
+        just before it deletes a duplicate: the two predictions differ only
+        in spelling, so a review on either applies to the same (detection,
+        species) pair and must survive the collision-merge.
+
+        For each ``(loser_id, workspace_id)`` review row:
+
+        - If the winner has no row for that workspace, re-point the loser's
+          row at the winner.
+        - If the winner already has a row for that workspace (both were
+          reviewed independently), keep whichever encodes the stronger
+          decision: a non-pending status beats pending, and among two
+          non-pending decisions the later ``reviewed_at`` wins.  Ties keep
+          the winner's row so the choice stays deterministic.
+
+        The loser's remaining rows are removed by the caller's DELETE via
+        the ON DELETE CASCADE, so no explicit cleanup is needed here.
+        """
+        loser_rows = self.conn.execute(
+            "SELECT workspace_id, status, reviewed_at, individual, group_id, "
+            "vote_count, total_votes FROM prediction_review "
+            "WHERE prediction_id = ?",
+            (loser_id,),
+        ).fetchall()
+        for lr in loser_rows:
+            ws = lr["workspace_id"]
+            winner = self.conn.execute(
+                "SELECT status, reviewed_at FROM prediction_review "
+                "WHERE prediction_id = ? AND workspace_id = ?",
+                (winner_id, ws),
+            ).fetchone()
+            if winner is None:
+                self.conn.execute(
+                    "UPDATE prediction_review SET prediction_id = ? "
+                    "WHERE prediction_id = ? AND workspace_id = ?",
+                    (winner_id, loser_id, ws),
+                )
+                continue
+            loser_status = lr["status"] or "pending"
+            winner_status = winner["status"] or "pending"
+            loser_decided = loser_status in ("accepted", "rejected")
+            winner_decided = winner_status in ("accepted", "rejected")
+            prefer_loser = False
+            if loser_decided and not winner_decided:
+                prefer_loser = True
+            elif loser_decided and winner_decided:
+                if (lr["reviewed_at"] or "") > (winner["reviewed_at"] or ""):
+                    prefer_loser = True
+            if prefer_loser:
+                self.conn.execute(
+                    """UPDATE prediction_review
+                       SET status = ?, reviewed_at = ?, individual = ?,
+                           group_id = ?, vote_count = ?, total_votes = ?
+                       WHERE prediction_id = ? AND workspace_id = ?""",
+                    (lr["status"], lr["reviewed_at"], lr["individual"],
+                     lr["group_id"], lr["vote_count"], lr["total_votes"],
+                     winner_id, ws),
+                )
 
     def _align_curation_species_case(self):
         """Re-key curation rows whose species differs from the canonical
@@ -15276,6 +15351,19 @@ class Database:
                 "predictions without a detection row are orphaned and "
                 "invisible to workspace-scoped queries"
             )
+        # Fold the species into keyword-storage form so a curly-apostrophe
+        # label file (`Swinhoe’s White-eye`) cannot re-mint a predictions row
+        # that fails to match its accepted ASCII keyword (`Swinhoe's
+        # white-eye`) under exact and COLLATE NOCASE joins. Doing it here
+        # rather than only in the classify_job helpers covers every caller —
+        # `_store_pending_detection_prediction`, `_store_match_prediction`,
+        # and any future write path — so the invariant that keyword-side and
+        # prediction-side spellings agree can't drift by adding a new caller
+        # that forgot to normalize. Idempotent on already-folded strings.
+        if species is not None:
+            normalized_species = normalize_keyword_display(species)
+            if normalized_species:
+                species = normalized_species
         tax = taxonomy or {}
         cur = self.conn.execute(
             """INSERT OR IGNORE INTO predictions

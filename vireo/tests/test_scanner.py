@@ -4373,7 +4373,7 @@ def test_scan_leaves_derived_caches_alone_for_rows_it_did_not_create(
 def test_pairing_purges_the_merged_companion_derived_caches(tmp_path):
     """Folding a JPEG companion into its RAW frees the companion's rowid.
 
-    ``_merge_companion_pair`` deletes the companion photo row with raw
+    ``_pair_raw_jpeg_companions`` deletes the companion photo row with raw
     SQL. Without unlinking its derivatives, the next photo to inherit that
     id adopts the companion's thumbnail.
     """

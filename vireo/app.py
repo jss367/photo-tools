@@ -24728,7 +24728,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         next insert. Combined with delete paths that don't unlink cached
         files (``audit.remove_orphans``, folder consolidation in
         ``Database.consolidate_folders``, companion-pair dedup in
-        ``scanner._merge_companion_pair``), a JPEG at ``<id>.jpg`` can
+        ``scanner._pair_raw_jpeg_companions``), a JPEG at ``<id>.jpg`` can
         outlive its original photo and then be served as the thumbnail
         for an entirely different photo that later inherits that ID.
         Compare the cached file's mtime against the photo's

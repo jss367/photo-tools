@@ -22,6 +22,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import tempfile
 import time
 
@@ -259,10 +260,25 @@ def transfer_snapshots(vireo_dir, old_photo_id, new_photo_id):
 
     Byte-identical snapshots for the same ref hash to the same file name,
     so ``os.replace`` on a pre-existing destination is safe (same content).
+
+    Returns ``{"moved": [refs], "failed": [refs]}``. ``load_snapshot``
+    only ever builds ``snapshot_path(vireo_dir, photo_id, ref)``, so a
+    snapshot left under the *old* id is unreachable no matter what — the
+    render disables the local pass indefinitely. That makes a silent
+    failure here invisible, so:
+
+    * ``os.replace`` failing (typically a locked source on Windows) falls
+      back to ``shutil.copy2`` + best-effort unlink. The copy is what
+      actually restores the local pass; leaving the original behind is
+      harmless because ``gc_edit_masks`` reaps by ref, not by id.
+    * Anything still unrecoverable is reported in ``failed`` so the
+      caller can say so out loud instead of rendering a silently
+      degraded image (CORE_PHILOSOPHY: no black boxes).
     """
     directory = edit_masks_dir(vireo_dir)
+    result = {"moved": [], "failed": []}
     if not os.path.isdir(directory):
-        return
+        return result
     prefix = f"{int(old_photo_id)}."
     for name in os.listdir(directory):
         if not name.startswith(prefix):
@@ -270,15 +286,33 @@ def transfer_snapshots(vireo_dir, old_photo_id, new_photo_id):
         match = _SNAPSHOT_FILE_RE.match(name)
         if not match or int(match.group(1)) != int(old_photo_id):
             continue
+        ref = match.group(2)
         src = os.path.join(directory, name)
-        dst = snapshot_path(vireo_dir, int(new_photo_id), match.group(2))
+        dst = snapshot_path(vireo_dir, int(new_photo_id), ref)
         try:
             os.replace(src, dst)
         except OSError:
             log.warning(
-                "Could not transfer edit-mask snapshot %s -> %s",
+                "Could not rename edit-mask snapshot %s -> %s; trying a copy",
                 src, dst, exc_info=True,
             )
+            try:
+                shutil.copy2(src, dst)
+            except OSError:
+                log.warning(
+                    "Could not copy edit-mask snapshot %s -> %s either; "
+                    "the local adjustment for photo %s will render "
+                    "without its mask until the snapshot is recreated",
+                    src, dst, new_photo_id, exc_info=True,
+                )
+                result["failed"].append(ref)
+                continue
+            # The copy already restored the local pass; the leftover
+            # source is only clutter, and gc_edit_masks reaps by ref.
+            with contextlib.suppress(OSError):
+                os.remove(src)
+        result["moved"].append(ref)
+    return result
 
 
 def _referenced_refs(db):

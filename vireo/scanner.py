@@ -613,7 +613,22 @@ def _pair_raw_jpeg_companions(db, vireo_dir=None, thumb_cache_dir=None):
                     pid=_primary_id, cid=_companion_id, tcd=_tcd, vd=_vd,
                 ):
                     from local_masks import transfer_snapshots
-                    transfer_snapshots(vd, cid, pid)
+                    # transfer_snapshots falls back to a copy when the
+                    # rename fails, so ``failed`` means the snapshot is
+                    # genuinely unreachable — ``load_snapshot`` only ever
+                    # builds snapshot_path(vireo_dir, pid, ref), so the
+                    # local pass for those refs renders without its mask.
+                    # Say so rather than degrading the image silently.
+                    transferred = transfer_snapshots(vd, cid, pid)
+                    if transferred["failed"]:
+                        log.warning(
+                            "Pairing moved photo %s's edit recipe to %s but "
+                            "could not relocate %d local-mask snapshot(s) "
+                            "(refs %s); those local adjustments will render "
+                            "without their mask until recreated",
+                            cid, pid, len(transferred["failed"]),
+                            ", ".join(transferred["failed"]),
+                        )
                     _invalidate_derived_caches(
                         db, vd, pid, thumb_cache_dir=tcd,
                     )

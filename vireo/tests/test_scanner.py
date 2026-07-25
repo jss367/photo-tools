@@ -4673,22 +4673,19 @@ def test_recycled_id_index_indexes_external_dng_subdirectories(tmp_path):
     )
 
 
-def test_pairing_keeps_companion_snapshot_when_transfer_fails(tmp_path, monkeypatch):
-    """A failed snapshot rename must not lose the only copy.
+def test_pairing_recovers_snapshot_when_rename_fails(tmp_path, monkeypatch):
+    """A failed snapshot rename must still leave the mask reachable.
 
-    ``local_masks.transfer_snapshots`` catches ``OSError`` and returns
-    normally (a locked destination on Windows, a permissions blip), so the
-    source ``edit-masks/<companion_id>.<ref>.png`` stays put. The recipe row
-    has *already* been reassigned to the primary by then, so if the
-    companion cleanup deleted edit-mask snapshots by photo id it would
-    destroy the sole remaining copy — ``load_snapshot`` misses, and that
-    local adjustment is silently disabled forever with nothing to recover.
-
-    Snapshots are content-addressed, so the id-keyed purge has no business
-    in that directory at all; ``gc_edit_masks`` reaps by ref instead.
+    ``transfer_snapshots`` catches ``OSError`` from ``os.replace`` (a locked
+    source on Windows, a permissions blip). The recipe row has already been
+    reassigned to the primary by then, and ``load_snapshot`` only ever
+    builds ``snapshot_path(vireo_dir, primary_id, ref)`` — so merely leaving
+    the old-id file in place doesn't help: every render still disables the
+    local pass. The copy fallback is what actually recovers it.
     """
     import local_masks
     from db import Database
+    from local_masks import snapshot_path
     from scanner import _pair_raw_jpeg_companions
 
     img_dir = tmp_path / "photos"
@@ -4702,19 +4699,18 @@ def test_pairing_keeps_companion_snapshot_when_transfer_fails(tmp_path, monkeypa
         folder_id=fid, filename="IMG_004.jpg", extension=".jpg",
         file_size=1000, file_mtime=1.0,
     )
-    db.add_photo(
+    raw_id = db.add_photo(
         folder_id=fid, filename="IMG_004.cr3", extension=".cr3",
         file_size=2000, file_mtime=1.0,
     )
     # A recipe on the JPEG is what makes pairing transfer the row (and the
     # snapshot files) over to the RAW primary.
     db.set_photo_edit_recipe(jpeg_id, {"rotation": 90})
-    snapshot = _seed_edit_mask_snapshot(vireo_dir, jpeg_id)
+    ref = "abcdef012345"
+    _seed_edit_mask_snapshot(vireo_dir, jpeg_id, ref)
 
-    # Simulate the rename failing the way it does on a locked destination:
-    # transfer_snapshots logs and returns, leaving the source in place.
     def _failing_replace(src, dst):
-        raise OSError("simulated locked destination")
+        raise OSError("simulated locked source")
 
     monkeypatch.setattr(local_masks.os, "replace", _failing_replace)
 
@@ -4722,11 +4718,38 @@ def test_pairing_keeps_companion_snapshot_when_transfer_fails(tmp_path, monkeypa
         db, vireo_dir=vireo_dir, thumb_cache_dir=thumb_dir,
     )
 
-    assert os.path.exists(snapshot), (
-        "companion's local-mask snapshot was deleted after its rename "
-        "failed; the recipe now points at the primary id, so this was the "
-        "only copy and the local adjustment is unrecoverable"
+    assert os.path.exists(snapshot_path(vireo_dir, raw_id, ref)), (
+        "snapshot never reached the primary id after the rename failed; "
+        "load_snapshot builds the path from the primary id, so the local "
+        "adjustment renders without its mask"
     )
+
+
+def test_transfer_snapshots_reports_unrecoverable_refs(tmp_path):
+    """When neither rename nor copy works, the caller must be told.
+
+    A silently-degraded render is exactly the black box CORE_PHILOSOPHY
+    forbids — the mask is gone and the image just looks different.
+    """
+    import local_masks
+
+    vireo_dir = str(tmp_path / "vireo")
+    ref = "abcdef012345"
+    _seed_edit_mask_snapshot(vireo_dir, 11, ref)
+
+    def _boom(*args, **kwargs):
+        raise OSError("simulated failure")
+
+    local_masks.os.replace, real_replace = _boom, local_masks.os.replace
+    local_masks.shutil.copy2, real_copy = _boom, local_masks.shutil.copy2
+    try:
+        result = local_masks.transfer_snapshots(vireo_dir, 11, 22)
+    finally:
+        local_masks.os.replace = real_replace
+        local_masks.shutil.copy2 = real_copy
+
+    assert result["failed"] == [ref]
+    assert result["moved"] == []
 
 
 def test_delete_photos_cleanup_leaves_edit_mask_snapshots_to_gc(tmp_path):
@@ -4760,4 +4783,47 @@ def test_delete_photos_cleanup_leaves_edit_mask_snapshots_to_gc(tmp_path):
     )
     assert os.path.exists(snapshot), (
         "content-addressed edit-mask snapshot must be left to gc_edit_masks"
+    )
+
+
+def test_recycled_id_purge_backdates_derivatives_it_could_not_delete(tmp_path):
+    """"Ran the purge" is not the same as "the stale pixels are gone".
+
+    ``cleanup_cached_files_for_deleted_photos`` logs and continues when an
+    unlink fails (locked file on Windows, momentarily unwritable dir), so a
+    purge that reports success can still leave the previous owner's
+    thumbnail servable — and ``serve_thumbnail``'s mtime guard won't catch
+    it, because a recently generated thumbnail beats an old capture's
+    ``file_mtime``. Backdating the survivor makes that existing guard do
+    the right thing.
+    """
+    import preview_cache
+    from preview_cache import purge_cached_files_for_recycled_id
+
+    vireo_dir = tmp_path / "vireo"
+    thumb_dir = vireo_dir / "thumbnails"
+    thumb_dir.mkdir(parents=True)
+    stuck = thumb_dir / "88.jpg"
+    stuck.write_bytes(b"previous-tenant")
+    # Recent mtime — exactly the case the freshness guard would wave through.
+    os.utime(stuck, (2_000_000_000, 2_000_000_000))
+
+    real_remove = os.remove
+
+    def _locked_remove(path, *args, **kwargs):
+        if os.path.normpath(str(path)) == os.path.normpath(str(stuck)):
+            raise OSError("simulated Windows lock")
+        return real_remove(path, *args, **kwargs)
+
+    preview_cache.os.remove = _locked_remove
+    try:
+        purged = purge_cached_files_for_recycled_id(str(thumb_dir), 88)
+    finally:
+        preview_cache.os.remove = real_remove
+
+    assert purged is True
+    assert stuck.exists(), "test setup failed to simulate an undeletable file"
+    assert os.path.getmtime(stuck) == 0, (
+        "undeletable stale derivative kept its recent mtime, so the "
+        "freshness guard would serve the previous owner's pixels"
     )

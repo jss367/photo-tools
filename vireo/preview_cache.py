@@ -343,6 +343,24 @@ class RecycledIdIndex:
         return photo_id in self._ids
 
 
+def _surviving_derivative_paths(thumb_cache_dir, photo_id):
+    """Concrete derivative paths for ``photo_id`` still on disk.
+
+    Post-purge audit for :func:`purge_cached_files_for_recycled_id` — the
+    probe helpers answer "does anything exist?" and short-circuit, but
+    here we need the full list so each survivor can be dealt with.
+    """
+    paths = [
+        p for p in _recycled_id_probe_paths(thumb_cache_dir, photo_id)
+        if os.path.exists(p)
+    ]
+    for pattern in _recycled_id_probe_patterns(thumb_cache_dir, photo_id):
+        paths.extend(_glob.glob(pattern))
+    # dict.fromkeys: de-dupe (a bare name can match a variant pattern too)
+    # while keeping a stable order for the log message.
+    return list(dict.fromkeys(paths))
+
+
 def purge_cached_files_for_recycled_id(
     thumb_cache_dir, photo_id, id_index=None,
 ):
@@ -390,6 +408,41 @@ def purge_cached_files_for_recycled_id(
     cleanup_cached_files_for_deleted_photos(
         thumb_cache_dir, [{"photo_id": photo_id}],
     )
+    # ``cleanup_cached_files_for_deleted_photos`` logs and continues when an
+    # unlink fails (locked file on Windows, a momentarily unwritable
+    # directory), so "we ran the purge" is not the same as "the stale
+    # pixels are gone". Returning True unconditionally would let the scan
+    # commit a recycled row while the previous owner's thumbnail is still
+    # servable — and the request path's mtime guard can't catch it, since
+    # a recently generated thumbnail beats an old capture's file_mtime.
+    # Re-probe, and for anything left behind, backdate its mtime so that
+    # guard *does* reject it. Timestamps are usually still writable when
+    # deletion isn't (the lock blocks unlink, not utime), so this recovers
+    # the common case; when even that fails we say so instead of leaving a
+    # silent wrong-pixels bug.
+    survivors = _surviving_derivative_paths(thumb_cache_dir, photo_id)
+    if survivors:
+        unfixable = []
+        for path in survivors:
+            try:
+                os.utime(path, (0, 0))
+            except OSError:
+                unfixable.append(path)
+        if unfixable:
+            log.error(
+                "Photo %s reused a freed rowid but %d cached derivative(s) "
+                "could not be removed or invalidated: %s. Until they are "
+                "cleared (Settings > Storage > Clear cache), this photo may "
+                "render the previous owner's pixels.",
+                photo_id, len(unfixable), ", ".join(unfixable),
+            )
+        else:
+            log.warning(
+                "Photo %s reused a freed rowid; %d cached derivative(s) "
+                "survived deletion but were backdated so the freshness "
+                "guard regenerates them: %s",
+                photo_id, len(survivors), ", ".join(survivors),
+            )
     return True
 
 

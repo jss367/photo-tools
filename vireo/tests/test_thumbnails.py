@@ -1676,3 +1676,245 @@ def test_serve_thumbnail_404s_for_photo_outside_active_workspace(tmp_path, monke
         "thumbnail self-heal must not serve a photo that the active "
         "workspace cannot see"
     )
+
+
+def test_serve_thumbnail_does_not_serve_stale_pixels_when_unlink_fails(
+    tmp_path, monkeypatch,
+):
+    """A stale thumbnail we cannot delete must not be served either.
+
+    This branch fires for recycled rowids, so the cached pixels belong to
+    a *different photo*. The old behaviour served the file "once" and
+    retried the unlink next request — but if the lock persists (which is
+    what locks do), every request serves the previous owner's image. A
+    broken image is better than the wrong bird.
+
+    The route now regenerates to a ``{photo_id}_regen.jpg`` sidecar and
+    serves that. The sidecar's ``{photo_id}_*`` shape means the existing
+    recycled-id purge and delete cleanup already sweep it.
+    """
+    import app as app_module
+
+    app, db, pid, thumb_dir = _make_app_with_real_photo(tmp_path, monkeypatch)
+
+    thumb_file = os.path.join(thumb_dir, f"{pid}.jpg")
+    # 50x50 flat colour at q70 — nothing like the 800x600 real source, so
+    # a byte comparison is decisive.
+    Image.new("RGB", (50, 50), (1, 2, 3)).save(thumb_file, "JPEG", quality=70)
+    sentinel_bytes = open(thumb_file, "rb").read()
+    photo_mtime = db.conn.execute(
+        "SELECT file_mtime FROM photos WHERE id=?", (pid,)
+    ).fetchone()["file_mtime"]
+    stale_mtime = photo_mtime - 86400
+    os.utime(thumb_file, (stale_mtime, stale_mtime))
+
+    real_remove = app_module.os.remove
+
+    def failing_remove(path, *args, **kwargs):
+        if path == thumb_file:
+            raise PermissionError(13, "Permission denied", path)
+        return real_remove(path, *args, **kwargs)
+
+    monkeypatch.setattr(app_module.os, "remove", failing_remove)
+
+    client = app.test_client()
+    resp = client.get(f"/thumbnails/{pid}.jpg")
+
+    assert resp.status_code == 200
+    assert resp.data != sentinel_bytes, (
+        "the undeletable stale thumbnail was served; on a recycled rowid "
+        "that is the previous owner's photo, and a persistent lock means "
+        "every request shows it"
+    )
+    # The locked original is left alone, and the fresh bytes came from the
+    # sidecar the purge globs already cover.
+    assert open(thumb_file, "rb").read() == sentinel_bytes
+    assert os.path.exists(os.path.join(thumb_dir, f"{pid}_regen.jpg"))
+
+
+def test_thumbnail_raw_fallbacks_honor_an_explicit_cache_name():
+    """The RAW-decode fallbacks must write to the caller's cache name.
+
+    ``serve_thumbnail`` redirects to a ``<id>_regen.jpg`` sidecar when the
+    real thumbnail is stale but undeletable. If the companion / working-copy
+    fallbacks re-enter ``generate_thumbnail`` with the default ``<id>.jpg``
+    they target that *locked stale file* — ``generate_thumbnail`` returns it
+    as-is without generating, and the ``os.utime(result, ...)`` that follows
+    pins the previous owner's pixels as permanently fresh, which is exactly
+    what the freshness guard exists to prevent. The response meanwhile points
+    at a sidecar nobody wrote.
+    """
+    import inspect
+
+    import thumbnails as thumbnails_module
+
+    for fn in (
+        thumbnails_module._retry_thumbnail_with_companion,
+        thumbnails_module._retry_thumbnail_with_working_copy,
+    ):
+        params = inspect.signature(fn).parameters
+        assert "cache_name" in params, (
+            f"{fn.__name__} cannot honor a caller-chosen cache name, so the "
+            "sidecar redirect leaks back onto the locked default path"
+        )
+        src = inspect.getsource(fn)
+        assert "cache_name=cache_name" in src, (
+            f"{fn.__name__} accepts cache_name but does not forward it to "
+            "generate_thumbnail"
+        )
+
+
+def test_serve_thumbnail_passes_sidecar_name_to_every_generation_call(
+    tmp_path, monkeypatch,
+):
+    """No generation call may escape the sidecar redirect.
+
+    Guards the wiring end-to-end: once ``serve_thumbnail`` has redirected to
+    the sidecar, every ``generate_thumbnail`` it makes — primary or fallback
+    — must carry that name.
+    """
+    import app as app_module
+
+    app, db, pid, thumb_dir = _make_app_with_real_photo(tmp_path, monkeypatch)
+
+    thumb_file = os.path.join(thumb_dir, f"{pid}.jpg")
+    Image.new("RGB", (50, 50), (1, 2, 3)).save(thumb_file, "JPEG", quality=70)
+    sentinel_bytes = open(thumb_file, "rb").read()
+    photo_mtime = db.conn.execute(
+        "SELECT file_mtime FROM photos WHERE id=?", (pid,)
+    ).fetchone()["file_mtime"]
+    os.utime(thumb_file, (photo_mtime - 86400, photo_mtime - 86400))
+
+    real_remove = app_module.os.remove
+
+    def failing_remove(path, *args, **kwargs):
+        if path == thumb_file:
+            raise PermissionError(13, "Permission denied", path)
+        return real_remove(path, *args, **kwargs)
+
+    monkeypatch.setattr(app_module.os, "remove", failing_remove)
+
+    import thumbnails as thumbnails_module
+
+    real_generate = thumbnails_module.generate_thumbnail
+    seen_names = []
+
+    def recording_generate(photo_id_, source, cache_dir, **kwargs):
+        seen_names.append(kwargs.get("cache_name"))
+        return real_generate(photo_id_, source, cache_dir, **kwargs)
+
+    monkeypatch.setattr(
+        thumbnails_module, "generate_thumbnail", recording_generate,
+    )
+
+    client = app.test_client()
+    resp = client.get(f"/thumbnails/{pid}.jpg")
+
+    assert resp.status_code == 200
+    assert resp.data != sentinel_bytes
+    assert seen_names, "no thumbnail generation happened"
+    assert all(n == f"{pid}_regen.jpg" for n in seen_names), (
+        f"a generation call escaped the sidecar redirect: {seen_names}"
+    )
+    assert open(thumb_file, "rb").read() == sentinel_bytes
+    assert os.path.getmtime(thumb_file) < photo_mtime
+
+
+def test_serve_thumbnail_404s_when_both_thumbnail_and_sidecar_are_locked(
+    tmp_path, monkeypatch,
+):
+    """Nowhere safe to write means serve nothing, not the wrong photo.
+
+    If a recycled id has an undeletable stale ``<id>.jpg`` *and* an
+    undeletable stale ``<id>_regen.jpg``, suppressing the sidecar's removal
+    failure and falling through would let ``generate_thumbnail`` short-
+    circuit on the stale sidecar and return it — then ``os.utime(result,
+    ...)`` marks the previous owner's pixels fresh and the response serves
+    them. With both cache targets locked there is no safe file to write, so
+    the honest answer is 404.
+    """
+    import app as app_module
+
+    app, db, pid, thumb_dir = _make_app_with_real_photo(tmp_path, monkeypatch)
+
+    photo_mtime = db.conn.execute(
+        "SELECT file_mtime FROM photos WHERE id=?", (pid,)
+    ).fetchone()["file_mtime"]
+    stale = photo_mtime - 86400
+
+    locked = {}
+    for name in (f"{pid}.jpg", f"{pid}_regen.jpg"):
+        path = os.path.join(thumb_dir, name)
+        Image.new("RGB", (50, 50), (9, 9, 9)).save(path, "JPEG", quality=70)
+        os.utime(path, (stale, stale))
+        locked[path] = open(path, "rb").read()
+
+    real_remove = app_module.os.remove
+
+    def failing_remove(path, *args, **kwargs):
+        if path in locked:
+            raise PermissionError(13, "Permission denied", path)
+        return real_remove(path, *args, **kwargs)
+
+    monkeypatch.setattr(app_module.os, "remove", failing_remove)
+
+    client = app.test_client()
+    resp = client.get(f"/thumbnails/{pid}.jpg")
+
+    assert resp.status_code == 404, (
+        "with both the thumbnail and its sidecar stale and locked, the "
+        "route served something — on a recycled rowid that is another "
+        "photo's image"
+    )
+    # Neither locked file may be pinned as fresh; the next request retries.
+    for path, original in locked.items():
+        assert open(path, "rb").read() == original
+        assert os.path.getmtime(path) < photo_mtime
+
+
+def test_serve_thumbnail_sidecar_does_not_claim_coverage_for_the_stale_default(
+    tmp_path, monkeypatch,
+):
+    """A sidecar serve must not record ``<id>.jpg`` as a done thumbnail.
+
+    The real ``<id>.jpg`` is still the previous owner's locked, stale file.
+    Writing ``photos.thumb_path = '<id>.jpg'`` would tell the coverage
+    dashboard and ``backfill_thumb_paths`` this photo has a valid
+    thumbnail, so nothing regenerates it once the lock clears — a status
+    that claims work is finished when the next run would not be a no-op is
+    exactly what CORE_PHILOSOPHY forbids.
+    """
+    import app as app_module
+
+    app, db, pid, thumb_dir = _make_app_with_real_photo(tmp_path, monkeypatch)
+
+    thumb_file = os.path.join(thumb_dir, f"{pid}.jpg")
+    Image.new("RGB", (50, 50), (1, 2, 3)).save(thumb_file, "JPEG", quality=70)
+    photo_mtime = db.conn.execute(
+        "SELECT file_mtime FROM photos WHERE id=?", (pid,)
+    ).fetchone()["file_mtime"]
+    os.utime(thumb_file, (photo_mtime - 86400, photo_mtime - 86400))
+    db.conn.execute("UPDATE photos SET thumb_path=NULL WHERE id=?", (pid,))
+    db.conn.commit()
+
+    real_remove = app_module.os.remove
+
+    def failing_remove(path, *args, **kwargs):
+        if path == thumb_file:
+            raise PermissionError(13, "Permission denied", path)
+        return real_remove(path, *args, **kwargs)
+
+    monkeypatch.setattr(app_module.os, "remove", failing_remove)
+
+    client = app.test_client()
+    resp = client.get(f"/thumbnails/{pid}.jpg")
+    assert resp.status_code == 200
+
+    stored = db.conn.execute(
+        "SELECT thumb_path FROM photos WHERE id=?", (pid,)
+    ).fetchone()["thumb_path"]
+    assert stored is None, (
+        f"thumb_path was set to {stored!r} while the real thumbnail is "
+        "still the locked stale file; coverage would report this photo "
+        "done and never regenerate it"
+    )

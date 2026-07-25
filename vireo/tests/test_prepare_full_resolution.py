@@ -1,5 +1,6 @@
 import io
 import os
+import time
 
 from PIL import Image
 from wait import wait_for_job_via_client
@@ -298,3 +299,123 @@ def test_photo_cache_cleanup_removes_prepared_render(tmp_path):
     )
 
     assert not rendered.exists()
+
+
+def test_prepared_render_rejected_when_mtime_predates_source(client_with_photo):
+    """A stale ``originals/<id>_<sig>.jpg`` must not serve the previous
+    owner's pixels after a recycled-rowid purge failed to delete it.
+
+    ``purge_cached_files_for_recycled_id`` backdates any undeletable
+    ``originals/<id>_<sig>.jpg`` survivor to mtime 0 when the recycled row
+    inherits its previous owner's cached derivative. That is a no-op
+    unless ``_prepared_full_resolution_render`` refuses to serve files
+    whose mtime is older than the photo's ``file_mtime`` — the existence-
+    and-size probe alone can't distinguish a backdated survivor from a
+    fresh render, and ``/photos/<id>/original`` would happily send the
+    stale JPEG.
+
+    Prime the render endpoint, replace the cached JPEG with recognisable
+    sentinel bytes, backdate its mtime, and confirm the next request
+    re-renders (returning a valid JPEG whose bytes differ from the
+    sentinel).
+    """
+    app, db, photo_id = client_with_photo
+    client = app.test_client()
+
+    # An edit recipe is what routes ``/original`` through the render-and-
+    # cache path (``_full_resolution_render_path``). Without one, the
+    # endpoint just streams the raw source file — nothing lands in
+    # ``originals/`` and there's no signature-keyed cache to invalidate.
+    db.set_photo_edit_recipe(photo_id, {"rotation": 90})
+
+    # Prime the cache: the first request writes the prepared render.
+    primed = client.get(f"/photos/{photo_id}/original")
+    assert primed.status_code == 200
+    # Release the WSGI file wrapper's handle on ``cache_path`` before we
+    # try to overwrite it below. On Windows, ``send_file``'s underlying
+    # handle is held until the response is closed, and ``os.replace`` on
+    # the second request would then fail with ``WinError 5``.
+    primed.close()
+
+    vireo_dir = os.path.dirname(app.config["THUMB_CACHE_DIR"])
+    originals_dir = os.path.join(vireo_dir, "originals")
+    cached_names = [
+        name for name in os.listdir(originals_dir)
+        if name.startswith(f"{photo_id}_") and name.endswith(".jpg")
+    ]
+    assert len(cached_names) == 1, cached_names
+    cache_path = os.path.join(originals_dir, cached_names[0])
+
+    # Replace with sentinel bytes and backdate to a mtime before the
+    # photo's file_mtime — the shape of a survivor that ``os.utime((0, 0))``
+    # from ``purge_cached_files_for_recycled_id`` leaves behind when it
+    # couldn't unlink the file.
+    sentinel = b"NOT A VALID JPEG, previous owner's leftover render"
+    with open(cache_path, "wb") as fh:
+        fh.write(sentinel)
+    os.utime(cache_path, (0, 0))
+
+    resp = client.get(f"/photos/{photo_id}/original")
+    assert resp.status_code == 200
+    assert resp.data != sentinel, (
+        "``/original`` served the backdated survivor verbatim; on a "
+        "recycled rowid that would be the previous owner's pixels"
+    )
+    # And the endpoint must have written a *new* JPEG (either overwriting
+    # the sentinel path or a fresh sibling), whose mtime is newer than
+    # the backdated survivor's — the freshness guard's inverse.
+    with Image.open(io.BytesIO(resp.data)) as fresh:
+        assert fresh.format == "JPEG"
+
+
+def test_prepared_render_not_regenerated_every_request_for_future_mtime(
+    client_with_photo,
+):
+    """A future-dated source must not cause a re-render on every request.
+
+    ``_prepared_full_resolution_render`` rejects renders whose mtime
+    predates ``photos.file_mtime``. Renders are written with the wall
+    clock, so a source whose ``file_mtime`` is in the future — clock skew
+    on the writing machine, archives that preserve future timestamps —
+    fails that gate the instant it's written, and every request pays a
+    full-resolution decode plus the edit pipeline again.
+
+    ``serve_thumbnail`` documents and guards this exact trap for the much
+    cheaper thumbnail path; the render path needs the same mtime peg.
+    """
+    app, db, photo_id = client_with_photo
+    client = app.test_client()
+
+    db.set_photo_edit_recipe(photo_id, {"rotation": 90})
+    # Put the source's mtime well ahead of the wall clock.
+    future = time.time() + 86400
+    db.conn.execute(
+        "UPDATE photos SET file_mtime=? WHERE id=?", (future, photo_id),
+    )
+    db.conn.commit()
+
+    assert client.get(f"/photos/{photo_id}/original").status_code == 200
+
+    vireo_dir = os.path.dirname(app.config["THUMB_CACHE_DIR"])
+    originals_dir = os.path.join(vireo_dir, "originals")
+    cached = [
+        name for name in os.listdir(originals_dir)
+        if name.startswith(f"{photo_id}_") and name.endswith(".jpg")
+    ]
+    assert len(cached) == 1, cached
+    cache_path = os.path.join(originals_dir, cached[0])
+
+    # The cached render must satisfy its own freshness gate, or the next
+    # request re-renders from scratch.
+    assert os.path.getmtime(cache_path) >= future, (
+        "the just-written render already fails the freshness gate, so "
+        "every request re-renders at full resolution"
+    )
+
+    # Prove it: a second request must reuse the cache rather than rewrite.
+    before = os.path.getmtime(cache_path)
+    assert client.get(f"/photos/{photo_id}/original").status_code == 200
+    assert os.path.getmtime(cache_path) == before, (
+        "the second request rewrote the prepared render instead of "
+        "serving the cached one"
+    )

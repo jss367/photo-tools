@@ -4243,3 +4243,1220 @@ def test_scan_recursive_raises_permission_error_without_callback(
     db = Database(str(tmp_path / "test.db"))
     with pytest.raises(PermissionError):
         scan(root, db)
+
+
+# ---------------------------------------------------------------------------
+# Recycled rowid → stale derived caches
+# ---------------------------------------------------------------------------
+
+
+def _seed_derivative_files(vireo_dir, thumb_dir, photo_id, marker=b"previous-tenant"):
+    """Write one file per *purgeable* id-keyed derivative family.
+
+    ``external_dng`` is a per-id *directory* (``external-dng/<pid>/``
+    holds Nikon-HE-NEF conversions the external-editor path reuses when
+    ``cached_mtime >= source_mtime``); callers check its presence the
+    same way as the file entries.
+
+    ``edit-masks/`` is deliberately absent: those snapshots are
+    content-addressed and owned by ``local_masks.gc_edit_masks``, not by
+    the id-keyed purge. See ``_seed_edit_mask_snapshot``.
+    """
+    paths = {
+        "thumb": os.path.join(thumb_dir, f"{photo_id}.jpg"),
+        "thumb_variant": os.path.join(thumb_dir, f"{photo_id}_raw.jpg"),
+        "working": os.path.join(vireo_dir, "working", f"{photo_id}.jpg"),
+        "preview": os.path.join(vireo_dir, "previews", f"{photo_id}_1920.jpg"),
+        "display": os.path.join(
+            vireo_dir, "originals", f"{photo_id}.display.jpg"
+        ),
+        "mask": os.path.join(vireo_dir, "masks", f"{photo_id}.png"),
+        "mask_variant": os.path.join(
+            vireo_dir, "masks", f"{photo_id}.sam2-large.png"
+        ),
+        "external_dng": os.path.join(
+            vireo_dir, "external-dng", str(photo_id), "gull.dng"
+        ),
+        "inat_upload": os.path.join(
+            vireo_dir, "inat-uploads", f"{photo_id}.jpg"
+        ),
+        "inat_upload_meta": os.path.join(
+            vireo_dir, "inat-uploads", f"{photo_id}.json"
+        ),
+    }
+    for path in paths.values():
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as fh:
+            fh.write(marker)
+    return paths
+
+
+def _seed_edit_mask_snapshot(vireo_dir, photo_id, ref="abcdef012345"):
+    """Write a local-adjustment snapshot at ``edit-masks/<pid>.<ref>.png``."""
+    path = os.path.join(vireo_dir, "edit-masks", f"{photo_id}.{ref}.png")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "wb") as fh:
+        fh.write(b"snapshot-bytes")
+    return path
+
+
+def test_scan_purges_derived_caches_when_new_photo_reuses_a_freed_rowid(
+    tmp_path,
+):
+    """A new photo that inherits a freed rowid must not inherit its cache.
+
+    ``photos.id`` is INTEGER PRIMARY KEY without AUTOINCREMENT, so SQLite
+    hands the next insert ``max(rowid) + 1`` — delete the highest-numbered
+    rows and those ids come straight back. Every derivative in ``~/.vireo``
+    is keyed by bare photo id, so if a delete path left the files behind
+    (several drop photo rows with raw SQL and do), the next photo to claim
+    the id renders the *previous* photo's pixels — the wrong bird on a
+    Life List card. Ingest is the one place the collision is observable,
+    so it re-checks there.
+    """
+    from db import Database
+    from scanner import scan
+
+    root = str(tmp_path / "photos")
+    _create_test_images(root, {'': ['gull.jpg']})
+    vireo_dir = str(tmp_path / "vireo")
+    thumb_dir = os.path.join(vireo_dir, "thumbnails")
+
+    db = Database(str(tmp_path / "test.db"))
+    # Claim (and free) a rowid so the real scan's insert reuses it.
+    placeholder_folder = db.add_folder(str(tmp_path / "gone"), name="gone")
+    doomed_id = db.add_photo(
+        folder_id=placeholder_folder, filename="munia.jpg", extension=".jpg",
+        file_size=10, file_mtime=1.0,
+    )
+    db.conn.execute("DELETE FROM photos WHERE id = ?", (doomed_id,))
+    db.conn.commit()
+
+    seeded = _seed_derivative_files(vireo_dir, thumb_dir, doomed_id)
+
+    scan(root, db, vireo_dir=vireo_dir, thumb_cache_dir=thumb_dir,
+         skip_working_copies=True)
+
+    new_id = db.conn.execute(
+        "SELECT id FROM photos WHERE filename = 'gull.jpg'"
+    ).fetchone()["id"]
+    assert new_id == doomed_id, (
+        "test setup no longer reproduces rowid reuse; SQLite handed out "
+        f"{new_id} instead of {doomed_id}"
+    )
+    for name, path in seeded.items():
+        assert not os.path.exists(path), (
+            f"{name} cache from the freed rowid's previous owner survived "
+            f"the insert and would be served as photo {new_id}'s"
+        )
+
+
+def test_scan_leaves_derived_caches_alone_for_rows_it_did_not_create(
+    tmp_path,
+):
+    """The recycled-id purge must not fire on a plain rescan.
+
+    Re-scanning an unchanged library re-visits every photo; treating those
+    as fresh inserts would wipe (and force regeneration of) the entire
+    thumbnail cache on every scan.
+    """
+    from db import Database
+    from scanner import scan
+
+    root = str(tmp_path / "photos")
+    _create_test_images(root, {'': ['gull.jpg']})
+    vireo_dir = str(tmp_path / "vireo")
+    thumb_dir = os.path.join(vireo_dir, "thumbnails")
+
+    db = Database(str(tmp_path / "test.db"))
+    scan(root, db, vireo_dir=vireo_dir, thumb_cache_dir=thumb_dir,
+         skip_working_copies=True)
+    pid = db.conn.execute(
+        "SELECT id FROM photos WHERE filename = 'gull.jpg'"
+    ).fetchone()["id"]
+
+    seeded = _seed_derivative_files(vireo_dir, thumb_dir, pid, b"legit-cache")
+
+    scan(root, db, vireo_dir=vireo_dir, thumb_cache_dir=thumb_dir,
+         skip_working_copies=True)
+
+    for name, path in seeded.items():
+        assert os.path.exists(path), (
+            f"rescan of an existing photo deleted its {name} cache"
+        )
+
+
+def test_pairing_purges_the_merged_companion_derived_caches(tmp_path):
+    """Folding a JPEG companion into its RAW frees the companion's rowid.
+
+    ``_pair_raw_jpeg_companions`` deletes the companion photo row with raw
+    SQL. Without unlinking its derivatives, the next photo to inherit that
+    id adopts the companion's thumbnail.
+    """
+    from db import Database
+    from scanner import _pair_raw_jpeg_companions
+
+    img_dir = tmp_path / "photos"
+    img_dir.mkdir()
+    vireo_dir = str(tmp_path / "vireo")
+    thumb_dir = os.path.join(vireo_dir, "thumbnails")
+
+    db = Database(str(tmp_path / "test.db"))
+    fid = db.add_folder(str(img_dir), name="photos")
+    jpeg_id = db.add_photo(
+        folder_id=fid, filename="IMG_002.jpg", extension=".jpg",
+        file_size=1000, file_mtime=1.0,
+    )
+    raw_id = db.add_photo(
+        folder_id=fid, filename="IMG_002.cr3", extension=".cr3",
+        file_size=2000, file_mtime=1.0,
+    )
+
+    companion_files = _seed_derivative_files(vireo_dir, thumb_dir, jpeg_id)
+    primary_thumb = os.path.join(thumb_dir, f"{raw_id}.jpg")
+    with open(primary_thumb, "wb") as fh:
+        fh.write(b"primary-thumb")
+
+    _pair_raw_jpeg_companions(
+        db, vireo_dir=vireo_dir, thumb_cache_dir=thumb_dir,
+    )
+
+    assert db.conn.execute(
+        "SELECT COUNT(*) AS n FROM photos WHERE id = ?", (jpeg_id,)
+    ).fetchone()["n"] == 0
+    for name, path in companion_files.items():
+        assert not os.path.exists(path), (
+            f"merged companion's {name} cache outlived its photo row"
+        )
+
+
+def test_scan_purges_variant_only_caches_when_new_photo_reuses_a_freed_rowid(
+    tmp_path,
+):
+    """The recycled-id probe must catch derivative families that only exist
+    in a variant form (no legacy exact-name file).
+
+    Sized preview files (``previews/{id}_1920.jpg``) are the standard shape
+    written by the preview stage; source-specific thumbnails
+    (``thumbnails/{id}_raw.jpg``), variant subject masks, and edit-mask
+    snapshots have the same "no bare-name counterpart" property. A probe
+    that only checks the legacy exact names returns False for these, skips
+    the purge, and the request paths' lazy-adoption shortcuts then serve
+    the previous owner's pixels as if they were the new photo's.
+    """
+    from db import Database
+    from scanner import scan
+
+    root = str(tmp_path / "photos")
+    _create_test_images(root, {'': ['gull.jpg']})
+    vireo_dir = str(tmp_path / "vireo")
+    thumb_dir = os.path.join(vireo_dir, "thumbnails")
+
+    db = Database(str(tmp_path / "test.db"))
+    placeholder_folder = db.add_folder(str(tmp_path / "gone"), name="gone")
+    doomed_id = db.add_photo(
+        folder_id=placeholder_folder, filename="munia.jpg", extension=".jpg",
+        file_size=10, file_mtime=1.0,
+    )
+    db.conn.execute("DELETE FROM photos WHERE id = ?", (doomed_id,))
+    db.conn.commit()
+
+    # Seed ONLY variant-form derivatives — no bare-name legacy files.
+    variant_paths = {
+        "sized_preview": os.path.join(
+            vireo_dir, "previews", f"{doomed_id}_1920.jpg",
+        ),
+        "raw_thumbnail_variant": os.path.join(
+            thumb_dir, f"{doomed_id}_raw.jpg",
+        ),
+        "prepared_render": os.path.join(
+            vireo_dir, "originals", f"{doomed_id}_2048.jpg",
+        ),
+        "variant_mask": os.path.join(
+            vireo_dir, "masks", f"{doomed_id}.sam2-large.png",
+        ),
+        "offline_original": os.path.join(
+            vireo_dir, "offline", "originals", f"{doomed_id}.NEF",
+        ),
+    }
+    for path in variant_paths.values():
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as fh:
+            fh.write(b"previous-tenant")
+
+    scan(root, db, vireo_dir=vireo_dir, thumb_cache_dir=thumb_dir,
+         skip_working_copies=True)
+
+    new_id = db.conn.execute(
+        "SELECT id FROM photos WHERE filename = 'gull.jpg'"
+    ).fetchone()["id"]
+    assert new_id == doomed_id, (
+        "test setup no longer reproduces rowid reuse; SQLite handed out "
+        f"{new_id} instead of {doomed_id}"
+    )
+    for name, path in variant_paths.items():
+        assert not os.path.exists(path), (
+            f"variant-only {name} cache survived the recycled-id purge and "
+            f"would be served as photo {new_id}'s pixels"
+        )
+
+
+def test_pairing_defers_companion_file_cleanup_until_commit_succeeds(
+    tmp_path, monkeypatch,
+):
+    """If ``commit_with_retry`` raises, the transaction rolls back — every
+    companion row that had been DELETEd earlier in the loop comes back.
+    Any files we'd already unlinked inline would then leave those restored
+    rows pointing at gone-from-disk thumbnails / working copies / masks
+    / offline originals.
+
+    Simulate the failure by monkeypatching ``commit_with_retry`` inside
+    scanner to raise, then assert that the companion row is still present
+    AND its cached derivatives are all still on disk.
+    """
+    import scanner
+    from db import Database
+    from scanner import _pair_raw_jpeg_companions
+
+    img_dir = tmp_path / "photos"
+    img_dir.mkdir()
+    vireo_dir = str(tmp_path / "vireo")
+    thumb_dir = os.path.join(vireo_dir, "thumbnails")
+
+    db = Database(str(tmp_path / "test.db"))
+    fid = db.add_folder(str(img_dir), name="photos")
+    jpeg_id = db.add_photo(
+        folder_id=fid, filename="IMG_003.jpg", extension=".jpg",
+        file_size=1000, file_mtime=1.0,
+    )
+    db.add_photo(
+        folder_id=fid, filename="IMG_003.cr3", extension=".cr3",
+        file_size=2000, file_mtime=1.0,
+    )
+    db.conn.commit()
+
+    seeded = _seed_derivative_files(vireo_dir, thumb_dir, jpeg_id)
+
+    def _boom(_conn):
+        raise RuntimeError("simulated commit failure")
+
+    monkeypatch.setattr(scanner, "commit_with_retry", _boom)
+
+    with pytest.raises(RuntimeError, match="simulated commit failure"):
+        _pair_raw_jpeg_companions(
+            db, vireo_dir=vireo_dir, thumb_cache_dir=thumb_dir,
+        )
+
+    # Force a rollback of the aborted transaction (mirroring what the
+    # scan orchestrator does when a partial pair-up raises) so the
+    # visibility check below sees post-rollback state.
+    db.conn.rollback()
+
+    assert db.conn.execute(
+        "SELECT COUNT(*) AS n FROM photos WHERE id = ?", (jpeg_id,)
+    ).fetchone()["n"] == 1, (
+        "companion row should have been restored by the transaction "
+        "rollback after commit failure"
+    )
+    for name, path in seeded.items():
+        assert os.path.exists(path), (
+            f"companion's {name} cache was deleted before the commit "
+            "succeeded, leaving the restored companion row pointing at a "
+            "missing file"
+        )
+
+
+def test_scan_probes_recycled_ids_without_walking_dirs_per_photo(
+    tmp_path, monkeypatch,
+):
+    """The recycled-id probe must be batched, not per-photo.
+
+    Answering "does this id already own cached files?" by globbing costs a
+    full directory enumeration per inserted photo — O(new photos × cached
+    files). Measured against a 76k-thumbnail library that was 117 ms per
+    insert, i.e. ~10 minutes of pure ``scandir`` for a 5000-photo import.
+    ``RecycledIdIndex`` snapshots the answer for every id with one
+    ``scandir`` per derivative directory, so the count must not grow with
+    the number of photos ingested.
+    """
+    from db import Database
+    from scanner import scan
+
+    root = str(tmp_path / "photos")
+    _create_test_images(root, {'': [f"bird{i}.jpg" for i in range(12)]})
+    vireo_dir = str(tmp_path / "vireo")
+    thumb_dir = os.path.join(vireo_dir, "thumbnails")
+    # Populate the cache so the directories aren't trivially empty.
+    os.makedirs(thumb_dir, exist_ok=True)
+    for i in range(50):
+        with open(os.path.join(thumb_dir, f"{9000 + i}.jpg"), "wb") as fh:
+            fh.write(b"stale")
+
+    import preview_cache
+    from preview_cache import _derivative_dirs
+
+    derivative_dirs = {
+        os.path.normpath(d) for d in _derivative_dirs(thumb_dir)
+    }
+    enumerations = []
+    real_scandir = os.scandir
+
+    def counting_scandir(path, *args, **kwargs):
+        # ``glob`` reaches os.scandir through the same module attribute we
+        # patch here, so this counts globbing too — which is the point.
+        if isinstance(path, (str, bytes, os.PathLike)):
+            normalized = os.path.normpath(os.fspath(path))
+            if normalized in derivative_dirs:
+                enumerations.append(normalized)
+        return real_scandir(path, *args, **kwargs)
+
+    monkeypatch.setattr(preview_cache.os, "scandir", counting_scandir)
+
+    db = Database(str(tmp_path / "test.db"))
+    scan(root, db, vireo_dir=vireo_dir, thumb_cache_dir=thumb_dir,
+         skip_working_copies=True)
+
+    assert db.conn.execute(
+        "SELECT COUNT(*) AS n FROM photos"
+    ).fetchone()["n"] == 12
+    # Each derivative directory is enumerated at most once for the whole
+    # scan. Per-photo probing would hit each of them 12 times.
+    repeats = {d: enumerations.count(d) for d in set(enumerations)
+               if enumerations.count(d) > 1}
+    assert not repeats, (
+        "recycled-id probe enumerated derivative directories more than "
+        f"once for a 12-photo scan: {repeats}"
+    )
+
+
+def test_recycled_id_index_does_not_confuse_id_prefixes(tmp_path):
+    """``40.jpg`` must not register photo 4 as having a cached derivative.
+
+    Derivative names are the bare id followed by ``.`` or ``_``; parsing
+    the leading digit run without requiring that separator would make
+    every id a false positive for its numeric prefixes, and the purge
+    would delete a *live* photo's cache on every unrelated insert.
+    """
+    from preview_cache import RecycledIdIndex
+
+    thumb_dir = tmp_path / "vireo" / "thumbnails"
+    thumb_dir.mkdir(parents=True)
+    (thumb_dir / "40.jpg").write_bytes(b"forty")
+    (thumb_dir / "7_raw.jpg").write_bytes(b"seven-raw")
+    (thumb_dir / "not-a-photo.jpg").write_bytes(b"junk")
+
+    index = RecycledIdIndex(str(thumb_dir))
+
+    assert 40 in index
+    assert 7 in index
+    assert 4 not in index, "'40.jpg' was parsed as id 4"
+    assert 0 not in index
+
+
+def test_recycled_id_index_falls_back_to_per_id_probe_when_dir_unreadable(
+    tmp_path, monkeypatch,
+):
+    """A derivative directory that can't be enumerated must not be
+    silently treated as empty.
+
+    ``scandir`` fails on directories that are execute-only but not
+    readable (a permissions gap, transient EIO, ACL quirk). Treating
+    that as "no cached files for any id" makes the batch index drop
+    every recycled id whose only surviving derivative lives there — and
+    ``purge_cached_files_for_recycled_id`` short-circuits on the index,
+    so a subsequent request lazily adopts the previous owner's pixels.
+
+    The exact-path probe (``os.path.exists``) works even on execute-only
+    directories, so falling back to it for uncertain lookups recovers the
+    common case (id-keyed exact filenames like ``masks/<id>.png`` or the
+    legacy ``previews/<id>.jpg``). Verify the fallback fires when
+    ``scandir`` raises.
+    """
+    from preview_cache import RecycledIdIndex
+
+    vireo_dir = tmp_path / "vireo"
+    thumb_dir = vireo_dir / "thumbnails"
+    thumb_dir.mkdir(parents=True)
+    masks_dir = vireo_dir / "masks"
+    masks_dir.mkdir()
+
+    # Only surviving derivative for id 7 is its subject mask. If the
+    # index treated an unreadable masks/ as empty, ``7 in index`` would
+    # return False and the purge would be skipped — the recycled RAW
+    # would then get another photo's mask applied to the local pass.
+    stale = masks_dir / "7.png"
+    stale.write_bytes(b"previous owner's mask")
+
+    import preview_cache
+
+    real_scandir = preview_cache.os.scandir
+    unreadable_dir = os.path.normpath(str(masks_dir))
+
+    def scandir_denied(path):
+        if os.path.normpath(str(path)) == unreadable_dir:
+            raise PermissionError(13, "Permission denied", str(path))
+        return real_scandir(path)
+
+    monkeypatch.setattr(preview_cache.os, "scandir", scandir_denied)
+
+    index = RecycledIdIndex(str(thumb_dir), vireo_dir=str(vireo_dir))
+
+    assert 7 in index, (
+        "batch index treated an unreadable derivative directory as "
+        "empty; recycled id 7 would skip the purge and the new photo "
+        "would inherit the previous owner's mask"
+    )
+    # An id whose variant patterns don't touch the unreadable directory
+    # must still be reported absent — the fallback only conservatively
+    # says True when a variant *could* be hiding in a dir the sweep
+    # couldn't enumerate. Point the probe at a fresh library where every
+    # derivative dir except masks/ is missing (FileNotFoundError, treated
+    # as genuinely empty), then verify the id isn't blanket-forced true.
+    fresh_vireo = tmp_path / "vireo-fresh"
+    fresh_thumbs = fresh_vireo / "thumbnails"
+    fresh_thumbs.mkdir(parents=True)
+    fresh_index = RecycledIdIndex(
+        str(fresh_thumbs), vireo_dir=str(fresh_vireo),
+    )
+    assert 12345 not in fresh_index, (
+        "fallback returned a blanket True for a fresh library where no "
+        "directory is unreadable; the probe should say False"
+    )
+
+
+def test_recycled_id_index_probe_forces_purge_for_variant_in_unreadable_dir(
+    tmp_path, monkeypatch,
+):
+    """A variant-only derivative in an unreadable directory must still trip.
+
+    Only the exact-path probe (``os.path.exists``) survives when a
+    directory is execute-only but not readable. The variant globs
+    (``previews/<id>_*.jpg``, ``masks/<id>.*.png``) still call
+    ``scandir`` under the hood, so if the fallback trusted their
+    "no match" answer, a variant-only derivative in that directory
+    would slip through and the recycled id would silently serve the
+    previous owner's pixels.
+    """
+    import preview_cache
+    from preview_cache import RecycledIdIndex
+
+    vireo_dir = tmp_path / "vireo"
+    thumb_dir = vireo_dir / "thumbnails"
+    thumb_dir.mkdir(parents=True)
+    previews_dir = vireo_dir / "previews"
+    previews_dir.mkdir()
+
+    # id 9's ONLY surviving derivative is a variant preview — the
+    # exact-path probe (``previews/9.jpg``) won't see it, and the
+    # variant glob would need to enumerate a directory the sweep just
+    # reported unreadable.
+    (previews_dir / "9_1920.jpg").write_bytes(b"previous owner's preview")
+
+    real_scandir = preview_cache.os.scandir
+    unreadable = os.path.normpath(str(previews_dir))
+
+    def scandir_denied(path):
+        if os.path.normpath(str(path)) == unreadable:
+            raise PermissionError(13, "Permission denied", str(path))
+        return real_scandir(path)
+
+    monkeypatch.setattr(preview_cache.os, "scandir", scandir_denied)
+
+    real_iglob = preview_cache._glob.iglob
+
+    def iglob_denied(pattern, *args, **kwargs):
+        if os.path.normpath(os.path.dirname(pattern)) == unreadable:
+            # glob.iglob against an unreadable directory silently
+            # returns no matches under scandir failure — same class of
+            # failure the fallback is meant to guard against.
+            return iter(())
+        return real_iglob(pattern, *args, **kwargs)
+
+    monkeypatch.setattr(preview_cache._glob, "iglob", iglob_denied)
+
+    index = RecycledIdIndex(str(thumb_dir), vireo_dir=str(vireo_dir))
+
+    assert 9 in index, (
+        "fallback probe missed a variant-only preview in an unreadable "
+        "directory; recycled id 9 would skip the purge and the new "
+        "photo would inherit the previous owner's preview"
+    )
+
+
+def test_recycled_id_index_sweep_survives_iterator_error(tmp_path, monkeypatch):
+    """OSError raised while iterating scandir must not abort the build.
+
+    ``os.scandir`` succeeds but iterating the entries can still raise
+    (network-backed cache losing the mount mid-walk, ACL change between
+    the open and the first ``__next__``). Without the iterator guard,
+    the whole ``_build`` aborts and every subsequent lookup wrongly
+    reports the id absent — recycled ids skip the purge and their
+    replacements silently serve the previous owner's pixels.
+    """
+    import preview_cache
+    from preview_cache import RecycledIdIndex
+
+    vireo_dir = tmp_path / "vireo"
+    thumb_dir = vireo_dir / "thumbnails"
+    thumb_dir.mkdir(parents=True)
+    masks_dir = vireo_dir / "masks"
+    masks_dir.mkdir()
+    (masks_dir / "13.png").write_bytes(b"stale mask")
+
+    real_scandir = preview_cache.os.scandir
+    unreadable = os.path.normpath(str(masks_dir))
+
+    class ExplodingIterator:
+        def __init__(self, wrapped):
+            self._wrapped = wrapped
+
+        def __enter__(self):
+            self._wrapped.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self._wrapped.__exit__(*args)
+
+        def __iter__(self):
+            raise OSError("simulated mid-iteration failure")
+
+    def scandir_explodes(path):
+        result = real_scandir(path)
+        if os.path.normpath(str(path)) == unreadable:
+            return ExplodingIterator(result)
+        return result
+
+    monkeypatch.setattr(preview_cache.os, "scandir", scandir_explodes)
+
+    index = RecycledIdIndex(str(thumb_dir), vireo_dir=str(vireo_dir))
+
+    # The build must not raise — the sweep should catch the iteration
+    # failure and mark the index incomplete. The exact-path fallback
+    # then still finds id 13 via ``os.path.exists``.
+    assert 13 in index, (
+        "sweep didn't recover from an iteration OSError; the whole "
+        "batch index aborted and recycled id 13 would skip the purge"
+    )
+
+
+def test_recycled_id_index_indexes_external_dng_subdirectories(tmp_path):
+    """The Nikon-HE-NEF DNG cache lives at ``external-dng/<pid>/`` — the
+    entries are bare-digit *directory* names rather than files with a
+    ``.``/``_`` separator, so the standard ``_leading_photo_id`` parser
+    (which requires the separator) skips them. Verify the index's
+    external-dng sweep picks them up so a recycled RAW id doesn't reuse
+    the previous owner's DNG when Darktable is launched.
+    """
+    from preview_cache import RecycledIdIndex
+
+    vireo_dir = tmp_path / "vireo"
+    thumb_dir = vireo_dir / "thumbnails"
+    thumb_dir.mkdir(parents=True)
+    external_dng = vireo_dir / "external-dng"
+    (external_dng / "1234").mkdir(parents=True)
+    (external_dng / "1234" / "DSC_9999.dng").write_bytes(b"stale-conversion")
+
+    index = RecycledIdIndex(str(thumb_dir))
+
+    assert 1234 in index, (
+        "batch index missed an external-dng orphan; the recycled RAW id "
+        "would silently reuse the previous owner's DNG through the "
+        "external-editor freshness check"
+    )
+
+
+def test_pairing_recovers_snapshot_when_rename_fails(tmp_path, monkeypatch):
+    """A failed snapshot rename must still leave the mask reachable.
+
+    ``transfer_snapshots`` catches ``OSError`` from ``os.replace`` (a locked
+    source on Windows, a permissions blip). The recipe row has already been
+    reassigned to the primary by then, and ``load_snapshot`` only ever
+    builds ``snapshot_path(vireo_dir, primary_id, ref)`` — so merely leaving
+    the old-id file in place doesn't help: every render still disables the
+    local pass. The copy fallback is what actually recovers it.
+    """
+    import local_masks
+    from db import Database
+    from local_masks import snapshot_path
+    from scanner import _pair_raw_jpeg_companions
+
+    img_dir = tmp_path / "photos"
+    img_dir.mkdir()
+    vireo_dir = str(tmp_path / "vireo")
+    thumb_dir = os.path.join(vireo_dir, "thumbnails")
+
+    db = Database(str(tmp_path / "test.db"))
+    fid = db.add_folder(str(img_dir), name="photos")
+    jpeg_id = db.add_photo(
+        folder_id=fid, filename="IMG_004.jpg", extension=".jpg",
+        file_size=1000, file_mtime=1.0,
+    )
+    raw_id = db.add_photo(
+        folder_id=fid, filename="IMG_004.cr3", extension=".cr3",
+        file_size=2000, file_mtime=1.0,
+    )
+    # A recipe on the JPEG is what makes pairing transfer the row (and the
+    # snapshot files) over to the RAW primary.
+    db.set_photo_edit_recipe(jpeg_id, {"rotation": 90})
+    ref = "abcdef012345"
+    _seed_edit_mask_snapshot(vireo_dir, jpeg_id, ref)
+
+    def _failing_replace(src, dst):
+        raise OSError("simulated locked source")
+
+    monkeypatch.setattr(local_masks.os, "replace", _failing_replace)
+
+    _pair_raw_jpeg_companions(
+        db, vireo_dir=vireo_dir, thumb_cache_dir=thumb_dir,
+    )
+
+    assert os.path.exists(snapshot_path(vireo_dir, raw_id, ref)), (
+        "snapshot never reached the primary id after the rename failed; "
+        "load_snapshot builds the path from the primary id, so the local "
+        "adjustment renders without its mask"
+    )
+
+
+def test_transfer_snapshots_reports_unrecoverable_refs(tmp_path):
+    """When neither rename nor copy works, the caller must be told.
+
+    A silently-degraded render is exactly the black box CORE_PHILOSOPHY
+    forbids — the mask is gone and the image just looks different.
+    """
+    import local_masks
+
+    vireo_dir = str(tmp_path / "vireo")
+    ref = "abcdef012345"
+    _seed_edit_mask_snapshot(vireo_dir, 11, ref)
+
+    def _boom(*args, **kwargs):
+        raise OSError("simulated failure")
+
+    local_masks.os.replace, real_replace = _boom, local_masks.os.replace
+    local_masks.shutil.copy2, real_copy = _boom, local_masks.shutil.copy2
+    try:
+        result = local_masks.transfer_snapshots(vireo_dir, 11, 22)
+    finally:
+        local_masks.os.replace = real_replace
+        local_masks.shutil.copy2 = real_copy
+
+    assert result["failed"] == [ref]
+    assert result["moved"] == []
+
+
+def test_transfer_snapshots_reports_enumerate_failure(tmp_path, monkeypatch):
+    """``os.listdir`` failing on ``edit-masks/`` must surface as a flag.
+
+    Without the flag, the raised ``OSError`` is caught by the deferred-
+    action loop in scanner._pair_raw_jpeg_companions after the recipe
+    has already been committed to the primary. Every affected local
+    adjustment renders without its mask indefinitely, and the caller
+    can't say so because the exception vanished before ``failed`` got
+    populated.
+    """
+    import local_masks
+
+    vireo_dir = str(tmp_path / "vireo")
+    _seed_edit_mask_snapshot(vireo_dir, 55)
+
+    def boom(path):
+        raise PermissionError(13, "Permission denied", path)
+
+    monkeypatch.setattr(local_masks.os, "listdir", boom)
+
+    result = local_masks.transfer_snapshots(vireo_dir, 55, 66)
+
+    assert result["enumerate_failed"] is True, (
+        "os.listdir failure did not surface as enumerate_failed; the "
+        "caller can't warn the user about masks left under the old id"
+    )
+    assert result["moved"] == []
+    assert result["failed"] == []
+
+
+def test_delete_photos_cleanup_leaves_edit_mask_snapshots_to_gc(tmp_path):
+    """The id-keyed purge must not touch ``edit-masks/``.
+
+    Snapshot filenames carry a photo id, but lookup is by *ref* — a hash of
+    the mask bytes — so a recycled id can't surface a previous owner's
+    snapshot (a new photo has no local section, and a ref match means the
+    masks are byte-identical). ``gc_edit_masks`` owns the directory and
+    reaps by ref with a grace period; purging by id here would only create
+    the data-loss window this test guards.
+    """
+    from preview_cache import cleanup_cached_files_for_deleted_photos
+
+    vireo_dir = tmp_path / "vireo"
+    thumb_dir = vireo_dir / "thumbnails"
+    thumb_dir.mkdir(parents=True)
+    (thumb_dir / "77.jpg").write_bytes(b"thumb")
+    subject_mask = vireo_dir / "masks" / "77.png"
+    subject_mask.parent.mkdir(parents=True)
+    subject_mask.write_bytes(b"subject-mask")
+    snapshot = _seed_edit_mask_snapshot(str(vireo_dir), 77)
+
+    cleanup_cached_files_for_deleted_photos(
+        str(thumb_dir), [{"photo_id": 77}],
+    )
+
+    assert not (thumb_dir / "77.jpg").exists(), "thumbnail should be purged"
+    assert not subject_mask.exists(), (
+        "subject mask is read by photo id and must be purged"
+    )
+    assert os.path.exists(snapshot), (
+        "content-addressed edit-mask snapshot must be left to gc_edit_masks"
+    )
+
+
+def test_recycled_id_purge_backdates_derivatives_it_could_not_delete(tmp_path):
+    """"Ran the purge" is not the same as "the stale pixels are gone".
+
+    ``cleanup_cached_files_for_deleted_photos`` logs and continues when an
+    unlink fails (locked file on Windows, momentarily unwritable dir), so a
+    purge that reports success can still leave the previous owner's
+    thumbnail servable — and ``serve_thumbnail``'s mtime guard won't catch
+    it, because a recently generated thumbnail beats an old capture's
+    ``file_mtime``. Backdating the survivor makes that existing guard do
+    the right thing.
+    """
+    import preview_cache
+    from preview_cache import purge_cached_files_for_recycled_id
+
+    vireo_dir = tmp_path / "vireo"
+    thumb_dir = vireo_dir / "thumbnails"
+    thumb_dir.mkdir(parents=True)
+    stuck = thumb_dir / "88.jpg"
+    stuck.write_bytes(b"previous-tenant")
+    # Recent mtime — exactly the case the freshness guard would wave through.
+    os.utime(stuck, (2_000_000_000, 2_000_000_000))
+
+    real_remove = os.remove
+
+    def _locked_remove(path, *args, **kwargs):
+        if os.path.normpath(str(path)) == os.path.normpath(str(stuck)):
+            raise OSError("simulated Windows lock")
+        return real_remove(path, *args, **kwargs)
+
+    preview_cache.os.remove = _locked_remove
+    try:
+        purged = purge_cached_files_for_recycled_id(str(thumb_dir), 88)
+    finally:
+        preview_cache.os.remove = real_remove
+
+    assert purged is True
+    assert stuck.exists(), "test setup failed to simulate an undeletable file"
+    assert os.path.getmtime(stuck) == 0, (
+        "undeletable stale derivative kept its recent mtime, so the "
+        "freshness guard would serve the previous owner's pixels"
+    )
+
+
+def test_recycled_id_purge_honors_a_thumb_dir_outside_vireo_dir(tmp_path):
+    """``--db`` and ``--thumb-dir`` are independent paths.
+
+    ``audit.import_untracked`` takes ``vireo_dir`` and ``thumb_cache_dir``
+    separately for exactly this reason. Deriving the cache root as
+    ``dirname(thumb_cache_dir)`` would look for previews, working copies,
+    masks, offline files, and DNGs beside the *thumbnails* — so under a
+    split layout none of them are detected or purged, and a recycled id
+    keeps serving the previous owner's pixels from every family except
+    thumbnails.
+    """
+    from preview_cache import (
+        RecycledIdIndex,
+        purge_cached_files_for_recycled_id,
+    )
+
+    vireo_dir = tmp_path / "data"
+    thumb_dir = tmp_path / "elsewhere" / "thumbs"   # NOT vireo_dir/thumbnails
+    thumb_dir.mkdir(parents=True)
+    (thumb_dir / "55.jpg").write_bytes(b"stale-thumb")
+    working = vireo_dir / "working" / "55.jpg"
+    working.parent.mkdir(parents=True)
+    working.write_bytes(b"stale-working")
+    preview = vireo_dir / "previews" / "55_1920.jpg"
+    preview.parent.mkdir(parents=True)
+    preview.write_bytes(b"stale-preview")
+
+    index = RecycledIdIndex(str(thumb_dir), vireo_dir=str(vireo_dir))
+    assert 55 in index, "index missed derivatives under a split layout"
+
+    assert purge_cached_files_for_recycled_id(
+        str(thumb_dir), 55, vireo_dir=str(vireo_dir),
+    )
+
+    assert not (thumb_dir / "55.jpg").exists()
+    assert not working.exists(), (
+        "working copy under the real vireo_dir survived; the purge looked "
+        "beside the thumbnails instead"
+    )
+    assert not preview.exists(), "sized preview under the real vireo_dir survived"
+
+
+def test_recycled_id_purge_backdates_files_inside_an_undeletable_dng_dir(
+    tmp_path,
+):
+    """Backdating a directory does nothing for the file inside it.
+
+    ``external-dng/<id>/`` is a per-id *directory*, but the external-editor
+    freshness check stats the DNG **file** (``cached_mtime >= source_mtime``).
+    If ``rmtree`` fails and we backdate only the directory, the purge reports
+    a successful invalidation while a recycled RAW with the same stem can
+    still be handed the previous owner's DNG.
+    """
+    import preview_cache
+    from preview_cache import purge_cached_files_for_recycled_id
+
+    vireo_dir = tmp_path / "vireo"
+    thumb_dir = vireo_dir / "thumbnails"
+    thumb_dir.mkdir(parents=True)
+    dng_dir = vireo_dir / "external-dng" / "99"
+    dng_dir.mkdir(parents=True)
+    dng = dng_dir / "DSC_0001.dng"
+    dng.write_bytes(b"previous-tenant-conversion")
+    os.utime(dng, (2_000_000_000, 2_000_000_000))
+
+    def _locked_rmtree(path, *args, **kwargs):
+        raise OSError("simulated locked DNG")
+
+    real_rmtree = preview_cache.shutil.rmtree
+    preview_cache.shutil.rmtree = _locked_rmtree
+    try:
+        purge_cached_files_for_recycled_id(str(thumb_dir), 99)
+    finally:
+        preview_cache.shutil.rmtree = real_rmtree
+
+    assert dng.exists(), "test setup failed to simulate an undeletable DNG"
+    assert os.path.getmtime(dng) == 0, (
+        "the DNG inside the undeletable directory kept its recent mtime, so "
+        "the external-editor freshness check would hand Darktable the "
+        "previous owner's conversion"
+    )
+
+
+def test_recycled_id_purge_marks_surviving_previews_uncacheable(tmp_path):
+    """Backdating a preview does not invalidate it.
+
+    ``_serve_preview``'s lazy-adoption branch tests
+    ``os.path.exists(cache_path)`` with no mtime comparison, so a sized
+    preview that outlived its owner gets adopted and re-registered
+    verbatim — the recycled photo serves the previous owner's pixels *and*
+    the LRU records them as legitimately cached. The durable
+    ``preview_cache_invalidations`` row is the only thing that branch
+    honours, so a preview we could not delete must get one.
+    """
+    import preview_cache
+    from db import Database
+    from preview_cache import purge_cached_files_for_recycled_id
+
+    vireo_dir = tmp_path / "vireo"
+    thumb_dir = vireo_dir / "thumbnails"
+    thumb_dir.mkdir(parents=True)
+    preview = vireo_dir / "previews" / "66_1920.jpg"
+    preview.parent.mkdir(parents=True)
+    preview.write_bytes(b"previous-tenant-preview")
+
+    db = Database(str(tmp_path / "test.db"))
+    fid = db.add_folder(str(tmp_path / "photos"), name="photos")
+    photo_id = db.add_photo(
+        folder_id=fid, filename="gull.jpg", extension=".jpg",
+        file_size=10, file_mtime=1.0,
+    )
+    # Rename the seeded preview onto whatever rowid we actually got, so the
+    # FK on preview_cache_invalidations is satisfiable.
+    survivor = vireo_dir / "previews" / f"{photo_id}_1920.jpg"
+    preview.rename(survivor)
+
+    real_remove = os.remove
+
+    def _locked_remove(path, *args, **kwargs):
+        if os.path.normpath(str(path)) == os.path.normpath(str(survivor)):
+            raise OSError("simulated lock")
+        return real_remove(path, *args, **kwargs)
+
+    preview_cache.os.remove = _locked_remove
+    try:
+        purge_cached_files_for_recycled_id(
+            str(thumb_dir), photo_id, vireo_dir=str(vireo_dir), db=db,
+        )
+    finally:
+        preview_cache.os.remove = real_remove
+
+    assert survivor.exists(), "test setup failed to simulate a locked preview"
+    row = db.conn.execute(
+        "SELECT 1 FROM preview_cache_invalidations WHERE photo_id=? AND size=?",
+        (photo_id, 1920),
+    ).fetchone()
+    assert row is not None, (
+        "surviving preview was only backdated; _serve_preview would still "
+        "adopt it and serve the previous owner's pixels"
+    )
+
+
+def test_recycled_id_purge_clears_external_edit_handoffs(tmp_path):
+    """The external-editor handoff render is id-keyed and must be purged.
+
+    ``external-edits/<id>.jpg`` is the render handed to an external editor
+    and ``<id>.json`` is its cache key — recipe, source path, source mtime,
+    edit-math version. None of those is a photo id or a content hash, so a
+    recycled id re-imported at the same path with a preserved mtime and the
+    same recipe matches the previous owner's metadata, and the editor is
+    handed the previous owner's pixels.
+    """
+    from preview_cache import (
+        RecycledIdIndex,
+        purge_cached_files_for_recycled_id,
+    )
+
+    vireo_dir = tmp_path / "vireo"
+    thumb_dir = vireo_dir / "thumbnails"
+    thumb_dir.mkdir(parents=True)
+    handoff_dir = vireo_dir / "external-edits"
+    handoff_dir.mkdir()
+    render = handoff_dir / "77.jpg"
+    meta = handoff_dir / "77.json"
+    render.write_bytes(b"previous-tenant-render")
+    meta.write_text('{"recipe": "", "source_mtime": 1.0}')
+
+    index = RecycledIdIndex(str(thumb_dir), vireo_dir=str(vireo_dir))
+    assert 77 in index, "index missed an external-edit handoff"
+
+    assert purge_cached_files_for_recycled_id(
+        str(thumb_dir), 77, vireo_dir=str(vireo_dir),
+    )
+
+    assert not render.exists(), "external-edit render outlived its photo"
+    assert not meta.exists(), (
+        "external-edit cache metadata outlived its photo; it is what makes "
+        "the stale render look valid"
+    )
+
+
+def test_preview_marker_written_even_when_backdating_fails(tmp_path):
+    """For previews the marker matters more than the mtime.
+
+    ``_serve_preview``'s lazy-adoption branch never compares mtimes, so a
+    readable surviving preview is adoptable regardless of its timestamp —
+    only the durable ``preview_cache_invalidations`` row keeps it out. An
+    earlier revision attempted the marker only on the backdate's success
+    path, so a survivor whose ``utime`` also failed stayed adoptable.
+    """
+    import preview_cache
+    from db import Database
+    from preview_cache import purge_cached_files_for_recycled_id
+
+    vireo_dir = tmp_path / "vireo"
+    thumb_dir = vireo_dir / "thumbnails"
+    thumb_dir.mkdir(parents=True)
+
+    db = Database(str(tmp_path / "test.db"))
+    fid = db.add_folder(str(tmp_path / "photos"), name="photos")
+    pid = db.add_photo(
+        folder_id=fid, filename="gull.jpg", extension=".jpg",
+        file_size=10, file_mtime=1.0,
+    )
+    survivor = vireo_dir / "previews" / f"{pid}_1920.jpg"
+    survivor.parent.mkdir(parents=True)
+    survivor.write_bytes(b"previous-tenant-preview")
+
+    real_remove, real_utime = preview_cache.os.remove, preview_cache.os.utime
+
+    def locked_remove(path, *a, **k):
+        if os.path.normpath(str(path)) == os.path.normpath(str(survivor)):
+            raise OSError("locked")
+        return real_remove(path, *a, **k)
+
+    def locked_utime(path, *a, **k):
+        if os.path.normpath(str(path)) == os.path.normpath(str(survivor)):
+            raise OSError("locked")
+        return real_utime(path, *a, **k)
+
+    preview_cache.os.remove, preview_cache.os.utime = locked_remove, locked_utime
+    try:
+        purge_cached_files_for_recycled_id(
+            str(thumb_dir), pid, vireo_dir=str(vireo_dir), db=db,
+        )
+    finally:
+        preview_cache.os.remove, preview_cache.os.utime = real_remove, real_utime
+
+    row = db.conn.execute(
+        "SELECT 1 FROM preview_cache_invalidations WHERE photo_id=? AND size=?",
+        (pid, 1920),
+    ).fetchone()
+    assert row is not None, (
+        "no invalidation marker was written because the backdate failed "
+        "first; _serve_preview would adopt the previous owner's preview"
+    )
+
+
+def test_prepared_render_survivor_does_not_get_a_preview_marker(tmp_path):
+    """``originals/<id>_2048.jpg`` is not a preview.
+
+    The name shape is identical to a sized preview, so a name-only parse
+    earns the photo a durable ``preview_cache_invalidations`` row for a
+    size that was never cached — which would then suppress adoption of a
+    preview that legitimately gets written later.
+    """
+    from db import Database
+    from preview_cache import (
+        ensure_preview_cache_invalidations_table,
+        purge_cached_files_for_recycled_id,
+    )
+
+    vireo_dir = tmp_path / "vireo"
+    thumb_dir = vireo_dir / "thumbnails"
+    thumb_dir.mkdir(parents=True)
+
+    db = Database(str(tmp_path / "test.db"))
+    fid = db.add_folder(str(tmp_path / "photos"), name="photos")
+    pid = db.add_photo(
+        folder_id=fid, filename="gull.jpg", extension=".jpg",
+        file_size=10, file_mtime=1.0,
+    )
+    # Create the table up front so an empty result means "no marker was
+    # written", not "the purge never touched this family".
+    ensure_preview_cache_invalidations_table(db)
+    render = vireo_dir / "originals" / f"{pid}_2048.jpg"
+    render.parent.mkdir(parents=True)
+    render.write_bytes(b"prepared-render")
+
+    # Lock it so it actually becomes a *survivor* — otherwise the purge
+    # just deletes it and the marker logic is never reached.
+    import preview_cache
+
+    real_remove = preview_cache.os.remove
+
+    def locked_remove(path, *a, **k):
+        if os.path.normpath(str(path)) == os.path.normpath(str(render)):
+            raise OSError("locked")
+        return real_remove(path, *a, **k)
+
+    preview_cache.os.remove = locked_remove
+    try:
+        purge_cached_files_for_recycled_id(
+            str(thumb_dir), pid, vireo_dir=str(vireo_dir), db=db,
+        )
+    finally:
+        preview_cache.os.remove = real_remove
+
+    assert render.exists(), "test setup failed to make the render survive"
+
+    rows = db.conn.execute(
+        "SELECT size FROM preview_cache_invalidations WHERE photo_id=?", (pid,)
+    ).fetchall()
+    assert not rows, (
+        f"a prepared render earned bogus preview invalidation rows: {rows}"
+    )
+
+
+def test_recycled_id_purge_clears_inat_upload_handoffs(tmp_path):
+    """``inat-uploads/<id>.{jpg,json}`` is id-keyed and must be purged.
+
+    ``_inat_upload_photo_path`` caches the render under the photo id and
+    reuses it when the metadata JSON matches only
+    {recipe, source_path, source_mtime, edit_math_version} — none of which
+    is a photo id or content hash. A recycled id imported at the same path
+    and mtime with the same recipe would therefore ship the previous
+    owner's pixels to iNaturalist.
+    """
+    from preview_cache import (
+        RecycledIdIndex,
+        purge_cached_files_for_recycled_id,
+    )
+
+    vireo_dir = tmp_path / "vireo"
+    thumb_dir = vireo_dir / "thumbnails"
+    thumb_dir.mkdir(parents=True)
+    inat_dir = vireo_dir / "inat-uploads"
+    inat_dir.mkdir()
+    render = inat_dir / "77.jpg"
+    meta = inat_dir / "77.json"
+    render.write_bytes(b"previous-tenant-inat-render")
+    meta.write_text('{"recipe": "", "source_mtime": 1.0}')
+
+    index = RecycledIdIndex(str(thumb_dir), vireo_dir=str(vireo_dir))
+    assert 77 in index, "index missed an iNat upload handoff"
+
+    assert purge_cached_files_for_recycled_id(
+        str(thumb_dir), 77, vireo_dir=str(vireo_dir),
+    )
+
+    assert not render.exists(), "iNat upload render outlived its photo"
+    assert not meta.exists(), (
+        "iNat upload cache metadata outlived its photo; it is what makes "
+        "the stale render look valid"
+    )
+
+
+def test_delete_photos_cleanup_removes_inat_upload_handoffs(tmp_path):
+    """``cleanup_cached_files_for_deleted_photos`` must sweep inat-uploads.
+
+    Same reasoning as the external-edit handoff: the metadata compares
+    recipe/source/mtime and never inspects file mtime, so any recycled id
+    with matching envelope would upload the previous owner's pixels.
+    """
+    from preview_cache import cleanup_cached_files_for_deleted_photos
+
+    vireo_dir = tmp_path / "vireo"
+    thumb_dir = vireo_dir / "thumbnails"
+    thumb_dir.mkdir(parents=True)
+    inat_dir = vireo_dir / "inat-uploads"
+    inat_dir.mkdir()
+    (inat_dir / "42.jpg").write_bytes(b"render")
+    (inat_dir / "42.json").write_text("{}")
+
+    cleanup_cached_files_for_deleted_photos(
+        str(thumb_dir),
+        [{"photo_id": 42, "filename": "gone.jpg"}],
+        vireo_dir=str(vireo_dir),
+    )
+
+    assert not (inat_dir / "42.jpg").exists()
+    assert not (inat_dir / "42.json").exists()
+
+
+def test_recycled_id_purge_backdates_below_a_negative_source_mtime(tmp_path):
+    """Backdating survivors to ``0`` fails when the source is at/below epoch.
+
+    ``serve_thumbnail`` / ``_prepared_full_resolution_render`` / the
+    external-DNG gate all treat ``cached_mtime >= source_mtime`` as fresh.
+    If a rowid gets recycled onto a photo whose archived filesystem
+    timestamp is ``0`` (or negative), a survivor backdated to ``0`` still
+    satisfies that comparison and the previous owner's pixels are served
+    as fresh. Anchor the backdate to the new photo's own ``file_mtime``.
+    """
+    import preview_cache
+    from preview_cache import purge_cached_files_for_recycled_id
+
+    vireo_dir = tmp_path / "vireo"
+    thumb_dir = vireo_dir / "thumbnails"
+    thumb_dir.mkdir(parents=True)
+    stuck = thumb_dir / "88.jpg"
+    stuck.write_bytes(b"previous-tenant")
+    os.utime(stuck, (2_000_000_000, 2_000_000_000))
+
+    real_remove = os.remove
+
+    def _locked_remove(path, *args, **kwargs):
+        if os.path.normpath(str(path)) == os.path.normpath(str(stuck)):
+            raise OSError("simulated Windows lock")
+        return real_remove(path, *args, **kwargs)
+
+    preview_cache.os.remove = _locked_remove
+    try:
+        # New photo's source file_mtime is 0 (an archive preserved an epoch
+        # timestamp). A hard-coded ``0`` sentinel would not invalidate the
+        # survivor for this source.
+        purge_cached_files_for_recycled_id(
+            str(thumb_dir), 88, file_mtime=0.0,
+        )
+    finally:
+        preview_cache.os.remove = real_remove
+
+    assert stuck.exists(), "test setup failed to simulate an undeletable file"
+    survivor_mtime = os.path.getmtime(stuck)
+    assert survivor_mtime < 0.0, (
+        f"survivor mtime {survivor_mtime} is not strictly less than the "
+        "source file_mtime of 0.0, so the freshness guard would still "
+        "serve the previous owner's pixels"
+    )

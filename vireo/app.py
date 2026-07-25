@@ -3198,27 +3198,16 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
 
     _invalid_preview_cache_paths = set()
 
+    # Canonical definitions live in preview_cache so the recycled-rowid
+    # purge (which runs in the scanner, outside this app factory) writes
+    # the same marker _serve_preview's lazy-adoption branch consults.
     def _ensure_preview_cache_invalidations_table(db):
-        db.conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS preview_cache_invalidations (
-                photo_id INTEGER NOT NULL,
-                size INTEGER NOT NULL,
-                PRIMARY KEY (photo_id, size),
-                FOREIGN KEY (photo_id) REFERENCES photos(id) ON DELETE CASCADE
-            )
-            """,
-        )
+        from preview_cache import ensure_preview_cache_invalidations_table
+        ensure_preview_cache_invalidations_table(db)
 
     def _mark_preview_cache_invalid(db, photo_id, size, *, commit=True):
-        _ensure_preview_cache_invalidations_table(db)
-        db.conn.execute(
-            "INSERT OR IGNORE INTO preview_cache_invalidations (photo_id, size) "
-            "VALUES (?, ?)",
-            (photo_id, size),
-        )
-        if commit:
-            db.conn.commit()
+        from preview_cache import mark_preview_cache_invalid
+        mark_preview_cache_invalid(db, photo_id, size, commit=commit)
 
     def _clear_preview_cache_invalid(db, photo_id, size, *, commit=True):
         _ensure_preview_cache_invalidations_table(db)
@@ -3275,6 +3264,66 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             vireo_dir, "originals", f"{photo['id']}_{cache_key}.jpg",
         )
 
+    def _peg_render_mtime_to_source(cache_path, photo):
+        """Align a freshly written render's mtime to the photo's source.
+
+        ``_prepared_full_resolution_render`` rejects renders whose mtime
+        predates ``photos.file_mtime``. Renders are written with the wall
+        clock, so a source whose ``file_mtime`` is in the *future* — clock
+        skew on the machine that wrote it, archives that preserve future
+        timestamps — would fail that gate immediately and re-render on
+        every single request. ``serve_thumbnail`` already documents and
+        guards this exact trap; the cost here is a full-resolution decode
+        plus edit pipeline per request, so it matters more.
+
+        Use this for *signature-keyed* prepared renders only — the
+        signature already encodes the recipe and edit-math version, so
+        pegging to ``photos.file_mtime`` alone is enough. For the unedited
+        RAW display cache, use :func:`_peg_display_cache_mtime` instead;
+        that cache-hit check compares the file against
+        ``max(mtime(source), mtime(companion))``, so pegging to the row's
+        ``file_mtime`` here would fail the check on every request when a
+        paired companion has a later mtime than the RAW row.
+        """
+        source_mtime = photo["file_mtime"] if photo is not None else None
+        if source_mtime is None:
+            return
+        with contextlib.suppress(OSError, TypeError, ValueError):
+            os.utime(cache_path, (float(source_mtime), float(source_mtime)))
+
+    def _peg_display_cache_mtime(cache_path, source_paths):
+        """Align an unedited RAW display cache's mtime to its own hit check.
+
+        ``/photos/<id>/original`` decides the display cache is fresh when
+        its mtime is ``>= max(mtime(image_path), mtime(companion))``.
+        Renders are written with the wall clock, so if either live source
+        has a *future* mtime — clock skew, archives that preserve future
+        timestamps — the just-written cache fails the check the instant
+        it lands and every request re-decodes the RAW plus the companion
+        JPEG. And even without clock skew, pegging the display cache to
+        ``photos.file_mtime`` (the row's stored mtime for the RAW) would
+        fail the check whenever a paired companion JPEG has a later
+        filesystem mtime than the RAW row does, which is the common shape
+        for a fresh camera dump touched by any post-import step.
+
+        Peg to the same max the cache-hit check consults so a valid
+        render satisfies its own gate. Best-effort: a failed ``utime``
+        only costs the next request a re-render.
+        """
+        mtimes = []
+        for path in source_paths:
+            if not path:
+                continue
+            try:
+                mtimes.append(os.path.getmtime(path))
+            except OSError:
+                continue
+        if not mtimes:
+            return
+        peg = max(mtimes)
+        with contextlib.suppress(OSError, TypeError, ValueError):
+            os.utime(cache_path, (peg, peg))
+
     def _prepared_full_resolution_render(
         vireo_dir, photo, recipe, file_state=None,
     ):
@@ -3283,6 +3332,24 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         )
         try:
             if not os.path.isfile(cache_path) or os.path.getsize(cache_path) <= 0:
+                return None
+            # Same freshness gate ``serve_thumbnail`` uses. The signature
+            # hash already covers the normal invalidation case (a scan that
+            # updates ``file_mtime`` computes a different cache path), so
+            # this check is a no-op for legitimate renders — their mtime is
+            # the write time, which is by definition ``>= file_mtime``.
+            # It exists to reject a *surviving* render left over when a
+            # rowid is recycled and the new photo's signature happens to
+            # collide with a previous owner's: ``purge_cached_files_for_
+            # recycled_id`` backdates any undeletable survivor to mtime 0,
+            # and without this check ``/original`` would happily send the
+            # previous owner's pixels since the existence-and-size probe
+            # can't distinguish them from a fresh render.
+            source_mtime = photo["file_mtime"]
+            if (
+                source_mtime is not None
+                and os.path.getmtime(cache_path) < float(source_mtime)
+            ):
                 return None
         except OSError:
             return None
@@ -3316,6 +3383,24 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     log.warning(
                         "Failed to remove stale paired-source thumbnail %s",
                         variant,
+                        exc_info=True,
+                    )
+            # ``<pid>_regen.jpg`` / ``<pid>_raw_regen.jpg`` /
+            # ``<pid>_jpeg_regen.jpg`` are the sidecars ``serve_thumbnail``
+            # falls back to when the default couldn't be unlinked (a
+            # persistent lock). Without this pass, editing the recipe
+            # while the default stays locked leaves the sidecar carrying
+            # the pre-edit pixels; the freshness gate there compares
+            # against the unchanged source mtime and re-serves them.
+            for stem in (f"{pid}", f"{pid}_raw", f"{pid}_jpeg"):
+                sidecar = os.path.join(thumb_dir, f"{stem}_regen.jpg")
+                try:
+                    if os.path.exists(sidecar):
+                        os.remove(sidecar)
+                except OSError:
+                    log.warning(
+                        "Failed to remove stale regeneration sidecar %s",
+                        sidecar,
                         exc_info=True,
                     )
             if clear_thumb_path:
@@ -24728,7 +24813,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         next insert. Combined with delete paths that don't unlink cached
         files (``audit.remove_orphans``, folder consolidation in
         ``Database.consolidate_folders``, companion-pair dedup in
-        ``scanner._merge_companion_pair``), a JPEG at ``<id>.jpg`` can
+        ``scanner._pair_raw_jpeg_companions``), a JPEG at ``<id>.jpg`` can
         outlive its original photo and then be served as the thumbnail
         for an entirely different photo that later inherits that ID.
         Compare the cached file's mtime against the photo's
@@ -24794,6 +24879,9 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             f"{photo_id}_{pair_source}.jpg" if pair_source else filename
         )
         thumb_path = os.path.join(thumb_dir, cache_filename)
+        # Set when a locked stale thumbnail forces regeneration to the
+        # ``<id>_regen.jpg`` sidecar; the real ``<id>.jpg`` stays stale.
+        served_from_regen_sidecar = False
         try:
             selected_source_mtime = (
                 os.path.getmtime(pair_source_path)
@@ -24835,19 +24923,65 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             try:
                 os.remove(thumb_path)
             except OSError:
-                # If we can't unlink the stale file (Windows lock,
-                # permissions, antivirus quarantine), do NOT proceed to
-                # regen+utime: ``generate_thumbnail`` would short-circuit
-                # on the existing file and the subsequent ``os.utime``
-                # below would mark the stale image as fresh forever.
-                # Serve what's on disk this once and leave the mtime
-                # alone — next request will retry the unlink.
+                # We can't unlink the stale file (Windows lock,
+                # permissions, antivirus quarantine) and we must not
+                # regenerate over it: ``generate_thumbnail`` would
+                # short-circuit on the existing file and the ``os.utime``
+                # below would then mark the stale image fresh forever.
+                #
+                # Serving it is not an option either. This branch fires
+                # for recycled rowids, so those pixels belong to a
+                # *different photo* — and if the lock persists, every
+                # subsequent request serves them too. Showing another
+                # bird is worse than showing nothing.
+                #
+                # Regenerate to a sidecar and serve that instead. The
+                # ``{photo_id}_*`` shape means the recycled-id purge and
+                # the delete cleanup already sweep it.
+                stem, ext = os.path.splitext(cache_filename)
+                cache_filename = f"{stem}_regen{ext}"
+                served_from_regen_sidecar = True
+                thumb_path = os.path.join(thumb_dir, cache_filename)
                 log.warning(
-                    "Could not unlink stale thumbnail %s; serving stale "
-                    "file once. Next request will retry the unlink.",
-                    thumb_path, exc_info=True,
+                    "Could not unlink stale thumbnail %s; regenerating to "
+                    "%s rather than serving the previous owner's pixels.",
+                    os.path.join(thumb_dir, f"{stem}{ext}"), cache_filename,
+                    exc_info=True,
                 )
-                return _send_cached(thumb_dir, cache_filename)
+                try:
+                    sidecar_mtime = os.path.getmtime(thumb_path)
+                except FileNotFoundError:
+                    sidecar_mtime = None
+                if sidecar_mtime is not None and (
+                    selected_source_mtime is None
+                    or sidecar_mtime >= selected_source_mtime
+                ):
+                    return _send_cached(thumb_dir, cache_filename)
+                # A stale sidecar has to go before we fall through, for
+                # the same reason as the original: ``generate_thumbnail``
+                # short-circuits on an existing destination, so leaving it
+                # would return the previous owner's pixels and the
+                # ``os.utime(result, ...)`` below would then mark them
+                # fresh forever.
+                if sidecar_mtime is not None:
+                    with contextlib.suppress(OSError):
+                        os.remove(thumb_path)
+                    if os.path.exists(thumb_path):
+                        # Both the real thumbnail and the sidecar are
+                        # stale and undeletable, so there is nowhere in
+                        # the cache we can safely write. Every remaining
+                        # option would serve another photo's pixels;
+                        # answer honestly instead. The next request
+                        # retries both unlinks.
+                        log.error(
+                            "Photo %s has a stale thumbnail and a stale "
+                            "regeneration sidecar, neither of which could "
+                            "be removed (%s). Serving no thumbnail rather "
+                            "than the previous owner's pixels; clear the "
+                            "cache in Settings > Storage to recover.",
+                            photo_id, thumb_path,
+                        )
+                        return "", 404
 
         # Self-heal path: regenerate on miss (or stale) when the photo
         # still exists.
@@ -24989,6 +25123,13 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                                 _recipe_source_dimensions(photo)
                                 if render_recipe else None
                             ),
+                            # Must match the primary call's target: when a
+                            # locked stale thumbnail redirected us to the
+                            # sidecar, generating to the default
+                            # ``<id>.jpg`` would short-circuit on that
+                            # locked file and the os.utime below would pin
+                            # the previous owner's pixels as fresh.
+                            cache_name=cache_filename,
                         )
                         if result:
                             source = companion_abs
@@ -25007,6 +25148,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     cfg.load().get("thumbnail_quality", 85),
                     render_recipe,
                     vireo_dir,
+                    cache_name=cache_filename,
                 )
                 if result:
                     source = result
@@ -25048,7 +25190,17 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         # Persist on-disk presence so the dashboard's coverage query
         # (`thumb_path IS NOT NULL`) reflects this regeneration. Stored
         # value is the bare filename, matching ``thumbnails.generate_all``.
-        if not pair_source:
+        #
+        # Skipped when we fell back to the ``_regen`` sidecar: the real
+        # ``<id>.jpg`` is still the previous owner's locked, stale file.
+        # Recording it as done would tell the coverage dashboard and
+        # ``backfill_thumb_paths`` this photo has a valid thumbnail, so
+        # nothing would regenerate it once the lock clears — a pill
+        # claiming work is finished when the next run would not be a
+        # no-op is exactly what CORE_PHILOSOPHY forbids. Leaving the
+        # column NULL keeps the photo in the "needs a thumbnail" set,
+        # which is the truth.
+        if not pair_source and not served_from_regen_sidecar:
             try:
                 db.conn.execute(
                     "UPDATE photos SET thumb_path=? WHERE id=?",
@@ -27739,6 +27891,40 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             result["detection_conf"] = None
         return jsonify(result)
 
+    def _mask_file_is_db_backed(filename, mask_path):
+        """Whether a mask file on disk is actually this photo's.
+
+        ``masks/<id>.png`` and ``masks/<id>.<variant>.png`` are keyed by
+        bare photo id, and ``photos.id`` recycles freed rowids, so file
+        existence alone does not mean the file belongs to the photo now
+        holding that id. ``photo_masks`` rows cascade away with the photo,
+        so requiring one is what distinguishes "this photo's mask" from
+        "a mask the previous owner of this rowid left behind" — and unlike
+        a timestamp check it can't be fooled by a stale file that happens
+        to be newer than the new photo's source.
+
+        Files whose name doesn't start with a photo id aren't id-keyed and
+        are served as before.
+        """
+        m = re.match(r"^(\d+)[._]", filename)
+        if not m:
+            return True
+        pid = int(m.group(1))
+        db = _get_db()
+        real = os.path.realpath(mask_path)
+        for row in db.conn.execute(
+            "SELECT path FROM photo_masks WHERE photo_id = ?", (pid,)
+        ):
+            if row["path"] and os.path.realpath(row["path"]) == real:
+                return True
+        row = db.conn.execute(
+            "SELECT mask_path FROM photos WHERE id = ?", (pid,)
+        ).fetchone()
+        return bool(
+            row and row["mask_path"]
+            and os.path.realpath(row["mask_path"]) == real
+        )
+
     @app.route("/masks/<filename>")
     def serve_mask(filename):
         """Serve mask PNG files.
@@ -27752,7 +27938,9 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         """
         masks_dir = os.path.join(os.path.dirname(db_path), "masks")
         mask_path = os.path.join(masks_dir, filename)
-        if os.path.exists(mask_path):
+        if os.path.exists(mask_path) and _mask_file_is_db_backed(
+            filename, mask_path,
+        ):
             return send_from_directory(masks_dir, filename)
 
         m = re.match(r"^(\d+)\.png$", filename)
@@ -30206,6 +30394,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             try:
                 img.save(tmp_path, format="JPEG", quality=quality)
                 os.replace(tmp_path, cache_path)
+                _peg_render_mtime_to_source(cache_path, photo)
             except Exception:
                 with contextlib.suppress(OSError):
                     os.unlink(tmp_path)
@@ -30280,6 +30469,13 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 live_source_path=image_path, folder_path=folder["path"],
             )
         )
+        # Preserve the resolved RAW path before the RAW-failure branch
+        # below rewrites ``image_path`` to the companion. The display
+        # cache-hit check on the next request reconstructs both live
+        # sources and pegs against their max, so passing only the
+        # companion into ``_peg_display_cache_mtime`` would fail the
+        # gate whenever the RAW is newer and re-extract on every hit.
+        raw_source_path = image_path
         if has_current_raw_failure:
             if (
                 resolved_ext in RAW_EXTENSIONS
@@ -30358,6 +30554,21 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 if extracted and tmp_path:
                     os.replace(tmp_path, wc_abs)
                     tmp_path = None
+                    # The display cache-hit check compares against
+                    # ``max(mtime(image_path), mtime(companion))``.
+                    # Leaving wall-clock mtime here fails that check
+                    # whenever either live source has a future mtime
+                    # (clock skew, archives that preserve future
+                    # timestamps), and every request re-decodes the RAW
+                    # and companion. Peg to the same max the check
+                    # consults. Use ``raw_source_path`` — the RAW resolved
+                    # before the has_current_raw_failure branch rewrote
+                    # ``image_path`` to the companion — so a newer RAW
+                    # mtime doesn't fail the gate and re-extract on every
+                    # hit.
+                    _peg_display_cache_mtime(
+                        wc_abs, (raw_source_path, companion_for_extraction),
+                    )
                 return extracted
             finally:
                 if tmp_path:
@@ -30555,6 +30766,18 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         try:
             img.save(tmp_path, format="JPEG", quality=quality)
             os.replace(tmp_path, cache_path)
+            if primary_is_raw:
+                # The unedited RAW display cache-hit check compares
+                # against ``max(mtime(image_path), mtime(companion))``.
+                # Pegging to ``photo['file_mtime']`` alone (as the
+                # signature-keyed prepared render does) would fail that
+                # check on every request when the paired companion is
+                # newer than the RAW row.
+                _peg_display_cache_mtime(
+                    cache_path, (image_path, companion_for_extraction),
+                )
+            else:
+                _peg_render_mtime_to_source(cache_path, photo)
         except Exception:
             with contextlib.suppress(OSError):
                 os.unlink(tmp_path)

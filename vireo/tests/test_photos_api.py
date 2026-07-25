@@ -1758,6 +1758,106 @@ def test_unedited_raw_original_uses_camera_display_cache_not_working_copy(
     assert db.get_photo(photo_id)["working_copy_path"] == f"working/{photo_id}.jpg"
 
 
+def test_unedited_raw_display_cache_survives_when_companion_is_newer_than_raw_row(
+    app_and_db, monkeypatch, tmp_path,
+):
+    """The written display cache must satisfy its own hit check.
+
+    ``/photos/<id>/original`` treats ``originals/<id>.display.jpg`` as a
+    hit only when its mtime is ``>= max(mtime(image_path), mtime(companion))``.
+    Pegging the cache to ``photos.file_mtime`` (the row's stored RAW
+    mtime) would fail that check whenever a paired companion JPEG has a
+    later filesystem mtime than the RAW row does — the common shape for
+    any post-import step that touches the JPEG — and every request would
+    re-decode the RAW plus the companion again.
+
+    Verify that a second request reuses the cache when the companion is
+    newer than the RAW row's stored mtime.
+    """
+    import io
+
+    import image_loader
+    from PIL import Image
+
+    app, db = app_and_db
+    client = app.test_client()
+    photo = db.get_photos()[0]
+    photo_id = photo["id"]
+
+    source_dir = tmp_path / "raw-source"
+    source_dir.mkdir()
+    raw_path = source_dir / "DSC_0001.NEF"
+    raw_path.write_bytes(b"fake raw")
+    companion_path = source_dir / "DSC_0001.JPG"
+    Image.new("RGB", (800, 600), (200, 50, 50)).save(
+        str(companion_path), "JPEG",
+    )
+
+    raw_mtime = os.path.getmtime(str(raw_path))
+    # Companion is deliberately newer than the RAW row's file_mtime — the
+    # exact case that codex flagged. Also ensure the RAW row's stored
+    # mtime is behind the companion's actual filesystem mtime.
+    later = raw_mtime + 3600
+    os.utime(str(companion_path), (later, later))
+
+    db.conn.execute(
+        "UPDATE folders SET path=? WHERE id=?",
+        (str(source_dir), photo["folder_id"]),
+    )
+    db.conn.execute(
+        """UPDATE photos
+           SET filename='DSC_0001.NEF', extension='.nef',
+               width=800, height=600,
+               companion_path='DSC_0001.JPG',
+               file_mtime=?
+           WHERE id=?""",
+        (raw_mtime, photo_id),
+    )
+    db.conn.commit()
+
+    calls = []
+
+    def camera_extract(source, output, **kwargs):
+        calls.append((os.fspath(source), os.fspath(output), kwargs))
+        Image.new("RGB", (800, 600), (220, 220, 220)).save(output, "JPEG")
+        return True
+
+    monkeypatch.setattr(image_loader, "extract_working_copy", camera_extract)
+
+    first = client.get(f"/photos/{photo_id}/original")
+    assert first.status_code == 200
+    assert len(calls) == 1
+
+    vireo_dir = os.path.dirname(app.config["THUMB_CACHE_DIR"])
+    display_path = os.path.join(
+        vireo_dir, "originals", f"{photo_id}.display.jpg",
+    )
+    assert os.path.exists(display_path)
+    display_mtime = os.path.getmtime(display_path)
+
+    # The core defect: the just-written cache must satisfy its own
+    # hit check. If it doesn't, the second request re-extracts.
+    max_source_mtime = max(
+        os.path.getmtime(str(raw_path)),
+        os.path.getmtime(str(companion_path)),
+    )
+    assert display_mtime >= max_source_mtime, (
+        f"display cache mtime {display_mtime} is behind max source "
+        f"mtime {max_source_mtime}; every /original request will "
+        "re-decode the RAW plus companion"
+    )
+
+    second = client.get(f"/photos/{photo_id}/original")
+    assert second.status_code == 200
+    assert len(calls) == 1, (
+        "second /original request re-extracted instead of reusing the "
+        "display cache — the peg to the RAW row's mtime made the cache "
+        "fail its own hit check under a newer companion"
+    )
+    with Image.open(io.BytesIO(second.data)) as rendered:
+        assert rendered.getpixel((0, 0))[0] > 200
+
+
 def test_original_trusts_raw_working_copy_even_when_smaller_than_stored_dims(
     app_and_db, monkeypatch,
 ):
@@ -9033,20 +9133,57 @@ def test_legacy_serve_mask_404_when_no_active_variant(app_and_db):
     assert resp.status_code == 404
 
 
-def test_legacy_serve_mask_direct_file_still_served(app_and_db):
-    """A literal ``{pid}.png`` on disk (legacy backfill) is served as-is."""
+def test_legacy_serve_mask_direct_file_served_when_db_backed(app_and_db):
+    """A literal ``{pid}.png`` is served when a ``photo_masks`` row owns it."""
+    import os as _os
+    app, db = app_and_db
+    pid = db.get_photos()[0]["id"]
+    masks_dir = _os.path.join(_os.path.dirname(db._db_path), "masks")
+    _os.makedirs(masks_dir, exist_ok=True)
+    mask_file = _os.path.join(masks_dir, f"{pid}.png")
+    with open(mask_file, "wb") as fh:
+        fh.write(b"LEGACYDIRECT")
+    db.upsert_photo_mask(
+        photo_id=pid, variant="legacy", path=mask_file,
+        detector_model="md", prompt_x=0, prompt_y=0, prompt_w=0, prompt_h=0,
+    )
+
+    client = app.test_client()
+    resp = client.get(f"/masks/{pid}.png")
+    assert resp.status_code == 200
+    assert resp.data == b"LEGACYDIRECT"
+
+
+def test_serve_mask_404s_a_file_no_db_row_claims(app_and_db):
+    """An id-keyed mask with no DB row behind it must not be served.
+
+    ``masks/<id>.png`` is keyed by bare photo id and ``photos.id`` recycles
+    freed rowids, so existence alone doesn't mean the file belongs to the
+    photo now holding that id — and ``photo_masks`` rows cascade away with
+    the deleted photo, which is exactly what makes their absence the
+    signal. Serving on existence let the inspect overlay show the previous
+    owner's mask indefinitely; an mtime check can't catch it either, since
+    a recently written mask beats an old capture's source timestamp.
+
+    This tightens the old "legacy backfill is served as-is" contract. On
+    the real library that contract was protecting stale data: of 916
+    unreferenced bare mask files, 915 belonged to dead photo ids and one
+    to a live photo.
+    """
     import os as _os
     app, db = app_and_db
     pid = db.get_photos()[0]["id"]
     masks_dir = _os.path.join(_os.path.dirname(db._db_path), "masks")
     _os.makedirs(masks_dir, exist_ok=True)
     with open(_os.path.join(masks_dir, f"{pid}.png"), "wb") as fh:
-        fh.write(b"LEGACYDIRECT")
+        fh.write(b"PREVIOUS-TENANT-MASK")
 
     client = app.test_client()
     resp = client.get(f"/masks/{pid}.png")
-    assert resp.status_code == 200
-    assert resp.data == b"LEGACYDIRECT"
+    assert resp.status_code == 404, (
+        "a mask file no DB row claims was served; a recycled rowid would "
+        "show the previous owner's mask in the inspect overlay"
+    )
 
 
 def test_api_serve_mask_rejects_path_outside_masks_dir(app_and_db, tmp_path):

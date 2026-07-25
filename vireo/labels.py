@@ -396,6 +396,16 @@ def load_merged_labels(label_sets):
     UNIQUE row, and the alternative's INSERT-OR-IGNORE re-queries that row
     and upserts ``prediction_review.status = 'alternative'`` -- hiding the
     only top-1 prediction from the pending review queue.
+
+    The fold decides only which of two COLLIDING spellings to drop; a label
+    whose folded key is unique keeps its original source spelling. That
+    distinction matters because ``compute_fingerprint(labels)`` hashes this
+    exact list and ``classifier_runs`` is keyed on the result: rewriting a
+    non-colliding label (e.g. the lone `Bosc's Fringe-toed lizard` in
+    california-us-reptiles, or `'Anianiau` in the Hawaii set) would change
+    the fingerprint of five of the six shipped label sets and strand ~70k
+    cached runs, re-running inference over the whole catalog for no dedupe
+    benefit.
     """
     # Import here rather than at module load: ``labels.py`` is imported
     # from environments (packaging, first-run bootstrap) that don't yet
@@ -412,8 +422,27 @@ def load_merged_labels(label_sets):
         with open(path) as f:
             for line in f:
                 name = line.strip()
-                if not name:
-                    continue
-                canonical = normalize_keyword_display(name)
-                all_species.add(canonical if canonical else name)
-    return sorted(all_species)
+                if name:
+                    all_species.add(name)
+    # Group by the fold key, then collapse only the groups that actually
+    # have more than one spelling. Sorting the group makes the survivor
+    # deterministic regardless of label-set order.
+    by_key = {}
+    for name in all_species:
+        by_key.setdefault(normalize_keyword_display(name) or name, []).append(
+            name
+        )
+    merged = []
+    for canonical, variants in by_key.items():
+        if len(variants) == 1:
+            # No collision: preserve the source spelling so the fingerprint
+            # is byte-identical to what earlier runs hashed.
+            merged.append(variants[0])
+        else:
+            # Genuine variant collision: keep the folded spelling, which is
+            # what add_prediction will store, so the classifier's label and
+            # the persisted species agree.
+            merged.append(
+                canonical if canonical in variants else sorted(variants)[0]
+            )
+    return sorted(merged)

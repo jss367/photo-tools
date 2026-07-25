@@ -176,6 +176,38 @@ def test_load_merged_labels_dedupes_apostrophe_variants(tmp_path):
     )
 
 
+def test_load_merged_labels_preserves_spelling_without_collision(tmp_path):
+    """A curly-apostrophe label with no ASCII twin keeps its source spelling.
+
+    ``compute_fingerprint(labels)`` hashes this exact list and
+    ``classifier_runs`` is keyed on the result, so rewriting a label that
+    has nothing to dedupe against changes the fingerprint of the label set
+    and strands every cached run — re-running inference over the whole
+    catalog for no benefit. Five of the six shipped label sets contain such
+    lone variants (`Bosc’s Fringe-toed lizard`, `Geoffroy’s Tamarin`,
+    `'Anianiau`), which together account for ~70k cached runs.
+    """
+    from labels_fingerprint import compute_fingerprint
+
+    dir_ = str(tmp_path / "labels")
+    os.makedirs(dir_)
+
+    txt = os.path.join(dir_, "reptiles.txt")
+    with open(txt, "w", encoding="utf-8") as f:
+        f.write("Bosc’s Fringe-toed lizard\nGeyr’s Spiny-tailed Lizard\n"
+                "'Anianiau\nSkink\n")
+
+    raw = ["'Anianiau", "Bosc’s Fringe-toed lizard",
+           "Geyr’s Spiny-tailed Lizard", "Skink"]
+    result = load_merged_labels([{"labels_file": txt}])
+
+    assert result == sorted(raw), (
+        "labels with no folded-key collision must keep their source "
+        f"spelling so the fingerprint stays stable — got {result}"
+    )
+    assert compute_fingerprint(result) == compute_fingerprint(sorted(raw))
+
+
 def test_load_merged_labels_preserves_okina_letters(tmp_path):
     """The apostrophe fold in ``normalize_keyword_display`` deliberately
     excludes the Hawaiian okina (U+02BB, category Lm — a letter, not

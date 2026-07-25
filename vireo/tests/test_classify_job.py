@@ -5540,3 +5540,114 @@ def test_store_match_alt_that_only_differs_in_case_preserves_auto_accept(
     )
     assert rows[0]["status"] == "accepted"
     assert rows[0]["individual"] == AUTO_MATCH_REVIEW_MARKER
+
+
+def test_store_match_alt_non_ascii_case_preserves_both_predictions(tmp_path):
+    """SQLite ``COLLATE NOCASE`` and ``keyword_match_key`` fold only A-Z, so
+    ``Éclair`` and ``éclair`` are distinct keywords on the DB side.
+    ``str.lower()`` would collapse them into one dedupe key and drop the
+    alternative; the ASCII-only fold used by ``_species_match_key`` must
+    preserve both predictions so the alternative reaches the UI.
+    """
+    from classify_job import _store_match_prediction
+    from db import Database
+
+    db = Database(str(tmp_path / "test.db"))
+    ws_id = db.ensure_default_workspace()
+    db.set_active_workspace(ws_id)
+    fid = db.add_folder("/photos", name="photos")
+    pid = db.add_photo(folder_id=fid, filename="bird.jpg", extension=".jpg",
+                       file_size=1000, file_mtime=1.0)
+    det_ids = db.save_detections(pid, [
+        {"box": {"x": 0.1, "y": 0.1, "w": 0.5, "h": 0.5}, "confidence": 0.9}
+    ], detector_model="megadetector-v6")
+
+    item = {
+        "detection_id": det_ids[0],
+        "prediction": "Éclair",
+        "confidence": 0.85,
+        "taxonomy": None,
+        "alternatives": [
+            # Non-ASCII case difference only. SQLite treats these as
+            # distinct rows; a Python ``str.lower()`` dedupe would drop
+            # this alternative and hide it from the user.
+            {"species": "éclair", "confidence": 0.10, "taxonomy": None},
+        ],
+    }
+    _store_match_prediction(
+        db, item, model_name="test-model", labels_fingerprint="fp1",
+    )
+
+    species = sorted(
+        r["species"]
+        for r in db.conn.execute(
+            "SELECT species FROM predictions WHERE detection_id = ?",
+            (det_ids[0],),
+        ).fetchall()
+    )
+    assert species == ["Éclair", "éclair"], (
+        "non-ASCII case variants are distinct rows under COLLATE NOCASE; "
+        "the alternative must not be deduped away by a Unicode ``.lower()``"
+    )
+
+
+def test_burst_consensus_non_ascii_case_variants_stay_split(tmp_path):
+    """Two burst frames predicting ``Éclair`` and ``éclair`` are distinct
+    species under SQLite ``COLLATE NOCASE``. A Python ``.lower()`` fold
+    would report them as one unanimous species; the ASCII-only fold used
+    by ``_species_match_key`` must keep them separate so ``group_species``
+    has two entries and ``group_reviewable`` stays False (no group_id or
+    inflated vote count on the stored predictions).
+    """
+    from datetime import datetime
+    from unittest.mock import MagicMock
+
+    from classify_job import _store_grouped_predictions
+
+    mock_db = MagicMock()
+
+    raw_results = [
+        {
+            "photo": {"id": 1, "filename": "a.jpg"},
+            "detection_id": 201,
+            "folder_path": "/photos",
+            "prediction": "Éclair",
+            "confidence": 0.95,
+            "timestamp": datetime(2024, 1, 15, 10, 0, 0),
+            "filename": "a.jpg",
+            "embedding": None,
+            "taxonomy": None,
+        },
+        {
+            "photo": {"id": 2, "filename": "b.jpg"},
+            "detection_id": 202,
+            "folder_path": "/photos",
+            "prediction": "éclair",
+            "confidence": 0.90,
+            "timestamp": datetime(2024, 1, 15, 10, 0, 3),
+            "filename": "b.jpg",
+            "embedding": None,
+            "taxonomy": None,
+        },
+    ]
+
+    _store_grouped_predictions(
+        raw_results=raw_results,
+        job_id="classify-test",
+        model_name="BioCLIP",
+        grouping_window=10,
+        similarity_threshold=0.85,
+        tax=None,
+        db=mock_db,
+    )
+
+    calls = mock_db.add_prediction.call_args_list
+    assert len(calls) == 2
+    for c in calls:
+        kwargs = c.kwargs or c[1]
+        assert kwargs["group_id"] is None, (
+            "non-ASCII case variants are distinct species; the burst must "
+            "not collapse to a single group_id via ``.lower()``"
+        )
+        assert kwargs["vote_count"] is None
+        assert kwargs["individual"] is None

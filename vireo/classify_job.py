@@ -31,7 +31,7 @@ except ImportError:
     load_working_image = None
 
 from db import AUTO_MATCH_REVIEW_MARKER, Database, commit_with_retry
-from keyword_normalization import normalize_keyword_display
+from keyword_normalization import _ASCII_LOWER_TABLE, normalize_keyword_display
 from models import get_active_model, get_models
 
 
@@ -47,6 +47,21 @@ def _folded_species_key(species):
         return None
     folded = normalize_keyword_display(species)
     return folded if folded else species
+
+
+def _species_match_key(species):
+    """Return the equivalence key used to dedupe species names.
+
+    Mirrors ``keyword_match_key`` / SQLite ``COLLATE NOCASE``: strip and
+    ASCII-only case fold. Python's ``str.lower()`` folds non-ASCII pairs
+    such as ``É``/``é`` and ``Maße``/``masse`` that SQLite treats as
+    distinct, so using it here would silently drop a legitimate second
+    prediction row or collapse two distinct-per-DB burst species into
+    one consensus vote.
+    """
+    return (_folded_species_key(species) or "").strip().translate(
+        _ASCII_LOWER_TABLE,
+    )
 
 try:
     from classifier import ClassificationCancelled, Classifier
@@ -1425,16 +1440,20 @@ def _store_match_prediction(
         # review). Dedupe on the same normalized key ``add_prediction`` uses
         # so alternatives-that-are-actually-the-primary stay unwritten.
         #
-        # Comparison is case-insensitive (``.strip().lower()``): downstream
-        # keyword joins already use SQLite ``COLLATE NOCASE`` (see
-        # ``_fold_prediction_species_apostrophes``), so a merged label set
-        # yielding primary `Say's Phoebe` and alternative `Say's phoebe`
-        # is semantically one bird — but ``_folded_species_key`` preserves
-        # case, letting them survive as two BINARY-unique rows with the
-        # alternative overwriting the primary's review to ``alternative``.
-        seen_species = {(_folded_species_key(species) or "").strip().lower()}
+        # Comparison uses ``_species_match_key`` (ASCII-only case fold):
+        # downstream keyword joins already use SQLite ``COLLATE NOCASE``
+        # (see ``_fold_prediction_species_apostrophes``), so a merged
+        # label set yielding primary `Say's Phoebe` and alternative
+        # `Say's phoebe` is semantically one bird — but
+        # ``_folded_species_key`` preserves case, letting them survive as
+        # two BINARY-unique rows with the alternative overwriting the
+        # primary's review to ``alternative``. ``str.lower()`` folds
+        # non-ASCII case pairs (``Éclair``/``éclair``, ``Maße``/``masse``)
+        # that the DB treats as distinct, so it would silently drop a
+        # legitimate second alternative.
+        seen_species = {_species_match_key(species)}
         for alt in item.get("alternatives", []):
-            alt_key = (_folded_species_key(alt["species"]) or "").strip().lower()
+            alt_key = _species_match_key(alt["species"])
             if alt_key in seen_species:
                 continue
             seen_species.add(alt_key)
@@ -1608,16 +1627,15 @@ def _store_pending_detection_prediction(
     )
     # See _store_match_prediction for why alternatives are deduped by the
     # same normalized key that ``add_prediction`` uses (and why the
-    # comparison is case-insensitive): without this, an alternative that
-    # folds to the primary — including one that differs only by ASCII
-    # capitalization — would upsert the primary's prediction_review row to
+    # comparison uses the ASCII-only ``_species_match_key`` rather than
+    # ``str.lower``): without this, an alternative that folds to the
+    # primary — including one that differs only by ASCII capitalization —
+    # would upsert the primary's prediction_review row to
     # ``status='alternative'``, hiding the only top-1 prediction from the
     # pending queue.
-    seen_species = {
-        (_folded_species_key(item["prediction"]) or "").strip().lower()
-    }
+    seen_species = {_species_match_key(item["prediction"])}
     for alt in item.get("alternatives", []):
-        alt_key = (_folded_species_key(alt["species"]) or "").strip().lower()
+        alt_key = _species_match_key(alt["species"])
         if alt_key in seen_species:
             continue
         seen_species.add(alt_key)
@@ -1717,24 +1735,35 @@ def _store_grouped_predictions(
             # `_folded_species_key` still returns two distinct case
             # variants. `consensus_prediction` keys on the raw string, so
             # a semantically unanimous burst gets split votes such as
-            # `1/2`, while `group_species` below already lowercases and
+            # `1/2`, while `group_species` below already ASCII-folds and
             # would declare it reviewable — a mismatch that stores split
             # `individual` entries and a wrong vote count. Canonicalize
             # to the first-seen casing for each ASCII-lowercase key so
             # the count sums correctly while `individual_predictions`
             # still shows a real display-cased species name.
+            #
+            # ASCII-only case fold (``_ASCII_LOWER_TABLE``) rather than
+            # ``.lower()``: SQLite ``COLLATE NOCASE`` and
+            # ``keyword_match_key`` treat non-ASCII case pairs such as
+            # ``Éclair``/``éclair`` as distinct, so ``.lower()`` here
+            # would canonicalize them into one species and inflate a
+            # burst into a spuriously unanimous vote.
             _canonical_case = {}
             for item in group:
                 key = _folded_species_key(item.get("prediction"))
                 if key is None:
                     continue
-                _canonical_case.setdefault(key.strip().lower(), key)
+                _canonical_case.setdefault(
+                    key.strip().translate(_ASCII_LOWER_TABLE), key,
+                )
 
             def _cons_key(species, _canon=_canonical_case):
                 folded = _folded_species_key(species)
                 if folded is None:
                     return folded
-                return _canon.get(folded.strip().lower(), folded)
+                return _canon.get(
+                    folded.strip().translate(_ASCII_LOWER_TABLE), folded,
+                )
 
             cons_input = [
                 {
@@ -1748,7 +1777,7 @@ def _store_grouped_predictions(
                 continue
 
             group_species = {
-                (_folded_species_key(item.get("prediction")) or "").strip().lower()
+                _species_match_key(item.get("prediction"))
                 for item in group
                 if item.get("prediction")
             }

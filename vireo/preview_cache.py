@@ -36,6 +36,8 @@ def cleanup_cached_files_for_deleted_photos(
     preview_dir = os.path.join(vireo_dir, "previews")
     working_dir = os.path.join(vireo_dir, "working")
     originals_dir = os.path.join(vireo_dir, "originals")
+    masks_dir = os.path.join(vireo_dir, "masks")
+    edit_masks_dir = os.path.join(vireo_dir, "edit-masks")
     # Offline-cache layout: offline/{originals,xmp,companions}/{pid}{ext}.
     # The FK cascade drops the offline_originals row when the photo is
     # deleted, so we lose the exact stored paths — glob by photo id to
@@ -117,8 +119,87 @@ def cleanup_cached_files_for_deleted_photos(
                         "Cache: %s",
                         orphan, e,
                     )
+        # Subject masks (``masks/{pid}.png``, ``masks/{pid}.{variant}.png``)
+        # and local-adjustment snapshots (``edit-masks/{pid}.{ref}.png``)
+        # are id-keyed like everything above. photos.mask_path goes away
+        # with the row, so a leftover file is invisible to the DB but is
+        # picked back up by any photo that later inherits the id — the
+        # renderer would apply another photo's mask to the local pass.
+        for d in (masks_dir, edit_masks_dir):
+            for orphan in _glob.glob(os.path.join(d, f"{pid}.png")) + _glob.glob(
+                os.path.join(d, f"{pid}.*.png")
+            ):
+                try:
+                    os.remove(orphan)
+                except OSError as e:
+                    log.warning(
+                        "Failed to remove mask file %s after photo delete "
+                        "— will be reclaimed by Clear Cache: %s",
+                        orphan, e,
+                    )
         if progress_callback:
             progress_callback(idx, total, f.get("filename") or str(pid))
+
+
+def _recycled_id_probe_paths(thumb_cache_dir, photo_id):
+    """One exact (non-globbed) path per id-keyed derivative family.
+
+    Used as a cheap existence probe before the full globbing purge — see
+    ``purge_cached_files_for_recycled_id``.
+    """
+    vireo_dir = os.path.dirname(thumb_cache_dir)
+    return (
+        os.path.join(thumb_cache_dir, f"{photo_id}.jpg"),
+        os.path.join(vireo_dir, "working", f"{photo_id}.jpg"),
+        os.path.join(vireo_dir, "previews", f"{photo_id}.jpg"),
+        os.path.join(vireo_dir, "originals", f"{photo_id}.display.jpg"),
+        os.path.join(vireo_dir, "masks", f"{photo_id}.png"),
+    )
+
+
+def purge_cached_files_for_recycled_id(thumb_cache_dir, photo_id):
+    """Drop any cached derivative left over from a previous owner of ``photo_id``.
+
+    ``photos.id`` is ``INTEGER PRIMARY KEY`` *without* ``AUTOINCREMENT``,
+    so SQLite hands the next insert ``max(rowid) + 1`` — the ids freed by
+    deleting the highest-numbered rows get handed straight back out. Every
+    derivative in ``~/.vireo`` is keyed by bare photo id
+    (``thumbnails/<id>.jpg``, ``working/<id>.jpg``, ``masks/<id>.png``, …),
+    so a new photo that inherits a freed id silently adopts the *previous*
+    photo's pixels: the Life List card for a gull renders whatever bird
+    used to own that row.
+
+    Delete paths are supposed to unlink these files, but several
+    (``Database._merge_into_existing``, ``scanner._merge_companion_pair``,
+    ``audit.remove_orphans``) drop photo rows with raw SQL and leave the
+    cache behind, and any unlink that fails leaves an orphan too. Rather
+    than trusting every delete site, ingest re-checks at the one moment
+    the collision can actually happen — when a brand-new row claims a
+    rowid.
+
+    Returns ``True`` when something was purged. The caller uses that to
+    schedule the batched untracked-preview sweep, which is too expensive
+    to run per-photo.
+
+    The probe is 5 ``stat`` calls; only ids that actually collide pay for
+    the globbing purge, so a first scan of a fresh library adds ~nothing.
+    """
+    if not thumb_cache_dir:
+        return False
+    if not any(
+        os.path.exists(p)
+        for p in _recycled_id_probe_paths(thumb_cache_dir, photo_id)
+    ):
+        return False
+    log.info(
+        "Photo %s reused a freed rowid with cached derivatives still on "
+        "disk — purging them so the new photo renders its own pixels",
+        photo_id,
+    )
+    cleanup_cached_files_for_deleted_photos(
+        thumb_cache_dir, [{"photo_id": photo_id}],
+    )
+    return True
 
 
 def evict_if_over_quota(db, vireo_dir):

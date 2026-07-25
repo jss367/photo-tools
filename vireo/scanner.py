@@ -27,6 +27,10 @@ from image_loader import (
 from keyword_normalization import keyword_match_key
 from metadata import EXIF_SUMMARY_COLUMNS, exif_summary_columns, extract_metadata
 from PIL import Image
+from preview_cache import (
+    cleanup_cached_files_for_deleted_photos,
+    purge_cached_files_for_recycled_id,
+)
 from render_source import exif_orientation as _exif_orientation_from_data
 from render_source import is_undersized
 from xmp import read_hierarchical_keywords, read_keywords
@@ -587,6 +591,15 @@ def _pair_raw_jpeg_companions(db, vireo_dir=None, thumb_cache_dir=None):
         # Remove keyword associations then the duplicate JPEG record
         db.conn.execute("DELETE FROM photo_keywords WHERE photo_id = ?", (companion["id"],))
         db.conn.execute("DELETE FROM photos WHERE id = ?", (companion["id"],))
+        # The companion's rowid is now free for SQLite to hand to the next
+        # insert. Unlink its derivatives here so the next photo to inherit
+        # the id can't adopt the companion's thumbnail / working copy /
+        # masks (see ``purge_cached_files_for_recycled_id``).
+        if vireo_dir:
+            cleanup_cached_files_for_deleted_photos(
+                thumb_cache_dir or os.path.join(vireo_dir, "thumbnails"),
+                [{"photo_id": companion["id"]}],
+            )
 
     commit_with_retry(db.conn)
 
@@ -2083,10 +2096,11 @@ def scan(root, db, progress_callback=None, incremental=False, extract_full_metad
                 longitude = exif_group.get("GPSLongitude")
 
             # Pre-check: capture prior content identity AND whether the
-            # row existed before add_photo touches it. Brand-new rows
-            # have no derived caches to flush — skipping invalidation
-            # for them avoids O(N) wasted UPDATE + commit round-trips on
-            # large initial scans.
+            # row existed before add_photo touches it. Existing rows take
+            # the content-change invalidation below; brand-new rows take
+            # the cheaper recycled-rowid probe right after the insert, so
+            # a large initial scan doesn't pay for O(N) UPDATE + commit
+            # round-trips it has no reason to make.
             existing_row = db.conn.execute(
                 "SELECT file_hash, flag FROM photos WHERE folder_id = ? AND filename = ?",
                 (folder_id, image_path.name),
@@ -2118,6 +2132,21 @@ def scan(root, db, progress_callback=None, incremental=False, extract_full_metad
                 width=width,
                 height=height,
             )
+
+            # A brand-new row may have claimed a *recycled* rowid (see
+            # ``purge_cached_files_for_recycled_id``). Cached derivatives
+            # from the id's previous owner would otherwise be served as
+            # this photo's — a wrong-bird Life List card. Cheap stat probe
+            # per insert; only actual collisions do real work.
+            if (
+                not row_already_existed
+                and vireo_dir
+                and purge_cached_files_for_recycled_id(
+                    thumb_cache_dir or os.path.join(vireo_dir, "thumbnails"),
+                    photo_id,
+                )
+            ):
+                invalidated_photo_ids.add(photo_id)
 
             # Update metadata columns (also fixes existing photos that were
             # inserted before ExifTool metadata was available)

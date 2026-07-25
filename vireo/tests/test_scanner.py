@@ -4243,3 +4243,163 @@ def test_scan_recursive_raises_permission_error_without_callback(
     db = Database(str(tmp_path / "test.db"))
     with pytest.raises(PermissionError):
         scan(root, db)
+
+
+# ---------------------------------------------------------------------------
+# Recycled rowid → stale derived caches
+# ---------------------------------------------------------------------------
+
+
+def _seed_derivative_files(vireo_dir, thumb_dir, photo_id, marker=b"previous-tenant"):
+    """Write one file per id-keyed derivative family for ``photo_id``."""
+    paths = {
+        "thumb": os.path.join(thumb_dir, f"{photo_id}.jpg"),
+        "thumb_variant": os.path.join(thumb_dir, f"{photo_id}_raw.jpg"),
+        "working": os.path.join(vireo_dir, "working", f"{photo_id}.jpg"),
+        "preview": os.path.join(vireo_dir, "previews", f"{photo_id}_1920.jpg"),
+        "display": os.path.join(
+            vireo_dir, "originals", f"{photo_id}.display.jpg"
+        ),
+        "mask": os.path.join(vireo_dir, "masks", f"{photo_id}.png"),
+        "mask_variant": os.path.join(
+            vireo_dir, "masks", f"{photo_id}.sam2-large.png"
+        ),
+        "edit_mask": os.path.join(
+            vireo_dir, "edit-masks", f"{photo_id}.abcdef012345.png"
+        ),
+    }
+    for path in paths.values():
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as fh:
+            fh.write(marker)
+    return paths
+
+
+def test_scan_purges_derived_caches_when_new_photo_reuses_a_freed_rowid(
+    tmp_path,
+):
+    """A new photo that inherits a freed rowid must not inherit its cache.
+
+    ``photos.id`` is INTEGER PRIMARY KEY without AUTOINCREMENT, so SQLite
+    hands the next insert ``max(rowid) + 1`` — delete the highest-numbered
+    rows and those ids come straight back. Every derivative in ``~/.vireo``
+    is keyed by bare photo id, so if a delete path left the files behind
+    (several drop photo rows with raw SQL and do), the next photo to claim
+    the id renders the *previous* photo's pixels — the wrong bird on a
+    Life List card. Ingest is the one place the collision is observable,
+    so it re-checks there.
+    """
+    from db import Database
+    from scanner import scan
+
+    root = str(tmp_path / "photos")
+    _create_test_images(root, {'': ['gull.jpg']})
+    vireo_dir = str(tmp_path / "vireo")
+    thumb_dir = os.path.join(vireo_dir, "thumbnails")
+
+    db = Database(str(tmp_path / "test.db"))
+    # Claim (and free) a rowid so the real scan's insert reuses it.
+    placeholder_folder = db.add_folder(str(tmp_path / "gone"), name="gone")
+    doomed_id = db.add_photo(
+        folder_id=placeholder_folder, filename="munia.jpg", extension=".jpg",
+        file_size=10, file_mtime=1.0,
+    )
+    db.conn.execute("DELETE FROM photos WHERE id = ?", (doomed_id,))
+    db.conn.commit()
+
+    seeded = _seed_derivative_files(vireo_dir, thumb_dir, doomed_id)
+
+    scan(root, db, vireo_dir=vireo_dir, thumb_cache_dir=thumb_dir,
+         skip_working_copies=True)
+
+    new_id = db.conn.execute(
+        "SELECT id FROM photos WHERE filename = 'gull.jpg'"
+    ).fetchone()["id"]
+    assert new_id == doomed_id, (
+        "test setup no longer reproduces rowid reuse; SQLite handed out "
+        f"{new_id} instead of {doomed_id}"
+    )
+    for name, path in seeded.items():
+        assert not os.path.exists(path), (
+            f"{name} cache from the freed rowid's previous owner survived "
+            f"the insert and would be served as photo {new_id}'s"
+        )
+
+
+def test_scan_leaves_derived_caches_alone_for_rows_it_did_not_create(
+    tmp_path,
+):
+    """The recycled-id purge must not fire on a plain rescan.
+
+    Re-scanning an unchanged library re-visits every photo; treating those
+    as fresh inserts would wipe (and force regeneration of) the entire
+    thumbnail cache on every scan.
+    """
+    from db import Database
+    from scanner import scan
+
+    root = str(tmp_path / "photos")
+    _create_test_images(root, {'': ['gull.jpg']})
+    vireo_dir = str(tmp_path / "vireo")
+    thumb_dir = os.path.join(vireo_dir, "thumbnails")
+
+    db = Database(str(tmp_path / "test.db"))
+    scan(root, db, vireo_dir=vireo_dir, thumb_cache_dir=thumb_dir,
+         skip_working_copies=True)
+    pid = db.conn.execute(
+        "SELECT id FROM photos WHERE filename = 'gull.jpg'"
+    ).fetchone()["id"]
+
+    seeded = _seed_derivative_files(vireo_dir, thumb_dir, pid, b"legit-cache")
+
+    scan(root, db, vireo_dir=vireo_dir, thumb_cache_dir=thumb_dir,
+         skip_working_copies=True)
+
+    for name, path in seeded.items():
+        assert os.path.exists(path), (
+            f"rescan of an existing photo deleted its {name} cache"
+        )
+
+
+def test_pairing_purges_the_merged_companion_derived_caches(tmp_path):
+    """Folding a JPEG companion into its RAW frees the companion's rowid.
+
+    ``_merge_companion_pair`` deletes the companion photo row with raw
+    SQL. Without unlinking its derivatives, the next photo to inherit that
+    id adopts the companion's thumbnail.
+    """
+    from db import Database
+    from scanner import _pair_raw_jpeg_companions
+
+    img_dir = tmp_path / "photos"
+    img_dir.mkdir()
+    vireo_dir = str(tmp_path / "vireo")
+    thumb_dir = os.path.join(vireo_dir, "thumbnails")
+
+    db = Database(str(tmp_path / "test.db"))
+    fid = db.add_folder(str(img_dir), name="photos")
+    jpeg_id = db.add_photo(
+        folder_id=fid, filename="IMG_002.jpg", extension=".jpg",
+        file_size=1000, file_mtime=1.0,
+    )
+    raw_id = db.add_photo(
+        folder_id=fid, filename="IMG_002.cr3", extension=".cr3",
+        file_size=2000, file_mtime=1.0,
+    )
+
+    companion_files = _seed_derivative_files(vireo_dir, thumb_dir, jpeg_id)
+    primary_thumb = os.path.join(thumb_dir, f"{raw_id}.jpg")
+    with open(primary_thumb, "wb") as fh:
+        fh.write(b"primary-thumb")
+
+    _pair_raw_jpeg_companions(
+        db, vireo_dir=vireo_dir, thumb_cache_dir=thumb_dir,
+    )
+
+    assert db.conn.execute(
+        "SELECT COUNT(*) AS n FROM photos WHERE id = ?", (jpeg_id,)
+    ).fetchone()["n"] == 0
+    for name, path in companion_files.items():
+        assert not os.path.exists(path), (
+            f"merged companion's {name} cache outlived its photo row"
+        )

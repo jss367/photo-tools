@@ -3190,6 +3190,82 @@ def test_store_grouped_predictions_burst_group():
     assert mock_db.add_prediction.call_count == 2
 
 
+def test_store_grouped_predictions_folds_species_before_group_consensus():
+    """When the active labels carry both `Say's Phoebe` (ASCII) and
+    `Say’s Phoebe` (U+2019) — a common situation with merged bundled
+    label files — the classifier can return either spelling per frame.
+    Before central folding was applied inside ``_store_grouped_predictions``,
+    ``group_species`` was computed off the raw ``item["prediction"]``
+    strings, so a two-frame burst with one of each spelling produced
+    ``{'say\\'s phoebe', 'say’s phoebe'}`` and ``group_reviewable``
+    became False. The consensus itself also split the votes.
+
+    Because ``add_prediction`` folds the stored species centrally, both
+    frames land on the same prediction row afterwards; the burst was
+    unanimous. So the burst_group *must* survive with a group_id and
+    the full vote count, or the survivor prediction silently loses its
+    grouping metadata."""
+    from datetime import datetime
+    from unittest.mock import MagicMock
+
+    from classify_job import _store_grouped_predictions
+
+    mock_db = MagicMock()
+
+    raw_results = [
+        {
+            "photo": {"id": 1, "filename": "bird1.jpg"},
+            "detection_id": 101,
+            "folder_path": "/photos",
+            "prediction": "Say's Phoebe",
+            "confidence": 0.95,
+            "timestamp": datetime(2024, 1, 15, 10, 0, 0),
+            "filename": "bird1.jpg",
+            "embedding": None,
+            "taxonomy": None,
+        },
+        {
+            "photo": {"id": 2, "filename": "bird2.jpg"},
+            "detection_id": 102,
+            "folder_path": "/photos",
+            # Curly-apostrophe variant of the same species name.
+            "prediction": "Say’s Phoebe",
+            "confidence": 0.90,
+            "timestamp": datetime(2024, 1, 15, 10, 0, 3),
+            "filename": "bird2.jpg",
+            "embedding": None,
+            "taxonomy": None,
+        },
+    ]
+
+    result = _store_grouped_predictions(
+        raw_results=raw_results,
+        job_id="classify-test",
+        model_name="BioCLIP",
+        grouping_window=10,
+        similarity_threshold=0.85,
+        tax=None,
+        db=mock_db,
+    )
+
+    assert result["burst_groups"] == 1, (
+        "unanimous burst was split into non-group predictions because "
+        "raw species strings differ only by apostrophe glyph"
+    )
+    # Both frames should be stored with a group_id and full vote counts.
+    calls = mock_db.add_prediction.call_args_list
+    assert len(calls) == 2
+    for c in calls:
+        kwargs = c.kwargs or c[1]
+        assert kwargs["group_id"] is not None, (
+            "group_id dropped: group_reviewable was False, so the "
+            "survivor prediction lost its burst grouping"
+        )
+        assert kwargs["vote_count"] == 2
+        assert kwargs["total_votes"] == 2
+        assert kwargs["individual"] is not None
+
+
 # ── Task 6: run_classify_job full pipeline test ───────────────────────────────
 
 

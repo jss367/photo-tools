@@ -1689,9 +1689,18 @@ def _store_grouped_predictions(
         else:
             group_count += 1
             gid = f"g{job_id[-6:]}-{group_count:04d}"
+            # Fold each frame's species onto the same key ``add_prediction``
+            # uses before computing consensus and the reviewability check.
+            # Without this, a burst whose frames spell the same bird as
+            # both `Say's Phoebe` and `Say’s Phoebe` (because the merged
+            # label set carries both variants) counts as two distinct
+            # species, ``group_reviewable`` becomes False, and the
+            # unanimous burst is stored without its group_id, vote counts,
+            # or individual JSON — so the survivor prediction drops out
+            # of its burst group even though every frame agreed.
             cons_input = [
                 {
-                    "prediction": item["prediction"],
+                    "prediction": _folded_species_key(item["prediction"]),
                     "confidence": item["confidence"],
                 }
                 for item in group
@@ -1701,7 +1710,7 @@ def _store_grouped_predictions(
                 continue
 
             group_species = {
-                (item.get("prediction") or "").strip().lower()
+                (_folded_species_key(item.get("prediction")) or "").strip().lower()
                 for item in group
                 if item.get("prediction")
             }

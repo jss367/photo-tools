@@ -182,6 +182,73 @@ def test_load_merged_labels_dedupes_apostrophe_variants(tmp_path):
     )
 
 
+def test_load_merged_labels_dedupes_case_only_variants(tmp_path):
+    """Two label files that spell the same species with different case must
+    merge into a single entry — otherwise the classifier's softmax gets fed
+    both prompts as separate classes, splitting probability between
+    near-duplicates. Each result is thresholded independently in
+    ``_build_custom_results``, so a valid prediction can fall below the
+    configured threshold or lose an alternative slot. SQLite's ``COLLATE
+    NOCASE`` and ``add_prediction`` already treat these as one species at
+    the storage layer; label merging must match that semantics.
+    """
+    dir_ = str(tmp_path / "labels")
+    os.makedirs(dir_)
+
+    txt1 = os.path.join(dir_, "birds_titlecase.txt")
+    with open(txt1, "w") as f:
+        f.write("Say's Phoebe\nJay\n")
+
+    txt2 = os.path.join(dir_, "birds_lowercase.txt")
+    with open(txt2, "w") as f:
+        f.write("say's phoebe\nRobin\n")
+
+    label_sets = [
+        {"labels_file": txt1, "name": "Birds Title Case"},
+        {"labels_file": txt2, "name": "Birds lowercase"},
+    ]
+    result = load_merged_labels(label_sets)
+    # Exactly one Say's phoebe survives — either capitalization is
+    # DB-equivalent under COLLATE NOCASE, so the test asserts the count
+    # rather than the specific case.
+    say_variants = [n for n in result if n.lower() == "say's phoebe"]
+    assert len(say_variants) == 1, (
+        "case-only apostrophe variants must merge to a single entry — "
+        f"got {result}"
+    )
+    assert "Jay" in result and "Robin" in result
+
+
+def test_load_merged_labels_dedupes_case_plus_apostrophe_variants(tmp_path):
+    """Case + apostrophe collision (``Say's Phoebe`` ASCII vs ``Say's
+    phoebe`` curly) collapses to a single spelling. The prior fold used
+    ``normalize_keyword_display`` for the group key, which preserved case
+    and left these in separate buckets; the ASCII-NOCASE key matches the
+    downstream storage/consensus/alternative dedupe.
+    """
+    dir_ = str(tmp_path / "labels")
+    os.makedirs(dir_)
+
+    txt = os.path.join(dir_, "birds.txt")
+    with open(txt, "w", encoding="utf-8") as f:
+        f.write("Say's Phoebe\nSay’s phoebe\nJay\n")
+
+    result = load_merged_labels([{"labels_file": txt}])
+    say_variants = [n for n in result if n.lower().replace("’", "'")
+                    == "say's phoebe"]
+    assert len(say_variants) == 1, (
+        "case + apostrophe collision must merge to a single entry — "
+        f"got {result}"
+    )
+    # The survivor should be in add_prediction's storage form (ASCII
+    # apostrophe), so the classifier's label and the persisted species
+    # agree byte-for-byte.
+    assert "’" not in say_variants[0], (
+        "collision survivor should be in the ASCII apostrophe form so it "
+        f"matches what add_prediction stores — got {say_variants[0]!r}"
+    )
+
+
 def test_load_merged_labels_preserves_spelling_without_collision(tmp_path):
     """A curly-apostrophe label with no ASCII twin keeps its source spelling.
 

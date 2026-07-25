@@ -417,31 +417,40 @@ def load_merged_labels(label_sets):
     Returns:
         sorted, deduplicated list of species name strings.
 
-    Dedupes by the same apostrophe-fold that ``add_prediction`` applies to
-    ``predictions.species``. Some bundled label files carry curly
-    apostrophes (`Bosc's Fringe-toed lizard`, `Geoffroy's Tamarin`) while
-    others use the plain ASCII form. Handing the classifier both spellings
-    lets it return one as primary and the other as an alternative; after
-    the central fold in ``add_prediction`` both writes resolve to the same
-    UNIQUE row, and the alternative's INSERT-OR-IGNORE re-queries that row
-    and upserts ``prediction_review.status = 'alternative'`` -- hiding the
-    only top-1 prediction from the pending review queue.
+    Dedupes by the same ASCII-NOCASE key that ``add_prediction``,
+    alternative dedupe, and burst consensus use downstream — matching
+    SQLite's ``COLLATE NOCASE`` semantics via ``keyword_match_key``.
+    Some bundled label files carry curly apostrophes (`Bosc's
+    Fringe-toed lizard`, `Geoffroy's Tamarin`) while others use the
+    plain ASCII form, and hand-edited sets can differ only in case
+    (`Say's Phoebe` vs `Say's phoebe`). Handing the classifier two
+    spellings of the same species feeds its softmax two near-duplicate
+    classes that split probability between them — because each result
+    is thresholded independently in ``_build_custom_results``, a valid
+    prediction can fall below the configured threshold or lose an
+    alternative slot. Grouping by ``normalize_keyword_display`` alone
+    would miss the case-only collision because that helper preserves
+    case; ``keyword_match_key`` composes it with the same ASCII-only
+    lowercase table SQLite uses.
 
-    The fold decides only which of two COLLIDING spellings to drop; a label
-    whose folded key is unique keeps its original source spelling. That
-    distinction matters because ``compute_fingerprint(labels)`` hashes this
-    exact list and ``classifier_runs`` is keyed on the result: rewriting a
-    non-colliding label (e.g. the lone `Bosc's Fringe-toed lizard` in
-    california-us-reptiles, or `'Anianiau` in the Hawaii set) would change
-    the fingerprint of five of the six shipped label sets and strand ~70k
-    cached runs, re-running inference over the whole catalog for no dedupe
-    benefit.
+    The fold decides only which of two COLLIDING spellings to drop; a
+    label whose folded key is unique keeps its original source spelling.
+    That distinction matters because ``compute_fingerprint(labels)``
+    hashes this exact list and ``classifier_runs`` is keyed on the
+    result: rewriting a non-colliding label (e.g. the lone `Bosc's
+    Fringe-toed lizard` in california-us-reptiles, or `'Anianiau` in the
+    Hawaii set) would change the fingerprint of five of the six shipped
+    label sets and strand ~70k cached runs, re-running inference over
+    the whole catalog for no dedupe benefit.
     """
     # Import here rather than at module load: ``labels.py`` is imported
     # from environments (packaging, first-run bootstrap) that don't yet
     # have ``vireo/`` on ``sys.path``, and this helper is only reachable
     # once the app is running.
-    from keyword_normalization import normalize_keyword_display
+    from keyword_normalization import (
+        keyword_match_key,
+        normalize_keyword_display,
+    )
 
     all_species = set()
     for ls in label_sets:
@@ -451,28 +460,28 @@ def load_merged_labels(label_sets):
             continue
         for name in read_label_file(path):
             all_species.add(name)
-    # Group by the fold key, then collapse only the groups that actually
-    # have more than one spelling. Sorting the group makes the survivor
-    # deterministic regardless of label-set order.
+    # Group by the ASCII-NOCASE key so case-only variants collapse the
+    # same way SQLite's ``COLLATE NOCASE`` does, then collapse only the
+    # groups that actually have more than one raw spelling.
     by_key = {}
     for name in all_species:
-        by_key.setdefault(normalize_keyword_display(name) or name, []).append(
-            name
-        )
+        by_key.setdefault(keyword_match_key(name) or name, []).append(name)
     merged = []
-    for canonical, variants in by_key.items():
+    for variants in by_key.values():
         if len(variants) == 1:
             # No collision: preserve the source spelling so the fingerprint
             # is byte-identical to what earlier runs hashed.
             merged.append(variants[0])
         else:
-            # Genuine variant collision: always use the folded canonical
-            # spelling. That's what ``add_prediction`` will store, so the
-            # classifier's label and the persisted species agree. If neither
-            # raw variant already equals it (both are non-ASCII apostrophe
-            # spellings, e.g. ``Say’s phoebe`` + ``Say‛s phoebe``), a
-            # ``sorted(variants)[0]`` fallback would leave a curly form in
-            # the label list even though ``add_prediction`` will fold it —
-            # so labels and persisted species would still disagree.
-            merged.append(canonical)
+            # Genuine variant collision: prefer a spelling that
+            # ``normalize_keyword_display`` leaves unchanged (i.e. one
+            # already in the storage form, so the classifier's label and
+            # what ``add_prediction`` writes agree byte-for-byte). Sort
+            # first so both the primary preference and the fallback are
+            # deterministic regardless of label-set order.
+            ordered = sorted(variants)
+            merged.append(next(
+                (v for v in ordered if normalize_keyword_display(v) == v),
+                ordered[0],
+            ))
     return sorted(merged)

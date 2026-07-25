@@ -143,3 +143,50 @@ def test_load_merged_labels_skips_missing(tmp_path):
     ]
     result = load_merged_labels(label_sets)
     assert result == ["Jay", "Robin"]
+
+
+def test_load_merged_labels_dedupes_apostrophe_variants(tmp_path):
+    """Two label files that spell the same species with a curly vs plain
+    apostrophe must merge into a single canonical entry — otherwise the
+    classifier can return one as primary and the other as an alternative,
+    and after ``add_prediction`` folds both onto the same UNIQUE row the
+    alternative's INSERT-OR-IGNORE upserts ``prediction_review.status =
+    'alternative'``, hiding the only top-1 prediction from the pending
+    review queue.
+    """
+    dir_ = str(tmp_path / "labels")
+    os.makedirs(dir_)
+
+    txt1 = os.path.join(dir_, "birds_ascii.txt")
+    with open(txt1, "w") as f:
+        f.write("Say's phoebe\nJay\n")
+
+    txt2 = os.path.join(dir_, "birds_curly.txt")
+    with open(txt2, "w", encoding="utf-8") as f:
+        f.write("Say’s phoebe\nRobin\n")
+
+    label_sets = [
+        {"labels_file": txt1, "name": "Birds ASCII"},
+        {"labels_file": txt2, "name": "Birds curly"},
+    ]
+    result = load_merged_labels(label_sets)
+    assert result == ["Jay", "Robin", "Say's phoebe"], (
+        "curly and ASCII apostrophe spellings of the same species must "
+        f"merge to a single canonical entry — got {result}"
+    )
+
+
+def test_load_merged_labels_preserves_okina_letters(tmp_path):
+    """The apostrophe fold in ``normalize_keyword_display`` deliberately
+    excludes the Hawaiian okina (U+02BB, category Lm — a letter, not
+    punctuation). Species names like ``ʻApapane`` and ``Hawaiʻi ʻamakihi``
+    must round-trip through the label loader unchanged."""
+    dir_ = str(tmp_path / "labels")
+    os.makedirs(dir_)
+
+    txt = os.path.join(dir_, "hawaii.txt")
+    with open(txt, "w", encoding="utf-8") as f:
+        f.write("ʻApapane\nHawaiʻi ʻamakihi\n")
+
+    result = load_merged_labels([{"labels_file": txt}])
+    assert result == ["Hawaiʻi ʻamakihi", "ʻApapane"]

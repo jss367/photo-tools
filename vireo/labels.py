@@ -386,7 +386,23 @@ def load_merged_labels(label_sets):
 
     Returns:
         sorted, deduplicated list of species name strings.
+
+    Dedupes by the same apostrophe-fold that ``add_prediction`` applies to
+    ``predictions.species``. Some bundled label files carry curly
+    apostrophes (`Bosc's Fringe-toed lizard`, `Geoffroy's Tamarin`) while
+    others use the plain ASCII form. Handing the classifier both spellings
+    lets it return one as primary and the other as an alternative; after
+    the central fold in ``add_prediction`` both writes resolve to the same
+    UNIQUE row, and the alternative's INSERT-OR-IGNORE re-queries that row
+    and upserts ``prediction_review.status = 'alternative'`` -- hiding the
+    only top-1 prediction from the pending review queue.
     """
+    # Import here rather than at module load: ``labels.py`` is imported
+    # from environments (packaging, first-run bootstrap) that don't yet
+    # have ``vireo/`` on ``sys.path``, and this helper is only reachable
+    # once the app is running.
+    from keyword_normalization import normalize_keyword_display
+
     all_species = set()
     for ls in label_sets:
         path = ls.get("labels_file", "")
@@ -396,6 +412,8 @@ def load_merged_labels(label_sets):
         with open(path) as f:
             for line in f:
                 name = line.strip()
-                if name:
-                    all_species.add(name)
+                if not name:
+                    continue
+                canonical = normalize_keyword_display(name)
+                all_species.add(canonical if canonical else name)
     return sorted(all_species)

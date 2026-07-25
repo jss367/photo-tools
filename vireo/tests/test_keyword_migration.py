@@ -16,7 +16,7 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
-from db import Database  # noqa: E402
+from db import AUTO_MATCH_REVIEW_MARKER, Database  # noqa: E402
 
 
 def _make_db(tmp_path):
@@ -887,6 +887,862 @@ def test_migration_preserves_okina_names(tmp_path):
         db.close()
 
 
+def test_migration_merges_typographic_apostrophe_keyword_rows(tmp_path):
+    """`Say’s phoebe` (U+2019) and `Say's phoebe` (U+0027) are one bird.
+
+    Both spellings could be stored as separate rows because SQLite's
+    COLLATE NOCASE cannot fold U+2019, which produced two Life List cards
+    with two lifer numbers for the same species. Tags from the variant must
+    migrate onto the ASCII survivor.
+    """
+    db, ws_id, p1, p2 = _make_db(tmp_path)
+    try:
+        ascii_id = _insert_keyword(
+            db, "Say's phoebe", "taxonomy", is_species=1
+        )
+        curly_id = _insert_keyword(
+            db, "Say’s phoebe", "taxonomy", is_species=1
+        )
+        db.conn.execute(
+            "INSERT INTO photo_keywords (photo_id, keyword_id) VALUES (?, ?)",
+            (p1, ascii_id),
+        )
+        db.conn.execute(
+            "INSERT INTO photo_keywords (photo_id, keyword_id) VALUES (?, ?)",
+            (p2, curly_id),
+        )
+        db.conn.commit()
+
+        db._normalize_keyword_data_once()
+        db.conn.commit()
+
+        names = [
+            r["name"] for r in db.conn.execute(
+                "SELECT name FROM keywords WHERE name LIKE 'Say%phoebe'"
+            ).fetchall()
+        ]
+        assert names == ["Say's phoebe"], names
+        survivor = db.conn.execute(
+            "SELECT id FROM keywords WHERE name = ?", ("Say's phoebe",)
+        ).fetchone()["id"]
+        tagged = {
+            r["photo_id"] for r in db.conn.execute(
+                "SELECT photo_id FROM photo_keywords WHERE keyword_id = ?",
+                (survivor,),
+            ).fetchall()
+        }
+        assert tagged == {p1, p2}
+    finally:
+        db.close()
+
+
+def test_migration_preserves_internal_okina_against_apostrophe_fold(tmp_path):
+    """U+02BB inside a name (``Hawaiʻi ʻamakihi``) is a letter, not a
+    quote, and the apostrophe fold must not reach it. The edge-quote strip
+    never touched internal characters, so this is only at risk now that the
+    fold applies mid-string."""
+    db, _ws_id, _p1, _p2 = _make_db(tmp_path)
+    try:
+        kid = _insert_keyword(db, "Hawaiʻi ʻamakihi", "taxonomy", is_species=1)
+        db.conn.commit()
+
+        db._normalize_keyword_data_once()
+        db.conn.commit()
+
+        row = db.conn.execute(
+            "SELECT name FROM keywords WHERE id = ?", (kid,)
+        ).fetchone()
+        assert row["name"] == "Hawaiʻi ʻamakihi"
+    finally:
+        db.close()
+
+
+def _insert_prediction(db, photo_id, species, confidence=0.9, model="m1"):
+    det = db.conn.execute(
+        "INSERT INTO detections (photo_id, category, detector_confidence) "
+        "VALUES (?, 'animal', 0.99)",
+        (photo_id,),
+    ).lastrowid
+    db.conn.execute(
+        "INSERT INTO predictions (detection_id, classifier_model, "
+        "labels_fingerprint, species, confidence) VALUES (?, ?, 'fp1', ?, ?)",
+        (det, model, species, confidence),
+    )
+    return det
+
+
+def test_migration_folds_prediction_species_apostrophes(tmp_path):
+    """predictions.species is joined to keywords.name with COLLATE NOCASE,
+    which cannot fold U+2019 — so a `Swinhoe’s White-eye` prediction never
+    matched the accepted `Swinhoe's white-eye` keyword and the photo's own
+    prediction rendered as unaccepted."""
+    db, _ws_id, p1, _p2 = _make_db(tmp_path)
+    try:
+        _insert_prediction(db, p1, "Swinhoe’s White-eye")
+        db.conn.commit()
+
+        assert db._fold_prediction_species_apostrophes() == 1
+        db.conn.commit()
+
+        species = [
+            r["species"] for r in db.conn.execute(
+                "SELECT species FROM predictions"
+            ).fetchall()
+        ]
+        assert species == ["Swinhoe's White-eye"]
+    finally:
+        db.close()
+
+
+def test_prediction_fold_resolves_unique_collision_by_confidence(tmp_path):
+    """predictions has UNIQUE(detection_id, classifier_model,
+    labels_fingerprint, species). When both spellings exist on one
+    detection, folding would violate it — keep the higher-confidence row
+    rather than aborting the whole migration."""
+    db, _ws_id, p1, _p2 = _make_db(tmp_path)
+    try:
+        det = _insert_prediction(db, p1, "Say's phoebe", confidence=0.4)
+        db.conn.execute(
+            "INSERT INTO predictions (detection_id, classifier_model, "
+            "labels_fingerprint, species, confidence) "
+            "VALUES (?, 'm1', 'fp1', ?, ?)",
+            (det, "Say’s phoebe", 0.8),
+        )
+        db.conn.commit()
+
+        db._fold_prediction_species_apostrophes()
+        db.conn.commit()
+
+        rows = db.conn.execute(
+            "SELECT species, confidence FROM predictions"
+        ).fetchall()
+        assert len(rows) == 1
+        assert rows[0]["species"] == "Say's phoebe"
+        assert rows[0]["confidence"] == 0.8
+    finally:
+        db.close()
+
+
+def test_prediction_fold_collision_matches_case_insensitively(tmp_path):
+    """Downstream keyword joins use ``COLLATE NOCASE``, so a DB carrying
+    both `Say's Phoebe` (ASCII, title-case) and `Say’s phoebe` (curly,
+    lowercase) already renders as one bird. The fold must merge them
+    the same way; a case-sensitive collision lookup would rename only
+    the curly row and leave two ASCII case-variants that survive as
+    duplicate predictions on the same (detection, model, fingerprint).
+    """
+    db, _ws_id, p1, _p2 = _make_db(tmp_path)
+    try:
+        det = _insert_prediction(db, p1, "Say's Phoebe", confidence=0.9)
+        db.conn.execute(
+            "INSERT INTO predictions (detection_id, classifier_model, "
+            "labels_fingerprint, species, confidence) "
+            "VALUES (?, 'm1', 'fp1', ?, ?)",
+            (det, "Say’s phoebe", 0.3),
+        )
+        db.conn.commit()
+
+        db._fold_prediction_species_apostrophes()
+        db.conn.commit()
+
+        rows = db.conn.execute(
+            "SELECT species, confidence FROM predictions"
+        ).fetchall()
+        assert len(rows) == 1
+        # Higher-confidence winner keeps its casing; loser's curly variant
+        # is deleted rather than left as a folded duplicate.
+        assert rows[0]["species"] == "Say's Phoebe"
+        assert rows[0]["confidence"] == 0.9
+    finally:
+        db.close()
+
+
+def test_prediction_fold_merges_three_way_case_and_apostrophe_collision(tmp_path):
+    """A single (detection, model, fingerprint) scope can legally hold three
+    NOCASE-equivalent variants at once (``predictions.species`` is BINARY
+    UNIQUE): ``Say's Phoebe`` (ASCII title-case), ``Say's phoebe`` (ASCII
+    lowercase), ``Say's phoebe`` (curly, lowercase). A per-row ``fetchone``
+    peer lookup would only merge one of the two ASCII neighbours, and if
+    the curly row wins by confidence the subsequent
+    ``UPDATE ... SET species = 'Say's phoebe'`` collides with the unmerged
+    ASCII-lowercase row and aborts the migration under UNIQUE — reopening
+    the DB just fails again. All three must merge in one pass.
+    """
+    db, _ws_id, p1, _p2 = _make_db(tmp_path)
+    try:
+        det = _insert_prediction(db, p1, "Say's Phoebe", confidence=0.5)
+        db.conn.execute(
+            "INSERT INTO predictions (detection_id, classifier_model, "
+            "labels_fingerprint, species, confidence) "
+            "VALUES (?, 'm1', 'fp1', ?, ?)",
+            (det, "Say's phoebe", 0.3),
+        )
+        db.conn.execute(
+            "INSERT INTO predictions (detection_id, classifier_model, "
+            "labels_fingerprint, species, confidence) "
+            "VALUES (?, 'm1', 'fp1', ?, ?)",
+            (det, "Say’s phoebe", 0.9),
+        )
+        db.conn.commit()
+
+        # No exception: the whole collision set is merged in one pass.
+        db._fold_prediction_species_apostrophes()
+        db.conn.commit()
+
+        rows = db.conn.execute(
+            "SELECT species, confidence FROM predictions"
+        ).fetchall()
+        assert len(rows) == 1
+        # Curly row (0.9) is the highest-confidence winner; it gets folded
+        # to the clean spelling, and neither ASCII peer remains to collide
+        # with the UPDATE.
+        assert rows[0]["species"] == "Say's phoebe"
+        assert rows[0]["confidence"] == 0.9
+    finally:
+        db.close()
+
+
+def test_prediction_fold_preserves_review_when_loser_carries_decision(tmp_path):
+    """When the collision-merge deletes the losing prediction, its per-
+    workspace prediction_review row must migrate onto the surviving row.
+    `prediction_review.prediction_id` uses `ON DELETE CASCADE`, so a bare
+    delete would silently drop the user's accepted/rejected decision (and
+    its group metadata) during the one-shot migration.
+
+    Reproduces the P1 finding on the direction where the curly variant is
+    the *losing* row: its review sits on the id that gets deleted.
+    """
+    db, ws_id, p1, _p2 = _make_db(tmp_path)
+    try:
+        det = _insert_prediction(db, p1, "Say's phoebe", confidence=0.8)
+        # Curly variant has lower confidence and is therefore the loser.
+        db.conn.execute(
+            "INSERT INTO predictions (detection_id, classifier_model, "
+            "labels_fingerprint, species, confidence) "
+            "VALUES (?, 'm1', 'fp1', ?, ?)",
+            (det, "Say’s phoebe", 0.4),
+        )
+        loser_pid = db.conn.execute(
+            "SELECT id FROM predictions WHERE species = ?", ("Say’s phoebe",)
+        ).fetchone()["id"]
+        db.conn.execute(
+            "INSERT INTO prediction_review "
+            "(prediction_id, workspace_id, status, reviewed_at, "
+            " individual, group_id, vote_count, total_votes) "
+            "VALUES (?, ?, 'accepted', '2025-01-02 03:04:05', "
+            "        'reviewer-note', 'g-1', 3, 5)",
+            (loser_pid, ws_id),
+        )
+        db.conn.commit()
+
+        db._fold_prediction_species_apostrophes()
+        db.conn.commit()
+
+        rows = db.conn.execute(
+            "SELECT species FROM predictions"
+        ).fetchall()
+        assert [r["species"] for r in rows] == ["Say's phoebe"]
+        survivor_pid = db.conn.execute(
+            "SELECT id FROM predictions WHERE species = ?", ("Say's phoebe",)
+        ).fetchone()["id"]
+        review = db.conn.execute(
+            "SELECT status, individual, group_id, vote_count, total_votes "
+            "FROM prediction_review "
+            "WHERE prediction_id = ? AND workspace_id = ?",
+            (survivor_pid, ws_id),
+        ).fetchone()
+        assert review is not None, "loser's accepted review was dropped"
+        assert review["status"] == "accepted"
+        assert review["individual"] == "reviewer-note"
+        assert review["group_id"] == "g-1"
+        assert review["vote_count"] == 3
+        assert review["total_votes"] == 5
+    finally:
+        db.close()
+
+
+def test_prediction_fold_preserves_review_when_variant_wins_collision(tmp_path):
+    """Symmetric to the loser-side case: when the variant has *higher*
+    confidence, the migration deletes the clean row and renames the variant
+    onto the clean spelling. A review row attached to the deleted clean row
+    would be lost without an explicit merge step."""
+    db, ws_id, p1, _p2 = _make_db(tmp_path)
+    try:
+        det = _insert_prediction(db, p1, "Say's phoebe", confidence=0.4)
+        db.conn.execute(
+            "INSERT INTO predictions (detection_id, classifier_model, "
+            "labels_fingerprint, species, confidence) "
+            "VALUES (?, 'm1', 'fp1', ?, ?)",
+            (det, "Say’s phoebe", 0.8),
+        )
+        clean_pid = db.conn.execute(
+            "SELECT id FROM predictions WHERE species = ?", ("Say's phoebe",)
+        ).fetchone()["id"]
+        db.conn.execute(
+            "INSERT INTO prediction_review "
+            "(prediction_id, workspace_id, status, reviewed_at) "
+            "VALUES (?, ?, 'rejected', '2025-01-02 03:04:05')",
+            (clean_pid, ws_id),
+        )
+        db.conn.commit()
+
+        db._fold_prediction_species_apostrophes()
+        db.conn.commit()
+
+        rows = db.conn.execute(
+            "SELECT species FROM predictions"
+        ).fetchall()
+        assert [r["species"] for r in rows] == ["Say's phoebe"]
+        survivor_pid = db.conn.execute(
+            "SELECT id FROM predictions WHERE species = ?", ("Say's phoebe",)
+        ).fetchone()["id"]
+        review = db.conn.execute(
+            "SELECT status FROM prediction_review "
+            "WHERE prediction_id = ? AND workspace_id = ?",
+            (survivor_pid, ws_id),
+        ).fetchone()
+        assert review is not None
+        assert review["status"] == "rejected"
+    finally:
+        db.close()
+
+
+def test_prediction_fold_prefers_stronger_decision_on_review_collision(
+    tmp_path,
+):
+    """Both spellings can independently have review rows in the same
+    workspace (e.g. one was reviewed under the curly spelling, then the
+    clean one appeared and was left pending). The merge must keep the
+    non-pending user decision instead of the pending stub."""
+    db, ws_id, p1, _p2 = _make_db(tmp_path)
+    try:
+        det = _insert_prediction(db, p1, "Say's phoebe", confidence=0.8)
+        db.conn.execute(
+            "INSERT INTO predictions (detection_id, classifier_model, "
+            "labels_fingerprint, species, confidence) "
+            "VALUES (?, 'm1', 'fp1', ?, ?)",
+            (det, "Say’s phoebe", 0.4),
+        )
+        winner_pid = db.conn.execute(
+            "SELECT id FROM predictions WHERE species = ?", ("Say's phoebe",)
+        ).fetchone()["id"]
+        loser_pid = db.conn.execute(
+            "SELECT id FROM predictions WHERE species = ?", ("Say’s phoebe",)
+        ).fetchone()["id"]
+        # Winner has a pending stub row; loser carries the real decision.
+        db.conn.execute(
+            "INSERT INTO prediction_review "
+            "(prediction_id, workspace_id, status) VALUES (?, ?, 'pending')",
+            (winner_pid, ws_id),
+        )
+        db.conn.execute(
+            "INSERT INTO prediction_review "
+            "(prediction_id, workspace_id, status, reviewed_at, individual) "
+            "VALUES (?, ?, 'accepted', '2025-01-02 03:04:05', 'kept-me')",
+            (loser_pid, ws_id),
+        )
+        db.conn.commit()
+
+        db._fold_prediction_species_apostrophes()
+        db.conn.commit()
+
+        survivor_pid = db.conn.execute(
+            "SELECT id FROM predictions WHERE species = ?", ("Say's phoebe",)
+        ).fetchone()["id"]
+        review = db.conn.execute(
+            "SELECT status, individual FROM prediction_review "
+            "WHERE prediction_id = ? AND workspace_id = ?",
+            (survivor_pid, ws_id),
+        ).fetchone()
+        assert review is not None
+        assert review["status"] == "accepted"
+        assert review["individual"] == "kept-me"
+
+
+        reviews = db.conn.execute(
+            "SELECT COUNT(*) AS c FROM prediction_review"
+        ).fetchone()["c"]
+        assert reviews == 1
+    finally:
+        db.close()
+
+
+def test_prediction_fold_preserves_review_per_workspace_independently(tmp_path):
+    """A collision can touch multiple workspaces at once: each workspace's
+    review row on the loser must migrate to the survivor independently and
+    unaffected by other workspaces' state.
+    """
+    db, ws_a, p1, _p2 = _make_db(tmp_path)
+    try:
+        ws_b = db.create_workspace("Beta")
+        det = _insert_prediction(db, p1, "Say's phoebe", confidence=0.8)
+        db.conn.execute(
+            "INSERT INTO predictions (detection_id, classifier_model, "
+            "labels_fingerprint, species, confidence) "
+            "VALUES (?, 'm1', 'fp1', ?, ?)",
+            (det, "Say’s phoebe", 0.4),
+        )
+        loser_pid = db.conn.execute(
+            "SELECT id FROM predictions WHERE species = ?", ("Say’s phoebe",)
+        ).fetchone()["id"]
+        db.conn.execute(
+            "INSERT INTO prediction_review "
+            "(prediction_id, workspace_id, status, reviewed_at) "
+            "VALUES (?, ?, 'accepted', '2025-01-02 03:04:05')",
+            (loser_pid, ws_a),
+        )
+        db.conn.execute(
+            "INSERT INTO prediction_review "
+            "(prediction_id, workspace_id, status, reviewed_at) "
+            "VALUES (?, ?, 'rejected', '2025-01-03 03:04:05')",
+            (loser_pid, ws_b),
+        )
+        db.conn.commit()
+
+        db._fold_prediction_species_apostrophes()
+        db.conn.commit()
+
+        survivor_pid = db.conn.execute(
+            "SELECT id FROM predictions WHERE species = ?", ("Say's phoebe",)
+        ).fetchone()["id"]
+        rows = {
+            r["workspace_id"]: r["status"]
+            for r in db.conn.execute(
+                "SELECT workspace_id, status FROM prediction_review "
+                "WHERE prediction_id = ?",
+                (survivor_pid,),
+            ).fetchall()
+        }
+        assert rows == {ws_a: "accepted", ws_b: "rejected"}
+    finally:
+        db.close()
+
+
+def _insert_prediction_accept_history(db, ws_id, photo_id, old_value,
+                                      new_value="42"):
+    """Insert a `prediction_accept` edit_history + edit_history_items pair
+    directly, mirroring what `record_edit` would write for an accept edit
+    without going through the full API. Returns (edit_id, item_id)."""
+    cur = db.conn.execute(
+        "INSERT INTO edit_history (workspace_id, action_type, description, "
+        "new_value) VALUES (?, 'prediction_accept', 'accept', ?)",
+        (ws_id, new_value),
+    )
+    edit_id = cur.lastrowid
+    cur = db.conn.execute(
+        "INSERT INTO edit_history_items (edit_id, photo_id, old_value, "
+        "new_value) VALUES (?, ?, ?, ?)",
+        (edit_id, photo_id, old_value, new_value),
+    )
+    return edit_id, cur.lastrowid
+
+
+def test_prediction_fold_retargets_bare_edit_history_on_loser_delete(tmp_path):
+    """The compact single-model accept encodes the prediction id as a
+    bare-int string in `edit_history_items.old_value`. When the collision-
+    merge deletes the loser, that id must be rewritten to the surviving
+    prediction id so `_apply_undo` can still restore the status flip."""
+    db, ws_id, p1, _p2 = _make_db(tmp_path)
+    try:
+        det = _insert_prediction(db, p1, "Say's phoebe", confidence=0.8)
+        db.conn.execute(
+            "INSERT INTO predictions (detection_id, classifier_model, "
+            "labels_fingerprint, species, confidence) "
+            "VALUES (?, 'm1', 'fp1', ?, ?)",
+            (det, "Say’s phoebe", 0.4),
+        )
+        loser_pid = db.conn.execute(
+            "SELECT id FROM predictions WHERE species = ?", ("Say’s phoebe",)
+        ).fetchone()["id"]
+        _, item_id = _insert_prediction_accept_history(
+            db, ws_id, p1, old_value=str(loser_pid),
+        )
+        db.conn.commit()
+
+        db._fold_prediction_species_apostrophes()
+        db.conn.commit()
+
+        survivor_pid = db.conn.execute(
+            "SELECT id FROM predictions WHERE species = ?", ("Say's phoebe",)
+        ).fetchone()["id"]
+        row = db.conn.execute(
+            "SELECT old_value FROM edit_history_items WHERE id = ?",
+            (item_id,),
+        ).fetchone()
+        assert row["old_value"] == str(survivor_pid), (
+            "loser prediction id in bare-int edit history was not retargeted"
+        )
+    finally:
+        db.close()
+
+
+def test_prediction_fold_retargets_json_prediction_id_on_loser_delete(tmp_path):
+    """`no_tag` accepts serialize `{"prediction_id": N, "no_tag": true}` as
+    the item's old_value. That id must be rewritten too — otherwise the
+    reverse-a-no-op-accept undo path silently loses the reference and the
+    prediction stays flipped."""
+    db, ws_id, p1, _p2 = _make_db(tmp_path)
+    try:
+        det = _insert_prediction(db, p1, "Say's phoebe", confidence=0.8)
+        db.conn.execute(
+            "INSERT INTO predictions (detection_id, classifier_model, "
+            "labels_fingerprint, species, confidence) "
+            "VALUES (?, 'm1', 'fp1', ?, ?)",
+            (det, "Say’s phoebe", 0.4),
+        )
+        loser_pid = db.conn.execute(
+            "SELECT id FROM predictions WHERE species = ?", ("Say’s phoebe",)
+        ).fetchone()["id"]
+        payload = json.dumps({"prediction_id": loser_pid, "no_tag": True})
+        _, item_id = _insert_prediction_accept_history(
+            db, ws_id, p1, old_value=payload,
+        )
+        db.conn.commit()
+
+        db._fold_prediction_species_apostrophes()
+        db.conn.commit()
+
+        survivor_pid = db.conn.execute(
+            "SELECT id FROM predictions WHERE species = ?", ("Say's phoebe",)
+        ).fetchone()["id"]
+        row = db.conn.execute(
+            "SELECT old_value FROM edit_history_items WHERE id = ?",
+            (item_id,),
+        ).fetchone()
+        data = json.loads(row["old_value"])
+        assert data["prediction_id"] == survivor_pid, (
+            "JSON prediction_id was not retargeted to the surviving row"
+        )
+        assert data.get("no_tag") is True, (
+            "unrelated JSON keys must survive the retarget"
+        )
+    finally:
+        db.close()
+
+
+def test_prediction_fold_retargets_prediction_ids_list_entry(tmp_path):
+    """Accept-subject records `{"prediction_ids": [pid_a, pid_b, ...]}`
+    covering agreeing sibling classifier models on one detection. If one
+    sibling is the collision loser, only that entry must be rewritten:
+    the untouched siblings must remain byte-identical so undo/redo still
+    reaches every model's scope."""
+    db, ws_id, p1, _p2 = _make_db(tmp_path)
+    try:
+        det = _insert_prediction(db, p1, "Say's phoebe", confidence=0.8)
+        db.conn.execute(
+            "INSERT INTO predictions (detection_id, classifier_model, "
+            "labels_fingerprint, species, confidence) "
+            "VALUES (?, 'm1', 'fp1', ?, ?)",
+            (det, "Say’s phoebe", 0.4),
+        )
+        loser_pid = db.conn.execute(
+            "SELECT id FROM predictions WHERE species = ?", ("Say’s phoebe",)
+        ).fetchone()["id"]
+        sibling_a = 9001
+        sibling_b = 9002
+        payload = json.dumps({
+            "prediction_ids": [sibling_a, loser_pid, sibling_b],
+        })
+        _, item_id = _insert_prediction_accept_history(
+            db, ws_id, p1, old_value=payload,
+        )
+        db.conn.commit()
+
+        db._fold_prediction_species_apostrophes()
+        db.conn.commit()
+
+        survivor_pid = db.conn.execute(
+            "SELECT id FROM predictions WHERE species = ?", ("Say's phoebe",)
+        ).fetchone()["id"]
+        row = db.conn.execute(
+            "SELECT old_value FROM edit_history_items WHERE id = ?",
+            (item_id,),
+        ).fetchone()
+        data = json.loads(row["old_value"])
+        assert data["prediction_ids"] == [sibling_a, survivor_pid, sibling_b]
+    finally:
+        db.close()
+
+
+def test_prediction_fold_retargets_edit_history_when_variant_wins_collision(
+    tmp_path,
+):
+    """Symmetric case: when the curly variant has higher confidence, the
+    migration deletes the *clean* row. A prediction_accept history item
+    that references the clean row must be retargeted to the variant id
+    (which then gets renamed onto the clean spelling in place)."""
+    db, ws_id, p1, _p2 = _make_db(tmp_path)
+    try:
+        det = _insert_prediction(db, p1, "Say's phoebe", confidence=0.4)
+        db.conn.execute(
+            "INSERT INTO predictions (detection_id, classifier_model, "
+            "labels_fingerprint, species, confidence) "
+            "VALUES (?, 'm1', 'fp1', ?, ?)",
+            (det, "Say’s phoebe", 0.8),
+        )
+        clean_pid = db.conn.execute(
+            "SELECT id FROM predictions WHERE species = ?", ("Say's phoebe",)
+        ).fetchone()["id"]
+        _, item_id = _insert_prediction_accept_history(
+            db, ws_id, p1, old_value=str(clean_pid),
+        )
+        db.conn.commit()
+
+        db._fold_prediction_species_apostrophes()
+        db.conn.commit()
+
+        survivor_pid = db.conn.execute(
+            "SELECT id FROM predictions WHERE species = ?", ("Say's phoebe",)
+        ).fetchone()["id"]
+        row = db.conn.execute(
+            "SELECT old_value FROM edit_history_items WHERE id = ?",
+            (item_id,),
+        ).fetchone()
+        assert row["old_value"] == str(survivor_pid)
+    finally:
+        db.close()
+
+
+def test_prediction_fold_retargets_relabel_edit_history(tmp_path):
+    """``/api/highlights/relabel`` records edits as ``keyword_add`` or
+    ``species_replace`` (not ``prediction_accept``), stashing the top
+    prediction's id in ``edit_history_items.old_value`` as JSON
+    ``{"prediction_id": N, "prediction_status": ...}`` so undo can restore
+    the pending status via ``_restore_edit_prediction_status``.
+
+    Before the fold retargets these action types too, an undo/redo would
+    call ``update_prediction_status(loser_id, ...)`` on a vanished
+    prediction id, failing the ``prediction_review`` FK to
+    ``predictions`` and aborting the undo/redo."""
+    db, ws_id, p1, _p2 = _make_db(tmp_path)
+    try:
+        det = _insert_prediction(db, p1, "Say's phoebe", confidence=0.8)
+        db.conn.execute(
+            "INSERT INTO predictions (detection_id, classifier_model, "
+            "labels_fingerprint, species, confidence) "
+            "VALUES (?, 'm1', 'fp1', ?, ?)",
+            (det, "Say’s phoebe", 0.4),
+        )
+        loser_pid = db.conn.execute(
+            "SELECT id FROM predictions WHERE species = ?", ("Say’s phoebe",)
+        ).fetchone()["id"]
+
+        payload = json.dumps({
+            "keyword_id": "17",
+            "keyword_ids": [17],
+            "prediction_id": loser_pid,
+            "prediction_status": "pending",
+        }, sort_keys=True)
+
+        # keyword_add relabel
+        ka_edit = db.conn.execute(
+            "INSERT INTO edit_history (workspace_id, action_type, description, "
+            "new_value) VALUES (?, 'keyword_add', 'relabel', '17')",
+            (ws_id,),
+        ).lastrowid
+        ka_item = db.conn.execute(
+            "INSERT INTO edit_history_items (edit_id, photo_id, old_value, "
+            "new_value) VALUES (?, ?, ?, '17')",
+            (ka_edit, p1, payload),
+        ).lastrowid
+
+        # species_replace relabel (photo already had a species tag)
+        sr_edit = db.conn.execute(
+            "INSERT INTO edit_history (workspace_id, action_type, description, "
+            "new_value) VALUES (?, 'species_replace', 'relabel', '17')",
+            (ws_id,),
+        ).lastrowid
+        sr_item = db.conn.execute(
+            "INSERT INTO edit_history_items (edit_id, photo_id, old_value, "
+            "new_value) VALUES (?, ?, ?, '17')",
+            (sr_edit, p1, payload),
+        ).lastrowid
+
+        db.conn.commit()
+
+        db._fold_prediction_species_apostrophes()
+        db.conn.commit()
+
+        survivor_pid = db.conn.execute(
+            "SELECT id FROM predictions WHERE species = ?", ("Say's phoebe",)
+        ).fetchone()["id"]
+        for item_id, label in ((ka_item, "keyword_add"),
+                               (sr_item, "species_replace")):
+            row = db.conn.execute(
+                "SELECT old_value FROM edit_history_items WHERE id = ?",
+                (item_id,),
+            ).fetchone()
+            data = json.loads(row["old_value"])
+            assert data["prediction_id"] == survivor_pid, (
+                f"{label}.old_value prediction_id was not retargeted to the "
+                f"surviving prediction"
+            )
+            assert data["keyword_id"] == "17", (
+                f"{label}.old_value keyword_id must survive the retarget "
+                "unchanged"
+            )
+    finally:
+        db.close()
+
+
+def test_prediction_fold_only_retargets_prediction_accept_history(tmp_path):
+    """Guard against a blanket UPDATE: `keyword_add.new_value` and
+    `species_replace.new_value`/`.old_value` store keyword ids in the
+    same columns. A keyword id that numerically happens to equal a
+    deleted-prediction id must not be silently rewritten to the
+    surviving prediction id."""
+    db, ws_id, p1, _p2 = _make_db(tmp_path)
+    try:
+        det = _insert_prediction(db, p1, "Say's phoebe", confidence=0.8)
+        db.conn.execute(
+            "INSERT INTO predictions (detection_id, classifier_model, "
+            "labels_fingerprint, species, confidence) "
+            "VALUES (?, 'm1', 'fp1', ?, ?)",
+            (det, "Say’s phoebe", 0.4),
+        )
+        loser_pid = db.conn.execute(
+            "SELECT id FROM predictions WHERE species = ?", ("Say’s phoebe",)
+        ).fetchone()["id"]
+        # A `keyword_add` row whose new_value is the numeric string that
+        # matches the loser prediction id. Must survive the fold unchanged.
+        kw_edit = db.conn.execute(
+            "INSERT INTO edit_history (workspace_id, action_type, description, "
+            "new_value) VALUES (?, 'keyword_add', 'add', ?)",
+            (ws_id, str(loser_pid)),
+        ).lastrowid
+        kw_item = db.conn.execute(
+            "INSERT INTO edit_history_items (edit_id, photo_id, old_value, "
+            "new_value) VALUES (?, ?, ?, ?)",
+            (kw_edit, p1, "", str(loser_pid)),
+        ).lastrowid
+        db.conn.commit()
+
+        db._fold_prediction_species_apostrophes()
+        db.conn.commit()
+
+        row = db.conn.execute(
+            "SELECT old_value, new_value FROM edit_history_items WHERE id = ?",
+            (kw_item,),
+        ).fetchone()
+        assert row["old_value"] == "", (
+            "keyword_add.old_value was unexpectedly rewritten by the "
+            "prediction-id retarget"
+        )
+        assert row["new_value"] == str(loser_pid), (
+            "keyword_add.new_value carries a keyword id and must not be "
+            "retargeted by the prediction-id path"
+        )
+    finally:
+        db.close()
+
+
+def test_add_prediction_folds_curly_apostrophe_species(tmp_path):
+    """`Database.add_prediction` is the shared choke point for the classify
+    job's storage helpers (`_store_pending_detection_prediction`,
+    `_store_match_prediction`). Neither production path runs
+    `normalize_keyword_display` before calling here, so a bundled label
+    that spells `Swinhoe’s White-eye` with U+2019 would still land in
+    predictions.species as-is and fail to match its accepted
+    `Swinhoe's white-eye` keyword row (both exact and COLLATE NOCASE joins
+    are quote-preserving). Folding inside `add_prediction` closes that
+    hole once for every caller."""
+    db, _ws_id, p1, _p2 = _make_db(tmp_path)
+    try:
+        det = db.conn.execute(
+            "INSERT INTO detections (photo_id, category, detector_confidence) "
+            "VALUES (?, 'animal', 0.99)",
+            (p1,),
+        ).lastrowid
+        db.conn.commit()
+
+        db.add_prediction(
+            detection_id=det,
+            species="Swinhoe’s White-eye",
+            confidence=0.8,
+            model="m1",
+            labels_fingerprint="fp1",
+        )
+
+        stored = [
+            r["species"] for r in db.conn.execute(
+                "SELECT species FROM predictions"
+            ).fetchall()
+        ]
+        assert stored == ["Swinhoe's White-eye"]
+    finally:
+        db.close()
+
+
+def test_add_prediction_folds_review_row_to_normalized_species(tmp_path):
+    """When add_prediction folds species, the workspace-scoped
+    prediction_review row must land on the *folded* prediction row's id,
+    not on a stray original-spelling row (which would never exist because
+    the fold applies before insert). Verifies the id lookup after fold."""
+    db, ws_id, p1, _p2 = _make_db(tmp_path)
+    try:
+        det = db.conn.execute(
+            "INSERT INTO detections (photo_id, category, detector_confidence) "
+            "VALUES (?, 'animal', 0.99)",
+            (p1,),
+        ).lastrowid
+        db.conn.commit()
+
+        db.add_prediction(
+            detection_id=det,
+            species="Swinhoe’s White-eye",
+            confidence=0.8,
+            model="m1",
+            status="accepted",
+            labels_fingerprint="fp1",
+        )
+
+        row = db.conn.execute(
+            "SELECT p.id AS pid, p.species, pr.status "
+            "FROM predictions p "
+            "LEFT JOIN prediction_review pr "
+            "  ON pr.prediction_id = p.id AND pr.workspace_id = ? "
+            "WHERE p.detection_id = ?",
+            (ws_id, det),
+        ).fetchone()
+        assert row is not None
+        assert row["species"] == "Swinhoe's White-eye"
+        assert row["status"] == "accepted"
+    finally:
+        db.close()
+
+
+def test_apostrophe_fold_migration_gated_by_its_own_marker(tmp_path):
+    """The v1 sweep already ran on live DBs (marker
+    `keyword_names_normalized` is set), so the apostrophe fold needs its
+    own marker or it would silently never run on the databases that
+    actually have the duplicate rows."""
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    # Simulate a DB that completed the earlier sweeps, then acquired an
+    # apostrophe-variant duplicate before the fold existed.
+    db.set_meta("keyword_names_normalized", "1")
+    db.set_meta("curation_species_case_aligned_v2", "1")
+    db.conn.execute(
+        "DELETE FROM db_meta WHERE key = 'keyword_apostrophes_folded_v1'"
+    )
+    _insert_keyword(db, "Say's phoebe", "taxonomy", is_species=1)
+    _insert_keyword(db, "Say’s phoebe", "taxonomy", is_species=1)
+    db.conn.commit()
+    db.close()
+
+    reopened = Database(db_path)
+    try:
+        names = [
+            r["name"] for r in reopened.conn.execute(
+                "SELECT name FROM keywords WHERE name LIKE 'Say%phoebe'"
+            ).fetchall()
+        ]
+        assert names == ["Say's phoebe"], names
+        assert reopened.get_meta("keyword_apostrophes_folded_v1") == "1"
+    finally:
+        reopened.close()
+
+
 def test_migration_gated_by_db_meta_marker(tmp_path):
     """The backfill runs once per database, gated by the db_meta marker
     (NOT PRAGMA user_version — live DBs have been advanced past the next
@@ -1696,5 +2552,647 @@ def test_curation_case_alignment_leaves_ambiguous_homonyms_alone(tmp_path):
         ]
         assert species == ["ROBIN"]
         assert db.get_meta("curation_species_case_aligned_v2") == "1"
+    finally:
+        db.close()
+
+
+def test_prime_symbol_not_folded_in_keywords(tmp_path):
+    """U+2032 PRIME is the semantic prime symbol used for feet and
+    arcminutes. Keywords like `10′ waterfall` must not be silently
+    rewritten to `10' waterfall` by the apostrophe fold — the fold table
+    intentionally excludes U+2032 so measurement notation survives the
+    display/storage normalization applied on every keyword write."""
+    from keyword_normalization import normalize_keyword_display
+
+    assert normalize_keyword_display("10′ waterfall") == "10′ waterfall"
+    # Middle-of-string preservation matters most, but a lone prime as an
+    # edge char is stripped by _EDGE_QUOTES (measurement notation almost
+    # never appears at the boundary of a keyword name — the edge behavior
+    # is unchanged from before the fold table existed).
+
+    db, _ws_id, p1, _p2 = _make_db(tmp_path)
+    try:
+        det = db.conn.execute(
+            "INSERT INTO detections (photo_id, category, detector_confidence) "
+            "VALUES (?, 'animal', 0.99)",
+            (p1,),
+        ).lastrowid
+        db.conn.commit()
+
+        # A prediction whose species carries a legitimate prime stays intact
+        # after add_prediction normalizes on write.
+        db.add_prediction(
+            detection_id=det,
+            species="10′ waterfall bird",
+            confidence=0.5,
+            model="m1",
+            labels_fingerprint="fp1",
+        )
+        stored = db.conn.execute(
+            "SELECT species FROM predictions WHERE detection_id = ?", (det,)
+        ).fetchone()["species"]
+        assert stored == "10′ waterfall bird"
+    finally:
+        db.close()
+
+
+def test_prediction_fold_merge_backfills_pending_group_metadata(tmp_path):
+    """Two spellings can both have PENDING review rows in the same
+    workspace — the loser carrying the current burst's ``group_id`` and
+    vote counts, the winner just a bare pending stub. The prior merge
+    logic only preserved group metadata when the loser's status was
+    accepted/rejected, so a pending loser's grouping was cascaded away
+    and the surviving prediction silently fell out of its burst group.
+    The merge helper now backfills group metadata from whichever side
+    supplies it, independently of the accepted/rejected decision."""
+    db, ws_id, p1, _p2 = _make_db(tmp_path)
+    try:
+        det = _insert_prediction(db, p1, "Say's phoebe", confidence=0.8)
+        db.conn.execute(
+            "INSERT INTO predictions (detection_id, classifier_model, "
+            "labels_fingerprint, species, confidence) "
+            "VALUES (?, 'm1', 'fp1', ?, ?)",
+            (det, "Say’s phoebe", 0.4),
+        )
+        winner_pid = db.conn.execute(
+            "SELECT id FROM predictions WHERE species = ?", ("Say's phoebe",)
+        ).fetchone()["id"]
+        loser_pid = db.conn.execute(
+            "SELECT id FROM predictions WHERE species = ?", ("Say’s phoebe",)
+        ).fetchone()["id"]
+        db.conn.execute(
+            "INSERT INTO prediction_review "
+            "(prediction_id, workspace_id, status) VALUES (?, ?, 'pending')",
+            (winner_pid, ws_id),
+        )
+        db.conn.execute(
+            "INSERT INTO prediction_review "
+            "(prediction_id, workspace_id, status, group_id, vote_count, "
+            " total_votes, individual) "
+            "VALUES (?, ?, 'pending', 'burst-1', 2, 3, 'ind-1')",
+            (loser_pid, ws_id),
+        )
+        db.conn.commit()
+
+        db._fold_prediction_species_apostrophes()
+        db.conn.commit()
+
+        survivor_pid = db.conn.execute(
+            "SELECT id FROM predictions WHERE species = ?", ("Say's phoebe",)
+        ).fetchone()["id"]
+        review = db.conn.execute(
+            "SELECT status, group_id, vote_count, total_votes, individual "
+            "FROM prediction_review "
+            "WHERE prediction_id = ? AND workspace_id = ?",
+            (survivor_pid, ws_id),
+        ).fetchone()
+        assert review is not None
+        assert review["status"] == "pending"
+        assert review["group_id"] == "burst-1"
+        assert review["vote_count"] == 2
+        assert review["total_votes"] == 3
+        assert review["individual"] == "ind-1"
+    finally:
+        db.close()
+
+
+def test_prediction_fold_merges_taxonomy_metadata_from_loser(tmp_path):
+    """When the higher-confidence row happens to be the one written by a
+    raw-classifier path that never filled in `scientific_name` or the
+    taxonomy hierarchy, the migration must backfill those fields from the
+    loser before the CASCADEd DELETE strips them. Otherwise taxonomy
+    filters and review displays that rely on `taxonomy_family` etc. show
+    the surviving prediction as unclassified. `category` also promotes
+    from the schema default `'new'` to the loser's more specific
+    `'match'`, since the two rows describe the same (detection, species)
+    pair and any classifier enrichment belongs to whichever survives."""
+    db, _ws_id, p1, _p2 = _make_db(tmp_path)
+    try:
+        det = db.conn.execute(
+            "INSERT INTO detections (photo_id, category, detector_confidence) "
+            "VALUES (?, 'animal', 0.99)",
+            (p1,),
+        ).lastrowid
+        # Winner (higher confidence, clean spelling): no taxonomy fields.
+        db.conn.execute(
+            "INSERT INTO predictions (detection_id, classifier_model, "
+            "labels_fingerprint, species, confidence, category) "
+            "VALUES (?, 'm1', 'fp1', ?, ?, 'new')",
+            (det, "Say's phoebe", 0.8),
+        )
+        # Loser (curly, lower confidence): full taxonomy.
+        db.conn.execute(
+            "INSERT INTO predictions (detection_id, classifier_model, "
+            "labels_fingerprint, species, confidence, category, "
+            "scientific_name, taxonomy_kingdom, taxonomy_phylum, "
+            "taxonomy_class, taxonomy_order, taxonomy_family, "
+            "taxonomy_genus) "
+            "VALUES (?, 'm1', 'fp1', ?, ?, 'match', ?, 'Animalia', "
+            "'Chordata', 'Aves', 'Passeriformes', 'Tyrannidae', 'Sayornis')",
+            (det, "Say’s phoebe", 0.4, "Sayornis saya"),
+        )
+        db.conn.commit()
+
+        db._fold_prediction_species_apostrophes()
+        db.conn.commit()
+
+        row = db.conn.execute(
+            "SELECT species, category, scientific_name, taxonomy_kingdom, "
+            "taxonomy_phylum, taxonomy_class, taxonomy_order, "
+            "taxonomy_family, taxonomy_genus, confidence "
+            "FROM predictions"
+        ).fetchone()
+        assert row["species"] == "Say's phoebe"
+        assert row["confidence"] == 0.8
+        assert row["scientific_name"] == "Sayornis saya"
+        assert row["taxonomy_kingdom"] == "Animalia"
+        assert row["taxonomy_phylum"] == "Chordata"
+        assert row["taxonomy_class"] == "Aves"
+        assert row["taxonomy_order"] == "Passeriformes"
+        assert row["taxonomy_family"] == "Tyrannidae"
+        assert row["taxonomy_genus"] == "Sayornis"
+        assert row["category"] == "match"
+    finally:
+        db.close()
+
+
+def test_prediction_fold_metadata_merge_does_not_clobber_winner(tmp_path):
+    """When the winning row already carries taxonomy fields, the merge
+    must not overwrite them with the loser's values. Backfill-only
+    keeps a deliberate override in place on the survivor."""
+    db, _ws_id, p1, _p2 = _make_db(tmp_path)
+    try:
+        det = db.conn.execute(
+            "INSERT INTO detections (photo_id, category, detector_confidence) "
+            "VALUES (?, 'animal', 0.99)",
+            (p1,),
+        ).lastrowid
+        db.conn.execute(
+            "INSERT INTO predictions (detection_id, classifier_model, "
+            "labels_fingerprint, species, confidence, category, "
+            "scientific_name, taxonomy_family) "
+            "VALUES (?, 'm1', 'fp1', ?, ?, 'match', 'Sayornis saya', "
+            "'Tyrannidae')",
+            (det, "Say's phoebe", 0.8),
+        )
+        db.conn.execute(
+            "INSERT INTO predictions (detection_id, classifier_model, "
+            "labels_fingerprint, species, confidence, category, "
+            "scientific_name, taxonomy_family) "
+            "VALUES (?, 'm1', 'fp1', ?, ?, 'new', 'wrong sci name', "
+            "'WrongFamily')",
+            (det, "Say’s phoebe", 0.4),
+        )
+        db.conn.commit()
+
+        db._fold_prediction_species_apostrophes()
+        db.conn.commit()
+
+        row = db.conn.execute(
+            "SELECT scientific_name, taxonomy_family, category FROM predictions"
+        ).fetchone()
+        assert row["scientific_name"] == "Sayornis saya"
+        assert row["taxonomy_family"] == "Tyrannidae"
+        assert row["category"] == "match"
+    finally:
+        db.close()
+
+
+def test_prediction_fold_keeps_pending_winner_when_loser_is_alternative(tmp_path):
+    """A pre-migration setup can leave the clean spelling as the pending
+    top-1 (no ``prediction_review`` row at all, since absence == pending)
+    and the curly spelling as a per-frame runner-up stored with an explicit
+    ``status='alternative'`` row. After the fold collides them onto one
+    ``predictions`` row, blindly re-pointing the loser's row at the winner
+    would flip the surviving top-1 to ``alternative`` and hide it from the
+    pending queue. The merge must treat an absent winner review as implicit
+    pending and drop a bare ``alternative`` loser instead of transferring
+    it."""
+    db, ws_id, p1, _p2 = _make_db(tmp_path)
+    try:
+        det = _insert_prediction(db, p1, "Say's phoebe", confidence=0.8)
+        db.conn.execute(
+            "INSERT INTO predictions (detection_id, classifier_model, "
+            "labels_fingerprint, species, confidence) "
+            "VALUES (?, 'm1', 'fp1', ?, ?)",
+            (det, "Say’s phoebe", 0.4),
+        )
+        loser_pid = db.conn.execute(
+            "SELECT id FROM predictions WHERE species = ?", ("Say’s phoebe",)
+        ).fetchone()["id"]
+        db.conn.execute(
+            "INSERT INTO prediction_review "
+            "(prediction_id, workspace_id, status) VALUES (?, ?, 'alternative')",
+            (loser_pid, ws_id),
+        )
+        db.conn.commit()
+
+        db._fold_prediction_species_apostrophes()
+        db.conn.commit()
+
+        survivor_pid = db.conn.execute(
+            "SELECT id FROM predictions WHERE species = ?", ("Say's phoebe",)
+        ).fetchone()["id"]
+        review = db.conn.execute(
+            "SELECT status FROM prediction_review "
+            "WHERE prediction_id = ? AND workspace_id = ?",
+            (survivor_pid, ws_id),
+        ).fetchone()
+        assert review is None, (
+            "loser's status='alternative' row was moved onto the surviving "
+            "pending primary, hiding it from the review queue"
+        )
+    finally:
+        db.close()
+
+
+def test_prediction_fold_moves_loser_alternative_metadata_when_present(tmp_path):
+    """Complement to the previous test: when the loser's alternative row
+    still carries burst grouping metadata (an atypical but legal state),
+    the merge should preserve that metadata on the winner rather than
+    discarding it — the ``continue`` shortcut only applies when the loser
+    row has nothing worth keeping beyond ``status='alternative'``.
+
+    Status is downgraded to ``pending`` on the survivor, though: the
+    winner had no review row of its own (implicit pending), and
+    propagating ``alternative`` would hide the higher-confidence primary
+    from the pending queue even though we're keeping its burst
+    metadata."""
+    db, ws_id, p1, _p2 = _make_db(tmp_path)
+    try:
+        det = _insert_prediction(db, p1, "Say's phoebe", confidence=0.8)
+        db.conn.execute(
+            "INSERT INTO predictions (detection_id, classifier_model, "
+            "labels_fingerprint, species, confidence) "
+            "VALUES (?, 'm1', 'fp1', ?, ?)",
+            (det, "Say’s phoebe", 0.4),
+        )
+        loser_pid = db.conn.execute(
+            "SELECT id FROM predictions WHERE species = ?", ("Say’s phoebe",)
+        ).fetchone()["id"]
+        db.conn.execute(
+            "INSERT INTO prediction_review "
+            "(prediction_id, workspace_id, status, group_id, vote_count, "
+            " total_votes) "
+            "VALUES (?, ?, 'alternative', 'burst-9', 4, 5)",
+            (loser_pid, ws_id),
+        )
+        db.conn.commit()
+
+        db._fold_prediction_species_apostrophes()
+        db.conn.commit()
+
+        survivor_pid = db.conn.execute(
+            "SELECT id FROM predictions WHERE species = ?", ("Say's phoebe",)
+        ).fetchone()["id"]
+        review = db.conn.execute(
+            "SELECT status, group_id, vote_count, total_votes "
+            "FROM prediction_review "
+            "WHERE prediction_id = ? AND workspace_id = ?",
+            (survivor_pid, ws_id),
+        ).fetchone()
+        assert review is not None
+        assert review["status"] == "pending", (
+            "surviving pending primary must not inherit the loser's "
+            "'alternative' status even when transferring its burst metadata"
+        )
+        assert review["group_id"] == "burst-9"
+        assert review["vote_count"] == 4
+        assert review["total_votes"] == 5
+    finally:
+        db.close()
+
+
+def test_prediction_fold_drops_sentinel_only_alternative_loser(tmp_path):
+    """A losing ``status='alternative'`` row whose only non-null metadata
+    is ``individual=AUTO_MATCH_REVIEW_MARKER`` carries no user decision
+    and no burst grouping — the sentinel is provenance for auto-accepted
+    taxonomy matches, not metadata worth preserving. Transferring it
+    would flip the higher-confidence pending winner to ``alternative``
+    (and NULL-out the marker on the way) even though nothing survives
+    the scrub except the misleading status."""
+    from db import AUTO_MATCH_REVIEW_MARKER
+
+    db, ws_id, p1, _p2 = _make_db(tmp_path)
+    try:
+        det = _insert_prediction(db, p1, "Say's phoebe", confidence=0.8)
+        db.conn.execute(
+            "INSERT INTO predictions (detection_id, classifier_model, "
+            "labels_fingerprint, species, confidence) "
+            "VALUES (?, 'm1', 'fp1', ?, ?)",
+            (det, "Say’s phoebe", 0.4),
+        )
+        loser_pid = db.conn.execute(
+            "SELECT id FROM predictions WHERE species = ?", ("Say’s phoebe",)
+        ).fetchone()["id"]
+        db.conn.execute(
+            "INSERT INTO prediction_review "
+            "(prediction_id, workspace_id, status, individual) "
+            "VALUES (?, ?, 'alternative', ?)",
+            (loser_pid, ws_id, AUTO_MATCH_REVIEW_MARKER),
+        )
+        db.conn.commit()
+
+        db._fold_prediction_species_apostrophes()
+        db.conn.commit()
+
+        survivor_pid = db.conn.execute(
+            "SELECT id FROM predictions WHERE species = ?", ("Say's phoebe",)
+        ).fetchone()["id"]
+        review = db.conn.execute(
+            "SELECT status FROM prediction_review "
+            "WHERE prediction_id = ? AND workspace_id = ?",
+            (survivor_pid, ws_id),
+        ).fetchone()
+        assert review is None, (
+            "sentinel-only 'alternative' loser was moved onto the "
+            "surviving pending primary, hiding it from the review queue"
+        )
+    finally:
+        db.close()
+
+
+def test_prediction_fold_does_not_stamp_auto_marker_on_manual_review(tmp_path):
+    """When two spellings each carry a review row and the chosen (later)
+    row is a manual accept with ``individual=NULL``, the merge previously
+    copied the losing spelling's ``AUTO_MATCH_REVIEW_MARKER`` into the
+    ``individual`` slot as a backfill. That misrepresents provenance:
+    ``preserve_manual_review`` and ``reconcile_match_review_state`` both
+    treat the marker as "auto-generated", so a subsequent classify run
+    could overwrite or delete the user's manual decision. The merge must
+    never propagate the auto-match sentinel onto a chosen manual review.
+    """
+    db, ws_id, p1, _p2 = _make_db(tmp_path)
+    try:
+        det = _insert_prediction(db, p1, "Say's phoebe", confidence=0.8)
+        db.conn.execute(
+            "INSERT INTO predictions (detection_id, classifier_model, "
+            "labels_fingerprint, species, confidence) "
+            "VALUES (?, 'm1', 'fp1', ?, ?)",
+            (det, "Say’s phoebe", 0.4),
+        )
+        winner_pid = db.conn.execute(
+            "SELECT id FROM predictions WHERE species = ?", ("Say's phoebe",)
+        ).fetchone()["id"]
+        loser_pid = db.conn.execute(
+            "SELECT id FROM predictions WHERE species = ?", ("Say’s phoebe",)
+        ).fetchone()["id"]
+        # Winner carries the manual accept (later reviewed_at, individual NULL).
+        db.conn.execute(
+            "INSERT INTO prediction_review "
+            "(prediction_id, workspace_id, status, reviewed_at, individual) "
+            "VALUES (?, ?, 'accepted', '2026-01-02 03:04:05', NULL)",
+            (winner_pid, ws_id),
+        )
+        # Loser is an older auto-accept — the sentinel must not migrate onto
+        # the manual decision when it wins the tie-break.
+        db.conn.execute(
+            "INSERT INTO prediction_review "
+            "(prediction_id, workspace_id, status, reviewed_at, individual) "
+            "VALUES (?, ?, 'accepted', '2025-06-01 00:00:00', ?)",
+            (loser_pid, ws_id, AUTO_MATCH_REVIEW_MARKER),
+        )
+        db.conn.commit()
+
+        db._fold_prediction_species_apostrophes()
+        db.conn.commit()
+
+        survivor_pid = db.conn.execute(
+            "SELECT id FROM predictions WHERE species = ?", ("Say's phoebe",)
+        ).fetchone()["id"]
+        review = db.conn.execute(
+            "SELECT status, individual FROM prediction_review "
+            "WHERE prediction_id = ? AND workspace_id = ?",
+            (survivor_pid, ws_id),
+        ).fetchone()
+        assert review is not None
+        assert review["status"] == "accepted"
+        assert review["individual"] is None, (
+            "auto-match sentinel leaked from loser onto the manual accept — "
+            "later reconcile / preserve_manual_review would treat this as "
+            "auto-generated"
+        )
+    finally:
+        db.close()
+
+
+def test_prediction_fold_scrubs_auto_marker_when_transferring_pending_loser(tmp_path):
+    """Same anti-provenance concern applies on the "winner has no row"
+    path: if the loser is a pending row (some odd historical state) that
+    still carries the auto-match sentinel in ``individual``, moving it
+    onto the winner would stamp the sentinel onto a row the user has never
+    reviewed. Scrub the sentinel to NULL when transferring a non-decided
+    row so future automation cannot misinterpret provenance."""
+    db, ws_id, p1, _p2 = _make_db(tmp_path)
+    try:
+        det = _insert_prediction(db, p1, "Say's phoebe", confidence=0.8)
+        db.conn.execute(
+            "INSERT INTO predictions (detection_id, classifier_model, "
+            "labels_fingerprint, species, confidence) "
+            "VALUES (?, 'm1', 'fp1', ?, ?)",
+            (det, "Say’s phoebe", 0.4),
+        )
+        loser_pid = db.conn.execute(
+            "SELECT id FROM predictions WHERE species = ?", ("Say’s phoebe",)
+        ).fetchone()["id"]
+        db.conn.execute(
+            "INSERT INTO prediction_review "
+            "(prediction_id, workspace_id, status, group_id, individual) "
+            "VALUES (?, ?, 'pending', 'burst-11', ?)",
+            (loser_pid, ws_id, AUTO_MATCH_REVIEW_MARKER),
+        )
+        db.conn.commit()
+
+        db._fold_prediction_species_apostrophes()
+        db.conn.commit()
+
+        survivor_pid = db.conn.execute(
+            "SELECT id FROM predictions WHERE species = ?", ("Say's phoebe",)
+        ).fetchone()["id"]
+        review = db.conn.execute(
+            "SELECT status, group_id, individual FROM prediction_review "
+            "WHERE prediction_id = ? AND workspace_id = ?",
+            (survivor_pid, ws_id),
+        ).fetchone()
+        assert review is not None
+        assert review["group_id"] == "burst-11"
+        assert review["individual"] is None, (
+            "auto-match sentinel from a non-decided loser leaked onto the "
+            "surviving prediction"
+        )
+    finally:
+        db.close()
+
+
+def test_prediction_fold_preserves_auto_marker_on_decided_transfer(tmp_path):
+    """When the winner has no ``prediction_review`` row (implicit pending)
+    and the loser IS a genuine auto-accepted taxonomy match — ``status=
+    'accepted'`` with ``individual=AUTO_MATCH_REVIEW_MARKER`` — moving the
+    row must preserve the marker. ``reconcile_match_review_state`` deletes
+    stale auto-accepts by matching the marker; scrubbing it here would
+    convert a real auto-accept into an apparent manual decision, stranding
+    the acceptance even after the XMP match evidence goes away."""
+    db, ws_id, p1, _p2 = _make_db(tmp_path)
+    try:
+        det = _insert_prediction(db, p1, "Say's phoebe", confidence=0.8)
+        db.conn.execute(
+            "INSERT INTO predictions (detection_id, classifier_model, "
+            "labels_fingerprint, species, confidence, category) "
+            "VALUES (?, 'm1', 'fp1', ?, ?, 'match')",
+            (det, "Say’s phoebe", 0.4),
+        )
+        loser_pid = db.conn.execute(
+            "SELECT id FROM predictions WHERE species = ?", ("Say’s phoebe",)
+        ).fetchone()["id"]
+        db.conn.execute(
+            "INSERT INTO prediction_review "
+            "(prediction_id, workspace_id, status, individual) "
+            "VALUES (?, ?, 'accepted', ?)",
+            (loser_pid, ws_id, AUTO_MATCH_REVIEW_MARKER),
+        )
+        db.conn.commit()
+
+        db._fold_prediction_species_apostrophes()
+        db.conn.commit()
+
+        survivor_pid = db.conn.execute(
+            "SELECT id FROM predictions WHERE species = ?", ("Say's phoebe",)
+        ).fetchone()["id"]
+        review = db.conn.execute(
+            "SELECT status, individual FROM prediction_review "
+            "WHERE prediction_id = ? AND workspace_id = ?",
+            (survivor_pid, ws_id),
+        ).fetchone()
+        assert review is not None
+        assert review["status"] == "accepted"
+        assert review["individual"] == AUTO_MATCH_REVIEW_MARKER, (
+            "auto-match sentinel was scrubbed while transferring a genuine "
+            "auto-accept; reconcile_match_review_state can no longer "
+            "identify (and clean up) this row when the match evidence "
+            "goes away"
+        )
+    finally:
+        db.close()
+
+
+def test_prediction_fold_preserves_individual_json_on_pending_transfer(tmp_path):
+    """Complement to the sentinel-scrub test: ``individual`` on a pending
+    review row can be the real JSON vote-breakdown that
+    ``_store_grouped_predictions`` stores alongside ``group_id`` /
+    ``vote_count`` / ``total_votes``, not only the auto-match sentinel.
+    Blanket-scrubbing ``individual`` to NULL when transferring a pending
+    loser would silently drop the burst's per-frame vote payload so a
+    later group-accept could no longer derive the consensus species from
+    the individual votes. Only the sentinel gets scrubbed; ordinary
+    JSON payloads are preserved verbatim."""
+    import json
+
+    db, ws_id, p1, _p2 = _make_db(tmp_path)
+    try:
+        det = _insert_prediction(db, p1, "Say's phoebe", confidence=0.8)
+        db.conn.execute(
+            "INSERT INTO predictions (detection_id, classifier_model, "
+            "labels_fingerprint, species, confidence) "
+            "VALUES (?, 'm1', 'fp1', ?, ?)",
+            (det, "Say’s phoebe", 0.4),
+        )
+        loser_pid = db.conn.execute(
+            "SELECT id FROM predictions WHERE species = ?", ("Say’s phoebe",)
+        ).fetchone()["id"]
+        individual_json = json.dumps(
+            [{"species": "Say's phoebe", "confidence": 0.91},
+             {"species": "Say's phoebe", "confidence": 0.83}]
+        )
+        db.conn.execute(
+            "INSERT INTO prediction_review "
+            "(prediction_id, workspace_id, status, group_id, vote_count, "
+            " total_votes, individual) "
+            "VALUES (?, ?, 'pending', 'burst-13', 2, 3, ?)",
+            (loser_pid, ws_id, individual_json),
+        )
+        db.conn.commit()
+
+        db._fold_prediction_species_apostrophes()
+        db.conn.commit()
+
+        survivor_pid = db.conn.execute(
+            "SELECT id FROM predictions WHERE species = ?", ("Say's phoebe",)
+        ).fetchone()["id"]
+        review = db.conn.execute(
+            "SELECT status, group_id, vote_count, total_votes, individual "
+            "FROM prediction_review "
+            "WHERE prediction_id = ? AND workspace_id = ?",
+            (survivor_pid, ws_id),
+        ).fetchone()
+        assert review is not None
+        assert review["group_id"] == "burst-13"
+        assert review["vote_count"] == 2
+        assert review["total_votes"] == 3
+        assert review["individual"] == individual_json, (
+            "burst per-frame vote JSON was scrubbed to NULL on transfer; "
+            "later group acceptance can no longer derive the consensus "
+            "species from the individual votes"
+        )
+    finally:
+        db.close()
+
+
+def test_prediction_fold_preserves_individual_json_on_alternative_transfer(
+    tmp_path,
+):
+    """Same shape as the pending-transfer test but with the loser row
+    carrying ``status='alternative'`` plus burst metadata *and* the JSON
+    vote payload. The existing ``moves_loser_alternative_metadata_when_
+    present`` test only pins the ``group_id`` / ``vote_count`` /
+    ``total_votes`` copy-through and leaves the ``individual`` slot
+    untested; without this the JSON silently disappears on transfer,
+    breaking the same burst-consensus flow. Only the sentinel gets
+    scrubbed."""
+    import json
+
+    db, ws_id, p1, _p2 = _make_db(tmp_path)
+    try:
+        det = _insert_prediction(db, p1, "Say's phoebe", confidence=0.8)
+        db.conn.execute(
+            "INSERT INTO predictions (detection_id, classifier_model, "
+            "labels_fingerprint, species, confidence) "
+            "VALUES (?, 'm1', 'fp1', ?, ?)",
+            (det, "Say’s phoebe", 0.4),
+        )
+        loser_pid = db.conn.execute(
+            "SELECT id FROM predictions WHERE species = ?", ("Say’s phoebe",)
+        ).fetchone()["id"]
+        individual_json = json.dumps(
+            [{"species": "Say's phoebe", "confidence": 0.72}]
+        )
+        db.conn.execute(
+            "INSERT INTO prediction_review "
+            "(prediction_id, workspace_id, status, group_id, vote_count, "
+            " total_votes, individual) "
+            "VALUES (?, ?, 'alternative', 'burst-14', 3, 4, ?)",
+            (loser_pid, ws_id, individual_json),
+        )
+        db.conn.commit()
+
+        db._fold_prediction_species_apostrophes()
+        db.conn.commit()
+
+        survivor_pid = db.conn.execute(
+            "SELECT id FROM predictions WHERE species = ?", ("Say's phoebe",)
+        ).fetchone()["id"]
+        review = db.conn.execute(
+            "SELECT status, group_id, vote_count, total_votes, individual "
+            "FROM prediction_review "
+            "WHERE prediction_id = ? AND workspace_id = ?",
+            (survivor_pid, ws_id),
+        ).fetchone()
+        assert review is not None
+        # Alternative status is downgraded to pending on the survivor so
+        # the higher-confidence primary stays visible in the queue.
+        assert review["status"] == "pending"
+        assert review["group_id"] == "burst-14"
+        assert review["vote_count"] == 3
+        assert review["total_votes"] == 4
+        assert review["individual"] == individual_json
     finally:
         db.close()

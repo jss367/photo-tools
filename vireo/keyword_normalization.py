@@ -33,6 +33,43 @@ _ASCII_LOWER_TABLE = str.maketrans(
     "abcdefghijklmnopqrstuvwxyz",
 )
 
+# Typographic single quotes that are unambiguously PUNCTUATION (Unicode
+# categories Pi/Pf/Po) fold to ASCII U+0027 so one species does not split
+# into two keywords. macOS smart-quote substitution, pasted iNaturalist
+# common names, and a handful of label-file lines all yield ``Say’s
+# phoebe``; stored verbatim it is a distinct row from ``Say's phoebe``
+# under SQLite ``COLLATE NOCASE``, which is how one bird ended up with
+# two Life List cards and two lifer numbers.
+#
+# The fold happens in the DISPLAY/STORAGE form rather than only in
+# ``keyword_match_key`` on purpose: ``add_keyword`` dedupes with SQL
+# ``COLLATE NOCASE``, which cannot fold U+2019. Folding only the match key
+# would let the merge pass collapse rows that the SQL layer still treats
+# as distinct, so ``add_keyword`` would immediately re-insert the curly
+# variant and the duplicate would grow back. Normalizing on write keeps
+# the two layers in lockstep — see ``keyword_match_key``'s docstring.
+#
+# Deliberately EXCLUDED:
+#   * U+02BB / U+02BC / U+02B9 — spacing modifier LETTERS (category Lm).
+#     U+02BB is the Hawaiian okina in ``ʻApapane`` and ``Hawaiʻi
+#     ʻamakihi``; folding it would rewrite the taxonomy.
+#   * U+00B4 ACUTE ACCENT — preserved internally by
+#     ``_nfkc_preserving_internal_acute`` for names like ``O´Brien``.
+#   * U+2032 PRIME — the semantic prime symbol used for feet, arcminutes,
+#     and similar measurements. ``normalize_keyword_display`` runs on every
+#     keyword (not only species names), so a folded-in-place `10′ waterfall`
+#     would silently rewrite existing DB and queued XMP values. Species
+#     labels with a stray prime are rare enough that the case-collision
+#     merger below can handle them; folding them here would break the
+#     legitimate measurement case with no way for the user to opt out.
+# Edge occurrences of the folded characters are already removed by
+# ``_EDGE_QUOTES``, so in practice this only rewrites INTERNAL ones.
+_APOSTROPHE_FOLD = {
+    ord("‘"): "'",  # LEFT SINGLE QUOTATION MARK
+    ord("’"): "'",  # RIGHT SINGLE QUOTATION MARK
+    ord("‛"): "'",  # SINGLE HIGH-REVERSED-9 QUOTATION MARK
+}
+
 
 def _nfkc_preserving_internal_acute(value: str) -> str:
     """Apply NFKC while leaving internal U+00B4 ACUTE ACCENT intact.
@@ -80,6 +117,11 @@ def normalize_keyword_display(name: str) -> str:
     value = re.sub(r" +", " ", value).strip()
     value = value.strip(_EDGE_QUOTES)
     value = re.sub(r" +", " ", value).strip()
+    # Fold internal typographic apostrophes LAST, after the edge strips have
+    # had their chance to delete them outright. Doing it earlier would turn a
+    # leading `’` into `'` and still strip it, but running last keeps the
+    # edge-case behavior identical to before this fold existed.
+    value = value.translate(_APOSTROPHE_FOLD)
     return value
 
 

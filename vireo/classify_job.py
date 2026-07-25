@@ -11,7 +11,7 @@ import os
 import time
 from dataclasses import dataclass
 
-from labels import get_active_labels, get_saved_labels, load_merged_labels
+from labels import get_active_labels, get_saved_labels, load_merged_labels, read_label_file
 
 try:
     from detector import detect_animals, get_primary_detection
@@ -31,7 +31,37 @@ except ImportError:
     load_working_image = None
 
 from db import AUTO_MATCH_REVIEW_MARKER, Database, commit_with_retry
+from keyword_normalization import _ASCII_LOWER_TABLE, normalize_keyword_display
 from models import get_active_model, get_models
+
+
+def _folded_species_key(species):
+    """Return the string ``add_prediction`` uses to key ``predictions.species``.
+
+    Mirrors the normalization branch in ``Database.add_prediction``: fold when
+    the result is non-empty, otherwise keep the original. Callers use this to
+    dedupe alternatives against a primary before writing prediction_review
+    rows, so the key must match exactly what ends up in the UNIQUE column.
+    """
+    if species is None:
+        return None
+    folded = normalize_keyword_display(species)
+    return folded if folded else species
+
+
+def _species_match_key(species):
+    """Return the equivalence key used to dedupe species names.
+
+    Mirrors ``keyword_match_key`` / SQLite ``COLLATE NOCASE``: strip and
+    ASCII-only case fold. Python's ``str.lower()`` folds non-ASCII pairs
+    such as ``É``/``é`` and ``Maße``/``masse`` that SQLite treats as
+    distinct, so using it here would silently drop a legitimate second
+    prediction row or collapse two distinct-per-DB burst species into
+    one consensus vote.
+    """
+    return (_folded_species_key(species) or "").strip().translate(
+        _ASCII_LOWER_TABLE,
+    )
 
 try:
     from classifier import ClassificationCancelled, Classifier
@@ -110,8 +140,7 @@ def _load_labels(
         labels = load_merged_labels(active_sets)
         log.info("Using %d merged labels from %d sets", len(labels), len(active_sets))
     elif labels_file and os.path.exists(labels_file):
-        with open(labels_file) as f:
-            labels = [line.strip() for line in f if line.strip()]
+        labels = read_label_file(labels_file)
         log.info("Using %d labels from file: %s", len(labels), labels_file)
     else:
         # Try workspace-scoped active labels first
@@ -224,6 +253,20 @@ def _run_classifier_on_detection(db, detection_id, classifier_model, labels,
         species = pred.get("species")
         if not species:
             continue
+        # Fold the label's spelling into keyword-storage form before it lands
+        # in predictions.species. Several bundled label files carry curly
+        # apostrophes (`Bosc’s Fringe-toed lizard`, `Geoffroy’s Tamarin`),
+        # and predictions are matched against keywords.name with exact and
+        # COLLATE NOCASE compares -- neither of which folds U+2019. Storing
+        # the raw label left an accepted `Swinhoe's white-eye` keyword unable
+        # to match its own `Swinhoe’s White-eye` prediction. Normalizing here
+        # rather than at label-load keeps labels_fingerprint (derived from the
+        # raw label file) stable, so this does not invalidate cached
+        # classifier runs or trigger a reclassify.
+        normalized_species = normalize_keyword_display(species)
+        if normalized_species:
+            species = normalized_species
+            pred["species"] = normalized_species
         confidence = pred.get("confidence") or pred.get("score")
         tax = pred.get("taxonomy") or {}
         db.conn.execute(
@@ -1384,7 +1427,35 @@ def _store_match_prediction(
         preserve_manual_review=True,
     )
     if store_alternatives:
+        # Skip alternatives whose normalized species collides with the primary
+        # (or a previously stored alternative). ``add_prediction`` folds
+        # apostrophes centrally, so an active label set with both `Say's
+        # Phoebe` and `Say’s Phoebe` (or a classifier that returns both
+        # spellings in one call) would resolve every ``alt`` to the primary's
+        # unique row. The alternative's re-queried INSERT then upserts
+        # ``prediction_review.status = 'alternative'``, silently overwriting
+        # the auto-accepted match status (or, for a pending primary via
+        # ``_store_pending_detection_prediction``, hiding the top-1 from
+        # review). Dedupe on the same normalized key ``add_prediction`` uses
+        # so alternatives-that-are-actually-the-primary stay unwritten.
+        #
+        # Comparison uses ``_species_match_key`` (ASCII-only case fold):
+        # downstream keyword joins already use SQLite ``COLLATE NOCASE``
+        # (see ``_fold_prediction_species_apostrophes``), so a merged
+        # label set yielding primary `Say's Phoebe` and alternative
+        # `Say's phoebe` is semantically one bird — but
+        # ``_folded_species_key`` preserves case, letting them survive as
+        # two BINARY-unique rows with the alternative overwriting the
+        # primary's review to ``alternative``. ``str.lower()`` folds
+        # non-ASCII case pairs (``Éclair``/``éclair``, ``Maße``/``masse``)
+        # that the DB treats as distinct, so it would silently drop a
+        # legitimate second alternative.
+        seen_species = {_species_match_key(species)}
         for alt in item.get("alternatives", []):
+            alt_key = _species_match_key(alt["species"])
+            if alt_key in seen_species:
+                continue
+            seen_species.add(alt_key)
             alt_tax = alt.get("taxonomy") or (
                 tax.get_hierarchy(alt["species"]) if tax else {}
             )
@@ -1553,7 +1624,20 @@ def _store_pending_detection_prediction(
         item["prediction"], category,
         auto_accept=False,
     )
+    # See _store_match_prediction for why alternatives are deduped by the
+    # same normalized key that ``add_prediction`` uses (and why the
+    # comparison uses the ASCII-only ``_species_match_key`` rather than
+    # ``str.lower``): without this, an alternative that folds to the
+    # primary — including one that differs only by ASCII capitalization —
+    # would upsert the primary's prediction_review row to
+    # ``status='alternative'``, hiding the only top-1 prediction from the
+    # pending queue.
+    seen_species = {_species_match_key(item["prediction"])}
     for alt in item.get("alternatives", []):
+        alt_key = _species_match_key(alt["species"])
+        if alt_key in seen_species:
+            continue
+        seen_species.add(alt_key)
         alt_tax = alt.get("taxonomy") or (
             tax.get_hierarchy(alt["species"]) if tax else {}
         )
@@ -1634,9 +1718,55 @@ def _store_grouped_predictions(
         else:
             group_count += 1
             gid = f"g{job_id[-6:]}-{group_count:04d}"
+            # Fold each frame's species onto the same key ``add_prediction``
+            # uses before computing consensus and the reviewability check.
+            # Without this, a burst whose frames spell the same bird as
+            # both `Say's Phoebe` and `Say’s Phoebe` (because the merged
+            # label set carries both variants) counts as two distinct
+            # species, ``group_reviewable`` becomes False, and the
+            # unanimous burst is stored without its group_id, vote counts,
+            # or individual JSON — so the survivor prediction drops out
+            # of its burst group even though every frame agreed.
+            #
+            # Apostrophe folding alone is not enough: when frames also
+            # differ in ASCII capitalization (`Say's Phoebe` vs
+            # `Say's phoebe` — same word, different label-file entries),
+            # `_folded_species_key` still returns two distinct case
+            # variants. `consensus_prediction` keys on the raw string, so
+            # a semantically unanimous burst gets split votes such as
+            # `1/2`, while `group_species` below already ASCII-folds and
+            # would declare it reviewable — a mismatch that stores split
+            # `individual` entries and a wrong vote count. Canonicalize
+            # to the first-seen casing for each ASCII-lowercase key so
+            # the count sums correctly while `individual_predictions`
+            # still shows a real display-cased species name.
+            #
+            # ASCII-only case fold (``_ASCII_LOWER_TABLE``) rather than
+            # ``.lower()``: SQLite ``COLLATE NOCASE`` and
+            # ``keyword_match_key`` treat non-ASCII case pairs such as
+            # ``Éclair``/``éclair`` as distinct, so ``.lower()`` here
+            # would canonicalize them into one species and inflate a
+            # burst into a spuriously unanimous vote.
+            _canonical_case = {}
+            for item in group:
+                key = _folded_species_key(item.get("prediction"))
+                if key is None:
+                    continue
+                _canonical_case.setdefault(
+                    key.strip().translate(_ASCII_LOWER_TABLE), key,
+                )
+
+            def _cons_key(species, _canon=_canonical_case):
+                folded = _folded_species_key(species)
+                if folded is None:
+                    return folded
+                return _canon.get(
+                    folded.strip().translate(_ASCII_LOWER_TABLE), folded,
+                )
+
             cons_input = [
                 {
-                    "prediction": item["prediction"],
+                    "prediction": _cons_key(item["prediction"]),
                     "confidence": item["confidence"],
                 }
                 for item in group
@@ -1646,7 +1776,7 @@ def _store_grouped_predictions(
                 continue
 
             group_species = {
-                (item.get("prediction") or "").strip().lower()
+                _species_match_key(item.get("prediction"))
                 for item in group
                 if item.get("prediction")
             }

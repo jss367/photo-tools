@@ -14994,7 +14994,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
     def api_classify_readiness():
         """Check what's ready for classification and what will need work."""
         from classifier import _embedding_cache_path, _resolve_model_dir
-        from labels import get_active_labels, get_saved_labels, load_merged_labels
+        from labels import get_active_labels, get_saved_labels, load_merged_labels, read_label_file
         from models import get_active_model, get_models
 
         model_id = request.args.get("model_id", "")
@@ -15056,14 +15056,12 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         if labels_file:
             # Single file override from query param (classify page picker)
             if os.path.exists(labels_file):
-                with open(labels_file) as f:
-                    label_count = sum(1 for line in f if line.strip())
+                labels = read_label_file(labels_file)
+                label_count = len(labels)
                 for ls in get_saved_labels():
                     if ls.get("labels_file") == labels_file:
                         label_name = ls.get("name", labels_file)
                         break
-                with open(labels_file) as f:
-                    labels = [line.strip() for line in f if line.strip()]
         elif labels_files:
             # Multiple files override from query param
             active_sets = []
@@ -17003,7 +17001,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
     def api_embedding_matrix():
         """Return which model+labels combinations have cached embeddings."""
         from classifier import _embedding_cache_path, _resolve_model_dir
-        from labels import get_saved_labels
+        from labels import get_saved_labels, read_label_file
         from models import get_models
 
         # Only BioCLIP-style models use per-label text embeddings. timm models
@@ -17021,8 +17019,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             labels_file = ls.get("labels_file", "")
             if not labels_file or not os.path.exists(labels_file):
                 continue
-            with open(labels_file) as f:
-                labels = [line.strip() for line in f if line.strip()]
+            labels = read_label_file(labels_file)
             row = {
                 "labels_name": ls.get("name", ""),
                 "labels_file": labels_file,
@@ -17058,6 +17055,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
 
         def work(job):
             from classifier import Classifier
+            from labels import read_label_file
             from models import get_models
 
             # Find the model
@@ -17086,8 +17084,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 },
             )
 
-            with open(labels_file) as f:
-                labels = [line.strip() for line in f if line.strip()]
+            labels = read_label_file(labels_file)
 
             log.info(
                 "Pre-computing embeddings: %d labels with %s",
@@ -18361,7 +18358,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         active_ws = _get_db()._active_workspace_id
 
         def work(job):
-            from labels import fetch_species_list, save_labels
+            from labels import fetch_species_list, read_label_file, save_labels
 
             def progress_cb(msg, current=None, total=None):
                 job["progress"]["current_file"] = msg
@@ -18411,8 +18408,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 try:
                     from classifier import _embedding_cache_path, _resolve_model_dir
 
-                    with open(labels_path) as f:
-                        labels = [line.strip() for line in f if line.strip()]
+                    labels = read_label_file(labels_path)
                     model_dir = _resolve_model_dir(
                         active_model["model_str"], active_model.get("weights_path")
                     )
@@ -27804,7 +27800,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         if len(q) < 2:
             return jsonify([])
 
-        from labels import get_active_labels
+        from labels import get_active_labels, read_label_file
 
         matches = []
         seen = set()
@@ -27813,20 +27809,16 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             if not labels_file or not os.path.exists(labels_file):
                 continue
             try:
-                with open(labels_file) as f:
-                    for line in f:
-                        name = line.strip()
-                        if not name:
-                            continue
-                        name_key = name.casefold()
-                        if (
-                            text_search_match(name, q, match_case, whole_word)
-                            and name_key not in seen
-                        ):
-                            seen.add(name_key)
-                            matches.append(name)
-                            if len(matches) >= 20:
-                                break
+                for name in read_label_file(labels_file):
+                    name_key = name.casefold()
+                    if (
+                        text_search_match(name, q, match_case, whole_word)
+                        and name_key not in seen
+                    ):
+                        seen.add(name_key)
+                        matches.append(name)
+                        if len(matches) >= 20:
+                            break
             except Exception:
                 pass
             if len(matches) >= 20:

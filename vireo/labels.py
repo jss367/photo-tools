@@ -258,6 +258,32 @@ def save_labels(name, place_id, place_name, taxon_groups, species,
     return labels_path
 
 
+def read_label_file(path):
+    """Read a label file, returning its stripped, non-empty lines.
+
+    UTF-8 with a cp1252 fallback: label files hold non-ASCII species names
+    and current writes are explicitly UTF-8, but a Windows install that
+    saved a label set before the writer became explicit stored the file in
+    the locale default (cp1252). Reading that legacy file strictly as UTF-8
+    raises ``UnicodeDecodeError`` on the first non-ASCII byte and silently
+    drops the whole active set. Any caller opening a label file directly
+    must route through here so the fallback protects every code path, not
+    just ``load_merged_labels``.
+    """
+    try:
+        with open(path, encoding="utf-8") as f:
+            lines = f.readlines()
+    except UnicodeDecodeError:
+        log.warning(
+            "Label file %s is not valid UTF-8; falling back to cp1252 "
+            "for legacy Windows-written files",
+            path,
+        )
+        with open(path, encoding="cp1252") as f:
+            lines = f.readlines()
+    return [line.strip() for line in lines if line.strip()]
+
+
 def _atomic_write_text(path, text):
     """Write text to ``path`` via a sibling temp file + os.replace().
 
@@ -271,7 +297,11 @@ def _atomic_write_text(path, text):
         prefix=f".{os.path.basename(path)}.", suffix=".tmp", dir=directory
     )
     try:
-        with os.fdopen(fd, "w") as f:
+        # Explicit UTF-8: label files hold species names with non-ASCII
+        # characters (`Köhler’s Vine Snake`, `Hawaiʻi ʻamakihi`), and Python's
+        # default text encoding is the locale codepage on Windows (cp1252),
+        # which cannot represent U+02BB at all.
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(text)
         os.replace(tmp_path, path)
     except Exception:
@@ -386,16 +416,72 @@ def load_merged_labels(label_sets):
 
     Returns:
         sorted, deduplicated list of species name strings.
+
+    Dedupes by the same ASCII-NOCASE key that ``add_prediction``,
+    alternative dedupe, and burst consensus use downstream — matching
+    SQLite's ``COLLATE NOCASE`` semantics via ``keyword_match_key``.
+    Some bundled label files carry curly apostrophes (`Bosc's
+    Fringe-toed lizard`, `Geoffroy's Tamarin`) while others use the
+    plain ASCII form, and hand-edited sets can differ only in case
+    (`Say's Phoebe` vs `Say's phoebe`). Handing the classifier two
+    spellings of the same species feeds its softmax two near-duplicate
+    classes that split probability between them — because each result
+    is thresholded independently in ``_build_custom_results``, a valid
+    prediction can fall below the configured threshold or lose an
+    alternative slot. Grouping by ``normalize_keyword_display`` alone
+    would miss the case-only collision because that helper preserves
+    case; ``keyword_match_key`` composes it with the same ASCII-only
+    lowercase table SQLite uses.
+
+    The fold decides only which of two COLLIDING spellings to drop; a
+    label whose folded key is unique keeps its original source spelling.
+    That distinction matters because ``compute_fingerprint(labels)``
+    hashes this exact list and ``classifier_runs`` is keyed on the
+    result: rewriting a non-colliding label (e.g. the lone `Bosc's
+    Fringe-toed lizard` in california-us-reptiles, or `'Anianiau` in the
+    Hawaii set) would change the fingerprint of five of the six shipped
+    label sets and strand ~70k cached runs, re-running inference over
+    the whole catalog for no dedupe benefit.
     """
+    # Import here rather than at module load: ``labels.py`` is imported
+    # from environments (packaging, first-run bootstrap) that don't yet
+    # have ``vireo/`` on ``sys.path``, and this helper is only reachable
+    # once the app is running.
+    from keyword_normalization import (
+        keyword_match_key,
+        normalize_keyword_display,
+    )
+
     all_species = set()
     for ls in label_sets:
         path = ls.get("labels_file", "")
         if not path or not os.path.exists(path):
             log.warning("Label file missing, skipping: %s", path)
             continue
-        with open(path) as f:
-            for line in f:
-                name = line.strip()
-                if name:
-                    all_species.add(name)
-    return sorted(all_species)
+        for name in read_label_file(path):
+            all_species.add(name)
+    # Group by the ASCII-NOCASE key so case-only variants collapse the
+    # same way SQLite's ``COLLATE NOCASE`` does, then collapse only the
+    # groups that actually have more than one raw spelling.
+    by_key = {}
+    for name in all_species:
+        by_key.setdefault(keyword_match_key(name) or name, []).append(name)
+    merged = []
+    for variants in by_key.values():
+        if len(variants) == 1:
+            # No collision: preserve the source spelling so the fingerprint
+            # is byte-identical to what earlier runs hashed.
+            merged.append(variants[0])
+        else:
+            # Genuine variant collision: prefer a spelling that
+            # ``normalize_keyword_display`` leaves unchanged (i.e. one
+            # already in the storage form, so the classifier's label and
+            # what ``add_prediction`` writes agree byte-for-byte). Sort
+            # first so both the primary preference and the fallback are
+            # deterministic regardless of label-set order.
+            ordered = sorted(variants)
+            merged.append(next(
+                (v for v in ordered if normalize_keyword_display(v) == v),
+                ordered[0],
+            ))
+    return sorted(merged)

@@ -2343,6 +2343,94 @@ def test_ungrouped_burst_clears_stale_group_id_on_reuse(
         assert not after[det_id]["individual"]
 
 
+def test_stored_prediction_species_folds_curly_apostrophe(tmp_path):
+    """Bundled label files contain curly apostrophes (`Geoffroy’s Tamarin`,
+    `Bosc’s Fringe-toed lizard`). predictions.species is matched against
+    keywords.name with exact / COLLATE NOCASE compares that cannot fold
+    U+2019, so storing the raw label left an accepted ASCII keyword unable
+    to match its own prediction. Fold on write so the variant cannot come
+    back after the one-shot migration."""
+    import classify_job
+    from db import Database
+
+    db = Database(str(tmp_path / "test.db"))
+    try:
+        folder_id = db.add_folder("/tmp/p")
+        ws = db.create_workspace("A")
+        db._active_workspace_id = ws
+        db.add_workspace_folder(ws, folder_id)
+        photo_id = db.add_photo(
+            folder_id, "a.jpg", extension=".jpg", file_size=100,
+            file_mtime=1.0,
+        )
+        det_id = db.save_detections(
+            photo_id,
+            [{"box": {"x": 0, "y": 0, "w": 1, "h": 1}, "confidence": 0.9,
+              "category": "animal"}],
+            detector_model="megadetector-v6",
+        )[0]
+
+        stored = classify_job._run_classifier_on_detection(
+            db=db, detection_id=det_id, classifier_model="bioclip-2",
+            labels=["Geoffroy’s Tamarin"], labels_fingerprint="fp1",
+            classify_fn=lambda: [
+                {"species": "Geoffroy’s Tamarin", "confidence": 0.77}
+            ],
+        )
+
+        row = db.conn.execute(
+            "SELECT species FROM predictions WHERE detection_id = ?",
+            (det_id,),
+        ).fetchone()
+        assert row["species"] == "Geoffroy's Tamarin"
+        # The returned dicts feed downstream accept/count logic, so they must
+        # agree with what was persisted.
+        assert stored[0]["species"] == "Geoffroy's Tamarin"
+    finally:
+        db.close()
+
+
+def test_stored_prediction_species_preserves_okina(tmp_path):
+    """U+02BB is a letter in `ʻApapane`, not a stray quote — the fold on the
+    prediction write path must not touch it, or the Hawaii label set would
+    store species that no longer match their keywords."""
+    import classify_job
+    from db import Database
+
+    db = Database(str(tmp_path / "test.db"))
+    try:
+        folder_id = db.add_folder("/tmp/p")
+        ws = db.create_workspace("A")
+        db._active_workspace_id = ws
+        db.add_workspace_folder(ws, folder_id)
+        photo_id = db.add_photo(
+            folder_id, "a.jpg", extension=".jpg", file_size=100,
+            file_mtime=1.0,
+        )
+        det_id = db.save_detections(
+            photo_id,
+            [{"box": {"x": 0, "y": 0, "w": 1, "h": 1}, "confidence": 0.9,
+              "category": "animal"}],
+            detector_model="megadetector-v6",
+        )[0]
+
+        classify_job._run_classifier_on_detection(
+            db=db, detection_id=det_id, classifier_model="bioclip-2",
+            labels=["Hawaiʻi ʻamakihi"], labels_fingerprint="fp1",
+            classify_fn=lambda: [
+                {"species": "Hawaiʻi ʻamakihi", "confidence": 0.77}
+            ],
+        )
+
+        row = db.conn.execute(
+            "SELECT species FROM predictions WHERE detection_id = ?",
+            (det_id,),
+        ).fetchone()
+        assert row["species"] == "Hawaiʻi ʻamakihi"
+    finally:
+        db.close()
+
+
 def test_classifier_skipped_when_run_already_recorded(tmp_path, monkeypatch):
     """If (detection, classifier_model, fingerprint) already ran, don't invoke again."""
     from db import Database
@@ -3100,6 +3188,158 @@ def test_store_grouped_predictions_burst_group():
     assert result["predictions_stored"] == 2
     assert result["burst_groups"] >= 1
     assert mock_db.add_prediction.call_count == 2
+
+
+def test_store_grouped_predictions_folds_species_before_group_consensus():
+    """When the active labels carry both `Say's Phoebe` (ASCII) and
+    `Say’s Phoebe` (U+2019) — a common situation with merged bundled
+    label files — the classifier can return either spelling per frame.
+    Before central folding was applied inside ``_store_grouped_predictions``,
+    ``group_species`` was computed off the raw ``item["prediction"]``
+    strings, so a two-frame burst with one of each spelling produced
+    ``{'say\\'s phoebe', 'say’s phoebe'}`` and ``group_reviewable``
+    became False. The consensus itself also split the votes.
+
+    Because ``add_prediction`` folds the stored species centrally, both
+    frames land on the same prediction row afterwards; the burst was
+    unanimous. So the burst_group *must* survive with a group_id and
+    the full vote count, or the survivor prediction silently loses its
+    grouping metadata."""
+    from datetime import datetime
+    from unittest.mock import MagicMock
+
+    from classify_job import _store_grouped_predictions
+
+    mock_db = MagicMock()
+
+    raw_results = [
+        {
+            "photo": {"id": 1, "filename": "bird1.jpg"},
+            "detection_id": 101,
+            "folder_path": "/photos",
+            "prediction": "Say's Phoebe",
+            "confidence": 0.95,
+            "timestamp": datetime(2024, 1, 15, 10, 0, 0),
+            "filename": "bird1.jpg",
+            "embedding": None,
+            "taxonomy": None,
+        },
+        {
+            "photo": {"id": 2, "filename": "bird2.jpg"},
+            "detection_id": 102,
+            "folder_path": "/photos",
+            # Curly-apostrophe variant of the same species name.
+            "prediction": "Say’s Phoebe",
+            "confidence": 0.90,
+            "timestamp": datetime(2024, 1, 15, 10, 0, 3),
+            "filename": "bird2.jpg",
+            "embedding": None,
+            "taxonomy": None,
+        },
+    ]
+
+    result = _store_grouped_predictions(
+        raw_results=raw_results,
+        job_id="classify-test",
+        model_name="BioCLIP",
+        grouping_window=10,
+        similarity_threshold=0.85,
+        tax=None,
+        db=mock_db,
+    )
+
+    assert result["burst_groups"] == 1, (
+        "unanimous burst was split into non-group predictions because "
+        "raw species strings differ only by apostrophe glyph"
+    )
+    # Both frames should be stored with a group_id and full vote counts.
+    calls = mock_db.add_prediction.call_args_list
+    assert len(calls) == 2
+    for c in calls:
+        kwargs = c.kwargs or c[1]
+        assert kwargs["group_id"] is not None, (
+            "group_id dropped: group_reviewable was False, so the "
+            "survivor prediction lost its burst grouping"
+        )
+        assert kwargs["vote_count"] == 2
+        assert kwargs["total_votes"] == 2
+        assert kwargs["individual"] is not None
+
+
+def test_store_grouped_predictions_folds_case_for_burst_consensus():
+    """When burst frames' predictions differ in both apostrophe glyph AND
+    ASCII capitalization (e.g., `Say's Phoebe` and `Say’s phoebe`), the
+    apostrophe fold alone still yields two distinct consensus keys.
+    ``consensus_prediction`` keys on the raw string, so a semantically
+    unanimous burst would report a `1/2` vote count. Meanwhile
+    ``group_species`` already lowercases and would set
+    ``group_reviewable=True``: the mismatch stored split ``individual``
+    entries against an inconsistent count.
+
+    Canonicalizing to the first-seen casing for each ASCII-lowercase
+    fold key sums the vote correctly while ``individual_predictions``
+    still shows a real display-cased name."""
+    import json
+    from datetime import datetime
+    from unittest.mock import MagicMock
+
+    from classify_job import _store_grouped_predictions
+
+    mock_db = MagicMock()
+
+    raw_results = [
+        {
+            "photo": {"id": 1, "filename": "bird1.jpg"},
+            "detection_id": 101,
+            "folder_path": "/photos",
+            "prediction": "Say's Phoebe",
+            "confidence": 0.95,
+            "timestamp": datetime(2024, 1, 15, 10, 0, 0),
+            "filename": "bird1.jpg",
+            "embedding": None,
+            "taxonomy": None,
+        },
+        {
+            "photo": {"id": 2, "filename": "bird2.jpg"},
+            "detection_id": 102,
+            "folder_path": "/photos",
+            # Curly apostrophe AND lowercase — differs from frame 1 in
+            # two axes at once.
+            "prediction": "Say’s phoebe",
+            "confidence": 0.90,
+            "timestamp": datetime(2024, 1, 15, 10, 0, 3),
+            "filename": "bird2.jpg",
+            "embedding": None,
+            "taxonomy": None,
+        },
+    ]
+
+    result = _store_grouped_predictions(
+        raw_results=raw_results,
+        job_id="classify-test",
+        model_name="BioCLIP",
+        grouping_window=10,
+        similarity_threshold=0.85,
+        tax=None,
+        db=mock_db,
+    )
+
+    assert result["burst_groups"] == 1
+    calls = mock_db.add_prediction.call_args_list
+    assert len(calls) == 2
+    for c in calls:
+        kwargs = c.kwargs or c[1]
+        assert kwargs["group_id"] is not None
+        assert kwargs["vote_count"] == 2, (
+            "vote_count was split because case-variant apostrophe folds "
+            "keyed consensus separately"
+        )
+        assert kwargs["total_votes"] == 2
+        # After case folding the individual dict has one entry summing
+        # to 2, not two entries of 1 each.
+        votes = json.loads(kwargs["individual"])
+        assert sum(votes.values()) == 2
+        assert len(votes) == 1
 
 
 # ── Task 6: run_classify_job full pipeline test ───────────────────────────────
@@ -5121,3 +5361,293 @@ def test_precancelled_job_finalizes_all_step_rows(tmp_path):
             f"Step {step_id!r} must be marked cancelled on the "
             f"pre-resolution cancel gate, got {finals.get(step_id)!r}"
         )
+
+
+def test_store_pending_alt_that_folds_to_primary_does_not_hide_top1(tmp_path):
+    """A pending primary + a curly-spelled alternative that folds to the
+    same species must NOT overwrite the primary's review row with
+    ``status='alternative'``.
+
+    ``Database.add_prediction`` folds species centrally, so both the
+    primary and the collision-alternative resolve to the same predictions
+    row. The alternative's INSERT-OR-IGNORE is a no-op on that row, but
+    the second call still re-queries and unconditionally upserts
+    ``prediction_review`` — with ``status='alternative'``. Without the
+    dedupe added in ``_store_pending_detection_prediction``, the only
+    top-1 prediction for that detection would appear as an alternative
+    and drop out of the pending queue.
+    """
+    from unittest.mock import patch
+
+    from classify_job import _store_grouped_predictions
+    from db import Database
+
+    db = Database(str(tmp_path / "test.db"))
+    ws_id = db.ensure_default_workspace()
+    db.set_active_workspace(ws_id)
+    fid = db.add_folder("/photos", name="photos")
+    pid = db.add_photo(folder_id=fid, filename="bird.jpg", extension=".jpg",
+                       file_size=1000, file_mtime=1.0,
+                       timestamp="2024-01-15T10:00:00")
+    det_ids = db.save_detections(pid, [
+        {"box": {"x": 0.1, "y": 0.1, "w": 0.5, "h": 0.5}, "confidence": 0.9}
+    ], detector_model="megadetector-v6")
+
+    raw_results = [{
+        "photo": {"id": pid, "filename": "bird.jpg",
+                  "timestamp": "2024-01-15T10:00:00"},
+        "detection_id": det_ids[0],
+        "folder_path": "/photos",
+        "image_path": "/photos/bird.jpg",
+        "prediction": "Say's phoebe",
+        "confidence": 0.85,
+        "timestamp": None,
+        "filename": "bird.jpg",
+        "embedding": None,
+        "taxonomy": None,
+        # Curly-spelled variant folds to the same species as the primary.
+        # Also include a genuinely different alternative to confirm the
+        # dedupe skips only the collision.
+        "alternatives": [
+            {"species": "Say’s phoebe", "confidence": 0.10, "taxonomy": None},
+            {"species": "Cassin's kingbird", "confidence": 0.05,
+             "taxonomy": None},
+        ],
+    }]
+
+    with patch("xmp.read_keywords", return_value=[]), \
+         patch("compare.categorize", return_value="new"):
+        _store_grouped_predictions(
+            raw_results=raw_results,
+            job_id="test-alt-collision-1",
+            model_name="test-model",
+            grouping_window=10,
+            similarity_threshold=0.85,
+            tax=None,
+            db=db,
+        )
+
+    all_preds = db.get_predictions()
+    species = sorted(p["species"] for p in all_preds)
+    assert species == ["Cassin's kingbird", "Say's phoebe"], species
+
+    pending = db.get_predictions(status="pending")
+    assert [p["species"] for p in pending] == ["Say's phoebe"], (
+        "the primary must remain in the pending queue — an alternative that "
+        "folds to the same species must not upsert status='alternative' onto it"
+    )
+    alts = db.get_predictions(status="alternative")
+    assert [p["species"] for p in alts] == ["Cassin's kingbird"]
+
+
+def test_store_match_alt_that_folds_to_primary_preserves_auto_accept(tmp_path):
+    """Same collision on the match path: an auto-accepted primary with the
+    ``AUTO_MATCH_REVIEW_MARKER`` must keep its accepted status when an
+    alternative folds to it. Without the dedupe, the alternative's
+    ``status='alternative'`` upsert would overwrite the auto-accept and
+    the previously-labeled match would silently reappear in review."""
+    from classify_job import _store_match_prediction
+    from db import AUTO_MATCH_REVIEW_MARKER, Database
+
+    db = Database(str(tmp_path / "test.db"))
+    ws_id = db.ensure_default_workspace()
+    db.set_active_workspace(ws_id)
+    fid = db.add_folder("/photos", name="photos")
+    pid = db.add_photo(folder_id=fid, filename="bird.jpg", extension=".jpg",
+                       file_size=1000, file_mtime=1.0)
+    det_ids = db.save_detections(pid, [
+        {"box": {"x": 0.1, "y": 0.1, "w": 0.5, "h": 0.5}, "confidence": 0.9}
+    ], detector_model="megadetector-v6")
+
+    item = {
+        "detection_id": det_ids[0],
+        "prediction": "Say's phoebe",
+        "confidence": 0.85,
+        "taxonomy": None,
+        "alternatives": [
+            {"species": "Say’s phoebe", "confidence": 0.10, "taxonomy": None},
+        ],
+    }
+    _store_match_prediction(
+        db, item, model_name="test-model", labels_fingerprint="fp1",
+    )
+
+    rows = db.conn.execute(
+        "SELECT p.species, pr.status, pr.individual "
+        "FROM predictions p "
+        "LEFT JOIN prediction_review pr "
+        "  ON pr.prediction_id = p.id AND pr.workspace_id = ? "
+        "WHERE p.detection_id = ?",
+        (ws_id, det_ids[0]),
+    ).fetchall()
+    assert len(rows) == 1
+    assert rows[0]["species"] == "Say's phoebe"
+    assert rows[0]["status"] == "accepted", (
+        "the alternative that folds to the primary must not overwrite the "
+        "auto-accept back to status='alternative'"
+    )
+    assert rows[0]["individual"] == AUTO_MATCH_REVIEW_MARKER
+
+
+def test_store_match_alt_that_only_differs_in_case_preserves_auto_accept(
+    tmp_path,
+):
+    """Downstream keyword joins already use ``COLLATE NOCASE``, so a merged
+    label set yielding primary ``Say's Phoebe`` and alternative ``Say's
+    phoebe`` is semantically one bird. The BINARY UNIQUE on
+    ``predictions.species`` would still let both survive as distinct rows,
+    with the alternative overwriting the primary's ``prediction_review``.
+    The alternatives-dedupe must therefore match case-insensitively too,
+    otherwise the auto-accepted match silently reappears in review.
+    """
+    from classify_job import _store_match_prediction
+    from db import AUTO_MATCH_REVIEW_MARKER, Database
+
+    db = Database(str(tmp_path / "test.db"))
+    ws_id = db.ensure_default_workspace()
+    db.set_active_workspace(ws_id)
+    fid = db.add_folder("/photos", name="photos")
+    pid = db.add_photo(folder_id=fid, filename="bird.jpg", extension=".jpg",
+                       file_size=1000, file_mtime=1.0)
+    det_ids = db.save_detections(pid, [
+        {"box": {"x": 0.1, "y": 0.1, "w": 0.5, "h": 0.5}, "confidence": 0.9}
+    ], detector_model="megadetector-v6")
+
+    item = {
+        "detection_id": det_ids[0],
+        "prediction": "Say's Phoebe",
+        "confidence": 0.85,
+        "taxonomy": None,
+        "alternatives": [
+            {"species": "Say's phoebe", "confidence": 0.10, "taxonomy": None},
+        ],
+    }
+    _store_match_prediction(
+        db, item, model_name="test-model", labels_fingerprint="fp1",
+    )
+
+    rows = db.conn.execute(
+        "SELECT p.species, pr.status, pr.individual "
+        "FROM predictions p "
+        "LEFT JOIN prediction_review pr "
+        "  ON pr.prediction_id = p.id AND pr.workspace_id = ? "
+        "WHERE p.detection_id = ?",
+        (ws_id, det_ids[0]),
+    ).fetchall()
+    assert len(rows) == 1, (
+        "case-differing alternative must be deduped: it and the primary are "
+        "one species under COLLATE NOCASE"
+    )
+    assert rows[0]["status"] == "accepted"
+    assert rows[0]["individual"] == AUTO_MATCH_REVIEW_MARKER
+
+
+def test_store_match_alt_non_ascii_case_preserves_both_predictions(tmp_path):
+    """SQLite ``COLLATE NOCASE`` and ``keyword_match_key`` fold only A-Z, so
+    ``Éclair`` and ``éclair`` are distinct keywords on the DB side.
+    ``str.lower()`` would collapse them into one dedupe key and drop the
+    alternative; the ASCII-only fold used by ``_species_match_key`` must
+    preserve both predictions so the alternative reaches the UI.
+    """
+    from classify_job import _store_match_prediction
+    from db import Database
+
+    db = Database(str(tmp_path / "test.db"))
+    ws_id = db.ensure_default_workspace()
+    db.set_active_workspace(ws_id)
+    fid = db.add_folder("/photos", name="photos")
+    pid = db.add_photo(folder_id=fid, filename="bird.jpg", extension=".jpg",
+                       file_size=1000, file_mtime=1.0)
+    det_ids = db.save_detections(pid, [
+        {"box": {"x": 0.1, "y": 0.1, "w": 0.5, "h": 0.5}, "confidence": 0.9}
+    ], detector_model="megadetector-v6")
+
+    item = {
+        "detection_id": det_ids[0],
+        "prediction": "Éclair",
+        "confidence": 0.85,
+        "taxonomy": None,
+        "alternatives": [
+            # Non-ASCII case difference only. SQLite treats these as
+            # distinct rows; a Python ``str.lower()`` dedupe would drop
+            # this alternative and hide it from the user.
+            {"species": "éclair", "confidence": 0.10, "taxonomy": None},
+        ],
+    }
+    _store_match_prediction(
+        db, item, model_name="test-model", labels_fingerprint="fp1",
+    )
+
+    species = sorted(
+        r["species"]
+        for r in db.conn.execute(
+            "SELECT species FROM predictions WHERE detection_id = ?",
+            (det_ids[0],),
+        ).fetchall()
+    )
+    assert species == ["Éclair", "éclair"], (
+        "non-ASCII case variants are distinct rows under COLLATE NOCASE; "
+        "the alternative must not be deduped away by a Unicode ``.lower()``"
+    )
+
+
+def test_burst_consensus_non_ascii_case_variants_stay_split(tmp_path):
+    """Two burst frames predicting ``Éclair`` and ``éclair`` are distinct
+    species under SQLite ``COLLATE NOCASE``. A Python ``.lower()`` fold
+    would report them as one unanimous species; the ASCII-only fold used
+    by ``_species_match_key`` must keep them separate so ``group_species``
+    has two entries and ``group_reviewable`` stays False (no group_id or
+    inflated vote count on the stored predictions).
+    """
+    from datetime import datetime
+    from unittest.mock import MagicMock
+
+    from classify_job import _store_grouped_predictions
+
+    mock_db = MagicMock()
+
+    raw_results = [
+        {
+            "photo": {"id": 1, "filename": "a.jpg"},
+            "detection_id": 201,
+            "folder_path": "/photos",
+            "prediction": "Éclair",
+            "confidence": 0.95,
+            "timestamp": datetime(2024, 1, 15, 10, 0, 0),
+            "filename": "a.jpg",
+            "embedding": None,
+            "taxonomy": None,
+        },
+        {
+            "photo": {"id": 2, "filename": "b.jpg"},
+            "detection_id": 202,
+            "folder_path": "/photos",
+            "prediction": "éclair",
+            "confidence": 0.90,
+            "timestamp": datetime(2024, 1, 15, 10, 0, 3),
+            "filename": "b.jpg",
+            "embedding": None,
+            "taxonomy": None,
+        },
+    ]
+
+    _store_grouped_predictions(
+        raw_results=raw_results,
+        job_id="classify-test",
+        model_name="BioCLIP",
+        grouping_window=10,
+        similarity_threshold=0.85,
+        tax=None,
+        db=mock_db,
+    )
+
+    calls = mock_db.add_prediction.call_args_list
+    assert len(calls) == 2
+    for c in calls:
+        kwargs = c.kwargs or c[1]
+        assert kwargs["group_id"] is None, (
+            "non-ASCII case variants are distinct species; the burst must "
+            "not collapse to a single group_id via ``.lower()``"
+        )
+        assert kwargs["vote_count"] is None
+        assert kwargs["individual"] is None

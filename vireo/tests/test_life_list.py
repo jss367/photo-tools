@@ -1441,6 +1441,44 @@ def test_life_list_bucket_survives_root_repair_spelling_drift(tmp_path, monkeypa
     db.close()
 
 
+def test_life_list_merges_apostrophe_variant_species_into_one_entry(life_app):
+    """One bird must get ONE card and ONE lifer number.
+
+    Regression: photos tagged ``Say's phoebe`` (ASCII U+0027) and
+    ``Say’s phoebe`` (curly U+2019) produced two separate Life List
+    cards — ``#47`` with 345 photos and ``#203`` with 27 — even though
+    both keyword rows carried the same ``taxon_id``. The Life List
+    buckets on the canonicalized name, and nothing folded the curly
+    apostrophe, so the two spellings never met.
+    """
+    app, db, ids = life_app
+
+    ascii_kw = db.add_keyword("Say's phoebe", is_species=True)
+    curly_kw = db.add_keyword("Say’s phoebe", is_species=True)
+    # The fold happens at the storage choke point, so both spellings must
+    # land on a single keyword row.
+    assert curly_kw == ascii_kw
+
+    for i, filename in enumerate(("say-ascii.jpg", "say-curly.jpg")):
+        pid = db.add_photo(
+            folder_id=ids["folder"],
+            filename=filename,
+            extension=".jpg",
+            file_size=1000,
+            file_mtime=300.0 + i,
+            timestamp=f"2026-02-0{i + 1}T09:00:00",
+        )
+        db.tag_photo(pid, ascii_kw)
+
+    data = _get_life_list(app)
+    matches = [e for e in data["species"] if "phoebe" in e["species"].lower()]
+    assert len(matches) == 1, (
+        f"expected one phoebe entry, got {[m['species'] for m in matches]}"
+    )
+    assert matches[0]["species"] == "Say's phoebe"
+    assert matches[0]["photo_count"] == 2
+
+
 def test_life_list_alphabetical_key_ignores_apostrophe_variants():
     """Server-side sort key strips the same leading apostrophe variants
     the client's ``lifeListAlphabeticalName`` does, so lifer numbering

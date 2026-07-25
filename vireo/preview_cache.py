@@ -145,7 +145,9 @@ def _recycled_id_probe_paths(thumb_cache_dir, photo_id):
     """One exact (non-globbed) path per id-keyed derivative family.
 
     Used as a cheap existence probe before the full globbing purge — see
-    ``purge_cached_files_for_recycled_id``.
+    ``purge_cached_files_for_recycled_id``. These are the "legacy" (bare
+    id, no variant suffix) names — the variant patterns are covered by
+    ``_recycled_id_probe_patterns``.
     """
     vireo_dir = os.path.dirname(thumb_cache_dir)
     return (
@@ -155,6 +157,56 @@ def _recycled_id_probe_paths(thumb_cache_dir, photo_id):
         os.path.join(vireo_dir, "originals", f"{photo_id}.display.jpg"),
         os.path.join(vireo_dir, "masks", f"{photo_id}.png"),
     )
+
+
+def _recycled_id_probe_patterns(thumb_cache_dir, photo_id):
+    """Glob patterns covering the id-keyed derivative *variants*.
+
+    The exact-path probe above misses the common case where a family
+    exists only in a variant form: sized previews (``previews/7_1920.jpg``,
+    the standard shape written by ``scanner._extract_previews``), source-
+    specific thumbnails (``thumbnails/7_raw.jpg`` / ``7_jpeg.jpg``),
+    prepared full-res renders (``originals/7_1920.jpg``), model-scoped
+    subject masks (``masks/7.sam2-large.png``), edit-mask snapshots
+    (``edit-masks/7.abcdef012345.png``), and offline originals
+    (``offline/originals/7.NEF``). Every one of these is unlinked by
+    ``cleanup_cached_files_for_deleted_photos`` on the delete side, so
+    the *probe* must also see them or the purge silently returns without
+    firing and the new photo serves the previous owner's pixels through
+    the request paths' lazy-adoption shortcuts.
+
+    Callers use ``glob.iglob(pattern)`` with ``next(..., None)`` so each
+    pattern short-circuits at the first hit — a fresh library pays only
+    the ``os.scandir`` open on each empty derivative dir.
+    """
+    vireo_dir = os.path.dirname(thumb_cache_dir)
+    return (
+        os.path.join(thumb_cache_dir, f"{photo_id}_*.jpg"),
+        os.path.join(vireo_dir, "previews", f"{photo_id}_*.jpg"),
+        os.path.join(vireo_dir, "originals", f"{photo_id}_*.jpg"),
+        os.path.join(vireo_dir, "masks", f"{photo_id}.*.png"),
+        os.path.join(vireo_dir, "edit-masks", f"{photo_id}.png"),
+        os.path.join(vireo_dir, "edit-masks", f"{photo_id}.*.png"),
+        os.path.join(vireo_dir, "offline", "originals", f"{photo_id}.*"),
+        os.path.join(vireo_dir, "offline", "xmp", f"{photo_id}.*"),
+        os.path.join(vireo_dir, "offline", "companions", f"{photo_id}.*"),
+    )
+
+
+def _recycled_id_has_stale_derivative(thumb_cache_dir, photo_id):
+    """True when *any* id-keyed derivative for ``photo_id`` still exists.
+
+    Exact paths (cheap ``stat``) first; falls through to variant globs
+    only if none of the legacy names matched — so a fresh library's
+    collision-free path stays at N stats and never enumerates directories.
+    """
+    for p in _recycled_id_probe_paths(thumb_cache_dir, photo_id):
+        if os.path.exists(p):
+            return True
+    for pattern in _recycled_id_probe_patterns(thumb_cache_dir, photo_id):
+        if next(_glob.iglob(pattern), None) is not None:
+            return True
+    return False
 
 
 def purge_cached_files_for_recycled_id(thumb_cache_dir, photo_id):
@@ -181,15 +233,14 @@ def purge_cached_files_for_recycled_id(thumb_cache_dir, photo_id):
     schedule the batched untracked-preview sweep, which is too expensive
     to run per-photo.
 
-    The probe is 5 ``stat`` calls; only ids that actually collide pay for
-    the globbing purge, so a first scan of a fresh library adds ~nothing.
+    The probe is a handful of ``stat`` calls plus, only when none hit,
+    a lazy ``glob.iglob`` per variant family that short-circuits on the
+    first match. Only ids that actually collide pay for the full purge,
+    so a first scan of a fresh library adds ~nothing.
     """
     if not thumb_cache_dir:
         return False
-    if not any(
-        os.path.exists(p)
-        for p in _recycled_id_probe_paths(thumb_cache_dir, photo_id)
-    ):
+    if not _recycled_id_has_stale_derivative(thumb_cache_dir, photo_id):
         return False
     log.info(
         "Photo %s reused a freed rowid with cached derivatives still on "

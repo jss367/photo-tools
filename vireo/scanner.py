@@ -293,6 +293,17 @@ def _pair_raw_jpeg_companions(db, vireo_dir=None, thumb_cache_dir=None):
         base = os.path.splitext(row["filename"])[0]
         groups[(row["folder_id"], base)].append(dict(row))
 
+    # Filesystem changes are collected here and executed only after
+    # commit_with_retry succeeds. All pairs share one transaction, so a
+    # failure on any later iteration (or on the commit itself) rolls back
+    # every companion row that was DELETEd earlier — but any files we'd
+    # already unlinked inline are gone for good, leaving the restored
+    # companion rows pointing at missing thumbnails, working copies,
+    # masks, offline originals, and moved mask snapshots. Deferring gives
+    # us "all DB changes durable, then all FS changes" — commit failure
+    # aborts both halves.
+    post_commit_fs_actions = []
+
     for (_folder_id, _base), members in groups.items():
         if len(members) < 2:
             continue
@@ -396,20 +407,33 @@ def _pair_raw_jpeg_companions(db, vireo_dir=None, thumb_cache_dir=None):
             # An unedited RAW display cache may have been rendered before the
             # camera JPEG was paired. File mtimes cannot tell which source
             # produced that cache, so discard it when the companion changes.
-            _invalidate_raw_display_cache(vireo_dir, primary["id"])
-            thumb_dir = thumb_cache_dir or os.path.join(vireo_dir, "thumbnails")
-            jpeg_variant = os.path.join(
-                thumb_dir, f"{primary['id']}_jpeg.jpg",
+            # Deferred to post-commit: if this pair's DB changes roll back
+            # (because a later iteration or the final commit fails), the
+            # primary's companion_path stays NULL and there's no reason to
+            # have invalidated its display cache — the RAW render is still
+            # valid.
+            _primary_id = primary["id"]
+            _thumb_dir = thumb_cache_dir or os.path.join(
+                vireo_dir, "thumbnails",
             )
-            try:
-                if os.path.exists(jpeg_variant):
-                    os.remove(jpeg_variant)
-            except OSError:
-                log.debug(
-                    "Could not delete stale companion thumbnail %s",
-                    jpeg_variant,
-                    exc_info=True,
-                )
+            _vireo_dir = vireo_dir
+
+            def _invalidate_primary_variants(
+                pid=_primary_id, td=_thumb_dir, vd=_vireo_dir,
+            ):
+                _invalidate_raw_display_cache(vd, pid)
+                jpeg_variant = os.path.join(td, f"{pid}_jpeg.jpg")
+                try:
+                    if os.path.exists(jpeg_variant):
+                        os.remove(jpeg_variant)
+                except OSError:
+                    log.debug(
+                        "Could not delete stale companion thumbnail %s",
+                        jpeg_variant,
+                        exc_info=True,
+                    )
+
+            post_commit_fs_actions.append(_invalidate_primary_variants)
 
         # Transfer detections (and their cascaded predictions) from companion to primary.
         # Detection IDs are content-addressed on (photo_id, detector_model, box,
@@ -573,12 +597,27 @@ def _pair_raw_jpeg_companions(db, vireo_dir=None, thumb_cache_dir=None):
                 # (photo_id, ref); the transferred recipe now points at
                 # primary["id"], so the files must move with it or every
                 # render silently disables the local pass.
-                from local_masks import transfer_snapshots
-                transfer_snapshots(vireo_dir, companion["id"], primary["id"])
-                _invalidate_derived_caches(
-                    db, vireo_dir, primary["id"],
-                    thumb_cache_dir=thumb_cache_dir,
-                )
+                # Deferred to post-commit: transfer_snapshots MOVES files
+                # and _invalidate_derived_caches DELETES them. Running
+                # either before the transaction is durable risks moving
+                # the companion's snapshots onto the primary and then
+                # rolling back the recipe transfer — the render would
+                # then load snapshots the DB no longer knows about.
+                _primary_id = primary["id"]
+                _companion_id = companion["id"]
+                _tcd = thumb_cache_dir
+                _vd = vireo_dir
+
+                def _apply_recipe_transfer_fs(
+                    pid=_primary_id, cid=_companion_id, tcd=_tcd, vd=_vd,
+                ):
+                    from local_masks import transfer_snapshots
+                    transfer_snapshots(vd, cid, pid)
+                    _invalidate_derived_caches(
+                        db, vd, pid, thumb_cache_dir=tcd,
+                    )
+
+                post_commit_fs_actions.append(_apply_recipe_transfer_fs)
             else:
                 db.conn.execute(
                     "UPDATE photos SET thumb_path = NULL WHERE id = ?",
@@ -592,16 +631,50 @@ def _pair_raw_jpeg_companions(db, vireo_dir=None, thumb_cache_dir=None):
         db.conn.execute("DELETE FROM photo_keywords WHERE photo_id = ?", (companion["id"],))
         db.conn.execute("DELETE FROM photos WHERE id = ?", (companion["id"],))
         # The companion's rowid is now free for SQLite to hand to the next
-        # insert. Unlink its derivatives here so the next photo to inherit
-        # the id can't adopt the companion's thumbnail / working copy /
-        # masks (see ``purge_cached_files_for_recycled_id``).
+        # insert. Its derivatives must be unlinked so the next photo to
+        # inherit the id can't adopt the companion's thumbnail / working
+        # copy / masks (see ``purge_cached_files_for_recycled_id``).
+        # Deferred to post-commit: unlinking inline and then losing this
+        # pair's DELETE to a later rollback would leave a restored
+        # companion row pointing at gone-from-disk derivatives, and none
+        # of ``purge_cached_files_for_recycled_id``'s protections would
+        # help — the rowid is still occupied by that restored row, not
+        # available for reuse.
         if vireo_dir:
-            cleanup_cached_files_for_deleted_photos(
-                thumb_cache_dir or os.path.join(vireo_dir, "thumbnails"),
-                [{"photo_id": companion["id"]}],
+            _companion_id = companion["id"]
+            _thumb_dir_for_companion = thumb_cache_dir or os.path.join(
+                vireo_dir, "thumbnails",
             )
 
+            def _cleanup_companion(
+                cid=_companion_id, td=_thumb_dir_for_companion,
+            ):
+                cleanup_cached_files_for_deleted_photos(
+                    td, [{"photo_id": cid}],
+                )
+
+            post_commit_fs_actions.append(_cleanup_companion)
+
     commit_with_retry(db.conn)
+    # DB state is durable now. Run the collected filesystem operations —
+    # any exception here is per-action so a single failing unlink doesn't
+    # skip the rest, and the recycled-id purge on the next insert would
+    # eventually recover anything we missed.
+    for action in post_commit_fs_actions:
+        try:
+            action()
+        except Exception:
+            log.exception(
+                "Deferred filesystem cleanup after raw+JPEG pairing "
+                "failed; may leave stale derivative files that the "
+                "recycled-id purge or Clear Cache will reclaim later",
+            )
+    # ``_invalidate_derived_caches`` inside a deferred action issues DB
+    # updates (clears thumb_path / working_copy_path, drops preview_cache
+    # rows). Those auto-opened a new transaction; commit it so the state
+    # is durable and doesn't leak into the caller's next write.
+    if db.conn.in_transaction:
+        commit_with_retry(db.conn)
 
 
 def _invalidate_raw_display_cache(vireo_dir, photo_id):

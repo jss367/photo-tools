@@ -4403,3 +4403,142 @@ def test_pairing_purges_the_merged_companion_derived_caches(tmp_path):
         assert not os.path.exists(path), (
             f"merged companion's {name} cache outlived its photo row"
         )
+
+
+def test_scan_purges_variant_only_caches_when_new_photo_reuses_a_freed_rowid(
+    tmp_path,
+):
+    """The recycled-id probe must catch derivative families that only exist
+    in a variant form (no legacy exact-name file).
+
+    Sized preview files (``previews/{id}_1920.jpg``) are the standard shape
+    written by the preview stage; source-specific thumbnails
+    (``thumbnails/{id}_raw.jpg``), variant subject masks, and edit-mask
+    snapshots have the same "no bare-name counterpart" property. A probe
+    that only checks the legacy exact names returns False for these, skips
+    the purge, and the request paths' lazy-adoption shortcuts then serve
+    the previous owner's pixels as if they were the new photo's.
+    """
+    from db import Database
+    from scanner import scan
+
+    root = str(tmp_path / "photos")
+    _create_test_images(root, {'': ['gull.jpg']})
+    vireo_dir = str(tmp_path / "vireo")
+    thumb_dir = os.path.join(vireo_dir, "thumbnails")
+
+    db = Database(str(tmp_path / "test.db"))
+    placeholder_folder = db.add_folder(str(tmp_path / "gone"), name="gone")
+    doomed_id = db.add_photo(
+        folder_id=placeholder_folder, filename="munia.jpg", extension=".jpg",
+        file_size=10, file_mtime=1.0,
+    )
+    db.conn.execute("DELETE FROM photos WHERE id = ?", (doomed_id,))
+    db.conn.commit()
+
+    # Seed ONLY variant-form derivatives — no bare-name legacy files.
+    variant_paths = {
+        "sized_preview": os.path.join(
+            vireo_dir, "previews", f"{doomed_id}_1920.jpg",
+        ),
+        "raw_thumbnail_variant": os.path.join(
+            thumb_dir, f"{doomed_id}_raw.jpg",
+        ),
+        "prepared_render": os.path.join(
+            vireo_dir, "originals", f"{doomed_id}_2048.jpg",
+        ),
+        "variant_mask": os.path.join(
+            vireo_dir, "masks", f"{doomed_id}.sam2-large.png",
+        ),
+        "edit_mask_snapshot": os.path.join(
+            vireo_dir, "edit-masks", f"{doomed_id}.abcdef012345.png",
+        ),
+        "offline_original": os.path.join(
+            vireo_dir, "offline", "originals", f"{doomed_id}.NEF",
+        ),
+    }
+    for path in variant_paths.values():
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as fh:
+            fh.write(b"previous-tenant")
+
+    scan(root, db, vireo_dir=vireo_dir, thumb_cache_dir=thumb_dir,
+         skip_working_copies=True)
+
+    new_id = db.conn.execute(
+        "SELECT id FROM photos WHERE filename = 'gull.jpg'"
+    ).fetchone()["id"]
+    assert new_id == doomed_id, (
+        "test setup no longer reproduces rowid reuse; SQLite handed out "
+        f"{new_id} instead of {doomed_id}"
+    )
+    for name, path in variant_paths.items():
+        assert not os.path.exists(path), (
+            f"variant-only {name} cache survived the recycled-id purge and "
+            f"would be served as photo {new_id}'s pixels"
+        )
+
+
+def test_pairing_defers_companion_file_cleanup_until_commit_succeeds(
+    tmp_path, monkeypatch,
+):
+    """If ``commit_with_retry`` raises, the transaction rolls back — every
+    companion row that had been DELETEd earlier in the loop comes back.
+    Any files we'd already unlinked inline would then leave those restored
+    rows pointing at gone-from-disk thumbnails / working copies / masks
+    / offline originals.
+
+    Simulate the failure by monkeypatching ``commit_with_retry`` inside
+    scanner to raise, then assert that the companion row is still present
+    AND its cached derivatives are all still on disk.
+    """
+    import scanner
+    from db import Database
+    from scanner import _pair_raw_jpeg_companions
+
+    img_dir = tmp_path / "photos"
+    img_dir.mkdir()
+    vireo_dir = str(tmp_path / "vireo")
+    thumb_dir = os.path.join(vireo_dir, "thumbnails")
+
+    db = Database(str(tmp_path / "test.db"))
+    fid = db.add_folder(str(img_dir), name="photos")
+    jpeg_id = db.add_photo(
+        folder_id=fid, filename="IMG_003.jpg", extension=".jpg",
+        file_size=1000, file_mtime=1.0,
+    )
+    db.add_photo(
+        folder_id=fid, filename="IMG_003.cr3", extension=".cr3",
+        file_size=2000, file_mtime=1.0,
+    )
+    db.conn.commit()
+
+    seeded = _seed_derivative_files(vireo_dir, thumb_dir, jpeg_id)
+
+    def _boom(_conn):
+        raise RuntimeError("simulated commit failure")
+
+    monkeypatch.setattr(scanner, "commit_with_retry", _boom)
+
+    with pytest.raises(RuntimeError, match="simulated commit failure"):
+        _pair_raw_jpeg_companions(
+            db, vireo_dir=vireo_dir, thumb_cache_dir=thumb_dir,
+        )
+
+    # Force a rollback of the aborted transaction (mirroring what the
+    # scan orchestrator does when a partial pair-up raises) so the
+    # visibility check below sees post-rollback state.
+    db.conn.rollback()
+
+    assert db.conn.execute(
+        "SELECT COUNT(*) AS n FROM photos WHERE id = ?", (jpeg_id,)
+    ).fetchone()["n"] == 1, (
+        "companion row should have been restored by the transaction "
+        "rollback after commit failure"
+    )
+    for name, path in seeded.items():
+        assert os.path.exists(path), (
+            f"companion's {name} cache was deleted before the commit "
+            "succeeded, leaving the restored companion row pointing at a "
+            "missing file"
+        )

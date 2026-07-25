@@ -4827,3 +4827,86 @@ def test_recycled_id_purge_backdates_derivatives_it_could_not_delete(tmp_path):
         "undeletable stale derivative kept its recent mtime, so the "
         "freshness guard would serve the previous owner's pixels"
     )
+
+
+def test_recycled_id_purge_honors_a_thumb_dir_outside_vireo_dir(tmp_path):
+    """``--db`` and ``--thumb-dir`` are independent paths.
+
+    ``audit.import_untracked`` takes ``vireo_dir`` and ``thumb_cache_dir``
+    separately for exactly this reason. Deriving the cache root as
+    ``dirname(thumb_cache_dir)`` would look for previews, working copies,
+    masks, offline files, and DNGs beside the *thumbnails* — so under a
+    split layout none of them are detected or purged, and a recycled id
+    keeps serving the previous owner's pixels from every family except
+    thumbnails.
+    """
+    from preview_cache import (
+        RecycledIdIndex,
+        purge_cached_files_for_recycled_id,
+    )
+
+    vireo_dir = tmp_path / "data"
+    thumb_dir = tmp_path / "elsewhere" / "thumbs"   # NOT vireo_dir/thumbnails
+    thumb_dir.mkdir(parents=True)
+    (thumb_dir / "55.jpg").write_bytes(b"stale-thumb")
+    working = vireo_dir / "working" / "55.jpg"
+    working.parent.mkdir(parents=True)
+    working.write_bytes(b"stale-working")
+    preview = vireo_dir / "previews" / "55_1920.jpg"
+    preview.parent.mkdir(parents=True)
+    preview.write_bytes(b"stale-preview")
+
+    index = RecycledIdIndex(str(thumb_dir), vireo_dir=str(vireo_dir))
+    assert 55 in index, "index missed derivatives under a split layout"
+
+    assert purge_cached_files_for_recycled_id(
+        str(thumb_dir), 55, vireo_dir=str(vireo_dir),
+    )
+
+    assert not (thumb_dir / "55.jpg").exists()
+    assert not working.exists(), (
+        "working copy under the real vireo_dir survived; the purge looked "
+        "beside the thumbnails instead"
+    )
+    assert not preview.exists(), "sized preview under the real vireo_dir survived"
+
+
+def test_recycled_id_purge_backdates_files_inside_an_undeletable_dng_dir(
+    tmp_path,
+):
+    """Backdating a directory does nothing for the file inside it.
+
+    ``external-dng/<id>/`` is a per-id *directory*, but the external-editor
+    freshness check stats the DNG **file** (``cached_mtime >= source_mtime``).
+    If ``rmtree`` fails and we backdate only the directory, the purge reports
+    a successful invalidation while a recycled RAW with the same stem can
+    still be handed the previous owner's DNG.
+    """
+    import preview_cache
+    from preview_cache import purge_cached_files_for_recycled_id
+
+    vireo_dir = tmp_path / "vireo"
+    thumb_dir = vireo_dir / "thumbnails"
+    thumb_dir.mkdir(parents=True)
+    dng_dir = vireo_dir / "external-dng" / "99"
+    dng_dir.mkdir(parents=True)
+    dng = dng_dir / "DSC_0001.dng"
+    dng.write_bytes(b"previous-tenant-conversion")
+    os.utime(dng, (2_000_000_000, 2_000_000_000))
+
+    def _locked_rmtree(path, *args, **kwargs):
+        raise OSError("simulated locked DNG")
+
+    real_rmtree = preview_cache.shutil.rmtree
+    preview_cache.shutil.rmtree = _locked_rmtree
+    try:
+        purge_cached_files_for_recycled_id(str(thumb_dir), 99)
+    finally:
+        preview_cache.shutil.rmtree = real_rmtree
+
+    assert dng.exists(), "test setup failed to simulate an undeletable DNG"
+    assert os.path.getmtime(dng) == 0, (
+        "the DNG inside the undeletable directory kept its recent mtime, so "
+        "the external-editor freshness check would hand Darktable the "
+        "previous owner's conversion"
+    )

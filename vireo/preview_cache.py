@@ -16,7 +16,7 @@ log = logging.getLogger(__name__)
 
 
 def cleanup_cached_files_for_deleted_photos(
-    thumb_cache_dir, files, progress_callback=None,
+    thumb_cache_dir, files, progress_callback=None, vireo_dir=None,
 ):
     """Remove thumbnail, preview, working-copy, and display files for deleted photos.
 
@@ -32,8 +32,17 @@ def cleanup_cached_files_for_deleted_photos(
     remains on disk as an orphan because the cascade has already removed
     the preview_cache row. "Clear cache" in Settings recovers by globbing
     the directory.
+
+    ``--db`` and ``--thumb-dir`` are independently configurable, so
+    ``thumb_cache_dir`` is not necessarily ``<vireo_dir>/thumbnails`` —
+    ``audit.import_untracked`` takes both separately for exactly this
+    reason. Callers that know the real cache root must pass ``vireo_dir``;
+    every other family (previews, working copies, masks, offline, DNG)
+    lives under it, and guessing ``dirname(thumb_cache_dir)`` would look
+    for them beside the thumbnails instead. The fallback keeps the
+    conventional layout working for callers that only have one path.
     """
-    vireo_dir = os.path.dirname(thumb_cache_dir)
+    vireo_dir = vireo_dir or os.path.dirname(thumb_cache_dir)
     preview_dir = os.path.join(vireo_dir, "previews")
     working_dir = os.path.join(vireo_dir, "working")
     originals_dir = os.path.join(vireo_dir, "originals")
@@ -172,7 +181,7 @@ def cleanup_cached_files_for_deleted_photos(
             progress_callback(idx, total, f.get("filename") or str(pid))
 
 
-def _recycled_id_probe_paths(thumb_cache_dir, photo_id):
+def _recycled_id_probe_paths(thumb_cache_dir, photo_id, vireo_dir=None):
     """One exact (non-globbed) path per id-keyed derivative family.
 
     Used as a cheap existence probe before the full globbing purge — see
@@ -180,7 +189,7 @@ def _recycled_id_probe_paths(thumb_cache_dir, photo_id):
     id, no variant suffix) names — the variant patterns are covered by
     ``_recycled_id_probe_patterns``.
     """
-    vireo_dir = os.path.dirname(thumb_cache_dir)
+    vireo_dir = vireo_dir or os.path.dirname(thumb_cache_dir)
     return (
         os.path.join(thumb_cache_dir, f"{photo_id}.jpg"),
         os.path.join(vireo_dir, "working", f"{photo_id}.jpg"),
@@ -195,7 +204,7 @@ def _recycled_id_probe_paths(thumb_cache_dir, photo_id):
     )
 
 
-def _recycled_id_probe_patterns(thumb_cache_dir, photo_id):
+def _recycled_id_probe_patterns(thumb_cache_dir, photo_id, vireo_dir=None):
     """Glob patterns covering the id-keyed derivative *variants*.
 
     The exact-path probe above misses the common case where a family
@@ -214,7 +223,7 @@ def _recycled_id_probe_patterns(thumb_cache_dir, photo_id):
     pattern short-circuits at the first hit — a fresh library pays only
     the ``os.scandir`` open on each empty derivative dir.
     """
-    vireo_dir = os.path.dirname(thumb_cache_dir)
+    vireo_dir = vireo_dir or os.path.dirname(thumb_cache_dir)
     return (
         os.path.join(thumb_cache_dir, f"{photo_id}_*.jpg"),
         os.path.join(vireo_dir, "previews", f"{photo_id}_*.jpg"),
@@ -226,7 +235,7 @@ def _recycled_id_probe_patterns(thumb_cache_dir, photo_id):
     )
 
 
-def _recycled_id_has_stale_derivative(thumb_cache_dir, photo_id):
+def _recycled_id_has_stale_derivative(thumb_cache_dir, photo_id, vireo_dir=None):
     """True when *any* id-keyed derivative for ``photo_id`` still exists.
 
     Exact paths (cheap ``stat``) first; falls through to variant globs
@@ -239,18 +248,20 @@ def _recycled_id_has_stale_derivative(thumb_cache_dir, photo_id):
     measured at 117 ms per miss against a 76k-thumbnail library, i.e.
     ~10 minutes of pure ``scandir`` for a 5000-photo import.
     """
-    for p in _recycled_id_probe_paths(thumb_cache_dir, photo_id):
+    for p in _recycled_id_probe_paths(thumb_cache_dir, photo_id, vireo_dir):
         if os.path.exists(p):
             return True
-    for pattern in _recycled_id_probe_patterns(thumb_cache_dir, photo_id):
+    for pattern in _recycled_id_probe_patterns(
+        thumb_cache_dir, photo_id, vireo_dir,
+    ):
         if next(_glob.iglob(pattern), None) is not None:
             return True
     return False
 
 
-def _derivative_dirs(thumb_cache_dir):
+def _derivative_dirs(thumb_cache_dir, vireo_dir=None):
     """Every directory that stores files keyed by bare photo id."""
-    vireo_dir = os.path.dirname(thumb_cache_dir)
+    vireo_dir = vireo_dir or os.path.dirname(thumb_cache_dir)
     return (
         thumb_cache_dir,
         os.path.join(vireo_dir, "previews"),
@@ -298,13 +309,19 @@ class RecycledIdIndex:
     ids collided.
     """
 
-    def __init__(self, thumb_cache_dir):
+    def __init__(self, thumb_cache_dir, vireo_dir=None):
         self._thumb_cache_dir = thumb_cache_dir
+        # --db and --thumb-dir are independent, so the other derivative
+        # dirs are not necessarily siblings of the thumbnails. Callers
+        # that know the real cache root pass it explicitly.
+        self._vireo_dir = vireo_dir or os.path.dirname(thumb_cache_dir)
         self._ids = None
 
     def _build(self):
         ids = set()
-        for directory in _derivative_dirs(self._thumb_cache_dir):
+        for directory in _derivative_dirs(
+            self._thumb_cache_dir, self._vireo_dir,
+        ):
             try:
                 entries = os.scandir(directory)
             except OSError:
@@ -321,9 +338,10 @@ class RecycledIdIndex:
         # registering as id 4, and loosening it for the file-based
         # families to accept EOL would break that guard. Handle
         # external-dng in its own sweep instead.
-        vireo_dir = os.path.dirname(self._thumb_cache_dir)
         try:
-            entries = os.scandir(os.path.join(vireo_dir, "external-dng"))
+            entries = os.scandir(
+                os.path.join(self._vireo_dir, "external-dng")
+            )
         except OSError:
             entries = None
         if entries is not None:
@@ -343,26 +361,45 @@ class RecycledIdIndex:
         return photo_id in self._ids
 
 
-def _surviving_derivative_paths(thumb_cache_dir, photo_id):
-    """Concrete derivative paths for ``photo_id`` still on disk.
+def _surviving_derivative_paths(thumb_cache_dir, photo_id, vireo_dir=None):
+    """Concrete surviving derivative **files** for ``photo_id``.
 
     Post-purge audit for :func:`purge_cached_files_for_recycled_id` — the
     probe helpers answer "does anything exist?" and short-circuit, but
     here we need the full list so each survivor can be dealt with.
+
+    Directories are expanded into the files they contain rather than
+    returned as-is. ``external-dng/<id>/`` is a per-id directory, and the
+    freshness check that consumes it (``app.py``'s external-editor path)
+    stats the *DNG file*, not its parent — so backdating the directory
+    would leave the child's recent mtime intact and the caller would
+    report a successful invalidation that invalidates nothing.
     """
     paths = [
-        p for p in _recycled_id_probe_paths(thumb_cache_dir, photo_id)
+        p for p in _recycled_id_probe_paths(
+            thumb_cache_dir, photo_id, vireo_dir,
+        )
         if os.path.exists(p)
     ]
-    for pattern in _recycled_id_probe_patterns(thumb_cache_dir, photo_id):
+    for pattern in _recycled_id_probe_patterns(
+        thumb_cache_dir, photo_id, vireo_dir,
+    ):
         paths.extend(_glob.glob(pattern))
+
+    files = []
+    for path in paths:
+        if not os.path.isdir(path):
+            files.append(path)
+            continue
+        for root, _dirs, names in os.walk(path):
+            files.extend(os.path.join(root, name) for name in names)
     # dict.fromkeys: de-dupe (a bare name can match a variant pattern too)
     # while keeping a stable order for the log message.
-    return list(dict.fromkeys(paths))
+    return list(dict.fromkeys(files))
 
 
 def purge_cached_files_for_recycled_id(
-    thumb_cache_dir, photo_id, id_index=None,
+    thumb_cache_dir, photo_id, id_index=None, vireo_dir=None,
 ):
     """Drop any cached derivative left over from a previous owner of ``photo_id``.
 
@@ -398,7 +435,9 @@ def purge_cached_files_for_recycled_id(
     if id_index is not None:
         if photo_id not in id_index:
             return False
-    elif not _recycled_id_has_stale_derivative(thumb_cache_dir, photo_id):
+    elif not _recycled_id_has_stale_derivative(
+        thumb_cache_dir, photo_id, vireo_dir,
+    ):
         return False
     log.info(
         "Photo %s reused a freed rowid with cached derivatives still on "
@@ -406,7 +445,7 @@ def purge_cached_files_for_recycled_id(
         photo_id,
     )
     cleanup_cached_files_for_deleted_photos(
-        thumb_cache_dir, [{"photo_id": photo_id}],
+        thumb_cache_dir, [{"photo_id": photo_id}], vireo_dir=vireo_dir,
     )
     # ``cleanup_cached_files_for_deleted_photos`` logs and continues when an
     # unlink fails (locked file on Windows, a momentarily unwritable
@@ -420,7 +459,9 @@ def purge_cached_files_for_recycled_id(
     # deletion isn't (the lock blocks unlink, not utime), so this recovers
     # the common case; when even that fails we say so instead of leaving a
     # silent wrong-pixels bug.
-    survivors = _surviving_derivative_paths(thumb_cache_dir, photo_id)
+    survivors = _surviving_derivative_paths(
+        thumb_cache_dir, photo_id, vireo_dir,
+    )
     if survivors:
         unfixable = []
         for path in survivors:

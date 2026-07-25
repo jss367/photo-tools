@@ -664,9 +664,10 @@ def _pair_raw_jpeg_companions(db, vireo_dir=None, thumb_cache_dir=None):
 
             def _cleanup_companion(
                 cid=_companion_id, td=_thumb_dir_for_companion,
+                vd=vireo_dir,
             ):
                 cleanup_cached_files_for_deleted_photos(
-                    td, [{"photo_id": cid}],
+                    td, [{"photo_id": cid}], vireo_dir=vd,
                 )
 
             post_commit_fs_actions.append(_cleanup_companion)
@@ -1857,7 +1858,8 @@ def scan(root, db, progress_callback=None, incremental=False, extract_full_metad
     recycled_id_index = RecycledIdIndex(
         thumb_cache_dir or (
             os.path.join(vireo_dir, "thumbnails") if vireo_dir else ""
-        )
+        ),
+        vireo_dir=vireo_dir,
     )
     scoped_paths = {str(root_path)}
     if restrict_dirs is not None:
@@ -2243,6 +2245,7 @@ def scan(root, db, progress_callback=None, incremental=False, extract_full_metad
                     thumb_cache_dir or os.path.join(vireo_dir, "thumbnails"),
                     photo_id,
                     id_index=recycled_id_index,
+                    vireo_dir=vireo_dir,
                 )
             ):
                 invalidated_photo_ids.add(photo_id)

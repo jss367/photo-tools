@@ -11362,6 +11362,87 @@ class Database:
             except Exception:
                 self.conn.rollback()
                 raise
+        # Third-generation sweep: typographic-apostrophe folding.
+        # normalize_keyword_display() previously kept an internal U+2019, so
+        # `Say’s phoebe` was stored as a row distinct from `Say's phoebe`
+        # under SQLite COLLATE NOCASE -- one bird, two keyword rows, two
+        # Life List cards, two lifer numbers. Now that the fold happens on
+        # write, re-run the whole normalization sweep under its own marker
+        # to merge the variants that already exist, and fold the same
+        # characters in predictions.species (joined to keywords.name with
+        # `COLLATE NOCASE`, so a curly prediction silently fails to match
+        # its accepted ASCII keyword).
+        if self.get_meta("keyword_apostrophes_folded_v1") != "1":
+            try:
+                self._normalize_keyword_data_once()
+                folded = self._fold_prediction_species_apostrophes()
+                if folded:
+                    log.info(
+                        "apostrophe fold: rewrote %d prediction species", folded
+                    )
+                self.set_meta(
+                    "keyword_apostrophes_folded_v1", "1", _commit=False
+                )
+                self.conn.commit()
+            except Exception:
+                self.conn.rollback()
+                raise
+
+    def _fold_prediction_species_apostrophes(self):
+        """Rewrite ``predictions.species`` into normalize_keyword_display form.
+
+        Predictions are compared against ``keywords.name`` with exact and
+        ``COLLATE NOCASE`` matches (see the predicted-species subqueries in
+        :meth:`get_photos`), neither of which can fold U+2019. A prediction
+        stored as ``Swinhoe’s White-eye`` therefore never matched the
+        accepted ``Swinhoe's white-eye`` keyword, so the photo's own
+        prediction looked unaccepted in the UI.
+
+        ``predictions`` has UNIQUE(detection_id, classifier_model,
+        labels_fingerprint, species); when folding would collide with a row
+        that already holds the clean spelling, keep the higher-confidence
+        row and drop the variant instead of failing the migration.
+        """
+        folded = 0
+        for row in self.conn.execute(
+            "SELECT id, detection_id, classifier_model, labels_fingerprint, "
+            "species, confidence FROM predictions WHERE species IS NOT NULL"
+        ).fetchall():
+            clean = normalize_keyword_display(row["species"])
+            if clean == row["species"]:
+                continue
+            if not clean:
+                # A prediction whose label is pure stray punctuation has no
+                # canonical spelling to match; leave it rather than inventing
+                # an empty species that would join to nothing.
+                continue
+            dup = self.conn.execute(
+                "SELECT id, confidence FROM predictions "
+                "WHERE detection_id = ? AND classifier_model = ? "
+                "AND labels_fingerprint = ? AND species = ? AND id != ?",
+                (row["detection_id"], row["classifier_model"],
+                 row["labels_fingerprint"], clean, row["id"]),
+            ).fetchone()
+            if dup is not None:
+                if (row["confidence"] or 0) > (dup["confidence"] or 0):
+                    self.conn.execute(
+                        "DELETE FROM predictions WHERE id = ?", (dup["id"],)
+                    )
+                    self.conn.execute(
+                        "UPDATE predictions SET species = ? WHERE id = ?",
+                        (clean, row["id"]),
+                    )
+                else:
+                    self.conn.execute(
+                        "DELETE FROM predictions WHERE id = ?", (row["id"],)
+                    )
+            else:
+                self.conn.execute(
+                    "UPDATE predictions SET species = ? WHERE id = ?",
+                    (clean, row["id"]),
+                )
+            folded += 1
+        return folded
 
     def _align_curation_species_case(self):
         """Re-key curation rows whose species differs from the canonical

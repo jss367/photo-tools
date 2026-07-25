@@ -2343,6 +2343,94 @@ def test_ungrouped_burst_clears_stale_group_id_on_reuse(
         assert not after[det_id]["individual"]
 
 
+def test_stored_prediction_species_folds_curly_apostrophe(tmp_path):
+    """Bundled label files contain curly apostrophes (`Geoffroy’s Tamarin`,
+    `Bosc’s Fringe-toed lizard`). predictions.species is matched against
+    keywords.name with exact / COLLATE NOCASE compares that cannot fold
+    U+2019, so storing the raw label left an accepted ASCII keyword unable
+    to match its own prediction. Fold on write so the variant cannot come
+    back after the one-shot migration."""
+    import classify_job
+    from db import Database
+
+    db = Database(str(tmp_path / "test.db"))
+    try:
+        folder_id = db.add_folder("/tmp/p")
+        ws = db.create_workspace("A")
+        db._active_workspace_id = ws
+        db.add_workspace_folder(ws, folder_id)
+        photo_id = db.add_photo(
+            folder_id, "a.jpg", extension=".jpg", file_size=100,
+            file_mtime=1.0,
+        )
+        det_id = db.save_detections(
+            photo_id,
+            [{"box": {"x": 0, "y": 0, "w": 1, "h": 1}, "confidence": 0.9,
+              "category": "animal"}],
+            detector_model="megadetector-v6",
+        )[0]
+
+        stored = classify_job._run_classifier_on_detection(
+            db=db, detection_id=det_id, classifier_model="bioclip-2",
+            labels=["Geoffroy’s Tamarin"], labels_fingerprint="fp1",
+            classify_fn=lambda: [
+                {"species": "Geoffroy’s Tamarin", "confidence": 0.77}
+            ],
+        )
+
+        row = db.conn.execute(
+            "SELECT species FROM predictions WHERE detection_id = ?",
+            (det_id,),
+        ).fetchone()
+        assert row["species"] == "Geoffroy's Tamarin"
+        # The returned dicts feed downstream accept/count logic, so they must
+        # agree with what was persisted.
+        assert stored[0]["species"] == "Geoffroy's Tamarin"
+    finally:
+        db.close()
+
+
+def test_stored_prediction_species_preserves_okina(tmp_path):
+    """U+02BB is a letter in `ʻApapane`, not a stray quote — the fold on the
+    prediction write path must not touch it, or the Hawaii label set would
+    store species that no longer match their keywords."""
+    import classify_job
+    from db import Database
+
+    db = Database(str(tmp_path / "test.db"))
+    try:
+        folder_id = db.add_folder("/tmp/p")
+        ws = db.create_workspace("A")
+        db._active_workspace_id = ws
+        db.add_workspace_folder(ws, folder_id)
+        photo_id = db.add_photo(
+            folder_id, "a.jpg", extension=".jpg", file_size=100,
+            file_mtime=1.0,
+        )
+        det_id = db.save_detections(
+            photo_id,
+            [{"box": {"x": 0, "y": 0, "w": 1, "h": 1}, "confidence": 0.9,
+              "category": "animal"}],
+            detector_model="megadetector-v6",
+        )[0]
+
+        classify_job._run_classifier_on_detection(
+            db=db, detection_id=det_id, classifier_model="bioclip-2",
+            labels=["Hawaiʻi ʻamakihi"], labels_fingerprint="fp1",
+            classify_fn=lambda: [
+                {"species": "Hawaiʻi ʻamakihi", "confidence": 0.77}
+            ],
+        )
+
+        row = db.conn.execute(
+            "SELECT species FROM predictions WHERE detection_id = ?",
+            (det_id,),
+        ).fetchone()
+        assert row["species"] == "Hawaiʻi ʻamakihi"
+    finally:
+        db.close()
+
+
 def test_classifier_skipped_when_run_already_recorded(tmp_path, monkeypatch):
     """If (detection, classifier_model, fingerprint) already ran, don't invoke again."""
     from db import Database

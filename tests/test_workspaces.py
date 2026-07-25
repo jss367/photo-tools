@@ -1037,6 +1037,56 @@ def test_add_keyword_normalizes_acute_accent_with_leading_whitespace(db):
     assert db.add_keyword("apapane") == kid
 
 
+def test_add_keyword_folds_internal_typographic_apostrophe(db):
+    """A curly apostrophe inside a name must fold to ASCII U+0027.
+
+    macOS smart-quote substitution, pasted iNaturalist common names, and
+    label files all produce ``Say\u2019s phoebe``. Storing that verbatim
+    left it invisibly distinct from ``Say's phoebe`` under SQLite
+    ``COLLATE NOCASE``, so add_keyword inserted a SECOND species row and
+    the Life List showed two cards with two lifer numbers for one bird.
+    Folding in the storage form (not just the match key) keeps
+    keyword_match_key in lockstep with the SQL dedupe.
+    """
+    kid = db.add_keyword("Say's phoebe", is_species=True)
+
+    row = db.conn.execute(
+        "SELECT name FROM keywords WHERE id = ?", (kid,)
+    ).fetchone()
+    assert row["name"] == "Say's phoebe"
+    # The curly variant must resolve to the SAME row, not insert a new one.
+    assert db.add_keyword("Say\u2019s phoebe", is_species=True) == kid
+    assert db.conn.execute(
+        "SELECT COUNT(*) c FROM keywords WHERE name LIKE 'Say%phoebe'"
+    ).fetchone()["c"] == 1
+
+
+def test_add_keyword_folds_curly_apostrophe_when_curly_arrives_first(db):
+    """Fold direction must not depend on insertion order."""
+    kid = db.add_keyword("Cassin\u2019s kingbird", is_species=True)
+
+    row = db.conn.execute(
+        "SELECT name FROM keywords WHERE id = ?", (kid,)
+    ).fetchone()
+    assert row["name"] == "Cassin's kingbird"
+    assert db.add_keyword("Cassin's kingbird", is_species=True) == kid
+
+
+def test_add_keyword_preserves_okina_against_apostrophe_folding(db):
+    """U+02BB/U+02BC are Lm LETTERS in real species names and must survive
+    the apostrophe fold even when they appear INSIDE a name (where the
+    edge-quote strip does not reach)."""
+    for name in ("Hawai\u02bbi \u02bbamakihi", "\u02bbI\u02bbiwi",
+                 "Lili\u02bbuokalani Gardens", "Hawai\u02bci"):
+        kid = db.add_keyword(name)
+        row = db.conn.execute(
+            "SELECT name FROM keywords WHERE id = ?", (kid,)
+        ).fetchone()
+        assert row["name"] == name, (
+            f"okina folded to apostrophe in {name!r} -> {row['name']!r}"
+        )
+
+
 def test_add_keyword_preserves_internal_acute_accent(db):
     """U+00B4 should be stripped only at the edges, not inside a keyword."""
     keyword_id = db.add_keyword("O\u00b4Brien")

@@ -31,6 +31,7 @@ except ImportError:
     load_working_image = None
 
 from db import AUTO_MATCH_REVIEW_MARKER, Database, commit_with_retry
+from keyword_normalization import normalize_keyword_display
 from models import get_active_model, get_models
 
 try:
@@ -224,6 +225,20 @@ def _run_classifier_on_detection(db, detection_id, classifier_model, labels,
         species = pred.get("species")
         if not species:
             continue
+        # Fold the label's spelling into keyword-storage form before it lands
+        # in predictions.species. Several bundled label files carry curly
+        # apostrophes (`Bosc’s Fringe-toed lizard`, `Geoffroy’s Tamarin`),
+        # and predictions are matched against keywords.name with exact and
+        # COLLATE NOCASE compares -- neither of which folds U+2019. Storing
+        # the raw label left an accepted `Swinhoe's white-eye` keyword unable
+        # to match its own `Swinhoe’s White-eye` prediction. Normalizing here
+        # rather than at label-load keeps labels_fingerprint (derived from the
+        # raw label file) stable, so this does not invalidate cached
+        # classifier runs or trigger a reclassify.
+        normalized_species = normalize_keyword_display(species)
+        if normalized_species:
+            species = normalized_species
+            pred["species"] = normalized_species
         confidence = pred.get("confidence") or pred.get("score")
         tax = pred.get("taxonomy") or {}
         db.conn.execute(

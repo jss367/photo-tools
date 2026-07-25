@@ -887,6 +887,174 @@ def test_migration_preserves_okina_names(tmp_path):
         db.close()
 
 
+def test_migration_merges_typographic_apostrophe_keyword_rows(tmp_path):
+    """`Say’s phoebe` (U+2019) and `Say's phoebe` (U+0027) are one bird.
+
+    Both spellings could be stored as separate rows because SQLite's
+    COLLATE NOCASE cannot fold U+2019, which produced two Life List cards
+    with two lifer numbers for the same species. Tags from the variant must
+    migrate onto the ASCII survivor.
+    """
+    db, ws_id, p1, p2 = _make_db(tmp_path)
+    try:
+        ascii_id = _insert_keyword(
+            db, "Say's phoebe", "taxonomy", is_species=1
+        )
+        curly_id = _insert_keyword(
+            db, "Say’s phoebe", "taxonomy", is_species=1
+        )
+        db.conn.execute(
+            "INSERT INTO photo_keywords (photo_id, keyword_id) VALUES (?, ?)",
+            (p1, ascii_id),
+        )
+        db.conn.execute(
+            "INSERT INTO photo_keywords (photo_id, keyword_id) VALUES (?, ?)",
+            (p2, curly_id),
+        )
+        db.conn.commit()
+
+        db._normalize_keyword_data_once()
+        db.conn.commit()
+
+        names = [
+            r["name"] for r in db.conn.execute(
+                "SELECT name FROM keywords WHERE name LIKE 'Say%phoebe'"
+            ).fetchall()
+        ]
+        assert names == ["Say's phoebe"], names
+        survivor = db.conn.execute(
+            "SELECT id FROM keywords WHERE name = ?", ("Say's phoebe",)
+        ).fetchone()["id"]
+        tagged = {
+            r["photo_id"] for r in db.conn.execute(
+                "SELECT photo_id FROM photo_keywords WHERE keyword_id = ?",
+                (survivor,),
+            ).fetchall()
+        }
+        assert tagged == {p1, p2}
+    finally:
+        db.close()
+
+
+def test_migration_preserves_internal_okina_against_apostrophe_fold(tmp_path):
+    """U+02BB inside a name (``Hawaiʻi ʻamakihi``) is a letter, not a
+    quote, and the apostrophe fold must not reach it. The edge-quote strip
+    never touched internal characters, so this is only at risk now that the
+    fold applies mid-string."""
+    db, _ws_id, _p1, _p2 = _make_db(tmp_path)
+    try:
+        kid = _insert_keyword(db, "Hawaiʻi ʻamakihi", "taxonomy", is_species=1)
+        db.conn.commit()
+
+        db._normalize_keyword_data_once()
+        db.conn.commit()
+
+        row = db.conn.execute(
+            "SELECT name FROM keywords WHERE id = ?", (kid,)
+        ).fetchone()
+        assert row["name"] == "Hawaiʻi ʻamakihi"
+    finally:
+        db.close()
+
+
+def _insert_prediction(db, photo_id, species, confidence=0.9, model="m1"):
+    det = db.conn.execute(
+        "INSERT INTO detections (photo_id, category, detector_confidence) "
+        "VALUES (?, 'animal', 0.99)",
+        (photo_id,),
+    ).lastrowid
+    db.conn.execute(
+        "INSERT INTO predictions (detection_id, classifier_model, "
+        "labels_fingerprint, species, confidence) VALUES (?, ?, 'fp1', ?, ?)",
+        (det, model, species, confidence),
+    )
+    return det
+
+
+def test_migration_folds_prediction_species_apostrophes(tmp_path):
+    """predictions.species is joined to keywords.name with COLLATE NOCASE,
+    which cannot fold U+2019 — so a `Swinhoe’s White-eye` prediction never
+    matched the accepted `Swinhoe's white-eye` keyword and the photo's own
+    prediction rendered as unaccepted."""
+    db, _ws_id, p1, _p2 = _make_db(tmp_path)
+    try:
+        _insert_prediction(db, p1, "Swinhoe’s White-eye")
+        db.conn.commit()
+
+        assert db._fold_prediction_species_apostrophes() == 1
+        db.conn.commit()
+
+        species = [
+            r["species"] for r in db.conn.execute(
+                "SELECT species FROM predictions"
+            ).fetchall()
+        ]
+        assert species == ["Swinhoe's White-eye"]
+    finally:
+        db.close()
+
+
+def test_prediction_fold_resolves_unique_collision_by_confidence(tmp_path):
+    """predictions has UNIQUE(detection_id, classifier_model,
+    labels_fingerprint, species). When both spellings exist on one
+    detection, folding would violate it — keep the higher-confidence row
+    rather than aborting the whole migration."""
+    db, _ws_id, p1, _p2 = _make_db(tmp_path)
+    try:
+        det = _insert_prediction(db, p1, "Say's phoebe", confidence=0.4)
+        db.conn.execute(
+            "INSERT INTO predictions (detection_id, classifier_model, "
+            "labels_fingerprint, species, confidence) "
+            "VALUES (?, 'm1', 'fp1', ?, ?)",
+            (det, "Say’s phoebe", 0.8),
+        )
+        db.conn.commit()
+
+        db._fold_prediction_species_apostrophes()
+        db.conn.commit()
+
+        rows = db.conn.execute(
+            "SELECT species, confidence FROM predictions"
+        ).fetchall()
+        assert len(rows) == 1
+        assert rows[0]["species"] == "Say's phoebe"
+        assert rows[0]["confidence"] == 0.8
+    finally:
+        db.close()
+
+
+def test_apostrophe_fold_migration_gated_by_its_own_marker(tmp_path):
+    """The v1 sweep already ran on live DBs (marker
+    `keyword_names_normalized` is set), so the apostrophe fold needs its
+    own marker or it would silently never run on the databases that
+    actually have the duplicate rows."""
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    # Simulate a DB that completed the earlier sweeps, then acquired an
+    # apostrophe-variant duplicate before the fold existed.
+    db.set_meta("keyword_names_normalized", "1")
+    db.set_meta("curation_species_case_aligned_v2", "1")
+    db.conn.execute(
+        "DELETE FROM db_meta WHERE key = 'keyword_apostrophes_folded_v1'"
+    )
+    _insert_keyword(db, "Say's phoebe", "taxonomy", is_species=1)
+    _insert_keyword(db, "Say’s phoebe", "taxonomy", is_species=1)
+    db.conn.commit()
+    db.close()
+
+    reopened = Database(db_path)
+    try:
+        names = [
+            r["name"] for r in reopened.conn.execute(
+                "SELECT name FROM keywords WHERE name LIKE 'Say%phoebe'"
+            ).fetchall()
+        ]
+        assert names == ["Say's phoebe"], names
+        assert reopened.get_meta("keyword_apostrophes_folded_v1") == "1"
+    finally:
+        reopened.close()
+
+
 def test_migration_gated_by_db_meta_marker(tmp_path):
     """The backfill runs once per database, gated by the db_meta marker
     (NOT PRAGMA user_version — live DBs have been advanced past the next

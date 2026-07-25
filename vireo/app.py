@@ -25003,6 +25003,13 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                                 _recipe_source_dimensions(photo)
                                 if render_recipe else None
                             ),
+                            # Must match the primary call's target: when a
+                            # locked stale thumbnail redirected us to the
+                            # sidecar, generating to the default
+                            # ``<id>.jpg`` would short-circuit on that
+                            # locked file and the os.utime below would pin
+                            # the previous owner's pixels as fresh.
+                            cache_name=cache_filename,
                         )
                         if result:
                             source = companion_abs
@@ -25021,6 +25028,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     cfg.load().get("thumbnail_quality", 85),
                     render_recipe,
                     vireo_dir,
+                    cache_name=cache_filename,
                 )
                 if result:
                     source = result

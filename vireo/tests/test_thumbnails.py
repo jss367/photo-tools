@@ -1730,3 +1730,91 @@ def test_serve_thumbnail_does_not_serve_stale_pixels_when_unlink_fails(
     # sidecar the purge globs already cover.
     assert open(thumb_file, "rb").read() == sentinel_bytes
     assert os.path.exists(os.path.join(thumb_dir, f"{pid}_regen.jpg"))
+
+
+def test_thumbnail_raw_fallbacks_honor_an_explicit_cache_name():
+    """The RAW-decode fallbacks must write to the caller's cache name.
+
+    ``serve_thumbnail`` redirects to a ``<id>_regen.jpg`` sidecar when the
+    real thumbnail is stale but undeletable. If the companion / working-copy
+    fallbacks re-enter ``generate_thumbnail`` with the default ``<id>.jpg``
+    they target that *locked stale file* — ``generate_thumbnail`` returns it
+    as-is without generating, and the ``os.utime(result, ...)`` that follows
+    pins the previous owner's pixels as permanently fresh, which is exactly
+    what the freshness guard exists to prevent. The response meanwhile points
+    at a sidecar nobody wrote.
+    """
+    import inspect
+
+    import thumbnails as thumbnails_module
+
+    for fn in (
+        thumbnails_module._retry_thumbnail_with_companion,
+        thumbnails_module._retry_thumbnail_with_working_copy,
+    ):
+        params = inspect.signature(fn).parameters
+        assert "cache_name" in params, (
+            f"{fn.__name__} cannot honor a caller-chosen cache name, so the "
+            "sidecar redirect leaks back onto the locked default path"
+        )
+        src = inspect.getsource(fn)
+        assert "cache_name=cache_name" in src, (
+            f"{fn.__name__} accepts cache_name but does not forward it to "
+            "generate_thumbnail"
+        )
+
+
+def test_serve_thumbnail_passes_sidecar_name_to_every_generation_call(
+    tmp_path, monkeypatch,
+):
+    """No generation call may escape the sidecar redirect.
+
+    Guards the wiring end-to-end: once ``serve_thumbnail`` has redirected to
+    the sidecar, every ``generate_thumbnail`` it makes — primary or fallback
+    — must carry that name.
+    """
+    import app as app_module
+
+    app, db, pid, thumb_dir = _make_app_with_real_photo(tmp_path, monkeypatch)
+
+    thumb_file = os.path.join(thumb_dir, f"{pid}.jpg")
+    Image.new("RGB", (50, 50), (1, 2, 3)).save(thumb_file, "JPEG", quality=70)
+    sentinel_bytes = open(thumb_file, "rb").read()
+    photo_mtime = db.conn.execute(
+        "SELECT file_mtime FROM photos WHERE id=?", (pid,)
+    ).fetchone()["file_mtime"]
+    os.utime(thumb_file, (photo_mtime - 86400, photo_mtime - 86400))
+
+    real_remove = app_module.os.remove
+
+    def failing_remove(path, *args, **kwargs):
+        if path == thumb_file:
+            raise PermissionError(13, "Permission denied", path)
+        return real_remove(path, *args, **kwargs)
+
+    monkeypatch.setattr(app_module.os, "remove", failing_remove)
+
+    import thumbnails as thumbnails_module
+
+    real_generate = thumbnails_module.generate_thumbnail
+    seen_names = []
+
+    def recording_generate(photo_id_, source, cache_dir, **kwargs):
+        seen_names.append(kwargs.get("cache_name"))
+        return real_generate(photo_id_, source, cache_dir, **kwargs)
+
+    monkeypatch.setattr(
+        thumbnails_module, "generate_thumbnail", recording_generate,
+    )
+
+    client = app.test_client()
+    resp = client.get(f"/thumbnails/{pid}.jpg")
+
+    assert resp.status_code == 200
+    assert resp.data != sentinel_bytes
+    assert seen_names, "no thumbnail generation happened"
+    assert all(n == f"{pid}_regen.jpg" for n in seen_names), (
+        f"a generation call escaped the sidecar redirect: {seen_names}"
+    )
+    assert open(thumb_file, "rb").read() == sentinel_bytes
+    assert os.path.getmtime(thumb_file) < photo_mtime

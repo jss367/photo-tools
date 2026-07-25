@@ -82,6 +82,7 @@ def _has_current_raw_failure(photo, source_path):
 
 def _retry_thumbnail_with_companion(
     db, photo, source_path, cache_dir, size, quality, recipe, folder_path,
+    cache_name=None,
 ):
     if not photo or not folder_path:
         return None
@@ -120,12 +121,14 @@ def _retry_thumbnail_with_companion(
         cache_dir,
         size=size,
         quality=quality,
+        cache_name=cache_name,
         **recipe_kwargs,
     )
 
 
 def _retry_thumbnail_with_working_copy(
     db, photo, source_path, cache_dir, size, quality, recipe, vireo_dir,
+    cache_name=None,
 ):
     if not photo or not recipe or not vireo_dir:
         return None
@@ -161,6 +164,7 @@ def _retry_thumbnail_with_working_copy(
         cache_dir,
         size=size,
         quality=quality,
+        cache_name=cache_name,
         **recipe_kwargs,
     )
 

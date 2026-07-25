@@ -3022,3 +3022,177 @@ def test_prediction_fold_scrubs_auto_marker_when_transferring_pending_loser(tmp_
         )
     finally:
         db.close()
+
+
+def test_prediction_fold_preserves_auto_marker_on_decided_transfer(tmp_path):
+    """When the winner has no ``prediction_review`` row (implicit pending)
+    and the loser IS a genuine auto-accepted taxonomy match — ``status=
+    'accepted'`` with ``individual=AUTO_MATCH_REVIEW_MARKER`` — moving the
+    row must preserve the marker. ``reconcile_match_review_state`` deletes
+    stale auto-accepts by matching the marker; scrubbing it here would
+    convert a real auto-accept into an apparent manual decision, stranding
+    the acceptance even after the XMP match evidence goes away."""
+    db, ws_id, p1, _p2 = _make_db(tmp_path)
+    try:
+        det = _insert_prediction(db, p1, "Say's phoebe", confidence=0.8)
+        db.conn.execute(
+            "INSERT INTO predictions (detection_id, classifier_model, "
+            "labels_fingerprint, species, confidence, category) "
+            "VALUES (?, 'm1', 'fp1', ?, ?, 'match')",
+            (det, "Say’s phoebe", 0.4),
+        )
+        loser_pid = db.conn.execute(
+            "SELECT id FROM predictions WHERE species = ?", ("Say’s phoebe",)
+        ).fetchone()["id"]
+        db.conn.execute(
+            "INSERT INTO prediction_review "
+            "(prediction_id, workspace_id, status, individual) "
+            "VALUES (?, ?, 'accepted', ?)",
+            (loser_pid, ws_id, AUTO_MATCH_REVIEW_MARKER),
+        )
+        db.conn.commit()
+
+        db._fold_prediction_species_apostrophes()
+        db.conn.commit()
+
+        survivor_pid = db.conn.execute(
+            "SELECT id FROM predictions WHERE species = ?", ("Say's phoebe",)
+        ).fetchone()["id"]
+        review = db.conn.execute(
+            "SELECT status, individual FROM prediction_review "
+            "WHERE prediction_id = ? AND workspace_id = ?",
+            (survivor_pid, ws_id),
+        ).fetchone()
+        assert review is not None
+        assert review["status"] == "accepted"
+        assert review["individual"] == AUTO_MATCH_REVIEW_MARKER, (
+            "auto-match sentinel was scrubbed while transferring a genuine "
+            "auto-accept; reconcile_match_review_state can no longer "
+            "identify (and clean up) this row when the match evidence "
+            "goes away"
+        )
+    finally:
+        db.close()
+
+
+def test_prediction_fold_preserves_individual_json_on_pending_transfer(tmp_path):
+    """Complement to the sentinel-scrub test: ``individual`` on a pending
+    review row can be the real JSON vote-breakdown that
+    ``_store_grouped_predictions`` stores alongside ``group_id`` /
+    ``vote_count`` / ``total_votes``, not only the auto-match sentinel.
+    Blanket-scrubbing ``individual`` to NULL when transferring a pending
+    loser would silently drop the burst's per-frame vote payload so a
+    later group-accept could no longer derive the consensus species from
+    the individual votes. Only the sentinel gets scrubbed; ordinary
+    JSON payloads are preserved verbatim."""
+    import json
+
+    db, ws_id, p1, _p2 = _make_db(tmp_path)
+    try:
+        det = _insert_prediction(db, p1, "Say's phoebe", confidence=0.8)
+        db.conn.execute(
+            "INSERT INTO predictions (detection_id, classifier_model, "
+            "labels_fingerprint, species, confidence) "
+            "VALUES (?, 'm1', 'fp1', ?, ?)",
+            (det, "Say’s phoebe", 0.4),
+        )
+        loser_pid = db.conn.execute(
+            "SELECT id FROM predictions WHERE species = ?", ("Say’s phoebe",)
+        ).fetchone()["id"]
+        individual_json = json.dumps(
+            [{"species": "Say's phoebe", "confidence": 0.91},
+             {"species": "Say's phoebe", "confidence": 0.83}]
+        )
+        db.conn.execute(
+            "INSERT INTO prediction_review "
+            "(prediction_id, workspace_id, status, group_id, vote_count, "
+            " total_votes, individual) "
+            "VALUES (?, ?, 'pending', 'burst-13', 2, 3, ?)",
+            (loser_pid, ws_id, individual_json),
+        )
+        db.conn.commit()
+
+        db._fold_prediction_species_apostrophes()
+        db.conn.commit()
+
+        survivor_pid = db.conn.execute(
+            "SELECT id FROM predictions WHERE species = ?", ("Say's phoebe",)
+        ).fetchone()["id"]
+        review = db.conn.execute(
+            "SELECT status, group_id, vote_count, total_votes, individual "
+            "FROM prediction_review "
+            "WHERE prediction_id = ? AND workspace_id = ?",
+            (survivor_pid, ws_id),
+        ).fetchone()
+        assert review is not None
+        assert review["group_id"] == "burst-13"
+        assert review["vote_count"] == 2
+        assert review["total_votes"] == 3
+        assert review["individual"] == individual_json, (
+            "burst per-frame vote JSON was scrubbed to NULL on transfer; "
+            "later group acceptance can no longer derive the consensus "
+            "species from the individual votes"
+        )
+    finally:
+        db.close()
+
+
+def test_prediction_fold_preserves_individual_json_on_alternative_transfer(
+    tmp_path,
+):
+    """Same shape as the pending-transfer test but with the loser row
+    carrying ``status='alternative'`` plus burst metadata *and* the JSON
+    vote payload. The existing ``moves_loser_alternative_metadata_when_
+    present`` test only pins the ``group_id`` / ``vote_count`` /
+    ``total_votes`` copy-through and leaves the ``individual`` slot
+    untested; without this the JSON silently disappears on transfer,
+    breaking the same burst-consensus flow. Only the sentinel gets
+    scrubbed."""
+    import json
+
+    db, ws_id, p1, _p2 = _make_db(tmp_path)
+    try:
+        det = _insert_prediction(db, p1, "Say's phoebe", confidence=0.8)
+        db.conn.execute(
+            "INSERT INTO predictions (detection_id, classifier_model, "
+            "labels_fingerprint, species, confidence) "
+            "VALUES (?, 'm1', 'fp1', ?, ?)",
+            (det, "Say’s phoebe", 0.4),
+        )
+        loser_pid = db.conn.execute(
+            "SELECT id FROM predictions WHERE species = ?", ("Say’s phoebe",)
+        ).fetchone()["id"]
+        individual_json = json.dumps(
+            [{"species": "Say's phoebe", "confidence": 0.72}]
+        )
+        db.conn.execute(
+            "INSERT INTO prediction_review "
+            "(prediction_id, workspace_id, status, group_id, vote_count, "
+            " total_votes, individual) "
+            "VALUES (?, ?, 'alternative', 'burst-14', 3, 4, ?)",
+            (loser_pid, ws_id, individual_json),
+        )
+        db.conn.commit()
+
+        db._fold_prediction_species_apostrophes()
+        db.conn.commit()
+
+        survivor_pid = db.conn.execute(
+            "SELECT id FROM predictions WHERE species = ?", ("Say's phoebe",)
+        ).fetchone()["id"]
+        review = db.conn.execute(
+            "SELECT status, group_id, vote_count, total_votes, individual "
+            "FROM prediction_review "
+            "WHERE prediction_id = ? AND workspace_id = ?",
+            (survivor_pid, ws_id),
+        ).fetchone()
+        assert review is not None
+        # Alternative status is downgraded to pending on the survivor so
+        # the higher-confidence primary stays visible in the queue.
+        assert review["status"] == "pending"
+        assert review["group_id"] == "burst-14"
+        assert review["vote_count"] == 3
+        assert review["total_votes"] == 4
+        assert review["individual"] == individual_json
+    finally:
+        db.close()

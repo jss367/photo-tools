@@ -11534,7 +11534,16 @@ class Database:
           etc.) worth preserving. A bare ``status='alternative'`` row on
           the loser is dropped instead: transferring it would turn a
           higher-confidence pending primary into an alternative, hiding
-          the sole top-1 prediction from the pending queue.
+          the sole top-1 prediction from the pending queue.  When the
+          decided loser IS itself the auto-accepted taxonomy match (its
+          ``individual`` carries ``AUTO_MATCH_REVIEW_MARKER``), the marker
+          is preserved on the transfer: it's the provenance
+          ``reconcile_match_review_state`` uses to delete the row later
+          if the XMP match goes away; scrubbing it would leave a stale
+          auto-accept looking like a manual decision no automation can
+          revisit. A pending-loser transfer still scrubs the marker
+          (a non-decided row carrying it is spurious historical state,
+          not a real auto-accept).
         - If the winner already has a row for that workspace (both were
           reviewed independently), keep whichever encodes the stronger
           decision: a non-pending status beats pending, and among two
@@ -11599,38 +11608,42 @@ class Database:
                 if not loser_decided and not loser_metadata:
                     continue
                 if loser_decided:
-                    # Preserve the loser's accept/reject.  Scrub the
-                    # auto-match sentinel from ``individual`` so a
-                    # manually-decided row can't be mistaken for an
-                    # auto-review row on the winner (see class-level
-                    # comment on why the marker must not propagate onto
-                    # a manual decision).
-                    if lr["individual"] == AUTO_MATCH_REVIEW_MARKER:
-                        self.conn.execute(
-                            "UPDATE prediction_review SET prediction_id = ?, "
-                            "individual = NULL "
-                            "WHERE prediction_id = ? AND workspace_id = ?",
-                            (winner_id, loser_id, ws),
-                        )
-                    else:
-                        self.conn.execute(
-                            "UPDATE prediction_review SET prediction_id = ? "
-                            "WHERE prediction_id = ? AND workspace_id = ?",
-                            (winner_id, loser_id, ws),
-                        )
+                    # Move the row intact, ``individual`` included: the
+                    # loser IS the decision, not a competing manual row
+                    # the sentinel could pollute. Preserving
+                    # ``AUTO_MATCH_REVIEW_MARKER`` when it's set is what
+                    # lets ``reconcile_match_review_state`` recognize an
+                    # auto-accept later and clean it up if the XMP match
+                    # goes away; scrubbing it here would strand the
+                    # accept as an apparent manual decision no automation
+                    # can revisit.
+                    self.conn.execute(
+                        "UPDATE prediction_review SET prediction_id = ? "
+                        "WHERE prediction_id = ? AND workspace_id = ?",
+                        (winner_id, loser_id, ws),
+                    )
                 else:
                     # Undecided loser with real burst metadata: keep the
                     # metadata but leave the winner implicit-pending by
-                    # downgrading the transferred status. Individual is
-                    # always the sentinel or NULL for undecided rows;
-                    # scrub either way so the winner stays clean of
-                    # spurious auto-match provenance.
+                    # downgrading the transferred status. ``individual``
+                    # on a pending row can be the JSON vote breakdown
+                    # ``_store_grouped_predictions`` stores alongside
+                    # ``group_id`` / ``vote_count`` / ``total_votes``,
+                    # so preserve it verbatim; only the auto-match
+                    # sentinel gets scrubbed so future automation
+                    # doesn't misread provenance on a row the user has
+                    # never reviewed.
+                    scrubbed_individual = (
+                        None
+                        if lr["individual"] == AUTO_MATCH_REVIEW_MARKER
+                        else lr["individual"]
+                    )
                     self.conn.execute(
                         "UPDATE prediction_review "
                         "SET prediction_id = ?, status = 'pending', "
-                        "    individual = NULL "
+                        "    individual = ? "
                         "WHERE prediction_id = ? AND workspace_id = ?",
-                        (winner_id, loser_id, ws),
+                        (winner_id, scrubbed_individual, loser_id, ws),
                     )
                 continue
             winner_status = winner["status"] or "pending"

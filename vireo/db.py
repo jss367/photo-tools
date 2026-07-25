@@ -11481,8 +11481,15 @@ class Database:
 
         For each ``(loser_id, workspace_id)`` review row:
 
-        - If the winner has no row for that workspace, re-point the loser's
-          row at the winner.
+        - If the winner has no row for that workspace, absence encodes an
+          implicit ``pending`` state, so treat it as a real row rather than
+          a slot to be filled. Move the loser's row onto the winner only
+          when the loser carries a genuine user decision
+          (``accepted``/``rejected``) or non-status metadata (``group_id``
+          etc.) worth preserving. A bare ``status='alternative'`` row on
+          the loser is dropped instead: transferring it would turn a
+          higher-confidence pending primary into an alternative, hiding
+          the sole top-1 prediction from the pending queue.
         - If the winner already has a row for that workspace (both were
           reviewed independently), keep whichever encodes the stronger
           decision: a non-pending status beats pending, and among two
@@ -11496,6 +11503,12 @@ class Database:
           prediction would silently drop out of its burst group. This is
           safe because two rows for the same (detection, species) pair
           across spelling variants are always about the same burst.
+          ``individual`` is filled only when the source value is not the
+          ``AUTO_MATCH_REVIEW_MARKER`` sentinel; that string is provenance
+          for auto-accepted taxonomy matches, and copying it onto a
+          manually chosen accept/reject would let later automation
+          (``preserve_manual_review`` / ``reconcile_match_review_state``)
+          overwrite or delete the user's decision.
 
         The loser's remaining rows are removed by the caller's DELETE via
         the ON DELETE CASCADE, so no explicit cleanup is needed here.
@@ -11514,16 +11527,45 @@ class Database:
                 "WHERE prediction_id = ? AND workspace_id = ?",
                 (winner_id, ws),
             ).fetchone()
-            if winner is None:
-                self.conn.execute(
-                    "UPDATE prediction_review SET prediction_id = ? "
-                    "WHERE prediction_id = ? AND workspace_id = ?",
-                    (winner_id, loser_id, ws),
-                )
-                continue
             loser_status = lr["status"] or "pending"
-            winner_status = winner["status"] or "pending"
             loser_decided = loser_status in ("accepted", "rejected")
+            loser_metadata = {
+                col: lr[col]
+                for col in ("group_id", "vote_count", "total_votes", "individual")
+                if lr[col] is not None
+            }
+            if winner is None:
+                # Winner's absence == implicit pending. Overriding that with
+                # the loser's row only makes sense when the loser carries a
+                # user decision or group metadata worth preserving; a bare
+                # ``status='alternative'`` transfer would silently flip a
+                # higher-confidence pending primary into an alternative and
+                # hide the sole top-1 prediction from the pending queue.
+                if not loser_decided and not loser_metadata:
+                    continue
+                # Preserve the loser's group metadata / status, but scrub
+                # the auto-match sentinel out of a non-decided row so it
+                # can't later be mistaken for provenance on the winner (see
+                # class-level comment on why the marker must not propagate
+                # onto a manual decision).
+                if (
+                    lr["individual"] == AUTO_MATCH_REVIEW_MARKER
+                    and not loser_decided
+                ):
+                    self.conn.execute(
+                        "UPDATE prediction_review SET prediction_id = ?, "
+                        "individual = NULL "
+                        "WHERE prediction_id = ? AND workspace_id = ?",
+                        (winner_id, loser_id, ws),
+                    )
+                else:
+                    self.conn.execute(
+                        "UPDATE prediction_review SET prediction_id = ? "
+                        "WHERE prediction_id = ? AND workspace_id = ?",
+                        (winner_id, loser_id, ws),
+                    )
+                continue
+            winner_status = winner["status"] or "pending"
             winner_decided = winner_status in ("accepted", "rejected")
             prefer_loser = loser_decided and (
                 not winner_decided
@@ -11537,7 +11579,16 @@ class Database:
             # it via CASCADE without this backfill. Symmetric across sides:
             # whichever side supplied the decision, missing group metadata
             # is filled from the other so the surviving prediction stays
-            # inside its burst group.
+            # inside its burst group. ``individual`` intentionally skips
+            # the ``AUTO_MATCH_REVIEW_MARKER`` fill-in: the chosen row is
+            # the surviving decision (a manual accept/reject may store
+            # ``individual=NULL``), and copying the auto-match sentinel
+            # from a stale auto-accepted row would let later runs of
+            # ``reconcile_match_review_state`` delete the user's decision
+            # or let ``preserve_manual_review`` overwrite it.
+            other_individual = other["individual"]
+            if other_individual == AUTO_MATCH_REVIEW_MARKER:
+                other_individual = None
             self.conn.execute(
                 """UPDATE prediction_review
                    SET status = ?, reviewed_at = ?, individual = ?,
@@ -11545,7 +11596,7 @@ class Database:
                    WHERE prediction_id = ? AND workspace_id = ?""",
                 (chosen["status"], chosen["reviewed_at"],
                  chosen["individual"] if chosen["individual"] is not None
-                 else other["individual"],
+                 else other_individual,
                  chosen["group_id"] if chosen["group_id"] is not None
                  else other["group_id"],
                  chosen["vote_count"] if chosen["vote_count"] is not None

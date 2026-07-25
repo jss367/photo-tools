@@ -1023,6 +1023,40 @@ def test_prediction_fold_resolves_unique_collision_by_confidence(tmp_path):
         db.close()
 
 
+def test_prediction_fold_collision_matches_case_insensitively(tmp_path):
+    """Downstream keyword joins use ``COLLATE NOCASE``, so a DB carrying
+    both `Say's Phoebe` (ASCII, title-case) and `Say’s phoebe` (curly,
+    lowercase) already renders as one bird. The fold must merge them
+    the same way; a case-sensitive collision lookup would rename only
+    the curly row and leave two ASCII case-variants that survive as
+    duplicate predictions on the same (detection, model, fingerprint).
+    """
+    db, _ws_id, p1, _p2 = _make_db(tmp_path)
+    try:
+        det = _insert_prediction(db, p1, "Say's Phoebe", confidence=0.9)
+        db.conn.execute(
+            "INSERT INTO predictions (detection_id, classifier_model, "
+            "labels_fingerprint, species, confidence) "
+            "VALUES (?, 'm1', 'fp1', ?, ?)",
+            (det, "Say’s phoebe", 0.3),
+        )
+        db.conn.commit()
+
+        db._fold_prediction_species_apostrophes()
+        db.conn.commit()
+
+        rows = db.conn.execute(
+            "SELECT species, confidence FROM predictions"
+        ).fetchall()
+        assert len(rows) == 1
+        # Higher-confidence winner keeps its casing; loser's curly variant
+        # is deleted rather than left as a folded duplicate.
+        assert rows[0]["species"] == "Say's Phoebe"
+        assert rows[0]["confidence"] == 0.9
+    finally:
+        db.close()
+
+
 def test_prediction_fold_preserves_review_when_loser_carries_decision(tmp_path):
     """When the collision-merge deletes the losing prediction, its per-
     workspace prediction_review row must migrate onto the surviving row.

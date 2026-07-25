@@ -11422,10 +11422,18 @@ class Database:
                 # canonical spelling to match; leave it rather than inventing
                 # an empty species that would join to nothing.
                 continue
+            # ``COLLATE NOCASE`` matches SQLite's ASCII case fold, which is
+            # the same equivalence downstream keyword joins already use. Without
+            # it, a DB carrying `Say's Phoebe` (ASCII, title-case) alongside a
+            # `Say’s phoebe` (curly, lowercase) misses the collision, folds only
+            # the curly row, and leaves two case-variant predictions on the same
+            # (detection, model, fingerprint) — preserving the split review state
+            # and duplicate rendering the fold was meant to erase.
             dup = self.conn.execute(
                 "SELECT id, confidence FROM predictions "
                 "WHERE detection_id = ? AND classifier_model = ? "
-                "AND labels_fingerprint = ? AND species = ? AND id != ?",
+                "AND labels_fingerprint = ? "
+                "AND species = ? COLLATE NOCASE AND id != ?",
                 (row["detection_id"], row["classifier_model"],
                  row["labels_fingerprint"], clean, row["id"]),
             ).fetchone()

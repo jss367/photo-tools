@@ -3266,6 +3266,82 @@ def test_store_grouped_predictions_folds_species_before_group_consensus():
         assert kwargs["individual"] is not None
 
 
+def test_store_grouped_predictions_folds_case_for_burst_consensus():
+    """When burst frames' predictions differ in both apostrophe glyph AND
+    ASCII capitalization (e.g., `Say's Phoebe` and `Say’s phoebe`), the
+    apostrophe fold alone still yields two distinct consensus keys.
+    ``consensus_prediction`` keys on the raw string, so a semantically
+    unanimous burst would report a `1/2` vote count. Meanwhile
+    ``group_species`` already lowercases and would set
+    ``group_reviewable=True``: the mismatch stored split ``individual``
+    entries against an inconsistent count.
+
+    Canonicalizing to the first-seen casing for each ASCII-lowercase
+    fold key sums the vote correctly while ``individual_predictions``
+    still shows a real display-cased name."""
+    import json
+    from datetime import datetime
+    from unittest.mock import MagicMock
+
+    from classify_job import _store_grouped_predictions
+
+    mock_db = MagicMock()
+
+    raw_results = [
+        {
+            "photo": {"id": 1, "filename": "bird1.jpg"},
+            "detection_id": 101,
+            "folder_path": "/photos",
+            "prediction": "Say's Phoebe",
+            "confidence": 0.95,
+            "timestamp": datetime(2024, 1, 15, 10, 0, 0),
+            "filename": "bird1.jpg",
+            "embedding": None,
+            "taxonomy": None,
+        },
+        {
+            "photo": {"id": 2, "filename": "bird2.jpg"},
+            "detection_id": 102,
+            "folder_path": "/photos",
+            # Curly apostrophe AND lowercase — differs from frame 1 in
+            # two axes at once.
+            "prediction": "Say’s phoebe",
+            "confidence": 0.90,
+            "timestamp": datetime(2024, 1, 15, 10, 0, 3),
+            "filename": "bird2.jpg",
+            "embedding": None,
+            "taxonomy": None,
+        },
+    ]
+
+    result = _store_grouped_predictions(
+        raw_results=raw_results,
+        job_id="classify-test",
+        model_name="BioCLIP",
+        grouping_window=10,
+        similarity_threshold=0.85,
+        tax=None,
+        db=mock_db,
+    )
+
+    assert result["burst_groups"] == 1
+    calls = mock_db.add_prediction.call_args_list
+    assert len(calls) == 2
+    for c in calls:
+        kwargs = c.kwargs or c[1]
+        assert kwargs["group_id"] is not None
+        assert kwargs["vote_count"] == 2, (
+            "vote_count was split because case-variant apostrophe folds "
+            "keyed consensus separately"
+        )
+        assert kwargs["total_votes"] == 2
+        # After case folding the individual dict has one entry summing
+        # to 2, not two entries of 1 each.
+        votes = json.loads(kwargs["individual"])
+        assert sum(votes.values()) == 2
+        assert len(votes) == 1
+
+
 # ── Task 6: run_classify_job full pipeline test ───────────────────────────────
 
 

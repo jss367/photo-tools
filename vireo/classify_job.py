@@ -1698,9 +1698,35 @@ def _store_grouped_predictions(
             # unanimous burst is stored without its group_id, vote counts,
             # or individual JSON — so the survivor prediction drops out
             # of its burst group even though every frame agreed.
+            #
+            # Apostrophe folding alone is not enough: when frames also
+            # differ in ASCII capitalization (`Say's Phoebe` vs
+            # `Say's phoebe` — same word, different label-file entries),
+            # `_folded_species_key` still returns two distinct case
+            # variants. `consensus_prediction` keys on the raw string, so
+            # a semantically unanimous burst gets split votes such as
+            # `1/2`, while `group_species` below already lowercases and
+            # would declare it reviewable — a mismatch that stores split
+            # `individual` entries and a wrong vote count. Canonicalize
+            # to the first-seen casing for each ASCII-lowercase key so
+            # the count sums correctly while `individual_predictions`
+            # still shows a real display-cased species name.
+            _canonical_case = {}
+            for item in group:
+                key = _folded_species_key(item.get("prediction"))
+                if key is None:
+                    continue
+                _canonical_case.setdefault(key.strip().lower(), key)
+
+            def _cons_key(species, _canon=_canonical_case):
+                folded = _folded_species_key(species)
+                if folded is None:
+                    return folded
+                return _canon.get(folded.strip().lower(), folded)
+
             cons_input = [
                 {
-                    "prediction": _folded_species_key(item["prediction"]),
+                    "prediction": _cons_key(item["prediction"]),
                     "confidence": item["confidence"],
                 }
                 for item in group

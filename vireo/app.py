@@ -24857,11 +24857,31 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     or sidecar_mtime >= selected_source_mtime
                 ):
                     return _send_cached(thumb_dir, cache_filename)
-                # Fall through: the regen path below now targets the
-                # sidecar, so a stale sidecar is overwritten too.
-                with contextlib.suppress(OSError):
-                    if sidecar_mtime is not None:
+                # A stale sidecar has to go before we fall through, for
+                # the same reason as the original: ``generate_thumbnail``
+                # short-circuits on an existing destination, so leaving it
+                # would return the previous owner's pixels and the
+                # ``os.utime(result, ...)`` below would then mark them
+                # fresh forever.
+                if sidecar_mtime is not None:
+                    with contextlib.suppress(OSError):
                         os.remove(thumb_path)
+                    if os.path.exists(thumb_path):
+                        # Both the real thumbnail and the sidecar are
+                        # stale and undeletable, so there is nowhere in
+                        # the cache we can safely write. Every remaining
+                        # option would serve another photo's pixels;
+                        # answer honestly instead. The next request
+                        # retries both unlinks.
+                        log.error(
+                            "Photo %s has a stale thumbnail and a stale "
+                            "regeneration sidecar, neither of which could "
+                            "be removed (%s). Serving no thumbnail rather "
+                            "than the previous owner's pixels; clear the "
+                            "cache in Settings > Storage to recover.",
+                            photo_id, thumb_path,
+                        )
+                        return "", 404
 
         # Self-heal path: regenerate on miss (or stale) when the photo
         # still exists.

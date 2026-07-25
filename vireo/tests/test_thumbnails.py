@@ -1818,3 +1818,55 @@ def test_serve_thumbnail_passes_sidecar_name_to_every_generation_call(
     )
     assert open(thumb_file, "rb").read() == sentinel_bytes
     assert os.path.getmtime(thumb_file) < photo_mtime
+
+
+def test_serve_thumbnail_404s_when_both_thumbnail_and_sidecar_are_locked(
+    tmp_path, monkeypatch,
+):
+    """Nowhere safe to write means serve nothing, not the wrong photo.
+
+    If a recycled id has an undeletable stale ``<id>.jpg`` *and* an
+    undeletable stale ``<id>_regen.jpg``, suppressing the sidecar's removal
+    failure and falling through would let ``generate_thumbnail`` short-
+    circuit on the stale sidecar and return it — then ``os.utime(result,
+    ...)`` marks the previous owner's pixels fresh and the response serves
+    them. With both cache targets locked there is no safe file to write, so
+    the honest answer is 404.
+    """
+    import app as app_module
+
+    app, db, pid, thumb_dir = _make_app_with_real_photo(tmp_path, monkeypatch)
+
+    photo_mtime = db.conn.execute(
+        "SELECT file_mtime FROM photos WHERE id=?", (pid,)
+    ).fetchone()["file_mtime"]
+    stale = photo_mtime - 86400
+
+    locked = {}
+    for name in (f"{pid}.jpg", f"{pid}_regen.jpg"):
+        path = os.path.join(thumb_dir, name)
+        Image.new("RGB", (50, 50), (9, 9, 9)).save(path, "JPEG", quality=70)
+        os.utime(path, (stale, stale))
+        locked[path] = open(path, "rb").read()
+
+    real_remove = app_module.os.remove
+
+    def failing_remove(path, *args, **kwargs):
+        if path in locked:
+            raise PermissionError(13, "Permission denied", path)
+        return real_remove(path, *args, **kwargs)
+
+    monkeypatch.setattr(app_module.os, "remove", failing_remove)
+
+    client = app.test_client()
+    resp = client.get(f"/thumbnails/{pid}.jpg")
+
+    assert resp.status_code == 404, (
+        "with both the thumbnail and its sidecar stale and locked, the "
+        "route served something — on a recycled rowid that is another "
+        "photo's image"
+    )
+    # Neither locked file may be pinned as fresh; the next request retries.
+    for path, original in locked.items():
+        assert open(path, "rb").read() == original
+        assert os.path.getmtime(path) < photo_mtime

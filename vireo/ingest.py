@@ -123,6 +123,58 @@ def _sanitize_template(template):
     return template
 
 
+# The date-folder formats offered as one-click presets on the import and move
+# pages. Kept here beside ``build_destination_path`` so the UI's example
+# labels are rendered by the same code that builds the real folders.
+FOLDER_TEMPLATE_PRESETS = (
+    "%Y/%Y-%m-%d",
+    "%Y/%m/%d",
+    "%Y/%m",
+    "%Y",
+    "%Y-%m-%d",
+)
+
+
+def folder_template_samples(timestamps, templates=FOLDER_TEMPLATE_PRESETS):
+    """Render each preset folder template against a real capture time.
+
+    The UI labels each preset with an example folder name, and users read that
+    example as "this is what my folder will be called" — so it has to be a
+    folder the operation will really create, not an illustrative constant.
+    (It was a hardcoded ``2026-07-12`` copied from a test fixture, which sat
+    inches from a resulting-folders panel showing a different date. See
+    CORE_PHILOSOPHY.md, "No black boxes".)
+
+    The earliest capture time wins. Rendered paths sort chronologically for
+    every preset here, so the sample is also the first folder the
+    resulting-folders preview lists.
+
+    Args:
+        timestamps: iterable of datetimes, ``None`` for photos with no
+            usable capture time.
+        templates: strftime formats to render. Defaults to the UI presets.
+
+    Returns:
+        dict with ``samples`` (template -> rendered folder name),
+        ``sample_date`` (ISO string or None), and ``dated_count``. Templates
+        that cannot render safely are omitted from ``samples`` rather than
+        raising — a bad custom preset must not take the whole preview down.
+    """
+    dated = sorted(t for t in timestamps if t is not None)
+    sample_dt = dated[0] if dated else None
+    samples = {}
+    for template in templates:
+        try:
+            samples[template] = build_destination_path(sample_dt, template)
+        except ValueError:
+            continue
+    return {
+        "samples": samples,
+        "sample_date": sample_dt.isoformat() if sample_dt else None,
+        "dated_count": len(dated),
+    }
+
+
 def build_destination_path(exif_timestamp, template="%Y/%Y-%m-%d"):
     """Build relative destination folder path from EXIF timestamp.
 
@@ -224,6 +276,10 @@ def preview_destination(sources, destination, folder_template="%Y/%Y-%m-%d",
         "new_folders": new_count,
         "existing_folders": existing_count,
         "files": file_destinations,
+        # Real example folder names for the template dropdown, resolved from
+        # the very timestamps grouped above so the labels and the folder list
+        # can never disagree.
+        "template_samples": folder_template_samples(timestamps.values()),
     }
 
 

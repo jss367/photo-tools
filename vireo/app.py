@@ -22044,10 +22044,12 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             return json_error("destination must be an absolute path")
 
         if folder_template:
+            from ingest import folder_template_samples
             try:
-                plan = move_mod.plan_folder_date_moves(
-                    _get_db(), folder_id, destination, folder_template,
-                )
+                plan, capture_dts = \
+                    move_mod.plan_folder_date_moves_with_capture_dates(
+                        _get_db(), folder_id, destination, folder_template,
+                    )
             except ValueError as exc:
                 return json_error(str(exc))
             destinations = [
@@ -22069,6 +22071,12 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 "exists": any(item["exists"] for item in destinations),
                 "file_count": 0,
                 "file_count_truncated": False,
+                # Example folder names for the format dropdown, rendered from
+                # the very capture dates that produced ``destinations`` above.
+                # Same scan, same code path — so the label a user reads as
+                # "my folder will be called this" cannot disagree with the
+                # folder list it sits beside.
+                "template_samples": folder_template_samples(capture_dts),
             })
 
         resolved = resolve_folder_dest(

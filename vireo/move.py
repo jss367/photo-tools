@@ -1559,27 +1559,37 @@ def _tracked_destination_ancestor(db, folder_id, dest_path):
     return None
 
 
-def plan_folder_date_moves(db, folder_id, destination, folder_template):
-    """Plan a folder's tracked photos into capture-date destinations.
-
-    The date comes from the same catalog capture-time helper used elsewhere;
-    file mtime is the fallback, matching import's folder-planning behavior.
-    Returns a list ordered by rendered relative path so previews and jobs are
-    deterministic. Each item contains ``relative_path``, ``destination``,
-    ``photo_ids``, and ``photo_count``.
+def _photo_capture_datetime(photo):
+    """Resolve one photo's date-folder timestamp: EXIF capture time, else file
+    mtime. Shared by the date-move planner and the UI's example-folder samples
+    so a label can never name a folder the move wouldn't create.
     """
-    if not isinstance(destination, str) or not os.path.isabs(destination):
-        raise ValueError("destination must be an absolute path")
-    if not isinstance(folder_template, str) or not folder_template.strip():
-        raise ValueError("folder_template must be a non-empty string")
-
     try:
         from .capture_time import _capture_datetime
-        from .ingest import build_destination_path
     except ImportError:
         from capture_time import _capture_datetime
-        from ingest import build_destination_path
 
+    capture_dt = _capture_datetime(photo)
+    if capture_dt is None and photo["file_mtime"] is not None:
+        try:
+            capture_dt = datetime.fromtimestamp(float(photo["file_mtime"]))
+        except (OSError, OverflowError, TypeError, ValueError):
+            capture_dt = None
+    return capture_dt
+
+
+def _folder_subtree_photos(db, folder_id):
+    """Tracked photos in a folder and its descendants, ordered by id.
+
+    Only the columns date-folder planning actually reads are selected. A
+    ``p.*`` here is expensive at library scale: ``photos`` carries two DINOv2
+    embedding BLOBs and the full ``exif_data`` JSON, which on a 60k-photo
+    subtree is ~800MB pulled into Python to compute one date per row. The
+    keystroke-debounced move preflight runs this on every destination edit.
+
+    Descendant matching is alias-aware (symlinks, case-folding volumes,
+    Windows separators) — see the inline notes below.
+    """
     folder = db.conn.execute(
         "SELECT path FROM folders WHERE id = ?", (folder_id,)
     ).fetchone()
@@ -1652,8 +1662,8 @@ def plan_folder_date_moves(db, folder_id, destination, folder_template):
         )
         descendant_predicate = "VIREO_DATE_MOVE_DESCENDS(f.path) = 1"
         descendant_params = ()
-    photos = db.conn.execute(
-        f"""SELECT p.*, f.path AS folder_path
+    return db.conn.execute(
+        f"""SELECT p.id, p.exif_data, p.timestamp, p.file_mtime
            FROM photos p
            JOIN folders f ON f.id = p.folder_id
            WHERE f.id = ?
@@ -1662,15 +1672,52 @@ def plan_folder_date_moves(db, folder_id, destination, folder_template):
         (folder_id, *descendant_params),
     ).fetchall()
 
+
+def plan_folder_date_moves(db, folder_id, destination, folder_template):
+    """Plan a folder's tracked photos into capture-date destinations.
+
+    The date comes from the same catalog capture-time helper used elsewhere;
+    file mtime is the fallback, matching import's folder-planning behavior.
+    Returns a list ordered by rendered relative path so previews and jobs are
+    deterministic. Each item contains ``relative_path``, ``destination``,
+    ``photo_ids``, and ``photo_count``.
+    """
+    return plan_folder_date_moves_with_capture_dates(
+        db, folder_id, destination, folder_template)[0]
+
+
+def plan_folder_date_moves_with_capture_dates(
+    db, folder_id, destination, folder_template,
+):
+    """``plan_folder_date_moves`` plus the capture datetimes behind the plan.
+
+    The move page labels each date-format preset with an example folder name,
+    and that example has to be a folder this very plan would create. Handing
+    back the resolved datetimes lets the preflight endpoint render those
+    labels from the same scan that produced the plan — one pass over the
+    subtree, and no way for the label to drift from the folder list beside it.
+
+    Returns ``(plans, capture_datetimes)``; ``capture_datetimes`` holds one
+    entry per tracked photo, ``None`` where no date could be resolved.
+    """
+    if not isinstance(destination, str) or not os.path.isabs(destination):
+        raise ValueError("destination must be an absolute path")
+    if not isinstance(folder_template, str) or not folder_template.strip():
+        raise ValueError("folder_template must be a non-empty string")
+
+    try:
+        from .ingest import build_destination_path
+    except ImportError:
+        from ingest import build_destination_path
+
+    photos = _folder_subtree_photos(db, folder_id)
+
     groups = {}
+    capture_dts = []
     template = folder_template.strip()
     for photo in photos:
-        capture_dt = _capture_datetime(photo)
-        if capture_dt is None and photo["file_mtime"] is not None:
-            try:
-                capture_dt = datetime.fromtimestamp(float(photo["file_mtime"]))
-            except (OSError, OverflowError, TypeError, ValueError):
-                capture_dt = None
+        capture_dt = _photo_capture_datetime(photo)
+        capture_dts.append(capture_dt)
         relative = build_destination_path(capture_dt, template)
         if not relative:
             raise ValueError("folder template produced an empty path")
@@ -1768,7 +1815,7 @@ def plan_folder_date_moves(db, folder_id, destination, folder_template):
             "photo_ids": groups[relative],
             "photo_count": len(groups[relative]),
         })
-    return plans
+    return plans, capture_dts
 
 
 def move_folder_by_date(db, folder_id, destination, folder_template,

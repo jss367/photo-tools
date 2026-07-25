@@ -808,15 +808,21 @@ body { padding-bottom: 48px; }
                   <div class="field-hint">Edit this name to rename the folder as part of the move.</div>
                 </div>
                 <div id="quickDateFolderControls" style="display:none;margin-top:8px;">
+                  <!-- Option labels are bare patterns here and gain a real
+                       example folder name from applyQuickDateSamples() once
+                       the selected folder's capture dates are known. Never
+                       hardcode a sample date: users read it as the folder
+                       they are about to create. -->
                   <select class="move-control" id="quickFolderTemplatePreset" aria-label="Date folder format" onchange="updateQuickFolderTemplateControls()">
-                    <option value="%Y/%Y-%m-%d">%Y/%Y-%m-%d — 2026/2026-07-12</option>
-                    <option value="%Y/%m/%d">%Y/%m/%d — 2026/07/12</option>
-                    <option value="%Y/%m">%Y/%m — 2026/07</option>
-                    <option value="%Y">%Y — 2026</option>
-                    <option value="%Y-%m-%d" selected>%Y-%m-%d — 2026-07-12</option>
+                    <option value="%Y/%Y-%m-%d">%Y/%Y-%m-%d</option>
+                    <option value="%Y/%m/%d">%Y/%m/%d</option>
+                    <option value="%Y/%m">%Y/%m</option>
+                    <option value="%Y">%Y</option>
+                    <option value="%Y-%m-%d" selected>%Y-%m-%d</option>
                     <option value="__custom__">Custom…</option>
                   </select>
                   <input class="move-control" type="text" id="quickFolderTemplate" aria-label="Custom date folder format" placeholder="Enter a strftime format" oninput="updateQuickMoveBtn()" style="display:none;margin-top:8px;">
+                  <div class="field-hint" id="quickDateSampleHint"></div>
                   <div class="field-hint">Photos can land in different folders when their capture dates differ. Photos without a capture date go to <code>unsorted</code>.</div>
                 </div>
                 <div class="field-error" id="quickFolderNameError" role="status"></div>
@@ -1083,6 +1089,9 @@ function onQuickFolderChange() {
   var nameInput = document.getElementById('quickFolderName');
   var resetBtn = document.getElementById('quickResetNameBtn');
   var fid = parseInt(sel.value);
+  // Drop the previous folder's example dates immediately — the next preflight
+  // brings this folder's real ones.
+  applyQuickDateSamples(null);
   if (!fid) {
     info.textContent = '';
     nameInput.value = '';
@@ -1131,6 +1140,39 @@ function selectedQuickFolderTemplate() {
   var preset = document.getElementById('quickFolderTemplatePreset');
   if (preset.value !== '__custom__') return preset.value;
   return (document.getElementById('quickFolderTemplate').value || '').trim();
+}
+
+// Label each date-format preset with a folder this move would really create.
+// The examples ride along on the date preflight response, rendered server-side
+// by the same build_destination_path() that produced the resulting-folders
+// list — one scan, one source of truth, so the label a user reads as "my
+// folder will be called this" cannot disagree with the folder list beside it.
+//
+// Passing null resets the labels to bare patterns — the deliberate state
+// before this folder's real dates are known. An example that is stale or
+// invented is worse than no example: this control shipped a frozen sample
+// date for months that contradicted the panel right below it.
+//
+// The examples depend on the selected source folder and nothing else, so the
+// only thing that invalidates them is changing that folder.
+function applyQuickDateSamples(templateSamples) {
+  var preset = document.getElementById('quickFolderTemplatePreset');
+  var hint = document.getElementById('quickDateSampleHint');
+  var samples = (templateSamples && templateSamples.samples) || {};
+  Array.prototype.forEach.call(preset.options, function(option) {
+    if (option.value === '__custom__') return;
+    var sample = samples[option.value];
+    option.textContent = sample ? option.value + ' — ' + sample : option.value;
+  });
+  if (!hint) return;
+  if (!templateSamples) {
+    hint.textContent = '';
+  } else if (!templateSamples.dated_count) {
+    hint.textContent = 'No photo in this folder has a capture date, so every '
+      + 'example reads unsorted.';
+  } else {
+    hint.textContent = 'Examples use the earliest capture date in this folder.';
+  }
 }
 
 function updateQuickFolderTemplateControls() {
@@ -1496,6 +1538,11 @@ var quickPreflightTimer = null;
 function scheduleQuickDatePreflight(fid, destination, folderTemplate) {
   if (quickPreflightTimer) clearTimeout(quickPreflightTimer);
   var seq = ++quickPreflightSeq;
+  // An unusable destination doesn't invalidate the dropdown's examples: they
+  // are rendered from the source folder's capture dates alone, so editing or
+  // clearing the destination cannot change them. Leave the last real values
+  // in place — onQuickFolderChange() clears them when the folder itself
+  // changes, which is the only input they depend on.
   if (!_isAbsolutePath(destination)) return;
   quickPreflightTimer = setTimeout(async function() {
     var data;
@@ -1518,6 +1565,9 @@ function scheduleQuickDatePreflight(fid, destination, folderTemplate) {
     if (seq !== quickPreflightSeq || !quickUsesDateFolders()) return;
     var folder = allFolders.find(function(item) { return item.id === fid; });
     setQuickDateSummary(folder, data);
+    // Same response that drew the folder list above, so the dropdown's
+    // examples and that list are always the same dates.
+    applyQuickDateSamples(data.template_samples);
     var status = document.getElementById('quickDestStatus');
     if (!status) return;
     if (!data.photo_count) {

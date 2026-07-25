@@ -18273,7 +18273,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         active_ws = _get_db()._active_workspace_id
 
         def work(job):
-            from labels import fetch_species_list, save_labels
+            from labels import fetch_species_list, read_label_file, save_labels
 
             def progress_cb(msg, current=None, total=None):
                 job["progress"]["current_file"] = msg
@@ -18323,8 +18323,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 try:
                     from classifier import _embedding_cache_path, _resolve_model_dir
 
-                    with open(labels_path) as f:
-                        labels = [line.strip() for line in f if line.strip()]
+                    labels = read_label_file(labels_path)
                     model_dir = _resolve_model_dir(
                         active_model["model_str"], active_model.get("weights_path")
                     )

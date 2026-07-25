@@ -376,8 +376,9 @@ def main():
     parser.add_argument("--no-recursive", action="store_true")
     args = parser.parse_args()
 
-    with open(args.labels_file) as f:
-        labels = [line.strip() for line in f if line.strip()]
+    from labels import read_label_file
+
+    labels = read_label_file(args.labels_file)
     log.info("Loaded %d labels from %s", len(labels), args.labels_file)
 
     analyze(

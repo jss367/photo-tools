@@ -3264,6 +3264,24 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             vireo_dir, "originals", f"{photo['id']}_{cache_key}.jpg",
         )
 
+    def _peg_render_mtime_to_source(cache_path, photo):
+        """Align a freshly written render's mtime to the photo's source.
+
+        ``_prepared_full_resolution_render`` rejects renders whose mtime
+        predates ``photos.file_mtime``. Renders are written with the wall
+        clock, so a source whose ``file_mtime`` is in the *future* — clock
+        skew on the machine that wrote it, archives that preserve future
+        timestamps — would fail that gate immediately and re-render on
+        every single request. ``serve_thumbnail`` already documents and
+        guards this exact trap; the cost here is a full-resolution decode
+        plus edit pipeline per request, so it matters more.
+        """
+        source_mtime = photo["file_mtime"] if photo is not None else None
+        if source_mtime is None:
+            return
+        with contextlib.suppress(OSError, TypeError, ValueError):
+            os.utime(cache_path, (float(source_mtime), float(source_mtime)))
+
     def _prepared_full_resolution_render(
         vireo_dir, photo, recipe, file_state=None,
     ):
@@ -30316,6 +30334,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             try:
                 img.save(tmp_path, format="JPEG", quality=quality)
                 os.replace(tmp_path, cache_path)
+                _peg_render_mtime_to_source(cache_path, photo)
             except Exception:
                 with contextlib.suppress(OSError):
                     os.unlink(tmp_path)
@@ -30665,6 +30684,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         try:
             img.save(tmp_path, format="JPEG", quality=quality)
             os.replace(tmp_path, cache_path)
+            _peg_render_mtime_to_source(cache_path, photo)
         except Exception:
             with contextlib.suppress(OSError):
                 os.unlink(tmp_path)

@@ -38,7 +38,6 @@ def cleanup_cached_files_for_deleted_photos(
     working_dir = os.path.join(vireo_dir, "working")
     originals_dir = os.path.join(vireo_dir, "originals")
     masks_dir = os.path.join(vireo_dir, "masks")
-    edit_masks_dir = os.path.join(vireo_dir, "edit-masks")
     external_dng_dir = os.path.join(vireo_dir, "external-dng")
     # Offline-cache layout: offline/{originals,xmp,companions}/{pid}{ext}.
     # The FK cascade drops the offline_originals row when the photo is
@@ -122,23 +121,37 @@ def cleanup_cached_files_for_deleted_photos(
                         orphan, e,
                     )
         # Subject masks (``masks/{pid}.png``, ``masks/{pid}.{variant}.png``)
-        # and local-adjustment snapshots (``edit-masks/{pid}.{ref}.png``)
         # are id-keyed like everything above. photos.mask_path goes away
         # with the row, so a leftover file is invisible to the DB but is
         # picked back up by any photo that later inherits the id — the
-        # renderer would apply another photo's mask to the local pass.
-        for d in (masks_dir, edit_masks_dir):
-            for orphan in _glob.glob(os.path.join(d, f"{pid}.png")) + _glob.glob(
-                os.path.join(d, f"{pid}.*.png")
-            ):
-                try:
-                    os.remove(orphan)
-                except OSError as e:
-                    log.warning(
-                        "Failed to remove mask file %s after photo delete "
-                        "— will be reclaimed by Clear Cache: %s",
-                        orphan, e,
-                    )
+        # pipeline would score the new photo against another photo's mask.
+        #
+        # ``edit-masks/{pid}.{ref}.png`` is deliberately NOT purged here.
+        # Those snapshots are content-addressed: the filename carries a
+        # photo id, but ``load_snapshot`` only reads one when the photo's
+        # own recipe names that ``ref``, and a ref is a hash of the mask
+        # bytes. A recycled id therefore can't surface a previous owner's
+        # snapshot — a brand-new photo has no local section at all, and a
+        # ref match would mean byte-identical masks. Deleting them by id
+        # only creates a data-loss window: ``transfer_snapshots`` swallows
+        # OSError when a rename fails (locked destination on Windows), so
+        # an id-keyed purge in the companion-merge path would destroy the
+        # sole remaining copy of a snapshot whose recipe has already been
+        # reassigned to the primary, silently disabling that local
+        # adjustment forever. ``local_masks.gc_edit_masks`` owns this
+        # directory instead and reaps by ref — the correct key — with a
+        # grace period and a re-stat guard.
+        for orphan in _glob.glob(
+            os.path.join(masks_dir, f"{pid}.png")
+        ) + _glob.glob(os.path.join(masks_dir, f"{pid}.*.png")):
+            try:
+                os.remove(orphan)
+            except OSError as e:
+                log.warning(
+                    "Failed to remove mask file %s after photo delete "
+                    "— will be reclaimed by Clear Cache: %s",
+                    orphan, e,
+                )
         # ``external-dng/<pid>/<stem>.dng`` caches DNG conversions per
         # photo id for the Nikon-HE-NEF external-editor path. The
         # freshness check there is source-mtime-based, so a recycled id
@@ -190,8 +203,7 @@ def _recycled_id_probe_patterns(thumb_cache_dir, photo_id):
     the standard shape written by ``scanner._extract_previews``), source-
     specific thumbnails (``thumbnails/7_raw.jpg`` / ``7_jpeg.jpg``),
     prepared full-res renders (``originals/7_1920.jpg``), model-scoped
-    subject masks (``masks/7.sam2-large.png``), edit-mask snapshots
-    (``edit-masks/7.abcdef012345.png``), and offline originals
+    subject masks (``masks/7.sam2-large.png``), and offline originals
     (``offline/originals/7.NEF``). Every one of these is unlinked by
     ``cleanup_cached_files_for_deleted_photos`` on the delete side, so
     the *probe* must also see them or the purge silently returns without
@@ -208,8 +220,6 @@ def _recycled_id_probe_patterns(thumb_cache_dir, photo_id):
         os.path.join(vireo_dir, "previews", f"{photo_id}_*.jpg"),
         os.path.join(vireo_dir, "originals", f"{photo_id}_*.jpg"),
         os.path.join(vireo_dir, "masks", f"{photo_id}.*.png"),
-        os.path.join(vireo_dir, "edit-masks", f"{photo_id}.png"),
-        os.path.join(vireo_dir, "edit-masks", f"{photo_id}.*.png"),
         os.path.join(vireo_dir, "offline", "originals", f"{photo_id}.*"),
         os.path.join(vireo_dir, "offline", "xmp", f"{photo_id}.*"),
         os.path.join(vireo_dir, "offline", "companions", f"{photo_id}.*"),
@@ -247,7 +257,6 @@ def _derivative_dirs(thumb_cache_dir):
         os.path.join(vireo_dir, "working"),
         os.path.join(vireo_dir, "originals"),
         os.path.join(vireo_dir, "masks"),
-        os.path.join(vireo_dir, "edit-masks"),
         os.path.join(vireo_dir, "offline", "originals"),
         os.path.join(vireo_dir, "offline", "xmp"),
         os.path.join(vireo_dir, "offline", "companions"),

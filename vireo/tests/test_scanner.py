@@ -4251,12 +4251,16 @@ def test_scan_recursive_raises_permission_error_without_callback(
 
 
 def _seed_derivative_files(vireo_dir, thumb_dir, photo_id, marker=b"previous-tenant"):
-    """Write one file per id-keyed derivative family for ``photo_id``.
+    """Write one file per *purgeable* id-keyed derivative family.
 
     ``external_dng`` is a per-id *directory* (``external-dng/<pid>/``
     holds Nikon-HE-NEF conversions the external-editor path reuses when
     ``cached_mtime >= source_mtime``); callers check its presence the
     same way as the file entries.
+
+    ``edit-masks/`` is deliberately absent: those snapshots are
+    content-addressed and owned by ``local_masks.gc_edit_masks``, not by
+    the id-keyed purge. See ``_seed_edit_mask_snapshot``.
     """
     paths = {
         "thumb": os.path.join(thumb_dir, f"{photo_id}.jpg"),
@@ -4270,9 +4274,6 @@ def _seed_derivative_files(vireo_dir, thumb_dir, photo_id, marker=b"previous-ten
         "mask_variant": os.path.join(
             vireo_dir, "masks", f"{photo_id}.sam2-large.png"
         ),
-        "edit_mask": os.path.join(
-            vireo_dir, "edit-masks", f"{photo_id}.abcdef012345.png"
-        ),
         "external_dng": os.path.join(
             vireo_dir, "external-dng", str(photo_id), "gull.dng"
         ),
@@ -4282,6 +4283,15 @@ def _seed_derivative_files(vireo_dir, thumb_dir, photo_id, marker=b"previous-ten
         with open(path, "wb") as fh:
             fh.write(marker)
     return paths
+
+
+def _seed_edit_mask_snapshot(vireo_dir, photo_id, ref="abcdef012345"):
+    """Write a local-adjustment snapshot at ``edit-masks/<pid>.<ref>.png``."""
+    path = os.path.join(vireo_dir, "edit-masks", f"{photo_id}.{ref}.png")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "wb") as fh:
+        fh.write(b"snapshot-bytes")
+    return path
 
 
 def test_scan_purges_derived_caches_when_new_photo_reuses_a_freed_rowid(
@@ -4458,9 +4468,6 @@ def test_scan_purges_variant_only_caches_when_new_photo_reuses_a_freed_rowid(
         ),
         "variant_mask": os.path.join(
             vireo_dir, "masks", f"{doomed_id}.sam2-large.png",
-        ),
-        "edit_mask_snapshot": os.path.join(
-            vireo_dir, "edit-masks", f"{doomed_id}.abcdef012345.png",
         ),
         "offline_original": os.path.join(
             vireo_dir, "offline", "originals", f"{doomed_id}.NEF",
@@ -4663,4 +4670,94 @@ def test_recycled_id_index_indexes_external_dng_subdirectories(tmp_path):
         "batch index missed an external-dng orphan; the recycled RAW id "
         "would silently reuse the previous owner's DNG through the "
         "external-editor freshness check"
+    )
+
+
+def test_pairing_keeps_companion_snapshot_when_transfer_fails(tmp_path, monkeypatch):
+    """A failed snapshot rename must not lose the only copy.
+
+    ``local_masks.transfer_snapshots`` catches ``OSError`` and returns
+    normally (a locked destination on Windows, a permissions blip), so the
+    source ``edit-masks/<companion_id>.<ref>.png`` stays put. The recipe row
+    has *already* been reassigned to the primary by then, so if the
+    companion cleanup deleted edit-mask snapshots by photo id it would
+    destroy the sole remaining copy — ``load_snapshot`` misses, and that
+    local adjustment is silently disabled forever with nothing to recover.
+
+    Snapshots are content-addressed, so the id-keyed purge has no business
+    in that directory at all; ``gc_edit_masks`` reaps by ref instead.
+    """
+    import local_masks
+    from db import Database
+    from scanner import _pair_raw_jpeg_companions
+
+    img_dir = tmp_path / "photos"
+    img_dir.mkdir()
+    vireo_dir = str(tmp_path / "vireo")
+    thumb_dir = os.path.join(vireo_dir, "thumbnails")
+
+    db = Database(str(tmp_path / "test.db"))
+    fid = db.add_folder(str(img_dir), name="photos")
+    jpeg_id = db.add_photo(
+        folder_id=fid, filename="IMG_004.jpg", extension=".jpg",
+        file_size=1000, file_mtime=1.0,
+    )
+    db.add_photo(
+        folder_id=fid, filename="IMG_004.cr3", extension=".cr3",
+        file_size=2000, file_mtime=1.0,
+    )
+    # A recipe on the JPEG is what makes pairing transfer the row (and the
+    # snapshot files) over to the RAW primary.
+    db.set_photo_edit_recipe(jpeg_id, {"rotation": 90})
+    snapshot = _seed_edit_mask_snapshot(vireo_dir, jpeg_id)
+
+    # Simulate the rename failing the way it does on a locked destination:
+    # transfer_snapshots logs and returns, leaving the source in place.
+    def _failing_replace(src, dst):
+        raise OSError("simulated locked destination")
+
+    monkeypatch.setattr(local_masks.os, "replace", _failing_replace)
+
+    _pair_raw_jpeg_companions(
+        db, vireo_dir=vireo_dir, thumb_cache_dir=thumb_dir,
+    )
+
+    assert os.path.exists(snapshot), (
+        "companion's local-mask snapshot was deleted after its rename "
+        "failed; the recipe now points at the primary id, so this was the "
+        "only copy and the local adjustment is unrecoverable"
+    )
+
+
+def test_delete_photos_cleanup_leaves_edit_mask_snapshots_to_gc(tmp_path):
+    """The id-keyed purge must not touch ``edit-masks/``.
+
+    Snapshot filenames carry a photo id, but lookup is by *ref* — a hash of
+    the mask bytes — so a recycled id can't surface a previous owner's
+    snapshot (a new photo has no local section, and a ref match means the
+    masks are byte-identical). ``gc_edit_masks`` owns the directory and
+    reaps by ref with a grace period; purging by id here would only create
+    the data-loss window this test guards.
+    """
+    from preview_cache import cleanup_cached_files_for_deleted_photos
+
+    vireo_dir = tmp_path / "vireo"
+    thumb_dir = vireo_dir / "thumbnails"
+    thumb_dir.mkdir(parents=True)
+    (thumb_dir / "77.jpg").write_bytes(b"thumb")
+    subject_mask = vireo_dir / "masks" / "77.png"
+    subject_mask.parent.mkdir(parents=True)
+    subject_mask.write_bytes(b"subject-mask")
+    snapshot = _seed_edit_mask_snapshot(str(vireo_dir), 77)
+
+    cleanup_cached_files_for_deleted_photos(
+        str(thumb_dir), [{"photo_id": 77}],
+    )
+
+    assert not (thumb_dir / "77.jpg").exists(), "thumbnail should be purged"
+    assert not subject_mask.exists(), (
+        "subject mask is read by photo id and must be purged"
+    )
+    assert os.path.exists(snapshot), (
+        "content-addressed edit-mask snapshot must be left to gc_edit_masks"
     )

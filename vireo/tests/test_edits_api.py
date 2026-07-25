@@ -1684,3 +1684,46 @@ def test_history_isolated_between_workspaces(app_and_db):
     ws1 = db.conn.execute("SELECT id FROM workspaces WHERE name = 'Default'").fetchone()['id']
     db.set_active_workspace(ws1)
     assert len(db.get_edit_history()) == 1
+
+
+def test_set_edit_recipe_removes_regeneration_sidecar(app_and_db, tmp_path):
+    """A recipe edit must clear ``<pid>_regen.jpg`` too.
+
+    When the default thumbnail can't be unlinked (Windows lock,
+    antivirus, permissions blip), ``serve_thumbnail`` falls back to a
+    ``<pid>_regen.jpg`` sidecar. Editing the recipe without also
+    invalidating the sidecar leaves it carrying the pre-edit pixels:
+    the freshness gate compares against the unchanged source mtime and
+    re-serves the sidecar indefinitely. The invalidation must sweep the
+    sidecar the same way it sweeps ``<pid>.jpg``.
+    """
+    app, db = app_and_db
+    photos = db.get_photos()
+    pid = photos[0]['id']
+    thumb_dir = app.config["THUMB_CACHE_DIR"]
+
+    # Simulate the state after serve_thumbnail regenerated to a sidecar
+    # because the default was locked.
+    sidecar = os.path.join(thumb_dir, f"{pid}_regen.jpg")
+    with open(sidecar, "wb") as fh:
+        fh.write(b"pre-edit sidecar pixels")
+    raw_sidecar = os.path.join(thumb_dir, f"{pid}_raw_regen.jpg")
+    with open(raw_sidecar, "wb") as fh:
+        fh.write(b"pre-edit paired sidecar")
+
+    client = app.test_client()
+    resp = client.post(
+        f"/api/photos/{pid}/edit-recipe",
+        json={"recipe": {"exposure": 0.5}},
+    )
+
+    assert resp.status_code == 200
+    assert not os.path.exists(sidecar), (
+        f"{pid}_regen.jpg survived the recipe-edit invalidation; if "
+        "the default thumbnail is locked, the next request would "
+        "keep serving pre-edit pixels through the sidecar path"
+    )
+    assert not os.path.exists(raw_sidecar), (
+        f"{pid}_raw_regen.jpg survived the recipe-edit invalidation; "
+        "paired-source sidecars need the same sweep as the default"
+    )

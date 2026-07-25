@@ -275,7 +275,9 @@ def _recycled_id_probe_patterns(thumb_cache_dir, photo_id, vireo_dir=None):
     )
 
 
-def _recycled_id_has_stale_derivative(thumb_cache_dir, photo_id, vireo_dir=None):
+def _recycled_id_has_stale_derivative(
+    thumb_cache_dir, photo_id, vireo_dir=None, unreadable_dirs=None,
+):
     """True when *any* id-keyed derivative for ``photo_id`` still exists.
 
     Exact paths (cheap ``stat``) first; falls through to variant globs
@@ -287,13 +289,29 @@ def _recycled_id_has_stale_derivative(thumb_cache_dir, photo_id, vireo_dir=None)
     per-photo across a populated cache is O(new photos × cached files):
     measured at 117 ms per miss against a 76k-thumbnail library, i.e.
     ~10 minutes of pure ``scandir`` for a 5000-photo import.
+
+    ``unreadable_dirs`` lets ``RecycledIdIndex`` pass through the set of
+    directories its own sweep couldn't enumerate. Variant patterns
+    targeting those dirs would silently miss under ``glob.iglob`` (same
+    ``scandir`` that already failed), so treat their presence as
+    "unknown, assume a derivative exists" and return True — the purge is
+    the conservative move; a spurious purge is cheap, a skipped one
+    silently serves the previous owner's pixels.
     """
     for p in _recycled_id_probe_paths(thumb_cache_dir, photo_id, vireo_dir):
         if os.path.exists(p):
             return True
+    unreadable = set()
+    if unreadable_dirs:
+        unreadable = {os.path.normpath(d) for d in unreadable_dirs}
     for pattern in _recycled_id_probe_patterns(
         thumb_cache_dir, photo_id, vireo_dir,
     ):
+        if unreadable and os.path.normpath(os.path.dirname(pattern)) in unreadable:
+            # The batch sweep couldn't enumerate this directory, so
+            # ``glob.iglob`` would fail too. Assume a variant may be
+            # hiding there and force the purge.
+            return True
         if next(_glob.iglob(pattern), None) is not None:
             return True
     return False
@@ -367,6 +385,7 @@ class RecycledIdIndex:
         self._vireo_dir = vireo_dir or os.path.dirname(thumb_cache_dir)
         self._ids = None
         self._incomplete = False
+        self._unreadable_dirs = set()
 
     def _sweep(self, directory):
         """Return the ids seen in ``directory`` or ``None`` if unreadable.
@@ -375,6 +394,11 @@ class RecycledIdIndex:
         derivatives yet). Any other ``OSError`` — permissions, EIO — is
         an *unknown*, not an empty; the caller records the incomplete
         sweep and the per-id probe covers it later.
+
+        The iterator itself can also raise (a network-backed cache
+        losing the mount mid-walk, an ACL change between ``scandir`` and
+        the first ``__next__``). Catch that too so an unrelated
+        directory failure doesn't abort the whole index build.
         """
         try:
             entries = os.scandir(directory)
@@ -391,22 +415,33 @@ class RecycledIdIndex:
             )
             return None
         found = set()
-        with entries:
-            for entry in entries:
-                photo_id = _leading_photo_id(entry.name)
-                if photo_id is not None:
-                    found.add(photo_id)
+        try:
+            with entries:
+                for entry in entries:
+                    photo_id = _leading_photo_id(entry.name)
+                    if photo_id is not None:
+                        found.add(photo_id)
+        except OSError as e:
+            log.warning(
+                "Iterating derivative directory %s raised %s partway "
+                "through recycled-rowid detection; treating as unreadable "
+                "so the batch index falls back to the exact-path probe",
+                directory, e,
+            )
+            return None
         return found
 
     def _build(self):
         ids = set()
         incomplete = False
+        unreadable = set()
         for directory in _derivative_dirs(
             self._thumb_cache_dir, self._vireo_dir,
         ):
             seen = self._sweep(directory)
             if seen is None:
                 incomplete = True
+                unreadable.add(os.path.normpath(directory))
             else:
                 ids.update(seen)
         # ``external-dng/`` isn't in ``_derivative_dirs`` because its
@@ -429,12 +464,24 @@ class RecycledIdIndex:
             )
             entries = None
             incomplete = True
+            unreadable.add(os.path.normpath(external_dng))
         if entries is not None:
-            with entries:
-                for entry in entries:
-                    if entry.name.isdigit():
-                        ids.add(int(entry.name))
+            try:
+                with entries:
+                    for entry in entries:
+                        if entry.name.isdigit():
+                            ids.add(int(entry.name))
+            except OSError as e:
+                log.warning(
+                    "Iterating %s raised %s partway through recycled-"
+                    "rowid detection; treating as unreadable so the "
+                    "batch index falls back to the exact-path probe",
+                    external_dng, e,
+                )
+                incomplete = True
+                unreadable.add(os.path.normpath(external_dng))
         self._incomplete = incomplete
+        self._unreadable_dirs = unreadable
         log.info(
             "Indexed %d photo ids with cached derivatives for "
             "recycled-rowid detection%s", len(ids),
@@ -454,9 +501,14 @@ class RecycledIdIndex:
             # exact-path probe, which uses ``os.path.exists`` on specific
             # files and works even when the containing directory is
             # execute-only but not readable — the shape of a permissions
-            # gap that trips ``scandir`` but not ``stat``.
+            # gap that trips ``scandir`` but not ``stat``. Variant globs
+            # rely on ``scandir`` too, so pass the unreadable-directory
+            # set through: the probe treats variants in those dirs as
+            # "unknown, assume present" and forces the purge rather than
+            # silently serving another photo's pixels.
             return _recycled_id_has_stale_derivative(
                 self._thumb_cache_dir, photo_id, self._vireo_dir,
+                unreadable_dirs=self._unreadable_dirs,
             )
         return False
 

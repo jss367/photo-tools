@@ -4706,9 +4706,137 @@ def test_recycled_id_index_falls_back_to_per_id_probe_when_dir_unreadable(
         "empty; recycled id 7 would skip the purge and the new photo "
         "would inherit the previous owner's mask"
     )
-    # An id with no cached derivative anywhere must still be reported
-    # absent — the fallback probe returns False, not a blanket True.
-    assert 12345 not in index
+    # An id whose variant patterns don't touch the unreadable directory
+    # must still be reported absent — the fallback only conservatively
+    # says True when a variant *could* be hiding in a dir the sweep
+    # couldn't enumerate. Point the probe at a fresh library where every
+    # derivative dir except masks/ is missing (FileNotFoundError, treated
+    # as genuinely empty), then verify the id isn't blanket-forced true.
+    fresh_vireo = tmp_path / "vireo-fresh"
+    fresh_thumbs = fresh_vireo / "thumbnails"
+    fresh_thumbs.mkdir(parents=True)
+    fresh_index = RecycledIdIndex(
+        str(fresh_thumbs), vireo_dir=str(fresh_vireo),
+    )
+    assert 12345 not in fresh_index, (
+        "fallback returned a blanket True for a fresh library where no "
+        "directory is unreadable; the probe should say False"
+    )
+
+
+def test_recycled_id_index_probe_forces_purge_for_variant_in_unreadable_dir(
+    tmp_path, monkeypatch,
+):
+    """A variant-only derivative in an unreadable directory must still trip.
+
+    Only the exact-path probe (``os.path.exists``) survives when a
+    directory is execute-only but not readable. The variant globs
+    (``previews/<id>_*.jpg``, ``masks/<id>.*.png``) still call
+    ``scandir`` under the hood, so if the fallback trusted their
+    "no match" answer, a variant-only derivative in that directory
+    would slip through and the recycled id would silently serve the
+    previous owner's pixels.
+    """
+    import preview_cache
+    from preview_cache import RecycledIdIndex
+
+    vireo_dir = tmp_path / "vireo"
+    thumb_dir = vireo_dir / "thumbnails"
+    thumb_dir.mkdir(parents=True)
+    previews_dir = vireo_dir / "previews"
+    previews_dir.mkdir()
+
+    # id 9's ONLY surviving derivative is a variant preview — the
+    # exact-path probe (``previews/9.jpg``) won't see it, and the
+    # variant glob would need to enumerate a directory the sweep just
+    # reported unreadable.
+    (previews_dir / "9_1920.jpg").write_bytes(b"previous owner's preview")
+
+    real_scandir = preview_cache.os.scandir
+    unreadable = os.path.normpath(str(previews_dir))
+
+    def scandir_denied(path):
+        if os.path.normpath(str(path)) == unreadable:
+            raise PermissionError(13, "Permission denied", str(path))
+        return real_scandir(path)
+
+    monkeypatch.setattr(preview_cache.os, "scandir", scandir_denied)
+
+    real_iglob = preview_cache._glob.iglob
+
+    def iglob_denied(pattern, *args, **kwargs):
+        if os.path.normpath(os.path.dirname(pattern)) == unreadable:
+            # glob.iglob against an unreadable directory silently
+            # returns no matches under scandir failure — same class of
+            # failure the fallback is meant to guard against.
+            return iter(())
+        return real_iglob(pattern, *args, **kwargs)
+
+    monkeypatch.setattr(preview_cache._glob, "iglob", iglob_denied)
+
+    index = RecycledIdIndex(str(thumb_dir), vireo_dir=str(vireo_dir))
+
+    assert 9 in index, (
+        "fallback probe missed a variant-only preview in an unreadable "
+        "directory; recycled id 9 would skip the purge and the new "
+        "photo would inherit the previous owner's preview"
+    )
+
+
+def test_recycled_id_index_sweep_survives_iterator_error(tmp_path, monkeypatch):
+    """OSError raised while iterating scandir must not abort the build.
+
+    ``os.scandir`` succeeds but iterating the entries can still raise
+    (network-backed cache losing the mount mid-walk, ACL change between
+    the open and the first ``__next__``). Without the iterator guard,
+    the whole ``_build`` aborts and every subsequent lookup wrongly
+    reports the id absent — recycled ids skip the purge and their
+    replacements silently serve the previous owner's pixels.
+    """
+    import preview_cache
+    from preview_cache import RecycledIdIndex
+
+    vireo_dir = tmp_path / "vireo"
+    thumb_dir = vireo_dir / "thumbnails"
+    thumb_dir.mkdir(parents=True)
+    masks_dir = vireo_dir / "masks"
+    masks_dir.mkdir()
+    (masks_dir / "13.png").write_bytes(b"stale mask")
+
+    real_scandir = preview_cache.os.scandir
+    unreadable = os.path.normpath(str(masks_dir))
+
+    class ExplodingIterator:
+        def __init__(self, wrapped):
+            self._wrapped = wrapped
+
+        def __enter__(self):
+            self._wrapped.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self._wrapped.__exit__(*args)
+
+        def __iter__(self):
+            raise OSError("simulated mid-iteration failure")
+
+    def scandir_explodes(path):
+        result = real_scandir(path)
+        if os.path.normpath(str(path)) == unreadable:
+            return ExplodingIterator(result)
+        return result
+
+    monkeypatch.setattr(preview_cache.os, "scandir", scandir_explodes)
+
+    index = RecycledIdIndex(str(thumb_dir), vireo_dir=str(vireo_dir))
+
+    # The build must not raise — the sweep should catch the iteration
+    # failure and mark the index incomplete. The exact-path fallback
+    # then still finds id 13 via ``os.path.exists``.
+    assert 13 in index, (
+        "sweep didn't recover from an iteration OSError; the whole "
+        "batch index aborted and recycled id 13 would skip the purge"
+    )
 
 
 def test_recycled_id_index_indexes_external_dng_subdirectories(tmp_path):
@@ -4814,6 +4942,36 @@ def test_transfer_snapshots_reports_unrecoverable_refs(tmp_path):
 
     assert result["failed"] == [ref]
     assert result["moved"] == []
+
+
+def test_transfer_snapshots_reports_enumerate_failure(tmp_path, monkeypatch):
+    """``os.listdir`` failing on ``edit-masks/`` must surface as a flag.
+
+    Without the flag, the raised ``OSError`` is caught by the deferred-
+    action loop in scanner._pair_raw_jpeg_companions after the recipe
+    has already been committed to the primary. Every affected local
+    adjustment renders without its mask indefinitely, and the caller
+    can't say so because the exception vanished before ``failed`` got
+    populated.
+    """
+    import local_masks
+
+    vireo_dir = str(tmp_path / "vireo")
+    _seed_edit_mask_snapshot(vireo_dir, 55)
+
+    def boom(path):
+        raise PermissionError(13, "Permission denied", path)
+
+    monkeypatch.setattr(local_masks.os, "listdir", boom)
+
+    result = local_masks.transfer_snapshots(vireo_dir, 55, 66)
+
+    assert result["enumerate_failed"] is True, (
+        "os.listdir failure did not surface as enumerate_failed; the "
+        "caller can't warn the user about masks left under the old id"
+    )
+    assert result["moved"] == []
+    assert result["failed"] == []
 
 
 def test_delete_photos_cleanup_leaves_edit_mask_snapshots_to_gc(tmp_path):

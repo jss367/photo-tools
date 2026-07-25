@@ -261,11 +261,12 @@ def transfer_snapshots(vireo_dir, old_photo_id, new_photo_id):
     Byte-identical snapshots for the same ref hash to the same file name,
     so ``os.replace`` on a pre-existing destination is safe (same content).
 
-    Returns ``{"moved": [refs], "failed": [refs]}``. ``load_snapshot``
-    only ever builds ``snapshot_path(vireo_dir, photo_id, ref)``, so a
-    snapshot left under the *old* id is unreachable no matter what — the
-    render disables the local pass indefinitely. That makes a silent
-    failure here invisible, so:
+    Returns ``{"moved": [refs], "failed": [refs], "enumerate_failed":
+    bool}``. ``load_snapshot`` only ever builds
+    ``snapshot_path(vireo_dir, photo_id, ref)``, so a snapshot left under
+    the *old* id is unreachable no matter what — the render disables the
+    local pass indefinitely. That makes a silent failure here invisible,
+    so:
 
     * ``os.replace`` failing (typically a locked source on Windows) falls
       back to ``shutil.copy2`` + best-effort unlink. The copy is what
@@ -274,13 +275,30 @@ def transfer_snapshots(vireo_dir, old_photo_id, new_photo_id):
     * Anything still unrecoverable is reported in ``failed`` so the
       caller can say so out loud instead of rendering a silently
       degraded image (CORE_PHILOSOPHY: no black boxes).
+    * If ``os.listdir`` itself raises (transient EIO, ACL change on
+      ``edit-masks/``), the individual refs are unknown but the outcome
+      is the same as ``failed``: every snapshot stays under the old id
+      and every affected local pass renders without its mask.
+      ``enumerate_failed`` surfaces that so the caller can log it rather
+      than let the exception vanish into the deferred-action guard.
     """
     directory = edit_masks_dir(vireo_dir)
-    result = {"moved": [], "failed": []}
+    result = {"moved": [], "failed": [], "enumerate_failed": False}
     if not os.path.isdir(directory):
         return result
     prefix = f"{int(old_photo_id)}."
-    for name in os.listdir(directory):
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        log.warning(
+            "Could not enumerate edit-masks directory %s while moving "
+            "snapshots from photo %s to %s; any local adjustments will "
+            "render without their mask until the snapshots are recreated",
+            directory, old_photo_id, new_photo_id, exc_info=True,
+        )
+        result["enumerate_failed"] = True
+        return result
+    for name in names:
         if not name.startswith(prefix):
             continue
         match = _SNAPSHOT_FILE_RE.match(name)

@@ -629,6 +629,24 @@ def _pair_raw_jpeg_companions(db, vireo_dir=None, thumb_cache_dir=None):
                             cid, pid, len(transferred["failed"]),
                             ", ".join(transferred["failed"]),
                         )
+                    if transferred.get("enumerate_failed"):
+                        # ``os.listdir(edit-masks/)`` failed, so the snapshot
+                        # refs are unknown. The recipe has been transferred
+                        # to the primary and load_snapshot always builds
+                        # ``snapshot_path(vireo_dir, primary_id, ref)`` — any
+                        # snapshot still under the companion's id is
+                        # unreachable, and the local pass renders without
+                        # its mask until the snapshot is recreated. Say so
+                        # (CORE_PHILOSOPHY: no black boxes) instead of
+                        # letting the exception vanish into the deferred-
+                        # action guard.
+                        log.warning(
+                            "Pairing moved photo %s's edit recipe to %s but "
+                            "could not enumerate edit-masks/ to move any "
+                            "snapshots; every affected local adjustment will "
+                            "render without its mask until recreated",
+                            cid, pid,
+                        )
                     _invalidate_derived_caches(
                         db, vd, pid, thumb_cache_dir=tcd,
                     )

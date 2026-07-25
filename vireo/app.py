@@ -3385,6 +3385,24 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                         variant,
                         exc_info=True,
                     )
+            # ``<pid>_regen.jpg`` / ``<pid>_raw_regen.jpg`` /
+            # ``<pid>_jpeg_regen.jpg`` are the sidecars ``serve_thumbnail``
+            # falls back to when the default couldn't be unlinked (a
+            # persistent lock). Without this pass, editing the recipe
+            # while the default stays locked leaves the sidecar carrying
+            # the pre-edit pixels; the freshness gate there compares
+            # against the unchanged source mtime and re-serves them.
+            for stem in (f"{pid}", f"{pid}_raw", f"{pid}_jpeg"):
+                sidecar = os.path.join(thumb_dir, f"{stem}_regen.jpg")
+                try:
+                    if os.path.exists(sidecar):
+                        os.remove(sidecar)
+                except OSError:
+                    log.warning(
+                        "Failed to remove stale regeneration sidecar %s",
+                        sidecar,
+                        exc_info=True,
+                    )
             if clear_thumb_path:
                 db.conn.execute(
                     "UPDATE photos SET thumb_path = NULL WHERE id = ?", (pid,),
@@ -30451,6 +30469,13 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 live_source_path=image_path, folder_path=folder["path"],
             )
         )
+        # Preserve the resolved RAW path before the RAW-failure branch
+        # below rewrites ``image_path`` to the companion. The display
+        # cache-hit check on the next request reconstructs both live
+        # sources and pegs against their max, so passing only the
+        # companion into ``_peg_display_cache_mtime`` would fail the
+        # gate whenever the RAW is newer and re-extract on every hit.
+        raw_source_path = image_path
         if has_current_raw_failure:
             if (
                 resolved_ext in RAW_EXTENSIONS
@@ -30536,9 +30561,13 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     # (clock skew, archives that preserve future
                     # timestamps), and every request re-decodes the RAW
                     # and companion. Peg to the same max the check
-                    # consults.
+                    # consults. Use ``raw_source_path`` — the RAW resolved
+                    # before the has_current_raw_failure branch rewrote
+                    # ``image_path`` to the companion — so a newer RAW
+                    # mtime doesn't fail the gate and re-extract on every
+                    # hit.
                     _peg_display_cache_mtime(
-                        wc_abs, (image_path, companion_for_extraction),
+                        wc_abs, (raw_source_path, companion_for_extraction),
                     )
                 return extracted
             finally:

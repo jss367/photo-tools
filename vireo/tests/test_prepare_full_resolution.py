@@ -331,6 +331,11 @@ def test_prepared_render_rejected_when_mtime_predates_source(client_with_photo):
     # Prime the cache: the first request writes the prepared render.
     primed = client.get(f"/photos/{photo_id}/original")
     assert primed.status_code == 200
+    # Release the WSGI file wrapper's handle on ``cache_path`` before we
+    # try to overwrite it below. On Windows, ``send_file``'s underlying
+    # handle is held until the response is closed, and ``os.replace`` on
+    # the second request would then fail with ``WinError 5``.
+    primed.close()
 
     vireo_dir = os.path.dirname(app.config["THUMB_CACHE_DIR"])
     originals_dir = os.path.join(vireo_dir, "originals")

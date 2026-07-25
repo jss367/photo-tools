@@ -11399,21 +11399,37 @@ class Database:
         prediction looked unaccepted in the UI.
 
         ``predictions`` has UNIQUE(detection_id, classifier_model,
-        labels_fingerprint, species); when folding would collide with a row
-        that already holds the clean spelling, keep the higher-confidence
-        row and drop the variant instead of failing the migration.  Before
-        deleting the loser, migrate any workspace review rows onto the
-        surviving prediction so an accepted/rejected decision on the variant
-        (`prediction_review.prediction_id` uses `ON DELETE CASCADE`) is not
-        silently lost mid-migration, and retarget any `prediction_accept`
-        edit-history references from the loser id to the winner id so
-        undo/redo can still find the prediction after the DELETE.
+        labels_fingerprint, species); the constraint is BINARY, so a single
+        (detection, model, fingerprint) scope can legally hold three
+        NOCASE-equivalent variants at once (e.g. ``Say's Phoebe``,
+        ``Say's phoebe``, ``Say’s phoebe``). A per-row ``fetchone`` peer
+        lookup would only merge one of the ASCII neighbours: with the
+        curly row winning by confidence, the subsequent
+        ``UPDATE ... SET species = 'Say's phoebe'`` would then collide with
+        the unmerged ASCII-lowercase row and abort the whole migration
+        under UNIQUE — and on every open thereafter. Fetch every
+        NOCASE-equivalent peer up-front and merge the entire collision set
+        around a single winner so the final UPDATE has no peer left to
+        clash with.
+
+        Before deleting any loser, migrate its workspace review rows onto
+        the surviving prediction so an accepted/rejected decision on a
+        variant (``prediction_review.prediction_id`` uses
+        ``ON DELETE CASCADE``) is not silently lost, and retarget any
+        ``prediction_accept`` edit-history references from the loser id
+        to the winner id so undo/redo can still find the prediction after
+        the DELETE.
         """
         folded = 0
+        processed_ids = set()
         for row in self.conn.execute(
             "SELECT id, detection_id, classifier_model, labels_fingerprint, "
             "species, confidence FROM predictions WHERE species IS NOT NULL"
         ).fetchall():
+            if row["id"] in processed_ids:
+                # Already merged (or deleted) as a peer of an earlier
+                # collision group; skip so we don't reprocess a stale row.
+                continue
             clean = normalize_keyword_display(row["species"])
             if clean == row["species"]:
                 continue
@@ -11429,50 +11445,71 @@ class Database:
             # the curly row, and leaves two case-variant predictions on the same
             # (detection, model, fingerprint) — preserving the split review state
             # and duplicate rendering the fold was meant to erase.
-            dup = self.conn.execute(
-                "SELECT id, confidence FROM predictions "
+            #
+            # ``fetchall`` (not ``fetchone``) so a three-way collision such as
+            # ``Say's Phoebe`` + ``Say's phoebe`` + ``Say’s phoebe`` is merged
+            # in one pass: leaving even one NOCASE-equivalent ASCII peer would
+            # let the winner's final ``UPDATE ... SET species = clean`` collide
+            # with it and abort the migration under UNIQUE.
+            peers = self.conn.execute(
+                "SELECT id, confidence, species FROM predictions "
                 "WHERE detection_id = ? AND classifier_model = ? "
                 "AND labels_fingerprint = ? "
                 "AND species = ? COLLATE NOCASE AND id != ?",
                 (row["detection_id"], row["classifier_model"],
                  row["labels_fingerprint"], clean, row["id"]),
-            ).fetchone()
-            if dup is not None:
-                if (row["confidence"] or 0) > (dup["confidence"] or 0):
+            ).fetchall()
+            if peers:
+                # Whole collision set: this row plus every NOCASE-equivalent
+                # peer. Pick the winner by highest confidence, tie-broken by
+                # (a) already-clean species (avoids a needless UPDATE and
+                # preserves the reviewer's chosen casing) then (b) lowest
+                # id for determinism.
+                candidates = [
+                    (row["id"], row["confidence"] or 0.0, row["species"]),
+                ]
+                for p in peers:
+                    candidates.append(
+                        (p["id"], p["confidence"] or 0.0, p["species"])
+                    )
+                winner_id, _, winner_species = max(
+                    candidates,
+                    key=lambda c: (
+                        c[1],
+                        normalize_keyword_display(c[2]) == c[2],
+                        -c[0],
+                    ),
+                )
+                for cid, _, _ in candidates:
+                    if cid == winner_id:
+                        continue
                     self._merge_prediction_metadata_before_delete(
-                        loser_id=dup["id"], winner_id=row["id"],
+                        loser_id=cid, winner_id=winner_id,
                     )
                     self._merge_prediction_review_before_delete(
-                        loser_id=dup["id"], winner_id=row["id"],
+                        loser_id=cid, winner_id=winner_id,
                     )
                     self._retarget_prediction_edit_history(
-                        loser_id=dup["id"], winner_id=row["id"],
+                        loser_id=cid, winner_id=winner_id,
                     )
                     self.conn.execute(
-                        "DELETE FROM predictions WHERE id = ?", (dup["id"],)
+                        "DELETE FROM predictions WHERE id = ?", (cid,)
                     )
+                    processed_ids.add(cid)
+                # Only rewrite the survivor when it still carries curly
+                # punctuation; an already-clean winner keeps its casing.
+                if normalize_keyword_display(winner_species) != winner_species:
                     self.conn.execute(
                         "UPDATE predictions SET species = ? WHERE id = ?",
-                        (clean, row["id"]),
+                        (clean, winner_id),
                     )
-                else:
-                    self._merge_prediction_metadata_before_delete(
-                        loser_id=row["id"], winner_id=dup["id"],
-                    )
-                    self._merge_prediction_review_before_delete(
-                        loser_id=row["id"], winner_id=dup["id"],
-                    )
-                    self._retarget_prediction_edit_history(
-                        loser_id=row["id"], winner_id=dup["id"],
-                    )
-                    self.conn.execute(
-                        "DELETE FROM predictions WHERE id = ?", (row["id"],)
-                    )
+                processed_ids.add(winner_id)
             else:
                 self.conn.execute(
                     "UPDATE predictions SET species = ? WHERE id = ?",
                     (clean, row["id"]),
                 )
+                processed_ids.add(row["id"])
             folded += 1
         return folded
 

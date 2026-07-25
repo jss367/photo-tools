@@ -1057,6 +1057,51 @@ def test_prediction_fold_collision_matches_case_insensitively(tmp_path):
         db.close()
 
 
+def test_prediction_fold_merges_three_way_case_and_apostrophe_collision(tmp_path):
+    """A single (detection, model, fingerprint) scope can legally hold three
+    NOCASE-equivalent variants at once (``predictions.species`` is BINARY
+    UNIQUE): ``Say's Phoebe`` (ASCII title-case), ``Say's phoebe`` (ASCII
+    lowercase), ``Say's phoebe`` (curly, lowercase). A per-row ``fetchone``
+    peer lookup would only merge one of the two ASCII neighbours, and if
+    the curly row wins by confidence the subsequent
+    ``UPDATE ... SET species = 'Say's phoebe'`` collides with the unmerged
+    ASCII-lowercase row and aborts the migration under UNIQUE — reopening
+    the DB just fails again. All three must merge in one pass.
+    """
+    db, _ws_id, p1, _p2 = _make_db(tmp_path)
+    try:
+        det = _insert_prediction(db, p1, "Say's Phoebe", confidence=0.5)
+        db.conn.execute(
+            "INSERT INTO predictions (detection_id, classifier_model, "
+            "labels_fingerprint, species, confidence) "
+            "VALUES (?, 'm1', 'fp1', ?, ?)",
+            (det, "Say's phoebe", 0.3),
+        )
+        db.conn.execute(
+            "INSERT INTO predictions (detection_id, classifier_model, "
+            "labels_fingerprint, species, confidence) "
+            "VALUES (?, 'm1', 'fp1', ?, ?)",
+            (det, "Say’s phoebe", 0.9),
+        )
+        db.conn.commit()
+
+        # No exception: the whole collision set is merged in one pass.
+        db._fold_prediction_species_apostrophes()
+        db.conn.commit()
+
+        rows = db.conn.execute(
+            "SELECT species, confidence FROM predictions"
+        ).fetchall()
+        assert len(rows) == 1
+        # Curly row (0.9) is the highest-confidence winner; it gets folded
+        # to the clean spelling, and neither ASCII peer remains to collide
+        # with the UPDATE.
+        assert rows[0]["species"] == "Say's phoebe"
+        assert rows[0]["confidence"] == 0.9
+    finally:
+        db.close()
+
+
 def test_prediction_fold_preserves_review_when_loser_carries_decision(tmp_path):
     """When the collision-merge deletes the losing prediction, its per-
     workspace prediction_review row must migrate onto the surviving row.

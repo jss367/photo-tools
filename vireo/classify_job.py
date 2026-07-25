@@ -1424,9 +1424,17 @@ def _store_match_prediction(
         # ``_store_pending_detection_prediction``, hiding the top-1 from
         # review). Dedupe on the same normalized key ``add_prediction`` uses
         # so alternatives-that-are-actually-the-primary stay unwritten.
-        seen_species = {_folded_species_key(species)}
+        #
+        # Comparison is case-insensitive (``.strip().lower()``): downstream
+        # keyword joins already use SQLite ``COLLATE NOCASE`` (see
+        # ``_fold_prediction_species_apostrophes``), so a merged label set
+        # yielding primary `Say's Phoebe` and alternative `Say's phoebe`
+        # is semantically one bird — but ``_folded_species_key`` preserves
+        # case, letting them survive as two BINARY-unique rows with the
+        # alternative overwriting the primary's review to ``alternative``.
+        seen_species = {(_folded_species_key(species) or "").strip().lower()}
         for alt in item.get("alternatives", []):
-            alt_key = _folded_species_key(alt["species"])
+            alt_key = (_folded_species_key(alt["species"]) or "").strip().lower()
             if alt_key in seen_species:
                 continue
             seen_species.add(alt_key)
@@ -1599,13 +1607,17 @@ def _store_pending_detection_prediction(
         auto_accept=False,
     )
     # See _store_match_prediction for why alternatives are deduped by the
-    # same normalized key that ``add_prediction`` uses: without this, an
-    # alternative that folds to the primary would upsert the primary's
-    # prediction_review row to ``status='alternative'``, hiding the only
-    # top-1 prediction from the pending queue.
-    seen_species = {_folded_species_key(item["prediction"])}
+    # same normalized key that ``add_prediction`` uses (and why the
+    # comparison is case-insensitive): without this, an alternative that
+    # folds to the primary — including one that differs only by ASCII
+    # capitalization — would upsert the primary's prediction_review row to
+    # ``status='alternative'``, hiding the only top-1 prediction from the
+    # pending queue.
+    seen_species = {
+        (_folded_species_key(item["prediction"]) or "").strip().lower()
+    }
     for alt in item.get("alternatives", []):
-        alt_key = _folded_species_key(alt["species"])
+        alt_key = (_folded_species_key(alt["species"]) or "").strip().lower()
         if alt_key in seen_species:
             continue
         seen_species.add(alt_key)

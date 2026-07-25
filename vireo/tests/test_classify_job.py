@@ -5487,3 +5487,56 @@ def test_store_match_alt_that_folds_to_primary_preserves_auto_accept(tmp_path):
         "auto-accept back to status='alternative'"
     )
     assert rows[0]["individual"] == AUTO_MATCH_REVIEW_MARKER
+
+
+def test_store_match_alt_that_only_differs_in_case_preserves_auto_accept(
+    tmp_path,
+):
+    """Downstream keyword joins already use ``COLLATE NOCASE``, so a merged
+    label set yielding primary ``Say's Phoebe`` and alternative ``Say's
+    phoebe`` is semantically one bird. The BINARY UNIQUE on
+    ``predictions.species`` would still let both survive as distinct rows,
+    with the alternative overwriting the primary's ``prediction_review``.
+    The alternatives-dedupe must therefore match case-insensitively too,
+    otherwise the auto-accepted match silently reappears in review.
+    """
+    from classify_job import _store_match_prediction
+    from db import AUTO_MATCH_REVIEW_MARKER, Database
+
+    db = Database(str(tmp_path / "test.db"))
+    ws_id = db.ensure_default_workspace()
+    db.set_active_workspace(ws_id)
+    fid = db.add_folder("/photos", name="photos")
+    pid = db.add_photo(folder_id=fid, filename="bird.jpg", extension=".jpg",
+                       file_size=1000, file_mtime=1.0)
+    det_ids = db.save_detections(pid, [
+        {"box": {"x": 0.1, "y": 0.1, "w": 0.5, "h": 0.5}, "confidence": 0.9}
+    ], detector_model="megadetector-v6")
+
+    item = {
+        "detection_id": det_ids[0],
+        "prediction": "Say's Phoebe",
+        "confidence": 0.85,
+        "taxonomy": None,
+        "alternatives": [
+            {"species": "Say's phoebe", "confidence": 0.10, "taxonomy": None},
+        ],
+    }
+    _store_match_prediction(
+        db, item, model_name="test-model", labels_fingerprint="fp1",
+    )
+
+    rows = db.conn.execute(
+        "SELECT p.species, pr.status, pr.individual "
+        "FROM predictions p "
+        "LEFT JOIN prediction_review pr "
+        "  ON pr.prediction_id = p.id AND pr.workspace_id = ? "
+        "WHERE p.detection_id = ?",
+        (ws_id, det_ids[0]),
+    ).fetchall()
+    assert len(rows) == 1, (
+        "case-differing alternative must be deduped: it and the primary are "
+        "one species under COLLATE NOCASE"
+    )
+    assert rows[0]["status"] == "accepted"
+    assert rows[0]["individual"] == AUTO_MATCH_REVIEW_MARKER

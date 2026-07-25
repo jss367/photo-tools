@@ -1,3 +1,4 @@
+import builtins
 import json
 import os
 import sys
@@ -206,6 +207,40 @@ def test_load_merged_labels_preserves_spelling_without_collision(tmp_path):
         f"spelling so the fingerprint stays stable — got {result}"
     )
     assert compute_fingerprint(result) == compute_fingerprint(sorted(raw))
+
+
+def test_load_merged_labels_reads_utf8_regardless_of_locale(tmp_path,
+                                                            monkeypatch):
+    """Label files must be read as UTF-8, not the platform default.
+
+    Python picks the locale codepage for text files opened without an
+    explicit ``encoding``, which is cp1252 on Windows. Label files hold
+    non-ASCII species names, so the platform default silently mojibakes
+    ``Hawaiʻi ʻamakihi`` into ``HawaiÊ»i Ê»amakihi`` (U+02BB cannot be
+    represented in cp1252 at all) and can raise on byte sequences cp1252
+    leaves undefined. This reproduced as three Windows-only CI failures.
+    """
+    dir_ = str(tmp_path / "labels")
+    os.makedirs(dir_)
+    txt = os.path.join(dir_, "mixed.txt")
+    with open(txt, "w", encoding="utf-8") as f:
+        f.write("Hawaiʻi ʻamakihi\nKöhler’s Vine Snake\nSkink\n")
+
+    # Simulate a Windows interpreter: default text encoding = cp1252.
+    real_open = builtins.open
+
+    def locale_default_open(*args, **kwargs):
+        mode = args[1] if len(args) > 1 else kwargs.get("mode", "r")
+        if "b" not in str(mode) and "encoding" not in kwargs:
+            kwargs["encoding"] = "cp1252"
+        return real_open(*args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", locale_default_open)
+    result = load_merged_labels([{"labels_file": txt}])
+
+    assert result == ["Hawaiʻi ʻamakihi", "Köhler’s Vine Snake", "Skink"], (
+        f"label names were decoded with the locale codepage — got {result}"
+    )
 
 
 def test_load_merged_labels_preserves_okina_letters(tmp_path):

@@ -271,7 +271,11 @@ def _atomic_write_text(path, text):
         prefix=f".{os.path.basename(path)}.", suffix=".tmp", dir=directory
     )
     try:
-        with os.fdopen(fd, "w") as f:
+        # Explicit UTF-8: label files hold species names with non-ASCII
+        # characters (`Köhler’s Vine Snake`, `Hawaiʻi ʻamakihi`), and Python's
+        # default text encoding is the locale codepage on Windows (cp1252),
+        # which cannot represent U+02BB at all.
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(text)
         os.replace(tmp_path, path)
     except Exception:
@@ -419,7 +423,11 @@ def load_merged_labels(label_sets):
         if not path or not os.path.exists(path):
             log.warning("Label file missing, skipping: %s", path)
             continue
-        with open(path) as f:
+        # encoding="utf-8": these files carry non-ASCII species names, and the
+        # platform default is cp1252 on Windows -- reading UTF-8 bytes through
+        # it silently mojibakes `Hawaiʻi ʻamakihi` into `HawaiÊ»i Ê»amakihi`
+        # (and can raise on byte sequences cp1252 leaves undefined).
+        with open(path, encoding="utf-8") as f:
             for line in f:
                 name = line.strip()
                 if name:

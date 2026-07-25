@@ -14971,13 +14971,13 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         if labels_file:
             # Single file override from query param (classify page picker)
             if os.path.exists(labels_file):
-                with open(labels_file) as f:
+                with open(labels_file, encoding="utf-8") as f:
                     label_count = sum(1 for line in f if line.strip())
                 for ls in get_saved_labels():
                     if ls.get("labels_file") == labels_file:
                         label_name = ls.get("name", labels_file)
                         break
-                with open(labels_file) as f:
+                with open(labels_file, encoding="utf-8") as f:
                     labels = [line.strip() for line in f if line.strip()]
         elif labels_files:
             # Multiple files override from query param
@@ -16936,7 +16936,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             labels_file = ls.get("labels_file", "")
             if not labels_file or not os.path.exists(labels_file):
                 continue
-            with open(labels_file) as f:
+            with open(labels_file, encoding="utf-8") as f:
                 labels = [line.strip() for line in f if line.strip()]
             row = {
                 "labels_name": ls.get("name", ""),
@@ -17001,7 +17001,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 },
             )
 
-            with open(labels_file) as f:
+            with open(labels_file, encoding="utf-8") as f:
                 labels = [line.strip() for line in f if line.strip()]
 
             log.info(
@@ -27653,7 +27653,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             if not labels_file or not os.path.exists(labels_file):
                 continue
             try:
-                with open(labels_file) as f:
+                with open(labels_file, encoding="utf-8") as f:
                     for line in f:
                         name = line.strip()
                         if not name:

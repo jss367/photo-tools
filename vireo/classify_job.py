@@ -125,7 +125,7 @@ def _load_labels(
         labels = load_merged_labels(active_sets)
         log.info("Using %d merged labels from %d sets", len(labels), len(active_sets))
     elif labels_file and os.path.exists(labels_file):
-        with open(labels_file) as f:
+        with open(labels_file, encoding="utf-8") as f:
             labels = [line.strip() for line in f if line.strip()]
         log.info("Using %d labels from file: %s", len(labels), labels_file)
     else:

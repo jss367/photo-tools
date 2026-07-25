@@ -55,13 +55,19 @@ _ASCII_LOWER_TABLE = str.maketrans(
 #     ʻamakihi``; folding it would rewrite the taxonomy.
 #   * U+00B4 ACUTE ACCENT — preserved internally by
 #     ``_nfkc_preserving_internal_acute`` for names like ``O´Brien``.
+#   * U+2032 PRIME — the semantic prime symbol used for feet, arcminutes,
+#     and similar measurements. ``normalize_keyword_display`` runs on every
+#     keyword (not only species names), so a folded-in-place `10′ waterfall`
+#     would silently rewrite existing DB and queued XMP values. Species
+#     labels with a stray prime are rare enough that the case-collision
+#     merger below can handle them; folding them here would break the
+#     legitimate measurement case with no way for the user to opt out.
 # Edge occurrences of the folded characters are already removed by
 # ``_EDGE_QUOTES``, so in practice this only rewrites INTERNAL ones.
 _APOSTROPHE_FOLD = {
     ord("‘"): "'",  # LEFT SINGLE QUOTATION MARK
     ord("’"): "'",  # RIGHT SINGLE QUOTATION MARK
     ord("‛"): "'",  # SINGLE HIGH-REVERSED-9 QUOTATION MARK
-    ord("′"): "'",  # PRIME
 }
 
 

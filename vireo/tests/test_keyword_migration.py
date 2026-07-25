@@ -2393,3 +2393,103 @@ def test_curation_case_alignment_leaves_ambiguous_homonyms_alone(tmp_path):
         assert db.get_meta("curation_species_case_aligned_v2") == "1"
     finally:
         db.close()
+
+
+def test_prime_symbol_not_folded_in_keywords(tmp_path):
+    """U+2032 PRIME is the semantic prime symbol used for feet and
+    arcminutes. Keywords like `10′ waterfall` must not be silently
+    rewritten to `10' waterfall` by the apostrophe fold — the fold table
+    intentionally excludes U+2032 so measurement notation survives the
+    display/storage normalization applied on every keyword write."""
+    from keyword_normalization import normalize_keyword_display
+
+    assert normalize_keyword_display("10′ waterfall") == "10′ waterfall"
+    # Middle-of-string preservation matters most, but a lone prime as an
+    # edge char is stripped by _EDGE_QUOTES (measurement notation almost
+    # never appears at the boundary of a keyword name — the edge behavior
+    # is unchanged from before the fold table existed).
+
+    db, _ws_id, p1, _p2 = _make_db(tmp_path)
+    try:
+        det = db.conn.execute(
+            "INSERT INTO detections (photo_id, category, detector_confidence) "
+            "VALUES (?, 'animal', 0.99)",
+            (p1,),
+        ).lastrowid
+        db.conn.commit()
+
+        # A prediction whose species carries a legitimate prime stays intact
+        # after add_prediction normalizes on write.
+        db.add_prediction(
+            detection_id=det,
+            species="10′ waterfall bird",
+            confidence=0.5,
+            model="m1",
+            labels_fingerprint="fp1",
+        )
+        stored = db.conn.execute(
+            "SELECT species FROM predictions WHERE detection_id = ?", (det,)
+        ).fetchone()["species"]
+        assert stored == "10′ waterfall bird"
+    finally:
+        db.close()
+
+
+def test_prediction_fold_merge_backfills_pending_group_metadata(tmp_path):
+    """Two spellings can both have PENDING review rows in the same
+    workspace — the loser carrying the current burst's ``group_id`` and
+    vote counts, the winner just a bare pending stub. The prior merge
+    logic only preserved group metadata when the loser's status was
+    accepted/rejected, so a pending loser's grouping was cascaded away
+    and the surviving prediction silently fell out of its burst group.
+    The merge helper now backfills group metadata from whichever side
+    supplies it, independently of the accepted/rejected decision."""
+    db, ws_id, p1, _p2 = _make_db(tmp_path)
+    try:
+        det = _insert_prediction(db, p1, "Say's phoebe", confidence=0.8)
+        db.conn.execute(
+            "INSERT INTO predictions (detection_id, classifier_model, "
+            "labels_fingerprint, species, confidence) "
+            "VALUES (?, 'm1', 'fp1', ?, ?)",
+            (det, "Say’s phoebe", 0.4),
+        )
+        winner_pid = db.conn.execute(
+            "SELECT id FROM predictions WHERE species = ?", ("Say's phoebe",)
+        ).fetchone()["id"]
+        loser_pid = db.conn.execute(
+            "SELECT id FROM predictions WHERE species = ?", ("Say’s phoebe",)
+        ).fetchone()["id"]
+        db.conn.execute(
+            "INSERT INTO prediction_review "
+            "(prediction_id, workspace_id, status) VALUES (?, ?, 'pending')",
+            (winner_pid, ws_id),
+        )
+        db.conn.execute(
+            "INSERT INTO prediction_review "
+            "(prediction_id, workspace_id, status, group_id, vote_count, "
+            " total_votes, individual) "
+            "VALUES (?, ?, 'pending', 'burst-1', 2, 3, 'ind-1')",
+            (loser_pid, ws_id),
+        )
+        db.conn.commit()
+
+        db._fold_prediction_species_apostrophes()
+        db.conn.commit()
+
+        survivor_pid = db.conn.execute(
+            "SELECT id FROM predictions WHERE species = ?", ("Say's phoebe",)
+        ).fetchone()["id"]
+        review = db.conn.execute(
+            "SELECT status, group_id, vote_count, total_votes, individual "
+            "FROM prediction_review "
+            "WHERE prediction_id = ? AND workspace_id = ?",
+            (survivor_pid, ws_id),
+        ).fetchone()
+        assert review is not None
+        assert review["status"] == "pending"
+        assert review["group_id"] == "burst-1"
+        assert review["vote_count"] == 2
+        assert review["total_votes"] == 3
+        assert review["individual"] == "ind-1"
+    finally:
+        db.close()

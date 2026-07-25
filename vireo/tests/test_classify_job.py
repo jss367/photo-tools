@@ -5209,3 +5209,129 @@ def test_precancelled_job_finalizes_all_step_rows(tmp_path):
             f"Step {step_id!r} must be marked cancelled on the "
             f"pre-resolution cancel gate, got {finals.get(step_id)!r}"
         )
+
+
+def test_store_pending_alt_that_folds_to_primary_does_not_hide_top1(tmp_path):
+    """A pending primary + a curly-spelled alternative that folds to the
+    same species must NOT overwrite the primary's review row with
+    ``status='alternative'``.
+
+    ``Database.add_prediction`` folds species centrally, so both the
+    primary and the collision-alternative resolve to the same predictions
+    row. The alternative's INSERT-OR-IGNORE is a no-op on that row, but
+    the second call still re-queries and unconditionally upserts
+    ``prediction_review`` — with ``status='alternative'``. Without the
+    dedupe added in ``_store_pending_detection_prediction``, the only
+    top-1 prediction for that detection would appear as an alternative
+    and drop out of the pending queue.
+    """
+    from unittest.mock import patch
+
+    from classify_job import _store_grouped_predictions
+    from db import Database
+
+    db = Database(str(tmp_path / "test.db"))
+    ws_id = db.ensure_default_workspace()
+    db.set_active_workspace(ws_id)
+    fid = db.add_folder("/photos", name="photos")
+    pid = db.add_photo(folder_id=fid, filename="bird.jpg", extension=".jpg",
+                       file_size=1000, file_mtime=1.0,
+                       timestamp="2024-01-15T10:00:00")
+    det_ids = db.save_detections(pid, [
+        {"box": {"x": 0.1, "y": 0.1, "w": 0.5, "h": 0.5}, "confidence": 0.9}
+    ], detector_model="megadetector-v6")
+
+    raw_results = [{
+        "photo": {"id": pid, "filename": "bird.jpg",
+                  "timestamp": "2024-01-15T10:00:00"},
+        "detection_id": det_ids[0],
+        "folder_path": "/photos",
+        "image_path": "/photos/bird.jpg",
+        "prediction": "Say's phoebe",
+        "confidence": 0.85,
+        "timestamp": None,
+        "filename": "bird.jpg",
+        "embedding": None,
+        "taxonomy": None,
+        # Curly-spelled variant folds to the same species as the primary.
+        # Also include a genuinely different alternative to confirm the
+        # dedupe skips only the collision.
+        "alternatives": [
+            {"species": "Say’s phoebe", "confidence": 0.10, "taxonomy": None},
+            {"species": "Cassin's kingbird", "confidence": 0.05,
+             "taxonomy": None},
+        ],
+    }]
+
+    with patch("xmp.read_keywords", return_value=[]), \
+         patch("compare.categorize", return_value="new"):
+        _store_grouped_predictions(
+            raw_results=raw_results,
+            job_id="test-alt-collision-1",
+            model_name="test-model",
+            grouping_window=10,
+            similarity_threshold=0.85,
+            tax=None,
+            db=db,
+        )
+
+    all_preds = db.get_predictions()
+    species = sorted(p["species"] for p in all_preds)
+    assert species == ["Cassin's kingbird", "Say's phoebe"], species
+
+    pending = db.get_predictions(status="pending")
+    assert [p["species"] for p in pending] == ["Say's phoebe"], (
+        "the primary must remain in the pending queue — an alternative that "
+        "folds to the same species must not upsert status='alternative' onto it"
+    )
+    alts = db.get_predictions(status="alternative")
+    assert [p["species"] for p in alts] == ["Cassin's kingbird"]
+
+
+def test_store_match_alt_that_folds_to_primary_preserves_auto_accept(tmp_path):
+    """Same collision on the match path: an auto-accepted primary with the
+    ``AUTO_MATCH_REVIEW_MARKER`` must keep its accepted status when an
+    alternative folds to it. Without the dedupe, the alternative's
+    ``status='alternative'`` upsert would overwrite the auto-accept and
+    the previously-labeled match would silently reappear in review."""
+    from classify_job import _store_match_prediction
+    from db import AUTO_MATCH_REVIEW_MARKER, Database
+
+    db = Database(str(tmp_path / "test.db"))
+    ws_id = db.ensure_default_workspace()
+    db.set_active_workspace(ws_id)
+    fid = db.add_folder("/photos", name="photos")
+    pid = db.add_photo(folder_id=fid, filename="bird.jpg", extension=".jpg",
+                       file_size=1000, file_mtime=1.0)
+    det_ids = db.save_detections(pid, [
+        {"box": {"x": 0.1, "y": 0.1, "w": 0.5, "h": 0.5}, "confidence": 0.9}
+    ], detector_model="megadetector-v6")
+
+    item = {
+        "detection_id": det_ids[0],
+        "prediction": "Say's phoebe",
+        "confidence": 0.85,
+        "taxonomy": None,
+        "alternatives": [
+            {"species": "Say’s phoebe", "confidence": 0.10, "taxonomy": None},
+        ],
+    }
+    _store_match_prediction(
+        db, item, model_name="test-model", labels_fingerprint="fp1",
+    )
+
+    rows = db.conn.execute(
+        "SELECT p.species, pr.status, pr.individual "
+        "FROM predictions p "
+        "LEFT JOIN prediction_review pr "
+        "  ON pr.prediction_id = p.id AND pr.workspace_id = ? "
+        "WHERE p.detection_id = ?",
+        (ws_id, det_ids[0]),
+    ).fetchall()
+    assert len(rows) == 1
+    assert rows[0]["species"] == "Say's phoebe"
+    assert rows[0]["status"] == "accepted", (
+        "the alternative that folds to the primary must not overwrite the "
+        "auto-accept back to status='alternative'"
+    )
+    assert rows[0]["individual"] == AUTO_MATCH_REVIEW_MARKER

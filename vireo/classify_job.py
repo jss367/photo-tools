@@ -34,6 +34,20 @@ from db import AUTO_MATCH_REVIEW_MARKER, Database, commit_with_retry
 from keyword_normalization import normalize_keyword_display
 from models import get_active_model, get_models
 
+
+def _folded_species_key(species):
+    """Return the string ``add_prediction`` uses to key ``predictions.species``.
+
+    Mirrors the normalization branch in ``Database.add_prediction``: fold when
+    the result is non-empty, otherwise keep the original. Callers use this to
+    dedupe alternatives against a primary before writing prediction_review
+    rows, so the key must match exactly what ends up in the UNIQUE column.
+    """
+    if species is None:
+        return None
+    folded = normalize_keyword_display(species)
+    return folded if folded else species
+
 try:
     from classifier import ClassificationCancelled, Classifier
 except ImportError:
@@ -1399,7 +1413,23 @@ def _store_match_prediction(
         preserve_manual_review=True,
     )
     if store_alternatives:
+        # Skip alternatives whose normalized species collides with the primary
+        # (or a previously stored alternative). ``add_prediction`` folds
+        # apostrophes centrally, so an active label set with both `Say's
+        # Phoebe` and `Say’s Phoebe` (or a classifier that returns both
+        # spellings in one call) would resolve every ``alt`` to the primary's
+        # unique row. The alternative's re-queried INSERT then upserts
+        # ``prediction_review.status = 'alternative'``, silently overwriting
+        # the auto-accepted match status (or, for a pending primary via
+        # ``_store_pending_detection_prediction``, hiding the top-1 from
+        # review). Dedupe on the same normalized key ``add_prediction`` uses
+        # so alternatives-that-are-actually-the-primary stay unwritten.
+        seen_species = {_folded_species_key(species)}
         for alt in item.get("alternatives", []):
+            alt_key = _folded_species_key(alt["species"])
+            if alt_key in seen_species:
+                continue
+            seen_species.add(alt_key)
             alt_tax = alt.get("taxonomy") or (
                 tax.get_hierarchy(alt["species"]) if tax else {}
             )
@@ -1568,7 +1598,17 @@ def _store_pending_detection_prediction(
         item["prediction"], category,
         auto_accept=False,
     )
+    # See _store_match_prediction for why alternatives are deduped by the
+    # same normalized key that ``add_prediction`` uses: without this, an
+    # alternative that folds to the primary would upsert the primary's
+    # prediction_review row to ``status='alternative'``, hiding the only
+    # top-1 prediction from the pending queue.
+    seen_species = {_folded_species_key(item["prediction"])}
     for alt in item.get("alternatives", []):
+        alt_key = _folded_species_key(alt["species"])
+        if alt_key in seen_species:
+            continue
+        seen_species.add(alt_key)
         alt_tax = alt.get("taxonomy") or (
             tax.get_hierarchy(alt["species"]) if tax else {}
         )

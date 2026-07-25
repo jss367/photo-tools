@@ -11482,6 +11482,14 @@ class Database:
           decision: a non-pending status beats pending, and among two
           non-pending decisions the later ``reviewed_at`` wins.  Ties keep
           the winner's row so the choice stays deterministic.
+        - Independently of the status choice, backfill missing group
+          metadata (``group_id`` / ``vote_count`` / ``total_votes`` /
+          ``individual``) from whichever side carries it: a pending loser
+          that carries the current burst's ``group_id`` while the winner is
+          also pending would otherwise be cascaded away and the surviving
+          prediction would silently drop out of its burst group. This is
+          safe because two rows for the same (detection, species) pair
+          across spelling variants are always about the same burst.
 
         The loser's remaining rows are removed by the caller's DELETE via
         the ON DELETE CASCADE, so no explicit cleanup is needed here.
@@ -11495,7 +11503,8 @@ class Database:
         for lr in loser_rows:
             ws = lr["workspace_id"]
             winner = self.conn.execute(
-                "SELECT status, reviewed_at FROM prediction_review "
+                "SELECT status, reviewed_at, individual, group_id, "
+                "vote_count, total_votes FROM prediction_review "
                 "WHERE prediction_id = ? AND workspace_id = ?",
                 (winner_id, ws),
             ).fetchone()
@@ -11514,16 +11523,31 @@ class Database:
                 not winner_decided
                 or (lr["reviewed_at"] or "") > (winner["reviewed_at"] or "")
             )
-            if prefer_loser:
-                self.conn.execute(
-                    """UPDATE prediction_review
-                       SET status = ?, reviewed_at = ?, individual = ?,
-                           group_id = ?, vote_count = ?, total_votes = ?
-                       WHERE prediction_id = ? AND workspace_id = ?""",
-                    (lr["status"], lr["reviewed_at"], lr["individual"],
-                     lr["group_id"], lr["vote_count"], lr["total_votes"],
-                     winner_id, ws),
-                )
+            chosen = lr if prefer_loser else winner
+            other = winner if prefer_loser else lr
+            # ``prefer_loser`` only reflects the accepted/rejected decision,
+            # so a pending winner whose row lacks ``group_id`` while a
+            # pending loser carries the current burst's grouping would lose
+            # it via CASCADE without this backfill. Symmetric across sides:
+            # whichever side supplied the decision, missing group metadata
+            # is filled from the other so the surviving prediction stays
+            # inside its burst group.
+            self.conn.execute(
+                """UPDATE prediction_review
+                   SET status = ?, reviewed_at = ?, individual = ?,
+                       group_id = ?, vote_count = ?, total_votes = ?
+                   WHERE prediction_id = ? AND workspace_id = ?""",
+                (chosen["status"], chosen["reviewed_at"],
+                 chosen["individual"] if chosen["individual"] is not None
+                 else other["individual"],
+                 chosen["group_id"] if chosen["group_id"] is not None
+                 else other["group_id"],
+                 chosen["vote_count"] if chosen["vote_count"] is not None
+                 else other["vote_count"],
+                 chosen["total_votes"] if chosen["total_votes"] is not None
+                 else other["total_votes"],
+                 winner_id, ws),
+            )
 
     def _retarget_prediction_edit_history(self, loser_id, winner_id):
         """Rewrite `prediction_accept` history entries from loser to winner.

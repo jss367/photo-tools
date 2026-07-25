@@ -11502,12 +11502,10 @@ class Database:
             winner_status = winner["status"] or "pending"
             loser_decided = loser_status in ("accepted", "rejected")
             winner_decided = winner_status in ("accepted", "rejected")
-            prefer_loser = False
-            if loser_decided and not winner_decided:
-                prefer_loser = True
-            elif loser_decided and winner_decided:
-                if (lr["reviewed_at"] or "") > (winner["reviewed_at"] or ""):
-                    prefer_loser = True
+            prefer_loser = loser_decided and (
+                not winner_decided
+                or (lr["reviewed_at"] or "") > (winner["reviewed_at"] or "")
+            )
             if prefer_loser:
                 self.conn.execute(
                     """UPDATE prediction_review

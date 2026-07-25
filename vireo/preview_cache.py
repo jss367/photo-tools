@@ -348,10 +348,11 @@ def purge_cached_files_for_recycled_id(
     photo's pixels: the Life List card for a gull renders whatever bird
     used to own that row.
 
-    Delete paths are supposed to unlink these files, but several
-    (``Database._merge_into_existing``, ``scanner._merge_companion_pair``,
-    ``audit.remove_orphans``) drop photo rows with raw SQL and leave the
-    cache behind, and any unlink that fails leaves an orphan too. Rather
+    Delete paths are supposed to unlink these files, but the surface
+    area is wide — ``Database._merge_into_existing``,
+    ``scanner._pair_raw_jpeg_companions``, ``audit.remove_orphans`` and
+    other raw-SQL drops each need to remember every id-keyed derivative
+    family, and any unlink that fails leaves an orphan behind. Rather
     than trusting every delete site, ingest re-checks at the one moment
     the collision can actually happen — when a brand-new row claims a
     rowid.

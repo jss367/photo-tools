@@ -1676,3 +1676,57 @@ def test_serve_thumbnail_404s_for_photo_outside_active_workspace(tmp_path, monke
         "thumbnail self-heal must not serve a photo that the active "
         "workspace cannot see"
     )
+
+
+def test_serve_thumbnail_does_not_serve_stale_pixels_when_unlink_fails(
+    tmp_path, monkeypatch,
+):
+    """A stale thumbnail we cannot delete must not be served either.
+
+    This branch fires for recycled rowids, so the cached pixels belong to
+    a *different photo*. The old behaviour served the file "once" and
+    retried the unlink next request — but if the lock persists (which is
+    what locks do), every request serves the previous owner's image. A
+    broken image is better than the wrong bird.
+
+    The route now regenerates to a ``{photo_id}_regen.jpg`` sidecar and
+    serves that. The sidecar's ``{photo_id}_*`` shape means the existing
+    recycled-id purge and delete cleanup already sweep it.
+    """
+    import app as app_module
+
+    app, db, pid, thumb_dir = _make_app_with_real_photo(tmp_path, monkeypatch)
+
+    thumb_file = os.path.join(thumb_dir, f"{pid}.jpg")
+    # 50x50 flat colour at q70 — nothing like the 800x600 real source, so
+    # a byte comparison is decisive.
+    Image.new("RGB", (50, 50), (1, 2, 3)).save(thumb_file, "JPEG", quality=70)
+    sentinel_bytes = open(thumb_file, "rb").read()
+    photo_mtime = db.conn.execute(
+        "SELECT file_mtime FROM photos WHERE id=?", (pid,)
+    ).fetchone()["file_mtime"]
+    stale_mtime = photo_mtime - 86400
+    os.utime(thumb_file, (stale_mtime, stale_mtime))
+
+    real_remove = app_module.os.remove
+
+    def failing_remove(path, *args, **kwargs):
+        if path == thumb_file:
+            raise PermissionError(13, "Permission denied", path)
+        return real_remove(path, *args, **kwargs)
+
+    monkeypatch.setattr(app_module.os, "remove", failing_remove)
+
+    client = app.test_client()
+    resp = client.get(f"/thumbnails/{pid}.jpg")
+
+    assert resp.status_code == 200
+    assert resp.data != sentinel_bytes, (
+        "the undeletable stale thumbnail was served; on a recycled rowid "
+        "that is the previous owner's photo, and a persistent lock means "
+        "every request shows it"
+    )
+    # The locked original is left alone, and the fresh bytes came from the
+    # sidecar the purge globs already cover.
+    assert open(thumb_file, "rb").read() == sentinel_bytes
+    assert os.path.exists(os.path.join(thumb_dir, f"{pid}_regen.jpg"))

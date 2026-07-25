@@ -24824,19 +24824,44 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             try:
                 os.remove(thumb_path)
             except OSError:
-                # If we can't unlink the stale file (Windows lock,
-                # permissions, antivirus quarantine), do NOT proceed to
-                # regen+utime: ``generate_thumbnail`` would short-circuit
-                # on the existing file and the subsequent ``os.utime``
-                # below would mark the stale image as fresh forever.
-                # Serve what's on disk this once and leave the mtime
-                # alone — next request will retry the unlink.
+                # We can't unlink the stale file (Windows lock,
+                # permissions, antivirus quarantine) and we must not
+                # regenerate over it: ``generate_thumbnail`` would
+                # short-circuit on the existing file and the ``os.utime``
+                # below would then mark the stale image fresh forever.
+                #
+                # Serving it is not an option either. This branch fires
+                # for recycled rowids, so those pixels belong to a
+                # *different photo* — and if the lock persists, every
+                # subsequent request serves them too. Showing another
+                # bird is worse than showing nothing.
+                #
+                # Regenerate to a sidecar and serve that instead. The
+                # ``{photo_id}_*`` shape means the recycled-id purge and
+                # the delete cleanup already sweep it.
+                stem, ext = os.path.splitext(cache_filename)
+                cache_filename = f"{stem}_regen{ext}"
+                thumb_path = os.path.join(thumb_dir, cache_filename)
                 log.warning(
-                    "Could not unlink stale thumbnail %s; serving stale "
-                    "file once. Next request will retry the unlink.",
-                    thumb_path, exc_info=True,
+                    "Could not unlink stale thumbnail %s; regenerating to "
+                    "%s rather than serving the previous owner's pixels.",
+                    os.path.join(thumb_dir, f"{stem}{ext}"), cache_filename,
+                    exc_info=True,
                 )
-                return _send_cached(thumb_dir, cache_filename)
+                try:
+                    sidecar_mtime = os.path.getmtime(thumb_path)
+                except FileNotFoundError:
+                    sidecar_mtime = None
+                if sidecar_mtime is not None and (
+                    selected_source_mtime is None
+                    or sidecar_mtime >= selected_source_mtime
+                ):
+                    return _send_cached(thumb_dir, cache_filename)
+                # Fall through: the regen path below now targets the
+                # sidecar, so a stale sidecar is overwritten too.
+                with contextlib.suppress(OSError):
+                    if sidecar_mtime is not None:
+                        os.remove(thumb_path)
 
         # Self-heal path: regenerate on miss (or stale) when the photo
         # still exists.

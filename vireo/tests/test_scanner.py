@@ -5008,3 +5008,120 @@ def test_recycled_id_purge_clears_external_edit_handoffs(tmp_path):
         "external-edit cache metadata outlived its photo; it is what makes "
         "the stale render look valid"
     )
+
+
+def test_preview_marker_written_even_when_backdating_fails(tmp_path):
+    """For previews the marker matters more than the mtime.
+
+    ``_serve_preview``'s lazy-adoption branch never compares mtimes, so a
+    readable surviving preview is adoptable regardless of its timestamp —
+    only the durable ``preview_cache_invalidations`` row keeps it out. An
+    earlier revision attempted the marker only on the backdate's success
+    path, so a survivor whose ``utime`` also failed stayed adoptable.
+    """
+    import preview_cache
+    from db import Database
+    from preview_cache import purge_cached_files_for_recycled_id
+
+    vireo_dir = tmp_path / "vireo"
+    thumb_dir = vireo_dir / "thumbnails"
+    thumb_dir.mkdir(parents=True)
+
+    db = Database(str(tmp_path / "test.db"))
+    fid = db.add_folder(str(tmp_path / "photos"), name="photos")
+    pid = db.add_photo(
+        folder_id=fid, filename="gull.jpg", extension=".jpg",
+        file_size=10, file_mtime=1.0,
+    )
+    survivor = vireo_dir / "previews" / f"{pid}_1920.jpg"
+    survivor.parent.mkdir(parents=True)
+    survivor.write_bytes(b"previous-tenant-preview")
+
+    real_remove, real_utime = preview_cache.os.remove, preview_cache.os.utime
+
+    def locked_remove(path, *a, **k):
+        if os.path.normpath(str(path)) == os.path.normpath(str(survivor)):
+            raise OSError("locked")
+        return real_remove(path, *a, **k)
+
+    def locked_utime(path, *a, **k):
+        if os.path.normpath(str(path)) == os.path.normpath(str(survivor)):
+            raise OSError("locked")
+        return real_utime(path, *a, **k)
+
+    preview_cache.os.remove, preview_cache.os.utime = locked_remove, locked_utime
+    try:
+        purge_cached_files_for_recycled_id(
+            str(thumb_dir), pid, vireo_dir=str(vireo_dir), db=db,
+        )
+    finally:
+        preview_cache.os.remove, preview_cache.os.utime = real_remove, real_utime
+
+    row = db.conn.execute(
+        "SELECT 1 FROM preview_cache_invalidations WHERE photo_id=? AND size=?",
+        (pid, 1920),
+    ).fetchone()
+    assert row is not None, (
+        "no invalidation marker was written because the backdate failed "
+        "first; _serve_preview would adopt the previous owner's preview"
+    )
+
+
+def test_prepared_render_survivor_does_not_get_a_preview_marker(tmp_path):
+    """``originals/<id>_2048.jpg`` is not a preview.
+
+    The name shape is identical to a sized preview, so a name-only parse
+    earns the photo a durable ``preview_cache_invalidations`` row for a
+    size that was never cached — which would then suppress adoption of a
+    preview that legitimately gets written later.
+    """
+    from db import Database
+    from preview_cache import (
+        ensure_preview_cache_invalidations_table,
+        purge_cached_files_for_recycled_id,
+    )
+
+    vireo_dir = tmp_path / "vireo"
+    thumb_dir = vireo_dir / "thumbnails"
+    thumb_dir.mkdir(parents=True)
+
+    db = Database(str(tmp_path / "test.db"))
+    fid = db.add_folder(str(tmp_path / "photos"), name="photos")
+    pid = db.add_photo(
+        folder_id=fid, filename="gull.jpg", extension=".jpg",
+        file_size=10, file_mtime=1.0,
+    )
+    # Create the table up front so an empty result means "no marker was
+    # written", not "the purge never touched this family".
+    ensure_preview_cache_invalidations_table(db)
+    render = vireo_dir / "originals" / f"{pid}_2048.jpg"
+    render.parent.mkdir(parents=True)
+    render.write_bytes(b"prepared-render")
+
+    # Lock it so it actually becomes a *survivor* — otherwise the purge
+    # just deletes it and the marker logic is never reached.
+    import preview_cache
+
+    real_remove = preview_cache.os.remove
+
+    def locked_remove(path, *a, **k):
+        if os.path.normpath(str(path)) == os.path.normpath(str(render)):
+            raise OSError("locked")
+        return real_remove(path, *a, **k)
+
+    preview_cache.os.remove = locked_remove
+    try:
+        purge_cached_files_for_recycled_id(
+            str(thumb_dir), pid, vireo_dir=str(vireo_dir), db=db,
+        )
+    finally:
+        preview_cache.os.remove = real_remove
+
+    assert render.exists(), "test setup failed to make the render survive"
+
+    rows = db.conn.execute(
+        "SELECT size FROM preview_cache_invalidations WHERE photo_id=?", (pid,)
+    ).fetchall()
+    assert not rows, (
+        f"a prepared render earned bogus preview invalidation rows: {rows}"
+    )

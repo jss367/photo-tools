@@ -415,8 +415,20 @@ def mark_preview_cache_invalid(db, photo_id, size, *, commit=True):
         db.conn.commit()
 
 
-def _preview_size_from_path(path, photo_id):
-    """Parse ``previews/<id>_<size>.jpg`` -> ``size``, else ``None``."""
+def _preview_size_from_path(path, photo_id, preview_dir=None):
+    """Parse ``previews/<id>_<size>.jpg`` -> ``size``, else ``None``.
+
+    ``preview_dir`` gates the match on the file actually living in
+    ``previews/``. The name shape alone is ambiguous: a prepared render at
+    ``originals/<id>_2048.jpg`` parses identically and would earn a durable
+    ``preview_cache_invalidations`` row for a preview size that was never
+    cached, permanently suppressing adoption of a preview that does get
+    written later.
+    """
+    if preview_dir is not None and os.path.normpath(
+        os.path.dirname(path)
+    ) != os.path.normpath(preview_dir):
+        return None
     name = os.path.basename(path)
     stem, ext = os.path.splitext(name)
     if ext.lower() != ".jpg":
@@ -537,28 +549,51 @@ def purge_cached_files_for_recycled_id(
         thumb_cache_dir, photo_id, vireo_dir,
     )
     if survivors:
+        preview_dir = os.path.join(
+            vireo_dir or os.path.dirname(thumb_cache_dir), "previews",
+        )
+        external_edits_dir = os.path.join(
+            vireo_dir or os.path.dirname(thumb_cache_dir), "external-edits",
+        )
         unfixable = []
         for path in survivors:
+            backdated = True
             try:
                 os.utime(path, (0, 0))
             except OSError:
+                backdated = False
+
+            size = _preview_size_from_path(path, photo_id, preview_dir)
+            if size is not None:
+                # Previews are the one family where the marker, not the
+                # mtime, is what keeps the adoption branch off the file —
+                # so attempt it even when the backdate failed. Doing this
+                # only on the backdate's success path (as an earlier
+                # revision did) left a readable survivor adoptable.
+                if db is None:
+                    unfixable.append(path)
+                    continue
+                try:
+                    mark_preview_cache_invalid(db, photo_id, size)
+                except Exception:
+                    log.warning(
+                        "Could not mark surviving preview %s invalid", path,
+                        exc_info=True,
+                    )
+                    unfixable.append(path)
+                continue
+
+            if os.path.normpath(os.path.dirname(path)) == os.path.normpath(
+                external_edits_dir
+            ):
+                # ``_external_edit_handoff_path`` compares the JSON's
+                # {recipe, source_path, source_mtime, edit_math_version}
+                # and never stats either file, so a backdate here changes
+                # nothing. Nothing short of removing them helps.
                 unfixable.append(path)
                 continue
-            size = _preview_size_from_path(path, photo_id)
-            if size is None:
-                continue
-            if db is None:
-                # No handle to write the marker, and mtime alone won't
-                # keep the adoption branch off it.
-                unfixable.append(path)
-                continue
-            try:
-                mark_preview_cache_invalid(db, photo_id, size)
-            except Exception:
-                log.warning(
-                    "Could not mark surviving preview %s invalid", path,
-                    exc_info=True,
-                )
+
+            if not backdated:
                 unfixable.append(path)
         if unfixable:
             log.error(

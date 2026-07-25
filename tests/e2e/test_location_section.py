@@ -1735,3 +1735,44 @@ def test_freetext_location_batches_selection_and_refreshes_smart_collection(
         assert row["name"] == "the meadow"
         expect(page.locator(f".grid-card[data-id='{photo_id}']")).to_have_count(0)
     assert db.count_collection_photos(collection_id) == 0
+
+
+def test_location_applies_to_selection_larger_than_batch_cap(live_server, page):
+    """A selection above the server's 1000-photo cap still gets saved.
+
+    Regression: browse.html posted the whole selection in one
+    /api/batch/location/text request, so selecting ~1.3k photos and typing a
+    location came back 400 "too many photo_ids" (vireo/app.py caps photo_ids
+    at 1000) and applied to *nothing*. location_review.html already chunked;
+    the detail-panel path did not.
+    """
+    db = live_server["db"]
+    folder_id = db.add_folder("/photos/laguna", name="laguna")
+    photo_ids = [
+        db.add_photo(
+            folder_id=folder_id, filename=f"laguna{i}.jpg", extension=".jpg",
+            file_size=1000, file_mtime=1.0, timestamp="2024-05-01T09:00:00",
+        )
+        for i in range(1200)
+    ]
+
+    page.goto(f"{live_server['url']}/browse")
+    page.locator(".grid-card").first.wait_for(state="visible")
+
+    # Seed the selection directly rather than clicking 1200 cards: the grid
+    # lazy-loads far fewer than that, and multi-select is covered elsewhere.
+    # What's under test is what the save path does with a big selection.
+    page.evaluate(
+        "(ids) => { selectedPhotos.clear(); ids.forEach(function(id) "
+        "{ selectedPhotos.add(id); }); }",
+        photo_ids,
+    )
+    page.evaluate("() => _submitLocationText('Mount Laguna')")
+
+    tagged = db.conn.execute(
+        "SELECT COUNT(DISTINCT pk.photo_id) AS n FROM photo_keywords pk "
+        "JOIN keywords k ON k.id = pk.keyword_id "
+        "WHERE k.type = 'location' AND k.name = ?",
+        ("Mount Laguna",),
+    ).fetchone()["n"]
+    assert tagged == len(photo_ids)

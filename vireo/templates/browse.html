@@ -7164,6 +7164,27 @@ function _locationApplyPhotoIds() {
   return getActiveSelection();
 }
 
+// The batch location endpoints reject more than 1000 photo_ids per request
+// (vireo/app.py), and reject the whole request — so posting a bigger selection
+// in one shot applied the location to *nothing*. Split it. location_review.html
+// chunks against the same cap.
+var LOCATION_BATCH_LIMIT = 1000;
+
+async function _postLocationBatched(endpoint, baseBody, ids) {
+  var last = null;
+  for (var offset = 0; offset < ids.length; offset += LOCATION_BATCH_LIMIT) {
+    var body = Object.assign({}, baseBody, {
+      photo_ids: ids.slice(offset, offset + LOCATION_BATCH_LIMIT),
+    });
+    last = await safeFetch(endpoint, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+  }
+  return last;
+}
+
 async function _afterLocationMutation(photoIds, detailPhotoId) {
   // Bump the location-mutation epoch so any in-flight reverse-geocode from an
   // earlier maybeShowExifSuggestion(A) bails out of its post-await paint. Every
@@ -7299,16 +7320,14 @@ async function _submitLocationPlace(placeId, placeDetails) {
   var detailPhotoId = window._detailPhotoId || null;
   var body = { place_id: placeId };
   if (placeDetails) body.place = placeDetails;
-  if (useBatch) body.photo_ids = ids;
   try {
-    var endpoint = useBatch
-      ? '/api/batch/location'
-      : '/api/photos/' + ids[0] + '/location';
-    var resp = await safeFetch(endpoint, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    });
+    var resp = useBatch
+      ? await _postLocationBatched('/api/batch/location', body, ids)
+      : await safeFetch('/api/photos/' + ids[0] + '/location', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
     if (resp && resp.location) {
       renderLocationFilled(resp.location);
     }
@@ -7326,16 +7345,14 @@ async function _submitLocationKeyword(keyword) {
   var useBatch = ids.length > 1;
   var detailPhotoId = window._detailPhotoId || null;
   var body = { keyword_id: keyword.id };
-  if (useBatch) body.photo_ids = ids;
   try {
-    var endpoint = useBatch
-      ? '/api/batch/location'
-      : '/api/photos/' + ids[0] + '/location';
-    var resp = await safeFetch(endpoint, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    });
+    var resp = useBatch
+      ? await _postLocationBatched('/api/batch/location', body, ids)
+      : await safeFetch('/api/photos/' + ids[0] + '/location', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
     if (resp && resp.location) {
       renderLocationFilled(resp.location);
     }
@@ -7352,17 +7369,13 @@ async function _submitLocationText(name) {
   var useBatch = ids.length > 1;
   var detailPhotoId = window._detailPhotoId || null;
   try {
-    var endpoint = useBatch
-      ? '/api/batch/location/text'
-      : '/api/photos/' + ids[0] + '/location/text';
-    var body = useBatch
-      ? { name: name, photo_ids: ids }
-      : { name: name };
-    var resp = await safeFetch(endpoint, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    });
+    var resp = useBatch
+      ? await _postLocationBatched('/api/batch/location/text', { name: name }, ids)
+      : await safeFetch('/api/photos/' + ids[0] + '/location/text', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name: name }),
+        });
     if (resp && resp.location) {
       renderLocationFilled(resp.location);
       await _afterLocationMutation(ids, detailPhotoId);
@@ -7583,17 +7596,13 @@ async function acceptExifSuggestion(placeId) {
   var ids = _locationApplyPhotoIds();
   var useBatch = ids.length > 1;
   try {
-    var endpoint = useBatch
-      ? '/api/batch/location'
-      : '/api/photos/' + photoId + '/location';
-    var body = useBatch
-      ? { place_id: placeId, photo_ids: ids }
-      : { place_id: placeId };
-    var resp = await safeFetch(endpoint, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    });
+    var resp = useBatch
+      ? await _postLocationBatched('/api/batch/location', { place_id: placeId }, ids)
+      : await safeFetch('/api/photos/' + photoId + '/location', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ place_id: placeId }),
+        });
     if (resp && resp.location) {
       renderLocationFilled(resp.location);
     }

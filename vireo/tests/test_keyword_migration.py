@@ -1503,6 +1503,88 @@ def test_prediction_fold_retargets_edit_history_when_variant_wins_collision(
         db.close()
 
 
+def test_prediction_fold_retargets_relabel_edit_history(tmp_path):
+    """``/api/highlights/relabel`` records edits as ``keyword_add`` or
+    ``species_replace`` (not ``prediction_accept``), stashing the top
+    prediction's id in ``edit_history_items.old_value`` as JSON
+    ``{"prediction_id": N, "prediction_status": ...}`` so undo can restore
+    the pending status via ``_restore_edit_prediction_status``.
+
+    Before the fold retargets these action types too, an undo/redo would
+    call ``update_prediction_status(loser_id, ...)`` on a vanished
+    prediction id, failing the ``prediction_review`` FK to
+    ``predictions`` and aborting the undo/redo."""
+    db, ws_id, p1, _p2 = _make_db(tmp_path)
+    try:
+        det = _insert_prediction(db, p1, "Say's phoebe", confidence=0.8)
+        db.conn.execute(
+            "INSERT INTO predictions (detection_id, classifier_model, "
+            "labels_fingerprint, species, confidence) "
+            "VALUES (?, 'm1', 'fp1', ?, ?)",
+            (det, "Say’s phoebe", 0.4),
+        )
+        loser_pid = db.conn.execute(
+            "SELECT id FROM predictions WHERE species = ?", ("Say’s phoebe",)
+        ).fetchone()["id"]
+
+        payload = json.dumps({
+            "keyword_id": "17",
+            "keyword_ids": [17],
+            "prediction_id": loser_pid,
+            "prediction_status": "pending",
+        }, sort_keys=True)
+
+        # keyword_add relabel
+        ka_edit = db.conn.execute(
+            "INSERT INTO edit_history (workspace_id, action_type, description, "
+            "new_value) VALUES (?, 'keyword_add', 'relabel', '17')",
+            (ws_id,),
+        ).lastrowid
+        ka_item = db.conn.execute(
+            "INSERT INTO edit_history_items (edit_id, photo_id, old_value, "
+            "new_value) VALUES (?, ?, ?, '17')",
+            (ka_edit, p1, payload),
+        ).lastrowid
+
+        # species_replace relabel (photo already had a species tag)
+        sr_edit = db.conn.execute(
+            "INSERT INTO edit_history (workspace_id, action_type, description, "
+            "new_value) VALUES (?, 'species_replace', 'relabel', '17')",
+            (ws_id,),
+        ).lastrowid
+        sr_item = db.conn.execute(
+            "INSERT INTO edit_history_items (edit_id, photo_id, old_value, "
+            "new_value) VALUES (?, ?, ?, '17')",
+            (sr_edit, p1, payload),
+        ).lastrowid
+
+        db.conn.commit()
+
+        db._fold_prediction_species_apostrophes()
+        db.conn.commit()
+
+        survivor_pid = db.conn.execute(
+            "SELECT id FROM predictions WHERE species = ?", ("Say's phoebe",)
+        ).fetchone()["id"]
+        for item_id, label in ((ka_item, "keyword_add"),
+                               (sr_item, "species_replace")):
+            row = db.conn.execute(
+                "SELECT old_value FROM edit_history_items WHERE id = ?",
+                (item_id,),
+            ).fetchone()
+            data = json.loads(row["old_value"])
+            assert data["prediction_id"] == survivor_pid, (
+                f"{label}.old_value prediction_id was not retargeted to the "
+                f"surviving prediction"
+            )
+            assert data["keyword_id"] == "17", (
+                f"{label}.old_value keyword_id must survive the retarget "
+                "unchanged"
+            )
+    finally:
+        db.close()
+
+
 def test_prediction_fold_only_retargets_prediction_accept_history(tmp_path):
     """Guard against a blanket UPDATE: `keyword_add.new_value` and
     `species_replace.new_value`/`.old_value` store keyword ids in the
@@ -2729,7 +2811,13 @@ def test_prediction_fold_moves_loser_alternative_metadata_when_present(tmp_path)
     still carries burst grouping metadata (an atypical but legal state),
     the merge should preserve that metadata on the winner rather than
     discarding it — the ``continue`` shortcut only applies when the loser
-    row has nothing worth keeping beyond ``status='alternative'``."""
+    row has nothing worth keeping beyond ``status='alternative'``.
+
+    Status is downgraded to ``pending`` on the survivor, though: the
+    winner had no review row of its own (implicit pending), and
+    propagating ``alternative`` would hide the higher-confidence primary
+    from the pending queue even though we're keeping its burst
+    metadata."""
     db, ws_id, p1, _p2 = _make_db(tmp_path)
     try:
         det = _insert_prediction(db, p1, "Say's phoebe", confidence=0.8)
@@ -2764,9 +2852,62 @@ def test_prediction_fold_moves_loser_alternative_metadata_when_present(tmp_path)
             (survivor_pid, ws_id),
         ).fetchone()
         assert review is not None
+        assert review["status"] == "pending", (
+            "surviving pending primary must not inherit the loser's "
+            "'alternative' status even when transferring its burst metadata"
+        )
         assert review["group_id"] == "burst-9"
         assert review["vote_count"] == 4
         assert review["total_votes"] == 5
+    finally:
+        db.close()
+
+
+def test_prediction_fold_drops_sentinel_only_alternative_loser(tmp_path):
+    """A losing ``status='alternative'`` row whose only non-null metadata
+    is ``individual=AUTO_MATCH_REVIEW_MARKER`` carries no user decision
+    and no burst grouping — the sentinel is provenance for auto-accepted
+    taxonomy matches, not metadata worth preserving. Transferring it
+    would flip the higher-confidence pending winner to ``alternative``
+    (and NULL-out the marker on the way) even though nothing survives
+    the scrub except the misleading status."""
+    from db import AUTO_MATCH_REVIEW_MARKER
+
+    db, ws_id, p1, _p2 = _make_db(tmp_path)
+    try:
+        det = _insert_prediction(db, p1, "Say's phoebe", confidence=0.8)
+        db.conn.execute(
+            "INSERT INTO predictions (detection_id, classifier_model, "
+            "labels_fingerprint, species, confidence) "
+            "VALUES (?, 'm1', 'fp1', ?, ?)",
+            (det, "Say’s phoebe", 0.4),
+        )
+        loser_pid = db.conn.execute(
+            "SELECT id FROM predictions WHERE species = ?", ("Say’s phoebe",)
+        ).fetchone()["id"]
+        db.conn.execute(
+            "INSERT INTO prediction_review "
+            "(prediction_id, workspace_id, status, individual) "
+            "VALUES (?, ?, 'alternative', ?)",
+            (loser_pid, ws_id, AUTO_MATCH_REVIEW_MARKER),
+        )
+        db.conn.commit()
+
+        db._fold_prediction_species_apostrophes()
+        db.conn.commit()
+
+        survivor_pid = db.conn.execute(
+            "SELECT id FROM predictions WHERE species = ?", ("Say's phoebe",)
+        ).fetchone()["id"]
+        review = db.conn.execute(
+            "SELECT status FROM prediction_review "
+            "WHERE prediction_id = ? AND workspace_id = ?",
+            (survivor_pid, ws_id),
+        ).fetchone()
+        assert review is None, (
+            "sentinel-only 'alternative' loser was moved onto the "
+            "surviving pending primary, hiding it from the review queue"
+        )
     finally:
         db.close()
 

@@ -11574,38 +11574,61 @@ class Database:
             ).fetchone()
             loser_status = lr["status"] or "pending"
             loser_decided = loser_status in ("accepted", "rejected")
+            # ``AUTO_MATCH_REVIEW_MARKER`` in ``individual`` is a
+            # taxonomy-match sentinel, not user-authored metadata worth
+            # preserving. Counting it here would let a bare
+            # ``status='alternative'`` loser row whose only "metadata" is
+            # the sentinel pass the guard below and flip the pending
+            # winner to ``alternative``.
             loser_metadata = {
                 col: lr[col]
                 for col in ("group_id", "vote_count", "total_votes", "individual")
                 if lr[col] is not None
+                and not (
+                    col == "individual" and lr[col] == AUTO_MATCH_REVIEW_MARKER
+                )
             }
             if winner is None:
-                # Winner's absence == implicit pending. Overriding that with
-                # the loser's row only makes sense when the loser carries a
-                # user decision or group metadata worth preserving; a bare
-                # ``status='alternative'`` transfer would silently flip a
-                # higher-confidence pending primary into an alternative and
-                # hide the sole top-1 prediction from the pending queue.
+                # Winner's absence == implicit pending. Overriding that
+                # with the loser's row makes sense only when the loser
+                # carries a real user decision or preserved metadata; a
+                # bare ``status='alternative'`` transfer would flip the
+                # higher-confidence pending primary into an alternative
+                # and hide the sole top-1 prediction from the pending
+                # queue.
                 if not loser_decided and not loser_metadata:
                     continue
-                # Preserve the loser's group metadata / status, but scrub
-                # the auto-match sentinel out of a non-decided row so it
-                # can't later be mistaken for provenance on the winner (see
-                # class-level comment on why the marker must not propagate
-                # onto a manual decision).
-                if (
-                    lr["individual"] == AUTO_MATCH_REVIEW_MARKER
-                    and not loser_decided
-                ):
-                    self.conn.execute(
-                        "UPDATE prediction_review SET prediction_id = ?, "
-                        "individual = NULL "
-                        "WHERE prediction_id = ? AND workspace_id = ?",
-                        (winner_id, loser_id, ws),
-                    )
+                if loser_decided:
+                    # Preserve the loser's accept/reject.  Scrub the
+                    # auto-match sentinel from ``individual`` so a
+                    # manually-decided row can't be mistaken for an
+                    # auto-review row on the winner (see class-level
+                    # comment on why the marker must not propagate onto
+                    # a manual decision).
+                    if lr["individual"] == AUTO_MATCH_REVIEW_MARKER:
+                        self.conn.execute(
+                            "UPDATE prediction_review SET prediction_id = ?, "
+                            "individual = NULL "
+                            "WHERE prediction_id = ? AND workspace_id = ?",
+                            (winner_id, loser_id, ws),
+                        )
+                    else:
+                        self.conn.execute(
+                            "UPDATE prediction_review SET prediction_id = ? "
+                            "WHERE prediction_id = ? AND workspace_id = ?",
+                            (winner_id, loser_id, ws),
+                        )
                 else:
+                    # Undecided loser with real burst metadata: keep the
+                    # metadata but leave the winner implicit-pending by
+                    # downgrading the transferred status. Individual is
+                    # always the sentinel or NULL for undecided rows;
+                    # scrub either way so the winner stays clean of
+                    # spurious auto-match provenance.
                     self.conn.execute(
-                        "UPDATE prediction_review SET prediction_id = ? "
+                        "UPDATE prediction_review "
+                        "SET prediction_id = ?, status = 'pending', "
+                        "    individual = NULL "
                         "WHERE prediction_id = ? AND workspace_id = ?",
                         (winner_id, loser_id, ws),
                     )
@@ -11721,42 +11744,48 @@ class Database:
             )
 
     def _retarget_prediction_edit_history(self, loser_id, winner_id):
-        """Rewrite `prediction_accept` history entries from loser to winner.
+        """Rewrite prediction-id references in edit history from loser to winner.
 
-        `api_accept_prediction` and `api_accept_subject_species` encode the
-        accepted prediction id in `edit_history_items.old_value` on
-        `prediction_accept` rows.  The shape is one of:
+        Three action types anchor prediction ids into
+        ``edit_history_items.old_value``:
 
-        - a bare-int string (single-model, changed-tag accept), or
-        - JSON `{"prediction_id": N, "no_tag": true}` (single, no-op accept),
-          or
-        - JSON `{"prediction_ids": [N, ...], "no_tag"?: true}` (accept-subject
-          collecting agreeing sibling classifier models).
+        - ``prediction_accept`` (``api_accept_prediction`` /
+          ``api_accept_subject_species``): stores either a bare-int string
+          (single-model, changed-tag accept), JSON
+          ``{"prediction_id": N, "no_tag": true}`` (single no-op accept),
+          or JSON ``{"prediction_ids": [N, ...], "no_tag"?: true}``
+          (accept-subject collecting agreeing sibling classifier models).
+        - ``keyword_add`` and ``species_replace``
+          (``api_highlights_relabel``): store a JSON payload whose
+          ``prediction_id`` field points at the top prediction captured
+          when the relabel ran, so undo can restore its ``pending`` status
+          via ``_restore_edit_prediction_status`` (and redo can re-reject
+          it via ``_reject_edit_prediction``). Bare-int ``old_value`` for
+          these two action types encodes the previous keyword id, not a
+          prediction id, so it is left alone.
 
         When the fold migration deletes a colliding prediction row, an
-        undo/redo later would look the id up in `predictions` (see
-        `_apply_undo` in the `prediction_accept` branch) and quietly skip
-        the missing row.  On a mixed workspace this means:
+        undo/redo later would call ``update_prediction_status(loser_id,
+        ...)`` on the vanished id: the ``INSERT`` into ``prediction_review``
+        then fails the FK to ``predictions``, aborting the undo/redo, and
+        for the ``prediction_accept`` accept-subject variant the missing
+        id would silently be skipped by ``_apply_undo`` so the surviving
+        prediction stays anchored in its accepted state.
 
-        - `undo` cannot restore the loser's `prediction_review.status` back
-          to `pending`, so the surviving prediction stays in the accepted
-          state even after the user reverses the edit; and
-        - a subject-accept whose sibling list contained the loser has that
-          sibling's status flip permanently anchored (no way to reset it).
-
-        Retargeting the reference from `loser_id` -> `winner_id` before the
-        DELETE keeps undo/redo sound: the two predictions differed only in
-        spelling, so any status flip captured on either applies to the same
-        (detection, model, labels_fingerprint) scope after the merge.
+        Retargeting the reference from ``loser_id`` -> ``winner_id`` before
+        the DELETE keeps undo/redo sound: the two predictions differ only
+        in spelling, so any status flip captured on either applies to the
+        same (detection, model, labels_fingerprint) scope after the merge.
         """
         if loser_id == winner_id:
             return
         loser_str = str(loser_id)
         winner_str = str(winner_id)
-        # (1) Bare-int old_value: rewrite in place.  Scoped by action_type
-        #     because `keyword_add` / `species_replace` / `keyword_remove`
-        #     store keyword ids in these columns and a blanket UPDATE would
-        #     corrupt any keyword id that happened to equal loser_id.
+        # (1) Bare-int old_value: rewrite in place.  Scoped strictly to
+        #     ``prediction_accept`` because ``keyword_add`` /
+        #     ``species_replace`` / ``keyword_remove`` store keyword ids
+        #     in these columns and a blanket UPDATE would corrupt any
+        #     keyword id that happened to equal loser_id.
         self.conn.execute(
             """UPDATE edit_history_items
                SET old_value = ?
@@ -11767,15 +11796,20 @@ class Database:
                  )""",
             (winner_str, loser_str),
         )
-        # (2) JSON old_value: parse, rewrite `prediction_id` and every
-        #     `prediction_ids` entry that matches the loser, re-serialize.
-        #     The `LIKE '{%'` prefix skips the bare-int rows handled above
-        #     without loading them into Python.
+        # (2) JSON old_value: parse, rewrite ``prediction_id`` and every
+        #     ``prediction_ids`` entry that matches the loser, re-serialize.
+        #     The ``LIKE '{%'`` prefix skips the bare-int rows handled above
+        #     without loading them into Python. Scoped to the three action
+        #     types that carry prediction ids in their JSON payload so a
+        #     ``keyword_remove`` JSON blob (which happens to also start with
+        #     ``{`` if it ever gains structured payloads) is unaffected.
         json_rows = self.conn.execute(
             """SELECT ehi.id, ehi.old_value
                FROM edit_history_items ehi
                JOIN edit_history eh ON eh.id = ehi.edit_id
-               WHERE eh.action_type = 'prediction_accept'
+               WHERE eh.action_type IN (
+                       'prediction_accept', 'keyword_add', 'species_replace'
+                     )
                  AND ehi.old_value IS NOT NULL
                  AND ehi.old_value LIKE ?""",
             ('{%',),
@@ -15779,6 +15813,15 @@ class Database:
         disagreement/refinement enrichment).
         """
         ws = self._ws_id()
+        # Mirror ``add_prediction``'s normalize-on-write: the persisted row
+        # is keyed on the folded spelling, so a caller that hands us the
+        # raw curly form (e.g. a future write path that forgot to fold)
+        # would otherwise miss the row and skip the auto-accept marker
+        # scrub even though the row plainly exists.
+        if species is not None:
+            normalized_species = normalize_keyword_display(species)
+            if normalized_species:
+                species = normalized_species
         row = self.conn.execute(
             """SELECT id, category FROM predictions
                WHERE detection_id = ? AND classifier_model = ?

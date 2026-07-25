@@ -466,10 +466,13 @@ def load_merged_labels(label_sets):
             # is byte-identical to what earlier runs hashed.
             merged.append(variants[0])
         else:
-            # Genuine variant collision: keep the folded spelling, which is
-            # what add_prediction will store, so the classifier's label and
-            # the persisted species agree.
-            merged.append(
-                canonical if canonical in variants else sorted(variants)[0]
-            )
+            # Genuine variant collision: always use the folded canonical
+            # spelling. That's what ``add_prediction`` will store, so the
+            # classifier's label and the persisted species agree. If neither
+            # raw variant already equals it (both are non-ASCII apostrophe
+            # spellings, e.g. ``Say’s phoebe`` + ``Say‛s phoebe``), a
+            # ``sorted(variants)[0]`` fallback would leave a curly form in
+            # the label list even though ``add_prediction`` will fold it —
+            # so labels and persisted species would still disagree.
+            merged.append(canonical)
     return sorted(merged)

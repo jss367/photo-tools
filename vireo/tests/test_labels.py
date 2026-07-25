@@ -243,6 +243,33 @@ def test_load_merged_labels_reads_utf8_regardless_of_locale(tmp_path,
     )
 
 
+def test_load_merged_labels_falls_back_to_cp1252_for_legacy_windows_files(
+    tmp_path,
+):
+    """Files saved by _atomic_write_text before it took an explicit UTF-8
+    encoding used the locale default -- cp1252 on Windows. Reading those
+    legacy files strictly as UTF-8 raises UnicodeDecodeError on the first
+    non-ASCII species (0x92 for a curly apostrophe, 0xF6 for `ö`), which
+    would silently drop the active set from classification. The reader
+    falls back to cp1252 so those files keep working.
+    """
+    dir_ = str(tmp_path / "labels")
+    os.makedirs(dir_)
+    txt = os.path.join(dir_, "legacy.txt")
+    # Write cp1252 bytes for `Köhler's Vine Snake` (with a curly apostrophe)
+    # and `Say's phoebe` (ASCII apostrophe) -- 0xF6 is `ö` and 0x92 is the
+    # curly right single quote in cp1252, both invalid as standalone UTF-8.
+    with open(txt, "wb") as f:
+        f.write("Köhler’s Vine Snake\nSay's phoebe\n".encode("cp1252"))
+
+    result = load_merged_labels([{"labels_file": txt}])
+
+    assert result == ["Köhler’s Vine Snake", "Say's phoebe"], (
+        "legacy cp1252 label file did not round-trip through the fallback: "
+        f"got {result}"
+    )
+
+
 def test_load_merged_labels_preserves_okina_letters(tmp_path):
     """The apostrophe fold in ``normalize_keyword_display`` deliberately
     excludes the Hawaiian okina (U+02BB, category Lm — a letter, not

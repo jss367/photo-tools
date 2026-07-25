@@ -427,11 +427,30 @@ def load_merged_labels(label_sets):
         # platform default is cp1252 on Windows -- reading UTF-8 bytes through
         # it silently mojibakes `Hawaiʻi ʻamakihi` into `HawaiÊ»i Ê»amakihi`
         # (and can raise on byte sequences cp1252 leaves undefined).
-        with open(path, encoding="utf-8") as f:
-            for line in f:
-                name = line.strip()
-                if name:
-                    all_species.add(name)
+        #
+        # cp1252 fallback: _atomic_write_text() only switched to explicit
+        # UTF-8 in the same change that added the reader above, so a Windows
+        # install that saved a label set before then wrote it in cp1252 (the
+        # locale default). Reading such a legacy file strictly as UTF-8
+        # raises UnicodeDecodeError on the first non-ASCII species and
+        # silently drops the whole active set from classification. Fall back
+        # to cp1252 so those files keep working; future saves rewrite as
+        # UTF-8 via _atomic_write_text.
+        try:
+            with open(path, encoding="utf-8") as f:
+                lines = f.readlines()
+        except UnicodeDecodeError:
+            log.warning(
+                "Label file %s is not valid UTF-8; falling back to cp1252 "
+                "for legacy Windows-written files",
+                path,
+            )
+            with open(path, encoding="cp1252") as f:
+                lines = f.readlines()
+        for line in lines:
+            name = line.strip()
+            if name:
+                all_species.add(name)
     # Group by the fold key, then collapse only the groups that actually
     # have more than one spelling. Sorting the group makes the survivor
     # deterministic regardless of label-set order.

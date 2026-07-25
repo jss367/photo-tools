@@ -49,6 +49,7 @@ def cleanup_cached_files_for_deleted_photos(
     masks_dir = os.path.join(vireo_dir, "masks")
     external_dng_dir = os.path.join(vireo_dir, "external-dng")
     external_edits_dir = os.path.join(vireo_dir, "external-edits")
+    inat_uploads_dir = os.path.join(vireo_dir, "inat-uploads")
     # Offline-cache layout: offline/{originals,xmp,companions}/{pid}{ext}.
     # The FK cascade drops the offline_originals row when the photo is
     # deleted, so we lose the exact stored paths — glob by photo id to
@@ -179,6 +180,23 @@ def cleanup_cached_files_for_deleted_photos(
                         "photo delete — will be reclaimed by Clear Cache: %s",
                         handoff, e,
                     )
+        # ``inat-uploads/<pid>.jpg`` is the analogous handoff to iNaturalist,
+        # and ``<pid>.json`` caches the same {recipe, source_path,
+        # source_mtime, edit_math_version} envelope. Same failure mode:
+        # ``_inat_upload_photo_path`` never checks the file mtime, so a
+        # recycled id imported at the same path/mtime with the same recipe
+        # would ship the previous owner's pixels to iNaturalist.
+        for name in (f"{pid}.jpg", f"{pid}.json"):
+            handoff = os.path.join(inat_uploads_dir, name)
+            if os.path.isfile(handoff):
+                try:
+                    os.remove(handoff)
+                except OSError as e:
+                    log.warning(
+                        "Failed to remove iNat upload handoff %s after "
+                        "photo delete — will be reclaimed by Clear Cache: %s",
+                        handoff, e,
+                    )
         # ``external-dng/<pid>/<stem>.dng`` caches DNG conversions per
         # photo id for the Nikon-HE-NEF external-editor path. The
         # freshness check there is source-mtime-based, so a recycled id
@@ -215,6 +233,7 @@ def _recycled_id_probe_paths(thumb_cache_dir, photo_id, vireo_dir=None):
         os.path.join(vireo_dir, "originals", f"{photo_id}.display.jpg"),
         os.path.join(vireo_dir, "masks", f"{photo_id}.png"),
         os.path.join(vireo_dir, "external-edits", f"{photo_id}.jpg"),
+        os.path.join(vireo_dir, "inat-uploads", f"{photo_id}.jpg"),
         # ``external-dng/<pid>/`` is a per-photo-id *directory* rather than
         # a file — ``os.path.exists`` returns True for directories, so
         # the same machinery covers it. The batch index's directory sweep
@@ -249,6 +268,7 @@ def _recycled_id_probe_patterns(thumb_cache_dir, photo_id, vireo_dir=None):
         os.path.join(vireo_dir, "originals", f"{photo_id}_*.jpg"),
         os.path.join(vireo_dir, "masks", f"{photo_id}.*.png"),
         os.path.join(vireo_dir, "external-edits", f"{photo_id}.json"),
+        os.path.join(vireo_dir, "inat-uploads", f"{photo_id}.json"),
         os.path.join(vireo_dir, "offline", "originals", f"{photo_id}.*"),
         os.path.join(vireo_dir, "offline", "xmp", f"{photo_id}.*"),
         os.path.join(vireo_dir, "offline", "companions", f"{photo_id}.*"),
@@ -289,6 +309,7 @@ def _derivative_dirs(thumb_cache_dir, vireo_dir=None):
         os.path.join(vireo_dir, "originals"),
         os.path.join(vireo_dir, "masks"),
         os.path.join(vireo_dir, "external-edits"),
+        os.path.join(vireo_dir, "inat-uploads"),
         os.path.join(vireo_dir, "offline", "originals"),
         os.path.join(vireo_dir, "offline", "xmp"),
         os.path.join(vireo_dir, "offline", "companions"),
@@ -537,6 +558,7 @@ def _surviving_derivative_paths(thumb_cache_dir, photo_id, vireo_dir=None):
 
 def purge_cached_files_for_recycled_id(
     thumb_cache_dir, photo_id, id_index=None, vireo_dir=None, db=None,
+    file_mtime=None,
 ):
     """Drop any cached derivative left over from a previous owner of ``photo_id``.
 
@@ -566,6 +588,17 @@ def purge_cached_files_for_recycled_id(
     loop (ingest does): the probe becomes an O(1) set lookup against one
     ``scandir`` per derivative directory instead of a per-photo directory
     enumeration. Without it, falls back to the single-id probe.
+
+    ``file_mtime`` is the new photo's source ``photos.file_mtime``. It
+    picks the timestamp we backdate undeletable survivors to: the
+    ``serve_thumbnail`` / prepared-render / external-DNG freshness gates
+    all compare ``cached_mtime >= source_mtime``, so a survivor pinned to
+    ``file_mtime - 1`` is provably rejected regardless of what the source
+    mtime happens to be. When ``file_mtime`` is unavailable (older
+    single-id callers) we fall back to ``0``, which works for any source
+    with a positive mtime — the case the reviewer specifically flagged is
+    a source at or below the Unix epoch, and callers on the ingest path
+    do have ``file_mtime`` in hand.
     """
     if not thumb_cache_dir:
         return False
@@ -607,17 +640,31 @@ def purge_cached_files_for_recycled_id(
         thumb_cache_dir, photo_id, vireo_dir,
     )
     if survivors:
-        preview_dir = os.path.join(
-            vireo_dir or os.path.dirname(thumb_cache_dir), "previews",
-        )
-        external_edits_dir = os.path.join(
-            vireo_dir or os.path.dirname(thumb_cache_dir), "external-edits",
-        )
+        base_dir = vireo_dir or os.path.dirname(thumb_cache_dir)
+        preview_dir = os.path.join(base_dir, "previews")
+        external_edits_dir = os.path.join(base_dir, "external-edits")
+        inat_uploads_dir = os.path.join(base_dir, "inat-uploads")
+        # ``serve_thumbnail`` / ``_prepared_full_resolution_render`` / the
+        # external-DNG gate all treat ``cached_mtime >= source_mtime`` as
+        # fresh. Backdating to a hard-coded ``0`` fails when the new
+        # photo's source is itself at or below the Unix epoch (an archive
+        # that preserved an epoch or negative filesystem timestamp) — the
+        # survivor's mtime then still matches or exceeds ``file_mtime`` and
+        # the guard waves the previous owner's pixels through. Anchor the
+        # sentinel to the new photo's source instead so the comparison is
+        # provably false regardless of what value ``file_mtime`` takes.
+        if file_mtime is not None:
+            try:
+                backdate_target = float(file_mtime) - 1.0
+            except (TypeError, ValueError):
+                backdate_target = 0.0
+        else:
+            backdate_target = 0.0
         unfixable = []
         for path in survivors:
             backdated = True
             try:
-                os.utime(path, (0, 0))
+                os.utime(path, (backdate_target, backdate_target))
             except OSError:
                 backdated = False
 
@@ -641,12 +688,14 @@ def purge_cached_files_for_recycled_id(
                     unfixable.append(path)
                 continue
 
-            if os.path.normpath(os.path.dirname(path)) == os.path.normpath(
-                external_edits_dir
+            parent = os.path.normpath(os.path.dirname(path))
+            if parent == os.path.normpath(external_edits_dir) or parent == (
+                os.path.normpath(inat_uploads_dir)
             ):
-                # ``_external_edit_handoff_path`` compares the JSON's
+                # ``_external_edit_handoff_path`` and
+                # ``_inat_upload_photo_path`` compare the JSON's
                 # {recipe, source_path, source_mtime, edit_math_version}
-                # and never stats either file, so a backdate here changes
+                # and never stat either file, so a backdate here changes
                 # nothing. Nothing short of removing them helps.
                 unfixable.append(path)
                 continue

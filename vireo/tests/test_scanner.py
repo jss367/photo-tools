@@ -4277,6 +4277,12 @@ def _seed_derivative_files(vireo_dir, thumb_dir, photo_id, marker=b"previous-ten
         "external_dng": os.path.join(
             vireo_dir, "external-dng", str(photo_id), "gull.dng"
         ),
+        "inat_upload": os.path.join(
+            vireo_dir, "inat-uploads", f"{photo_id}.jpg"
+        ),
+        "inat_upload_meta": os.path.join(
+            vireo_dir, "inat-uploads", f"{photo_id}.json"
+        ),
     }
     for path in paths.values():
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -5182,4 +5188,117 @@ def test_prepared_render_survivor_does_not_get_a_preview_marker(tmp_path):
     ).fetchall()
     assert not rows, (
         f"a prepared render earned bogus preview invalidation rows: {rows}"
+    )
+
+
+def test_recycled_id_purge_clears_inat_upload_handoffs(tmp_path):
+    """``inat-uploads/<id>.{jpg,json}`` is id-keyed and must be purged.
+
+    ``_inat_upload_photo_path`` caches the render under the photo id and
+    reuses it when the metadata JSON matches only
+    {recipe, source_path, source_mtime, edit_math_version} — none of which
+    is a photo id or content hash. A recycled id imported at the same path
+    and mtime with the same recipe would therefore ship the previous
+    owner's pixels to iNaturalist.
+    """
+    from preview_cache import (
+        RecycledIdIndex,
+        purge_cached_files_for_recycled_id,
+    )
+
+    vireo_dir = tmp_path / "vireo"
+    thumb_dir = vireo_dir / "thumbnails"
+    thumb_dir.mkdir(parents=True)
+    inat_dir = vireo_dir / "inat-uploads"
+    inat_dir.mkdir()
+    render = inat_dir / "77.jpg"
+    meta = inat_dir / "77.json"
+    render.write_bytes(b"previous-tenant-inat-render")
+    meta.write_text('{"recipe": "", "source_mtime": 1.0}')
+
+    index = RecycledIdIndex(str(thumb_dir), vireo_dir=str(vireo_dir))
+    assert 77 in index, "index missed an iNat upload handoff"
+
+    assert purge_cached_files_for_recycled_id(
+        str(thumb_dir), 77, vireo_dir=str(vireo_dir),
+    )
+
+    assert not render.exists(), "iNat upload render outlived its photo"
+    assert not meta.exists(), (
+        "iNat upload cache metadata outlived its photo; it is what makes "
+        "the stale render look valid"
+    )
+
+
+def test_delete_photos_cleanup_removes_inat_upload_handoffs(tmp_path):
+    """``cleanup_cached_files_for_deleted_photos`` must sweep inat-uploads.
+
+    Same reasoning as the external-edit handoff: the metadata compares
+    recipe/source/mtime and never inspects file mtime, so any recycled id
+    with matching envelope would upload the previous owner's pixels.
+    """
+    from preview_cache import cleanup_cached_files_for_deleted_photos
+
+    vireo_dir = tmp_path / "vireo"
+    thumb_dir = vireo_dir / "thumbnails"
+    thumb_dir.mkdir(parents=True)
+    inat_dir = vireo_dir / "inat-uploads"
+    inat_dir.mkdir()
+    (inat_dir / "42.jpg").write_bytes(b"render")
+    (inat_dir / "42.json").write_text("{}")
+
+    cleanup_cached_files_for_deleted_photos(
+        str(thumb_dir),
+        [{"photo_id": 42, "filename": "gone.jpg"}],
+        vireo_dir=str(vireo_dir),
+    )
+
+    assert not (inat_dir / "42.jpg").exists()
+    assert not (inat_dir / "42.json").exists()
+
+
+def test_recycled_id_purge_backdates_below_a_negative_source_mtime(tmp_path):
+    """Backdating survivors to ``0`` fails when the source is at/below epoch.
+
+    ``serve_thumbnail`` / ``_prepared_full_resolution_render`` / the
+    external-DNG gate all treat ``cached_mtime >= source_mtime`` as fresh.
+    If a rowid gets recycled onto a photo whose archived filesystem
+    timestamp is ``0`` (or negative), a survivor backdated to ``0`` still
+    satisfies that comparison and the previous owner's pixels are served
+    as fresh. Anchor the backdate to the new photo's own ``file_mtime``.
+    """
+    import preview_cache
+    from preview_cache import purge_cached_files_for_recycled_id
+
+    vireo_dir = tmp_path / "vireo"
+    thumb_dir = vireo_dir / "thumbnails"
+    thumb_dir.mkdir(parents=True)
+    stuck = thumb_dir / "88.jpg"
+    stuck.write_bytes(b"previous-tenant")
+    os.utime(stuck, (2_000_000_000, 2_000_000_000))
+
+    real_remove = os.remove
+
+    def _locked_remove(path, *args, **kwargs):
+        if os.path.normpath(str(path)) == os.path.normpath(str(stuck)):
+            raise OSError("simulated Windows lock")
+        return real_remove(path, *args, **kwargs)
+
+    preview_cache.os.remove = _locked_remove
+    try:
+        # New photo's source file_mtime is 0 (an archive preserved an epoch
+        # timestamp). A hard-coded ``0`` sentinel would not invalidate the
+        # survivor for this source.
+        purge_cached_files_for_recycled_id(
+            str(thumb_dir), 88, file_mtime=0.0,
+        )
+    finally:
+        preview_cache.os.remove = real_remove
+
+    assert stuck.exists(), "test setup failed to simulate an undeletable file"
+    survivor_mtime = os.path.getmtime(stuck)
+    assert survivor_mtime < 0.0, (
+        f"survivor mtime {survivor_mtime} is not strictly less than the "
+        "source file_mtime of 0.0, so the freshness guard would still "
+        "serve the previous owner's pixels"
     )

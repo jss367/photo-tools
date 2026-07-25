@@ -4542,3 +4542,90 @@ def test_pairing_defers_companion_file_cleanup_until_commit_succeeds(
             "succeeded, leaving the restored companion row pointing at a "
             "missing file"
         )
+
+
+def test_scan_probes_recycled_ids_without_walking_dirs_per_photo(
+    tmp_path, monkeypatch,
+):
+    """The recycled-id probe must be batched, not per-photo.
+
+    Answering "does this id already own cached files?" by globbing costs a
+    full directory enumeration per inserted photo — O(new photos × cached
+    files). Measured against a 76k-thumbnail library that was 117 ms per
+    insert, i.e. ~10 minutes of pure ``scandir`` for a 5000-photo import.
+    ``RecycledIdIndex`` snapshots the answer for every id with one
+    ``scandir`` per derivative directory, so the count must not grow with
+    the number of photos ingested.
+    """
+    from db import Database
+    from scanner import scan
+
+    root = str(tmp_path / "photos")
+    _create_test_images(root, {'': [f"bird{i}.jpg" for i in range(12)]})
+    vireo_dir = str(tmp_path / "vireo")
+    thumb_dir = os.path.join(vireo_dir, "thumbnails")
+    # Populate the cache so the directories aren't trivially empty.
+    os.makedirs(thumb_dir, exist_ok=True)
+    for i in range(50):
+        with open(os.path.join(thumb_dir, f"{9000 + i}.jpg"), "wb") as fh:
+            fh.write(b"stale")
+
+    import preview_cache
+    from preview_cache import _derivative_dirs
+
+    derivative_dirs = {
+        os.path.normpath(d) for d in _derivative_dirs(thumb_dir)
+    }
+    enumerations = []
+    real_scandir = os.scandir
+
+    def counting_scandir(path, *args, **kwargs):
+        # ``glob`` reaches os.scandir through the same module attribute we
+        # patch here, so this counts globbing too — which is the point.
+        if isinstance(path, (str, bytes, os.PathLike)):
+            normalized = os.path.normpath(os.fspath(path))
+            if normalized in derivative_dirs:
+                enumerations.append(normalized)
+        return real_scandir(path, *args, **kwargs)
+
+    monkeypatch.setattr(preview_cache.os, "scandir", counting_scandir)
+
+    db = Database(str(tmp_path / "test.db"))
+    scan(root, db, vireo_dir=vireo_dir, thumb_cache_dir=thumb_dir,
+         skip_working_copies=True)
+
+    assert db.conn.execute(
+        "SELECT COUNT(*) AS n FROM photos"
+    ).fetchone()["n"] == 12
+    # Each derivative directory is enumerated at most once for the whole
+    # scan. Per-photo probing would hit each of them 12 times.
+    repeats = {d: enumerations.count(d) for d in set(enumerations)
+               if enumerations.count(d) > 1}
+    assert not repeats, (
+        "recycled-id probe enumerated derivative directories more than "
+        f"once for a 12-photo scan: {repeats}"
+    )
+
+
+def test_recycled_id_index_does_not_confuse_id_prefixes(tmp_path):
+    """``40.jpg`` must not register photo 4 as having a cached derivative.
+
+    Derivative names are the bare id followed by ``.`` or ``_``; parsing
+    the leading digit run without requiring that separator would make
+    every id a false positive for its numeric prefixes, and the purge
+    would delete a *live* photo's cache on every unrelated insert.
+    """
+    from preview_cache import RecycledIdIndex
+
+    thumb_dir = tmp_path / "vireo" / "thumbnails"
+    thumb_dir.mkdir(parents=True)
+    (thumb_dir / "40.jpg").write_bytes(b"forty")
+    (thumb_dir / "7_raw.jpg").write_bytes(b"seven-raw")
+    (thumb_dir / "not-a-photo.jpg").write_bytes(b"junk")
+
+    index = RecycledIdIndex(str(thumb_dir))
+
+    assert 40 in index
+    assert 7 in index
+    assert 4 not in index, "'40.jpg' was parsed as id 4"
+    assert 0 not in index

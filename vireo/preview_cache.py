@@ -197,8 +197,14 @@ def _recycled_id_has_stale_derivative(thumb_cache_dir, photo_id):
     """True when *any* id-keyed derivative for ``photo_id`` still exists.
 
     Exact paths (cheap ``stat``) first; falls through to variant globs
-    only if none of the legacy names matched — so a fresh library's
-    collision-free path stays at N stats and never enumerates directories.
+    only if none of the legacy names matched.
+
+    Single-id probe — for the *batch* case (ingest, which asks this once
+    per inserted photo) use :class:`RecycledIdIndex` instead. The variant
+    globs enumerate a whole directory when they don't match, so asking
+    per-photo across a populated cache is O(new photos × cached files):
+    measured at 117 ms per miss against a 76k-thumbnail library, i.e.
+    ~10 minutes of pure ``scandir`` for a 5000-photo import.
     """
     for p in _recycled_id_probe_paths(thumb_cache_dir, photo_id):
         if os.path.exists(p):
@@ -209,7 +215,88 @@ def _recycled_id_has_stale_derivative(thumb_cache_dir, photo_id):
     return False
 
 
-def purge_cached_files_for_recycled_id(thumb_cache_dir, photo_id):
+def _derivative_dirs(thumb_cache_dir):
+    """Every directory that stores files keyed by bare photo id."""
+    vireo_dir = os.path.dirname(thumb_cache_dir)
+    return (
+        thumb_cache_dir,
+        os.path.join(vireo_dir, "previews"),
+        os.path.join(vireo_dir, "working"),
+        os.path.join(vireo_dir, "originals"),
+        os.path.join(vireo_dir, "masks"),
+        os.path.join(vireo_dir, "edit-masks"),
+        os.path.join(vireo_dir, "offline", "originals"),
+        os.path.join(vireo_dir, "offline", "xmp"),
+        os.path.join(vireo_dir, "offline", "companions"),
+    )
+
+
+def _leading_photo_id(name):
+    """Parse the photo id a derivative filename is keyed by, or ``None``.
+
+    Every derivative name is the bare id followed by ``.`` or ``_`` and
+    then a suffix / variant: ``4.jpg``, ``4_1920.jpg``, ``4.display.jpg``,
+    ``4.sam2-large.png``, ``4.NEF``. Requiring that separator is what
+    stops ``40.jpg`` from registering as id 4.
+    """
+    digits = 0
+    while digits < len(name) and name[digits].isdigit():
+        digits += 1
+    if not digits or digits == len(name) or name[digits] not in "._":
+        return None
+    return int(name[:digits])
+
+
+class RecycledIdIndex:
+    """The set of photo ids that already have a cached derivative on disk.
+
+    Ingest needs the same question answered once per inserted photo, and
+    the per-id probe answers it by enumerating directories — see
+    :func:`_recycled_id_has_stale_derivative` for the measured cost. One
+    ``scandir`` per derivative directory answers it for every id at once,
+    so a scan pays O(cached files) total instead of per photo. Mirrors
+    the batching in ``scanner._sweep_untracked_previews_for_photos``,
+    which exists for exactly this reason.
+
+    Built lazily on first query, so a scan that inserts nothing never
+    touches the filesystem. The snapshot is deliberately taken before
+    ingest generates any derivative of its own: working copies and
+    previews are extracted at the end of ``scan()``, and those belong to
+    the new rows — a live re-read would see them and wrongly conclude the
+    ids collided.
+    """
+
+    def __init__(self, thumb_cache_dir):
+        self._thumb_cache_dir = thumb_cache_dir
+        self._ids = None
+
+    def _build(self):
+        ids = set()
+        for directory in _derivative_dirs(self._thumb_cache_dir):
+            try:
+                entries = os.scandir(directory)
+            except OSError:
+                continue  # dir absent on a fresh install, or unreadable
+            with entries:
+                for entry in entries:
+                    photo_id = _leading_photo_id(entry.name)
+                    if photo_id is not None:
+                        ids.add(photo_id)
+        log.info(
+            "Indexed %d photo ids with cached derivatives for "
+            "recycled-rowid detection", len(ids),
+        )
+        return ids
+
+    def __contains__(self, photo_id):
+        if self._ids is None:
+            self._ids = self._build()
+        return photo_id in self._ids
+
+
+def purge_cached_files_for_recycled_id(
+    thumb_cache_dir, photo_id, id_index=None,
+):
     """Drop any cached derivative left over from a previous owner of ``photo_id``.
 
     ``photos.id`` is ``INTEGER PRIMARY KEY`` *without* ``AUTOINCREMENT``,
@@ -233,14 +320,17 @@ def purge_cached_files_for_recycled_id(thumb_cache_dir, photo_id):
     schedule the batched untracked-preview sweep, which is too expensive
     to run per-photo.
 
-    The probe is a handful of ``stat`` calls plus, only when none hit,
-    a lazy ``glob.iglob`` per variant family that short-circuits on the
-    first match. Only ids that actually collide pay for the full purge,
-    so a first scan of a fresh library adds ~nothing.
+    Pass a :class:`RecycledIdIndex` as ``id_index`` when calling this in a
+    loop (ingest does): the probe becomes an O(1) set lookup against one
+    ``scandir`` per derivative directory instead of a per-photo directory
+    enumeration. Without it, falls back to the single-id probe.
     """
     if not thumb_cache_dir:
         return False
-    if not _recycled_id_has_stale_derivative(thumb_cache_dir, photo_id):
+    if id_index is not None:
+        if photo_id not in id_index:
+            return False
+    elif not _recycled_id_has_stale_derivative(thumb_cache_dir, photo_id):
         return False
     log.info(
         "Photo %s reused a freed rowid with cached derivatives still on "

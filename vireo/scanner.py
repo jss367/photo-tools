@@ -28,6 +28,7 @@ from keyword_normalization import keyword_match_key
 from metadata import EXIF_SUMMARY_COLUMNS, exif_summary_columns, extract_metadata
 from PIL import Image
 from preview_cache import (
+    RecycledIdIndex,
     cleanup_cached_files_for_deleted_photos,
     purge_cached_files_for_recycled_id,
 )
@@ -1835,6 +1836,14 @@ def scan(root, db, progress_callback=None, incremental=False, extract_full_metad
     # so the untracked-preview sweep can run once as a batch instead of
     # per-photo (avoids O(N × M) directory walks on large rescans).
     invalidated_photo_ids: set[int] = set()
+    # Photo IDs that already own cached derivative files, for the
+    # recycled-rowid check on insert. Snapshotted once (lazily, on the
+    # first insert) for the same batching reason as the sweep above.
+    recycled_id_index = RecycledIdIndex(
+        thumb_cache_dir or (
+            os.path.join(vireo_dir, "thumbnails") if vireo_dir else ""
+        )
+    )
     scoped_paths = {str(root_path)}
     if restrict_dirs is not None:
         scoped_paths.update(str(d) for d in restrict_dirs)
@@ -2209,14 +2218,16 @@ def scan(root, db, progress_callback=None, incremental=False, extract_full_metad
             # A brand-new row may have claimed a *recycled* rowid (see
             # ``purge_cached_files_for_recycled_id``). Cached derivatives
             # from the id's previous owner would otherwise be served as
-            # this photo's — a wrong-bird Life List card. Cheap stat probe
-            # per insert; only actual collisions do real work.
+            # this photo's — a wrong-bird Life List card. The index makes
+            # this an O(1) set lookup per insert; only ids that actually
+            # collide do real work.
             if (
                 not row_already_existed
                 and vireo_dir
                 and purge_cached_files_for_recycled_id(
                     thumb_cache_dir or os.path.join(vireo_dir, "thumbnails"),
                     photo_id,
+                    id_index=recycled_id_index,
                 )
             ):
                 invalidated_photo_ids.add(photo_id)

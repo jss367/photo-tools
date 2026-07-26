@@ -1466,7 +1466,11 @@ function updateAfterMoveUI() {
     if (importIsAbsolutePath(destination)) {
       unavailable.textContent =
         "Move to NAS unavailable: the destination is not inside any remote "
-        + "target's local archive root. Set one under Settings > Remote targets.";
+        + "target's local archive root. ";
+      const setup = document.createElement('a');
+      setup.href = '/settings#nas-setup';
+      setup.textContent = 'Set up remote target…';
+      unavailable.appendChild(setup);
       unavailable.style.display = '';
     }
     return;

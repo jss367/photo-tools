@@ -122,7 +122,7 @@ def _reverse_dns(ip):
     try:
         kind, value = result_q.get(timeout=2)
     except _queue.Empty:
-        raise TimeoutError(f"reverse DNS for {ip} timed out")
+        raise TimeoutError(f"reverse DNS for {ip} timed out") from None
     if kind == "err":
         raise value
     return value[0]
@@ -168,10 +168,8 @@ def ensure_vireo_key(run=subprocess.run, ssh_keygen_bin="ssh-keygen"):
     os.makedirs(key_dir, mode=0o700, exist_ok=True)
     os.chmod(key_dir, 0o700)  # makedirs mode is ignored for existing dirs
     if os.path.exists(priv):
-        try:
+        with contextlib.suppress(OSError):
             os.chmod(priv, 0o600)
-        except OSError:
-            pass
         if os.path.exists(pub):
             return priv, pub
         # Rebuild the .pub from the existing private key. ``-y`` reads the
@@ -191,10 +189,8 @@ def ensure_vireo_key(run=subprocess.run, ssh_keygen_bin="ssh-keygen"):
             pub_line = pub_line + " vireo"
         with open(pub, "w") as f:
             f.write(pub_line + "\n")
-        try:
+        with contextlib.suppress(OSError):
             os.chmod(pub, 0o644)
-        except OSError:
-            pass
         return priv, pub
     r = run([ssh_keygen_bin, "-t", "ed25519", "-N", "", "-f", priv,
              "-C", "vireo"], capture_output=True, text=True, timeout=30)

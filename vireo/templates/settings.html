@@ -1866,7 +1866,11 @@ async function nwVolumeStep(body) {
 
 function _nwPickMount(m) {
   _nw.mount = m;
-  _nw.host = m.friendly_host || m.host;
+  // Pin SSH ops to the mount's verified network address — a stale or spoofed
+  // PTR record could otherwise steer the password prompt at install-key time
+  // to a different machine. `display_name` in the picker still surfaces the
+  // friendly name; users can override the host in step 2 if they need to.
+  _nw.host = m.host;
   _nw.user = m.user || _nw.user;
   _nwSetNext(true);
 }

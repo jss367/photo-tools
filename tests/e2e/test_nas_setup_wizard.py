@@ -107,7 +107,7 @@ def _finish_from_share_step(page, live_server, nas_env):
             break
         time.sleep(0.2)
     assert target, "remote target was not saved to config"
-    assert target["host"] == "synology-nas.ts.net"
+    assert target["host"] == "100.80.236.59"  # pinned to the verified mount IP
     assert target["user"] == "julius_admin"
     assert target["remote_path"] == "/volume1/Photography"
     assert target["mount_path"] == nas_env["mount_dir"]

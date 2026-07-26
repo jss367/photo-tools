@@ -294,6 +294,24 @@ _PTY_SPAWN_HELPER = (
 )
 
 
+def _pty_helper_prefix():
+    """argv prefix that wraps ssh in the pty setup helper.
+
+    In a PyInstaller ``--onefile`` build (the production packaging on
+    macOS via ``scripts/build_sidecar.py``) ``sys.executable`` is the
+    frozen ``vireo-server`` binary, not a Python interpreter, so the
+    ``[sys.executable, "-c", helper]`` shape used in dev would relaunch
+    the whole app with an unrecognized ``-c`` and never exec ssh. The
+    frozen build instead routes through the app's ``--pty-spawn-helper``
+    subcommand (dispatched in ``app.py`` before ``main()``'s argparse
+    runs), which performs the identical setsid + TIOCSCTTY + ECHO=off +
+    execvp dance.
+    """
+    if getattr(sys, "frozen", False):
+        return [sys.executable, "--pty-spawn-helper"]
+    return [sys.executable, "-c", _PTY_SPAWN_HELPER]
+
+
 def install_key_with_password(spawn_argv, password, timeout=30):
     """Drive ``spawn_argv`` through a pty, answering one password prompt.
 
@@ -317,7 +335,7 @@ def install_key_with_password(spawn_argv, password, timeout=30):
     # inherited locks so its setup code cannot deadlock.
     try:
         proc = subprocess.Popen(
-            [sys.executable, "-c", _PTY_SPAWN_HELPER, *spawn_argv],
+            [*_pty_helper_prefix(), *spawn_argv],
             stdin=slave, stdout=slave, stderr=slave)
     except OSError as exc:
         os.close(master)

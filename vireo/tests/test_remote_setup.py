@@ -116,6 +116,29 @@ def test_list_network_mounts_caches_reverse_dns_per_host():
     assert sorted(calls) == ["100.80.236.59", "100.80.236.60"]
 
 
+def test_pty_helper_prefix_uses_c_snippet_in_dev(monkeypatch):
+    """In a normal Python run, sys.executable IS a python interpreter, so
+    the pty helper is passed via ``-c`` — no separate file needed at
+    runtime, no dependency on the frozen build's subcommand handler."""
+    monkeypatch.delattr(remote_setup.sys, "frozen", raising=False)
+    prefix = remote_setup._pty_helper_prefix()
+    assert prefix[0] == remote_setup.sys.executable
+    assert prefix[1] == "-c"
+    assert "TIOCSCTTY" in prefix[2]  # the actual helper snippet
+
+
+def test_pty_helper_prefix_uses_subcommand_in_frozen_build(monkeypatch):
+    """In a PyInstaller --onefile build (the production packaging via
+    scripts/build_sidecar.py), sys.executable is the frozen ``vireo-server``
+    binary, not python — ``-c`` would relaunch the whole app with an
+    unrecognized flag and never reach ssh. The prefix routes through the
+    ``--pty-spawn-helper`` subcommand instead, which app.py dispatches
+    before argparse sees the ssh argv."""
+    monkeypatch.setattr(remote_setup.sys, "frozen", True, raising=False)
+    prefix = remote_setup._pty_helper_prefix()
+    assert prefix == [remote_setup.sys.executable, "--pty-spawn-helper"]
+
+
 def test_friendly_host_passthrough_for_hostnames_and_failed_reverse():
     # Non-IP hosts pass through; resolver failures fall back to the raw host.
     assert remote_setup.friendly_host_name("mynas.local", resolver=None) == "mynas.local"

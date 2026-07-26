@@ -31297,4 +31297,20 @@ if __name__ == "__main__":
     # when we actually call it.
     import multiprocessing
     multiprocessing.freeze_support()
+    # --pty-spawn-helper: pty setup shim dispatched by remote_setup's
+    # install-key path. In the packaged (PyInstaller --onefile) build
+    # sys.executable is this same binary, so remote_setup can't shell
+    # out via `[python, "-c", helper]` and instead re-executes us with
+    # this flag. Must run BEFORE argparse — the wrapped ssh argv follows
+    # and would otherwise get rejected as unknown options.
+    if len(sys.argv) >= 3 and sys.argv[1] == "--pty-spawn-helper":
+        import fcntl
+        import termios
+        os.setsid()
+        fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+        a = termios.tcgetattr(0)
+        a[3] &= ~(termios.ECHO | termios.ECHOE | termios.ECHOK
+                  | termios.ECHONL)
+        termios.tcsetattr(0, termios.TCSANOW, a)
+        os.execvp(sys.argv[2], sys.argv[2:])
     main()

@@ -1,6 +1,8 @@
 import os
+import socket
 import subprocess
 import sys
+import time
 
 import pytest
 
@@ -121,6 +123,119 @@ def test_ensure_vireo_key_raises_on_keygen_failure(tmp_path, monkeypatch):
     run = FakeRun(returncode=1)
     with pytest.raises(RuntimeError):
         remote_setup.ensure_vireo_key(run=run)
+
+
+@pytest.mark.skipif(sys.platform == "win32",
+                    reason="POSIX chmod bits are ignored on Windows")
+def test_ensure_vireo_key_recovers_missing_pub_from_existing_priv(
+        tmp_path, monkeypatch):
+    """If the .pub was deleted (or a prior generation was interrupted after
+    writing priv), rebuild the public key with ``ssh-keygen -y`` instead
+    of re-running ``ssh-keygen -f priv`` — the latter blocks forever on the
+    non-interactive overwrite prompt and the wizard cannot repair itself."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    priv, pub = remote_setup.vireo_key_paths()
+    os.makedirs(os.path.dirname(priv), exist_ok=True)
+    open(priv, "w").write("EXISTING PRIVATE KEY")
+    os.chmod(priv, 0o644)  # loose perms — must be normalized to 0600
+
+    calls = []
+
+    def fake_run(argv, **kw):
+        calls.append(argv)
+        return subprocess.CompletedProcess(
+            argv, 0, stdout="ssh-ed25519 AAAAREGENERATED\n", stderr="")
+
+    out_priv, out_pub = remote_setup.ensure_vireo_key(run=fake_run)
+    assert out_priv == priv and out_pub == pub
+    # Exactly one ssh-keygen invocation, and it's the non-interactive
+    # -y derivation — never the interactive -f overwrite path.
+    assert len(calls) == 1
+    assert calls[0][:2] == ["ssh-keygen", "-y"] and "-f" in calls[0]
+    assert "-t" not in calls[0]  # no regeneration attempted
+    # The rebuilt .pub carries the vireo comment for parity with fresh gen.
+    assert open(pub).read().strip() == "ssh-ed25519 AAAAREGENERATED vireo"
+    # Loose priv perms were tightened.
+    assert oct(os.stat(priv).st_mode & 0o777) == "0o600"
+
+
+@pytest.mark.skipif(sys.platform == "win32",
+                    reason="POSIX chmod bits are ignored on Windows")
+def test_ensure_vireo_key_raises_when_pub_derivation_fails(
+        tmp_path, monkeypatch):
+    """If ssh-keygen -y fails on a corrupted private key, surface the
+    error rather than silently overwriting the private key."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    priv, _ = remote_setup.vireo_key_paths()
+    os.makedirs(os.path.dirname(priv), exist_ok=True)
+    open(priv, "w").write("CORRUPTED")
+
+    def fake_run(argv, **kw):
+        return subprocess.CompletedProcess(
+            argv, 1, stdout="", stderr="Load key: invalid format")
+
+    with pytest.raises(RuntimeError, match="ssh-keygen -y failed"):
+        remote_setup.ensure_vireo_key(run=fake_run)
+
+
+def test_reverse_dns_worker_is_daemon(monkeypatch):
+    """Hung PTR queries must leave only daemon threads behind so process
+    shutdown never blocks. A ThreadPoolExecutor here would silently leak
+    non-daemon workers that Python's atexit hook then joins on exit."""
+    import threading as _t
+
+    spawned = []
+    real_start = _t.Thread.start
+
+    def spy_start(self):
+        spawned.append(self)
+        return real_start(self)
+
+    monkeypatch.setattr(_t.Thread, "start", spy_start)
+    # Fast fake resolver so the test doesn't spend real time waiting.
+    monkeypatch.setattr(remote_setup.socket, "gethostbyaddr",
+                        lambda ip: ("cachedname", [], [ip]))
+
+    assert remote_setup._reverse_dns("192.0.2.1") == "cachedname"
+    assert spawned, "no worker thread was spawned"
+    assert all(t.daemon for t in spawned), (
+        "reverse-DNS worker must be a daemon so a hung lookup can't block exit")
+
+
+def test_reverse_dns_times_out_when_lookup_hangs(monkeypatch):
+    """A hung ``gethostbyaddr`` must surface as ``TimeoutError`` and not
+    block on a shutdown(wait=True) after the guard fires."""
+    import threading as _t
+
+    def hang(_ip):
+        _t.Event().wait()  # simulates a PTR query that never returns
+
+    monkeypatch.setattr(remote_setup.socket, "gethostbyaddr", hang)
+    # Shrink the 2s guard so the test doesn't sit on it.
+    real_get = remote_setup._queue.Queue.get
+
+    def quick_get(self, timeout=None):
+        return real_get(self, timeout=0.05)
+
+    monkeypatch.setattr(remote_setup._queue.Queue, "get", quick_get)
+
+    start = time.monotonic()
+    with pytest.raises(TimeoutError):
+        remote_setup._reverse_dns("192.0.2.1")
+    # If the code had done shutdown(wait=True), this would take much longer;
+    # the daemon-thread + queue approach returns as soon as the wait expires.
+    assert time.monotonic() - start < 1.0
+
+
+def test_reverse_dns_propagates_lookup_error(monkeypatch):
+    """Real resolver errors (e.g. no PTR record) must surface as an
+    exception so ``friendly_host_name`` can fall back to the raw host."""
+    def boom(_ip):
+        raise socket.gaierror("no PTR")
+
+    monkeypatch.setattr(remote_setup.socket, "gethostbyaddr", boom)
+    with pytest.raises(socket.gaierror):
+        remote_setup._reverse_dns("192.0.2.1")
 
 
 def test_key_auth_works_builds_batchmode_ssh(tmp_path):

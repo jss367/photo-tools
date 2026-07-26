@@ -5,10 +5,10 @@ pattern): production passes nothing and gets ``subprocess``; tests pass
 fakes. Nothing here imports Flask or touches the database.
 """
 
-import concurrent.futures
 import contextlib
 import ipaddress
 import os
+import queue as _queue
 import re
 import secrets
 import select
@@ -16,6 +16,7 @@ import shlex
 import socket
 import subprocess
 import sys
+import threading
 import time
 import urllib.parse
 
@@ -90,21 +91,32 @@ def _reverse_dns(ip):
     no timeout parameter and can hang for many seconds on networks that
     drop PTR queries, which would stall the wizard's mounts endpoint.
 
-    The executor is torn down without waiting: the ``with`` form calls
-    ``shutdown(wait=True)`` on exit even when ``fut.result`` already raised
-    a TimeoutError, which would silently re-block the endpoint for the full
-    DNS delay. Leftover worker threads are daemons — they die on process
-    exit, or when ``gethostbyaddr`` finally returns.
+    Runs the lookup in a daemon thread and reads the answer through a
+    bounded queue. The daemon flag is what makes the leak-free story true:
+    a hung ``gethostbyaddr`` cannot block interpreter shutdown, and each
+    stuck lookup costs exactly one OS thread that dies the moment the
+    kernel returns from the syscall. ``ThreadPoolExecutor`` doesn't work
+    here — its worker threads are NON-daemon and are joined via an
+    ``atexit`` hook, so a stuck PTR query would silently block process
+    exit, and dropping the executor with ``shutdown(wait=False)`` leaks
+    a non-daemon worker per timed-out lookup.
     """
-    ex = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-    try:
-        fut = ex.submit(socket.gethostbyaddr, ip)
-        return fut.result(timeout=2)[0]
-    finally:
+    result_q = _queue.Queue(maxsize=1)
+
+    def _worker():
         try:
-            ex.shutdown(wait=False, cancel_futures=True)
-        except TypeError:  # cancel_futures added in 3.9
-            ex.shutdown(wait=False)
+            result_q.put(("ok", socket.gethostbyaddr(ip)))
+        except BaseException as exc:  # pylint: disable=broad-except
+            result_q.put(("err", exc))
+
+    threading.Thread(target=_worker, daemon=True).start()
+    try:
+        kind, value = result_q.get(timeout=2)
+    except _queue.Empty:
+        raise TimeoutError(f"reverse DNS for {ip} timed out")
+    if kind == "err":
+        raise value
+    return value[0]
 
 
 def friendly_host_name(host, resolver=None):
@@ -134,12 +146,46 @@ def ensure_vireo_key(run=subprocess.run, ssh_keygen_bin="ssh-keygen"):
 
     No passphrase: background rsync jobs must run unattended. The key never
     leaves this machine and grants only what the NAS account grants.
+
+    Repairs partial state: if only ``priv`` exists (interrupted generation,
+    or the ``.pub`` was deleted), regenerate the public key with
+    ``ssh-keygen -y -f priv`` rather than falling through to a fresh
+    ``-f priv`` that would sit forever on the non-interactive overwrite
+    prompt. Always normalizes ``priv`` to ``0600`` so an existing key with
+    loose permissions doesn't cause ssh to reject it later.
     """
     priv, pub = vireo_key_paths()
     key_dir = os.path.dirname(priv)
     os.makedirs(key_dir, mode=0o700, exist_ok=True)
     os.chmod(key_dir, 0o700)  # makedirs mode is ignored for existing dirs
-    if os.path.exists(priv) and os.path.exists(pub):
+    if os.path.exists(priv):
+        try:
+            os.chmod(priv, 0o600)
+        except OSError:
+            pass
+        if os.path.exists(pub):
+            return priv, pub
+        # Rebuild the .pub from the existing private key. ``-y`` reads the
+        # private key and prints the corresponding public key to stdout —
+        # no interactive prompts, no risk of clobbering ``priv``.
+        r = run([ssh_keygen_bin, "-y", "-f", priv],
+                capture_output=True, text=True, timeout=15)
+        pub_line = (getattr(r, "stdout", "") or "").strip()
+        if r.returncode != 0 or not pub_line:
+            detail = (getattr(r, "stderr", "") or "").strip()
+            raise RuntimeError(
+                f"ssh-keygen -y failed: {detail or 'unknown error'}")
+        # -y output omits the trailing comment; add "vireo" to match what
+        # fresh generation produces so the rest of the app doesn't see two
+        # shapes of the same key.
+        if len(pub_line.split()) == 2:
+            pub_line = pub_line + " vireo"
+        with open(pub, "w") as f:
+            f.write(pub_line + "\n")
+        try:
+            os.chmod(pub, 0o644)
+        except OSError:
+            pass
         return priv, pub
     r = run([ssh_keygen_bin, "-t", "ed25519", "-N", "", "-f", priv,
              "-C", "vireo"], capture_output=True, text=True, timeout=30)

@@ -2825,7 +2825,10 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         if (
             expected_api_token
             and supplied_api_token
-            and secrets.compare_digest(supplied_api_token, expected_api_token)
+            and secrets.compare_digest(
+                supplied_api_token.encode("utf-8"),
+                expected_api_token.encode("utf-8"),
+            )
         ):
             return None
 
@@ -2851,7 +2854,8 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         cookie_name = app.config["BROWSER_SESSION_COOKIE"]
         expected_token = app.config["BROWSER_SESSION_TOKEN"]
         if not secrets.compare_digest(
-            request.cookies.get(cookie_name, ""), expected_token,
+            request.cookies.get(cookie_name, "").encode("utf-8"),
+            expected_token.encode("utf-8"),
         ):
             return json_error(
                 "Browser session required",
@@ -3666,7 +3670,11 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             # No token configured → deny all v1 traffic.
             return json_error("API token not configured", 401)
         supplied = request.headers.get("X-Vireo-Token", "")
-        if not secrets.compare_digest(supplied, expected):
+        # ``secrets.compare_digest`` raises ``TypeError`` when either str
+        # operand contains a non-ASCII code point, which would surface as a
+        # 500 for an attacker-supplied token — encode to bytes so a bogus
+        # header is a plain 401 like any other wrong value.
+        if not secrets.compare_digest(supplied.encode("utf-8"), expected.encode("utf-8")):
             return json_error("Invalid or missing X-Vireo-Token", 401)
         return None
 

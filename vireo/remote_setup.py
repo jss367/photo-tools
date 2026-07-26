@@ -16,7 +16,6 @@ import shlex
 import socket
 import subprocess
 import sys
-import termios
 import time
 import urllib.parse
 
@@ -203,7 +202,10 @@ def install_key_with_password(spawn_argv, password, timeout=30):
     The password must never reach logs, exceptions, or the returned dict —
     it is written to the pty and nowhere else.
     """
-    import pty  # POSIX-only; imported here so module import stays portable
+    # pty + termios are POSIX-only; import here so `remote_setup` still
+    # loads on Windows (the wizard itself is macOS-only in production).
+    import pty
+    import termios
 
     master, slave = pty.openpty()
     # Disable pty ECHO up front — a new pty defaults to ECHO=ON, and any

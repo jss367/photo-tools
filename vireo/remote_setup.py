@@ -9,8 +9,11 @@ import concurrent.futures
 import ipaddress
 import os
 import re
+import select
+import shlex
 import socket
 import subprocess
+import time
 import urllib.parse
 
 # `mount` line: "<source> on <mount point> (<fstype>, opt, ...)".
@@ -139,6 +142,97 @@ def key_auth_works(host, user, port, key, ssh_bin, run=subprocess.run):
     except (OSError, subprocess.SubprocessError):
         return False
     return r.returncode == 0 and "vireo_ok" in (r.stdout or "")
+
+
+def build_install_argv(host, user, port, key_pub_line, ssh_bin):
+    """ssh argv that appends our public key to the NAS user's
+    authorized_keys — what ssh-copy-id does, minus the extra binary.
+    No BatchMode: the password prompt must reach the pty driver. The
+    append is idempotent (grep before echo) so re-runs are safe."""
+    quoted = shlex.quote(key_pub_line.strip())
+    snippet = (
+        f"umask 077; mkdir -p ~/.ssh; touch ~/.ssh/authorized_keys; "
+        f"grep -qxF {quoted} ~/.ssh/authorized_keys || "
+        f"echo {quoted} >> ~/.ssh/authorized_keys"
+    )
+    return ([ssh_bin] + _ssh_option_args(port, key="", batch=False)
+            + [f"{user}@{host}", snippet])
+
+
+_PASSWORD_PROMPT_RE = re.compile(r"[Pp]assword[^\n]*:")
+
+
+def install_key_with_password(spawn_argv, password, timeout=30):
+    """Drive ``spawn_argv`` through a pty, answering one password prompt.
+
+    Returns ``{"ok": bool, "error": code-or-None}`` (plus ``"detail"`` for
+    unclassified failures). Error codes: ``wrong_password`` (a second
+    prompt appeared — never answered twice), ``password_auth_disabled``,
+    ``host_key``, ``timeout``, ``ssh_failed``.
+
+    The password must never reach logs, exceptions, or the returned dict —
+    it is written to the pty and nowhere else.
+    """
+    import pty  # POSIX-only; imported here so module import stays portable
+
+    master, slave = pty.openpty()
+    try:
+        proc = subprocess.Popen(
+            spawn_argv, stdin=slave, stdout=slave, stderr=slave,
+            start_new_session=True)
+    except OSError as exc:
+        os.close(master)
+        os.close(slave)
+        return {"ok": False, "error": "ssh_failed", "detail": str(exc)}
+    os.close(slave)
+
+    output = ""
+    answered = False
+    deadline = time.monotonic() + timeout
+    try:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                proc.kill()
+                return {"ok": False, "error": "timeout"}
+            ready, _, _ = select.select([master], [], [], min(remaining, 0.5))
+            if ready:
+                try:
+                    chunk = os.read(master, 4096)
+                except OSError:  # EIO on macOS/Linux when the child exits
+                    chunk = b""
+                if chunk:
+                    output += chunk.decode("utf-8", "replace")
+                    prompts = len(_PASSWORD_PROMPT_RE.findall(output))
+                    if prompts >= 2:
+                        # A re-prompt means the first answer was rejected.
+                        # Never answer twice — fail fast as wrong password.
+                        proc.kill()
+                        return {"ok": False, "error": "wrong_password"}
+                    if prompts == 1 and not answered:
+                        answered = True
+                        os.write(master, (password + "\n").encode())
+                    continue
+            if proc.poll() is not None:
+                break
+    finally:
+        os.close(master)
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait()
+
+    if proc.returncode == 0:
+        return {"ok": True, "error": None}
+    # Classify from the ACCUMULATED output — the failure text and EOF can
+    # arrive in a single read, after the loop has already answered once.
+    if len(_PASSWORD_PROMPT_RE.findall(output)) >= 2:
+        return {"ok": False, "error": "wrong_password"}
+    if "Host key verification failed" in output:
+        return {"ok": False, "error": "host_key"}
+    if "Permission denied" in output and not answered:
+        return {"ok": False, "error": "password_auth_disabled"}
+    return {"ok": False, "error": "ssh_failed",
+            "detail": output[-400:].strip()}
 
 
 def list_network_mounts(run=subprocess.run, resolver=None):

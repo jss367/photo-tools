@@ -137,3 +137,77 @@ def test_key_auth_works_false_on_denied(tmp_path):
     assert remote_setup.key_auth_works(
         host="nas", user="admin", port=22, key="", ssh_bin="ssh",
         run=run) is False
+
+
+# --- Password-driven key install (pty) ------------------------------------
+
+
+STUB = r'''#!/usr/bin/env python3
+import sys
+mode = sys.argv[1]  # ok | wrongpw | nopw | hostkey
+if mode == "nopw":
+    sys.stderr.write("admin@nas: Permission denied (publickey).\n")
+    sys.exit(255)
+if mode == "hostkey":
+    sys.stderr.write("Host key verification failed.\n")
+    sys.exit(255)
+sys.stderr.write("admin@nas's password: ")
+sys.stderr.flush()
+pw = input()
+if mode == "ok" and pw == "sekret":
+    sys.exit(0)
+sys.stderr.write("Permission denied, please try again.\nadmin@nas's password: ")
+sys.stderr.flush()
+sys.exit(255)
+'''
+
+
+def _stub(tmp_path, mode):
+    p = tmp_path / "fake_ssh.py"
+    p.write_text(STUB)
+    p.chmod(0o755)
+    return [sys.executable, str(p), mode]
+
+
+def test_install_key_success(tmp_path):
+    res = remote_setup.install_key_with_password(
+        spawn_argv=_stub(tmp_path, "ok"), password="sekret", timeout=15)
+    assert res == {"ok": True, "error": None}
+
+
+def test_install_key_wrong_password(tmp_path):
+    res = remote_setup.install_key_with_password(
+        spawn_argv=_stub(tmp_path, "wrongpw"), password="nope", timeout=15)
+    assert res["ok"] is False and res["error"] == "wrong_password"
+
+
+def test_install_key_password_auth_disabled(tmp_path):
+    res = remote_setup.install_key_with_password(
+        spawn_argv=_stub(tmp_path, "nopw"), password="x", timeout=15)
+    assert res["ok"] is False and res["error"] == "password_auth_disabled"
+
+
+def test_install_key_host_key_rejected(tmp_path):
+    res = remote_setup.install_key_with_password(
+        spawn_argv=_stub(tmp_path, "hostkey"), password="x", timeout=15)
+    assert res["ok"] is False and res["error"] == "host_key"
+
+
+def test_password_never_in_result_text(tmp_path):
+    res = remote_setup.install_key_with_password(
+        spawn_argv=_stub(tmp_path, "wrongpw"), password="hunter2", timeout=15)
+    assert "hunter2" not in repr(res)
+
+
+def test_build_install_argv_no_batchmode_and_idempotent_append():
+    argv = remote_setup.build_install_argv(
+        host="nas", user="admin", port=22,
+        key_pub_line="ssh-ed25519 AAAA vireo", ssh_bin="/usr/bin/ssh")
+    assert argv[0] == "/usr/bin/ssh"
+    assert "BatchMode=yes" not in argv          # password prompt must reach the pty
+    assert "StrictHostKeyChecking=accept-new" in argv
+    assert argv[-2] == "admin@nas"
+    snippet = argv[-1]
+    assert "umask 077" in snippet and "mkdir -p ~/.ssh" in snippet
+    assert "grep -qxF" in snippet and "authorized_keys" in snippet
+    assert "ssh-ed25519 AAAA vireo" in snippet

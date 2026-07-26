@@ -22241,6 +22241,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         result = {
             "port_open": remote_setup.port_reachable(conn["host"], conn["port"]),
             "pub_key_line": pub_key_line,
+            "key_path": _priv,
             "key_auth_ok": False,
         }
         ssh_bin = _remote_setup_ssh_bin()

@@ -47,6 +47,7 @@ def test_ssh_check_reports_port_auth_and_pubkey(app_and_db, monkeypatch, tmp_pat
     body = res.get_json()
     assert body["port_open"] is True and body["key_auth_ok"] is False
     assert body["pub_key_line"] == "ssh-ed25519 AAAA vireo"
+    assert body["key_path"] == str(tmp_path / "vireo_ed25519")
 
 
 def test_ssh_check_validates_input(app_and_db):

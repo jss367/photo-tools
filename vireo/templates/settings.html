@@ -2249,11 +2249,32 @@ async function nwReviewStep(body) {
   }
 }
 
-function nwSave() {
+async function nwSave() {
   var t = _nwAssembledTarget();
   _remoteTargetsState.push(t);
   renderRemoteTargets();
-  saveConfig();
+  // The debounced saveConfig used by inline handlers only SCHEDULES a POST
+  // 500 ms out; if the user reloads or closes the tab in that window the
+  // target is lost. This is an explicit Save action, so flush immediately
+  // and keep the modal up until the write lands.
+  clearTimeout(_saveTimer);
+  _nwSetNext(false, 'Saving…');
+  document.getElementById('nwBack').disabled = true;
+  try {
+    await _saveConfigNow();
+  } catch (e) {
+    // Roll back the optimistic push so the row disappears when we show the
+    // error — the target didn't actually make it to disk.
+    var idx = _remoteTargetsState.indexOf(t);
+    if (idx >= 0) _remoteTargetsState.splice(idx, 1);
+    renderRemoteTargets();
+    var body = document.getElementById('nwBody');
+    if (body) body.appendChild(_nwEl('div', _nwErrCss,
+      '⚠ Could not save: ' + ((e && e.message) || e)));
+    _nwSetNext(true, 'Save');
+    document.getElementById('nwBack').disabled = false;
+    return;
+  }
   closeNasWizard();
   var listEl = document.getElementById('cfgRemoteTargetsList');
   if (listEl) listEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
@@ -2486,9 +2507,7 @@ function getSelectedCardFields() {
   return fields;
 }
 
-function saveConfig() {
-  clearTimeout(_saveTimer);
-  _saveTimer = setTimeout(async function() {
+async function _saveConfigNow() {
     var threshold = parseInt(document.getElementById('cfgThreshold').value, 10) / 100;
     var grouping = parseInt(document.getElementById('cfgGroupingWindow').value, 10);
     if (isNaN(grouping)) grouping = 10;
@@ -2497,8 +2516,7 @@ function saveConfig() {
     var keywordCase = document.getElementById('cfgKeywordCase').value;
     var maxEditHistory = parseInt(document.getElementById('cfgMaxEditHistory').value, 10);
     if (isNaN(maxEditHistory)) maxEditHistory = 1000;
-    try {
-      await safeFetch('/api/config', {
+    await safeFetch('/api/config', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({
@@ -2599,13 +2617,23 @@ function saveConfig() {
           },
         }),
       });
-      if (typeof loadPreviewCacheStatus === 'function') loadPreviewCacheStatus();
-      // Drop the cached editor list so the next "Open in Editor" action
-      // sees changes to the editors list without a page reload.
-      if (typeof window.invalidateEditorsCache === 'function') {
-        window.invalidateEditorsCache();
-      }
-    } catch(e) {}
+    if (typeof loadPreviewCacheStatus === 'function') loadPreviewCacheStatus();
+    // Drop the cached editor list so the next "Open in Editor" action
+    // sees changes to the editors list without a page reload.
+    if (typeof window.invalidateEditorsCache === 'function') {
+      window.invalidateEditorsCache();
+    }
+}
+
+function saveConfig() {
+  // Debounced fire-and-forget for the settings-page inline handlers. Errors
+  // are silent — the network layer already toasts on failure and the next
+  // change re-tries. Callers that need to KNOW the write landed (e.g. the
+  // NAS wizard, before it tears down its modal) must call _saveConfigNow()
+  // directly and await it.
+  clearTimeout(_saveTimer);
+  _saveTimer = setTimeout(function() {
+    _saveConfigNow().catch(function() {});
   }, 500);
 }
 

@@ -215,8 +215,9 @@ def install_key_with_password(spawn_argv, password, timeout=30):
     The password must never reach logs, exceptions, or the returned dict —
     it is written to the pty and nowhere else.
     """
-    # pty + termios are POSIX-only; import here so `remote_setup` still
-    # loads on Windows (the wizard itself is macOS-only in production).
+    # pty + termios + fcntl are POSIX-only; import here so `remote_setup`
+    # still loads on Windows (the wizard itself is macOS-only in production).
+    import fcntl
     import pty
     import termios
 
@@ -234,10 +235,22 @@ def install_key_with_password(spawn_argv, password, timeout=30):
         termios.tcsetattr(slave, termios.TCSANOW, attrs)
     except termios.error:
         pass  # if we can't disable echo, redaction below is the backstop
+    def _preexec():
+        # Real OpenSSH reads the password prompt from /dev/tty, not stdin,
+        # so start_new_session on its own is not enough: setsid detaches the
+        # child from the parent's tty but leaves the child with NO controlling
+        # terminal, and `/dev/tty` then fails with ENXIO. TIOCSCTTY on the
+        # slave (which is stdin/stdout/stderr in the child) is what promotes
+        # the pty to being the controlling terminal so the prompt reaches us.
+        # The test stub in test_remote_setup.py reads from stdin via input()
+        # and doesn't need this, but real ssh does.
+        os.setsid()
+        fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+
     try:
         proc = subprocess.Popen(
             spawn_argv, stdin=slave, stdout=slave, stderr=slave,
-            start_new_session=True)
+            preexec_fn=_preexec)
     except OSError as exc:
         os.close(master)
         os.close(slave)

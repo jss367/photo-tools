@@ -89,10 +89,14 @@ authorize this Mac's key, never stored"). Submitting calls
 `POST /api/remote-setup/install-key`, which:
 
 1. Generates `~/.vireo/ssh/vireo_ed25519` if missing.
-2. Installs the public key by driving `ssh-copy-id` through a pty (macOS
-   ships no `sshpass`; Python's `pty` module answers the password prompt).
-   The password lives only in request scope; it is never written to config,
-   DB, or logs.
+2. Installs the public key by driving plain `ssh` through a pty (macOS
+   ships no `sshpass`; Python's `pty` module answers the password prompt),
+   running an idempotent append snippet (`umask 077; mkdir -p ~/.ssh;
+   grep -qxF <key> ~/.ssh/authorized_keys || echo <key> >> …`) — the same
+   thing `ssh-copy-id` does, but reusing the already-configurable ssh
+   binary so tests and Settings → Paths overrides cover it. The password
+   lives only in request scope; it is never written to config, DB, or
+   logs.
 3. Accepts the host key on first contact (`accept-new`) and returns the
    fingerprint for display.
 4. Verifies `BatchMode=yes` login now succeeds.
@@ -146,7 +150,7 @@ save endpoint. Any failure links back to the relevant step.
 
 ## Backend
 
-Four new endpoints in `app.py` under `/api/remote-setup/`:
+Endpoints in `app.py` under `/api/remote-setup/`:
 
 | Endpoint | Method | Purpose |
 |---|---|---|
@@ -154,6 +158,8 @@ Four new endpoints in `app.py` under `/api/remote-setup/`:
 | `ssh-check` | POST | Port reachability, key existence, key-auth status |
 | `install-key` | POST | Generate key if needed, install via pty, verify |
 | `locate-share` | POST | Nonce probe, return verified remote path |
+| `list-remote-dirs` | POST | SSH-backed directory listing for the fallback browser |
+| `disk-free` | GET | Free bytes for the archive-root step's free-space readout |
 
 Constraints:
 

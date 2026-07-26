@@ -6,6 +6,7 @@ fakes. Nothing here imports Flask or touches the database.
 """
 
 import concurrent.futures
+import contextlib
 import ipaddress
 import os
 import re
@@ -341,10 +342,8 @@ def locate_share(mount_point, share, host, user, port, key, ssh_bin,
     finally:
         # Mount-side cleanup only: the nonce lives on the share, so this
         # removes it regardless of which NAS path it appeared at.
-        try:
+        with contextlib.suppress(OSError):
             os.unlink(nonce_path)
-        except OSError:
-            pass
 
 
 def list_remote_dirs(path, host, user, port, key, ssh_bin,

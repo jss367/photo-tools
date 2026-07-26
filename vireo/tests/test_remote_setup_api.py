@@ -10,6 +10,10 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 
 def test_mounts_endpoint_returns_parsed_mounts(app_and_db, monkeypatch):
+    # The endpoint only enumerates mounts on macOS (mount-line format is
+    # platform-specific); force the darwin branch so CI on Linux/Windows
+    # exercises the same code path.
+    monkeypatch.setattr(sys, "platform", "darwin")
     app, _db = app_and_db
     import remote_setup
     monkeypatch.setattr(remote_setup, "platform_supported", lambda: True)

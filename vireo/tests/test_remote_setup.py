@@ -8,7 +8,6 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import remote_setup
 
-
 SMB = "//julius_admin@100.80.236.59/Photography on /Volumes/Photography (smbfs, nodev, nosuid, mounted by julius)"
 SMB_SPACES = "//guest@My%20NAS._smb._tcp.local/Photo%20Library on /Volumes/Photo Library (smbfs, nodev, nosuid, mounted by julius)"
 NFS = "truenas:/mnt/tank/photos on /Volumes/photos (nfs, nodev, nosuid, mounted by julius)"
@@ -92,6 +91,8 @@ def test_key_paths_under_vireo_home(tmp_path, monkeypatch):
     assert pub == priv + ".pub"
 
 
+@pytest.mark.skipif(sys.platform == "win32",
+                    reason="POSIX chmod bits are ignored on Windows")
 def test_ensure_vireo_key_generates_once(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))
     calls = []
@@ -157,6 +158,14 @@ def test_port_reachable(monkeypatch):
 
 # --- Password-driven key install (pty) ------------------------------------
 
+# install_key_with_password uses the `pty` module, which is POSIX-only
+# (Windows Python raises ModuleNotFoundError: No module named 'termios'),
+# so these tests only run on POSIX platforms — the feature itself is
+# macOS-only in production.
+pytestmark_pty = pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="pty/termios are POSIX-only; install-key runs on macOS")
+
 
 STUB = r'''#!/usr/bin/env python3
 import sys
@@ -194,30 +203,35 @@ def _stub(tmp_path, mode):
     return [sys.executable, str(p), mode]
 
 
+@pytestmark_pty
 def test_install_key_success(tmp_path):
     res = remote_setup.install_key_with_password(
         spawn_argv=_stub(tmp_path, "ok"), password="sekret", timeout=15)
     assert res == {"ok": True, "error": None}
 
 
+@pytestmark_pty
 def test_install_key_wrong_password(tmp_path):
     res = remote_setup.install_key_with_password(
         spawn_argv=_stub(tmp_path, "wrongpw"), password="nope", timeout=15)
     assert res["ok"] is False and res["error"] == "wrong_password"
 
 
+@pytestmark_pty
 def test_install_key_password_auth_disabled(tmp_path):
     res = remote_setup.install_key_with_password(
         spawn_argv=_stub(tmp_path, "nopw"), password="x", timeout=15)
     assert res["ok"] is False and res["error"] == "password_auth_disabled"
 
 
+@pytestmark_pty
 def test_install_key_host_key_rejected(tmp_path):
     res = remote_setup.install_key_with_password(
         spawn_argv=_stub(tmp_path, "hostkey"), password="x", timeout=15)
     assert res["ok"] is False and res["error"] == "host_key"
 
 
+@pytestmark_pty
 def test_password_never_in_result_text(tmp_path):
     res = remote_setup.install_key_with_password(
         spawn_argv=_stub(tmp_path, "wrongpw"), password="hunter2", timeout=15)
@@ -283,6 +297,8 @@ def test_locate_share_no_match_returns_none_and_cleans_up(tmp_path):
 
 @pytest.mark.skipif(hasattr(os, "geteuid") and os.geteuid() == 0,
                     reason="root ignores directory write bits")
+@pytest.mark.skipif(sys.platform == "win32",
+                    reason="Windows ignores POSIX chmod, so read-only bit does not apply")
 def test_locate_share_readonly_mount_raises(tmp_path):
     mount = tmp_path / "mnt"
     mount.mkdir()

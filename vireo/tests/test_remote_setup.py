@@ -67,6 +67,25 @@ def test_parse_afpfs_and_ipv6_hosts():
     assert rows[1]["host"] == "fe80::1%en0" and rows[1]["share"] == "Backup"
 
 
+def test_parse_nfs_ipv6_mount():
+    # IPv6 NFS mounts wrap the host in brackets to keep the host/path split
+    # unambiguous (`[fe80::1]:/exports/photos`). NFS sources aren't
+    # URL-encoded the way smbfs URLs are, so the scope id appears verbatim.
+    # Without accepting the bracketed form the mount is silently dropped
+    # from the wizard.
+    v6 = "[fe80::1%en0]:/exports/photos on /Volumes/photos (nfs, nodev, nosuid, mounted by julius)"
+    plain = "[2001:db8::5]:/mnt/tank/backup on /Volumes/backup (nfs, nodev, nosuid, mounted by julius)"
+    rows = remote_setup.parse_mount_output(v6 + "\n" + plain)
+    assert rows[0] == {
+        "fs_type": "nfs", "host": "fe80::1%en0",
+        "share": "photos", "mount_point": "/Volumes/photos", "user": "",
+    }
+    assert rows[1] == {
+        "fs_type": "nfs", "host": "2001:db8::5",
+        "share": "backup", "mount_point": "/Volumes/backup", "user": "",
+    }
+
+
 def test_list_network_mounts_runs_mount_and_resolves():
     run = FakeRun(stdout=SMB)
     rows = remote_setup.list_network_mounts(

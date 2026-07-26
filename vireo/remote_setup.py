@@ -27,8 +27,13 @@ import urllib.parse
 _MOUNT_RE = re.compile(r"^(?P<src>\S+?) on (?P<mp>.+) \((?P<opts>[^()]*)\)$")
 # smbfs/afp source: //[user@]host/share  (URL-encoded)
 _SMB_SRC_RE = re.compile(r"^//(?:(?P<user>[^@/]+)@)?(?P<host>[^/]+)/(?P<share>.+)$")
-# nfs source: host:/export/path
-_NFS_SRC_RE = re.compile(r"^(?P<host>[^:/]+):(?P<path>/.*)$")
+# nfs source: host:/export/path — host may be a hostname, IPv4, or a
+# bracketed IPv6 address (`[fe80::1%en0]:/exports/photos`). The colon count
+# in an IPv6 literal forces the brackets so the host/path split stays
+# unambiguous, so accept either form and normalize the host below.
+_NFS_SRC_RE = re.compile(
+    r"^(?:\[(?P<hostv6>[^\]]+)\]|(?P<host>[^:/]+)):(?P<path>/.*)$"
+)
 
 _NETWORK_FS = ("smbfs", "nfs", "afpfs", "webdav")
 
@@ -61,8 +66,12 @@ def parse_mount_output(text):
             n = _NFS_SRC_RE.match(src)
             if not n:
                 continue
+            # Return the plain address for IPv6 hosts (matches the smbfs
+            # path above): socket.create_connection and friendly_host_name
+            # both want `fe80::1%en0`, not `[fe80::1%en0]`.
+            host = n.group("hostv6") or n.group("host")
             rows.append({
-                "fs_type": fs_type, "host": n.group("host"),
+                "fs_type": fs_type, "host": host,
                 "share": os.path.basename(n.group("path").rstrip("/")),
                 "mount_point": mount_point, "user": "",
             })

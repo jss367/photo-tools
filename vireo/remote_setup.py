@@ -82,6 +82,65 @@ def friendly_host_name(host, resolver=None):
     return (name or host).rstrip(".") or host
 
 
+def vireo_key_paths():
+    """Paths of the dedicated wizard-managed keypair. Lives under ~/.vireo
+    (not ~/.ssh) so setup never touches or clobbers user-managed keys."""
+    priv = os.path.join(os.path.expanduser("~"), ".vireo", "ssh",
+                        "vireo_ed25519")
+    return priv, priv + ".pub"
+
+
+def ensure_vireo_key(run=subprocess.run, ssh_keygen_bin="ssh-keygen"):
+    """Generate the Vireo keypair if missing; return (private, public) paths.
+
+    No passphrase: background rsync jobs must run unattended. The key never
+    leaves this machine and grants only what the NAS account grants.
+    """
+    priv, pub = vireo_key_paths()
+    key_dir = os.path.dirname(priv)
+    os.makedirs(key_dir, mode=0o700, exist_ok=True)
+    os.chmod(key_dir, 0o700)  # makedirs mode is ignored for existing dirs
+    if os.path.exists(priv) and os.path.exists(pub):
+        return priv, pub
+    r = run([ssh_keygen_bin, "-t", "ed25519", "-N", "", "-f", priv,
+             "-C", "vireo"], capture_output=True, text=True, timeout=30)
+    if r.returncode != 0 or not os.path.exists(priv):
+        detail = (getattr(r, "stderr", "") or "").strip()
+        raise RuntimeError(f"ssh-keygen failed: {detail or 'unknown error'}")
+    os.chmod(priv, 0o600)
+    return priv, pub
+
+
+def _ssh_option_args(port, key, batch=True):
+    """Mirror of move.ssh_base_args for wizard probes (kept local so this
+    module stays import-light; see that docstring for the option rationale).
+    ``batch=False`` drops BatchMode so a password prompt can reach a pty."""
+    args = []
+    if batch:
+        args += ["-o", "BatchMode=yes"]
+    args += ["-o", "StrictHostKeyChecking=accept-new",
+             "-o", "ConnectTimeout=10"]
+    try:
+        if int(port or 22) != 22:
+            args += ["-p", str(int(port))]
+    except (TypeError, ValueError):
+        pass
+    if key:
+        args += ["-i", key]
+    return args
+
+
+def key_auth_works(host, user, port, key, ssh_bin, run=subprocess.run):
+    """True when passwordless (key) SSH login works right now."""
+    argv = ([ssh_bin] + _ssh_option_args(port, key)
+            + [f"{user}@{host}", "echo vireo_ok"])
+    try:
+        r = run(argv, capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return r.returncode == 0 and "vireo_ok" in (r.stdout or "")
+
+
 def list_network_mounts(run=subprocess.run, resolver=None):
     """Enumerate mounted network shares, each with a display-friendly host."""
     try:

@@ -80,3 +80,60 @@ def test_friendly_host_passthrough_for_hostnames_and_failed_reverse():
         raise OSError("no PTR")
 
     assert remote_setup.friendly_host_name("100.80.236.59", resolver=boom) == "100.80.236.59"
+
+
+# --- Vireo key management -------------------------------------------------
+
+
+def test_key_paths_under_vireo_home(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    priv, pub = remote_setup.vireo_key_paths()
+    assert priv == str(tmp_path / ".vireo" / "ssh" / "vireo_ed25519")
+    assert pub == priv + ".pub"
+
+
+def test_ensure_vireo_key_generates_once(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    calls = []
+
+    def fake_run(argv, **kw):
+        calls.append(argv)
+        priv, pub = remote_setup.vireo_key_paths()
+        open(priv, "w").write("KEY")
+        open(pub, "w").write("ssh-ed25519 AAAA vireo")
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    priv, pub = remote_setup.ensure_vireo_key(run=fake_run)
+    assert calls and calls[0][0] == "ssh-keygen"
+    assert "-N" in calls[0] and "-t" in calls[0]
+    assert oct(os.stat(os.path.dirname(priv)).st_mode & 0o777) == "0o700"
+    # Second call: key exists, no regeneration.
+    remote_setup.ensure_vireo_key(run=fake_run)
+    assert len(calls) == 1
+
+
+def test_ensure_vireo_key_raises_on_keygen_failure(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    run = FakeRun(returncode=1)
+    with pytest.raises(RuntimeError):
+        remote_setup.ensure_vireo_key(run=run)
+
+
+def test_key_auth_works_builds_batchmode_ssh(tmp_path):
+    run = FakeRun(stdout="vireo_ok\n")
+    ok = remote_setup.key_auth_works(
+        host="nas", user="admin", port=2222, key="/k", ssh_bin="/usr/bin/ssh",
+        run=run)
+    assert ok is True
+    argv = run.calls[0]
+    assert argv[0] == "/usr/bin/ssh"
+    assert "BatchMode=yes" in argv
+    assert "-p" in argv and "2222" in argv and "-i" in argv and "/k" in argv
+    assert argv[-2:] == ["admin@nas", "echo vireo_ok"]
+
+
+def test_key_auth_works_false_on_denied(tmp_path):
+    run = FakeRun(stdout="", returncode=255)
+    assert remote_setup.key_auth_works(
+        host="nas", user="admin", port=22, key="", ssh_bin="ssh",
+        run=run) is False

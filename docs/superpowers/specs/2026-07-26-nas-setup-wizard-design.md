@@ -52,8 +52,10 @@ path. The existing manual form remains as the advanced/edit path.
    `~/.ssh` keys. No passphrase is a deliberate trade-off: background rsync
    jobs must run unattended; the key grants only what the NAS account
    grants, and it never leaves the machine.
-5. **macOS first.** Mount enumeration is the only platform-specific piece;
-   Windows (`net use` parsing) slots in later without redesign.
+5. **macOS first.** Two pieces are platform-specific: mount enumeration
+   (Windows `net use` parsing slots in later without redesign) and the
+   pty-driven key install (Python's `pty` is POSIX-only; a Windows port
+   needs its own mechanism). Neither is built now.
 
 ## User flow
 
@@ -126,10 +128,12 @@ to the NAS." Show free space for the containing volume. Validation mirrors
 ### Step 5 — Review and test
 
 Show the assembled target (name defaulted from the friendly hostname or
-share). Auto-run the existing Test connection check (ssh login, GNU rsync
-presence, mount writability). Green → Save appends to
-`config.remote_targets` through the existing coercion/validation. Any
-failure links back to the relevant step.
+share; `bwlimit_kbps` stays 0 — the wizard adds no field for it, the
+manual form covers changing it later). Auto-run the existing Test
+connection check (ssh login, GNU rsync presence, mount writability).
+Green → Save appends to `config.remote_targets` through the existing
+settings config-save path and `_coerce_remote_target` validation — no new
+save endpoint. Any failure links back to the relevant step.
 
 ## Entry points
 

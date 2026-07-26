@@ -342,6 +342,7 @@ POST         /api/preview-cache/clear
 POST         /api/processes
 POST         /api/recent-destinations
 POST         /api/redo
+POST         /api/remote-setup/check-archive-root
 POST         /api/remote-setup/install-key
 POST         /api/remote-setup/list-remote-dirs
 POST         /api/remote-setup/locate-share

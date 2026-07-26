@@ -30862,6 +30862,35 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
     return app
 
 
+def _emit_incompatible_database_exit(e):
+    # Both --load-taxonomy and create_app open the catalog; either can trip
+    # ensure_schema's newer-DB guard, and both need the same guided exit so
+    # the desktop launcher gets a structured signal instead of a raw
+    # traceback.
+    import sys as _sys
+    if getattr(e, "newer", False):
+        log.error(
+            "Cannot open database at %s: it was created by a newer "
+            "version of Vireo than this build supports. Update Vireo to "
+            "its latest version to open this catalog. Underlying error: %s",
+            e.db_path, e.cause,
+        )
+    else:
+        log.error(
+            "Cannot open database at %s: it is from an incompatible older "
+            "version of Vireo. Back it up and remove it to start fresh "
+            "(e.g. `mv %s %s.bak`), then relaunch. Underlying error: %s",
+            e.db_path, e.db_path, e.db_path, e.cause,
+        )
+    _sys.stderr.write(json.dumps({
+        "error": "incompatible_database",
+        "db_path": e.db_path,
+        "reason": str(e),
+        "newer": getattr(e, "newer", False),
+    }) + "\n")
+    raise SystemExit(3) from e
+
+
 def main():
     _setup_file_logging()
 
@@ -30913,6 +30942,14 @@ def main():
     if args.load_taxonomy:
         from db import Database
         from taxonomy import fetch_common_names, load_taxonomy, seed_informal_groups
+        # Run the newer-schema guard before Database(args.db) executes any
+        # legacy DDL/ALTERs against a catalog stamped by a future Vireo build.
+        # create_app takes this same check through ensure_schema; keep the two
+        # entry points in sync so `--load-taxonomy` can't corrupt a newer DB.
+        try:
+            ensure_schema(args.db)
+        except IncompatibleDatabaseError as e:
+            _emit_incompatible_database_exit(e)
         db = Database(args.db)
         log.info("Loading taxonomy tree from iNaturalist...")
         stats = load_taxonomy(db)
@@ -30995,28 +31032,7 @@ def main():
         # as "did not become healthy within 30s"). The atexit/SIGTERM cleanup
         # registered above releases the single-instance lock and runtime.json
         # on this exit, so a retry isn't blocked by a stale reservation.
-        import sys as _sys
-        if getattr(e, "newer", False):
-            log.error(
-                "Cannot open database at %s: it was created by a newer "
-                "version of Vireo than this build supports. Update Vireo to "
-                "its latest version to open this catalog. Underlying error: %s",
-                e.db_path, e.cause,
-            )
-        else:
-            log.error(
-                "Cannot open database at %s: it is from an incompatible older "
-                "version of Vireo. Back it up and remove it to start fresh "
-                "(e.g. `mv %s %s.bak`), then relaunch. Underlying error: %s",
-                e.db_path, e.db_path, e.db_path, e.cause,
-            )
-        _sys.stderr.write(json.dumps({
-            "error": "incompatible_database",
-            "db_path": e.db_path,
-            "reason": str(e),
-            "newer": getattr(e, "newer", False),
-        }) + "\n")
-        raise SystemExit(3) from e
+        _emit_incompatible_database_exit(e)
     except Exception as e:
         # Any other failure to build the app is still a fatal startup error
         # (corrupt-but-not-stale DB, missing/locked resource, an unexpected

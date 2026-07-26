@@ -1525,3 +1525,44 @@ def test_ensure_schema_newer_db_raises_incompatible_database_error(tmp_path):
     assert excinfo.value.db_path == db_path
     with sqlite3.connect(db_path) as conn:
         assert conn.execute("PRAGMA user_version").fetchone()[0] == 99
+
+
+def test_load_taxonomy_cli_refuses_newer_db(tmp_path, monkeypatch, capsys):
+    """``--load-taxonomy`` must not run legacy DDL against a catalog stamped
+    by a newer Vireo. Previously it bypassed ensure_schema and constructed
+    Database(args.db) directly, mutating the file and burying the version
+    mismatch in an OperationalError; the guided-exit handler should now fire
+    the same structured signal here as it does for the normal startup path."""
+    import json as _json
+
+    import app as vireo_app
+
+    db_path = str(tmp_path / "vireo.db")
+    schema.ensure_schema(db_path)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("PRAGMA user_version = 99")
+
+    monkeypatch.setattr(
+        "sys.argv",
+        ["vireo", "--db", db_path, "--thumb-dir", str(tmp_path / "thumbs"),
+         "--load-taxonomy"],
+    )
+    # Guard against actually touching the DB or the network if the fix
+    # regresses and control ever reaches Database(args.db)/load_taxonomy.
+    def _boom(*_a, **_kw):  # pragma: no cover - regression guard
+        raise AssertionError("--load-taxonomy touched the DB before ensure_schema")
+
+    monkeypatch.setattr("db.Database", _boom)
+
+    with pytest.raises(SystemExit) as excinfo:
+        vireo_app.main()
+    assert excinfo.value.code == 3
+
+    captured = capsys.readouterr()
+    payload = _json.loads(captured.err.strip().splitlines()[-1])
+    assert payload["error"] == "incompatible_database"
+    assert payload["newer"] is True
+    assert payload["db_path"] == db_path
+
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 99

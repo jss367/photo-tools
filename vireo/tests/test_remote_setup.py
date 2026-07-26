@@ -371,6 +371,7 @@ def test_password_never_in_result_text(tmp_path):
     assert "hunter2" not in repr(res)
 
 
+@pytestmark_pty
 def test_unclassified_failure_redacts_password_from_detail(tmp_path):
     """An unclassified ssh failure (post-auth remote error) may include
     output that echoed the password back — pty ECHO=off is the primary

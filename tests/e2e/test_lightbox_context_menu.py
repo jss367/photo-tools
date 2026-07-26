@@ -397,13 +397,17 @@ def test_mask_toggle_off_detaches_loaded_overlay_image(live_server, page):
         _lbApplyMaskVisibility();
         """
     )
+    # `show` is added from the overlay's onload handler, and Chromium exposes
+    # naturalWidth/complete as soon as the bitmap is decoded — one task tick
+    # before it dispatches the load event. Waiting on naturalWidth alone races
+    # that dispatch, so wait for the class the hide assertions depend on.
     page.wait_for_function(
-        "document.getElementById('lightboxMaskOverlay').naturalWidth > 0",
+        """() => {
+            const el = document.getElementById('lightboxMaskOverlay');
+            return el.naturalWidth > 0 && el.classList.contains('show');
+        }""",
         timeout=3000,
     )
-    assert page.locator("#lightboxMaskOverlay").evaluate(
-        "el => el.classList.contains('show')"
-    ), "loaded mask overlay should be visible before hiding"
 
     page.locator("#lightboxToggleMasks").click()
     assert page.evaluate("localStorage.getItem('vireo.lb.masksVisible')") == "0"

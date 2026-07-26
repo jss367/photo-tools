@@ -21,7 +21,7 @@
 | `vireo/remote_setup.py` | Create | Mount parsing, friendly-name resolution, Vireo key management, pty key install, nonce share-locate, remote dir listing. Pure logic, injectable runner, no Flask imports. |
 | `vireo/tests/test_remote_setup.py` | Create | Unit tests for the module (fake runners, stub pty script). |
 | `vireo/tests/test_remote_setup_api.py` | Create | Endpoint tests via `app_and_db` fixture + monkeypatched `remote_setup`. |
-| `vireo/app.py` | Modify | Five `/api/remote-setup/*` routes + loopback guard (near `api_remote_target_test`, ~line 22134). |
+| `vireo/app.py` | Modify | Six `/api/remote-setup/*` routes + loopback guard (near `api_remote_target_test`, ~line 22134). |
 | `vireo/templates/settings.html` | Modify | "Set up from mounted volume…" button + wizard modal + inline JS (near the remote-targets section, ~line 867, and the editor JS, ~line 1566). |
 | `vireo/templates/import.html` | Modify | Turn the "Move to NAS unavailable…" hint (`updateAfterMoveUI`, ~line 1467) into a link to the wizard. |
 | `tests/e2e/test_nas_setup_wizard.py` | Create | Wizard walk-through with `remote_setup` monkeypatched in the in-process server. |
@@ -84,6 +84,14 @@ def test_parse_nfs_mount():
 
 def test_parse_ignores_non_network_and_garbage():
     assert remote_setup.parse_mount_output(LOCAL + "\nnot a mount line\n") == []
+
+
+def test_parse_afpfs_and_ipv6_hosts():
+    afp = "//julius@mynas._afpovertcp._tcp.local/Media on /Volumes/Media (afpfs, nodev, nosuid, mounted by julius)"
+    v6 = "//admin@[fe80::1%25en0]/Backup on /Volumes/Backup (smbfs, nodev, nosuid, mounted by julius)"
+    rows = remote_setup.parse_mount_output(afp + "\n" + v6)
+    assert rows[0]["fs_type"] == "afpfs" and rows[0]["share"] == "Media"
+    assert rows[1]["host"] == "[fe80::1%en0]" and rows[1]["share"] == "Backup"
 ```
 
 - [ ] **Step 2: Run** `python -m pytest vireo/tests/test_remote_setup.py -q` — expect FAIL (`ModuleNotFoundError` / `AttributeError`).
@@ -262,9 +270,12 @@ umask 077; mkdir -p ~/.ssh; touch ~/.ssh/authorized_keys; grep -qxF <quoted pubk
 ```python
 STUB = r'''#!/usr/bin/env python3
 import sys
-mode = sys.argv[1]  # test passes: ok | wrongpw | nopw
+mode = sys.argv[1]  # test passes: ok | wrongpw | nopw | hostkey
 if mode == "nopw":
     sys.stderr.write("admin@nas: Permission denied (publickey).\n")
+    sys.exit(255)
+if mode == "hostkey":
+    sys.stderr.write("Host key verification failed.\n")
     sys.exit(255)
 sys.stderr.write("admin@nas's password: ")
 sys.stderr.flush()
@@ -295,6 +306,12 @@ def test_install_key_wrong_password(tmp_path):
     assert res["ok"] is False and res["error"] == "wrong_password"
 
 
+def test_install_key_host_key_rejected(tmp_path):
+    res = remote_setup.install_key_with_password(
+        spawn_argv=_stub(tmp_path, "hostkey"), password="x", timeout=15)
+    assert res["ok"] is False and res["error"] == "host_key"
+
+
 def test_install_key_password_auth_disabled(tmp_path):
     res = remote_setup.install_key_with_password(
         spawn_argv=_stub(tmp_path, "nopw"), password="x", timeout=15)
@@ -310,8 +327,8 @@ def test_password_never_in_result_or_exception_text(tmp_path):
 - [ ] **Step 2: Run — FAIL.**
 - [ ] **Step 3: Implement** `install_key_with_password(spawn_argv, password, timeout=30)`:
   - `pty.openpty()`; `subprocess.Popen(spawn_argv, stdin=slave, stdout=slave, stderr=slave, start_new_session=True)`; close slave in parent.
-  - Loop: `select.select([master], [], [], deadline-remaining)`; accumulate decoded output (replace errors). On buffer matching `re.search(r"[Pp]assword.*: ?$", tail)`: first prompt → write `password + "\n"`; **second** prompt → wrong password: kill process, return `{"ok": False, "error": "wrong_password"}`.
-  - On EOF/exit: rc 0 → ok. Output containing `Permission denied (publickey` (no password prompt ever shown) → `password_auth_disabled`. Host-key verification text → `host_key`. Anything else → `{"ok": False, "error": "ssh_failed", "detail": <output tail, max ~400 chars>}`.
+  - Loop: `select.select([master], [], [], deadline-remaining)`; accumulate decoded output (replace errors). Count password prompts (`re.findall(r"[Pp]assword[^\n]*:", output)`): on the first prompt → write `password + "\n"`; a second prompt at any point (live read OR post-EOF accumulated output) → wrong password: kill process if alive, return `{"ok": False, "error": "wrong_password"}`.
+  - On EOF/exit: rc 0 → ok. Classify from the **accumulated output**, not just the live reads (the stub prints its second prompt and exits immediately, so prompt+EOF can arrive in one read): ≥2 password prompts observed → `wrong_password`; `Permission denied (publickey` with no password prompt ever shown → `password_auth_disabled`; `Host key verification failed` → `host_key`; anything else → `{"ok": False, "error": "ssh_failed", "detail": <output tail, max ~400 chars>}`.
   - Timeout → kill, `{"ok": False, "error": "timeout"}`.
   - Never put the password into logs, exceptions, or the returned dict. `del password` before returning is cosmetic — the real rule is simply never to log it; note this in a comment.
   - A small pure helper `build_install_argv(host, user, port, key_pub_line, ssh_bin)` assembles the argv (unit-testable without pty): base ssh args **without** BatchMode (password prompts must reach the pty) but **with** `accept-new`, plus the quoted append snippet. Add a direct test asserting BatchMode is absent and the snippet greps before appending.
@@ -377,7 +394,7 @@ def test_list_remote_dirs_parses_and_quotes(tmp_path):
 - [ ] **Step 2: Run — FAIL.**
 - [ ] **Step 3: Implement.**
   - `class MountNotWritable(RuntimeError)`.
-  - `locate_share(...)`: nonce = `".vireo-probe-" + secrets.token_hex(8)`; write it inside `mount_point` (wrap `OSError`/`PermissionError` → `MountNotWritable`); `try/finally` unlink (missing-ok). One ssh command with `S=<shlex.quote(share)>` and candidates `/volume*/"$S" /share/"$S" /shares/"$S" /mnt/*/"$S" /srv/*/"$S"`, `[ -e "$p/<nonce>" ] && { echo "FOUND:$p"; break; }` — parse the `FOUND:` line. `timeout=20` on the run.
+  - `locate_share(...)`: nonce = `".vireo-probe-" + secrets.token_hex(8)`; write it inside `mount_point` (wrap `OSError`/`PermissionError` → `MountNotWritable`); `try/finally` unlink (missing-ok). Cleanup is mount-side only — a deliberate narrowing of the spec's "best-effort over SSH too": it's the same file either way, and the mount is by definition writable once the nonce was written. One ssh command with `S=<shlex.quote(share)>` and candidates `/volume*/"$S" /share/"$S" /shares/"$S" /mnt/*/"$S" /srv/*/"$S"`, `[ -e "$p/<nonce>" ] && { echo "FOUND:$p"; break; }` — parse the `FOUND:` line. `timeout=20` on the run.
   - `list_remote_dirs(...)`: `find <quoted path> -mindepth 1 -maxdepth 1 -type d -exec basename {} \;` (avoids `ls -p` symlink ambiguity), sorted casefolded; return `[]` on nonzero rc.
 - [ ] **Step 4: Run — PASS.**  **Step 5: Commit** `feat: nonce-verified share location and remote dir listing`.
 
@@ -410,17 +427,23 @@ def test_mounts_endpoint_returns_parsed_mounts(app_and_db, monkeypatch):
     assert res.get_json()["mounts"][0]["share"] == "Photos"
 
 
-def test_ssh_check_reports_port_key_and_auth(app_and_db, monkeypatch):
+def test_ssh_check_reports_port_auth_and_pubkey(app_and_db, monkeypatch, tmp_path):
+    # ssh-check ensures the Vireo key exists (idempotent, local-only) and
+    # returns its public line — the Terminal-fallback expander needs it
+    # WITHOUT ever calling install-key (no password submitted).
     app, _db = app_and_db
     import remote_setup
+    pub = tmp_path / "vireo_ed25519.pub"
+    pub.write_text("ssh-ed25519 AAAA vireo\n")
     monkeypatch.setattr(remote_setup, "port_reachable", lambda host, port, timeout=5: True)
-    monkeypatch.setattr(remote_setup, "vireo_key_paths", lambda: ("/k", "/k.pub"))
-    monkeypatch.setattr(os.path, "exists", os.path.exists)  # key_exists computed in endpoint via os.path.exists("/k")
+    monkeypatch.setattr(remote_setup, "ensure_vireo_key",
+                        lambda **kw: (str(tmp_path / "vireo_ed25519"), str(pub)))
     monkeypatch.setattr(remote_setup, "key_auth_works", lambda **kw: False)
     res = app.test_client().post("/api/remote-setup/ssh-check",
         json={"host": "nas", "port": 22, "user": "admin"})
     body = res.get_json()
     assert body["port_open"] is True and body["key_auth_ok"] is False
+    assert body["pub_key_line"] == "ssh-ed25519 AAAA vireo"
 
 
 def test_ssh_check_validates_input(app_and_db):
@@ -446,7 +469,6 @@ def test_install_key_happy_path_never_echoes_password(app_and_db, monkeypatch):
     monkeypatch.setattr(remote_setup, "install_key_with_password",
                         lambda **kw: {"ok": True, "error": None})
     monkeypatch.setattr(remote_setup, "key_auth_works", lambda **kw: True)
-    monkeypatch.setattr("builtins.open", open)
     res = app.test_client().post("/api/remote-setup/install-key",
         json={"host": "nas", "user": "a", "port": 22, "password": "hunter2"})
     body = res.get_json()
@@ -479,11 +501,12 @@ def test_locate_share_readonly_mount_is_clean_error(app_and_db, monkeypatch, tmp
 ```
 
 - [ ] **Step 2: Run — FAIL** (404s).
-- [ ] **Step 3: Implement the five routes** in `app.py`. Shared shape:
+- [ ] **Step 3: Implement the six routes** in `app.py`. Shared shape:
   - `_remote_setup_loopback_guard()` helper: `request.remote_addr not in ("127.0.0.1", "::1")` → `json_error("remote setup is only available from this machine", 403)`. Applied to **all** `/api/remote-setup/*` routes (cheapest consistent rule; the app binds loopback via waitress anyway — this is defense in depth).
   - `GET /api/remote-setup/mounts` → `{"mounts": remote_setup.list_network_mounts()}` (platform gate: non-darwin returns `{"mounts": [], "unsupported_platform": True}`).
-  - `POST /api/remote-setup/ssh-check` `{host, port, user}` (validate host/user non-empty, port int 1–65535) → `{"port_open", "key_exists", "key_auth_ok"}`. `port_open` via new `remote_setup.port_reachable(host, port, timeout=5)` (plain `socket.create_connection`; add a unit test in Task 6 too — fake socket via monkeypatch). `key_auth_ok` only probed when the key exists; `ssh_bin` resolved via `move_mod.resolve_ssh_bin(effective_cfg.get("ssh_bin", ""))` exactly like `api_remote_target_test`; `key_auth_ok` is `False` with `"ssh_missing": True` when no ssh binary resolves.
+  - `POST /api/remote-setup/ssh-check` `{host, port, user}` (validate host/user non-empty, port int 1–65535) → `{"port_open", "key_auth_ok", "pub_key_line"}`. This endpoint calls `remote_setup.ensure_vireo_key()` (idempotent, local-only, no network) and reads the public line — the Terminal-fallback expander builds its one-liner from `pub_key_line` and must work without install-key ever being called. `port_open` via new `remote_setup.port_reachable(host, port, timeout=5)` (plain `socket.create_connection`; unit test with a monkeypatched socket). `ssh_bin` resolved via `move_mod.resolve_ssh_bin(effective_cfg.get("ssh_bin", ""))` exactly like `api_remote_target_test`; `key_auth_ok` is `False` with `"ssh_missing": True` when no ssh binary resolves.
   - `POST /api/remote-setup/install-key` `{host, port, user, password}` → ensure key, `build_install_argv`, `install_key_with_password`, then verify with `key_auth_works`; response `{"ok", "error", "fingerprint"}` (fingerprint via `ssh-keygen -lf pub`, best-effort). The password variable is request-scoped; never logged (request-timing logs only record the URL — confirm no body logging on this path).
+  - `GET /api/remote-setup/disk-free?path=` → `{"free_bytes": shutil.disk_usage(path).free}` for the archive-root step's free-space readout; 400 on non-absolute or missing path. One test: create a tmp dir, assert `free_bytes > 0`.
   - `POST /api/remote-setup/locate-share` `{mount_path, share, host, port, user}` → validate `mount_path` is an absolute existing dir; map `MountNotWritable` → 400 with a "mount is not writable" message; result `{"remote_path": ... or None}`.
   - `POST /api/remote-setup/list-remote-dirs` `{path, host, port, user}` → `{"dirs": [...]}` for the fallback browser.
 - [ ] **Step 4: Run — PASS.** Also run the neighbors: `python -m pytest vireo/tests/test_app.py -q` (no route collisions).
@@ -502,9 +525,9 @@ No unit tests (vanilla JS in template, covered by Task 9 e2e). Structure — fol
 - [ ] **Step 2: Modal skeleton** appended near the page's other overlays: `#nasWizard` fixed overlay, one step container per spec step (`data-step="volume|ssh|share|archive|review"`), Back/Next footer, close ×. Step state machine in JS: `_nwState = {step, mounts, mount, host, port, user, keyExists, keyAuthOk, remotePath, archiveRoot, name}`.
 - [ ] **Step 3: Step logic**, one function per step:
   - `nwLoadMounts()` → `GET /api/remote-setup/mounts`; zero mounts → guidance ("connect in Finder ⌘K") + Refresh; one → preselect and advance enabled.
-  - `nwSshStep()` → editable user/host/port prefilled from mount (`friendly_host` preferred, IP shown as hint); on entry call `ssh-check`; port closed → Synology-aware help text (detect via `display_name`/`share` heuristic `/synology|diskstation/i`, generic otherwise) + Retry. `key_auth_ok` already true → skip password UI, auto-advance ("This Mac is already authorized ✓"). Password form posts `install-key`; map `error` codes to messages (`wrong_password` → retry with field cleared; `password_auth_disabled` → point at the Terminal expander; `timeout`/`ssh_failed` → show detail). Terminal expander shows the equivalent one-liner (built client-side from state: `ssh user@host` + append snippet with the actual pubkey — fetch the pubkey line from the install-key response's new `pub_key_line` field, added in Task 6's endpoint; include it there) and a **Verify** button that re-runs `ssh-check` until `key_auth_ok`.
+  - `nwSshStep()` → editable user/host/port prefilled from mount (`friendly_host` preferred, IP shown as hint); on entry call `ssh-check`; port closed → Synology-aware help text (detect via `display_name`/`share` heuristic `/synology|diskstation/i`, generic otherwise) + Retry. `key_auth_ok` already true → skip password UI, auto-advance ("This Mac is already authorized ✓"). Password form posts `install-key`; map `error` codes to messages (`wrong_password` → retry with field cleared; `password_auth_disabled` → point at the Terminal expander; `timeout`/`ssh_failed` → show detail). Terminal expander shows the equivalent one-liner (built client-side from state: `ssh user@host` + append snippet with the actual pubkey, taken from `ssh-check`'s `pub_key_line` — available before and without any password submission) and a **Verify** button that re-runs `ssh-check` until `key_auth_ok`.
   - `nwShareStep()` → auto-runs `locate-share`; found → green "Verified: /volume1/Photography" + Next; not found → fallback mini-browser (`list-remote-dirs`, drill-down list starting at `/`, plus a manual text input); read-only-mount 400 → its own error text.
-  - `nwArchiveStep()` → folder picker on `/api/browse` + `/api/browse/mkdir` (compact list: current path, subdirs, "New folder" inline input), default suggestion `<home>/Pictures/Vireo Archive` (home = the `path` returned by parameterless `/api/browse`); "create it" action; free-space line (add `free_bytes` of the containing volume to the archive step via a tiny `GET /api/remote-setup/disk-free?path=` — **no**: YAGNI, reuse client-side `navigator` is impossible; instead extend `locate-share`? Simplest honest option: add `free_gb` to the `/api/browse` response? Don't touch a shared endpoint for this — **drop the free-space readout to a follow-up if it needs new surface area**; the spec lists it, so implement it as `GET /api/remote-setup/disk-free` returning `shutil.disk_usage(path).free` — 5 lines + 1 test in Task 6's file). Validation mirror: absolute, not inside mount (client-side check copying `collectRemoteTargets`' spirit; server re-validates on save anyway).
+  - `nwArchiveStep()` → folder picker on `/api/browse` + `/api/browse/mkdir` (compact list: current path, subdirs, "New folder" inline input), default suggestion `<home>/Pictures/Vireo Archive` (home = the `path` returned by parameterless `/api/browse`); "create it" action; free-space line from `GET /api/remote-setup/disk-free?path=` (built in Task 6). Validation mirror: absolute, not inside mount (client-side check copying `collectRemoteTargets`' spirit; server re-validates on save anyway).
   - `nwReviewStep()` → assembled card (name defaulted from `display_name` or share; `bwlimit_kbps: 0`; `ssh_key`: the wizard key path); auto-POST `/api/remote-targets/test` with the assembled target; per-check lines from its response (`ssh`, `remote_path_writable`, `rsync_ok`, `remote_rsync_ok`, mount presence); failures link back ("Fix connection" → step 2, "Fix path" → step 3). Save = push into `_remoteTargetsState` + `renderRemoteTargets()` + `saveConfig()` (the existing config-save path), close, scroll to the new card.
 - [ ] **Step 4: Deep link.** On settings page load: `location.hash === "#nas-setup"` → `openNasWizard()`.
 - [ ] **Step 5: Manual smoke** (see Task 10) then **commit** `feat: NAS setup wizard modal on the settings page`.

@@ -34,7 +34,9 @@ pub enum SidecarStartError {
 impl std::fmt::Display for SidecarStartError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::IncompatibleDatabase { db_path, reason, .. } => {
+            Self::IncompatibleDatabase {
+                db_path, reason, ..
+            } => {
                 write!(f, "Incompatible database at {}: {}", db_path, reason)
             }
             Self::Generic(msg) => f.write_str(msg),
@@ -596,7 +598,11 @@ mod tests {
     fn parse_structured_error_recognizes_incompatible_database() {
         let line = r#"{"error":"incompatible_database","db_path":"/home/u/.vireo/vireo.db","reason":"no such column: classifier_model"}"#;
         match parse_structured_error(line) {
-            Some(SidecarStartError::IncompatibleDatabase { db_path, reason, newer }) => {
+            Some(SidecarStartError::IncompatibleDatabase {
+                db_path,
+                reason,
+                newer,
+            }) => {
                 assert_eq!(db_path, "/home/u/.vireo/vireo.db");
                 assert!(reason.contains("classifier_model"));
                 assert!(!newer);

@@ -9,6 +9,7 @@ import concurrent.futures
 import ipaddress
 import os
 import re
+import secrets
 import select
 import shlex
 import socket
@@ -233,6 +234,78 @@ def install_key_with_password(spawn_argv, password, timeout=30):
         return {"ok": False, "error": "password_auth_disabled"}
     return {"ok": False, "error": "ssh_failed",
             "detail": output[-400:].strip()}
+
+
+class MountNotWritable(RuntimeError):
+    """The local mount refused the nonce write — the wizard needs a
+    writable share (so does the move workflow it is setting up)."""
+
+
+def _ssh_exec(host, user, port, key, ssh_bin, command, run, timeout=20):
+    argv = ([ssh_bin] + _ssh_option_args(port, key)
+            + [f"{user}@{host}", command])
+    return run(argv, capture_output=True, text=True, timeout=timeout)
+
+
+# Candidate export roots checked for the share, in likelihood order:
+# Synology (/volume*), QNAP (/share, /shares), TrueNAS/generic (/mnt/*),
+# plain Linux servers (/srv/*).
+_SHARE_CANDIDATE_ROOTS = '/volume*/"$S" /share/"$S" /shares/"$S" /mnt/*/"$S" /srv/*/"$S"'
+
+
+def locate_share(mount_point, share, host, user, port, key, ssh_bin,
+                 run=subprocess.run):
+    """Prove which NAS-side directory backs ``mount_point``.
+
+    Writes a nonce file through the mount, then asks the NAS (over SSH)
+    which candidate share directory contains that exact file. A match is
+    the verified remote path — heuristics could pick a same-named share on
+    the wrong volume, and the chained move DELETES local originals, so
+    only proof is acceptable here. Returns None when no candidate matched.
+    """
+    nonce = ".vireo-probe-" + secrets.token_hex(8)
+    nonce_path = os.path.join(mount_point, nonce)
+    try:
+        with open(nonce_path, "w") as f:
+            f.write("vireo share-locate probe; safe to delete\n")
+    except OSError as exc:
+        raise MountNotWritable(str(exc)) from exc
+    try:
+        cmd = (f"S={shlex.quote(share)}; "
+               f"for p in {_SHARE_CANDIDATE_ROOTS}; do "
+               f'[ -e "$p/{nonce}" ] && {{ echo "FOUND:$p"; break; }}; '
+               f"done; true")
+        try:
+            r = _ssh_exec(host, user, port, key, ssh_bin, cmd, run)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        for line in (r.stdout or "").splitlines():
+            if line.startswith("FOUND:"):
+                return line[len("FOUND:"):].strip() or None
+        return None
+    finally:
+        # Mount-side cleanup only: the nonce lives on the share, so this
+        # removes it regardless of which NAS path it appeared at.
+        try:
+            os.unlink(nonce_path)
+        except OSError:
+            pass
+
+
+def list_remote_dirs(path, host, user, port, key, ssh_bin,
+                     run=subprocess.run):
+    """Immediate subdirectory names of ``path`` on the NAS, for the
+    fallback browser when the nonce probe finds nothing."""
+    cmd = (f"find {shlex.quote(path)} -mindepth 1 -maxdepth 1 -type d "
+           f"-exec basename {{}} \\;")
+    try:
+        r = _ssh_exec(host, user, port, key, ssh_bin, cmd, run)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if r.returncode != 0:
+        return []
+    names = [n for n in (r.stdout or "").splitlines() if n.strip()]
+    return sorted(names, key=str.casefold)
 
 
 def list_network_mounts(run=subprocess.run, resolver=None):

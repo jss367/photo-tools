@@ -199,6 +199,69 @@ def test_password_never_in_result_text(tmp_path):
     assert "hunter2" not in repr(res)
 
 
+# --- Nonce share-locate + remote dir listing ------------------------------
+
+
+def test_locate_share_writes_nonce_probes_and_cleans_up(tmp_path):
+    mount = tmp_path / "mnt"
+    mount.mkdir()
+    seen = {}
+
+    def fake_run(argv, **kw):
+        seen["cmd"] = argv[-1]
+        # Server-side: pretend /volume1/Photography contains the nonce.
+        return subprocess.CompletedProcess(
+            argv, 0, stdout="FOUND:/volume1/Photography\n", stderr="")
+
+    path = remote_setup.locate_share(
+        mount_point=str(mount), share="Photography",
+        host="nas", user="admin", port=22, key="/k", ssh_bin="ssh",
+        run=fake_run)
+    assert path == "/volume1/Photography"
+    assert ".vireo-probe-" in seen["cmd"] and "/volume*/" in seen["cmd"]
+    assert list(mount.iterdir()) == []          # nonce cleaned up
+
+
+def test_locate_share_no_match_returns_none_and_cleans_up(tmp_path):
+    mount = tmp_path / "mnt"
+    mount.mkdir()
+    fake_run = FakeRun(stdout="")               # no candidate matched
+    assert remote_setup.locate_share(
+        mount_point=str(mount), share="Photography", host="nas",
+        user="admin", port=22, key="/k", ssh_bin="ssh", run=fake_run) is None
+    assert list(mount.iterdir()) == []
+
+
+@pytest.mark.skipif(hasattr(os, "geteuid") and os.geteuid() == 0,
+                    reason="root ignores directory write bits")
+def test_locate_share_readonly_mount_raises(tmp_path):
+    mount = tmp_path / "mnt"
+    mount.mkdir()
+    mount.chmod(0o500)          # no write bit — nonce write must fail cleanly
+    try:
+        with pytest.raises(remote_setup.MountNotWritable):
+            remote_setup.locate_share(
+                mount_point=str(mount), share="S", host="h", user="u",
+                port=22, key="", ssh_bin="ssh", run=FakeRun())
+    finally:
+        mount.chmod(0o700)      # let pytest clean tmp_path up
+
+
+def test_list_remote_dirs_parses_and_quotes(tmp_path):
+    run = FakeRun(stdout="Raw Files\nExports\n")
+    dirs = remote_setup.list_remote_dirs(
+        path="/volume1/My Photos", host="nas", user="admin", port=22,
+        key="", ssh_bin="ssh", run=run)
+    assert dirs == ["Exports", "Raw Files"]
+    assert "'/volume1/My Photos'" in run.calls[0][-1]
+
+
+def test_list_remote_dirs_empty_on_error():
+    assert remote_setup.list_remote_dirs(
+        path="/nope", host="h", user="u", port=22, key="", ssh_bin="ssh",
+        run=FakeRun(returncode=255)) == []
+
+
 def test_build_install_argv_no_batchmode_and_idempotent_append():
     argv = remote_setup.build_install_argv(
         host="nas", user="admin", port=22,

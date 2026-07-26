@@ -4,7 +4,7 @@
 
 **Goal:** A guided Settings-page wizard that takes a user from a Finder-mounted NAS share to a tested, saved remote target — auto-detecting mounts, installing an SSH key, and proving the NAS-side path with a nonce probe — without Terminal or hand-typed absolute paths.
 
-**Architecture:** One new pure-logic module `vireo/remote_setup.py` with an injectable command-runner seam (mirroring `move.py`), four new synchronous `/api/remote-setup/*` endpoints in `app.py`, a wizard modal inline in `settings.html` (project convention: one file per page, inline JS), and a deep-link from the Import page's "Move to NAS unavailable" hint. Spec: `docs/superpowers/specs/2026-07-26-nas-setup-wizard-design.md`.
+**Architecture:** One new pure-logic module `vireo/remote_setup.py` with an injectable command-runner seam (mirroring `move.py`), six new synchronous `/api/remote-setup/*` endpoints in `app.py`, a wizard modal inline in `settings.html` (project convention: one file per page, inline JS), and a deep-link from the Import page's "Move to NAS unavailable" hint. Spec: `docs/superpowers/specs/2026-07-26-nas-setup-wizard-design.md`.
 
 **Tech Stack:** Python 3 / Flask, `pty` + `select` for the password-driven key install, vanilla JS + existing `safeFetch`, pytest with the `app_and_db` fixture (`vireo/tests/conftest.py`).
 
@@ -371,11 +371,9 @@ def test_locate_share_no_match_returns_none_and_cleans_up(tmp_path):
     assert list(mount.iterdir()) == []
 
 
-def test_locate_share_readonly_mount_raises(tmp_path, monkeypatch):
+def test_locate_share_readonly_mount_raises(tmp_path):
     mount = tmp_path / "mnt"; mount.mkdir()
-    def deny(*a, **k):
-        raise PermissionError("read-only")
-    monkeypatch.setattr("builtins.open", deny)
+    mount.chmod(0o500)          # no write bit — nonce write must fail cleanly
     with pytest.raises(remote_setup.MountNotWritable):
         remote_setup.locate_share(
             mount_point=str(mount), share="S", host="h", user="u",
@@ -552,7 +550,7 @@ No unit tests (vanilla JS in template, covered by Task 9 e2e). Structure — fol
 
 The e2e server runs in-process (`tests/e2e/conftest.py` uses `make_server`), so monkeypatch `remote_setup` module functions in the fixture — no real ssh anywhere.
 
-- [ ] **Step 1:** Fixture: patch `list_network_mounts` (one smbfs row), `port_reachable` (True), `ensure_vireo_key`/`build_install_argv`/`install_key_with_password` (success)/`key_auth_works` (False until install called, True after — a tiny stateful fake), `locate_share` ("/volume1/Photography"), and `move.test_remote_connection` (all-green dict). Follow the existing e2e patching idiom in that conftest.
+- [ ] **Step 1:** Fixture: patch `list_network_mounts` (one smbfs row), `port_reachable` (True), `ensure_vireo_key` (must return a path to a **real** pub file on disk in the test home — the ssh-check route reads it for `pub_key_line`), `build_install_argv`/`install_key_with_password` (success)/`key_auth_works` (False until install called, True after — a tiny stateful fake), `locate_share` ("/volume1/Photography"), and `move.test_remote_connection` (all-green dict). Follow the existing e2e patching idiom in that conftest.
 - [ ] **Step 2:** Test A — happy path: open `/settings`, click "Set up from mounted volume…", walk all five steps (select mount → password `sekret` → verified share → pick archive root via the picker into a tmp dir → review shows green → Save), assert the new target card renders in the remote-targets list and `GET /api/config` now contains the target with `ssh_key` = wizard key path and `bwlimit_kbps` 0.
 - [ ] **Step 3:** Test B — Terminal fallback branch: stateful fake starts with `install_key_with_password` unused; expand the fallback, flip the fake's auth state, click Verify, assert the wizard advances without ever calling `install_key_with_password`.
 - [ ] **Step 4:** Run `python -m pytest tests/e2e/test_nas_setup_wizard.py -v` — PASS. **Commit** `test: e2e coverage for the NAS setup wizard`.

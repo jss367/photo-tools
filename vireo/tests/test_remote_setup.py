@@ -139,6 +139,22 @@ def test_key_auth_works_false_on_denied(tmp_path):
         run=run) is False
 
 
+def test_port_reachable(monkeypatch):
+    class FakeSock:
+        def close(self):
+            pass
+
+    monkeypatch.setattr(remote_setup.socket, "create_connection",
+                        lambda addr, timeout: FakeSock())
+    assert remote_setup.port_reachable("nas", 22) is True
+
+    def refuse(addr, timeout):
+        raise OSError("refused")
+
+    monkeypatch.setattr(remote_setup.socket, "create_connection", refuse)
+    assert remote_setup.port_reachable("nas", 22) is False
+
+
 # --- Password-driven key install (pty) ------------------------------------
 
 

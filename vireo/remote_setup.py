@@ -236,6 +236,16 @@ def install_key_with_password(spawn_argv, password, timeout=30):
             "detail": output[-400:].strip()}
 
 
+def port_reachable(host, port, timeout=5):
+    """True when a TCP connection to host:port succeeds within timeout."""
+    try:
+        sock = socket.create_connection((host, int(port)), timeout=timeout)
+    except (OSError, ValueError):
+        return False
+    sock.close()
+    return True
+
+
 class MountNotWritable(RuntimeError):
     """The local mount refused the nonce write — the wizard needs a
     writable share (so does the move workflow it is setting up)."""

@@ -459,13 +459,23 @@ def list_remote_dirs(path, host, user, port, key, ssh_bin,
 
 
 def list_network_mounts(run=subprocess.run, resolver=None):
-    """Enumerate mounted network shares, each with a display-friendly host."""
+    """Enumerate mounted network shares, each with a display-friendly host.
+
+    Reverse-DNS results are memoized per unique host across the rows, so N
+    shares from the same IP-based NAS cost one PTR lookup instead of N.
+    Without this, a single unresponsive PTR server would stall the mounts
+    endpoint by ``2s × number_of_shares`` (the ``_reverse_dns`` cap).
+    """
     try:
         r = run(["mount"], capture_output=True, text=True, timeout=10)
     except (OSError, subprocess.SubprocessError):
         return []
     rows = parse_mount_output(r.stdout or "")
+    friendly_by_host = {}
     for row in rows:
-        row["friendly_host"] = friendly_host_name(row["host"], resolver=resolver)
+        host = row["host"]
+        if host not in friendly_by_host:
+            friendly_by_host[host] = friendly_host_name(host, resolver=resolver)
+        row["friendly_host"] = friendly_by_host[host]
         row["display_name"] = row["friendly_host"].split(".", 1)[0]
     return rows

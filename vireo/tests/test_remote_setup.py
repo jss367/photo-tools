@@ -95,6 +95,27 @@ def test_list_network_mounts_runs_mount_and_resolves():
     assert rows[0]["display_name"] == "synology-nas"
 
 
+def test_list_network_mounts_caches_reverse_dns_per_host():
+    # Two shares on the same IP-based NAS + one share on a different NAS:
+    # the resolver must be called exactly once per unique host so that a
+    # slow (2s-capped) PTR lookup can't stall the wizard by N × 2s.
+    same_host_a = "//u@100.80.236.59/Photography on /Volumes/Photography (smbfs, nodev, nosuid, mounted by j)"
+    same_host_b = "//u@100.80.236.59/Video on /Volumes/Video (smbfs, nodev, nosuid, mounted by j)"
+    other_host = "//u@100.80.236.60/Backup on /Volumes/Backup (smbfs, nodev, nosuid, mounted by j)"
+    run = FakeRun(stdout="\n".join([same_host_a, same_host_b, other_host]))
+    calls = []
+
+    def resolver(ip):
+        calls.append(ip)
+        return {"100.80.236.59": "nas-a.ts.net",
+                "100.80.236.60": "nas-b.ts.net"}[ip]
+
+    rows = remote_setup.list_network_mounts(run=run, resolver=resolver)
+    assert [r["friendly_host"] for r in rows] == [
+        "nas-a.ts.net", "nas-a.ts.net", "nas-b.ts.net"]
+    assert sorted(calls) == ["100.80.236.59", "100.80.236.60"]
+
+
 def test_friendly_host_passthrough_for_hostnames_and_failed_reverse():
     # Non-IP hosts pass through; resolver failures fall back to the raw host.
     assert remote_setup.friendly_host_name("mynas.local", resolver=None) == "mynas.local"

@@ -1299,3 +1299,51 @@ def test_export_import_round_trip_keeps_secrets_and_omits_marker(app_and_db):
     raw = cfg._read_raw()
     assert raw.get("google_maps_api_key") == "maps_LOCAL"
     assert "_secrets_omitted" not in raw
+
+
+# ---------------------------------------------------------------------------
+# Corrupt-config preservation via schema-driven write paths
+# ---------------------------------------------------------------------------
+
+
+def test_patch_global_preserves_corrupt_config_before_overwrite(app_and_db):
+    """If ``config.json`` becomes corrupt while Vireo is running, the next
+    PATCH must copy the current bytes to ``config.json.corrupt`` before the
+    read-modify-write path overwrites the file — otherwise the user's
+    original settings are silently lost."""
+    app, _ = app_and_db
+    import config as cfg
+
+    corrupt_body = '{"classification_threshold": 0.9, TRUNCATED'
+    with open(cfg.CONFIG_PATH, "w") as f:
+        f.write(corrupt_body)
+
+    client = app.test_client()
+    resp = client.patch(
+        "/api/settings/global",
+        json={"key": "classification_threshold", "value": 0.31},
+    )
+    assert resp.status_code == 200
+    # New value landed on disk.
+    assert cfg.load()["classification_threshold"] == 0.31
+    # The pre-corruption bytes survive next to the file so the user isn't
+    # left with only near-defaults.
+    with open(cfg.CONFIG_PATH + ".corrupt") as f:
+        assert f.read() == corrupt_body
+
+
+def test_delete_global_preserves_corrupt_config_before_overwrite(app_and_db):
+    """DELETE uses the same read-modify-write path — a corrupt file must be
+    preserved before it's silently rewritten to defaults."""
+    app, _ = app_and_db
+    import config as cfg
+
+    corrupt_body = "not json at all }}}"
+    with open(cfg.CONFIG_PATH, "w") as f:
+        f.write(corrupt_body)
+
+    client = app.test_client()
+    resp = client.delete("/api/settings/global/classification_threshold")
+    assert resp.status_code == 200
+    with open(cfg.CONFIG_PATH + ".corrupt") as f:
+        assert f.read() == corrupt_body

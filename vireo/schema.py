@@ -12,6 +12,7 @@ import glob
 import json
 import logging
 import os
+import re
 import sqlite3
 import threading
 from collections.abc import Callable
@@ -972,6 +973,9 @@ def _snapshot_before_migrations(db_path, target_version):
             os.remove(tmp)
 
 
+_BACKUP_SUFFIX_RE = re.compile(r"\.pre-v(\d+)\.bak\Z")
+
+
 def _prune_stale_backups(db_path, keep_version):
     # If the target-version snapshot never landed (VACUUM INTO failed, the
     # volume filled up, etc.), keep every older `.pre-v*.bak` — deleting them
@@ -979,10 +983,27 @@ def _prune_stale_backups(db_path, keep_version):
     keep = _backup_path(db_path, keep_version)
     if not os.path.exists(keep):
         return
-    for path in glob.glob(glob.escape(db_path) + ".pre-v*.bak"):
-        if path != keep:
-            with contextlib.suppress(OSError):
-                os.remove(path)
+    prefix = db_path
+    for path in glob.glob(glob.escape(prefix) + ".pre-v*.bak"):
+        if path == keep:
+            continue
+        # Only prune snapshots for schema versions strictly older than the one
+        # we're keeping. A `.pre-v{N}.bak` where N > keep_version was produced
+        # by a newer build (e.g. after the user restored an older live catalog
+        # while a later-version backup remained on disk) and may hold the
+        # user's only copy of edits made under that later schema.
+        suffix = path[len(prefix):]
+        match = _BACKUP_SUFFIX_RE.match(suffix)
+        if match is None:
+            continue
+        try:
+            version = int(match.group(1))
+        except ValueError:
+            continue
+        if version >= keep_version:
+            continue
+        with contextlib.suppress(OSError):
+            os.remove(path)
 
 
 def ensure_schema(db_path):

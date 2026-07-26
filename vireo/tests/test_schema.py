@@ -1566,3 +1566,30 @@ def test_load_taxonomy_cli_refuses_newer_db(tmp_path, monkeypatch, capsys):
 
     with sqlite3.connect(db_path) as conn:
         assert conn.execute("PRAGMA user_version").fetchone()[0] == 99
+
+
+def test_ensure_schema_keeps_later_version_snapshots(tmp_path):
+    """Restoring an older live database while a later-version backup remains
+    (e.g. `.pre-v9.bak` beside a v7 file, then launching this v8 build) must
+    keep the newer snapshot — it may hold the user's only copy of edits made
+    under that later schema. Only strictly older snapshots may be pruned."""
+    import os
+
+    db_path = str(tmp_path / "vireo.db")
+    schema.ensure_schema(db_path)
+    latest = schema.MIGRATIONS[-1].version
+    older_backup = f"{db_path}.pre-v{latest - 1}.bak"
+    newer_backup = f"{db_path}.pre-v{latest + 1}.bak"
+    with open(older_backup, "w") as f:
+        f.write("older snapshot")
+    with open(newer_backup, "w") as f:
+        f.write("later-version snapshot")
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("PRAGMA user_version = 7")
+
+    schema.ensure_schema(db_path)
+
+    assert os.path.exists(f"{db_path}.pre-v{latest}.bak")
+    assert not os.path.exists(older_backup)
+    # The later-version backup must survive — it may be irreplaceable.
+    assert os.path.exists(newer_backup)

@@ -1660,3 +1660,58 @@ def test_remote_target_archive_root_inside_mount_via_case_alias_is_blanked(
     assert coerced is not None
     assert coerced["local_archive_root"] == ""
     assert coerced["mount_path"] == str(mount)
+
+
+def test_load_preserves_corrupt_file_copy(tmp_path):
+    """A corrupt config file is preserved next to the original before the app
+    falls back to defaults, so a later save() can't silently destroy whatever
+    the user had."""
+    import config as cfg
+
+    cfg.CONFIG_PATH = str(tmp_path / "config.json")
+    corrupt_body = "not valid json {{{"
+    with open(cfg.CONFIG_PATH, "w") as f:
+        f.write(corrupt_body)
+
+    loaded = cfg.load()
+
+    assert loaded == cfg.DEFAULTS
+    backup_path = cfg.CONFIG_PATH + ".corrupt"
+    assert os.path.exists(backup_path)
+    with open(backup_path) as f:
+        assert f.read() == corrupt_body
+
+
+def test_set_after_corrupt_load_keeps_backup(tmp_path):
+    """set() on a corrupt config overwrites the main file with defaults+key,
+    but the preserved .corrupt copy keeps the user's original bytes."""
+    import json
+
+    import config as cfg
+
+    cfg.CONFIG_PATH = str(tmp_path / "config.json")
+    corrupt_body = '{"classification_threshold": 0.9, TRUNCATED'
+    with open(cfg.CONFIG_PATH, "w") as f:
+        f.write(corrupt_body)
+
+    cfg.set("photos_per_page", 25)
+
+    with open(cfg.CONFIG_PATH) as f:
+        assert json.load(f)["photos_per_page"] == 25
+    with open(cfg.CONFIG_PATH + ".corrupt") as f:
+        assert f.read() == corrupt_body
+
+
+def test_read_raw_preserves_corrupt_file_copy(tmp_path):
+    """_read_raw (the migration read path) also preserves a corrupt file —
+    migrations call save() right after, which would otherwise clobber it."""
+    import config as cfg
+
+    cfg.CONFIG_PATH = str(tmp_path / "config.json")
+    corrupt_body = "[1, 2,"
+    with open(cfg.CONFIG_PATH, "w") as f:
+        f.write(corrupt_body)
+
+    assert cfg._read_raw() == {}
+    with open(cfg.CONFIG_PATH + ".corrupt") as f:
+        assert f.read() == corrupt_body

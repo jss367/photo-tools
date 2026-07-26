@@ -715,6 +715,16 @@ def is_excluded(dotted_key):
     return any(dotted_key == p or dotted_key.startswith(p + ".") for p in EXCLUDED)
 
 
+def secret_keys():
+    """Dotted keys of every secret-typed setting (tokens/API keys).
+
+    Their *values* must never leave the machine in a settings export — the
+    export/import endpoints use this list to omit them on the way out and to
+    preserve the local values on the way back in.
+    """
+    return [k for k, spec in SCHEMA.items() if spec.get("type") == "secret"]
+
+
 def schema_parent_prefixes():
     """Return the set of dotted prefixes that are parents of any SCHEMA key.
 

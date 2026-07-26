@@ -5,6 +5,10 @@ All notable changes to Vireo are documented in this file.
 ## Unreleased
 
 ### Added
+- **Automatic catalog backup before upgrades.** When a new Vireo version
+  needs to migrate the database, a snapshot is saved next to it (e.g.
+  `vireo.db.pre-v8.bak`) before any migration runs. Only the most recent
+  pre-upgrade snapshot is kept.
 - **Advanced color and tone editing.** The non-destructive photo editor now
   includes a five-point tone curve, an eight-color hue/saturation/luminance
   mixer, and independent shadow, midtone, and highlight color grading. These
@@ -20,6 +24,18 @@ All notable changes to Vireo are documented in this file.
   updater, and uninstall-preservation gates before publication.
 
 ### Fixed
+- Opening a catalog that was already migrated by a newer Vireo (for example
+  after reinstalling an older build) now shows clear "update Vireo to open
+  this catalog" guidance instead of a crash — and no longer suggests moving
+  the database aside, which would have orphaned the newer catalog.
+- A corrupt `~/.vireo/config.json` is now preserved as `config.json.corrupt`
+  before Vireo falls back to defaults, instead of being silently overwritten
+  on the next settings change.
+
+- Settings export no longer includes secret values (iNaturalist token,
+  Hugging Face token, Google Maps API key); the exported file lists which
+  keys were omitted. Importing a backup keeps the secrets already configured
+  on the machine unless the file explicitly provides them.
 - After-import classification now pauses with an actionable label-download
   message when the selected model cannot run without a species list, instead
   of enqueueing a pipeline job guaranteed to fail.

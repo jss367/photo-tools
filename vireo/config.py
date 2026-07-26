@@ -5,6 +5,7 @@ import copy
 import json
 import logging
 import os
+import shutil
 import sys
 import tempfile
 import threading
@@ -236,6 +237,24 @@ def _deep_merge(base, override):
     return result
 
 
+def _preserve_corrupt_config():
+    """Copy an unreadable config file to ``<path>.corrupt`` before callers
+    fall back to defaults — the next ``save()`` overwrites the original,
+    which would otherwise silently destroy whatever the user had."""
+    backup = CONFIG_PATH + ".corrupt"
+    try:
+        # copy2 preserves mtime, so an already-preserved copy of this exact
+        # corruption is skipped instead of re-copied on every load().
+        if os.path.exists(backup) and (
+            os.path.getmtime(backup) >= os.path.getmtime(CONFIG_PATH)
+        ):
+            return
+        shutil.copy2(CONFIG_PATH, backup)
+        log.warning("Config file is unreadable; preserved a copy at %s", backup)
+    except OSError:
+        pass
+
+
 def load():
     """Load config, returning defaults for any missing keys."""
     config = copy.deepcopy(DEFAULTS)
@@ -245,6 +264,7 @@ def load():
                 config = _deep_merge(config, json.load(f))
         except Exception:
             log.warning("Failed to read config, using defaults")
+            _preserve_corrupt_config()
     return config
 
 
@@ -336,8 +356,14 @@ def _read_raw():
         with open(CONFIG_PATH) as f:
             raw = json.load(f)
     except (OSError, json.JSONDecodeError):
+        # Callers (the config migrations) save() right after this read, so an
+        # unpreserved corrupt file would be clobbered with near-defaults.
+        _preserve_corrupt_config()
         return {}
-    return raw if isinstance(raw, dict) else {}
+    if not isinstance(raw, dict):
+        _preserve_corrupt_config()
+        return {}
+    return raw
 
 
 def _migrations_applied(raw):

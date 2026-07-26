@@ -1217,3 +1217,85 @@ def test_concurrent_global_patch_does_not_drop_writes(app_and_db):
     values = client.get("/api/settings/values").get_json()
     assert values["global"]["classification_threshold"] == 0.31
     assert values["global"]["similarity_threshold"] == 0.77
+
+
+# ---------------------------------------------------------------------------
+# Secrets in export/import
+# ---------------------------------------------------------------------------
+
+
+def test_export_omits_secret_values(app_and_db):
+    """Exported settings must not carry API tokens/keys — users attach these
+    files to bug reports. Omitted keys are listed so the user knows what to
+    re-enter after an import."""
+    app, _ = app_and_db
+    import config as cfg
+
+    cfg.set("hf_token", "hf_SECRET")
+    cfg.set("inat_token", "inat_SECRET")
+    cfg.set("classification_threshold", 0.7)
+
+    client = app.test_client()
+    resp = client.get("/api/settings/export")
+    assert resp.status_code == 200
+    body = resp.get_data(as_text=True)
+    assert "hf_SECRET" not in body
+    assert "inat_SECRET" not in body
+    data = json.loads(body)
+    assert "hf_token" not in data
+    assert "inat_token" not in data
+    assert data["classification_threshold"] == 0.7
+    assert set(data["_secrets_omitted"]) == {"hf_token", "inat_token"}
+
+
+def test_import_preserves_existing_secrets_when_payload_omits_them(app_and_db):
+    """Restoring a (secret-free) exported backup must not wipe tokens the
+    user already has configured on this machine."""
+    app, _ = app_and_db
+    import config as cfg
+
+    cfg.set("hf_token", "hf_KEEP")
+    client = app.test_client()
+
+    resp = client.post(
+        "/api/settings/import",
+        json={"json": json.dumps({"classification_threshold": 0.5})},
+    )
+    assert resp.status_code == 200
+    loaded = cfg.load()
+    assert loaded["hf_token"] == "hf_KEEP"
+    assert loaded["classification_threshold"] == 0.5
+
+
+def test_import_explicit_secret_value_wins(app_and_db):
+    """A payload that explicitly carries a secret key writes it through."""
+    app, _ = app_and_db
+    import config as cfg
+
+    cfg.set("inat_token", "old")
+    client = app.test_client()
+
+    resp = client.post(
+        "/api/settings/import",
+        json={"json": json.dumps({"inat_token": "new-token"})},
+    )
+    assert resp.status_code == 200
+    assert cfg.load()["inat_token"] == "new-token"
+
+
+def test_export_import_round_trip_keeps_secrets_and_omits_marker(app_and_db):
+    """Export → import on the same machine keeps the local tokens, and the
+    _secrets_omitted marker doesn't leak into the config file."""
+    app, _ = app_and_db
+    import config as cfg
+
+    cfg.set("google_maps_api_key", "maps_LOCAL")
+    client = app.test_client()
+
+    exported = client.get("/api/settings/export").get_data(as_text=True)
+    resp = client.post("/api/settings/import", json={"json": exported})
+    assert resp.status_code == 200
+
+    raw = cfg._read_raw()
+    assert raw.get("google_maps_api_key") == "maps_LOCAL"
+    assert "_secrets_omitted" not in raw

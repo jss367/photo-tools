@@ -2,6 +2,7 @@
 
 import contextlib
 import copy
+import filecmp
 import json
 import logging
 import os
@@ -243,11 +244,13 @@ def _preserve_corrupt_config():
     which would otherwise silently destroy whatever the user had."""
     backup = CONFIG_PATH + ".corrupt"
     try:
-        # copy2 preserves mtime, so an already-preserved copy of this exact
-        # corruption is skipped instead of re-copied on every load().
-        if os.path.exists(backup) and (
-            os.path.getmtime(backup) >= os.path.getmtime(CONFIG_PATH)
-        ):
+        # Skip only when the current corrupt file is byte-for-byte the same
+        # as the existing backup. mtime comparison isn't safe here: a
+        # restored-from-history file, a coarse-resolution filesystem, or an
+        # editor that resets mtime can leave the current corruption with an
+        # equal-or-older timestamp than an unrelated older backup, and the
+        # current bytes would then be discarded.
+        if os.path.exists(backup) and filecmp.cmp(backup, CONFIG_PATH, shallow=False):
             return
         shutil.copy2(CONFIG_PATH, backup)
         log.warning("Config file is unreadable; preserved a copy at %s", backup)

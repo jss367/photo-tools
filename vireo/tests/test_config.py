@@ -1715,3 +1715,31 @@ def test_read_raw_preserves_corrupt_file_copy(tmp_path):
     assert cfg._read_raw() == {}
     with open(cfg.CONFIG_PATH + ".corrupt") as f:
         assert f.read() == corrupt_body
+
+
+def test_load_preserves_current_corrupt_over_older_backup_with_newer_mtime(tmp_path):
+    """A pre-existing `.corrupt` file with an equal-or-newer mtime must not
+    trick the preserve step into discarding the *current* corrupt bytes.
+    Real triggers: restoring the backup from history, coarse-mtime
+    filesystems (FAT/some NFS), or an editor that resets timestamps."""
+    import os
+
+    import config as cfg
+
+    cfg.CONFIG_PATH = str(tmp_path / "config.json")
+    backup_path = cfg.CONFIG_PATH + ".corrupt"
+    old_backup = "{ old-corruption"
+    with open(backup_path, "w") as f:
+        f.write(old_backup)
+    current_body = "{ different-current-corruption"
+    with open(cfg.CONFIG_PATH, "w") as f:
+        f.write(current_body)
+    # Force the backup's mtime to look newer than the current file so a
+    # timestamp-based check would incorrectly skip preservation.
+    now = os.path.getmtime(cfg.CONFIG_PATH)
+    os.utime(backup_path, (now + 10, now + 10))
+
+    cfg.load()
+
+    with open(backup_path) as f:
+        assert f.read() == current_body

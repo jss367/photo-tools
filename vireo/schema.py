@@ -973,7 +973,12 @@ def _snapshot_before_migrations(db_path, target_version):
 
 
 def _prune_stale_backups(db_path, keep_version):
+    # If the target-version snapshot never landed (VACUUM INTO failed, the
+    # volume filled up, etc.), keep every older `.pre-v*.bak` — deleting them
+    # would leave the upgraded database with no recovery snapshot at all.
     keep = _backup_path(db_path, keep_version)
+    if not os.path.exists(keep):
+        return
     for path in glob.glob(glob.escape(db_path) + ".pre-v*.bak"):
         if path != keep:
             with contextlib.suppress(OSError):

@@ -1481,6 +1481,32 @@ def test_ensure_schema_prunes_older_backups(tmp_path):
     assert not os.path.exists(stale_backup)
 
 
+def test_ensure_schema_keeps_older_backups_when_snapshot_fails(tmp_path, monkeypatch):
+    """If the pre-migration snapshot can't be written (VACUUM INTO fails,
+    volume full, etc.), an older `.pre-v*.bak` from a previous successful
+    run must survive — otherwise the upgrade completes with no recovery
+    snapshot at all."""
+    import os
+
+    db_path = str(tmp_path / "vireo.db")
+    schema.ensure_schema(db_path)
+    latest = schema.MIGRATIONS[-1].version
+    stale_backup = f"{db_path}.pre-v{latest - 1}.bak"
+    with open(stale_backup, "w") as f:
+        f.write("older snapshot")
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("PRAGMA user_version = 7")
+
+    # Simulate _snapshot_before_migrations failing silently (its except
+    # branch already swallows sqlite3.Error / OSError and logs a warning).
+    monkeypatch.setattr(schema, "_snapshot_before_migrations", lambda *a, **k: None)
+
+    schema.ensure_schema(db_path)
+
+    assert not os.path.exists(f"{db_path}.pre-v{latest}.bak")
+    assert os.path.exists(stale_backup)
+
+
 def test_ensure_schema_newer_db_raises_incompatible_database_error(tmp_path):
     """Opening a DB stamped by a newer Vireo raises the friendly
     IncompatibleDatabaseError (caught by main's guided-exit handler) instead

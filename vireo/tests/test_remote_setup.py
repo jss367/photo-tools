@@ -492,3 +492,27 @@ def test_build_install_argv_no_batchmode_and_idempotent_append():
     assert "umask 077" in snippet and "mkdir -p ~/.ssh" in snippet
     assert "grep -qxF" in snippet and "authorized_keys" in snippet
     assert "ssh-ed25519 AAAA vireo" in snippet
+
+
+def test_build_install_argv_forces_password_only_auth():
+    """An encrypted ~/.ssh/id_* would otherwise trigger a passphrase prompt
+    ("Enter passphrase for key ..."), which the pty driver's
+    _PASSWORD_PROMPT_RE doesn't match, hanging the wizard until the 30s
+    timeout. Disabling pubkey auth for this one bootstrap invocation makes
+    ssh go straight to the password prompt the driver is designed to answer."""
+    argv = remote_setup.build_install_argv(
+        host="nas", user="admin", port=22,
+        key_pub_line="ssh-ed25519 AAAA vireo", ssh_bin="ssh")
+    assert "PubkeyAuthentication=no" in argv
+    assert "PreferredAuthentications=password" in argv
+
+
+def test_key_auth_works_argv_still_negotiates_pubkey():
+    """The pubkey probe must NOT inherit the install-key path's password-only
+    lockdown — that would make every key_auth_works() call return False."""
+    run = FakeRun(stdout="vireo_ok\n")
+    remote_setup.key_auth_works(
+        host="nas", user="admin", port=22, key="/k", ssh_bin="ssh", run=run)
+    argv = run.calls[0]
+    assert "PubkeyAuthentication=no" not in argv
+    assert "PreferredAuthentications=password" not in argv

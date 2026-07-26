@@ -201,10 +201,13 @@ def ensure_vireo_key(run=subprocess.run, ssh_keygen_bin="ssh-keygen"):
     return priv, pub
 
 
-def _ssh_option_args(port, key, batch=True):
+def _ssh_option_args(port, key, batch=True, password_only=False):
     """Mirror of move.ssh_base_args for wizard probes (kept local so this
     module stays import-light; see that docstring for the option rationale).
-    ``batch=False`` drops BatchMode so a password prompt can reach a pty."""
+    ``batch=False`` drops BatchMode so a password prompt can reach a pty.
+    ``password_only=True`` disables public-key auth entirely so the pty
+    driver reaches the password prompt without first getting stuck on a
+    passphrase prompt for an encrypted default identity."""
     args = []
     if batch:
         args += ["-o", "BatchMode=yes"]
@@ -215,6 +218,14 @@ def _ssh_option_args(port, key, batch=True):
             args += ["-p", str(int(port))]
     except (TypeError, ValueError):
         pass
+    if password_only:
+        # Without these, ssh first offers any ssh-agent identities and any
+        # ~/.ssh/id_* defaults; an encrypted one prompts for its PASSPHRASE
+        # ("Enter passphrase for key ..."), which _PASSWORD_PROMPT_RE does
+        # not match, and the pty driver waits out the 30s timeout instead
+        # of ever seeing the NAS password prompt it is designed to answer.
+        args += ["-o", "PubkeyAuthentication=no",
+                 "-o", "PreferredAuthentications=password"]
     if key:
         # IdentitiesOnly=yes is what makes ``key_auth_works`` a truthful check.
         # Without it, ssh still consults ssh-agent and any default identities,
@@ -248,7 +259,8 @@ def build_install_argv(host, user, port, key_pub_line, ssh_bin):
         f"grep -qxF {quoted} ~/.ssh/authorized_keys || "
         f"echo {quoted} >> ~/.ssh/authorized_keys"
     )
-    return ([ssh_bin] + _ssh_option_args(port, key="", batch=False)
+    return ([ssh_bin] + _ssh_option_args(port, key="", batch=False,
+                                         password_only=True)
             + [f"{user}@{host}", snippet])
 
 

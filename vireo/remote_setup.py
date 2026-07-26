@@ -14,6 +14,8 @@ import select
 import shlex
 import socket
 import subprocess
+import sys
+import termios
 import time
 import urllib.parse
 
@@ -28,6 +30,19 @@ _SMB_SRC_RE = re.compile(r"^//(?:(?P<user>[^@/]+)@)?(?P<host>[^/]+)/(?P<share>.+
 _NFS_SRC_RE = re.compile(r"^(?P<host>[^:/]+):(?P<path>/.*)$")
 
 _NETWORK_FS = ("smbfs", "nfs", "afpfs", "webdav")
+
+
+def platform_supported():
+    """True where the wizard can meaningfully enumerate mounted NAS shares.
+
+    Only macOS today: mount-line parsing (``_MOUNT_RE`` + URL-decoded smbfs
+    sources) is written against ``/sbin/mount`` output. Linux and Windows
+    format ``mount`` differently, so the wizard's mounts endpoint returns
+    ``unsupported_platform`` there. Named as its own function so tests that
+    exercise the wizard end-to-end can flip it without stomping on
+    ``sys.platform`` globally.
+    """
+    return sys.platform == "darwin"
 
 
 def parse_mount_output(text):
@@ -66,10 +81,23 @@ def parse_mount_output(text):
 def _reverse_dns(ip):
     """Default resolver: PTR lookup with a hard 2s cap — gethostbyaddr has
     no timeout parameter and can hang for many seconds on networks that
-    drop PTR queries, which would stall the wizard's mounts endpoint."""
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+    drop PTR queries, which would stall the wizard's mounts endpoint.
+
+    The executor is torn down without waiting: the ``with`` form calls
+    ``shutdown(wait=True)`` on exit even when ``fut.result`` already raised
+    a TimeoutError, which would silently re-block the endpoint for the full
+    DNS delay. Leftover worker threads are daemons — they die on process
+    exit, or when ``gethostbyaddr`` finally returns.
+    """
+    ex = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    try:
         fut = ex.submit(socket.gethostbyaddr, ip)
         return fut.result(timeout=2)[0]
+    finally:
+        try:
+            ex.shutdown(wait=False, cancel_futures=True)
+        except TypeError:  # cancel_futures added in 3.9
+            ex.shutdown(wait=False)
 
 
 def friendly_host_name(host, resolver=None):
@@ -177,6 +205,19 @@ def install_key_with_password(spawn_argv, password, timeout=30):
     import pty  # POSIX-only; imported here so module import stays portable
 
     master, slave = pty.openpty()
+    # Disable pty ECHO up front — a new pty defaults to ECHO=ON, and any
+    # bytes we write for the password prompt would then be echoed back into
+    # our read buffer, leaving the password sitting in ``output`` where an
+    # unclassified failure (below) could return it as ``detail``. ssh sets
+    # ECHO off itself when it prompts, but the default state before that is
+    # too fragile to rely on.
+    try:
+        attrs = termios.tcgetattr(slave)
+        attrs[3] &= ~(termios.ECHO | termios.ECHOE | termios.ECHOK
+                      | termios.ECHONL)
+        termios.tcsetattr(slave, termios.TCSANOW, attrs)
+    except termios.error:
+        pass  # if we can't disable echo, redaction below is the backstop
     try:
         proc = subprocess.Popen(
             spawn_argv, stdin=slave, stdout=slave, stderr=slave,
@@ -232,8 +273,12 @@ def install_key_with_password(spawn_argv, password, timeout=30):
         return {"ok": False, "error": "host_key"}
     if "Permission denied" in output and not answered:
         return {"ok": False, "error": "password_auth_disabled"}
+    # Belt-and-braces on top of the pty ECHO=off above: never let the
+    # password reach the returned detail even if something along the way
+    # (an unusual terminal driver, a stubborn ssh build) echoed it back.
+    safe = output.replace(password, "<redacted>") if password else output
     return {"ok": False, "error": "ssh_failed",
-            "detail": output[-400:].strip()}
+            "detail": safe[-400:].strip()}
 
 
 def port_reachable(host, port, timeout=5):

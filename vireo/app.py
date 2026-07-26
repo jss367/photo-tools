@@ -22211,7 +22211,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         forbidden = _remote_setup_forbidden()
         if forbidden:
             return forbidden
-        if sys.platform != "darwin":
+        if not remote_setup.platform_supported():
             return jsonify({"mounts": [], "unsupported_platform": True})
         return jsonify({"mounts": remote_setup.list_network_mounts()})
 

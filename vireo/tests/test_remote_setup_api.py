@@ -12,6 +12,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 def test_mounts_endpoint_returns_parsed_mounts(app_and_db, monkeypatch):
     app, _db = app_and_db
     import remote_setup
+    monkeypatch.setattr(remote_setup, "platform_supported", lambda: True)
     monkeypatch.setattr(remote_setup, "list_network_mounts", lambda **kw: [
         {"fs_type": "smbfs", "host": "1.2.3.4", "friendly_host": "nas.ts.net",
          "display_name": "nas", "share": "Photos",
@@ -19,6 +20,19 @@ def test_mounts_endpoint_returns_parsed_mounts(app_and_db, monkeypatch):
     res = app.test_client().get("/api/remote-setup/mounts")
     assert res.status_code == 200
     assert res.get_json()["mounts"][0]["share"] == "Photos"
+
+
+def test_mounts_endpoint_reports_unsupported_platform(app_and_db, monkeypatch):
+    """Endpoint short-circuits with unsupported_platform where the wizard's
+    mount parsing doesn't apply (Linux/Windows), even if `list_network_mounts`
+    is available — the gate is on `platform_supported()`."""
+    app, _db = app_and_db
+    import remote_setup
+    monkeypatch.setattr(remote_setup, "platform_supported", lambda: False)
+    res = app.test_client().get("/api/remote-setup/mounts")
+    body = res.get_json()
+    assert res.status_code == 200
+    assert body == {"mounts": [], "unsupported_platform": True}
 
 
 def test_mounts_endpoint_rejects_non_loopback(app_and_db):

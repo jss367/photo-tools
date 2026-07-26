@@ -31,6 +31,11 @@ def nas_env(live_server, tmp_path, monkeypatch):
 
     state = {"auth": False, "installs": 0}
 
+    # The full E2E suite runs on Ubuntu, but the wizard is macOS-only in
+    # production — force platform_supported() true so /api/remote-setup/mounts
+    # doesn't short-circuit to `unsupported_platform` before returning the
+    # seeded mount below.
+    monkeypatch.setattr(remote_setup, "platform_supported", lambda: True)
     monkeypatch.setattr(remote_setup, "list_network_mounts", lambda **kw: [{
         "fs_type": "smbfs", "host": "100.80.236.59",
         "friendly_host": "synology-nas.ts.net", "display_name": "synology-nas",

@@ -160,7 +160,7 @@ def test_port_reachable(monkeypatch):
 
 STUB = r'''#!/usr/bin/env python3
 import sys
-mode = sys.argv[1]  # ok | wrongpw | nopw | hostkey
+mode = sys.argv[1]  # ok | wrongpw | nopw | hostkey | unclassified
 if mode == "nopw":
     sys.stderr.write("admin@nas: Permission denied (publickey).\n")
     sys.exit(255)
@@ -170,6 +170,15 @@ if mode == "hostkey":
 sys.stderr.write("admin@nas's password: ")
 sys.stderr.flush()
 pw = input()
+if mode == "unclassified":
+    # ssh accepted the password prompt, then failed for some other reason
+    # the classifier doesn't match — plus deliberately echo the password
+    # back to prove redaction of `detail` catches the case where something
+    # DID echo it (pty ECHO=off is the primary defense; this is the
+    # belt-and-braces test).
+    sys.stderr.write("echo-check:" + pw + "\n")
+    sys.stderr.write("bash: /nas/authorized_keys: Read-only file system\n")
+    sys.exit(1)
 if mode == "ok" and pw == "sekret":
     sys.exit(0)
 sys.stderr.write("Permission denied, please try again.\nadmin@nas's password: ")
@@ -213,6 +222,30 @@ def test_password_never_in_result_text(tmp_path):
     res = remote_setup.install_key_with_password(
         spawn_argv=_stub(tmp_path, "wrongpw"), password="hunter2", timeout=15)
     assert "hunter2" not in repr(res)
+
+
+def test_unclassified_failure_redacts_password_from_detail(tmp_path):
+    """An unclassified ssh failure (post-auth remote error) may include
+    output that echoed the password back — pty ECHO=off is the primary
+    defense, and detail redaction is the belt-and-braces backstop that
+    keeps the password out of the returned dict either way."""
+    res = remote_setup.install_key_with_password(
+        spawn_argv=_stub(tmp_path, "unclassified"),
+        password="hunter2_secret_pw", timeout=15)
+    assert res["ok"] is False
+    assert res["error"] == "ssh_failed"
+    # Password must not appear anywhere in the returned dict — including detail.
+    assert "hunter2_secret_pw" not in repr(res)
+    assert "<redacted>" in res.get("detail", "")
+
+
+def test_platform_supported_reflects_sys_platform(monkeypatch):
+    """The wizard's mount enumeration only works on macOS today; the app
+    endpoint routes through this helper so tests can flip it cleanly."""
+    monkeypatch.setattr(remote_setup.sys, "platform", "darwin")
+    assert remote_setup.platform_supported() is True
+    monkeypatch.setattr(remote_setup.sys, "platform", "linux")
+    assert remote_setup.platform_supported() is False
 
 
 # --- Nonce share-locate + remote dir listing ------------------------------

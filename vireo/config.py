@@ -2,9 +2,11 @@
 
 import contextlib
 import copy
+import filecmp
 import json
 import logging
 import os
+import shutil
 import sys
 import tempfile
 import threading
@@ -236,6 +238,26 @@ def _deep_merge(base, override):
     return result
 
 
+def _preserve_corrupt_config():
+    """Copy an unreadable config file to ``<path>.corrupt`` before callers
+    fall back to defaults — the next ``save()`` overwrites the original,
+    which would otherwise silently destroy whatever the user had."""
+    backup = CONFIG_PATH + ".corrupt"
+    try:
+        # Skip only when the current corrupt file is byte-for-byte the same
+        # as the existing backup. mtime comparison isn't safe here: a
+        # restored-from-history file, a coarse-resolution filesystem, or an
+        # editor that resets mtime can leave the current corruption with an
+        # equal-or-older timestamp than an unrelated older backup, and the
+        # current bytes would then be discarded.
+        if os.path.exists(backup) and filecmp.cmp(backup, CONFIG_PATH, shallow=False):
+            return
+        shutil.copy2(CONFIG_PATH, backup)
+        log.warning("Config file is unreadable; preserved a copy at %s", backup)
+    except OSError:
+        pass
+
+
 def load():
     """Load config, returning defaults for any missing keys."""
     config = copy.deepcopy(DEFAULTS)
@@ -245,6 +267,7 @@ def load():
                 config = _deep_merge(config, json.load(f))
         except Exception:
             log.warning("Failed to read config, using defaults")
+            _preserve_corrupt_config()
     return config
 
 
@@ -336,8 +359,14 @@ def _read_raw():
         with open(CONFIG_PATH) as f:
             raw = json.load(f)
     except (OSError, json.JSONDecodeError):
+        # Callers (the config migrations) save() right after this read, so an
+        # unpreserved corrupt file would be clobbered with near-defaults.
+        _preserve_corrupt_config()
         return {}
-    return raw if isinstance(raw, dict) else {}
+    if not isinstance(raw, dict):
+        _preserve_corrupt_config()
+        return {}
+    return raw
 
 
 def _migrations_applied(raw):

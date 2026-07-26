@@ -19,8 +19,14 @@ const GUI_CLIENTS_DIR: &str = ".vireo/gui-clients";
 pub enum SidecarStartError {
     /// The sidecar exited with a structured `incompatible_database` signal
     /// on stderr. The launcher surfaces `db_path` so the user knows which
-    /// file to back up.
-    IncompatibleDatabase { db_path: String, reason: String },
+    /// file to back up. `newer` means the database was migrated by a newer
+    /// Vireo than this build — the remedy is updating the app, NOT moving
+    /// the file aside.
+    IncompatibleDatabase {
+        db_path: String,
+        reason: String,
+        newer: bool,
+    },
     /// Any other failure (spawn error, generic early exit, health timeout).
     Generic(String),
 }
@@ -28,7 +34,9 @@ pub enum SidecarStartError {
 impl std::fmt::Display for SidecarStartError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::IncompatibleDatabase { db_path, reason } => {
+            Self::IncompatibleDatabase {
+                db_path, reason, ..
+            } => {
                 write!(f, "Incompatible database at {}: {}", db_path, reason)
             }
             Self::Generic(msg) => f.write_str(msg),
@@ -43,6 +51,7 @@ struct SidecarErrorPayload {
     error: String,
     db_path: Option<String>,
     reason: Option<String>,
+    newer: Option<bool>,
 }
 
 /// Parse a single line of sidecar stderr looking for a structured startup
@@ -61,6 +70,7 @@ fn parse_structured_error(line: &str) -> Option<SidecarStartError> {
         "incompatible_database" => Some(SidecarStartError::IncompatibleDatabase {
             db_path: payload.db_path.unwrap_or_default(),
             reason: payload.reason.unwrap_or_else(|| "no details".into()),
+            newer: payload.newer.unwrap_or(false),
         }),
         "startup_failed" => {
             let reason = payload
@@ -588,10 +598,34 @@ mod tests {
     fn parse_structured_error_recognizes_incompatible_database() {
         let line = r#"{"error":"incompatible_database","db_path":"/home/u/.vireo/vireo.db","reason":"no such column: classifier_model"}"#;
         match parse_structured_error(line) {
-            Some(SidecarStartError::IncompatibleDatabase { db_path, reason }) => {
+            Some(SidecarStartError::IncompatibleDatabase {
+                db_path,
+                reason,
+                newer,
+            }) => {
                 assert_eq!(db_path, "/home/u/.vireo/vireo.db");
                 assert!(reason.contains("classifier_model"));
+                assert!(!newer);
             }
+            other => panic!("expected IncompatibleDatabase, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_structured_error_carries_newer_database_flag() {
+        let line = r#"{"error":"incompatible_database","db_path":"/tmp/x.db","reason":"schema version 99 is newer than supported 8","newer":true}"#;
+        match parse_structured_error(line) {
+            Some(SidecarStartError::IncompatibleDatabase { newer, .. }) => assert!(newer),
+            other => panic!("expected IncompatibleDatabase, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_structured_error_defaults_newer_flag_to_false() {
+        // Older sidecar builds don't emit the field at all.
+        let line = r#"{"error":"incompatible_database","db_path":"/tmp/x.db","reason":"r"}"#;
+        match parse_structured_error(line) {
+            Some(SidecarStartError::IncompatibleDatabase { newer, .. }) => assert!(!newer),
             other => panic!("expected IncompatibleDatabase, got {:?}", other),
         }
     }

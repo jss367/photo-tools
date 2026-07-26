@@ -1426,3 +1426,170 @@ def test_legacy_merge_null_species_predictions_collapse_to_one_row(tmp_path):
         assert review is not None
         assert review["status"] == "accepted"
         assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+
+
+def test_ensure_schema_backs_up_before_pending_migrations(tmp_path):
+    """An existing DB with pending registry migrations is snapshotted before
+    any migration runs, so a bad migration can't destroy the only copy."""
+    import os
+
+    db_path = str(tmp_path / "vireo.db")
+    schema.ensure_schema(db_path)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("PRAGMA user_version = 7")
+
+    schema.ensure_schema(db_path)
+
+    latest = schema.MIGRATIONS[-1].version
+    backup_path = f"{db_path}.pre-v{latest}.bak"
+    assert os.path.exists(backup_path)
+    # The snapshot reflects the pre-migration state.
+    with sqlite3.connect(backup_path) as conn:
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 7
+        assert conn.execute("SELECT COUNT(*) FROM workspaces").fetchone()[0] >= 1
+
+
+def test_ensure_schema_no_backup_for_fresh_or_current_db(tmp_path):
+    """No snapshot for a brand-new DB, and none when the schema is already
+    at the latest version (normal startup must not accrete backups)."""
+    import glob
+
+    db_path = str(tmp_path / "vireo.db")
+    schema.ensure_schema(db_path)
+    assert glob.glob(f"{db_path}*.bak") == []
+
+    schema.ensure_schema(db_path)
+    assert glob.glob(f"{db_path}*.bak") == []
+
+
+def test_ensure_schema_prunes_older_backups(tmp_path):
+    """Only the most recent pre-migration snapshot is kept."""
+    import os
+
+    db_path = str(tmp_path / "vireo.db")
+    schema.ensure_schema(db_path)
+    latest = schema.MIGRATIONS[-1].version
+    stale_backup = f"{db_path}.pre-v{latest - 1}.bak"
+    with open(stale_backup, "w") as f:
+        f.write("old snapshot")
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("PRAGMA user_version = 7")
+
+    schema.ensure_schema(db_path)
+
+    assert os.path.exists(f"{db_path}.pre-v{latest}.bak")
+    assert not os.path.exists(stale_backup)
+
+
+def test_ensure_schema_keeps_older_backups_when_snapshot_fails(tmp_path, monkeypatch):
+    """If the pre-migration snapshot can't be written (VACUUM INTO fails,
+    volume full, etc.), an older `.pre-v*.bak` from a previous successful
+    run must survive — otherwise the upgrade completes with no recovery
+    snapshot at all."""
+    import os
+
+    db_path = str(tmp_path / "vireo.db")
+    schema.ensure_schema(db_path)
+    latest = schema.MIGRATIONS[-1].version
+    stale_backup = f"{db_path}.pre-v{latest - 1}.bak"
+    with open(stale_backup, "w") as f:
+        f.write("older snapshot")
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("PRAGMA user_version = 7")
+
+    # Simulate _snapshot_before_migrations failing silently (its except
+    # branch already swallows sqlite3.Error / OSError and logs a warning).
+    monkeypatch.setattr(schema, "_snapshot_before_migrations", lambda *a, **k: None)
+
+    schema.ensure_schema(db_path)
+
+    assert not os.path.exists(f"{db_path}.pre-v{latest}.bak")
+    assert os.path.exists(stale_backup)
+
+
+def test_ensure_schema_newer_db_raises_incompatible_database_error(tmp_path):
+    """Opening a DB stamped by a newer Vireo raises the friendly
+    IncompatibleDatabaseError (caught by main's guided-exit handler) instead
+    of an anonymous RuntimeError crash — and does not mutate the file."""
+    from db import IncompatibleDatabaseError
+
+    db_path = str(tmp_path / "vireo.db")
+    schema.ensure_schema(db_path)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("PRAGMA user_version = 99")
+
+    with pytest.raises(IncompatibleDatabaseError) as excinfo:
+        schema.ensure_schema(db_path)
+
+    assert "newer" in str(excinfo.value)
+    assert excinfo.value.db_path == db_path
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 99
+
+
+def test_load_taxonomy_cli_refuses_newer_db(tmp_path, monkeypatch, capsys):
+    """``--load-taxonomy`` must not run legacy DDL against a catalog stamped
+    by a newer Vireo. Previously it bypassed ensure_schema and constructed
+    Database(args.db) directly, mutating the file and burying the version
+    mismatch in an OperationalError; the guided-exit handler should now fire
+    the same structured signal here as it does for the normal startup path."""
+    import json as _json
+
+    import app as vireo_app
+
+    db_path = str(tmp_path / "vireo.db")
+    schema.ensure_schema(db_path)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("PRAGMA user_version = 99")
+
+    monkeypatch.setattr(
+        "sys.argv",
+        ["vireo", "--db", db_path, "--thumb-dir", str(tmp_path / "thumbs"),
+         "--load-taxonomy"],
+    )
+    # Guard against actually touching the DB or the network if the fix
+    # regresses and control ever reaches Database(args.db)/load_taxonomy.
+    def _boom(*_a, **_kw):  # pragma: no cover - regression guard
+        raise AssertionError("--load-taxonomy touched the DB before ensure_schema")
+
+    monkeypatch.setattr("db.Database", _boom)
+
+    with pytest.raises(SystemExit) as excinfo:
+        vireo_app.main()
+    assert excinfo.value.code == 3
+
+    captured = capsys.readouterr()
+    payload = _json.loads(captured.err.strip().splitlines()[-1])
+    assert payload["error"] == "incompatible_database"
+    assert payload["newer"] is True
+    assert payload["db_path"] == db_path
+
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 99
+
+
+def test_ensure_schema_keeps_later_version_snapshots(tmp_path):
+    """Restoring an older live database while a later-version backup remains
+    (e.g. `.pre-v9.bak` beside a v7 file, then launching this v8 build) must
+    keep the newer snapshot — it may hold the user's only copy of edits made
+    under that later schema. Only strictly older snapshots may be pruned."""
+    import os
+
+    db_path = str(tmp_path / "vireo.db")
+    schema.ensure_schema(db_path)
+    latest = schema.MIGRATIONS[-1].version
+    older_backup = f"{db_path}.pre-v{latest - 1}.bak"
+    newer_backup = f"{db_path}.pre-v{latest + 1}.bak"
+    with open(older_backup, "w") as f:
+        f.write("older snapshot")
+    with open(newer_backup, "w") as f:
+        f.write("later-version snapshot")
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("PRAGMA user_version = 7")
+
+    schema.ensure_schema(db_path)
+
+    assert os.path.exists(f"{db_path}.pre-v{latest}.bak")
+    assert not os.path.exists(older_backup)
+    # The later-version backup must survive — it may be irreplaceable.
+    assert os.path.exists(newer_backup)

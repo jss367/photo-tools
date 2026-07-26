@@ -217,15 +217,19 @@ pub fn run() {
                             }
                         }
                     }
-                    Err(SidecarStartError::IncompatibleDatabase { db_path, reason }) => {
+                    Err(SidecarStartError::IncompatibleDatabase { db_path, reason, newer }) => {
                         // The Python sidecar refused to open the DB because
-                        // its schema predates a non-migratable change. Surface
+                        // its schema version doesn't match this build. Surface
                         // an actionable dialog before exiting — without this
                         // the user just sees the WKWebView fail to load and
                         // has no way to tell whether to delete the DB, file a
-                        // bug, or reinstall.
+                        // bug, or reinstall. The remediation depends on the
+                        // direction of the mismatch: an older DB can be moved
+                        // aside to start fresh, but a NEWER DB (downgraded
+                        // install) must not be discarded — updating Vireo
+                        // opens it intact.
                         log::error!(
-                            "Incompatible database at {}: {}. Back up this file and relaunch.",
+                            "Incompatible database at {}: {}",
                             db_path, reason
                         );
                         eprintln!(
@@ -237,12 +241,20 @@ pub fn run() {
                             .app_log_dir()
                             .map(|path| path.display().to_string())
                             .unwrap_or_else(|_| "the Vireo application log directory".into());
-                        app.handle()
-                            .dialog()
-                            .message(format!(
+                        let message = if newer {
+                            format!(
+                                "Vireo can't open the database at:\n\n{}\n\nIt was created by a newer version of Vireo than the one you're running. Update Vireo to its latest version to open this catalog — don't delete or move the file; your photos and edits are intact.\n\nDetails: {}\n\nLogs: {}",
+                                db_path, reason, log_dir
+                            )
+                        } else {
+                            format!(
                                 "Vireo can't open the database at:\n\n{}\n\nIt's from an incompatible older version of Vireo. To start fresh, move this file aside (for example, rename it with a `.bak` suffix) and relaunch.\n\nDetails: {}\n\nLogs: {}",
                                 db_path, reason, log_dir
-                            ))
+                            )
+                        };
+                        app.handle()
+                            .dialog()
+                            .message(message)
                             .title("Incompatible Vireo Database")
                             .kind(MessageDialogKind::Error)
                             .blocking_show();

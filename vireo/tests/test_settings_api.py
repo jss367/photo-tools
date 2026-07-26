@@ -1217,3 +1217,133 @@ def test_concurrent_global_patch_does_not_drop_writes(app_and_db):
     values = client.get("/api/settings/values").get_json()
     assert values["global"]["classification_threshold"] == 0.31
     assert values["global"]["similarity_threshold"] == 0.77
+
+
+# ---------------------------------------------------------------------------
+# Secrets in export/import
+# ---------------------------------------------------------------------------
+
+
+def test_export_omits_secret_values(app_and_db):
+    """Exported settings must not carry API tokens/keys — users attach these
+    files to bug reports. Omitted keys are listed so the user knows what to
+    re-enter after an import."""
+    app, _ = app_and_db
+    import config as cfg
+
+    cfg.set("hf_token", "hf_SECRET")
+    cfg.set("inat_token", "inat_SECRET")
+    cfg.set("classification_threshold", 0.7)
+
+    client = app.test_client()
+    resp = client.get("/api/settings/export")
+    assert resp.status_code == 200
+    body = resp.get_data(as_text=True)
+    assert "hf_SECRET" not in body
+    assert "inat_SECRET" not in body
+    data = json.loads(body)
+    assert "hf_token" not in data
+    assert "inat_token" not in data
+    assert data["classification_threshold"] == 0.7
+    assert set(data["_secrets_omitted"]) == {"hf_token", "inat_token"}
+
+
+def test_import_preserves_existing_secrets_when_payload_omits_them(app_and_db):
+    """Restoring a (secret-free) exported backup must not wipe tokens the
+    user already has configured on this machine."""
+    app, _ = app_and_db
+    import config as cfg
+
+    cfg.set("hf_token", "hf_KEEP")
+    client = app.test_client()
+
+    resp = client.post(
+        "/api/settings/import",
+        json={"json": json.dumps({"classification_threshold": 0.5})},
+    )
+    assert resp.status_code == 200
+    loaded = cfg.load()
+    assert loaded["hf_token"] == "hf_KEEP"
+    assert loaded["classification_threshold"] == 0.5
+
+
+def test_import_explicit_secret_value_wins(app_and_db):
+    """A payload that explicitly carries a secret key writes it through."""
+    app, _ = app_and_db
+    import config as cfg
+
+    cfg.set("inat_token", "old")
+    client = app.test_client()
+
+    resp = client.post(
+        "/api/settings/import",
+        json={"json": json.dumps({"inat_token": "new-token"})},
+    )
+    assert resp.status_code == 200
+    assert cfg.load()["inat_token"] == "new-token"
+
+
+def test_export_import_round_trip_keeps_secrets_and_omits_marker(app_and_db):
+    """Export → import on the same machine keeps the local tokens, and the
+    _secrets_omitted marker doesn't leak into the config file."""
+    app, _ = app_and_db
+    import config as cfg
+
+    cfg.set("google_maps_api_key", "maps_LOCAL")
+    client = app.test_client()
+
+    exported = client.get("/api/settings/export").get_data(as_text=True)
+    resp = client.post("/api/settings/import", json={"json": exported})
+    assert resp.status_code == 200
+
+    raw = cfg._read_raw()
+    assert raw.get("google_maps_api_key") == "maps_LOCAL"
+    assert "_secrets_omitted" not in raw
+
+
+# ---------------------------------------------------------------------------
+# Corrupt-config preservation via schema-driven write paths
+# ---------------------------------------------------------------------------
+
+
+def test_patch_global_preserves_corrupt_config_before_overwrite(app_and_db):
+    """If ``config.json`` becomes corrupt while Vireo is running, the next
+    PATCH must copy the current bytes to ``config.json.corrupt`` before the
+    read-modify-write path overwrites the file — otherwise the user's
+    original settings are silently lost."""
+    app, _ = app_and_db
+    import config as cfg
+
+    corrupt_body = '{"classification_threshold": 0.9, TRUNCATED'
+    with open(cfg.CONFIG_PATH, "w") as f:
+        f.write(corrupt_body)
+
+    client = app.test_client()
+    resp = client.patch(
+        "/api/settings/global",
+        json={"key": "classification_threshold", "value": 0.31},
+    )
+    assert resp.status_code == 200
+    # New value landed on disk.
+    assert cfg.load()["classification_threshold"] == 0.31
+    # The pre-corruption bytes survive next to the file so the user isn't
+    # left with only near-defaults.
+    with open(cfg.CONFIG_PATH + ".corrupt") as f:
+        assert f.read() == corrupt_body
+
+
+def test_delete_global_preserves_corrupt_config_before_overwrite(app_and_db):
+    """DELETE uses the same read-modify-write path — a corrupt file must be
+    preserved before it's silently rewritten to defaults."""
+    app, _ = app_and_db
+    import config as cfg
+
+    corrupt_body = "not json at all }}}"
+    with open(cfg.CONFIG_PATH, "w") as f:
+        f.write(corrupt_body)
+
+    client = app.test_client()
+    resp = client.delete("/api/settings/global/classification_threshold")
+    assert resp.status_code == 200
+    with open(cfg.CONFIG_PATH + ".corrupt") as f:
+        assert f.read() == corrupt_body

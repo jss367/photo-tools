@@ -2825,7 +2825,10 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         if (
             expected_api_token
             and supplied_api_token
-            and secrets.compare_digest(supplied_api_token, expected_api_token)
+            and secrets.compare_digest(
+                supplied_api_token.encode("utf-8"),
+                expected_api_token.encode("utf-8"),
+            )
         ):
             return None
 
@@ -2851,7 +2854,8 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         cookie_name = app.config["BROWSER_SESSION_COOKIE"]
         expected_token = app.config["BROWSER_SESSION_TOKEN"]
         if not secrets.compare_digest(
-            request.cookies.get(cookie_name, ""), expected_token,
+            request.cookies.get(cookie_name, "").encode("utf-8"),
+            expected_token.encode("utf-8"),
         ):
             return json_error(
                 "Browser session required",
@@ -3665,7 +3669,12 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         if not expected:
             # No token configured → deny all v1 traffic.
             return json_error("API token not configured", 401)
-        if request.headers.get("X-Vireo-Token") != expected:
+        supplied = request.headers.get("X-Vireo-Token", "")
+        # ``secrets.compare_digest`` raises ``TypeError`` when either str
+        # operand contains a non-ASCII code point, which would surface as a
+        # 500 for an attacker-supplied token — encode to bytes so a bogus
+        # header is a plain 401 like any other wrong value.
+        if not secrets.compare_digest(supplied.encode("utf-8"), expected.encode("utf-8")):
             return json_error("Invalid or missing X-Vireo-Token", 401)
         return None
 
@@ -15517,6 +15526,11 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         Unlike cfg.load(), this does NOT merge DEFAULTS — so it contains
         only the keys the user has actually set. Used by write paths so the
         on-disk file stays minimal.
+
+        Preserves a `.corrupt` backup on unreadable/non-dict content before
+        returning `{}` — otherwise the very next PATCH/DELETE via the
+        schema-driven settings routes would call `cfg.save()` on the empty
+        dict and silently overwrite whatever the user had.
         """
         import config as cfg
 
@@ -15525,9 +15539,13 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         try:
             with open(cfg.CONFIG_PATH) as f:
                 raw = json.load(f)
-            return raw if isinstance(raw, dict) else {}
         except (OSError, json.JSONDecodeError):
+            cfg._preserve_corrupt_config()
             return {}
+        if not isinstance(raw, dict):
+            cfg._preserve_corrupt_config()
+            return {}
+        return raw
 
     # Serializes read-modify-write of ~/.vireo/config.json and the active
     # workspace's config_overrides across the schema-driven settings
@@ -15668,8 +15686,26 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         """
         import datetime as _datetime
 
+        import config_schema as schema
+
         raw = _read_raw_config_file()
         raw.pop("_migrations_applied", None)
+        # Never ship secret values in a settings backup — these files get
+        # attached to bug reports and shared machines. Import leaves this
+        # machine's stored secrets alone when the payload omits them, and
+        # ``_secrets_omitted`` tells the user what to re-enter after
+        # importing on a fresh machine.
+        _ABSENT = object()
+        omitted = []
+        for secret_key in schema.secret_keys():
+            val = schema.get_dotted(raw, secret_key, default=_ABSENT)
+            if val is _ABSENT:
+                continue
+            schema.delete_dotted(raw, secret_key)
+            if val:
+                omitted.append(secret_key)
+        if omitted:
+            raw["_secrets_omitted"] = sorted(omitted)
         # ``pipeline.default_process_id`` points into ``saved_processes``,
         # whose rows are DB-local — the ids don't transfer across databases.
         # If the same integer id happens to exist in the target DB it points
@@ -15729,6 +15765,9 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             return json_error(f"invalid JSON: {e}", status=400)
         if not isinstance(payload, dict):
             return json_error("payload must be a JSON object", status=400)
+
+        # Bookkeeping marker written by /api/settings/export; never persist it.
+        payload.pop("_secrets_omitted", None)
 
         # Translate the legacy ``pipeline.default_strategy`` (hardcoded strategy
         # name) to the current ``pipeline.default_process_id`` before schema
@@ -15903,6 +15942,17 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             return jsonify({"error": "validation failed", "errors": errors}), 400
 
         with _settings_write_lock:
+            # Exports omit secret values (see /api/settings/export), so a
+            # restored backup must not wipe the tokens already configured on
+            # this machine: absent secret keys keep their current on-disk
+            # value; explicitly supplied ones write through.
+            current_raw = _read_raw_config_file()
+            for secret_key in schema.secret_keys():
+                if schema.get_dotted(payload, secret_key, default=_MISSING) is not _MISSING:
+                    continue
+                existing = schema.get_dotted(current_raw, secret_key, default=_MISSING)
+                if existing is not _MISSING:
+                    schema.set_dotted(payload, secret_key, existing)
             cfg.save(payload)
             _settings_post_save_side_effects(cfg.load())
         return jsonify({"ok": True})
@@ -30821,6 +30871,35 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
     return app
 
 
+def _emit_incompatible_database_exit(e):
+    # Both --load-taxonomy and create_app open the catalog; either can trip
+    # ensure_schema's newer-DB guard, and both need the same guided exit so
+    # the desktop launcher gets a structured signal instead of a raw
+    # traceback.
+    import sys as _sys
+    if getattr(e, "newer", False):
+        log.error(
+            "Cannot open database at %s: it was created by a newer "
+            "version of Vireo than this build supports. Update Vireo to "
+            "its latest version to open this catalog. Underlying error: %s",
+            e.db_path, e.cause,
+        )
+    else:
+        log.error(
+            "Cannot open database at %s: it is from an incompatible older "
+            "version of Vireo. Back it up and remove it to start fresh "
+            "(e.g. `mv %s %s.bak`), then relaunch. Underlying error: %s",
+            e.db_path, e.db_path, e.db_path, e.cause,
+        )
+    _sys.stderr.write(json.dumps({
+        "error": "incompatible_database",
+        "db_path": e.db_path,
+        "reason": str(e),
+        "newer": getattr(e, "newer", False),
+    }) + "\n")
+    raise SystemExit(3) from e
+
+
 def main():
     _setup_file_logging()
 
@@ -30872,6 +30951,14 @@ def main():
     if args.load_taxonomy:
         from db import Database
         from taxonomy import fetch_common_names, load_taxonomy, seed_informal_groups
+        # Run the newer-schema guard before Database(args.db) executes any
+        # legacy DDL/ALTERs against a catalog stamped by a future Vireo build.
+        # create_app takes this same check through ensure_schema; keep the two
+        # entry points in sync so `--load-taxonomy` can't corrupt a newer DB.
+        try:
+            ensure_schema(args.db)
+        except IncompatibleDatabaseError as e:
+            _emit_incompatible_database_exit(e)
         db = Database(args.db)
         log.info("Loading taxonomy tree from iNaturalist...")
         stats = load_taxonomy(db)
@@ -30954,19 +31041,7 @@ def main():
         # as "did not become healthy within 30s"). The atexit/SIGTERM cleanup
         # registered above releases the single-instance lock and runtime.json
         # on this exit, so a retry isn't blocked by a stale reservation.
-        import sys as _sys
-        log.error(
-            "Cannot open database at %s: it is from an incompatible older "
-            "version of Vireo. Back it up and remove it to start fresh "
-            "(e.g. `mv %s %s.bak`), then relaunch. Underlying error: %s",
-            e.db_path, e.db_path, e.db_path, e.cause,
-        )
-        _sys.stderr.write(json.dumps({
-            "error": "incompatible_database",
-            "db_path": e.db_path,
-            "reason": str(e),
-        }) + "\n")
-        raise SystemExit(3) from e
+        _emit_incompatible_database_exit(e)
     except Exception as e:
         # Any other failure to build the app is still a fatal startup error
         # (corrupt-but-not-stale DB, missing/locked resource, an unexpected

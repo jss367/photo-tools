@@ -2112,14 +2112,34 @@ async function nwArchiveStep(body) {
   var freeLine = _nwEl('div', _nwHintCss, '');
   var err = _nwEl('div', _nwErrCss, '');
   var setChosen = async function(p) {
-    // Mirror _coerce_remote_target: absolute and not inside the mount.
-    var norm = function(x) { return String(x || '').replace(/\/+$/, '').toLowerCase(); };
-    var inMount = norm(p) === norm(_nw.mount.mount_point) ||
-      norm(p).indexOf(norm(_nw.mount.mount_point) + '/') === 0;
-    if (inMount) {
-      err.textContent = 'The archive folder must be on this Mac, not on the NAS volume itself.';
-      _nwSetNext(false);
-      return;
+    // Filesystem-aware containment: the same check _coerce_remote_target
+    // performs at save time. A purely-lexical prefix compare on the client
+    // (which we used to do here) misses symlink aliases — e.g. ~/Archive
+    // that points at /Volumes/Photography — and the save-time validator
+    // would then silently blank local_archive_root, leaving the wizard's
+    // target unable to offer the chained move. Fail here instead so the
+    // user gets an actionable error while still in step 4.
+    err.textContent = '';
+    _nwSetNext(false);
+    try {
+      var chk = await safeFetch('/api/remote-setup/check-archive-root', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({path: p, mount_path: _nw.mount.mount_point}),
+      }, { toast: false });
+      if (chk && chk.inside_mount) {
+        err.textContent = 'That folder resolves inside the NAS mount (symlink or alias). Pick a folder on this Mac instead.';
+        return;
+      }
+    } catch (e) {
+      // Endpoint unavailable (e.g. offline test harness) — fall back to a
+      // lexical check so this step still gates the obvious case.
+      var norm = function(x) { return String(x || '').replace(/\/+$/, '').toLowerCase(); };
+      var inMount = norm(p) === norm(_nw.mount.mount_point) ||
+        norm(p).indexOf(norm(_nw.mount.mount_point) + '/') === 0;
+      if (inMount) {
+        err.textContent = 'The archive folder must be on this Mac, not on the NAS volume itself.';
+        return;
+      }
     }
     err.textContent = '';
     _nw.archiveRoot = p;

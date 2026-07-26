@@ -22375,6 +22375,37 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             return json_error("path must be an existing absolute path")
         return jsonify({"free_bytes": shutil.disk_usage(path).free})
 
+    @app.route("/api/remote-setup/check-archive-root", methods=["POST"])
+    def api_remote_setup_check_archive_root():
+        """True if ``path`` resolves (through symlinks or case-only aliases)
+        into ``mount_path``. Exposes the same filesystem-aware containment
+        check ``_coerce_remote_target`` runs at save time so the wizard's
+        archive-root step can reject aliased folders up front instead of
+        letting the save silently blank ``local_archive_root``, which would
+        leave the target unable to offer the chained move the wizard was
+        meant to configure. A purely-lexical check on the client can't see
+        symlinks, so this has to be server-side."""
+        import move as move_mod
+
+        forbidden = _remote_setup_forbidden()
+        if forbidden:
+            return forbidden
+        body = request.get_json(silent=True) or {}
+        path = (body.get("path") or "").strip()
+        mount_path = (body.get("mount_path") or "").strip()
+        if not path or not mount_path:
+            return json_error("path and mount_path are required")
+        if not os.path.isabs(path) or not os.path.isabs(mount_path):
+            return json_error("both paths must be absolute")
+        try:
+            inside = bool(move_mod._path_equal_or_descends(path, mount_path))
+        except (OSError, ValueError):
+            # realpath failed (unreadable / cross-device on Windows) — the
+            # save-time validator is the authoritative check, so let the
+            # user proceed rather than block on a transient FS hiccup.
+            inside = False
+        return jsonify({"inside_mount": inside})
+
     @app.route("/api/jobs/import-full", methods=["POST"])
     def api_job_import_full():
         """Full-chain import: copy files -> scan -> create collection."""

@@ -182,3 +182,55 @@ def test_disk_free_endpoint(app_and_db, tmp_path):
     bad = app.test_client().get(
         "/api/remote-setup/disk-free", query_string={"path": "not/absolute"})
     assert bad.status_code == 400
+
+
+def test_check_archive_root_flags_alias_into_mount(app_and_db, tmp_path):
+    """The endpoint must catch a symlinked archive that resolves inside the
+    mount — the whole point of adding it is that a lexical prefix check on
+    the client misses aliases and the save-time validator would then
+    silently blank local_archive_root."""
+    app, _db = app_and_db
+    mount = tmp_path / "mnt"
+    mount.mkdir()
+    alias = tmp_path / "alias"
+    try:
+        os.symlink(str(mount), str(alias))
+    except (OSError, NotImplementedError):
+        import pytest
+        pytest.skip("symlink not supported on this filesystem")
+    res = app.test_client().post(
+        "/api/remote-setup/check-archive-root",
+        json={"path": str(alias), "mount_path": str(mount)})
+    assert res.status_code == 200
+    assert res.get_json() == {"inside_mount": True}
+
+
+def test_check_archive_root_accepts_separate_path(app_and_db, tmp_path):
+    app, _db = app_and_db
+    mount = tmp_path / "mnt"
+    mount.mkdir()
+    outside = tmp_path / "elsewhere"
+    outside.mkdir()
+    res = app.test_client().post(
+        "/api/remote-setup/check-archive-root",
+        json={"path": str(outside), "mount_path": str(mount)})
+    assert res.status_code == 200
+    assert res.get_json() == {"inside_mount": False}
+
+
+def test_check_archive_root_validates_inputs(app_and_db):
+    app, _db = app_and_db
+    c = app.test_client()
+    assert c.post("/api/remote-setup/check-archive-root",
+                  json={"path": "", "mount_path": "/mnt"}).status_code == 400
+    assert c.post("/api/remote-setup/check-archive-root",
+                  json={"path": "rel", "mount_path": "/mnt"}).status_code == 400
+
+
+def test_check_archive_root_rejects_non_loopback(app_and_db, tmp_path):
+    app, _db = app_and_db
+    res = app.test_client().post(
+        "/api/remote-setup/check-archive-root",
+        json={"path": str(tmp_path), "mount_path": str(tmp_path)},
+        environ_overrides={"REMOTE_ADDR": "192.168.1.50"})
+    assert res.status_code == 403

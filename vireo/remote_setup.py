@@ -249,6 +249,33 @@ def build_install_argv(host, user, port, key_pub_line, ssh_bin):
 
 _PASSWORD_PROMPT_RE = re.compile(r"[Pp]assword[^\n]*:")
 
+# Runs in a fresh Python interpreter (spawned via subprocess), NOT as a
+# preexec_fn callback in the forked child. That distinction matters: this
+# install-key path runs inside the 16-thread Waitress worker pool, and the
+# subprocess docs warn that preexec_fn is unsafe under threads because the
+# forked child inherits every lock the parent's other threads were holding
+# and can deadlock before exec. A subprocess helper avoids that entirely —
+# the child process is a brand-new Python with no inherited threads or
+# locks, and Popen without preexec_fn uses posix_spawn/vfork under the
+# hood (thread-safe). The helper does the pty setup real ssh needs
+# (setsid + TIOCSCTTY so /dev/tty resolves) plus a defensive ECHO=off,
+# then execvp's the real ssh argv. Written as a one-line -c snippet so
+# there's no separate file to ship or find at runtime.
+_PTY_SPAWN_HELPER = (
+    "import os,sys,fcntl,termios;"
+    "os.setsid();"
+    "fcntl.ioctl(0,termios.TIOCSCTTY,0);"
+    # ECHO=off before ssh takes over: a fresh pty defaults to ECHO=ON, and
+    # the password we write later would then echo into the parent's read
+    # buffer where an unclassified failure could return it as `detail`.
+    # ssh sets ECHO off itself when it prompts, but pre-disabling closes
+    # the race; the redaction below is the belt-and-braces backstop.
+    "a=termios.tcgetattr(0);"
+    "a[3]&=~(termios.ECHO|termios.ECHOE|termios.ECHOK|termios.ECHONL);"
+    "termios.tcsetattr(0,termios.TCSANOW,a);"
+    "os.execvp(sys.argv[1],sys.argv[1:])"
+)
+
 
 def install_key_with_password(spawn_argv, password, timeout=30):
     """Drive ``spawn_argv`` through a pty, answering one password prompt.
@@ -261,42 +288,20 @@ def install_key_with_password(spawn_argv, password, timeout=30):
     The password must never reach logs, exceptions, or the returned dict —
     it is written to the pty and nowhere else.
     """
-    # pty + termios + fcntl are POSIX-only; import here so `remote_setup`
-    # still loads on Windows (the wizard itself is macOS-only in production).
-    import fcntl
+    # pty is POSIX-only; import here so `remote_setup` still loads on
+    # Windows (the wizard itself is macOS-only in production).
     import pty
-    import termios
 
     master, slave = pty.openpty()
-    # Disable pty ECHO up front — a new pty defaults to ECHO=ON, and any
-    # bytes we write for the password prompt would then be echoed back into
-    # our read buffer, leaving the password sitting in ``output`` where an
-    # unclassified failure (below) could return it as ``detail``. ssh sets
-    # ECHO off itself when it prompts, but the default state before that is
-    # too fragile to rely on.
-    try:
-        attrs = termios.tcgetattr(slave)
-        attrs[3] &= ~(termios.ECHO | termios.ECHOE | termios.ECHOK
-                      | termios.ECHONL)
-        termios.tcsetattr(slave, termios.TCSANOW, attrs)
-    except termios.error:
-        pass  # if we can't disable echo, redaction below is the backstop
-    def _preexec():
-        # Real OpenSSH reads the password prompt from /dev/tty, not stdin,
-        # so start_new_session on its own is not enough: setsid detaches the
-        # child from the parent's tty but leaves the child with NO controlling
-        # terminal, and `/dev/tty` then fails with ENXIO. TIOCSCTTY on the
-        # slave (which is stdin/stdout/stderr in the child) is what promotes
-        # the pty to being the controlling terminal so the prompt reaches us.
-        # The test stub in test_remote_setup.py reads from stdin via input()
-        # and doesn't need this, but real ssh does.
-        os.setsid()
-        fcntl.ioctl(0, termios.TIOCSCTTY, 0)
-
+    # Spawn the real ssh through a Python helper (see _PTY_SPAWN_HELPER):
+    # the helper does the setsid+TIOCSCTTY+ECHO=off dance and then execs
+    # ssh. No preexec_fn — Popen without one is thread-safe under
+    # Waitress, and the helper Python is a fresh process with no
+    # inherited locks so its setup code cannot deadlock.
     try:
         proc = subprocess.Popen(
-            spawn_argv, stdin=slave, stdout=slave, stderr=slave,
-            preexec_fn=_preexec)
+            [sys.executable, "-c", _PTY_SPAWN_HELPER, *spawn_argv],
+            stdin=slave, stdout=slave, stderr=slave)
     except OSError as exc:
         os.close(master)
         os.close(slave)

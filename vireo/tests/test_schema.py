@@ -1508,15 +1508,23 @@ def test_ensure_schema_keeps_older_backups_when_snapshot_fails(tmp_path, monkeyp
 
 
 def test_ensure_schema_newer_db_raises_incompatible_database_error(tmp_path):
-    """Opening a DB stamped by a newer Vireo raises the friendly
-    IncompatibleDatabaseError (caught by main's guided-exit handler) instead
-    of an anonymous RuntimeError crash — and does not mutate the file."""
+    """Opening a DB whose ``schema_registry_version`` marker exceeds this
+    build's registry raises the friendly IncompatibleDatabaseError (caught
+    by main's guided-exit handler) instead of an anonymous RuntimeError
+    crash — and does not mutate the file."""
     from db import IncompatibleDatabaseError
 
     db_path = str(tmp_path / "vireo.db")
     schema.ensure_schema(db_path)
+    latest = schema.MIGRATIONS[-1].version
     with sqlite3.connect(db_path) as conn:
-        conn.execute("PRAGMA user_version = 99")
+        # A future Vireo running its (newer) migrations would leave both the
+        # pragma and the registry-version marker stamped ahead of this build.
+        conn.execute(f"PRAGMA user_version = {latest + 1}")
+        conn.execute(
+            "INSERT OR REPLACE INTO db_meta(key, value) VALUES ('schema_registry_version', ?)",
+            (str(latest + 1),),
+        )
 
     with pytest.raises(IncompatibleDatabaseError) as excinfo:
         schema.ensure_schema(db_path)
@@ -1524,7 +1532,127 @@ def test_ensure_schema_newer_db_raises_incompatible_database_error(tmp_path):
     assert "newer" in str(excinfo.value)
     assert excinfo.value.db_path == db_path
     with sqlite3.connect(db_path) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 99
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == latest + 1
+        marker = conn.execute(
+            "SELECT value FROM db_meta WHERE key='schema_registry_version'"
+        ).fetchone()
+        assert marker[0] == str(latest + 1)
+
+
+def test_ensure_schema_tolerates_parallel_branch_user_version_drift(tmp_path):
+    """A live DB from an unmerged/parallel branch build often has a higher
+    ``PRAGMA user_version`` than this build's registry — the db_meta-gated
+    migrations in db.py exist precisely because that drift is known and
+    expected. Without an accompanying ``schema_registry_version`` marker
+    ahead of this build's latest, the drifted DB must open normally instead
+    of hard-failing every future startup."""
+    db_path = str(tmp_path / "vireo.db")
+    schema.ensure_schema(db_path)
+    latest = schema.MIGRATIONS[-1].version
+    # Simulate parallel-branch drift: pragma bumped, marker untouched.
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(f"PRAGMA user_version = {latest + 3}")
+
+    schema.ensure_schema(db_path)
+
+    with sqlite3.connect(db_path) as conn:
+        # The drifted pragma is preserved (we don't silently downgrade it),
+        # and the DB is otherwise operable.
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == latest + 3
+        assert conn.execute("SELECT COUNT(*) FROM workspaces").fetchone()[0] >= 1
+
+
+def test_ensure_schema_records_registry_version_marker(tmp_path):
+    """On successful startup, ``schema_registry_version`` is stamped with the
+    current registry's latest so a future older build can distinguish
+    genuinely-newer catalogs from drift."""
+    db_path = str(tmp_path / "vireo.db")
+    schema.ensure_schema(db_path)
+    latest = schema.MIGRATIONS[-1].version
+    with sqlite3.connect(db_path) as conn:
+        marker = conn.execute(
+            "SELECT value FROM db_meta WHERE key='schema_registry_version'"
+        ).fetchone()
+    assert marker == (str(latest),)
+
+
+def test_ensure_schema_never_downgrades_registry_version_marker(tmp_path):
+    """``_record_registry_version`` must never lower an existing marker.
+    The marker is the sole evidence a still-newer Vireo has for rejecting
+    this catalog — downgrading it would strip that evidence and turn a
+    subsequent open by that newer build into a silent no-op or worse."""
+    db_path = str(tmp_path / "vireo.db")
+    schema.ensure_schema(db_path)
+    latest = schema.MIGRATIONS[-1].version
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO db_meta(key, value) VALUES "
+            "('schema_registry_version', ?)",
+            (str(latest + 5),),
+        )
+        schema._record_registry_version(conn, latest)
+        marker = conn.execute(
+            "SELECT value FROM db_meta WHERE key='schema_registry_version'"
+        ).fetchone()
+    assert marker == (str(latest + 5),)
+
+
+def test_ensure_schema_keeps_newer_version_snapshots(tmp_path):
+    """A snapshot from a strictly-newer schema version — say a `.pre-v99.bak`
+    left by a future Vireo — may contain the user's only copy of edits made
+    under that newer schema. Pruning must key on the version suffix (older
+    only), not "everything except keep", so restoring an older live DB and
+    launching this build doesn't wipe the newer snapshot."""
+    import os
+
+    db_path = str(tmp_path / "vireo.db")
+    schema.ensure_schema(db_path)
+    latest = schema.MIGRATIONS[-1].version
+
+    older_snapshot = f"{db_path}.pre-v{latest - 1}.bak"
+    newer_snapshot = f"{db_path}.pre-v{latest + 5}.bak"
+    with open(older_snapshot, "w") as f:
+        f.write("older snapshot")
+    with open(newer_snapshot, "w") as f:
+        f.write("newer-vireo snapshot with user edits")
+
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("PRAGMA user_version = 7")
+
+    schema.ensure_schema(db_path)
+
+    assert os.path.exists(f"{db_path}.pre-v{latest}.bak")
+    assert not os.path.exists(older_snapshot)
+    assert os.path.exists(newer_snapshot), (
+        "prune erased a newer-schema snapshot that may hold the only copy "
+        "of edits made under a future Vireo"
+    )
+
+
+def test_snapshot_preserves_source_permission_mode(tmp_path):
+    """``VACUUM INTO`` honors the process umask, so a ``0600`` catalog would
+    otherwise become a ``0644`` backup — silently widening access to
+    thumbnails, GPS, and paths for any local user who can traverse the
+    parent directory. The snapshot must inherit the source file's mode."""
+    import os
+    import stat as _stat
+
+    if os.name != "posix":
+        pytest.skip("POSIX permission bits not meaningful on this platform")
+
+    db_path = str(tmp_path / "vireo.db")
+    schema.ensure_schema(db_path)
+    os.chmod(db_path, 0o600)
+
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("PRAGMA user_version = 7")
+
+    schema.ensure_schema(db_path)
+
+    latest = schema.MIGRATIONS[-1].version
+    backup = f"{db_path}.pre-v{latest}.bak"
+    assert os.path.exists(backup)
+    assert _stat.S_IMODE(os.stat(backup).st_mode) == 0o600
 
 
 def test_load_taxonomy_cli_refuses_newer_db(tmp_path, monkeypatch, capsys):
@@ -1539,8 +1667,14 @@ def test_load_taxonomy_cli_refuses_newer_db(tmp_path, monkeypatch, capsys):
 
     db_path = str(tmp_path / "vireo.db")
     schema.ensure_schema(db_path)
+    latest = schema.MIGRATIONS[-1].version
     with sqlite3.connect(db_path) as conn:
-        conn.execute("PRAGMA user_version = 99")
+        conn.execute(f"PRAGMA user_version = {latest + 1}")
+        conn.execute(
+            "INSERT OR REPLACE INTO db_meta(key, value) VALUES "
+            "('schema_registry_version', ?)",
+            (str(latest + 1),),
+        )
 
     monkeypatch.setattr(
         "sys.argv",
@@ -1565,4 +1699,4 @@ def test_load_taxonomy_cli_refuses_newer_db(tmp_path, monkeypatch, capsys):
     assert payload["db_path"] == db_path
 
     with sqlite3.connect(db_path) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 99
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == latest + 1

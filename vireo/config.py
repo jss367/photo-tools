@@ -2,7 +2,6 @@
 
 import contextlib
 import copy
-import filecmp
 import json
 import logging
 import os
@@ -245,13 +244,17 @@ def _preserve_corrupt_config():
     backup = CONFIG_PATH + ".corrupt"
     try:
         # Skip only when the current corrupt file is byte-for-byte the same
-        # as the existing backup. mtime comparison isn't safe here: a
-        # restored-from-history file, a coarse-resolution filesystem, or an
-        # editor that resets mtime can leave the current corruption with an
-        # equal-or-older timestamp than an unrelated older backup, and the
-        # current bytes would then be discarded.
-        if os.path.exists(backup) and filecmp.cmp(backup, CONFIG_PATH, shallow=False):
-            return
+        # as the existing backup. Direct byte comparison (rather than
+        # mtime, or ``filecmp.cmp`` which caches results keyed on stat
+        # tuples) avoids two silent-loss modes: a restored-from-history
+        # file / coarse-resolution filesystem leaving the current
+        # corruption with an equal-or-older timestamp than an unrelated
+        # older backup, and ``filecmp``'s cache reporting a stale "equal"
+        # verdict when the file's stat key hasn't advanced.
+        if os.path.exists(backup):
+            with open(backup, "rb") as bf, open(CONFIG_PATH, "rb") as cf:
+                if bf.read() == cf.read():
+                    return
         shutil.copy2(CONFIG_PATH, backup)
         log.warning("Config file is unreadable; preserved a copy at %s", backup)
     except OSError:
@@ -358,9 +361,11 @@ def _read_raw():
     try:
         with open(CONFIG_PATH) as f:
             raw = json.load(f)
-    except (OSError, json.JSONDecodeError):
-        # Callers (the config migrations) save() right after this read, so an
-        # unpreserved corrupt file would be clobbered with near-defaults.
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        # UnicodeError catches invalid-UTF-8 config bytes too: json.load's
+        # underlying text decode raises it, and without preservation the
+        # migration caller's immediate save() would clobber the corrupt
+        # file with near-defaults.
         _preserve_corrupt_config()
         return {}
     if not isinstance(raw, dict):

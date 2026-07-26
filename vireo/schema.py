@@ -12,7 +12,9 @@ import glob
 import json
 import logging
 import os
+import re
 import sqlite3
+import stat
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -22,6 +24,21 @@ from db import Database, IncompatibleDatabaseError
 log = logging.getLogger(__name__)
 
 _SCHEMA_LOCK = threading.Lock()
+
+# ``.pre-vN.bak`` — used both for creating snapshots and for pruning older
+# ones without collateral-damaging newer-version snapshots that a future
+# Vireo left behind.
+_BACKUP_SUFFIX_RE = re.compile(r"\.pre-v(\d+)\.bak$")
+
+# db_meta marker that records the highest schema registry version to have
+# initialized this catalog. Bumped on every successful ensure_schema so a
+# future older build can distinguish parallel-branch drift (where
+# user_version happens to be higher than this build's ``latest`` but no
+# newer registry has actually written the file) from a genuinely-newer
+# catalog written by a future Vireo. Without this marker, an older build
+# has to treat every user_version > latest as newer/incompatible, which
+# turns known drift into a hard startup failure.
+_SCHEMA_REGISTRY_KEY = "schema_registry_version"
 
 
 @dataclass(frozen=True)
@@ -908,9 +925,12 @@ MIGRATIONS = (
 
 def _apply_pending(conn):
     current = conn.execute("PRAGMA user_version").fetchone()[0]
-    latest = MIGRATIONS[-1].version if MIGRATIONS else current
-    if current > latest:
-        raise RuntimeError(f"database schema version {current} is newer than supported {latest}")
+    # ensure_schema is the sole entry point and already gates truly-newer
+    # catalogs on the schema_registry_version marker (not user_version, which
+    # drifts under parallel-branch builds). Drift arriving here has
+    # current > MIGRATIONS[-1].version but no newer registry marker; the
+    # per-migration skip below is a no-op for that case, so we don't need
+    # to re-reject on user_version alone.
 
     for migration in MIGRATIONS:
         if migration.version <= current:
@@ -938,6 +958,64 @@ def _existing_user_version(db_path):
         return conn.execute("PRAGMA user_version").fetchone()[0]
 
 
+def _stored_registry_version(db_path):
+    """Highest schema registry version recorded in the DB's ``db_meta``, or
+    ``None`` when the marker is missing (older Vireo build) or unreadable.
+
+    This is the authoritative signal for "this catalog was written by a
+    newer Vireo." ``PRAGMA user_version`` alone is unreliable because
+    parallel/unmerged branch builds routinely stamp higher values without
+    changing the schema — see the ``db_meta``-gated migrations in
+    ``vireo/db.py``. This marker is only bumped by ``ensure_schema`` here,
+    so a value greater than the running build's ``latest`` is proof
+    (not inference) that a newer registry has already opened this file.
+    """
+    if not os.path.exists(db_path) or os.path.getsize(db_path) == 0:
+        return None
+    try:
+        with contextlib.closing(sqlite3.connect(db_path)) as conn:
+            row = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='db_meta'"
+            ).fetchone()
+            if row is None:
+                return None
+            row = conn.execute(
+                "SELECT value FROM db_meta WHERE key=?",
+                (_SCHEMA_REGISTRY_KEY,),
+            ).fetchone()
+    except sqlite3.Error:
+        return None
+    if row is None:
+        return None
+    try:
+        return int(row[0])
+    except (TypeError, ValueError):
+        return None
+
+
+def _record_registry_version(conn, latest):
+    """Bump the ``schema_registry_version`` marker to ``latest`` if newer.
+
+    Only writes on advancement so an older build reopening a drifted
+    catalog can't silently downgrade the marker back to its own level and
+    strip the "genuinely-newer" evidence a still-newer build had recorded.
+    """
+    row = conn.execute(
+        "SELECT value FROM db_meta WHERE key=?",
+        (_SCHEMA_REGISTRY_KEY,),
+    ).fetchone()
+    try:
+        stored = int(row[0]) if row is not None else None
+    except (TypeError, ValueError):
+        stored = None
+    if stored is None or stored < latest:
+        conn.execute(
+            "INSERT OR REPLACE INTO db_meta(key, value) VALUES (?, ?)",
+            (_SCHEMA_REGISTRY_KEY, str(latest)),
+        )
+        conn.commit()
+
+
 def _backup_path(db_path, target_version):
     return f"{db_path}.pre-v{target_version}.bak"
 
@@ -951,6 +1029,12 @@ def _snapshot_before_migrations(db_path, target_version):
     partial progress the failed run left behind. Backup failure (disk full,
     read-only volume) is logged but never blocks startup: per-migration
     transactions still protect the live file.
+
+    The snapshot is published with the same POSIX mode as the source
+    catalog. Without this, ``VACUUM INTO`` creates the file honoring the
+    process umask, so a ``0600`` catalog becomes a ``0644`` backup under a
+    typical ``022`` umask — exposing thumbnails, GPS, and paths to any
+    other local user who can traverse the enclosing directory.
     """
     backup = _backup_path(db_path, target_version)
     if os.path.exists(backup):
@@ -959,8 +1043,14 @@ def _snapshot_before_migrations(db_path, target_version):
     with contextlib.suppress(OSError):
         os.remove(tmp)
     try:
+        source_mode = None
+        with contextlib.suppress(OSError):
+            source_mode = stat.S_IMODE(os.stat(db_path).st_mode)
         with contextlib.closing(sqlite3.connect(db_path)) as conn:
             conn.execute("VACUUM INTO ?", (tmp,))
+        if source_mode is not None:
+            with contextlib.suppress(OSError):
+                os.chmod(tmp, source_mode)
         os.replace(tmp, backup)
         log.info("Backed up database to %s before schema migration", backup)
     except (sqlite3.Error, OSError):
@@ -979,10 +1069,19 @@ def _prune_stale_backups(db_path, keep_version):
     keep = _backup_path(db_path, keep_version)
     if not os.path.exists(keep):
         return
+    # Only prune backups **older** than the one we just wrote. A later-version
+    # snapshot (e.g. an unrelated `.pre-v9.bak` sitting next to a v7 catalog
+    # this v8 build is upgrading to v8) may contain the user's only copy of
+    # edits made under a newer schema; deleting it because the filename
+    # doesn't match `keep_version` would be silent data loss.
     for path in glob.glob(glob.escape(db_path) + ".pre-v*.bak"):
-        if path != keep:
-            with contextlib.suppress(OSError):
-                os.remove(path)
+        if path == keep:
+            continue
+        match = _BACKUP_SUFFIX_RE.search(path)
+        if match is None or int(match.group(1)) >= keep_version:
+            continue
+        with contextlib.suppress(OSError):
+            os.remove(path)
 
 
 def ensure_schema(db_path):
@@ -990,21 +1089,50 @@ def ensure_schema(db_path):
     with _SCHEMA_LOCK:
         latest = MIGRATIONS[-1].version if MIGRATIONS else 0
         current = _existing_user_version(db_path)
-        # Refuse a database stamped by a newer Vireo before Database.__init__
-        # runs its legacy ALTERs against it. IncompatibleDatabaseError (rather
-        # than the bare RuntimeError _apply_pending raises) reaches main()'s
-        # guided-exit handler, so the user gets "update Vireo" instead of a
-        # raw traceback.
-        if current is not None and current > latest:
+        # Refuse a database written by a strictly-newer Vireo before
+        # Database.__init__ runs its legacy ALTERs against it, and route
+        # through IncompatibleDatabaseError so main()'s guided-exit handler
+        # can tell the user "update Vireo" instead of surfacing a raw
+        # traceback. The check keys on the schema_registry_version
+        # db_meta marker rather than PRAGMA user_version: unmerged-branch
+        # builds routinely stamp user_version ahead of main (db.py's
+        # db_meta-gated migrations exist for exactly this reason), and
+        # rejecting drifted-but-compatible catalogs would leave those
+        # installs unable to launch. A marker greater than this build's
+        # latest is proof that ensure_schema in a newer build has already
+        # run against this file.
+        stored_registry = _stored_registry_version(db_path)
+        if stored_registry is not None and stored_registry > latest:
             raise IncompatibleDatabaseError(
                 db_path,
-                cause=f"schema version {current} is newer than supported {latest}",
+                cause=(
+                    f"schema registry version {stored_registry} is newer "
+                    f"than supported {latest}"
+                ),
                 newer=True,
             )
+        if current is not None and current > latest:
+            # user_version-only drift (no newer registry marker): a parallel
+            # build advanced the pragma but nothing about the schema is
+            # actually newer. Let the DB open so users on drifted installs
+            # aren't locked out; log so it's traceable in the app log.
+            log.warning(
+                "Database %s has user_version %s > known %s but no newer "
+                "schema_registry_version marker; treating as parallel-branch "
+                "drift and opening normally.",
+                db_path, current, latest,
+            )
+        # Snapshot on any user_version-based upgrade path. The marker is
+        # only consulted for the "genuinely-newer" rejection above; letting
+        # it also gate the snapshot would skip backups on legitimate v-1
+        # → v migrations whenever a same-latest marker already existed
+        # (e.g. after a manual pragma rewind, or a crashed migration that
+        # left the pragma behind but the marker up-to-date).
         upgrading = current is not None and current < latest
         if upgrading:
             _snapshot_before_migrations(db_path, latest)
         with Database(db_path) as db:
             _apply_pending(db.conn)
+            _record_registry_version(db.conn, latest)
         if upgrading:
             _prune_stale_backups(db_path, latest)

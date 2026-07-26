@@ -1717,6 +1717,84 @@ def test_read_raw_preserves_corrupt_file_copy(tmp_path):
         assert f.read() == corrupt_body
 
 
+def test_read_raw_preserves_valid_non_object_json(tmp_path):
+    """_read_raw treats valid JSON that isn't a top-level object (``[]``,
+    ``null``, a bare number) as corrupt too — the config schema requires a
+    mapping, and a subsequent migration ``save()`` would otherwise silently
+    discard the user's original payload."""
+    import config as cfg
+
+    cfg.CONFIG_PATH = str(tmp_path / "config.json")
+    body = "[1, 2, 3]"
+    with open(cfg.CONFIG_PATH, "w") as f:
+        f.write(body)
+
+    assert cfg._read_raw() == {}
+    with open(cfg.CONFIG_PATH + ".corrupt") as f:
+        assert f.read() == body
+
+
+def test_read_raw_preserves_invalid_utf8_bytes(tmp_path):
+    """``_read_raw()`` must fall back to ``{}`` and preserve the corrupt file
+    when its bytes aren't valid UTF-8; the underlying text decode raises
+    ``UnicodeDecodeError`` (a ``UnicodeError`` subclass), and without an
+    explicit catch it would escape the migration caller and abort startup."""
+    import config as cfg
+
+    cfg.CONFIG_PATH = str(tmp_path / "config.json")
+    body = b"\xff\xfe\xfd"  # Invalid UTF-8 leading bytes.
+    with open(cfg.CONFIG_PATH, "wb") as f:
+        f.write(body)
+
+    assert cfg._read_raw() == {}
+    with open(cfg.CONFIG_PATH + ".corrupt", "rb") as f:
+        assert f.read() == body
+
+
+def test_preserve_corrupt_bypasses_filecmp_stale_cache(tmp_path):
+    """``filecmp.cmp`` caches equality using a stat-tuple key; the previous
+    implementation could return a stale "equal" verdict and skip preserving
+    the new corrupt bytes when the current file's stat happened to reuse the
+    same key. A direct byte-level comparison avoids the trap.
+
+    This test poisons ``filecmp``'s cache with an equality result for
+    (backup, current) before the current file's bytes are rewritten, then
+    verifies the preservation helper still updates the backup."""
+    import config as cfg
+
+    cfg.CONFIG_PATH = str(tmp_path / "config.json")
+    backup = cfg.CONFIG_PATH + ".corrupt"
+
+    original = "{ old-corrupt"
+    with open(cfg.CONFIG_PATH, "w") as f:
+        f.write(original)
+    with open(backup, "w") as f:
+        f.write(original)
+
+    # Warm the filecmp cache. The old implementation would consult this
+    # entry on the next preserve call.
+    import filecmp
+    filecmp.cmp(backup, cfg.CONFIG_PATH, shallow=False)
+
+    # Overwrite the current file with different corruption but leave its
+    # size and mtime unchanged (in-place same-length write on many
+    # filesystems keeps stat identical to the cached key).
+    now = os.path.getmtime(cfg.CONFIG_PATH)
+    new_current = "{ new-corrupt"
+    assert len(new_current) == len(original)
+    with open(cfg.CONFIG_PATH, "w") as f:
+        f.write(new_current)
+    os.utime(cfg.CONFIG_PATH, (now, now))
+
+    cfg._preserve_corrupt_config()
+
+    with open(backup) as f:
+        assert f.read() == new_current, (
+            "preserve helper trusted a stale filecmp cache entry and left "
+            "the older corruption in place"
+        )
+
+
 def test_load_preserves_current_corrupt_over_older_backup_with_newer_mtime(tmp_path):
     """A pre-existing `.corrupt` file with an equal-or-newer mtime must not
     trick the preserve step into discarding the *current* corrupt bytes.

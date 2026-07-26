@@ -1299,3 +1299,38 @@ def test_export_import_round_trip_keeps_secrets_and_omits_marker(app_and_db):
     raw = cfg._read_raw()
     assert raw.get("google_maps_api_key") == "maps_LOCAL"
     assert "_secrets_omitted" not in raw
+
+
+# ---------------------------------------------------------------------------
+# Corrupt-config preservation through the settings endpoints
+# ---------------------------------------------------------------------------
+
+
+def test_settings_patch_preserves_corrupt_config_before_overwriting(app_and_db):
+    """A PATCH to ``/api/settings/global`` runs the app's ``_read_raw_config_file``
+    → ``set_dotted`` → ``cfg.save`` cycle. If the on-disk file has become
+    corrupt while Vireo is running (interrupted write, disk error), the raw
+    reader used to return ``{}`` without preserving the bytes, so the
+    immediate ``cfg.save`` in the same handler silently clobbered the user's
+    settings with near-defaults. The reader must route through
+    ``_preserve_corrupt_config`` so a ``.corrupt`` snapshot exists before
+    the overwrite happens."""
+    app, _ = app_and_db
+    import config as cfg
+
+    corrupt_body = '{"classification_threshold": 0.9, TRUNCATED'
+    with open(cfg.CONFIG_PATH, "w") as f:
+        f.write(corrupt_body)
+
+    client = app.test_client()
+    resp = client.patch(
+        "/api/settings/global",
+        json={"key": "classification_threshold", "value": 0.4},
+    )
+    assert resp.status_code == 200
+
+    # The write succeeded and the .corrupt snapshot survives with the
+    # user's original (though truncated) bytes intact.
+    assert cfg.load()["classification_threshold"] == 0.4
+    with open(cfg.CONFIG_PATH + ".corrupt") as f:
+        assert f.read() == corrupt_body

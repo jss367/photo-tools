@@ -15526,17 +15526,15 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         Unlike cfg.load(), this does NOT merge DEFAULTS — so it contains
         only the keys the user has actually set. Used by write paths so the
         on-disk file stays minimal.
+
+        Routes through ``cfg._read_raw`` so a config corrupted while Vireo
+        is running is preserved as ``config.json.corrupt`` before the
+        immediate follow-up ``cfg.save`` (from PATCH/DELETE/import) would
+        otherwise silently clobber it with near-defaults.
         """
         import config as cfg
 
-        if not os.path.exists(cfg.CONFIG_PATH):
-            return {}
-        try:
-            with open(cfg.CONFIG_PATH) as f:
-                raw = json.load(f)
-            return raw if isinstance(raw, dict) else {}
-        except (OSError, json.JSONDecodeError):
-            return {}
+        return cfg._read_raw()
 
     # Serializes read-modify-write of ~/.vireo/config.json and the active
     # workspace's config_overrides across the schema-driven settings

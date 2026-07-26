@@ -7,8 +7,11 @@ All notable changes to Vireo are documented in this file.
 ### Added
 - **Automatic catalog backup before upgrades.** When a new Vireo version
   needs to migrate the database, a snapshot is saved next to it (e.g.
-  `vireo.db.pre-v8.bak`) before any migration runs. Only the most recent
-  pre-upgrade snapshot is kept.
+  `vireo.db.pre-v8.bak`) before any migration runs. Older pre-upgrade
+  snapshots are pruned only after the replacement snapshot is written
+  successfully — if the new snapshot fails (disk full, read-only volume),
+  older snapshots are left in place so the upgrade still has a recovery
+  point.
 - **Advanced color and tone editing.** The non-destructive photo editor now
   includes a five-point tone curve, an eight-color hue/saturation/luminance
   mixer, and independent shadow, midtone, and highlight color grading. These

@@ -59,7 +59,10 @@ def test_parse_afpfs_and_ipv6_hosts():
     v6 = "//admin@[fe80::1%25en0]/Backup on /Volumes/Backup (smbfs, nodev, nosuid, mounted by julius)"
     rows = remote_setup.parse_mount_output(afp + "\n" + v6)
     assert rows[0]["fs_type"] == "afpfs" and rows[0]["share"] == "Media"
-    assert rows[1]["host"] == "[fe80::1%en0]" and rows[1]["share"] == "Backup"
+    # Brackets are the URL-authority spelling; socket.create_connection and
+    # friendly_host_name want the plain address, so parse_mount_output strips
+    # them while preserving the scope id.
+    assert rows[1]["host"] == "fe80::1%en0" and rows[1]["share"] == "Backup"
 
 
 def test_list_network_mounts_runs_mount_and_resolves():
@@ -130,7 +133,22 @@ def test_key_auth_works_builds_batchmode_ssh(tmp_path):
     assert argv[0] == "/usr/bin/ssh"
     assert "BatchMode=yes" in argv
     assert "-p" in argv and "2222" in argv and "-i" in argv and "/k" in argv
+    # IdentitiesOnly=yes prevents an ambient ssh-agent identity from making
+    # the probe pass on the agent's key instead of the wizard-managed one.
+    assert "IdentitiesOnly=yes" in argv
     assert argv[-2:] == ["admin@nas", "echo vireo_ok"]
+
+
+def test_key_auth_works_omits_identities_only_when_no_key():
+    """When no key is passed the probe shouldn't force IdentitiesOnly — the
+    install-key path uses this shape (key='') and must remain free to
+    negotiate password auth."""
+    run = FakeRun(stdout="", returncode=255)
+    remote_setup.key_auth_works(
+        host="nas", user="admin", port=22, key="", ssh_bin="ssh", run=run)
+    argv = run.calls[0]
+    assert "IdentitiesOnly=yes" not in argv
+    assert "-i" not in argv
 
 
 def test_key_auth_works_false_on_denied(tmp_path):

@@ -70,8 +70,15 @@ def parse_mount_output(text):
         if not s:
             continue
         unq = urllib.parse.unquote
+        # SMB URL-authority form wraps IPv6 in brackets (`[fe80::1%25en0]`).
+        # Keep the URL form out of downstream consumers: socket.create_connection
+        # and friendly_host_name want the plain address (`fe80::1%en0`), and
+        # the brackets confuse both. Strip them once here.
+        host = unq(s.group("host"))
+        if host.startswith("[") and host.endswith("]"):
+            host = host[1:-1]
         rows.append({
-            "fs_type": fs_type, "host": unq(s.group("host")),
+            "fs_type": fs_type, "host": host,
             "share": unq(s.group("share").rstrip("/")),
             "mount_point": mount_point, "user": unq(s.group("user") or ""),
         })
@@ -158,7 +165,13 @@ def _ssh_option_args(port, key, batch=True):
     except (TypeError, ValueError):
         pass
     if key:
-        args += ["-i", key]
+        # IdentitiesOnly=yes is what makes ``key_auth_works`` a truthful check.
+        # Without it, ssh still consults ssh-agent and any default identities,
+        # so an ambient agent identity already authorized on the NAS lets `-i
+        # <vireo-key>` succeed on the agent's key rather than ours — the wizard
+        # would then skip install-key and save a target that stops working the
+        # moment the agent identity is unavailable.
+        args += ["-o", "IdentitiesOnly=yes", "-i", key]
     return args
 
 

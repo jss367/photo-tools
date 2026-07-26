@@ -7647,24 +7647,51 @@ def test_api_photos_missing_stale_in_flight_result_is_discarded(
 
 def test_api_photos_missing_automatic_skips_during_heavy_job(app_and_db):
     """Automatic idle checks must not start while heavy jobs are running."""
+    import threading
     import time
 
     app, db = app_and_db
     client = app.test_client()
 
+    # Hold the scan job in the running queue until the assertion runs. A
+    # ``time.sleep`` in the work function is not reliable under load: on a
+    # slow CI runner the main thread can be preempted long enough for the
+    # sleep to elapse and the job to transition to ``completed`` before the
+    # heavy-job check runs, at which point the automatic scan is no longer
+    # suppressed.
+    release = threading.Event()
+
+    def _hold_running(job):
+        release.wait(timeout=5.0)
+        return {"ok": True}
+
     scan_job = app._job_runner.start(
         "scan",
-        lambda job: (time.sleep(0.2), {"ok": True})[1],
+        _hold_running,
         workspace_id=db._active_workspace_id,
         ephemeral=True,
     )
-    resp = client.post("/api/photos/missing/check", json={"automatic": True})
-    assert resp.status_code == 200
-    data = resp.get_json()
-    assert data["suppressed"] is True
-    assert data["reason"] == "heavy_job_active"
-    assert data["status"] == "skipped"
-    wait_for_job_via_client(client, scan_job)
+    try:
+        # Give the runner a moment to move the job to "running" so
+        # _missing_originals_heavy_job_active sees it.
+        for _ in range(50):
+            jobs = app._job_runner.list_jobs()
+            if any(
+                j.get("id") == scan_job and j.get("status") in ("running", "queued")
+                for j in jobs
+            ):
+                break
+            time.sleep(0.02)
+
+        resp = client.post("/api/photos/missing/check", json={"automatic": True})
+        assert resp.status_code == 200, resp.get_data(as_text=True)
+        data = resp.get_json()
+        assert data["suppressed"] is True, data
+        assert data["reason"] == "heavy_job_active", data
+        assert data["status"] == "skipped", data
+    finally:
+        release.set()
+        wait_for_job_via_client(client, scan_job)
 
 
 def test_api_photos_missing_automatic_skips_during_missing_originals_scan(app_and_db):

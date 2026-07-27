@@ -8,6 +8,7 @@ use tauri_plugin_shell::ShellExt;
 const RUNTIME_HEALTH_TIMEOUT: Duration = Duration::from_millis(500);
 const RUNTIME_BOOT_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 const RUNTIME_BOOT_WAIT_INTERVAL: Duration = Duration::from_millis(200);
+const HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 // A signed PyInstaller one-file build can spend tens of seconds unpacking
 // native dependencies before Python starts, then still have legitimate
 // one-time startup migrations to finish. Keep this comfortably above the
@@ -190,15 +191,30 @@ fn wait_for_health(
         if let Some(err) = early_exit.lock().unwrap_or_else(|e| e.into_inner()).clone() {
             return Err(err);
         }
-        if start.elapsed() > timeout {
+        let elapsed = start.elapsed();
+        if elapsed >= timeout {
             return Err(SidecarStartError::Generic(format!(
                 "Sidecar did not become healthy within {}s",
                 timeout.as_secs()
             )));
         }
-        match ureq::get(&url).call() {
+        // Bound every synchronous probe by both the short per-request cap
+        // and the remaining overall startup budget. Without this, a process
+        // that accepts TCP but never responds can block this loop forever
+        // and prevent the timeout path from killing the child.
+        let probe_timeout = std::cmp::min(HEALTH_PROBE_TIMEOUT, timeout - elapsed);
+        let agent = ureq::AgentBuilder::new()
+            .timeout_connect(probe_timeout)
+            .timeout(probe_timeout)
+            .build();
+        match agent.get(&url).call() {
             Ok(resp) if resp.status() == 200 => return Ok(()),
-            _ => std::thread::sleep(Duration::from_millis(200)),
+            _ => {
+                let remaining = timeout.saturating_sub(start.elapsed());
+                if !remaining.is_zero() {
+                    std::thread::sleep(std::cmp::min(RUNTIME_BOOT_WAIT_INTERVAL, remaining));
+                }
+            }
         }
     }
 }
@@ -701,5 +717,26 @@ mod tests {
 
         let _ = std::fs::remove_file(path);
         let _ = std::fs::remove_dir(dir);
+    }
+
+    #[test]
+    fn wait_for_health_bounds_a_stalled_probe_by_the_startup_budget() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (_stream, _) = listener.accept().unwrap();
+            std::thread::sleep(Duration::from_secs(1));
+        });
+        let early_exit = Arc::new(Mutex::new(None));
+        let start = std::time::Instant::now();
+
+        let error = wait_for_health(port, Duration::from_millis(100), early_exit).unwrap_err();
+
+        assert!(matches!(error, SidecarStartError::Generic(_)));
+        assert!(
+            start.elapsed() < Duration::from_millis(500),
+            "a stalled HTTP response must not outlive the startup budget"
+        );
+        server.join().unwrap();
     }
 }

@@ -7144,13 +7144,63 @@ def test_create_app_repairs_duplicate_species_after_taxonomy_marking(
     fake_tax.lookup.side_effect = lambda name: (
         {"taxon_id": 2912} if name == "Verdin" else None
     )
-    with patch("taxonomy.load_local_taxonomy", return_value=fake_tax):
+    with patch(
+        "taxonomy.load_local_taxonomy", return_value=fake_tax,
+    ) as load_taxonomy:
         create_app(db_path=db_path, thumb_cache_dir=thumb_dir, api_token="test")
 
+    assert load_taxonomy.call_count == 1, (
+        "overlapping synchronous startup migrations must share one taxonomy parse"
+    )
     db2 = Database(db_path, initialize_schema=False)
     tagged_ids = {row["id"] for row in db2.get_photo_keywords(pid)}
     assert nested in tagged_ids
     assert root not in tagged_ids
+    assert db2.get_meta(Database._DUPLICATE_PHOTO_SPECIES_REPAIR_KEY) == "1"
+    db2.close()
+
+
+def test_create_app_skips_taxonomy_when_duplicate_repair_is_impossible(
+    tmp_path, monkeypatch,
+):
+    """An empty/non-species catalog must not parse taxonomy.json merely to
+    stamp the one-time duplicate-species repair marker."""
+    from unittest.mock import patch
+
+    from db import Database
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    import config as cfg
+    import models
+    from app import create_app
+
+    monkeypatch.setattr(cfg, "CONFIG_PATH", str(tmp_path / "config.json"))
+    monkeypatch.setattr(models, "DEFAULT_MODELS_DIR", str(tmp_path / "vireo-models"))
+    monkeypatch.setattr(models, "CONFIG_PATH", str(tmp_path / "models.json"))
+
+    db_path = str(tmp_path / "test.db")
+    thumb_dir = str(tmp_path / "thumbs")
+    os.makedirs(thumb_dir)
+
+    db = Database(db_path)
+    ws_id = db.ensure_default_workspace()
+    db.set_active_workspace(ws_id)
+    db.set_meta(Database._WILDLIFE_BACKFILL_DONE_KEY, "1")
+    db.conn.execute(
+        "DELETE FROM db_meta WHERE key = ?",
+        (Database._DUPLICATE_PHOTO_SPECIES_REPAIR_KEY,),
+    )
+    db.conn.commit()
+    db.close()
+
+    with patch("taxonomy.load_local_taxonomy") as load_taxonomy:
+        app = create_app(
+            db_path=db_path, thumb_cache_dir=thumb_dir, api_token="test",
+        )
+        assert app is not None
+
+    load_taxonomy.assert_not_called()
+    db2 = Database(db_path, initialize_schema=False)
     assert db2.get_meta(Database._DUPLICATE_PHOTO_SPECIES_REPAIR_KEY) == "1"
     db2.close()
 

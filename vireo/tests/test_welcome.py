@@ -262,6 +262,21 @@ def test_settings_page_has_setup_link(app_and_db):
     assert b"/welcome?force=1" in resp.data
 
 
+def test_settings_embedding_precompute_failure_shows_job_error(app_and_db):
+    """A failed embedding warm-up should explain the cause, not just fail."""
+    app, _ = app_and_db
+    client = app.test_client()
+    resp = client.get("/settings")
+    assert resp.status_code == 200
+    html = resp.get_data(as_text=True)
+    assert "(result.errors && result.errors[0])" in html
+    assert "result.failure && result.failure.message" in html
+    assert (
+        "Species list downloaded, but embedding precompute failed: "
+        in html
+    )
+
+
 def test_download_model_endpoint_exists(app_and_db):
     """POST /api/jobs/download-model returns 400 when model_id missing (not 404)."""
     app, _ = app_and_db

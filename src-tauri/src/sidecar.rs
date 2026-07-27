@@ -9,6 +9,11 @@ const RUNTIME_HEALTH_TIMEOUT: Duration = Duration::from_millis(500);
 const RUNTIME_BOOT_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 const RUNTIME_LOCK_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 const RUNTIME_BOOT_WAIT_INTERVAL: Duration = Duration::from_millis(200);
+// A signed PyInstaller one-file build can spend tens of seconds unpacking
+// native dependencies before Python starts, then still have legitimate
+// one-time startup migrations to finish. Keep this comfortably above the
+// observed cold-start cost while retaining a finite failure boundary.
+const SIDECAR_HEALTH_TIMEOUT: Duration = Duration::from_secs(90);
 const GUI_CLIENTS_DIR: &str = ".vireo/gui-clients";
 
 /// Typed failure modes for `start_sidecar`. The launcher matches on these
@@ -503,18 +508,24 @@ pub fn start_sidecar(app: &AppHandle) -> Result<SidecarState, SidecarStartError>
         }
     });
 
-    // Wait up to 30 seconds for the sidecar to be healthy, but bail out
-    // early if the supervisor sees a structured failure or termination.
-    wait_for_health(port, Duration::from_secs(30), early_exit)?;
+    // Wait for the sidecar to be healthy, but bail out early if the
+    // supervisor sees a structured failure or termination. If readiness
+    // fails, explicitly kill the child before returning: otherwise the
+    // launcher exits while a late-starting backend remains orphaned.
+    if let Err(error) = wait_for_health(port, SIDECAR_HEALTH_TIMEOUT, early_exit) {
+        let _ = child.kill();
+        return Err(error);
+    }
 
     let runtime = runtime_json_path()
         .and_then(|path| read_runtime_json(&path))
-        .filter(|runtime| runtime.port == port)
-        .ok_or_else(|| {
-            SidecarStartError::Generic(
-                "Backend became healthy without publishing its runtime token".to_string(),
-            )
-        })?;
+        .filter(|runtime| runtime.port == port);
+    let Some(runtime) = runtime else {
+        let _ = child.kill();
+        return Err(SidecarStartError::Generic(
+            "Backend became healthy without publishing its runtime token".to_string(),
+        ));
+    };
 
     Ok(SidecarState::owned(child, port, runtime.token))
 }

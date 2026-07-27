@@ -3847,6 +3847,25 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             repaired_location_ancestors,
         )
 
+    # Parsing taxonomy.json is expensive for a full iNaturalist download.
+    # Cache the startup instance so overlapping one-time migrations and the
+    # immediate background species pass do not each parse it independently.
+    _taxonomy_not_loaded = object()
+    _startup_taxonomy = _taxonomy_not_loaded
+
+    def _load_startup_taxonomy():
+        nonlocal _startup_taxonomy
+        # Do not cache a miss: a concurrent first-run taxonomy download can
+        # make the file available before the background retry starts.
+        if (
+            _startup_taxonomy is _taxonomy_not_loaded
+            or _startup_taxonomy is None
+        ):
+            from taxonomy import load_local_taxonomy
+
+            _startup_taxonomy = load_local_taxonomy()
+        return _startup_taxonomy
+
     def _sync_mark_species_only(db, log_label):
         """Load taxonomy and run mark_species_keywords synchronously.
 
@@ -3856,9 +3875,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         that depends on hierarchy leaves being correctly typed as
         taxonomy/is_species.
         """
-        from taxonomy import load_local_taxonomy
-
-        tax = load_local_taxonomy()
+        tax = _load_startup_taxonomy()
         if tax is None:
             log.debug(
                 "[%s] taxonomy not loaded; deferring species marking",
@@ -3895,7 +3912,40 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
     # association remains permanently skipped. When taxonomy isn't
     # loaded yet (or marking fails), defer the repair to a later boot
     # rather than stamping the marker over an unmarked hierarchy.
-    if _sync_mark_species_only(init_db, "sync-startup-species-mark"):
+    duplicate_repair_key = Database._DUPLICATE_PHOTO_SPECIES_REPAIR_KEY
+    duplicate_repair_pending = init_db.get_meta(duplicate_repair_key) != "1"
+    if duplicate_repair_pending:
+        # The legacy bug always left a typed top-level species/taxonomy tag
+        # beside another tag on the same photo. If no such pair exists, the
+        # repair is structurally impossible and it is safe to stamp the
+        # one-shot marker without parsing a potentially huge taxonomy file.
+        possible_duplicate = init_db.conn.execute(
+            """SELECT 1
+               FROM photo_keywords species_pk
+               JOIN keywords species_k
+                 ON species_k.id = species_pk.keyword_id
+               WHERE (species_k.is_species = 1
+                      OR species_k.type = 'taxonomy')
+                 AND EXISTS (
+                     SELECT 1
+                     FROM photo_keywords other_pk
+                     WHERE other_pk.photo_id = species_pk.photo_id
+                       AND other_pk.keyword_id != species_pk.keyword_id
+                 )
+               LIMIT 1"""
+        ).fetchone()
+        if possible_duplicate is None:
+            init_db.set_meta(duplicate_repair_key, "1")
+            duplicate_repair_pending = False
+            log.info(
+                "Skipped duplicate-species startup repair: "
+                "no possible duplicate associations"
+            )
+
+    if (
+        duplicate_repair_pending
+        and _sync_mark_species_only(init_db, "sync-startup-species-mark")
+    ):
         init_db.repair_duplicate_photo_species()
     # One-time rewrite of the previous miss-threshold defaults (0.25 / 0.15)
     # to the new defaults (0.20 / 0.12) in both ~/.vireo/config.json and
@@ -3978,9 +4028,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         """Load taxonomy, mark species keywords, and run the one-shot
         Wildlife backfill. Returns silently on any failure so callers
         can choose between sync (block startup) and async (log only)."""
-        from taxonomy import load_local_taxonomy
-
-        tax = load_local_taxonomy()
+        tax = _load_startup_taxonomy()
         if tax is None:
             # No taxonomy yet — leave the marker unset so the backfill
             # retries on a future boot once taxonomy is downloaded.
@@ -4030,7 +4078,8 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         finally:
             bg_db.close()
 
-    threading.Thread(target=_mark_species, daemon=True).start()
+    if not os.environ.get("VIREO_DISABLE_STARTUP_BACKFILL_TIMERS"):
+        threading.Thread(target=_mark_species, daemon=True).start()
 
     def _folder_health_loop():
         """Periodically check folder health."""

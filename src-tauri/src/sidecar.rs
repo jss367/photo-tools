@@ -7,13 +7,18 @@ use tauri_plugin_shell::ShellExt;
 
 const RUNTIME_HEALTH_TIMEOUT: Duration = Duration::from_millis(500);
 const RUNTIME_BOOT_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
-const RUNTIME_LOCK_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 const RUNTIME_BOOT_WAIT_INTERVAL: Duration = Duration::from_millis(200);
 // A signed PyInstaller one-file build can spend tens of seconds unpacking
 // native dependencies before Python starts, then still have legitimate
 // one-time startup migrations to finish. Keep this comfortably above the
 // observed cold-start cost while retaining a finite failure boundary.
 const SIDECAR_HEALTH_TIMEOUT: Duration = Duration::from_secs(90);
+// Peer discovery must cover the full window a legitimately initializing
+// backend may hold `runtime.lock` for; otherwise a second GUI gives up
+// mid-startup, launches a competing child that loses
+// `acquire_single_instance()`, and surfaces a spurious startup failure.
+// Keep this tied to `SIDECAR_HEALTH_TIMEOUT` so the two can never drift.
+const RUNTIME_LOCK_WAIT_TIMEOUT: Duration = SIDECAR_HEALTH_TIMEOUT;
 const GUI_CLIENTS_DIR: &str = ".vireo/gui-clients";
 
 /// Typed failure modes for `start_sidecar`. The launcher matches on these

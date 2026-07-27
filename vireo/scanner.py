@@ -1619,6 +1619,14 @@ def scan(root, db, progress_callback=None, incremental=False, extract_full_metad
         # Only enumerate files in the specified directories (non-recursive).
         # root is still used as the folder hierarchy root for _ensure_folder.
         restrict_files_set = set(restrict_files) if restrict_files is not None else None
+        # Heartbeat counter, same interval as the recursive branch below.
+        # A restricted dir is not necessarily small — the import job's
+        # duplicate-folder link scan points this at archive day-folders
+        # holding a whole card's worth of files, and on a network mount
+        # that enumeration runs for minutes. Without the emit the caller
+        # has nothing to show between "Discovering files..." and the
+        # finished count.
+        checked = 0
         for d in restrict_dirs:
             _check_cancelled()
             dp = Path(d)
@@ -1655,6 +1663,11 @@ def scan(root, db, progress_callback=None, incremental=False, extract_full_metad
                 entries = list(safe_iter_dir(str(dp), onerror=_on_walk_error))
                 for f in entries:
                     _check_cancelled()
+                    checked += 1
+                    if checked % 500 == 0 and status_callback:
+                        _emit_status(
+                            f"Discovering files... ({len(image_files)} found)"
+                        )
                     if (f.is_file()
                             and f.suffix.lower() in SUPPORTED_EXTENSIONS
                             and not f.name.startswith(".")

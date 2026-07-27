@@ -202,6 +202,192 @@ def test_duplicate_only_import_links_matched_folders(tmp_path):
     assert len(_photo_rows(db)) == 1
 
 
+def _mark_exif_extracted(db):
+    """Stand in for a successful ExifTool pass over the cataloged rows.
+
+    ExifTool isn't installed in CI, so rows scanned there keep
+    ``exif_data`` NULL — which scanner reads as "metadata was never
+    extracted" and re-processes on the next incremental scan whatever
+    the mtime says. That retry path is deliberate and tested in
+    test_scanner.py; the tests below are about the duplicate-link scan,
+    so give the rows the marker a real extraction would have written.
+    """
+    db.conn.execute(
+        "UPDATE photos SET exif_data = '{}' WHERE exif_data IS NULL",
+    )
+    db.conn.commit()
+
+
+def _count_feature_computations(monkeypatch):
+    """Record every file scanner re-reads to derive phash/file_hash.
+
+    ``_compute_file_features`` opens the image and hashes every byte, so
+    it is the direct proxy for "did the scan actually read this file off
+    the archive volume".
+    """
+    import scanner
+
+    read_paths = []
+    real = scanner._compute_file_features
+
+    def _counting(path_str):
+        read_paths.append(path_str)
+        return real(path_str)
+
+    monkeypatch.setattr(scanner, "_compute_file_features", _counting)
+    return read_paths
+
+
+def test_duplicate_only_import_does_not_reread_unchanged_twins(
+    tmp_path, monkeypatch,
+):
+    """The duplicate-folder link scan must not re-read twins that are
+    already cataloged and unchanged.
+
+    The link scan exists to create/link the matched folders and to
+    self-heal uncataloged strays — neither needs the bytes of a file the
+    catalog already knows. Running it non-incrementally re-hashed every
+    file in the matched archive folder, so importing a card of pure
+    duplicates re-read the whole folder: on a network archive that turned
+    a zero-copy import into an hours-long rescan.
+    """
+    import shutil
+
+    import scanner
+    from import_job import ImportParams, run_import_job
+
+    archive = tmp_path / "archive"
+    twin_dir = archive / "2026" / "2026-07-03"
+    twin_dir.mkdir(parents=True)
+    names = ["IMG_0400.jpg", "IMG_0401.jpg", "IMG_0402.jpg"]
+    for i, name in enumerate(names):
+        Image.new("RGB", (16, 16), ("red", "green", "blue")[i]).save(
+            str(twin_dir / name),
+        )
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws_id = db._active_workspace_id
+    # Catalog the archive exactly as a normal scan would, so the rows
+    # carry the file_mtime/metadata an incremental pass needs to skip on.
+    scanner.scan(str(archive), db)
+    _mark_exif_extracted(db)
+    assert len(_photo_rows(db)) == 3
+
+    # The card holds byte-identical copies of all three cataloged files.
+    card = tmp_path / "card"
+    card.mkdir()
+    for name in names:
+        shutil.copy2(str(twin_dir / name), str(card / name))
+
+    read_paths = _count_feature_computations(monkeypatch)
+    result = run_import_job(
+        _make_job(), FakeRunner(), db_path, ws_id,
+        ImportParams(sources=[str(card)], destination=str(archive)),
+    )
+
+    assert result["copied"] == 0
+    assert result["skipped_duplicate"] == 3
+    assert result["failed"] == 0
+    # The folder is still linked — the scan did its actual job.
+    assert str(twin_dir) in _ws_linked_folder_paths(db, ws_id)
+    assert read_paths == [], (
+        "duplicate-only import re-read already-cataloged, unchanged twins: "
+        f"{read_paths}"
+    )
+
+
+def test_duplicate_only_import_reports_the_link_scan_phase(tmp_path):
+    """The dup-link scan walks the matched archive folders, which on a
+    network archive takes minutes. It must say so: without a phase emit
+    the UI sits on the last copy message while the job looks hung."""
+    import shutil
+
+    import scanner
+    from import_job import ImportParams, run_import_job
+
+    archive = tmp_path / "archive"
+    twin_dir = archive / "2026" / "2026-07-03"
+    twin_dir.mkdir(parents=True)
+    twin_file = twin_dir / "IMG_0600.jpg"
+    Image.new("RGB", (16, 16), "red").save(str(twin_file))
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws_id = db._active_workspace_id
+    scanner.scan(str(archive), db)
+
+    card = tmp_path / "card"
+    card.mkdir()
+    shutil.copy2(str(twin_file), str(card / "IMG_0600.jpg"))
+
+    runner = FakeRunner()
+    result = run_import_job(
+        _make_job(), runner, db_path, ws_id,
+        ImportParams(sources=[str(card)], destination=str(archive)),
+    )
+    assert result["skipped_duplicate"] == 1
+
+    phases = [
+        data.get("phase", "")
+        for _jid, kind, data in runner.events if kind == "progress"
+    ]
+    assert any("already in your library" in p for p in phases), (
+        "import must report the duplicate-folder link scan as its own "
+        f"phase; got {phases}"
+    )
+
+
+def test_duplicate_only_import_still_catalogs_stray_in_twin_folder(
+    tmp_path, monkeypatch,
+):
+    """Skipping unchanged twins must not cost the link scan its other
+    job: a file sitting in the matched folder that the catalog has never
+    seen still gets self-healed in, and it is the ONLY file re-read."""
+    import shutil
+
+    import scanner
+    from import_job import ImportParams, run_import_job
+
+    archive = tmp_path / "archive"
+    twin_dir = archive / "2026" / "2026-07-03"
+    twin_dir.mkdir(parents=True)
+    twin_file = twin_dir / "IMG_0500.jpg"
+    Image.new("RGB", (16, 16), "red").save(str(twin_file))
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws_id = db._active_workspace_id
+    scanner.scan(str(archive), db)
+    _mark_exif_extracted(db)
+
+    # A stray lands in the twin folder AFTER the catalog was built.
+    stray = twin_dir / "IMG_0501.jpg"
+    Image.new("RGB", (16, 16), "green").save(str(stray))
+
+    card = tmp_path / "card"
+    card.mkdir()
+    shutil.copy2(str(twin_file), str(card / "IMG_0500.jpg"))
+
+    read_paths = _count_feature_computations(monkeypatch)
+    result = run_import_job(
+        _make_job(), FakeRunner(), db_path, ws_id,
+        ImportParams(sources=[str(card)], destination=str(archive)),
+    )
+
+    assert result["skipped_duplicate"] == 1
+    row_paths = {
+        os.path.join(r["folder_path"], r["filename"]) for r in _photo_rows(db)
+    }
+    assert str(stray) in row_paths, (
+        "link scan must still self-heal uncataloged strays in the twin folder"
+    )
+    assert read_paths == [str(stray)], (
+        "only the uncataloged stray should be read off the archive: "
+        f"{read_paths}"
+    )
+
+
 def test_duplicate_only_import_links_alias_spelled_twin(tmp_path):
     """When a twin folder is cataloged through a symlink alias but the
     import ``destination`` resolves to a different (real) spelling, the
@@ -5139,6 +5325,59 @@ def test_remote_import_links_verified_twin_folder_in_other_layout(
         "before": sorted(linked_before), "after": sorted(linked_after),
         "twin_folder": twin_folder,
     }
+
+
+def test_remote_import_dup_link_scan_does_not_reread_unchanged_twins(
+        tmp_path, monkeypatch):
+    """Remote mirror of
+    ``test_duplicate_only_import_does_not_reread_unchanged_twins``: the
+    remote path runs its own dup-link scan, and it must skip already-
+    cataloged, unchanged twins too."""
+    from import_job import ImportParams, run_import_job
+
+    import scanner
+
+    ra = _remote_archive_for(tmp_path)
+    calls = _remote_calls(ra)
+    _install_fake_remote_rsync(monkeypatch, calls, verify=None)
+
+    card = _make_card(tmp_path, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+        ("DSC_0002.jpg", datetime(2026, 7, 3, 11, 0, 0), "green"),
+    ])
+
+    twin_folder = os.path.join(ra["mount_base"], "unsorted")
+    os.makedirs(twin_folder, exist_ok=True)
+    import shutil as _shutil
+    for name in ("DSC_0001.jpg", "DSC_0002.jpg"):
+        _shutil.copy2(str(card / name), os.path.join(twin_folder, name))
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws_id = db._active_workspace_id
+    # Catalog the twins the way a real scan would, so the rows carry the
+    # file_mtime/metadata an incremental pass needs to skip on.
+    scanner.scan(ra["mount_base"], db)
+    _mark_exif_extracted(db)
+    assert len(_photo_rows(db)) == 2
+
+    read_paths = _count_feature_computations(monkeypatch)
+    result = run_import_job(
+        _make_job(), FakeRunner(), db_path, ws_id,
+        ImportParams(
+            sources=[str(card)], destination=ra["mount_base"],
+            remote_target=ra, verify_by_hash=True,
+        ),
+    )
+
+    assert calls["rsync"] == [], calls["rsync"]
+    assert result["skipped_duplicate"] == 2, result
+    assert result["failed"] == 0, result
+    assert twin_folder in _ws_linked_folder_paths(db, ws_id)
+    assert read_paths == [], (
+        "remote duplicate-only import re-read already-cataloged, unchanged "
+        f"twins: {read_paths}"
+    )
 
 
 def test_remote_import_scans_adopted_duplicate_in_mixed_batch(

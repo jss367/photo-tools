@@ -2536,6 +2536,44 @@ def test_incremental_rescan_skips_small_jpeg_dims_not_raw(tmp_path, monkeypatch)
     assert all(image_path not in batch for batch in called_with)
 
 
+def test_restricted_scan_reports_discovery_progress(tmp_path):
+    """Enumerating a restricted dir must emit a discovery heartbeat.
+
+    The recursive/non-recursive branches already do. The restrict_dirs
+    branch did not, so a caller that streams status to a UI (the import
+    job's duplicate-folder link scan) showed nothing at all while the
+    enumeration ran — minutes of apparent hang on a network archive with
+    a folder of ~1000 files.
+    """
+    import scanner
+    from db import Database
+
+    root = tmp_path / "archive"
+    day = root / "2026-07-03"
+    day.mkdir(parents=True)
+    # One real image (the only file the scan is allowed to process) plus
+    # enough same-extension siblings to cross the heartbeat interval.
+    real = day / "IMG_0000.jpg"
+    Image.new("RGB", (16, 16), color="red").save(str(real), "JPEG")
+    for i in range(1, 601):
+        (day / f"IMG_{i:04d}.jpg").touch()
+
+    db = Database(str(tmp_path / "test.db"))
+    statuses = []
+    scanner.scan(
+        str(root), db,
+        restrict_dirs=[str(day)],
+        restrict_files={str(real)},
+        status_callback=lambda msg, **kw: statuses.append(msg),
+    )
+
+    discovery = [s for s in statuses if s.startswith("Discovering files")]
+    assert len(discovery) >= 2, (
+        "restricted discovery must emit progress while it enumerates, not "
+        f"just a single opening message; got {statuses}"
+    )
+
+
 def test_scan_restrict_files_ignores_files_not_in_list(tmp_path, monkeypatch):
     """When scan is called with restrict_files, files in restrict_dirs
     that are not in the list are left untouched — even if they're brand

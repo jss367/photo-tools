@@ -50,7 +50,9 @@ body { display: flex; flex-direction: column; height: 100vh; }
 .recent-destination-list .btn { font-size: 11px; padding: 2px 8px; max-width: 100%; overflow: hidden; text-overflow: ellipsis; }
 .input-fixed { max-width: 240px; flex: 0 1 240px; }
 .preview-summary { font-size: 12px; color: var(--text-secondary); margin-top: 6px; }
+.preview-filter { display: inline-flex; align-items: center; gap: 6px; margin-top: 8px; font-size: 12px; color: var(--text-secondary); }
 .import-preview-grid { display: flex; flex-direction: column; gap: 12px; margin-top: 12px; max-height: 520px; overflow-y: auto; }
+.import-preview-empty { font-size: 12px; color: var(--text-secondary); }
 .import-preview-folder { display: flex; flex-direction: column; gap: 6px; }
 .import-preview-folder-header { font-size: 12px; font-weight: 600; color: var(--text-secondary); overflow-wrap: anywhere; }
 .import-preview-thumbs { display: grid; grid-template-columns: repeat(auto-fill, minmax(104px, 1fr)); gap: 8px; }
@@ -400,6 +402,10 @@ body { display: flex; flex-direction: column; height: 100vh; }
         <button class="btn btn-primary" id="btnStart" onclick="startImport()">Start import</button>
       </div>
       <div class="preview-summary" id="previewSummary"></div>
+      <label class="preview-filter" id="hideDuplicatesRow" style="display:none;">
+        <input type="checkbox" id="chkHideDuplicates" onchange="rerenderImportPreviewGrid()">
+        <span id="hideDuplicatesLabel">Hide duplicates</span>
+      </label>
       <div id="importPreviewGrid" class="import-preview-grid" style="display:none;"></div>
       <div id="importError"></div>
     </div>
@@ -484,6 +490,9 @@ let destStructureSeq = 0;
 let importPreviewSeq = 0;
 let importPreviewTimer = null;
 let importThumbSchedulerCancel = null;
+// Last args passed to renderImportPreviewGrid, so the "Hide duplicates"
+// filter can re-render locally.
+let lastImportPreviewRender = null;
 let importTags = [];
 let newImagesSnapshotId = null;
 let importExiftoolReady = null;
@@ -1910,10 +1919,37 @@ function clearImportPreviewGrid() {
     importThumbSchedulerCancel();
     importThumbSchedulerCancel = null;
   }
+  lastImportPreviewRender = null;
+  updateHideDuplicatesControl(0);
   const grid = document.getElementById('importPreviewGrid');
   if (!grid) return;
   grid.style.display = 'none';
   grid.innerHTML = '';
+}
+
+// The "Hide duplicates" row only makes sense once a preview has actually
+// flagged duplicates — before the duplicate check runs (or with dedup off)
+// there is nothing to hide, so the control stays hidden rather than
+// implying a filter that would do nothing.
+function updateHideDuplicatesControl(dupCount) {
+  const row = document.getElementById('hideDuplicatesRow');
+  const label = document.getElementById('hideDuplicatesLabel');
+  if (!row || !label) return;
+  row.style.display = dupCount > 0 ? '' : 'none';
+  label.textContent = 'Hide duplicates (' + dupCount.toLocaleString() + ')';
+}
+
+function hideDuplicatesEnabled() {
+  const el = document.getElementById('chkHideDuplicates');
+  return !!(el && el.checked);
+}
+
+// Re-run the last grid render with the current filter state. Purely a view
+// toggle — it never re-requests the preview or the duplicate check.
+function rerenderImportPreviewGrid() {
+  if (!lastImportPreviewRender) return;
+  const last = lastImportPreviewRender;
+  renderImportPreviewGrid(last.files, last.duplicatePaths, last.destinationFiles);
 }
 
 function importDestinationMap(destinationFiles) {
@@ -1935,9 +1971,21 @@ function renderImportPreviewGrid(files, duplicatePaths, destinationFiles) {
   const dupes = new Set(duplicatePaths || []);
   const destMap = importDestinationMap(destinationFiles);
   if (!files || !files.length) {
+    lastImportPreviewRender = null;
+    updateHideDuplicatesControl(0);
     grid.style.display = 'none';
     return;
   }
+  // Remember the inputs so the filter toggle can re-render without
+  // re-running the preview or the duplicate check.
+  lastImportPreviewRender = {
+    files: files,
+    duplicatePaths: duplicatePaths,
+    destinationFiles: destinationFiles,
+  };
+  const dupeCount = files.filter((f) => dupes.has(f.path)).length;
+  updateHideDuplicatesControl(dupeCount);
+  const hidingDuplicates = dupeCount > 0 && hideDuplicatesEnabled();
 
   const groups = {};
   files.forEach((f) => {
@@ -1947,16 +1995,22 @@ function renderImportPreviewGrid(files, duplicatePaths, destinationFiles) {
   });
 
   Object.keys(groups).sort().forEach((subfolder) => {
+    const all = groups[subfolder];
+    const shown = hidingDuplicates ? all.filter((f) => !dupes.has(f.path)) : all;
+    if (!shown.length) return;
     const groupEl = document.createElement('div');
     groupEl.className = 'import-preview-folder';
     const header = document.createElement('div');
     header.className = 'import-preview-folder-header';
-    header.textContent = subfolder + ' (' + groups[subfolder].length + ')';
+    const hiddenHere = all.length - shown.length;
+    header.textContent = subfolder + ' (' + shown.length + ')' +
+      (hiddenHere ? ' · ' + hiddenHere.toLocaleString() + ' duplicate' +
+        (hiddenHere === 1 ? '' : 's') + ' hidden' : '');
     groupEl.appendChild(header);
 
     const thumbsEl = document.createElement('div');
     thumbsEl.className = 'import-preview-thumbs';
-    groups[subfolder].forEach((f) => {
+    shown.forEach((f) => {
       const isDuplicate = dupes.has(f.path);
       const isUnavailable = f.available === false;
       const card = document.createElement('div');
@@ -2004,6 +2058,16 @@ function renderImportPreviewGrid(files, duplicatePaths, destinationFiles) {
     groupEl.appendChild(thumbsEl);
     grid.appendChild(groupEl);
   });
+  // Every file was a duplicate, so the filter emptied the grid. Say so
+  // instead of leaving a blank panel that reads like "no files found".
+  if (!grid.children.length) {
+    const empty = document.createElement('div');
+    empty.className = 'import-preview-empty';
+    empty.textContent = 'All ' + files.length.toLocaleString() + ' file' +
+      (files.length === 1 ? ' is a duplicate' : 's are duplicates') +
+      ' — uncheck "Hide duplicates" to see them.';
+    grid.appendChild(empty);
+  }
   grid.style.display = '';
   setupImportThumbnailScheduler();
 }

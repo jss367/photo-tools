@@ -50,11 +50,9 @@ def test_import_source_browse_button_shows_quick_photo_count(live_server, page):
     expect(source_list.locator(".source-meta")).to_have_text("42 photos")
 
 
-def test_import_preview_runs_automatically_after_source_selection(live_server, page):
-    url = live_server["url"]
-    page.goto(f"{url}/import")
-    page.evaluate(
-        """
+# Stubs a two-file copy-mode preview where IMG_0002.jpg comes back flagged as
+# a duplicate. Shared by the tests that exercise the preview grid.
+TWO_FILE_PREVIEW_STUB = """
         () => {
           const originalFetch = window.fetch.bind(window);
           window.__fullPreviewCalls = 0;
@@ -141,7 +139,13 @@ def test_import_preview_runs_automatically_after_source_selection(live_server, p
           };
         }
         """
-    )
+
+
+def run_two_file_preview(live_server, page):
+    """Load /import with the stub above and wait for the preview to settle."""
+    url = live_server["url"]
+    page.goto(f"{url}/import")
+    page.evaluate(TWO_FILE_PREVIEW_STUB)
 
     page.locator("#modeCopy").check()
     page.locator("#destInput").fill("/archive")
@@ -151,6 +155,11 @@ def test_import_preview_runs_automatically_after_source_selection(live_server, p
     page.wait_for_function(
         "window.__fullPreviewCalls >= 1 && window.__dupCalls >= 1 && window.__destCalls >= 1"
     )
+
+
+def test_import_preview_runs_automatically_after_source_selection(live_server, page):
+    run_two_file_preview(live_server, page)
+
     expect(page.locator("#previewSummary")).to_contain_text("1 already in your library")
     grid = page.locator("#importPreviewGrid")
     expect(grid).to_be_visible()
@@ -158,6 +167,30 @@ def test_import_preview_runs_automatically_after_source_selection(live_server, p
     expect(grid).to_contain_text("IMG_0002.jpg")
     expect(grid).to_contain_text("Duplicate")
     expect(grid).to_contain_text("To: 2026/2026-07-11")
+
+
+def test_import_preview_hide_duplicates_checkbox_filters_grid(live_server, page):
+    run_two_file_preview(live_server, page)
+
+    grid = page.locator("#importPreviewGrid")
+    checkbox = page.locator("#chkHideDuplicates")
+    # Defaults to off: every discovered file is visible until the user opts in.
+    expect(page.locator("#hideDuplicatesRow")).to_be_visible()
+    expect(checkbox).not_to_be_checked()
+    expect(page.locator("#hideDuplicatesLabel")).to_have_text("Hide duplicates (1)")
+    expect(grid).to_contain_text("IMG_0002.jpg")
+
+    checkbox.check()
+    expect(grid).to_contain_text("IMG_0001.jpg")
+    expect(grid).not_to_contain_text("IMG_0002.jpg")
+    expect(grid).to_contain_text("1 duplicate hidden")
+    # The summary still reports the full picture — hiding is a view filter,
+    # not a change to what the import will do.
+    expect(page.locator("#previewSummary")).to_contain_text("1 already in your library")
+
+    checkbox.uncheck()
+    expect(grid).to_contain_text("IMG_0002.jpg")
+    expect(grid).to_contain_text("Duplicate")
 
 
 def test_import_auto_preview_clears_grid_when_selection_becomes_invalid(

@@ -2642,7 +2642,16 @@ async function startBackgroundEmbeddingPrecompute(precompute, opts) {
           }
           if (progressFill) progressFill.style.width = '100%';
         } else if (status) {
-          status.textContent = 'Species list downloaded; embedding precompute failed.';
+          var detail = (
+            (result.errors && result.errors[0]) ||
+            (result.failure && result.failure.message) ||
+            'Unknown error'
+          );
+          // Keep the actionable explanation while hiding the usually long
+          // ONNXRuntime diagnostic that follows it. The complete exception
+          // remains available in Jobs and Logs.
+          detail = detail.split(' Underlying error:')[0];
+          status.textContent = 'Species list downloaded, but embedding precompute failed: ' + detail;
           status.style.color = 'var(--warning)';
         }
         loadEmbeddingMatrix();

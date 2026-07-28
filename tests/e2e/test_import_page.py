@@ -267,6 +267,9 @@ def test_import_preview_runs_automatically_after_source_selection(live_server, p
     grid = page.locator("#importPreviewGrid")
     expect(grid).to_be_visible()
     expect(grid).to_contain_text("IMG_0001.jpg")
+    # Duplicate filtering is opt-in, so the automatic preview initially
+    # shows both files and marks the duplicate. The dedicated filter test
+    # below covers the collapsed state after the checkbox is enabled.
     expect(grid).to_contain_text("IMG_0002.jpg")
     expect(grid).to_contain_text("Duplicate")
     expect(grid).to_contain_text("To: 2026/2026-07-11")
@@ -306,6 +309,39 @@ def test_import_preview_hide_duplicates_checkbox_filters_grid(live_server, page)
     assert page.evaluate(
         "[window.__fullPreviewCalls, window.__dupCalls, window.__destCalls]",
     ) == calls_before
+
+
+def test_hide_duplicates_all_duplicate_banner_has_no_phantom_tiles(
+    live_server, page,
+):
+    """When filtering leaves zero pending files, the collapsed banner must
+    not claim that zero files are shown below when no tiles follow it."""
+    run_two_file_preview(live_server, page)
+    page.evaluate(
+        """
+        () => {
+          const file = {
+            path: '/tmp/card-a/IMG_0002.jpg',
+            filename: 'IMG_0002.jpg',
+            subfolder: 'card-a',
+          };
+          renderImportPreviewGrid(
+            [file],
+            [file.path],
+            [],
+          );
+        }
+        """
+    )
+
+    page.locator("#chkHideDuplicates").check()
+    banner = page.locator("[data-testid='collapsed-duplicate-preview']")
+    expect(banner).to_contain_text("1 duplicate hidden")
+    expect(banner).to_contain_text(
+        "Nothing else will be imported from this selection."
+    )
+    expect(banner).not_to_contain_text("0 files to import")
+    expect(page.locator("#importPreviewGrid .import-preview-thumb")).to_have_count(0)
 
 
 def test_hide_duplicates_resets_once_a_check_finds_no_duplicates(
@@ -949,7 +985,9 @@ def test_import_preview_shows_destination_folder_structure(live_server, page):
     expect(rows.nth(2).locator("td")).to_have_text(
         ["/archive/2026/2026-07-02", "1", "existing"]
     )
-    expect(structure).to_contain_text("Merging into a managed archive at")
+    expect(structure).to_contain_text(
+        "Files imported here land inside the managed archive rooted at"
+    )
     expect(structure).to_contain_text("/archive")
     expect(structure).to_contain_text("1284 photos already cataloged")
     expect(structure).to_contain_text("2026/2026-07-01")
@@ -1296,6 +1334,156 @@ def test_import_dest_structure_invalidation_survives_slow_startup(live_server, p
     # would stay visible.
     page.locator("#destInput").fill("/archive")
     expect(page.locator("#destStructure")).to_be_hidden()
+
+
+def test_import_remote_destination_requires_visible_folder_inside_nas(
+    live_server, page,
+):
+    """The remote root alone is not a complete destination. Explain the
+    missing folder beside the field and keep Start unavailable until it is
+    valid, instead of hiding a tiny error below the thumbnail grid."""
+    url = live_server["url"]
+
+    def remote_targets(route):
+        route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({
+                "rsync_available": True,
+                "ssh_available": True,
+                "targets": [{
+                    "id": "nas1",
+                    "name": "Photo NAS",
+                    "user": "photo",
+                    "host": "nas.local",
+                    "remote_path": "/volume1/Photography",
+                    "mount_path": "/Volumes/Photography",
+                }],
+            }),
+        )
+
+    page.route("**/api/remote-targets", remote_targets)
+    page.goto(f"{url}/import")
+    page.locator("#modeCopy").check()
+    page.locator("#sourceInput").fill("/tmp/card-a")
+    page.locator("#btnAddSource").click()
+    page.locator("#destMode").select_option("remote:nas1")
+
+    inline_error = page.locator("#remoteSubpathError")
+    expect(inline_error).to_be_visible()
+    expect(inline_error).to_contain_text(
+        "Enter the folder inside /volume1/Photography"
+    )
+    expect(page.locator("#btnStart")).to_be_disabled()
+    assert page.evaluate("resolvedCopyDestination()") == ""
+
+    page.locator("#remoteSubpath").fill("/Raw Files/USA")
+    expect(inline_error).to_contain_text("Subpath must be relative")
+    expect(page.locator("#btnStart")).to_be_disabled()
+
+    page.locator("#remoteSubpath").fill("Raw Files/USA")
+    expect(inline_error).to_be_hidden()
+    assert page.evaluate("resolvedCopyDestination()") == (
+        "/Volumes/Photography/Raw Files/USA"
+    )
+
+
+def test_failed_import_result_offers_preconfigured_retry(live_server, page):
+    """A mixed import can retry from its result without rebuilding the form;
+    the parent's duplicate-skip setting is preserved, and the parent's
+    already-imported photo IDs plus its own job ID are carried on the
+    retry request so the after-import chain covers the complete original
+    scope."""
+    url = live_server["url"]
+    captured = {}
+
+    def start_import(route):
+        captured["body"] = json.loads(route.request.post_data or "{}")
+        route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({"job_id": "import-retry"}),
+        )
+
+    page.route("**/api/jobs/import-photos", start_import)
+    page.goto(f"{url}/import")
+    page.evaluate(
+        """
+        () => {
+          lastFinishedImportJob = {
+            id: 'import-original',
+            type: 'import',
+            status: 'failed',
+            config: {
+              sources: ['/Volumes/CARD/DCIM'],
+              destination: '/Volumes/Photography/Raw Files/USA',
+              recursive: true,
+              folder_template: '%Y/%Y-%m-%d',
+              file_types: 'both',
+              skip_duplicates: false,
+              verify_by_hash: false,
+              trust_likely_duplicates: true,
+              after_import: 1,
+              tags: ['trip'],
+              location_from_gps: true,
+              allow_missing_exiftool: false,
+              remote_target_id: null,
+              remote_subpath: null,
+            },
+            result: {
+              photo_ids: [101, 102, 103],
+              failed: 1,
+            },
+          };
+          renderResult({
+            discovered: 985,
+            copied: 984,
+            verified: 984,
+            skipped_duplicate: 0,
+            failed: 1,
+            safe_to_format: false,
+            unsafe_files: [{
+              path: '/Volumes/CARD/DCIM/DSC_7172.NEF',
+              reason: 'copy verification failed',
+            }],
+            folders: {},
+            errors: ['copy verification failed'],
+          }, 'failed');
+        }
+        """
+    )
+
+    retry = page.locator("#btnRetryImport")
+    expect(retry).to_be_visible()
+    expect(retry).to_have_text("Retry 1 failed file")
+    retry.click()
+    expect(page.locator("#progressCard")).to_be_visible()
+
+    body = captured["body"]
+    assert body["sources"] == ["/Volumes/CARD/DCIM"]
+    assert body["destination"] == "/Volumes/Photography/Raw Files/USA"
+    assert body["folder_template"] == "%Y/%Y-%m-%d"
+    # retryBodyFromFinishedJob() preserves the parent's skip_duplicates
+    # setting rather than forcing it on, so a parent configured with
+    # dedup OFF retries with dedup OFF — otherwise the very file that
+    # failed could be silently skipped if it happens to match some
+    # unrelated catalog entry. The parent above seeds `false`, so the
+    # retry must send `false`.
+    assert body["skip_duplicates"] is False
+    assert body["after_import"] == 1
+    assert body["tags"] == ["trip"]
+    # The original run's successful photos must be carried into the retry
+    # so the after-import chain covers the complete import scope, not
+    # only the newly-recovered file. Without this, the failed original
+    # (which skipped chaining because it wasn't OK) plus the retry
+    # (which chains on only 1 new photo) silently leave 984 photos
+    # unprocessed.
+    assert body["carry_photo_ids"] == [101, 102, 103]
+    # And it must bind the carry list to the parent so the server can
+    # verify each carry ID actually came from that parent — without
+    # this binding an API caller could inject arbitrary IDs into the
+    # after-import chain scope.
+    assert body["parent_import_job_id"] == "import-original"
 
 
 def test_import_copy_start_sends_restored_options(live_server, page):

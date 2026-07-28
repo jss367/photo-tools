@@ -13947,6 +13947,44 @@ def test_import_page_returns_200(app_and_db):
     assert "/api/jobs/import-photos" in html
 
 
+def test_import_page_surfaces_destination_errors_and_recovery_actions(
+    app_and_db,
+):
+    """Import validation belongs beside the field and before the preview,
+    while failed copy runs offer a preconfigured recovery action."""
+    app, _ = app_and_db
+    html = app.test_client().get("/import").data.decode()
+
+    assert 'id="remoteSubpathError"' in html
+    assert 'aria-required="true"' in html
+    assert "Folder inside NAS" in html
+    assert "Local or mounted path" in html
+    assert "updateStartAvailability" in html
+    assert "importFormProblem" in html
+    assert html.index('id="importError"') < html.index('id="importPreviewGrid"')
+    assert 'id="retryImportRow"' in html
+    assert "retryFailedImport" in html
+    assert "Already imported files will be skipped" in html
+
+
+def test_import_page_collapses_duplicate_thumbnails(app_and_db):
+    """A one-file retry must not render or fetch thumbnails for every
+    catalogued duplicate on the card."""
+    app, _ = app_and_db
+    html = app.test_client().get("/import").data.decode()
+
+    assert "collapsed-duplicate-preview" in html
+    assert "duplicateCount.toLocaleString()" in html
+    assert "const pendingFiles = files.filter" in html
+    # Copy-with-dedup waits for the duplicate stream before rendering the
+    # grid; in-place and no-dedup branches still render immediately.
+    marker = "if (snapshotMode) {"
+    preview_prefix = html[
+        html.index("async function previewImport"):html.index(marker)
+    ]
+    assert "renderImportPreviewGrid(files, [], null)" not in preview_prefix
+
+
 def test_import_page_resolves_default_process_client_side(app_and_db):
     """Templates are Jinja-free by convention, so the after-import menu's
     default resolves in page JS from the workspace's config_overrides

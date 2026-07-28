@@ -3042,6 +3042,19 @@ async function retryFailedImport() {
   button.disabled = true;
   button.textContent = 'Starting retry…';
   hint.textContent = 'Already imported files will be skipped.';
+  // Flip the in-flight flag BEFORE the retry request goes out — not after
+  // its response arrives. Retry validation synchronously re-enumerates
+  // sources and hashes every carried destination file to guard against
+  // stealth overwrites, which pushes the fetch to a materially non-trivial
+  // wall-clock. If the main Start button remains enabled during that
+  // window, a click launches an ordinary import (no ``parent_import_job_id``
+  // in its body) that the server-side retry exclusivity gate can't catch,
+  // and the two runs race over the same card and destination. Mirror what
+  // startImport() does: flag first, updateStartAvailability(), then fetch;
+  // clear the flag on failure so the button re-enables. See PR #1387
+  // Codex review.
+  importStartInFlight = true;
+  updateStartAvailability();
   try {
     const resp = await fetch('/api/jobs/import-photos', {
       method: 'POST',
@@ -3051,14 +3064,6 @@ async function retryFailedImport() {
     const data = await resp.json().catch(() => ({}));
     if (!resp.ok) throw new Error(data.error || 'retry failed to start');
     activeJobId = data.job_id;
-    importStartInFlight = true;
-    // finishJob() re-enables the main Start button after the failed
-    // copy import ends. Without refreshing availability here the
-    // original Start would stay enabled while the recovery retry is
-    // running, letting the user launch a second import of the same
-    // card into the same destination concurrently. Mirror what
-    // startImport() does after flipping the flag.
-    updateStartAvailability();
     document.getElementById('progressCard').style.display = '';
     document.getElementById('resultCard').style.display = 'none';
     document.getElementById('progressCard').scrollIntoView({
@@ -3066,6 +3071,8 @@ async function retryFailedImport() {
     });
     watchJob(activeJobId);
   } catch (e) {
+    importStartInFlight = false;
+    updateStartAvailability();
     button.disabled = false;
     button.textContent = 'Retry failed files';
     hint.textContent = String(e.message || e);

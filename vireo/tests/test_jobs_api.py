@@ -6671,6 +6671,51 @@ def test_import_photos_source_snapshot_records_discovery_time_size(
         )
 
 
+def test_import_photos_source_snapshot_dedupes_overlapping_sources(
+        tmp_path):
+    """When the Import page selects overlapping sources such as
+    ``/card`` and ``/card/DCIM``, ``discover_source_files`` runs once
+    per source and yields each nested file twice in the combined list.
+    Without dedup, ``_capture_source_snapshots`` records each occurrence
+    in every applicable source's signature — parent snapshot for
+    ``/card/DCIM`` would list ``IMG.jpg`` twice, but retry validation
+    re-enumerates each source alone (one occurrence per file) and
+    computes a different signature, refusing a card whose contents did
+    not change. Assert both parent-side snapshots collapse to what a
+    single-source retry-time capture would produce."""
+    from import_job import _capture_source_snapshots
+
+    card = tmp_path / "card"
+    dcim = card / "DCIM"
+    dcim.mkdir(parents=True)
+    img = dcim / "IMG_0001.jpg"
+    img.write_bytes(b"payload")
+
+    # Simulate the discovery loop for overlapping sources: each source's
+    # enumeration runs independently and both surface the nested file.
+    combined_files = [img, img]
+    snapshots = _capture_source_snapshots(
+        combined_files, [str(card), str(dcim)],
+    )
+
+    # Retry re-enumerates each source alone, so the per-source signature
+    # captured from ``[img]`` is what the drift check will compare
+    # against; those must match the deduped parent snapshot.
+    single_card = _capture_source_snapshots([img], [str(card)])
+    single_dcim = _capture_source_snapshots([img], [str(dcim)])
+
+    assert snapshots[str(card)]["count"] == 1
+    assert snapshots[str(dcim)]["count"] == 1
+    assert (
+        snapshots[str(card)]["signature"]
+        == single_card[str(card)]["signature"]
+    )
+    assert (
+        snapshots[str(dcim)]["signature"]
+        == single_dcim[str(dcim)]["signature"]
+    )
+
+
 def test_import_photos_retry_refuses_same_size_replacement(
         app_and_db, tmp_path):
     """A file replaced with different bytes at the same path and same

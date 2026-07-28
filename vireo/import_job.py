@@ -156,11 +156,24 @@ def _capture_source_snapshots(files, sources):
     for src in sources:
         src_path = Path(src)
         src_str = str(src)
-        entries = []
+        # Deduplicate by relative path so overlapping sources (a case the
+        # Import page explicitly supports — e.g. selecting both ``/card``
+        # and ``/card/DCIM``) don't double-count nested files. The combined
+        # ``files`` list contains each nested file twice (once from each
+        # enumeration), so a plain append would put two identical entries
+        # in this source's snapshot; the retry re-enumerates each source
+        # alone and produces one entry per file, so the parent's doubled
+        # snapshot would refuse an unchanged card. Keying by ``rel.as_posix()``
+        # collapses the twin discoveries into the single-source view retry
+        # validation reconstructs. See PR #1387 Codex review.
+        entries_by_rel = {}
         for f in files:
             try:
                 rel = f.relative_to(src_path)
             except ValueError:
+                continue
+            rel_str = rel.as_posix()
+            if rel_str in entries_by_rel:
                 continue
             try:
                 st = f.stat()
@@ -169,8 +182,8 @@ def _capture_source_snapshots(files, sources):
             except OSError:
                 size = -1
                 mtime_ns = -1
-            entries.append((rel.as_posix(), size, mtime_ns))
-        entries.sort()
+            entries_by_rel[rel_str] = (rel_str, size, mtime_ns)
+        entries = sorted(entries_by_rel.values())
         payload = json.dumps(entries, separators=(",", ":"))
         digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
         snapshots[src_str] = {"count": len(entries), "signature": digest}

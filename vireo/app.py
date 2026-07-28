@@ -23105,10 +23105,22 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     # match the parent's stored value.
                     pass
                 if current_size is not None:
-                    try:
-                        current_hash = compute_file_hash(file_path)
-                    except OSError:
+                    # Match the scanner's empty-file convention: a zero-byte
+                    # file's stored ``file_hash`` is NULL (rendered as
+                    # ``h=`` in ``_fingerprint_for_row``), not the SHA-256
+                    # of empty content. Hashing it here would produce a
+                    # different fingerprint from the parent's and stall
+                    # an otherwise-valid retry of an import that had
+                    # successfully landed a zero-byte image. See PR #1387
+                    # Codex review; scanner.py resets ``file_hash`` on
+                    # ``size == 0 and hash == EMPTY_FILE_SHA256``.
+                    if current_size == 0:
                         current_hash = ""
+                    else:
+                        try:
+                            current_hash = compute_file_hash(file_path)
+                        except OSError:
+                            current_hash = ""
                 fp = _fingerprint_for_row({
                     "folder_path": folder_path,
                     "filename": filename,

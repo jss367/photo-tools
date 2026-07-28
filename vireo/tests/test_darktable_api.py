@@ -1,5 +1,6 @@
 import json
 import os
+import sys
 import time
 
 
@@ -171,3 +172,78 @@ def test_api_job_develop_mixed_outcomes_marks_job_failed(app_and_db, tmp_path, m
     errs = data.get('errors') or []
     assert len(errs) == 1, f"expected exactly one error entry, got {len(errs)}: {errs}"
     assert any('fake failure on second photo' in e for e in errs), errs
+
+
+def test_api_darktable_status_reports_checked_paths(app_and_db):
+    """The status route says where it looked, so a bare 'not found' can explain itself."""
+    app, _ = app_and_db
+    client = app.test_client()
+    data = client.get('/api/darktable/status').get_json()
+
+    assert 'checked_paths' in data
+    assert isinstance(data['checked_paths'], list)
+    assert all(isinstance(p, str) for p in data['checked_paths'])
+
+
+def test_api_darktable_status_checked_paths_mentions_path_probe(app_and_db):
+    """$PATH is the probe most likely to explain a miss, so it must be listed.
+
+    find_darktable tries shutil.which() before any filesystem candidate;
+    omitting it would make "we checked here" untrue by omission.
+    """
+    app, _ = app_and_db
+    data = app.test_client().get('/api/darktable/status').get_json()
+
+    assert any('PATH' in p for p in data['checked_paths'])
+
+
+def test_api_darktable_status_checked_paths_never_empty(app_and_db):
+    """Never render an empty 'we checked here' list.
+
+    darktable_search_paths() returns [] on a Linux box with no AppImage
+    installed — precisely the user this feature targets.
+    """
+    import develop
+    app, _ = app_and_db
+    original = develop.darktable_search_paths
+    develop.darktable_search_paths = lambda: []
+    try:
+        data = app.test_client().get('/api/darktable/status').get_json()
+    finally:
+        develop.darktable_search_paths = original
+
+    assert data['checked_paths'], "checked_paths must never be empty"
+
+
+def test_api_darktable_status_checked_paths_names_linux_tools_dir(app_and_db, monkeypatch):
+    """On Linux the list names the AppImage directory even when it's empty.
+
+    darktable_search_paths() only reports AppImages that already exist, so a
+    fresh Linux box contributes nothing; the route must still name the
+    directory find_darktable looks in, since that is where a download lands.
+    """
+    import develop
+    app, _ = app_and_db
+    monkeypatch.setattr(develop, "darktable_search_paths", lambda: [])
+    monkeypatch.setattr(os, "name", "posix")
+    monkeypatch.setattr(sys, "platform", "linux")
+
+    data = app.test_client().get('/api/darktable/status').get_json()
+
+    tools_dir = os.path.expanduser("~/.vireo/tools/darktable")
+    assert tools_dir in data['checked_paths']
+
+
+def test_api_darktable_status_checked_paths_omits_linux_tools_dir_on_macos(app_and_db, monkeypatch):
+    """macOS never probes the Linux AppImage directory, so don't claim we did."""
+    import develop
+    app, _ = app_and_db
+    monkeypatch.setattr(develop, "darktable_search_paths", lambda: [])
+    monkeypatch.setattr(os, "name", "posix")
+    monkeypatch.setattr(sys, "platform", "darwin")
+
+    data = app.test_client().get('/api/darktable/status').get_json()
+
+    tools_dir = os.path.expanduser("~/.vireo/tools/darktable")
+    assert tools_dir not in data['checked_paths']
+    assert data['checked_paths'], "checked_paths must never be empty"

@@ -15910,12 +15910,29 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
     @app.route("/api/darktable/status")
     def api_darktable_status():
         import config as cfg
-        from develop import find_darktable, find_dng_converter
+        from develop import darktable_search_paths, find_darktable, find_dng_converter
 
         configured = cfg.get("darktable_bin")
         binary = find_darktable(configured)
         dng_configured = cfg.get("dng_converter_bin")
         dng_binary = find_dng_converter(dng_configured)
+
+        # What we tell the user we checked has to match what find_darktable
+        # actually probes: shutil.which("darktable-cli") first, then the
+        # filesystem candidates. darktable_search_paths() covers only the
+        # latter, and on Linux it lists just the AppImages already present in
+        # ~/.vireo/tools/darktable — so a box with none yet would get an empty
+        # "we checked here" list, on exactly the platform the download targets.
+        # Hence compose here rather than returning that list raw. The platform
+        # check below mirrors darktable_search_paths()'s own branching so the
+        # directory is named on, and only on, the platform that probes it.
+        checked_paths = ["$PATH (darktable-cli)"]
+        checked_paths.extend(darktable_search_paths())
+        if os.name != "nt" and sys.platform != "darwin":
+            tools_dir = os.path.expanduser("~/.vireo/tools/darktable")
+            if tools_dir not in checked_paths:
+                checked_paths.append(tools_dir)
+
         return jsonify({
             "available": binary is not None,
             "bin": binary or "",
@@ -15927,6 +15944,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             "style": cfg.get("darktable_style"),
             "output_format": cfg.get("darktable_output_format"),
             "output_dir": cfg.get("darktable_output_dir"),
+            "checked_paths": checked_paths,
         })
 
     @app.route("/api/exiftool/status")

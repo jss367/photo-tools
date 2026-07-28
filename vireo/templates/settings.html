@@ -2264,14 +2264,33 @@ async function renderDarktableGetOption() {
 async function downloadDarktable() {
   var a = window._dtAsset || {};
   var isLinux = darktableIsLinux();
+  var isWindows = darktableIsWindows();
   var what = isLinux
     ? 'Vireo will download it and set the darktable-cli path for you.'
     : 'Vireo will download the installer and open it. You finish the install.';
+  // Warn about SmartScreen BEFORE the download starts, not after: the server
+  // calls os.startfile() from hand_off() before the SSE 'complete' event
+  // fires, so an onComplete-only warning arrives after the unknown-publisher
+  // prompt has already surfaced — defeating the warning at the exact moment
+  // the user has to decide whether to proceed. Same idea for Gatekeeper on
+  // macOS: naming the expected dialog turns "is this malware?" into
+  // "this is the OS check I was warned about".
+  var osWarning = '';
+  if (isWindows) {
+    osWarning = '\n\nWindows may show a SmartScreen "unknown publisher" ' +
+                'warning after the download finishes — darktable does not ' +
+                'sign its installer. Click "More info" then "Run anyway".';
+  } else if (!isLinux) {
+    osWarning = '\n\nmacOS may show a Gatekeeper warning — darktable does ' +
+                'not notarize its macOS builds. Drag darktable to the ' +
+                'Applications folder from the DMG the installer opens.';
+  }
   // Name the exact artifact before any bytes move: version, filename, size,
   // source host.
   if (!confirm('Download darktable ' + a.version + '?\n\n' +
                a.name + ' (' + Math.round(a.size / 1048576) + ' MB)\n' +
-               'From: github.com/darktable-org/darktable\n\n' + what)) return;
+               'From: github.com/darktable-org/darktable\n\n' + what +
+               osWarning)) return;
 
   // Hiding the button is a UX guard against double-clicks; the server also has
   // a singleton guard (a second POST joins the running job instead of starting

@@ -923,6 +923,61 @@ def test_develop_photo_appimage_extracted_cache_recovers_from_deleted_tree(tmp_p
     assert str(fake_bin) not in develop._APPIMAGE_APPRUN_CACHE
 
 
+def test_develop_photo_appimage_extracted_cache_reprobes_when_source_is_newer(tmp_path, monkeypatch):
+    """When the source AppImage is replaced in place (in-place Vireo update,
+    manual overwrite), the cached extraction points at the OLD darktable
+    version. Reusing it silently would keep running the old build until the
+    process restarts — same failure mode _extract_appimage_once already
+    guards against with the mtime check. Verify the develop_photo cache
+    branch checks it too.
+    """
+    import subprocess
+
+    import develop
+
+    develop._APPIMAGE_MODE_CACHE.clear()
+    develop._APPIMAGE_APPRUN_CACHE.clear()
+
+    raw = tmp_path / "bird.NEF"
+    raw.touch()
+    fake_bin = _write_appimage(tmp_path / "Darktable-5.6.0-x86_64.AppImage")
+    out = tmp_path / "out" / "bird.jpg"
+
+    # Pre-seed the cache with a real, executable AppRun. The mtime check is
+    # what should invalidate it, not the exec/exists check.
+    stale_apprun_dir = tmp_path / "old_extraction" / "squashfs-root"
+    stale_apprun_dir.mkdir(parents=True)
+    stale_apprun = stale_apprun_dir / "AppRun"
+    stale_apprun.write_text("#!/bin/sh\nexec /old/darktable-cli \"$@\"\n")
+    stale_apprun.chmod(0o755)
+    # Make the AppRun clearly older than the source.
+    ancient = os.path.getmtime(str(fake_bin)) - 3600
+    os.utime(str(stale_apprun), (ancient, ancient))
+
+    develop._APPIMAGE_MODE_CACHE[str(fake_bin)] = "extracted"
+    develop._APPIMAGE_APPRUN_CACHE[str(fake_bin)] = str(stale_apprun)
+
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(list(cmd))
+        # The stale AppRun must not be invoked; the cache should have been
+        # evicted and the re-probe should take the direct path.
+        assert cmd[0] != str(stale_apprun)
+        os.makedirs(os.path.dirname(cmd[-1]), exist_ok=True)
+        with open(cmd[-1], "w") as f:
+            f.write("jpg")
+        return _fake_completed(0)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = develop.develop_photo(str(fake_bin), str(raw), str(out))
+    assert result["success"] is True
+    # The stale cache entries were cleared and the re-probe succeeded direct.
+    assert develop._APPIMAGE_MODE_CACHE[str(fake_bin)] == "direct"
+    assert str(fake_bin) not in develop._APPIMAGE_APPRUN_CACHE
+
+
 def test_develop_photo_appimage_non_fuse_failure_is_not_retried(tmp_path, monkeypatch):
     """A darktable-side failure (bad RAW, missing style, etc.) must NOT be
     retried under APPIMAGE_EXTRACT_AND_RUN — that would waste a full squashfs

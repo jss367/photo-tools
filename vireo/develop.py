@@ -145,6 +145,29 @@ def _is_appimage(path):
         return False
 
 
+def _apprun_path_for(binary):
+    """Where _extract_appimage_once would place ``binary``'s AppRun."""
+    return os.path.join(binary + ".extracted", _APPIMAGE_EXTRACT_SUBDIR, "AppRun")
+
+
+def _is_reusable_apprun(apprun, source_binary):
+    """True when ``apprun`` is a valid extraction of ``source_binary``.
+
+    Compares mtimes so a source AppImage replaced in place (in-place
+    Vireo update, manual overwrite) invalidates the extracted tree; a
+    check that only asserts existence and the exec bit would keep serving
+    the old darktable version until the process restarted.
+    """
+    try:
+        return (
+            os.path.isfile(apprun)
+            and os.access(apprun, os.X_OK)
+            and os.path.getmtime(apprun) >= os.path.getmtime(source_binary)
+        )
+    except OSError:
+        return False
+
+
 def _extract_appimage_once(binary):
     """Extract ``binary`` once and return the path to its AppRun, or None.
 
@@ -165,22 +188,12 @@ def _extract_appimage_once(binary):
     on that binary so develop still succeeds, just at the per-photo cost.
     """
     extract_dir = binary + ".extracted"
-    apprun = os.path.join(extract_dir, _APPIMAGE_EXTRACT_SUBDIR, "AppRun")
-
-    def _reusable_apprun():
-        try:
-            return (
-                os.path.isfile(apprun)
-                and os.access(apprun, os.X_OK)
-                and os.path.getmtime(apprun) >= os.path.getmtime(binary)
-            )
-        except OSError:
-            return False
+    apprun = _apprun_path_for(binary)
 
     # Fast path — a valid tree from a prior call satisfies the request
     # without touching the lock. Two workers racing on this fast path is
     # safe because both would read the same on-disk state.
-    if _reusable_apprun():
+    if _is_reusable_apprun(apprun, binary):
         return apprun
 
     # Serialize the delete → extract → publish sequence per binary. Without
@@ -191,7 +204,7 @@ def _extract_appimage_once(binary):
     with _get_extract_lock(binary):
         # Re-check under the lock: another worker may have finished the
         # extraction while we were blocked, in which case we reuse it.
-        if _reusable_apprun():
+        if _is_reusable_apprun(apprun, binary):
             return apprun
 
         parent_dir = os.path.dirname(extract_dir) or "."
@@ -657,7 +670,11 @@ def develop_photo(
 
         if is_appimage and cached_mode == "extracted":
             apprun = _APPIMAGE_APPRUN_CACHE.get(binary)
-            if apprun and os.path.isfile(apprun) and os.access(apprun, os.X_OK):
+            # Same predicate as _extract_appimage_once, so a source AppImage
+            # replaced in place (in-place Vireo update, manual overwrite)
+            # invalidates the cached tree here too instead of silently
+            # running the old darktable until the process restarts.
+            if apprun and _is_reusable_apprun(apprun, binary):
                 # Reuse the one-time extraction: swap the AppImage entry point
                 # for its AppRun and keep every following argv slot (including
                 # the "darktable-cli" selector build_command inserted). No
@@ -665,8 +682,10 @@ def develop_photo(
                 # with the full CAMLIBS/IOLIBS/GIO_EXTRA_MODULES setup.
                 cmd_to_run = [apprun] + cmd[1:]
             else:
-                # Extraction tree disappeared under us (user cleaned tmp,
-                # reinstall, whatever). Reset and re-probe from scratch.
+                # Extraction is stale (source replaced) or gone (user cleaned
+                # tmp, reinstall, whatever). Reset and re-probe from scratch;
+                # _extract_appimage_once will re-run --appimage-extract for
+                # the new source under the per-binary lock.
                 _APPIMAGE_MODE_CACHE.pop(binary, None)
                 _APPIMAGE_APPRUN_CACHE.pop(binary, None)
                 cached_mode = None

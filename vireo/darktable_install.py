@@ -11,6 +11,7 @@ unsigned, so a fail-closed signature check would reject every legitimate
 download.  See docs/superpowers/specs/2026-07-26-darktable-download-design.md.
 """
 
+import contextlib
 import hashlib
 import json
 import logging
@@ -464,11 +465,37 @@ def download(asset, dest_dir=None, byte_callback=None, should_cancel=None):
     os.makedirs(dest_dir, exist_ok=True)
     dest = os.path.join(dest_dir, name)
 
-    _download_with_resume(
-        asset["url"], dest,
-        byte_callback=byte_callback,
-        should_cancel=should_cancel,
+    # Fast path: a previous attempt already finished the transfer but was
+    # cancelled during verify_digest.  _download_with_resume renames its
+    # .partial to dest on success, so cancellation observed inside the
+    # hash loop leaves no .partial to resume from — a naive retry would
+    # re-download the whole 87-178 MB asset even though the complete file
+    # is sitting right there.  If dest already exists at exactly the size
+    # the API published, skip straight to verify: verify_digest still
+    # decides whether the bytes are good (delete on mismatch, keep on
+    # match).  We deliberately gate on the API-supplied size so an
+    # unrelated file the user dropped in the tools directory does not get
+    # accepted as this asset.
+    expected_size = asset.get("size")
+    already_complete = bool(
+        expected_size
+        and os.path.exists(dest)
+        and os.path.getsize(dest) == expected_size
     )
+    if already_complete:
+        # Emit final progress so the UI's byte counter jumps to full instead
+        # of stalling at 0 while the (skipped) download "runs".  Match
+        # _download_with_resume's contract that callbacks may not raise —
+        # there they would be misreported as network failures.
+        if byte_callback is not None:
+            with contextlib.suppress(Exception):
+                byte_callback(expected_size, expected_size)
+    else:
+        _download_with_resume(
+            asset["url"], dest,
+            byte_callback=byte_callback,
+            should_cancel=should_cancel,
+        )
 
     actual_size = os.path.getsize(dest)
     if asset.get("size") and actual_size != asset["size"]:

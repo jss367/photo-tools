@@ -953,3 +953,208 @@ def test_api_job_download_darktable_cancellation_between_verify_and_handoff_does
         assert hand_off_calls == [], (
             "hand_off must not run after a Stop was observed"
         )
+
+
+def test_api_job_download_darktable_handoff_phase_is_uncancellable(
+        app_and_db, monkeypatch):
+    """A Stop that arrives WHILE hand_off is executing must be rejected —
+    otherwise cancellation "wins" the terminal-status race even though the
+    installer has already been opened / the AppImage chmodded, and the user
+    sees "cancelled" for a side effect that in fact committed.
+
+    Enforced by wrapping hand_off in begin_uncancellable(): once inside,
+    cancel_job() returns False and the run finishes as completed."""
+    import threading
+
+    import darktable_install
+    app, _ = app_and_db
+
+    in_handoff = threading.Event()
+    can_finish_handoff = threading.Event()
+
+    def slow_hand_off(path, **kwargs):
+        # Signal that we are past the cancellation gate; hold long enough
+        # for the test's cancel_job() call to land.
+        in_handoff.set()
+        assert can_finish_handoff.wait(timeout=10), "hand_off never released"
+        return {"action": "opened-installer", "location": path, "bin_path": None}
+
+    _stub_happy_path(monkeypatch)
+    monkeypatch.setattr(darktable_install, "hand_off", slow_hand_off)
+
+    client = app.test_client()
+    job_id = client.post('/api/jobs/download-darktable').get_json()['job_id']
+
+    # Wait until the worker is inside hand_off, then request cancellation.
+    assert in_handoff.wait(timeout=5), "hand_off was never entered"
+    cancel_accepted = app._job_runner.cancel_job(job_id)
+    # begin_uncancellable() has already fired, so the cancel is a no-op.
+    assert cancel_accepted is False, (
+        "cancel_job during hand_off must be rejected — otherwise the terminal "
+        "status would flip to cancelled while the side effect already committed"
+    )
+
+    # Let hand_off complete; the job must finish as 'completed', not
+    # 'cancelled', because the side effect DID happen.
+    can_finish_handoff.set()
+    from wait import wait_for_job_via_client
+    job = wait_for_job_via_client(client, job_id)
+    assert job['status'] == 'completed', job
+    assert job['result']['action'] == "opened-installer"
+
+
+def test_api_job_download_darktable_rejects_a_join_for_a_different_artifact(
+        app_and_db, monkeypatch):
+    """An in-flight download of version X + a fresh POST confirming version
+    Y must NOT join the old job — the user's dialog said Y and Y is what
+    they must receive (or an error). Silently joining a mismatched running
+    job would deliver X's bytes under Y's identity."""
+    import threading
+    app, _ = app_and_db
+
+    running = threading.Event()
+    release_download = threading.Event()
+
+    def slow_download(asset, byte_callback=None, should_cancel=None):
+        running.set()
+        assert release_download.wait(timeout=10), "download never released"
+        return "/tmp/d.dmg", "ok"
+
+    # First job resolves to 5.6.0.
+    first_release = _fake_release("5.6.0")
+    _stub_happy_path(monkeypatch, release=first_release, download=slow_download)
+
+    client = app.test_client()
+    first_id = client.post(
+        '/api/jobs/download-darktable',
+        data=json.dumps({
+            "expected_version": first_release["version"],
+            "expected_name": first_release["name"],
+            "expected_digest": first_release["digest"],
+        }),
+        content_type='application/json',
+    ).get_json()['job_id']
+    assert running.wait(timeout=5), "the first download never started"
+
+    # Second POST confirms a DIFFERENT artifact (a newer release the tab saw
+    # from a separate /install/available call).  Even though a singleton is
+    # running, the endpoint must not join it — it would deliver 5.6.0's bytes.
+    resp = client.post(
+        '/api/jobs/download-darktable',
+        data=json.dumps({
+            "expected_version": "5.7.0",
+            "expected_name": "darktable-5.7.0-arm64.dmg",
+            "expected_digest": "sha256:" + "b" * 64,
+        }),
+        content_type='application/json',
+    )
+    assert resp.status_code == 409, resp.get_json()
+    body = resp.get_json()
+    assert body['code'] == 'darktable_asset_changed'
+    # Message must name the version in flight and the version the user
+    # confirmed so they know why they were bounced back.
+    assert "5.6.0" in body['error']
+    assert "5.7.0" in body['error']
+
+    release_download.set()
+    from wait import wait_for_job_via_client
+    wait_for_job_via_client(client, first_id)
+
+
+def test_api_job_download_darktable_second_join_matches_when_artifacts_align(
+        app_and_db, monkeypatch):
+    """A second POST for the SAME artifact still joins the running job —
+    the mismatch guard must not accidentally reject compatible joins.
+    (Two Settings tabs, a refresh, a double-click — all should share one
+    download.)"""
+    import threading
+    app, _ = app_and_db
+
+    running = threading.Event()
+    release_download = threading.Event()
+
+    def slow_download(asset, byte_callback=None, should_cancel=None):
+        running.set()
+        assert release_download.wait(timeout=10), "download never released"
+        return "/tmp/d.dmg", "ok"
+
+    release = _fake_release("5.6.0")
+    _stub_happy_path(monkeypatch, release=release, download=slow_download)
+
+    client = app.test_client()
+    body = {
+        "expected_version": release["version"],
+        "expected_name": release["name"],
+        "expected_digest": release["digest"],
+    }
+    first_id = client.post(
+        '/api/jobs/download-darktable',
+        data=json.dumps(body), content_type='application/json',
+    ).get_json()['job_id']
+    assert running.wait(timeout=5)
+
+    second = client.post(
+        '/api/jobs/download-darktable',
+        data=json.dumps(body), content_type='application/json',
+    ).get_json()
+    assert second['job_id'] == first_id, (
+        "matching artifact identity must still join the running job"
+    )
+    assert second.get('joined_existing') is True
+
+    release_download.set()
+    from wait import wait_for_job_via_client
+    wait_for_job_via_client(client, first_id)
+
+
+def test_api_job_download_darktable_singleton_check_and_start_are_atomic(
+        app_and_db, monkeypatch):
+    """The earlier check-then-start pattern let two concurrent POSTs both
+    see "no running job" and both call runner.start(), racing on the same
+    ``.partial``. The fix is to check-and-start under a single lock
+    acquisition inside JobRunner. Exercise it by hitting the endpoint from
+    many threads at once and asserting exactly one worker was started."""
+    import threading
+    app, _ = app_and_db
+
+    workers_started = []
+    workers_lock = threading.Lock()
+    release_download = threading.Event()
+
+    def slow_download(asset, byte_callback=None, should_cancel=None):
+        with workers_lock:
+            workers_started.append(1)
+        assert release_download.wait(timeout=10), "download never released"
+        return "/tmp/d.dmg", "ok"
+
+    _stub_happy_path(monkeypatch, download=slow_download)
+
+    client = app.test_client()
+    ids = []
+    ids_lock = threading.Lock()
+    barrier = threading.Barrier(8)
+
+    def fire():
+        barrier.wait()
+        r = client.post('/api/jobs/download-darktable').get_json()
+        with ids_lock:
+            ids.append(r['job_id'])
+
+    threads = [threading.Thread(target=fire) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert len(set(ids)) == 1, (
+        f"all concurrent POSTs must return the same job id, got {set(ids)}"
+    )
+    # This is the load-bearing assertion: no matter how many callers slipped
+    # between the old list_jobs() check and start(), only ONE download worker
+    # ran. Two would race the same .partial and installer.
+    release_download.set()
+    from wait import wait_for_job_via_client
+    wait_for_job_via_client(client, ids[0])
+    assert len(workers_started) == 1, (
+        f"exactly one download worker must run, got {len(workers_started)}"
+    )

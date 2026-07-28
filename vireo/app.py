@@ -18322,19 +18322,30 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         runner = app._job_runner
         active_ws = _get_db()._active_workspace_id
 
-        # If a darktable download is already running, return its id instead of
-        # starting a second worker.  Both workers would target the same
-        # <asset>.partial and race truncation, rename, verification, and
-        # deletion — the second one's cleanup could delete the first one's
-        # verified installer.  Joining rather than rejecting means opening
-        # Settings in two tabs (or double-clicking Download) still ends in one
-        # download the user watches, not an error.
-        for existing in runner.list_jobs():
-            if (
-                existing.get("type") == "download-darktable"
-                and existing.get("status") in ("running", "queued", "pausing", "paused")
-            ):
-                return jsonify({"job_id": existing["id"], "joined_existing": True})
+        # Read the identity the user confirmed BEFORE any other check.  If a
+        # download is already running and we are about to join it, the join
+        # must be conditional on this matching the running job's stored
+        # artifact — otherwise a second tab that saw a fresh release would
+        # join an old, stale download and receive different bytes than the
+        # dialog confirmed.
+        body = request.get_json(silent=True) or {}
+        expected_name = body.get("expected_name")
+        expected_version = body.get("expected_version")
+        # digest is compared verbatim (the API sends "sha256:<hex>"); None on
+        # either side means the client did not send one, not that they match.
+        expected_digest = body.get("expected_digest")
+
+        def _artifact_matches(stored):
+            """True when the stored artifact identity matches expected_*."""
+            if not stored:
+                return not expected_name
+            if expected_name and expected_name != stored.get("asset_name"):
+                return False
+            if expected_version and expected_version != stored.get("asset_version"):
+                return False
+            return not (
+                expected_digest and expected_digest != stored.get("asset_digest")
+            )
 
         # resolve_release(), never the cached variant: this re-resolves
         # server-side so the URL we actually download can't be a ten-minute-old
@@ -18361,12 +18372,6 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         # confirmation would silently swap the artifact the user OK'd for a
         # different one.  code=darktable_asset_changed lets the client re-fetch
         # availability and re-prompt with the fresh identity.
-        body = request.get_json(silent=True) or {}
-        expected_name = body.get("expected_name")
-        expected_version = body.get("expected_version")
-        # digest is compared verbatim (the API sends "sha256:<hex>"); None on
-        # either side means the client did not send one, not that they match.
-        expected_digest = body.get("expected_digest")
         if expected_name and (
             expected_name != asset.get("name")
             or (expected_version and expected_version != asset.get("version"))
@@ -18442,10 +18447,13 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             # the installer anyway (Linux would also chmod the AppImage), then
             # jobs.py would still label the job "cancelled" — the user would
             # see cancellation but the side effect they cancelled happened.
-            # download() polls cancellation up through verify_digest, so a
-            # cancel there raises DownloadCancelled; this covers the narrow
-            # window between verify returning and hand_off starting.
-            if runner.cancellation_requested(job["id"]):
+            # begin_uncancellable is the atomic version of that check: it
+            # returns False (leaving the cancel flag intact so _run_job
+            # records the job as cancelled) if a cancel is already pending,
+            # otherwise it enters the uninterruptible phase so a Cancel that
+            # arrives during hand_off is rejected rather than flipping the
+            # terminal status once the side effect has already committed.
+            if not runner.begin_uncancellable(job["id"]):
                 raise DownloadCancelled("Download cancelled")
 
             result = darktable_install.hand_off(path)
@@ -18472,7 +18480,46 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 "quarantined": darktable_install.is_quarantined(path),
             }
 
-        job_id = runner.start("download-darktable", work, workspace_id=active_ws)
+        # Atomic singleton: the earlier check-then-start pattern (list_jobs()
+        # followed by runner.start()) let two concurrent POSTs both see "no
+        # existing job" and both start a worker on the same .partial.
+        # start_singleton does the existence check and the registration under
+        # one lock acquisition, so a second POST arriving between the check
+        # and the start joins the first instead of racing it.
+        #
+        # The stored config carries the artifact identity so a later POST for
+        # a DIFFERENT artifact (e.g. a new release published while an older
+        # download is still in flight) can be rejected instead of quietly
+        # joining a download of the wrong bytes.
+        job_id, joined, existing_snapshot = runner.start_singleton(
+            "download-darktable", work,
+            singleton_key="darktable-download",
+            config={
+                "asset_name": asset["name"],
+                "asset_version": asset["version"],
+                "asset_digest": asset.get("digest"),
+            },
+            workspace_id=active_ws,
+        )
+        if joined:
+            # Only join a running download whose artifact matches what THIS
+            # request confirmed. Without this check, a fresh POST for a new
+            # release would silently receive an old release's bytes from an
+            # already-running worker.
+            existing_config = (existing_snapshot or {}).get("config") or {}
+            if not _artifact_matches(existing_config):
+                return json_error(
+                    (
+                        "A different darktable download is already in progress "
+                        f"({existing_config.get('asset_name') or 'unknown'}). "
+                        f"Confirmation showed {asset.get('name')}. Wait for the "
+                        "in-flight download to finish (or cancel it) before "
+                        "starting this one."
+                    ),
+                    status=409,
+                    code="darktable_asset_changed",
+                )
+            return jsonify({"job_id": job_id, "joined_existing": True})
         return jsonify({"job_id": job_id})
 
     # -- Labels API routes --

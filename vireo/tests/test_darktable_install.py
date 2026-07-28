@@ -1128,3 +1128,123 @@ def test_hand_off_does_not_write_config(tmp_path, monkeypatch):
     appimage.write_bytes(b"stub")
     result = hand_off(str(appimage), platform_name="linux")
     assert result["bin_path"] == str(appimage)
+
+
+def test_download_reuses_a_completed_file_after_a_hash_cancellation(
+    tmp_path, monkeypatch
+):
+    """A Stop pressed during verify_digest leaves the finished file at dest
+    (``.partial`` was already renamed) and no ``.partial`` to resume from.
+    The next attempt must re-verify that file instead of downloading the
+    whole 87-178 MB asset all over again — the UI promises retry will
+    resume, and re-fetching everything violates that promise."""
+    from darktable_install import download
+
+    payload = b"already-here" * 100
+    dest = tmp_path / "darktable-5.6.0-arm64.dmg"
+    dest.write_bytes(payload)
+
+    def must_not_download(*a, **k):
+        raise AssertionError(
+            "download must reuse the complete dest file, not re-fetch it"
+        )
+
+    import taxonomy
+    monkeypatch.setattr(taxonomy, "_download_with_resume", must_not_download)
+
+    path, detail = download(_asset(payload), dest_dir=str(tmp_path))
+
+    assert path == str(dest)
+    assert dest.read_bytes() == payload, "the reused file must not be truncated"
+    assert "SHA256 matches" in detail
+
+
+def test_download_reuses_only_when_size_matches_exactly(tmp_path, monkeypatch):
+    """A file at dest with the wrong size is NOT the completed artifact —
+    a partial write left over from an unrelated crash, or a random file
+    the user dropped in the tools directory. Skipping the fetch there
+    would either accept a wrong-length file, or trigger the size-mismatch
+    branch that deletes a file the user might have wanted to keep. So the
+    reuse fast-path must gate strictly on the API-supplied size."""
+    from darktable_install import download
+
+    payload = b"real-content" * 100
+    dest = tmp_path / "darktable-5.6.0-arm64.dmg"
+    # Wrong size on disk — must NOT be reused.
+    dest.write_bytes(b"leftover-junk")
+
+    fetched = {"called": False}
+
+    def fake(url, dest_path, **kwargs):
+        fetched["called"] = True
+        # Real fetch overwrites the leftover with the real payload.
+        with open(dest_path, "wb") as f:
+            f.write(payload)
+        return dest_path
+
+    import taxonomy
+    monkeypatch.setattr(taxonomy, "_download_with_resume", fake)
+
+    path, detail = download(_asset(payload), dest_dir=str(tmp_path))
+
+    assert fetched["called"], (
+        "a wrong-length existing file must not be treated as the completed asset"
+    )
+    assert path == str(dest)
+    assert dest.read_bytes() == payload
+    assert "SHA256 matches" in detail
+
+
+def test_download_emits_final_byte_progress_when_reusing(tmp_path, monkeypatch):
+    """Reusing a completed file must still push a final byte_callback so
+    the UI's progress bar jumps to 100% instead of stalling at whatever
+    the previous run last reported. Silent reuse looks identical to a
+    hung download."""
+    from darktable_install import download
+
+    payload = b"cached-bytes" * 10
+    dest = tmp_path / "darktable-5.6.0-arm64.dmg"
+    dest.write_bytes(payload)
+
+    def must_not_download(*a, **k):
+        raise AssertionError("reused file must not trigger a fetch")
+
+    import taxonomy
+    monkeypatch.setattr(taxonomy, "_download_with_resume", must_not_download)
+
+    seen = []
+    download(
+        _asset(payload), dest_dir=str(tmp_path),
+        byte_callback=lambda done, total: seen.append((done, total)),
+    )
+
+    assert seen, "byte_callback must fire even on the reuse path"
+    # Whatever intermediate values the reuse path emits, the final one must
+    # be "complete": otherwise the UI has no signal that the phase is done.
+    assert seen[-1] == (len(payload), len(payload))
+
+
+def test_download_verify_failure_deletes_a_reused_file(tmp_path, monkeypatch):
+    """Reuse is a shortcut — it does not skip verification. A corrupt file
+    at dest with the right SIZE but the wrong BYTES must be deleted, same
+    as a corrupt fresh download. Otherwise the reuse fast-path would
+    become a way for a bad file to survive across attempts."""
+    from darktable_install import download
+
+    payload = b"real" * 100
+    dest = tmp_path / "darktable-5.6.0-arm64.dmg"
+    # Same length as payload, but different bytes → digest won't match.
+    dest.write_bytes(b"corr" * 100)
+
+    def must_not_download(*a, **k):
+        raise AssertionError("reused file must not trigger a fetch")
+
+    import taxonomy
+    monkeypatch.setattr(taxonomy, "_download_with_resume", must_not_download)
+
+    with pytest.raises(RuntimeError) as exc:
+        download(_asset(payload), dest_dir=str(tmp_path))
+    assert "mismatch" in str(exc.value).lower()
+    assert not dest.exists(), (
+        "a corrupt reused file must be deleted, same as a corrupt fresh one"
+    )

@@ -41,16 +41,26 @@ class IncompatibleDatabaseError(RuntimeError):
 
     ``db_path`` is the offending file; ``cause`` is the original SQLite error
     text, preserved so genuine schema bugs (vs. legitimately old DBs) stay
-    diagnosable.
+    diagnosable. ``newer=True`` means the reverse mismatch — the file's
+    schema version is ahead of this build (a downgraded install opening a
+    catalog a newer Vireo already migrated) — where the remedy is updating
+    the app, not discarding the database.
     """
 
-    def __init__(self, db_path, cause=None):
+    def __init__(self, db_path, cause=None, newer=False):
         self.db_path = db_path
         self.cause = cause
-        msg = (
-            f"The database at {db_path} is from an incompatible older version "
-            f"of Vireo and cannot be opened by this build"
-        )
+        self.newer = newer
+        if newer:
+            msg = (
+                f"The database at {db_path} was created by a newer version "
+                f"of Vireo than this build supports"
+            )
+        else:
+            msg = (
+                f"The database at {db_path} is from an incompatible older "
+                f"version of Vireo and cannot be opened by this build"
+            )
         if cause:
             msg += f" ({cause})"
         super().__init__(msg)

@@ -61,12 +61,14 @@ body { display: flex; flex-direction: column; height: 100vh; }
 .recent-destination-list .btn { font-size: 11px; padding: 2px 8px; max-width: 100%; overflow: hidden; text-overflow: ellipsis; }
 .input-fixed { max-width: 240px; flex: 0 1 240px; }
 .preview-summary { font-size: 12px; color: var(--text-secondary); margin-top: 6px; }
+.preview-filter { display: inline-flex; align-items: center; gap: 6px; margin-top: 8px; font-size: 12px; color: var(--text-secondary); }
 .import-preview-grid { display: flex; flex-direction: column; gap: 12px; margin-top: 12px; max-height: 520px; overflow-y: auto; }
 .import-preview-collapsed {
   padding: 9px 11px; border-radius: 6px; color: var(--text-secondary);
   background: var(--bg-tertiary); border: 1px solid var(--border-primary);
   font-size: 12px;
 }
+.import-preview-empty { font-size: 12px; color: var(--text-secondary); }
 .import-preview-folder { display: flex; flex-direction: column; gap: 6px; }
 .import-preview-folder-header { font-size: 12px; font-weight: 600; color: var(--text-secondary); overflow-wrap: anywhere; }
 .import-preview-thumbs { display: grid; grid-template-columns: repeat(auto-fill, minmax(104px, 1fr)); gap: 8px; }
@@ -431,6 +433,10 @@ body { display: flex; flex-direction: column; height: 100vh; }
       </div>
       <div id="importError" role="alert" aria-live="assertive"></div>
       <div class="preview-summary" id="previewSummary"></div>
+      <label class="preview-filter" id="hideDuplicatesRow" style="display:none;">
+        <input type="checkbox" id="chkHideDuplicates" onchange="rerenderImportPreviewGrid()">
+        <span id="hideDuplicatesLabel">Hide duplicates</span>
+      </label>
       <div id="importPreviewGrid" class="import-preview-grid" style="display:none;"></div>
     </div>
 
@@ -519,6 +525,9 @@ let destStructureSeq = 0;
 let importPreviewSeq = 0;
 let importPreviewTimer = null;
 let importThumbSchedulerCancel = null;
+// Last args passed to renderImportPreviewGrid, so the "Hide duplicates"
+// filter can re-render locally.
+let lastImportPreviewRender = null;
 let importTags = [];
 let newImagesSnapshotId = null;
 let importExiftoolReady = null;
@@ -1017,6 +1026,13 @@ function renderSources() {
       hideDestStructure();
       if (!sources.length) {
         clearImportPreviewGrid();
+        // Emptying the source list ends this card's session, so the
+        // filter retires with it — the row is already hidden here, and
+        // carrying the choice into whatever card is added next would
+        // filter that one on arrival without the user opting in. Note
+        // this is deliberately NOT in clearImportPreviewGrid(): ordinary
+        // re-previews clear the grid too and must keep the opt-in.
+        retireHideDuplicatesOptIn();
         document.getElementById('previewSummary').textContent = '';
       }
       renderSources();
@@ -1564,7 +1580,11 @@ function updateAfterMoveUI() {
     if (importIsAbsolutePath(destination)) {
       unavailable.textContent =
         "Move to NAS unavailable: the destination is not inside any remote "
-        + "target's local archive root. Set one under Settings > Remote targets.";
+        + "target's local archive root. ";
+      const setup = document.createElement('a');
+      setup.href = '/settings#nas-setup';
+      setup.textContent = 'Set up remote target…';
+      unavailable.appendChild(setup);
       unavailable.style.display = '';
     }
     return;
@@ -2105,10 +2125,51 @@ function clearImportPreviewGrid() {
     importThumbSchedulerCancel();
     importThumbSchedulerCancel = null;
   }
+  lastImportPreviewRender = null;
+  updateHideDuplicatesControl(0);
   const grid = document.getElementById('importPreviewGrid');
   if (!grid) return;
   grid.style.display = 'none';
   grid.innerHTML = '';
+}
+
+// The "Hide duplicates" row only makes sense once a preview has actually
+// flagged duplicates — before the duplicate check runs (or with dedup off)
+// there is nothing to hide, so the control stays hidden rather than
+// implying a filter that would do nothing.
+function updateHideDuplicatesControl(dupCount) {
+  const row = document.getElementById('hideDuplicatesRow');
+  const label = document.getElementById('hideDuplicatesLabel');
+  if (!row || !label) return;
+  row.style.display = dupCount > 0 ? '' : 'none';
+  label.textContent = 'Hide duplicates (' + dupCount.toLocaleString() + ')';
+}
+
+function hideDuplicatesEnabled() {
+  const el = document.getElementById('chkHideDuplicates');
+  return !!(el && el.checked);
+}
+
+// Drop the opt-in once a settled preview has nothing to hide, so the next
+// card that does carry duplicates starts unfiltered instead of inheriting
+// a choice made for a different card while the row was hidden.
+//
+// Only call this where the duplicate picture is FINAL. Every preview
+// renders the grid with an empty duplicate list before its check
+// finishes, so clearing on any zero count (including inside
+// updateHideDuplicatesControl) would silently flip the filter off every
+// time an import option change schedules a fresh preview.
+function retireHideDuplicatesOptIn() {
+  const el = document.getElementById('chkHideDuplicates');
+  if (el) el.checked = false;
+}
+
+// Re-run the last grid render with the current filter state. Purely a view
+// toggle — it never re-requests the preview or the duplicate check.
+function rerenderImportPreviewGrid() {
+  if (!lastImportPreviewRender) return;
+  const last = lastImportPreviewRender;
+  renderImportPreviewGrid(last.files, last.duplicatePaths, last.destinationFiles);
 }
 
 function importDestinationMap(destinationFiles) {
@@ -2119,6 +2180,33 @@ function importDestinationMap(destinationFiles) {
   return map;
 }
 
+// Duplicate identity is per-occurrence, not per-path. When source folders
+// overlap (e.g. `/card` and `/card/DCIM`) the same file path can appear
+// twice in `files`; the server's `check-duplicates` stream flags only the
+// *later* occurrence as an intra-import duplicate — the first is what will
+// actually be copied. A path-set membership test would tag both tiles as
+// duplicates, so enabling the filter would hide the to-copy file too and
+// the grid could claim every tile is a duplicate while the summary still
+// reports one file remaining. Match the server's ordering by walking
+// `files` in reverse and consuming duplicate-count credits per path.
+function computeDuplicateFlags(files, duplicatePaths) {
+  const flags = new Array(files.length).fill(false);
+  const remaining = new Map();
+  (duplicatePaths || []).forEach((p) => {
+    remaining.set(p, (remaining.get(p) || 0) + 1);
+  });
+  if (!remaining.size) return flags;
+  for (let i = files.length - 1; i >= 0; i -= 1) {
+    const p = files[i] && files[i].path;
+    const count = remaining.get(p) || 0;
+    if (count > 0) {
+      flags[i] = true;
+      remaining.set(p, count - 1);
+    }
+  }
+  return flags;
+}
+
 function renderImportPreviewGrid(files, duplicatePaths, destinationFiles) {
   const grid = document.getElementById('importPreviewGrid');
   if (!grid) return;
@@ -2127,29 +2215,41 @@ function renderImportPreviewGrid(files, duplicatePaths, destinationFiles) {
     importThumbSchedulerCancel = null;
   }
   grid.innerHTML = '';
-  const dupes = new Set(duplicatePaths || []);
   const destMap = importDestinationMap(destinationFiles);
   if (!files || !files.length) {
+    lastImportPreviewRender = null;
+    updateHideDuplicatesControl(0);
     grid.style.display = 'none';
     return;
   }
+  // Remember the inputs so the filter toggle can re-render without
+  // re-running the preview or the duplicate check.
+  lastImportPreviewRender = {
+    files: files,
+    duplicatePaths: duplicatePaths,
+    destinationFiles: destinationFiles,
+  };
+  const duplicateFlags = computeDuplicateFlags(files, duplicatePaths);
+  const dupeCount = duplicateFlags.reduce((n, isDup) => n + (isDup ? 1 : 0), 0);
+  updateHideDuplicatesControl(dupeCount);
+  const hidingDuplicates = dupeCount > 0 && hideDuplicatesEnabled();
 
   // Duplicate-heavy retries should foreground the work Vireo will actually
   // perform. Rendering hundreds of skipped cards obscures the one failed
-  // file and schedules a thumbnail request for every duplicate. Keep those
-  // files collapsed into one summary and render only pending/unavailable
-  // items. Before duplicate detection runs `duplicatePaths` is empty, so
-  // callers that need the full in-place preview retain the existing view.
-  const pendingFiles = files.filter((f) => !dupes.has(f.path));
+  // file and schedules a thumbnail request for every duplicate. When the
+  // user has opted into hiding duplicates, collapse them into one summary
+  // and render only pending/unavailable items; otherwise fall back to the
+  // per-folder view so each duplicate still surfaces as its own tile.
+  const pendingFiles = files.filter((f, i) => !duplicateFlags[i]);
   const duplicateCount = files.length - pendingFiles.length;
   const groups = {};
-  pendingFiles.forEach((f) => {
+  files.forEach((f, i) => {
     const key = f.subfolder || 'Source';
     if (!groups[key]) groups[key] = [];
-    groups[key].push(f);
+    groups[key].push({ file: f, isDuplicate: duplicateFlags[i] });
   });
 
-  if (duplicateCount) {
+  if (hidingDuplicates && duplicateCount) {
     const collapsed = document.createElement('div');
     collapsed.className = 'import-preview-collapsed';
     collapsed.setAttribute('data-testid', 'collapsed-duplicate-preview');
@@ -2163,18 +2263,39 @@ function renderImportPreviewGrid(files, duplicatePaths, destinationFiles) {
     grid.appendChild(collapsed);
   }
 
+  let anyTilesRendered = false;
+
   Object.keys(groups).sort().forEach((subfolder) => {
+    const all = groups[subfolder];
+    const shown = hidingDuplicates ? all.filter((e) => !e.isDuplicate) : all;
+    const hiddenHere = all.length - shown.length;
+    // Nothing to show and nothing hidden — no reason to render a header.
+    // (Only reachable if a group somehow started empty, which shouldn't
+    // happen since groups are built from `files`.)
+    if (!shown.length && !hiddenHere) return;
     const groupEl = document.createElement('div');
     groupEl.className = 'import-preview-folder';
     const header = document.createElement('div');
     header.className = 'import-preview-folder-header';
-    header.textContent = subfolder + ' (' + groups[subfolder].length + ')';
+    header.textContent = subfolder + ' (' + shown.length + ')' +
+      (hiddenHere ? ' · ' + hiddenHere.toLocaleString() + ' duplicate' +
+        (hiddenHere === 1 ? '' : 's') + ' hidden' : '');
     groupEl.appendChild(header);
 
+    // A folder made entirely of duplicates still gets its header — a
+    // silent drop would leave the user with no evidence the folder or its
+    // hidden count existed while other headers own their hidden files.
+    if (!shown.length) {
+      grid.appendChild(groupEl);
+      return;
+    }
+
+    anyTilesRendered = true;
     const thumbsEl = document.createElement('div');
     thumbsEl.className = 'import-preview-thumbs';
-    groups[subfolder].forEach((f) => {
-      const isDuplicate = dupes.has(f.path);
+    shown.forEach((entry) => {
+      const f = entry.file;
+      const isDuplicate = entry.isDuplicate;
       const isUnavailable = f.available === false;
       const card = document.createElement('div');
       card.className = 'import-preview-thumb' +
@@ -2221,6 +2342,25 @@ function renderImportPreviewGrid(files, duplicatePaths, destinationFiles) {
     groupEl.appendChild(thumbsEl);
     grid.appendChild(groupEl);
   });
+  // Every folder ended up fully filtered, so replace the wall of
+  // "(0) · N hidden" headers with a single clearer message that also
+  // tells the user how to see the tiles again. When the collapsed
+  // duplicate banner is already visible it already carries the count and
+  // outcome, so keep it and skip the fallback message.
+  if (!anyTilesRendered) {
+    const collapsedBanner = grid.querySelector('.import-preview-collapsed');
+    grid.innerHTML = '';
+    if (collapsedBanner) {
+      grid.appendChild(collapsedBanner);
+    } else {
+      const empty = document.createElement('div');
+      empty.className = 'import-preview-empty';
+      empty.textContent = 'All ' + files.length.toLocaleString() + ' file' +
+        (files.length === 1 ? ' is a duplicate' : 's are duplicates') +
+        ' — uncheck "Hide duplicates" to see them.';
+      grid.appendChild(empty);
+    }
+  }
   grid.style.display = '';
   setupImportThumbnailScheduler();
 }
@@ -2469,7 +2609,12 @@ async function previewImport(opts) {
   importPreviewSeq += 1;
   const requestSeq = importPreviewSeq;
   const summary = document.getElementById('previewSummary');
+  // Both bail-outs below are settled: the run stops before discovery, so
+  // nothing can be hidden and the opt-in must not linger behind the
+  // now-hidden row. (Contrast the in-flight path further down, which
+  // keeps the opt-in until the duplicate count is actually known.)
   if (!sources.length && newImagesSnapshotId === null) {
+    retireHideDuplicatesOptIn();
     summary.textContent = '';
     showError('Add at least one source folder.');
     return;
@@ -2477,6 +2622,7 @@ async function previewImport(opts) {
   const copyMode = newImagesSnapshotId === null && selectedImportMode() === 'copy';
   const fileTypes = copyMode ? selectedFileTypes() : 'both';
   if (copyMode && Array.isArray(fileTypes) && !fileTypes.length) {
+    retireHideDuplicatesOptIn();
     summary.textContent = '';
     showError('Choose at least one file extension.');
     return;
@@ -2515,10 +2661,22 @@ async function previewImport(opts) {
     if (!files.length) {
       summary.textContent = 'No importable files found.';
       clearImportPreviewGrid();
+      // A completed preview with zero files is a final "nothing to hide"
+      // state — like snapshot / in-place / dedup-off below — so retire the
+      // opt-in. Otherwise the row hides while the checkbox stays checked,
+      // and the next card that does surface duplicates gets filtered
+      // silently instead of opt-in.
+      retireHideDuplicatesOptIn();
       return;
     }
+    // The three branches below all settle without a duplicate check —
+    // in-place/snapshot imports have no duplicate concept and a dedup-off
+    // copy skips nothing — so each is a final "nothing to hide" state and
+    // retires the opt-in. The fall-through path does NOT: its duplicate
+    // count is still unknown until the check below completes.
     if (snapshotMode) {
       renderImportPreviewGrid(files, [], null);
+      retireHideDuplicatesOptIn();
       const unavailable = Number(data.unavailable_count || 0);
       summary.textContent = Number(data.total_count || files.length).toLocaleString() +
         ' captured file' + (Number(data.total_count || files.length) === 1 ? '' : 's') +
@@ -2528,11 +2686,13 @@ async function previewImport(opts) {
     }
     if (!copyMode) {
       renderImportPreviewGrid(files, [], null);
+      retireHideDuplicatesOptIn();
       summary.textContent = files.length + ' files found · originals will stay in place';
       return;
     }
     if (!document.getElementById('chkSkipDuplicates').checked) {
       renderImportPreviewGrid(files, [], null);
+      retireHideDuplicatesOptIn();
       summary.textContent = files.length + ' files found · duplicates will be copied';
       // No dedup gate, so every discovered file lands — pass no exclusions
       // so the folder-structure counts match the full copy set.
@@ -2583,6 +2743,8 @@ async function previewImport(opts) {
       return;
     }
     const dupCount = duplicatePaths.length;
+    // The check ran to completion, so this count is final.
+    if (dupCount === 0) retireHideDuplicatesOptIn();
     summary.textContent = files.length + ' files found · ' + dupCount +
       ' already in your library (will be skipped) · ' +
       (files.length - dupCount) + ' to copy';

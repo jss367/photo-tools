@@ -2825,7 +2825,10 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         if (
             expected_api_token
             and supplied_api_token
-            and secrets.compare_digest(supplied_api_token, expected_api_token)
+            and secrets.compare_digest(
+                supplied_api_token.encode("utf-8"),
+                expected_api_token.encode("utf-8"),
+            )
         ):
             return None
 
@@ -2851,7 +2854,8 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         cookie_name = app.config["BROWSER_SESSION_COOKIE"]
         expected_token = app.config["BROWSER_SESSION_TOKEN"]
         if not secrets.compare_digest(
-            request.cookies.get(cookie_name, ""), expected_token,
+            request.cookies.get(cookie_name, "").encode("utf-8"),
+            expected_token.encode("utf-8"),
         ):
             return json_error(
                 "Browser session required",
@@ -3665,7 +3669,12 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         if not expected:
             # No token configured → deny all v1 traffic.
             return json_error("API token not configured", 401)
-        if request.headers.get("X-Vireo-Token") != expected:
+        supplied = request.headers.get("X-Vireo-Token", "")
+        # ``secrets.compare_digest`` raises ``TypeError`` when either str
+        # operand contains a non-ASCII code point, which would surface as a
+        # 500 for an attacker-supplied token — encode to bytes so a bogus
+        # header is a plain 401 like any other wrong value.
+        if not secrets.compare_digest(supplied.encode("utf-8"), expected.encode("utf-8")):
             return json_error("Invalid or missing X-Vireo-Token", 401)
         return None
 
@@ -3838,6 +3847,25 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             repaired_location_ancestors,
         )
 
+    # Parsing taxonomy.json is expensive for a full iNaturalist download.
+    # Cache the startup instance so overlapping one-time migrations and the
+    # immediate background species pass do not each parse it independently.
+    _taxonomy_not_loaded = object()
+    _startup_taxonomy = _taxonomy_not_loaded
+
+    def _load_startup_taxonomy():
+        nonlocal _startup_taxonomy
+        # Do not cache a miss: a concurrent first-run taxonomy download can
+        # make the file available before the background retry starts.
+        if (
+            _startup_taxonomy is _taxonomy_not_loaded
+            or _startup_taxonomy is None
+        ):
+            from taxonomy import load_local_taxonomy
+
+            _startup_taxonomy = load_local_taxonomy()
+        return _startup_taxonomy
+
     def _sync_mark_species_only(db, log_label):
         """Load taxonomy and run mark_species_keywords synchronously.
 
@@ -3847,9 +3875,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         that depends on hierarchy leaves being correctly typed as
         taxonomy/is_species.
         """
-        from taxonomy import load_local_taxonomy
-
-        tax = load_local_taxonomy()
+        tax = _load_startup_taxonomy()
         if tax is None:
             log.debug(
                 "[%s] taxonomy not loaded; deferring species marking",
@@ -3886,7 +3912,40 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
     # association remains permanently skipped. When taxonomy isn't
     # loaded yet (or marking fails), defer the repair to a later boot
     # rather than stamping the marker over an unmarked hierarchy.
-    if _sync_mark_species_only(init_db, "sync-startup-species-mark"):
+    duplicate_repair_key = Database._DUPLICATE_PHOTO_SPECIES_REPAIR_KEY
+    duplicate_repair_pending = init_db.get_meta(duplicate_repair_key) != "1"
+    if duplicate_repair_pending:
+        # The legacy bug always left a typed top-level species/taxonomy tag
+        # beside another tag on the same photo. If no such pair exists, the
+        # repair is structurally impossible and it is safe to stamp the
+        # one-shot marker without parsing a potentially huge taxonomy file.
+        possible_duplicate = init_db.conn.execute(
+            """SELECT 1
+               FROM photo_keywords species_pk
+               JOIN keywords species_k
+                 ON species_k.id = species_pk.keyword_id
+               WHERE (species_k.is_species = 1
+                      OR species_k.type = 'taxonomy')
+                 AND EXISTS (
+                     SELECT 1
+                     FROM photo_keywords other_pk
+                     WHERE other_pk.photo_id = species_pk.photo_id
+                       AND other_pk.keyword_id != species_pk.keyword_id
+                 )
+               LIMIT 1"""
+        ).fetchone()
+        if possible_duplicate is None:
+            init_db.set_meta(duplicate_repair_key, "1")
+            duplicate_repair_pending = False
+            log.info(
+                "Skipped duplicate-species startup repair: "
+                "no possible duplicate associations"
+            )
+
+    if (
+        duplicate_repair_pending
+        and _sync_mark_species_only(init_db, "sync-startup-species-mark")
+    ):
         init_db.repair_duplicate_photo_species()
     # One-time rewrite of the previous miss-threshold defaults (0.25 / 0.15)
     # to the new defaults (0.20 / 0.12) in both ~/.vireo/config.json and
@@ -3969,9 +4028,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         """Load taxonomy, mark species keywords, and run the one-shot
         Wildlife backfill. Returns silently on any failure so callers
         can choose between sync (block startup) and async (log only)."""
-        from taxonomy import load_local_taxonomy
-
-        tax = load_local_taxonomy()
+        tax = _load_startup_taxonomy()
         if tax is None:
             # No taxonomy yet — leave the marker unset so the backfill
             # retries on a future boot once taxonomy is downloaded.
@@ -4021,7 +4078,8 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         finally:
             bg_db.close()
 
-    threading.Thread(target=_mark_species, daemon=True).start()
+    if not os.environ.get("VIREO_DISABLE_STARTUP_BACKFILL_TIMERS"):
+        threading.Thread(target=_mark_species, daemon=True).start()
 
     def _folder_health_loop():
         """Periodically check folder health."""
@@ -15517,6 +15575,11 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         Unlike cfg.load(), this does NOT merge DEFAULTS — so it contains
         only the keys the user has actually set. Used by write paths so the
         on-disk file stays minimal.
+
+        Preserves a `.corrupt` backup on unreadable/non-dict content before
+        returning `{}` — otherwise the very next PATCH/DELETE via the
+        schema-driven settings routes would call `cfg.save()` on the empty
+        dict and silently overwrite whatever the user had.
         """
         import config as cfg
 
@@ -15525,9 +15588,13 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         try:
             with open(cfg.CONFIG_PATH) as f:
                 raw = json.load(f)
-            return raw if isinstance(raw, dict) else {}
         except (OSError, json.JSONDecodeError):
+            cfg._preserve_corrupt_config()
             return {}
+        if not isinstance(raw, dict):
+            cfg._preserve_corrupt_config()
+            return {}
+        return raw
 
     # Serializes read-modify-write of ~/.vireo/config.json and the active
     # workspace's config_overrides across the schema-driven settings
@@ -15668,8 +15735,26 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         """
         import datetime as _datetime
 
+        import config_schema as schema
+
         raw = _read_raw_config_file()
         raw.pop("_migrations_applied", None)
+        # Never ship secret values in a settings backup — these files get
+        # attached to bug reports and shared machines. Import leaves this
+        # machine's stored secrets alone when the payload omits them, and
+        # ``_secrets_omitted`` tells the user what to re-enter after
+        # importing on a fresh machine.
+        _ABSENT = object()
+        omitted = []
+        for secret_key in schema.secret_keys():
+            val = schema.get_dotted(raw, secret_key, default=_ABSENT)
+            if val is _ABSENT:
+                continue
+            schema.delete_dotted(raw, secret_key)
+            if val:
+                omitted.append(secret_key)
+        if omitted:
+            raw["_secrets_omitted"] = sorted(omitted)
         # ``pipeline.default_process_id`` points into ``saved_processes``,
         # whose rows are DB-local — the ids don't transfer across databases.
         # If the same integer id happens to exist in the target DB it points
@@ -15729,6 +15814,9 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             return json_error(f"invalid JSON: {e}", status=400)
         if not isinstance(payload, dict):
             return json_error("payload must be a JSON object", status=400)
+
+        # Bookkeeping marker written by /api/settings/export; never persist it.
+        payload.pop("_secrets_omitted", None)
 
         # Translate the legacy ``pipeline.default_strategy`` (hardcoded strategy
         # name) to the current ``pipeline.default_process_id`` before schema
@@ -15903,6 +15991,17 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             return jsonify({"error": "validation failed", "errors": errors}), 400
 
         with _settings_write_lock:
+            # Exports omit secret values (see /api/settings/export), so a
+            # restored backup must not wipe the tokens already configured on
+            # this machine: absent secret keys keep their current on-disk
+            # value; explicitly supplied ones write through.
+            current_raw = _read_raw_config_file()
+            for secret_key in schema.secret_keys():
+                if schema.get_dotted(payload, secret_key, default=_MISSING) is not _MISSING:
+                    continue
+                existing = schema.get_dotted(current_raw, secret_key, default=_MISSING)
+                if existing is not _MISSING:
+                    schema.set_dotted(payload, secret_key, existing)
             cfg.save(payload)
             _settings_post_save_side_effects(cfg.load())
         return jsonify({"ok": True})
@@ -22193,6 +22292,245 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 "feature or configure ssh.exe under Settings → Paths."
             )
         return jsonify(res)
+
+    # --- NAS setup wizard (/api/remote-setup/*) --------------------------
+    # Synchronous discovery/setup endpoints behind the Settings-page wizard
+    # (docs/superpowers/specs/2026-07-26-nas-setup-wizard-design.md). All of
+    # them are loopback-only: the app already binds 127.0.0.1 via waitress,
+    # but the install-key route carries a NAS password, so defense in depth
+    # is cheap and the consistent rule is simplest.
+
+    def _remote_setup_forbidden():
+        if request.remote_addr not in ("127.0.0.1", "::1"):
+            return json_error(
+                "remote setup is only available from this machine", 403)
+        return None
+
+    def _remote_setup_conn_args(body):
+        """Validate and extract {host, user, port} shared by the wizard's
+        SSH-touching endpoints. Returns (args, None) or (None, response)."""
+        host = (body.get("host") or "").strip()
+        user = (body.get("user") or "").strip()
+        port = body.get("port", 22)
+        if not host or not user:
+            return None, json_error("host and user are required")
+        try:
+            port = int(port)
+        except (TypeError, ValueError):
+            return None, json_error("port must be an integer")
+        if not 1 <= port <= 65535:
+            return None, json_error("port must be between 1 and 65535")
+        return {"host": host, "user": user, "port": port}, None
+
+    def _remote_setup_ssh_bin():
+        import config as cfg
+        import move as move_mod
+
+        effective_cfg = _get_db().get_effective_config(cfg.load())
+        return move_mod.resolve_ssh_bin(effective_cfg.get("ssh_bin", "") or "")
+
+    @app.route("/api/remote-setup/mounts")
+    def api_remote_setup_mounts():
+        """Mounted network shares the wizard can offer as NAS candidates."""
+        import remote_setup
+
+        forbidden = _remote_setup_forbidden()
+        if forbidden:
+            return forbidden
+        if not remote_setup.platform_supported():
+            return jsonify({"mounts": [], "unsupported_platform": True})
+        return jsonify({"mounts": remote_setup.list_network_mounts()})
+
+    @app.route("/api/remote-setup/ssh-check", methods=["POST"])
+    def api_remote_setup_ssh_check():
+        """Port reachability + current key-auth status for a candidate NAS.
+
+        Also ensures the Vireo keypair exists (idempotent, local-only) and
+        returns its public line: the wizard's Terminal-fallback expander
+        builds its authorized_keys one-liner from ``pub_key_line`` and must
+        work without install-key (no password) ever being called.
+        """
+        import remote_setup
+
+        forbidden = _remote_setup_forbidden()
+        if forbidden:
+            return forbidden
+        conn, err = _remote_setup_conn_args(request.get_json(silent=True) or {})
+        if err:
+            return err
+        try:
+            _priv, pub = remote_setup.ensure_vireo_key()
+            with open(pub) as f:
+                pub_key_line = f.read().strip()
+        except (RuntimeError, OSError) as exc:
+            return json_error(f"could not prepare the Vireo SSH key: {exc}")
+        result = {
+            "port_open": remote_setup.port_reachable(conn["host"], conn["port"]),
+            "pub_key_line": pub_key_line,
+            "key_path": _priv,
+            "key_auth_ok": False,
+        }
+        ssh_bin = _remote_setup_ssh_bin()
+        if not ssh_bin:
+            result["ssh_missing"] = True
+        elif result["port_open"]:
+            result["key_auth_ok"] = remote_setup.key_auth_works(
+                host=conn["host"], user=conn["user"], port=conn["port"],
+                key=_priv, ssh_bin=ssh_bin)
+        return jsonify(result)
+
+    @app.route("/api/remote-setup/install-key", methods=["POST"])
+    def api_remote_setup_install_key():
+        """Authorize this Mac's Vireo key on the NAS using a password, once.
+
+        The password is request-scoped only: written to the ssh pty and
+        nowhere else — never config, DB, logs, or this response.
+        """
+        import remote_setup
+
+        forbidden = _remote_setup_forbidden()
+        if forbidden:
+            return forbidden
+        body = request.get_json(silent=True) or {}
+        conn, err = _remote_setup_conn_args(body)
+        if err:
+            return err
+        password = body.get("password") or ""
+        if not password:
+            return json_error("password is required")
+        ssh_bin = _remote_setup_ssh_bin()
+        if not ssh_bin:
+            return json_error("no OpenSSH client found — set its path under "
+                              "Settings > Paths")
+        try:
+            priv, pub = remote_setup.ensure_vireo_key()
+            with open(pub) as f:
+                pub_key_line = f.read().strip()
+        except (RuntimeError, OSError) as exc:
+            return json_error(f"could not prepare the Vireo SSH key: {exc}")
+        argv = remote_setup.build_install_argv(
+            host=conn["host"], user=conn["user"], port=conn["port"],
+            key_pub_line=pub_key_line, ssh_bin=ssh_bin)
+        res = remote_setup.install_key_with_password(
+            spawn_argv=argv, password=password)
+        out = {"ok": bool(res.get("ok")), "error": res.get("error")}
+        if res.get("detail"):
+            out["detail"] = res["detail"]
+        if out["ok"]:
+            out["key_auth_ok"] = remote_setup.key_auth_works(
+                host=conn["host"], user=conn["user"], port=conn["port"],
+                key=priv, ssh_bin=ssh_bin)
+            try:
+                fp = subprocess.run(
+                    ["ssh-keygen", "-lf", pub], capture_output=True,
+                    text=True, timeout=10)
+                if fp.returncode == 0:
+                    out["fingerprint"] = fp.stdout.strip()
+            except (OSError, subprocess.SubprocessError):
+                pass
+        return jsonify(out)
+
+    @app.route("/api/remote-setup/locate-share", methods=["POST"])
+    def api_remote_setup_locate_share():
+        """Nonce-verified NAS-side path for a mounted share. Proof, not a
+        guess — the chained move deletes local originals, so a same-named
+        share on the wrong volume must be impossible to configure here."""
+        import remote_setup
+
+        forbidden = _remote_setup_forbidden()
+        if forbidden:
+            return forbidden
+        body = request.get_json(silent=True) or {}
+        conn, err = _remote_setup_conn_args(body)
+        if err:
+            return err
+        mount_path = (body.get("mount_path") or "").strip()
+        share = (body.get("share") or "").strip()
+        if not share:
+            return json_error("share is required")
+        if not os.path.isabs(mount_path) or not os.path.isdir(mount_path):
+            return json_error("mount_path must be an existing absolute path")
+        ssh_bin = _remote_setup_ssh_bin()
+        if not ssh_bin:
+            return json_error("no OpenSSH client found — set its path under "
+                              "Settings > Paths")
+        priv, _pub = remote_setup.vireo_key_paths()
+        try:
+            remote_path = remote_setup.locate_share(
+                mount_point=mount_path, share=share, host=conn["host"],
+                user=conn["user"], port=conn["port"], key=priv,
+                ssh_bin=ssh_bin)
+        except remote_setup.MountNotWritable:
+            return json_error(
+                "the mounted volume is not writable — the wizard (and the "
+                "move workflow it sets up) needs write access to the share")
+        return jsonify({"remote_path": remote_path})
+
+    @app.route("/api/remote-setup/list-remote-dirs", methods=["POST"])
+    def api_remote_setup_list_remote_dirs():
+        """SSH-backed directory listing for the wizard's fallback browser."""
+        import remote_setup
+
+        forbidden = _remote_setup_forbidden()
+        if forbidden:
+            return forbidden
+        body = request.get_json(silent=True) or {}
+        conn, err = _remote_setup_conn_args(body)
+        if err:
+            return err
+        path = (body.get("path") or "").strip()
+        if not path.startswith("/"):
+            return json_error("path must be absolute")
+        ssh_bin = _remote_setup_ssh_bin()
+        if not ssh_bin:
+            return json_error("no OpenSSH client found — set its path under "
+                              "Settings > Paths")
+        priv, _pub = remote_setup.vireo_key_paths()
+        return jsonify({"dirs": remote_setup.list_remote_dirs(
+            path=path, host=conn["host"], user=conn["user"],
+            port=conn["port"], key=priv, ssh_bin=ssh_bin)})
+
+    @app.route("/api/remote-setup/disk-free")
+    def api_remote_setup_disk_free():
+        """Free bytes on the volume containing ``path`` (archive-root step)."""
+        forbidden = _remote_setup_forbidden()
+        if forbidden:
+            return forbidden
+        path = (request.args.get("path") or "").strip()
+        if not os.path.isabs(path) or not os.path.isdir(path):
+            return json_error("path must be an existing absolute path")
+        return jsonify({"free_bytes": shutil.disk_usage(path).free})
+
+    @app.route("/api/remote-setup/check-archive-root", methods=["POST"])
+    def api_remote_setup_check_archive_root():
+        """True if ``path`` resolves (through symlinks or case-only aliases)
+        into ``mount_path``. Exposes the same filesystem-aware containment
+        check ``_coerce_remote_target`` runs at save time so the wizard's
+        archive-root step can reject aliased folders up front instead of
+        letting the save silently blank ``local_archive_root``, which would
+        leave the target unable to offer the chained move the wizard was
+        meant to configure. A purely-lexical check on the client can't see
+        symlinks, so this has to be server-side."""
+        import move as move_mod
+
+        forbidden = _remote_setup_forbidden()
+        if forbidden:
+            return forbidden
+        body = request.get_json(silent=True) or {}
+        path = (body.get("path") or "").strip()
+        mount_path = (body.get("mount_path") or "").strip()
+        if not path or not mount_path:
+            return json_error("path and mount_path are required")
+        if not os.path.isabs(path) or not os.path.isabs(mount_path):
+            return json_error("both paths must be absolute")
+        try:
+            inside = bool(move_mod._path_equal_or_descends(path, mount_path))
+        except (OSError, ValueError):
+            # realpath failed (unreadable / cross-device on Windows) — the
+            # save-time validator is the authoritative check, so let the
+            # user proceed rather than block on a transient FS hiccup.
+            inside = False
+        return jsonify({"inside_mount": inside})
 
     @app.route("/api/jobs/import-full", methods=["POST"])
     def api_job_import_full():
@@ -30926,6 +31264,35 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
     return app
 
 
+def _emit_incompatible_database_exit(e):
+    # Both --load-taxonomy and create_app open the catalog; either can trip
+    # ensure_schema's newer-DB guard, and both need the same guided exit so
+    # the desktop launcher gets a structured signal instead of a raw
+    # traceback.
+    import sys as _sys
+    if getattr(e, "newer", False):
+        log.error(
+            "Cannot open database at %s: it was created by a newer "
+            "version of Vireo than this build supports. Update Vireo to "
+            "its latest version to open this catalog. Underlying error: %s",
+            e.db_path, e.cause,
+        )
+    else:
+        log.error(
+            "Cannot open database at %s: it is from an incompatible older "
+            "version of Vireo. Back it up and remove it to start fresh "
+            "(e.g. `mv %s %s.bak`), then relaunch. Underlying error: %s",
+            e.db_path, e.db_path, e.db_path, e.cause,
+        )
+    _sys.stderr.write(json.dumps({
+        "error": "incompatible_database",
+        "db_path": e.db_path,
+        "reason": str(e),
+        "newer": getattr(e, "newer", False),
+    }) + "\n")
+    raise SystemExit(3) from e
+
+
 def main():
     _setup_file_logging()
 
@@ -30977,6 +31344,14 @@ def main():
     if args.load_taxonomy:
         from db import Database
         from taxonomy import fetch_common_names, load_taxonomy, seed_informal_groups
+        # Run the newer-schema guard before Database(args.db) executes any
+        # legacy DDL/ALTERs against a catalog stamped by a future Vireo build.
+        # create_app takes this same check through ensure_schema; keep the two
+        # entry points in sync so `--load-taxonomy` can't corrupt a newer DB.
+        try:
+            ensure_schema(args.db)
+        except IncompatibleDatabaseError as e:
+            _emit_incompatible_database_exit(e)
         db = Database(args.db)
         log.info("Loading taxonomy tree from iNaturalist...")
         stats = load_taxonomy(db)
@@ -31059,19 +31434,7 @@ def main():
         # as "did not become healthy within 30s"). The atexit/SIGTERM cleanup
         # registered above releases the single-instance lock and runtime.json
         # on this exit, so a retry isn't blocked by a stale reservation.
-        import sys as _sys
-        log.error(
-            "Cannot open database at %s: it is from an incompatible older "
-            "version of Vireo. Back it up and remove it to start fresh "
-            "(e.g. `mv %s %s.bak`), then relaunch. Underlying error: %s",
-            e.db_path, e.db_path, e.db_path, e.cause,
-        )
-        _sys.stderr.write(json.dumps({
-            "error": "incompatible_database",
-            "db_path": e.db_path,
-            "reason": str(e),
-        }) + "\n")
-        raise SystemExit(3) from e
+        _emit_incompatible_database_exit(e)
     except Exception as e:
         # Any other failure to build the app is still a fatal startup error
         # (corrupt-but-not-stale DB, missing/locked resource, an unexpected
@@ -31163,4 +31526,20 @@ if __name__ == "__main__":
     # when we actually call it.
     import multiprocessing
     multiprocessing.freeze_support()
+    # --pty-spawn-helper: pty setup shim dispatched by remote_setup's
+    # install-key path. In the packaged (PyInstaller --onefile) build
+    # sys.executable is this same binary, so remote_setup can't shell
+    # out via `[python, "-c", helper]` and instead re-executes us with
+    # this flag. Must run BEFORE argparse — the wrapped ssh argv follows
+    # and would otherwise get rejected as unknown options.
+    if len(sys.argv) >= 3 and sys.argv[1] == "--pty-spawn-helper":
+        import fcntl
+        import termios
+        os.setsid()
+        fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+        a = termios.tcgetattr(0)
+        a[3] &= ~(termios.ECHO | termios.ECHOE | termios.ECHOK
+                  | termios.ECHONL)
+        termios.tcsetattr(0, termios.TCSANOW, a)
+        os.execvp(sys.argv[2], sys.argv[2:])
     main()

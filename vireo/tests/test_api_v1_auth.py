@@ -13,6 +13,17 @@ def test_api_v1_wrong_token_rejected(app_and_db):
     assert resp.status_code == 401
 
 
+def test_api_v1_non_ascii_token_rejected_as_401(app_and_db):
+    """A bogus token containing non-ASCII characters must be a plain 401.
+    ``secrets.compare_digest`` raises ``TypeError`` on non-ASCII ``str``
+    operands, which previously surfaced as a 500 for attacker-controlled
+    header values."""
+    app, _ = app_and_db
+    client = app.test_client()
+    resp = client.get("/api/v1/health", headers={"X-Vireo-Token": "wröng"})
+    assert resp.status_code == 401
+
+
 def test_api_v1_correct_token_accepted(app_and_db):
     app, _ = app_and_db
     client = app.test_client()

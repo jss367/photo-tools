@@ -111,6 +111,8 @@ GET          /api/predictions/group/<group_id>
 GET          /api/preview-cache
 GET          /api/processes
 GET          /api/redo/status
+GET          /api/remote-setup/disk-free
+GET          /api/remote-setup/mounts
 GET          /api/remote-targets
 GET          /api/scan/status
 GET          /api/settings/export
@@ -340,6 +342,11 @@ POST         /api/preview-cache/clear
 POST         /api/processes
 POST         /api/recent-destinations
 POST         /api/redo
+POST         /api/remote-setup/check-archive-root
+POST         /api/remote-setup/install-key
+POST         /api/remote-setup/list-remote-dirs
+POST         /api/remote-setup/locate-share
+POST         /api/remote-setup/ssh-check
 POST         /api/remote-targets/test
 POST         /api/report-issue
 POST         /api/selection/keyword-suggestions

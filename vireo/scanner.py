@@ -1619,6 +1619,14 @@ def scan(root, db, progress_callback=None, incremental=False, extract_full_metad
         # Only enumerate files in the specified directories (non-recursive).
         # root is still used as the folder hierarchy root for _ensure_folder.
         restrict_files_set = set(restrict_files) if restrict_files is not None else None
+        # Heartbeat counter, same interval as the recursive branch below.
+        # A restricted dir is not necessarily small — the import job's
+        # duplicate-folder link scan points this at archive day-folders
+        # holding a whole card's worth of files, and on a network mount
+        # that enumeration runs for minutes. Without the emit the caller
+        # has nothing to show between "Discovering files..." and the
+        # finished count.
+        checked = 0
         for d in restrict_dirs:
             _check_cancelled()
             dp = Path(d)
@@ -1652,9 +1660,21 @@ def scan(root, db, progress_callback=None, incremental=False, extract_full_metad
                 # callers like pipeline_job's repair scan (``except
                 # (OSError, RuntimeError)``) keep their loud failure
                 # semantics — we deliberately don't catch that raise.
-                entries = list(safe_iter_dir(str(dp), onerror=_on_walk_error))
-                for f in entries:
+                #
+                # Consume the generator directly rather than materializing
+                # with ``list(...)``: on a slow network mount the scandir
+                # walk that backs safe_iter_dir takes minutes for a full
+                # day-folder, and materializing here would delay every
+                # heartbeat below until after that wait — the same silent
+                # hang the heartbeat exists to break (PR #1385 Codex /
+                # CodeRabbit review).
+                for f in safe_iter_dir(str(dp), onerror=_on_walk_error):
                     _check_cancelled()
+                    checked += 1
+                    if checked % 500 == 0 and status_callback:
+                        _emit_status(
+                            f"Discovering files... ({len(image_files)} found)"
+                        )
                     if (f.is_file()
                             and f.suffix.lower() in SUPPORTED_EXTENSIONS
                             and not f.name.startswith(".")
@@ -1747,13 +1767,32 @@ def scan(root, db, progress_callback=None, incremental=False, extract_full_metad
             row["id"]: row["file_hash"]
             for row in db.conn.execute("SELECT id, file_hash FROM photos")
         }
-        # Build a path-based lookup: we need folder path + filename
+        # Path-based lookup keyed by absolute path, driving the
+        # incremental "skip on mtime" fast path. Queried GLOBALLY (not
+        # workspace-scoped, unlike ``db.get_photos()`` / ``db.get_folder_tree()``)
+        # so a twin already in the catalog still hits the skip path even
+        # when its folder is not yet linked as a ``workspace_folders``
+        # row in the active workspace. That is exactly the case the
+        # import job's duplicate-folder link scan exists to repair:
+        # scoping the lookup to the active workspace re-opened and
+        # re-hashed every already-known twin just to link the folder
+        # (PR #1385 Codex review). The sibling lookups above
+        # (``existing_file_hashes``, ``exif_extracted``,
+        # ``summary_needs_extract`` below) are already global for the
+        # same reason.
         existing_by_path = {}
-        folders = {f["id"]: f["path"] for f in db.get_folder_tree()}
-        for p in all_photos:
-            folder_path = folders.get(p["folder_id"], "")
-            full_path = os.path.join(folder_path, p["filename"])
-            existing_by_path[full_path] = p
+        folder_paths = {
+            row["id"]: row["path"]
+            for row in db.conn.execute("SELECT id, path FROM folders")
+        }
+        for row in db.conn.execute(
+            "SELECT id, folder_id, filename, extension, file_size, "
+            "file_mtime, xmp_mtime, timestamp, width, height FROM photos"
+        ):
+            folder_path = folder_paths.get(row["folder_id"], "")
+            if not folder_path:
+                continue
+            existing_by_path[os.path.join(folder_path, row["filename"])] = row
         # Track which photos have had ExifTool metadata extracted (exif_data
         # is non-NULL). Photos with NULL exif_data need re-extraction.
         for row in db.conn.execute("SELECT id FROM photos WHERE exif_data IS NOT NULL"):

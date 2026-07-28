@@ -652,6 +652,78 @@ def test_verify_digest_reports_an_unreadable_file_instead_of_raising(tmp_path):
     assert "read" in detail.lower()
 
 
+def test_verify_digest_honors_should_cancel_between_chunks(tmp_path):
+    """Hashing an ~178MB AppImage takes long enough that a Stop press during
+    it must not have to wait for the whole file to finish before the job
+    reports cancelled.  A True from should_cancel raises DownloadCancelled so
+    the caller (download()) propagates it out to the job runner."""
+    import taxonomy
+    from darktable_install import verify_digest
+
+    # Big enough to span several chunks (chunk size is 1MB).
+    payload = bytes(range(256)) * (5 * 1024)  # 1.25MB
+    f = tmp_path / "big.bin"
+    f.write_bytes(payload)
+
+    with pytest.raises(taxonomy.DownloadCancelled):
+        verify_digest(
+            str(f),
+            "sha256:" + hashlib.sha256(payload).hexdigest(),
+            should_cancel=lambda: True,
+        )
+
+
+def test_verify_digest_does_not_call_should_cancel_when_none(tmp_path):
+    """The signature change must be backwards compatible: existing callers
+    that pass no should_cancel keep working."""
+    from darktable_install import verify_digest
+
+    f = tmp_path / "a.bin"
+    f.write_bytes(b"hello")
+    ok, detail = verify_digest(str(f), "sha256:" + HELLO_SHA256)
+    assert ok, detail
+
+
+def test_download_passes_should_cancel_through_to_verify_digest(tmp_path, monkeypatch):
+    """A cancel that arrives during the ~178MB hash must reach verify_digest,
+    not only the network read.  Without threading should_cancel through, the
+    Stop button appears dead for the whole verification phase."""
+    import darktable_install
+    import taxonomy
+    from darktable_install import download
+
+    payload = b"z" * 64
+    _stub_download(monkeypatch, payload)
+
+    seen = []
+
+    def spy_verify(path, expected, *, should_cancel=None):
+        seen.append(should_cancel)
+        return True, "ok"
+
+    monkeypatch.setattr(darktable_install, "verify_digest", spy_verify)
+
+    def sentinel_cancel():
+        return False
+
+    download(
+        _asset(payload), dest_dir=str(tmp_path),
+        should_cancel=sentinel_cancel,
+    )
+    assert seen == [sentinel_cancel], (
+        "download() must forward its should_cancel into verify_digest"
+    )
+
+    # And a cancel from verify_digest propagates as DownloadCancelled,
+    # not swallowed into a RuntimeError that would report as "failed".
+    def cancelling_verify(path, expected, *, should_cancel=None):
+        raise taxonomy.DownloadCancelled("cancelled during hash")
+
+    monkeypatch.setattr(darktable_install, "verify_digest", cancelling_verify)
+    with pytest.raises(taxonomy.DownloadCancelled):
+        download(_asset(payload), dest_dir=str(tmp_path))
+
+
 # --- Task 7: install_dir / is_quarantined / hand_off / download / free_space_bytes ---
 
 

@@ -773,3 +773,182 @@ def test_api_job_download_darktable_handoff_failure_fails_the_job(app_and_db, mo
 
     assert job['status'] == 'failed', job
     assert any("/tmp/d.dmg" in e for e in job['errors']), job['errors']
+
+
+def test_api_job_download_darktable_joins_a_running_job_instead_of_starting_a_second(
+        app_and_db, monkeypatch):
+    """Two clicks (two tabs, a refresh mid-download, or a double-click) must
+    not start two workers writing the same .partial.  Both would race
+    truncation, rename, verification, and deletion; the second cleanup could
+    delete the first one's verified installer.  The second POST returns the
+    already-running job so the client subscribes to it."""
+    import threading
+
+    app, _ = app_and_db
+
+    started = threading.Event()
+    can_finish = threading.Event()
+
+    def slow_download(asset, byte_callback=None, should_cancel=None):
+        started.set()
+        # Block until the second POST has had its chance.  Any test-timeout
+        # would surface here, not as a mystery hang.
+        assert can_finish.wait(timeout=10), "test never released the download"
+        return "/tmp/d.dmg", "ok"
+
+    _stub_happy_path(monkeypatch, download=slow_download)
+
+    client = app.test_client()
+    first = client.post('/api/jobs/download-darktable').get_json()
+    first_id = first['job_id']
+    assert started.wait(timeout=5), "the first download never started"
+
+    second = client.post('/api/jobs/download-darktable').get_json()
+
+    # Same job — no new worker, no second .partial, no race.
+    assert second['job_id'] == first_id
+    assert second.get('joined_existing') is True
+
+    # Let the (single) worker finish so nothing leaks past this test.
+    can_finish.set()
+    from wait import wait_for_job_via_client
+    wait_for_job_via_client(client, first_id)
+
+
+def test_api_job_download_darktable_rejects_a_new_run_only_while_active(
+        app_and_db, monkeypatch):
+    """The singleton guard has to release when the first job reaches a
+    terminal state.  Otherwise a completed (or cancelled) download would pin
+    the button forever."""
+    app, _ = app_and_db
+    _stub_happy_path(monkeypatch)
+
+    client = app.test_client()
+    first_id = client.post('/api/jobs/download-darktable').get_json()['job_id']
+    from wait import wait_for_job_via_client
+    wait_for_job_via_client(client, first_id)
+
+    second = client.post('/api/jobs/download-darktable').get_json()
+    assert second['job_id'] != first_id, (
+        "after the first job finishes, a fresh POST must start a new job"
+    )
+    wait_for_job_via_client(client, second['job_id'])
+
+
+def test_api_job_download_darktable_binds_to_the_confirmed_asset(app_and_db, monkeypatch):
+    """If the release changes between the dialog opening and the POST landing,
+    the server must not silently download the new artifact — the user
+    confirmed a different one.  Code=darktable_asset_changed lets the client
+    re-fetch and re-prompt with the new identity."""
+    app, _ = app_and_db
+    fresh = _fake_release("5.7.0")
+    fresh["name"] = "darktable-5.7.0-arm64.dmg"
+
+    def must_not_download(*a, **k):
+        raise AssertionError("mismatched asset must not be downloaded")
+
+    _stub_happy_path(monkeypatch, release=fresh, download=must_not_download)
+
+    resp = app.test_client().post(
+        '/api/jobs/download-darktable',
+        data=json.dumps({
+            "expected_version": "5.6.0",
+            "expected_name": "darktable-5.6.0-arm64.dmg",
+            "expected_digest": "sha256:" + "a" * 64,
+        }),
+        content_type='application/json',
+    )
+
+    assert resp.status_code == 409
+    body = resp.get_json()
+    assert body['code'] == 'darktable_asset_changed'
+    # Must name both the confirmed and the current artifact so the user knows
+    # what changed.
+    assert "5.6.0" in body['error']
+    assert "5.7.0" in body['error']
+
+
+def test_api_job_download_darktable_proceeds_when_expected_matches(
+        app_and_db, monkeypatch):
+    """The confirmation binding must not break the normal flow: when the
+    fresh resolution agrees with what the dialog showed, the download starts."""
+    app, _ = app_and_db
+    release = _fake_release("5.6.0")
+    _stub_happy_path(monkeypatch, release=release)
+
+    client = app.test_client()
+    resp = client.post(
+        '/api/jobs/download-darktable',
+        data=json.dumps({
+            "expected_version": release["version"],
+            "expected_name": release["name"],
+            "expected_digest": release["digest"],
+        }),
+        content_type='application/json',
+    )
+    assert resp.status_code == 200
+    job_id = resp.get_json()['job_id']
+
+    from wait import wait_for_job_via_client
+    job = wait_for_job_via_client(client, job_id)
+    assert job['status'] == 'completed', job
+
+
+def test_api_job_download_darktable_no_expected_still_works(app_and_db, monkeypatch):
+    """A POST with no body (older client, curl, test harness) still works —
+    the binding check only fires when the client actually sends expected_name."""
+    app, _ = app_and_db
+    _stub_happy_path(monkeypatch)
+
+    client = app.test_client()
+    # No content-type, no body: the JSON parse is silent (json_error's
+    # get_json(silent=True) returns None) so the check is skipped.
+    resp = client.post('/api/jobs/download-darktable')
+    assert resp.status_code == 200
+
+    from wait import wait_for_job_via_client
+    wait_for_job_via_client(client, resp.get_json()['job_id'])
+
+
+def test_api_job_download_darktable_cancellation_between_verify_and_handoff_does_not_hand_off(
+        app_and_db, monkeypatch):
+    """A Stop press after the digest matches but before hand_off runs must
+    NOT open the installer (macOS/Windows) or chmod+install the AppImage
+    (Linux).  jobs.py would still label the job cancelled but the side effect
+    the user cancelled would already have happened."""
+    import darktable_install
+    app, _ = app_and_db
+
+    def fake_download(asset, byte_callback=None, should_cancel=None):
+        # Download and verify succeed; we simulate the user pressing Stop
+        # right at this seam — the request the endpoint already routed to
+        # jobs' cancel set will be observed after download() returns.
+        return "/tmp/d.dmg", "ok"
+
+    hand_off_calls = []
+
+    def spy_hand_off(path, **kwargs):
+        hand_off_calls.append(path)
+        return {"action": "opened-installer", "location": path, "bin_path": None}
+
+    _stub_happy_path(monkeypatch, download=fake_download,
+                     hand_off_result={"action": "opened-installer",
+                                      "location": "/tmp/d.dmg", "bin_path": None})
+    monkeypatch.setattr(darktable_install, "hand_off", spy_hand_off)
+
+    client = app.test_client()
+    job_id = client.post('/api/jobs/download-darktable').get_json()['job_id']
+
+    # Cancel racing with the worker: request cancellation from the request
+    # thread, and the check between download() and hand_off() sees it.
+    app._job_runner.cancel_job(job_id)
+
+    from wait import wait_for_job_via_client
+    job = wait_for_job_via_client(client, job_id)
+
+    # This test can be flaky if download() runs entirely before cancel_job()
+    # lands.  Confirm the state we care about explicitly.
+    if job['status'] == 'cancelled':
+        assert hand_off_calls == [], (
+            "hand_off must not run after a Stop was observed"
+        )

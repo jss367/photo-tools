@@ -232,7 +232,7 @@ _HASH_CHUNK_BYTES = 1024 * 1024
 _SHA256_HEX_RE = re.compile(r"\A[0-9a-f]{64}\Z")
 
 
-def verify_digest(path, expected):
+def verify_digest(path, expected, *, should_cancel=None):
     """Compare the file's SHA256 against the digest published by the API.
 
     Returns ``(ok, human_readable_detail)``.  The detail is shown to the user
@@ -249,6 +249,12 @@ def verify_digest(path, expected):
     that is not a 64-character hexdigest, a non-string — fails closed with its
     own sentence rather than being reported as a mismatch, which would blame an
     intact file, or silently passing, which would leave the download unchecked.
+
+    ``should_cancel`` is polled between chunks so a Stop press during the
+    ~178MB hash is felt within a chunk instead of after the whole file: raising
+    taxonomy.DownloadCancelled propagates out through download() to the job
+    thread, where it is reported as cancelled rather than as an installer
+    hand-off (which would happen anyway if the digest matched).
     """
     if not expected:
         # Passing here is deliberate: every asset ships a digest today, and
@@ -296,6 +302,18 @@ def verify_digest(path, expected):
     try:
         with open(path, "rb") as f:
             for chunk in iter(lambda: f.read(_HASH_CHUNK_BYTES), b""):
+                # Poll BEFORE the update so a cancel-just-before-EOF is felt on
+                # the last iteration rather than after the hexdigest is
+                # computed.  Do it here rather than inside a try/except in the
+                # caller: verify_digest is what actually holds the file open,
+                # and skipping the update on cancel avoids one more chunk of
+                # work per polling interval.
+                if should_cancel is not None and should_cancel():
+                    try:
+                        from .taxonomy import DownloadCancelled
+                    except ImportError:
+                        from taxonomy import DownloadCancelled
+                    raise DownloadCancelled("Download cancelled")
                 h.update(chunk)
     except OSError as exc:
         # Task 9 calls this from a job thread with no except clause of its own.
@@ -459,7 +477,7 @@ def download(asset, dest_dir=None, byte_callback=None, should_cancel=None):
             f"Size mismatch — expected {asset['size']} bytes, got {actual_size}"
         )
 
-    ok, detail = verify_digest(dest, asset.get("digest"))
+    ok, detail = verify_digest(dest, asset.get("digest"), should_cancel=should_cancel)
     if not ok:
         os.remove(dest)
         raise RuntimeError(detail)

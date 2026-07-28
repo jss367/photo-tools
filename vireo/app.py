@@ -18322,6 +18322,20 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         runner = app._job_runner
         active_ws = _get_db()._active_workspace_id
 
+        # If a darktable download is already running, return its id instead of
+        # starting a second worker.  Both workers would target the same
+        # <asset>.partial and race truncation, rename, verification, and
+        # deletion — the second one's cleanup could delete the first one's
+        # verified installer.  Joining rather than rejecting means opening
+        # Settings in two tabs (or double-clicking Download) still ends in one
+        # download the user watches, not an error.
+        for existing in runner.list_jobs():
+            if (
+                existing.get("type") == "download-darktable"
+                and existing.get("status") in ("running", "queued", "pausing", "paused")
+            ):
+                return jsonify({"job_id": existing["id"], "joined_existing": True})
+
         # resolve_release(), never the cached variant: this re-resolves
         # server-side so the URL we actually download can't be a ten-minute-old
         # value from whatever /install/available last showed.
@@ -18338,6 +18352,36 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             # collapsing them here would tell a user behind a proxy that their
             # platform is unsupported, which is false.
             return json_error(reason or darktable_install.REASON_UNREACHABLE)
+
+        # Bind the download to the exact artifact the user confirmed.  Between
+        # /install/available populating its 10-minute cache and this POST,
+        # darktable-org can publish a new release; the confirmation dialog
+        # still names the cached version and digest, but resolve_release() just
+        # returned the newer asset.  Downloading it here without another
+        # confirmation would silently swap the artifact the user OK'd for a
+        # different one.  code=darktable_asset_changed lets the client re-fetch
+        # availability and re-prompt with the fresh identity.
+        body = request.get_json(silent=True) or {}
+        expected_name = body.get("expected_name")
+        expected_version = body.get("expected_version")
+        # digest is compared verbatim (the API sends "sha256:<hex>"); None on
+        # either side means the client did not send one, not that they match.
+        expected_digest = body.get("expected_digest")
+        if expected_name and (
+            expected_name != asset.get("name")
+            or (expected_version and expected_version != asset.get("version"))
+            or (expected_digest and expected_digest != asset.get("digest"))
+        ):
+            return json_error(
+                (
+                    "The darktable release changed since this dialog opened. "
+                    f"Confirmation showed {expected_name}; the current release "
+                    f"is {asset.get('name')}. Re-check to see the new build "
+                    "before downloading."
+                ),
+                status=409,
+                code="darktable_asset_changed",
+            )
 
         # Refuse before spending 87MB, and say what is needed vs what is free.
         # 2x the asset size, per the design's error table: the artifact is kept
@@ -18363,6 +18407,11 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             )
 
         def work(job):
+            try:
+                from .taxonomy import DownloadCancelled
+            except ImportError:
+                from taxonomy import DownloadCancelled
+
             # byte_callback runs on the download thread inside the write loop,
             # so this must stay cheap — a queue put, never a DB write or
             # anything else that can stall the transfer.
@@ -18388,6 +18437,16 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             runner.push_event(job["id"], "progress", progress_event(
                 phase="Verifying", current=0, total=0, current_file=verify_detail,
             ))
+
+            # A Stop press after verification and before hand_off would open
+            # the installer anyway (Linux would also chmod the AppImage), then
+            # jobs.py would still label the job "cancelled" — the user would
+            # see cancellation but the side effect they cancelled happened.
+            # download() polls cancellation up through verify_digest, so a
+            # cancel there raises DownloadCancelled; this covers the narrow
+            # window between verify returning and hand_off starting.
+            if runner.cancellation_requested(job["id"]):
+                raise DownloadCancelled("Download cancelled")
 
             result = darktable_install.hand_off(path)
 

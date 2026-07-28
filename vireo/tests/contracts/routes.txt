@@ -256,6 +256,7 @@ POST         /api/jobs/capture-time
 POST         /api/jobs/classify
 POST         /api/jobs/cull
 POST         /api/jobs/develop
+POST         /api/jobs/download-darktable
 POST         /api/jobs/download-hf-model
 POST         /api/jobs/download-model
 POST         /api/jobs/download-taxonomy

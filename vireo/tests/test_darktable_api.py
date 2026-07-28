@@ -408,3 +408,368 @@ def test_api_darktable_install_available_does_not_cache_failures(app_and_db, mon
     assert first['reason'] == darktable_install.REASON_UNREACHABLE
     assert second['available'] is True, "a failure must not be cached over a later success"
     assert second['version'] == "5.6.0"
+
+
+# --- POST /api/jobs/download-darktable -------------------------------------
+
+
+def _stub_happy_path(monkeypatch, *, release=None, detail="ok",
+                     hand_off_result=None, download=None):
+    """Stub every darktable_install call the job makes. No network, ever."""
+    import darktable_install
+    release = release or _fake_release()
+    monkeypatch.setattr(darktable_install, "resolve_release", lambda: (release, None))
+    monkeypatch.setattr(darktable_install, "free_space_bytes", lambda p: 10 ** 12)
+    monkeypatch.setattr(
+        darktable_install, "download",
+        download or (lambda *a, **k: ("/tmp/d.dmg", detail)),
+    )
+    monkeypatch.setattr(
+        darktable_install, "hand_off",
+        lambda p, **k: hand_off_result or {
+            "action": "opened-installer", "location": p, "bin_path": None,
+        },
+    )
+    monkeypatch.setattr(darktable_install, "is_quarantined", lambda p: False)
+    return release
+
+
+def test_api_job_download_darktable_returns_job_id(app_and_db, monkeypatch):
+    import darktable_install
+    app, _ = app_and_db
+    monkeypatch.setattr(darktable_install, "resolve_release", lambda: ({
+        "version": "5.6.0", "name": "d.dmg", "size": 100,
+        "url": "https://github.com/darktable-org/darktable/releases/download/x/d.dmg",
+        "digest": None,
+    }, None))
+    monkeypatch.setattr(darktable_install, "free_space_bytes", lambda p: 10 ** 12)
+    monkeypatch.setattr(darktable_install, "download", lambda *a, **k: ("/tmp/d.dmg", "ok"))
+    monkeypatch.setattr(darktable_install, "hand_off",
+                        lambda p, **k: {"action": "opened-installer",
+                                        "location": p, "bin_path": None})
+    monkeypatch.setattr(darktable_install, "is_quarantined", lambda p: False)
+
+    client = app.test_client()
+    resp = client.post('/api/jobs/download-darktable')
+    assert resp.status_code == 200
+    job_id = resp.get_json()['job_id']
+
+    # Wait for the job thread to finish INSIDE the test. Returning early lets
+    # it run after monkeypatch teardown, where it would call the real download
+    # and hit the network.
+    from wait import wait_for_job_via_client
+    job = wait_for_job_via_client(client, job_id)
+    assert job['status'] == 'completed'
+    result = job['result']
+    assert result['version'] == "5.6.0"
+    assert result['downloaded_to'] == "/tmp/d.dmg"
+    assert result['action'] == "opened-installer"
+
+
+def test_api_job_download_darktable_refuses_without_disk_space(app_and_db, monkeypatch):
+    """Refuse before downloading 87MB, and say what is needed vs free."""
+    import darktable_install
+    app, _ = app_and_db
+    monkeypatch.setattr(darktable_install, "resolve_release", lambda: ({
+        "version": "5.6.0", "name": "d.dmg", "size": 87094261,
+        "url": "https://github.com/darktable-org/darktable/releases/download/x/d.dmg",
+        "digest": None,
+    }, None))
+    monkeypatch.setattr(darktable_install, "free_space_bytes", lambda p: 1024)
+
+    def must_not_download(*a, **k):
+        raise AssertionError("preflight must refuse before spending bandwidth")
+    monkeypatch.setattr(darktable_install, "download", must_not_download)
+
+    resp = app.test_client().post('/api/jobs/download-darktable')
+    assert resp.status_code == 400
+    error = resp.get_json()['error']
+    assert 'space' in error.lower()
+    # Both halves of the fact the user acts on: how much is needed, and how
+    # much they have. "Not enough disk space." alone tells them nothing.
+    assert '166' in error, f"needed size (2x87MB) missing from {error!r}"
+    assert 'free' in error.lower(), f"free space missing from {error!r}"
+
+
+def test_api_job_download_darktable_400_when_the_target_dir_is_unusable(
+        app_and_db, monkeypatch):
+    """A read-only home must not 500 a button press.
+
+    free_space_bytes creates the tools directory, so it raises when ~/.vireo
+    is not writable. A 500 tells the user nothing they can act on.
+    """
+    import darktable_install
+    app, _ = app_and_db
+    monkeypatch.setattr(darktable_install, "resolve_release",
+                        lambda: (_fake_release(), None))
+
+    def denied(path):
+        raise PermissionError(13, "Permission denied")
+    monkeypatch.setattr(darktable_install, "free_space_bytes", denied)
+
+    def must_not_download(*a, **k):
+        raise AssertionError("must not download into an unusable directory")
+    monkeypatch.setattr(darktable_install, "download", must_not_download)
+
+    resp = app.test_client().post('/api/jobs/download-darktable')
+    assert resp.status_code == 400
+    error = resp.get_json()['error']
+    assert 'Permission denied' in error, error
+    assert 'darktable' in error, f"the message must name the directory: {error!r}"
+
+
+def test_api_job_download_darktable_400_when_unavailable(app_and_db, monkeypatch):
+    import darktable_install
+    app, _ = app_and_db
+    monkeypatch.setattr(darktable_install, "resolve_release",
+                        lambda: (None, darktable_install.REASON_NO_PLATFORM_BUILD))
+
+    resp = app.test_client().post('/api/jobs/download-darktable')
+    assert resp.status_code == 400
+    # The 400 body must carry the specific reason, not a generic message.
+    assert resp.get_json()['error'] == darktable_install.REASON_NO_PLATFORM_BUILD
+
+
+def test_api_job_download_darktable_400_says_unreachable_not_unsupported(
+        app_and_db, monkeypatch):
+    """A user behind a proxy must not be told their platform is unsupported.
+
+    Paired with the test above, this pins that the route relays whichever
+    reason resolve_release gave rather than collapsing both to one sentence.
+    """
+    import darktable_install
+    app, _ = app_and_db
+    monkeypatch.setattr(darktable_install, "resolve_release",
+                        lambda: (None, darktable_install.REASON_UNREACHABLE))
+
+    resp = app.test_client().post('/api/jobs/download-darktable')
+    assert resp.status_code == 400
+    assert resp.get_json()['error'] == darktable_install.REASON_UNREACHABLE
+
+
+def test_api_job_download_darktable_400_when_resolve_raises(app_and_db, monkeypatch):
+    """resolve_release is documented never to raise; if it does, no 500."""
+    import darktable_install
+    app, _ = app_and_db
+
+    def boom():
+        raise OSError("network unreachable")
+    monkeypatch.setattr(darktable_install, "resolve_release", boom)
+
+    resp = app.test_client().post('/api/jobs/download-darktable')
+    assert resp.status_code == 400
+    assert resp.get_json()['error'] == darktable_install.REASON_UNREACHABLE
+
+
+def test_api_job_download_darktable_resolves_fresh_not_from_cache(app_and_db, monkeypatch):
+    """The job re-resolves server-side so it never downloads a stale URL.
+
+    /api/darktable/install/available caches for 10 minutes; if the job read
+    that cache it could fetch a URL the user never saw confirmed, or one
+    GitHub has since replaced.
+    """
+    import darktable_install
+    app, _ = app_and_db
+
+    stale = dict(_fake_release("5.0.0"),
+                 url="https://github.com/darktable-org/darktable/releases/download/x/stale.dmg")
+    fresh = dict(_fake_release("5.6.0"),
+                 url="https://github.com/darktable-org/darktable/releases/download/x/fresh.dmg")
+    darktable_install._release_cache.update(at=time.monotonic(), value=stale)
+
+    captured = {}
+
+    def fake_download(asset, **kwargs):
+        captured['asset'] = asset
+        return "/tmp/fresh.dmg", "ok"
+
+    _stub_happy_path(monkeypatch, release=fresh, download=fake_download)
+
+    client = app.test_client()
+    job_id = client.post('/api/jobs/download-darktable').get_json()['job_id']
+    from wait import wait_for_job_via_client
+    job = wait_for_job_via_client(client, job_id)
+
+    assert job['status'] == 'completed', job
+    assert captured['asset']['url'].endswith("fresh.dmg"), captured['asset']
+    assert job['result']['version'] == "5.6.0"
+
+
+def test_api_job_download_darktable_reports_verification_detail_verbatim(
+        app_and_db, monkeypatch):
+    """download() returns the only sentence that says WHAT was checked.
+
+    verify_digest returns ok=True both when the digest matched and when GitHub
+    published no digest at all. Synthesizing "Verified" from that boolean would
+    tell a user their unverifiable download was verified.
+    """
+    app, _ = app_and_db
+    detail = ("GitHub published no digest for this asset, so its contents could not "
+              "be verified.")
+    _stub_happy_path(monkeypatch, detail=detail)
+
+    client = app.test_client()
+    job_id = client.post('/api/jobs/download-darktable').get_json()['job_id']
+    from wait import wait_for_job_via_client
+    job = wait_for_job_via_client(client, job_id)
+
+    assert job['status'] == 'completed', job
+    assert job['result']['verified'] == detail
+
+
+def test_api_job_download_darktable_verifying_progress_carries_the_detail(
+        app_and_db, monkeypatch):
+    """The Verifying event must send total=0 and carry the detail.
+
+    A non-zero total makes the Settings progress UI take its byte-count branch
+    and render "Verifying: 0 of 0 MB" instead of what was actually checked.
+    """
+    app, _ = app_and_db
+    detail = "SHA256 matches the digest GitHub published for this asset (abc…)."
+    _stub_happy_path(monkeypatch, detail=detail)
+
+    client = app.test_client()
+    job_id = client.post('/api/jobs/download-darktable').get_json()['job_id']
+    from wait import wait_for_job_via_client
+    wait_for_job_via_client(client, job_id)
+
+    events = app._job_runner.get_events(job_id)
+    verifying = [e['data'] for e in events
+                 if e['type'] == 'progress' and e['data'].get('phase') == 'Verifying']
+    assert verifying, f"no Verifying progress event in {events!r}"
+    assert verifying[-1]['total'] == 0
+    assert verifying[-1]['current_file'] == detail
+
+
+def test_api_job_download_darktable_reports_byte_progress(app_and_db, monkeypatch):
+    """byte_callback must reach the job's event stream, unclamped.
+
+    Progress moving backwards is honest: when a server ignores Range the
+    retry truncates the .partial and restarts from 0.
+    """
+    app, _ = app_and_db
+
+    def fake_download(asset, byte_callback=None, should_cancel=None):
+        byte_callback(1024, 87094261)
+        byte_callback(4096, 87094261)
+        byte_callback(0, 87094261)  # server ignored Range; restarted
+        return "/tmp/d.dmg", "ok"
+
+    _stub_happy_path(monkeypatch, download=fake_download)
+
+    client = app.test_client()
+    job_id = client.post('/api/jobs/download-darktable').get_json()['job_id']
+    from wait import wait_for_job_via_client
+    job = wait_for_job_via_client(client, job_id)
+    assert job['status'] == 'completed', job
+
+    events = app._job_runner.get_events(job_id)
+    downloading = [e['data'] for e in events
+                   if e['type'] == 'progress'
+                   and e['data'].get('phase') == 'Downloading darktable']
+    assert [d['current'] for d in downloading] == [1024, 4096, 0]
+    assert all(d['total'] == 87094261 for d in downloading)
+    assert all(d['current_file'] == "darktable-5.6.0-arm64.dmg" for d in downloading)
+
+
+def test_api_job_download_darktable_writes_config_when_handoff_returns_bin(
+        app_and_db, monkeypatch):
+    """Linux: the AppImage we downloaded IS the binary, so record it.
+
+    Without this the user installs darktable and Settings still says it is
+    missing.
+    """
+    import config as cfg
+    app, _ = app_and_db
+    bin_path = "/tmp/darktable-5.6.0-x86_64.AppImage"
+    _stub_happy_path(monkeypatch, hand_off_result={
+        "action": "installed", "location": bin_path, "bin_path": bin_path,
+    })
+
+    client = app.test_client()
+    job_id = client.post('/api/jobs/download-darktable').get_json()['job_id']
+    from wait import wait_for_job_via_client
+    job = wait_for_job_via_client(client, job_id)
+
+    assert job['status'] == 'completed', job
+    assert cfg.get("darktable_bin") == bin_path
+    # And the result must say the write happened, so the UI can report it.
+    assert job['result']['config_written'] is True
+    assert job['result']['bin_path'] == bin_path
+
+
+def test_api_job_download_darktable_leaves_config_alone_without_bin(
+        app_and_db, monkeypatch):
+    """macOS/Windows hand off to an installer; where the app lands is unknown.
+
+    Writing a guessed darktable_bin here would overwrite a path the user
+    configured with one that does not exist.
+    """
+    import config as cfg
+    app, _ = app_and_db
+    cfg.set("darktable_bin", "/sentinel/darktable-cli")
+    _stub_happy_path(monkeypatch)
+
+    client = app.test_client()
+    job_id = client.post('/api/jobs/download-darktable').get_json()['job_id']
+    from wait import wait_for_job_via_client
+    job = wait_for_job_via_client(client, job_id)
+
+    assert job['status'] == 'completed', job
+    assert cfg.get("darktable_bin") == "/sentinel/darktable-cli"
+    assert job['result']['config_written'] is False
+
+
+def test_api_job_download_darktable_cancel_ends_cancelled_not_failed(
+        app_and_db, monkeypatch):
+    """A user pressing Stop must not see a red "failed" job.
+
+    The UI distinguishes the two, and a cancelled job carries no errors.
+    """
+    app, _ = app_and_db
+    import taxonomy
+
+    def fake_download(asset, byte_callback=None, should_cancel=None):
+        deadline = time.monotonic() + 20
+        while not should_cancel():
+            if time.monotonic() > deadline:
+                raise AssertionError("cancellation never reached the download")
+            time.sleep(0.01)
+        raise taxonomy.DownloadCancelled("cancelled")
+
+    _stub_happy_path(monkeypatch, download=fake_download)
+
+    client = app.test_client()
+    job_id = client.post('/api/jobs/download-darktable').get_json()['job_id']
+    assert client.post(f'/api/jobs/{job_id}/cancel').status_code == 200
+
+    from wait import wait_for_job_via_client
+    job = wait_for_job_via_client(client, job_id)
+    assert job['status'] == 'cancelled', job
+    assert not job['errors'], job['errors']
+
+
+def test_api_job_download_darktable_handoff_failure_fails_the_job(app_and_db, monkeypatch):
+    """hand_off raises after a good download; the message names the saved file.
+
+    That path is the user's way forward, so it must survive into job errors
+    rather than being swallowed into a generic failure.
+    """
+    import darktable_install
+    app, _ = app_and_db
+    _stub_happy_path(monkeypatch)
+
+    def boom(path, **kwargs):
+        raise RuntimeError(
+            f"Downloaded to {path}, but macOS could not open it (exit code 1). "
+            "Open it yourself to install darktable."
+        )
+    monkeypatch.setattr(darktable_install, "hand_off", boom)
+
+    client = app.test_client()
+    job_id = client.post('/api/jobs/download-darktable').get_json()['job_id']
+    from wait import wait_for_job_via_client
+    job = wait_for_job_via_client(client, job_id)
+
+    assert job['status'] == 'failed', job
+    assert any("/tmp/d.dmg" in e for e in job['errors']), job['errors']

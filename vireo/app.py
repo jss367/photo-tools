@@ -18313,6 +18313,109 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         job_id = runner.start("download-taxonomy", work, workspace_id=active_ws)
         return jsonify({"job_id": job_id})
 
+    @app.route("/api/jobs/download-darktable", methods=["POST"])
+    def api_job_download_darktable():
+        """Download the latest darktable build and hand it to the platform."""
+        import darktable_install
+        from job_contract import progress_event
+
+        runner = app._job_runner
+        active_ws = _get_db()._active_workspace_id
+
+        # resolve_release(), never the cached variant: this re-resolves
+        # server-side so the URL we actually download can't be a ten-minute-old
+        # value from whatever /install/available last showed.
+        try:
+            asset, reason = darktable_install.resolve_release()
+        except Exception as e:
+            # resolve_release is documented never to raise; belt and braces so
+            # an unexpected bug degrades to a message, not a 500.
+            log.warning("darktable release lookup failed: %s", e)
+            asset, reason = None, darktable_install.REASON_UNREACHABLE
+        if not asset:
+            # Surface the specific reason. resolve_release distinguishes
+            # "could not reach GitHub" from "no build for your platform";
+            # collapsing them here would tell a user behind a proxy that their
+            # platform is unsupported, which is false.
+            return json_error(reason or darktable_install.REASON_UNREACHABLE)
+
+        # Refuse before spending 87MB, and say what is needed vs what is free.
+        # 2x the asset size, per the design's error table: the artifact is kept
+        # after hand-off and the installer still has to unpack alongside it, so
+        # a check for exactly the download size would succeed and then strand
+        # the user on a full disk.
+        target = darktable_install.install_dir()
+        try:
+            free = darktable_install.free_space_bytes(target)
+        except OSError as e:
+            # free_space_bytes creates the directory, so this is where a
+            # read-only or otherwise unusable ~/.vireo surfaces. Name the
+            # directory and the OS error: a 500 would tell the user nothing.
+            log.warning("Cannot use the darktable download directory %s: %s", target, e)
+            return json_error(
+                f"Cannot use the download directory {target}: {e.strerror or e}"
+            )
+        needed = (asset.get("size") or 0) * 2
+        if free < needed:
+            return json_error(
+                f"Not enough disk space: {needed // (1024 * 1024)} MB needed in "
+                f"{target}, {free // (1024 * 1024)} MB free."
+            )
+
+        def work(job):
+            # byte_callback runs on the download thread inside the write loop,
+            # so this must stay cheap — a queue put, never a DB write or
+            # anything else that can stall the transfer.
+            def on_bytes(done, total):
+                runner.push_event(job["id"], "progress", progress_event(
+                    phase="Downloading darktable",
+                    current=done,
+                    total=total or asset.get("size") or 0,
+                    current_file=asset["name"],
+                ))
+
+            path, verify_detail = darktable_install.download(
+                asset,
+                byte_callback=on_bytes,
+                should_cancel=lambda: runner.is_cancelled(job["id"]),
+            )
+
+            # total=0 on purpose: the UI treats a non-zero total as a byte
+            # count and would render "Verifying: 0 of 0 MB" instead of the
+            # verification detail. That detail is passed through verbatim —
+            # it is the only thing that distinguishes "the digest matched"
+            # from "GitHub published no digest to check against".
+            runner.push_event(job["id"], "progress", progress_event(
+                phase="Verifying", current=0, total=0, current_file=verify_detail,
+            ))
+
+            result = darktable_install.hand_off(path)
+
+            # The single place config is mutated, right next to the field that
+            # tells the user it happened. hand_off deliberately does not write
+            # it. bin_path is only set where the download IS the binary
+            # (Linux AppImage); after an installer hand-off the user chooses
+            # where the app lands, so there is nothing truthful to record.
+            config_written = False
+            if result.get("bin_path"):
+                import config as cfg
+
+                cfg.set("darktable_bin", result["bin_path"])
+                config_written = True
+
+            return {
+                "version": asset["version"],
+                "downloaded_to": path,
+                "verified": verify_detail,
+                "action": result["action"],
+                "bin_path": result.get("bin_path"),
+                "config_written": config_written,
+                "quarantined": darktable_install.is_quarantined(path),
+            }
+
+        job_id = runner.start("download-darktable", work, workspace_id=active_ws)
+        return jsonify({"job_id": job_id})
+
     # -- Labels API routes --
 
     @app.route("/api/labels/search-places")

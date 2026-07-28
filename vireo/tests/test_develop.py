@@ -676,14 +676,16 @@ def test_build_command_appimage_named_like_anything_keeps_style_and_width(tmp_pa
                    "--style", "Wild", "--width", "2048"]
 
 
-def test_develop_photo_sets_appimage_extract_and_run(tmp_path, monkeypatch):
-    """AppImages need FUSE2 to self-mount; distros shipping only FUSE3 fail
-    outright unless APPIMAGE_EXTRACT_AND_RUN is set. The rest of the parent
-    environment must survive — darktable needs HOME, XDG_*, DISPLAY, etc.
+def test_develop_photo_appimage_direct_first_when_fuse_works(tmp_path, monkeypatch):
+    """On a system with working FUSE the AppImage must run directly — setting
+    APPIMAGE_EXTRACT_AND_RUN would force a ~178 MB squashfs unpack per photo.
+    The parent env still has to be carried through (HOME, XDG_*, DISPLAY, …).
     """
     import subprocess
 
     import develop
+
+    develop._APPIMAGE_MODE_CACHE.clear()
 
     raw = tmp_path / "bird.NEF"
     raw.touch()
@@ -691,11 +693,10 @@ def test_develop_photo_sets_appimage_extract_and_run(tmp_path, monkeypatch):
     out = tmp_path / "out" / "bird.jpg"
 
     monkeypatch.setenv("VIREO_TEST_INHERITED_VAR", "inherited-value")
-    captured = {}
+    calls = []
 
     def fake_run(cmd, **kwargs):
-        captured["cmd"] = cmd
-        captured["env"] = kwargs.get("env")
+        calls.append(kwargs.get("env"))
         os.makedirs(os.path.dirname(cmd[-1]), exist_ok=True)
         with open(cmd[-1], "w") as f:
             f.write("jpg")
@@ -705,26 +706,110 @@ def test_develop_photo_sets_appimage_extract_and_run(tmp_path, monkeypatch):
 
     result = develop.develop_photo(str(fake_bin), str(raw), str(out))
     assert result["success"] is True
+    assert len(calls) == 1, "unconditional retry would defeat the whole point"
 
-    # develop_photo must hand the *resolved* binary to build_command rather
-    # than assembling argv itself, or the AppImage launches its GUI.
-    assert captured["cmd"][1] == "darktable-cli"
-
-    env = captured["env"]
-    assert env is not None, "subprocess.run was called without an env"
-    assert env["APPIMAGE_EXTRACT_AND_RUN"] == "1"
-    # Not a bare dict: the parent environment is carried through.
+    env = calls[0]
+    assert env is not None
+    assert "APPIMAGE_EXTRACT_AND_RUN" not in env
     assert env["VIREO_TEST_INHERITED_VAR"] == "inherited-value"
     assert set(os.environ) <= set(env)
+    # Cached as "direct" so future photos skip the probe.
+    assert develop._APPIMAGE_MODE_CACHE[str(fake_bin)] == "direct"
 
 
-def test_develop_photo_omits_appimage_extract_and_run_for_plain_binary(tmp_path, monkeypatch):
-    """When set, the AppImage runtime skips the FUSE probe and unconditionally
-    unpacks the whole ~178MB squashfs — once per photo. A packaged
-    darktable-cli must not pay that, so the var is gated on real AppImages."""
+def test_develop_photo_appimage_falls_back_to_extract_on_fuse_failure(tmp_path, monkeypatch):
+    """When the AppImage runtime fails with a FUSE error, retry once with
+    APPIMAGE_EXTRACT_AND_RUN=1 and cache the answer so subsequent photos skip
+    the probe. Without the cache, every photo in a batch would pay the retry.
+    """
     import subprocess
 
     import develop
+
+    develop._APPIMAGE_MODE_CACHE.clear()
+
+    raw = tmp_path / "bird.NEF"
+    raw.touch()
+    fake_bin = _write_appimage(tmp_path / "Darktable-5.6.0-x86_64.AppImage")
+    out = tmp_path / "out" / "bird.jpg"
+
+    calls = []
+    fuse_stderr = (
+        "AppImages require FUSE to run.\n"
+        "You might still be able to extract the contents of this AppImage "
+        "if you run it with the --appimage-extract option.\n"
+    )
+
+    def fake_run(cmd, **kwargs):
+        env = kwargs.get("env") or {}
+        calls.append(env.get("APPIMAGE_EXTRACT_AND_RUN"))
+        if env.get("APPIMAGE_EXTRACT_AND_RUN") != "1":
+            # First call: simulate the runtime's FUSE failure.
+            return _fake_completed(1, stdout="", stderr=fuse_stderr)
+        os.makedirs(os.path.dirname(cmd[-1]), exist_ok=True)
+        with open(cmd[-1], "w") as f:
+            f.write("jpg")
+        return _fake_completed(0)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = develop.develop_photo(str(fake_bin), str(raw), str(out))
+    assert result["success"] is True
+    assert calls == [None, "1"], "expected one probe then one fallback"
+    assert develop._APPIMAGE_MODE_CACHE[str(fake_bin)] == "extract"
+
+    # Second call for the same binary skips the probe and goes straight to
+    # extract mode — no more wasted probe subprocess per photo.
+    calls.clear()
+    out2 = tmp_path / "out" / "bird2.jpg"
+    result2 = develop.develop_photo(str(fake_bin), str(raw), str(out2))
+    assert result2["success"] is True
+    assert calls == ["1"]
+
+
+def test_develop_photo_appimage_non_fuse_failure_is_not_retried(tmp_path, monkeypatch):
+    """A darktable-side failure (bad RAW, missing style, etc.) must NOT be
+    retried under APPIMAGE_EXTRACT_AND_RUN — that would waste a full squashfs
+    unpack on an error the fallback cannot fix, and surface the wrong error.
+    """
+    import subprocess
+
+    import develop
+
+    develop._APPIMAGE_MODE_CACHE.clear()
+
+    raw = tmp_path / "bird.NEF"
+    raw.touch()
+    fake_bin = _write_appimage(tmp_path / "Darktable-5.6.0-x86_64.AppImage")
+    out = tmp_path / "out" / "bird.jpg"
+
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        env = kwargs.get("env") or {}
+        calls.append(env.get("APPIMAGE_EXTRACT_AND_RUN"))
+        return _fake_completed(
+            1, stdout="[dt_init] ERROR: can't init develop system, aborting.",
+            stderr="",
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = develop.develop_photo(str(fake_bin), str(raw), str(out))
+    assert result["success"] is False
+    assert calls == [None], "must not retry when the failure is not FUSE-shaped"
+    # Nothing cached — a transient darktable error should not lock the mode.
+    assert str(fake_bin) not in develop._APPIMAGE_MODE_CACHE
+
+
+def test_develop_photo_omits_appimage_extract_and_run_for_plain_binary(tmp_path, monkeypatch):
+    """A packaged darktable-cli is not an AppImage; the flag must never be
+    set for it and the FUSE probe/cache must not touch its binary path."""
+    import subprocess
+
+    import develop
+
+    develop._APPIMAGE_MODE_CACHE.clear()
 
     raw = tmp_path / "bird.NEF"
     raw.touch()
@@ -749,3 +834,4 @@ def test_develop_photo_omits_appimage_extract_and_run_for_plain_binary(tmp_path,
     assert captured["cmd"] == [str(plain_bin), str(raw), str(out)]
     assert "APPIMAGE_EXTRACT_AND_RUN" not in captured["env"]
     assert set(os.environ) <= set(captured["env"])
+    assert str(plain_bin) not in develop._APPIMAGE_MODE_CACHE

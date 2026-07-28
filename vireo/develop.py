@@ -22,6 +22,44 @@ _NIKON_HE_COMPRESSION_VALUES = {13, 14}
 # an ordinary executable.
 _APPIMAGE_MAGIC = b"AI\x02"
 
+# Per-binary result of the "does FUSE work here?" probe. Keys are binary paths
+# and values are "direct" (ran without APPIMAGE_EXTRACT_AND_RUN) or "extract"
+# (needed the flag because FUSE was unavailable). Populated on the first
+# develop_photo call for a binary and reused thereafter so a batch of N photos
+# pays the probe cost once, not N times. Setting APPIMAGE_EXTRACT_AND_RUN on
+# every call forces the AppImage runtime to skip FUSE and unpack the whole
+# ~178 MB squashfs each time — the whole point of caching is to avoid that.
+_APPIMAGE_MODE_CACHE = {}
+
+# Substrings that identify an AppImage FUSE failure in the runtime's own
+# error output — lowercase and matched case-insensitively so kernel messages
+# in either case are covered. When we see one of these on a nonzero exit,
+# retrying with APPIMAGE_EXTRACT_AND_RUN=1 is what turns "fails outright"
+# into "runs". Other nonzero exits (bad RAW, missing style, etc.) must NOT
+# trigger the fallback: reopening subprocess.run with the extract flag on an
+# unrelated darktable error would waste a full unpack and still fail.
+_APPIMAGE_FUSE_FAILURE_MARKERS = (
+    "appimages require fuse",
+    "libfuse.so.2",
+    "libfuse.so",
+    "fusermount",
+    "cannot mount appimage",
+    "dlopen(): error loading libfuse",
+)
+
+
+def _looks_like_appimage_fuse_failure(stdout, stderr):
+    """True when subprocess output points at a missing/broken FUSE, not darktable.
+
+    Only these strings — printed by the AppImage runtime itself before darktable
+    starts — should trigger the APPIMAGE_EXTRACT_AND_RUN retry. A darktable
+    exit code with no FUSE marker is a real develop failure and must surface
+    as-is instead of being retried under an environment change that would
+    silently unpack ~178 MB.
+    """
+    combined = ((stdout or "") + "\n" + (stderr or "")).lower()
+    return any(marker in combined for marker in _APPIMAGE_FUSE_FAILURE_MARKERS)
+
 
 def _is_appimage(path):
     """True when ``path`` is a type-2 AppImage bundle.
@@ -435,18 +473,48 @@ def develop_photo(
 
     try:
         log.info("Developing %s -> %s", os.path.basename(input_path), output_path)
+        is_appimage = _is_appimage(binary)
+
+        # AppImages need FUSE2 to self-mount, and many current distros ship
+        # only FUSE3. APPIMAGE_EXTRACT_AND_RUN=1 makes the runtime bypass FUSE
+        # and unpack the whole ~178 MB squashfs into a temp dir — a fix when
+        # FUSE is missing, but a heavy cost when it is not, because this
+        # function runs once per photo. So probe once per binary and cache:
+        # try direct execution first, fall back to extract only on a real
+        # FUSE failure, and remember the outcome so the next photo pays
+        # nothing.
+        def _run(env):
+            return subprocess.run(
+                cmd, capture_output=True, text=True, timeout=120,
+                env=env, **no_window_kwargs()
+            )
+
         env = dict(os.environ)
-        if _is_appimage(binary):
-            # AppImages need FUSE2 to self-mount; many current distros ship
-            # only FUSE3. This makes the AppImage extract to a temp dir
-            # instead of failing outright. Gated because when set the runtime
-            # skips the FUSE probe entirely and *always* unpacks the whole
-            # ~178MB squashfs, and this runs once per photo.
+        cached_mode = _APPIMAGE_MODE_CACHE.get(binary) if is_appimage else None
+        if cached_mode == "extract":
             env["APPIMAGE_EXTRACT_AND_RUN"] = "1"
-        result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=120,
-            env=env, **no_window_kwargs()
-        )
+
+        result = _run(env)
+
+        if (
+            is_appimage
+            and cached_mode is None
+            and result.returncode != 0
+            and _looks_like_appimage_fuse_failure(result.stdout, result.stderr)
+        ):
+            # FUSE is the problem: retry once with the extract flag and
+            # cache the answer so subsequent photos skip the probe.
+            log.info(
+                "AppImage FUSE probe failed for %s; retrying with "
+                "APPIMAGE_EXTRACT_AND_RUN=1", binary,
+            )
+            env["APPIMAGE_EXTRACT_AND_RUN"] = "1"
+            result = _run(env)
+            if result.returncode == 0:
+                _APPIMAGE_MODE_CACHE[binary] = "extract"
+        elif is_appimage and cached_mode is None and result.returncode == 0:
+            _APPIMAGE_MODE_CACHE[binary] = "direct"
+
         if result.returncode != 0:
             # darktable-cli writes init/IO failures to stdout, not stderr.
             diag = _format_subprocess_diag(result.stdout, result.stderr)

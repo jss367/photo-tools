@@ -21,11 +21,13 @@ import io
 import json
 import logging
 import os
+import re
 import socket
 import ssl
 import threading
 import time
 import unicodedata
+import urllib.error
 import urllib.request
 import zipfile
 from datetime import date
@@ -41,6 +43,32 @@ _ssl_ctx = ssl.create_default_context(cafile=certifi.where())
 
 class DownloadCancelled(Exception):
     """Raised when should_cancel() asked us to stop."""
+
+
+# `Content-Range: bytes */<total>` — the header a 416 response uses to tell
+# the client what the actual size of the resource is. RFC 7233 §4.2 pins the
+# format; a compliant server puts the total after the slash.
+_CONTENT_RANGE_TOTAL_RE = re.compile(r"bytes\s*\*/(\d+)", re.IGNORECASE)
+
+
+def _content_range_total(headers):
+    """Total resource size advertised by a Content-Range: bytes */<total>.
+
+    Returns None when the header is absent or malformed — the caller falls
+    back to restarting the download from scratch, which is the safe outcome.
+    """
+    if headers is None:
+        return None
+    header = headers.get("Content-Range")
+    if not header:
+        return None
+    match = _CONTENT_RANGE_TOTAL_RE.search(header)
+    if not match:
+        return None
+    try:
+        return int(match.group(1))
+    except (TypeError, ValueError):
+        return None
 
 
 def _download_with_resume(url, dest_path, progress_callback=None,
@@ -203,6 +231,69 @@ def _download_with_resume(url, dest_path, progress_callback=None,
         except DownloadCancelled:
             raise
         except Exception as e:
+            # 416 Requested Range Not Satisfiable: our Range starts at or
+            # past the end of the resource.  Reachable when cancellation
+            # lands after the final chunk is written but before the
+            # empty-read break — the loop's cancel check raises, leaving a
+            # ``.partial`` already at the full size, so the next attempt
+            # asks for ``bytes=<full>-``.  Without this branch the retry
+            # loop would burn ``max_stalled`` attempts against a permanent
+            # 416 and give up despite promising "try again and the download
+            # will resume".  Verify the total via Content-Range and, when
+            # sizes agree, promote the partial to the final path.  On
+            # mismatch (the release was rebuilt) delete the stale partial
+            # and let the next iteration re-download from byte 0 — that is
+            # safer than shipping bytes of the wrong artifact to the
+            # caller's digest check.
+            if (
+                isinstance(e, urllib.error.HTTPError)
+                and e.code == 416
+                and downloaded_before > 0
+            ):
+                total = _content_range_total(getattr(e, "headers", None))
+                current_size = (
+                    os.path.getsize(partial_path)
+                    if os.path.exists(partial_path)
+                    else 0
+                )
+                if total is not None and current_size == total:
+                    if os.path.exists(dest_path):
+                        os.remove(dest_path)
+                    os.rename(partial_path, dest_path)
+                    if byte_callback is not None:
+                        byte_callback(current_size, total)
+                    mb = current_size // (1024 * 1024)
+                    log.info(
+                        "Server reported 416 with matching total (%d bytes);"
+                        " promoting complete .partial to %s",
+                        total, dest_path,
+                    )
+                    if progress_callback:
+                        progress_callback(f"Downloaded {mb} MB")
+                    return dest_path
+                # Stale or unverifiable partial: delete so the next iteration
+                # restarts from byte 0 rather than sending the same doomed
+                # Range header on every attempt.
+                with contextlib.suppress(OSError):
+                    os.remove(partial_path)
+                log.warning(
+                    "Server returned 416 but partial size (%d) does not match"
+                    " advertised total (%r); restarting download",
+                    current_size, total,
+                )
+                if progress_callback:
+                    progress_callback(
+                        f"Resume rejected by server (attempt {attempt}), "
+                        f"restarting download..."
+                    )
+                # Poll cancellation during the backoff so Stop feels
+                # responsive on a rejected-resume loop too.
+                for _ in range(6):
+                    if should_cancel is not None and should_cancel():
+                        raise DownloadCancelled("Download cancelled") from None
+                    time.sleep(0.5)
+                continue
+
             # The watcher thread closes ``resp`` on cancel, which surfaces
             # here as a socket error.  Reclassify it before the stall
             # detection can turn "user pressed Stop" into "download stalled

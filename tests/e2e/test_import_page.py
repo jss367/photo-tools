@@ -72,6 +72,18 @@ TWO_FILE_PREVIEW_STUB = """
                 }), {status: 200, headers: {'Content-Type': 'application/json'}}));
               }
               window.__fullPreviewCalls += 1;
+              // Tests flip __emptyPreview to simulate a source that comes
+              // back with zero importable files (e.g. an empty card or a
+              // filter that excludes everything).
+              if (window.__emptyPreview) {
+                return Promise.resolve(new Response(JSON.stringify({
+                  total_count: 0,
+                  total_size: 0,
+                  type_breakdown: {},
+                  duplicate_count: 0,
+                  files: [],
+                }), {status: 200, headers: {'Content-Type': 'application/json'}}));
+              }
               return Promise.resolve(new Response(JSON.stringify({
                 total_count: 2,
                 total_size: 2468,
@@ -281,6 +293,41 @@ def test_hide_duplicates_resets_when_the_last_source_is_removed(
     page.locator("#sourceInput").fill("/tmp/card-a")
     page.locator("#btnAddSource").click()
     page.wait_for_function(f"window.__dupCalls > {dup_calls}")
+    expect(page.locator("#chkHideDuplicates")).not_to_be_checked()
+    expect(page.locator("#importPreviewGrid")).to_contain_text("IMG_0002.jpg")
+
+
+def test_hide_duplicates_resets_when_a_preview_settles_with_no_files(
+    live_server, page,
+):
+    """A completed preview that returns zero files settles the picture too.
+
+    The `!files.length` branch hides the row without ever running the
+    duplicate check, so a filter left checked is invisible there — and
+    the next card that does surface duplicates would be filtered on
+    arrival without the user opting in for it.
+    """
+    run_two_file_preview(live_server, page)
+    page.locator("#chkHideDuplicates").check()
+
+    # Next preview finds nothing to import (e.g. an empty source card).
+    preview_calls = page.evaluate("window.__fullPreviewCalls")
+    page.evaluate("window.__emptyPreview = true")
+    page.locator("#btnPreview").click()
+    page.wait_for_function(f"window.__fullPreviewCalls > {preview_calls}")
+
+    expect(page.locator("#previewSummary")).to_contain_text(
+        "No importable files found.",
+    )
+    expect(page.locator("#hideDuplicatesRow")).to_be_hidden()
+    expect(page.locator("#chkHideDuplicates")).not_to_be_checked()
+
+    # ...so a later duplicate-bearing card starts unfiltered again.
+    page.evaluate("window.__emptyPreview = false")
+    dup_calls = page.evaluate("window.__dupCalls")
+    page.locator("#btnPreview").click()
+    page.wait_for_function(f"window.__dupCalls > {dup_calls}")
+    expect(page.locator("#hideDuplicatesRow")).to_be_visible()
     expect(page.locator("#chkHideDuplicates")).not_to_be_checked()
     expect(page.locator("#importPreviewGrid")).to_contain_text("IMG_0002.jpg")
 

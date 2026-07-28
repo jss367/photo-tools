@@ -2370,6 +2370,12 @@ async function previewImport(opts) {
     if (!files.length) {
       summary.textContent = 'No importable files found.';
       clearImportPreviewGrid();
+      // A completed preview with zero files is a final "nothing to hide"
+      // state — like snapshot / in-place / dedup-off below — so retire the
+      // opt-in. Otherwise the row hides while the checkbox stays checked,
+      // and the next card that does surface duplicates gets filtered
+      // silently instead of opt-in.
+      retireHideDuplicatesOptIn();
       return;
     }
     renderImportPreviewGrid(files, [], null);

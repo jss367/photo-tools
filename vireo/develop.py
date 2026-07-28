@@ -205,9 +205,18 @@ def build_command(darktable_bin, input_path, output_path, style=None, width=None
         width: optional max output width in pixels
 
     Returns:
-        list of command arguments
+        list of command arguments: the binary, then "darktable-cli" when the
+        binary is an AppImage, then the input and output paths, then any
+        optional flags.
     """
-    cmd = [darktable_bin, input_path, output_path]
+    cmd = [darktable_bin]
+    if darktable_bin.endswith(".AppImage"):
+        # darktable ships a multi-binary AppImage whose AppRun selects the
+        # binary from argv[1]. The alternative (a symlink named darktable-cli)
+        # does not survive find_darktable's os.path.realpath, which would
+        # silently launch the GUI and hang the job.
+        cmd.append("darktable-cli")
+    cmd.extend([input_path, output_path])
     if style:
         cmd.extend(["--style", style])
     if width:
@@ -387,8 +396,13 @@ def develop_photo(
 
     try:
         log.info("Developing %s -> %s", os.path.basename(input_path), output_path)
+        # AppImages need FUSE2 to self-mount; many current distros ship only
+        # FUSE3. This makes the AppImage extract to a temp dir instead of
+        # failing outright. Harmless for non-AppImage binaries.
+        env = {**os.environ, "APPIMAGE_EXTRACT_AND_RUN": "1"}
         result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=120, **no_window_kwargs()
+            cmd, capture_output=True, text=True, timeout=120,
+            env=env, **no_window_kwargs()
         )
         if result.returncode != 0:
             # darktable-cli writes init/IO failures to stdout, not stderr.

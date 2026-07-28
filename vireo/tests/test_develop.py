@@ -550,3 +550,71 @@ def test_darktable_search_paths_linux_survives_vanishing_appimage(tmp_path, monk
     paths = darktable_search_paths()
     assert str(survivor) in paths
     assert paths[0] == str(survivor)
+
+
+def test_build_command_selects_cli_inside_appimage():
+    """darktable's AppImage picks its binary from argv[1]; without this we
+    would launch the GUI and hang the export job."""
+    from develop import build_command
+
+    cmd = build_command(
+        "/home/u/.vireo/tools/darktable/Darktable-5.6.0-x86_64.AppImage",
+        "in.raw", "out.jpg",
+    )
+    assert cmd[1] == "darktable-cli"
+    assert cmd[2:] == ["in.raw", "out.jpg"]
+
+
+def test_build_command_plain_binary_unchanged():
+    from develop import build_command
+
+    cmd = build_command("/usr/bin/darktable-cli", "in.raw", "out.jpg")
+    assert cmd == ["/usr/bin/darktable-cli", "in.raw", "out.jpg"]
+
+
+def test_build_command_appimage_keeps_style_and_width():
+    """Optional args must land after the positional args, not before."""
+    from develop import build_command
+
+    cmd = build_command("/x/D.AppImage", "in.raw", "out.jpg", style="Wild", width=2048)
+    assert cmd == ["/x/D.AppImage", "darktable-cli", "in.raw", "out.jpg",
+                   "--style", "Wild", "--width", "2048"]
+
+
+def test_develop_photo_sets_appimage_extract_and_run(tmp_path, monkeypatch):
+    """AppImages need FUSE2 to self-mount; distros shipping only FUSE3 fail
+    outright unless APPIMAGE_EXTRACT_AND_RUN is set. The rest of the parent
+    environment must survive — darktable needs HOME, XDG_*, DISPLAY, etc.
+    """
+    import subprocess
+
+    import develop
+
+    raw = tmp_path / "bird.NEF"
+    raw.touch()
+    fake_bin = tmp_path / "Darktable-5.6.0-x86_64.AppImage"
+    fake_bin.touch()
+    fake_bin.chmod(0o755)
+    out = tmp_path / "out" / "bird.jpg"
+
+    monkeypatch.setenv("VIREO_TEST_INHERITED_VAR", "inherited-value")
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["env"] = kwargs.get("env")
+        os.makedirs(os.path.dirname(cmd[-1]), exist_ok=True)
+        with open(cmd[-1], "w") as f:
+            f.write("jpg")
+        return _fake_completed(0)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = develop.develop_photo(str(fake_bin), str(raw), str(out))
+    assert result["success"] is True
+
+    env = captured["env"]
+    assert env is not None, "subprocess.run was called without an env"
+    assert env["APPIMAGE_EXTRACT_AND_RUN"] == "1"
+    # Not a bare dict: the parent environment is carried through.
+    assert env["VIREO_TEST_INHERITED_VAR"] == "inherited-value"
+    assert set(os.environ) <= set(env)

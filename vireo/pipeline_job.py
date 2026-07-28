@@ -58,6 +58,11 @@ log = logging.getLogger(__name__)
 
 _SENTINEL = object()  # unique end-of-stream marker
 
+# How many times classify will pause for a vanished source volume before it
+# stops asking. Resuming without actually remounting the share would otherwise
+# pause again on the very next photo, forever.
+_MAX_SOURCE_OFFLINE_PAUSES = 3
+
 
 def _missing_archive_mount_root(path: str) -> str | None:
     """Return a likely missing mount root that must not be auto-created."""
@@ -76,6 +81,33 @@ def _missing_archive_mount_root(path: str) -> str | None:
     for mount_root in (_candidate(raw_posix), _candidate(normalized_posix)):
         if mount_root and not os.path.lexists(mount_root):
             return mount_root
+    return None
+
+
+def _source_offline_reason(folder_path: str, image_path: str) -> str | None:
+    """Return why the photo's SOURCE is unreachable, or None if it isn't.
+
+    Distinguishes "this one file won't load" (corrupt RAW, bad permissions —
+    genuinely that photo's failure) from "the volume holding the collection
+    went away" (every remaining read will fail too). Only the second warrants
+    stopping the run: a dropped SMB/NFS share turns each read into an instant
+    EIO, so a stage that keeps going marks the entire untouched remainder of
+    the collection "failed" — which reads to the user as "your photos are
+    broken" rather than "reconnect the share".
+
+    Deliberately conservative. Both probes require evidence that the source
+    *tree* is gone, so no single unreadable file can ever trip them, and a
+    collection on a local disk (no /Volumes-style mount root, folder still
+    present) always returns None and keeps today's per-photo behavior.
+    """
+    mount_root = _missing_archive_mount_root(image_path)
+    if mount_root:
+        return f"volume {mount_root} is not mounted"
+    # A stale mount can keep the mount root in place while the subtree turns
+    # unreadable, so fall back to asking whether the containing folder still
+    # resolves. os.path.isdir() swallows the EIO and returns False.
+    if folder_path and not os.path.isdir(folder_path):
+        return f"folder {folder_path} is unreadable"
     return None
 
 
@@ -3882,6 +3914,54 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                 first_model_photo_ids: set = set()
                 fresh_full_image_ids_by_photo: dict = {}
 
+                # ``reason`` latches only when classify is giving up for good,
+                # so the remaining models in a multi-model run skip themselves
+                # instead of re-discovering the same dead share. ``pauses``
+                # bounds the reconnect ping-pong: a user who resumes without
+                # actually fixing the mount gets a few tries, not an infinite
+                # pause/retry loop.
+                source_offline: dict = {"reason": None, "pauses": 0}
+
+                def _handle_source_offline(reason):
+                    """Park on a dead source; report whether we may continue.
+
+                    Returns True when the run was paused and then resumed, so
+                    the caller should keep classifying (the user reconnected
+                    the share). Returns False when classify should stop: the
+                    runner can't park, the job was cancelled, or we've already
+                    paused for this too many times.
+                    """
+                    if source_offline["pauses"] >= _MAX_SOURCE_OFFLINE_PAUSES:
+                        source_offline["reason"] = reason
+                        return False
+                    source_offline["pauses"] += 1
+                    errors.append(
+                        f"[classify] Source {reason} — paused. Reconnect it "
+                        f"and resume to classify the rest, or cancel the run."
+                    )
+                    log.warning("Classify paused: source offline (%s)", reason)
+
+                    pause = getattr(runner, "pause_job", None)
+                    paused = False
+                    if pause is not None:
+                        with contextlib.suppress(Exception):
+                            paused = bool(pause(job["id"]))
+                    if not paused:
+                        # Nothing to park on (non-pausable job, or a direct
+                        # run_pipeline_job call in a test). Stop rather than
+                        # spin through the rest of the collection collecting
+                        # instant EIOs.
+                        source_offline["reason"] = reason
+                        return False
+
+                    # Blocks here until the user resumes or cancels. Classify
+                    # is a registered pause participant, so this is the same
+                    # safe boundary the per-photo cancel check already uses.
+                    if _pause_checkpoint():
+                        source_offline["reason"] = reason
+                        return False
+                    return True
+
                 from datetime import datetime as dt
 
                 for spec_idx, active_spec in enumerate(resolved_specs_local):
@@ -3892,6 +3972,18 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                         runner.update_step(job["id"], step_id,
                                            status="completed",
                                            summary="Skipped (cancelled)")
+                        continue
+                    if source_offline["reason"]:
+                        # The share died during an earlier model. Every read for
+                        # this one would fail the same way, so say so instead of
+                        # running up a second identical failure count (the
+                        # incident's "0 predictions, 865 failed" second model).
+                        runner.update_step(
+                            job["id"], step_id, status="completed",
+                            summary=(
+                                f"Skipped (source {source_offline['reason']})"
+                            ),
+                        )
                         continue
 
                     runner.update_step(job["id"], step_id, status="running")
@@ -4030,6 +4122,10 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                     )
                     raw_results: list = []
                     failed = 0
+                    # Photos we never got to look at because the source volume
+                    # was offline. Kept apart from ``failed`` so the summary
+                    # never reports an unreachable share as broken photos.
+                    source_skipped = 0
                     skipped_existing = 0
                     full_image_fallbacks = 0
                     stages["classify"].setdefault("cached", 0)
@@ -4137,7 +4233,7 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                             )
 
                     for batch_start in range(0, total, batch_size):
-                        if _should_abort(abort):
+                        if _should_abort(abort) or source_offline["reason"]:
                             break
                         batch = photos[batch_start:batch_start + batch_size]
 
@@ -4147,7 +4243,11 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                             # next batch boundary (~32 photos). The outer batch
                             # loop's check at the top of the next iteration will
                             # then break out of the batch loop entirely.
-                            if _should_abort(abort):
+                            # ``source_offline`` rides the same boundary: once
+                            # the share is gone there is nothing left to read,
+                            # so stop pulling photos rather than spending the
+                            # rest of the batch collecting instant EIOs.
+                            if _should_abort(abort) or source_offline["reason"]:
                                 break
                             processed_in_spec += 1
                             stages["classify"]["seen"] = (
@@ -4394,6 +4494,26 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                                     None if full_image_fallback else detection,
                                 )
                                 if img is None:
+                                    # Before blaming the photo, check whether the
+                                    # source itself vanished. A dropped share
+                                    # fails every remaining read instantly, so
+                                    # counting these as per-photo failures would
+                                    # report the untouched remainder of the
+                                    # collection as broken images.
+                                    offline = _source_offline_reason(
+                                        folder_path, image_path,
+                                    )
+                                    if offline:
+                                        if not _handle_source_offline(offline):
+                                            break
+                                        # Resumed. Count this one as
+                                        # unreachable rather than failed: the
+                                        # source tree was gone, so the photo
+                                        # was never actually examined and
+                                        # calling it a failure would repeat
+                                        # the same lie at smaller scale.
+                                        source_skipped += 1
+                                        continue
                                     failed += 1
                                     failed_photo_ids.add(photo["id"])
                                     continue
@@ -4587,6 +4707,17 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                         )
                     if failed:
                         parts.append(f"{failed} failed")
+                    if source_skipped:
+                        parts.append(
+                            f"{source_skipped} unreachable (source offline)"
+                        )
+                    if source_offline["reason"]:
+                        # Name the photos we never reached rather than folding
+                        # them into a count that reads as "classified".
+                        parts.append(
+                            f"stopped after {processed_in_spec} of {total} — "
+                            f"source {source_offline['reason']}"
+                        )
                     runner.update_step(
                         job["id"], step_id, status="completed",
                         summary=", ".join(parts),
@@ -4615,8 +4746,25 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                 # IDs (not per-model attempt count) so the badge can never
                 # exceed total photos.
                 n_failed_photos = len(failed_photo_ids)
+                if source_offline["reason"]:
+                    # Must carry the "[classify] Fatal:" prefix: the end-of-run
+                    # rollup picks the job's headline error by that marker and
+                    # would otherwise fall back to errors[0] — likely an
+                    # unrelated per-photo warning logged much earlier.
+                    errors.append(
+                        f"[classify] Fatal: source "
+                        f"{source_offline['reason']}. Reconnect it and run "
+                        f"Process again to classify the rest — photos already "
+                        f"classified will be skipped."
+                    )
+                # A run that gave up on a dead source did NOT classify the
+                # collection, so it must not land on the job tree as a clean
+                # green stage — "completed" here would tell the user their
+                # photos were processed when most were never opened.
                 stages["classify"]["status"] = (
-                    "failed" if total_failed > 0 else "completed"
+                    "failed"
+                    if (total_failed > 0 or source_offline["reason"])
+                    else "completed"
                 )
                 if total_failed > 0:
                     errors.append(
@@ -4628,6 +4776,7 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                     "predictions_stored": total_predictions_stored,
                     "detected": detect_state["total_detected"],
                     "failed": total_failed,
+                    "source_offline": source_offline["reason"],
                     "already_classified": total_skipped_existing,
                     "full_image_fallbacks": total_full_image_fallbacks,
                     "weak_detection_rescues": len(contextual_weak_ids),

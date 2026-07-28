@@ -12377,3 +12377,516 @@ def test_collection_rerun_redoes_only_missing_work(tmp_path, monkeypatch):
     assert inference_calls == [], (
         f"rerun invoked the classifier: {inference_calls}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Source-offline detection (dropped network volume mid-run)
+#
+# A disconnected SMB/NFS share makes EVERY subsequent read fail with EIO.
+# Classify used to count each one as a per-photo failure, so a share that
+# dropped 200 photos into a 984-photo run reported "779 failed" — which reads
+# as "779 of your photos are broken" when the truth is "the volume went away
+# and we never looked at them". These tests pin the distinction.
+# ---------------------------------------------------------------------------
+
+def test_source_offline_reason_none_for_healthy_local_folder(tmp_path):
+    """A readable folder is never 'offline' — a load failure there is the
+    individual file's fault (corrupt RAW, bad permissions) and must stay a
+    per-photo failure."""
+    from pipeline_job import _source_offline_reason
+
+    folder = str(tmp_path / "photos")
+    os.makedirs(folder, exist_ok=True)
+    missing_file = os.path.join(folder, "does_not_exist.NEF")
+
+    assert _source_offline_reason(folder, missing_file) is None, (
+        "A missing/corrupt file inside a healthy folder must NOT be treated "
+        "as an offline source, or one bad RAW would pause the whole run."
+    )
+
+
+def test_source_offline_reason_flags_unmounted_volume():
+    """The incident case: /Volumes/<share> is gone entirely."""
+    from pipeline_job import _source_offline_reason
+
+    folder = "/Volumes/DefinitelyNotMounted12345/Raw Files"
+    image = os.path.join(folder, "DSC_7280.NEF")
+
+    reason = _source_offline_reason(folder, image)
+    assert reason is not None, (
+        "An unmounted /Volumes/... path must be reported as an offline source."
+    )
+    assert "/Volumes/DefinitelyNotMounted12345" in reason, (
+        f"The reason must name the mount root the user has to reconnect; "
+        f"got {reason!r}"
+    )
+
+
+def test_source_offline_reason_flags_vanished_folder(tmp_path):
+    """A stale mount can keep the mount root while the subtree turns
+    unreadable. The folder no longer resolving is enough to stop the run."""
+    from pipeline_job import _source_offline_reason
+
+    folder = str(tmp_path / "was_here")
+    image = os.path.join(folder, "DSC_0001.NEF")
+
+    reason = _source_offline_reason(folder, image)
+    assert reason is not None, (
+        "A folder that no longer resolves as a directory means the source "
+        "went away, not that one photo is corrupt."
+    )
+    assert folder in reason, f"Reason must name the folder; got {reason!r}"
+
+
+def test_pipeline_classify_pauses_when_source_volume_disappears(
+    tmp_path, monkeypatch,
+):
+    """Losing the source volume mid-classify must pause the job, not burn
+    through the remaining photos marking them 'failed'.
+
+    Reproduces the 2026-07-28 incident: the SMB share dropped partway through
+    classify and every remaining read returned EIO instantly, so the run
+    reported 779 failed photos and then marched on to the next model (865
+    failed) instead of stopping so the user could reconnect.
+    """
+    import classifier as classifier_mod
+    import classify_job
+    import config as cfg
+    from db import Database
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cfg.CONFIG_PATH = str(tmp_path / "config.json")
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws_id = db._active_workspace_id
+
+    folder_path = str(tmp_path / "photos")
+    os.makedirs(folder_path, exist_ok=True)
+    folder_id = db.add_folder(folder_path)
+    photo_ids = []
+    for i in range(6):
+        name = f"photo{i}.jpg"
+        pid = db.add_photo(folder_id, name, ".jpg", 4000 + i, 4_000_000.0 + i)
+        _drop_jpeg(folder_path, name)
+        db.save_detections(
+            pid,
+            [{"box": {"x": 0.1, "y": 0.1, "w": 0.5, "h": 0.5},
+              "confidence": 0.9, "category": "animal"}],
+            detector_model="MegaDetector",
+        )
+        photo_ids.append(pid)
+
+    col_id = db.add_collection(
+        "Test",
+        json.dumps([{"field": "photo_ids", "value": photo_ids}]),
+    )
+
+    _setup_fake_downloaded_model(tmp_path, monkeypatch)
+
+    import labels_fingerprint as lfp
+    monkeypatch.setattr(lfp, "compute_fingerprint", lambda *a, **k: "fp")
+
+    def fake_detect_batch(batch, folders, runner, job, reclassify, db_,
+                          det_conf_threshold=None, already_detected_ids=None,
+                          cached_detections=None):
+        det_map = {}
+        for p in batch:
+            det_map[p["id"]] = [{
+                "id": d["id"],
+                "box_x": d["box_x"], "box_y": d["box_y"],
+                "box_w": d["box_w"], "box_h": d["box_h"],
+                "confidence": d["detector_confidence"],
+                "category": d["category"],
+            } for d in db_.get_detections(p["id"])
+                if d["detector_model"] != "full-image"]
+        return det_map, len(batch), {p["id"] for p in batch}
+
+    monkeypatch.setattr(classify_job, "_detect_batch", fake_detect_batch)
+
+    # The share is gone: every load fails, and _prepare_image hands back the
+    # archive path it could not read (exactly what it does on EIO today).
+    gone_folder = "/Volumes/DefinitelyNotMounted12345/Raw Files"
+    prepare_calls = []
+
+    def offline_prepare_image(photo, folders, detection, vireo_dir=None):
+        prepare_calls.append(photo["id"])
+        return None, gone_folder, os.path.join(gone_folder, photo["filename"])
+
+    monkeypatch.setattr(classify_job, "_prepare_image", offline_prepare_image)
+
+    class FakeClassifier:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def encode_image(self, *args, **kwargs):
+            import numpy as np
+            return np.zeros(512, dtype=np.float32)
+
+    monkeypatch.setattr(classifier_mod, "Classifier", FakeClassifier)
+
+    class PausingRunner(FakeRunner):
+        def __init__(self):
+            super().__init__()
+            self.pause_calls = []
+            self._paused = False
+
+        def pause_job(self, job_id):
+            self.pause_calls.append(job_id)
+            self._paused = True
+            return True
+
+        def pause_requested(self, job_id):
+            return self._paused
+
+        def mark_paused(self, job_id):
+            return True
+
+        def wait_if_paused(self, job_id, *, publish_paused=False):
+            # Simulate the user reconnecting and hitting Resume so the test
+            # does not block forever.
+            self._paused = False
+            return False
+
+    params = PipelineParams(
+        collection_id=col_id,
+        skip_extract_masks=True,
+        skip_regroup=True,
+    )
+
+    runner = PausingRunner()
+    job = _make_job()
+
+    # The share never comes back, so the run ends failed rather than putting
+    # a green check on a collection it never opened.
+    with pytest.raises(RuntimeError):
+        run_pipeline_job(job, runner, db_path, ws_id, params)
+
+    assert runner.pause_calls, (
+        "Losing the source volume must request a pause so the user can "
+        "reconnect and resume. Instead the run continued and marked every "
+        "remaining photo failed."
+    )
+
+    joined = " ".join(job["errors"])
+    assert "/Volumes/DefinitelyNotMounted12345" in joined, (
+        f"The error must name the volume the user has to reconnect; "
+        f"got {job['errors']!r}"
+    )
+
+    # The whole point: photos we never got to look at are not "failures".
+    classify_steps = [
+        kwargs for (_jid, sid, kwargs) in runner.step_updates
+        if sid.startswith("classify:") and "summary" in kwargs
+    ]
+    summaries = " ".join(k["summary"] for k in classify_steps)
+    assert "failed" not in summaries, (
+        f"Photos skipped because the volume vanished must not be reported "
+        f"as classification failures; got summary {summaries!r}"
+    )
+    assert "unreachable (source offline)" in summaries, (
+        f"The summary must still account for the photos it skipped rather "
+        f"than silently dropping them; got {summaries!r}"
+    )
+    assert "is not mounted" in summaries, (
+        f"The summary must say why it stopped; got {summaries!r}"
+    )
+
+    # A user who keeps resuming without remounting must not loop forever.
+    from pipeline_job import _MAX_SOURCE_OFFLINE_PAUSES
+    assert len(runner.pause_calls) <= _MAX_SOURCE_OFFLINE_PAUSES, (
+        f"Classify paused {len(runner.pause_calls)} times for the same dead "
+        f"volume; it must give up after {_MAX_SOURCE_OFFLINE_PAUSES}."
+    )
+
+    # And we must stop pulling photos, not walk the whole collection.
+    assert len(prepare_calls) < 6, (
+        f"Classify kept requesting images after the volume disappeared "
+        f"({len(prepare_calls)} attempts across 6 photos); it should stop "
+        f"once it has given up on the source."
+    )
+
+
+def test_pipeline_classify_resumes_after_source_volume_reconnects(
+    tmp_path, monkeypatch,
+):
+    """Reconnecting the share and hitting Resume must finish the collection.
+
+    The pause is only worth having if resuming actually classifies the rest —
+    otherwise "reconnect and resume" is a false promise and the user has to
+    re-run the whole pipeline.
+    """
+    import classifier as classifier_mod
+    import classify_job
+    import config as cfg
+    from db import Database
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cfg.CONFIG_PATH = str(tmp_path / "config.json")
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws_id = db._active_workspace_id
+
+    folder_path = str(tmp_path / "photos")
+    os.makedirs(folder_path, exist_ok=True)
+    folder_id = db.add_folder(folder_path)
+    photo_ids = []
+    for i in range(6):
+        name = f"photo{i}.jpg"
+        pid = db.add_photo(folder_id, name, ".jpg", 4000 + i, 4_000_000.0 + i)
+        _drop_jpeg(folder_path, name)
+        db.save_detections(
+            pid,
+            [{"box": {"x": 0.1, "y": 0.1, "w": 0.5, "h": 0.5},
+              "confidence": 0.9, "category": "animal"}],
+            detector_model="MegaDetector",
+        )
+        photo_ids.append(pid)
+
+    col_id = db.add_collection(
+        "Test",
+        json.dumps([{"field": "photo_ids", "value": photo_ids}]),
+    )
+
+    _setup_fake_downloaded_model(tmp_path, monkeypatch)
+
+    import labels_fingerprint as lfp
+    monkeypatch.setattr(lfp, "compute_fingerprint", lambda *a, **k: "fp")
+
+    def fake_detect_batch(batch, folders, runner, job, reclassify, db_,
+                          det_conf_threshold=None, already_detected_ids=None,
+                          cached_detections=None):
+        det_map = {}
+        for p in batch:
+            det_map[p["id"]] = [{
+                "id": d["id"],
+                "box_x": d["box_x"], "box_y": d["box_y"],
+                "box_w": d["box_w"], "box_h": d["box_h"],
+                "confidence": d["detector_confidence"],
+                "category": d["category"],
+            } for d in db_.get_detections(p["id"])
+                if d["detector_model"] != "full-image"]
+        return det_map, len(batch), {p["id"] for p in batch}
+
+    monkeypatch.setattr(classify_job, "_detect_batch", fake_detect_batch)
+
+    from PIL import Image as _PILImage
+
+    gone_folder = "/Volumes/DefinitelyNotMounted12345/Raw Files"
+    state = {"mounted": True, "seen": 0}
+
+    def flaky_prepare_image(photo, folders, detection, vireo_dir=None):
+        state["seen"] += 1
+        if state["seen"] == 2:
+            # The share drops on the second photo.
+            state["mounted"] = False
+        if not state["mounted"]:
+            return None, gone_folder, os.path.join(
+                gone_folder, photo["filename"],
+            )
+        fp = folders.get(photo["folder_id"], "")
+        return (
+            _PILImage.new("RGB", (16, 16), "black"),
+            fp,
+            os.path.join(fp, photo["filename"]),
+        )
+
+    monkeypatch.setattr(classify_job, "_prepare_image", flaky_prepare_image)
+
+    def fake_flush_batch(batch, clf, model_type, model_name, db_, raw_results,
+                         top_k=1):
+        for entry in batch:
+            raw_results.append({
+                "photo": entry["photo"],
+                "detection_id": entry.get("detection_id"),
+                "folder_path": entry["folder_path"],
+                "image_path": entry["image_path"],
+                "prediction": "Robin",
+                "confidence": 0.9,
+                "timestamp": None,
+                "filename": entry["photo"]["filename"],
+                "embedding": None,
+                "taxonomy": None,
+            })
+        return 0
+
+    monkeypatch.setattr(classify_job, "_flush_batch", fake_flush_batch)
+
+    class FakeClassifier:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def encode_image(self, *args, **kwargs):
+            import numpy as np
+            return np.zeros(512, dtype=np.float32)
+
+    monkeypatch.setattr(classifier_mod, "Classifier", FakeClassifier)
+
+    class ReconnectingRunner(FakeRunner):
+        """Models the user remounting the share, then pressing Resume."""
+
+        def __init__(self):
+            super().__init__()
+            self.pause_calls = []
+            self._paused = False
+
+        def pause_job(self, job_id):
+            self.pause_calls.append(job_id)
+            self._paused = True
+            return True
+
+        def pause_requested(self, job_id):
+            return self._paused
+
+        def mark_paused(self, job_id):
+            return True
+
+        def wait_if_paused(self, job_id, *, publish_paused=False):
+            state["mounted"] = True   # user reconnects the volume
+            self._paused = False      # ...and hits Resume
+            return False
+
+    params = PipelineParams(
+        collection_id=col_id,
+        skip_extract_masks=True,
+        skip_regroup=True,
+    )
+
+    runner = ReconnectingRunner()
+    job = _make_job()
+
+    run_pipeline_job(job, runner, db_path, ws_id, params)
+
+    assert len(runner.pause_calls) == 1, (
+        f"Expected exactly one pause (the share dropped once); got "
+        f"{len(runner.pause_calls)}."
+    )
+
+    # Every photo except the one in flight when the share died should have
+    # been classified.
+    stored = db.conn.execute(
+        "SELECT COUNT(DISTINCT d.photo_id) FROM predictions p "
+        "JOIN detections d ON d.id = p.detection_id",
+    ).fetchone()[0]
+    assert stored >= 4, (
+        f"Resuming after the volume came back should have classified the "
+        f"rest of the collection; only {stored} of 6 photos got predictions."
+    )
+
+    classify_steps = [
+        kwargs for (_jid, sid, kwargs) in runner.step_updates
+        if sid.startswith("classify:") and "summary" in kwargs
+    ]
+    summaries = " ".join(k["summary"] for k in classify_steps)
+    assert "stopped after" not in summaries, (
+        f"The run recovered, so the summary must not claim it stopped early; "
+        f"got {summaries!r}"
+    )
+
+
+def test_pipeline_classify_offline_source_is_not_a_clean_success(
+    tmp_path, monkeypatch,
+):
+    """Giving up on a dead source must fail the job with an accurate headline.
+
+    Marking classify 'completed' would put a green check on a run that never
+    opened most of the collection, and the end-of-run rollup picks the job's
+    headline error by the '[classify] Fatal:' prefix — without one it reports
+    whatever unrelated warning happened to land in errors[0].
+    """
+    import classifier as classifier_mod
+    import classify_job
+    import config as cfg
+    from db import Database
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cfg.CONFIG_PATH = str(tmp_path / "config.json")
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws_id = db._active_workspace_id
+
+    folder_path = str(tmp_path / "photos")
+    os.makedirs(folder_path, exist_ok=True)
+    folder_id = db.add_folder(folder_path)
+    photo_ids = []
+    for i in range(3):
+        name = f"photo{i}.jpg"
+        pid = db.add_photo(folder_id, name, ".jpg", 4000 + i, 4_000_000.0 + i)
+        _drop_jpeg(folder_path, name)
+        db.save_detections(
+            pid,
+            [{"box": {"x": 0.1, "y": 0.1, "w": 0.5, "h": 0.5},
+              "confidence": 0.9, "category": "animal"}],
+            detector_model="MegaDetector",
+        )
+        photo_ids.append(pid)
+
+    col_id = db.add_collection(
+        "Test",
+        json.dumps([{"field": "photo_ids", "value": photo_ids}]),
+    )
+
+    _setup_fake_downloaded_model(tmp_path, monkeypatch)
+
+    import labels_fingerprint as lfp
+    monkeypatch.setattr(lfp, "compute_fingerprint", lambda *a, **k: "fp")
+
+    def fake_detect_batch(batch, folders, runner, job, reclassify, db_,
+                          det_conf_threshold=None, already_detected_ids=None,
+                          cached_detections=None):
+        det_map = {}
+        for p in batch:
+            det_map[p["id"]] = [{
+                "id": d["id"],
+                "box_x": d["box_x"], "box_y": d["box_y"],
+                "box_w": d["box_w"], "box_h": d["box_h"],
+                "confidence": d["detector_confidence"],
+                "category": d["category"],
+            } for d in db_.get_detections(p["id"])
+                if d["detector_model"] != "full-image"]
+        return det_map, len(batch), {p["id"] for p in batch}
+
+    monkeypatch.setattr(classify_job, "_detect_batch", fake_detect_batch)
+
+    gone_folder = "/Volumes/DefinitelyNotMounted12345/Raw Files"
+
+    def offline_prepare_image(photo, folders, detection, vireo_dir=None):
+        return None, gone_folder, os.path.join(gone_folder, photo["filename"])
+
+    monkeypatch.setattr(classify_job, "_prepare_image", offline_prepare_image)
+
+    class FakeClassifier:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def encode_image(self, *args, **kwargs):
+            import numpy as np
+            return np.zeros(512, dtype=np.float32)
+
+    monkeypatch.setattr(classifier_mod, "Classifier", FakeClassifier)
+
+    params = PipelineParams(
+        collection_id=col_id,
+        skip_extract_masks=True,
+        skip_regroup=True,
+    )
+
+    # A plain FakeRunner has no pause support, so classify gives up at once —
+    # the same path a non-pausable job takes.
+    runner = FakeRunner()
+    job = _make_job()
+
+    with pytest.raises(RuntimeError) as excinfo:
+        run_pipeline_job(job, runner, db_path, ws_id, params)
+
+    msg = str(excinfo.value)
+    assert "/Volumes/DefinitelyNotMounted12345" in msg, (
+        f"The job's headline error must name the offline volume rather than "
+        f"an unrelated earlier warning; got {msg!r}"
+    )
+    assert "failed to classify" not in msg, (
+        f"An offline share must not be reported as photos failing to "
+        f"classify; got {msg!r}"
+    )

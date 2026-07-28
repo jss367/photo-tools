@@ -12747,6 +12747,81 @@ def test_source_offline_reason_flags_stale_mount_that_raises_from_stat(
     )
 
 
+def test_source_offline_reason_flags_dead_mount_with_cached_folder_stat(
+    monkeypatch,
+):
+    """A dead mount whose folder ``isdir`` still returns True is mount-offline.
+
+    Codex #1388 P1 (r3665254569): a disconnected SMB/NFS mount can keep
+    the containing folder's directory metadata cached, so
+    ``os.path.isdir(folder)`` returns True even though every read of the
+    folder's files raises EIO. Pre-fix ``_source_offline_reason``
+    short-circuited on a truthy ``isdir(folder)`` and returned None — the
+    caller then counted the failed read as a per-photo failure and
+    classify kept hammering the dead share for every remaining photo
+    instead of pausing for reconnection. Pin that the mount-root probe
+    still runs when the folder stat looks fine, so a dead mount is
+    scoped mount-wide.
+    """
+    import pipeline_job
+
+    folder = "/mnt/photos/2026-07-27"
+    image = os.path.join(folder, "DSC_0001.NEF")
+
+    real_lexists = pipeline_job.os.path.lexists
+    real_isdir = pipeline_job.os.path.isdir
+    real_listdir = pipeline_job.os.listdir
+
+    def fake_lexists(path):
+        if path == "/mnt/photos":
+            return True
+        return real_lexists(path)
+
+    def fake_isdir(path):
+        # The critical bit: the folder's directory-stat cache is stale
+        # and still reports True, mirroring the real behaviour of a
+        # disconnected SMB/NFS mount where the containing folder's
+        # metadata survives the drop while file reads underneath it
+        # raise EIO.
+        if path == folder:
+            return True
+        # The mount root itself has to look present for
+        # ``_mount_root_offline`` to reach the ``listdir`` probe.
+        if path == "/mnt/photos":
+            return True
+        return real_isdir(path)
+
+    def fake_listdir(path):
+        # The mount is truly dead: reading the root raises EIO. This is
+        # what the fix relies on to detect the outage even when the
+        # folder stat lies about being present.
+        if path == "/mnt/photos":
+            raise OSError("Input/output error")
+        return real_listdir(path)
+
+    monkeypatch.setattr(pipeline_job.os.path, "lexists", fake_lexists)
+    monkeypatch.setattr(pipeline_job.os.path, "isdir", fake_isdir)
+    monkeypatch.setattr(pipeline_job.os, "listdir", fake_listdir)
+
+    result = pipeline_job._source_offline_reason(folder, image)
+    assert result is not None, (
+        "A cached folder stat that lies about a dead mount must not let "
+        "``_source_offline_reason`` return None — the caller would then "
+        "count every remaining read as a per-photo failure instead of "
+        "pausing for reconnection."
+    )
+    scope, reason = result
+    assert scope == "mount", (
+        f"A dead mount discovered via the mount-root probe must scope "
+        f"the outage mount-wide so the whole run pauses; got scope "
+        f"{scope!r}."
+    )
+    assert "/mnt/photos" in reason, (
+        f"Reason must name the mount the user needs to reconnect; got "
+        f"{reason!r}."
+    )
+
+
 def test_archive_mount_root_candidates_recognises_windows_paths():
     """Windows mapped drives and UNC shares are documented in
     ``docs/WINDOWS_SUPPORT.md`` as supported storage layouts.

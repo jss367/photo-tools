@@ -249,25 +249,34 @@ def _source_offline_reason(
       healthy folders (and, on ``reclassify=True``, cleared their
       existing predictions during finalization with no replacement).
 
-    Deliberately conservative — a healthy containing folder always
-    returns ``None`` regardless of the image path, so a single unreadable
-    file inside a working tree stays a per-photo failure and can never
-    trip the mount-root check by itself.
+    Deliberately conservative — an image path with no mount-shaped
+    prefix under a readable containing folder returns ``None``, so a
+    single unreadable file inside an ordinary local tree stays a
+    per-photo failure. A readable folder under a mount-shaped path is
+    still probed at the mount root, since a stale SMB/NFS mount can
+    keep folder metadata cached (Codex #1388 P1 r3665254569) — a
+    successful root probe there also returns ``None``.
     """
-    # A readable folder means one bad file, not a source outage — this
-    # short-circuit is what protects a local ``/mnt/photos/...`` catalog
-    # (unusual, but legal) from tripping the mount-root check just because
-    # a single file has been deleted.
-    if not folder_path or os.path.isdir(folder_path):
+    if not folder_path:
         return None
-    # The folder itself is gone / unreachable. If that folder lives under
-    # a mount-shaped path and the mount is no longer active, this is a
-    # mount-scoped outage (Codex #1388 P1 r3663493889): pause the whole
-    # run instead of skipping folder-by-folder while the same dead share
-    # rejects every subsequent read.
+    # A dead SMB/NFS mount can keep folder metadata cached: reads
+    # against the folder's files still raise EIO, but
+    # ``os.path.isdir(folder_path)`` returns True from the stale stat.
+    # Probe every mount-shaped root candidate first (Codex #1388 P1
+    # r3665254569) so that case is scoped mount-wide and classify
+    # pauses for reconnection, rather than being misread as "one bad
+    # file" and letting classify keep hammering the dead share. A
+    # successful root probe leaves the caller with the ordinary
+    # "readable folder → per-photo failure" outcome below.
     for mount_root in _archive_mount_root_candidates(image_path):
         if _mount_root_offline(mount_root):
             return "mount", f"volume {mount_root} is not mounted"
+    # No mount-root candidate is offline. A readable folder means the
+    # file is the problem, not the source — protects a local
+    # ``/mnt/photos/...`` catalog (unusual, but legal) from tripping
+    # the folder-scoped branch just because a single file was deleted.
+    if os.path.isdir(folder_path):
+        return None
     return "folder", f"folder {folder_path} is unreadable"
 
 

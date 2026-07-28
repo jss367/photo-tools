@@ -6458,6 +6458,7 @@ def test_import_photos_carry_photo_ids_defaults_to_none(app_and_db, tmp_path):
     # First-attempt imports have no parent, so the persisted config
     # advertises that to the Jobs page's parallel-retry gate.
     assert config["parent_import_job_id"] is None
+    assert config["root_import_job_id"] is None
 
 
 def test_import_photos_retry_persists_parent_import_job_id(
@@ -6466,7 +6467,9 @@ def test_import_photos_retry_persists_parent_import_job_id(
     Jobs page's ``hasActiveRetryFor`` gate can suppress a second Retry
     button click on the same failed parent while this retry is running.
     Without persistence the client-side check reads ``undefined`` on
-    every active job and the gate never fires."""
+    every active job and the gate never fires. On a first-level retry
+    ``root_import_job_id`` equals ``parent_import_job_id`` — the parent
+    is itself the root of the chain."""
     from wait import wait_for_job_via_client
 
     app, _ = app_and_db
@@ -6486,6 +6489,108 @@ def test_import_photos_retry_persists_parent_import_job_id(
         wait_for_job_via_client(client, retry_id)
         retry_config = _job_config(client, retry_id)
         assert retry_config["parent_import_job_id"] == parent_id
+        assert retry_config["root_import_job_id"] == parent_id
+
+
+def test_import_photos_retry_of_retry_inherits_root_import_job_id(
+        app_and_db, tmp_path):
+    """A retry-of-retry's ``root_import_job_id`` names the ORIGINAL
+    failed import, not its direct parent. Without this the Jobs page's
+    ``hasActiveRetryFor`` gate — keyed on the original failed job's id
+    — cannot recognize a deep retry as belonging to the chain, and a
+    second Retry click on the original would enqueue a parallel import
+    while the retry is still in flight."""
+    from wait import wait_for_job_via_client
+
+    app, _ = app_and_db
+    with app.test_client() as client:
+        original_id = _post_import(client, _import_card(tmp_path),
+                                   tmp_path / "archive", None)
+        wait_for_job_via_client(client, original_id)
+
+        first_retry_resp = client.post("/api/jobs/import-photos", json={
+            "sources": [_import_card(tmp_path)],
+            "destination": str(tmp_path / "archive"),
+            "after_import": None,
+            "parent_import_job_id": original_id,
+        })
+        assert first_retry_resp.status_code == 200, first_retry_resp.get_json()
+        first_retry_id = first_retry_resp.get_json()["job_id"]
+        wait_for_job_via_client(client, first_retry_id)
+
+        second_retry_resp = client.post("/api/jobs/import-photos", json={
+            "sources": [_import_card(tmp_path)],
+            "destination": str(tmp_path / "archive"),
+            "after_import": None,
+            "parent_import_job_id": first_retry_id,
+        })
+        assert second_retry_resp.status_code == 200, (
+            second_retry_resp.get_json())
+        second_retry_id = second_retry_resp.get_json()["job_id"]
+        wait_for_job_via_client(client, second_retry_id)
+        second_retry_config = _job_config(client, second_retry_id)
+        # Direct parent is the first retry; root points back at the
+        # original failed import so the gate matches either link.
+        assert second_retry_config["parent_import_job_id"] == first_retry_id
+        assert second_retry_config["root_import_job_id"] == original_id
+
+
+def test_import_photos_retry_refuses_source_content_change(
+        app_and_db, tmp_path):
+    """A recovery retry against a source whose file set changed since
+    the failed run is refused. Without this guard a "Retry failed
+    files" click against ``/mnt/card`` after a different card was
+    mounted there — or after new photos were shot on the same card —
+    would silently enumerate the current contents and import files the
+    original run never saw."""
+    from wait import wait_for_job_via_client
+
+    app, _ = app_and_db
+    with app.test_client() as client:
+        card = _import_card(tmp_path)
+        parent_id = _post_import(client, card,
+                                 tmp_path / "archive", None)
+        wait_for_job_via_client(client, parent_id)
+
+        # Simulate a source-content change between runs (an
+        # unexpectedly-added file on the same card, or a different card
+        # entirely mounted at the same path).
+        Image.new("RGB", (16, 16), "blue").save(
+            os.path.join(card, "IMG_NEW.jpg"),
+        )
+
+        resp = client.post("/api/jobs/import-photos", json={
+            "sources": [card],
+            "destination": str(tmp_path / "archive"),
+            "after_import": None,
+            "parent_import_job_id": parent_id,
+        })
+        assert resp.status_code == 400, resp.get_json()
+        error = resp.get_json()["error"]
+        assert "source contents have changed" in error
+
+
+def test_import_photos_retry_accepts_unchanged_source(
+        app_and_db, tmp_path):
+    """The complement to the drift check: a retry against an unchanged
+    source succeeds. Documents that the check only refuses genuine
+    content changes and doesn't silently break every retry."""
+    from wait import wait_for_job_via_client
+
+    app, _ = app_and_db
+    with app.test_client() as client:
+        card = _import_card(tmp_path)
+        parent_id = _post_import(client, card,
+                                 tmp_path / "archive", None)
+        wait_for_job_via_client(client, parent_id)
+
+        resp = client.post("/api/jobs/import-photos", json={
+            "sources": [card],
+            "destination": str(tmp_path / "archive"),
+            "after_import": None,
+            "parent_import_job_id": parent_id,
+        })
+        assert resp.status_code == 200, resp.get_json()
 
 
 def test_import_photos_carry_photo_ids_validation_400s(app_and_db, tmp_path):

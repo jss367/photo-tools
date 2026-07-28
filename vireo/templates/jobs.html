@@ -379,12 +379,16 @@
   }
 
   // A retry job carries its parent's id in ``config.parent_import_job_id``
+  // and the original failed import's id in ``config.root_import_job_id``
   // (see api_job_import_photos). Suppresses the Retry button on the
-  // parent while any active-or-recently-launched retry from that parent
-  // is still in flight — a second click would otherwise enqueue a
-  // parallel import of the same source and destination, letting the
-  // after-import chains and any ``after_process_move`` race with the
-  // first retry's move (which may already have relocated the folders).
+  // original failed import while any active-or-recently-launched retry
+  // in that chain is still in flight — a second click would otherwise
+  // enqueue a parallel import of the same source and destination,
+  // letting the after-import chains and any ``after_process_move`` race
+  // with the first retry's move (which may already have relocated the
+  // folders). Matches either field so a retry-of-retry — whose direct
+  // ``parent_import_job_id`` points at the first retry, not the
+  // original failed import — still blocks the original's Retry button.
   function hasActiveRetryFor(parentId) {
     if (!parentId) return false;
     return activeJobs.some(function(candidate) {
@@ -393,7 +397,9 @@
       if (status === 'completed' || status === 'failed' ||
           status === 'cancelled') return false;
       var cfg = jobConfig(candidate);
-      return cfg && cfg.parent_import_job_id === parentId;
+      if (!cfg) return false;
+      return cfg.parent_import_job_id === parentId ||
+             cfg.root_import_job_id === parentId;
     });
   }
 

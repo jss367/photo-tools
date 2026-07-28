@@ -52,6 +52,8 @@ Reconnaissance notes (Task 2.0, verified 2026-07-04):
 
 import contextlib
 import errno
+import hashlib
+import json
 import logging
 import os
 import posixpath
@@ -59,6 +61,7 @@ import shutil
 import sys
 import uuid
 from dataclasses import dataclass
+from pathlib import Path
 
 # POSIX advisory lock used by the hardlinkless-FS promote fallback (see
 # copy_and_hash_verify below). Unavailable on Windows; Vireo targets
@@ -113,18 +116,88 @@ def _invalidate_new_images(db, root):
 IMPORT_BATCH_SIZE = 200
 
 
+def _capture_source_snapshots(files, sources):
+    """Return ``{source_str: {"count": N, "signature": HEX}}`` per source.
+
+    Persisted in the import result so a recovery retry can verify each
+    source's file set still matches what the parent ran against. Without
+    this check, retrying against ``/mnt/card`` after the card was
+    ejected and a different one mounted at the same path would silently
+    import every file on the new card (they have no prior catalog
+    entry, so ``skip_duplicates`` doesn't gate them). Files added to
+    the same card between the failed run and the retry produce the
+    same mismatch — the "Retry failed files" button should not import
+    files the user's original import never saw.
+
+    Signature is a sha256 over the sorted ``(relative_posix_path,
+    size)`` list of files under each source root; a healthy file
+    reports its ``st_size`` byte count, an unreadable file renders as
+    ``-1`` so a stat failure produces a distinct signature from a
+    successful stat at the same path. Files not under a source root
+    (empty in practice — discovery only yields paths under the source)
+    are skipped.
+    """
+    if not sources:
+        return {}
+    snapshots = {}
+    for src in sources:
+        src_path = Path(src)
+        src_str = str(src)
+        entries = []
+        for f in files:
+            try:
+                rel = f.relative_to(src_path)
+            except ValueError:
+                continue
+            try:
+                size = f.stat().st_size
+            except OSError:
+                size = -1
+            entries.append((rel.as_posix(), size))
+        entries.sort()
+        payload = json.dumps(entries, separators=(",", ":"))
+        digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+        snapshots[src_str] = {"count": len(entries), "signature": digest}
+    return snapshots
+
+
+def _fingerprint_for_row(row):
+    """Format one photo row into a stable identity string.
+
+    Format: ``folder_path/filename|s=SIZE|h=HASH``. Path alone is not
+    enough: SQLite is free to reuse a freed ``photos.id`` on the next
+    insert, so a delete-then-import cycle can put an unrelated file at
+    the same path under the same numeric ID. ``file_size`` (always
+    populated by the copy pass) and ``file_hash`` (populated by
+    ``scanner.scan`` after the copy verifies) together identify the
+    file's bytes; a genuine retry sees identical values, a same-path
+    imposter almost never does. Missing hash/size render as empty
+    segments so the format stays comparable between parent-capture time
+    and retry-verify time even when the scanner hasn't stamped a hash
+    (both sides observe the same NULL and match). Returns ``None`` when
+    the row is missing the path fields the retry needs to compare
+    against.
+    """
+    folder_path = row["folder_path"] or ""
+    filename = row["filename"] or ""
+    if not folder_path or not filename:
+        return None
+    size = row["file_size"]
+    file_hash = row["file_hash"] or ""
+    size_str = "" if size is None else str(size)
+    return f"{folder_path}/{filename}|s={size_str}|h={file_hash}"
+
+
 def _capture_photo_fingerprints(db, photo_ids):
-    """Capture ``{id: "folder_path/filename"}`` for each landed photo.
+    """Capture ``{id: fingerprint_string}`` for each landed photo.
 
     Persisted in the import result so a retry can verify each carried ID
     is still the same file. ``photos.id`` is an ``INTEGER PRIMARY KEY``
     without ``AUTOINCREMENT``, so a delete-then-import cycle can reuse
     an ID for an unrelated photo; without a stable-identity check the
     retry's after-import chain (and any ``after_process_move``) would
-    silently pick up that unrelated row. Full path is the fingerprint
-    because photos share a ``UNIQUE(folder_id, filename)`` constraint
-    and ``folders.path`` is itself ``UNIQUE`` — two files cannot share
-    a full path in the catalog. Keys are stringified for JSON storage.
+    silently pick up that unrelated row. See ``_fingerprint_for_row``
+    for the string format. Keys are stringified for JSON storage.
     """
     if not photo_ids:
         return {}
@@ -132,18 +205,21 @@ def _capture_photo_fingerprints(db, photo_ids):
     for chunk in _chunks(sorted(int(pid) for pid in photo_ids)):
         placeholders = ",".join("?" for _ in chunk)
         rows = db.conn.execute(
-            f"""SELECT p.id AS id, f.path AS folder_path, p.filename AS filename
+            f"""SELECT p.id AS id,
+                       f.path AS folder_path,
+                       p.filename AS filename,
+                       p.file_size AS file_size,
+                       p.file_hash AS file_hash
                 FROM photos p
                 JOIN folders f ON f.id = p.folder_id
                 WHERE p.id IN ({placeholders})""",
             list(chunk),
         ).fetchall()
         for row in rows:
-            folder_path = row["folder_path"] or ""
-            filename = row["filename"] or ""
-            if not folder_path or not filename:
+            fp = _fingerprint_for_row(row)
+            if fp is None:
                 continue
-            fingerprints[str(row["id"])] = f"{folder_path}/{filename}"
+            fingerprints[str(row["id"])] = fp
     return fingerprints
 
 
@@ -2046,6 +2122,14 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
         "photo_fingerprints": _capture_photo_fingerprints(
             db, imported_photo_ids,
         ),
+        # Per-source signature over the discovered file set so a
+        # recovery retry can detect a source whose contents changed
+        # between the failed run and the retry — e.g. a different SD
+        # card mounted at the same path, or new photos added to the
+        # same card. See ``_capture_source_snapshots`` for the format.
+        "source_snapshots": _capture_source_snapshots(
+            files, params.sources,
+        ),
         "skipped_duplicate": skipped_duplicate,
         "unverified_duplicate": unverified_duplicate,
         "unverified_duplicates_only": unverified_duplicates_only,
@@ -3455,6 +3539,14 @@ def run_import_job(job, runner, db_path, workspace_id, params):
         # IDs on the next insert).
         "photo_fingerprints": _capture_photo_fingerprints(
             db, imported_photo_ids,
+        ),
+        # Per-source signature over the discovered file set so a
+        # recovery retry can detect a source whose contents changed
+        # between the failed run and the retry — e.g. a different SD
+        # card mounted at the same path, or new photos added to the
+        # same card. See ``_capture_source_snapshots`` for the format.
+        "source_snapshots": _capture_source_snapshots(
+            files, params.sources,
         ),
         "skipped_duplicate": skipped_duplicate,
         "unverified_duplicate": unverified_duplicate,

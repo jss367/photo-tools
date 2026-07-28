@@ -67,12 +67,20 @@ _MAX_SOURCE_OFFLINE_PAUSES = 3
 def _archive_mount_root_candidates(path: str) -> list[str]:
     """Return the plausible mount-root prefix(es) for ``path``, if any.
 
-    Extracts the mount-root component under the OS's mount conventions —
-    the first entry under ``/Volumes/`` or ``/mnt/`` (SMB/NFS style), or
-    the first user/name pair under ``/media/<user>/``. These conventions
-    strongly imply the user intended the location as a mount point; the
-    caller decides what state to require of it (missing entirely vs.
-    present but not actually mounted).
+    Extracts the mount-root component under each OS's mount conventions —
+    the first entry under ``/Volumes/`` or ``/mnt/`` (SMB/NFS style), the
+    first user/name pair under ``/media/<user>/``, a Windows drive letter
+    (``Z:/...`` — mapped SMB drives use this), or a UNC share
+    (``//server/share/...``). These shapes strongly imply the user
+    intended the location as a mount point; the caller decides what state
+    to require of it (missing entirely vs. present but not actually
+    mounted).
+
+    Windows mapped drives and UNC paths (Codex #1388 P2 r3663816324) are
+    documented storage layouts in ``docs/WINDOWS_SUPPORT.md``; without
+    detecting them, a disconnected SMB share on Windows would fall
+    through to folder-scoped skips and classify would keep reissuing
+    reads across the dead share instead of pausing for reconnection.
 
     Both the raw expanded path and the normalized absolute form are
     checked so relative or ``~``-prefixed paths still match. Duplicates
@@ -85,6 +93,29 @@ def _archive_mount_root_candidates(path: str) -> list[str]:
             return f"/{parts[1]}/{parts[2]}"
         if len(parts) >= 4 and parts[0] == "" and parts[1] == "media":
             return f"/media/{parts[2]}/{parts[3]}"
+        # UNC share: ``\\server\share\...`` after backslash-normalization
+        # becomes ``//server/share/...``, so ``parts`` starts with two
+        # empty strings.
+        if (
+            len(parts) >= 4
+            and parts[0] == ""
+            and parts[1] == ""
+            and parts[2]
+            and parts[3]
+        ):
+            return f"//{parts[2]}/{parts[3]}"
+        # Windows drive letter: ``Z:\...`` after normalization becomes
+        # ``Z:/...``. ``os.path.ismount("Z:")`` (no separator) returns
+        # False even for a real mounted drive because Windows treats
+        # ``Z:`` as a relative path on drive Z, so return with a trailing
+        # separator that ismount accepts.
+        if (
+            parts
+            and len(parts[0]) == 2
+            and parts[0][1] == ":"
+            and parts[0][0].isalpha()
+        ):
+            return f"{parts[0].upper()}/"
         return None
 
     raw_posix = os.path.expanduser(path).replace("\\", "/")
@@ -4804,6 +4835,28 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                                             else detection,
                                         )
                                     )
+                                    if img is not None:
+                                        # Successful recovery: refund the
+                                        # pause budget so an unrelated
+                                        # outage later in the run — a
+                                        # second share that drops, or the
+                                        # same share dropping again hours
+                                        # later — still gets its own
+                                        # bounded retry window. Without
+                                        # this, three separately-recovered
+                                        # outages exhaust the budget and
+                                        # the fourth outage immediately
+                                        # takes the give-up branch without
+                                        # ever offering Resume (Codex
+                                        # #1388 P2 r3663816327). The
+                                        # ``pauses`` bound is meant to
+                                        # protect against a user who
+                                        # resumes WITHOUT actually
+                                        # remounting the share — a
+                                        # successful read is proof the
+                                        # share IS back, so the counter
+                                        # can honestly reset.
+                                        source_offline["pauses"] = 0
                                 if gave_up_on_source:
                                     break
                                 if img is None:

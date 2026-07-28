@@ -12657,6 +12657,98 @@ def test_source_offline_reason_flags_stale_mount_that_raises_from_stat(
     )
 
 
+def test_archive_mount_root_candidates_recognises_windows_paths():
+    """Windows mapped drives and UNC shares are documented in
+    ``docs/WINDOWS_SUPPORT.md`` as supported storage layouts.
+
+    Codex #1388 P2 (r3663816324): before this fix, ``_candidate`` only
+    matched POSIX ``/Volumes``, ``/mnt``, ``/media`` prefixes. A
+    disconnected SMB share on Windows (mapped drive ``Z:\\photos`` or
+    UNC ``\\\\server\\share\\photos``) would therefore never produce a
+    mount-root candidate, ``_source_offline_reason`` would fall through
+    to the folder-scoped branch, and classify would keep reissuing
+    reads across the dead share instead of pausing the run for
+    reconnection.
+    """
+    from pipeline_job import _archive_mount_root_candidates
+
+    drive_cands = _archive_mount_root_candidates(r"Z:\photos\raw\DSC_0001.NEF")
+    assert "Z:/" in drive_cands, (
+        f"A Windows mapped-drive path must yield ``Z:/`` (trailing separator "
+        f"so ``os.path.ismount`` accepts it) as a mount-root candidate. "
+        f"Got {drive_cands!r}."
+    )
+
+    unc_cands = _archive_mount_root_candidates(
+        r"\\photos-nas\raw\2026\DSC_0001.NEF",
+    )
+    assert "//photos-nas/raw" in unc_cands, (
+        f"A UNC share path must yield ``//<server>/<share>`` as a mount-root "
+        f"candidate — that's the reconnect boundary the user names when the "
+        f"share drops. Got {unc_cands!r}."
+    )
+
+    # A drive letter with only ``Z:`` and no path underneath still names
+    # a mount root — this covers the corner case where an image path was
+    # itself just ``Z:\image.jpg``.
+    bare_drive = _archive_mount_root_candidates(r"C:\photo.jpg")
+    assert "C:/" in bare_drive, (
+        f"A bare drive-letter path must still yield its drive root; got "
+        f"{bare_drive!r}."
+    )
+
+
+def test_source_offline_reason_flags_disconnected_windows_share(monkeypatch):
+    """A disconnected Windows SMB share must scope its outage to the mount.
+
+    Codex #1388 P2 (r3663816324): without recognising ``Z:/`` and
+    ``//server/share`` as mount roots, ``_source_offline_reason`` would
+    fall through to the folder-scoped branch when the share drops, and
+    classify would skip folder-by-folder while every read into the dead
+    share still failed instantly. Pin that the mount-scoped path fires
+    for both Windows storage shapes so classify pauses for reconnection
+    instead.
+    """
+    import pipeline_job
+
+    folder = r"Z:\photos\2026-07-27"
+    image = folder + r"\DSC_0001.NEF"
+
+    real_isdir = pipeline_job.os.path.isdir
+    real_lexists = pipeline_job.os.path.lexists
+
+    def fake_isdir(path):
+        if path == folder:
+            return False
+        return real_isdir(path)
+
+    def fake_lexists(path):
+        # Windows disconnects a mapped drive by removing the drive
+        # letter entirely — the standard ``lexists`` False path in
+        # ``_mount_root_offline`` covers that.
+        if path == "Z:/":
+            return False
+        return real_lexists(path)
+
+    monkeypatch.setattr(pipeline_job.os.path, "isdir", fake_isdir)
+    monkeypatch.setattr(pipeline_job.os.path, "lexists", fake_lexists)
+
+    result = pipeline_job._source_offline_reason(folder, image)
+    assert result is not None, (
+        "A Windows mapped-drive path whose folder no longer resolves and "
+        "whose drive letter is gone must register as an offline source."
+    )
+    scope, reason = result
+    assert scope == "mount", (
+        f"A disconnected Windows share must scope offline to the mount so "
+        f"the whole run pauses for reconnection; got scope {scope!r}."
+    )
+    assert "Z:" in reason, (
+        f"The reason must name the drive the user needs to reconnect; got "
+        f"{reason!r}."
+    )
+
+
 def test_pipeline_classify_pauses_when_source_volume_disappears(
     tmp_path, monkeypatch,
 ):
@@ -13024,6 +13116,216 @@ def test_pipeline_classify_resumes_after_source_volume_reconnects(
     assert "unreachable" not in summaries, (
         f"After a successful resume nothing should still be reported as "
         f"unreachable — the retry classified it; got {summaries!r}"
+    )
+
+
+def test_pipeline_classify_resets_pause_budget_after_successful_recovery(
+    tmp_path, monkeypatch,
+):
+    """A successful reconnect must refund the pause budget for later outages.
+
+    Codex #1388 P2 (r3663816327): ``source_offline["pauses"]`` counts
+    every pause the run takes for a dead source and gives up once the
+    counter reaches ``_MAX_SOURCE_OFFLINE_PAUSES``. The intent is to
+    protect against a user who keeps pressing Resume without actually
+    remounting the share — an infinite pause/retry ping-pong.
+
+    Pre-fix, the counter never reset even when the user genuinely
+    reconnected and the retry succeeded. On a long classification run
+    over a share that drops and recovers several times (or over several
+    volumes that drop separately), the counter would climb across
+    unrelated outages and a later drop would take the give-up branch on
+    the first pause — the user would never be offered Resume for it,
+    even though the earlier drops were all recovered.
+
+    Pin that after ``_MAX_SOURCE_OFFLINE_PAUSES + 2`` separate
+    drop-and-recover cycles every photo still classifies: a
+    successful retry is proof the share IS back, so the counter can
+    honestly reset.
+    """
+    import classifier as classifier_mod
+    import classify_job
+    import config as cfg
+    import pipeline_job as pj
+    from db import Database
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cfg.CONFIG_PATH = str(tmp_path / "config.json")
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws_id = db._active_workspace_id
+
+    folder_path = str(tmp_path / "photos")
+    os.makedirs(folder_path, exist_ok=True)
+    folder_id = db.add_folder(folder_path)
+    # Enough photos to trigger MORE separate drops than the pause budget
+    # allows in a single continuous outage — without the reset, the run
+    # would give up partway through even though every drop was recovered.
+    n_photos = pj._MAX_SOURCE_OFFLINE_PAUSES + 3
+    photo_ids = []
+    for i in range(n_photos):
+        name = f"photo{i}.jpg"
+        pid = db.add_photo(folder_id, name, ".jpg", 4000 + i, 4_000_000.0 + i)
+        _drop_jpeg(folder_path, name)
+        db.save_detections(
+            pid,
+            [{"box": {"x": 0.1, "y": 0.1, "w": 0.5, "h": 0.5},
+              "confidence": 0.9, "category": "animal"}],
+            detector_model="MegaDetector",
+        )
+        photo_ids.append(pid)
+
+    col_id = db.add_collection(
+        "Test",
+        json.dumps([{"field": "photo_ids", "value": photo_ids}]),
+    )
+
+    _setup_fake_downloaded_model(tmp_path, monkeypatch)
+
+    import labels_fingerprint as lfp
+    monkeypatch.setattr(lfp, "compute_fingerprint", lambda *a, **k: "fp")
+
+    def fake_detect_batch(batch, folders, runner, job, reclassify, db_,
+                          det_conf_threshold=None, already_detected_ids=None,
+                          cached_detections=None):
+        det_map = {}
+        for p in batch:
+            det_map[p["id"]] = [{
+                "id": d["id"],
+                "box_x": d["box_x"], "box_y": d["box_y"],
+                "box_w": d["box_w"], "box_h": d["box_h"],
+                "confidence": d["detector_confidence"],
+                "category": d["category"],
+            } for d in db_.get_detections(p["id"])
+                if d["detector_model"] != "full-image"]
+        return det_map, len(batch), {p["id"] for p in batch}
+
+    monkeypatch.setattr(classify_job, "_detect_batch", fake_detect_batch)
+
+    from PIL import Image as _PILImage
+
+    gone_folder = "/Volumes/DefinitelyNotMounted12345/Raw Files"
+    # ``mounted`` flips False right before each initial read attempt so
+    # every photo trips a fresh drop; ``wait_if_paused`` flips it back
+    # True to model the user remounting the share for the resume.
+    state = {"mounted": True}
+
+    def flaky_prepare_image(photo, folders, detection, vireo_dir=None):
+        if not state["mounted"]:
+            return None, gone_folder, os.path.join(
+                gone_folder, photo["filename"],
+            )
+        # Flip immediately so the NEXT photo also trips a drop. The
+        # current photo already loaded successfully; the drop will be
+        # discovered on the next photo's first read attempt.
+        state["mounted"] = False
+        fp = folders.get(photo["folder_id"], "")
+        return (
+            _PILImage.new("RGB", (16, 16), "black"),
+            fp,
+            os.path.join(fp, photo["filename"]),
+        )
+
+    monkeypatch.setattr(classify_job, "_prepare_image", flaky_prepare_image)
+
+    def fake_flush_batch(batch, clf, model_type, model_name, db_, raw_results,
+                         top_k=1):
+        for entry in batch:
+            raw_results.append({
+                "photo": entry["photo"],
+                "detection_id": entry.get("detection_id"),
+                "folder_path": entry["folder_path"],
+                "image_path": entry["image_path"],
+                "prediction": "Robin",
+                "confidence": 0.9,
+                "timestamp": None,
+                "filename": entry["photo"]["filename"],
+                "embedding": None,
+                "taxonomy": None,
+            })
+        return 0
+
+    monkeypatch.setattr(classify_job, "_flush_batch", fake_flush_batch)
+
+    class FakeClassifier:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def encode_image(self, *args, **kwargs):
+            import numpy as np
+            return np.zeros(512, dtype=np.float32)
+
+    monkeypatch.setattr(classifier_mod, "Classifier", FakeClassifier)
+
+    class ReconnectingRunner(FakeRunner):
+        """The user genuinely remounts the share on every pause."""
+
+        def __init__(self):
+            super().__init__()
+            self.pause_calls = []
+            self._paused = False
+
+        def pause_job(self, job_id):
+            self.pause_calls.append(job_id)
+            self._paused = True
+            return True
+
+        def pause_requested(self, job_id):
+            return self._paused
+
+        def mark_paused(self, job_id):
+            return True
+
+        def wait_if_paused(self, job_id, *, publish_paused=False):
+            state["mounted"] = True   # user reconnects the volume
+            self._paused = False
+            return False
+
+    params = PipelineParams(
+        collection_id=col_id,
+        skip_extract_masks=True,
+        skip_regroup=True,
+    )
+
+    runner = ReconnectingRunner()
+    job = _make_job()
+
+    run_pipeline_job(job, runner, db_path, ws_id, params)
+
+    # Setup sanity: we must have paused MORE times than the fixed budget
+    # allows in a single continuous outage — otherwise this test isn't
+    # exercising the reset path at all.
+    assert len(runner.pause_calls) > pj._MAX_SOURCE_OFFLINE_PAUSES, (
+        f"Setup sanity: this test exercises the pause-budget reset by "
+        f"pausing more than the fixed budget of "
+        f"{pj._MAX_SOURCE_OFFLINE_PAUSES} across separate recovered "
+        f"outages; only {len(runner.pause_calls)} pauses fired."
+    )
+
+    # The heart of the fix: every drop was recovered, so every photo
+    # must be classified. Pre-fix the run would give up after the budget
+    # was spent (~3 photos in), leaving the tail unreachable.
+    stored = db.conn.execute(
+        "SELECT COUNT(DISTINCT d.photo_id) FROM predictions p "
+        "JOIN detections d ON d.id = p.detection_id",
+    ).fetchone()[0]
+    assert stored == n_photos, (
+        f"Every drop was recovered by the user, so every one of the "
+        f"{n_photos} photos must be classified. Only {stored} got "
+        f"predictions — the pause budget wasn't refunded after the "
+        f"successful retries, so the run gave up partway through."
+    )
+
+    # And the terminal errors list must stay clean — a run that recovered
+    # every outage is a successful run.
+    classify_errors = [
+        e for e in (job.get("errors") or [])
+        if isinstance(e, str) and e.startswith("[classify]")
+    ]
+    assert not classify_errors, (
+        f"Every outage was recovered, so no [classify] entry should be "
+        f"latched in the terminal errors list. Got {classify_errors!r}."
     )
 
 

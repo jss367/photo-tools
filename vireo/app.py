@@ -18404,7 +18404,25 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             return json_error(
                 f"Cannot use the download directory {target}: {e.strerror or e}"
             )
-        needed = (asset.get("size") or 0) * 2
+        asset_size = asset.get("size") or 0
+        # A previous cancelled-during-verify attempt leaves the full artifact
+        # already sitting at the final destination — download() fast-paths to
+        # verify in that case and spends zero download bytes.  Counting those
+        # bytes as still-to-be-downloaded blocks the promised retry with a
+        # "not enough space" error even though the retry only needs unpacking
+        # headroom.  Gate on the API-supplied size (same rule download() uses)
+        # so an unrelated file the user dropped in the tools directory does
+        # not get credited against the check.
+        reusable_bytes = 0
+        asset_name = asset.get("name") or ""
+        if asset_name:
+            existing_dest = os.path.join(target, os.path.basename(asset_name))
+            try:
+                if os.path.isfile(existing_dest) and os.path.getsize(existing_dest) == asset_size:
+                    reusable_bytes = asset_size
+            except OSError:
+                reusable_bytes = 0
+        needed = max(0, asset_size * 2 - reusable_bytes)
         if free < needed:
             return json_error(
                 f"Not enough disk space: {needed // (1024 * 1024)} MB needed in "
@@ -18463,11 +18481,21 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             # it. bin_path is only set where the download IS the binary
             # (Linux AppImage); after an installer hand-off the user chooses
             # where the app lands, so there is nothing truthful to record.
+            #
+            # Route the write through _settings_write_lock and the raw
+            # read-modify-write pattern the settings endpoints use.  cfg.set()
+            # takes only config._lock, so a concurrent /api/config save (or an
+            # autosave from the All-settings region) could otherwise interleave
+            # its own read-modify-write with this one and either lose
+            # darktable_bin or overwrite whatever field the user just changed.
             config_written = False
             if result.get("bin_path"):
                 import config as cfg
 
-                cfg.set("darktable_bin", result["bin_path"])
+                with _settings_write_lock:
+                    raw = _read_raw_config_file()
+                    raw["darktable_bin"] = result["bin_path"]
+                    cfg.save(raw)
                 config_written = True
 
             return {

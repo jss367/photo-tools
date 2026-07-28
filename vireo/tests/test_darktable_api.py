@@ -492,6 +492,78 @@ def test_api_job_download_darktable_refuses_without_disk_space(app_and_db, monke
     assert 'free' in error.lower(), f"free space missing from {error!r}"
 
 
+def test_api_job_download_darktable_space_check_reuses_completed_download(
+        app_and_db, monkeypatch):
+    """A cancelled-during-verify retry must not be blocked by the preflight.
+
+    When Stop is pressed during verify_digest, download() has already renamed
+    the .partial to the final destination.  A retry fast-paths straight to
+    verify and spends zero download bytes — but the preflight would still
+    demand 2x the asset size free, so a 178 MB download accepted with 400 MB
+    free would leave 222 MB and then refuse the retry.  Count the reusable
+    file against `needed` so the promised resume path actually works.
+    """
+    import darktable_install
+    app, _ = app_and_db
+    release = _fake_release()
+    asset_size = release["size"]
+    monkeypatch.setattr(darktable_install, "resolve_release", lambda: (release, None))
+
+    # Simulate the cancelled-verify state: the artifact is already on disk
+    # at the API-published size, ready for verify_digest to re-run.
+    target = darktable_install.install_dir()
+    os.makedirs(target, exist_ok=True)
+    completed = os.path.join(target, release["name"])
+    with open(completed, "wb") as f:
+        f.truncate(asset_size)
+
+    # Only unpacking headroom is available — one asset-size, not two.  Without
+    # the reusable-file credit the preflight would reject this.
+    monkeypatch.setattr(darktable_install, "free_space_bytes", lambda p: asset_size)
+
+    def fake_download(asset, **kwargs):
+        return completed, "ok"
+    monkeypatch.setattr(darktable_install, "download", fake_download)
+    monkeypatch.setattr(darktable_install, "hand_off",
+                        lambda p, **k: {"action": "opened-installer",
+                                        "location": p, "bin_path": None})
+    monkeypatch.setattr(darktable_install, "is_quarantined", lambda p: False)
+
+    resp = app.test_client().post('/api/jobs/download-darktable')
+    assert resp.status_code == 200, resp.get_json()
+
+
+def test_api_job_download_darktable_space_check_ignores_wrong_size_stray(
+        app_and_db, monkeypatch):
+    """A stray file of the *wrong* size must not credit the preflight.
+
+    Only the API-published size counts — an unrelated file the user dropped
+    into the tools directory could otherwise sneak past the check and leave
+    the retry stranded on a full disk when download() decides it cannot
+    reuse the bytes.
+    """
+    import darktable_install
+    app, _ = app_and_db
+    release = _fake_release()
+    monkeypatch.setattr(darktable_install, "resolve_release", lambda: (release, None))
+
+    target = darktable_install.install_dir()
+    os.makedirs(target, exist_ok=True)
+    stray = os.path.join(target, release["name"])
+    with open(stray, "wb") as f:
+        f.truncate(1024)  # wrong size — not a reusable download
+
+    monkeypatch.setattr(darktable_install, "free_space_bytes", lambda p: 1024)
+
+    def must_not_download(*a, **k):
+        raise AssertionError("preflight must refuse when the stray is unusable")
+    monkeypatch.setattr(darktable_install, "download", must_not_download)
+
+    resp = app.test_client().post('/api/jobs/download-darktable')
+    assert resp.status_code == 400
+    assert 'space' in resp.get_json()['error'].lower()
+
+
 def test_api_job_download_darktable_400_when_the_target_dir_is_unusable(
         app_and_db, monkeypatch):
     """A read-only home must not 500 a button press.
@@ -697,6 +769,78 @@ def test_api_job_download_darktable_writes_config_when_handoff_returns_bin(
     # And the result must say the write happened, so the UI can report it.
     assert job['result']['config_written'] is True
     assert job['result']['bin_path'] == bin_path
+
+
+def test_api_job_download_darktable_config_write_stays_raw_not_pinned(
+        app_and_db, monkeypatch):
+    """The bin_path write must not pin every DEFAULTS value into config.json.
+
+    Regression: the earlier path wrote via ``cfg.set()`` (load-modify-save on
+    the merged config), which pinned the current default for every setting
+    the user had never touched — silently blocking future default upgrades.
+    Routing through ``_settings_write_lock`` + raw read-modify-write leaves
+    the file minimal, the same way every other settings endpoint writes.
+    """
+    import config as cfg
+    app, _ = app_and_db
+    bin_path = "/tmp/darktable-5.6.0-x86_64.AppImage"
+    _stub_happy_path(monkeypatch, hand_off_result={
+        "action": "installed", "location": bin_path, "bin_path": bin_path,
+    })
+
+    client = app.test_client()
+    job_id = client.post('/api/jobs/download-darktable').get_json()['job_id']
+    from wait import wait_for_job_via_client
+    wait_for_job_via_client(client, job_id)
+
+    # Read the on-disk file directly, not through cfg.load()/cfg.get(): those
+    # deep-merge DEFAULTS in and would hide a pinned-defaults regression.
+    with open(cfg.CONFIG_PATH) as f:
+        raw = json.load(f)
+    assert raw.get("darktable_bin") == bin_path
+    # If cfg.set had been used, raw would carry every DEFAULTS key (e.g.
+    # thumbnail_size, preview_max_size, DEFAULTS["pipeline"], ...).
+    assert "thumbnail_size" not in raw, (
+        f"config write pinned unrelated defaults into config.json: {sorted(raw.keys())}"
+    )
+    assert "pipeline" not in raw, (
+        f"config write pinned the DEFAULTS pipeline block: {sorted(raw.keys())}"
+    )
+
+
+def test_api_job_download_darktable_config_write_preserves_other_user_settings(
+        app_and_db, monkeypatch):
+    """A user setting saved through /api/config must survive the download.
+
+    Both writers use the raw read-modify-write pattern under
+    ``_settings_write_lock``, so nothing on the on-disk file is lost when the
+    download finishes right after a settings save.
+    """
+    import config as cfg
+    app, _ = app_and_db
+    client = app.test_client()
+
+    # Persist a user setting the normal way — the settings endpoint uses
+    # _settings_write_lock + raw read-modify-write.
+    resp = client.post('/api/config',
+                       data=json.dumps({"darktable_style": "Wildlife"}),
+                       content_type='application/json')
+    assert resp.status_code == 200
+
+    bin_path = "/tmp/darktable-5.6.0-x86_64.AppImage"
+    _stub_happy_path(monkeypatch, hand_off_result={
+        "action": "installed", "location": bin_path, "bin_path": bin_path,
+    })
+
+    job_id = client.post('/api/jobs/download-darktable').get_json()['job_id']
+    from wait import wait_for_job_via_client
+    wait_for_job_via_client(client, job_id)
+
+    # Both the new value and the pre-existing one must be on disk.
+    with open(cfg.CONFIG_PATH) as f:
+        raw = json.load(f)
+    assert raw.get("darktable_bin") == bin_path
+    assert raw.get("darktable_style") == "Wildlife"
 
 
 def test_api_job_download_darktable_leaves_config_alone_without_bin(

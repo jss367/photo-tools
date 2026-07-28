@@ -247,8 +247,10 @@ def test_api_darktable_status_checked_paths_names_linux_tools_dir(app_and_db, mo
 
     data = app.test_client().get('/api/darktable/status').get_json()
 
-    tools_dir = os.path.expanduser("~/.vireo/tools/darktable")
-    assert tools_dir in data['checked_paths']
+    # Use the same helper the route uses so path-separator conventions match on
+    # Windows (os.path.join is bound at import time and ignores monkeypatched
+    # os.name, so a hand-built "~/.vireo/tools/darktable" would drift here).
+    assert develop.darktable_tools_dir() in data['checked_paths']
 
 
 def test_api_darktable_status_checked_paths_omits_linux_tools_dir_on_macos(app_and_db, monkeypatch):
@@ -261,8 +263,7 @@ def test_api_darktable_status_checked_paths_omits_linux_tools_dir_on_macos(app_a
 
     data = app.test_client().get('/api/darktable/status').get_json()
 
-    tools_dir = os.path.expanduser("~/.vireo/tools/darktable")
-    assert tools_dir not in data['checked_paths']
+    assert develop.darktable_tools_dir() not in data['checked_paths']
     assert data['checked_paths'], "checked_paths must never be empty"
 
 

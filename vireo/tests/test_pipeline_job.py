@@ -12976,6 +12976,17 @@ def test_still_offline_folder_ids_expands_beyond_seed_photos(tmp_path):
     )
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason=(
+        "POSIX mount-shape only: on Windows, ``symlink_to('/Volumes/NAS/photos')`` "
+        "treats the target as rooted on the current drive, so ``realpath`` yields "
+        "``C:\\Volumes\\NAS\\photos`` and the drive-letter branch matches instead "
+        "of ``/Volumes/NAS``. The Windows-shape equivalents are exercised by "
+        "``test_archive_mount_root_candidates_recognises_windows_paths`` and "
+        "``test_source_offline_reason_flags_disconnected_windows_share``."
+    ),
+)
 def test_archive_mount_root_candidates_resolves_symlink_aliases(tmp_path):
     """A symlink alias to a mount root must retain mount scope.
 

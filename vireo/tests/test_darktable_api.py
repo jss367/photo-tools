@@ -1093,6 +1093,50 @@ def test_api_job_download_darktable_binds_to_the_confirmed_asset(app_and_db, mon
     assert "5.7.0" in body['error']
 
 
+def test_api_job_download_darktable_409_refreshes_the_availability_cache(
+        app_and_db, monkeypatch):
+    """After a 409 the UI's Re-check must not hit the same stale asset again.
+
+    The availability endpoint caches for 10 minutes.  Without the refresh, a
+    Re-check between the POST that returned 409 and the TTL expiring would
+    hand back the same cached name, the user would re-confirm the same
+    identity, and the endpoint would 409 in a loop until the TTL elapsed.
+    """
+    import darktable_install
+    app, _ = app_and_db
+
+    stale = _fake_release("5.6.0")
+    fresh = dict(_fake_release("5.7.0"))
+    fresh["name"] = "darktable-5.7.0-arm64.dmg"
+
+    # Seed the availability cache with the stale release, as if /install/available
+    # ran once at dialog-open time and pinned 5.6.0.
+    darktable_install._release_cache.update(at=time.monotonic(), value=stale)
+    # The uncached resolver the POST handler calls returns the fresh release.
+    monkeypatch.setattr(darktable_install, "resolve_release", lambda: (fresh, None))
+
+    client = app.test_client()
+    resp = client.post(
+        '/api/jobs/download-darktable',
+        data=json.dumps({
+            "expected_version": stale["version"],
+            "expected_name": stale["name"],
+            "expected_digest": stale["digest"],
+        }),
+        content_type='application/json',
+    )
+    assert resp.status_code == 409
+    assert resp.get_json()['code'] == 'darktable_asset_changed'
+
+    # After the 409, /install/available must reflect the fresh release,
+    # not the pre-POST cached one — otherwise the client's Re-check would
+    # confirm the same stale asset and 409 again.
+    data = client.get('/api/darktable/install/available').get_json()
+    assert data['available'] is True
+    assert data['name'] == "darktable-5.7.0-arm64.dmg"
+    assert data['version'] == "5.7.0"
+
+
 def test_api_job_download_darktable_proceeds_when_expected_matches(
         app_and_db, monkeypatch):
     """The confirmation binding must not break the normal flow: when the

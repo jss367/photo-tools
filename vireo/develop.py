@@ -126,12 +126,22 @@ def darktable_search_paths():
     if darktable_uses_tools_dir():
         # Linux: an AppImage we installed ourselves. Newest mtime wins, since
         # installers are kept and this directory accumulates versions.
+        #
+        # The exec bit is the hand-off marker: a download cancelled during
+        # digest verification (or right before hand_off) leaves the AppImage
+        # at its final .AppImage path with the default 0o644 mode urllib
+        # writes.  Reporting it here would make /api/darktable/status say
+        # darktable is installed, hide the Try again affordance, and hand a
+        # non-executable file to darktable-cli for every RAW export.  Gating
+        # on os.X_OK matches what hand_off actually sets — no separate marker
+        # file to drift or clean up.
         tools_dir = darktable_tools_dir()
         if os.path.isdir(tools_dir):
             appimages = [
                 os.path.join(tools_dir, n)
                 for n in os.listdir(tools_dir)
                 if n.endswith(".AppImage")
+                and os.access(os.path.join(tools_dir, n), os.X_OK)
             ]
             appimages.sort(key=_mtime_or_missing, reverse=True)
             candidates.extend(appimages)

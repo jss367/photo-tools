@@ -485,6 +485,10 @@ def test_darktable_search_paths_linux_orders_appimages_newest_first(tmp_path, mo
     newer = tools_dir / "darktable-5.0.AppImage"
     older.write_bytes(b"old")
     newer.write_bytes(b"new")
+    # Match hand_off's post-download chmod: search_paths gates on the exec
+    # bit precisely to skip AppImages that never got there.
+    older.chmod(0o755)
+    newer.chmod(0o755)
     os.utime(older, (1_000_000, 1_000_000))
     os.utime(newer, (2_000_000, 2_000_000))
 
@@ -501,6 +505,7 @@ def test_darktable_search_paths_linux_ignores_non_appimages(tmp_path, monkeypatc
     tools_dir.mkdir(parents=True)
     appimage = tools_dir / "darktable-5.0.AppImage"
     appimage.write_bytes(b"app")
+    appimage.chmod(0o755)
     (tools_dir / "darktable-5.0.AppImage.part").write_bytes(b"partial")
     (tools_dir / "SHA256SUMS").write_bytes(b"sums")
     (tools_dir / "README.txt").write_bytes(b"readme")
@@ -508,6 +513,28 @@ def test_darktable_search_paths_linux_ignores_non_appimages(tmp_path, monkeypatc
     _force_linux_tools_dir(monkeypatch, tools_dir)
 
     assert darktable_search_paths() == [str(appimage)]
+
+
+def test_darktable_search_paths_linux_ignores_non_executable_appimages(tmp_path, monkeypatch):
+    """A download cancelled during digest verification leaves the AppImage at
+    its final path but with the default non-executable mode (hand_off never
+    ran the chmod).  find_darktable would otherwise report the abandoned file
+    as darktable — the Try again button would hide and every RAW export would
+    invoke darktable-cli on an unrunnable file."""
+    from develop import darktable_search_paths
+
+    tools_dir = tmp_path / "tools" / "darktable"
+    tools_dir.mkdir(parents=True)
+    installed = tools_dir / "darktable-5.6.AppImage"
+    abandoned = tools_dir / "darktable-5.7.AppImage"
+    installed.write_bytes(b"app")
+    installed.chmod(0o755)
+    abandoned.write_bytes(b"app")
+    abandoned.chmod(0o644)  # what urllib leaves it as; hand_off's chmod never ran
+
+    _force_linux_tools_dir(monkeypatch, tools_dir)
+
+    assert darktable_search_paths() == [str(installed)]
 
 
 def test_darktable_search_paths_linux_missing_dir_is_empty(tmp_path, monkeypatch):
@@ -534,7 +561,9 @@ def test_darktable_search_paths_linux_survives_vanishing_appimage(tmp_path, monk
     survivor = tools_dir / "darktable-5.0.AppImage"
     vanished = tools_dir / "darktable-4.6.AppImage"
     survivor.write_bytes(b"app")
+    survivor.chmod(0o755)
     vanished.write_bytes(b"doomed")
+    vanished.chmod(0o755)
 
     _force_linux_tools_dir(monkeypatch, tools_dir)
 

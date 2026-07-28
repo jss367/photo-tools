@@ -225,6 +225,25 @@ def resolve_release_cached():
     return release, reason
 
 
+def update_release_cache(release):
+    """Overwrite the cached release with a freshly resolved one.
+
+    Called by the download endpoint when its uncached resolve_release() has
+    already proved the stored value stale — the asset the user just confirmed
+    disagrees with what darktable-org is publishing right now.  Without this,
+    the client's Re-check would hit /install/available, get the same
+    ten-minute-old cached asset back, re-confirm it, and receive the same 409
+    in a loop until the TTL expires.  Writing the fresh release here means the
+    next Re-check shows what the server actually intends to download.
+
+    Does nothing on a falsy release: a failed resolution must never pin the
+    fallback link (mirrors resolve_release_cached's "only cache successes").
+    """
+    if not release:
+        return
+    _release_cache.update(at=time.monotonic(), value=release)
+
+
 # Read the asset a megabyte at a time: these builds are 87-178MB and hashing
 # happens right after the download, so f.read() with no size would hold the
 # whole file in RAM on top of whatever the download already cost.

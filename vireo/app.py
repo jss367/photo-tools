@@ -18377,6 +18377,11 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             or (expected_version and expected_version != asset.get("version"))
             or (expected_digest and expected_digest != asset.get("digest"))
         ):
+            # Refresh the availability cache with the release we just resolved.
+            # Without this, the UI's Re-check would fetch /install/available,
+            # get the same ten-minute-old cached asset back, re-confirm it, and
+            # get bounced by the same 409 in a loop until the TTL expires.
+            darktable_install.update_release_cache(asset)
             return json_error(
                 (
                     "The darktable release changed since this dialog opened. "
@@ -18548,6 +18553,11 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             # already-running worker.
             existing_config = (existing_snapshot or {}).get("config") or {}
             if not _artifact_matches(existing_config):
+                # Same reason as above: the cache may hold whatever asset the
+                # first tab's download targeted, so a Re-check without this
+                # refresh would re-render the stale identity and the user
+                # would re-confirm it into the same 409.
+                darktable_install.update_release_cache(asset)
                 return json_error(
                     (
                         "A different darktable download is already in progress "

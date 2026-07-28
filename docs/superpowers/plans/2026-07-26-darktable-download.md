@@ -1595,13 +1595,23 @@ async function loadDarktableStatus() {
         '  </div>' +
         '  <div id="dtProgressText" style="font-size:12px;color:var(--text-dim);margin-top:4px;"></div>' +
         '</div>';
+      // The user's OWN configured path is the highest-priority probe and the
+      // one they are most likely asking about. find_darktable falls through
+      // silently when darktable_bin points at a path that no longer exists
+      // (develop.py), and checked_paths deliberately does not include it — so
+      // say it explicitly, or the panel never answers the actual question.
+      if (data.configured_bin) {
+        el.innerHTML += '<div style="color:var(--danger);font-size:12px;margin-top:6px;">' +
+          'Configured path not found: ' + escapeHtml(data.configured_bin) + '</div>';
+      }
       // Say where we looked, so a bare ✗ can explain itself.
+      // 'Checked:' not 'Checked PATH and:' — element 0 of checked_paths is
+      // already "$PATH (darktable-cli)" (Task 2 composes it in), so the older
+      // prefix named PATH twice and implied the rest were additional to it.
+      // Task 2 also guarantees the list is never empty, so no else branch.
       if (data.checked_paths && data.checked_paths.length) {
         el.innerHTML += '<div style="font-size:11px;color:var(--text-ghost);margin-top:6px;">' +
-          'Checked PATH and: ' + data.checked_paths.map(escapeHtml).join(', ') + '</div>';
-      } else {
-        el.innerHTML += '<div style="font-size:11px;color:var(--text-ghost);margin-top:6px;">' +
-          'Checked PATH for darktable-cli.</div>';
+          'Checked: ' + data.checked_paths.map(escapeHtml).join(', ') + '</div>';
       }
       needsGetOption = true;
     }

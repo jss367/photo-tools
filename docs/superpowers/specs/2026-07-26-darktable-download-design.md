@@ -360,7 +360,21 @@ def _download_with_resume(url, dest_path, progress_callback=None,
 - `POST /api/jobs/download-darktable` → JobRunner job, following the
   `api_job_develop` shape at `app.py:25519-25520`.
 - `GET /api/darktable/status` (existing, `app.py:15910-15930`) gains a
-  `checked_paths` field populated from `darktable_search_paths()`.
+  `checked_paths` field **composed by the route**, not returned raw from
+  `darktable_search_paths()`. The invariant is *every entry names a location
+  `find_darktable` genuinely probes* — which is why the route may add entries
+  the detector's own list does not contain:
+  - `"$PATH (darktable-cli)"`, because `find_darktable` tries `shutil.which`
+    before any filesystem candidate. Omitting it would make "we checked here"
+    untrue by omission, and it is the probe most likely to explain a Homebrew
+    or distro user's miss.
+  - the Linux tools directory, because `darktable_search_paths()` returns only
+    AppImages *already present* there — so a fresh Linux box would otherwise
+    get an empty list, on exactly the platform the download targets.
+
+  Do not "simplify" this to return the detector's list directly; both of the
+  above are load-bearing. The configured path stays out of `checked_paths` and
+  is surfaced separately by the UI from the existing `configured_bin` field.
 
 Both new routes are added to `vireo/tests/contracts/routes.txt`. The job emits
 progress via the shared `progress_event()` / `failure_event()` helpers in

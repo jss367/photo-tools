@@ -844,12 +844,18 @@ def test_hand_off_default_platform_agrees_with_develop(tmp_path, monkeypatch):
 
     result = hand_off(str(artifact))
 
+    # os.access(..., X_OK) is Unix-specific: Windows has no execute bit and
+    # returns True for any existing file, so the "did chmod run" cross-check
+    # only means anything on POSIX. bin_path is the platform-agnostic signal
+    # for whether hand_off took the tools-dir branch.
     if develop.darktable_uses_tools_dir():
         assert result["bin_path"] == str(artifact)
-        assert os.access(str(artifact), os.X_OK)
+        if os.name != "nt":
+            assert os.access(str(artifact), os.X_OK)
     else:
         assert result["bin_path"] is None
-        assert not os.access(str(artifact), os.X_OK)
+        if os.name != "nt":
+            assert not os.access(str(artifact), os.X_OK)
 
 
 def test_is_quarantined_false_for_plain_file(tmp_path):

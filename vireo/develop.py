@@ -78,8 +78,13 @@ def darktable_tools_dir():
     A function rather than a module constant so tests (and any caller that
     relocates HOME) can patch os.path.expanduser and still be obeyed; a
     constant would freeze the expansion at import time.
+
+    Built with os.path.join, not by embedding "/" in the literal, so Windows
+    gets native backslashes throughout: the settings panel shows this path in
+    the "checked here" list, and the mixed-separator form from expanding a
+    forward-slash literal reads as broken.
     """
-    return os.path.expanduser("~/.vireo/tools/darktable")
+    return os.path.join(os.path.expanduser("~"), ".vireo", "tools", "darktable")
 
 
 def darktable_uses_tools_dir():

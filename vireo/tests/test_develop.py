@@ -463,16 +463,16 @@ def _force_linux_tools_dir(monkeypatch, tools_dir):
 
     A Linux box is os.name == "posix" *and* sys.platform == "linux"; pin both
     so this exercises the AppImage branch on macOS and Windows CI legs too.
+
+    Redirects darktable_tools_dir() rather than patching expanduser: the
+    function composes the path with os.path.join for native separators, so
+    an expanduser mock keyed on a specific literal would no longer intercept.
     """
     import develop
 
     monkeypatch.setattr(develop.os, "name", "posix")
     monkeypatch.setattr("sys.platform", "linux")
-    monkeypatch.setattr(
-        develop.os.path,
-        "expanduser",
-        lambda p: str(tools_dir) if p == "~/.vireo/tools/darktable" else p,
-    )
+    monkeypatch.setattr(develop, "darktable_tools_dir", lambda: str(tools_dir))
 
 
 def test_darktable_search_paths_linux_orders_appimages_newest_first(tmp_path, monkeypatch):

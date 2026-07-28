@@ -16353,3 +16353,127 @@ def test_pipeline_classify_source_offline_give_up_marks_per_model_step_failed(
         f"The error message must name the outage as source-related; "
         f"got {kwargs['error']!r}"
     )
+
+
+def test_pipeline_extract_masks_offline_survives_finalizer_override(
+    tmp_path, monkeypatch,
+):
+    """A mask-stage-owned outage must stay ``failed`` through finalization.
+
+    Codex #1388 P1 (r3665130244): when classify is fully cached (or skipped)
+    but masks are still needed from an offline folder, ``extract_masks_stage``
+    latches ``stages["extract_masks"]["status"] = "failed"`` in its
+    source-offline branch. But the finalizer at the bottom of the stage
+    derives ``final_status`` solely from ``em_failed``: because the offline
+    photos were pre-filtered from the worklist, ``em_failed`` is 0, so the
+    finalizer flips the stage back to ``"completed"`` — silently erasing
+    the outage. The end-of-run rollup only reads stage ``status`` values,
+    so the whole job then reports "successfully completed" while the
+    ``[extract_masks] Fatal:`` error sits in the errors list with no
+    corresponding failed stage to surface it.
+
+    Skip classify entirely to reproduce the fully-cached scenario without
+    also having to seed classifier_runs rows: the bug is not about how
+    the mask stage learns about the offline source, only about whether
+    its ``failed`` verdict survives its own finalizer.
+    """
+    import shutil
+
+    import config as cfg
+    from db import Database
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cfg.CONFIG_PATH = str(tmp_path / "config.json")
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws_id = db._active_workspace_id
+
+    folder_path = str(tmp_path / "photos")
+    os.makedirs(folder_path, exist_ok=True)
+    folder_id = db.add_folder(folder_path)
+    photo_ids = []
+    for i in range(3):
+        name = f"photo{i}.jpg"
+        pid = db.add_photo(folder_id, name, ".jpg", 4000 + i, 4_000_000.0 + i)
+        _drop_jpeg(folder_path, name)
+        db.save_detections(
+            pid,
+            [{"box": {"x": 0.1, "y": 0.1, "w": 0.5, "h": 0.5},
+              "confidence": 0.9, "category": "animal"}],
+            detector_model="MegaDetector",
+        )
+        photo_ids.append(pid)
+
+    col_id = db.add_collection(
+        "Test",
+        json.dumps([{"field": "photo_ids", "value": photo_ids}]),
+    )
+
+    # Delete the folder from disk AFTER seeding the DB. _still_offline_folder_ids_of
+    # probes the folder's stored path via os.path.isdir — an absent directory
+    # is exactly what a dropped SMB share looks like from userspace.
+    shutil.rmtree(folder_path)
+
+    # Skip classify (and thus model_loader). extract_masks_stage runs
+    # against the collection photos with no ``source_offline_state``
+    # seeded by classify, and must detect the outage on its own via the
+    # folder probe — the exact scenario Codex called out for the
+    # fully-cached path.
+    params = PipelineParams(
+        collection_id=col_id,
+        skip_classify=True,
+        skip_extract_masks=False,
+        skip_regroup=True,
+    )
+
+    runner = FakeRunner()
+    job = _make_job()
+
+    with pytest.raises(RuntimeError) as excinfo:
+        run_pipeline_job(job, runner, db_path, ws_id, params)
+
+    # The rollup at the bottom of run_pipeline_job derives failure state
+    # ONLY from stage statuses in ``stages`` — it does NOT scan errors
+    # for ``[extract_masks] Fatal:`` entries. So this RuntimeError firing
+    # at all is the load-bearing assertion: the finalizer preserved
+    # ``failed`` rather than overwriting it with ``completed``.
+    assert "extract_masks" in str(excinfo.value).lower(), (
+        f"The job's headline error must name extract_masks as the failed "
+        f"stage; got {excinfo.value!r}"
+    )
+
+    # The user-visible step update must also land as ``failed`` — the Jobs
+    # page reads status from step updates, and a ``completed`` step here
+    # would render a collapsed green row on a run that produced no masks.
+    em_step_updates = [
+        kwargs for (_jid, sid, kwargs) in runner.step_updates
+        if sid == "extract_masks" and "status" in kwargs
+    ]
+    assert em_step_updates, (
+        "Setup sanity: no extract_masks step updates fired at all."
+    )
+    terminal_em = em_step_updates[-1]
+    assert terminal_em.get("status") == "failed", (
+        f"The mask-stage terminal step update must be 'failed' — "
+        f"'completed' would leave a green, collapsed row on a run that "
+        f"never produced masks (Codex #1388 P1 r3665130244). Got "
+        f"status={terminal_em.get('status')!r} summary="
+        f"{terminal_em.get('summary')!r}"
+    )
+
+    # And the Fatal error must be preserved in the job's errors list so
+    # the pipeline UI can render the offline diagnostic under the card.
+    em_fatal = [
+        e for e in (job.get("errors") or [])
+        if isinstance(e, str) and e.startswith("[extract_masks] Fatal:")
+    ]
+    assert em_fatal, (
+        f"A source-offline mask stage must record a [extract_masks] "
+        f"Fatal: entry so the end-of-run rollup can name it as the "
+        f"headline error; got errors={job.get('errors')!r}"
+    )
+    assert "source offline" in em_fatal[0].lower(), (
+        f"The extract_masks Fatal error must name the outage as "
+        f"source-offline; got {em_fatal[0]!r}"
+    )

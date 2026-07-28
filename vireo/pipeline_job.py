@@ -5449,6 +5449,17 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
             runner.update_step(job["id"], "extract_masks", status="running")
             _update_stages(runner, job["id"], stages)
 
+            # Latched by the source-offline branch when the mask stage owns
+            # the outage (fully-cached classify + offline masks folder). The
+            # finalizer below preserves ``failed`` when this is set: without
+            # it, ``em_failed`` is zero (offline photos are pre-filtered from
+            # the worklist), and the finalizer flips the stage back to
+            # ``completed`` — silently masking the outage. The end-of-run
+            # rollup at ~L7005 reads only stage ``status`` values, so the job
+            # would complete "successfully" with the missing masks folded
+            # away in ``errors`` (Codex #1388 P1 r3665130244).
+            em_offline_latched = False
+
             try:
                 import config as cfg
                 from dino_embed import embed, embed_batch, embedding_to_blob
@@ -5570,6 +5581,12 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                             f"Process again to extract the rest."
                         )
                         stages["extract_masks"]["status"] = "failed"
+                        # Survive the em_failed==0 finalizer at the bottom
+                        # of this stage — the offline photos were removed
+                        # from the worklist above, so the per-photo failure
+                        # counter would otherwise flip the stage back to
+                        # ``completed`` (Codex #1388 P1 r3665130244).
+                        em_offline_latched = True
                     log.warning(
                         "Extract-masks: dropped %d photo(s) from %d "
                         "offline folder(s); source not reachable.",
@@ -6124,7 +6141,11 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                         "total": total, "cancelled": True,
                     }
                 else:
-                    final_status = "failed" if em_failed > 0 else "completed"
+                    final_status = (
+                        "failed"
+                        if em_failed > 0 or em_offline_latched
+                        else "completed"
+                    )
                     stages["extract_masks"]["status"] = final_status
                     em_rollup = (
                         f"[extract_masks] {em_failed} of {total} photos failed mask extraction"

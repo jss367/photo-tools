@@ -3949,7 +3949,59 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                 # pause/retry loop.
                 source_offline: dict = {"reason": None, "pauses": 0}
 
-                def _handle_source_offline(reason):
+                def _publish_pause_reason(reason, step_id):
+                    """Surface the offline reason on transient progress/pause state.
+
+                    Codex #1388 P1 r3663383513: the pause itself was only
+                    reported via server-side log; the jobs UI showed a generic
+                    ``paused`` state with no indication of *why* classify
+                    parked, so users could not tell they needed to remount a
+                    named volume and might keep pressing Resume until the
+                    bounded retry budget converted a recoverable outage into a
+                    failed run. Publish the reason via the progress event
+                    (mirrored onto ``job['progress']`` for /api/jobs polls and
+                    the SSE stream alike) and set the classify step's
+                    ``current_file`` so the reason renders directly beneath
+                    the paused pipeline step, right next to the Resume button.
+                    Kept off ``errors`` so a successful resume still finalizes
+                    as ``completed``.
+                    """
+                    message = (
+                        f"Paused: source {reason}. Reconnect it and press "
+                        f"Resume to keep classifying."
+                    )
+                    if step_id is not None:
+                        with contextlib.suppress(Exception):
+                            runner.update_step(
+                                job["id"], step_id, current_file=message,
+                            )
+                    _emit_progress(
+                        runner, job["id"], stages, "classify",
+                        message,
+                        step_id=step_id,
+                        pause_reason=message,
+                    )
+
+                def _clear_pause_reason(step_id):
+                    """Drop the pause banner once the user has resumed.
+
+                    Leaving a stale ``pause_reason`` on ``job['progress']``
+                    after a successful reconnect would keep the "reconnect
+                    and Resume" banner visible while classify happily runs.
+                    """
+                    if step_id is not None:
+                        with contextlib.suppress(Exception):
+                            runner.update_step(
+                                job["id"], step_id, current_file="",
+                            )
+                    _emit_progress(
+                        runner, job["id"], stages, "classify",
+                        "Resumed classification",
+                        step_id=step_id,
+                        pause_reason=None,
+                    )
+
+                def _handle_source_offline(reason, step_id=None):
                     """Park on a dead source; report whether we may continue.
 
                     Returns True when the run was paused and then resumed, so
@@ -3973,6 +4025,12 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                     # that never comes back still surfaces a real terminal
                     # error, and a run that does come back does not.
                     log.warning("Classify paused: source offline (%s)", reason)
+                    # Publish BEFORE calling pause_job so the reason is already
+                    # in job['progress'] by the time the UI reacts to the
+                    # ``pausing`` status flip. Otherwise the banner would only
+                    # appear after the next progress event, which for a fully
+                    # blocked read might be minutes away.
+                    _publish_pause_reason(reason, step_id)
 
                     pause = getattr(runner, "pause_job", None)
                     paused = False
@@ -3980,12 +4038,31 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                         with contextlib.suppress(Exception):
                             paused = bool(pause(job["id"]))
                     if not paused:
-                        # Nothing to park on (non-pausable job, or a direct
-                        # run_pipeline_job call in a test). Stop rather than
-                        # spin through the rest of the collection collecting
-                        # instant EIOs.
-                        source_offline["reason"] = reason
-                        return False
+                        # ``pause_job`` returns False in two very different
+                        # cases: (a) the job is not pausable at all — a
+                        # non-pausable pipeline or a direct
+                        # ``run_pipeline_job`` call in a test — genuinely
+                        # nothing to park on, and (b) the user already
+                        # pressed Pause while this network read was blocked,
+                        # so the job's public state is already ``pausing``
+                        # and a second pause request is a no-op. Treating (b)
+                        # as "can't pause" would waste the user's Pause
+                        # click by giving up instead of parking (Codex
+                        # #1388 P2 r3663383518); check
+                        # ``pause_requested`` and fall through to the
+                        # checkpoint so the run parks on the user's
+                        # already-in-flight request.
+                        pause_probe = getattr(runner, "pause_requested", None)
+                        already_pausing = False
+                        if pause_probe is not None:
+                            with contextlib.suppress(Exception):
+                                already_pausing = bool(pause_probe(job["id"]))
+                        if not already_pausing:
+                            # Nothing to park on. Stop rather than spin
+                            # through the rest of the collection
+                            # collecting instant EIOs.
+                            source_offline["reason"] = reason
+                            return False
 
                     # Blocks here until the user resumes or cancels. Classify
                     # is a registered pause participant, so this is the same
@@ -3993,6 +4070,9 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                     if _pause_checkpoint():
                         source_offline["reason"] = reason
                         return False
+                    # Successful resume: drop the stale "reconnect and Resume"
+                    # banner before the caller retries the read.
+                    _clear_pause_reason(step_id)
                     return True
 
                 from datetime import datetime as dt
@@ -4596,7 +4676,9 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                                     # the same way (and the finalization
                                     # rollup sets abort so downstream stages
                                     # skip the dead source).
-                                    if not _handle_source_offline(reason):
+                                    if not _handle_source_offline(
+                                        reason, step_id=step_id,
+                                    ):
                                         # Give-up: image never loaded, so
                                         # this photo is unreached — same
                                         # bucket as the folder-scoped skip

@@ -12936,6 +12936,370 @@ def test_pipeline_classify_offline_source_is_not_a_clean_success(
     )
 
 
+def test_pipeline_classify_source_offline_publishes_pause_reason(
+    tmp_path, monkeypatch,
+):
+    """A parked classify run must tell the UI *why* it paused, not just that
+    it did.
+
+    Codex #1388 P1 r3663383513: the incident fix parked the job on a dead
+    source but only wrote the reason to ``vireo.log``. The jobs UI showed
+    a generic "paused" pill with no indication of which volume the user
+    needed to reconnect, so pressing Resume without remounting could burn
+    through the bounded retry budget and turn a recoverable outage into a
+    failed run. Publish the reason via transient progress state (mirrored
+    onto ``job['progress']``) and pin the classify step's ``current_file``
+    so the reason renders under the paused step, next to Resume.
+    """
+    import classifier as classifier_mod
+    import classify_job
+    import config as cfg
+    from db import Database
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cfg.CONFIG_PATH = str(tmp_path / "config.json")
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws_id = db._active_workspace_id
+
+    folder_path = str(tmp_path / "photos")
+    os.makedirs(folder_path, exist_ok=True)
+    folder_id = db.add_folder(folder_path)
+    photo_ids = []
+    for i in range(3):
+        name = f"photo{i}.jpg"
+        pid = db.add_photo(folder_id, name, ".jpg", 4000 + i, 4_000_000.0 + i)
+        _drop_jpeg(folder_path, name)
+        db.save_detections(
+            pid,
+            [{"box": {"x": 0.1, "y": 0.1, "w": 0.5, "h": 0.5},
+              "confidence": 0.9, "category": "animal"}],
+            detector_model="MegaDetector",
+        )
+        photo_ids.append(pid)
+
+    col_id = db.add_collection(
+        "Test",
+        json.dumps([{"field": "photo_ids", "value": photo_ids}]),
+    )
+
+    _setup_fake_downloaded_model(tmp_path, monkeypatch)
+
+    import labels_fingerprint as lfp
+    monkeypatch.setattr(lfp, "compute_fingerprint", lambda *a, **k: "fp")
+
+    def fake_detect_batch(batch, folders, runner, job, reclassify, db_,
+                          det_conf_threshold=None, already_detected_ids=None,
+                          cached_detections=None):
+        det_map = {}
+        for p in batch:
+            det_map[p["id"]] = [{
+                "id": d["id"],
+                "box_x": d["box_x"], "box_y": d["box_y"],
+                "box_w": d["box_w"], "box_h": d["box_h"],
+                "confidence": d["detector_confidence"],
+                "category": d["category"],
+            } for d in db_.get_detections(p["id"])
+                if d["detector_model"] != "full-image"]
+        return det_map, len(batch), {p["id"] for p in batch}
+
+    monkeypatch.setattr(classify_job, "_detect_batch", fake_detect_batch)
+
+    gone_folder = "/Volumes/NamedShareForBanner/Raw Files"
+
+    def offline_prepare_image(photo, folders, detection, vireo_dir=None):
+        return None, gone_folder, os.path.join(gone_folder, photo["filename"])
+
+    monkeypatch.setattr(classify_job, "_prepare_image", offline_prepare_image)
+
+    class FakeClassifier:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def encode_image(self, *args, **kwargs):
+            import numpy as np
+            return np.zeros(512, dtype=np.float32)
+
+    monkeypatch.setattr(classifier_mod, "Classifier", FakeClassifier)
+
+    class PausingRunner(FakeRunner):
+        def __init__(self):
+            super().__init__()
+            self.pause_calls = []
+            self._paused = False
+
+        def pause_job(self, job_id):
+            self.pause_calls.append(job_id)
+            self._paused = True
+            return True
+
+        def pause_requested(self, job_id):
+            return self._paused
+
+        def mark_paused(self, job_id):
+            return True
+
+        def wait_if_paused(self, job_id, *, publish_paused=False):
+            self._paused = False
+            return False
+
+    params = PipelineParams(
+        collection_id=col_id,
+        skip_extract_masks=True,
+        skip_regroup=True,
+    )
+    runner = PausingRunner()
+    job = _make_job()
+
+    with pytest.raises(RuntimeError):
+        run_pipeline_job(job, runner, db_path, ws_id, params)
+
+    # The banner text must name the volume the user has to reconnect —
+    # a generic "paused" is exactly what Codex flagged.
+    pause_progress_events = [
+        data for (_jid, etype, data) in runner.events
+        if etype == "progress" and data.get("pause_reason")
+    ]
+    assert pause_progress_events, (
+        "Classify parked on a dead source but never published pause_reason "
+        "on a progress event; the UI has no way to tell the user *why* "
+        "the job paused."
+    )
+    reasons = [d["pause_reason"] for d in pause_progress_events]
+    joined_reasons = " ".join(reasons)
+    assert "NamedShareForBanner" in joined_reasons, (
+        f"The pause_reason must name the volume so the user knows what to "
+        f"reconnect; got {reasons!r}"
+    )
+    assert "Resume" in joined_reasons, (
+        f"The pause_reason must tell the user what to do after reconnecting "
+        f"(press Resume); got {reasons!r}"
+    )
+
+    # The classify step's current_file must carry the same reason so it
+    # renders directly under the paused step in the job tree, right next
+    # to the Resume button — the header banner alone is easy to miss on
+    # long collections whose stage tree scrolls off-screen.
+    classify_current_file = [
+        kwargs["current_file"]
+        for (_jid, sid, kwargs) in runner.step_updates
+        if sid.startswith("classify:") and "current_file" in kwargs
+        and kwargs["current_file"]
+    ]
+    assert any(
+        "NamedShareForBanner" in cf for cf in classify_current_file
+    ), (
+        f"The classify step should surface the offline reason via "
+        f"current_file so it renders under the paused step; got "
+        f"{classify_current_file!r}"
+    )
+
+
+def test_pipeline_classify_source_offline_honors_prior_user_pause(
+    tmp_path, monkeypatch,
+):
+    """If the user pressed Pause while a network read was blocked, classify
+    must still park on the checkpoint — not treat the second-pause no-op
+    as evidence that pausing is impossible.
+
+    Codex #1388 P2 r3663383518: ``JobRunner.pause_job`` returns ``False``
+    when the job's status is already ``pausing`` (a Pause request landed
+    while classify was blocked on an EIO). The old code interpreted every
+    ``False`` return as "nothing to park on" and gave up, throwing away
+    the user's Pause click and turning a recoverable outage into a failed
+    run. Treat ``pause_requested`` as evidence a pause is genuinely in
+    flight and fall through to the checkpoint so the run parks on the
+    already-in-flight request instead of latching source offline.
+    """
+    import classifier as classifier_mod
+    import classify_job
+    import config as cfg
+    from db import Database
+    from PIL import Image as _PILImage
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cfg.CONFIG_PATH = str(tmp_path / "config.json")
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws_id = db._active_workspace_id
+
+    folder_path = str(tmp_path / "photos")
+    os.makedirs(folder_path, exist_ok=True)
+    folder_id = db.add_folder(folder_path)
+    photo_ids = []
+    for i in range(4):
+        name = f"photo{i}.jpg"
+        pid = db.add_photo(folder_id, name, ".jpg", 4000 + i, 4_000_000.0 + i)
+        _drop_jpeg(folder_path, name)
+        db.save_detections(
+            pid,
+            [{"box": {"x": 0.1, "y": 0.1, "w": 0.5, "h": 0.5},
+              "confidence": 0.9, "category": "animal"}],
+            detector_model="MegaDetector",
+        )
+        photo_ids.append(pid)
+
+    col_id = db.add_collection(
+        "Test",
+        json.dumps([{"field": "photo_ids", "value": photo_ids}]),
+    )
+
+    _setup_fake_downloaded_model(tmp_path, monkeypatch)
+
+    import labels_fingerprint as lfp
+    monkeypatch.setattr(lfp, "compute_fingerprint", lambda *a, **k: "fp")
+
+    def fake_detect_batch(batch, folders, runner, job, reclassify, db_,
+                          det_conf_threshold=None, already_detected_ids=None,
+                          cached_detections=None):
+        det_map = {}
+        for p in batch:
+            det_map[p["id"]] = [{
+                "id": d["id"],
+                "box_x": d["box_x"], "box_y": d["box_y"],
+                "box_w": d["box_w"], "box_h": d["box_h"],
+                "confidence": d["detector_confidence"],
+                "category": d["category"],
+            } for d in db_.get_detections(p["id"])
+                if d["detector_model"] != "full-image"]
+        return det_map, len(batch), {p["id"] for p in batch}
+
+    monkeypatch.setattr(classify_job, "_detect_batch", fake_detect_batch)
+
+    gone_folder = "/Volumes/DefinitelyNotMounted12345/Raw Files"
+    # Give ``flaky_prepare_image`` a handle to the runner so the "user
+    # pressed Pause while we were blocked" click can be timed to land at
+    # the exact moment the read starts blocking — that's what puts the
+    # job into ``pausing`` state before classify's own pause_job() call.
+    holder = {"runner": None}
+    state = {"mounted": True, "seen": 0}
+
+    def flaky_prepare_image(photo, folders, detection, vireo_dir=None):
+        state["seen"] += 1
+        if state["seen"] == 2:
+            state["mounted"] = False
+            # The Pause click lands here (the read is about to block on
+            # EIO). By the time _handle_source_offline calls pause_job the
+            # job's public state is already ``pausing`` and pause_job
+            # returns False — the exact edge case Codex #1388 P2 flagged.
+            if holder["runner"] is not None:
+                holder["runner"]._paused = True
+        if not state["mounted"]:
+            return None, gone_folder, os.path.join(
+                gone_folder, photo["filename"],
+            )
+        fp = folders.get(photo["folder_id"], "")
+        return (
+            _PILImage.new("RGB", (16, 16), "black"),
+            fp,
+            os.path.join(fp, photo["filename"]),
+        )
+
+    monkeypatch.setattr(classify_job, "_prepare_image", flaky_prepare_image)
+
+    def fake_flush_batch(batch, clf, model_type, model_name, db_, raw_results,
+                         top_k=1):
+        for entry in batch:
+            raw_results.append({
+                "photo": entry["photo"],
+                "detection_id": entry.get("detection_id"),
+                "folder_path": entry["folder_path"],
+                "image_path": entry["image_path"],
+                "prediction": "Robin",
+                "confidence": 0.9,
+                "timestamp": None,
+                "filename": entry["photo"]["filename"],
+                "embedding": None,
+                "taxonomy": None,
+            })
+        return 0
+
+    monkeypatch.setattr(classify_job, "_flush_batch", fake_flush_batch)
+
+    class FakeClassifier:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def encode_image(self, *args, **kwargs):
+            import numpy as np
+            return np.zeros(512, dtype=np.float32)
+
+    monkeypatch.setattr(classifier_mod, "Classifier", FakeClassifier)
+
+    class PriorPauseRunner(FakeRunner):
+        """Models the user pressing Pause while classify was blocked on EIO.
+
+        ``pause_job`` returns ``False`` — the job's public state is already
+        ``pausing`` — but ``pause_requested`` reports ``True`` so classify
+        can still tell there is a live pause in flight and park on it.
+        """
+
+        def __init__(self):
+            super().__init__()
+            self.pause_calls = []
+            self.wait_calls = 0
+            self._paused = False
+
+        def pause_job(self, job_id):
+            self.pause_calls.append(job_id)
+            return False
+
+        def pause_requested(self, job_id):
+            return self._paused
+
+        def mark_paused(self, job_id):
+            return True
+
+        def wait_if_paused(self, job_id, *, publish_paused=False):
+            self.wait_calls += 1
+            state["mounted"] = True   # user reconnects the volume
+            self._paused = False      # ...then hits Resume
+            return False
+
+    params = PipelineParams(
+        collection_id=col_id,
+        skip_extract_masks=True,
+        skip_regroup=True,
+    )
+    runner = PriorPauseRunner()
+    holder["runner"] = runner
+    job = _make_job()
+
+    run_pipeline_job(job, runner, db_path, ws_id, params)
+
+    # The pre-fix behavior gave up as soon as pause_job returned False,
+    # never entered the checkpoint, and latched source_offline["reason"]
+    # so classify failed with a ``[classify] Fatal:`` error naming the
+    # volume. Now that we honor the already-in-flight pause, the checkpoint
+    # runs, the user's reconnect+resume flow completes normally, and the
+    # collection classifies to green.
+    assert runner.wait_calls >= 1, (
+        "Classify saw an offline read AND a live pause request, but never "
+        "reached the pause checkpoint — the user's Pause click was silently "
+        "discarded (Codex #1388 P2)."
+    )
+    stored = db.conn.execute(
+        "SELECT COUNT(DISTINCT d.photo_id) FROM predictions p "
+        "JOIN detections d ON d.id = p.detection_id",
+    ).fetchone()[0]
+    assert stored == 4, (
+        f"After the checkpoint parks and the user resumes with the mount "
+        f"back, classify should retry and finish the collection — instead "
+        f"only {stored}/4 photos got predictions, which is the pre-fix "
+        f"give-up path."
+    )
+    # And crucially, the run must not have logged a headline failure —
+    # the whole point of parking (instead of giving up on pause_job=False)
+    # is to preserve the recovery path.
+    classify_errors = [e for e in job["errors"] if "[classify] Fatal:" in e]
+    assert not classify_errors, (
+        f"A recovered pause must not surface as a terminal classify error; "
+        f"got {classify_errors!r}"
+    )
+
+
 def test_pipeline_classify_missing_folder_does_not_stop_healthy_folders(
     tmp_path, monkeypatch,
 ):

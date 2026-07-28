@@ -1826,6 +1826,10 @@ async function downloadDarktable() {
                a.name + ' (' + Math.round(a.size / 1048576) + ' MB)\n' +
                'From: github.com/darktable-org/darktable\n\n' + what)) return;
 
+  // NOTE from Task 9: there is no server-side duplicate-click guard (no other
+  // download job in app.py has one). Two rapid POSTs start two jobs writing the
+  // same .partial; the digest check catches it but BOTH report an error. Hiding
+  // the button here is what prevents that, so do not remove it.
   document.getElementById('darktableGet').style.display = 'none';
   var wrap = document.getElementById('darktableProgress');
   var fill = document.getElementById('dtProgressFill');
@@ -1868,8 +1872,10 @@ async function downloadDarktable() {
         // jobs.py:526 sets status 'cancelled' with empty errors and no
         // failure, so this must be handled before the failure branch or a
         // user-initiated cancel would read as "Download failed".
+        // A cancelled download keeps its .partial and a re-run RESUMES it
+        // (Task 4). Do not imply the bytes were thrown away.
         fill.style.width = '0%';
-        text.innerHTML = 'Download cancelled.' +
+        text.innerHTML = 'Download cancelled — partial progress kept, retrying will resume.' +
           '<br><button class="btn" style="margin-top:6px;" onclick="loadDarktableStatus()">Try again</button>';
         return;
       }

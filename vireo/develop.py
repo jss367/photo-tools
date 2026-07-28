@@ -5,6 +5,7 @@ import logging
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 
 try:
@@ -36,6 +37,46 @@ def _format_subprocess_diag(stdout, stderr):
     return combined
 
 
+def darktable_search_paths():
+    """Locations probed for darktable-cli, in priority order.
+
+    Exposed so the UI can tell the user exactly where we looked when the
+    binary is not found, instead of repeating a bare "not found".
+    ``find_darktable`` walks this same list, so the two cannot drift.
+    """
+    candidates = []
+    # os.name is checked FIRST, not sys.platform. test_find_darktable_detects_
+    # standard_windows_install patches develop.os.name = "nt" while leaving
+    # sys.platform as the host's value, so a leading darwin branch would
+    # shadow the Windows candidates and break that test on a Mac.
+    if os.name == "nt":
+        for env_var in ("PROGRAMFILES", "PROGRAMFILES(X86)", "PROGRAMW6432"):
+            base = os.environ.get(env_var)
+            if base:
+                candidates.extend([
+                    os.path.join(base, "darktable", "bin", "darktable-cli.exe"),
+                    os.path.join(base, "darktable", "darktable-cli.exe"),
+                ])
+    elif sys.platform == "darwin":
+        candidates.extend([
+            "/Applications/darktable.app/Contents/MacOS/darktable-cli",
+            os.path.expanduser("~/Applications/darktable.app/Contents/MacOS/darktable-cli"),
+        ])
+    else:
+        # Linux: an AppImage we installed ourselves. Newest mtime wins, since
+        # installers are kept and this directory accumulates versions.
+        tools_dir = os.path.expanduser("~/.vireo/tools/darktable")
+        if os.path.isdir(tools_dir):
+            appimages = [
+                os.path.join(tools_dir, n)
+                for n in os.listdir(tools_dir)
+                if n.endswith(".AppImage")
+            ]
+            appimages.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+            candidates.extend(appimages)
+    return candidates
+
+
 def find_darktable(configured_path):
     """Find the darktable-cli binary.
 
@@ -60,18 +101,9 @@ def find_darktable(configured_path):
     found = shutil.which("darktable-cli")
     if found:
         return os.path.realpath(found)
-    if os.name == "nt":
-        candidates = []
-        for env_var in ("PROGRAMFILES", "PROGRAMFILES(X86)", "PROGRAMW6432"):
-            base = os.environ.get(env_var)
-            if base:
-                candidates.extend([
-                    os.path.join(base, "darktable", "bin", "darktable-cli.exe"),
-                    os.path.join(base, "darktable", "darktable-cli.exe"),
-                ])
-        for candidate in candidates:
-            if os.path.isfile(candidate):
-                return os.path.realpath(candidate)
+    for candidate in darktable_search_paths():
+        if os.path.isfile(candidate):
+            return os.path.realpath(candidate)
     return None
 
 

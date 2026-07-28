@@ -9,6 +9,8 @@ def test_find_darktable_returns_none_when_missing(monkeypatch):
     from develop import find_darktable
 
     monkeypatch.setattr("shutil.which", lambda x: None)
+    import develop
+    monkeypatch.setattr(develop, "darktable_search_paths", list)
     assert find_darktable("") is None
 
 
@@ -73,6 +75,8 @@ def test_find_darktable_returns_none_for_bad_configured_path(monkeypatch):
     from develop import find_darktable
 
     monkeypatch.setattr("shutil.which", lambda x: None)
+    import develop
+    monkeypatch.setattr(develop, "darktable_search_paths", list)
     assert find_darktable("/nonexistent/darktable-cli") is None
 
 
@@ -403,3 +407,52 @@ def test_develop_photo_reports_missing_dng_converter_for_nikon_he(tmp_path, monk
     assert "Nikon High Efficiency NEF" in result["error"]
     assert "DNG conversion failed" in result["error"]
     assert "download it from Adobe" in result["error"]
+
+
+def test_find_darktable_finds_macos_app_bundle(monkeypatch):
+    """A normal macOS .dmg install is found even though it is not on PATH."""
+    import develop
+    from develop import find_darktable
+
+    bundle = "/Applications/darktable.app/Contents/MacOS/darktable-cli"
+    monkeypatch.setattr("shutil.which", lambda x: None)
+    # A Mac is os.name == "posix" *and* sys.platform == "darwin". Pin both, or
+    # this test exercises the Windows branch on the windows-latest CI leg.
+    monkeypatch.setattr(develop.os, "name", "posix")
+    monkeypatch.setattr("sys.platform", "darwin")
+    monkeypatch.setattr("os.path.isfile", lambda p: p == bundle)
+    monkeypatch.setattr("os.path.realpath", lambda p: p)
+
+    assert find_darktable("") == bundle
+
+
+def test_find_darktable_configured_path_wins_over_bundle(tmp_path, monkeypatch):
+    """An explicitly configured path takes precedence over the bundle probe."""
+    from develop import find_darktable
+
+    configured = tmp_path / "darktable-cli"
+    configured.touch()
+    monkeypatch.setattr("sys.platform", "darwin")
+
+    assert find_darktable(str(configured)) == str(configured)
+
+
+def test_darktable_search_paths_matches_find_darktable(monkeypatch):
+    """checked_paths cannot drift from what find_darktable actually probes.
+
+    Every candidate reported to the user must be one find_darktable would
+    accept; otherwise the "we checked here" message is a lie.
+    """
+    import develop
+    from develop import darktable_search_paths, find_darktable
+
+    monkeypatch.setattr("shutil.which", lambda x: None)
+    monkeypatch.setattr(develop.os, "name", "posix")
+    monkeypatch.setattr("sys.platform", "darwin")
+    paths = darktable_search_paths()
+    assert paths, "expected at least one candidate on darwin"
+
+    for candidate in paths:
+        monkeypatch.setattr("os.path.isfile", lambda p, c=candidate: p == c)
+        monkeypatch.setattr("os.path.realpath", lambda p: p)
+        assert find_darktable("") == candidate

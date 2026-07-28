@@ -1057,6 +1057,43 @@ git commit -m "feat: verify downloaded darktable against the API's SHA256 digest
 - Modify: `vireo/darktable_install.py`
 - Test: `vireo/tests/test_darktable_install.py`
 
+### OPEN QUESTION — decide this before writing the Linux path
+
+Task 3's code review surfaced a real performance problem that this task is the
+right place to solve.
+
+**The problem.** Task 3 sets `APPIMAGE_EXTRACT_AND_RUN=1` when invoking an
+AppImage (gated on `_is_appimage`, so only AppImage users pay). But when that
+variable is set, the AppImage type-2 runtime does not probe FUSE first — it
+*unconditionally* unpacks the whole squashfs to a temp dir, runs, and deletes.
+darktable's AppImage is ~178 MB, and the develop job calls `develop_photo` once
+per photo in a plain loop (`app.py`). So a 200-photo develop job on Linux
+extracts and deletes 178 MB **two hundred times**, and that overhead counts
+against the 120 s per-photo timeout.
+
+**The proposed alternative:** run `./X.AppImage --appimage-extract` **once at
+install time** here in Task 7, and point `darktable_bin` at
+`squashfs-root/usr/bin/darktable-cli`. If it works it is strictly better — that
+layout is what darktable's walk-up-from-`argv[0]` resource lookup expects, it
+survives `realpath`, it needs no `argv[1]` prefix, no FUSE at any version, and
+costs nothing per export. The trade is ~500 MB of disk, once.
+
+**Why it is not already decided:** darktable's `AppRun` does real setup before
+exec'ing — it sets `CAMLIBS`, `IOLIBS`, `GIO_EXTRA_MODULES`, and sources
+`apprun-hooks/linuxdeploy-plugin-gtk.sh`. The extracted `darktable-cli` may not
+run correctly without that environment, depending on whether linuxdeploy patched
+RPATH. **This is an empirical question that must be tested on real Linux** — it
+cannot be settled by reading.
+
+**What to do:** test it on Linux before implementing the Linux branch. If the
+extracted binary works, take it and simplify (Task 3's `argv[1]` prefix and env
+var become dead code for our own installs, though keep them for user-configured
+AppImages). If it does not, keep the current approach and note the per-photo cost
+in the plan so it is a known limitation rather than a surprise.
+
+**Do not silently pick one.** If you cannot test on Linux, say so and leave the
+current approach in place with the cost documented.
+
 - [ ] **Step 1: Write the failing tests**
 
 Append to `vireo/tests/test_darktable_install.py`:

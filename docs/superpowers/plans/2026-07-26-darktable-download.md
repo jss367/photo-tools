@@ -216,7 +216,27 @@ to the user, with a test asserting the two cannot drift."
 - Modify: `vireo/app.py:15910-15930`
 - Test: `vireo/tests/test_darktable_api.py`
 
-- [ ] **Step 1: Write the failing test**
+**Required reading before starting.** Task 1's code review established two
+constraints that this task exists to satisfy, and returning
+`darktable_search_paths()` raw would violate both:
+
+1. **It omits the two highest-priority probes.** `find_darktable` checks the
+   configured path and `shutil.which("darktable-cli")` *before* that list, and
+   neither appears in it. A panel saying "we checked here" while silently
+   omitting `$PATH` — the probe most likely to explain a Homebrew or distro
+   user's miss — answers a cheaper question than the one the user is reading,
+   which `CLAUDE.md` forbids.
+2. **On Linux it is empty until darktable is installed.** It returns the
+   AppImages actually present in `~/.vireo/tools/darktable`, so a fresh Linux box
+   gets `[]` — an empty "checked locations" list is *less* informative than the
+   bare ✗ this feature exists to fix, on exactly the platform where the download
+   matters most.
+
+So **the route composes the user-facing list**; the detector function stays the
+detector's concrete candidate list. Every entry the route adds must be something
+`find_darktable` genuinely probes, or the claim becomes a lie.
+
+- [ ] **Step 1: Write the failing tests**
 
 Append to `vireo/tests/test_darktable_api.py`:
 
@@ -230,25 +250,79 @@ def test_api_darktable_status_reports_checked_paths(app_and_db):
     assert 'checked_paths' in data
     assert isinstance(data['checked_paths'], list)
     assert all(isinstance(p, str) for p in data['checked_paths'])
+
+
+def test_api_darktable_status_checked_paths_mentions_path_probe(app_and_db):
+    """$PATH is the probe most likely to explain a miss, so it must be listed.
+
+    find_darktable tries shutil.which() before any filesystem candidate;
+    omitting it would make "we checked here" untrue by omission.
+    """
+    app, _ = app_and_db
+    data = app.test_client().get('/api/darktable/status').get_json()
+
+    assert any('PATH' in p for p in data['checked_paths'])
+
+
+def test_api_darktable_status_checked_paths_never_empty(app_and_db):
+    """Never render an empty 'we checked here' list.
+
+    darktable_search_paths() returns [] on a Linux box with no AppImage
+    installed — precisely the user this feature targets.
+    """
+    import develop
+    app, _ = app_and_db
+    original = develop.darktable_search_paths
+    develop.darktable_search_paths = lambda: []
+    try:
+        data = app.test_client().get('/api/darktable/status').get_json()
+    finally:
+        develop.darktable_search_paths = original
+
+    assert data['checked_paths'], "checked_paths must never be empty"
 ```
 
-- [ ] **Step 2: Run it to verify it fails**
+- [ ] **Step 2: Run them to verify they fail**
 
 Run: `python -m pytest vireo/tests/test_darktable_api.py -k checked_paths -v`
 Expected: FAIL — `KeyError`/assert on `'checked_paths' in data`.
 
 - [ ] **Step 3: Implement**
 
-In `vireo/app.py`, change the import on line 15913 and add one key to the returned dict:
+In `vireo/app.py`, change the import on line 15913:
 
 ```python
         from develop import find_darktable, find_dng_converter, darktable_search_paths
 ```
 
+Compose the user-facing list before the `return jsonify(...)`:
+
+```python
+        # What the user is told we checked must match what find_darktable
+        # actually probes: shutil.which first, then the filesystem candidates.
+        # darktable_search_paths() covers only the latter and is empty on a
+        # Linux box with no AppImage yet, so compose rather than return it raw.
+        checked_paths = ["$PATH (darktable-cli)"]
+        checked_paths.extend(darktable_search_paths())
+        if not sys.platform.startswith(("darwin", "win")) and os.name != "nt":
+            tools_dir = os.path.expanduser("~/.vireo/tools/darktable")
+            if tools_dir not in checked_paths:
+                checked_paths.append(tools_dir)
+```
+
+and add the key to the returned dict:
+
 ```python
             "output_dir": cfg.get("darktable_output_dir"),
-            "checked_paths": darktable_search_paths(),
+            "checked_paths": checked_paths,
 ```
+
+Check whether `sys` and `os` are already imported at `app.py` module level; use
+whatever is already there rather than adding function-local imports if so.
+
+**If you find a cleaner way to express the Linux condition, take it** — the
+requirement is behavioral (the list always names `$PATH`, is never empty, and
+names the Linux tools directory on Linux), not a specific expression.
 
 - [ ] **Step 4: Run the tests**
 

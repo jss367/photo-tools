@@ -264,26 +264,37 @@ def _still_offline_photo_ids(thread_db, photo_ids) -> set:
     r3664348758). Anything the DB no longer knows about is dropped
     from the returned set — a photo that was purged since classify
     can't be filtered either.
+
+    The IN-clause lookup is chunked under SQLite's bind-variable limit
+    (999 on legacy builds this repo explicitly accommodates — see
+    ``db.py``'s ``_SQLITE_PARAM_CHUNK_SIZE``). Without chunking a large
+    offline folder would raise ``OperationalError: too many SQL
+    variables`` before the mask/eye-keypoint stages could get past this
+    filter and continue with photos from healthy folders (Codex #1388
+    P2 r3664525158).
     """
     if not photo_ids:
         return set()
     ids = [int(pid) for pid in photo_ids]
-    placeholders = ",".join("?" * len(ids))
-    rows = thread_db.conn.execute(
-        f"SELECT p.id, f.path "
-        f"FROM photos p JOIN folders f ON p.folder_id = f.id "
-        f"WHERE p.id IN ({placeholders})",
-        ids,
-    ).fetchall()
+    _CHUNK = 900
     still_offline: set = set()
-    for row in rows:
-        pid = row["id"] if hasattr(row, "keys") else row[0]
-        path = row["path"] if hasattr(row, "keys") else row[1]
-        # ``isdir`` False covers both a still-missing folder and a
-        # mount-scoped outage (dead mount → isdir False for every
-        # child), so a single probe suffices for either scope.
-        if not path or not os.path.isdir(path):
-            still_offline.add(pid)
+    for i in range(0, len(ids), _CHUNK):
+        chunk = ids[i:i + _CHUNK]
+        placeholders = ",".join("?" * len(chunk))
+        rows = thread_db.conn.execute(
+            f"SELECT p.id, f.path "
+            f"FROM photos p JOIN folders f ON p.folder_id = f.id "
+            f"WHERE p.id IN ({placeholders})",
+            chunk,
+        ).fetchall()
+        for row in rows:
+            pid = row["id"] if hasattr(row, "keys") else row[0]
+            path = row["path"] if hasattr(row, "keys") else row[1]
+            # ``isdir`` False covers both a still-missing folder and a
+            # mount-scoped outage (dead mount → isdir False for every
+            # child), so a single probe suffices for either scope.
+            if not path or not os.path.isdir(path):
+                still_offline.add(pid)
     return still_offline
 
 

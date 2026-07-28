@@ -12902,6 +12902,46 @@ def test_still_offline_photo_ids_prunes_recovered_folders(tmp_path):
     assert _still_offline_photo_ids(db, []) == set()
 
 
+def test_still_offline_photo_ids_chunks_large_id_sets(tmp_path):
+    """Query in bounded chunks so SQLite's bind-variable limit can't 500 us.
+
+    Codex #1388 P2 (r3664525158): an offline folder can hold more photos
+    than SQLite's ``SQLITE_MAX_VARIABLE_NUMBER`` (999 on legacy builds
+    this repo explicitly accommodates elsewhere), so a single
+    ``id IN (?,?,…)`` here would raise ``OperationalError: too many SQL
+    variables`` before mask/eye-keypoint stages could get past the
+    downstream filter and continue with photos from healthy folders.
+    Exercise well over 999 IDs and pin that the caller still gets a
+    correct still-offline set — no exception, and every photo whose
+    folder is missing is returned.
+    """
+    import config as cfg
+    from db import Database
+    from pipeline_job import _still_offline_photo_ids
+
+    cfg.CONFIG_PATH = str(tmp_path / "config.json")
+    db = Database(str(tmp_path / "test.db"))
+
+    gone_folder = tmp_path / "vanished"
+    gone_folder.mkdir()
+    gone_folder_id = db.add_folder(str(gone_folder))
+
+    # 2500 > the 999-variable ceiling AND > the 900 chunk size, so the
+    # query has to run in at least three chunks to succeed.
+    photo_ids = [
+        db.add_photo(gone_folder_id, f"p{i:04d}.jpg", ".jpg", 1000, float(i))
+        for i in range(2500)
+    ]
+
+    os.rmdir(gone_folder)
+
+    still_offline = _still_offline_photo_ids(db, photo_ids)
+    assert still_offline == set(photo_ids), (
+        f"Chunked lookup must still return every photo whose folder is "
+        f"unreadable; got {len(still_offline)} of {len(photo_ids)}."
+    )
+
+
 def test_pipeline_classify_pauses_when_source_volume_disappears(
     tmp_path, monkeypatch,
 ):

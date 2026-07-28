@@ -1056,6 +1056,113 @@ def test_extract_appimage_once_returns_none_when_subprocess_fails(tmp_path, monk
     assert not os.path.exists(str(fake_bin) + ".extracted")
 
 
+def test_extract_appimage_once_serializes_concurrent_calls(tmp_path, monkeypatch):
+    """Two concurrent workers for the same binary must not race on the
+    shared <binary>.extracted directory: the extraction subprocess runs
+    exactly once and both callers get the same valid AppRun.
+    """
+    import subprocess
+    import threading
+
+    import develop
+
+    develop._APPIMAGE_EXTRACT_LOCKS.clear()
+
+    fake_bin = _write_appimage(tmp_path / "Darktable-5.6.0-x86_64.AppImage")
+
+    subprocess_started = threading.Event()
+    allow_finish = threading.Event()
+    call_count = 0
+    call_count_lock = threading.Lock()
+
+    def fake_run(cmd, **kwargs):
+        nonlocal call_count
+        with call_count_lock:
+            call_count += 1
+        subprocess_started.set()
+        # Hold the "extraction subprocess" open long enough that a second
+        # concurrent caller has time to enter _extract_appimage_once. Without
+        # the per-binary lock, that second caller would rmtree the extract_dir
+        # while this thread's fake_run is still writing into it.
+        assert allow_finish.wait(timeout=5.0), "test lock never released"
+        root = os.path.join(kwargs["cwd"], "squashfs-root")
+        os.makedirs(root, exist_ok=True)
+        apprun = os.path.join(root, "AppRun")
+        with open(apprun, "w") as f:
+            f.write("#!/bin/sh\nexec /usr/bin/darktable-cli \"$@\"\n")
+        os.chmod(apprun, 0o755)
+        return _fake_completed(0)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    results = {}
+
+    def worker(key):
+        results[key] = develop._extract_appimage_once(str(fake_bin))
+
+    t1 = threading.Thread(target=worker, args=("a",))
+    t2 = threading.Thread(target=worker, args=("b",))
+    t1.start()
+    assert subprocess_started.wait(timeout=5.0), "first extraction never started"
+    t2.start()
+    # Give the second thread a moment to reach the lock — if the lock is
+    # missing, it will race ahead and rmtree the extract_dir the first
+    # thread is still populating.
+    allow_finish.set()
+    t1.join(timeout=5.0)
+    t2.join(timeout=5.0)
+
+    assert not t1.is_alive() and not t2.is_alive()
+    assert call_count == 1, "extraction subprocess must run exactly once"
+    assert results["a"] is not None
+    assert results["b"] == results["a"]
+    assert os.path.isfile(results["a"])
+
+
+def test_extract_appimage_once_returns_none_when_disk_is_full(tmp_path, monkeypatch):
+    """Extraction must not proceed when the disk cannot fit the unpacked
+    tree — the download preflight only reserves ~2x the compressed AppImage
+    size, but the extracted tree is ~3.5x. Returning None here lets the
+    caller fall back to per-run APPIMAGE_EXTRACT_AND_RUN mode rather than
+    half-extracting and failing mid-batch.
+    """
+    import subprocess
+
+    import develop
+
+    develop._APPIMAGE_EXTRACT_LOCKS.clear()
+
+    fake_bin = _write_appimage(tmp_path / "Darktable-5.6.0-x86_64.AppImage")
+    # Pad the AppImage to a size where the space check kicks in on realistic
+    # disks; the test then reports free space below that so extraction is
+    # rejected before the subprocess is invoked.
+    with open(fake_bin, "r+b") as f:
+        f.seek(1024 * 1024 - 1)
+        f.write(b"\x00")
+
+    ran = []
+
+    def fake_run(cmd, **kwargs):
+        ran.append(list(cmd))
+        return _fake_completed(0)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    # Report free space smaller than the required multiple. shutil.disk_usage
+    # returns a named tuple, so a plain object with the same attributes works.
+    class _StingyUsage:
+        total = 10 * 1024 * 1024
+        used = 9 * 1024 * 1024
+        free = 100 * 1024  # far below the extraction requirement
+
+    monkeypatch.setattr(develop.shutil, "disk_usage", lambda path: _StingyUsage())
+
+    assert develop._extract_appimage_once(str(fake_bin)) is None
+    assert ran == [], "extraction subprocess must not run when disk is full"
+    # No half-written extraction dir should have been left behind.
+    assert not os.path.exists(str(fake_bin) + ".extracted")
+
+
 def test_develop_photo_omits_appimage_extract_and_run_for_plain_binary(tmp_path, monkeypatch):
     """A packaged darktable-cli is not an AppImage; the flag must never be
     set for it and the FUSE probe/cache must not touch its binary path."""

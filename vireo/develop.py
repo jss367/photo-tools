@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 
 try:
     from .proc import no_window_kwargs
@@ -52,6 +53,48 @@ _APPIMAGE_EXTRACT_SUBDIR = "squashfs-root"
 # unpacks in ~5–15 s on a spinning disk; 300 s is generous headroom without
 # hanging a develop job forever if the extraction is truly wedged.
 _APPIMAGE_EXTRACT_TIMEOUT_SECONDS = 300
+
+# Ratio of extracted-tree size to AppImage size on disk. Measured against
+# darktable: a ~178 MB AppImage unpacks to ~500 MB, so ~3x; the multiplier
+# adds headroom so a marginal disk that would just barely fit triggers the
+# per-run fallback instead of half-extracting and failing mid-batch.
+_APPIMAGE_EXTRACTION_SIZE_MULTIPLIER = 3.5
+
+# Per-binary lock guarding the "check for stale extraction, delete, extract,
+# publish" sequence in _extract_appimage_once. Two concurrent develop jobs on
+# a FUSE-less host would otherwise both observe an empty mode cache and race
+# on the shared <binary>.extracted directory, so one worker could rmtree or
+# execute the other's partial tree. The outer lock only protects insertion
+# into the dict; the returned per-binary Lock is held for the extraction
+# itself so concurrent callers for the SAME binary serialize while callers
+# for DIFFERENT binaries do not block one another.
+_APPIMAGE_EXTRACT_LOCKS_LOCK = threading.Lock()
+_APPIMAGE_EXTRACT_LOCKS = {}
+
+
+def _get_extract_lock(binary):
+    """Return (and lazily create) the per-binary extraction lock."""
+    with _APPIMAGE_EXTRACT_LOCKS_LOCK:
+        lock = _APPIMAGE_EXTRACT_LOCKS.get(binary)
+        if lock is None:
+            lock = threading.Lock()
+            _APPIMAGE_EXTRACT_LOCKS[binary] = lock
+        return lock
+
+
+def _has_space_for_extraction(binary, extract_dir_parent):
+    """True when there is plausibly enough free disk to unpack ``binary``.
+
+    Returns True on OSError so a transient stat failure does not block
+    extraction on a working disk; the extraction itself will surface a real
+    ENOSPC as a subprocess failure that the caller already handles.
+    """
+    try:
+        source_size = os.path.getsize(binary)
+        free_bytes = shutil.disk_usage(extract_dir_parent).free
+    except OSError:
+        return True
+    return free_bytes >= int(source_size * _APPIMAGE_EXTRACTION_SIZE_MULTIPLIER)
 
 # Substrings that identify an AppImage FUSE failure in the runtime's own
 # error output — lowercase and matched case-insensitively so kernel messages
@@ -124,48 +167,77 @@ def _extract_appimage_once(binary):
     extract_dir = binary + ".extracted"
     apprun = os.path.join(extract_dir, _APPIMAGE_EXTRACT_SUBDIR, "AppRun")
 
-    with contextlib.suppress(OSError):
-        if (
-            os.path.isfile(apprun)
-            and os.access(apprun, os.X_OK)
-            and os.path.getmtime(apprun) >= os.path.getmtime(binary)
-        ):
+    def _reusable_apprun():
+        try:
+            return (
+                os.path.isfile(apprun)
+                and os.access(apprun, os.X_OK)
+                and os.path.getmtime(apprun) >= os.path.getmtime(binary)
+            )
+        except OSError:
+            return False
+
+    # Fast path — a valid tree from a prior call satisfies the request
+    # without touching the lock. Two workers racing on this fast path is
+    # safe because both would read the same on-disk state.
+    if _reusable_apprun():
+        return apprun
+
+    # Serialize the delete → extract → publish sequence per binary. Without
+    # this, two concurrent develop jobs both observe an empty extraction,
+    # both rmtree() the shared directory, both write into it, and one can
+    # end up executing the other's partial output. A per-binary Lock means
+    # different binaries still extract in parallel.
+    with _get_extract_lock(binary):
+        # Re-check under the lock: another worker may have finished the
+        # extraction while we were blocked, in which case we reuse it.
+        if _reusable_apprun():
             return apprun
 
-    # Stale or absent — clear anything left behind (a half-finished previous
-    # extraction, or a tree from an older AppImage version) before extracting
-    # fresh, so a partial write cannot masquerade as a valid AppRun.
-    shutil.rmtree(extract_dir, ignore_errors=True)
-    try:
-        os.makedirs(extract_dir, exist_ok=True)
-    except OSError as e:
-        log.warning("Could not create AppImage extract dir %s: %s", extract_dir, e)
-        return None
+        parent_dir = os.path.dirname(extract_dir) or "."
+        if not _has_space_for_extraction(binary, parent_dir):
+            log.warning(
+                "Not enough free disk in %s to unpack %s (~%.1fx its size); "
+                "falling back to per-photo APPIMAGE_EXTRACT_AND_RUN",
+                parent_dir, binary, _APPIMAGE_EXTRACTION_SIZE_MULTIPLIER,
+            )
+            return None
 
-    try:
-        result = subprocess.run(
-            [binary, "--appimage-extract"],
-            capture_output=True, text=True,
-            timeout=_APPIMAGE_EXTRACT_TIMEOUT_SECONDS,
-            cwd=extract_dir, **no_window_kwargs(),
-        )
-    except (subprocess.TimeoutExpired, OSError) as e:
-        log.warning("AppImage --appimage-extract failed for %s: %s", binary, e)
+        # Stale or absent — clear anything left behind (a half-finished
+        # previous extraction, or a tree from an older AppImage version)
+        # before extracting fresh, so a partial write cannot masquerade as
+        # a valid AppRun.
         shutil.rmtree(extract_dir, ignore_errors=True)
-        return None
+        try:
+            os.makedirs(extract_dir, exist_ok=True)
+        except OSError as e:
+            log.warning("Could not create AppImage extract dir %s: %s", extract_dir, e)
+            return None
 
-    if (
-        result.returncode != 0
-        or not os.path.isfile(apprun)
-        or not os.access(apprun, os.X_OK)
-    ):
-        log.warning(
-            "AppImage --appimage-extract left no usable AppRun at %s "
-            "(exit=%s)", apprun, result.returncode,
-        )
-        shutil.rmtree(extract_dir, ignore_errors=True)
-        return None
-    return apprun
+        try:
+            result = subprocess.run(
+                [binary, "--appimage-extract"],
+                capture_output=True, text=True,
+                timeout=_APPIMAGE_EXTRACT_TIMEOUT_SECONDS,
+                cwd=extract_dir, **no_window_kwargs(),
+            )
+        except (subprocess.TimeoutExpired, OSError) as e:
+            log.warning("AppImage --appimage-extract failed for %s: %s", binary, e)
+            shutil.rmtree(extract_dir, ignore_errors=True)
+            return None
+
+        if (
+            result.returncode != 0
+            or not os.path.isfile(apprun)
+            or not os.access(apprun, os.X_OK)
+        ):
+            log.warning(
+                "AppImage --appimage-extract left no usable AppRun at %s "
+                "(exit=%s)", apprun, result.returncode,
+            )
+            shutil.rmtree(extract_dir, ignore_errors=True)
+            return None
+        return apprun
 
 
 def _format_subprocess_diag(stdout, stderr):

@@ -3962,10 +3962,16 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                         source_offline["reason"] = reason
                         return False
                     source_offline["pauses"] += 1
-                    errors.append(
-                        f"[classify] Source {reason} — paused. Reconnect it "
-                        f"and resume to classify the rest, or cancel the run."
-                    )
+                    # Don't push a pause message into ``errors``: a successful
+                    # reconnect+resume leaves classify completing normally, but
+                    # templates/pipeline.html treats every ``[classify]`` error
+                    # as a failed stage and suppresses the success redirect
+                    # (Codex #1388 P1). ``pause_job`` below already flips the
+                    # job state to ``pausing``/``paused`` (that's what the UI
+                    # renders while parked), and the give-up path below
+                    # appends its own ``[classify] Fatal:`` entry — so a run
+                    # that never comes back still surfaces a real terminal
+                    # error, and a run that does come back does not.
                     log.warning("Classify paused: source offline (%s)", reason)
 
                     pause = getattr(runner, "pause_job", None)
@@ -4173,6 +4179,19 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                     # counted once per (photo × spec) — matching ``total``.
                     photos_cached_in_spec: set = set()
                     photos_inferred_in_spec: set = set()
+                    # Per-spec tracking of photos whose per-photo iteration
+                    # was actually entered in THIS spec. Used by the
+                    # reclassify clear below so it never wipes predictions
+                    # for photos this spec never opened — on a mount-scoped
+                    # give-up we break out of the batch loop before reaching
+                    # later photos, and on a folder-scoped outage every photo
+                    # under the missing folder is skipped without ever
+                    # producing a replacement prediction. Without this,
+                    # ``clear_predictions`` on a ``reclassify=True`` run
+                    # would delete the prior predictions for those photos
+                    # even though nothing in this run had a chance to
+                    # rewrite them (Codex #1388 P1).
+                    spec_reached_photo_ids: set = set()
                     # Photos that iterated past the inner abort check IN THIS spec.
                     # Used for the per-spec ``runner.update_step`` progress (which
                     # is bounded by ``total``, not the multi-spec stage total) and
@@ -4280,6 +4299,10 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                             stages["classify"]["seen"] = (
                                 stages["classify"].get("seen", 0) + 1
                             )
+                            # Photo entered THIS spec's per-photo body; scopes
+                            # the reclassify clear below so unreached photos
+                            # keep their prior predictions.
+                            spec_reached_photo_ids.add(photo["id"])
                             # Record this photo as classify-processed for the first
                             # successful model. Used by the stale-detection purge to
                             # restrict deletions to photos actually reclassified.
@@ -4544,6 +4567,16 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                                             )
                                             continue
                                         if not _handle_source_offline(reason):
+                                            # Give-up: image never loaded, so
+                                            # this photo is unreached — same
+                                            # bucket as the folder-scoped
+                                            # skip above. Keeps the
+                                            # reclassify clear below from
+                                            # wiping its prior prediction
+                                            # (Codex #1388 P1).
+                                            source_skipped_photo_ids.add(
+                                                photo["id"]
+                                            )
                                             break
                                         # Resumed. The user reconnected the
                                         # share, so retry the same detection
@@ -4668,13 +4701,30 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                     # already wrote fresh classifier_runs rows for processed
                     # detections — wiping them here would strand the gate and
                     # force the next non-reclassify pass to re-infer everything.
+                    #
+                    # Scope to photos this spec actually reached AND wasn't
+                    # skipped as source-offline: an unreached photo (mount-
+                    # scoped give-up, or every photo under a vanished folder)
+                    # is one this run had no chance to rewrite, so wiping
+                    # its prior prediction would leave it with nothing at
+                    # all (Codex #1388 P1). Fall back to the collection-
+                    # wide clear when no source outage occurred — that's
+                    # still the desired behavior on a clean reclassify.
                     if params.reclassify:
-                        thread_db.clear_predictions(
-                            model=model_name,
-                            collection_photo_ids=[p["id"] for p in photos],
-                            labels_fingerprint=spec_fp,
-                            clear_run_keys=False,
-                        )
+                        if source_skipped_photo_ids:
+                            clear_ids = list(
+                                spec_reached_photo_ids
+                                - source_skipped_photo_ids
+                            )
+                        else:
+                            clear_ids = [p["id"] for p in photos]
+                        if clear_ids:
+                            thread_db.clear_predictions(
+                                model=model_name,
+                                collection_photo_ids=clear_ids,
+                                labels_fingerprint=spec_fp,
+                                clear_run_keys=False,
+                            )
 
                     group_result = _store_grouped_predictions(
                         raw_results, job["id"], model_name,

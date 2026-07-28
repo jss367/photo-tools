@@ -13445,3 +13445,403 @@ def test_pipeline_classify_give_up_skips_downstream_stages(
     # Sanity check the constant that gates the give-up path exists so a
     # future rename doesn't silently defeat the test.
     assert hasattr(pj, "_MAX_SOURCE_OFFLINE_PAUSES")
+
+
+def test_pipeline_classify_reclassify_preserves_predictions_for_unreachable_photos(
+    tmp_path, monkeypatch,
+):
+    """Reclassify must not wipe predictions for photos the run never opened.
+
+    Codex #1388 P1 (r3663159360): with ``reclassify=True``, the folder-scoped
+    branch increments ``source_skipped`` and continues without setting
+    ``abort``. Finalization then reaches the collection-wide
+    ``clear_predictions(collection_photo_ids=[p["id"] for p in photos])`` and
+    deletes the existing predictions for photos in the missing folder — even
+    though the run had no chance to write a replacement. The user loses
+    their prior labels for photos we didn't even open.
+
+    Scope the clear to photos this spec actually reached AND wasn't source-
+    skipped, so an unreached photo keeps its prior prediction.
+    """
+    import classifier as classifier_mod
+    import classify_job
+    import config as cfg
+    from db import Database
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cfg.CONFIG_PATH = str(tmp_path / "config.json")
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws_id = db._active_workspace_id
+
+    gone_folder_path = str(tmp_path / "vanished")
+    healthy_folder_path = str(tmp_path / "still_here")
+    os.makedirs(gone_folder_path, exist_ok=True)
+    os.makedirs(healthy_folder_path, exist_ok=True)
+
+    gone_folder_id = db.add_folder(gone_folder_path)
+    healthy_folder_id = db.add_folder(healthy_folder_path)
+
+    photo_ids = []
+    gone_photo_ids: set = set()
+    healthy_photo_ids = []
+    gone_detection_ids = []
+    for i in range(3):
+        name = f"gone{i}.jpg"
+        pid = db.add_photo(
+            gone_folder_id, name, ".jpg", 4000 + i, 4_000_000.0 + i,
+        )
+        _drop_jpeg(gone_folder_path, name)
+        det_ids = db.save_detections(
+            pid,
+            [{"box": {"x": 0.1, "y": 0.1, "w": 0.5, "h": 0.5},
+              "confidence": 0.9, "category": "animal"}],
+            detector_model="MegaDetector",
+        )
+        photo_ids.append(pid)
+        gone_photo_ids.add(pid)
+        gone_detection_ids.append(det_ids[0])
+    for i in range(3):
+        name = f"healthy{i}.jpg"
+        pid = db.add_photo(
+            healthy_folder_id, name, ".jpg", 5000 + i, 5_000_000.0 + i,
+        )
+        _drop_jpeg(healthy_folder_path, name)
+        db.save_detections(
+            pid,
+            [{"box": {"x": 0.1, "y": 0.1, "w": 0.5, "h": 0.5},
+              "confidence": 0.9, "category": "animal"}],
+            detector_model="MegaDetector",
+        )
+        photo_ids.append(pid)
+        healthy_photo_ids.append(pid)
+
+    col_id = db.add_collection(
+        "Test",
+        json.dumps([{"field": "photo_ids", "value": photo_ids}]),
+    )
+
+    _setup_fake_downloaded_model(tmp_path, monkeypatch)
+
+    import labels_fingerprint as lfp
+    monkeypatch.setattr(lfp, "compute_fingerprint", lambda *a, **k: "fp")
+
+    # Seed a prior prediction for every photo in the unreachable folder under
+    # the same (model, labels_fingerprint) the reclassify run will target.
+    # These are exactly the rows the buggy clear used to wipe out even
+    # though the run couldn't rewrite them.
+    prior_species = "PriorSpecies"
+    for det_id in gone_detection_ids:
+        db.add_prediction(
+            detection_id=det_id,
+            species=prior_species,
+            confidence=0.42,
+            model="clip",
+            labels_fingerprint="fp",
+        )
+
+    def fake_detect_batch(batch, folders, runner, job, reclassify, db_,
+                          det_conf_threshold=None, already_detected_ids=None,
+                          cached_detections=None):
+        det_map = {}
+        for p in batch:
+            det_map[p["id"]] = [{
+                "id": d["id"],
+                "box_x": d["box_x"], "box_y": d["box_y"],
+                "box_w": d["box_w"], "box_h": d["box_h"],
+                "confidence": d["detector_confidence"],
+                "category": d["category"],
+            } for d in db_.get_detections(p["id"])
+                if d["detector_model"] != "full-image"]
+        return det_map, len(batch), {p["id"] for p in batch}
+
+    monkeypatch.setattr(classify_job, "_detect_batch", fake_detect_batch)
+
+    from PIL import Image as _PILImage
+
+    fake_missing_root = str(tmp_path / "vanished_at_classify_time")
+
+    def selective_prepare_image(photo, folders, detection, vireo_dir=None):
+        if photo["id"] in gone_photo_ids:
+            image_path = os.path.join(fake_missing_root, photo["filename"])
+            return None, fake_missing_root, image_path
+        fp = folders.get(photo["folder_id"], "")
+        return (
+            _PILImage.new("RGB", (16, 16), "black"),
+            fp,
+            os.path.join(fp, photo["filename"]),
+        )
+
+    monkeypatch.setattr(classify_job, "_prepare_image", selective_prepare_image)
+
+    def fake_flush_batch(batch, clf, model_type, model_name, db_, raw_results,
+                         top_k=1):
+        for entry in batch:
+            raw_results.append({
+                "photo": entry["photo"],
+                "detection_id": entry.get("detection_id"),
+                "folder_path": entry["folder_path"],
+                "image_path": entry["image_path"],
+                "prediction": "FreshSpecies",
+                "confidence": 0.9,
+                "timestamp": None,
+                "filename": entry["photo"]["filename"],
+                "embedding": None,
+                "taxonomy": None,
+            })
+        return 0
+
+    monkeypatch.setattr(classify_job, "_flush_batch", fake_flush_batch)
+
+    class FakeClassifier:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def encode_image(self, *args, **kwargs):
+            import numpy as np
+            return np.zeros(512, dtype=np.float32)
+
+    monkeypatch.setattr(classifier_mod, "Classifier", FakeClassifier)
+
+    class NoPauseRunner(FakeRunner):
+        def pause_job(self, job_id):
+            return False
+
+        def wait_if_paused(self, job_id, *, publish_paused=False):
+            return False
+
+    params = PipelineParams(
+        collection_id=col_id,
+        skip_extract_masks=True,
+        skip_regroup=True,
+        reclassify=True,
+    )
+
+    runner = NoPauseRunner()
+    job = _make_job()
+
+    # The run finishes failed (the gone folder was never opened), but the
+    # unreachable photos' prior predictions must still be there afterwards.
+    with pytest.raises(RuntimeError):
+        run_pipeline_job(job, runner, db_path, ws_id, params)
+
+    surviving = db.conn.execute(
+        f"SELECT COUNT(*) FROM predictions p "
+        f"JOIN detections d ON d.id = p.detection_id "
+        f"WHERE d.photo_id IN "
+        f"({','.join('?' * len(gone_photo_ids))}) "
+        f"AND p.species = ?",
+        list(gone_photo_ids) + [prior_species],
+    ).fetchone()[0]
+    assert surviving == len(gone_detection_ids), (
+        f"reclassify with a folder-scoped outage must leave the prior "
+        f"predictions for unreachable photos in place — the run had no "
+        f"chance to rewrite them. Expected {len(gone_detection_ids)} "
+        f"surviving {prior_species!r} rows, got {surviving}."
+    )
+
+    # And the healthy folder's photos should have been (re)classified with
+    # the fresh prediction — the fix must not regress the happy path.
+    fresh_stored = db.conn.execute(
+        f"SELECT COUNT(DISTINCT d.photo_id) FROM predictions p "
+        f"JOIN detections d ON d.id = p.detection_id "
+        f"WHERE d.photo_id IN "
+        f"({','.join('?' * len(healthy_photo_ids))}) "
+        f"AND p.species = 'FreshSpecies'",
+        list(healthy_photo_ids),
+    ).fetchone()[0]
+    assert fresh_stored == len(healthy_photo_ids), (
+        f"Healthy folder must still be classified after the fix; "
+        f"expected {len(healthy_photo_ids)} FreshSpecies rows, "
+        f"got {fresh_stored}."
+    )
+
+
+def test_pipeline_classify_recovered_pause_leaves_no_terminal_classify_error(
+    tmp_path, monkeypatch,
+):
+    """A successful pause+resume must not leave the run looking failed.
+
+    Codex #1388 P1 (r3663159367): the pause path used to append a
+    ``[classify] Source X — paused. Reconnect...`` entry to ``job["errors"]``
+    every time it parked. When the user reconnected and the retry
+    succeeded, that entry stayed in ``job["errors"]`` even though classify
+    completed normally. templates/pipeline.html treats every ``[classify]``
+    error as a failed stage — banner shown, success redirect suppressed —
+    so the newly supported reconnect-and-resume flow still looked failed to
+    the user. After the fix, a run that recovers must not carry a
+    ``[classify]`` entry in its terminal errors.
+    """
+    import classifier as classifier_mod
+    import classify_job
+    import config as cfg
+    from db import Database
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cfg.CONFIG_PATH = str(tmp_path / "config.json")
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws_id = db._active_workspace_id
+
+    folder_path = str(tmp_path / "photos")
+    os.makedirs(folder_path, exist_ok=True)
+    folder_id = db.add_folder(folder_path)
+    photo_ids = []
+    for i in range(6):
+        name = f"photo{i}.jpg"
+        pid = db.add_photo(folder_id, name, ".jpg", 4000 + i, 4_000_000.0 + i)
+        _drop_jpeg(folder_path, name)
+        db.save_detections(
+            pid,
+            [{"box": {"x": 0.1, "y": 0.1, "w": 0.5, "h": 0.5},
+              "confidence": 0.9, "category": "animal"}],
+            detector_model="MegaDetector",
+        )
+        photo_ids.append(pid)
+
+    col_id = db.add_collection(
+        "Test",
+        json.dumps([{"field": "photo_ids", "value": photo_ids}]),
+    )
+
+    _setup_fake_downloaded_model(tmp_path, monkeypatch)
+
+    import labels_fingerprint as lfp
+    monkeypatch.setattr(lfp, "compute_fingerprint", lambda *a, **k: "fp")
+
+    def fake_detect_batch(batch, folders, runner, job, reclassify, db_,
+                          det_conf_threshold=None, already_detected_ids=None,
+                          cached_detections=None):
+        det_map = {}
+        for p in batch:
+            det_map[p["id"]] = [{
+                "id": d["id"],
+                "box_x": d["box_x"], "box_y": d["box_y"],
+                "box_w": d["box_w"], "box_h": d["box_h"],
+                "confidence": d["detector_confidence"],
+                "category": d["category"],
+            } for d in db_.get_detections(p["id"])
+                if d["detector_model"] != "full-image"]
+        return det_map, len(batch), {p["id"] for p in batch}
+
+    monkeypatch.setattr(classify_job, "_detect_batch", fake_detect_batch)
+
+    from PIL import Image as _PILImage
+
+    gone_folder = "/Volumes/DefinitelyNotMounted12345/Raw Files"
+    state = {"mounted": True, "seen": 0}
+
+    def flaky_prepare_image(photo, folders, detection, vireo_dir=None):
+        state["seen"] += 1
+        if state["seen"] == 2:
+            state["mounted"] = False
+        if not state["mounted"]:
+            return None, gone_folder, os.path.join(
+                gone_folder, photo["filename"],
+            )
+        fp = folders.get(photo["folder_id"], "")
+        return (
+            _PILImage.new("RGB", (16, 16), "black"),
+            fp,
+            os.path.join(fp, photo["filename"]),
+        )
+
+    monkeypatch.setattr(classify_job, "_prepare_image", flaky_prepare_image)
+
+    def fake_flush_batch(batch, clf, model_type, model_name, db_, raw_results,
+                         top_k=1):
+        for entry in batch:
+            raw_results.append({
+                "photo": entry["photo"],
+                "detection_id": entry.get("detection_id"),
+                "folder_path": entry["folder_path"],
+                "image_path": entry["image_path"],
+                "prediction": "Robin",
+                "confidence": 0.9,
+                "timestamp": None,
+                "filename": entry["photo"]["filename"],
+                "embedding": None,
+                "taxonomy": None,
+            })
+        return 0
+
+    monkeypatch.setattr(classify_job, "_flush_batch", fake_flush_batch)
+
+    class FakeClassifier:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def encode_image(self, *args, **kwargs):
+            import numpy as np
+            return np.zeros(512, dtype=np.float32)
+
+    monkeypatch.setattr(classifier_mod, "Classifier", FakeClassifier)
+
+    class ReconnectingRunner(FakeRunner):
+        def __init__(self):
+            super().__init__()
+            self.pause_calls = []
+            self._paused = False
+
+        def pause_job(self, job_id):
+            self.pause_calls.append(job_id)
+            self._paused = True
+            return True
+
+        def pause_requested(self, job_id):
+            return self._paused
+
+        def mark_paused(self, job_id):
+            return True
+
+        def wait_if_paused(self, job_id, *, publish_paused=False):
+            state["mounted"] = True   # user reconnects the volume
+            self._paused = False      # ...and hits Resume
+            return False
+
+    params = PipelineParams(
+        collection_id=col_id,
+        skip_extract_masks=True,
+        skip_regroup=True,
+    )
+
+    runner = ReconnectingRunner()
+    job = _make_job()
+
+    run_pipeline_job(job, runner, db_path, ws_id, params)
+
+    # The share dropped and came back — we must have paused at least once so
+    # this test is exercising the recovery path, not a happy-path run.
+    assert runner.pause_calls, (
+        "The share dropped mid-run; classify must have paused for the "
+        "recovery path to be under test at all. If pause never fired the "
+        "test setup regressed, not the code."
+    )
+
+    # And the recovery must have actually worked — every photo classified.
+    stored = db.conn.execute(
+        "SELECT COUNT(DISTINCT d.photo_id) FROM predictions p "
+        "JOIN detections d ON d.id = p.detection_id",
+    ).fetchone()[0]
+    assert stored == 6, (
+        f"Setup sanity: reconnect+resume must classify every photo for the "
+        f"pause-error assertion below to be meaningful; only {stored} were "
+        f"classified."
+    )
+
+    # The heart of the fix: nothing about the transient pause may survive
+    # into the terminal errors list. Any ``[classify]`` entry here trips
+    # pipeline.html's failure banner and blocks the success redirect,
+    # making the recovered run look failed to the user.
+    classify_errors = [
+        e for e in (job.get("errors") or [])
+        if isinstance(e, str) and e.startswith("[classify]")
+    ]
+    assert not classify_errors, (
+        f"A recovered pause must not leave a [classify] entry in the "
+        f"terminal errors list — pipeline.html would surface it as a "
+        f"failed stage even though classify finished successfully. Got "
+        f"{classify_errors!r}"
+    )

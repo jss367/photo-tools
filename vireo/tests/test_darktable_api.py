@@ -564,6 +564,86 @@ def test_api_job_download_darktable_space_check_ignores_wrong_size_stray(
     assert 'space' in resp.get_json()['error'].lower()
 
 
+def test_api_job_download_darktable_space_check_credits_resumable_partial(
+        app_and_db, monkeypatch):
+    """A retry after a mid-transfer cancel must not be rejected on disk space.
+
+    ``_download_with_resume`` resumes from ``<dest>.partial`` — those bytes
+    are already on disk, so the retry only needs the remaining transfer
+    plus the unpack headroom.  For a 100 MB partial of a 178 MB asset the
+    check should demand ~256 MB (178 to unpack + 78 still to transfer),
+    not the unretried 356 MB.
+    """
+    import darktable_install
+    app, _ = app_and_db
+    release = _fake_release()
+    asset_size = release["size"]
+    partial_size = asset_size // 2
+    monkeypatch.setattr(darktable_install, "resolve_release",
+                        lambda: (release, None))
+
+    target = darktable_install.install_dir()
+    os.makedirs(target, exist_ok=True)
+    partial_path = os.path.join(target, release["name"] + ".partial")
+    with open(partial_path, "wb") as f:
+        f.truncate(partial_size)
+
+    # Free space equals what the retry actually needs: one full asset (unpack
+    # headroom) plus the bytes still to transfer.  Without crediting the
+    # partial the preflight demands 2x the asset size and rejects the retry.
+    monkeypatch.setattr(darktable_install, "free_space_bytes",
+                        lambda p: asset_size + (asset_size - partial_size))
+
+    def fake_download(asset, **kwargs):
+        return os.path.join(target, release["name"]), "ok"
+    monkeypatch.setattr(darktable_install, "download", fake_download)
+    monkeypatch.setattr(darktable_install, "hand_off",
+                        lambda p, **k: {"action": "opened-installer",
+                                        "location": p, "bin_path": None})
+    monkeypatch.setattr(darktable_install, "is_quarantined", lambda p: False)
+
+    resp = app.test_client().post('/api/jobs/download-darktable')
+    assert resp.status_code == 200, resp.get_json()
+
+
+def test_api_job_download_darktable_space_check_partial_credit_capped_at_asset_size(
+        app_and_db, monkeypatch):
+    """A ``.partial`` larger than the API-published size must not over-credit.
+
+    A stale partial from a different release could otherwise let a retry
+    slip past the preflight and then fill the disk mid-transfer.  Bound
+    the credit at ``asset_size``.
+    """
+    import darktable_install
+    app, _ = app_and_db
+    release = _fake_release()
+    asset_size = release["size"]
+    monkeypatch.setattr(darktable_install, "resolve_release",
+                        lambda: (release, None))
+
+    target = darktable_install.install_dir()
+    os.makedirs(target, exist_ok=True)
+    partial_path = os.path.join(target, release["name"] + ".partial")
+    # Twice the asset size — a stale file that would over-credit the check
+    # if the cap did not exist.
+    with open(partial_path, "wb") as f:
+        f.truncate(asset_size * 2)
+
+    # Free = asset_size - 1 byte.  With no cap the credit would be
+    # 2*asset_size, so ``needed`` = 0 and the check would pass.  Capped at
+    # asset_size, ``needed`` = asset_size and the check must refuse.
+    monkeypatch.setattr(darktable_install, "free_space_bytes",
+                        lambda p: asset_size - 1)
+
+    def must_not_download(*a, **k):
+        raise AssertionError("preflight must refuse when credit would over-count")
+    monkeypatch.setattr(darktable_install, "download", must_not_download)
+
+    resp = app.test_client().post('/api/jobs/download-darktable')
+    assert resp.status_code == 400
+    assert 'space' in resp.get_json()['error'].lower()
+
+
 def test_api_job_download_darktable_400_when_the_target_dir_is_unusable(
         app_and_db, monkeypatch):
     """A read-only home must not 500 a button press.

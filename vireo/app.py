@@ -18413,13 +18413,25 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         # headroom.  Gate on the API-supplied size (same rule download() uses)
         # so an unrelated file the user dropped in the tools directory does
         # not get credited against the check.
+        #
+        # A cancelled- or connection-lost-during-transfer attempt leaves a
+        # ``.partial`` sibling that _download_with_resume will resume from,
+        # so those bytes are also already on disk and the retry only needs
+        # ``asset_size - partial_size`` more download bytes plus the unpack
+        # headroom.  Cap the credit at ``asset_size`` — a ``.partial`` bigger
+        # than the API-published size is a sign of a stale file from a
+        # different release, and crediting more than we can actually reuse
+        # would let the retry through only for the disk to fill mid-transfer.
         reusable_bytes = 0
         asset_name = asset.get("name") or ""
         if asset_name:
             existing_dest = os.path.join(target, os.path.basename(asset_name))
+            existing_partial = existing_dest + ".partial"
             try:
                 if os.path.isfile(existing_dest) and os.path.getsize(existing_dest) == asset_size:
                     reusable_bytes = asset_size
+                elif os.path.isfile(existing_partial) and asset_size:
+                    reusable_bytes = min(os.path.getsize(existing_partial), asset_size)
             except OSError:
                 reusable_bytes = 0
         needed = max(0, asset_size * 2 - reusable_bytes)

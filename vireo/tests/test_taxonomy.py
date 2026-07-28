@@ -901,6 +901,72 @@ def test_download_with_resume_cancels_midstream(tmp_path):
     assert requests["n"] == 1, f"expected a single request, got {requests['n']}"
 
 
+def test_download_with_resume_cancel_interrupts_stalled_read(tmp_path):
+    """A Stop press during a stalled resp.read must not wait for the socket timeout.
+
+    Before the watcher thread, cancellation was polled only between reads, so a
+    stalled connection let the flag sit unnoticed until the 120 s urlopen timeout
+    expired — the Settings progress UI stayed running for two minutes on the
+    exact unreliable-network scenario cancellation is for.  The watcher now
+    closes resp when should_cancel goes true, unblocking the read immediately.
+    """
+    import http.server
+    import threading
+    import time
+
+    from taxonomy import DownloadCancelled, _download_with_resume
+
+    # Promise 8 MB in Content-Length but only send 1 KB and hang.  resp.read
+    # of 8 MB has to keep reading until it gets Content-Length bytes or the
+    # connection closes — after the 1 KB flush the read blocks on the socket.
+    stop_hanging = threading.Event()
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Length", str(8 * 1024 * 1024))
+            self.end_headers()
+            self.wfile.write(b"x" * 1024)
+            self.wfile.flush()
+            # Hold the connection open until the test releases it — this is
+            # what makes resp.read block on the client side.
+            stop_hanging.wait(timeout=30)
+
+        def log_message(self, *a):
+            pass
+
+    server, port = _start_test_server(Handler)
+    cancel_flag = threading.Event()
+
+    def fire_cancel_after_read_starts():
+        # A short wait so we are already inside the blocked resp.read when
+        # the flag flips: much longer than the initial header exchange, much
+        # shorter than the socket timeout.
+        time.sleep(0.5)
+        cancel_flag.set()
+    threading.Thread(target=fire_cancel_after_read_starts, daemon=True).start()
+
+    try:
+        dest = tmp_path / "out.bin"
+        started = time.monotonic()
+        with pytest.raises(DownloadCancelled):
+            _download_with_resume(
+                f"http://127.0.0.1:{port}/x", str(dest),
+                chunk_size=8 * 1024 * 1024,  # bigger than the server ever sends
+                should_cancel=cancel_flag.is_set,
+            )
+        elapsed = time.monotonic() - started
+    finally:
+        stop_hanging.set()
+        server.shutdown()
+
+    # Well under the 120 s socket timeout — the watcher closed resp within
+    # its poll interval and the read exited immediately after.
+    assert elapsed < 5, (
+        f"cancel took {elapsed:.2f}s — the watcher did not close a stalled read"
+    )
+
+
 def test_download_with_resume_cancels_during_retry_backoff(tmp_path):
     """A cancel that lands during the retry wait aborts instead of sleeping it out.
 

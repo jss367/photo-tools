@@ -152,19 +152,13 @@ def _mount_root_offline(mount_root: str) -> bool:
 
     Callers only get here when a subtree read has already failed, so we
     need positive evidence the root was actually a mount before scoping
-    the outage to the whole share. Three shapes count as offline:
+    the outage to the whole share. Two shapes count as offline:
 
     * The directory is entirely gone — macOS removes ``/Volumes/<share>``
       on eject, so ``lexists`` alone is enough.
     * A stale mount whose device is dead raises EIO from ``listdir`` /
       stat probes — we're in the "reads are already failing" path so an
       errored probe can't be considered healthy.
-    * The directory exists, is readable but empty, and
-      ``os.path.ismount`` reports nothing is mounted at it — the Linux
-      common case, where the mount-point stub (``/mnt/<share>``,
-      ``/media/<user>/<name>``) persists after ``umount`` or a network
-      drop. When the mount was active its contents lived on the mounted
-      filesystem, so an unmounted stub is typically empty.
 
     ``ismount`` is intentionally NOT used as an early "still mounted →
     healthy" short-circuit. A stale SMB/NFS mount can keep its
@@ -173,18 +167,20 @@ def _mount_root_offline(mount_root: str) -> bool:
     the root raises EIO. Trusting ismount alone would classify the
     dropped share as folder-scoped and classify would keep reissuing
     reads across the dead share instead of pausing for reconnection
-    (Codex #1388 P1 r3664211201). Probe with ``listdir`` first;
-    ``ismount`` only comes into play as a positive mount-identity
-    signal when the root is empty (to tell an actual empty mount from
-    an unmounted stub).
+    (Codex #1388 P1 r3664211201). Probe with ``listdir`` first.
 
-    An ``ismount``-negative directory that still has siblings is not
-    treated as offline — that's proof it's an ordinary local directory
-    that happens to sit under ``/mnt/`` or ``/media/<user>/``, and one
-    deleted subfolder inside it must stay folder-scoped (Codex #1388 P1
-    r3663642357). Otherwise a user who deletes ``/mnt/photos/trip``
-    from a plain local ``/mnt/photos`` catalog would see the whole run
-    pause and eventually abandon their healthy sibling folders.
+    A root that exists and is readable — populated OR empty — is
+    treated as online. Populated is proof either that the mount is
+    live or that this is an ordinary local directory with siblings
+    to work through; either way any specific missing subtree is a
+    folder-scoped issue (Codex #1388 P1 r3663642357). Empty is
+    ambiguous — it could be an unmounted stub OR an ordinary local
+    ``/mnt/photos`` whose only child (the deleted collection folder)
+    just went away — so err folder-scoped rather than paint every
+    folder-only outage as a whole-mount outage (Codex #1388 P1
+    r3664348752). If the mount truly is dead, the ``listdir`` OSError
+    branch above still fires and catches the case that matters
+    (mount registered but server unreachable).
     """
     if not os.path.lexists(mount_root):
         return True
@@ -194,25 +190,15 @@ def _mount_root_offline(mount_root: str) -> bool:
     # scope the outage to the mount and pause, rather than falling
     # through to the folder-scoped branch and hammering the dead share.
     try:
-        entries = os.listdir(mount_root)
+        os.listdir(mount_root)
     except OSError:
         return True
-    if entries:
-        # Readable and populated: whether it's a real mount or a plain
-        # local directory, callers should treat it as online. The
-        # folder-scoped branch above will still flag whatever subtree
-        # was individually unreachable.
-        return False
-    # Empty root: distinguish an actual mount that happens to be empty
-    # from a bare mount-point stub. ``ismount`` here is a positive
-    # identity check (still mounted → healthy), not a readability
-    # claim. If the ismount probe itself errors, treat as offline —
-    # we're already on the failed-read path and have no reason to be
-    # generous.
-    try:
-        return not os.path.ismount(mount_root)
-    except OSError:
-        return True
+    # Readable root: whether populated (real mount OR local dir with
+    # siblings) or empty (empty mount OR local dir whose only child
+    # was deleted), we can't reliably prove the missing subtree is a
+    # mount-wide outage. Callers should treat it as online and take
+    # the folder-scoped branch.
+    return False
 
 
 def _source_offline_reason(
@@ -263,6 +249,42 @@ def _source_offline_reason(
         if _mount_root_offline(mount_root):
             return "mount", f"volume {mount_root} is not mounted"
     return "folder", f"folder {folder_path} is unreadable"
+
+
+def _still_offline_photo_ids(thread_db, photo_ids) -> set:
+    """Return the subset of ``photo_ids`` whose folder is still unreadable.
+
+    Downstream stages (extract_masks, eye_keypoints) filter photos by
+    the aggregate ``source_offline_state["skipped_photo_ids"]`` set so
+    an offline folder's photos aren't re-opened just to fail again.
+    That set accumulates across every classifier spec, but the folder
+    can recover between specs — or between classify and mask
+    extraction. Without a re-probe the mask/eye-keypoint stages would
+    silently exclude a photo whose folder came back (Codex #1388 P2
+    r3664348758). Anything the DB no longer knows about is dropped
+    from the returned set — a photo that was purged since classify
+    can't be filtered either.
+    """
+    if not photo_ids:
+        return set()
+    ids = [int(pid) for pid in photo_ids]
+    placeholders = ",".join("?" * len(ids))
+    rows = thread_db.conn.execute(
+        f"SELECT p.id, f.path "
+        f"FROM photos p JOIN folders f ON p.folder_id = f.id "
+        f"WHERE p.id IN ({placeholders})",
+        ids,
+    ).fetchall()
+    still_offline: set = set()
+    for row in rows:
+        pid = row["id"] if hasattr(row, "keys") else row[0]
+        path = row["path"] if hasattr(row, "keys") else row[1]
+        # ``isdir`` False covers both a still-missing folder and a
+        # mount-scoped outage (dead mount → isdir False for every
+        # child), so a single probe suffices for either scope.
+        if not path or not os.path.isdir(path):
+            still_offline.add(pid)
+    return still_offline
 
 
 @dataclass
@@ -4821,7 +4843,20 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                                         # offline; skip this photo as
                                         # unreachable and let later photos
                                         # in healthy folders keep processing.
-                                        source_skipped += 1
+                                        # Guard the counter with the per-spec
+                                        # skipped-photo set so a multi-subject
+                                        # photo (N qualifying detections)
+                                        # counts once, not N times — the
+                                        # per-spec ``total`` and step summary
+                                        # are photo-scoped, and without this
+                                        # the row could report e.g. ``3
+                                        # unreachable`` out of ``1`` photo
+                                        # (Codex #1388 P2 r3664348763).
+                                        if (
+                                            photo["id"]
+                                            not in spec_source_skipped_photo_ids
+                                        ):
+                                            source_skipped += 1
                                         source_skipped_photo_ids.add(
                                             photo["id"]
                                         )
@@ -5361,8 +5396,19 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                 # so healthy folders keep processing here; this filter is
                 # how "healthy folders keep processing" stays true without
                 # dragging the missing folder's photos along.
+                #
+                # Re-probe before filtering: the aggregate skipped set
+                # accumulates across every classifier spec, and a folder
+                # that dropped for spec A can recover before mask
+                # extraction runs. Without the re-probe we'd silently
+                # exclude photos whose folder came back (Codex #1388 P2
+                # r3664348758).
                 source_skipped_photo_ids = source_offline_state.get(
                     "skipped_photo_ids") or set()
+                if source_skipped_photo_ids:
+                    source_skipped_photo_ids = _still_offline_photo_ids(
+                        thread_db, source_skipped_photo_ids,
+                    )
                 if source_skipped_photo_ids:
                     photos = [
                         p for p in photos
@@ -6050,8 +6096,16 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                 # photo and record them as eye-detection failures — the
                 # same downstream-hammering pattern the classify pause is
                 # meant to prevent (Codex #1388 P2 r3664058173).
+                #
+                # Re-probe so a folder that recovered between classify
+                # and this stage is not left out (Codex #1388 P2
+                # r3664348758).
                 source_skipped_photo_ids = source_offline_state.get(
                     "skipped_photo_ids") or set()
+                if source_skipped_photo_ids:
+                    source_skipped_photo_ids = _still_offline_photo_ids(
+                        thread_db, source_skipped_photo_ids,
+                    )
                 if source_skipped_photo_ids:
                     photos_for_stage = [
                         p for p in photos_for_stage

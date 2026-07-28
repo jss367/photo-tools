@@ -12459,20 +12459,25 @@ def test_source_offline_reason_flags_vanished_folder(tmp_path):
     assert folder in reason, f"Reason must name the folder; got {reason!r}"
 
 
-def test_source_offline_reason_flags_persistent_mountpoint_after_unmount(
+def test_source_offline_reason_keeps_empty_mountshape_root_folder_scoped(
     monkeypatch,
 ):
-    """Linux common case: the mount-point directory outlives the mount.
+    """An empty mount-shaped root with no active mount is folder-scoped.
 
-    Codex #1388 P1 (r3663493889): when a Linux SMB/NFS share mounted on a
-    persistent directory like ``/mnt/photos`` is unmounted (or the network
-    drops), ``lexists("/mnt/photos")`` remains True — only the *contents*
-    become unreachable. Pre-fix, ``_source_offline_reason`` fell through
-    to the folder-scoped branch and classify skipped folder-by-folder
-    instead of pausing, so every descendant of the dead share still
-    reissued a doomed read. Pin that a mount-point-shaped directory
-    without a filesystem mounted at it is treated as a mount-scoped
-    outage regardless of whether the directory itself still exists.
+    Codex #1388 P1 (r3664348752) supersedes the earlier r3663493889
+    behavior: a directory that exists, is readable, is empty, and is
+    not currently a mount point is genuinely ambiguous — it could be
+    an unmounted SMB stub OR an ordinary local ``/mnt/photos`` whose
+    only child (the deleted collection folder) just went away. The
+    two shapes have identical current-state signals, so mount-scoping
+    the outage would pause the whole run for an ordinary local
+    catalog whenever the user archives their last subfolder. Prefer
+    folder-scoped when we can't prove the root was actually a mount;
+    the dead-mount-that-still-shows-up-in-mount case (the far more
+    common failure mode — network drop leaves ``ismount == True``
+    with EIO on every read) is still mount-scoped via the
+    ``listdir`` OSError branch (see the ``…flags_stale_mount…``
+    tests below).
     """
     import pipeline_job
 
@@ -12485,30 +12490,28 @@ def test_source_offline_reason_flags_persistent_mountpoint_after_unmount(
     real_listdir = pipeline_job.os.listdir
 
     def fake_lexists(path):
-        # The persistent mount-point directory is still there.
+        # The mount-point directory (or its plain-local twin) is still
+        # there.
         if path == "/mnt/photos":
             return True
         return real_lexists(path)
 
     def fake_isdir(path):
-        # The subtree is unreachable because the filesystem is gone.
+        # The subtree is unreachable — the collection folder is gone.
         if path == folder:
             return False
         return real_isdir(path)
 
     def fake_ismount(path):
-        # But nothing is actually mounted at /mnt/photos — the whole
-        # share, not just this one folder, is offline.
+        # No filesystem currently mounted at /mnt/photos. Could be a
+        # cleanly-unmounted share OR a plain local dir. We can't tell.
         if path == "/mnt/photos":
             return False
         return real_ismount(path)
 
     def fake_listdir(path):
-        # An unmounted mount stub is empty — its contents lived on the
-        # mounted filesystem and vanished with the mount. This is the
-        # positive signal ``_mount_root_offline`` uses to distinguish an
-        # actual mount from a plain local directory (Codex #1388 P1
-        # r3663642357).
+        # Empty root: either an unmounted stub or a plain local dir
+        # whose only child was the deleted folder. Same signal.
         if path == "/mnt/photos":
             return []
         return real_listdir(path)
@@ -12520,19 +12523,15 @@ def test_source_offline_reason_flags_persistent_mountpoint_after_unmount(
 
     result = pipeline_job._source_offline_reason(folder, image)
     assert result is not None, (
-        "A mount-point-shaped path with no filesystem mounted at it must "
-        "register as an offline source — pre-fix, this fell through to "
-        "the folder-scoped branch and never paused the run."
+        "The deleted subfolder is still unreachable, so the helper must "
+        "report an outage — just scoped to the folder, not the whole mount."
     )
     scope, reason = result
-    assert scope == "mount", (
-        f"Persistent-mountpoint outages must scope to the mount so the "
-        f"whole run pauses for reconnection; scoping to 'folder' would "
-        f"re-hit the dead share once per descendant. Got scope {scope!r}."
-    )
-    assert "/mnt/photos" in reason, (
-        f"Reason must name the mount root the user needs to reconnect; "
-        f"got {reason!r}."
+    assert scope == "folder", (
+        f"An empty mount-shaped root without positive mount-identity "
+        f"evidence is ambiguous; scoping it as a mount outage would pause "
+        f"an ordinary local catalog whenever its last subfolder is "
+        f"archived. Got scope {scope!r} reason {reason!r}."
     )
 
 
@@ -12825,6 +12824,82 @@ def test_source_offline_reason_flags_disconnected_windows_share(monkeypatch):
         f"The reason must name the drive the user needs to reconnect; got "
         f"{reason!r}."
     )
+
+
+def test_mount_root_offline_false_for_empty_ordinary_local_dir(tmp_path):
+    """An empty readable directory that isn't a mount is NOT offline.
+
+    Codex #1388 P1 (r3664348752): an ordinary local ``/mnt/photos``
+    whose only child (the deleted collection folder) just went away is
+    empty + ``ismount=False`` + readable — the same signals as an
+    unmounted stub. Pre-fix the helper returned True for either shape,
+    upgrading the missing subfolder to a mount-wide outage; the whole
+    run would pause and eventually abandon any healthy siblings. Pin
+    that ``_mount_root_offline`` treats a readable directory as online
+    regardless of whether it's populated or empty and whether it's
+    ismount-positive.
+    """
+    from pipeline_job import _mount_root_offline
+
+    empty_root = tmp_path / "empty_mnt_style"
+    empty_root.mkdir()  # readable, empty, not a mount
+
+    assert _mount_root_offline(str(empty_root)) is False, (
+        "An empty readable directory must not be reported as offline just "
+        "because ismount is False — that would pause runs on an ordinary "
+        "local catalog whose last subfolder was archived."
+    )
+
+
+def test_still_offline_photo_ids_prunes_recovered_folders(tmp_path):
+    """Photos whose folder is now readable must drop out of the skip set.
+
+    Codex #1388 P2 (r3664348758): the aggregate
+    ``source_offline_state["skipped_photo_ids"]`` accumulates across every
+    classifier spec, and a folder that dropped for spec A can recover
+    before mask extraction runs. Without a re-probe, the downstream
+    filter would silently exclude the now-readable photo and it would
+    never get its masks. Pin that ``_still_offline_photo_ids`` returns
+    only photos whose folder is still missing at re-probe time.
+    """
+    import config as cfg
+    from db import Database
+    from pipeline_job import _still_offline_photo_ids
+
+    cfg.CONFIG_PATH = str(tmp_path / "config.json")
+    db = Database(str(tmp_path / "test.db"))
+
+    healthy_folder = tmp_path / "healthy"
+    healthy_folder.mkdir()
+    gone_folder = tmp_path / "vanished"
+    gone_folder.mkdir()
+
+    healthy_folder_id = db.add_folder(str(healthy_folder))
+    gone_folder_id = db.add_folder(str(gone_folder))
+
+    healthy_id = db.add_photo(
+        healthy_folder_id, "a.jpg", ".jpg", 1000, 100.0,
+    )
+    gone_id = db.add_photo(
+        gone_folder_id, "b.jpg", ".jpg", 1000, 101.0,
+    )
+
+    # Now delete the "gone" folder — folder A recovered, folder B is
+    # still missing. This is the multi-model recovery shape: both
+    # photo IDs entered the aggregate skipped set for an earlier
+    # classifier spec, but only one of them is still unreachable now.
+    os.rmdir(gone_folder)
+
+    still_offline = _still_offline_photo_ids(db, {healthy_id, gone_id})
+    assert still_offline == {gone_id}, (
+        f"A recovered folder must drop its photo from the still-offline "
+        f"set so downstream stages can process it; only the folder that "
+        f"remains missing should stay in the set. Got {still_offline!r}."
+    )
+
+    # And the empty-input path is a no-op — no DB query needed.
+    assert _still_offline_photo_ids(db, set()) == set()
+    assert _still_offline_photo_ids(db, []) == set()
 
 
 def test_pipeline_classify_pauses_when_source_volume_disappears(
@@ -14232,6 +14307,141 @@ def test_pipeline_classify_folder_outage_is_not_a_clean_success(
     )
 
 
+def test_pipeline_classify_folder_outage_counts_each_photo_once(
+    tmp_path, monkeypatch,
+):
+    """A multi-subject unreachable photo counts once, not once per detection.
+
+    Codex #1388 P2 (r3664348763): the per-spec ``source_skipped`` counter
+    was incremented inside the per-detection loop. A single photo with N
+    qualifying detections would report ``N unreachable`` even though the
+    per-spec ``total`` (and the ``spec_source_skipped_photo_ids`` set) are
+    photo-scoped, so the step summary could read e.g. ``3 unreachable``
+    out of ``1`` photo. Pin that a single unreachable photo with several
+    detections counts as one skipped photo.
+    """
+    import classifier as classifier_mod
+    import classify_job
+    import config as cfg
+    from db import Database
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cfg.CONFIG_PATH = str(tmp_path / "config.json")
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws_id = db._active_workspace_id
+
+    folder_path = str(tmp_path / "photos")
+    os.makedirs(folder_path, exist_ok=True)
+    folder_id = db.add_folder(folder_path)
+    name = "photo0.jpg"
+    pid = db.add_photo(folder_id, name, ".jpg", 4000, 4_000_000.0)
+    _drop_jpeg(folder_path, name)
+    # Three qualifying animal detections on the same photo — this is what
+    # a multi-subject frame looks like to classify.
+    db.save_detections(
+        pid,
+        [
+            {"box": {"x": 0.1, "y": 0.1, "w": 0.2, "h": 0.2},
+             "confidence": 0.9, "category": "animal"},
+            {"box": {"x": 0.4, "y": 0.4, "w": 0.2, "h": 0.2},
+             "confidence": 0.85, "category": "animal"},
+            {"box": {"x": 0.7, "y": 0.1, "w": 0.2, "h": 0.2},
+             "confidence": 0.8, "category": "animal"},
+        ],
+        detector_model="MegaDetector",
+    )
+
+    col_id = db.add_collection(
+        "Test",
+        json.dumps([{"field": "photo_ids", "value": [pid]}]),
+    )
+
+    _setup_fake_downloaded_model(tmp_path, monkeypatch)
+
+    import labels_fingerprint as lfp
+    monkeypatch.setattr(lfp, "compute_fingerprint", lambda *a, **k: "fp")
+
+    def fake_detect_batch(batch, folders, runner, job, reclassify, db_,
+                          det_conf_threshold=None, already_detected_ids=None,
+                          cached_detections=None):
+        det_map = {}
+        for p in batch:
+            det_map[p["id"]] = [{
+                "id": d["id"],
+                "box_x": d["box_x"], "box_y": d["box_y"],
+                "box_w": d["box_w"], "box_h": d["box_h"],
+                "confidence": d["detector_confidence"],
+                "category": d["category"],
+            } for d in db_.get_detections(p["id"])
+                if d["detector_model"] != "full-image"]
+        return det_map, len(batch), {p["id"] for p in batch}
+
+    monkeypatch.setattr(classify_job, "_detect_batch", fake_detect_batch)
+
+    # Point every detection at a folder that never existed on disk — trips
+    # the folder-scoped branch. Because ``_prepare_image`` fails at the
+    # per-detection level, pre-fix the counter fires three times for this
+    # one photo.
+    fake_missing_folder = str(tmp_path / "vanished_folder")
+
+    def folder_missing_prepare_image(photo, folders, detection, vireo_dir=None):
+        return None, fake_missing_folder, os.path.join(
+            fake_missing_folder, photo["filename"],
+        )
+
+    monkeypatch.setattr(
+        classify_job, "_prepare_image", folder_missing_prepare_image,
+    )
+
+    class FakeClassifier:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def encode_image(self, *args, **kwargs):
+            import numpy as np
+            return np.zeros(512, dtype=np.float32)
+
+    monkeypatch.setattr(classifier_mod, "Classifier", FakeClassifier)
+
+    params = PipelineParams(
+        collection_id=col_id,
+        skip_extract_masks=True,
+        skip_regroup=True,
+    )
+
+    runner = FakeRunner()
+    job = _make_job()
+
+    with pytest.raises(RuntimeError):
+        run_pipeline_job(job, runner, db_path, ws_id, params)
+
+    # The per-model step summary must say "1 unreachable" for our single
+    # multi-detection photo, not "3 unreachable" (one tick per detection).
+    classify_steps = [
+        kwargs for (_jid, sid, kwargs) in runner.step_updates
+        if sid.startswith("classify:") and "summary" in kwargs
+    ]
+    summaries = " ".join(k["summary"] for k in classify_steps)
+    assert "1 unreachable" in summaries, (
+        f"A single unreachable photo with multiple qualifying detections "
+        f"must count as one skipped photo in the step summary, not once "
+        f"per detection. Got summary {summaries!r}"
+    )
+    assert "3 unreachable" not in summaries, (
+        f"Pre-fix regression: the summary reported N unreachable for a "
+        f"multi-subject photo with N detections. Got {summaries!r}"
+    )
+
+    # And the stage rollup must report the same photo-scoped count.
+    result_stages = job["result"]["stages"]
+    assert result_stages["classify"].get("source_skipped") == 1, (
+        f"Structured source_skipped is a photo-scoped count for downstream "
+        f"consumers; got {result_stages['classify']!r}"
+    )
+
+
 def test_pipeline_classify_give_up_skips_downstream_stages(
     tmp_path, monkeypatch,
 ):
@@ -15533,6 +15743,14 @@ def test_pipeline_classify_folder_outage_skips_unreachable_photos_in_downstream_
         )
         photo_ids.append(pid)
         healthy_photo_ids.add(pid)
+
+    # Drop the DB-recorded folder from disk so downstream stages re-probe
+    # (Codex #1388 P2 r3664348758) still see it as offline. Without this,
+    # the aggregate skip set would be pruned by the re-probe helper and
+    # extract_masks would (correctly) walk the now-reachable folder.
+    for entry in os.listdir(gone_folder_path):
+        os.remove(os.path.join(gone_folder_path, entry))
+    os.rmdir(gone_folder_path)
 
     col_id = db.add_collection(
         "Test",

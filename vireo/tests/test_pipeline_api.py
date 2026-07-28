@@ -2642,6 +2642,57 @@ def test_destination_preview_inside_managed_archive_flags_ancestor(setup, tmp_pa
         assert data["managed_archive"]["photo_count"] == 1
 
 
+def test_destination_preview_above_managed_archive_does_not_claim_merge(
+    setup, tmp_path,
+):
+    """A broad destination root must not claim it will merge into a managed
+    archive nested somewhere below it.
+
+    The import page can target a mounted NAS root while an existing library
+    lives several segments below that root. The resulting folder may be a
+    sibling of the library, so treating descendant overlap as a merge makes
+    the callout contradict the exact-folder table.
+    """
+    app, db_path = setup
+    mount_root = tmp_path / "Photography"
+    managed = mount_root / "Raw Files" / "USA" / "2026"
+    shoot = managed / "2026-07-26"
+    shoot.mkdir(parents=True)
+    old = shoot / "old.jpg"
+    Image.new("RGB", (16, 16), "green").save(old)
+
+    from db import Database
+    seed = Database(db_path)
+    managed_id = seed.add_folder(str(managed))
+    shoot_id = seed.add_folder(
+        str(shoot), parent_id=managed_id, workspace_root=False,
+    )
+    seed.add_photo(
+        shoot_id, old.name, ".jpg", old.stat().st_size, old.stat().st_mtime,
+    )
+    seed.close()
+
+    src = tmp_path / "card"
+    src.mkdir()
+    new = src / "new.jpg"
+    Image.new("RGB", (16, 16), "blue").save(new)
+    mtime = datetime(2026, 7, 27, 9, 30, 0).timestamp()
+    os.utime(str(new), (mtime, mtime))
+
+    with app.test_client() as c:
+        resp = c.post("/api/import/destination-preview", json={
+            "sources": [str(src)],
+            "destination": str(mount_root),
+            "folder_template": "%Y/%Y-%m-%d",
+        })
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["managed_archive"] is None
+        assert data["folders"][0]["full_path"] == str(
+            mount_root / "2026" / "2026-07-27"
+        )
+
+
 def _wait_for_job(client, job_id, timeout=30.0):
     """Poll the job-status endpoint until the job completes or fails."""
     deadline = time.time() + timeout

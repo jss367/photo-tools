@@ -155,8 +155,8 @@ def test_import_preview_runs_automatically_after_source_selection(live_server, p
     grid = page.locator("#importPreviewGrid")
     expect(grid).to_be_visible()
     expect(grid).to_contain_text("IMG_0001.jpg")
-    expect(grid).to_contain_text("IMG_0002.jpg")
-    expect(grid).to_contain_text("Duplicate")
+    expect(grid).not_to_contain_text("IMG_0002.jpg")
+    expect(grid).to_contain_text("1 duplicate hidden")
     expect(grid).to_contain_text("To: 2026/2026-07-11")
 
 
@@ -460,7 +460,9 @@ def test_import_preview_shows_destination_folder_structure(live_server, page):
     expect(rows.nth(2).locator("td")).to_have_text(
         ["/archive/2026/2026-07-02", "1", "existing"]
     )
-    expect(structure).to_contain_text("Merging into a managed archive at")
+    expect(structure).to_contain_text(
+        "This destination is inside the managed archive rooted at"
+    )
     expect(structure).to_contain_text("/archive")
     expect(structure).to_contain_text("1284 photos already cataloged")
     expect(structure).to_contain_text("2026/2026-07-01")
@@ -807,6 +809,130 @@ def test_import_dest_structure_invalidation_survives_slow_startup(live_server, p
     # would stay visible.
     page.locator("#destInput").fill("/archive")
     expect(page.locator("#destStructure")).to_be_hidden()
+
+
+def test_import_remote_destination_requires_visible_folder_inside_nas(
+    live_server, page,
+):
+    """The remote root alone is not a complete destination. Explain the
+    missing folder beside the field and keep Start unavailable until it is
+    valid, instead of hiding a tiny error below the thumbnail grid."""
+    url = live_server["url"]
+
+    def remote_targets(route):
+        route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({
+                "rsync_available": True,
+                "ssh_available": True,
+                "targets": [{
+                    "id": "nas1",
+                    "name": "Photo NAS",
+                    "user": "photo",
+                    "host": "nas.local",
+                    "remote_path": "/volume1/Photography",
+                    "mount_path": "/Volumes/Photography",
+                }],
+            }),
+        )
+
+    page.route("**/api/remote-targets", remote_targets)
+    page.goto(f"{url}/import")
+    page.locator("#modeCopy").check()
+    page.locator("#sourceInput").fill("/tmp/card-a")
+    page.locator("#btnAddSource").click()
+    page.locator("#destMode").select_option("remote:nas1")
+
+    inline_error = page.locator("#remoteSubpathError")
+    expect(inline_error).to_be_visible()
+    expect(inline_error).to_contain_text(
+        "Enter the folder inside /volume1/Photography"
+    )
+    expect(page.locator("#btnStart")).to_be_disabled()
+    assert page.evaluate("resolvedCopyDestination()") == ""
+
+    page.locator("#remoteSubpath").fill("/Raw Files/USA")
+    expect(inline_error).to_contain_text("Subpath must be relative")
+    expect(page.locator("#btnStart")).to_be_disabled()
+
+    page.locator("#remoteSubpath").fill("Raw Files/USA")
+    expect(inline_error).to_be_hidden()
+    assert page.evaluate("resolvedCopyDestination()") == (
+        "/Volumes/Photography/Raw Files/USA"
+    )
+
+
+def test_failed_import_result_offers_preconfigured_retry(live_server, page):
+    """A mixed import can retry from its result without rebuilding the form;
+    duplicate protection is forced so successful files remain untouched."""
+    url = live_server["url"]
+    captured = {}
+
+    def start_import(route):
+        captured["body"] = json.loads(route.request.post_data or "{}")
+        route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({"job_id": "import-retry"}),
+        )
+
+    page.route("**/api/jobs/import-photos", start_import)
+    page.goto(f"{url}/import")
+    page.evaluate(
+        """
+        () => {
+          lastFinishedImportJob = {
+            id: 'import-original',
+            status: 'failed',
+            config: {
+              sources: ['/Volumes/CARD/DCIM'],
+              destination: '/Volumes/Photography/Raw Files/USA',
+              recursive: true,
+              folder_template: '%Y/%Y-%m-%d',
+              file_types: 'both',
+              skip_duplicates: false,
+              verify_by_hash: false,
+              trust_likely_duplicates: true,
+              after_import: 1,
+              tags: ['trip'],
+              location_from_gps: true,
+              allow_missing_exiftool: false,
+              remote_target_id: null,
+              remote_subpath: null,
+            },
+          };
+          renderResult({
+            discovered: 985,
+            copied: 984,
+            verified: 984,
+            skipped_duplicate: 0,
+            failed: 1,
+            safe_to_format: false,
+            unsafe_files: [{
+              path: '/Volumes/CARD/DCIM/DSC_7172.NEF',
+              reason: 'copy verification failed',
+            }],
+            folders: {},
+            errors: ['copy verification failed'],
+          }, 'failed');
+        }
+        """
+    )
+
+    retry = page.locator("#btnRetryImport")
+    expect(retry).to_be_visible()
+    expect(retry).to_have_text("Retry 1 failed file")
+    retry.click()
+    expect(page.locator("#progressCard")).to_be_visible()
+
+    body = captured["body"]
+    assert body["sources"] == ["/Volumes/CARD/DCIM"]
+    assert body["destination"] == "/Volumes/Photography/Raw Files/USA"
+    assert body["folder_template"] == "%Y/%Y-%m-%d"
+    assert body["skip_duplicates"] is True
+    assert body["after_import"] == 1
+    assert body["tags"] == ["trip"]
 
 
 def test_import_copy_start_sends_restored_options(live_server, page):

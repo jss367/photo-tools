@@ -378,6 +378,37 @@
     return job && job.config && typeof job.config === 'object' ? job.config : {};
   }
 
+  function importRetryBody(job) {
+    var cfg = jobConfig(job);
+    if (!job || job.type !== 'import' ||
+        !Array.isArray(cfg.sources) || !cfg.sources.length) return null;
+    var body = {
+      sources: cfg.sources.slice(),
+      destination: cfg.destination,
+      recursive: cfg.recursive !== false,
+      folder_template: cfg.folder_template || '%Y/%Y-%m-%d',
+      file_types: cfg.file_types || 'both',
+      skip_duplicates: true,
+      verify_by_hash: !!cfg.verify_by_hash,
+      trust_likely_duplicates: !!cfg.trust_likely_duplicates,
+      after_import: cfg.after_import == null ? null : cfg.after_import,
+      tags: Array.isArray(cfg.tags) ? cfg.tags.slice() : [],
+      location_from_gps: !!cfg.location_from_gps,
+      allow_missing_exiftool: !!cfg.allow_missing_exiftool,
+    };
+    if (cfg.remote_target_id) {
+      delete body.destination;
+      body.remote_target_id = cfg.remote_target_id;
+      body.remote_subpath = cfg.remote_subpath;
+    }
+    if (cfg.after_process_move && cfg.after_process_move.remote_target_id) {
+      body.after_process_move = {
+        remote_target_id: cfg.after_process_move.remote_target_id,
+      };
+    }
+    return body;
+  }
+
   function jobCollectionText(job) {
     var cfg = jobConfig(job);
     if (cfg.collection_name) return 'Collection: ' + cfg.collection_name;
@@ -442,6 +473,16 @@
       html += '<span>' + esc(visibleProgress.label) + ': ' + progressPct(visibleProgress) + '%</span>';
     }
     html += '</div>';
+
+    var failedImportCount = job.result && Number(job.result.failed || 0);
+    if (!isLive && failedImportCount > 0 && importRetryBody(job)) {
+      html += '<div style="padding:10px 0 2px;font-size:12px;color:var(--text-muted);">';
+      html += '<button class="btn-retry" data-retry-import-job="' +
+        escapeAttr(job.id) + '">Retry ' + failedImportCount + ' failed file' +
+        (failedImportCount === 1 ? '' : 's') + '</button>';
+      html += '<span style="margin-left:8px;">Same source and destination; successful files are skipped.</span>';
+      html += '</div>';
+    }
 
     // Steps
     var steps = job.steps || job.tree || [];
@@ -891,6 +932,47 @@
 
   // Event delegation for detail pane clicks (step toggle, pause/resume, cancel)
   document.getElementById('jobDetailPane').addEventListener('click', function(e) {
+    var retryImportBtn = e.target.closest('[data-retry-import-job]');
+    if (retryImportBtn) {
+      var retryJobId = retryImportBtn.getAttribute('data-retry-import-job');
+      var retryJob = activeJobs.concat(historyJobs).find(function(job) {
+        return job.id === retryJobId;
+      });
+      var retryBody = importRetryBody(retryJob);
+      if (!retryBody) {
+        if (typeof showToast === 'function') {
+          showToast('The original import settings are no longer available.', 'error');
+        }
+        return;
+      }
+      retryImportBtn.disabled = true;
+      retryImportBtn.textContent = 'Starting retry…';
+      fetch('/api/jobs/import-photos', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(retryBody),
+      }).then(function(response) {
+        return response.json().catch(function() { return {}; }).then(function(data) {
+          if (!response.ok) {
+            throw new Error(data.error || 'Retry failed to start');
+          }
+          return data;
+        });
+      }).then(function(data) {
+        if (typeof showToast === 'function') {
+          showToast('Import retry started. Successful files will be skipped.', 'info');
+        }
+        selectedJobId = data.job_id;
+        selectedSource = 'active';
+        currentView = data.job_id;
+        fetchJobs();
+      }).catch(function(error) {
+        retryImportBtn.disabled = false;
+        retryImportBtn.textContent = 'Retry failed files';
+        if (typeof showToast === 'function') showToast(error.message, 'error');
+      });
+      return;
+    }
     var stepHeader = e.target.closest('[data-toggle-step]');
     if (stepHeader) {
       toggleStep(stepHeader.getAttribute('data-toggle-step'));

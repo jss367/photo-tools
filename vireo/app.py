@@ -17732,12 +17732,18 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
 
         # Transparency: if the destination is (or sits inside) a folder Vireo
         # already manages, surface it as an existing archive so the UI can
-        # frame the import as a merge rather than a fresh copy. Pure catalog
-        # read — no file I/O beyond the tracked-folder probe.
-        from move import _tracked_destination_ancestor, _tracked_destination_overlap
+        # frame the import as a merge rather than a fresh copy. Do NOT accept
+        # the inverse relationship (a tracked folder somewhere below the
+        # selected destination): selecting a broad mount such as
+        # /Volumes/Photography while a managed archive lives at
+        # /Volumes/Photography/Raw Files/USA does not mean a new import into
+        # /Volumes/Photography/2026 will merge into that nested archive.
+        # Calling the overlap helper here produced exactly that contradictory
+        # preview. Pure catalog read — no file I/O beyond the tracked-folder
+        # probe.
+        from move import _tracked_destination_ancestor
         db = _get_db()
-        tracked = (_tracked_destination_overlap(db, -1, destination)
-                   or _tracked_destination_ancestor(db, -1, destination))
+        tracked = _tracked_destination_ancestor(db, -1, destination)
         result["managed_archive"] = None
         if tracked:
             from db import _subtree_prefix

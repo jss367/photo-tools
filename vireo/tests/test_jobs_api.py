@@ -545,6 +545,8 @@ def test_jobs_page_returns_200(app_and_db):
     assert b'Jobs' in resp.data
     assert b'data-pause-job' in resp.data
     assert b'data-resume-job' in resp.data
+    assert b'data-retry-import-job' in resp.data
+    assert b'importRetryBody' in resp.data
 
 
 def test_navbar_has_jobs_link(app_and_db):

@@ -44,6 +44,17 @@ body { display: flex; flex-direction: column; height: 100vh; }
   font-size: 11px; color: var(--text-secondary); overflow-wrap: anywhere;
   margin-top: 4px; width: 100%;
 }
+.field-required { color: var(--danger); font-size: 10px; font-weight: 600; }
+.field-error {
+  display: none; width: 100%; margin: -2px 0 8px; padding-left: 2px;
+  color: var(--danger); font-size: 12px; font-weight: 600;
+}
+.field-error.visible { display: block; }
+.input-invalid { border-color: var(--danger) !important; }
+.destination-mode-hint {
+  font-size: 11px; color: var(--text-secondary); margin: -2px 0 10px;
+  overflow-wrap: anywhere;
+}
 .recent-destinations { margin: -2px 0 8px 0; }
 .recent-destinations-label { font-size: 11px; color: var(--text-secondary); margin-bottom: 4px; }
 .recent-destination-list { display: flex; flex-wrap: wrap; gap: 4px; }
@@ -51,6 +62,11 @@ body { display: flex; flex-direction: column; height: 100vh; }
 .input-fixed { max-width: 240px; flex: 0 1 240px; }
 .preview-summary { font-size: 12px; color: var(--text-secondary); margin-top: 6px; }
 .import-preview-grid { display: flex; flex-direction: column; gap: 12px; margin-top: 12px; max-height: 520px; overflow-y: auto; }
+.import-preview-collapsed {
+  padding: 9px 11px; border-radius: 6px; color: var(--text-secondary);
+  background: var(--bg-tertiary); border: 1px solid var(--border-primary);
+  font-size: 12px;
+}
 .import-preview-folder { display: flex; flex-direction: column; gap: 6px; }
 .import-preview-folder-header { font-size: 12px; font-weight: 600; color: var(--text-secondary); overflow-wrap: anywhere; }
 .import-preview-thumbs { display: grid; grid-template-columns: repeat(auto-fill, minmax(104px, 1fr)); gap: 8px; }
@@ -114,7 +130,13 @@ body { display: flex; flex-direction: column; height: 100vh; }
 .pill-warn { background: color-mix(in srgb, var(--warning, #bf8700) 18%, transparent); color: var(--warning, #9a6700); }
 .unsafe-list { margin: 6px 0 0 0; padding-left: 18px; font-size: 12px; color: var(--text-secondary); }
 .result-links a { color: var(--accent); font-size: 12px; }
-#importError { color: var(--danger); font-size: 12px; margin-top: 6px; display: none; }
+#importError {
+  color: var(--danger); font-size: 13px; font-weight: 600;
+  margin: 0 0 10px; padding: 9px 11px; display: none;
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--danger) 10%, transparent);
+  border: 1px solid color-mix(in srgb, var(--danger) 35%, transparent);
+}
 .warn { font-size: 12px; color: var(--warning, #bf8700); margin-top: 6px; }
 .staging-items { display: flex; flex-direction: column; gap: 8px; margin-top: 8px; }
 .staging-item { border: 1px solid var(--border-primary); border-radius: 6px; padding: 10px; background: var(--bg-tertiary); }
@@ -322,8 +344,11 @@ body { display: flex; flex-direction: column; height: 100vh; }
       <div class="row">
         <label>Archive destination</label>
         <select id="destMode" class="input-fixed" onchange="onImportDestModeChange()">
-          <option value="local" selected>Local path</option>
+          <option value="local" selected>Local or mounted path</option>
         </select>
+      </div>
+      <div class="destination-mode-hint" id="destModeHint">
+        Use this for folders on this Mac and NAS volumes mounted in Finder.
       </div>
       <div id="destLocalRows">
       <div class="row">
@@ -341,9 +366,13 @@ body { display: flex; flex-direction: column; height: 100vh; }
       </div>
       <div id="destRemoteRows" style="display:none;">
         <div class="row">
-          <label>Remote subpath</label>
-          <input type="text" id="remoteSubpath" class="input-fixed" placeholder="2026/trip" oninput="updateRemoteDestPreview()">
+          <label for="remoteSubpath">Folder inside NAS <span class="field-required">Required</span></label>
+          <input type="text" id="remoteSubpath" class="input-fixed"
+                 placeholder="Raw Files/USA" aria-required="true"
+                 aria-describedby="remoteSubpathError remoteDestPreview"
+                 oninput="updateRemoteDestPreview()">
         </div>
+        <div class="field-error" id="remoteSubpathError" role="alert"></div>
         <div class="remote-preview" id="remoteDestPreview"></div>
       </div>
       <div class="row">
@@ -396,12 +425,13 @@ body { display: flex; flex-direction: column; height: 100vh; }
 
     <div class="card">
       <div class="row">
-        <button class="btn" id="btnPreview" onclick="previewImport()">Preview import</button>
-        <button class="btn btn-primary" id="btnStart" onclick="startImport()">Start import</button>
+        <button class="btn" type="button" id="btnPreview" onclick="previewImport()">Preview import</button>
+        <button class="btn btn-primary" type="button" id="btnStart"
+                aria-describedby="importError" onclick="startImport()">Start import</button>
       </div>
+      <div id="importError" role="alert" aria-live="assertive"></div>
       <div class="preview-summary" id="previewSummary"></div>
       <div id="importPreviewGrid" class="import-preview-grid" style="display:none;"></div>
-      <div id="importError"></div>
     </div>
 
     <div class="card" id="progressCard" style="display:none;">
@@ -422,6 +452,11 @@ body { display: flex; flex-direction: column; height: 100vh; }
       <div id="chainInfo" class="hint" style="margin-top:8px;"></div>
       <div id="taggingInfo" class="hint" style="margin-top:8px;"></div>
       <div id="modelWarning" class="warn" style="display:none;"></div>
+      <div class="row" id="retryImportRow" style="display:none;margin-top:10px;">
+        <button class="btn btn-primary" type="button" id="btnRetryImport"
+                onclick="retryFailedImport()">Retry failed files</button>
+        <span class="hint" id="retryImportHint"></span>
+      </div>
       <div class="result-links" style="margin-top:8px;">
         <a href="/browse">Open Browse</a> &nbsp;·&nbsp; <a href="/jobs">Open Jobs</a>
       </div>
@@ -488,6 +523,8 @@ let importTags = [];
 let newImagesSnapshotId = null;
 let importExiftoolReady = null;
 let importExiftoolRequired = true;
+let importStartInFlight = false;
+let lastFinishedImportJob = null;
 
 async function loadImportReadiness() {
   const status = document.getElementById('importExiftoolStatus');
@@ -527,6 +564,7 @@ async function loadImportReadiness() {
     advanced.style.display = 'none';
     repairSection.style.display = 'none';
   }
+  updateStartAvailability();
 }
 
 async function installImportExiftool() {
@@ -637,6 +675,7 @@ function updateImportMode() {
   refreshSourceCounts();
   scheduleImportPreview();
   updateAfterMoveUI();
+  updateStartAvailability();
 }
 
 function selectedFileTypes() {
@@ -732,7 +771,8 @@ function wireDestStructureInvalidation() {
   [
     'chkRecursive', 'fileTypePreset', 'destMode', 'remoteSubpath',
     'chkSkipDuplicates', 'chkTrustLikelyDuplicates', 'chkVerifyByHash', 'destInput',
-    'folderTemplatePreset', 'folderTemplate',
+    'folderTemplatePreset', 'folderTemplate', 'newWorkspaceName',
+    'chkAllowMissingExiftool',
   ].forEach((id) => {
     const el = document.getElementById(id);
     if (!el) return;
@@ -740,6 +780,10 @@ function wireDestStructureInvalidation() {
       hideDestStructure();
       scheduleImportPreview();
       updateAfterMoveUI();
+      if (id === 'destInput' || id === 'destMode') {
+        updateDestinationModeHint();
+      }
+      updateStartAvailability();
     };
     el.addEventListener('change', onPreviewOptionChange);
     el.addEventListener('input', onPreviewOptionChange);
@@ -748,6 +792,7 @@ function wireDestStructureInvalidation() {
     el.addEventListener('change', () => {
       hideDestStructure();
       scheduleImportPreview();
+      updateStartAvailability();
     });
   });
 }
@@ -763,6 +808,7 @@ function updateWorkspaceMode() {
   // ...and the resync can change whether a process chains at all, which
   // gates the "Then move to NAS" row.
   updateAfterMoveUI();
+  updateStartAvailability();
 }
 
 function importRemoteTargetId() {
@@ -814,25 +860,50 @@ function updateRemoteDestPreview() {
   const el = document.getElementById('remoteDestPreview');
   if (!el) return;
   el.textContent = '';
+  const input = document.getElementById('remoteSubpath');
+  const errorEl = document.getElementById('remoteSubpathError');
   const t = importRemoteTarget();
-  if (!t) return;
-  const subResult = normalizeRemoteSubpath(document.getElementById('remoteSubpath').value);
+  if (!t) {
+    if (errorEl) {
+      errorEl.textContent = 'Choose a configured NAS target.';
+      errorEl.classList.add('visible');
+    }
+    if (input) input.classList.add('input-invalid');
+    updateStartAvailability();
+    return;
+  }
+  const subResult = normalizeRemoteSubpath(input.value);
+  let fieldError = '';
   if (subResult.error) {
-    el.appendChild(remotePreviewWarn('Warning: ' + subResult.error));
+    fieldError = subResult.error + ' Enter a folder such as Raw Files/USA.';
   } else if (!subResult.value) {
-    const hint = document.createElement('div');
-    hint.textContent = 'Name the archive folder under ' + t.remote_path + ', e.g. 2026/kenya-trip.';
-    el.appendChild(hint);
+    fieldError = 'Enter the folder inside ' + t.remote_path +
+      ', for example Raw Files/USA.';
   } else {
     const line = document.createElement('div');
-    line.textContent = 'Archive over SSH to: ';
+    line.textContent = 'Vireo will send files directly over SSH to: ';
     const span = document.createElement('span');
     span.style.fontFamily = 'monospace';
     span.textContent = rsyncDestSpec(
       t.user, t.host, t.remote_path.replace(/\/+$/, '') + '/' + subResult.value);
     line.appendChild(span);
     el.appendChild(line);
+    if (t.mount_path) {
+      const catalogLine = document.createElement('div');
+      catalogLine.textContent = 'The same folder is cataloged at: ';
+      const catalogPath = document.createElement('span');
+      catalogPath.style.fontFamily = 'monospace';
+      catalogPath.textContent =
+        t.mount_path.replace(/\/+$/, '') + '/' + subResult.value;
+      catalogLine.appendChild(catalogPath);
+      el.appendChild(catalogLine);
+    }
   }
+  if (errorEl) {
+    errorEl.textContent = fieldError;
+    errorEl.classList.toggle('visible', !!fieldError);
+  }
+  if (input) input.classList.toggle('input-invalid', !!fieldError);
   if (!importRsyncAvailable) {
     el.appendChild(remotePreviewWarn('Warning: no GNU rsync found. Install GNU rsync or set its path under Settings > Paths.'));
   }
@@ -841,6 +912,7 @@ function updateRemoteDestPreview() {
   } else if (!importIsAbsolutePath(t.mount_path)) {
     el.appendChild(remotePreviewWarn('Warning: this target local mount path must be absolute.'));
   }
+  updateStartAvailability();
 }
 
 function remoteArchiveSelectionReady() {
@@ -851,14 +923,39 @@ function remoteArchiveSelectionReady() {
   return !subResult.error && !!subResult.value;
 }
 
+function updateDestinationModeHint() {
+  const hint = document.getElementById('destModeHint');
+  if (!hint) return;
+  const target = importRemoteTarget();
+  if (target) {
+    hint.textContent = 'Direct SSH transfer to ' + target.remote_path +
+      '. The folder inside that root is required below.';
+    return;
+  }
+  const destination =
+    (document.getElementById('destInput')?.value || '').trim();
+  const mountedTarget = importRemoteTargets.find((item) => {
+    const mount = String(item.mount_path || '').replace(/\/+$/, '');
+    return mount && (
+      destination === mount || destination.indexOf(mount + '/') === 0
+    );
+  });
+  hint.textContent = mountedTarget
+    ? 'Using ' + mountedTarget.name + ' through its Finder-mounted path ' +
+      mountedTarget.mount_path + '. Files are copied through the mounted volume.'
+    : 'Use this for folders on this Mac and NAS volumes mounted in Finder.';
+}
+
 function onImportDestModeChange() {
   const remoteId = importRemoteTargetId();
   const localRows = document.getElementById('destLocalRows');
   const remoteRows = document.getElementById('destRemoteRows');
   if (localRows) localRows.style.display = remoteId ? 'none' : '';
   if (remoteRows) remoteRows.style.display = remoteId ? '' : 'none';
+  updateDestinationModeHint();
   updateRemoteDestPreview();
   updateAfterMoveUI();
+  updateStartAvailability();
 }
 
 async function loadImportRemoteTargets() {
@@ -880,7 +977,7 @@ async function loadImportRemoteTargets() {
   importRemoteTargets.forEach((t) => {
     const opt = document.createElement('option');
     opt.value = 'remote:' + t.id;
-    opt.textContent = t.name + ' - ' + t.user + '@' + t.host + ' (SSH)';
+    opt.textContent = t.name + ' — direct transfer over SSH';
     sel.appendChild(opt);
   });
   onImportDestModeChange();
@@ -931,6 +1028,7 @@ function renderSources() {
     div.appendChild(btn);
     list.appendChild(div);
   });
+  updateStartAvailability();
 }
 
 function selectedSourceCountOptions() {
@@ -1670,10 +1768,107 @@ let _globalDefaultProcessId = null;
 // default rather than sticking on whatever placeholder was showing.
 let _workspaceDefaultProcessId = null;
 
-function showError(msg) {
+function importFormProblem() {
+  if (!sources.length && newImagesSnapshotId === null) {
+    return {
+      message: 'Add at least one source folder.',
+      target: document.getElementById('sourceCard'),
+    };
+  }
+  const allowMissingExiftool =
+    !!document.getElementById('chkAllowMissingExiftool')?.checked;
+  if (
+    importExiftoolRequired && importExiftoolReady === false
+    && !allowMissingExiftool
+  ) {
+    return {
+      message: 'Repair ExifTool before importing, or use Advanced → Import without metadata.',
+      target: document.getElementById('exiftoolCard'),
+    };
+  }
+  if (document.getElementById('workspaceNew')?.checked) {
+    const name =
+      (document.getElementById('newWorkspaceName')?.value || '').trim();
+    if (!name) {
+      return {
+        message: 'Enter a name for the new workspace.',
+        target: document.getElementById('newWorkspaceName'),
+      };
+    }
+  }
+  const copyMode =
+    newImagesSnapshotId === null && selectedImportMode() === 'copy';
+  if (!copyMode) return null;
+  const fileTypes = selectedFileTypes();
+  if (Array.isArray(fileTypes) && !fileTypes.length) {
+    return {
+      message: 'Choose at least one file extension.',
+      target: document.getElementById('fileTypePreset'),
+    };
+  }
+  const remoteId = importRemoteTargetId();
+  if (remoteId) {
+    const target = importRemoteTarget();
+    const subResult = normalizeRemoteSubpath(
+      document.getElementById('remoteSubpath').value);
+    if (!target) {
+      return {
+        message: 'Choose a configured NAS target.',
+        target: document.getElementById('destMode'),
+      };
+    }
+    if (!importRsyncAvailable) {
+      return {
+        message: 'Direct NAS transfer needs GNU rsync. Repair its path in Settings, or use the mounted Local path.',
+        target: document.getElementById('destMode'),
+      };
+    }
+    if (!target.mount_path || !importIsAbsolutePath(target.mount_path)) {
+      return {
+        message: 'This NAS target needs an absolute mounted path in Settings before Vireo can catalog imported files.',
+        target: document.getElementById('destMode'),
+      };
+    }
+    if (subResult.error || !subResult.value) {
+      return {
+        message: subResult.error
+          ? subResult.error + ' Enter a folder such as Raw Files/USA.'
+          : 'Enter the folder inside ' + target.remote_path +
+            ', for example Raw Files/USA.',
+        target: document.getElementById('remoteSubpath'),
+      };
+    }
+  } else {
+    const destination =
+      (document.getElementById('destInput').value || '').trim();
+    if (!destination) {
+      return {
+        message: 'Choose a destination folder.',
+        target: document.getElementById('destInput'),
+      };
+    }
+  }
+  return null;
+}
+
+function updateStartAvailability() {
+  const button = document.getElementById('btnStart');
+  if (!button) return;
+  const problem = importFormProblem();
+  button.disabled = importStartInFlight || !!problem;
+  button.title = problem ? problem.message : '';
+  button.setAttribute('aria-disabled', button.disabled ? 'true' : 'false');
+}
+
+function showError(msg, target) {
   const el = document.getElementById('importError');
   el.textContent = msg;
   el.style.display = msg ? 'block' : 'none';
+  if (msg && target) {
+    const focusTarget = target.focus ? target : null;
+    target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    if (focusTarget) focusTarget.focus({ preventScroll: true });
+  }
 }
 
 function formatBytes(n) {
@@ -1939,12 +2134,34 @@ function renderImportPreviewGrid(files, duplicatePaths, destinationFiles) {
     return;
   }
 
+  // Duplicate-heavy retries should foreground the work Vireo will actually
+  // perform. Rendering hundreds of skipped cards obscures the one failed
+  // file and schedules a thumbnail request for every duplicate. Keep those
+  // files collapsed into one summary and render only pending/unavailable
+  // items. Before duplicate detection runs `duplicatePaths` is empty, so
+  // callers that need the full in-place preview retain the existing view.
+  const pendingFiles = files.filter((f) => !dupes.has(f.path));
+  const duplicateCount = files.length - pendingFiles.length;
   const groups = {};
-  files.forEach((f) => {
+  pendingFiles.forEach((f) => {
     const key = f.subfolder || 'Source';
     if (!groups[key]) groups[key] = [];
     groups[key].push(f);
   });
+
+  if (duplicateCount) {
+    const collapsed = document.createElement('div');
+    collapsed.className = 'import-preview-collapsed';
+    collapsed.setAttribute('data-testid', 'collapsed-duplicate-preview');
+    collapsed.textContent = duplicateCount.toLocaleString() +
+      ' duplicate' + (duplicateCount === 1 ? '' : 's') +
+      ' hidden — ' + (duplicateCount === 1 ? 'it will' : 'they will') +
+      ' be skipped. ' + pendingFiles.length.toLocaleString() +
+      ' file' + (pendingFiles.length === 1 ? '' : 's') +
+      ' to import ' + (pendingFiles.length === 1 ? 'is' : 'are') +
+      ' shown below.';
+    grid.appendChild(collapsed);
+  }
 
   Object.keys(groups).sort().forEach((subfolder) => {
     const groupEl = document.createElement('div');
@@ -2076,9 +2293,14 @@ function resolvedCopyDestination() {
     const t = importRemoteTarget();
     if (!t || !t.mount_path || !importIsAbsolutePath(t.mount_path)) return '';
     const sub = normalizeRemoteSubpath(document.getElementById('remoteSubpath').value);
-    if (sub.error) return '';
+    // The mount root by itself is not a valid remote selection: the SSH
+    // importer requires a folder below the configured remote root. Rendering
+    // a destination preview for the bare mount made an invalid form look
+    // complete and could surface an unrelated managed archive nested below
+    // that mount.
+    if (sub.error || !sub.value) return '';
     const base = t.mount_path.replace(/\/+$/, '');
-    return sub.value ? base + '/' + sub.value : base;
+    return base + '/' + sub.value;
   }
   const local = (document.getElementById('destInput').value || '').trim();
   return importIsAbsolutePath(local) ? local : '';
@@ -2184,7 +2406,7 @@ async function renderDestStructure(excludePaths) {
     const callout = document.createElement('div');
     callout.className = 'managed-archive-callout';
     const label = document.createElement('span');
-    label.textContent = 'Merging into a managed archive at ';
+    label.textContent = 'This destination is inside the managed archive rooted at ';
     const path = document.createElement('span');
     path.style.fontFamily = 'monospace';
     path.textContent = data.managed_archive.path;
@@ -2287,8 +2509,8 @@ async function previewImport(opts) {
       clearImportPreviewGrid();
       return;
     }
-    renderImportPreviewGrid(files, [], null);
     if (snapshotMode) {
+      renderImportPreviewGrid(files, [], null);
       const unavailable = Number(data.unavailable_count || 0);
       summary.textContent = Number(data.total_count || files.length).toLocaleString() +
         ' captured file' + (Number(data.total_count || files.length) === 1 ? '' : 's') +
@@ -2297,10 +2519,12 @@ async function previewImport(opts) {
       return;
     }
     if (!copyMode) {
+      renderImportPreviewGrid(files, [], null);
       summary.textContent = files.length + ' files found · originals will stay in place';
       return;
     }
     if (!document.getElementById('chkSkipDuplicates').checked) {
+      renderImportPreviewGrid(files, [], null);
       summary.textContent = files.length + ' files found · duplicates will be copied';
       // No dedup gate, so every discovered file lands — pass no exclusions
       // so the folder-structure counts match the full copy set.
@@ -2401,16 +2625,13 @@ function renderFolderTable(el, folders) {
 async function startImport() {
   showError('');
   addImportTagFromInput();
-  if (!sources.length && newImagesSnapshotId === null) {
-    showError('Add at least one source folder.');
+  const problem = importFormProblem();
+  if (problem) {
+    showError(problem.message, problem.target);
+    updateStartAvailability();
     return;
   }
   const allowMissingExiftool = !!document.getElementById('chkAllowMissingExiftool')?.checked;
-  if (importExiftoolRequired && importExiftoolReady === false && !allowMissingExiftool) {
-    showError('Repair ExifTool before importing, or use Advanced → Import without metadata.');
-    document.getElementById('exiftoolCard')?.scrollIntoView({ behavior: 'smooth', block: 'center' });
-    return;
-  }
   const copyMode = newImagesSnapshotId === null && selectedImportMode() === 'copy';
   const body = newImagesSnapshotId !== null ? {
     source_snapshot_id: newImagesSnapshotId,
@@ -2474,7 +2695,8 @@ async function startImport() {
   // archive copy + chained process + eligible target) — a hidden row means
   // a stale checkbox must not send anything.
   body.after_process_move = afterMoveRequest();
-  document.getElementById('btnStart').disabled = true;
+  importStartInFlight = true;
+  updateStartAvailability();
   try {
     const resp = await fetch(copyMode ? '/api/jobs/import-photos' : '/api/jobs/import-in-place', {
       method: 'POST',
@@ -2492,8 +2714,9 @@ async function startImport() {
     document.getElementById('resultCard').style.display = 'none';
     watchJob(activeJobId);
   } catch (e) {
-    showError(String(e.message || e));
-    document.getElementById('btnStart').disabled = false;
+    importStartInFlight = false;
+    showError(String(e.message || e), document.getElementById('btnStart'));
+    updateStartAvailability();
   }
 }
 
@@ -2532,16 +2755,91 @@ async function finishJob(jobId) {
     }
     await new Promise(r => setTimeout(r, 1000));
   }
-  document.getElementById('btnStart').disabled = false;
+  importStartInFlight = false;
+  updateStartAvailability();
   if (!job || !job.result) {
     showError('Import ended but its result could not be loaded — check the Jobs page.');
     return;
   }
+  lastFinishedImportJob = job;
   renderResult(job.result, job.status);
+}
+
+function retryBodyFromFinishedJob(job) {
+  const cfg = (job && job.config) || {};
+  if (!Array.isArray(cfg.sources) || !cfg.sources.length) return null;
+  const body = {
+    sources: cfg.sources.slice(),
+    destination: cfg.destination,
+    recursive: cfg.recursive !== false,
+    folder_template: cfg.folder_template || '%Y/%Y-%m-%d',
+    file_types: cfg.file_types || 'both',
+    // A recovery run must preserve already-landed files. Even if the
+    // original import intentionally allowed duplicates, the retry's job is
+    // to fill the failed gaps, not copy every successful file again.
+    skip_duplicates: true,
+    verify_by_hash: !!cfg.verify_by_hash,
+    trust_likely_duplicates: !!cfg.trust_likely_duplicates,
+    after_import: cfg.after_import == null ? null : cfg.after_import,
+    tags: Array.isArray(cfg.tags) ? cfg.tags.slice() : [],
+    location_from_gps: !!cfg.location_from_gps,
+    allow_missing_exiftool: !!cfg.allow_missing_exiftool,
+  };
+  if (cfg.remote_target_id) {
+    delete body.destination;
+    body.remote_target_id = cfg.remote_target_id;
+    body.remote_subpath = cfg.remote_subpath;
+  }
+  if (cfg.after_process_move && cfg.after_process_move.remote_target_id) {
+    body.after_process_move = {
+      remote_target_id: cfg.after_process_move.remote_target_id,
+    };
+  }
+  return body;
+}
+
+async function retryFailedImport() {
+  const button = document.getElementById('btnRetryImport');
+  const hint = document.getElementById('retryImportHint');
+  const body = retryBodyFromFinishedJob(lastFinishedImportJob);
+  if (!body) {
+    hint.textContent = 'The original import settings are no longer available. Start a new import from the source card.';
+    return;
+  }
+  button.disabled = true;
+  button.textContent = 'Starting retry…';
+  hint.textContent = 'Already imported files will be skipped.';
+  try {
+    const resp = await fetch('/api/jobs/import-photos', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok) throw new Error(data.error || 'retry failed to start');
+    activeJobId = data.job_id;
+    importStartInFlight = true;
+    document.getElementById('progressCard').style.display = '';
+    document.getElementById('resultCard').style.display = 'none';
+    document.getElementById('progressCard').scrollIntoView({
+      behavior: 'smooth', block: 'center',
+    });
+    watchJob(activeJobId);
+  } catch (e) {
+    button.disabled = false;
+    button.textContent = 'Retry failed files';
+    hint.textContent = String(e.message || e);
+  }
 }
 
 function renderResult(res, status) {
   document.getElementById('resultCard').style.display = '';
+  const retryRow = document.getElementById('retryImportRow');
+  const retryButton = document.getElementById('btnRetryImport');
+  const retryHint = document.getElementById('retryImportHint');
+  retryRow.style.display = 'none';
+  retryHint.textContent = '';
+  retryButton.disabled = false;
   const pill = document.getElementById('safeToFormatPill');
   const unsafe = document.getElementById('unsafeList');
   unsafe.innerHTML = '';
@@ -2650,6 +2948,15 @@ function renderResult(res, status) {
     res.skipped_duplicate + ' duplicates skipped · ' + res.failed + ' failed' +
     (status && status !== 'completed' ? ' · job ' + status : '');
   renderFolderTable(document.getElementById('resultFolders'), res.folders || {});
+
+  const failedCount = Number(res.failed || 0);
+  if (failedCount > 0 && retryBodyFromFinishedJob(lastFinishedImportJob)) {
+    retryRow.style.display = '';
+    retryButton.textContent = 'Retry ' + failedCount + ' failed file' +
+      (failedCount === 1 ? '' : 's');
+    retryHint.textContent =
+      'Uses the same source and destination; successful files are skipped.';
+  }
 
   renderChainInfo(res);
   renderTaggingInfo(res);

@@ -6308,6 +6308,59 @@ def test_import_photos_new_workspace_ignores_old_default_process(
     assert config["after_import"] is None
 
 
+def test_import_photos_carry_photo_ids_persisted(app_and_db, tmp_path):
+    """A recovery retry passes ``carry_photo_ids`` so the after-import chain
+    covers the complete original scope, not only the newly-recovered files.
+    The endpoint validates, deduplicates while preserving order, and stores
+    the list on the job config where ``_chain_after_import`` can read it.
+    """
+    app, _ = app_and_db
+    client = app.test_client()
+    resp = client.post("/api/jobs/import-photos", json={
+        "sources": [_import_card(tmp_path)],
+        "destination": str(tmp_path / "archive"),
+        "after_import": None,
+        "carry_photo_ids": [7, 3, 7, 42],
+    })
+    assert resp.status_code == 200, resp.get_json()
+    config = _job_config(client, resp.get_json()["job_id"])
+    assert config["carry_photo_ids"] == [7, 3, 42]
+
+
+def test_import_photos_carry_photo_ids_defaults_to_none(app_and_db, tmp_path):
+    """A first-attempt import (no carry list) leaves the field null so
+    ``_chain_after_import`` reads an empty list, not a non-list sentinel."""
+    app, _ = app_and_db
+    client = app.test_client()
+    resp = client.post("/api/jobs/import-photos", json={
+        "sources": [_import_card(tmp_path)],
+        "destination": str(tmp_path / "archive"),
+        "after_import": None,
+    })
+    assert resp.status_code == 200, resp.get_json()
+    config = _job_config(client, resp.get_json()["job_id"])
+    assert config["carry_photo_ids"] is None
+
+
+def test_import_photos_carry_photo_ids_validation_400s(app_and_db, tmp_path):
+    """Malformed carry lists fail at enqueue rather than crashing the
+    chain hook mid-run. Rejects: non-list, non-int entries, booleans (which
+    isinstance-int as True/False), zero, and negative IDs."""
+    app, _ = app_and_db
+    client = app.test_client()
+    card = _import_card(tmp_path)
+    dest = str(tmp_path / "archive")
+    for bad in ("not-a-list", [1, "two"], [1, True], [0], [-3], [1.5]):
+        resp = client.post("/api/jobs/import-photos", json={
+            "sources": [card],
+            "destination": dest,
+            "after_import": None,
+            "carry_photo_ids": bad,
+        })
+        assert resp.status_code == 400, (bad, resp.get_json())
+        assert "carry_photo_ids" in resp.get_json()["error"]
+
+
 def test_import_in_place_new_workspace_ignores_old_default_process(
         app_and_db, tmp_path):
     """Same regression as above, exercised through the in-place endpoint —
@@ -6668,6 +6721,69 @@ def test_import_chains_process_job(app_and_db, tmp_path):
         assert res["collection_name"].startswith("Import ")
         photos = db.get_collection_photos(col_id, per_page=999999)
         assert sorted(p["id"] for p in photos) == sorted(res["photo_ids"])
+
+
+def test_import_retry_chains_carried_photo_ids(app_and_db, tmp_path):
+    """A recovery-retry import carries forward the original run's successful
+    photo IDs so the chained process runs on the complete original scope,
+    not only the files this retry newly landed.
+
+    Reproduction of the P1 bug: the original run had 1 file failed, so its
+    ``_chain_after_import`` returned early on ``not ok`` — nothing was
+    processed. On retry, ``skip_duplicates`` is forced True, so the
+    previously-successful files are excluded from ``photo_ids`` (they are
+    now duplicates). Without ``carry_photo_ids`` the retry's collection
+    holds only the newly-recovered files and the previously-successful
+    ones stay unprocessed forever.
+    """
+    from wait import wait_for_job_via_client
+
+    app, db = app_and_db
+    quick_look_id = next(
+        pr["id"] for pr in db.get_saved_processes()
+        if pr["name"] == "Quick look")
+    card = _chain_card(tmp_path)
+    with app.test_client() as client:
+        # Land the seed files successfully. In production this would be
+        # the "984 succeeded" from a partially-failed run; here we
+        # simulate the "previously-imported" set by running a complete
+        # import first, then use those IDs as the carry list for the
+        # follow-up retry.
+        first = _post_import(client, card, tmp_path / "arch", None)
+        first_result = wait_for_job_via_client(client, first)["result"]
+        seed_ids = list(first_result["photo_ids"])
+        assert seed_ids, first_result
+
+        # Re-import the same card with skip_duplicates=True and a
+        # non-empty carry list. Every card file dedupes (skipped_duplicate),
+        # photo_ids is empty, but carry_photo_ids reintroduces the seed
+        # scope for the chain — the recovery-retry codepath.
+        resp = client.post("/api/jobs/import-photos", json={
+            "sources": [str(card)],
+            "destination": str(tmp_path / "arch"),
+            "after_import": quick_look_id,
+            "skip_duplicates": True,
+            "carry_photo_ids": seed_ids,
+        })
+        assert resp.status_code == 200, resp.get_json()
+        retry_id = resp.get_json()["job_id"]
+        retry_job = wait_for_job_via_client(client, retry_id)
+        retry_result = retry_job["result"]
+
+        # The retry itself imported nothing (all files dedupe), but the
+        # chain must fire because carry_photo_ids brought the original
+        # scope back in.
+        assert retry_result.get("photo_ids") == []
+        assert sorted(retry_result.get("carried_photo_ids") or []) == \
+            sorted(seed_ids)
+        assert retry_result.get("process_job_id"), retry_result
+        assert retry_result.get("after_import_skipped") is None
+        assert retry_result.get("collection_id")
+        col_id = retry_result["collection_id"]
+        photos = db.get_collection_photos(col_id, per_page=999999)
+        # The collection must cover the original scope so quick-look runs
+        # against every photo the user intended to import.
+        assert sorted(p["id"] for p in photos) == sorted(seed_ids)
 
 
 def test_import_pauses_chained_classification_when_labels_are_missing(

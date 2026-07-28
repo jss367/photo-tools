@@ -22925,16 +22925,41 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         )
         return collection_id, collection_name
 
-    def _record_import_collection(result, workspace_id):
-        """Attach a collection to a complete, successful import result."""
-        photo_ids = result.get("photo_ids") or []
-        if not result.get("ok") or result.get("cancelled") or not photo_ids:
+    def _record_import_collection(result, workspace_id, chain_photo_ids=None):
+        """Attach a collection to a complete, successful import result.
+
+        ``chain_photo_ids`` optionally extends the collection scope beyond
+        the files newly imported by this run. Recovery-retry imports pass
+        the photo IDs earlier attempts already landed so the after-import
+        chain processes the complete original scope instead of only the
+        newly-recovered files. The carry list is recorded on the result as
+        ``carried_photo_ids`` for transparency; ``result["photo_ids"]``
+        keeps meaning "files this run imported", so downstream counters
+        and retry helpers don't double-count on repeated retries.
+        """
+        photo_ids = list(result.get("photo_ids") or [])
+        seen = set(photo_ids)
+        carried = []
+        if chain_photo_ids:
+            for pid in chain_photo_ids:
+                if pid in seen:
+                    continue
+                seen.add(pid)
+                carried.append(pid)
+        if carried:
+            result["carried_photo_ids"] = carried
+        collection_ids = photo_ids + carried
+        if (
+            not result.get("ok")
+            or result.get("cancelled")
+            or not collection_ids
+        ):
             return None, None
         try:
             thread_db = Database(db_path)
             thread_db.set_active_workspace(workspace_id)
             collection_id, collection_name = _create_import_collection(
-                thread_db, photo_ids,
+                thread_db, collection_ids,
             )
             result["collection_id"] = collection_id
             result["collection_name"] = collection_name
@@ -23141,7 +23166,15 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 )
                 return
 
-            thread_db, col_id = _record_import_collection(result, active_ws)
+            carry_photo_ids = list(
+                (job.get("config") or {}).get("carry_photo_ids") or []
+            )
+            thread_db, col_id = _record_import_collection(
+                result, active_ws, chain_photo_ids=carry_photo_ids,
+            )
+            chain_scope = photo_ids + list(
+                result.get("carried_photo_ids") or []
+            )
 
             if after_import is None:
                 result["after_import_skipped"] = "import-only"
@@ -23152,7 +23185,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             if result.get("cancelled"):
                 result["after_import_skipped"] = "import cancelled"
                 return
-            if not photo_ids:
+            if not chain_scope:
                 result["after_import_skipped"] = "no photos"
                 return
             if col_id is None:
@@ -23801,6 +23834,32 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         if tag_options_err is not None:
             return tag_options_err
 
+        # Recovery-retry imports carry forward the photo IDs a previous
+        # attempt already landed, so the after-import chain covers the
+        # complete original scope even though those files are skipped as
+        # duplicates in this run. Validated at request time so a
+        # malformed retry body is rejected before a job is created.
+        carry_raw = body.get("carry_photo_ids")
+        if carry_raw is None:
+            carry_photo_ids = None
+        else:
+            if not isinstance(carry_raw, list) or not all(
+                isinstance(x, int) and not isinstance(x, bool) and x > 0
+                for x in carry_raw
+            ):
+                return json_error(
+                    "carry_photo_ids must be a list of positive integers"
+                )
+            # Preserve caller order but deduplicate — the chain does not
+            # need repeats and a giant duplicated list wastes work.
+            seen_carry = set()
+            carry_photo_ids = []
+            for pid in carry_raw:
+                if pid in seen_carry:
+                    continue
+                seen_carry.add(pid)
+                carry_photo_ids.append(pid)
+
         # Snapshot the chosen saved process's stage flags at enqueue time
         # so a mid-import edit or delete can't silently change (or void)
         # the after-import run the user already accepted. An archive-copy
@@ -23876,6 +23935,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             "remote_subpath": remote_subpath or None,
             "workspace_id": active_ws,
             "created_workspace": created_workspace,
+            "carry_photo_ids": carry_photo_ids,
         }
         if move_target_snapshot is not None:
             job_config["after_process_move"] = {
@@ -23892,7 +23952,24 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             photos gets one, including the import-only choice.
             """
             photo_ids = result.get("photo_ids") or []
-            thread_db, col_id = _record_import_collection(result, active_ws)
+            carry_photo_ids = list(
+                (job.get("config") or {}).get("carry_photo_ids") or []
+            )
+            thread_db, col_id = _record_import_collection(
+                result, active_ws, chain_photo_ids=carry_photo_ids,
+            )
+            # Recovery-retry imports may carry forward files earlier
+            # attempts landed. The original failed run skipped its
+            # after-import chain because ``ok`` was False, so those files
+            # were never processed. Roll them into the chain scope now so
+            # the collection AND the folder-based after-move both cover
+            # the complete original import, not just the newly-recovered
+            # files. ``carried_photo_ids`` on the result is the validated
+            # subset actually included, so a stale ID never leaks into
+            # this scope.
+            chain_scope = photo_ids + list(
+                result.get("carried_photo_ids") or []
+            )
 
             if after_import is None:
                 result["after_import_skipped"] = "import-only"
@@ -23903,7 +23980,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             if result.get("cancelled"):
                 result["after_import_skipped"] = "import cancelled"
                 return
-            if not photo_ids:
+            if not chain_scope:
                 result["after_import_skipped"] = "no new photos"
                 return
             if col_id is None:
@@ -23918,13 +23995,14 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 # non-nested set: moving an ancestor also moves its
                 # descendants. The target itself is the enqueue-time
                 # snapshot, so a Settings edit mid-chain can't redirect the
-                # move.
+                # move. Uses ``chain_scope`` so a recovery retry moves the
+                # folders holding the original run's successful files too.
                 after_move = None
                 if move_target_snapshot is not None:
                     from import_chain import minimal_move_set
                     folder_rows = []
-                    for i in range(0, len(photo_ids), 500):
-                        chunk = photo_ids[i:i + 500]
+                    for i in range(0, len(chain_scope), 500):
+                        chunk = chain_scope[i:i + 500]
                         ph = ",".join("?" * len(chunk))
                         folder_rows.extend(thread_db.conn.execute(
                             "SELECT DISTINCT f.id, f.path FROM photos p "

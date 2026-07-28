@@ -461,7 +461,7 @@ def test_import_preview_shows_destination_folder_structure(live_server, page):
         ["/archive/2026/2026-07-02", "1", "existing"]
     )
     expect(structure).to_contain_text(
-        "This destination is inside the managed archive rooted at"
+        "Files imported here land inside the managed archive rooted at"
     )
     expect(structure).to_contain_text("/archive")
     expect(structure).to_contain_text("1284 photos already cataloged")
@@ -884,6 +884,7 @@ def test_failed_import_result_offers_preconfigured_retry(live_server, page):
         () => {
           lastFinishedImportJob = {
             id: 'import-original',
+            type: 'import',
             status: 'failed',
             config: {
               sources: ['/Volumes/CARD/DCIM'],
@@ -900,6 +901,10 @@ def test_failed_import_result_offers_preconfigured_retry(live_server, page):
               allow_missing_exiftool: false,
               remote_target_id: null,
               remote_subpath: null,
+            },
+            result: {
+              photo_ids: [101, 102, 103],
+              failed: 1,
             },
           };
           renderResult({
@@ -933,6 +938,13 @@ def test_failed_import_result_offers_preconfigured_retry(live_server, page):
     assert body["skip_duplicates"] is True
     assert body["after_import"] == 1
     assert body["tags"] == ["trip"]
+    # The original run's successful photos must be carried into the retry
+    # so the after-import chain covers the complete import scope, not
+    # only the newly-recovered file. Without this, the failed original
+    # (which skipped chaining because it wasn't OK) plus the retry
+    # (which chains on only 1 new photo) silently leave 984 photos
+    # unprocessed.
+    assert body["carry_photo_ids"] == [101, 102, 103]
 
 
 def test_import_copy_start_sends_restored_options(live_server, page):

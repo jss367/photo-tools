@@ -2405,8 +2405,16 @@ async function renderDestStructure(excludePaths) {
   if (data.managed_archive) {
     const callout = document.createElement('div');
     callout.className = 'managed-archive-callout';
+    // Phrase this in terms of where the generated folders land, not the
+    // selected destination. The backend flags this callout whenever the
+    // resulting folders sit inside a tracked archive — which happens both
+    // when the destination itself is under that archive AND when the
+    // destination is above the archive but the folder template maps
+    // generated folders back into it (destination /Photography,
+    // tracked /Photography/2026, template 2026/%Y-%m-%d). Saying "this
+    // destination is inside" is inaccurate for the second case.
     const label = document.createElement('span');
-    label.textContent = 'This destination is inside the managed archive rooted at ';
+    label.textContent = 'Files imported here land inside the managed archive rooted at ';
     const path = document.createElement('span');
     path.style.fontFamily = 'monospace';
     path.textContent = data.managed_archive.path;
@@ -2792,6 +2800,27 @@ function retryBodyFromFinishedJob(job) {
     location_from_gps: !!cfg.location_from_gps,
     allow_missing_exiftool: !!cfg.allow_missing_exiftool,
   };
+  // Carry forward the complete original import scope so the after-import
+  // process runs on ALL files the user meant to import, not only the
+  // ones this retry newly landed. The parent's failed run skipped
+  // chaining entirely (its result.ok was false), so those photos are
+  // still unprocessed even though they're on disk. On a retry-of-retry
+  // the parent's own carry list must persist too, otherwise the second
+  // retry would forget everything the first retry inherited from the
+  // original attempt.
+  const parentCarry = Array.isArray(cfg.carry_photo_ids)
+    ? cfg.carry_photo_ids : [];
+  const parentImported = Array.isArray(job.result && job.result.photo_ids)
+    ? job.result.photo_ids : [];
+  const carry = [];
+  const carrySeen = new Set();
+  parentCarry.concat(parentImported).forEach((pid) => {
+    if (typeof pid !== 'number' || !Number.isInteger(pid) || pid <= 0) return;
+    if (carrySeen.has(pid)) return;
+    carrySeen.add(pid);
+    carry.push(pid);
+  });
+  if (carry.length) body.carry_photo_ids = carry;
   if (cfg.remote_target_id) {
     delete body.destination;
     body.remote_target_id = cfg.remote_target_id;

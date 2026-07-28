@@ -2324,6 +2324,12 @@ async function downloadDarktable() {
         expected_version: a.version,
         expected_name: a.name,
         expected_digest: a.digest || null,
+        // Size is the fallback identity for a digestless release: if GitHub
+        // deletes and re-uploads the asset under the same tag+filename
+        // during the availability cache's TTL, name+version still match but
+        // the bytes differ. Without this the server would accept the swap
+        // for any release that publishes no digest.
+        expected_size: (typeof a.size === 'number') ? a.size : null,
       }),
     });
   } catch(e) {

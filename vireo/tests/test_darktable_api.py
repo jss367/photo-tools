@@ -1093,6 +1093,43 @@ def test_api_job_download_darktable_binds_to_the_confirmed_asset(app_and_db, mon
     assert "5.7.0" in body['error']
 
 
+def test_api_job_download_darktable_binds_to_the_confirmed_size_for_digestless_assets(
+        app_and_db, monkeypatch):
+    """A release with no digest still needs a size check.
+
+    If GitHub deletes and re-uploads an asset under the same tag and filename
+    within the availability cache's TTL, name and version match but the bytes
+    differ.  With no digest to compare, the name/version check alone would
+    silently accept the swap.  ``expected_size`` closes that gap.
+    """
+    app, _ = app_and_db
+    # A digestless release: this is the case the digest check cannot catch.
+    fresh = _fake_release("5.6.0")
+    fresh["digest"] = None
+    fresh["size"] = 87094261 + 500_000  # Republished asset, same name+version
+
+    def must_not_download(*a, **k):
+        raise AssertionError("mismatched asset must not be downloaded")
+
+    _stub_happy_path(monkeypatch, release=fresh, download=must_not_download)
+
+    resp = app.test_client().post(
+        '/api/jobs/download-darktable',
+        data=json.dumps({
+            "expected_version": "5.6.0",
+            "expected_name": fresh["name"],
+            "expected_digest": None,
+            # Confirmation showed the original size — the republished asset
+            # differs and must be rejected even though digest cannot arbitrate.
+            "expected_size": 87094261,
+        }),
+        content_type='application/json',
+    )
+    assert resp.status_code == 409
+    body = resp.get_json()
+    assert body['code'] == 'darktable_asset_changed'
+
+
 def test_api_job_download_darktable_409_refreshes_the_availability_cache(
         app_and_db, monkeypatch):
     """After a 409 the UI's Re-check must not hit the same stale asset again.
@@ -1369,6 +1406,64 @@ def test_api_job_download_darktable_second_join_matches_when_artifacts_align(
         "matching artifact identity must still join the running job"
     )
     assert second.get('joined_existing') is True
+
+    release_download.set()
+    from wait import wait_for_job_via_client
+    wait_for_job_via_client(client, first_id)
+
+
+def test_api_job_download_darktable_join_rejects_size_mismatch_for_digestless_asset(
+        app_and_db, monkeypatch):
+    """Two tabs, one in-flight digestless download, republished asset between
+    them: the second POST confirms a different size for the same name+version,
+    and must NOT silently join a worker downloading different bytes.
+
+    Covers the join path specifically, which stores ``asset_size`` in the
+    singleton config so ``_artifact_matches`` can arbitrate without a digest.
+    """
+    import threading
+    app, _ = app_and_db
+
+    running = threading.Event()
+    release_download = threading.Event()
+
+    def slow_download(asset, byte_callback=None, should_cancel=None):
+        running.set()
+        assert release_download.wait(timeout=10), "download never released"
+        return "/tmp/d.dmg", "ok"
+
+    first_release = _fake_release("5.6.0")
+    first_release["digest"] = None
+    _stub_happy_path(monkeypatch, release=first_release, download=slow_download)
+
+    client = app.test_client()
+    first_id = client.post(
+        '/api/jobs/download-darktable',
+        data=json.dumps({
+            "expected_version": first_release["version"],
+            "expected_name": first_release["name"],
+            "expected_digest": None,
+            "expected_size": first_release["size"],
+        }),
+        content_type='application/json',
+    ).get_json()['job_id']
+    assert running.wait(timeout=5)
+
+    # Same name+version, no digest, different size — the republished-asset
+    # case.  Without the size guard this would silently return
+    # joined_existing=True and hand back the first job's bytes.
+    resp = client.post(
+        '/api/jobs/download-darktable',
+        data=json.dumps({
+            "expected_version": first_release["version"],
+            "expected_name": first_release["name"],
+            "expected_digest": None,
+            "expected_size": first_release["size"] + 500_000,
+        }),
+        content_type='application/json',
+    )
+    assert resp.status_code == 409, resp.get_json()
+    assert resp.get_json()['code'] == 'darktable_asset_changed'
 
     release_download.set()
     from wait import wait_for_job_via_client

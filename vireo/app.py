@@ -18334,6 +18334,16 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         # digest is compared verbatim (the API sends "sha256:<hex>"); None on
         # either side means the client did not send one, not that they match.
         expected_digest = body.get("expected_digest")
+        # Size is the fallback identity for digestless releases: if GitHub
+        # deletes and re-uploads an asset under the same tag+filename during
+        # the availability cache's TTL, name/version match but bytes differ,
+        # and without a digest the name/version check alone would silently
+        # accept the swap.  Compare when the client sent one — an int on the
+        # wire, coerced defensively so a stray string does not throw here.
+        try:
+            expected_size = int(body["expected_size"]) if body.get("expected_size") is not None else None
+        except (TypeError, ValueError):
+            expected_size = None
 
         def _artifact_matches(stored):
             """True when the stored artifact identity matches expected_*."""
@@ -18343,8 +18353,12 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 return False
             if expected_version and expected_version != stored.get("asset_version"):
                 return False
+            if expected_digest and expected_digest != stored.get("asset_digest"):
+                return False
             return not (
-                expected_digest and expected_digest != stored.get("asset_digest")
+                expected_size is not None
+                and stored.get("asset_size") is not None
+                and expected_size != stored.get("asset_size")
             )
 
         # resolve_release(), never the cached variant: this re-resolves
@@ -18376,6 +18390,11 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             expected_name != asset.get("name")
             or (expected_version and expected_version != asset.get("version"))
             or (expected_digest and expected_digest != asset.get("digest"))
+            or (
+                expected_size is not None
+                and asset.get("size") is not None
+                and expected_size != asset.get("size")
+            )
         ):
             # Refresh the availability cache with the release we just resolved.
             # Without this, the UI's Re-check would fetch /install/available,
@@ -18543,6 +18562,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 "asset_name": asset["name"],
                 "asset_version": asset["version"],
                 "asset_digest": asset.get("digest"),
+                "asset_size": asset.get("size"),
             },
             workspace_id=active_ws,
         )

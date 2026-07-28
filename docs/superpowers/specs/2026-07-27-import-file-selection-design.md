@@ -109,52 +109,113 @@ spec exists to fix, and would be worse than not having the feature. See §2.
 
 ### 1. Selection state
 
-A module-level `importSelected` map of `path -> bool`, mirroring
-`_previewSelected` in `pipeline.html:1687`, plus an `importSelectionTouched` Set
-of paths the user has explicitly clicked.
+**User intent and duplicate eligibility are separate structures.** This is the
+single most important decision in the spec, and the one an implementer is most
+likely to get wrong by reflex.
 
-**Seeding is separate from rendering, and happens in two stages.** This matters
-because `renderImportPreviewGrid()` has four call sites and runs up to three times
-per preview — `import.html:2290` (files only), then either `2310` (in-place, with
-destination data) or `2357` (copy, with duplicate verdicts) and `2364` (both).
-Duplicate verdicts do not exist at first render.
+- `importDeselected` — a `Set` of paths the user **explicitly unchecked**. This is
+  the only record of user intent, and the only thing that feeds `include_paths`.
+- Duplicate verdicts — a display and eligibility overlay from the preflight
+  stream. Never written into `importDeselected`.
 
-- **Stage 1**, when the file list arrives: seed every path not already in
-  `importSelected` to `true`, except files with `available === false`, which seed
-  `false`.
-- **Stage 2**, when the duplicate stream completes **and only if `chkSkipDuplicates`
-  is checked**: flip every duplicate path to `false` unless it is in
-  `importSelectionTouched`. Checking the touched set keeps this from stomping a
-  deliberate choice made while the stream was draining.
+Checkbox state is *derived*, never seeded:
 
-  The `chkSkipDuplicates` gate is essential. The duplicate stream at
-  `import.html:2318` runs on *every* copy-mode preview — it is not conditioned on
-  that checkbox, because the preview needs duplicate verdicts to render badges
-  either way. Deselecting duplicates unconditionally would mean that with Skip
-  duplicates **off**, `include_paths` omits the very files the user turned the
-  flag off in order to import, and they are dropped with no indication. With the
-  flag off, duplicates stay checked and enabled; the badge is informational only.
+```js
+checked  = !importDeselected.has(path) && !(isDuplicate && skipDuplicates)
+disabled = isDuplicate && skipDuplicates
+```
 
-  A path that is both touched-`true` and a duplicate, **with Skip duplicates on**,
-  is reachable only by unchecking then rechecking during the drain. There the
-  duplicate verdict wins: the card ends up unchecked and `disabled` like every
-  other duplicate, because the flag will exclude it regardless and a checked box
-  would promise an import that cannot happen (§2). `importSelectionTouched`
-  protects a user's choice among *importable* files; it does not override
-  eligibility.
+Because the default state is "absent from `importDeselected`", everything renders
+checked with no seeding pass at all. That eliminates a class of bugs outright:
 
-The renderer itself never seeds. It is a pure view over existing state. This is
-required because the in-flight `hide-duplicates-checkbox` branch adds a
-client-side filter that re-renders from cached inputs via
-`rerenderImportPreviewGrid()`; seeding inside the renderer would silently reset a
-hand-picked selection every time that filter is toggled.
+- **No seeding race.** `renderImportPreviewGrid()` has four call sites and runs up
+  to three times per preview (`import.html:2290`, then `2310` in-place or `2357`
+  and `2364` in copy mode). Duplicate verdicts don't exist at first render, but
+  since the renderer recomputes `checked` from current state each time rather than
+  seeding it, late-arriving verdicts simply change the derived value.
+- **No stomping.** A file the user unchecks while the duplicate stream is still
+  draining stays unchecked, because their click went into `importDeselected` and
+  the duplicate overlay never touches it. (For a path that later turns out to be a
+  duplicate, the click is discarded at wire time — see the eligibility filter
+  below.)
+- **Survives re-render.** The `hide-duplicates-checkbox` branch re-renders from
+  cached inputs via `rerenderImportPreviewGrid()`; with intent held separately, a
+  hand-picked selection cannot be reset by a view toggle.
 
-**Invalidation.** A selection is only meaningful for the file set that produced
-it. The `importPreviewSignature()` in effect at seed time is stored alongside.
-`startImport()` recomputes the signature; if it differs, the selection is
-discarded entirely and the import proceeds as though no preview had run. Changing
-sources, file types, or `recursive` after selecting therefore cannot silently
-apply a stale selection.
+Note `available === false` is emitted only by `/api/import/new-images-preview`
+(snapshot mode), which is out of scope per *Scope* — so it is unreachable in copy
+mode and needs no special handling here.
+
+**`include_paths` is not the set of checked boxes.** It is:
+
+```js
+// A deselection only counts if the file was eligible to import in the first
+// place. Duplicates are not, so a click on one is discarded here.
+eligibleDeselections = skipDuplicates
+  ? importDeselected.difference(duplicatePaths)
+  : importDeselected
+include_paths = previewedPaths - eligibleDeselections
+```
+
+The `difference(duplicatePaths)` step is not cosmetic. At the first render
+(`import.html:2290`) verdicts have not arrived, so duplicate cards are still
+enabled and clickable; a user unchecking one — or catching it in a shift-range —
+would write it into `importDeselected`, and nothing later removes it. Without the
+filter that path is subtracted from `include_paths`, never reaches the checker,
+lands in no ledger bucket, and produces exactly the false "the card still holds the
+only copies of them" accusation about a file the archive demonstrably already has.
+Filtering at wire time is stateless and covers the window regardless of when the
+click landed.
+
+Duplicates therefore **stay in `include_paths`** even though they render unchecked.
+This is deliberate and load-bearing — see §5, where excluding them breaks
+`safe_to_format` and produces a false accusation against the user. The job already
+owns duplicate policy via `skip_duplicates`; `include_paths` must not
+double-implement it. The rule is *"everything previewed, minus what the user
+actively unchecked"* — a duplicate the user never clicked was not deselected by
+them.
+
+The visible count readout is the checkbox count (what will actually be copied),
+which is a *subset* of `include_paths`. These two numbers legitimately differ; §2
+covers what the user is shown.
+
+**Preview state is four-valued.** "Never previewed", "previewed then invalidated",
+and "a preview is running right now" are different situations and must not
+collapse:
+
+| State | `startImport()` behavior |
+|---|---|
+| **No preview run** | `include_paths` omitted → import everything (current behavior) |
+| **Preview current** | send `include_paths` + `previewed_count` |
+| **Preview stale** — `importPreviewSignature()` differs from the one captured at preview time | **Start disabled**, labelled *"Preview again before importing"* |
+| **Preview in flight** | **Start disabled**, labelled *"Previewing…"* |
+
+Discarding a stale selection and silently importing everything is unsafe: the
+re-preview is debounced and automatic (`scheduleImportPreview()` at
+`import.html:1898`, wired to every signature input by
+`wireDestStructureInvalidation` at 731-751), so a user who picks 100 of 5,000
+files, toggles a file-type box, and clicks Start before the re-preview lands would
+copy all 5,000. Having expressed an intent is not the same as having expressed
+none, and the difference is thousands of unwanted files.
+
+**The in-flight state is a distinct hazard, not a rounding of the stale one.**
+`previewImport()` calls `clearImportPreviewGrid()` at `import.html:2238` — *before*
+the folder-preview fetch, which is the slow disk walk. If selection state were
+reset there, the page would sit in "No preview run → import everything" for the
+entire walk, and the stale check could not save it because the captured signature
+matches the current UI. That is the same 5,000-file failure displaced by a few
+hundred milliseconds.
+
+So: **the previous preview's `previewedPaths`, `importDeselected`, and captured
+signature are retained untouched until the new render completes.** Selection state
+is replaced on success, not cleared on start. The remaining exits from
+`previewImport()` must be explicit about which state they leave behind:
+
+| Exit | Resulting state |
+|---|---|
+| zero files returned (`import.html:2286-2289`) | no preview run; Start enabled (nothing to select) |
+| fetch throws (`2366-2372`) | previous state retained; Start disabled, stale |
+| superseded by `importPreviewSeq` or a signature change (`2281`, `2350`, `2363`) | previous state retained; the newer run owns the transition |
 
 ### 2. Grid interaction
 
@@ -173,22 +234,57 @@ order actually in the DOM, after any active filter. Ranging over the unfiltered
 list would toggle cards the user cannot see. Pattern follows `review.html:2201-2245`.
 
 Every user-driven toggle (individual, folder, select-all, shift-range) adds the
-affected paths to `importSelectionTouched`.
+affected paths to — or removes them from — `importDeselected`. Disabled cards are
+skipped by folder and select-all toggles; they cannot be deselected because they
+are already ineligible.
 
 **Duplicates.** While `Skip duplicates` is on, duplicate cards render unchecked and
 `disabled`, badge reading `Duplicate — skipped`. They are already excluded by that
 global toggle, so drawing a checked box next to them would promise an import that
-will not happen. Turning `chkSkipDuplicates` off re-enables and checks them; since
-that flag is part of the preview signature, flipping it invalidates the preview
-and forces a re-preview, so the two mechanisms can never disagree.
+will not happen.
 
-A hand-picked selection is lost when `Skip duplicates` is toggled. This is
-accepted: the toggle changes which files are eligible at all, so the prior
-selection is not meaningfully transferable.
+With `Skip duplicates` **off**, the duplicate stream does not run at all — the page
+returns early at `import.html:2303` and renders the grid with an empty duplicate
+list. So there are no verdicts, every card is checked and enabled, and the summary
+reads "duplicates will be copied". No special handling is required for this case;
+the derived-`checked` rule in §1 produces it naturally.
 
-**Readouts.** A `#previewSelectedCount` element shows `"1,147 of 1,234 selected"`.
-`#btnStart` relabels to `Start import (1,147 files)` whenever a selection is
-active.
+Because `chkSkipDuplicates` is part of `importPreviewSignature()`, toggling it
+invalidates the preview and disables Start until a re-preview completes. A
+hand-picked selection is lost across that toggle, which is accepted: the flag
+changes which files are eligible at all.
+
+**Start gating.** `#btnStart` is disabled whenever eligibility is unsettled or the
+selection cannot be trusted:
+
+- while a preview is in flight (§1), labelled *"Previewing…"*
+- while the preview is stale (§1), labelled *"Preview again before importing"*
+- while the duplicate stream is still draining — checkbox state is not yet final,
+  so submitting mid-stream would send an `include_paths` that doesn't match what
+  the user is looking at
+- **when the checked count is zero**, labelled *"No files selected"*
+
+That last one is the real guard against "the user deselected everything," not the
+empty-`include_paths` rejection in §3. Because duplicates remain in
+`include_paths`, deselecting all 90 importable files on a 100-file card still
+yields a *non-empty* list of 10 duplicate paths, which passes shape validation and
+runs an import that copies nothing. The checked count is the number that reflects
+what the user actually sees and intends; §3's empty-list `400` is a backstop for
+malformed clients, not the primary check.
+
+**One owner for the disabled state.** `#btnStart.disabled` is currently written
+unconditionally from seven places (`import.html:2477`, `2496`, `2535`, `2776`,
+`2810`, `2817`, `2842`) — notably `finishJob` at 2535 re-enables it after every
+import. Adding four more gating conditions as scattered assignments will race with
+those. All of them must route through a single `updateStartGate()` that recomputes
+from state and owns both `disabled` and the label.
+
+**Readouts.** A `#previewSelectedCount` element shows `"1,147 of 1,234 selected"`,
+counting *checked* cards — the files that will actually be copied, not the larger
+`include_paths` set. `#btnStart` relabels to `Start import (1,147 files)` using the
+same number. The user is never shown the `include_paths` count; it is an internal
+accounting detail (§5), and surfacing a number larger than the checkboxes would be
+its own black box.
 
 **In-place mode.** Per *Scope*, all selection affordances — per-card checkboxes,
 folder-header checkboxes, select-all, and `#previewSelectedCount` — are hidden
@@ -211,44 +307,84 @@ the selection is discarded rather than carried across as stale state.
 `/api/jobs/import-in-place` is unchanged, and the page never sends either field to
 it (per *Scope*).
 
-- `include_paths` — the selected paths.
+- `include_paths` — `previewedPaths - importDeselected` per §1. **Not** the checked
+  boxes: duplicates are present here even though they render unchecked.
 - `previewed_count` — an integer: **the number of files in the preview endpoint's
   response**, not the number of cards visible in the grid. These differ once the
   sibling `hide-duplicates-checkbox` filter is active, and defining it as
   "displayed" would make every hidden duplicate inflate the files-appeared count in
   §6. Needed for honest drift reporting; see why an integer suffices there.
 
-Three states for `include_paths`, and the distinction is load-bearing:
+Because `include_paths = previewedPaths - importDeselected`, the server can recover
+the user-deselected count as `previewed_count - len(include_paths)` without a third
+field. §5 uses this for the `unsafe_files` message.
+
+Three states for `include_paths`:
 
 | State | Meaning |
 |---|---|
-| key absent | no preview run, or signature went stale → import everything (current behavior, unchanged) |
+| key absent | no preview run → import everything (current behavior, unchanged) |
 | non-empty list | import exactly these paths |
-| empty list | client-side error `"No files selected."`; never sent |
+| empty list | rejected — see below |
+
+A stale preview is **not** one of these states; Start is disabled instead (§1), so
+no request is issued at all.
 
 An absent key and an empty list must not collapse into the same case. Absent means
-"no opinion"; empty means "the user deselected everything," which is a mistake to
-catch, not an instruction to import the whole card.
+"no opinion"; empty means the client is malformed, since §2 disables Start at zero
+*checked* files well before `include_paths` could empty out. The empty-list `400`
+is a backstop, not the user-facing guard — see §2 for why the checked count is the
+number that actually catches "I deselected everything."
 
 **String form.** `include_paths` carries the client's original path strings
-unmodified, matching `ingest()`'s existing `skip_paths` convention. Normalization
+unmodified, matching `ingest()`'s existing `skip_paths` convention. Path resolution
 is used only for the containment check in §4 — the stored set must still match
 raw `discover_source_files` output by string equality, or the filter matches
 nothing and imports zero files.
 
 ### 4. Backend validation
 
-`include_paths` is untrusted client input in the same class as the in-place
-snapshot's frozen path list, and is validated the same way: each path must resolve
-under one of the request's already-validated `sources` directories, checked with
-`os.path.commonpath`. Any path that does not → `400`. Import must not become a
-path-admission escape hatch because a client asked for a file outside the folders
-the user actually chose.
+`include_paths` and `previewed_count` are untrusted client input in the same class
+as the in-place snapshot's frozen path list. All validation is **server-side**; the
+client-side checks in §3 are conveniences, not the enforcement point.
 
-**Use `os.path.normpath` only — never `realpath`.** Neither `/api/jobs/import-photos`
-nor preview discovery resolves symlinks on `sources`, so `realpath`-ing one side of
-the comparison would reject legitimate imports from symlinked mount points. Both
-sides must be normalized the same way.
+**Shape validation**, before anything else, each failure → `400`:
+
+- `include_paths` is a list of non-empty strings (reject non-list, non-string
+  members, empty strings, and `null`)
+- `include_paths` is non-empty when present
+- `previewed_count` is a non-negative integer, and is present whenever
+  `include_paths` is
+- `include_paths` is **deduplicated** before any length comparison, and
+  `len(set(include_paths)) <= previewed_count` — the selection cannot exceed what
+  was previewed. Deduping matters beyond tidiness: §5 derives the deselected count
+  from `previewed_count - len(include_paths)`, so a client repeating paths would
+  otherwise shrink or invert that figure.
+
+**Containment validation.** Each path must live under one of the request's
+already-validated `sources` directories, checked with `os.path.commonpath`. Any
+path that does not → `400`. Import must not become a path-admission escape hatch
+because a client asked for a file outside the folders the user actually chose.
+
+**Resolve both sides with `os.path.realpath` for the containment check, and keep
+the raw string for discovery matching.** Lexical `normpath` cannot detect a symlink
+escape — a link inside the source pointing outside it normalizes to a path that
+still appears contained, which would defeat the check entirely. Resolving *both*
+the candidate and the source directory keeps symlinked mount points working (the
+failure mode is only present when one side is resolved and the other isn't), while
+actually catching escapes. The resolved form is used for comparison only; the
+original string is what goes into `ImportParams.include_paths`, because §5 matches
+it against unresolved `discover_source_files` output.
+
+**A symlinked file that escapes the source is dropped, not fatal.**
+`discover_source_files` walks with `followlinks` off but still *returns* symlinked
+files inside a source, and the preview endpoint applies no containment filter — so
+such a file is displayed, checked by default, and would arrive in `include_paths`
+through no fault of the user. Rejecting the whole request with a `400` would break
+an import that works today. Drop the offending path from `include_paths`, log a
+warning, and proceed. Escapes that indicate a crafted client — paths that were
+never in any source at all — still `400`; the distinction is whether the path was
+reachable from a source the user chose.
 
 ### 5. Job execution
 
@@ -293,6 +429,30 @@ This position is load-bearing in both directions:
   the right thing on its own.
 - **Before `prepare()`** — the dedup preflight does not hash files nobody selected.
 
+**Why duplicates must stay in `include_paths`.** `import_job.py:2150` states the
+ledger invariant: *"Every discovered file ends in exactly one terminal bucket."*
+`skipped_duplicate` is only ever incremented inside the copy loop, which iterates
+the filtered `files` list. A file removed by the filter therefore lands in **no**
+bucket, and `copied + skipped_duplicate` silently falls short of `discovered`.
+
+If the UI excluded duplicates from `include_paths` — the reflexive
+"`include_paths` = the checked boxes" implementation — the ordinary case would
+regress:
+
+| 100 files, 10 already in the archive | discovered | copied | skipped_dup | verdict |
+|---|---|---|---|---|
+| today | 100 | 90 | 10 | ✅ safe to format |
+| duplicates excluded from `include_paths` | 100 | 90 | **0** | ❌ unsafe, blames the user |
+
+The user would be told not to format a card that is genuinely fully archived, with
+an `unsafe_files` entry accusing them of deselecting ten files they never touched.
+Keeping duplicates in `include_paths` lets the checker see them, skip them, and
+count them, so the invariant holds:
+
+- deselect nothing → `include_paths` = 100 → 90 copied + 10 skipped = 100 → **safe**
+- deselect 20 → `include_paths` = 80 → 70 copied + 10 skipped = 80 ≠ 100 →
+  **unsafe**, correctly attributing the gap to the 20 deselected files
+
 **The card-safety warning must explain itself.** Keeping `discovered` honest means
 any deselection correctly flips `safe_to_format` to false — but as the code stands
 that surfaces as a bare red "Do NOT format the card yet" pill with no reason
@@ -308,10 +468,39 @@ entry must be that pair and carries no markup. Follow the existing aggregate-ent
 convention (`{"path": "Likely duplicates", ...}` at `import_job.py:3305`):
 
 ```python
-{"path": "Deselected files",
- "reason": f"{deselected} files you deselected were not copied — "
-           "the card still holds the only copies of them"}
+if params.include_paths is not None and params.previewed_count is not None:
+    deselected = params.previewed_count - len(params.include_paths)
+    if deselected > 0:
+        unsafe_files.append({
+            "path": "Deselected files",
+            "reason": f"{deselected} files you deselected were not copied — "
+                      "the card still holds the only copies of them",
+        })
 ```
+
+Deriving the count from `previewed_count - len(include_paths)` rather than from
+`discovered` is what keeps duplicates and newly-appeared files out of it: both
+inflate `discovered`, neither was deselected by the user. `include_paths` is
+deduplicated at validation (§4) so a client repeating a path cannot inflate the
+figure.
+
+**Files appearing after the preview also need an entry**, for the same reason.
+They flip `safe_to_format` false on their own — `discovered` grows while the
+filtered `files` list does not — but `deselected` is zero in that case, so the
+block above appends nothing and the user gets the bare red pill this section spends
+a paragraph prohibiting:
+
+```python
+if appeared > 0:
+    unsafe_files.append({
+        "path": "Files added after preview",
+        "reason": f"at least {appeared} files arrived after your preview and "
+                  "were not imported — re-preview to include them",
+    })
+```
+
+This is the same signal §6 reports; routing it through `unsafe_files` as well is
+what connects it to the formatting warning it causes.
 
 Note every `unsafe_files` entry is also mirrored into `result["errors"]`
 (`import_job.py:1965`, `3353`), so this wording appears in two places.
@@ -319,12 +508,22 @@ Note every `unsafe_files` entry is also mirrored into `result["errors"]`
 Without it, the warning is exactly the black box `CORE_PHILOSOPHY.md` prohibits:
 technically correct, and unreadable as to why.
 
-**Progress and summary counts stay on the full card.** `_emit(..., emitted,
-discovered)` (`import_job.py:2348`, 3200) and the step summary
-`"{failed} failed of {discovered} discovered"` (3245) all use `discovered`, so a
-half-deselected import shows a bar that completes at roughly half. This is
-consistent with `discovered` meaning "files on the card" and needs no change —
-but the result card copy above is what makes it legible.
+**Progress runs on the selected workload; safety accounting stays on the full
+card.** These are different denominators and conflating them breaks one or the
+other. `_emit(..., emitted, discovered)` currently uses `discovered`, so a
+half-deselected import would run to completion with the bar stalled near 50% — a
+finished job that looks hung. Progress must instead use `len(files)` *after* the
+filter, the work actually queued.
+
+**Both copy paths again.** The `_emit` call sites are `import_job.py:2348` and
+`3200` locally, and **806, 830, 904, 1847** in `_run_remote_import_job`; the step
+summaries are `3245` and **1879**. Wiring only the local set leaves remote imports
+with the stalled bar.
+
+`discovered` continues to back `safe_to_format` unchanged, and the step summary
+should name both so the difference is legible rather than mysterious:
+
+> 500 selected of 1,234 discovered · 500 copied · 0 failed
 
 ### 6. Drift reporting
 
@@ -379,20 +578,38 @@ independent of checkboxes.
 
 - include-path filtering selects exactly the requested files
 - absent key imports everything; empty list is rejected
-- path-escape rejection: `../` traversal, symlink out of tree, sibling directory
-- **`safe_to_format` is false when any file is deselected, and true when all files
-  are selected** — the card-safety regression guard
+- **shape validation**: non-list, non-string members, empty strings, negative or
+  missing `previewed_count`, and `len(include_paths) > previewed_count` each `400`
+- path-escape rejection: `../` traversal, **symlink pointing outside the source**,
+  sibling directory — the symlink case must fail containment, which is what forces
+  `realpath` over `normpath`
+- a source directory that is itself reached through a symlink still imports
+  successfully (the regression `realpath`-ing only one side would cause)
+- **`safe_to_format` is true when a card containing duplicates is fully selected**
+  — the 90-copied/10-skipped case; this is the regression guard for the duplicate
+  accounting rule, and it fails if duplicates are dropped from `include_paths`
+- **`safe_to_format` is false when any file is deselected**, and the
+  `unsafe_files` entry names the deselected count and no more — duplicates and
+  newly-appeared files must not inflate it
+- **a duplicate unchecked before verdicts arrive still reaches the checker** —
+  `include_paths` retains it via the eligibility filter, so a fully-archived card
+  stays safe to format; this is the regression guard for the pre-verdict click
+  window
+- **files appearing after the preview produce their own `unsafe_files` entry**, so
+  the red pill is never bare
+- a client repeating a path in `include_paths` does not inflate the deselected
+  count (dedupe at validation)
 - `discovered` reports full card contents, not the selected subset
+- progress emits against the filtered workload, so a half-deselected import
+  reaches 100%
 - both drift signals populate correctly; an ordinary deselection reports *zero*
   files-appeared, and a mixed appear/vanish case never goes negative
 - drift signals are skipped entirely when no preview ran (`previewed_count is None`)
-- interaction with `skip_duplicates` — a selected file that is also a duplicate is
-  still skipped when the flag is on
 - filtering happens before `DuplicateChecker.prepare()`
 - **the remote path (`_run_remote_import_job`) honors `include_paths`** — the full
-  set of assertions above, including `safe_to_format` and the `unsafe_files` entry;
-  a regression here silently rsyncs deselected files
-- a deselection produces an `unsafe_files` entry naming the uncopied count
+  set of assertions above, including `safe_to_format`, the duplicate accounting
+  case, and the `unsafe_files` entry; a regression here silently rsyncs deselected
+  files
 - `include_paths` posted to `/api/jobs/import-in-place` is ignored, never silently
   half-applied (that route is unchanged by this spec)
 
@@ -403,15 +620,26 @@ independent of checkboxes.
 - checkboxes render and default to checked
 - duplicates flip to unchecked and disabled when the duplicate stream completes,
   not before
-- a file toggled while the duplicate stream is draining keeps the user's choice
-- folder-header checkbox toggles its subfolder and shows indeterminate state
+- a file unchecked while the duplicate stream is draining stays unchecked
+- with `Skip duplicates` off, no duplicate stream runs and every card is checked
+  and enabled
+- folder-header checkbox toggles its subfolder and shows indeterminate state;
+  disabled duplicate cards are skipped by folder and select-all toggles
 - select-all / select-none
 - shift-click selects a contiguous range in visible order
 - selection survives a `rerenderImportPreviewGrid()` (the "Hide duplicates" filter)
-- `#btnStart` label reflects the selected count
-- changing a source after selecting discards the selection
+  — **conditional on merge order**; `rerenderImportPreviewGrid` /
+  `lastImportPreviewRender` do not exist on this branch yet (see §Coordination)
+- `#btnStart` label reflects the *checked* count, not the `include_paths` count
+- **Start is disabled while the duplicate stream is draining**
+- **Start is disabled while a preview is in flight**, and the prior selection is
+  still intact when that preview completes
+- **Start is disabled when every importable file is unchecked**, even though
+  `include_paths` is non-empty because duplicates remain in it
+- **changing a source after selecting disables Start with "Preview again before
+  importing"** — it must not fall back to importing everything
 - **in-place mode hides all selection controls and shows the explanatory note**
-- switching from copy to in-place after selecting discards the selection
+- switching from copy to in-place after selecting disables Start the same way
 
 ## Out of scope
 
@@ -439,6 +667,15 @@ independent of checkboxes.
 The `hide-duplicates-checkbox` branch (worktree `banjul`) modifies
 `renderImportPreviewGrid()` and `clearImportPreviewGrid()` in
 `vireo/templates/import.html` and adds `lastImportPreviewRender` /
-`rerenderImportPreviewGrid()`. The seeding-outside-the-renderer decision in §1
-exists specifically to compose with it. Whichever branch merges second must
-verify that toggling "Hide duplicates" preserves selection state.
+`rerenderImportPreviewGrid()`. The derived-checkbox-state decision in §1 exists
+specifically to compose with it. Whichever branch merges second must verify:
+
+- toggling "Hide duplicates" preserves `importDeselected`
+- `previewed_count` still reflects the preview endpoint's response size, not the
+  post-filter visible count (§3)
+- **the early return at `import.html:2303` still holds.** §1 and §2 depend on the
+  duplicate stream not running when `Skip duplicates` is off. If that branch — or
+  any other — makes the stream unconditional so the filter has verdicts to work
+  with, this spec's duplicate handling must be revisited before merge, because
+  duplicate verdicts would then exist in a mode where they must not affect
+  eligibility.

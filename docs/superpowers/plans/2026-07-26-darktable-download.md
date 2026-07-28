@@ -26,6 +26,11 @@
 - Flask routes live inside `create_app` in `vireo/app.py` and are registered with `@app.route`. Imports are function-local by convention in this file.
 - Every new route must be added to `vireo/tests/contracts/routes.txt` or a contract test fails.
 - Job progress should use `progress_event()` / `failure_event()` from `vireo/job_contract.py` for a consistent payload shape. (`vireo/tests/test_job_contract.py` unit-tests those helpers; it does not enforce their use across `app.py`, so this is convention, not a failing test.)
+- **Run `ruff check vireo/ tests/` before every commit.** That is exactly what CI
+  runs (`.github/workflows/test.yml:258`), and it is repo-wide — a lint error
+  anywhere fails the PR. Task 4 left it red with 6 errors (a `B904` plus 5
+  `I001` import-sort errors in new test code), caught only a review round later.
+  Linting just the files you touched is not sufficient.
 
 ---
 
@@ -536,6 +541,32 @@ def test_download_with_resume_cancels_midstream(tmp_path):
 `_start_test_server(handler_class, port=0)` returns `(server, port)`
 (`test_taxonomy.py:543-548`); the URL is built from the port, as above. Add
 `import pytest` at the top of the file if it is not already there.
+
+**These two tests are NOT sufficient — proven by mutation, not guessed.** During
+implementation, forcing `progress_base = downloaded_before` always (i.e. exactly
+the "bar past 100%" bug this step spends a paragraph warning about) passed both
+tests above. Four more are required, each closing a mutation that otherwise
+survives the whole suite:
+
+- `..._bytes_reset_when_server_ignores_range` — a server that ignores `Range` and
+  returns 200 on the retry. Assert the reported total never exceeds the real file
+  size and progress restarts from 0 rather than continuing from
+  `downloaded_before`.
+- **Pin `except DownloadCancelled: raise`** — pass a `progress_callback`, assert
+  no message contains `"retrying"`, and assert the server was hit exactly once.
+  Without it, deleting that clause still passes: the backoff cancel check catches
+  the exception one beat later, but the user is then told the *connection
+  dropped* after pressing Cancel.
+- **Pin the backoff cancel check** — a 500 handler plus a `should_cancel` that
+  flips after the first attempt. Assert it raises well under the 3 s backoff and
+  hit the server once. Without it, reverting to `time.sleep(3)` still passes,
+  masked by the re-raise. **Each of these two gaps hides the other's removal** —
+  the weakest possible state.
+- **Pin the throttle interval, not just its existence.** Extract it as a private
+  keyword-only `_emit_interval=0.25` param; assert `_emit_interval=0` fires ~once
+  per chunk and a huge value fires exactly once. Otherwise setting the interval to
+  `1e9` passes every test while the real 178 MB progress bar never moves until
+  completion — the exact failure Task 10 exists to prevent.
 
 - [ ] **Step 2: Run to verify they fail**
 

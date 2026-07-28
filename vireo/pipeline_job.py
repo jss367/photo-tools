@@ -3923,6 +3923,13 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                 # message always produces a valid X-of-N ratio. total_failed sums
                 # per-model failures and can exceed total in multi-model runs.
                 failed_photo_ids: set = set()
+                # Photos we never opened because their containing folder was
+                # unreachable at read time. Kept apart from ``failed`` (those
+                # ARE actual per-photo decode failures) so the rollup can name
+                # unreachable photos honestly, and kept as unique photo IDs so
+                # a folder outage that hits the same photos across every model
+                # in a multi-model run doesn't multiply-count.
+                source_skipped_photo_ids: set = set()
 
                 skipped_model_names: list = []
                 models_succeeded = 0
@@ -4532,6 +4539,9 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                                             # unreachable and let later photos
                                             # in healthy folders keep processing.
                                             source_skipped += 1
+                                            source_skipped_photo_ids.add(
+                                                photo["id"]
+                                            )
                                             continue
                                         if not _handle_source_offline(reason):
                                             break
@@ -4562,6 +4572,9 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                                             # counter still bounds how many
                                             # times we ask.
                                             source_skipped += 1
+                                            source_skipped_photo_ids.add(
+                                                photo["id"]
+                                            )
                                             continue
                                         # Retry succeeded — fall through to
                                         # the normal inference path below.
@@ -4798,6 +4811,7 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                 # IDs (not per-model attempt count) so the badge can never
                 # exceed total photos.
                 n_failed_photos = len(failed_photo_ids)
+                n_source_skipped_photos = len(source_skipped_photo_ids)
                 if source_offline["reason"]:
                     # Must carry the "[classify] Fatal:" prefix: the end-of-run
                     # rollup picks the job's headline error by that marker and
@@ -4809,13 +4823,41 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                         f"Process again to classify the rest — photos already "
                         f"classified will be skipped."
                     )
-                # A run that gave up on a dead source did NOT classify the
-                # collection, so it must not land on the job tree as a clean
-                # green stage — "completed" here would tell the user their
-                # photos were processed when most were never opened.
+                    # extract_masks_stage / eye_keypoints_stage only gate on
+                    # abort.is_set(); with the source dead there is nothing
+                    # for them to read either, so without this they walk every
+                    # detected photo and reproduce the exact "N failed"
+                    # pattern this PR fixes — just one stage later, before
+                    # the failed-stage rollup at the end of the pipeline gets
+                    # a chance to short-circuit them.
+                    abort.set()
+                elif n_source_skipped_photos > 0:
+                    # Folder-scoped outage: some photos were unreachable but
+                    # the source as a whole is not necessarily gone (other
+                    # folders in the collection may still be healthy). Do NOT
+                    # abort — later stages can still make progress on the
+                    # reachable photos — but the classify pass did not open
+                    # every photo it was asked to, so surface a fatal-prefixed
+                    # error so the end-of-run rollup names the outage instead
+                    # of letting the run finish silent-green.
+                    errors.append(
+                        f"[classify] Fatal: {n_source_skipped_photos} of "
+                        f"{total} photos unreachable (source offline). "
+                        f"Reconnect the missing folder(s) and run Process "
+                        f"again to classify the rest."
+                    )
+                # A run that gave up on a dead source, or that skipped photos
+                # because their folder was unreachable, did NOT classify the
+                # whole collection, so it must not land on the job tree as a
+                # clean green stage — "completed" here would tell the user
+                # their photos were processed when some were never opened.
                 stages["classify"]["status"] = (
                     "failed"
-                    if (total_failed > 0 or source_offline["reason"])
+                    if (
+                        total_failed > 0
+                        or source_offline["reason"]
+                        or n_source_skipped_photos > 0
+                    )
                     else "completed"
                 )
                 if total_failed > 0:
@@ -4829,6 +4871,7 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                     "detected": detect_state["total_detected"],
                     "failed": total_failed,
                     "source_offline": source_offline["reason"],
+                    "source_skipped": n_source_skipped_photos,
                     "already_classified": total_skipped_existing,
                     "full_image_fallbacks": total_full_image_fallbacks,
                     "weak_detection_rescues": len(contextual_weak_ids),

@@ -64,8 +64,21 @@ _SENTINEL = object()  # unique end-of-stream marker
 _MAX_SOURCE_OFFLINE_PAUSES = 3
 
 
-def _missing_archive_mount_root(path: str) -> str | None:
-    """Return a likely missing mount root that must not be auto-created."""
+def _archive_mount_root_candidates(path: str) -> list[str]:
+    """Return the plausible mount-root prefix(es) for ``path``, if any.
+
+    Extracts the mount-root component under the OS's mount conventions —
+    the first entry under ``/Volumes/`` or ``/mnt/`` (SMB/NFS style), or
+    the first user/name pair under ``/media/<user>/``. These conventions
+    strongly imply the user intended the location as a mount point; the
+    caller decides what state to require of it (missing entirely vs.
+    present but not actually mounted).
+
+    Both the raw expanded path and the normalized absolute form are
+    checked so relative or ``~``-prefixed paths still match. Duplicates
+    are collapsed, and paths not shaped like a mount root return no
+    candidates.
+    """
     def _candidate(posix_path: str) -> str | None:
         parts = posix_path.split("/")
         if len(parts) >= 3 and parts[0] == "" and parts[1] in {"Volumes", "mnt"}:
@@ -78,10 +91,56 @@ def _missing_archive_mount_root(path: str) -> str | None:
     normalized = os.path.normpath(os.path.abspath(os.path.expanduser(path)))
     normalized_posix = normalized.replace("\\", "/")
 
-    for mount_root in (_candidate(raw_posix), _candidate(normalized_posix)):
-        if mount_root and not os.path.lexists(mount_root):
+    seen: list[str] = []
+    for cand in (_candidate(raw_posix), _candidate(normalized_posix)):
+        if cand and cand not in seen:
+            seen.append(cand)
+    return seen
+
+
+def _missing_archive_mount_root(path: str) -> str | None:
+    """Return a likely missing mount root that must not be auto-created.
+
+    "Missing" here means the mount-root directory itself doesn't exist —
+    which is what the archive-parent preflight needs, so ``makedirs``
+    doesn't silently create a stub directory and write onto the local
+    disk when the intended NAS wasn't mounted. A mount point that
+    persists after unmount (Linux ``/mnt/<name>``) is NOT flagged by
+    this helper — see ``_source_offline_reason`` for the mid-run outage
+    check that also treats a directory-still-there-but-not-mounted case
+    as offline.
+    """
+    for mount_root in _archive_mount_root_candidates(path):
+        if not os.path.lexists(mount_root):
             return mount_root
     return None
+
+
+def _mount_root_offline(mount_root: str) -> bool:
+    """Whether ``mount_root`` appears to not have a filesystem mounted at it.
+
+    Two shapes count as offline, because callers only get here when a
+    subtree read has already failed:
+
+    * The directory is entirely gone — macOS removes ``/Volumes/<share>``
+      on eject, so ``lexists`` alone is enough.
+    * The directory exists but ``os.path.ismount`` reports nothing is
+      mounted at it — the Linux common case, where the mount point
+      (``/mnt/<share>``, ``/media/<user>/<name>``) persists after
+      ``umount`` or after a network drop. Codex #1388 P1 r3663493889:
+      without this branch, the pipeline would treat every descendant as
+      an isolated folder outage instead of pausing for reconnection.
+
+    A stale mount whose device is dead can raise EIO from stat probes;
+    treat that as offline too — we're in the "reads are already failing"
+    path so the mount can't be considered healthy.
+    """
+    if not os.path.lexists(mount_root):
+        return True
+    try:
+        return not os.path.ismount(mount_root)
+    except OSError:
+        return True
 
 
 def _source_offline_reason(
@@ -103,32 +162,35 @@ def _source_offline_reason(
     * ``"mount"`` — the shared volume is gone. Every remaining photo on it
       will fail the same way; classify should pause the whole run so the
       user can reconnect.
-    * ``"folder"`` — the mount root is still present but this one folder no
-      longer resolves. Other folders in the collection may be healthy, so
-      the caller should skip photos in this folder as unreachable and keep
-      processing rather than stopping cold. This covers a single deleted
-      or renamed local folder — the incident-fix's original global-stop
-      behavior would have stranded later healthy folders (and, on
-      ``reclassify=True``, cleared their existing predictions during
-      finalization with no replacement).
+    * ``"folder"`` — the mount root is still present and mounted but this
+      one folder no longer resolves. Other folders in the collection may
+      be healthy, so the caller should skip photos in this folder as
+      unreachable and keep processing rather than stopping cold. This
+      covers a single deleted or renamed local folder — the incident
+      fix's original global-stop behavior would have stranded later
+      healthy folders (and, on ``reclassify=True``, cleared their
+      existing predictions during finalization with no replacement).
 
-    Deliberately conservative. Both probes require evidence that a tree —
-    the mount or the folder itself — is gone, so no single unreadable file
-    can ever trip them, and a collection on a local disk with all its
-    folders intact always returns ``None`` and keeps today's per-photo
-    behavior.
+    Deliberately conservative — a healthy containing folder always
+    returns ``None`` regardless of the image path, so a single unreadable
+    file inside a working tree stays a per-photo failure and can never
+    trip the mount-root check by itself.
     """
-    mount_root = _missing_archive_mount_root(image_path)
-    if mount_root:
-        return "mount", f"volume {mount_root} is not mounted"
-    # A stale mount can keep the mount root in place while the subtree turns
-    # unreadable, so fall back to asking whether the containing folder still
-    # resolves. os.path.isdir() swallows the EIO and returns False. Scope
-    # this to the folder rather than the whole source: a single missing
-    # local folder is not evidence the rest of the collection is offline.
-    if folder_path and not os.path.isdir(folder_path):
-        return "folder", f"folder {folder_path} is unreadable"
-    return None
+    # A readable folder means one bad file, not a source outage — this
+    # short-circuit is what protects a local ``/mnt/photos/...`` catalog
+    # (unusual, but legal) from tripping the mount-root check just because
+    # a single file has been deleted.
+    if not folder_path or os.path.isdir(folder_path):
+        return None
+    # The folder itself is gone / unreachable. If that folder lives under
+    # a mount-shaped path and the mount is no longer active, this is a
+    # mount-scoped outage (Codex #1388 P1 r3663493889): pause the whole
+    # run instead of skipping folder-by-folder while the same dead share
+    # rejects every subsequent read.
+    for mount_root in _archive_mount_root_candidates(image_path):
+        if _mount_root_offline(mount_root):
+            return "mount", f"volume {mount_root} is not mounted"
+    return "folder", f"folder {folder_path} is unreadable"
 
 
 @dataclass

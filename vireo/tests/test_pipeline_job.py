@@ -12459,6 +12459,118 @@ def test_source_offline_reason_flags_vanished_folder(tmp_path):
     assert folder in reason, f"Reason must name the folder; got {reason!r}"
 
 
+def test_source_offline_reason_flags_persistent_mountpoint_after_unmount(
+    monkeypatch,
+):
+    """Linux common case: the mount-point directory outlives the mount.
+
+    Codex #1388 P1 (r3663493889): when a Linux SMB/NFS share mounted on a
+    persistent directory like ``/mnt/photos`` is unmounted (or the network
+    drops), ``lexists("/mnt/photos")`` remains True — only the *contents*
+    become unreachable. Pre-fix, ``_source_offline_reason`` fell through
+    to the folder-scoped branch and classify skipped folder-by-folder
+    instead of pausing, so every descendant of the dead share still
+    reissued a doomed read. Pin that a mount-point-shaped directory
+    without a filesystem mounted at it is treated as a mount-scoped
+    outage regardless of whether the directory itself still exists.
+    """
+    import pipeline_job
+
+    folder = "/mnt/photos/2026-07-27"
+    image = os.path.join(folder, "DSC_0001.NEF")
+
+    real_lexists = pipeline_job.os.path.lexists
+    real_isdir = pipeline_job.os.path.isdir
+    real_ismount = pipeline_job.os.path.ismount
+
+    def fake_lexists(path):
+        # The persistent mount-point directory is still there.
+        if path == "/mnt/photos":
+            return True
+        return real_lexists(path)
+
+    def fake_isdir(path):
+        # The subtree is unreachable because the filesystem is gone.
+        if path == folder:
+            return False
+        return real_isdir(path)
+
+    def fake_ismount(path):
+        # But nothing is actually mounted at /mnt/photos — the whole
+        # share, not just this one folder, is offline.
+        if path == "/mnt/photos":
+            return False
+        return real_ismount(path)
+
+    monkeypatch.setattr(pipeline_job.os.path, "lexists", fake_lexists)
+    monkeypatch.setattr(pipeline_job.os.path, "isdir", fake_isdir)
+    monkeypatch.setattr(pipeline_job.os.path, "ismount", fake_ismount)
+
+    result = pipeline_job._source_offline_reason(folder, image)
+    assert result is not None, (
+        "A mount-point-shaped path with no filesystem mounted at it must "
+        "register as an offline source — pre-fix, this fell through to "
+        "the folder-scoped branch and never paused the run."
+    )
+    scope, reason = result
+    assert scope == "mount", (
+        f"Persistent-mountpoint outages must scope to the mount so the "
+        f"whole run pauses for reconnection; scoping to 'folder' would "
+        f"re-hit the dead share once per descendant. Got scope {scope!r}."
+    )
+    assert "/mnt/photos" in reason, (
+        f"Reason must name the mount root the user needs to reconnect; "
+        f"got {reason!r}."
+    )
+
+
+def test_source_offline_reason_flags_stale_mount_that_raises_from_stat(
+    monkeypatch,
+):
+    """A stale mount whose stat probes raise EIO is still offline.
+
+    ``os.path.ismount`` uses stat calls on the path and its parent; a
+    dead NFS/SMB mount can raise ``OSError`` (EIO) from those instead of
+    returning a clean answer. Since we only ask about the mount state
+    once a read has already failed, an errored probe must count as
+    offline — otherwise the same dead share would be treated as healthy
+    and folder-scoped for every subsequent read.
+    """
+    import pipeline_job
+
+    folder = "/mnt/photos/2026-07-27"
+    image = os.path.join(folder, "DSC_0001.NEF")
+
+    real_lexists = pipeline_job.os.path.lexists
+    real_isdir = pipeline_job.os.path.isdir
+    real_ismount = pipeline_job.os.path.ismount
+
+    def fake_lexists(path):
+        if path == "/mnt/photos":
+            return True
+        return real_lexists(path)
+
+    def fake_isdir(path):
+        if path == folder:
+            return False
+        return real_isdir(path)
+
+    def fake_ismount(path):
+        if path == "/mnt/photos":
+            raise OSError("Input/output error")
+        return real_ismount(path)
+
+    monkeypatch.setattr(pipeline_job.os.path, "lexists", fake_lexists)
+    monkeypatch.setattr(pipeline_job.os.path, "isdir", fake_isdir)
+    monkeypatch.setattr(pipeline_job.os.path, "ismount", fake_ismount)
+
+    result = pipeline_job._source_offline_reason(folder, image)
+    assert result is not None and result[0] == "mount", (
+        f"A stale mount whose ismount probe raises must be treated as "
+        f"offline, not silently accepted as healthy. Got {result!r}."
+    )
+
+
 def test_pipeline_classify_pauses_when_source_volume_disappears(
     tmp_path, monkeypatch,
 ):

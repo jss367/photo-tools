@@ -778,6 +778,22 @@ def test_select_asset_never_picks_zsync():
     assert asset["size"] > 10 * 1024 * 1024
 
 
+def test_select_asset_skips_zsync_listed_before_the_appimage():
+    """THE test above is vacuous on its own — verified by mutation.
+
+    The fixture lists each AppImage before its .zsync sibling, and
+    select_asset returns on the first suffix match, so a substring matcher
+    still returns the real AppImage and the test above passes. GitHub makes
+    no ordering promise, so re-sort the assets to put the decoys first.
+    """
+    from darktable_install import select_asset
+
+    release = _release()
+    release["assets"].sort(key=lambda a: not a["name"].endswith(".zsync"))
+    asset = select_asset(release, "linux", "x86_64")
+    assert asset["name"] == "Darktable-5.6.0-x86_64.AppImage"
+
+
 def test_select_asset_unknown_platform_returns_none():
     from darktable_install import select_asset
 

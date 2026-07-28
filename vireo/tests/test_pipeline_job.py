@@ -14257,9 +14257,12 @@ def test_pipeline_classify_give_up_skips_downstream_stages(
         render_proxy_calls.append(args)
         return None
 
-    with contextlib.suppress(Exception):
-        import masking as masking_mod
-        monkeypatch.setattr(masking_mod, "render_proxy", spy_render_proxy)
+    # Patch unconditionally — a suppressed patch would leave
+    # ``render_proxy_calls`` permanently empty, letting the ``assert not
+    # render_proxy_calls`` guard below pass vacuously if extract_masks
+    # regressed (CodeRabbit nit #1388).
+    import masking as masking_mod
+    monkeypatch.setattr(masking_mod, "render_proxy", spy_render_proxy)
 
     # A plain FakeRunner has no pause support, so classify gives up at once —
     # the same path a non-pausable job takes when the source is offline.
@@ -14758,6 +14761,241 @@ def test_pipeline_classify_multimodel_reclassify_per_spec_source_skips(
     )
 
 
+def test_pipeline_classify_stale_purge_preserves_source_skipped_photos(
+    tmp_path, monkeypatch,
+):
+    """The reclassify stale-detection purge must not touch source-skipped photos.
+
+    Codex #1388 P1 (r3663922709): on a reclassify run where detection
+    succeeded but the source disappeared before classification, a photo
+    ends up in ``source_skipped_photo_ids`` AND — because
+    ``first_model_photo_ids`` is added to at the top of the per-photo
+    body, before the image read — remains in ``first_model_photo_ids``
+    too. The purge at ``pipeline_job.py`` lines 5015-5066 therefore
+    included that photo, and if the fresh detect returned different boxes
+    than the pre-run snapshot the pre-run detection ids for the skipped
+    photo were deleted — cascading through their prior predictions
+    despite the new ``clear_predictions`` exclusion that already spared
+    them.
+    """
+    import classifier as classifier_mod
+    import classify_job
+    import config as cfg
+    from db import Database
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cfg.CONFIG_PATH = str(tmp_path / "config.json")
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws_id = db._active_workspace_id
+
+    gone_folder_path = str(tmp_path / "vanishes_at_classify")
+    healthy_folder_path = str(tmp_path / "always_here")
+    os.makedirs(gone_folder_path, exist_ok=True)
+    os.makedirs(healthy_folder_path, exist_ok=True)
+
+    gone_folder_id = db.add_folder(gone_folder_path)
+    healthy_folder_id = db.add_folder(healthy_folder_path)
+
+    # Pre-existing detection: THIS is the row (and its cascaded
+    # prediction) the fix must preserve. Its box is deliberately
+    # different from what fake_detect_batch will return below so that
+    # the pre-run id is NOT re-produced by the fresh detect — the
+    # exact precondition that triggers the purge.
+    gone_photo_id = db.add_photo(
+        gone_folder_id, "gone.jpg", ".jpg", 4000, 4_000_000.0,
+    )
+    _drop_jpeg(gone_folder_path, "gone.jpg")
+    old_gone_det_id = db.save_detections(
+        gone_photo_id,
+        [{"box": {"x": 0.05, "y": 0.05, "w": 0.30, "h": 0.30},
+          "confidence": 0.9, "category": "animal"}],
+        detector_model="MegaDetector",
+    )[0]
+    OLD_SPECIES = "PreservedPriorSpecies"
+    db.add_prediction(
+        detection_id=old_gone_det_id,
+        species=OLD_SPECIES,
+        confidence=0.42,
+        model="BioCLIP-2",
+        labels_fingerprint="fp",
+    )
+
+    # Healthy photo is here to drive ``models_succeeded == 1`` so the
+    # purge fires. Its pre-run boxes are the same as fresh, so it does
+    # not exercise the purge itself.
+    healthy_photo_id = db.add_photo(
+        healthy_folder_id, "healthy.jpg", ".jpg", 5000, 5_000_000.0,
+    )
+    _drop_jpeg(healthy_folder_path, "healthy.jpg")
+    db.save_detections(
+        healthy_photo_id,
+        [{"box": {"x": 0.1, "y": 0.1, "w": 0.5, "h": 0.5},
+          "confidence": 0.9, "category": "animal"}],
+        detector_model="MegaDetector",
+    )
+
+    col_id = db.add_collection(
+        "Test",
+        json.dumps([{"field": "photo_ids",
+                     "value": [gone_photo_id, healthy_photo_id]}]),
+    )
+
+    _setup_fake_downloaded_model(tmp_path, monkeypatch)
+
+    import labels_fingerprint as lfp
+    monkeypatch.setattr(lfp, "compute_fingerprint", lambda *a, **k: "fp")
+
+    # Fresh detect returns a DIFFERENT box for the gone photo so its
+    # content-addressed id (vireo/detection_id.py) does NOT match the
+    # pre-run id. The pre-run id therefore lands in the purge's
+    # stale-id list — unless the fix excludes source-skipped photos
+    # from the purge scope, which is what this test pins.
+    from detection_id import detection_id as compute_det_id
+    NEW_BOX = (0.75, 0.75, 0.20, 0.20)
+    new_gone_det_id = compute_det_id(
+        gone_photo_id, "megadetector-v6", NEW_BOX, "animal",
+    )
+    assert new_gone_det_id != old_gone_det_id, (
+        "Test setup precondition: fresh box must produce a different "
+        "detection id than the pre-run box, otherwise the purge would "
+        "have nothing to consider stale for this photo."
+    )
+
+    def fake_detect_batch(batch, folders, runner, job, reclassify, db_,
+                          det_conf_threshold=None, already_detected_ids=None,
+                          cached_detections=None):
+        det_map = {}
+        for p in batch:
+            if p["id"] == gone_photo_id:
+                det_map[p["id"]] = [{
+                    "id": new_gone_det_id,
+                    "box_x": NEW_BOX[0], "box_y": NEW_BOX[1],
+                    "box_w": NEW_BOX[2], "box_h": NEW_BOX[3],
+                    "confidence": 0.9, "category": "animal",
+                }]
+            else:
+                det_map[p["id"]] = [{
+                    "id": d["id"],
+                    "box_x": d["box_x"], "box_y": d["box_y"],
+                    "box_w": d["box_w"], "box_h": d["box_h"],
+                    "confidence": d["detector_confidence"],
+                    "category": d["category"],
+                } for d in db_.get_detections(p["id"])
+                    if d["detector_model"] != "full-image"]
+        return det_map, len(batch), {p["id"] for p in batch}
+
+    monkeypatch.setattr(classify_job, "_detect_batch", fake_detect_batch)
+
+    from PIL import Image as _PILImage
+
+    def selective_prepare_image(photo, folders, detection, vireo_dir=None):
+        # The gone photo's folder vanished between detect and classify.
+        if photo["id"] == gone_photo_id:
+            image_path = os.path.join(
+                str(tmp_path / "vanished_at_classify_time"),
+                photo["filename"],
+            )
+            return None, str(tmp_path / "vanished_at_classify_time"), image_path
+        fp = folders.get(photo["folder_id"], "")
+        return (
+            _PILImage.new("RGB", (16, 16), "black"),
+            fp,
+            os.path.join(fp, photo["filename"]),
+        )
+
+    monkeypatch.setattr(classify_job, "_prepare_image", selective_prepare_image)
+
+    def fake_flush_batch(batch, clf, model_type, model_name, db_, raw_results,
+                         top_k=1):
+        for entry in batch:
+            raw_results.append({
+                "photo": entry["photo"],
+                "detection_id": entry.get("detection_id"),
+                "folder_path": entry["folder_path"],
+                "image_path": entry["image_path"],
+                "prediction": "FreshSpecies",
+                "confidence": 0.9,
+                "timestamp": None,
+                "filename": entry["photo"]["filename"],
+                "embedding": None,
+                "taxonomy": None,
+            })
+        return 0
+
+    monkeypatch.setattr(classify_job, "_flush_batch", fake_flush_batch)
+
+    class FakeClassifier:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def encode_image(self, *args, **kwargs):
+            import numpy as np
+            return np.zeros(512, dtype=np.float32)
+
+    monkeypatch.setattr(classifier_mod, "Classifier", FakeClassifier)
+
+    # NoPauseRunner keeps the gone photo on the folder-scoped path so
+    # the healthy photo still gets classified (``models_succeeded == 1``
+    # is required for the purge to fire).
+    class NoPauseRunner(FakeRunner):
+        def pause_job(self, job_id):
+            return False
+
+        def wait_if_paused(self, job_id, *, publish_paused=False):
+            return False
+
+    params = PipelineParams(
+        collection_id=col_id,
+        reclassify=True,
+        skip_extract_masks=True,
+        skip_regroup=True,
+    )
+
+    runner = NoPauseRunner()
+    job = _make_job()
+
+    # A folder-scoped skip on a partial run raises a fatal source-offline
+    # error at the end of the run (Codex #1388 P1) — accept the raise so
+    # the classify body ran the purge.
+    with contextlib.suppress(RuntimeError):
+        run_pipeline_job(job, runner, db_path, ws_id, params)
+
+    # The heart of the fix: the pre-run detection row for the
+    # source-skipped photo must still exist. Pre-fix, ``first_model_
+    # photo_ids`` still contained gone_photo_id (added at the top of the
+    # per-photo body before the image read), so the purge treated the
+    # pre-run id as stale and deleted it — cascading through the
+    # prediction below.
+    surviving_det_ids = {
+        row[0] for row in db.conn.execute(
+            "SELECT id FROM detections WHERE photo_id = ?",
+            (gone_photo_id,),
+        ).fetchall()
+    }
+    assert old_gone_det_id in surviving_det_ids, (
+        f"The pre-run detection row for a source-skipped photo must "
+        f"survive the reclassify stale-detection purge. Got surviving "
+        f"ids {surviving_det_ids!r}; expected {old_gone_det_id} to be "
+        f"present."
+    )
+
+    # And its cascaded prediction must survive too — cascading through
+    # the FK delete is exactly what the pre-fix code did.
+    surviving_species = sorted(
+        row[0] for row in db.conn.execute(
+            "SELECT species FROM predictions WHERE detection_id = ?",
+            (old_gone_det_id,),
+        ).fetchall()
+    )
+    assert OLD_SPECIES in surviving_species, (
+        f"The prior prediction for a source-skipped photo must not be "
+        f"cascade-deleted by the stale-detection purge. Got species "
+        f"{surviving_species!r}."
+    )
+
+
 def test_pipeline_classify_recovered_pause_leaves_no_terminal_classify_error(
     tmp_path, monkeypatch,
 ):
@@ -15055,9 +15293,12 @@ def test_pipeline_classify_failed_retry_on_last_photo_latches_source_offline(
         render_proxy_calls.append(args)
         return None
 
-    with contextlib.suppress(Exception):
-        import masking as masking_mod
-        monkeypatch.setattr(masking_mod, "render_proxy", spy_render_proxy)
+    # Patch unconditionally — a suppressed patch would leave
+    # ``render_proxy_calls`` permanently empty, letting the ``assert not
+    # render_proxy_calls`` guard below pass vacuously if the
+    # last-photo retry-fail path regressed (CodeRabbit nit #1388).
+    import masking as masking_mod
+    monkeypatch.setattr(masking_mod, "render_proxy", spy_render_proxy)
 
     class ResumingRunner(FakeRunner):
         """User keeps hitting Resume without actually remounting the share."""

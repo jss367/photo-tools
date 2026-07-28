@@ -5012,9 +5012,22 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                         # delete rows for photos the classifier never reached.
                         # The intersection guarantees there's a replacement
                         # detection AND that the classifier considered it.
+                        #
+                        # Also subtract source-skipped photos: ``first_model_
+                        # photo_ids`` is added to at the TOP of the per-photo
+                        # body (before the image read), so a photo whose read
+                        # later failed with the source offline is still in
+                        # that set. Without this subtraction, the purge below
+                        # would delete any pre-run detection ids whose boxes
+                        # differ from the fresh boxes even for photos we
+                        # never classified — cascading through their prior
+                        # predictions despite the ``clear_predictions``
+                        # exclusion that already spares them (Codex #1388
+                        # P1 r3663922709).
                         purge_ids = (
-                            first_model_photo_ids
-                            & detect_state["processed_ids"]
+                            (first_model_photo_ids
+                             & detect_state["processed_ids"])
+                            - source_skipped_photo_ids
                         )
                         # Delete only pre-run ids the current run did NOT
                         # re-produce. Detection ids are content-addressed

@@ -12406,15 +12406,25 @@ def test_source_offline_reason_none_for_healthy_local_folder(tmp_path):
 
 
 def test_source_offline_reason_flags_unmounted_volume():
-    """The incident case: /Volumes/<share> is gone entirely."""
+    """The incident case: /Volumes/<share> is gone entirely.
+
+    Scoped ``"mount"`` because every remaining read of the collection will
+    fail the same way — classify must pause the whole run, not just this
+    folder.
+    """
     from pipeline_job import _source_offline_reason
 
     folder = "/Volumes/DefinitelyNotMounted12345/Raw Files"
     image = os.path.join(folder, "DSC_7280.NEF")
 
-    reason = _source_offline_reason(folder, image)
-    assert reason is not None, (
+    result = _source_offline_reason(folder, image)
+    assert result is not None, (
         "An unmounted /Volumes/... path must be reported as an offline source."
+    )
+    scope, reason = result
+    assert scope == "mount", (
+        f"An unmounted volume must scope offline to the mount so the whole "
+        f"run pauses; got scope {scope!r}."
     )
     assert "/Volumes/DefinitelyNotMounted12345" in reason, (
         f"The reason must name the mount root the user has to reconnect; "
@@ -12423,17 +12433,28 @@ def test_source_offline_reason_flags_unmounted_volume():
 
 
 def test_source_offline_reason_flags_vanished_folder(tmp_path):
-    """A stale mount can keep the mount root while the subtree turns
-    unreadable. The folder no longer resolving is enough to stop the run."""
+    """A single unreadable folder is scoped to that folder alone.
+
+    Codex #1388 P1: with ``reclassify=True`` in a multi-folder collection,
+    stopping the whole run on one deleted local folder would strand later
+    healthy folders (finalization would clear their existing predictions
+    with no replacement). Scope ``"folder"`` lets the run skip the missing
+    folder's photos as unreachable and keep processing the rest.
+    """
     from pipeline_job import _source_offline_reason
 
     folder = str(tmp_path / "was_here")
     image = os.path.join(folder, "DSC_0001.NEF")
 
-    reason = _source_offline_reason(folder, image)
-    assert reason is not None, (
+    result = _source_offline_reason(folder, image)
+    assert result is not None, (
         "A folder that no longer resolves as a directory means the source "
-        "went away, not that one photo is corrupt."
+        "for THIS folder went away, not that one photo is corrupt."
+    )
+    scope, reason = result
+    assert scope == "folder", (
+        f"A single missing folder must not stop the whole run; scope must be "
+        f"'folder' so later healthy folders keep processing. Got {scope!r}."
     )
     assert folder in reason, f"Reason must name the folder; got {reason!r}"
 
@@ -12600,10 +12621,16 @@ def test_pipeline_classify_pauses_when_source_volume_disappears(
     )
 
     # And we must stop pulling photos, not walk the whole collection.
-    assert len(prepare_calls) < 6, (
+    # Each pause is followed by ONE post-resume retry (Codex #1388 P2), so
+    # the upper bound is 2*max + 1 (the initial call that trips the giving-up
+    # branch, no retry). Anything more means classify walked past the pause
+    # budget and kept EIO-ing the rest of the collection.
+    max_prepare_calls = 2 * _MAX_SOURCE_OFFLINE_PAUSES + 1
+    assert len(prepare_calls) <= max_prepare_calls, (
         f"Classify kept requesting images after the volume disappeared "
-        f"({len(prepare_calls)} attempts across 6 photos); it should stop "
-        f"once it has given up on the source."
+        f"({len(prepare_calls)} attempts across 6 photos, cap "
+        f"{max_prepare_calls}); it should stop once it has given up on "
+        f"the source."
     )
 
 
@@ -12763,15 +12790,19 @@ def test_pipeline_classify_resumes_after_source_volume_reconnects(
         f"{len(runner.pause_calls)}."
     )
 
-    # Every photo except the one in flight when the share died should have
-    # been classified.
+    # The photo in flight when the share died must be retried after resume
+    # (Codex #1388 P2), so every photo — including that one — should have
+    # been classified. Silently skipping it would leave the user with a
+    # stranded photo even though the source is back, and on a reclassify
+    # run finalization would clear its old prediction with no replacement.
     stored = db.conn.execute(
         "SELECT COUNT(DISTINCT d.photo_id) FROM predictions p "
         "JOIN detections d ON d.id = p.detection_id",
     ).fetchone()[0]
-    assert stored >= 4, (
-        f"Resuming after the volume came back should have classified the "
-        f"rest of the collection; only {stored} of 6 photos got predictions."
+    assert stored == 6, (
+        f"Reconnect+resume must retry the paused photo so every one of the "
+        f"6 gets classified, not skip it as unreachable; only {stored} got "
+        f"predictions."
     )
 
     classify_steps = [
@@ -12782,6 +12813,10 @@ def test_pipeline_classify_resumes_after_source_volume_reconnects(
     assert "stopped after" not in summaries, (
         f"The run recovered, so the summary must not claim it stopped early; "
         f"got {summaries!r}"
+    )
+    assert "unreachable" not in summaries, (
+        f"After a successful resume nothing should still be reported as "
+        f"unreachable — the retry classified it; got {summaries!r}"
     )
 
 
@@ -12889,4 +12924,208 @@ def test_pipeline_classify_offline_source_is_not_a_clean_success(
     assert "failed to classify" not in msg, (
         f"An offline share must not be reported as photos failing to "
         f"classify; got {msg!r}"
+    )
+
+
+def test_pipeline_classify_missing_folder_does_not_stop_healthy_folders(
+    tmp_path, monkeypatch,
+):
+    """A single deleted local folder must not stop the whole classification.
+
+    Codex #1388 P1: the incident-fix's global-scope offline signal would
+    treat one unreadable folder as evidence the entire collection is
+    offline, so later photos in healthy folders would be skipped without
+    even being tried — and on a ``reclassify=True`` run, finalization
+    would clear their existing predictions with no replacement. Scope
+    ``"folder"`` in ``_source_offline_reason`` keeps the run going past
+    the missing folder so the healthy ones still get classified.
+    """
+    import classifier as classifier_mod
+    import classify_job
+    import config as cfg
+    from db import Database
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cfg.CONFIG_PATH = str(tmp_path / "config.json")
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws_id = db._active_workspace_id
+
+    # Two local folders whose files stay on disk (previews/thumbnails read
+    # them). The classify-time _prepare_image mock below simulates one
+    # folder going away between preview and classify.
+    gone_folder_path = str(tmp_path / "vanished")
+    healthy_folder_path = str(tmp_path / "still_here")
+    os.makedirs(gone_folder_path, exist_ok=True)
+    os.makedirs(healthy_folder_path, exist_ok=True)
+
+    gone_folder_id = db.add_folder(gone_folder_path)
+    healthy_folder_id = db.add_folder(healthy_folder_path)
+
+    photo_ids = []
+    gone_photo_ids: set = set()
+    healthy_photo_ids = []
+    for i in range(3):
+        name = f"gone{i}.jpg"
+        pid = db.add_photo(
+            gone_folder_id, name, ".jpg", 4000 + i, 4_000_000.0 + i,
+        )
+        _drop_jpeg(gone_folder_path, name)
+        db.save_detections(
+            pid,
+            [{"box": {"x": 0.1, "y": 0.1, "w": 0.5, "h": 0.5},
+              "confidence": 0.9, "category": "animal"}],
+            detector_model="MegaDetector",
+        )
+        photo_ids.append(pid)
+        gone_photo_ids.add(pid)
+    for i in range(3):
+        name = f"healthy{i}.jpg"
+        pid = db.add_photo(
+            healthy_folder_id, name, ".jpg", 5000 + i, 5_000_000.0 + i,
+        )
+        _drop_jpeg(healthy_folder_path, name)
+        db.save_detections(
+            pid,
+            [{"box": {"x": 0.1, "y": 0.1, "w": 0.5, "h": 0.5},
+              "confidence": 0.9, "category": "animal"}],
+            detector_model="MegaDetector",
+        )
+        photo_ids.append(pid)
+        healthy_photo_ids.append(pid)
+
+    col_id = db.add_collection(
+        "Test",
+        json.dumps([{"field": "photo_ids", "value": photo_ids}]),
+    )
+
+    _setup_fake_downloaded_model(tmp_path, monkeypatch)
+
+    import labels_fingerprint as lfp
+    monkeypatch.setattr(lfp, "compute_fingerprint", lambda *a, **k: "fp")
+
+    def fake_detect_batch(batch, folders, runner, job, reclassify, db_,
+                          det_conf_threshold=None, already_detected_ids=None,
+                          cached_detections=None):
+        det_map = {}
+        for p in batch:
+            det_map[p["id"]] = [{
+                "id": d["id"],
+                "box_x": d["box_x"], "box_y": d["box_y"],
+                "box_w": d["box_w"], "box_h": d["box_h"],
+                "confidence": d["detector_confidence"],
+                "category": d["category"],
+            } for d in db_.get_detections(p["id"])
+                if d["detector_model"] != "full-image"]
+        return det_map, len(batch), {p["id"] for p in batch}
+
+    monkeypatch.setattr(classify_job, "_detect_batch", fake_detect_batch)
+
+    from PIL import Image as _PILImage
+
+    # The gone folder's classify-time paths point at a subdir that never
+    # exists — that trips _source_offline_reason's folder-scoped branch
+    # without disturbing previews (which see the real files at the paths
+    # stored in the DB).
+    fake_missing_root = str(tmp_path / "vanished_at_classify_time")
+
+    def selective_prepare_image(photo, folders, detection, vireo_dir=None):
+        if photo["id"] in gone_photo_ids:
+            image_path = os.path.join(fake_missing_root, photo["filename"])
+            return None, fake_missing_root, image_path
+        fp = folders.get(photo["folder_id"], "")
+        return (
+            _PILImage.new("RGB", (16, 16), "black"),
+            fp,
+            os.path.join(fp, photo["filename"]),
+        )
+
+    monkeypatch.setattr(classify_job, "_prepare_image", selective_prepare_image)
+
+    def fake_flush_batch(batch, clf, model_type, model_name, db_, raw_results,
+                         top_k=1):
+        for entry in batch:
+            raw_results.append({
+                "photo": entry["photo"],
+                "detection_id": entry.get("detection_id"),
+                "folder_path": entry["folder_path"],
+                "image_path": entry["image_path"],
+                "prediction": "Robin",
+                "confidence": 0.9,
+                "timestamp": None,
+                "filename": entry["photo"]["filename"],
+                "embedding": None,
+                "taxonomy": None,
+            })
+        return 0
+
+    monkeypatch.setattr(classify_job, "_flush_batch", fake_flush_batch)
+
+    class FakeClassifier:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def encode_image(self, *args, **kwargs):
+            import numpy as np
+            return np.zeros(512, dtype=np.float32)
+
+    monkeypatch.setattr(classifier_mod, "Classifier", FakeClassifier)
+
+    # A pausing runner would let the whole run stop; use a plain FakeRunner
+    # so the folder-scoped branch has to keep going on its own rather than
+    # falling back to the pause path.
+    class NoPauseRunner(FakeRunner):
+        def pause_job(self, job_id):
+            return False
+
+        def wait_if_paused(self, job_id, *, publish_paused=False):
+            return False
+
+    params = PipelineParams(
+        collection_id=col_id,
+        skip_extract_masks=True,
+        skip_regroup=True,
+    )
+
+    runner = NoPauseRunner()
+    job = _make_job()
+
+    run_pipeline_job(job, runner, db_path, ws_id, params)
+
+    # The healthy folder's photos must be classified even though the other
+    # folder went away. Without the P1 fix, the gone folder trips a global
+    # source_offline["reason"] and the batch/photo loops break before the
+    # healthy folder gets a turn.
+    healthy_stored = db.conn.execute(
+        f"SELECT COUNT(DISTINCT d.photo_id) FROM predictions p "
+        f"JOIN detections d ON d.id = p.detection_id "
+        f"WHERE d.photo_id IN "
+        f"({','.join('?' * len(healthy_photo_ids))})",
+        list(healthy_photo_ids),
+    ).fetchone()[0]
+    assert healthy_stored == len(healthy_photo_ids), (
+        f"A single missing folder must not strand healthy folders; "
+        f"expected {len(healthy_photo_ids)} healthy photos classified but "
+        f"got {healthy_stored}."
+    )
+
+    # The gone folder's photos should surface as unreachable, not as a
+    # global offline that stopped the run.
+    classify_steps = [
+        kwargs for (_jid, sid, kwargs) in runner.step_updates
+        if sid.startswith("classify:") and "summary" in kwargs
+    ]
+    summaries = " ".join(k["summary"] for k in classify_steps)
+    assert "unreachable (source offline)" in summaries, (
+        f"Photos in the missing folder should be reported as unreachable "
+        f"rather than folded into failures; got {summaries!r}"
+    )
+    assert "stopped after" not in summaries, (
+        f"A folder-scoped outage must not report the whole pass as "
+        f"stopped early; got {summaries!r}"
+    )
+    assert "failed" not in summaries, (
+        f"Missing-folder photos must not be counted as failures; "
+        f"got {summaries!r}"
     )

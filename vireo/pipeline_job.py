@@ -84,8 +84,10 @@ def _missing_archive_mount_root(path: str) -> str | None:
     return None
 
 
-def _source_offline_reason(folder_path: str, image_path: str) -> str | None:
-    """Return why the photo's SOURCE is unreachable, or None if it isn't.
+def _source_offline_reason(
+    folder_path: str, image_path: str,
+) -> tuple[str, str] | None:
+    """Return ``(scope, reason)`` for an unreachable source, or ``None``.
 
     Distinguishes "this one file won't load" (corrupt RAW, bad permissions —
     genuinely that photo's failure) from "the volume holding the collection
@@ -95,19 +97,37 @@ def _source_offline_reason(folder_path: str, image_path: str) -> str | None:
     the collection "failed" — which reads to the user as "your photos are
     broken" rather than "reconnect the share".
 
-    Deliberately conservative. Both probes require evidence that the source
-    *tree* is gone, so no single unreadable file can ever trip them, and a
-    collection on a local disk (no /Volumes-style mount root, folder still
-    present) always returns None and keeps today's per-photo behavior.
+    ``scope`` says how far the outage reaches, so callers can react at the
+    right blast radius:
+
+    * ``"mount"`` — the shared volume is gone. Every remaining photo on it
+      will fail the same way; classify should pause the whole run so the
+      user can reconnect.
+    * ``"folder"`` — the mount root is still present but this one folder no
+      longer resolves. Other folders in the collection may be healthy, so
+      the caller should skip photos in this folder as unreachable and keep
+      processing rather than stopping cold. This covers a single deleted
+      or renamed local folder — the incident-fix's original global-stop
+      behavior would have stranded later healthy folders (and, on
+      ``reclassify=True``, cleared their existing predictions during
+      finalization with no replacement).
+
+    Deliberately conservative. Both probes require evidence that a tree —
+    the mount or the folder itself — is gone, so no single unreadable file
+    can ever trip them, and a collection on a local disk with all its
+    folders intact always returns ``None`` and keeps today's per-photo
+    behavior.
     """
     mount_root = _missing_archive_mount_root(image_path)
     if mount_root:
-        return f"volume {mount_root} is not mounted"
+        return "mount", f"volume {mount_root} is not mounted"
     # A stale mount can keep the mount root in place while the subtree turns
     # unreadable, so fall back to asking whether the containing folder still
-    # resolves. os.path.isdir() swallows the EIO and returns False.
+    # resolves. os.path.isdir() swallows the EIO and returns False. Scope
+    # this to the folder rather than the whole source: a single missing
+    # local folder is not evidence the rest of the collection is offline.
     if folder_path and not os.path.isdir(folder_path):
-        return f"folder {folder_path} is unreadable"
+        return "folder", f"folder {folder_path} is unreadable"
     return None
 
 
@@ -4504,19 +4524,51 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                                         folder_path, image_path,
                                     )
                                     if offline:
-                                        if not _handle_source_offline(offline):
+                                        scope, reason = offline
+                                        if scope == "folder":
+                                            # A single missing folder is not
+                                            # evidence the whole source is
+                                            # offline; skip this photo as
+                                            # unreachable and let later photos
+                                            # in healthy folders keep processing.
+                                            source_skipped += 1
+                                            continue
+                                        if not _handle_source_offline(reason):
                                             break
-                                        # Resumed. Count this one as
-                                        # unreachable rather than failed: the
-                                        # source tree was gone, so the photo
-                                        # was never actually examined and
-                                        # calling it a failure would repeat
-                                        # the same lie at smaller scale.
-                                        source_skipped += 1
+                                        # Resumed. The user reconnected the
+                                        # share, so retry the same detection
+                                        # before advancing — silently skipping
+                                        # it here would leave the photo
+                                        # unclassified even though the source
+                                        # is back, and on a reclassify run
+                                        # finalization would clear its old
+                                        # prediction with no replacement.
+                                        img, folder_path, image_path = (
+                                            _prepare_image(
+                                                photo, folders,
+                                                None if full_image_fallback
+                                                else detection,
+                                            )
+                                        )
+                                        if img is None:
+                                            # Retry failed too — the remount
+                                            # didn't stick. Count this one as
+                                            # unreachable rather than failed:
+                                            # the source tree was gone, so the
+                                            # photo was never actually
+                                            # examined and calling it a
+                                            # failure would repeat the same
+                                            # lie at smaller scale. The pause
+                                            # counter still bounds how many
+                                            # times we ask.
+                                            source_skipped += 1
+                                            continue
+                                        # Retry succeeded — fall through to
+                                        # the normal inference path below.
+                                    else:
+                                        failed += 1
+                                        failed_photo_ids.add(photo["id"])
                                         continue
-                                    failed += 1
-                                    failed_photo_ids.add(photo["id"])
-                                    continue
                                 inference_batch.append({
                                     "photo": photo,
                                     "detection_id": detection["id"],

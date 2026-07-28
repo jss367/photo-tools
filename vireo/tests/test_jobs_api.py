@@ -7163,6 +7163,92 @@ def test_import_photos_remote_target_unchanged_retry_ok(
         assert retry.status_code == 200, retry.get_json()
 
 
+def test_import_photos_retry_rejects_unknown_source(
+        app_and_db, tmp_path):
+    """A retry that lists a source path the parent never enumerated is
+    refused: skipping validation for unknown paths would let the retry
+    import every file at that path and stream them into the after-
+    import / NAS-move scope, even though the button only promises the
+    parent's failed files. See PR #1387 Codex review."""
+    from wait import wait_for_job_via_client
+
+    app, _ = app_and_db
+    with app.test_client() as client:
+        parent_card = _import_card(tmp_path)
+        parent_id = _post_import(
+            client, parent_card, tmp_path / "archive", None,
+        )
+        wait_for_job_via_client(client, parent_id)
+
+        # Retry lists a *different* card path the parent never saw.
+        (tmp_path / "rogue").mkdir()
+        rogue_card = _import_card(tmp_path / "rogue")
+        resp = client.post("/api/jobs/import-photos", json={
+            "sources": [rogue_card],
+            "destination": str(tmp_path / "archive"),
+            "after_import": None,
+            "parent_import_job_id": parent_id,
+        })
+        assert resp.status_code == 400, resp.get_json()
+        assert "never enumerated" in resp.get_json()["error"]
+
+
+def test_import_photos_retry_rejects_second_concurrent_retry(
+        app_and_db, tmp_path, monkeypatch):
+    """Once one retry for a failed import is in flight, a second
+    submission with the same parent (or its root ancestor) is rejected
+    409 rather than racing another import + after-import chain against
+    the first one. See PR #1387 Codex review."""
+    import import_job
+    from wait import wait_for_job_via_client
+
+    app, _ = app_and_db
+    card = _import_card(tmp_path)
+    with app.test_client() as client:
+        parent_id = _post_import(
+            client, card, tmp_path / "archive", None,
+        )
+        wait_for_job_via_client(client, parent_id)
+
+        # Block the first retry inside run_import_job so it stays
+        # active while we submit the second one. The parent already
+        # finished above, so it doesn't hit this hook.
+        release_first_retry = threading.Event()
+
+        def blocking_result(job, runner, db_path, workspace_id, params):
+            assert release_first_retry.wait(timeout=5)
+            return {
+                "ok": True, "cancelled": False, "photo_ids": [],
+                "discovered": 0, "copied": 0, "verified": 0,
+                "skipped_duplicate": 0, "failed": 0,
+                "safe_to_format": True, "unsafe_files": [],
+                "folders": {}, "errors": [],
+            }
+
+        monkeypatch.setattr(import_job, "run_import_job", blocking_result)
+
+        first_retry = client.post("/api/jobs/import-photos", json={
+            "sources": [card],
+            "destination": str(tmp_path / "archive"),
+            "after_import": None,
+            "parent_import_job_id": parent_id,
+        })
+        assert first_retry.status_code == 200, first_retry.get_json()
+
+        # Second retry with the same parent should be rejected 409.
+        second_retry = client.post("/api/jobs/import-photos", json={
+            "sources": [card],
+            "destination": str(tmp_path / "archive"),
+            "after_import": None,
+            "parent_import_job_id": parent_id,
+        })
+        assert second_retry.status_code == 409, second_retry.get_json()
+        assert "already in flight" in second_retry.get_json()["error"]
+
+        release_first_retry.set()
+        wait_for_job_via_client(client, first_retry.get_json()["job_id"])
+
+
 def test_import_photos_remote_and_destination_mutually_exclusive(
         app_and_db, tmp_path, monkeypatch):
     app, _ = app_and_db

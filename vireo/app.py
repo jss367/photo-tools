@@ -23046,15 +23046,27 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         owns the string format via ``_fingerprint_for_row``) but at
         request time on caller-supplied IDs, so a recovery retry can
         detect when SQLite has reused an ID for an unrelated photo
-        since the parent import ran. The fingerprint now includes
+        since the parent import ran. The fingerprint includes
         ``file_size`` and ``file_hash`` alongside the path, catching
         the case where a delete-then-import put an unrelated file at
         the same path — path alone would then match falsely and the
         retry's after-import chain (and any ``after_process_move``)
-        would sweep up the imposter. Missing IDs are simply absent
-        from the result — the caller decides how to treat that.
+        would sweep up the imposter.
+
+        Size and hash come from **the file on disk right now**, not the
+        catalog. When a destination file is overwritten at the same
+        path between the parent run and this retry without a rescan,
+        ``photos.file_size`` / ``photos.file_hash`` still carry the
+        parent's values — comparing two copies of the same cached row
+        would then admit the changed bytes into the retry's chain and
+        NAS-move scope. Reading the file forces a byte-identity check
+        that catches a stealth overwrite; a missing or unreadable file
+        yields empty size/hash so the fingerprint won't match the
+        parent's and the retry fails-closed. Missing IDs are simply
+        absent from the result — the caller decides how to treat that.
         """
         from import_job import _fingerprint_for_row
+        from scanner import compute_file_hash
 
         cleaned = []
         for pid in ids or []:
@@ -23071,16 +23083,38 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             rows = db.conn.execute(
                 f"""SELECT p.id AS id,
                            f.path AS folder_path,
-                           p.filename AS filename,
-                           p.file_size AS file_size,
-                           p.file_hash AS file_hash
+                           p.filename AS filename
                     FROM photos p
                     JOIN folders f ON f.id = p.folder_id
                     WHERE p.id IN ({placeholders})""",
                 list(chunk),
             ).fetchall()
             for row in rows:
-                fp = _fingerprint_for_row(row)
+                folder_path = row["folder_path"] or ""
+                filename = row["filename"] or ""
+                if not folder_path or not filename:
+                    continue
+                file_path = os.path.join(folder_path, filename)
+                current_size = None
+                current_hash = ""
+                try:
+                    current_size = os.path.getsize(file_path)
+                except OSError:
+                    # Missing / unreadable file falls through with
+                    # empty size + hash so the fingerprint won't
+                    # match the parent's stored value.
+                    pass
+                if current_size is not None:
+                    try:
+                        current_hash = compute_file_hash(file_path)
+                    except OSError:
+                        current_hash = ""
+                fp = _fingerprint_for_row({
+                    "folder_path": folder_path,
+                    "filename": filename,
+                    "file_size": current_size,
+                    "file_hash": current_hash,
+                })
                 if fp is None:
                     continue
                 fingerprints[row["id"]] = fp
@@ -24609,11 +24643,30 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             from import_job import _capture_source_snapshots
             from ingest import discover_source_files
 
+            # Fail-closed on retry sources the parent never enumerated:
+            # skipping validation for unknown paths would let a retry
+            # import every file at that path (no prior catalog entry
+            # gates them via ``skip_duplicates``) and stream those IDs
+            # into the after-import chain / NAS-move scope, even though
+            # the "Retry failed files" button only ever promised the
+            # parent's failed files. See PR #1387 Codex review.
+            unknown_sources = [
+                src for src in sources
+                if not isinstance(parent_source_snapshots.get(src), dict)
+                or not parent_source_snapshots.get(src)
+            ]
+            if unknown_sources:
+                return json_error(
+                    "Retry submitted source paths the original import "
+                    "never enumerated (a different card mounted at the "
+                    "same path, or a new source added): "
+                    f"{unknown_sources[:3]}. Start a new import instead "
+                    "of retrying."
+                )
+
             drifted_sources = []
             for src in sources:
                 parent_snap = parent_source_snapshots.get(src)
-                if not isinstance(parent_snap, dict) or not parent_snap:
-                    continue
                 # Reuse the same discovery + snapshot helpers the parent
                 # ran through so a mismatch here reflects a genuine
                 # source change, not a difference in enumeration logic.
@@ -25085,6 +25138,46 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     log.exception(
                         "Failed to invalidate missing-originals cache "
                         "after import-photos job",
+                    )
+
+        # Server-side retry-exclusivity gate: refuse a retry whose
+        # root ancestor already has an active retry in flight, even
+        # when the Jobs-page UI gate was bypassed (two tabs, a stale
+        # UI that didn't observe the sibling retry yet, or a direct
+        # API caller). Without this an overlapping retry can enqueue
+        # a second import against the same source and destination and
+        # race the chained after-import / NAS move against the first
+        # one. Runs after all snapshot validation so a rejected
+        # request costs no worker thread. Best-effort against
+        # exact-simultaneous starts — ``list_jobs`` releases the
+        # runner lock before ``start`` takes it — which is acceptable
+        # for the double-click / two-tab case this fix targets; the
+        # follow-up work is to fold both under one runner-side call.
+        # See PR #1387 Codex review.
+        retry_root = job_config.get("root_import_job_id")
+        if retry_root:
+            for other in runner.list_jobs():
+                if other.get("type") != "import":
+                    continue
+                if other.get("status") not in ("queued", "running", "paused"):
+                    continue
+                other_cfg = other.get("config") or {}
+                other_root = (
+                    other_cfg.get("root_import_job_id")
+                    or other_cfg.get("parent_import_job_id")
+                )
+                # Only reject a competing RETRY — one whose own
+                # ancestry root matches ours. The failed parent itself
+                # (still in ``_jobs`` briefly after finishing) has no
+                # ancestry field so it never matches here, letting the
+                # first retry through. The parent's own liveness is
+                # gated separately by ``_validate_parent_import_job``.
+                if other_root and other_root == retry_root:
+                    return json_error(
+                        "Another retry for the same failed import is "
+                        "already in flight; wait for it to finish "
+                        "before starting a new one.",
+                        409,
                     )
 
         job_id = runner.start(

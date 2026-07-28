@@ -49,6 +49,17 @@ _APPIMAGE_APPRUN_CACHE = {}
 # every extraction ends up isolated next to its source AppImage.
 _APPIMAGE_EXTRACT_SUBDIR = "squashfs-root"
 
+# Marker file inside <binary>.extracted/ recording the source AppImage's
+# fingerprint at the moment extraction succeeded. --appimage-extract preserves
+# AppRun's embedded build timestamp (from when darktable was built), while a
+# freshly downloaded AppImage carries a download-time mtime — so AppRun is
+# typically OLDER than the source it came from. Comparing the two mtimes
+# directly would therefore invalidate every fresh extraction on its next
+# reuse and re-unpack the ~500 MB tree per photo. The marker sidesteps that:
+# we record what the source looked like at extraction time and reuse only
+# while it still matches.
+_APPIMAGE_SOURCE_MARKER = ".vireo-source-fingerprint"
+
 # Cap the one-time --appimage-extract subprocess. A 178 MB darktable AppImage
 # unpacks in ~5–15 s on a spinning disk; 300 s is generous headroom without
 # hanging a develop job forever if the extraction is truly wedged.
@@ -150,20 +161,55 @@ def _apprun_path_for(binary):
     return os.path.join(binary + ".extracted", _APPIMAGE_EXTRACT_SUBDIR, "AppRun")
 
 
+def _source_fingerprint(source_binary):
+    """Identity used to detect an in-place replacement of ``source_binary``.
+
+    Combines mtime (nanoseconds) and size: mtime alone can be forged by
+    os.utime, size alone misses same-size rebuilds, together they identify
+    the file well enough to spot an actual reinstall.
+    """
+    st = os.stat(source_binary)
+    return f"{st.st_mtime_ns}:{st.st_size}"
+
+
+def _marker_path_for_apprun(apprun):
+    """Location of the source-fingerprint marker for ``apprun``'s extraction.
+
+    ``apprun`` sits at ``<extract_dir>/squashfs-root/AppRun``; the marker
+    lives at ``<extract_dir>/`` so it is a peer of the squashfs-root that
+    ``--appimage-extract`` creates, and so a full rmtree of ``extract_dir``
+    removes it alongside the tree.
+    """
+    return os.path.join(
+        os.path.dirname(os.path.dirname(apprun)), _APPIMAGE_SOURCE_MARKER,
+    )
+
+
 def _is_reusable_apprun(apprun, source_binary):
     """True when ``apprun`` is a valid extraction of ``source_binary``.
 
-    Compares mtimes so a source AppImage replaced in place (in-place
-    Vireo update, manual overwrite) invalidates the extracted tree; a
-    check that only asserts existence and the exec bit would keep serving
-    the old darktable version until the process restarted.
+    Reuse is gated on the marker file written when extraction completed, not
+    on a comparison of the two mtimes: ``--appimage-extract`` preserves
+    AppRun's embedded build timestamp (from when darktable was built),
+    whereas the source AppImage carries a fresh download-time mtime, so
+    AppRun is typically OLDER than the source it was extracted from. An
+    mtime comparison would therefore invalidate every fresh extraction on
+    its next reuse and re-unpack the ~500 MB tree per photo. Instead we
+    persist the source's fingerprint at extraction time and reuse only
+    while it still matches, so an in-place source replacement (in-place
+    Vireo update, manual overwrite) still invalidates the tree.
+
+    A missing or unreadable marker counts as "not reusable" so a partial
+    extraction, a tree seeded outside this module, or a marker cleared
+    on disk all force a rebuild rather than silently reusing state whose
+    provenance is unknown.
     """
     try:
-        return (
-            os.path.isfile(apprun)
-            and os.access(apprun, os.X_OK)
-            and os.path.getmtime(apprun) >= os.path.getmtime(source_binary)
-        )
+        if not (os.path.isfile(apprun) and os.access(apprun, os.X_OK)):
+            return False
+        with open(_marker_path_for_apprun(apprun)) as f:
+            stored = f.read().strip()
+        return bool(stored) and stored == _source_fingerprint(source_binary)
     except OSError:
         return False
 
@@ -181,9 +227,10 @@ def _extract_appimage_once(binary):
     so the resulting darktable-cli has the same environment either way.
 
     Reuses an existing extraction if AppRun is still there, executable, and
-    not older than the source AppImage; a newer source (Vireo replaced the
-    installer) invalidates the tree and re-extracts. Returns ``None`` when
-    the extraction cannot be produced (subprocess failure, unwritable dir,
+    the persisted source fingerprint still matches; a source AppImage
+    replaced in place (Vireo installed a newer build, manual overwrite)
+    invalidates the tree and re-extracts. Returns ``None`` when the
+    extraction cannot be produced (subprocess failure, unwritable dir,
     truncated output); the caller falls back to APPIMAGE_EXTRACT_AND_RUN=1
     on that binary so develop still succeeds, just at the per-photo cost.
     """
@@ -247,6 +294,29 @@ def _extract_appimage_once(binary):
             log.warning(
                 "AppImage --appimage-extract left no usable AppRun at %s "
                 "(exit=%s)", apprun, result.returncode,
+            )
+            shutil.rmtree(extract_dir, ignore_errors=True)
+            return None
+
+        # Record the source's fingerprint so _is_reusable_apprun can decide
+        # whether this tree still matches without comparing AppRun's mtime
+        # (which the extract runtime preserves as darktable's build
+        # timestamp and is therefore older than the source AppImage). If
+        # the marker cannot be written the tree is unsafe to reuse, so
+        # discard it rather than let a subsequent call read a stale or
+        # absent marker as "the source must have changed" and re-unpack
+        # every photo.
+        try:
+            with open(
+                os.path.join(extract_dir, _APPIMAGE_SOURCE_MARKER), "w"
+            ) as f:
+                f.write(_source_fingerprint(binary))
+        except OSError as e:
+            log.warning(
+                "AppImage extraction succeeded but source-fingerprint marker "
+                "could not be written for %s: %s; discarding tree so the "
+                "caller falls back to per-photo extraction",
+                binary, e,
             )
             shutil.rmtree(extract_dir, ignore_errors=True)
             return None
@@ -672,8 +742,9 @@ def develop_photo(
             apprun = _APPIMAGE_APPRUN_CACHE.get(binary)
             # Same predicate as _extract_appimage_once, so a source AppImage
             # replaced in place (in-place Vireo update, manual overwrite)
-            # invalidates the cached tree here too instead of silently
-            # running the old darktable until the process restarts.
+            # invalidates the cached tree here too — the source-fingerprint
+            # marker no longer matches — instead of silently running the
+            # old darktable until the process restarts.
             if apprun and _is_reusable_apprun(apprun, binary):
                 # Reuse the one-time extraction: swap the AppImage entry point
                 # for its AppRun and keep every following argv slot (including

@@ -928,8 +928,8 @@ def test_develop_photo_appimage_extracted_cache_reprobes_when_source_is_newer(tm
     manual overwrite), the cached extraction points at the OLD darktable
     version. Reusing it silently would keep running the old build until the
     process restarts — same failure mode _extract_appimage_once already
-    guards against with the mtime check. Verify the develop_photo cache
-    branch checks it too.
+    guards against with its source-fingerprint marker. Verify the
+    develop_photo cache branch checks that marker too.
     """
     import subprocess
 
@@ -943,16 +943,24 @@ def test_develop_photo_appimage_extracted_cache_reprobes_when_source_is_newer(tm
     fake_bin = _write_appimage(tmp_path / "Darktable-5.6.0-x86_64.AppImage")
     out = tmp_path / "out" / "bird.jpg"
 
-    # Pre-seed the cache with a real, executable AppRun. The mtime check is
-    # what should invalidate it, not the exec/exists check.
+    # Pre-seed the cache with a real, executable AppRun alongside a
+    # source-fingerprint marker recording the CURRENT source. That means
+    # only a follow-up change to the source can invalidate the tree — the
+    # exists/exec checks all pass, so any eviction has to come from the
+    # marker no longer matching.
     stale_apprun_dir = tmp_path / "old_extraction" / "squashfs-root"
     stale_apprun_dir.mkdir(parents=True)
     stale_apprun = stale_apprun_dir / "AppRun"
     stale_apprun.write_text("#!/bin/sh\nexec /old/darktable-cli \"$@\"\n")
     stale_apprun.chmod(0o755)
-    # Make the AppRun clearly older than the source.
-    ancient = os.path.getmtime(str(fake_bin)) - 3600
-    os.utime(str(stale_apprun), (ancient, ancient))
+    marker = stale_apprun_dir.parent / develop._APPIMAGE_SOURCE_MARKER
+    marker.write_text(develop._source_fingerprint(str(fake_bin)))
+
+    # Now simulate the in-place replacement — bump the source's mtime past
+    # what the marker recorded. The marker no longer matches the source,
+    # and the cached tree must be evicted.
+    future = os.path.getmtime(str(fake_bin)) + 3600
+    os.utime(str(fake_bin), (future, future))
 
     develop._APPIMAGE_MODE_CACHE[str(fake_bin)] = "extracted"
     develop._APPIMAGE_APPRUN_CACHE[str(fake_bin)] = str(stale_apprun)
@@ -1045,11 +1053,56 @@ def test_extract_appimage_once_reuses_existing_apprun(tmp_path, monkeypatch):
     assert os.path.isfile(first)
     assert len(calls) == 1
 
-    # Second call: same AppRun, no new subprocess. The extraction on disk
-    # already satisfies the freshness check (mtime >= source), so no work.
+    # Second call: same AppRun, no new subprocess. The source-fingerprint
+    # marker written by the first call still matches the source, so the
+    # extraction on disk satisfies the reuse check.
     second = develop._extract_appimage_once(str(fake_bin))
     assert second == first
     assert len(calls) == 1, "must not re-extract when a valid tree is present"
+
+
+def test_extract_appimage_once_reuses_when_apprun_older_than_source(tmp_path, monkeypatch):
+    """--appimage-extract preserves AppRun's embedded build timestamp, so on
+    a real download AppRun is OLDER than the freshly downloaded source
+    AppImage. Reuse must not depend on AppRun's mtime — the whole batch
+    would otherwise re-unpack ~500 MB per photo, defeating the persistent
+    extraction. As long as the source-fingerprint marker still matches,
+    an older AppRun is reused as-is.
+    """
+    import subprocess
+
+    import develop
+
+    fake_bin = _write_appimage(tmp_path / "Darktable-5.6.0-x86_64.AppImage")
+
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(list(cmd))
+        root = os.path.join(kwargs["cwd"], "squashfs-root")
+        os.makedirs(root, exist_ok=True)
+        apprun = os.path.join(root, "AppRun")
+        with open(apprun, "w") as f:
+            f.write("#!/bin/sh\nexec /usr/bin/darktable-cli \"$@\"\n")
+        os.chmod(apprun, 0o755)
+        return _fake_completed(0)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    first = develop._extract_appimage_once(str(fake_bin))
+    assert first is not None
+
+    # Simulate the real world: AppRun carries darktable's embedded build
+    # timestamp (weeks/months old), the source has a fresh download mtime.
+    long_ago = os.path.getmtime(str(fake_bin)) - 90 * 86400
+    os.utime(first, (long_ago, long_ago))
+
+    second = develop._extract_appimage_once(str(fake_bin))
+    assert second == first
+    assert len(calls) == 1, (
+        "AppRun older than source must NOT trigger a re-extract — the "
+        "source-fingerprint marker is what decides reuse"
+    )
 
 
 def test_extract_appimage_once_re_extracts_when_source_is_newer(tmp_path, monkeypatch):

@@ -552,32 +552,98 @@ def test_darktable_search_paths_linux_survives_vanishing_appimage(tmp_path, monk
     assert paths[0] == str(survivor)
 
 
-def test_build_command_selects_cli_inside_appimage():
+def _write_appimage(path):
+    """Write a file that looks like a type-2 AppImage to a magic-byte probe.
+
+    The ELF ident bytes are padding up to offset 8, where the AppImage spec
+    puts 0x41 0x49 0x02.
+    """
+    path.write_bytes(b"\x7fELF\x02\x01\x01\x00" + b"AI\x02" + b"\x00" * 32)
+    path.chmod(0o755)
+    return path
+
+
+def _write_plain_elf(path):
+    """An ordinary ELF executable: same header, EI_PAD left zeroed."""
+    path.write_bytes(b"\x7fELF\x02\x01\x01\x00" + b"\x00" * 40)
+    path.chmod(0o755)
+    return path
+
+
+def test_is_appimage_detects_magic_bytes(tmp_path):
+    """Name-independent detection: users rename AppImages to ~/.local/bin/darktable."""
+    from develop import _is_appimage
+
+    assert _is_appimage(str(_write_appimage(tmp_path / "darktable"))) is True
+
+
+def test_is_appimage_rejects_plain_elf(tmp_path):
+    """A real darktable-cli binary must not get the AppImage argv[1] prefix."""
+    from develop import _is_appimage
+
+    assert _is_appimage(str(_write_plain_elf(tmp_path / "darktable-cli"))) is False
+
+
+def test_is_appimage_missing_path_is_false(tmp_path):
+    """build_command is still called with paths that may not exist; never raise."""
+    from develop import _is_appimage
+
+    assert _is_appimage(str(tmp_path / "nope.AppImage")) is False
+
+
+def test_is_appimage_short_file_is_false(tmp_path):
+    """A truncated download is shorter than the magic offset; must not raise."""
+    from develop import _is_appimage
+
+    short = tmp_path / "partial.AppImage"
+    short.write_bytes(b"\x7fELF")
+    assert _is_appimage(str(short)) is False
+
+
+def test_is_appimage_directory_is_false(tmp_path):
+    """Opening a directory raises IsADirectoryError, an OSError; swallow it."""
+    from develop import _is_appimage
+
+    assert _is_appimage(str(tmp_path)) is False
+
+
+def test_build_command_selects_cli_inside_appimage(tmp_path):
     """darktable's AppImage picks its binary from argv[1]; without this we
     would launch the GUI and hang the export job."""
     from develop import build_command
 
-    cmd = build_command(
-        "/home/u/.vireo/tools/darktable/Darktable-5.6.0-x86_64.AppImage",
-        "in.raw", "out.jpg",
-    )
+    appimage = _write_appimage(tmp_path / "Darktable-5.6.0-x86_64.AppImage")
+    cmd = build_command(str(appimage), "in.raw", "out.jpg")
     assert cmd[1] == "darktable-cli"
     assert cmd[2:] == ["in.raw", "out.jpg"]
 
 
-def test_build_command_plain_binary_unchanged():
+def test_build_command_selects_cli_inside_renamed_appimage(tmp_path):
+    """The conventional Linux move is to rename the AppImage to ~/.local/bin/darktable
+    and point Settings at it. find_darktable returns configured paths without
+    consulting darktable_search_paths, so filename-based detection would miss it."""
     from develop import build_command
 
-    cmd = build_command("/usr/bin/darktable-cli", "in.raw", "out.jpg")
-    assert cmd == ["/usr/bin/darktable-cli", "in.raw", "out.jpg"]
+    appimage = _write_appimage(tmp_path / "darktable")
+    cmd = build_command(str(appimage), "in.raw", "out.jpg")
+    assert cmd[1] == "darktable-cli"
 
 
-def test_build_command_appimage_keeps_style_and_width():
+def test_build_command_plain_binary_unchanged(tmp_path):
+    from develop import build_command
+
+    plain = _write_plain_elf(tmp_path / "darktable-cli")
+    cmd = build_command(str(plain), "in.raw", "out.jpg")
+    assert cmd == [str(plain), "in.raw", "out.jpg"]
+
+
+def test_build_command_appimage_named_like_anything_keeps_style_and_width(tmp_path):
     """Optional args must land after the positional args, not before."""
     from develop import build_command
 
-    cmd = build_command("/x/D.AppImage", "in.raw", "out.jpg", style="Wild", width=2048)
-    assert cmd == ["/x/D.AppImage", "darktable-cli", "in.raw", "out.jpg",
+    appimage = _write_appimage(tmp_path / "D.AppImage")
+    cmd = build_command(str(appimage), "in.raw", "out.jpg", style="Wild", width=2048)
+    assert cmd == [str(appimage), "darktable-cli", "in.raw", "out.jpg",
                    "--style", "Wild", "--width", "2048"]
 
 
@@ -592,15 +658,14 @@ def test_develop_photo_sets_appimage_extract_and_run(tmp_path, monkeypatch):
 
     raw = tmp_path / "bird.NEF"
     raw.touch()
-    fake_bin = tmp_path / "Darktable-5.6.0-x86_64.AppImage"
-    fake_bin.touch()
-    fake_bin.chmod(0o755)
+    fake_bin = _write_appimage(tmp_path / "Darktable-5.6.0-x86_64.AppImage")
     out = tmp_path / "out" / "bird.jpg"
 
     monkeypatch.setenv("VIREO_TEST_INHERITED_VAR", "inherited-value")
     captured = {}
 
     def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
         captured["env"] = kwargs.get("env")
         os.makedirs(os.path.dirname(cmd[-1]), exist_ok=True)
         with open(cmd[-1], "w") as f:
@@ -612,9 +677,46 @@ def test_develop_photo_sets_appimage_extract_and_run(tmp_path, monkeypatch):
     result = develop.develop_photo(str(fake_bin), str(raw), str(out))
     assert result["success"] is True
 
+    # develop_photo must hand the *resolved* binary to build_command rather
+    # than assembling argv itself, or the AppImage launches its GUI.
+    assert captured["cmd"][1] == "darktable-cli"
+
     env = captured["env"]
     assert env is not None, "subprocess.run was called without an env"
     assert env["APPIMAGE_EXTRACT_AND_RUN"] == "1"
     # Not a bare dict: the parent environment is carried through.
     assert env["VIREO_TEST_INHERITED_VAR"] == "inherited-value"
     assert set(os.environ) <= set(env)
+
+
+def test_develop_photo_omits_appimage_extract_and_run_for_plain_binary(tmp_path, monkeypatch):
+    """When set, the AppImage runtime skips the FUSE probe and unconditionally
+    unpacks the whole ~178MB squashfs — once per photo. A packaged
+    darktable-cli must not pay that, so the var is gated on real AppImages."""
+    import subprocess
+
+    import develop
+
+    raw = tmp_path / "bird.NEF"
+    raw.touch()
+    plain_bin = _write_plain_elf(tmp_path / "darktable-cli")
+    out = tmp_path / "out" / "bird.jpg"
+
+    monkeypatch.delenv("APPIMAGE_EXTRACT_AND_RUN", raising=False)
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        captured["env"] = kwargs.get("env")
+        os.makedirs(os.path.dirname(cmd[-1]), exist_ok=True)
+        with open(cmd[-1], "w") as f:
+            f.write("jpg")
+        return _fake_completed(0)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = develop.develop_photo(str(plain_bin), str(raw), str(out))
+    assert result["success"] is True
+    assert captured["cmd"] == [str(plain_bin), str(raw), str(out)]
+    assert "APPIMAGE_EXTRACT_AND_RUN" not in captured["env"]
+    assert set(os.environ) <= set(captured["env"])

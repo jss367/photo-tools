@@ -17,6 +17,29 @@ log = logging.getLogger(__name__)
 
 _DIAG_MAX_CHARS = 500
 _NIKON_HE_COMPRESSION_VALUES = {13, 14}
+# Bytes 8..10 of a type-2 AppImage. They sit in the ELF header's EI_PAD
+# region, which real toolchains leave zeroed, so this does not collide with
+# an ordinary executable.
+_APPIMAGE_MAGIC = b"AI\x02"
+
+
+def _is_appimage(path):
+    """True when ``path`` is a type-2 AppImage bundle.
+
+    Detected by magic bytes rather than filename: users commonly rename an
+    AppImage (~/.local/bin/darktable) or keep a lowercase .appimage suffix,
+    and find_darktable hands back any configured file as-is. A missed
+    detection launches darktable's GUI and stalls a headless export for the
+    full 120s timeout with an error naming nothing the user could act on.
+
+    Never raises: a missing path, a directory, or an unreadable file is
+    simply "not an AppImage".
+    """
+    try:
+        with open(path, "rb") as f:
+            return f.read(11)[8:11] == _APPIMAGE_MAGIC
+    except OSError:
+        return False
 
 
 def _format_subprocess_diag(stdout, stderr):
@@ -198,7 +221,8 @@ def build_command(darktable_bin, input_path, output_path, style=None, width=None
     """Build the darktable-cli command list.
 
     Args:
-        darktable_bin: path to darktable-cli binary
+        darktable_bin: path to a darktable-cli binary or to a darktable
+            AppImage bundle (detected by content, so its name is irrelevant)
         input_path: path to input RAW file
         output_path: path for output file
         style: optional darktable style name
@@ -210,7 +234,7 @@ def build_command(darktable_bin, input_path, output_path, style=None, width=None
         optional flags.
     """
     cmd = [darktable_bin]
-    if darktable_bin.endswith(".AppImage"):
+    if _is_appimage(darktable_bin):
         # darktable ships a multi-binary AppImage whose AppRun selects the
         # binary from argv[1]. The alternative (a symlink named darktable-cli)
         # does not survive find_darktable's os.path.realpath, which would
@@ -396,10 +420,14 @@ def develop_photo(
 
     try:
         log.info("Developing %s -> %s", os.path.basename(input_path), output_path)
-        # AppImages need FUSE2 to self-mount; many current distros ship only
-        # FUSE3. This makes the AppImage extract to a temp dir instead of
-        # failing outright. Harmless for non-AppImage binaries.
-        env = {**os.environ, "APPIMAGE_EXTRACT_AND_RUN": "1"}
+        env = dict(os.environ)
+        if _is_appimage(binary):
+            # AppImages need FUSE2 to self-mount; many current distros ship
+            # only FUSE3. This makes the AppImage extract to a temp dir
+            # instead of failing outright. Gated because when set the runtime
+            # skips the FUSE probe entirely and *always* unpacks the whole
+            # ~178MB squashfs, and this runs once per photo.
+            env["APPIMAGE_EXTRACT_AND_RUN"] = "1"
         result = subprocess.run(
             cmd, capture_output=True, text=True, timeout=120,
             env=env, **no_window_kwargs()

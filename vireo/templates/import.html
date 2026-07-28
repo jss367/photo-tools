@@ -2324,7 +2324,12 @@ async function previewImport(opts) {
   importPreviewSeq += 1;
   const requestSeq = importPreviewSeq;
   const summary = document.getElementById('previewSummary');
+  // Both bail-outs below are settled: the run stops before discovery, so
+  // nothing can be hidden and the opt-in must not linger behind the
+  // now-hidden row. (Contrast the in-flight path further down, which
+  // keeps the opt-in until the duplicate count is actually known.)
   if (!sources.length && newImagesSnapshotId === null) {
+    retireHideDuplicatesOptIn();
     summary.textContent = '';
     showError('Add at least one source folder.');
     return;
@@ -2332,6 +2337,7 @@ async function previewImport(opts) {
   const copyMode = newImagesSnapshotId === null && selectedImportMode() === 'copy';
   const fileTypes = copyMode ? selectedFileTypes() : 'both';
   if (copyMode && Array.isArray(fileTypes) && !fileTypes.length) {
+    retireHideDuplicatesOptIn();
     summary.textContent = '';
     showError('Choose at least one file extension.');
     return;

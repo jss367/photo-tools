@@ -332,6 +332,32 @@ def test_hide_duplicates_resets_when_a_preview_settles_with_no_files(
     expect(page.locator("#importPreviewGrid")).to_contain_text("IMG_0002.jpg")
 
 
+def test_hide_duplicates_resets_when_the_preview_cannot_run(live_server, page):
+    """A preview that stops on a validation error is settled as well.
+
+    Clearing every file extension aborts before discovery, so nothing can
+    be hidden, and the opt-in must not survive behind the hidden row.
+    """
+    run_two_file_preview(live_server, page)
+    page.locator("#chkHideDuplicates").check()
+
+    page.locator("#fileTypePreset").select_option("custom")
+    exts = page.locator(".file-ext")
+    for i in range(exts.count()):
+        exts.nth(i).uncheck()
+
+    expect(page.locator("#importError")).to_contain_text(
+        "Choose at least one file extension.",
+    )
+    expect(page.locator("#hideDuplicatesRow")).to_be_hidden()
+    expect(page.locator("#chkHideDuplicates")).not_to_be_checked()
+
+    # Leave a valid selection behind. This test is the only one that puts
+    # the page in an unpreviewable state, and the preset is the kind of
+    # option later tests assume is sane.
+    page.locator("#fileTypePreset").select_option("both")
+
+
 def test_hide_duplicates_survives_a_repreview_that_still_has_duplicates(
     live_server, page,
 ):

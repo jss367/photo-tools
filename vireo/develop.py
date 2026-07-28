@@ -37,18 +37,41 @@ def _format_subprocess_diag(stdout, stderr):
     return combined
 
 
-def darktable_search_paths():
-    """Locations probed for darktable-cli, in priority order.
+def _mtime_or_missing(path):
+    """mtime of ``path``, or -1 if it cannot be stat'd.
 
-    Exposed so the UI can tell the user exactly where we looked when the
-    binary is not found, instead of repeating a bare "not found".
-    ``find_darktable`` walks this same list, so the two cannot drift.
+    Keeps ``darktable_search_paths`` from raising when a file disappears
+    between the listdir that found it and the sort that orders it.
+    """
+    try:
+        return os.path.getmtime(path)
+    except OSError:
+        return -1.0
+
+
+def darktable_search_paths():
+    """Filesystem locations probed for darktable-cli, in priority order.
+
+    These are the *additional* locations ``find_darktable`` checks after the
+    configured path and ``shutil.which("darktable-cli")``; both of those take
+    precedence and neither appears in this list. The list is platform-specific
+    and holds only paths that could plausibly exist on this machine — on Linux
+    it is the AppImages actually present in ~/.vireo/tools/darktable, so it is
+    empty until we have installed one.
+
+    Exposed so the UI can tell the user where we looked instead of repeating a
+    bare "not found". Because $PATH is the probe most likely to explain a miss
+    (Homebrew, distro packages), any caller showing this list to a user must
+    mention the $PATH probe alongside it rather than presenting these entries
+    as the whole search.
     """
     candidates = []
-    # os.name is checked FIRST, not sys.platform. test_find_darktable_detects_
-    # standard_windows_install patches develop.os.name = "nt" while leaving
-    # sys.platform as the host's value, so a leading darwin branch would
-    # shadow the Windows candidates and break that test on a Mac.
+    # Windows is os.name == "nt" *and* sys.platform == "win32", and macOS is
+    # neither, so these branches are mutually exclusive on every real platform
+    # and their order is immaterial there. Don't reorder anyway:
+    # test_find_darktable_detects_standard_windows_install patches os.name on
+    # its own, leaving sys.platform as the host's value, so a leading darwin
+    # branch would shadow the Windows candidates on a Mac.
     if os.name == "nt":
         for env_var in ("PROGRAMFILES", "PROGRAMFILES(X86)", "PROGRAMW6432"):
             base = os.environ.get(env_var)
@@ -72,7 +95,7 @@ def darktable_search_paths():
                 for n in os.listdir(tools_dir)
                 if n.endswith(".AppImage")
             ]
-            appimages.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+            appimages.sort(key=_mtime_or_missing, reverse=True)
             candidates.extend(appimages)
     return candidates
 

@@ -10,7 +10,7 @@ def test_find_darktable_returns_none_when_missing(monkeypatch):
 
     monkeypatch.setattr("shutil.which", lambda x: None)
     import develop
-    monkeypatch.setattr(develop, "darktable_search_paths", list)
+    monkeypatch.setattr(develop, "darktable_search_paths", lambda: [])
     assert find_darktable("") is None
 
 
@@ -76,7 +76,7 @@ def test_find_darktable_returns_none_for_bad_configured_path(monkeypatch):
 
     monkeypatch.setattr("shutil.which", lambda x: None)
     import develop
-    monkeypatch.setattr(develop, "darktable_search_paths", list)
+    monkeypatch.setattr(develop, "darktable_search_paths", lambda: [])
     assert find_darktable("/nonexistent/darktable-cli") is None
 
 
@@ -456,3 +456,97 @@ def test_darktable_search_paths_matches_find_darktable(monkeypatch):
         monkeypatch.setattr("os.path.isfile", lambda p, c=candidate: p == c)
         monkeypatch.setattr("os.path.realpath", lambda p: p)
         assert find_darktable("") == candidate
+
+
+def _force_linux_tools_dir(monkeypatch, tools_dir):
+    """Pin the platform branch to Linux and point it at ``tools_dir``.
+
+    A Linux box is os.name == "posix" *and* sys.platform == "linux"; pin both
+    so this exercises the AppImage branch on macOS and Windows CI legs too.
+    """
+    import develop
+
+    monkeypatch.setattr(develop.os, "name", "posix")
+    monkeypatch.setattr("sys.platform", "linux")
+    monkeypatch.setattr(
+        develop.os.path,
+        "expanduser",
+        lambda p: str(tools_dir) if p == "~/.vireo/tools/darktable" else p,
+    )
+
+
+def test_darktable_search_paths_linux_orders_appimages_newest_first(tmp_path, monkeypatch):
+    """The tools dir accumulates versions; the most recent install must win."""
+    from develop import darktable_search_paths
+
+    tools_dir = tmp_path / "tools" / "darktable"
+    tools_dir.mkdir(parents=True)
+    older = tools_dir / "darktable-4.6.AppImage"
+    newer = tools_dir / "darktable-5.0.AppImage"
+    older.write_bytes(b"old")
+    newer.write_bytes(b"new")
+    os.utime(older, (1_000_000, 1_000_000))
+    os.utime(newer, (2_000_000, 2_000_000))
+
+    _force_linux_tools_dir(monkeypatch, tools_dir)
+
+    assert darktable_search_paths() == [str(newer), str(older)]
+
+
+def test_darktable_search_paths_linux_ignores_non_appimages(tmp_path, monkeypatch):
+    """Download leftovers (partials, checksums) are not runnable candidates."""
+    from develop import darktable_search_paths
+
+    tools_dir = tmp_path / "tools" / "darktable"
+    tools_dir.mkdir(parents=True)
+    appimage = tools_dir / "darktable-5.0.AppImage"
+    appimage.write_bytes(b"app")
+    (tools_dir / "darktable-5.0.AppImage.part").write_bytes(b"partial")
+    (tools_dir / "SHA256SUMS").write_bytes(b"sums")
+    (tools_dir / "README.txt").write_bytes(b"readme")
+
+    _force_linux_tools_dir(monkeypatch, tools_dir)
+
+    assert darktable_search_paths() == [str(appimage)]
+
+
+def test_darktable_search_paths_linux_missing_dir_is_empty(tmp_path, monkeypatch):
+    """No install yet is the common case and must not raise."""
+    from develop import darktable_search_paths
+
+    _force_linux_tools_dir(monkeypatch, tmp_path / "never" / "created")
+
+    assert darktable_search_paths() == []
+
+
+def test_darktable_search_paths_linux_survives_vanishing_appimage(tmp_path, monkeypatch):
+    """A file removed between listdir and the mtime sort must not raise.
+
+    All callers are written against "returns paths or nothing, never raises":
+    an escaping OSError would 500 /api/darktable/status and fail a develop job
+    with a stack trace instead of a clean "darktable-cli not found".
+    """
+    import develop
+    from develop import darktable_search_paths
+
+    tools_dir = tmp_path / "tools" / "darktable"
+    tools_dir.mkdir(parents=True)
+    survivor = tools_dir / "darktable-5.0.AppImage"
+    vanished = tools_dir / "darktable-4.6.AppImage"
+    survivor.write_bytes(b"app")
+    vanished.write_bytes(b"doomed")
+
+    _force_linux_tools_dir(monkeypatch, tools_dir)
+
+    real_getmtime = os.path.getmtime
+
+    def racing_getmtime(path):
+        if path == str(vanished):
+            raise FileNotFoundError(2, "No such file or directory", path)
+        return real_getmtime(path)
+
+    monkeypatch.setattr(develop.os.path, "getmtime", racing_getmtime)
+
+    paths = darktable_search_paths()
+    assert str(survivor) in paths
+    assert paths[0] == str(survivor)

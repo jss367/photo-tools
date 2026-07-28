@@ -2693,6 +2693,64 @@ def test_destination_preview_above_managed_archive_does_not_claim_merge(
         )
 
 
+def test_destination_preview_generated_folder_inside_managed_archive_flags_merge(
+    setup, tmp_path,
+):
+    """When the selected destination sits ABOVE a tracked archive but the
+    folder template maps generated files INTO that archive, the preview must
+    surface the archive as a merge (not stay silent because the destination
+    itself isn't inside a tracked folder).
+
+    Example: destination /Photography with tracked root /Photography/2026 and
+    template 2026/%Y-%m-%d — the generated folder /Photography/2026/2026-07-28
+    is inside the tracked archive even though the destination isn't.
+    """
+    app, db_path = setup
+    root = tmp_path / "Photography"
+    managed = root / "2026"
+    existing = managed / "2026-01-01"
+    existing.mkdir(parents=True)
+    old = existing / "old.jpg"
+    Image.new("RGB", (16, 16), "green").save(old)
+
+    from db import Database
+    seed = Database(db_path)
+    managed_id = seed.add_folder(str(managed))
+    existing_id = seed.add_folder(
+        str(existing), parent_id=managed_id, workspace_root=False,
+    )
+    seed.add_photo(
+        existing_id, old.name, ".jpg",
+        old.stat().st_size, old.stat().st_mtime,
+    )
+    seed.close()
+
+    src = tmp_path / "card"
+    src.mkdir()
+    new = src / "new.jpg"
+    Image.new("RGB", (16, 16), "blue").save(new)
+    mtime = datetime(2026, 7, 28, 9, 30, 0).timestamp()
+    os.utime(str(new), (mtime, mtime))
+
+    with app.test_client() as c:
+        resp = c.post("/api/import/destination-preview", json={
+            "sources": [str(src)],
+            # Destination is /Photography (ABOVE the tracked /Photography/2026),
+            # but the template pushes generated files into 2026/... — i.e.
+            # inside the tracked archive.
+            "destination": str(root),
+            "folder_template": "2026/%Y-%m-%d",
+        })
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["managed_archive"] is not None
+        assert data["managed_archive"]["path"] == str(managed)
+        assert data["managed_archive"]["photo_count"] == 1
+        assert data["folders"][0]["full_path"] == str(
+            managed / "2026-07-28"
+        )
+
+
 def _wait_for_job(client, job_id, timeout=30.0):
     """Poll the job-status endpoint until the job completes or fails."""
     deadline = time.time() + timeout

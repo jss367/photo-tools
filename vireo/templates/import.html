@@ -2767,6 +2767,13 @@ async function finishJob(jobId) {
 
 function retryBodyFromFinishedJob(job) {
   const cfg = (job && job.config) || {};
+  // Recovery retry always POSTs to /api/jobs/import-photos, which rejects
+  // requests without a destination. An in-place import finishes with a
+  // non-empty sources list but cfg.destination === null / cfg.mode ===
+  // "in_place", so exposing the retry action there would offer a run that
+  // cannot start. Gate on the persisted job type/mode the same way the
+  // Jobs page does.
+  if (!job || job.type !== 'import' || cfg.mode === 'in_place') return null;
   if (!Array.isArray(cfg.sources) || !cfg.sources.length) return null;
   const body = {
     sources: cfg.sources.slice(),
@@ -2819,6 +2826,13 @@ async function retryFailedImport() {
     if (!resp.ok) throw new Error(data.error || 'retry failed to start');
     activeJobId = data.job_id;
     importStartInFlight = true;
+    // finishJob() re-enables the main Start button after the failed
+    // copy import ends. Without refreshing availability here the
+    // original Start would stay enabled while the recovery retry is
+    // running, letting the user launch a second import of the same
+    // card into the same destination concurrently. Mirror what
+    // startImport() does after flipping the flag.
+    updateStartAvailability();
     document.getElementById('progressCard').style.display = '';
     document.getElementById('resultCard').style.display = 'none';
     document.getElementById('progressCard').scrollIntoView({

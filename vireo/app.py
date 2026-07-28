@@ -17744,6 +17744,27 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         from move import _tracked_destination_ancestor
         db = _get_db()
         tracked = _tracked_destination_ancestor(db, -1, destination)
+        # The destination itself may sit above every tracked archive while the
+        # folder template still maps generated files into one — e.g.
+        # destination /Photography with a tracked root /Photography/2026 and
+        # template 2026/%Y-%m-%d lands every file inside the managed
+        # /Photography/2026 archive. Checking only the destination's ancestors
+        # leaves managed_archive None even though the import IS a merge into
+        # a tracked archive. Fall back to the concrete full_path values from
+        # preview_destination() so we catch that case, while still avoiding
+        # the sibling-folder false positive the destination-only guard was
+        # written to prevent (a broad mount whose tracked archive is a
+        # sibling of the generated folders never becomes an ancestor of any
+        # full_path).
+        if tracked is None:
+            for entry in result.get("folders") or []:
+                full_path = entry.get("full_path")
+                if not full_path:
+                    continue
+                candidate = _tracked_destination_ancestor(db, -1, full_path)
+                if candidate is not None:
+                    tracked = candidate
+                    break
         result["managed_archive"] = None
         if tracked:
             from db import _subtree_prefix

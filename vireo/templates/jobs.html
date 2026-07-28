@@ -382,6 +382,12 @@
     var cfg = jobConfig(job);
     if (!job || job.type !== 'import' || cfg.mode === 'in_place' ||
         !Array.isArray(cfg.sources) || !cfg.sources.length) return null;
+    // parent_import_job_id lets the server bind carry_photo_ids to this
+    // parent's imported scope and, when the parent used a remote
+    // target, verify the target still resolves to the enqueue-time
+    // host/root/mount. Without a parent id the server rejects the
+    // carry list, so the retry couldn't chain properly.
+    if (!job.id) return null;
     var body = {
       sources: cfg.sources.slice(),
       destination: cfg.destination,
@@ -395,6 +401,7 @@
       tags: Array.isArray(cfg.tags) ? cfg.tags.slice() : [],
       location_from_gps: !!cfg.location_from_gps,
       allow_missing_exiftool: !!cfg.allow_missing_exiftool,
+      parent_import_job_id: job.id,
     };
     // Recover the complete original scope. See import.html for the full
     // rationale; the summary: the parent's failed run skipped chaining

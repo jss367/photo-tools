@@ -945,6 +945,11 @@ def test_failed_import_result_offers_preconfigured_retry(live_server, page):
     # (which chains on only 1 new photo) silently leave 984 photos
     # unprocessed.
     assert body["carry_photo_ids"] == [101, 102, 103]
+    # And it must bind the carry list to the parent so the server can
+    # verify each carry ID actually came from that parent — without
+    # this binding an API caller could inject arbitrary IDs into the
+    # after-import chain scope.
+    assert body["parent_import_job_id"] == "import-original"
 
 
 def test_import_copy_start_sends_restored_options(live_server, page):

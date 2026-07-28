@@ -119,28 +119,42 @@ def _missing_archive_mount_root(path: str) -> str | None:
 def _mount_root_offline(mount_root: str) -> bool:
     """Whether ``mount_root`` appears to not have a filesystem mounted at it.
 
-    Two shapes count as offline, because callers only get here when a
-    subtree read has already failed:
+    Callers only get here when a subtree read has already failed, so we
+    need positive evidence the root was actually a mount before scoping
+    the outage to the whole share. Three shapes count as offline:
 
     * The directory is entirely gone — macOS removes ``/Volumes/<share>``
       on eject, so ``lexists`` alone is enough.
-    * The directory exists but ``os.path.ismount`` reports nothing is
-      mounted at it — the Linux common case, where the mount point
-      (``/mnt/<share>``, ``/media/<user>/<name>``) persists after
-      ``umount`` or after a network drop. Codex #1388 P1 r3663493889:
-      without this branch, the pipeline would treat every descendant as
-      an isolated folder outage instead of pausing for reconnection.
+    * A stale mount whose device is dead raises EIO from stat/listdir
+      probes — we're in the "reads are already failing" path so an
+      errored probe can't be considered healthy.
+    * The directory exists, ``os.path.ismount`` reports nothing is
+      mounted, AND the directory is empty — the Linux common case, where
+      the mount-point stub (``/mnt/<share>``, ``/media/<user>/<name>``)
+      persists after ``umount`` or a network drop. When the mount was
+      active its contents lived on the mounted filesystem, so an
+      unmounted stub is typically empty.
 
-    A stale mount whose device is dead can raise EIO from stat probes;
-    treat that as offline too — we're in the "reads are already failing"
-    path so the mount can't be considered healthy.
+    An ``ismount``-negative directory that still has siblings is not
+    treated as offline — that's proof it's an ordinary local directory
+    that happens to sit under ``/mnt/`` or ``/media/<user>/``, and one
+    deleted subfolder inside it must stay folder-scoped (Codex #1388 P1
+    r3663642357). Otherwise a user who deletes ``/mnt/photos/trip``
+    from a plain local ``/mnt/photos`` catalog would see the whole run
+    pause and eventually abandon their healthy sibling folders.
     """
     if not os.path.lexists(mount_root):
         return True
     try:
-        return not os.path.ismount(mount_root)
+        if os.path.ismount(mount_root):
+            return False
     except OSError:
         return True
+    try:
+        entries = os.listdir(mount_root)
+    except OSError:
+        return True
+    return not entries
 
 
 def _source_offline_reason(
@@ -4334,6 +4348,19 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                     # even though nothing in this run had a chance to
                     # rewrite them (Codex #1388 P1).
                     spec_reached_photo_ids: set = set()
+                    # Per-spec source skips, scoped to just THIS spec's
+                    # reads. Codex #1388 P2 (r3663642360): if the folder
+                    # was unreachable for model A but returned before
+                    # model B, the aggregate ``source_skipped_photo_ids``
+                    # would still exclude that photo from model B's
+                    # reclassify clear — leaving model B's stale
+                    # prediction in place. Because ``add_prediction``
+                    # uses ``INSERT OR IGNORE``, that stale row can win
+                    # over the fresh result and retain the wrong
+                    # species/confidence. Track skips per spec for the
+                    # clear; the aggregate set below still drives the
+                    # outage rollup at end-of-run.
+                    spec_source_skipped_photo_ids: set = set()
                     # Photos that iterated past the inner abort check IN THIS spec.
                     # Used for the per-spec ``runner.update_step`` progress (which
                     # is bounded by ``total``, not the multi-spec stage total) and
@@ -4728,6 +4755,9 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                                         source_skipped_photo_ids.add(
                                             photo["id"]
                                         )
+                                        spec_source_skipped_photo_ids.add(
+                                            photo["id"]
+                                        )
                                         break
                                     # Mount-scoped: park and wait for the
                                     # user to reconnect. On give-up,
@@ -4749,6 +4779,9 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                                         # prediction (Codex #1388 P1
                                         # r3663159360).
                                         source_skipped_photo_ids.add(
+                                            photo["id"]
+                                        )
+                                        spec_source_skipped_photo_ids.add(
                                             photo["id"]
                                         )
                                         gave_up_on_source = True
@@ -4867,14 +4900,22 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                     # scoped give-up, or every photo under a vanished folder)
                     # is one this run had no chance to rewrite, so wiping
                     # its prior prediction would leave it with nothing at
-                    # all (Codex #1388 P1). Fall back to the collection-
-                    # wide clear when no source outage occurred — that's
-                    # still the desired behavior on a clean reclassify.
+                    # all (Codex #1388 P1). Use the per-spec skipped set
+                    # rather than the aggregate one so a photo skipped for
+                    # an earlier spec but successfully reached this spec
+                    # still has its stale prior prediction cleared before
+                    # ``_store_grouped_predictions`` writes the fresh row —
+                    # ``add_prediction`` is ``INSERT OR IGNORE`` and would
+                    # otherwise keep the stale species/confidence (Codex
+                    # #1388 P2 r3663642360). Fall back to the collection-
+                    # wide clear when no source outage hit this spec —
+                    # that's still the desired behavior on a clean
+                    # reclassify.
                     if params.reclassify:
-                        if source_skipped_photo_ids:
+                        if spec_source_skipped_photo_ids:
                             clear_ids = list(
                                 spec_reached_photo_ids
-                                - source_skipped_photo_ids
+                                - spec_source_skipped_photo_ids
                             )
                         else:
                             clear_ids = [p["id"] for p in photos]

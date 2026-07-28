@@ -12482,6 +12482,7 @@ def test_source_offline_reason_flags_persistent_mountpoint_after_unmount(
     real_lexists = pipeline_job.os.path.lexists
     real_isdir = pipeline_job.os.path.isdir
     real_ismount = pipeline_job.os.path.ismount
+    real_listdir = pipeline_job.os.listdir
 
     def fake_lexists(path):
         # The persistent mount-point directory is still there.
@@ -12502,9 +12503,20 @@ def test_source_offline_reason_flags_persistent_mountpoint_after_unmount(
             return False
         return real_ismount(path)
 
+    def fake_listdir(path):
+        # An unmounted mount stub is empty — its contents lived on the
+        # mounted filesystem and vanished with the mount. This is the
+        # positive signal ``_mount_root_offline`` uses to distinguish an
+        # actual mount from a plain local directory (Codex #1388 P1
+        # r3663642357).
+        if path == "/mnt/photos":
+            return []
+        return real_listdir(path)
+
     monkeypatch.setattr(pipeline_job.os.path, "lexists", fake_lexists)
     monkeypatch.setattr(pipeline_job.os.path, "isdir", fake_isdir)
     monkeypatch.setattr(pipeline_job.os.path, "ismount", fake_ismount)
+    monkeypatch.setattr(pipeline_job.os, "listdir", fake_listdir)
 
     result = pipeline_job._source_offline_reason(folder, image)
     assert result is not None, (
@@ -12521,6 +12533,80 @@ def test_source_offline_reason_flags_persistent_mountpoint_after_unmount(
     assert "/mnt/photos" in reason, (
         f"Reason must name the mount root the user needs to reconnect; "
         f"got {reason!r}."
+    )
+
+
+def test_source_offline_reason_keeps_populated_local_mnt_dir_folder_scoped(
+    tmp_path,
+):
+    """A plain local dir under ``/mnt/`` isn't a mount just because ismount says so.
+
+    Codex #1388 P1 (r3663642357): the mount-shape check equated
+    ``os.path.ismount == False`` with "mount is offline", but a plain
+    local catalog at ``/mnt/photos`` with several sibling folders is
+    also ``ismount``-negative. Deleting one subfolder (say the trip
+    the user just archived) would then re-classify the whole tree as a
+    mount-wide outage — the run would pause, exhaust its retry budget,
+    and abandon every healthy sibling. Pin that a mount-shaped root
+    with visible sibling entries is treated as an ordinary local dir
+    so the deleted subfolder stays folder-scoped.
+    """
+    import pipeline_job
+
+    mount_root = tmp_path / "mnt_style_local"
+    mount_root.mkdir()
+    # Siblings that survive whatever happened to the missing folder are
+    # the positive proof this is a plain local dir, not an unmounted
+    # share (which would take its whole tree with it).
+    (mount_root / "beach").mkdir()
+    (mount_root / "mountain").mkdir()
+
+    missing_folder = str(mount_root / "trip")
+    image_under_missing = os.path.join(missing_folder, "DSC_0001.NEF")
+
+    # Force the mount-root candidate lookup at the tmp path — the real
+    # helper only recognises /Volumes, /mnt, /media roots, and we need
+    # to exercise the "populated → not offline" branch without touching
+    # the real filesystem's /mnt.
+    real_candidates = pipeline_job._archive_mount_root_candidates
+
+    def fake_candidates(path):
+        if path == image_under_missing:
+            return [str(mount_root)]
+        return real_candidates(path)
+
+    real_ismount = pipeline_job.os.path.ismount
+
+    def fake_ismount(path):
+        # The plain local dir naturally has ``ismount == False`` — mirror
+        # that explicitly so the test doesn't depend on the FS layout of
+        # the CI machine.
+        if path == str(mount_root):
+            return False
+        return real_ismount(path)
+
+    import unittest.mock as mock
+    with (
+        mock.patch.object(
+            pipeline_job, "_archive_mount_root_candidates", fake_candidates,
+        ),
+        mock.patch.object(pipeline_job.os.path, "ismount", fake_ismount),
+    ):
+        result = pipeline_job._source_offline_reason(
+            missing_folder, image_under_missing,
+        )
+
+    assert result is not None, (
+        "The deleted subfolder itself is unreachable, so the helper must "
+        "still report an outage — just scoped to the folder, not the whole "
+        "mount root."
+    )
+    scope, reason = result
+    assert scope == "folder", (
+        f"A mount-shaped root with sibling entries is proof it's a plain "
+        f"local dir; scoping the missing subfolder as a mount outage would "
+        f"pause the whole run and abandon healthy siblings. Got scope "
+        f"{scope!r} reason {reason!r}."
     )
 
 
@@ -14140,6 +14226,233 @@ def test_pipeline_classify_reclassify_preserves_predictions_for_unreachable_phot
         f"Healthy folder must still be classified after the fix; "
         f"expected {len(healthy_photo_ids)} FreshSpecies rows, "
         f"got {fresh_stored}."
+    )
+
+
+def test_pipeline_classify_multimodel_reclassify_per_spec_source_skips(
+    tmp_path, monkeypatch,
+):
+    """Multi-model reclassify must clear per-spec, not per-run, source skips.
+
+    Codex #1388 P2 (r3663642360): ``source_skipped_photo_ids`` used to
+    accumulate across every spec. If a photo was unreachable for model A
+    but the folder was back before model B, model B's reclassify clear
+    still excluded the photo — because the aggregate set said "leave it
+    alone". ``Database.add_prediction`` uses ``INSERT OR IGNORE``, so
+    model B's fresh result then couldn't overwrite the stale prior row,
+    and the photo retained a wrong species/confidence for model B
+    forever. Pin the fix: model B's clear must cover the photo, so its
+    fresh prediction wins.
+    """
+    import classifier as classifier_mod
+    import classify_job
+    import config as cfg
+    from db import Database
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cfg.CONFIG_PATH = str(tmp_path / "config.json")
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws_id = db._active_workspace_id
+
+    gone_folder_path = str(tmp_path / "gone_for_model_a")
+    healthy_folder_path = str(tmp_path / "always_here")
+    os.makedirs(gone_folder_path, exist_ok=True)
+    os.makedirs(healthy_folder_path, exist_ok=True)
+
+    gone_folder_id = db.add_folder(gone_folder_path)
+    healthy_folder_id = db.add_folder(healthy_folder_path)
+
+    gone_photo_id = db.add_photo(
+        gone_folder_id, "gone.jpg", ".jpg", 4000, 4_000_000.0,
+    )
+    _drop_jpeg(gone_folder_path, "gone.jpg")
+    gone_det_id = db.save_detections(
+        gone_photo_id,
+        [{"box": {"x": 0.1, "y": 0.1, "w": 0.5, "h": 0.5},
+          "confidence": 0.9, "category": "animal"}],
+        detector_model="MegaDetector",
+    )[0]
+
+    healthy_photo_id = db.add_photo(
+        healthy_folder_id, "healthy.jpg", ".jpg", 5000, 5_000_000.0,
+    )
+    _drop_jpeg(healthy_folder_path, "healthy.jpg")
+    db.save_detections(
+        healthy_photo_id,
+        [{"box": {"x": 0.1, "y": 0.1, "w": 0.5, "h": 0.5},
+          "confidence": 0.9, "category": "animal"}],
+        detector_model="MegaDetector",
+    )
+
+    col_id = db.add_collection(
+        "Test",
+        json.dumps([{"field": "photo_ids",
+                     "value": [gone_photo_id, healthy_photo_id]}]),
+    )
+
+    model_ids = _setup_two_fake_downloaded_models(tmp_path, monkeypatch)
+    # ``_setup_two_fake_downloaded_models`` only installs the model files;
+    # verify_if_needed still fires for bioclip-2 during
+    # ``_load_model_bundle`` and would try to reach HuggingFace. Stub it
+    # so the second model actually loads under the test's isolated HOME.
+    import model_verify
+    monkeypatch.setattr(
+        model_verify,
+        "verify_if_needed",
+        lambda model_id, model_dir, hf_subdir, optional_files=None: None,
+    )
+
+    import labels_fingerprint as lfp
+    monkeypatch.setattr(lfp, "compute_fingerprint", lambda *a, **k: "fp")
+
+    # Pre-seed the stale model-B prediction on the gone photo. This is the
+    # row the pre-fix code left in place because the aggregate skipped set
+    # still contained gone_photo_id when model B's clear ran — the fresh
+    # prediction then couldn't overwrite it via INSERT OR IGNORE, and the
+    # user was stuck with OldModelBSpecies forever.
+    OLD_B = "OldModelBSpecies"
+    db.add_prediction(
+        detection_id=gone_det_id,
+        species=OLD_B,
+        confidence=0.42,
+        model="BioCLIP-2",
+        labels_fingerprint="fp",
+    )
+
+    def fake_detect_batch(batch, folders, runner, job, reclassify, db_,
+                          det_conf_threshold=None, already_detected_ids=None,
+                          cached_detections=None):
+        det_map = {}
+        for p in batch:
+            det_map[p["id"]] = [{
+                "id": d["id"],
+                "box_x": d["box_x"], "box_y": d["box_y"],
+                "box_w": d["box_w"], "box_h": d["box_h"],
+                "confidence": d["detector_confidence"],
+                "category": d["category"],
+            } for d in db_.get_detections(p["id"])
+                if d["detector_model"] != "full-image"]
+        return det_map, len(batch), {p["id"] for p in batch}
+
+    monkeypatch.setattr(classify_job, "_detect_batch", fake_detect_batch)
+
+    from PIL import Image as _PILImage
+
+    # Track which model's classifier was most recently constructed. Model
+    # A (bioclip-vit-b-16) is preloaded by model_loader_stage; model B
+    # (bioclip-2) is constructed by ``_load_model_bundle`` when
+    # classify_stage moves to spec_idx==1. That construction is our
+    # only in-test signal that we've crossed the spec boundary, so we
+    # key the folder-availability behavior off it.
+    current_model = ["A"]
+    fake_missing_root = str(tmp_path / "vanished_at_classify_time")
+
+    def selective_prepare_image(photo, folders, detection, vireo_dir=None):
+        # gone_photo_id is unreachable ONLY during model A. When we're
+        # on model B, its folder is back — matching the P2 scenario where
+        # a transient outage clears before the next spec starts.
+        if (
+            photo["id"] == gone_photo_id
+            and current_model[0] == "A"
+        ):
+            image_path = os.path.join(fake_missing_root, photo["filename"])
+            return None, fake_missing_root, image_path
+        fp = folders.get(photo["folder_id"], "")
+        return (
+            _PILImage.new("RGB", (16, 16), "black"),
+            fp,
+            os.path.join(fp, photo["filename"]),
+        )
+
+    monkeypatch.setattr(classify_job, "_prepare_image", selective_prepare_image)
+
+    def fake_flush_batch(batch, clf, model_type, model_name, db_, raw_results,
+                         top_k=1):
+        # Fresh predictions carry the model in the species string so the
+        # per-model assertions below can pull them apart.
+        for entry in batch:
+            raw_results.append({
+                "photo": entry["photo"],
+                "detection_id": entry.get("detection_id"),
+                "folder_path": entry["folder_path"],
+                "image_path": entry["image_path"],
+                "prediction": f"Fresh_{model_name}",
+                "confidence": 0.9,
+                "timestamp": None,
+                "filename": entry["photo"]["filename"],
+                "embedding": None,
+                "taxonomy": None,
+            })
+        return 0
+
+    monkeypatch.setattr(classify_job, "_flush_batch", fake_flush_batch)
+
+    class FakeClassifier:
+        def __init__(self, *args, **kwargs):
+            pretrained = str(kwargs.get("pretrained_str") or "")
+            if model_ids[1] in pretrained:
+                current_model[0] = "B"
+            else:
+                current_model[0] = "A"
+
+        def encode_image(self, *args, **kwargs):
+            import numpy as np
+            return np.zeros(512, dtype=np.float32)
+
+    monkeypatch.setattr(classifier_mod, "Classifier", FakeClassifier)
+
+    # NoPauseRunner keeps model A on the folder-scoped path instead of
+    # falling into pause+cancel: an outage that only affects one folder
+    # is exactly the scenario we're pinning.
+    class NoPauseRunner(FakeRunner):
+        def pause_job(self, job_id):
+            return False
+
+        def wait_if_paused(self, job_id, *, publish_paused=False):
+            return False
+
+    params = PipelineParams(
+        collection_id=col_id,
+        model_ids=model_ids,
+        reclassify=True,
+        skip_extract_masks=True,
+        skip_regroup=True,
+    )
+
+    runner = NoPauseRunner()
+    job = _make_job()
+
+    # The run does NOT raise here: model B reaches every photo, so
+    # ``models_succeeded`` is 1 and the earlier folder-scoped skip on
+    # model A produces an incomplete rollup but no fatal fatal-source
+    # error — the rollup for a partial multi-model outage returns
+    # normally with a "stopped after" summary rather than raising.
+    with contextlib.suppress(RuntimeError):
+        run_pipeline_job(job, runner, db_path, ws_id, params)
+
+    # The heart of the P2 fix: model B's fresh prediction for the
+    # previously-skipped photo must win. Pre-fix, model B's clear
+    # excluded gone_photo_id (still in the aggregate skipped set from
+    # model A) — so INSERT OR IGNORE left the stale OldModelBSpecies in
+    # place, and the fresh row was silently dropped.
+    stored = db.conn.execute(
+        "SELECT species FROM predictions "
+        "WHERE detection_id = ? AND classifier_model = ?",
+        (gone_det_id, "BioCLIP-2"),
+    ).fetchall()
+    species = sorted(row[0] for row in stored)
+    assert "Fresh_BioCLIP-2" in species, (
+        f"Model B's clear must cover a photo model A skipped so the "
+        f"fresh reclassify result can overwrite the stale prior row "
+        f"(add_prediction is INSERT OR IGNORE). Got species {species!r}."
+    )
+    assert OLD_B not in species, (
+        f"The stale model-B prediction for the previously-skipped photo "
+        f"must be cleared before storing the fresh result — otherwise "
+        f"INSERT OR IGNORE leaves the wrong species in place. Got "
+        f"species {species!r}."
     )
 
 

@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import sys
@@ -408,3 +409,243 @@ def test_resolve_release_never_raises_on_a_malformed_body(monkeypatch, payload, 
     assert reason == (
         REASON_UNREACHABLE if expected_reason == "unreachable" else REASON_NO_USABLE_ASSET
     )
+
+
+# --------------------------------------------------------------------------
+# verify_digest
+# --------------------------------------------------------------------------
+
+# sha256(b"hello")
+HELLO_SHA256 = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+
+
+def test_verify_digest_matches(tmp_path):
+    from darktable_install import verify_digest
+
+    f = tmp_path / "a.bin"
+    f.write_bytes(b"hello")
+    sha = "sha256:2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+    ok, detail = verify_digest(str(f), sha)
+    assert ok, detail
+
+
+def test_verify_digest_mismatch_is_reported_with_both_hashes(tmp_path):
+    from darktable_install import verify_digest
+
+    f = tmp_path / "a.bin"
+    f.write_bytes(b"tampered")
+    ok, detail = verify_digest(str(f), "sha256:" + "0" * 64)
+    assert not ok
+    assert "0000" in detail          # expected
+    assert "expected" in detail.lower()
+    # ...and the hash we actually computed, so a support thread can tell a
+    # truncated download from a substituted one.
+    assert "d121be3103007b41edf96f8262925f8c7d61894afe9a041843b631f69445bc57" in detail
+
+
+@pytest.mark.parametrize("differ_at", [0, 7, 8, 15, 16, 31, 32, 62, 63])
+def test_verify_digest_compares_the_whole_hash_not_a_prefix(tmp_path, differ_at):
+    """A near-miss digest must still be rejected.
+
+    The obvious mismatch case (expected 0*64) is caught even by a
+    `actual[:8] == want[:8]` comparison, so on its own it does not prove the
+    whole hash was checked.  These differ from the true digest in exactly one
+    position, spread across its length, so any truncated comparison passes one
+    of them and fails this test.
+    """
+    from darktable_install import verify_digest
+
+    f = tmp_path / "a.bin"
+    f.write_bytes(b"hello")
+
+    chars = list(HELLO_SHA256)
+    chars[differ_at] = "0" if chars[differ_at] != "0" else "1"
+    near_miss = "".join(chars)
+    assert near_miss != HELLO_SHA256
+
+    ok, detail = verify_digest(str(f), "sha256:" + near_miss)
+    assert not ok, f"accepted a digest differing at index {differ_at}: {detail}"
+    assert "mismatch" in detail.lower()
+
+
+def test_verify_digest_absent_says_so_rather_than_silently_passing(tmp_path):
+    from darktable_install import verify_digest
+
+    f = tmp_path / "a.bin"
+    f.write_bytes(b"hello")
+    ok, detail = verify_digest(str(f), None)
+    assert ok
+    assert "no digest" in detail.lower()
+    # ...and it must not imply a check that did not happen.
+    assert "could not be verified" in detail.lower(), detail
+
+
+def test_verify_digest_success_detail_does_not_overclaim(tmp_path):
+    """The detail is shown to the user verbatim.
+
+    A matching digest proves the bytes are what GitHub's API *said* to expect.
+    It is not a signature: the digest arrived over the same HTTPS response as
+    the download URL, so it shares that response's trust boundary.  The string
+    must not let a user believe darktable signed anything.
+    """
+    from darktable_install import verify_digest
+
+    f = tmp_path / "a.bin"
+    f.write_bytes(b"hello")
+    ok, detail = verify_digest(str(f), "sha256:" + HELLO_SHA256)
+
+    assert ok
+    lower = detail.lower()
+    assert "github" in lower, detail
+    # It has to say where the expectation came from *and* that no signature was
+    # involved, so nobody reads "verified" as "vouched for by darktable".
+    assert "no signature" in lower or "does not sign" in lower, detail
+    for overclaim in ("authentic", "safe to run", "trusted", "signed by darktable"):
+        assert overclaim not in lower, f"{overclaim!r} overclaims: {detail}"
+
+
+@pytest.mark.parametrize("expected", [
+    "sha256:" + HELLO_SHA256,                    # exactly what the API sends today
+    "SHA256:" + HELLO_SHA256.upper(),            # algorithm and hex upper-cased
+    "sha256:" + HELLO_SHA256.upper(),
+    "  sha256:" + HELLO_SHA256 + "  \n",         # stray whitespace
+    HELLO_SHA256,                                # bare hash, no algorithm prefix
+    "  " + HELLO_SHA256.upper() + "\t",
+])
+def test_verify_digest_accepts_every_shape_a_correct_sha256_can_arrive_in(tmp_path, expected):
+    """`expected` comes from an external API; hex case, padding and the
+    presence of the `sha256:` prefix are all cosmetic.  Rejecting a correct
+    digest over cosmetics would delete a perfectly good 178MB download."""
+    from darktable_install import verify_digest
+
+    f = tmp_path / "a.bin"
+    f.write_bytes(b"hello")
+    ok, detail = verify_digest(str(f), expected)
+    assert ok, detail
+
+
+@pytest.mark.parametrize("algorithm,digest", [
+    # The *right* hash of the *right* file under a different algorithm.
+    ("md5", "5d41402abc4b2a76b9719d911017c592"),
+    ("sha1", "aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d"),
+    ("sha512", "9b71d224bd62f3785d96d46ad3ea3d73319bfbc2890caadae2dff72519673ca7"
+               "2323c3d99ba5c11d7c7acc6e14b8c5da0c4663475c2e5c3adef46f73bcdec043"),
+    # 64 hex characters, so it is shaped exactly like a SHA256 and only the
+    # algorithm name gives it away.  This is the case that would otherwise be
+    # reported as "mismatch — the download was replaced" about an intact file.
+    ("blake2s", hashlib.blake2s(b"hello").hexdigest()),
+])
+def test_verify_digest_rejects_a_digest_from_another_algorithm_by_name(tmp_path, algorithm, digest):
+    """Stripping the prefix blindly would compare, say, an MD5 against a
+    SHA256 and blame the file.  The detail has to name the algorithm GitHub
+    actually sent, otherwise a format change that silently weakens (or
+    disables) verification looks identical to a corrupt download."""
+    from darktable_install import verify_digest
+
+    f = tmp_path / "a.bin"
+    f.write_bytes(b"hello")
+    ok, detail = verify_digest(str(f), f"{algorithm}:{digest}")
+
+    assert not ok, f"{algorithm} digest was accepted as if it were SHA256"
+    assert "mismatch" not in detail.lower(), f"{detail!r} blames an intact file"
+    assert "verif" in detail.lower(), detail
+    assert algorithm in detail.lower(), f"{detail!r} does not say GitHub sent a {algorithm} digest"
+
+
+@pytest.mark.parametrize("expected,label", [
+    # Malformed values that can never equal a SHA256 hexdigest.
+    ("sha256:" + "z" * 64, "non-hex"),
+    ("sha256:" + HELLO_SHA256[:32], "too short"),
+    ("sha256:" + HELLO_SHA256 + "ff", "too long"),
+    ("sha256:" + "ff" + HELLO_SHA256, "prefixed with junk"),
+    ("sha256:", "empty"),
+    ({"sha256": HELLO_SHA256}, "not a string"),
+])
+def test_verify_digest_fails_closed_and_says_why_when_it_cannot_check(tmp_path, expected, label):
+    """Fail closed, but with its own sentence.
+
+    An unusable digest is not evidence of tampering, so it must not be reported
+    as a mismatch — and it must not pass, because the digest is the only
+    integrity check this feature has.  If GitHub ever changes the format this
+    breaks loudly on the next release instead of quietly verifying nothing.
+    """
+    from darktable_install import verify_digest
+
+    f = tmp_path / "a.bin"
+    f.write_bytes(b"hello")
+    ok, detail = verify_digest(str(f), expected)
+
+    assert not ok, f"{label}: an unverifiable digest must not pass"
+    assert "mismatch" not in detail.lower(), f"{label}: {detail!r} blames the file"
+    assert "verif" in detail.lower(), f"{label}: {detail!r} does not say it could not verify"
+
+
+def test_verify_digest_reads_in_chunks_not_all_at_once(tmp_path, monkeypatch):
+    """These assets are 87-178MB and Task 7 verifies right after download.
+    f.read() with no size would pull the whole file into RAM."""
+    import darktable_install
+    from darktable_install import verify_digest
+
+    f = tmp_path / "a.bin"
+    f.write_bytes(b"hello" * 1000)
+
+    reads = []
+    real_open = open
+
+    class _SpyFile:
+        def __init__(self, fh):
+            self._fh = fh
+
+        def read(self, *args):
+            reads.append(args)
+            return self._fh.read(*args)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return self._fh.__exit__(*exc)
+
+    def spy_open(path, *args, **kwargs):
+        return _SpyFile(real_open(path, *args, **kwargs))
+
+    monkeypatch.setattr(darktable_install, "open", spy_open, raising=False)
+
+    ok, detail = verify_digest(str(f), hashlib.sha256(b"hello" * 1000).hexdigest())
+
+    assert ok, detail
+    assert reads, "expected the file to be read"
+    assert all(args and isinstance(args[0], int) and args[0] > 0 for args in reads), (
+        f"every read() must pass an explicit chunk size, got {reads}"
+    )
+
+
+def test_verify_digest_hashes_the_whole_file_across_chunk_boundaries(tmp_path):
+    """A chunked loop that drops or reorders a chunk still 'verifies' small
+    test files.  Use a payload several chunks long with distinct content."""
+    from darktable_install import verify_digest
+
+    payload = bytes(range(256)) * (5 * 1024)  # 1.25MB, spans >1 chunk at 1MB
+    f = tmp_path / "big.bin"
+    f.write_bytes(payload)
+
+    ok, detail = verify_digest(str(f), "sha256:" + hashlib.sha256(payload).hexdigest())
+    assert ok, detail
+
+    # ...and flipping a single byte in the middle must be caught.
+    tampered = bytearray(payload)
+    tampered[len(tampered) // 2] ^= 0xFF
+    f.write_bytes(bytes(tampered))
+    ok, detail = verify_digest(str(f), "sha256:" + hashlib.sha256(payload).hexdigest())
+    assert not ok
+    assert "mismatch" in detail.lower()
+
+
+def test_verify_digest_reports_an_unreadable_file_instead_of_raising(tmp_path):
+    """Task 9's job calls this from a background thread; an OSError escaping
+    here would kill the job with no user-facing explanation."""
+    from darktable_install import verify_digest
+
+    ok, detail = verify_digest(str(tmp_path / "does-not-exist.bin"), "sha256:" + HELLO_SHA256)
+    assert not ok
+    assert "read" in detail.lower()

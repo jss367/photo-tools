@@ -11,10 +11,12 @@ unsigned, so a fail-closed signature check would reject every legitimate
 download.  See docs/superpowers/specs/2026-07-26-darktable-download-design.md.
 """
 
+import hashlib
 import json
 import logging
 import platform
 import posixpath
+import re
 import ssl
 import sys
 import urllib.parse
@@ -183,3 +185,95 @@ def resolve_release(timeout=15):
     tag = release.get("tag_name")
     version = tag.removeprefix("release-") if isinstance(tag, str) else ""
     return {"version": version, **asset}, None
+
+
+# Read the asset a megabyte at a time: these builds are 87-178MB and hashing
+# happens right after the download, so f.read() with no size would hold the
+# whole file in RAM on top of whatever the download already cost.
+_HASH_CHUNK_BYTES = 1024 * 1024
+
+_SHA256_HEX_RE = re.compile(r"\A[0-9a-f]{64}\Z")
+
+
+def verify_digest(path, expected):
+    """Compare the file's SHA256 against the digest published by the API.
+
+    Returns ``(ok, human_readable_detail)``.  The detail is shown to the user
+    verbatim, so it must be honest about what was and was not checked: a
+    matching digest proves the bytes are what GitHub's API said they are, not
+    that darktable signed them.  The digest arrives in the same HTTPS response
+    as the download URL, so it shares that response's trust boundary — it is
+    not an independent signature, and there is none to check (see the module
+    docstring).  This is the only integrity check the feature has.
+
+    ``expected`` comes from an external API, so its cosmetics are tolerated:
+    the ``sha256:`` prefix is optional, hex case and surrounding whitespace are
+    ignored.  Anything we cannot actually evaluate — another algorithm, a value
+    that is not a 64-character hexdigest, a non-string — fails closed with its
+    own sentence rather than being reported as a mismatch, which would blame an
+    intact file, or silently passing, which would leave the download unchecked.
+    """
+    if not expected:
+        # Passing here is deliberate: every asset ships a digest today, and
+        # refusing the download if one is ever missing would break the feature
+        # over something the user cannot fix.  Say so instead of implying a
+        # check happened.
+        log.warning("No digest published for %s — accepting it unverified", path)
+        return True, (
+            "GitHub published no digest for this asset, so its contents could not be "
+            "verified. The download came from darktable's official GitHub release, but "
+            "nothing confirms the bytes arrived intact."
+        )
+
+    if not isinstance(expected, str):
+        log.warning("Cannot verify %s: digest is %r, not a string", path, type(expected).__name__)
+        return False, (
+            "Could not verify the download: GitHub sent a digest in a form Vireo does "
+            "not understand."
+        )
+
+    # rpartition, not partition: with no ":" at all it puts the whole string in
+    # the last field, so a bare hexdigest is read as a hash with no algorithm
+    # rather than as an algorithm with no hash.  The strips also absorb any
+    # whitespace around the value, since leading whitespace lands on the
+    # algorithm and trailing whitespace on the hash.
+    algorithm, _, value = expected.rpartition(":")
+    algorithm = algorithm.strip().lower() or "sha256"
+    want = value.strip().lower()
+
+    if algorithm != "sha256":
+        log.warning("Cannot verify %s: digest algorithm is %r, not sha256", path, algorithm)
+        return False, (
+            # Truncated: this is an API-supplied string being rendered in the UI.
+            f'Could not verify the download: GitHub published the digest as "'
+            f'{algorithm[:20]}" and Vireo only checks SHA256.'
+        )
+    if not _SHA256_HEX_RE.match(want):
+        log.warning("Cannot verify %s: %r is not a SHA256 hexdigest", path, expected)
+        return False, (
+            "Could not verify the download: the digest GitHub published is not a valid "
+            "SHA256 hash."
+        )
+
+    h = hashlib.sha256()
+    try:
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(_HASH_CHUNK_BYTES), b""):
+                h.update(chunk)
+    except OSError as exc:
+        # Task 9 calls this from a job thread with no except clause of its own.
+        log.warning("Could not read %s to verify it: %s", path, exc)
+        return False, f"Could not read the downloaded file to verify it: {exc.strerror or exc}"
+    actual = h.hexdigest()
+
+    if actual == want:
+        return True, (
+            f"SHA256 matches the digest GitHub published for this asset ({actual[:16]}…). "
+            "That confirms the bytes are what GitHub said to expect; darktable does not "
+            "sign its builds, so there is no signature to check."
+        )
+    log.warning("Digest mismatch for %s: expected %s, got %s", path, want, actual)
+    return False, (
+        f"SHA256 mismatch — expected {want}, got {actual}. The download does not match "
+        "the digest GitHub published, so it was truncated, corrupted or replaced."
+    )

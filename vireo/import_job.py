@@ -38,11 +38,16 @@ Reconnaissance notes (Task 2.0, verified 2026-07-04):
    enumerate the restricted dirs, so per-batch scan cost tracks the
    batch, not the archive tree. One deliberate deviation from the plan
    text: duplicate-matched folders are scanned in a SEPARATE
-   ``scan(restrict_dirs=…)`` call without ``restrict_files`` —
-   ``_ensure_folder`` only fires for *discovered* files, so folding
-   duplicate dirs into the fresh-copy call (whose ``restrict_files``
-   excludes their files) would create/link nothing for duplicate-only
-   imports.
+   ``scan(restrict_dirs=…, incremental=True)`` call without
+   ``restrict_files``, so that uncataloged strays sitting in a matched
+   folder get self-healed into the catalog. ``incremental=True`` is what
+   keeps that affordable: without it the call re-read and re-hashed
+   every file in the matched folders, so importing a card of pure
+   duplicates re-read the whole archive folder (see
+   ``test_duplicate_only_import_does_not_reread_unchanged_twins``).
+   Note the folder rows/workspace links do NOT depend on this call
+   discovering files — ``scanner._ensure_folder`` runs unconditionally
+   for every ``restrict_dirs`` entry (PR #752).
 """
 
 import contextlib
@@ -518,6 +523,20 @@ def _linkable_twin_dirs(rows, under_destination):
             continue
         dirs.add(folder_path)
     return dirs
+
+
+def _dup_link_phase(dup_dirs):
+    """Progress phase for the duplicate-folder link scan.
+
+    Says what the scan is actually walking — the archive folders that
+    already hold this card's photos — rather than a generic "scanning".
+    Wording mirrors the import preview's "N already in your library" so
+    the two screens describe the same files the same way.
+    """
+    n = len(dup_dirs)
+    return (
+        f"Checking {n} folder{'' if n == 1 else 's'} already in your library"
+    )
 
 
 def _run_remote_import_job(job, runner, db, workspace_id, params):
@@ -1809,13 +1828,28 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
 
             if lex_dup_dirs:
                 try:
+                    # ``incremental=True`` and the phase emits for the
+                    # same reasons as the local path's dup-link scan:
+                    # already-cataloged, unchanged twins must not be
+                    # re-read just to link their folder, and the walk is
+                    # slow enough that silence reads as a hang. See the
+                    # module docstring.
+                    _phase_prefix = _dup_link_phase(lex_dup_dirs)
+                    _emit(_phase_prefix, emitted, discovered)
                     scan(
                         destination, db,
                         restrict_dirs=sorted(lex_dup_dirs),
+                        incremental=True,
                         vireo_dir=params.vireo_dir,
                         thumb_cache_dir=params.thumb_cache_dir,
                         skip_working_copies=True,
                         cancel_check=lambda: runner.is_cancelled(job["id"]),
+                        status_callback=(
+                            lambda msg, _p=_phase_prefix, _e=emitted,
+                            _d=discovered, **kw: _emit(
+                                f"{_p} — {msg}", _e, _d,
+                            )
+                        ),
                     )
                     linked_dup_dirs.update(lex_dup_dirs)
                     for d in sorted(lex_dup_dirs):
@@ -3041,11 +3075,17 @@ def run_import_job(job, runner, db_path, workspace_id, params):
                 wc_dest_folders.add(dest_folder)
 
         # --- Link duplicate-twin folders. Separate scan call WITHOUT
-        # restrict_files: scan only creates/links folder rows for files it
-        # discovers, so folding these dirs into the restricted call above
-        # would link nothing for duplicate-only batches. No restrict on
-        # files also means any uncataloged strays in these dirs get
-        # self-healed into the catalog.
+        # restrict_files so any uncataloged strays in these dirs get
+        # self-healed into the catalog — the restricted call above sees
+        # only what this batch landed. ``incremental=True`` bounds the
+        # cost to those strays: a twin that is already cataloged and
+        # unchanged is skipped on mtime instead of being re-opened and
+        # re-hashed. Without it, a card of pure duplicates re-read every
+        # byte of the matched archive folder(s) — hours over a network
+        # archive to import nothing. The folder rows and workspace links
+        # this block exists for do not depend on discovering any file:
+        # ``scanner._ensure_folder`` runs unconditionally per
+        # ``restrict_dirs`` entry (PR #752).
         new_dup_dirs = dup_dirs - linked_dup_dirs
         if new_dup_dirs:
             # Twin folders may be cataloged through a symlink alias while
@@ -3134,6 +3174,14 @@ def run_import_job(job, runner, db_path, workspace_id, params):
 
             if lex_dup_dirs:
                 try:
+                    # Walking the matched folders is the last thing this
+                    # job does and, on a network archive, by far the
+                    # slowest — the enumeration alone runs for minutes.
+                    # Name the phase and stream scanner's own discovery
+                    # counter into it, or the UI sits on the batch's
+                    # "N already present" line looking hung.
+                    _phase_prefix = _dup_link_phase(lex_dup_dirs)
+                    _emit(_phase_prefix, emitted, discovered)
                     # Same rationale as the fresh-batch scan above: pass
                     # ``vireo_dir`` / ``thumb_cache_dir`` so pairing keeps
                     # cache context, and defer per-batch WC extraction to
@@ -3141,10 +3189,17 @@ def run_import_job(job, runner, db_path, workspace_id, params):
                     scan(
                         destination, db,
                         restrict_dirs=sorted(lex_dup_dirs),
+                        incremental=True,
                         vireo_dir=params.vireo_dir,
                         thumb_cache_dir=params.thumb_cache_dir,
                         skip_working_copies=True,
                         cancel_check=lambda: runner.is_cancelled(job["id"]),
+                        status_callback=(
+                            lambda msg, _p=_phase_prefix, _e=emitted,
+                            _d=discovered, **kw: _emit(
+                                f"{_p} — {msg}", _e, _d,
+                            )
+                        ),
                     )
                     linked_dup_dirs.update(lex_dup_dirs)
                     # Duplicate-link scan created/linked workspace_folders

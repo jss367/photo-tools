@@ -24593,13 +24593,18 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         # failed files", not "Import whatever's at this path now".
         #
         # Each parent source's ``count`` + ``signature`` (sha256 over
-        # the sorted ``(rel_path, size)`` list) is captured at
-        # parent-completion time in ``import_job._capture_source_snapshots``
-        # and persisted on ``result["source_snapshots"]``. Here we
-        # recompute the current signature for every retry source that
-        # shares a path with a parent source and refuse the retry when
-        # any signature has drifted. Legacy parents from before this
-        # fix have no snapshots and fall through unchanged.
+        # the sorted ``(rel_path, size, mtime_ns)`` list) is captured
+        # at parent DISCOVERY time in
+        # ``import_job._capture_source_snapshots`` and persisted on
+        # ``result["source_snapshots"]``. ``mtime_ns`` is in the tuple
+        # so a same-size in-place replacement doesn't slip past the
+        # size check; discovery-time capture keeps a card ejected
+        # mid-copy from stamping ``-1`` sizes that would refuse a
+        # legitimate reinsert-and-retry recovery. Here we recompute
+        # the current signature for every retry source that shares a
+        # path with a parent source and refuse the retry when any
+        # signature has drifted. Legacy parents from before this fix
+        # have no snapshots and fall through unchanged.
         if parent_source_snapshots:
             from import_job import _capture_source_snapshots
             from ingest import discover_source_files

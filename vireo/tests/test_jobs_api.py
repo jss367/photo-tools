@@ -3582,7 +3582,15 @@ def _import_card(tmp_path, names=("DSC_0001.jpg",)):
     card = tmp_path / "import-card"
     card.mkdir(exist_ok=True)
     for name in names:
-        Image.new("RGB", (16, 16), "red").save(str(card / name))
+        target = card / name
+        # Idempotent: don't rewrite an existing file. Callers that pass
+        # ``_import_card(tmp_path)`` to both the parent import and the
+        # retry request rely on the card looking unchanged between the
+        # two calls, which now includes ``st_mtime_ns`` (part of the
+        # source-drift signature) — rewriting the file would bump mtime
+        # and trip the drift check.
+        if not target.exists():
+            Image.new("RGB", (16, 16), "red").save(str(target))
     return str(card)
 
 
@@ -6591,6 +6599,135 @@ def test_import_photos_retry_accepts_unchanged_source(
             "parent_import_job_id": parent_id,
         })
         assert resp.status_code == 200, resp.get_json()
+
+
+def test_import_photos_source_snapshot_records_discovery_time_size(
+        app_and_db, tmp_path):
+    """The parent's ``source_snapshots`` must be captured at DISCOVERY
+    time, not at completion time. Without this, a card ejected or
+    momentarily unreadable mid-run would backfill ``-1`` sizes for
+    successfully-discovered files; the retry-side signature check
+    would then refuse the natural "reinsert the card and retry"
+    recovery even though the source hasn't actually changed.
+
+    Regression guard: the persisted snapshot must match a fresh
+    discovery-time capture of the same source, and must NOT match the
+    signature a completion-time capture would have produced if the
+    card had become unreadable between discovery and completion."""
+    from pathlib import Path
+
+    from import_job import _capture_source_snapshots
+    from wait import wait_for_job_via_client
+
+    app, _ = app_and_db
+    with app.test_client() as client:
+        card = _import_card(tmp_path)
+        parent_id = _post_import(client, card,
+                                 tmp_path / "archive", None)
+        parent = wait_for_job_via_client(client, parent_id)
+
+        snapshots = parent["result"]["source_snapshots"]
+        card_snap = snapshots.get(card) or next(iter(snapshots.values()))
+        assert card_snap["count"] == 1
+        assert card_snap["signature"]
+
+        # A discovery-time capture repeated against the (still
+        # readable) source must reproduce the parent's signature. If
+        # it doesn't, the parent recorded something other than what a
+        # normal discovery-time capture would produce.
+        real_path = Path(card) / "DSC_0001.jpg"
+        rediscovered = _capture_source_snapshots([real_path], [card])
+        assert (
+            rediscovered[card]["signature"] == card_snap["signature"]
+        ), (
+            "persisted snapshot signature does not match a fresh "
+            "discovery-time capture of the same file"
+        )
+
+        # A completion-time capture with the file unreadable (the
+        # ejected-card mid-run scenario) would stamp ``-1`` and yield
+        # a different signature. Prove the parent's signature is NOT
+        # that one — the snapshot was captured while the source was
+        # readable, not backfilled after ejection.
+        import unittest.mock as _mock
+        original_stat = Path.stat
+
+        def _fail_stat(self, *args, **kwargs):
+            if str(self) == str(real_path):
+                raise OSError("simulated ejected card")
+            return original_stat(self, *args, **kwargs)
+
+        with _mock.patch.object(Path, "stat", _fail_stat):
+            ejected_snapshot = _capture_source_snapshots(
+                [real_path], [card],
+            )
+        assert (
+            ejected_snapshot[card]["signature"]
+            != card_snap["signature"]
+        ), (
+            "parent snapshot signature matches an ejected-card capture, "
+            "so the snapshot must have been recorded at completion time "
+            "instead of at discovery"
+        )
+
+
+def test_import_photos_retry_refuses_same_size_replacement(
+        app_and_db, tmp_path):
+    """A file replaced with different bytes at the same path and same
+    byte size still counts as a source change: without ``mtime_ns`` in
+    the snapshot tuple the ``(rel_path, size)`` signature would match
+    and the retry would silently copy the new bytes as if they were
+    the parent's failed files. Guard against that by asserting the
+    drift check refuses the retry when only the mtime differs."""
+    from pathlib import Path
+
+    from wait import wait_for_job_via_client
+
+    app, _ = app_and_db
+    with app.test_client() as client:
+        card = _import_card(tmp_path)
+        parent_id = _post_import(client, card,
+                                 tmp_path / "archive", None)
+        wait_for_job_via_client(client, parent_id)
+
+        # Replace the single card file with a different-color image of
+        # identical dimensions. Two 16x16 solid-color JPEGs typically
+        # encode to identical byte counts; if PIL happens to differ,
+        # pad the replacement to preserve the size so the test still
+        # exercises the "same-size-different-bytes" invariant.
+        original = Path(card) / "DSC_0001.jpg"
+        original_size = original.stat().st_size
+        # A no-op mtime bump would race the filesystem's timestamp
+        # resolution on retry; sleep past the resolution boundary
+        # before rewriting so mtime_ns strictly advances.
+        time.sleep(0.02)
+        Image.new("RGB", (16, 16), "green").save(str(original))
+        replacement_size = original.stat().st_size
+        if replacement_size != original_size:
+            # PIL's encoder produced a slightly different byte count.
+            # Pad or truncate to the original size to keep this a
+            # same-size replacement test. (Ext4/APFS both accept
+            # arbitrary bytes appended to a JPEG; the drift check
+            # doesn't validate JPEG structure.)
+            with open(original, "ab") as fh:
+                needed = original_size - replacement_size
+                if needed > 0:
+                    fh.write(b"\x00" * needed)
+                elif needed < 0:
+                    fh.truncate(original_size)
+            # File writes update mtime again; no extra sleep needed
+            # since we're only asserting mtime != parent's, not
+            # ordering of two rewrites.
+            assert original.stat().st_size == original_size
+
+        resp = client.post("/api/jobs/import-photos", json={
+            "sources": [card],
+            "destination": str(tmp_path / "archive"),
+            "after_import": None,
+            "parent_import_job_id": parent_id,
+        })
+        assert resp.status_code == 400, resp.get_json()
+        assert "source contents have changed" in resp.get_json()["error"]
 
 
 def test_import_photos_carry_photo_ids_validation_400s(app_and_db, tmp_path):

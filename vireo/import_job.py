@@ -130,12 +130,25 @@ def _capture_source_snapshots(files, sources):
     files the user's original import never saw.
 
     Signature is a sha256 over the sorted ``(relative_posix_path,
-    size)`` list of files under each source root; a healthy file
-    reports its ``st_size`` byte count, an unreadable file renders as
-    ``-1`` so a stat failure produces a distinct signature from a
-    successful stat at the same path. Files not under a source root
-    (empty in practice — discovery only yields paths under the source)
-    are skipped.
+    size, mtime_ns)`` list of files under each source root; a healthy
+    file reports its ``st_size`` and ``st_mtime_ns``, an unreadable
+    file renders both as ``-1`` so a stat failure produces a distinct
+    signature from a successful stat at the same path. ``st_mtime_ns``
+    is included alongside size so a same-size in-place replacement
+    (edit that preserves byte count, or a rewritten SD-card file at
+    the identical path and length) is caught by the drift check —
+    ``size`` alone would treat it as unchanged and let the retry copy
+    the new bytes as if they were the parent's failed files. Files
+    not under a source root (empty in practice — discovery only yields
+    paths under the source) are skipped.
+
+    Called from the import job at DISCOVERY time, before any copy work
+    starts, so the persisted snapshot reflects the source as the
+    parent first observed it. Snapshotting at completion time instead
+    would let a card ejected or momentarily unreadable mid-copy record
+    ``-1`` for successfully-discovered files, then refuse the natural
+    "reinsert the card and retry" recovery even though the source is
+    unchanged.
     """
     if not sources:
         return {}
@@ -150,10 +163,13 @@ def _capture_source_snapshots(files, sources):
             except ValueError:
                 continue
             try:
-                size = f.stat().st_size
+                st = f.stat()
+                size = st.st_size
+                mtime_ns = st.st_mtime_ns
             except OSError:
                 size = -1
-            entries.append((rel.as_posix(), size))
+                mtime_ns = -1
+            entries.append((rel.as_posix(), size, mtime_ns))
         entries.sort()
         payload = json.dumps(entries, separators=(",", ":"))
         digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
@@ -790,6 +806,14 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
             onerror=_discovery_onerror,
         ))
     discovered = len(files)
+
+    # Snapshot the discovered source metadata NOW — before any copy work
+    # or duplicate hashing — so a card ejected or momentarily unreadable
+    # mid-run doesn't backfill ``-1`` sizes for files we successfully
+    # enumerated. Reinserting the card and retrying is a common recovery
+    # workflow, and the retry-side signature check must have a snapshot
+    # taken from the source as-observed at run start to accept it.
+    source_snapshots = _capture_source_snapshots(files, params.sources)
 
     checker = None
     if params.skip_duplicates:
@@ -2126,10 +2150,11 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
         # recovery retry can detect a source whose contents changed
         # between the failed run and the retry — e.g. a different SD
         # card mounted at the same path, or new photos added to the
-        # same card. See ``_capture_source_snapshots`` for the format.
-        "source_snapshots": _capture_source_snapshots(
-            files, params.sources,
-        ),
+        # same card. Captured at DISCOVERY time (see the ``source_snapshots``
+        # assignment above the copy loop); recording it here instead
+        # would let a mid-copy card ejection stamp ``-1`` sizes and
+        # refuse a legitimate reinsert-and-retry recovery.
+        "source_snapshots": source_snapshots,
         "skipped_duplicate": skipped_duplicate,
         "unverified_duplicate": unverified_duplicate,
         "unverified_duplicates_only": unverified_duplicates_only,
@@ -2293,6 +2318,14 @@ def run_import_job(job, runner, db_path, workspace_id, params):
             onerror=_discovery_onerror,
         ))
     discovered = len(files)
+
+    # Snapshot the discovered source metadata NOW — before any copy work
+    # or duplicate hashing — so a card ejected or momentarily unreadable
+    # mid-run doesn't backfill ``-1`` sizes for files we successfully
+    # enumerated. Reinserting the card and retrying is a common recovery
+    # workflow, and the retry-side signature check must have a snapshot
+    # taken from the source as-observed at run start to accept it.
+    source_snapshots = _capture_source_snapshots(files, params.sources)
 
     checker = None
     if params.skip_duplicates:
@@ -3544,10 +3577,11 @@ def run_import_job(job, runner, db_path, workspace_id, params):
         # recovery retry can detect a source whose contents changed
         # between the failed run and the retry — e.g. a different SD
         # card mounted at the same path, or new photos added to the
-        # same card. See ``_capture_source_snapshots`` for the format.
-        "source_snapshots": _capture_source_snapshots(
-            files, params.sources,
-        ),
+        # same card. Captured at DISCOVERY time (see the ``source_snapshots``
+        # assignment above the copy loop); recording it here instead
+        # would let a mid-copy card ejection stamp ``-1`` sizes and
+        # refuse a legitimate reinsert-and-retry recovery.
+        "source_snapshots": source_snapshots,
         "skipped_duplicate": skipped_duplicate,
         "unverified_duplicate": unverified_duplicate,
         "unverified_duplicates_only": unverified_duplicates_only,

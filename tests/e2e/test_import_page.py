@@ -185,6 +185,10 @@ def test_import_preview_hide_duplicates_checkbox_filters_grid(live_server, page)
     expect(page.locator("#hideDuplicatesLabel")).to_have_text("Hide duplicates (1)")
     expect(grid).to_contain_text("IMG_0002.jpg")
 
+    calls_before = page.evaluate(
+        "[window.__fullPreviewCalls, window.__dupCalls, window.__destCalls]",
+    )
+
     checkbox.check()
     expect(grid).to_contain_text("IMG_0001.jpg")
     expect(grid).not_to_contain_text("IMG_0002.jpg")
@@ -196,6 +200,14 @@ def test_import_preview_hide_duplicates_checkbox_filters_grid(live_server, page)
     checkbox.uncheck()
     expect(grid).to_contain_text("IMG_0002.jpg")
     expect(grid).to_contain_text("Duplicate")
+
+    # Toggling re-renders from the last preview result and must never
+    # re-run discovery, the duplicate check, or the destination preview —
+    # on a real card those are the slow calls the filter exists to avoid
+    # repeating.
+    assert page.evaluate(
+        "[window.__fullPreviewCalls, window.__dupCalls, window.__destCalls]",
+    ) == calls_before
 
 
 def test_hide_duplicates_resets_once_a_check_finds_no_duplicates(
@@ -243,6 +255,31 @@ def test_hide_duplicates_resets_when_dedup_is_turned_off(live_server, page):
 
     dup_calls = page.evaluate("window.__dupCalls")
     page.locator("#chkSkipDuplicates").check()
+    page.wait_for_function(f"window.__dupCalls > {dup_calls}")
+    expect(page.locator("#chkHideDuplicates")).not_to_be_checked()
+    expect(page.locator("#importPreviewGrid")).to_contain_text("IMG_0002.jpg")
+
+
+def test_hide_duplicates_resets_when_the_last_source_is_removed(
+    live_server, page,
+):
+    """Emptying the source list ends this card's session.
+
+    The row is hidden at that point, so a filter left checked is invisible
+    — and the next card added would be filtered on arrival without the
+    user opting in for it.
+    """
+    run_two_file_preview(live_server, page)
+    page.locator("#chkHideDuplicates").check()
+
+    page.locator("#sourceList button", has_text="×").first.click()
+    expect(page.locator("#hideDuplicatesRow")).to_be_hidden()
+    expect(page.locator("#chkHideDuplicates")).not_to_be_checked()
+
+    # A different card arrives and starts unfiltered.
+    dup_calls = page.evaluate("window.__dupCalls")
+    page.locator("#sourceInput").fill("/tmp/card-a")
+    page.locator("#btnAddSource").click()
     page.wait_for_function(f"window.__dupCalls > {dup_calls}")
     expect(page.locator("#chkHideDuplicates")).not_to_be_checked()
     expect(page.locator("#importPreviewGrid")).to_contain_text("IMG_0002.jpg")

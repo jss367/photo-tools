@@ -929,6 +929,13 @@ function renderSources() {
       hideDestStructure();
       if (!sources.length) {
         clearImportPreviewGrid();
+        // Emptying the source list ends this card's session, so the
+        // filter retires with it — the row is already hidden here, and
+        // carrying the choice into whatever card is added next would
+        // filter that one on arrival without the user opting in. Note
+        // this is deliberately NOT in clearImportPreviewGrid(): ordinary
+        // re-previews clear the grid too and must keep the opt-in.
+        retireHideDuplicatesOptIn();
         document.getElementById('previewSummary').textContent = '';
       }
       renderSources();

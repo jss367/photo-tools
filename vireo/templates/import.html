@@ -2532,7 +2532,16 @@ async function renderDestStructure(excludePaths) {
   // when there is no folder table to draw.
   applyFolderTemplateSamples(data.template_samples);
   const folders = data.folders || [];
-  if (!folders.length && !data.managed_archive) return data;
+  const archives = Array.isArray(data.managed_archives)
+    ? data.managed_archives
+    : (data.managed_archive
+        ? [{
+            path: data.managed_archive.path,
+            photo_count: data.managed_archive.photo_count,
+            coverage: 'full',
+          }]
+        : []);
+  if (!folders.length && !archives.length) return data;
 
   const headline = document.createElement('div');
   headline.className = 'structure-headline';
@@ -2542,29 +2551,34 @@ async function renderDestStructure(excludePaths) {
     ' (' + data.new_folders + ' new, ' + data.existing_folders + ' existing)';
   el.appendChild(headline);
 
-  if (data.managed_archive) {
+  // Phrase each callout in terms of where the generated folders land,
+  // not the selected destination — the backend flags an archive whenever
+  // *some* generated folders sit inside it (including when the
+  // destination is above the archive but the template maps files back
+  // into it). Coverage 'full' means every generated folder lands inside
+  // this archive; 'partial' means only some do — either because part of
+  // the source lands outside every tracked archive, or because multiple
+  // archives split the generated folders between them. Say so, so the
+  // caller does not read "lands inside X" as "all of it lands inside X".
+  const multipleArchives = archives.length > 1;
+  archives.forEach((arch) => {
     const callout = document.createElement('div');
     callout.className = 'managed-archive-callout';
-    // Phrase this in terms of where the generated folders land, not the
-    // selected destination. The backend flags this callout whenever the
-    // resulting folders sit inside a tracked archive — which happens both
-    // when the destination itself is under that archive AND when the
-    // destination is above the archive but the folder template maps
-    // generated folders back into it (destination /Photography,
-    // tracked /Photography/2026, template 2026/%Y-%m-%d). Saying "this
-    // destination is inside" is inaccurate for the second case.
     const label = document.createElement('span');
-    label.textContent = 'Files imported here land inside the managed archive rooted at ';
+    const partial = arch.coverage === 'partial' || multipleArchives;
+    label.textContent = partial
+      ? 'Some files imported here will land inside the managed archive rooted at '
+      : 'Files imported here land inside the managed archive rooted at ';
     const path = document.createElement('span');
     path.style.fontFamily = 'monospace';
-    path.textContent = data.managed_archive.path;
+    path.textContent = arch.path;
     const tail = document.createElement('span');
-    tail.textContent = ' — ' + data.managed_archive.photo_count +
-      ' photo' + (data.managed_archive.photo_count === 1 ? '' : 's') +
+    tail.textContent = ' — ' + arch.photo_count +
+      ' photo' + (arch.photo_count === 1 ? '' : 's') +
       ' already cataloged there.';
     callout.append(label, path, tail);
     el.appendChild(callout);
-  }
+  });
 
   const table = document.createElement('table');
   table.className = 'structure-table';

@@ -17842,47 +17842,107 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         # probe.
         from move import _tracked_destination_ancestor
         db = _get_db()
-        tracked = _tracked_destination_ancestor(db, -1, destination)
-        # The destination itself may sit above every tracked archive while the
-        # folder template still maps generated files into one — e.g.
-        # destination /Photography with a tracked root /Photography/2026 and
-        # template 2026/%Y-%m-%d lands every file inside the managed
-        # /Photography/2026 archive. Checking only the destination's ancestors
-        # leaves managed_archive None even though the import IS a merge into
-        # a tracked archive. Fall back to the concrete full_path values from
-        # preview_destination() so we catch that case, while still avoiding
-        # the sibling-folder false positive the destination-only guard was
-        # written to prevent (a broad mount whose tracked archive is a
-        # sibling of the generated folders never becomes an ancestor of any
-        # full_path).
-        if tracked is None:
-            for entry in result.get("folders") or []:
-                full_path = entry.get("full_path")
-                if not full_path:
-                    continue
-                candidate = _tracked_destination_ancestor(db, -1, full_path)
-                if candidate is not None:
-                    tracked = candidate
-                    break
-        result["managed_archive"] = None
-        if tracked:
-            from db import _subtree_prefix
-            prefix = _subtree_prefix(tracked["path"])
+        from db import _subtree_prefix
+
+        def _archive_photo_count(archive_path):
+            prefix = _subtree_prefix(archive_path)
             # Count only ok/partial folders — the same set ingest treats as
-            # "the archive" — so the callout's "N photos" matches what the merge
-            # actually considers present. Pure catalog read; no on-disk check.
-            count = db.conn.execute(
+            # "the archive" — so the callout's "N photos" matches what the
+            # merge actually considers present. Pure catalog read; no on-disk
+            # check.
+            return db.conn.execute(
                 """SELECT COUNT(*) AS c
                      FROM photos p JOIN folders f ON f.id = p.folder_id
                     WHERE (f.path = ?
                            OR substr(REPLACE(f.path, '\\', '/'), 1, ?) = ?)
                       AND f.status IN ('ok', 'partial')""",
-                (tracked["path"], len(prefix), prefix),
+                (archive_path, len(prefix), prefix),
             ).fetchone()["c"]
-            result["managed_archive"] = {
-                "path": tracked["path"],
-                "photo_count": count,
+
+        managed_archives = []
+        managed_archive = None
+
+        dest_tracked = _tracked_destination_ancestor(db, -1, destination)
+        if dest_tracked is not None:
+            # The destination itself is (or sits inside) a tracked archive, so
+            # every generated folder lands inside it — full coverage.
+            managed_archive = {
+                "path": dest_tracked["path"],
+                "photo_count": _archive_photo_count(dest_tracked["path"]),
             }
+            managed_archives = [dict(managed_archive, coverage="full")]
+        else:
+            # The destination itself may sit above every tracked archive while
+            # the folder template still maps generated files into one — e.g.
+            # destination /Photography with a tracked root /Photography/2026
+            # and template 2026/%Y-%m-%d lands every file inside the managed
+            # /Photography/2026 archive. Checking only the destination's
+            # ancestors leaves managed_archive None even though the import IS
+            # a merge into a tracked archive. Walk the concrete full_path
+            # values from preview_destination() so we catch that case, while
+            # still avoiding the sibling-folder false positive the
+            # destination-only guard was written to prevent (a broad mount
+            # whose tracked archive is a sibling of the generated folders
+            # never becomes an ancestor of any full_path).
+            #
+            # Do NOT collapse mixed coverage to a single archive. A source
+            # spanning multiple date-templated folders can split so that some
+            # generated folders land inside a tracked archive and others land
+            # outside it, or land in DIFFERENT tracked archives — for example
+            # files from 2025 and 2026 with destination /Photography, template
+            # %Y/%Y-%m-%d, and only /Photography/2026 tracked (2025 files land
+            # outside the archive), or the same source but with both
+            # /Photography/2025 and /Photography/2026 tracked (each subset
+            # lands in a different archive). Breaking at the first match and
+            # asserting "this import lands inside archive X" for the whole
+            # preview lies about the other subsets. Aggregate the matches and
+            # expose partial/multiple overlaps distinctly.
+            folder_entries = result.get("folders") or []
+            per_archive = {}  # archive_path -> matched_folder_count
+            unmatched = 0
+            considered = 0
+            for entry in folder_entries:
+                full_path = entry.get("full_path")
+                if not full_path:
+                    continue
+                considered += 1
+                candidate = _tracked_destination_ancestor(db, -1, full_path)
+                if candidate is None:
+                    unmatched += 1
+                else:
+                    key = candidate["path"]
+                    per_archive[key] = per_archive.get(key, 0) + 1
+            for archive_path, matched in per_archive.items():
+                # A single archive covers "all" generated folders only when it
+                # matched every considered entry AND nothing landed outside a
+                # tracked archive AND no other tracked archive claimed any
+                # folder. Anything else is a partial overlap for that archive.
+                full = (
+                    unmatched == 0
+                    and len(per_archive) == 1
+                    and matched == considered
+                    and considered > 0
+                )
+                managed_archives.append({
+                    "path": archive_path,
+                    "photo_count": _archive_photo_count(archive_path),
+                    "coverage": "full" if full else "partial",
+                })
+            if (
+                len(managed_archives) == 1
+                and managed_archives[0]["coverage"] == "full"
+            ):
+                managed_archive = {
+                    "path": managed_archives[0]["path"],
+                    "photo_count": managed_archives[0]["photo_count"],
+                }
+
+        result["managed_archive"] = managed_archive
+        # ``managed_archives`` is the authoritative list — the UI should
+        # prefer it so partial or multi-archive overlaps are described
+        # honestly. ``managed_archive`` stays populated only for the
+        # single-archive full-coverage case so older clients keep working.
+        result["managed_archives"] = managed_archives
         return jsonify(result)
 
     @app.route("/api/import/folder-preview/thumbnail")
@@ -23056,13 +23116,17 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     allowed_ids.add(pid)
         return parent_config, allowed_ids, None
 
-    def _validate_after_import(value, db):
+    def _validate_after_import(value, db, *, allow_missing=False):
         """Return a JSON error response for a bad after_import spec, else None.
 
         Shared by both import endpoints: null means import-only; a non-null
         value must be a saved-process id that exists, so chained processing
         can't fail hours later on a dangling id the enqueue step could have
-        caught.
+        caught. ``allow_missing`` waives the existence check — used by the
+        recovery-retry path when the parent import already captured a
+        frozen ``after_import_snapshot`` for this exact id, so a Settings
+        delete between the failed run and the retry no longer strands the
+        retry outright.
         """
         if value is None:
             return None
@@ -23071,7 +23135,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 "after_import must be a process id or null, got "
                 f"{type(value).__name__}"
             )
-        if db.get_saved_process(value) is None:
+        if not allow_missing and db.get_saved_process(value) is None:
             return json_error(f"unknown process id: {value}")
         return None
 
@@ -24277,23 +24341,6 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             after_import = (
                 effective_cfg.get("pipeline", {}).get("default_process_id")
             )
-        err = _validate_after_import(after_import, db)
-        if err is not None:
-            return err
-
-        file_types = body.get("file_types", "both")
-        skip_duplicates = bool(body.get("skip_duplicates", True))
-        verify_by_hash = bool(body.get("verify_by_hash", False))
-        trust_likely_duplicates = bool(
-            body.get("trust_likely_duplicates", False)
-        ) and not verify_by_hash
-        recursive = bool(body.get("recursive", True))
-        import_tags, location_from_gps, tag_options_err = (
-            _validate_import_tag_options(body)
-        )
-        if tag_options_err is not None:
-            return tag_options_err
-
         # Recovery-retry imports carry forward the photo IDs a previous
         # attempt already landed, so the after-import chain covers the
         # complete original scope even though those files are skipped as
@@ -24312,6 +24359,13 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         # decides which folders the NAS transfer sweeps up, potentially
         # moving folders outside the active workspace. Refuse the
         # request rather than silently permit it.
+        #
+        # Resolved BEFORE ``_validate_after_import`` so a retry whose saved
+        # process was deleted between the failed run and this retry can
+        # still start: the parent's frozen ``after_import_snapshot`` is a
+        # legitimate substitute for the deleted process's stage flags, and
+        # rejecting the retry with "unknown process id" here would strand
+        # every deleted-process retry outright.
         parent_id_raw = body.get("parent_import_job_id")
         parent_config = None
         parent_allowed_ids = None
@@ -24327,6 +24381,35 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             )
             if parent_err is not None:
                 return parent_err
+
+        # Skip the "process still exists" check ONLY when the parent has a
+        # frozen snapshot for THIS exact process id — that snapshot will
+        # substitute for db.resolve_process() below. A retry that changed
+        # the process id must still go through normal existence validation.
+        parent_has_snapshot_for_after_import = (
+            parent_config is not None
+            and parent_config.get("after_import") == after_import
+            and parent_config.get("after_import_snapshot") is not None
+        )
+        err = _validate_after_import(
+            after_import, db,
+            allow_missing=parent_has_snapshot_for_after_import,
+        )
+        if err is not None:
+            return err
+
+        file_types = body.get("file_types", "both")
+        skip_duplicates = bool(body.get("skip_duplicates", True))
+        verify_by_hash = bool(body.get("verify_by_hash", False))
+        trust_likely_duplicates = bool(
+            body.get("trust_likely_duplicates", False)
+        ) and not verify_by_hash
+        recursive = bool(body.get("recursive", True))
+        import_tags, location_from_gps, tag_options_err = (
+            _validate_import_tag_options(body)
+        )
+        if tag_options_err is not None:
+            return tag_options_err
 
         carry_raw = body.get("carry_photo_ids")
         if carry_raw is None:
@@ -24411,12 +24494,35 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         # chain hook fires the pipeline_job's actual toggles are still up
         # for grabs — resolving here freezes them (mirrors the remote-
         # transport snapshot below).
+        #
+        # A recovery retry must inherit the parent's frozen snapshot when
+        # the retry still points at the same process id: the original
+        # enqueue already froze the stages the user accepted, and
+        # resolving again would silently pick up any Settings edit made
+        # after the failure (or fail outright if the process was
+        # deleted). Re-resolve only when the retry deliberately switches
+        # to a different process id — then the user is asking for
+        # whatever that process currently is.
         after_import_snapshot = None
         if after_import is not None:
-            try:
-                after_import_snapshot = db.resolve_process(after_import)
-            except ValueError as e:
-                return json_error(str(e), 404)
+            reused_parent_snapshot = None
+            if parent_config is not None:
+                parent_after_import = parent_config.get("after_import")
+                parent_snapshot_process = (
+                    parent_config.get("after_import_snapshot")
+                )
+                if (
+                    parent_snapshot_process is not None
+                    and parent_after_import == after_import
+                ):
+                    reused_parent_snapshot = parent_snapshot_process
+            if reused_parent_snapshot is not None:
+                after_import_snapshot = reused_parent_snapshot
+            else:
+                try:
+                    after_import_snapshot = db.resolve_process(after_import)
+                except ValueError as e:
+                    return json_error(str(e), 404)
 
         # Validate the optional NAS move that chains after processing
         # completes. Requires after_import (the move fires from the process
@@ -24504,6 +24610,13 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             "trust_likely_duplicates": trust_likely_duplicates,
             "recursive": recursive,
             "after_import": after_import,
+            # Persist the enqueue-time snapshot alongside the process id so a
+            # recovery retry can reuse the exact stages the user accepted.
+            # Without this a retry silently re-resolves the current process
+            # (an edit or delete between the failed run and the retry would
+            # otherwise change or void what runs); see the reuse block above
+            # and the corresponding remote-target snapshot handling.
+            "after_import_snapshot": after_import_snapshot,
             "tags": import_tags,
             "location_from_gps": location_from_gps,
             "allow_missing_exiftool": bool(

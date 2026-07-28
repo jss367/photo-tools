@@ -6347,6 +6347,101 @@ def test_import_photos_carry_photo_ids_persisted(app_and_db, tmp_path):
         assert config["carry_photo_ids"] == expected
 
 
+def test_import_photos_persists_after_import_snapshot(app_and_db, tmp_path):
+    """An import with a chained process freezes the process's stage flags in
+    the persisted job config, so a recovery retry can reuse the exact stages
+    the user originally accepted rather than re-resolving (and picking up a
+    mid-recovery Settings edit or 404ing on a deleted process)."""
+    app, db = app_and_db
+    client = app.test_client()
+    quick_look_id = next(
+        pr["id"] for pr in db.get_saved_processes() if pr["name"] == "Quick look")
+    resp = client.post("/api/jobs/import-photos", json={
+        "sources": [_import_card(tmp_path)],
+        "destination": str(tmp_path / "archive"),
+        "after_import": quick_look_id,
+    })
+    assert resp.status_code == 200, resp.get_json()
+    config = _job_config(client, resp.get_json()["job_id"])
+    snap = config["after_import_snapshot"]
+    assert snap is not None
+    # Snapshot mirrors db.resolve_process — a dict of the stage flags at
+    # enqueue time. The important invariant is that it's persisted and
+    # matches the current resolution, so the retry validator has a frozen
+    # record to fall back on.
+    assert snap == db.resolve_process(quick_look_id)
+
+
+def test_import_photos_retry_reuses_parent_after_import_snapshot(
+        app_and_db, tmp_path):
+    """When a retry keeps the same ``after_import`` id, the endpoint uses the
+    parent's frozen snapshot instead of re-resolving. This is what protects
+    the retry from a mid-recovery edit to the saved process (or a delete
+    that would otherwise 404 the retry outright)."""
+    from wait import wait_for_job_via_client
+
+    app, db = app_and_db
+    with app.test_client() as client:
+        quick_look_id = next(
+            pr["id"] for pr in db.get_saved_processes()
+            if pr["name"] == "Quick look")
+        parent_id = _post_import(client, _import_card(tmp_path),
+                                 tmp_path / "archive", quick_look_id)
+        wait_for_job_via_client(client, parent_id)
+        parent_config = _job_config(client, parent_id)
+        parent_snapshot = parent_config["after_import_snapshot"]
+        assert parent_snapshot is not None
+
+        # Flip a stage AFTER the parent has run — a Settings edit the retry
+        # must not silently pick up. ``skip_classify`` starts True on the
+        # Quick look seed, so flipping to False produces a different
+        # resolution the frozen snapshot must not equal.
+        db.update_saved_process(quick_look_id, skip_classify=False)
+        current = db.resolve_process(quick_look_id)
+        assert current != parent_snapshot
+
+        resp = client.post("/api/jobs/import-photos", json={
+            "sources": [_import_card(tmp_path)],
+            "destination": str(tmp_path / "archive"),
+            "after_import": quick_look_id,
+            "parent_import_job_id": parent_id,
+        })
+        assert resp.status_code == 200, resp.get_json()
+        retry_config = _job_config(client, resp.get_json()["job_id"])
+        assert retry_config["after_import_snapshot"] == parent_snapshot
+
+
+def test_import_photos_retry_survives_deleted_process(app_and_db, tmp_path):
+    """When the saved process is deleted after a failed run, a retry that
+    still points at that id must still start — reusing the parent's frozen
+    snapshot instead of 404ing on ``db.resolve_process``."""
+    from wait import wait_for_job_via_client
+
+    app, db = app_and_db
+    with app.test_client() as client:
+        quick_look_id = next(
+            pr["id"] for pr in db.get_saved_processes()
+            if pr["name"] == "Quick look")
+        parent_id = _post_import(client, _import_card(tmp_path),
+                                 tmp_path / "archive", quick_look_id)
+        wait_for_job_via_client(client, parent_id)
+        parent_snapshot = _job_config(client, parent_id)[
+            "after_import_snapshot"]
+        assert parent_snapshot is not None
+
+        db.delete_saved_process(quick_look_id)
+
+        resp = client.post("/api/jobs/import-photos", json={
+            "sources": [_import_card(tmp_path)],
+            "destination": str(tmp_path / "archive"),
+            "after_import": quick_look_id,
+            "parent_import_job_id": parent_id,
+        })
+        assert resp.status_code == 200, resp.get_json()
+        retry_config = _job_config(client, resp.get_json()["job_id"])
+        assert retry_config["after_import_snapshot"] == parent_snapshot
+
+
 def test_import_photos_carry_photo_ids_defaults_to_none(app_and_db, tmp_path):
     """A first-attempt import (no carry list) leaves the field null so
     ``_chain_after_import`` reads an empty list, not a non-list sentinel."""

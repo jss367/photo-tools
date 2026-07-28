@@ -156,15 +156,27 @@ def _mount_root_offline(mount_root: str) -> bool:
 
     * The directory is entirely gone — macOS removes ``/Volumes/<share>``
       on eject, so ``lexists`` alone is enough.
-    * A stale mount whose device is dead raises EIO from stat/listdir
-      probes — we're in the "reads are already failing" path so an
+    * A stale mount whose device is dead raises EIO from ``listdir`` /
+      stat probes — we're in the "reads are already failing" path so an
       errored probe can't be considered healthy.
-    * The directory exists, ``os.path.ismount`` reports nothing is
-      mounted, AND the directory is empty — the Linux common case, where
-      the mount-point stub (``/mnt/<share>``, ``/media/<user>/<name>``)
-      persists after ``umount`` or a network drop. When the mount was
-      active its contents lived on the mounted filesystem, so an
-      unmounted stub is typically empty.
+    * The directory exists, is readable but empty, and
+      ``os.path.ismount`` reports nothing is mounted at it — the Linux
+      common case, where the mount-point stub (``/mnt/<share>``,
+      ``/media/<user>/<name>``) persists after ``umount`` or a network
+      drop. When the mount was active its contents lived on the mounted
+      filesystem, so an unmounted stub is typically empty.
+
+    ``ismount`` is intentionally NOT used as an early "still mounted →
+    healthy" short-circuit. A stale SMB/NFS mount can keep its
+    mount-point metadata after the server disconnects, so
+    ``os.path.ismount`` still returns True while every read against
+    the root raises EIO. Trusting ismount alone would classify the
+    dropped share as folder-scoped and classify would keep reissuing
+    reads across the dead share instead of pausing for reconnection
+    (Codex #1388 P1 r3664211201). Probe with ``listdir`` first;
+    ``ismount`` only comes into play as a positive mount-identity
+    signal when the root is empty (to tell an actual empty mount from
+    an unmounted stub).
 
     An ``ismount``-negative directory that still has siblings is not
     treated as offline — that's proof it's an ordinary local directory
@@ -176,16 +188,31 @@ def _mount_root_offline(mount_root: str) -> bool:
     """
     if not os.path.lexists(mount_root):
         return True
-    try:
-        if os.path.ismount(mount_root):
-            return False
-    except OSError:
-        return True
+    # Probe the root itself before consulting ``ismount``: a dead SMB/NFS
+    # mount that still shows up in ``mount`` will keep ``ismount == True``
+    # but every read raises EIO. Catching that here is what lets classify
+    # scope the outage to the mount and pause, rather than falling
+    # through to the folder-scoped branch and hammering the dead share.
     try:
         entries = os.listdir(mount_root)
     except OSError:
         return True
-    return not entries
+    if entries:
+        # Readable and populated: whether it's a real mount or a plain
+        # local directory, callers should treat it as online. The
+        # folder-scoped branch above will still flag whatever subtree
+        # was individually unreachable.
+        return False
+    # Empty root: distinguish an actual mount that happens to be empty
+    # from a bare mount-point stub. ``ismount`` here is a positive
+    # identity check (still mounted → healthy), not a readability
+    # claim. If the ismount probe itself errors, treat as offline —
+    # we're already on the failed-read path and have no reason to be
+    # generous.
+    try:
+        return not os.path.ismount(mount_root)
+    except OSError:
+        return True
 
 
 def _source_offline_reason(

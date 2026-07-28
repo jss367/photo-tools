@@ -12610,6 +12610,84 @@ def test_source_offline_reason_keeps_populated_local_mnt_dir_folder_scoped(
     )
 
 
+def test_source_offline_reason_flags_stale_mount_still_reporting_ismount_true(
+    monkeypatch,
+):
+    """A dead SMB/NFS mount can keep ``ismount == True``; probe reads too.
+
+    Codex #1388 P1 (r3664211201): ``os.path.ismount`` only inspects
+    mount-point metadata, so a share whose server disconnected can keep
+    ``ismount`` returning True even though every read against the root
+    raises EIO. Pre-fix, ``_mount_root_offline`` short-circuited on
+    ``ismount == True`` and returned "not offline", which routed the
+    dropped share through the folder-scoped branch — classify would then
+    keep reissuing reads across the dead share instead of pausing for
+    reconnection. Pin that the helper probes the root with ``listdir``
+    even when ``ismount`` is True, so a stale-but-registered mount is
+    correctly scoped mount-offline.
+    """
+    import pipeline_job
+
+    folder = "/mnt/photos/2026-07-27"
+    image = os.path.join(folder, "DSC_0001.NEF")
+
+    real_lexists = pipeline_job.os.path.lexists
+    real_isdir = pipeline_job.os.path.isdir
+    real_ismount = pipeline_job.os.path.ismount
+    real_listdir = pipeline_job.os.listdir
+
+    def fake_lexists(path):
+        # The mount-point directory is still present — the mount table
+        # entry hasn't been cleaned up.
+        if path == "/mnt/photos":
+            return True
+        return real_lexists(path)
+
+    def fake_isdir(path):
+        # The subtree read fails — this is what triggered the check in
+        # the first place.
+        if path == folder:
+            return False
+        return real_isdir(path)
+
+    def fake_ismount(path):
+        # ``mount`` still lists /mnt/photos, so ``ismount`` says True —
+        # exactly the case Codex flagged.
+        if path == "/mnt/photos":
+            return True
+        return real_ismount(path)
+
+    def fake_listdir(path):
+        # But the underlying filesystem is dead: reading the root
+        # returns Input/output error. Without probing this, the helper
+        # would trust ``ismount`` alone and mislabel the outage.
+        if path == "/mnt/photos":
+            raise OSError("Input/output error")
+        return real_listdir(path)
+
+    monkeypatch.setattr(pipeline_job.os.path, "lexists", fake_lexists)
+    monkeypatch.setattr(pipeline_job.os.path, "isdir", fake_isdir)
+    monkeypatch.setattr(pipeline_job.os.path, "ismount", fake_ismount)
+    monkeypatch.setattr(pipeline_job.os, "listdir", fake_listdir)
+
+    result = pipeline_job._source_offline_reason(folder, image)
+    assert result is not None, (
+        "A stale mount whose ``ismount`` still returns True but whose "
+        "root read raises EIO must register as offline — otherwise "
+        "classify keeps hammering the dead share instead of pausing."
+    )
+    scope, reason = result
+    assert scope == "mount", (
+        f"A dead-but-still-registered mount must scope offline to the "
+        f"mount so the whole run pauses for reconnection; got scope "
+        f"{scope!r}."
+    )
+    assert "/mnt/photos" in reason, (
+        f"Reason must name the mount the user needs to reconnect; got "
+        f"{reason!r}."
+    )
+
+
 def test_source_offline_reason_flags_stale_mount_that_raises_from_stat(
     monkeypatch,
 ):

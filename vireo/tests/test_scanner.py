@@ -2536,41 +2536,79 @@ def test_incremental_rescan_skips_small_jpeg_dims_not_raw(tmp_path, monkeypatch)
     assert all(image_path not in batch for batch in called_with)
 
 
-def test_restricted_scan_reports_discovery_progress(tmp_path):
-    """Enumerating a restricted dir must emit a discovery heartbeat.
+def test_restricted_scan_reports_discovery_progress(tmp_path, monkeypatch):
+    """Enumerating a restricted dir must emit a discovery heartbeat
+    WHILE the enumeration is still running, not only after it finishes.
 
-    The recursive/non-recursive branches already do. The restrict_dirs
-    branch did not, so a caller that streams status to a UI (the import
-    job's duplicate-folder link scan) showed nothing at all while the
-    enumeration ran — minutes of apparent hang on a network archive with
-    a folder of ~1000 files.
+    The recursive/non-recursive branches already emit heartbeats. The
+    restrict_dirs branch did not, so a caller that streams status to a
+    UI (the import job's duplicate-folder link scan) showed nothing at
+    all while the enumeration ran — minutes of apparent hang on a
+    network archive with a folder of ~1000 files.
+
+    A materialized-then-iterate variant (``list(safe_iter_dir(...))``)
+    would emit heartbeats too, but only after the whole slow scandir
+    finishes — the exact silence this exists to break. The spy below
+    records how many entries the underlying iterator had yielded at the
+    moment each heartbeat fired: at least one heartbeat must fire before
+    the iterator is exhausted (PR #1385 Codex / CodeRabbit review).
     """
     import scanner
     from db import Database
+    from image_loader import safe_iter_dir as real_safe_iter_dir
 
     root = tmp_path / "archive"
     day = root / "2026-07-03"
     day.mkdir(parents=True)
     # One real image (the only file the scan is allowed to process) plus
-    # enough same-extension siblings to cross the heartbeat interval.
+    # enough same-extension siblings to cross the heartbeat interval
+    # multiple times.
     real = day / "IMG_0000.jpg"
     Image.new("RGB", (16, 16), color="red").save(str(real), "JPEG")
-    for i in range(1, 601):
+    for i in range(1, 1201):
         (day / f"IMG_{i:04d}.jpg").touch()
 
+    yields = [0]
+
+    def spy_iter_dir(top, onerror=None):
+        for entry in real_safe_iter_dir(top, onerror=onerror):
+            yields[0] += 1
+            yield entry
+
+    monkeypatch.setattr(scanner, "safe_iter_dir", spy_iter_dir)
+
     db = Database(str(tmp_path / "test.db"))
-    statuses = []
+    statuses = []  # list of (msg, yields_when_emitted)
     scanner.scan(
         str(root), db,
         restrict_dirs=[str(day)],
         restrict_files={str(real)},
-        status_callback=lambda msg, **kw: statuses.append(msg),
+        status_callback=lambda msg, **kw: statuses.append((msg, yields[0])),
     )
 
-    discovery = [s for s in statuses if s.startswith("Discovering files")]
+    total_yielded = yields[0]
+    discovery = [
+        (msg, at) for msg, at in statuses
+        if msg.startswith("Discovering files")
+    ]
     assert len(discovery) >= 2, (
         "restricted discovery must emit progress while it enumerates, not "
         f"just a single opening message; got {statuses}"
+    )
+    # At least one heartbeat must have fired mid-enumeration — after the
+    # generator started yielding but before it was exhausted. The scan
+    # emits an "opening" heartbeat before any yield (at ``yields == 0``),
+    # so that one doesn't count; the "closing" heartbeats after
+    # enumeration is done (``at == total_yielded``) don't count either.
+    # A materialized-then-iterate variant would only land in those two
+    # buckets — no true in-flight ticks — leaving the UI silent through
+    # the entire slow scandir walk this heartbeat exists to break.
+    in_flight = [at for _, at in discovery if 0 < at < total_yielded]
+    assert in_flight, (
+        "heartbeats never fired mid-enumeration — the UI would be silent "
+        "through the whole slow scandir walk this heartbeat exists to "
+        f"break (iterator total: {total_yielded}, heartbeats at: "
+        f"{[at for _, at in discovery]})"
     )
 
 

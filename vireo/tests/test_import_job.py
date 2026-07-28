@@ -388,6 +388,78 @@ def test_duplicate_only_import_still_catalogs_stray_in_twin_folder(
     )
 
 
+def test_duplicate_only_import_skips_twins_cataloged_in_other_workspace(
+    tmp_path, monkeypatch,
+):
+    """The dup-link scan must skip twins whose folder is cataloged but
+    not yet linked to the active workspace — the exact case this scan
+    exists to repair.
+
+    Regression for PR #1385 Codex review. The scan initially scoped its
+    incremental "skip on mtime" lookup to the active workspace, so a
+    folder cataloged in a different workspace (or previously known but
+    not yet workspace-linked here) would still be re-opened and
+    re-hashed on every file inside it, defeating the fix for the very
+    "cataloged, unchanged twins" case the PR targets. The sibling test
+    ``test_duplicate_only_import_does_not_reread_unchanged_twins``
+    happens to also link the twin folder to the active workspace during
+    setup, so this test forces the "cataloged elsewhere" state
+    explicitly by seeding in one workspace and running the import from
+    a fresh one.
+    """
+    import shutil
+
+    import scanner
+    from import_job import ImportParams, run_import_job
+
+    archive = tmp_path / "archive"
+    twin_dir = archive / "2026" / "2026-07-03"
+    twin_dir.mkdir(parents=True)
+    names = ["IMG_0700.jpg", "IMG_0701.jpg", "IMG_0702.jpg"]
+    for i, name in enumerate(names):
+        Image.new("RGB", (16, 16), ("red", "green", "blue")[i]).save(
+            str(twin_dir / name),
+        )
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    seed_ws = db._active_workspace_id
+    # Seed the catalog by scanning under the default workspace so rows
+    # carry the file_mtime/metadata an incremental pass needs to skip on.
+    scanner.scan(str(archive), db)
+    _mark_exif_extracted(db)
+    assert len(_photo_rows(db)) == 3
+    assert str(twin_dir) in _ws_linked_folder_paths(db, seed_ws)
+
+    # A fresh workspace has never seen this folder — the exact state the
+    # dup-link scan is intended to repair.
+    fresh_ws = db.create_workspace("Fresh")
+    assert str(twin_dir) not in _ws_linked_folder_paths(db, fresh_ws)
+
+    card = tmp_path / "card"
+    card.mkdir()
+    for name in names:
+        shutil.copy2(str(twin_dir / name), str(card / name))
+
+    read_paths = _count_feature_computations(monkeypatch)
+    result = run_import_job(
+        _make_job(), FakeRunner(), db_path, fresh_ws,
+        ImportParams(sources=[str(card)], destination=str(archive)),
+    )
+
+    assert result["copied"] == 0
+    assert result["skipped_duplicate"] == 3, result
+    assert result["failed"] == 0, result
+    # The folder is now linked to the fresh workspace — the scan did its
+    # actual job of workspace-linking the matched folder.
+    assert str(twin_dir) in _ws_linked_folder_paths(db, fresh_ws)
+    assert read_paths == [], (
+        "duplicate-only import re-read twins whose folder was cataloged "
+        "but not yet linked to the active workspace: "
+        f"{read_paths}"
+    )
+
+
 def test_duplicate_only_import_links_alias_spelled_twin(tmp_path):
     """When a twin folder is cataloged through a symlink alias but the
     import ``destination`` resolves to a different (real) spelling, the

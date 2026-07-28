@@ -2945,6 +2945,11 @@ function retryBodyFromFinishedJob(job) {
   // Jobs page does.
   if (!job || job.type !== 'import' || cfg.mode === 'in_place') return null;
   if (!Array.isArray(cfg.sources) || !cfg.sources.length) return null;
+  // The server binds the retry's carry list to this parent (below) and
+  // — when the parent used a remote target — verifies the current
+  // resolution still matches the parent's snapshot. Skip when the
+  // parent has no id (defensive; production always has one).
+  if (!job.id) return null;
   const body = {
     sources: cfg.sources.slice(),
     destination: cfg.destination,
@@ -2961,6 +2966,7 @@ function retryBodyFromFinishedJob(job) {
     tags: Array.isArray(cfg.tags) ? cfg.tags.slice() : [],
     location_from_gps: !!cfg.location_from_gps,
     allow_missing_exiftool: !!cfg.allow_missing_exiftool,
+    parent_import_job_id: job.id,
   };
   // Carry forward the complete original import scope so the after-import
   // process runs on ALL files the user meant to import, not only the

@@ -22934,6 +22934,105 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         except Exception as e:
             return None, None, json_error(str(e))
 
+    def _remote_target_snapshot(remote_archive_config):
+        """Freeze the parts of a resolved remote target that decide where
+        files land, for retry-time comparison against the parent job.
+
+        Returns None when the current request is not a remote-archive
+        import — a retry that swapped from remote to local (or vice
+        versa) will already fail the exact-equal comparison against a
+        parent snapshot of the opposite shape. See
+        ``api_job_import_photos``'s parent_import_job_id check.
+        """
+        if remote_archive_config is None:
+            return None
+        target = remote_archive_config["target"]
+        return {
+            "host": target.get("host", ""),
+            "user": target.get("user", ""),
+            "port": int(target.get("port") or 22),
+            "remote_path": target.get("remote_path", ""),
+            "mount_path": target.get("mount_path", ""),
+            "subpath": remote_archive_config.get("subpath", ""),
+        }
+
+    def _validate_parent_import_job(parent_id, active_ws, db):
+        """Resolve a retry's parent_import_job_id into the scope this
+        retry is allowed to inherit.
+
+        Returns ``(parent_config, allowed_ids, None)`` on success or
+        ``(None, None, error_response)`` when the parent can't be used.
+        ``parent_config`` is the parent job's persisted config dict;
+        ``allowed_ids`` is the set of photo IDs a retry may include in
+        ``carry_photo_ids`` — the parent's own imported IDs plus any
+        the parent itself inherited from an earlier retry.
+
+        Cross-workspace parents are refused: photos and folders live
+        globally, so a caller who names a parent from another workspace
+        would smuggle that workspace's photos into this workspace's
+        after-import chain and (with after_process_move) its NAS
+        transfer scope. Falls through to job_history when the runner
+        has already pruned the finished job.
+        """
+        runner = app._job_runner
+        parent = runner.get(parent_id)
+        parent_config = None
+        parent_result = None
+        parent_workspace = None
+        parent_type = None
+        if parent is not None:
+            parent_config = parent.get("config") or {}
+            parent_result = parent.get("result") or {}
+            parent_workspace = parent.get("workspace_id")
+            parent_type = parent.get("type")
+        else:
+            row = db.conn.execute(
+                "SELECT type, workspace_id, config, result "
+                "FROM job_history WHERE id = ?",
+                (parent_id,),
+            ).fetchone()
+            if row is None:
+                return None, None, json_error(
+                    "parent_import_job_id not found — the original import "
+                    "may have aged out of history; start a new import",
+                    404,
+                )
+            parent_type = row["type"]
+            parent_workspace = row["workspace_id"]
+            try:
+                parent_config = json.loads(row["config"] or "{}") or {}
+            except (json.JSONDecodeError, TypeError):
+                parent_config = {}
+            try:
+                parent_result = json.loads(row["result"] or "{}") or {}
+            except (json.JSONDecodeError, TypeError):
+                parent_result = {}
+        if parent_type != "import":
+            return None, None, json_error(
+                "parent_import_job_id must reference an import job "
+                f"(got type {parent_type!r})"
+            )
+        if parent_workspace != active_ws:
+            return None, None, json_error(
+                "parent_import_job_id belongs to a different workspace "
+                "than the active one; switch workspaces or start a new "
+                "import instead of retrying"
+            )
+        allowed_ids = set()
+        for source in (
+            parent_result.get("photo_ids") or [],
+            parent_result.get("carried_photo_ids") or [],
+            parent_config.get("carry_photo_ids") or [],
+        ):
+            for pid in source:
+                if (
+                    isinstance(pid, int)
+                    and not isinstance(pid, bool)
+                    and pid > 0
+                ):
+                    allowed_ids.add(pid)
+        return parent_config, allowed_ids, None
+
     def _validate_after_import(value, db):
         """Return a JSON error response for a bad after_import spec, else None.
 
@@ -24177,6 +24276,35 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         # complete original scope even though those files are skipped as
         # duplicates in this run. Validated at request time so a
         # malformed retry body is rejected before a job is created.
+        #
+        # ``parent_import_job_id`` binds this retry to the failed run
+        # whose scope it inherits: the server verifies the parent is an
+        # import job in the same workspace, then constrains
+        # ``carry_photo_ids`` to IDs the parent actually imported (or
+        # itself inherited from an earlier retry). Without this binding
+        # an API caller could inject arbitrary positive integers into
+        # the after-import chain scope — those IDs would then flow into
+        # ``_record_import_collection``'s scope and, with an
+        # ``after_process_move`` chain, into the folder lookup that
+        # decides which folders the NAS transfer sweeps up, potentially
+        # moving folders outside the active workspace. Refuse the
+        # request rather than silently permit it.
+        parent_id_raw = body.get("parent_import_job_id")
+        parent_config = None
+        parent_allowed_ids = None
+        if parent_id_raw is not None:
+            if not isinstance(parent_id_raw, str) or not parent_id_raw.strip():
+                return json_error(
+                    "parent_import_job_id must be a non-empty string"
+                )
+            parent_config, parent_allowed_ids, parent_err = (
+                _validate_parent_import_job(
+                    parent_id_raw.strip(), db._active_workspace_id, db,
+                )
+            )
+            if parent_err is not None:
+                return parent_err
+
         carry_raw = body.get("carry_photo_ids")
         if carry_raw is None:
             carry_photo_ids = None
@@ -24188,6 +24316,19 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 return json_error(
                     "carry_photo_ids must be a list of positive integers"
                 )
+            # A caller-supplied carry list must be bound to a real
+            # parent import job. See parent_import_job_id above.
+            if parent_allowed_ids is None:
+                return json_error(
+                    "carry_photo_ids requires parent_import_job_id "
+                    "(the failed import this retry inherits scope from)"
+                )
+            invalid = [pid for pid in carry_raw if pid not in parent_allowed_ids]
+            if invalid:
+                return json_error(
+                    "carry_photo_ids contains IDs the parent import did "
+                    f"not land or inherit: {invalid[:5]}"
+                )
             # Preserve caller order but deduplicate — the chain does not
             # need repeats and a giant duplicated list wastes work.
             seen_carry = set()
@@ -24197,6 +24338,30 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     continue
                 seen_carry.add(pid)
                 carry_photo_ids.append(pid)
+
+        # A retry that keeps the same remote target must land on the
+        # same host/root/mount as the failed run — otherwise the retry
+        # would copy the remaining files to a different NAS, or (if
+        # only the mount changed) skip prior successes based on the
+        # old catalog view while transferring failures to a new
+        # location. When the parent recorded a remote_target_snapshot,
+        # verify that the current resolution matches; refuse the retry
+        # if the target has been edited since. The Import-page and
+        # Jobs-page retry helpers both send parent_import_job_id, so
+        # both go through this check.
+        if parent_config is not None:
+            parent_snapshot = parent_config.get("remote_target_snapshot")
+            if parent_snapshot is not None:
+                current_snapshot = _remote_target_snapshot(
+                    remote_archive_config,
+                )
+                if current_snapshot != parent_snapshot:
+                    return json_error(
+                        "The remote target for the original import has "
+                        "changed (host, path, mount, or subpath differs). "
+                        "Verify Settings → Remote targets and start a new "
+                        "import instead of retrying."
+                    )
 
         # Snapshot the chosen saved process's stage flags at enqueue time
         # so a mid-import edit or delete can't silently change (or void)
@@ -24271,6 +24436,9 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             ),
             "remote_target_id": remote_target_id or None,
             "remote_subpath": remote_subpath or None,
+            "remote_target_snapshot": _remote_target_snapshot(
+                remote_archive_config,
+            ),
             "workspace_id": active_ws,
             "created_workspace": created_workspace,
             "carry_photo_ids": carry_photo_ids,

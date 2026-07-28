@@ -15385,3 +15385,475 @@ def test_pipeline_classify_failed_retry_on_last_photo_latches_source_offline(
         f"its per-photo loop against the dead share instead of "
         f"short-circuiting on abort (Codex #1388 P1 r3663278142)."
     )
+
+
+def test_pipeline_classify_folder_outage_skips_unreachable_photos_in_downstream_stages(
+    tmp_path, monkeypatch,
+):
+    """Folder-scoped outages must exclude unreachable photos from downstream stages.
+
+    Codex #1388 P2 (r3664058173): the folder-scoped branch deliberately
+    leaves ``abort`` clear so healthy folders keep processing — but the
+    unreachable photos still hung off the collection, so
+    ``extract_masks_stage`` (and ``eye_keypoints_stage``) would rebuild
+    ``photos_to_process`` from the whole collection and call
+    ``render_proxy`` against the dead folder for every one of them. Every
+    call returned None, they all landed in the "skipped" bucket, and the
+    stage summary showed a mask-extraction failure count instead of the
+    real diagnosis (missing folder). Filter the classify-time source-
+    skipped set out of extract_masks / eye_keypoints so the missing folder
+    doesn't get walked twice.
+    """
+    import classifier as classifier_mod
+    import classify_job
+    import config as cfg
+    from db import Database
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cfg.CONFIG_PATH = str(tmp_path / "config.json")
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws_id = db._active_workspace_id
+
+    gone_folder_path = str(tmp_path / "vanished")
+    healthy_folder_path = str(tmp_path / "still_here")
+    os.makedirs(gone_folder_path, exist_ok=True)
+    os.makedirs(healthy_folder_path, exist_ok=True)
+
+    gone_folder_id = db.add_folder(gone_folder_path)
+    healthy_folder_id = db.add_folder(healthy_folder_path)
+
+    photo_ids = []
+    gone_photo_ids: set = set()
+    healthy_photo_ids: set = set()
+    for i in range(3):
+        name = f"gone{i}.jpg"
+        pid = db.add_photo(
+            gone_folder_id, name, ".jpg", 4000 + i, 4_000_000.0 + i,
+        )
+        _drop_jpeg(gone_folder_path, name)
+        db.save_detections(
+            pid,
+            [{"box": {"x": 0.1, "y": 0.1, "w": 0.5, "h": 0.5},
+              "confidence": 0.9, "category": "animal"}],
+            detector_model="MegaDetector",
+        )
+        photo_ids.append(pid)
+        gone_photo_ids.add(pid)
+    for i in range(3):
+        name = f"healthy{i}.jpg"
+        pid = db.add_photo(
+            healthy_folder_id, name, ".jpg", 5000 + i, 5_000_000.0 + i,
+        )
+        _drop_jpeg(healthy_folder_path, name)
+        db.save_detections(
+            pid,
+            [{"box": {"x": 0.1, "y": 0.1, "w": 0.5, "h": 0.5},
+              "confidence": 0.9, "category": "animal"}],
+            detector_model="MegaDetector",
+        )
+        photo_ids.append(pid)
+        healthy_photo_ids.add(pid)
+
+    col_id = db.add_collection(
+        "Test",
+        json.dumps([{"field": "photo_ids", "value": photo_ids}]),
+    )
+
+    _setup_fake_downloaded_model(tmp_path, monkeypatch)
+
+    import labels_fingerprint as lfp
+    monkeypatch.setattr(lfp, "compute_fingerprint", lambda *a, **k: "fp")
+
+    def fake_detect_batch(batch, folders, runner, job, reclassify, db_,
+                          det_conf_threshold=None, already_detected_ids=None,
+                          cached_detections=None):
+        det_map = {}
+        for p in batch:
+            det_map[p["id"]] = [{
+                "id": d["id"],
+                "box_x": d["box_x"], "box_y": d["box_y"],
+                "box_w": d["box_w"], "box_h": d["box_h"],
+                "confidence": d["detector_confidence"],
+                "category": d["category"],
+            } for d in db_.get_detections(p["id"])
+                if d["detector_model"] != "full-image"]
+        return det_map, len(batch), {p["id"] for p in batch}
+
+    monkeypatch.setattr(classify_job, "_detect_batch", fake_detect_batch)
+
+    from PIL import Image as _PILImage
+
+    fake_missing_root = str(tmp_path / "vanished_at_classify_time")
+
+    def selective_prepare_image(photo, folders, detection, vireo_dir=None):
+        if photo["id"] in gone_photo_ids:
+            image_path = os.path.join(fake_missing_root, photo["filename"])
+            return None, fake_missing_root, image_path
+        fp = folders.get(photo["folder_id"], "")
+        return (
+            _PILImage.new("RGB", (16, 16), "black"),
+            fp,
+            os.path.join(fp, photo["filename"]),
+        )
+
+    monkeypatch.setattr(classify_job, "_prepare_image", selective_prepare_image)
+
+    def fake_flush_batch(batch, clf, model_type, model_name, db_, raw_results,
+                         top_k=1):
+        for entry in batch:
+            raw_results.append({
+                "photo": entry["photo"],
+                "detection_id": entry.get("detection_id"),
+                "folder_path": entry["folder_path"],
+                "image_path": entry["image_path"],
+                "prediction": "Robin",
+                "confidence": 0.9,
+                "timestamp": None,
+                "filename": entry["photo"]["filename"],
+                "embedding": None,
+                "taxonomy": None,
+            })
+        return 0
+
+    monkeypatch.setattr(classify_job, "_flush_batch", fake_flush_batch)
+
+    class FakeClassifier:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def encode_image(self, *args, **kwargs):
+            import numpy as np
+            return np.zeros(512, dtype=np.float32)
+
+    monkeypatch.setattr(classifier_mod, "Classifier", FakeClassifier)
+
+    # Stub SAM2 / DINOv2 so extract_masks runs end-to-end. Record every
+    # render_proxy image_path so the assertion below can distinguish
+    # "healthy folder was processed" from "gone folder was retried."
+    _stub_extract_masks_heavy_ops(monkeypatch)
+    import masking as masking_mod
+    render_proxy_paths: list = []
+    _original_render_proxy = masking_mod.render_proxy
+
+    def spy_render_proxy(image_path, longest_edge=None):
+        render_proxy_paths.append(image_path)
+        return _original_render_proxy(image_path, longest_edge=longest_edge)
+
+    monkeypatch.setattr(masking_mod, "render_proxy", spy_render_proxy)
+
+    class NoPauseRunner(FakeRunner):
+        def pause_job(self, job_id):
+            return False
+
+        def wait_if_paused(self, job_id, *, publish_paused=False):
+            return False
+
+    # Do NOT skip_extract_masks — this test is that extract_masks runs on
+    # the healthy folder AND skips the gone folder rather than walking it.
+    params = PipelineParams(
+        collection_id=col_id,
+        skip_regroup=True,
+        skip_eye_keypoints=True,
+    )
+
+    runner = NoPauseRunner()
+    job = _make_job()
+
+    with pytest.raises(RuntimeError):
+        run_pipeline_job(job, runner, db_path, ws_id, params)
+
+    # extract_masks must have opened ONLY the healthy folder's files.
+    # Pre-fix, it also called render_proxy against fake_missing_root for
+    # each unreachable photo and reported them as skips.
+    assert render_proxy_paths, (
+        "extract_masks should have processed the healthy folder — if "
+        "no render_proxy calls fired at all, the stage short-circuited "
+        "and this test doesn't exercise the filter under review."
+    )
+    assert not any(
+        fake_missing_root in path for path in render_proxy_paths
+    ), (
+        f"extract_masks re-opened the missing folder via render_proxy — "
+        f"the classify-time source-skipped set must be filtered out of "
+        f"downstream stages so the folder outage doesn't get walked "
+        f"twice (Codex #1388 P2 r3664058173). Got paths: "
+        f"{render_proxy_paths!r}"
+    )
+    # Belt-and-suspenders: every render_proxy path must live under the
+    # healthy folder root.
+    assert all(
+        healthy_folder_path in path for path in render_proxy_paths
+    ), (
+        f"extract_masks called render_proxy for paths outside the "
+        f"healthy folder — expected only {healthy_folder_path!r}, got "
+        f"{render_proxy_paths!r}"
+    )
+
+
+def test_pipeline_classify_folder_outage_marks_per_model_step_failed(
+    tmp_path, monkeypatch,
+):
+    """The per-model classify step must land as ``failed`` on a folder outage.
+
+    Codex #1388 P2 (r3664058179): the new source-offline summary described
+    the incomplete work in the step's ``summary`` field, but the
+    ``runner.update_step`` call still passed ``status="completed"``. The
+    Jobs page renders status from ``step.status`` directly and auto-
+    collapses ``completed`` rows without warnings, so a failed job would
+    show a green, collapsed classifier row — hiding the reason the stage
+    stopped short. The later stage-status rollup that flips
+    ``stages["classify"]["status"] = "failed"`` isn't mapped back to the
+    per-model step, so this must be fixed inline.
+    """
+    import classifier as classifier_mod
+    import classify_job
+    import config as cfg
+    from db import Database
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cfg.CONFIG_PATH = str(tmp_path / "config.json")
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws_id = db._active_workspace_id
+
+    folder_path = str(tmp_path / "photos")
+    os.makedirs(folder_path, exist_ok=True)
+    folder_id = db.add_folder(folder_path)
+    photo_ids = []
+    for i in range(3):
+        name = f"photo{i}.jpg"
+        pid = db.add_photo(folder_id, name, ".jpg", 4000 + i, 4_000_000.0 + i)
+        _drop_jpeg(folder_path, name)
+        db.save_detections(
+            pid,
+            [{"box": {"x": 0.1, "y": 0.1, "w": 0.5, "h": 0.5},
+              "confidence": 0.9, "category": "animal"}],
+            detector_model="MegaDetector",
+        )
+        photo_ids.append(pid)
+
+    col_id = db.add_collection(
+        "Test",
+        json.dumps([{"field": "photo_ids", "value": photo_ids}]),
+    )
+
+    _setup_fake_downloaded_model(tmp_path, monkeypatch)
+
+    import labels_fingerprint as lfp
+    monkeypatch.setattr(lfp, "compute_fingerprint", lambda *a, **k: "fp")
+
+    def fake_detect_batch(batch, folders, runner, job, reclassify, db_,
+                          det_conf_threshold=None, already_detected_ids=None,
+                          cached_detections=None):
+        det_map = {}
+        for p in batch:
+            det_map[p["id"]] = [{
+                "id": d["id"],
+                "box_x": d["box_x"], "box_y": d["box_y"],
+                "box_w": d["box_w"], "box_h": d["box_h"],
+                "confidence": d["detector_confidence"],
+                "category": d["category"],
+            } for d in db_.get_detections(p["id"])
+                if d["detector_model"] != "full-image"]
+        return det_map, len(batch), {p["id"] for p in batch}
+
+    monkeypatch.setattr(classify_job, "_detect_batch", fake_detect_batch)
+
+    # Every photo lives in a folder that doesn't exist at classify time.
+    fake_missing_folder = str(tmp_path / "vanished_folder")
+
+    def folder_missing_prepare_image(photo, folders, detection, vireo_dir=None):
+        return None, fake_missing_folder, os.path.join(
+            fake_missing_folder, photo["filename"],
+        )
+
+    monkeypatch.setattr(
+        classify_job, "_prepare_image", folder_missing_prepare_image,
+    )
+
+    class FakeClassifier:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def encode_image(self, *args, **kwargs):
+            import numpy as np
+            return np.zeros(512, dtype=np.float32)
+
+    monkeypatch.setattr(classifier_mod, "Classifier", FakeClassifier)
+
+    params = PipelineParams(
+        collection_id=col_id,
+        skip_extract_masks=True,
+        skip_regroup=True,
+    )
+
+    runner = FakeRunner()
+    job = _make_job()
+
+    with pytest.raises(RuntimeError):
+        run_pipeline_job(job, runner, db_path, ws_id, params)
+
+    # Every update_step for the classify:<model> row, in order. The final
+    # terminal one carries the outage status the Jobs page renders.
+    classify_step_updates = [
+        (sid, kwargs) for (_jid, sid, kwargs) in runner.step_updates
+        if sid.startswith("classify:") and "status" in kwargs
+    ]
+    assert classify_step_updates, (
+        "Setup sanity: no classify:<model> step updates fired at all."
+    )
+    terminal = classify_step_updates[-1]
+    sid, kwargs = terminal
+    assert kwargs.get("status") == "failed", (
+        f"On a folder-scoped outage the classify:<model> step must land "
+        f"as 'failed' — leaving it 'completed' shows a green, collapsed "
+        f"row on the Jobs page for a run that never opened the missing "
+        f"folder (Codex #1388 P2 r3664058179). Got status="
+        f"{kwargs.get('status')!r} on step {sid!r} with summary="
+        f"{kwargs.get('summary')!r}."
+    )
+    # The row must also carry a human-readable error so the collapsed row
+    # explains itself.
+    assert kwargs.get("error"), (
+        f"A failed classify:<model> row must carry a non-empty error "
+        f"field naming the outage — that's what the Jobs page shows next "
+        f"to the collapsed row. Got kwargs={kwargs!r}"
+    )
+    assert "unreachable" in kwargs["error"].lower() or (
+        "source" in kwargs["error"].lower()
+    ), (
+        f"The error must name the outage as source-related, not a generic "
+        f"failure; got {kwargs['error']!r}"
+    )
+
+
+def test_pipeline_classify_source_offline_give_up_marks_per_model_step_failed(
+    tmp_path, monkeypatch,
+):
+    """A mount give-up must land the responsible classify:<model> step as failed.
+
+    Codex #1388 P2 (r3664058179), mount-outage variant: the model that
+    was actively reading when the mount died reaches finalization with
+    ``source_offline["reason"]`` latched. Pre-fix, that spec still called
+    ``runner.update_step(..., status="completed", ...)``. The Jobs page
+    would then show a green, collapsed classifier row for the run that
+    gave up — the exact "your photos are fine!" misread this PR fixes.
+    """
+    import classifier as classifier_mod
+    import classify_job
+    import config as cfg
+    from db import Database
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cfg.CONFIG_PATH = str(tmp_path / "config.json")
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws_id = db._active_workspace_id
+
+    folder_path = str(tmp_path / "photos")
+    os.makedirs(folder_path, exist_ok=True)
+    folder_id = db.add_folder(folder_path)
+    photo_ids = []
+    for i in range(3):
+        name = f"photo{i}.jpg"
+        pid = db.add_photo(folder_id, name, ".jpg", 4000 + i, 4_000_000.0 + i)
+        _drop_jpeg(folder_path, name)
+        db.save_detections(
+            pid,
+            [{"box": {"x": 0.1, "y": 0.1, "w": 0.5, "h": 0.5},
+              "confidence": 0.9, "category": "animal"}],
+            detector_model="MegaDetector",
+        )
+        photo_ids.append(pid)
+
+    col_id = db.add_collection(
+        "Test",
+        json.dumps([{"field": "photo_ids", "value": photo_ids}]),
+    )
+
+    _setup_fake_downloaded_model(tmp_path, monkeypatch)
+
+    import labels_fingerprint as lfp
+    monkeypatch.setattr(lfp, "compute_fingerprint", lambda *a, **k: "fp")
+
+    def fake_detect_batch(batch, folders, runner, job, reclassify, db_,
+                          det_conf_threshold=None, already_detected_ids=None,
+                          cached_detections=None):
+        det_map = {}
+        for p in batch:
+            det_map[p["id"]] = [{
+                "id": d["id"],
+                "box_x": d["box_x"], "box_y": d["box_y"],
+                "box_w": d["box_w"], "box_h": d["box_h"],
+                "confidence": d["detector_confidence"],
+                "category": d["category"],
+            } for d in db_.get_detections(p["id"])
+                if d["detector_model"] != "full-image"]
+        return det_map, len(batch), {p["id"] for p in batch}
+
+    monkeypatch.setattr(classify_job, "_detect_batch", fake_detect_batch)
+
+    # Mount-shaped fake path so the outage escalates to mount-scope
+    # (folder scope wouldn't latch source_offline["reason"]).
+    gone_mount = "/Volumes/DefinitelyNotMounted12345/Raw Files"
+
+    def offline_prepare_image(photo, folders, detection, vireo_dir=None):
+        return None, gone_mount, os.path.join(gone_mount, photo["filename"])
+
+    monkeypatch.setattr(classify_job, "_prepare_image", offline_prepare_image)
+
+    class FakeClassifier:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def encode_image(self, *args, **kwargs):
+            import numpy as np
+            return np.zeros(512, dtype=np.float32)
+
+    monkeypatch.setattr(classifier_mod, "Classifier", FakeClassifier)
+
+    # Plain FakeRunner has no pause support, so classify hits the
+    # "can't park → latch source_offline['reason'] and stop" branch.
+    params = PipelineParams(
+        collection_id=col_id,
+        skip_extract_masks=True,
+        skip_regroup=True,
+    )
+
+    runner = FakeRunner()
+    job = _make_job()
+
+    with pytest.raises(RuntimeError):
+        run_pipeline_job(job, runner, db_path, ws_id, params)
+
+    # The classify:<model> step for the spec that actually gave up must
+    # terminate as ``failed`` — the Jobs page renders status directly and
+    # a ``completed`` row would collapse silent-green.
+    classify_step_updates = [
+        (sid, kwargs) for (_jid, sid, kwargs) in runner.step_updates
+        if sid.startswith("classify:") and "status" in kwargs
+    ]
+    assert classify_step_updates, (
+        "Setup sanity: no classify:<model> step updates fired at all."
+    )
+    terminal = classify_step_updates[-1]
+    sid, kwargs = terminal
+    assert kwargs.get("status") == "failed", (
+        f"On a mount give-up the classify:<model> step must land as "
+        f"'failed' — 'completed' would leave a green, collapsed row on "
+        f"a job that never classified the collection (Codex #1388 P2 "
+        f"r3664058179). Got status={kwargs.get('status')!r} with "
+        f"summary={kwargs.get('summary')!r}."
+    )
+    assert kwargs.get("error"), (
+        f"The failed row must carry an error field naming the mount "
+        f"outage; got kwargs={kwargs!r}"
+    )
+    assert "source" in kwargs["error"].lower(), (
+        f"The error message must name the outage as source-related; "
+        f"got {kwargs['error']!r}"
+    )

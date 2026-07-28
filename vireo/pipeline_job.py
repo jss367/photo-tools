@@ -1153,6 +1153,18 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
             "archive": {"status": "pending", "count": 0, "label": "Archiving photos"},
         }
 
+        # Photos classify skipped because their folder went offline mid-run
+        # (folder-scoped outage; abort stays clear so healthy folders keep
+        # processing). Downstream source-reading stages (extract_masks,
+        # eye_keypoints) filter these out so they don't walk back into the
+        # missing folder and re-record the same photos as mask/keypoint
+        # failures, obscuring the intended source-offline diagnosis
+        # (Codex #1388 P2 r3664058173). Held on a dict rather than
+        # ``stages["classify"]`` because ``_update_stages`` pushes stage
+        # dicts as JSON to SSE consumers, and a raw ``set`` isn't
+        # JSON-serialisable.
+        source_offline_state: dict = {"skipped_photo_ids": set()}
+
         # Normalize model_ids: prefer the explicit list, fall back to the legacy
         # single `model_id`, and finally to `[]` which means "use the active model
         # from config." This is the knob the multi-model fix hangs off of.
@@ -4991,7 +5003,29 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                     total_failed += failed
                     total_skipped_existing += skipped_existing
                     models_succeeded += 1
-                    completed_step_ids.add(step_id)
+                    # A per-model row is "completed" only when it actually
+                    # finished classifying every photo it was asked to. If
+                    # the mount died (source_offline["reason"] latched) or
+                    # a folder outage left photos unread
+                    # (spec_source_skipped_photo_ids), the row should be
+                    # ``failed`` — the Jobs page reads ``step.status``
+                    # directly and auto-collapses ``completed`` rows without
+                    # warnings, so leaving this ``completed`` would show a
+                    # failed job with a green, collapsed classifier row
+                    # (Codex #1388 P2 r3664058179). The later stage-status
+                    # rollup at the end of the function isn't mapped back
+                    # to the ``classify:<model>`` step, so the fix has to
+                    # land here.
+                    spec_gave_up = bool(source_offline["reason"])
+                    spec_had_skips = bool(spec_source_skipped_photo_ids)
+                    spec_step_status = (
+                        "failed" if (spec_gave_up or spec_had_skips)
+                        else "completed"
+                    )
+                    if spec_step_status == "failed":
+                        failed_step_ids.add(step_id)
+                    else:
+                        completed_step_ids.add(step_id)
 
                     # Reclassify stale-row purge: only fires after the FIRST
                     # successful model has written fresh predictions, so a run
@@ -5100,9 +5134,27 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                             f"stopped after {processed_in_spec} of {total} — "
                             f"source {source_offline['reason']}"
                         )
+                    # Attach the outage as ``error=`` on the failed row so the
+                    # Jobs page shows a human-readable reason next to the
+                    # collapsed step, matching the shape of the
+                    # model-load-failure branch above (line 4271).
+                    step_error = None
+                    if spec_step_status == "failed":
+                        if spec_gave_up:
+                            step_error = (
+                                f"Stopped after {processed_in_spec} of "
+                                f"{total} — source {source_offline['reason']}"
+                            )
+                        else:
+                            step_error = (
+                                f"{len(spec_source_skipped_photo_ids)} of "
+                                f"{total} photos unreachable "
+                                "(source offline)"
+                            )
                     runner.update_step(
-                        job["id"], step_id, status="completed",
+                        job["id"], step_id, status=spec_step_status,
                         summary=", ".join(parts),
+                        error=step_error,
                     )
 
                 # Cancellation takes precedence over the all-models-failed-to-load
@@ -5129,6 +5181,16 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                 # exceed total photos.
                 n_failed_photos = len(failed_photo_ids)
                 n_source_skipped_photos = len(source_skipped_photo_ids)
+                # Publish the source-skipped set to downstream stages BEFORE
+                # deciding to set ``abort``. extract_masks and eye_keypoints
+                # need this even on the folder-scoped path (abort deliberately
+                # stays clear so healthy folders keep processing) — otherwise
+                # they still walk every detected photo in the missing folder
+                # and re-issue reads against the offline share (Codex #1388
+                # P2 r3664058173).
+                source_offline_state["skipped_photo_ids"] = (
+                    set(source_skipped_photo_ids)
+                )
                 if source_offline["reason"]:
                     # Must carry the "[classify] Fatal:" prefix: the end-of-run
                     # rollup picks the job's headline error by that marker and
@@ -5261,6 +5323,24 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                 os.makedirs(masks_dir, exist_ok=True)
 
                 photos = _filter_excluded(thread_db.get_collection_photos(collection_id, per_page=999999))
+
+                # Drop photos classify couldn't reach because their folder
+                # was offline. Without this we'd render_proxy every one of
+                # them, they'd all skip with proxy=None, and the stage
+                # summary would land as "N skipped" — obscuring the real
+                # cause (missing folder) with a mask-extraction failure
+                # count (Codex #1388 P2 r3664058173). The folder-scoped
+                # branch in classify deliberately leaves ``abort`` clear
+                # so healthy folders keep processing here; this filter is
+                # how "healthy folders keep processing" stays true without
+                # dragging the missing folder's photos along.
+                source_skipped_photo_ids = source_offline_state.get(
+                    "skipped_photo_ids") or set()
+                if source_skipped_photo_ids:
+                    photos = [
+                        p for p in photos
+                        if p["id"] not in source_skipped_photo_ids
+                    ]
 
                 # Build a map of photo_id -> primary detection (highest confidence)
                 # from the detections table. Only photos with detections and without
@@ -5934,6 +6014,21 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                     photos_for_stage = [
                         p for p in photos_for_stage
                         if p["id"] not in params.exclude_photo_ids
+                    ]
+
+                # Drop photos classify couldn't reach because their folder
+                # was offline. eye_keypoints also opens the source image
+                # (via the pipeline detect_eye_keypoints_stage → keypoint
+                # runners), so without this it would walk every unreachable
+                # photo and record them as eye-detection failures — the
+                # same downstream-hammering pattern the classify pause is
+                # meant to prevent (Codex #1388 P2 r3664058173).
+                source_skipped_photo_ids = source_offline_state.get(
+                    "skipped_photo_ids") or set()
+                if source_skipped_photo_ids:
+                    photos_for_stage = [
+                        p for p in photos_for_stage
+                        if p["id"] not in source_skipped_photo_ids
                     ]
                 total = len(photos_for_stage)
                 start_time = time.time()

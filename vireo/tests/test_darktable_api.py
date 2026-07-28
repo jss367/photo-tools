@@ -3,6 +3,8 @@ import os
 import sys
 import time
 
+import pytest
+
 
 def test_api_darktable_status(app_and_db):
     """GET /api/darktable/status returns availability info."""
@@ -262,3 +264,147 @@ def test_api_darktable_status_checked_paths_omits_linux_tools_dir_on_macos(app_a
     tools_dir = os.path.expanduser("~/.vireo/tools/darktable")
     assert tools_dir not in data['checked_paths']
     assert data['checked_paths'], "checked_paths must never be empty"
+
+
+@pytest.fixture(autouse=True)
+def _clear_release_cache():
+    """The release cache is module-level state that would leak between tests.
+
+    Without this, a test that stubs a failure would see the previous test's
+    cached success and pass for the wrong reason.
+    """
+    import darktable_install
+    darktable_install._release_cache.update(at=0.0, value=None)
+    yield
+    darktable_install._release_cache.update(at=0.0, value=None)
+
+
+def _fake_release(version="5.6.0"):
+    return {
+        "version": version,
+        "name": f"darktable-{version}-arm64.dmg",
+        "size": 87094261,
+        "url": "https://github.com/darktable-org/darktable/releases/download/x/d.dmg",
+        "digest": "sha256:" + "a" * 64,
+    }
+
+
+def test_api_darktable_install_available_shape(app_and_db, monkeypatch):
+    """The confirmation needs version, name, size, url and digest."""
+    import darktable_install
+    app, _ = app_and_db
+    monkeypatch.setattr(darktable_install, "resolve_release", lambda: (_fake_release(), None))
+
+    data = app.test_client().get('/api/darktable/install/available').get_json()
+    assert data['available'] is True
+    assert data['version'] == "5.6.0"
+    assert data['name'] == "darktable-5.6.0-arm64.dmg"
+    assert data['size'] == 87094261
+    assert data['url'].startswith("https://github.com/darktable-org/darktable/releases/download/")
+    assert data['digest'].startswith("sha256:")
+
+
+def test_api_darktable_install_available_reports_network_failure_honestly(app_and_db, monkeypatch):
+    """A user behind a proxy must not be told their platform is unsupported."""
+    import darktable_install
+    app, _ = app_and_db
+    monkeypatch.setattr(darktable_install, "resolve_release",
+                        lambda: (None, darktable_install.REASON_UNREACHABLE))
+
+    resp = app.test_client().get('/api/darktable/install/available')
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert data['available'] is False
+    assert data['reason'] == darktable_install.REASON_UNREACHABLE
+    assert 'platform' not in data['reason'].lower()
+
+
+def test_api_darktable_install_available_handles_unsupported_platform(app_and_db, monkeypatch):
+    import darktable_install
+    app, _ = app_and_db
+    monkeypatch.setattr(darktable_install, "resolve_release",
+                        lambda: (None, darktable_install.REASON_NO_PLATFORM_BUILD))
+
+    data = app.test_client().get('/api/darktable/install/available').get_json()
+    assert data['available'] is False
+    assert data['reason'] == darktable_install.REASON_NO_PLATFORM_BUILD
+
+
+def test_api_darktable_install_available_distinguishes_no_usable_asset(app_and_db, monkeypatch):
+    """"Release had no build we could use" is a third, distinct fact.
+
+    Together with the two tests above this pins that the route relays whatever
+    resolve_release said rather than collapsing every miss to one sentence.
+    """
+    import darktable_install
+    app, _ = app_and_db
+    monkeypatch.setattr(darktable_install, "resolve_release",
+                        lambda: (None, darktable_install.REASON_NO_USABLE_ASSET))
+
+    data = app.test_client().get('/api/darktable/install/available').get_json()
+    assert data['available'] is False
+    assert data['reason'] == darktable_install.REASON_NO_USABLE_ASSET
+
+
+def test_api_darktable_install_available_survives_an_unexpected_raise(app_and_db, monkeypatch):
+    """Belt and braces: resolve_release should never raise, but if it does the
+    route must still 200 with a reason rather than 500 into a dead button."""
+    import darktable_install
+    app, _ = app_and_db
+
+    def boom():
+        raise OSError("network unreachable")
+    monkeypatch.setattr(darktable_install, "resolve_release", boom)
+
+    resp = app.test_client().get('/api/darktable/install/available')
+    assert resp.status_code == 200
+    assert resp.get_json()['available'] is False
+    assert resp.get_json()['reason']
+
+
+def test_api_darktable_install_available_caches_a_successful_lookup(app_and_db, monkeypatch):
+    """Repeated Settings loads must not burn GitHub's 60 unauthenticated req/hr.
+
+    Once that budget is gone every user on the IP gets the fallback link, so a
+    second call within the TTL must not reach the API at all.
+    """
+    import darktable_install
+    app, _ = app_and_db
+    calls = []
+
+    def counting():
+        calls.append(1)
+        return _fake_release(), None
+    monkeypatch.setattr(darktable_install, "resolve_release", counting)
+
+    client = app.test_client()
+    first = client.get('/api/darktable/install/available').get_json()
+    second = client.get('/api/darktable/install/available').get_json()
+
+    assert first['available'] is True
+    assert second == first
+    assert len(calls) == 1, f"expected one API lookup, got {len(calls)}"
+
+
+def test_api_darktable_install_available_does_not_cache_failures(app_and_db, monkeypatch):
+    """A transient outage must not pin the fallback link for the whole TTL.
+
+    Caching a failure would also freeze its reason string, so a user who fixed
+    their network would keep being told GitHub is unreachable.
+    """
+    import darktable_install
+    app, _ = app_and_db
+    outcomes = [
+        (None, darktable_install.REASON_UNREACHABLE),
+        (_fake_release(), None),
+    ]
+    monkeypatch.setattr(darktable_install, "resolve_release", lambda: outcomes.pop(0))
+
+    client = app.test_client()
+    first = client.get('/api/darktable/install/available').get_json()
+    second = client.get('/api/darktable/install/available').get_json()
+
+    assert first['available'] is False
+    assert first['reason'] == darktable_install.REASON_UNREACHABLE
+    assert second['available'] is True, "a failure must not be cached over a later success"
+    assert second['version'] == "5.6.0"

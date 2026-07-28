@@ -15953,6 +15953,35 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             "checked_paths": checked_paths,
         })
 
+    @app.route("/api/darktable/install/available")
+    def api_darktable_install_available():
+        """What a download would fetch, for the confirmation dialog.
+
+        Always 200: when this cannot answer, the panel shows a plain
+        "Get darktable" link and the reason, rather than a dead button.
+        """
+        import darktable_install
+
+        try:
+            release, reason = darktable_install.resolve_release_cached()
+        except Exception as e:
+            # resolve_release is documented never to raise; this is belt and
+            # braces so an unexpected bug still degrades to a link, not a 500.
+            log.warning("darktable release lookup failed: %s", e)
+            return jsonify({
+                "available": False,
+                "reason": darktable_install.REASON_UNREACHABLE,
+            })
+
+        if not release:
+            # Pass the reason through verbatim. Do NOT substitute a generic
+            # message: "we could not reach GitHub" and "no build exists for
+            # your platform" are different facts and users act on them
+            # differently.
+            return jsonify({"available": False, "reason": reason})
+
+        return jsonify({"available": True, **release})
+
     @app.route("/api/exiftool/status")
     def api_exiftool_status():
         """Report whether the exiftool binary is installed.

@@ -23,6 +23,7 @@ import ssl
 import stat
 import subprocess
 import sys
+import time
 import urllib.parse
 import urllib.request
 
@@ -194,6 +195,33 @@ def resolve_release(timeout=15):
     tag = release.get("tag_name")
     version = tag.removeprefix("release-") if isinstance(tag, str) else ""
     return {"version": version, **asset}, None
+
+
+# Unauthenticated GitHub API calls are limited to 60/hour per IP.  Settings can
+# be opened repeatedly in a session, so cache the answer briefly rather than
+# spending that budget and degrading everyone on the IP to the fallback link.
+_release_cache = {"at": 0.0, "value": None}
+_RELEASE_CACHE_SECS = 600
+
+
+def resolve_release_cached():
+    """resolve_release() with a short TTL, returning the same 2-tuple.
+
+    Only successes are cached.  A transient outage or a rate-limit reply must
+    not pin the fallback link for ten minutes — and caching a failure would
+    also freeze its reason string, so a user who fixed their network would keep
+    being told GitHub is unreachable.
+
+    Never raises, for the same reason resolve_release does not.
+    """
+    now = time.monotonic()
+    cached = _release_cache["value"]
+    if cached is not None and now - _release_cache["at"] < _RELEASE_CACHE_SECS:
+        return cached, None
+    release, reason = resolve_release()
+    if release is not None:
+        _release_cache.update(at=now, value=release)
+    return release, reason
 
 
 # Read the asset a megabyte at a time: these builds are 87-178MB and hashing

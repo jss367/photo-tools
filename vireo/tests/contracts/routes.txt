@@ -35,6 +35,7 @@ GET          /api/collections/<int:collection_id>/photos
 GET          /api/config
 GET          /api/coverage
 GET          /api/culling/results
+GET          /api/darktable/install/available
 GET          /api/darktable/status
 GET          /api/dashboard/options
 GET          /api/detection-cache/stats

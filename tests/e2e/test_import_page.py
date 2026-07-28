@@ -99,13 +99,18 @@ TWO_FILE_PREVIEW_STUB = """
             }
             if (target && target.indexOf('/api/import/check-duplicates') === 0) {
               window.__dupCalls += 1;
+              // Tests flip __noDupes to simulate the next card coming back
+              // clean, which is how the preview reaches a completed check
+              // with zero duplicates.
+              const dupes = window.__noDupes
+                ? [] : ['/tmp/card-a/IMG_0002.jpg'];
               const frame = 'data: ' + JSON.stringify({
-                duplicates: ['/tmp/card-a/IMG_0002.jpg'],
+                duplicates: dupes,
                 checked: 2,
                 total: 2,
               }) + '\\n\\n' + 'data: ' + JSON.stringify({
                 done: true,
-                duplicate_count: 1,
+                duplicate_count: dupes.length,
                 checked: 2,
                 total: 2,
               }) + '\\n\\n';
@@ -191,6 +196,79 @@ def test_import_preview_hide_duplicates_checkbox_filters_grid(live_server, page)
     checkbox.uncheck()
     expect(grid).to_contain_text("IMG_0002.jpg")
     expect(grid).to_contain_text("Duplicate")
+
+
+def test_hide_duplicates_resets_once_a_check_finds_no_duplicates(
+    live_server, page,
+):
+    """A completed check that finds nothing to hide retires the opt-in.
+
+    Otherwise the checkbox stays silently checked while its row is hidden,
+    and the next card that does have duplicates gets filtered without the
+    user asking for it this time.
+    """
+    run_two_file_preview(live_server, page)
+    page.locator("#chkHideDuplicates").check()
+    expect(page.locator("#importPreviewGrid")).not_to_contain_text(
+        "IMG_0002.jpg",
+    )
+
+    # Next preview comes back clean, so the control has nothing to offer.
+    page.evaluate("window.__noDupes = true")
+    page.locator("#btnPreview").click()
+    expect(page.locator("#hideDuplicatesRow")).to_be_hidden()
+    expect(page.locator("#chkHideDuplicates")).not_to_be_checked()
+
+    # ...so a later duplicate-bearing card starts unfiltered again.
+    page.evaluate("window.__noDupes = false")
+    page.locator("#btnPreview").click()
+    expect(page.locator("#hideDuplicatesRow")).to_be_visible()
+    expect(page.locator("#chkHideDuplicates")).not_to_be_checked()
+    expect(page.locator("#importPreviewGrid")).to_contain_text("IMG_0002.jpg")
+
+
+def test_hide_duplicates_resets_when_dedup_is_turned_off(live_server, page):
+    """Turning off "Skip duplicates" settles the picture too: nothing will
+    be skipped, so the filter has nothing to hide and the opt-in retires
+    rather than lying in wait for the next dedup-enabled preview."""
+    run_two_file_preview(live_server, page)
+    page.locator("#chkHideDuplicates").check()
+
+    page.locator("#chkSkipDuplicates").uncheck()
+    expect(page.locator("#previewSummary")).to_contain_text(
+        "duplicates will be copied",
+    )
+    expect(page.locator("#hideDuplicatesRow")).to_be_hidden()
+    expect(page.locator("#chkHideDuplicates")).not_to_be_checked()
+
+    dup_calls = page.evaluate("window.__dupCalls")
+    page.locator("#chkSkipDuplicates").check()
+    page.wait_for_function(f"window.__dupCalls > {dup_calls}")
+    expect(page.locator("#chkHideDuplicates")).not_to_be_checked()
+    expect(page.locator("#importPreviewGrid")).to_contain_text("IMG_0002.jpg")
+
+
+def test_hide_duplicates_survives_a_repreview_that_still_has_duplicates(
+    live_server, page,
+):
+    """Re-previewing must not silently drop the filter.
+
+    Any import-option change schedules a fresh preview, and each preview
+    renders the grid with an empty duplicate list before its check
+    finishes. Clearing the opt-in on every zero-count render would flip
+    the filter off mid-session and flood the grid back.
+    """
+    run_two_file_preview(live_server, page)
+    page.locator("#chkHideDuplicates").check()
+
+    dup_calls = page.evaluate("window.__dupCalls")
+    page.locator("#btnPreview").click()
+    page.wait_for_function(f"window.__dupCalls > {dup_calls}")
+
+    expect(page.locator("#chkHideDuplicates")).to_be_checked()
+    expect(page.locator("#importPreviewGrid")).not_to_contain_text(
+        "IMG_0002.jpg",
+    )
 
 
 def test_import_auto_preview_clears_grid_when_selection_becomes_invalid(

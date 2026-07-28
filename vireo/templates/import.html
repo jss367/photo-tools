@@ -1944,6 +1944,20 @@ function hideDuplicatesEnabled() {
   return !!(el && el.checked);
 }
 
+// Drop the opt-in once a settled preview has nothing to hide, so the next
+// card that does carry duplicates starts unfiltered instead of inheriting
+// a choice made for a different card while the row was hidden.
+//
+// Only call this where the duplicate picture is FINAL. Every preview
+// renders the grid with an empty duplicate list before its check
+// finishes, so clearing on any zero count (including inside
+// updateHideDuplicatesControl) would silently flip the filter off every
+// time an import option change schedules a fresh preview.
+function retireHideDuplicatesOptIn() {
+  const el = document.getElementById('chkHideDuplicates');
+  if (el) el.checked = false;
+}
+
 // Re-run the last grid render with the current filter state. Purely a view
 // toggle — it never re-requests the preview or the duplicate check.
 function rerenderImportPreviewGrid() {
@@ -2352,7 +2366,13 @@ async function previewImport(opts) {
       return;
     }
     renderImportPreviewGrid(files, [], null);
+    // The three branches below all settle without a duplicate check —
+    // in-place/snapshot imports have no duplicate concept and a dedup-off
+    // copy skips nothing — so each is a final "nothing to hide" state and
+    // retires the opt-in. The fall-through path does NOT: its duplicate
+    // count is still unknown until the check below completes.
     if (snapshotMode) {
+      retireHideDuplicatesOptIn();
       const unavailable = Number(data.unavailable_count || 0);
       summary.textContent = Number(data.total_count || files.length).toLocaleString() +
         ' captured file' + (Number(data.total_count || files.length) === 1 ? '' : 's') +
@@ -2361,10 +2381,12 @@ async function previewImport(opts) {
       return;
     }
     if (!copyMode) {
+      retireHideDuplicatesOptIn();
       summary.textContent = files.length + ' files found · originals will stay in place';
       return;
     }
     if (!document.getElementById('chkSkipDuplicates').checked) {
+      retireHideDuplicatesOptIn();
       summary.textContent = files.length + ' files found · duplicates will be copied';
       // No dedup gate, so every discovered file lands — pass no exclusions
       // so the folder-structure counts match the full copy set.
@@ -2415,6 +2437,8 @@ async function previewImport(opts) {
       return;
     }
     const dupCount = duplicatePaths.length;
+    // The check ran to completion, so this count is final.
+    if (dupCount === 0) retireHideDuplicatesOptIn();
     summary.textContent = files.length + ' files found · ' + dupCount +
       ' already in your library (will be skipped) · ' +
       (files.length - dupCount) + ' to copy';

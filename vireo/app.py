@@ -24754,6 +24754,16 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 if parent_allowed_fingerprints
                 else {}
             ),
+            # Persist the parent's id so the Jobs page's parallel-retry
+            # gate (``hasActiveRetryFor``) can recognize this retry as
+            # belonging to that parent and suppress a second Retry button
+            # click while this run is still in flight. Without the field
+            # on ``job_config`` the gate reads ``undefined`` on every
+            # active job, so reselecting the failed parent renders a
+            # live Retry button that would race the in-flight retry.
+            "parent_import_job_id": (
+                parent_id_raw.strip() if parent_id_raw else None
+            ),
         }
         if move_target_snapshot is not None:
             job_config["after_process_move"] = {

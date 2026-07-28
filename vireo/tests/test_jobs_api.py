@@ -6455,6 +6455,37 @@ def test_import_photos_carry_photo_ids_defaults_to_none(app_and_db, tmp_path):
     assert resp.status_code == 200, resp.get_json()
     config = _job_config(client, resp.get_json()["job_id"])
     assert config["carry_photo_ids"] is None
+    # First-attempt imports have no parent, so the persisted config
+    # advertises that to the Jobs page's parallel-retry gate.
+    assert config["parent_import_job_id"] is None
+
+
+def test_import_photos_retry_persists_parent_import_job_id(
+        app_and_db, tmp_path):
+    """A recovery retry stores its parent's id on ``job_config`` so the
+    Jobs page's ``hasActiveRetryFor`` gate can suppress a second Retry
+    button click on the same failed parent while this retry is running.
+    Without persistence the client-side check reads ``undefined`` on
+    every active job and the gate never fires."""
+    from wait import wait_for_job_via_client
+
+    app, _ = app_and_db
+    with app.test_client() as client:
+        parent_id = _post_import(client, _import_card(tmp_path),
+                                 tmp_path / "archive", None)
+        wait_for_job_via_client(client, parent_id)
+
+        resp = client.post("/api/jobs/import-photos", json={
+            "sources": [_import_card(tmp_path)],
+            "destination": str(tmp_path / "archive"),
+            "after_import": None,
+            "parent_import_job_id": parent_id,
+        })
+        assert resp.status_code == 200, resp.get_json()
+        retry_id = resp.get_json()["job_id"]
+        wait_for_job_via_client(client, retry_id)
+        retry_config = _job_config(client, retry_id)
+        assert retry_config["parent_import_job_id"] == parent_id
 
 
 def test_import_photos_carry_photo_ids_validation_400s(app_and_db, tmp_path):

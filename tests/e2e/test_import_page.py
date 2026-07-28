@@ -1354,7 +1354,10 @@ def test_import_remote_destination_requires_visible_folder_inside_nas(
 
 def test_failed_import_result_offers_preconfigured_retry(live_server, page):
     """A mixed import can retry from its result without rebuilding the form;
-    duplicate protection is forced so successful files remain untouched."""
+    the parent's duplicate-skip setting is preserved, and the parent's
+    already-imported photo IDs plus its own job ID are carried on the
+    retry request so the after-import chain covers the complete original
+    scope."""
     url = live_server["url"]
     captured = {}
 
@@ -1424,7 +1427,13 @@ def test_failed_import_result_offers_preconfigured_retry(live_server, page):
     assert body["sources"] == ["/Volumes/CARD/DCIM"]
     assert body["destination"] == "/Volumes/Photography/Raw Files/USA"
     assert body["folder_template"] == "%Y/%Y-%m-%d"
-    assert body["skip_duplicates"] is True
+    # retryBodyFromFinishedJob() preserves the parent's skip_duplicates
+    # setting rather than forcing it on, so a parent configured with
+    # dedup OFF retries with dedup OFF — otherwise the very file that
+    # failed could be silently skipped if it happens to match some
+    # unrelated catalog entry. The parent above seeds `false`, so the
+    # retry must send `false`.
+    assert body["skip_duplicates"] is False
     assert body["after_import"] == 1
     assert body["tags"] == ["trip"]
     # The original run's successful photos must be carried into the retry

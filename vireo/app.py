@@ -23039,16 +23039,58 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             "local_archive_root": target.get("local_archive_root", ""),
         }
 
+    def _capture_photo_fingerprints_for_ids(db, ids):
+        """Return the current ``{id: "folder_path/filename"}`` for each ID.
+
+        Same shape as ``import_job._capture_photo_fingerprints`` but at
+        request time on caller-supplied IDs, so a recovery retry can
+        detect when SQLite has reused an ID for an unrelated photo since
+        the parent import ran. Missing IDs are simply absent from the
+        result — the caller decides how to treat that.
+        """
+        cleaned = []
+        for pid in ids or []:
+            if isinstance(pid, int) and not isinstance(pid, bool) and pid > 0:
+                cleaned.append(pid)
+        if not cleaned:
+            return {}
+        fingerprints = {}
+        # SQLite default bound-param cap is 999; 500 stays well under
+        # that and mirrors the sibling helper in import_job.
+        for start in range(0, len(cleaned), 500):
+            chunk = cleaned[start:start + 500]
+            placeholders = ",".join("?" for _ in chunk)
+            rows = db.conn.execute(
+                f"""SELECT p.id AS id,
+                           f.path AS folder_path,
+                           p.filename AS filename
+                    FROM photos p
+                    JOIN folders f ON f.id = p.folder_id
+                    WHERE p.id IN ({placeholders})""",
+                list(chunk),
+            ).fetchall()
+            for row in rows:
+                folder_path = row["folder_path"] or ""
+                filename = row["filename"] or ""
+                if not folder_path or not filename:
+                    continue
+                fingerprints[row["id"]] = f"{folder_path}/{filename}"
+        return fingerprints
+
     def _validate_parent_import_job(parent_id, active_ws, db):
         """Resolve a retry's parent_import_job_id into the scope this
         retry is allowed to inherit.
 
-        Returns ``(parent_config, allowed_ids, None)`` on success or
-        ``(None, None, error_response)`` when the parent can't be used.
-        ``parent_config`` is the parent job's persisted config dict;
-        ``allowed_ids`` is the set of photo IDs a retry may include in
-        ``carry_photo_ids`` — the parent's own imported IDs plus any
-        the parent itself inherited from an earlier retry.
+        Returns ``(parent_config, allowed_ids, allowed_fingerprints,
+        None)`` on success or ``(None, None, None, error_response)`` when
+        the parent can't be used. ``parent_config`` is the parent job's
+        persisted config dict; ``allowed_ids`` is the set of photo IDs a
+        retry may include in ``carry_photo_ids`` — the parent's own
+        imported IDs plus any the parent itself inherited from an earlier
+        retry. ``allowed_fingerprints`` maps those IDs to the stable
+        ``folder_path/filename`` recorded at parent-run time, so the
+        retry can refuse a carry ID whose current row belongs to an
+        unrelated photo that happened to reuse the numeric ID.
 
         Cross-workspace parents are refused: photos and folders live
         globally, so a caller who names a parent from another workspace
@@ -23075,7 +23117,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 (parent_id,),
             ).fetchone()
             if row is None:
-                return None, None, json_error(
+                return None, None, None, json_error(
                     "parent_import_job_id not found — the original import "
                     "may have aged out of history; start a new import",
                     404,
@@ -23091,12 +23133,12 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             except (json.JSONDecodeError, TypeError):
                 parent_result = {}
         if parent_type != "import":
-            return None, None, json_error(
+            return None, None, None, json_error(
                 "parent_import_job_id must reference an import job "
                 f"(got type {parent_type!r})"
             )
         if parent_workspace != active_ws:
-            return None, None, json_error(
+            return None, None, None, json_error(
                 "parent_import_job_id belongs to a different workspace "
                 "than the active one; switch workspaces or start a new "
                 "import instead of retrying"
@@ -23114,7 +23156,32 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     and pid > 0
                 ):
                     allowed_ids.add(pid)
-        return parent_config, allowed_ids, None
+        # Stable-identity map so the retry can verify each carried ID
+        # still points at the same file. ``photos.id`` is a bare
+        # ``INTEGER PRIMARY KEY`` — SQLite is free to reuse the numeric
+        # ID after a delete, so an ID that legitimately named one of the
+        # parent's imports can later name an unrelated photo. Merges
+        # every fingerprint hop persisted alongside the ID sources
+        # above; missing keys just fall through the verify step below
+        # (legacy parents from before this fix keep working with the
+        # same integer-ID trust).
+        allowed_fingerprints = {}
+        for source in (
+            parent_result.get("photo_fingerprints") or {},
+            parent_result.get("carried_photo_fingerprints") or {},
+            parent_config.get("carry_photo_fingerprints") or {},
+        ):
+            if not isinstance(source, dict):
+                continue
+            for key, value in source.items():
+                try:
+                    pid = int(key)
+                except (TypeError, ValueError):
+                    continue
+                if pid <= 0 or not isinstance(value, str) or not value:
+                    continue
+                allowed_fingerprints.setdefault(pid, value)
+        return parent_config, allowed_ids, allowed_fingerprints, None
 
     def _validate_after_import(value, db, *, allow_missing=False):
         """Return a JSON error response for a bad after_import spec, else None.
@@ -24369,15 +24436,19 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         parent_id_raw = body.get("parent_import_job_id")
         parent_config = None
         parent_allowed_ids = None
+        parent_allowed_fingerprints = None
         if parent_id_raw is not None:
             if not isinstance(parent_id_raw, str) or not parent_id_raw.strip():
                 return json_error(
                     "parent_import_job_id must be a non-empty string"
                 )
-            parent_config, parent_allowed_ids, parent_err = (
-                _validate_parent_import_job(
-                    parent_id_raw.strip(), db._active_workspace_id, db,
-                )
+            (
+                parent_config,
+                parent_allowed_ids,
+                parent_allowed_fingerprints,
+                parent_err,
+            ) = _validate_parent_import_job(
+                parent_id_raw.strip(), db._active_workspace_id, db,
             )
             if parent_err is not None:
                 return parent_err
@@ -24435,6 +24506,43 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     "carry_photo_ids contains IDs the parent import did "
                     f"not land or inherit: {invalid[:5]}"
                 )
+            # Stable-identity re-check for each carried ID. ``photos.id``
+            # is a bare ``INTEGER PRIMARY KEY`` — SQLite reuses freed IDs
+            # on the next insert, so an ID that legitimately named one of
+            # the parent's imports at parent-run time can, after a delete,
+            # name an unrelated photo by retry-run time. Compare each
+            # carried ID's CURRENT ``folder_path/filename`` against the
+            # fingerprint recorded when the parent landed it; refuse a
+            # mismatch rather than letting the after-import chain (and
+            # any ``after_process_move``) sweep up the unrelated row.
+            # Parents from before this fix carry no fingerprints at all
+            # (empty dict), and are exempted — hard-rejecting every
+            # legacy failed job's retry would be a bigger regression than
+            # the narrow race window this protects.
+            if parent_allowed_fingerprints:
+                current_fingerprints = _capture_photo_fingerprints_for_ids(
+                    db, carry_raw,
+                )
+                stale = []
+                for pid in carry_raw:
+                    expected = parent_allowed_fingerprints.get(pid)
+                    if expected is None:
+                        # Parent tracked fingerprints for some IDs but not
+                        # this one — an ID the parent's ``allowed_ids``
+                        # blessed but never fingerprinted (e.g. inherited
+                        # from a legacy grandparent). Accept, matching
+                        # the same rationale as the empty-dict case above.
+                        continue
+                    current = current_fingerprints.get(pid)
+                    if current != expected:
+                        stale.append(pid)
+                if stale:
+                    return json_error(
+                        "carry_photo_ids no longer matches the files the "
+                        "parent import landed (the numeric IDs now point "
+                        "at different photos, likely because the parent's "
+                        f"photos were deleted and re-imported): {stale[:5]}"
+                    )
             # Preserve caller order but deduplicate — the chain does not
             # need repeats and a giant duplicated list wastes work.
             seen_carry = set()
@@ -24630,6 +24738,22 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             "workspace_id": active_ws,
             "created_workspace": created_workspace,
             "carry_photo_ids": carry_photo_ids,
+            # Fingerprint sidecar to carry_photo_ids so a retry-of-retry
+            # can still verify the inherited scope by stable identity
+            # even after the grandparent's job has aged out of history.
+            # Keyed by str(id) for JSON round-tripping; empty for
+            # first-attempt imports or legacy parents with no
+            # fingerprints of their own.
+            "carry_photo_fingerprints": (
+                {
+                    str(pid): parent_allowed_fingerprints[pid]
+                    for pid in (carry_photo_ids or [])
+                    if parent_allowed_fingerprints
+                    and pid in parent_allowed_fingerprints
+                }
+                if parent_allowed_fingerprints
+                else {}
+            ),
         }
         if move_target_snapshot is not None:
             job_config["after_process_move"] = {

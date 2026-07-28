@@ -113,6 +113,57 @@ def _invalidate_new_images(db, root):
 IMPORT_BATCH_SIZE = 200
 
 
+def _capture_photo_fingerprints(db, photo_ids):
+    """Capture ``{id: "folder_path/filename"}`` for each landed photo.
+
+    Persisted in the import result so a retry can verify each carried ID
+    is still the same file. ``photos.id`` is an ``INTEGER PRIMARY KEY``
+    without ``AUTOINCREMENT``, so a delete-then-import cycle can reuse
+    an ID for an unrelated photo; without a stable-identity check the
+    retry's after-import chain (and any ``after_process_move``) would
+    silently pick up that unrelated row. Full path is the fingerprint
+    because photos share a ``UNIQUE(folder_id, filename)`` constraint
+    and ``folders.path`` is itself ``UNIQUE`` — two files cannot share
+    a full path in the catalog. Keys are stringified for JSON storage.
+    """
+    if not photo_ids:
+        return {}
+    fingerprints = {}
+    for chunk in _chunks(sorted(int(pid) for pid in photo_ids)):
+        placeholders = ",".join("?" for _ in chunk)
+        rows = db.conn.execute(
+            f"""SELECT p.id AS id, f.path AS folder_path, p.filename AS filename
+                FROM photos p
+                JOIN folders f ON f.id = p.folder_id
+                WHERE p.id IN ({placeholders})""",
+            list(chunk),
+        ).fetchall()
+        for row in rows:
+            folder_path = row["folder_path"] or ""
+            filename = row["filename"] or ""
+            if not folder_path or not filename:
+                continue
+            fingerprints[str(row["id"])] = f"{folder_path}/{filename}"
+    return fingerprints
+
+
+def _chunks(items, size=500):
+    """Yield ``items`` split into lists of up to ``size`` elements.
+
+    Kept module-private so callers here don't reach into ``db._chunks``.
+    500 keeps well under SQLite's default 999 bound-parameter cap while
+    holding fingerprint round-trips to one per few hundred photos.
+    """
+    buf = []
+    for item in items:
+        buf.append(item)
+        if len(buf) >= size:
+            yield buf
+            buf = []
+    if buf:
+        yield buf
+
+
 # Case-folded matching is unconditional on darwin/win32 (the OS enforces
 # case-insensitive filesystems). On Linux we probe each source's actual
 # filesystem: a FAT/exFAT/NTFS-mounted SD card is case-insensitive even
@@ -1986,6 +2037,15 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
         # the local path. Without this the remote import always missed
         # after-import processing. See PR #1113 review.
         "photo_ids": sorted(imported_photo_ids),
+        # Stable-identity map so a recovery retry can verify each carried
+        # ID still points at the same file. Without this the retry
+        # authorizes any current photo row that happens to share an ID
+        # with something the parent landed — an especially real risk
+        # after users delete recent imports (SQLite reuses the freed
+        # IDs on the next insert).
+        "photo_fingerprints": _capture_photo_fingerprints(
+            db, imported_photo_ids,
+        ),
         "skipped_duplicate": skipped_duplicate,
         "unverified_duplicate": unverified_duplicate,
         "unverified_duplicates_only": unverified_duplicates_only,
@@ -3387,6 +3447,15 @@ def run_import_job(job, runner, db_path, workspace_id, params):
         "copied": copied,
         "verified": verified,
         "photo_ids": sorted(imported_photo_ids),
+        # Stable-identity map so a recovery retry can verify each carried
+        # ID still points at the same file. Without this the retry
+        # authorizes any current photo row that happens to share an ID
+        # with something the parent landed — an especially real risk
+        # after users delete recent imports (SQLite reuses the freed
+        # IDs on the next insert).
+        "photo_fingerprints": _capture_photo_fingerprints(
+            db, imported_photo_ids,
+        ),
         "skipped_duplicate": skipped_duplicate,
         "unverified_duplicate": unverified_duplicate,
         "unverified_duplicates_only": unverified_duplicates_only,

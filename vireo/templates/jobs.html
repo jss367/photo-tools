@@ -378,6 +378,25 @@
     return job && job.config && typeof job.config === 'object' ? job.config : {};
   }
 
+  // A retry job carries its parent's id in ``config.parent_import_job_id``
+  // (see api_job_import_photos). Suppresses the Retry button on the
+  // parent while any active-or-recently-launched retry from that parent
+  // is still in flight — a second click would otherwise enqueue a
+  // parallel import of the same source and destination, letting the
+  // after-import chains and any ``after_process_move`` race with the
+  // first retry's move (which may already have relocated the folders).
+  function hasActiveRetryFor(parentId) {
+    if (!parentId) return false;
+    return activeJobs.some(function(candidate) {
+      if (!candidate || candidate.type !== 'import') return false;
+      var status = candidate.status;
+      if (status === 'completed' || status === 'failed' ||
+          status === 'cancelled') return false;
+      var cfg = jobConfig(candidate);
+      return cfg && cfg.parent_import_job_id === parentId;
+    });
+  }
+
   function importRetryBody(job) {
     var cfg = jobConfig(job);
     if (!job || job.type !== 'import' || cfg.mode === 'in_place' ||
@@ -511,11 +530,24 @@
 
     var failedImportCount = job.result && Number(job.result.failed || 0);
     if (!isLive && failedImportCount > 0 && importRetryBody(job)) {
+      var retryInFlight = hasActiveRetryFor(job.id);
       html += '<div style="padding:10px 0 2px;font-size:12px;color:var(--text-muted);">';
-      html += '<button class="btn-retry" data-retry-import-job="' +
-        escapeAttr(job.id) + '">Retry ' + failedImportCount + ' failed file' +
-        (failedImportCount === 1 ? '' : 's') + '</button>';
-      html += '<span style="margin-left:8px;">Same source and destination; successful files are skipped.</span>';
+      if (retryInFlight) {
+        // Same failed job, retry already running. A second Start would
+        // race the first — same source, same destination, same carry
+        // scope — so surface the in-flight status instead of a live
+        // button. Re-enables automatically when the retry finishes and
+        // ``activeJobs`` no longer contains it.
+        html += '<button class="btn-retry" disabled aria-disabled="true" ' +
+          'title="A retry for this import is already running">' +
+          'Retry in progress…</button>';
+        html += '<span style="margin-left:8px;">Retry already launched for this job; wait for it to finish before starting another.</span>';
+      } else {
+        html += '<button class="btn-retry" data-retry-import-job="' +
+          escapeAttr(job.id) + '">Retry ' + failedImportCount + ' failed file' +
+          (failedImportCount === 1 ? '' : 's') + '</button>';
+        html += '<span style="margin-left:8px;">Same source and destination; successful files are skipped.</span>';
+      }
       html += '</div>';
     }
 
@@ -980,6 +1012,24 @@
         }
         return;
       }
+      // Backstop the render-time gate: a click landing between poll
+      // ticks could otherwise fire a second retry for the same parent
+      // while the first is still active. Same rationale as the disabled
+      // button above; keeps the parallel-launch race closed even when
+      // ``activeJobs`` refreshed just after render.
+      if (hasActiveRetryFor(retryJobId)) {
+        if (typeof showToast === 'function') {
+          showToast(
+            'A retry for this import is already running; wait for it to finish.',
+            'info',
+          );
+        }
+        return;
+      }
+      // Preserve the original count-specific label so the error path
+      // below can restore it exactly — dropping to a generic "Retry
+      // failed files" would silently hide the real failed-file count.
+      var retryOriginalLabel = retryImportBtn.textContent;
       retryImportBtn.disabled = true;
       retryImportBtn.textContent = 'Starting retry…';
       fetch('/api/jobs/import-photos', {
@@ -1003,7 +1053,7 @@
         fetchJobs();
       }).catch(function(error) {
         retryImportBtn.disabled = false;
-        retryImportBtn.textContent = 'Retry failed files';
+        retryImportBtn.textContent = retryOriginalLabel;
         if (typeof showToast === 'function') showToast(error.message, 'error');
       });
       return;

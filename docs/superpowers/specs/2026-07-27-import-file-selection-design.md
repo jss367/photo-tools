@@ -213,9 +213,14 @@ is replaced on success, not cleared on start. The remaining exits from
 
 | Exit | Resulting state |
 |---|---|
-| zero files returned (`import.html:2286-2289`) | no preview run; Start enabled (nothing to select) |
+| zero files returned (`import.html:2286-2289`) | **preview current, with an empty file set; Start disabled** |
 | fetch throws (`2366-2372`) | previous state retained; Start disabled, stale |
 | superseded by `importPreviewSeq` or a signature change (`2281`, `2350`, `2363`) | previous state retained; the newer run owns the transition |
+
+A zero-file preview is a *completed* preview that found nothing importable — not
+an absence of one. Treating it as "no preview run" would omit `include_paths` and
+re-open the unseen-import hole: files landing on the card after that preview would
+be imported without ever having been shown.
 
 ### 2. Grid interaction
 
@@ -262,7 +267,8 @@ selection cannot be trusted:
 - while the duplicate stream is still draining — checkbox state is not yet final,
   so submitting mid-stream would send an `include_paths` that doesn't match what
   the user is looking at
-- **when the checked count is zero**, labelled *"No files selected"*
+- **when the checked count is zero *and at least one file was eligible*,**
+  labelled *"No files selected"*
 
 That last one is the real guard against "the user deselected everything," not the
 empty-`include_paths` rejection in §3. Because duplicates remain in
@@ -271,6 +277,15 @@ yields a *non-empty* list of 10 duplicate paths, which passes shape validation a
 runs an import that copies nothing. The checked count is the number that reflects
 what the user actually sees and intends; §3's empty-list `400` is a backstop for
 malformed clients, not the primary check.
+
+**The eligibility qualifier is load-bearing.** A card whose files are *all* already
+archived renders every card unchecked and disabled, so the checked count is zero
+through no choice of the user's. Blocking Start there would remove a capability
+that exists today: running the import to have those duplicates verified and receive
+the safe-to-format verdict — the whole point of pointing Vireo at a card you think
+is already backed up. So the gate is `eligibleCount > 0 && checkedCount == 0`.
+"Nothing is checked because nothing can be" and "the user unchecked everything" are
+different situations with opposite correct behaviors.
 
 **One owner for the disabled state.** `#btnStart.disabled` is currently written
 unconditionally from seven places (`import.html:2477`, `2496`, `2535`, `2776`,
@@ -309,15 +324,30 @@ it (per *Scope*).
 
 - `include_paths` — `previewedPaths - importDeselected` per §1. **Not** the checked
   boxes: duplicates are present here even though they render unchecked.
-- `previewed_count` — an integer: **the number of files in the preview endpoint's
-  response**, not the number of cards visible in the grid. These differ once the
-  sibling `hide-duplicates-checkbox` filter is active, and defining it as
-  "displayed" would make every hidden duplicate inflate the files-appeared count in
-  §6. Needed for honest drift reporting; see why an integer suffices there.
+- `previewed_count` — an integer: **the number of *unique* paths in the preview
+  endpoint's response**, not the response's array length and not the number of
+  cards visible in the grid.
+- `checked_count` — an integer: the number of cards rendered checked, i.e. the
+  files the user was told would be copied.
 
-Because `include_paths = previewedPaths - importDeselected`, the server can recover
-the user-deselected count as `previewed_count - len(include_paths)` without a third
-field. §5 uses this for the `unsafe_files` message.
+`previewed_count` must be a unique count because `/api/import/folder-preview`
+appends per source folder with no cross-source dedup (`app.py:17500-17506`), and
+`total_count` is a plain `len(all_files)`. Nested sources — adding both `/card` and
+`/card/DCIM` — emit the same file twice, which would inflate the array length above
+the true set size and skew every figure derived from it. Counting the deduplicated
+set of `path` values keeps it aligned with `previewedPaths`, `include_paths`, and
+`discovered_paths`, all of which are sets.
+
+It also must not be the *displayed* count: those differ once the sibling
+`hide-duplicates-checkbox` filter is active, and every hidden duplicate would
+inflate the files-appeared figure in §6.
+
+`checked_count` exists because `len(include_paths)` cannot serve as the selected
+count — that set deliberately contains unchecked duplicates (§1). Without it the
+job cannot report back the same number the UI promised the user, which is the
+contract this spec is built on. The server recovers the user-deselected count as
+`previewed_count - len(include_paths)`; §5 uses that for the `unsafe_files`
+message and `checked_count` for the summary line.
 
 Three states for `include_paths`:
 
@@ -353,8 +383,11 @@ client-side checks in §3 are conveniences, not the enforcement point.
 - `include_paths` is a list of non-empty strings (reject non-list, non-string
   members, empty strings, and `null`)
 - `include_paths` is non-empty when present
-- `previewed_count` is a non-negative integer, and is present whenever
-  `include_paths` is
+- `previewed_count` and `checked_count` are non-negative integers, present whenever
+  `include_paths` is, with `checked_count <= previewed_count`
+- **booleans are rejected for both counts.** `isinstance(True, int)` is `True` in
+  Python, so a naive integer check accepts `{"previewed_count": true}` as `1`.
+  Test `type(v) is int` or exclude `bool` explicitly.
 - `include_paths` is **deduplicated** before any length comparison, and
   `len(set(include_paths)) <= previewed_count` — the selection cannot exceed what
   was previewed. Deduping matters beyond tidiness: §5 derives the deselected count
@@ -366,25 +399,31 @@ already-validated `sources` directories, checked with `os.path.commonpath`. Any
 path that does not → `400`. Import must not become a path-admission escape hatch
 because a client asked for a file outside the folders the user actually chose.
 
-**Resolve both sides with `os.path.realpath` for the containment check, and keep
-the raw string for discovery matching.** Lexical `normpath` cannot detect a symlink
-escape — a link inside the source pointing outside it normalizes to a path that
-still appears contained, which would defeat the check entirely. Resolving *both*
-the candidate and the source directory keeps symlinked mount points working (the
-failure mode is only present when one side is resolved and the other isn't), while
-actually catching escapes. The resolved form is used for comparison only; the
-original string is what goes into `ImportParams.include_paths`, because §5 matches
-it against unresolved `discover_source_files` output.
+**Containment is lexical: `os.path.normpath` on both sides, never `realpath`.**
+This is a deliberate choice with a documented limit, not an oversight.
 
-**A symlinked file that escapes the source is dropped, not fatal.**
-`discover_source_files` walks with `followlinks` off but still *returns* symlinked
-files inside a source, and the preview endpoint applies no containment filter — so
-such a file is displayed, checked by default, and would arrive in `include_paths`
-through no fault of the user. Rejecting the whole request with a `400` would break
-an import that works today. Drop the offending path from `include_paths`, log a
-warning, and proceed. Escapes that indicate a crafted client — paths that were
-never in any source at all — still `400`; the distinction is whether the path was
-reachable from a source the user chose.
+The threat `include_paths` introduces is a client naming files the user never
+chose. Lexical containment catches exactly that: `/src/../etc/passwd` collapses to
+`/etc/passwd` and fails `commonpath` against `/src`.
+
+What it does *not* catch is a symlink inside a source pointing outside it. That is
+correct behavior here, because it is what happens today: `discover_source_files`
+walks with `followlinks` off but still returns symlinked *files*, the preview
+endpoint applies no containment filter, and `ingest()` copies them. A user who
+points Vireo at a folder containing a link has already chosen to import through it.
+Adding `realpath` would newly reject imports that work today, for no gain against
+the actual threat.
+
+Resolving symlinks is also unworkable in this position. The server holds only
+`sources` and a path list, so a symlinked file inside a source is indistinguishable
+from a crafted path pointing outside one — there is no rule that admits the first
+and rejects the second. And "drop it and continue" is worse than either: a silently
+removed path becomes an invisible deselection, inflating the §5 deselected count
+and breaking the promise that a checked file is either imported or accounted for.
+
+So: every containment failure is a `400`, uniformly, and symlinked files inside a
+source pass because lexically they are inside it. The policy is stated here so a
+future reader does not "fix" it into a regression.
 
 ### 5. Job execution
 
@@ -502,6 +541,31 @@ if appeared > 0:
 This is the same signal §6 reports; routing it through `unsafe_files` as well is
 what connects it to the formatting warning it causes.
 
+**A vanished in-scope file must force `safe_to_format` false.** The existing
+equality cannot catch this on its own. If 100 files are previewed and one
+disappears before the job runs, discovery finds 99, `discovered` is 99, the filter
+keeps 99, and `copied + skipped_duplicate == 99 == discovered` — a clean **safe to
+format** verdict on a card where a file the user asked for was never archived.
+
+`safe_to_format` therefore gains `not vanished_paths` alongside the existing
+conditions, with a matching entry:
+
+```python
+if vanished_paths:
+    unsafe_files.append({
+        "path": "Files missing at import time",
+        "reason": f"{len(vanished_paths)} files were in scope but had "
+                  "disappeared from the source when the import ran",
+    })
+```
+
+Conservatism is right here even though a vanished file is, by definition, no longer
+on the card. The job cannot distinguish "the user deleted it" from a read error or
+failing media — and in the latter case the bytes may still be physically present
+and recoverable until a format destroys them. Declaring a card safe to erase is the
+most destructive assertion this feature makes; it should fail closed. This matches
+how `partial_scope` and `unverified_duplicate` already behave.
+
 Note every `unsafe_files` entry is also mirrored into `result["errors"]`
 (`import_job.py:1965`, `3353`), so this wording appears in two places.
 
@@ -520,8 +584,10 @@ filter, the work actually queued.
 summaries are `3245` and **1879**. Wiring only the local set leaves remote imports
 with the stalled bar.
 
-`discovered` continues to back `safe_to_format` unchanged, and the step summary
-should name both so the difference is legible rather than mysterious:
+`discovered` continues to back `safe_to_format`, and the step summary should name
+both so the difference is legible rather than mysterious. The selected figure comes
+from `checked_count` (§3), **not** `len(include_paths)` — that set contains
+unchecked duplicates and would overstate what the user chose:
 
 > 500 selected of 1,234 discovered · 500 copied · 0 failed
 
@@ -548,16 +614,23 @@ precisely the failure mode this spec opens by citing. The two honest signals are
   phrased "at least N". Computing an exact figure would require shipping the
   previewed path set, which §Out of scope rejects for the same reason as above.
 - **Files vanished.** `include_paths - discovered_paths`, an exact path set: files
-  the user selected that are no longer on disk. Note this covers *selected* files
-  only — a deselected file that vanished is invisible to both signals, which is
-  acceptable since the user had already declined to import it.
+  that were **in scope** and are no longer on disk. The wording matters —
+  `include_paths` contains unchecked duplicates (§1), so this set can include a
+  file the user was shown as *not* being copied. Calling these "files you selected"
+  would be false for exactly those paths. A *deselected* file that vanished is
+  invisible to both signals, which is acceptable since the user had already
+  declined to import it.
 
 Both are carried in the job result and surfaced on the result card:
 
 > At least 20 files were added to the source folder after your preview and were
 > not imported. Re-preview to include them.
 
-> 3 files you selected were no longer on disk when the import ran.
+> 3 files were in scope for this import but had disappeared from the source when
+> it ran.
+
+The vanished set also forces `safe_to_format` false; see §5 for why that has to be
+a separate condition rather than falling out of the ledger equality.
 
 Drift reporting is copy-mode only, following *Scope*. The in-place route never
 materializes a discovered-path set — `do_scan` does not return one, and its result
@@ -580,11 +653,16 @@ independent of checkboxes.
 - absent key imports everything; empty list is rejected
 - **shape validation**: non-list, non-string members, empty strings, negative or
   missing `previewed_count`, and `len(include_paths) > previewed_count` each `400`
-- path-escape rejection: `../` traversal, **symlink pointing outside the source**,
-  sibling directory — the symlink case must fail containment, which is what forces
-  `realpath` over `normpath`
-- a source directory that is itself reached through a symlink still imports
-  successfully (the regression `realpath`-ing only one side would cause)
+- path-escape rejection → `400`: `../` traversal, sibling directory, absolute path
+  outside every source
+- **a symlinked file inside a source still imports successfully** — lexical
+  containment admits it, matching today's `ingest()` behavior; this is the
+  regression guard against someone "hardening" §4 with `realpath`
+- a source directory itself reached through a symlink still imports successfully
+- **booleans are rejected for `previewed_count` / `checked_count`** — `{"previewed_count": true}`
+  must `400`, not be coerced to `1`
+- overlapping sources (`/card` and `/card/DCIM`) yield a `previewed_count` equal to
+  the unique path count, and the derived deselected count stays correct
 - **`safe_to_format` is true when a card containing duplicates is fully selected**
   — the 90-copied/10-skipped case; this is the regression guard for the duplicate
   accounting rule, and it fails if duplicates are dropped from `include_paths`
@@ -597,6 +675,11 @@ independent of checkboxes.
   window
 - **files appearing after the preview produce their own `unsafe_files` entry**, so
   the red pill is never bare
+- **a vanished in-scope file forces `safe_to_format` false** even though the ledger
+  equality still balances — the 100-previewed/99-discovered case, with its own
+  `unsafe_files` entry
+- the step summary's selected figure comes from `checked_count`, not
+  `len(include_paths)`, so a card with duplicates doesn't overstate it
 - a client repeating a path in `include_paths` does not inflate the deselected
   count (dedupe at validation)
 - `discovered` reports full card contents, not the selected subset
@@ -636,6 +719,10 @@ independent of checkboxes.
   still intact when that preview completes
 - **Start is disabled when every importable file is unchecked**, even though
   `include_paths` is non-empty because duplicates remain in it
+- **Start stays *enabled* on a card where every file is a duplicate** — zero
+  checked, zero eligible, and the user must still be able to run it for the
+  safe-to-format verdict
+- **a zero-file preview disables Start** rather than reverting to "no preview run"
 - **changing a source after selecting disables Start with "Preview again before
   importing"** — it must not fall back to importing everything
 - **in-place mode hides all selection controls and shows the explanatory note**

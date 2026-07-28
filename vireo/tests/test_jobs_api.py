@@ -6741,11 +6741,8 @@ def test_import_photos_retry_refuses_same_size_replacement(
         # pad the replacement to preserve the size so the test still
         # exercises the "same-size-different-bytes" invariant.
         original = Path(card) / "DSC_0001.jpg"
-        original_size = original.stat().st_size
-        # A no-op mtime bump would race the filesystem's timestamp
-        # resolution on retry; sleep past the resolution boundary
-        # before rewriting so mtime_ns strictly advances.
-        time.sleep(0.02)
+        original_stat = original.stat()
+        original_size = original_stat.st_size
         Image.new("RGB", (16, 16), "green").save(str(original))
         replacement_size = original.stat().st_size
         if replacement_size != original_size:
@@ -6760,10 +6757,19 @@ def test_import_photos_retry_refuses_same_size_replacement(
                     fh.write(b"\x00" * needed)
                 elif needed < 0:
                     fh.truncate(original_size)
-            # File writes update mtime again; no extra sleep needed
-            # since we're only asserting mtime != parent's, not
-            # ordering of two rewrites.
             assert original.stat().st_size == original_size
+        # Force an mtime change beyond coarse one-second filesystem
+        # granularity instead of relying on a short wall-clock sleep.
+        rewritten_stat = original.stat()
+        bumped_mtime_ns = max(
+            original_stat.st_mtime_ns,
+            rewritten_stat.st_mtime_ns,
+        ) + 2_000_000_000
+        os.utime(
+            original,
+            ns=(rewritten_stat.st_atime_ns, bumped_mtime_ns),
+        )
+        assert original.stat().st_mtime_ns != original_stat.st_mtime_ns
 
         resp = client.post("/api/jobs/import-photos", json={
             "sources": [card],
@@ -6882,6 +6888,68 @@ def test_import_photos_parent_job_wrong_workspace_rejected(
         })
     assert resp.status_code == 400
     assert "different workspace" in resp.get_json()["error"]
+
+
+@pytest.mark.parametrize("status", [
+    "queued", "running", "pausing", "paused",
+])
+def test_import_photos_parent_job_must_be_terminal(
+        app_and_db, tmp_path, status):
+    """A retry cannot use an import that is still active as its parent.
+    Active parents have incomplete results and snapshots, so accepting one
+    can enqueue two imports against the same source and destination."""
+    app, db = app_and_db
+    runner = app._job_runner
+    parent_id = f"import-active-{status}"
+    with runner._lock:
+        runner._jobs[parent_id] = {
+            "id": parent_id,
+            "type": "import",
+            "status": status,
+            "workspace_id": db._active_workspace_id,
+            "config": {},
+            "result": {},
+        }
+
+    with app.test_client() as client:
+        resp = client.post("/api/jobs/import-photos", json={
+            "sources": [_import_card(tmp_path)],
+            "destination": str(tmp_path / "archive"),
+            "after_import": None,
+            "parent_import_job_id": parent_id,
+        })
+
+    assert resp.status_code == 409, resp.get_json()
+    assert "still active" in resp.get_json()["error"]
+
+
+def test_import_photos_retry_cannot_create_new_workspace(
+        app_and_db, tmp_path):
+    """A parent is bound to its original workspace; creating and switching
+    to another workspace after validating that parent would leak carried
+    photo scope across workspaces."""
+    from wait import wait_for_job_via_client
+
+    app, db = app_and_db
+    original_workspace = db._active_workspace_id
+    with app.test_client() as client:
+        card = _import_card(tmp_path)
+        parent_id = _post_import(
+            client, card, tmp_path / "archive", None,
+        )
+        wait_for_job_via_client(client, parent_id)
+
+        resp = client.post("/api/jobs/import-photos", json={
+            "sources": [card],
+            "destination": str(tmp_path / "archive"),
+            "after_import": None,
+            "parent_import_job_id": parent_id,
+            "new_workspace_name": "Unsafe Retry Workspace",
+        })
+
+    assert resp.status_code == 400, resp.get_json()
+    assert "cannot create a new workspace" in resp.get_json()["error"]
+    assert db._active_workspace_id == original_workspace
 
 
 def test_import_photos_parent_job_missing_404(app_and_db, tmp_path):
@@ -7155,6 +7223,8 @@ def test_import_photos_remote_target_edit_blocks_retry(
     Otherwise the retry would copy the remaining files to a different
     NAS, or (if the mount changed) skip prior successes based on the
     old catalog view while transferring failures to a new location."""
+    from wait import wait_for_job_via_client
+
     app, _ = app_and_db
     _save_remote_target(monkeypatch, tmp_path)
     with app.test_client() as client:
@@ -7163,6 +7233,7 @@ def test_import_photos_remote_target_edit_blocks_retry(
             "/api/jobs/import-photos", json=_remote_import_body(card))
         assert first.status_code == 200, first.get_json()
         parent_id = first.get_json()["job_id"]
+        wait_for_job_via_client(client, parent_id)
 
         # Simulate the operator editing the target — new host, new
         # remote_path, new mount — after the failed run finished.
@@ -7191,6 +7262,8 @@ def test_import_photos_remote_target_unchanged_retry_ok(
     """When the target hasn't changed, a retry with parent_import_job_id
     is accepted — same host/root/mount/subpath resolves to the same
     snapshot."""
+    from wait import wait_for_job_via_client
+
     app, _ = app_and_db
     _save_remote_target(monkeypatch, tmp_path)
     with app.test_client() as client:
@@ -7199,6 +7272,7 @@ def test_import_photos_remote_target_unchanged_retry_ok(
             "/api/jobs/import-photos", json=_remote_import_body(card))
         assert first.status_code == 200, first.get_json()
         parent_id = first.get_json()["job_id"]
+        wait_for_job_via_client(client, parent_id)
 
         retry = client.post(
             "/api/jobs/import-photos", json=_remote_import_body(
@@ -7236,6 +7310,44 @@ def test_import_photos_retry_rejects_unknown_source(
         })
         assert resp.status_code == 400, resp.get_json()
         assert "never enumerated" in resp.get_json()["error"]
+
+
+def test_import_photos_retry_requires_every_parent_source(
+        app_and_db, tmp_path):
+    """A retry cannot omit one of a multi-source parent's sources.
+    Otherwise it can finish and run carried processing even though failures
+    from the omitted source were never retried."""
+    from wait import wait_for_job_via_client
+
+    app, _ = app_and_db
+    card_a = tmp_path / "card-a"
+    card_b = tmp_path / "card-b"
+    card_a.mkdir()
+    card_b.mkdir()
+    Image.new("RGB", (16, 16), "red").save(card_a / "A.jpg")
+    Image.new("RGB", (16, 16), "blue").save(card_b / "B.jpg")
+
+    with app.test_client() as client:
+        parent = client.post("/api/jobs/import-photos", json={
+            "sources": [str(card_a), str(card_b)],
+            "destination": str(tmp_path / "archive"),
+            "after_import": None,
+        })
+        assert parent.status_code == 200, parent.get_json()
+        parent_id = parent.get_json()["job_id"]
+        wait_for_job_via_client(client, parent_id)
+
+        retry = client.post("/api/jobs/import-photos", json={
+            "sources": [str(card_a)],
+            "destination": str(tmp_path / "archive"),
+            "after_import": None,
+            "parent_import_job_id": parent_id,
+        })
+
+    assert retry.status_code == 400, retry.get_json()
+    error = retry.get_json()["error"]
+    assert "every source" in error
+    assert str(card_b) in error
 
 
 def test_import_photos_retry_rejects_second_concurrent_retry(

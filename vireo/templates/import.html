@@ -2256,10 +2256,14 @@ function renderImportPreviewGrid(files, duplicatePaths, destinationFiles) {
     collapsed.textContent = duplicateCount.toLocaleString() +
       ' duplicate' + (duplicateCount === 1 ? '' : 's') +
       ' hidden — ' + (duplicateCount === 1 ? 'it will' : 'they will') +
-      ' be skipped. ' + pendingFiles.length.toLocaleString() +
-      ' file' + (pendingFiles.length === 1 ? '' : 's') +
-      ' to import ' + (pendingFiles.length === 1 ? 'is' : 'are') +
-      ' shown below.';
+      ' be skipped. ' + (
+        pendingFiles.length
+          ? pendingFiles.length.toLocaleString() +
+            ' file' + (pendingFiles.length === 1 ? '' : 's') +
+            ' to import ' + (pendingFiles.length === 1 ? 'is' : 'are') +
+            ' shown below.'
+          : 'Nothing else will be imported from this selection.'
+      );
     grid.appendChild(collapsed);
   }
 

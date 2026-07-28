@@ -267,8 +267,11 @@ def test_import_preview_runs_automatically_after_source_selection(live_server, p
     grid = page.locator("#importPreviewGrid")
     expect(grid).to_be_visible()
     expect(grid).to_contain_text("IMG_0001.jpg")
-    expect(grid).not_to_contain_text("IMG_0002.jpg")
-    expect(grid).to_contain_text("1 duplicate hidden")
+    # Duplicate filtering is opt-in, so the automatic preview initially
+    # shows both files and marks the duplicate. The dedicated filter test
+    # below covers the collapsed state after the checkbox is enabled.
+    expect(grid).to_contain_text("IMG_0002.jpg")
+    expect(grid).to_contain_text("Duplicate")
     expect(grid).to_contain_text("To: 2026/2026-07-11")
 
 
@@ -306,6 +309,39 @@ def test_import_preview_hide_duplicates_checkbox_filters_grid(live_server, page)
     assert page.evaluate(
         "[window.__fullPreviewCalls, window.__dupCalls, window.__destCalls]",
     ) == calls_before
+
+
+def test_hide_duplicates_all_duplicate_banner_has_no_phantom_tiles(
+    live_server, page,
+):
+    """When filtering leaves zero pending files, the collapsed banner must
+    not claim that zero files are shown below when no tiles follow it."""
+    run_two_file_preview(live_server, page)
+    page.evaluate(
+        """
+        () => {
+          const file = {
+            path: '/tmp/card-a/IMG_0002.jpg',
+            filename: 'IMG_0002.jpg',
+            subfolder: 'card-a',
+          };
+          renderImportPreviewGrid(
+            [file],
+            [file.path],
+            [],
+          );
+        }
+        """
+    )
+
+    page.locator("#chkHideDuplicates").check()
+    banner = page.locator("[data-testid='collapsed-duplicate-preview']")
+    expect(banner).to_contain_text("1 duplicate hidden")
+    expect(banner).to_contain_text(
+        "Nothing else will be imported from this selection."
+    )
+    expect(banner).not_to_contain_text("0 files to import")
+    expect(page.locator("#importPreviewGrid .import-preview-thumb")).to_have_count(0)
 
 
 def test_hide_duplicates_resets_once_a_check_finds_no_duplicates(

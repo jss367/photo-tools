@@ -23170,14 +23170,16 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         parent_result = None
         parent_workspace = None
         parent_type = None
+        parent_status = None
         if parent is not None:
             parent_config = parent.get("config") or {}
             parent_result = parent.get("result") or {}
             parent_workspace = parent.get("workspace_id")
             parent_type = parent.get("type")
+            parent_status = parent.get("status")
         else:
             row = db.conn.execute(
-                "SELECT type, workspace_id, config, result "
+                "SELECT type, status, workspace_id, config, result "
                 "FROM job_history WHERE id = ?",
                 (parent_id,),
             ).fetchone()
@@ -23188,6 +23190,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     404,
                 )
             parent_type = row["type"]
+            parent_status = row["status"]
             parent_workspace = row["workspace_id"]
             try:
                 parent_config = json.loads(row["config"] or "{}") or {}
@@ -23201,6 +23204,13 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             return None, None, None, None, json_error(
                 "parent_import_job_id must reference an import job "
                 f"(got type {parent_type!r})"
+            )
+        if parent_status not in {"completed", "failed", "cancelled"}:
+            return None, None, None, None, json_error(
+                "parent_import_job_id is still active "
+                f"(status {parent_status!r}); wait for the original import "
+                "to finish before retrying",
+                409,
             )
         if parent_workspace != active_ws:
             return None, None, None, None, json_error(
@@ -24517,6 +24527,12 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 return json_error(
                     "parent_import_job_id must be a non-empty string"
                 )
+            if "new_workspace_name" in body:
+                return json_error(
+                    "A recovery retry cannot create a new workspace; "
+                    "retry in the original import's workspace or start "
+                    "a new import instead."
+                )
             (
                 parent_config,
                 parent_allowed_ids,
@@ -24662,11 +24678,12 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             # into the after-import chain / NAS-move scope, even though
             # the "Retry failed files" button only ever promised the
             # parent's failed files. See PR #1387 Codex review.
-            unknown_sources = [
-                src for src in sources
-                if not isinstance(parent_source_snapshots.get(src), dict)
-                or not parent_source_snapshots.get(src)
-            ]
+            parent_sources = {
+                src for src, snapshot in parent_source_snapshots.items()
+                if isinstance(snapshot, dict) and snapshot
+            }
+            requested_sources = set(sources)
+            unknown_sources = sorted(requested_sources - parent_sources)
             if unknown_sources:
                 return json_error(
                     "Retry submitted source paths the original import "
@@ -24674,6 +24691,14 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     "same path, or a new source added): "
                     f"{unknown_sources[:3]}. Start a new import instead "
                     "of retrying."
+                )
+            missing_sources = sorted(parent_sources - requested_sources)
+            if missing_sources:
+                return json_error(
+                    "A recovery retry must include every source from the "
+                    "original import. These sources are missing: "
+                    f"{missing_sources[:3]}. Reconnect all original "
+                    "sources, or start a new import instead of retrying."
                 )
 
             drifted_sources = []

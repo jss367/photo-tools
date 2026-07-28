@@ -51,8 +51,19 @@ darktable is GPL and publishes official release assets on GitHub. As of
 ### Version resolution
 
 Query the GitHub releases API for `latest` at click time, then hard-allowlist the
-host (`github.com` / `objects.githubusercontent.com`) and the repo path
-(`darktable-org/darktable`).
+host (`github.com`) and the release-download path
+(`/darktable-org/darktable/releases/download/`).
+
+**`objects.githubusercontent.com` was removed from the allowlist** after Task 5's
+review: against the live API every `browser_download_url` is on `github.com`, the
+redirect goes to `release-assets.githubusercontent.com` (which we deliberately do
+not check — see below), and that host serves arbitrary user blobs. It was
+unreachable in practice and widened the trust boundary for nothing.
+
+The path prefix is the full `releases/download/` path, not just the repo, and is
+normalised before comparison — `startswith` on a raw path let
+`/darktable-org/darktable/releases/download/../../../../attacker/evil.dmg` through,
+since GitHub normalises `..` on receipt.
 
 **Why not pin a version + SHA256** like `scripts/fetch_exiftool.py` does: darktable
 releases a few times a year, so a pinned build goes stale between Vireo releases,
@@ -243,9 +254,27 @@ the fix, a successful download is followed by the same ✗.
 
 One module, four functions, each independently testable:
 
-- `resolve_release()` → `{version, name, size, url, digest}` or `None`. Queries the
-  GitHub releases API, selects the asset by `(sys.platform, machine)`, enforces the
-  host and repo-path allowlist.
+- `resolve_release()` → `({version, name, size, url, digest}, None)` on success, or
+  `(None, reason)` on failure. Queries the GitHub releases API, selects the asset by
+  `(sys.platform, machine)`, enforces the host and repo-path allowlist.
+
+  **It returns a reason, not a bare `None`, because the failure modes are not
+  interchangeable.** A bare `None` conflated four outcomes — unsupported platform,
+  no matching asset, asset rejected as suspicious, and network failure — and the
+  route mapped all of them to *"No darktable build is published for this
+  platform."* For a user on a plane, behind a corporate proxy, or over GitHub's
+  60/hr unauthenticated rate limit, that sentence is simply false. Three
+  constants are exported so callers never duplicate the strings:
+  `REASON_UNREACHABLE`, `REASON_NO_PLATFORM_BUILD`, `REASON_NO_USABLE_ASSET`.
+
+  Note that GitHub's rate-limit reply is itself a well-formed JSON *dict*
+  (`{"message": "API rate limit exceeded…"}`), so "did it parse?" is not enough
+  to tell success from throttling — the payload must be checked for a release
+  shape before it is trusted, or throttling reports as "no usable build".
+
+  `resolve_release` **never raises**, including on a non-dict or non-JSON body:
+  Task 9's job calls it directly, outside any route's error handling, so a
+  captive-portal HTML response would otherwise crash the job thread.
 
   **Asset matching must be exact-suffix, not substring.** The release also carries
   `Darktable-5.6.0-x86_64.AppImage.zsync` and `…-aarch64.AppImage.zsync` — ~300 KB

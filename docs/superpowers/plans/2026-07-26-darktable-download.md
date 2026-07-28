@@ -1349,18 +1349,31 @@ def _clear_release_cache():
 
 Add `import pytest` to the file if it is not already there. Then:
 
+**CONTRACT CHANGE from Task 5's review.** `resolve_release()` returns a **2-tuple
+`(release_or_None, reason_or_None)`**, not a bare value. Bare `None` conflated
+four distinct outcomes — unsupported platform, no matching asset, asset rejected
+as suspicious, and network failure — so this route would have told a user behind
+a proxy or over GitHub's 60/hr rate limit *"No darktable build is published for
+this platform."* That is false, and it is the exact failure `CLAUDE.md` forbids.
+
+`darktable_install` exports the three reason strings as constants
+(`REASON_UNREACHABLE`, `REASON_NO_PLATFORM_BUILD`, `REASON_NO_USABLE_ASSET`) —
+compare against those, do not duplicate the literals. `resolve_release` also
+never raises now, so **the route's `except` clause is not a fallback you can rely
+on** — the reason string is.
+
 ```python
 def test_api_darktable_install_available_shape(app_and_db, monkeypatch):
     """The confirmation needs version, name, size, url and digest."""
     import darktable_install
     app, _ = app_and_db
-    monkeypatch.setattr(darktable_install, "resolve_release", lambda: {
+    monkeypatch.setattr(darktable_install, "resolve_release", lambda: ({
         "version": "5.6.0",
         "name": "darktable-5.6.0-arm64.dmg",
         "size": 87094261,
         "url": "https://github.com/darktable-org/darktable/releases/download/x/d.dmg",
         "digest": "sha256:" + "a" * 64,
-    })
+    }, None))
 
     data = app.test_client().get('/api/darktable/install/available').get_json()
     assert data['available'] is True
@@ -1369,8 +1382,35 @@ def test_api_darktable_install_available_shape(app_and_db, monkeypatch):
     assert data['digest'].startswith("sha256:")
 
 
-def test_api_darktable_install_available_falls_back_when_api_unreachable(app_and_db, monkeypatch):
-    """Never a dead button: an unreachable API yields a reason, not a 500."""
+def test_api_darktable_install_available_reports_network_failure_honestly(app_and_db, monkeypatch):
+    """A user behind a proxy must not be told their platform is unsupported."""
+    import darktable_install
+    app, _ = app_and_db
+    monkeypatch.setattr(darktable_install, "resolve_release",
+                        lambda: (None, darktable_install.REASON_UNREACHABLE))
+
+    resp = app.test_client().get('/api/darktable/install/available')
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert data['available'] is False
+    assert data['reason'] == darktable_install.REASON_UNREACHABLE
+    assert 'platform' not in data['reason'].lower()
+
+
+def test_api_darktable_install_available_handles_unsupported_platform(app_and_db, monkeypatch):
+    import darktable_install
+    app, _ = app_and_db
+    monkeypatch.setattr(darktable_install, "resolve_release",
+                        lambda: (None, darktable_install.REASON_NO_PLATFORM_BUILD))
+
+    data = app.test_client().get('/api/darktable/install/available').get_json()
+    assert data['available'] is False
+    assert data['reason'] == darktable_install.REASON_NO_PLATFORM_BUILD
+
+
+def test_api_darktable_install_available_survives_an_unexpected_raise(app_and_db, monkeypatch):
+    """Belt and braces: resolve_release should never raise, but if it does the
+    route must still 200 with a reason rather than 500 into a dead button."""
     import darktable_install
     app, _ = app_and_db
 
@@ -1380,19 +1420,8 @@ def test_api_darktable_install_available_falls_back_when_api_unreachable(app_and
 
     resp = app.test_client().get('/api/darktable/install/available')
     assert resp.status_code == 200
-    data = resp.get_json()
-    assert data['available'] is False
-    assert data['reason']
-
-
-def test_api_darktable_install_available_handles_unsupported_platform(app_and_db, monkeypatch):
-    import darktable_install
-    app, _ = app_and_db
-    monkeypatch.setattr(darktable_install, "resolve_release", lambda: None)
-
-    data = app.test_client().get('/api/darktable/install/available').get_json()
-    assert data['available'] is False
-    assert data['reason']
+    assert resp.get_json()['available'] is False
+    assert resp.get_json()['reason']
 ```
 
 - [ ] **Step 2: Run to verify they fail**
@@ -1415,19 +1444,22 @@ In `vireo/app.py`, immediately after `api_darktable_status` ends (line 15930):
         import darktable_install
 
         try:
-            release = darktable_install.resolve_release()
+            release, reason = darktable_install.resolve_release()
         except Exception as e:
+            # resolve_release is documented never to raise; this is belt and
+            # braces so an unexpected bug still degrades to a link, not a 500.
             log.warning("darktable release lookup failed: %s", e)
             return jsonify({
                 "available": False,
-                "reason": "Could not reach GitHub to check for a darktable release.",
+                "reason": darktable_install.REASON_UNREACHABLE,
             })
 
         if not release:
-            return jsonify({
-                "available": False,
-                "reason": "No darktable build is published for this platform.",
-            })
+            # Pass the reason through verbatim. Do NOT substitute a generic
+            # message: "we could not reach GitHub" and "no build exists for
+            # your platform" are different facts and users act on them
+            # differently.
+            return jsonify({"available": False, "reason": reason})
 
         return jsonify({"available": True, **release})
 ```
@@ -1442,15 +1474,23 @@ _RELEASE_CACHE_SECS = 600
 
 
 def resolve_release_cached():
-    import time
+    """resolve_release() with a short TTL, returning the same 2-tuple.
+
+    Only successes are cached. A transient outage or a rate-limit reply must
+    not pin the fallback link for ten minutes — and caching a failure would
+    also freeze its reason string, so a user who fixed their network would
+    keep being told GitHub is unreachable.
+    """
     now = time.monotonic()
     if _release_cache["value"] is not None and now - _release_cache["at"] < _RELEASE_CACHE_SECS:
-        return _release_cache["value"]
-    value = resolve_release()
-    if value is not None:
-        _release_cache.update(at=now, value=value)
-    return value
+        return _release_cache["value"], None
+    release, reason = resolve_release()
+    if release is not None:
+        _release_cache.update(at=now, value=release)
+    return release, reason
 ```
+
+Add `import time` at module level (it is not currently imported).
 
 Call `resolve_release_cached()` from the route above. Failures are deliberately
 not cached, so a transient outage does not pin the fallback link for ten minutes.
@@ -1497,11 +1537,11 @@ Append to `vireo/tests/test_darktable_api.py`:
 def test_api_job_download_darktable_returns_job_id(app_and_db, monkeypatch):
     import darktable_install
     app, _ = app_and_db
-    monkeypatch.setattr(darktable_install, "resolve_release", lambda: {
+    monkeypatch.setattr(darktable_install, "resolve_release", lambda: ({
         "version": "5.6.0", "name": "d.dmg", "size": 100,
         "url": "https://github.com/darktable-org/darktable/releases/download/x/d.dmg",
         "digest": None,
-    })
+    }, None))
     monkeypatch.setattr(darktable_install, "free_space_bytes", lambda p: 10 ** 12)
     monkeypatch.setattr(darktable_install, "download", lambda *a, **k: ("/tmp/d.dmg", "ok"))
     monkeypatch.setattr(darktable_install, "hand_off",
@@ -1526,11 +1566,11 @@ def test_api_job_download_darktable_refuses_without_disk_space(app_and_db, monke
     """Refuse before downloading 87MB, and say what is needed vs free."""
     import darktable_install
     app, _ = app_and_db
-    monkeypatch.setattr(darktable_install, "resolve_release", lambda: {
+    monkeypatch.setattr(darktable_install, "resolve_release", lambda: ({
         "version": "5.6.0", "name": "d.dmg", "size": 87094261,
         "url": "https://github.com/darktable-org/darktable/releases/download/x/d.dmg",
         "digest": None,
-    })
+    }, None))
     monkeypatch.setattr(darktable_install, "free_space_bytes", lambda p: 1024)
 
     resp = app.test_client().post('/api/jobs/download-darktable')
@@ -1541,10 +1581,13 @@ def test_api_job_download_darktable_refuses_without_disk_space(app_and_db, monke
 def test_api_job_download_darktable_400_when_unavailable(app_and_db, monkeypatch):
     import darktable_install
     app, _ = app_and_db
-    monkeypatch.setattr(darktable_install, "resolve_release", lambda: None)
+    monkeypatch.setattr(darktable_install, "resolve_release",
+                        lambda: (None, darktable_install.REASON_NO_PLATFORM_BUILD))
 
     resp = app.test_client().post('/api/jobs/download-darktable')
     assert resp.status_code == 400
+    # The 400 body must carry the specific reason, not a generic message.
+    assert resp.get_json()['error'] == darktable_install.REASON_NO_PLATFORM_BUILD
 ```
 
 - [ ] **Step 2: Run to verify they fail**
@@ -1566,11 +1609,14 @@ In `vireo/app.py`, after `api_job_download_taxonomy`:
         active_ws = _get_db()._active_workspace_id
 
         try:
-            asset = darktable_install.resolve_release()
+            asset, reason = darktable_install.resolve_release()
         except Exception:
-            asset = None
+            asset, reason = None, darktable_install.REASON_UNREACHABLE
         if not asset:
-            return json_error("No darktable build is available for this platform.")
+            # Surface the specific reason. resolve_release distinguishes
+            # "could not reach GitHub" from "no build for your platform";
+            # collapsing them here would re-introduce the lie Task 5 fixed.
+            return json_error(reason or darktable_install.REASON_UNREACHABLE)
 
         # Refuse before spending 87MB, and say what is needed vs what is free.
         target = darktable_install.install_dir()

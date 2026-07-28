@@ -4543,78 +4543,94 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                                     photo, folders,
                                     None if full_image_fallback else detection,
                                 )
-                                if img is None:
-                                    # Before blaming the photo, check whether the
-                                    # source itself vanished. A dropped share
-                                    # fails every remaining read instantly, so
-                                    # counting these as per-photo failures would
-                                    # report the untouched remainder of the
-                                    # collection as broken images.
+                                # Before blaming the photo, check whether the
+                                # source itself vanished. A dropped share
+                                # fails every remaining read instantly, so
+                                # counting these as per-photo failures would
+                                # report the untouched remainder of the
+                                # collection as broken images.
+                                #
+                                # Loop rather than one-shot pause+retry so a
+                                # mount that stays dead across a resume also
+                                # gets latched when this happens to be the
+                                # last photo (or last detection) needing an
+                                # image read: silently continuing on the
+                                # failed retry would leave source_offline
+                                # ["reason"] unset, abort clear, and
+                                # extract_masks / eye_keypoints would still
+                                # walk every detected photo reissuing reads
+                                # against the dead share (Codex #1388 P1
+                                # r3663278142). _handle_source_offline
+                                # bounds the total pause/retry cycles via
+                                # _MAX_SOURCE_OFFLINE_PAUSES, so this
+                                # can't loop forever.
+                                gave_up_on_source = False
+                                while img is None:
                                     offline = _source_offline_reason(
                                         folder_path, image_path,
                                     )
-                                    if offline:
-                                        scope, reason = offline
-                                        if scope == "folder":
-                                            # A single missing folder is not
-                                            # evidence the whole source is
-                                            # offline; skip this photo as
-                                            # unreachable and let later photos
-                                            # in healthy folders keep processing.
-                                            source_skipped += 1
-                                            source_skipped_photo_ids.add(
-                                                photo["id"]
-                                            )
-                                            continue
-                                        if not _handle_source_offline(reason):
-                                            # Give-up: image never loaded, so
-                                            # this photo is unreached — same
-                                            # bucket as the folder-scoped
-                                            # skip above. Keeps the
-                                            # reclassify clear below from
-                                            # wiping its prior prediction
-                                            # (Codex #1388 P1).
-                                            source_skipped_photo_ids.add(
-                                                photo["id"]
-                                            )
-                                            break
-                                        # Resumed. The user reconnected the
-                                        # share, so retry the same detection
-                                        # before advancing — silently skipping
-                                        # it here would leave the photo
-                                        # unclassified even though the source
-                                        # is back, and on a reclassify run
-                                        # finalization would clear its old
-                                        # prediction with no replacement.
-                                        img, folder_path, image_path = (
-                                            _prepare_image(
-                                                photo, folders,
-                                                None if full_image_fallback
-                                                else detection,
-                                            )
-                                        )
-                                        if img is None:
-                                            # Retry failed too — the remount
-                                            # didn't stick. Count this one as
-                                            # unreachable rather than failed:
-                                            # the source tree was gone, so the
-                                            # photo was never actually
-                                            # examined and calling it a
-                                            # failure would repeat the same
-                                            # lie at smaller scale. The pause
-                                            # counter still bounds how many
-                                            # times we ask.
-                                            source_skipped += 1
-                                            source_skipped_photo_ids.add(
-                                                photo["id"]
-                                            )
-                                            continue
-                                        # Retry succeeded — fall through to
-                                        # the normal inference path below.
-                                    else:
+                                    if offline is None:
+                                        # The source is reachable; this one
+                                        # file is genuinely broken.
                                         failed += 1
                                         failed_photo_ids.add(photo["id"])
-                                        continue
+                                        break
+                                    scope, reason = offline
+                                    if scope == "folder":
+                                        # A single missing folder is not
+                                        # evidence the whole source is
+                                        # offline; skip this photo as
+                                        # unreachable and let later photos
+                                        # in healthy folders keep processing.
+                                        source_skipped += 1
+                                        source_skipped_photo_ids.add(
+                                            photo["id"]
+                                        )
+                                        break
+                                    # Mount-scoped: park and wait for the
+                                    # user to reconnect. On give-up,
+                                    # _handle_source_offline latches
+                                    # source_offline["reason"] and returns
+                                    # False — we then break the per-photo
+                                    # loop so remaining photos short-circuit
+                                    # the same way (and the finalization
+                                    # rollup sets abort so downstream stages
+                                    # skip the dead source).
+                                    if not _handle_source_offline(reason):
+                                        # Give-up: image never loaded, so
+                                        # this photo is unreached — same
+                                        # bucket as the folder-scoped skip
+                                        # above. Keeps the reclassify clear
+                                        # below from wiping its prior
+                                        # prediction (Codex #1388 P1
+                                        # r3663159360).
+                                        source_skipped_photo_ids.add(
+                                            photo["id"]
+                                        )
+                                        gave_up_on_source = True
+                                        break
+                                    # Resumed. Retry the same read before
+                                    # advancing — silently skipping the
+                                    # paused-during photo would leave it
+                                    # unclassified even though the source
+                                    # came back, and on a reclassify run
+                                    # finalization would clear its old
+                                    # prediction with no replacement
+                                    # (Codex #1388 P2). If the retry also
+                                    # fails, the loop re-probes and either
+                                    # pauses again (bounded), degrades to
+                                    # folder-scope, or gives up.
+                                    img, folder_path, image_path = (
+                                        _prepare_image(
+                                            photo, folders,
+                                            None if full_image_fallback
+                                            else detection,
+                                        )
+                                    )
+                                if gave_up_on_source:
+                                    break
+                                if img is None:
+                                    continue
                                 inference_batch.append({
                                     "photo": photo,
                                     "detection_id": detection["id"],

@@ -12605,7 +12605,16 @@ def test_pipeline_classify_pauses_when_source_volume_disappears(
         f"Photos skipped because the volume vanished must not be reported "
         f"as classification failures; got summary {summaries!r}"
     )
-    assert "unreachable (source offline)" in summaries, (
+    # After Codex #1388 P1 r3663278142, the pause+retry loop runs against
+    # the SAME photo until the pause budget is spent (rather than one
+    # pause per photo advancing through the collection). Photos never
+    # attempted don't count as "unreachable"; the "stopped after N of Y"
+    # line names the outage and accounts for the untouched remainder.
+    # Accept either phrasing so the assertion stays about "did we account
+    # for what got skipped" and not the specific accounting shape.
+    assert (
+        "unreachable" in summaries or "stopped after" in summaries
+    ), (
         f"The summary must still account for the photos it skipped rather "
         f"than silently dropping them; got {summaries!r}"
     )
@@ -13844,4 +13853,203 @@ def test_pipeline_classify_recovered_pause_leaves_no_terminal_classify_error(
         f"terminal errors list — pipeline.html would surface it as a "
         f"failed stage even though classify finished successfully. Got "
         f"{classify_errors!r}"
+    )
+
+
+def test_pipeline_classify_failed_retry_on_last_photo_latches_source_offline(
+    tmp_path, monkeypatch,
+):
+    """A failed resume-retry on the last photo must still latch the outage.
+
+    Codex #1388 P1 (r3663278142): when the source stays offline through the
+    pause/resume cycle AND this is the final photo/detection that needs an
+    image read, the pre-fix retry-failed branch fell through with a silent
+    ``source_skipped += 1; continue`` — the classify loop then exited
+    normally with ``source_offline["reason"]`` unset and ``abort`` still
+    clear. The finalization rollup only sets ``abort`` when
+    ``source_offline["reason"]`` is truthy, so ``extract_masks_stage`` and
+    ``eye_keypoints_stage`` walked every detected photo and reissued reads
+    against the dead share — reproducing the exact "N failed" pattern this
+    PR is meant to fix, one stage later.
+
+    Reproduce by giving the run a SINGLE photo (so no subsequent photo can
+    re-trigger ``_handle_source_offline``) with a mount that stays dead
+    through the resume. The while-loop fix keeps invoking
+    ``_handle_source_offline`` on retry failure until the pause budget is
+    spent, at which point it latches ``source_offline["reason"]`` and
+    downstream stages short-circuit.
+    """
+    import classifier as classifier_mod
+    import classify_job
+    import config as cfg
+    import pipeline_job as pj
+    from db import Database
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cfg.CONFIG_PATH = str(tmp_path / "config.json")
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws_id = db._active_workspace_id
+
+    folder_path = str(tmp_path / "photos")
+    os.makedirs(folder_path, exist_ok=True)
+    folder_id = db.add_folder(folder_path)
+    name = "photo0.jpg"
+    pid = db.add_photo(folder_id, name, ".jpg", 4000, 4_000_000.0)
+    _drop_jpeg(folder_path, name)
+    db.save_detections(
+        pid,
+        [{"box": {"x": 0.1, "y": 0.1, "w": 0.5, "h": 0.5},
+          "confidence": 0.9, "category": "animal"}],
+        detector_model="MegaDetector",
+    )
+    photo_ids = [pid]
+
+    col_id = db.add_collection(
+        "Test",
+        json.dumps([{"field": "photo_ids", "value": photo_ids}]),
+    )
+
+    _setup_fake_downloaded_model(tmp_path, monkeypatch)
+
+    import labels_fingerprint as lfp
+    monkeypatch.setattr(lfp, "compute_fingerprint", lambda *a, **k: "fp")
+
+    def fake_detect_batch(batch, folders, runner, job, reclassify, db_,
+                          det_conf_threshold=None, already_detected_ids=None,
+                          cached_detections=None):
+        det_map = {}
+        for p in batch:
+            det_map[p["id"]] = [{
+                "id": d["id"],
+                "box_x": d["box_x"], "box_y": d["box_y"],
+                "box_w": d["box_w"], "box_h": d["box_h"],
+                "confidence": d["detector_confidence"],
+                "category": d["category"],
+            } for d in db_.get_detections(p["id"])
+                if d["detector_model"] != "full-image"]
+        return det_map, len(batch), {p["id"] for p in batch}
+
+    monkeypatch.setattr(classify_job, "_detect_batch", fake_detect_batch)
+
+    # The mount is dead and the user's premature resumes don't fix it, so
+    # every read — initial AND every retry — fails.
+    gone_folder = "/Volumes/DefinitelyNotMounted12345/Raw Files"
+    prepare_calls: list = []
+
+    def offline_prepare_image(photo, folders, detection, vireo_dir=None):
+        prepare_calls.append(photo["id"])
+        return None, gone_folder, os.path.join(gone_folder, photo["filename"])
+
+    monkeypatch.setattr(classify_job, "_prepare_image", offline_prepare_image)
+
+    class FakeClassifier:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def encode_image(self, *args, **kwargs):
+            import numpy as np
+            return np.zeros(512, dtype=np.float32)
+
+    monkeypatch.setattr(classifier_mod, "Classifier", FakeClassifier)
+
+    # Spy on masking.render_proxy — the exact call extract_masks_stage
+    # makes to re-open source images. If the fix regresses, abort stays
+    # clear on the last-photo path and extract_masks walks its per-photo
+    # loop hitting this spy.
+    render_proxy_calls: list = []
+
+    def spy_render_proxy(*args, **kwargs):
+        render_proxy_calls.append(args)
+        return None
+
+    with contextlib.suppress(Exception):
+        import masking as masking_mod
+        monkeypatch.setattr(masking_mod, "render_proxy", spy_render_proxy)
+
+    class ResumingRunner(FakeRunner):
+        """User keeps hitting Resume without actually remounting the share."""
+
+        def __init__(self):
+            super().__init__()
+            self.pause_calls = []
+            self._paused = False
+
+        def pause_job(self, job_id):
+            self.pause_calls.append(job_id)
+            self._paused = True
+            return True
+
+        def pause_requested(self, job_id):
+            return self._paused
+
+        def mark_paused(self, job_id):
+            return True
+
+        def wait_if_paused(self, job_id, *, publish_paused=False):
+            self._paused = False  # premature resume
+            return False
+
+    # Don't set skip_extract_masks — the whole point is that extract_masks
+    # would otherwise re-open the same dead share.
+    params = PipelineParams(
+        collection_id=col_id,
+        skip_regroup=True,
+    )
+
+    runner = ResumingRunner()
+    job = _make_job()
+
+    with pytest.raises(RuntimeError) as excinfo:
+        run_pipeline_job(job, runner, db_path, ws_id, params)
+
+    # The bounded pause loop must have fired — otherwise this test would
+    # be testing the initial-failure path, not the resume-retry path we
+    # care about.
+    assert runner.pause_calls, (
+        "Classify must have paused at least once for the resume-retry "
+        "path to be under test at all; if pause never fired the setup "
+        "regressed, not the code."
+    )
+    assert len(runner.pause_calls) <= pj._MAX_SOURCE_OFFLINE_PAUSES, (
+        f"Classify paused {len(runner.pause_calls)} times for the same "
+        f"dead volume on a single photo; the bounded loop must give up "
+        f"after {pj._MAX_SOURCE_OFFLINE_PAUSES}."
+    )
+
+    # The headline error must name the outage — pre-fix, source_offline
+    # ["reason"] stayed unset on this path so the end-of-run rollup fell
+    # back to an unrelated error.
+    msg = str(excinfo.value)
+    assert "/Volumes/DefinitelyNotMounted12345" in msg, (
+        f"The job's headline error must name the offline volume; "
+        f"got {msg!r}"
+    )
+    assert "failed to classify" not in msg, (
+        f"A dead share must not be reported as photos failing to "
+        f"classify; got {msg!r}"
+    )
+
+    # The core assertion: extract_masks must have skipped. Pre-fix, the
+    # last-photo retry-fail left abort clear, and this stage walked its
+    # per-photo loop reissuing reads against the dead mount.
+    extract_masks_updates = [
+        kwargs for (_jid, sid, kwargs) in runner.step_updates
+        if sid == "extract_masks"
+    ]
+    assert any(
+        kwargs.get("summary") == "Skipped"
+        for kwargs in extract_masks_updates
+    ), (
+        f"extract_masks must mark itself Skipped after classify gives up "
+        f"on the last-photo retry-fail path; without the fix, abort "
+        f"stays clear and this stage walks every detected photo "
+        f"re-opening the offline share. Got updates {extract_masks_updates!r}"
+    )
+    assert not render_proxy_calls, (
+        f"masking.render_proxy fired {len(render_proxy_calls)} time(s) "
+        f"after classify's last-photo retry-fail — extract_masks walked "
+        f"its per-photo loop against the dead share instead of "
+        f"short-circuiting on abort (Codex #1388 P1 r3663278142)."
     )

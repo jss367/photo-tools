@@ -121,9 +121,29 @@ def _archive_mount_root_candidates(path: str) -> list[str]:
     raw_posix = os.path.expanduser(path).replace("\\", "/")
     normalized = os.path.normpath(os.path.abspath(os.path.expanduser(path)))
     normalized_posix = normalized.replace("\\", "/")
+    # Also probe the symlink-resolved form so a catalog alias like
+    # ``/photos`` pointing into ``/Volumes/NAS/photos`` retains its
+    # mount-shaped prefix (Codex #1388 P2 r3664891998). Without this,
+    # neither the raw alias nor its ``abspath`` normalization has a
+    # ``/Volumes``/``/mnt``/``/media``/drive-letter/UNC prefix, so
+    # ``_source_offline_reason`` would classify a disconnected share
+    # reached via the alias as folder-scoped and classify would skip
+    # its photos instead of pausing for reconnection. ``realpath``
+    # only resolves symlinks (readlink), so it does not stat the
+    # target and stays safe even when the underlying mount is dead.
+    try:
+        resolved = os.path.realpath(os.path.expanduser(path))
+    except OSError:
+        resolved = None
+    resolved_posix = (
+        resolved.replace("\\", "/") if resolved else None
+    )
 
     seen: list[str] = []
-    for cand in (_candidate(raw_posix), _candidate(normalized_posix)):
+    for source in (raw_posix, normalized_posix, resolved_posix):
+        if source is None:
+            continue
+        cand = _candidate(source)
         if cand and cand not in seen:
             seen.append(cand)
     return seen
@@ -249,6 +269,54 @@ def _source_offline_reason(
         if _mount_root_offline(mount_root):
             return "mount", f"volume {mount_root} is not mounted"
     return "folder", f"folder {folder_path} is unreadable"
+
+
+def _still_offline_folder_ids_of(thread_db, folder_ids) -> set:
+    """Return the folder IDs whose stored ``folders.path`` is unreachable.
+
+    Twin of ``_still_offline_folder_ids`` that takes folder IDs directly
+    instead of a photo-seed set. Downstream stages use this to catch a
+    dead source that classify never observed — a fully-cached classify
+    (every detection + classifier result already stored) makes no image
+    opens, so ``source_offline_state["skipped_photo_ids"]`` stays empty
+    even if every remaining file lives on a disconnected share. Without
+    an always-probe pass over the downstream worklist, ``extract_masks``
+    / ``eye_keypoints`` would then reopen the dead source, hammering it
+    photo-by-photo — the exact pattern the classify pause is meant to
+    prevent (Codex #1388 P1 r3664891993).
+
+    Each unique folder path is probed once (``isdir`` returns False for
+    every child of a dead mount, so a single probe covers folder- and
+    mount-scoped outages alike). Folders the DB no longer knows about
+    are silently dropped, and the lookup is chunked under SQLite's
+    bind-variable limit so large worklists don't raise ``too many SQL
+    variables`` before the filter can run (see ``db.py``'s
+    ``_SQLITE_PARAM_CHUNK_SIZE``).
+    """
+    if not folder_ids:
+        return set()
+    ids = [int(fid) for fid in folder_ids]
+    _CHUNK = 900
+    probe_cache: dict = {}
+    still_offline: set = set()
+    for i in range(0, len(ids), _CHUNK):
+        chunk = ids[i:i + _CHUNK]
+        placeholders = ",".join("?" * len(chunk))
+        rows = thread_db.conn.execute(
+            f"SELECT id, path FROM folders WHERE id IN ({placeholders})",
+            chunk,
+        ).fetchall()
+        for row in rows:
+            fid = row["id"] if hasattr(row, "keys") else row[0]
+            path = row["path"] if hasattr(row, "keys") else row[1]
+            if not path:
+                still_offline.add(fid)
+                continue
+            if path not in probe_cache:
+                probe_cache[path] = os.path.isdir(path)
+            if not probe_cache[path]:
+                still_offline.add(fid)
+    return still_offline
 
 
 def _still_offline_folder_ids(thread_db, seed_photo_ids) -> set:
@@ -5407,16 +5475,28 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
 
                 photos = _filter_excluded(thread_db.get_collection_photos(collection_id, per_page=999999))
 
-                # Drop photos classify couldn't reach because their folder
-                # was offline. Without this we'd render_proxy every one of
-                # them, they'd all skip with proxy=None, and the stage
-                # summary would land as "N skipped" — obscuring the real
-                # cause (missing folder) with a mask-extraction failure
-                # count (Codex #1388 P2 r3664058173). The folder-scoped
-                # branch in classify deliberately leaves ``abort`` clear
-                # so healthy folders keep processing here; this filter is
-                # how "healthy folders keep processing" stays true without
-                # dragging the missing folder's photos along.
+                # Drop photos whose folder is offline. Without this we'd
+                # render_proxy every one of them, they'd all skip with
+                # proxy=None, and the stage summary would land as "N
+                # skipped" — obscuring the real cause (missing folder)
+                # with a mask-extraction failure count (Codex #1388 P2
+                # r3664058173). The folder-scoped branch in classify
+                # deliberately leaves ``abort`` clear so healthy folders
+                # keep processing here; this filter is how "healthy
+                # folders keep processing" stays true without dragging
+                # the missing folder's photos along.
+                #
+                # Always probe the worklist's folders — do NOT gate on
+                # ``source_skipped_photo_ids`` (Codex #1388 P1
+                # r3664891993). A fully-cached classify (every detection
+                # + classifier result already stored, only masks missing
+                # — e.g. after a SAM variant change) makes no image
+                # opens, so the seed set stays empty even though every
+                # remaining file is on an unreachable share. Without the
+                # unconditional probe, extract_masks would then reopen
+                # the dead source photo-by-photo, count each failed
+                # render_proxy as merely skipped, and the pipeline
+                # could finish "successfully" with no masks made.
                 #
                 # Filter by FOLDER, not by photo id: the classify seed
                 # only accumulates photos that reached ``_prepare_image``,
@@ -5431,17 +5511,70 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                 # for spec A comes back before mask extraction runs, so
                 # its photos aren't silently excluded (Codex #1388 P2
                 # r3664348758).
-                source_skipped_photo_ids = source_offline_state.get(
-                    "skipped_photo_ids") or set()
-                if source_skipped_photo_ids:
-                    still_offline_folder_ids = _still_offline_folder_ids(
-                        thread_db, source_skipped_photo_ids,
+                def _row_folder_id(row):
+                    # sqlite.Row raises IndexError on missing columns; a
+                    # test-shape dict raises KeyError. Both mean "no
+                    # folder to probe" for this row — leave it in place
+                    # rather than treating it as offline.
+                    try:
+                        fid = row["folder_id"]
+                    except (KeyError, IndexError):
+                        return None
+                    return fid
+
+                worklist_folder_ids = {
+                    fid for fid in (_row_folder_id(p) for p in photos)
+                    if fid is not None
+                }
+                still_offline_folder_ids = _still_offline_folder_ids_of(
+                    thread_db, worklist_folder_ids,
+                )
+                if still_offline_folder_ids:
+                    kept, dropped = [], []
+                    for p in photos:
+                        if _row_folder_id(p) in still_offline_folder_ids:
+                            dropped.append(p)
+                        else:
+                            kept.append(p)
+                    total_before = len(photos)
+                    photos = kept
+                    dropped_ids = {p["id"] for p in dropped}
+                    # Publish so eye_keypoints (later downstream) sees
+                    # the same offline set without having to re-probe
+                    # every folder from scratch.
+                    prior_skipped = (
+                        source_offline_state.get("skipped_photo_ids")
+                        or set()
                     )
-                    if still_offline_folder_ids:
-                        photos = [
-                            p for p in photos
-                            if p["folder_id"] not in still_offline_folder_ids
-                        ]
+                    source_offline_state["skipped_photo_ids"] = (
+                        set(prior_skipped) | dropped_ids
+                    )
+                    already_flagged_classify = any(
+                        e.startswith("[classify] Fatal:") for e in errors
+                    )
+                    if not already_flagged_classify:
+                        # Classify didn't already own this outage
+                        # (e.g. fully-cached run where classify made no
+                        # image reads). Surface the source-offline
+                        # failure at this stage instead — a fatal-
+                        # prefixed error keeps the end-of-run rollup
+                        # from picking an unrelated warning as the
+                        # headline error, and marking the stage
+                        # ``failed`` prevents the pipeline from
+                        # finishing "successfully" with no masks made.
+                        errors.append(
+                            f"[extract_masks] Fatal: "
+                            f"{len(dropped_ids)} of {total_before} "
+                            f"photos unreachable (source offline). "
+                            f"Reconnect the missing folder(s) and run "
+                            f"Process again to extract the rest."
+                        )
+                        stages["extract_masks"]["status"] = "failed"
+                    log.warning(
+                        "Extract-masks: dropped %d photo(s) from %d "
+                        "offline folder(s); source not reachable.",
+                        len(dropped_ids), len(still_offline_folder_ids),
+                    )
 
                 # Build a map of photo_id -> primary detection (highest confidence)
                 # from the detections table. Only photos with detections and without
@@ -6117,13 +6250,20 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                         if p["id"] not in params.exclude_photo_ids
                     ]
 
-                # Drop photos classify couldn't reach because their folder
-                # was offline. eye_keypoints also opens the source image
-                # (via the pipeline detect_eye_keypoints_stage → keypoint
-                # runners), so without this it would walk every unreachable
-                # photo and record them as eye-detection failures — the
-                # same downstream-hammering pattern the classify pause is
+                # Drop photos whose folder is offline. eye_keypoints also
+                # opens the source image (via the pipeline
+                # detect_eye_keypoints_stage → keypoint runners), so
+                # without this it would walk every unreachable photo and
+                # record them as eye-detection failures — the same
+                # downstream-hammering pattern the classify pause is
                 # meant to prevent (Codex #1388 P2 r3664058173).
+                #
+                # Always probe the worklist's folders — not just when
+                # classify populated ``source_skipped_photo_ids`` (Codex
+                # #1388 P1 r3664891993). A fully-cached-classify /
+                # eye-only rerun makes no image reads in classify, so
+                # the seed set can stay empty even when every remaining
+                # file is on an unreachable share.
                 #
                 # Filter by FOLDER, not by photo id — cached photos
                 # never populate the classify seed set, so an ID-only
@@ -6131,17 +6271,65 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                 # P2 r3664694179). Re-probing per folder also lets a
                 # folder that recovered between classify and this stage
                 # rejoin (Codex #1388 P2 r3664348758).
-                source_skipped_photo_ids = source_offline_state.get(
-                    "skipped_photo_ids") or set()
-                if source_skipped_photo_ids:
-                    still_offline_folder_ids = _still_offline_folder_ids(
-                        thread_db, source_skipped_photo_ids,
+                def _row_folder_id(row):
+                    # sqlite.Row raises IndexError on missing columns; a
+                    # test-shape dict raises KeyError. Both mean "no
+                    # folder to probe" for this row.
+                    try:
+                        fid = row["folder_id"]
+                    except (KeyError, IndexError):
+                        return None
+                    return fid
+
+                worklist_folder_ids = {
+                    fid for fid in (
+                        _row_folder_id(p) for p in photos_for_stage
+                    ) if fid is not None
+                }
+                still_offline_folder_ids = _still_offline_folder_ids_of(
+                    thread_db, worklist_folder_ids,
+                )
+                if still_offline_folder_ids:
+                    dropped_ids = {
+                        p["id"] for p in photos_for_stage
+                        if _row_folder_id(p) in still_offline_folder_ids
+                    }
+                    photos_for_stage = [
+                        p for p in photos_for_stage
+                        if _row_folder_id(p) not in still_offline_folder_ids
+                    ]
+                    # The stage-level call at the bottom re-resolves
+                    # photos from ``collection_id`` and filters via
+                    # ``exclude_photo_ids`` — the local filter above
+                    # only drives the weight-download planner and
+                    # ``total``. Merge the offline IDs into the stage's
+                    # exclusion set so the actual keypoint runners
+                    # don't reopen the dead source (CodeRabbit
+                    # r3664548813).
+                    existing_exclude = (
+                        set(params.exclude_photo_ids)
+                        if params.exclude_photo_ids else set()
                     )
-                    if still_offline_folder_ids:
-                        photos_for_stage = [
-                            p for p in photos_for_stage
-                            if p["folder_id"] not in still_offline_folder_ids
-                        ]
+                    params.exclude_photo_ids = (
+                        existing_exclude | dropped_ids
+                    )
+                    # Publish for anyone downstream that may probe
+                    # ``source_offline_state`` later.
+                    prior_skipped = (
+                        source_offline_state.get("skipped_photo_ids")
+                        or set()
+                    )
+                    source_offline_state["skipped_photo_ids"] = (
+                        set(prior_skipped) | dropped_ids
+                    )
+                    if dropped_ids:
+                        log.warning(
+                            "Eye-keypoints: dropped %d photo(s) from "
+                            "%d offline folder(s); source not "
+                            "reachable.",
+                            len(dropped_ids),
+                            len(still_offline_folder_ids),
+                        )
                 total = len(photos_for_stage)
                 start_time = time.time()
                 processed = {"count": 0}

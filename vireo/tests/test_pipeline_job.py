@@ -12706,7 +12706,7 @@ def test_source_offline_reason_flags_stale_mount_that_raises_from_stat(
 
     real_lexists = pipeline_job.os.path.lexists
     real_isdir = pipeline_job.os.path.isdir
-    real_ismount = pipeline_job.os.path.ismount
+    real_listdir = pipeline_job.os.listdir
 
     def fake_lexists(path):
         if path == "/mnt/photos":
@@ -12718,18 +12718,31 @@ def test_source_offline_reason_flags_stale_mount_that_raises_from_stat(
             return False
         return real_isdir(path)
 
-    def fake_ismount(path):
+    def fake_listdir(path):
+        # ``_mount_root_offline`` probes readability of the mount
+        # root itself via ``os.listdir``; a stale SMB/NFS mount whose
+        # server has disconnected raises ``OSError`` (EIO) from that
+        # call even though ``lexists``/``ismount`` still report the
+        # mount as present. This is the exact behaviour that lets us
+        # scope the outage to the whole mount (pause + resume flow)
+        # rather than silently accepting the dropped share as healthy
+        # and folder-scoping every subsequent read. Without patching
+        # ``os.listdir``, the test would depend on the host machine
+        # not having a real ``/mnt/photos`` — pass on a bare CI image,
+        # fail on WSL/containers/Linux desktops that do — and the
+        # intended branch would never be exercised (CodeRabbit
+        # r3664548822).
         if path == "/mnt/photos":
             raise OSError("Input/output error")
-        return real_ismount(path)
+        return real_listdir(path)
 
     monkeypatch.setattr(pipeline_job.os.path, "lexists", fake_lexists)
     monkeypatch.setattr(pipeline_job.os.path, "isdir", fake_isdir)
-    monkeypatch.setattr(pipeline_job.os.path, "ismount", fake_ismount)
+    monkeypatch.setattr(pipeline_job.os, "listdir", fake_listdir)
 
     result = pipeline_job._source_offline_reason(folder, image)
     assert result is not None and result[0] == "mount", (
-        f"A stale mount whose ismount probe raises must be treated as "
+        f"A stale mount whose listdir probe raises must be treated as "
         f"offline, not silently accepted as healthy. Got {result!r}."
     )
 
@@ -12961,6 +12974,93 @@ def test_still_offline_folder_ids_expands_beyond_seed_photos(tmp_path):
         f"folder-scoped filter — otherwise the mask/eye-keypoint stages "
         f"would reopen the dead source. Got {filtered!r}."
     )
+
+
+def test_archive_mount_root_candidates_resolves_symlink_aliases(tmp_path):
+    """A symlink alias to a mount root must retain mount scope.
+
+    Codex #1388 P2 (r3664891998): a common catalog shape is a stable
+    alias in the user's home (or a top-level ``/photos``) that points
+    into a real mount like ``/Volumes/NAS/photos``. When the underlying
+    share disconnects, neither the raw alias nor its ``abspath``
+    normalization has a ``/Volumes``/``/mnt``/drive-letter/UNC prefix,
+    so pre-fix ``_source_offline_reason`` would classify the dropped
+    share as folder-scoped — skipping its photos silently instead of
+    offering the reconnect-and-resume flow. Pin that ``realpath``
+    resolution surfaces the underlying mount root so the outage scope
+    reaches the whole share.
+    """
+    from pipeline_job import _archive_mount_root_candidates
+
+    # A real symlink whose target is a mount-shaped path. The target
+    # doesn't need to exist — ``realpath`` only resolves symlink chains
+    # (readlink), it doesn't stat the resolved path — but we build a
+    # dead-mount-looking layout on disk to keep the test hermetic.
+    volumes = tmp_path / "Volumes"
+    volumes.mkdir()
+    share_target = volumes / "NAS" / "photos"
+    share_target.mkdir(parents=True)
+
+    alias = tmp_path / "photos_alias"
+    # Point the alias at ``/Volumes/NAS/photos`` verbatim so realpath
+    # yields a canonical mount-shaped absolute path regardless of the
+    # tmp_path prefix.
+    alias.symlink_to("/Volumes/NAS/photos")
+
+    aliased_image = str(alias / "2026-07-28" / "DSC_0001.NEF")
+    cands = _archive_mount_root_candidates(aliased_image)
+    assert "/Volumes/NAS" in cands, (
+        f"A symlink alias into ``/Volumes/NAS`` must yield the "
+        f"underlying mount root via realpath so the outage scope "
+        f"reaches the whole share. Got {cands!r}."
+    )
+
+
+def test_still_offline_folder_ids_of_probes_folder_ids_directly(tmp_path):
+    """The direct-probe helper accepts folder IDs, not a photo seed.
+
+    Codex #1388 P1 (r3664891993): a fully-cached-classify run
+    (every detection and classifier result already stored, only masks
+    missing after a SAM variant change) makes no image opens, so
+    ``source_offline_state["skipped_photo_ids"]`` stays empty even
+    when every remaining file lives on an unreachable share. The
+    seed-based ``_still_offline_folder_ids`` therefore returns an
+    empty set, and downstream stages would reopen the dead source
+    photo-by-photo. Pin that the direct-probe twin handles the
+    fully-cached case by taking folder IDs from the downstream
+    worklist and probing them independently.
+    """
+    import config as cfg
+    from db import Database
+    from pipeline_job import _still_offline_folder_ids_of
+
+    cfg.CONFIG_PATH = str(tmp_path / "config.json")
+    db = Database(str(tmp_path / "test.db"))
+
+    healthy_folder = tmp_path / "healthy"
+    healthy_folder.mkdir()
+    gone_folder = tmp_path / "vanished"
+    gone_folder.mkdir()
+
+    healthy_folder_id = db.add_folder(str(healthy_folder))
+    gone_folder_id = db.add_folder(str(gone_folder))
+
+    # Delete only the "gone" folder. In the fully-cached scenario the
+    # classify seed set is empty, but the downstream worklist still
+    # references the gone folder via ``folder_id``.
+    os.rmdir(gone_folder)
+
+    still_offline = _still_offline_folder_ids_of(
+        db, {healthy_folder_id, gone_folder_id},
+    )
+    assert still_offline == {gone_folder_id}, (
+        f"Direct-probe helper must return only the folder that is "
+        f"actually unreachable at probe time; got {still_offline!r}."
+    )
+
+    # Empty input is a no-op — no DB query needed.
+    assert _still_offline_folder_ids_of(db, set()) == set()
+    assert _still_offline_folder_ids_of(db, []) == set()
 
 
 def test_still_offline_folder_ids_chunks_large_id_sets(tmp_path):

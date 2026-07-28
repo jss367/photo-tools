@@ -24685,19 +24685,21 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             requested_sources = set(sources)
             unknown_sources = sorted(requested_sources - parent_sources)
             if unknown_sources:
+                unknown_source_text = ", ".join(unknown_sources[:3])
                 return json_error(
                     "Retry submitted source paths the original import "
                     "never enumerated (a different card mounted at the "
                     "same path, or a new source added): "
-                    f"{unknown_sources[:3]}. Start a new import instead "
+                    f"{unknown_source_text}. Start a new import instead "
                     "of retrying."
                 )
             missing_sources = sorted(parent_sources - requested_sources)
             if missing_sources:
+                missing_source_text = ", ".join(missing_sources[:3])
                 return json_error(
                     "A recovery retry must include every source from the "
                     "original import. These sources are missing: "
-                    f"{missing_sources[:3]}. Reconnect all original "
+                    f"{missing_source_text}. Reconnect all original "
                     "sources, or start a new import instead of retrying."
                 )
 

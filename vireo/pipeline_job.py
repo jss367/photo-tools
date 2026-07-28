@@ -251,51 +251,61 @@ def _source_offline_reason(
     return "folder", f"folder {folder_path} is unreadable"
 
 
-def _still_offline_photo_ids(thread_db, photo_ids) -> set:
-    """Return the subset of ``photo_ids`` whose folder is still unreadable.
+def _still_offline_folder_ids(thread_db, seed_photo_ids) -> set:
+    """Return the folder IDs whose ``folders.path`` is still unreadable.
 
-    Downstream stages (extract_masks, eye_keypoints) filter photos by
-    the aggregate ``source_offline_state["skipped_photo_ids"]`` set so
-    an offline folder's photos aren't re-opened just to fail again.
-    That set accumulates across every classifier spec, but the folder
-    can recover between specs — or between classify and mask
-    extraction. Without a re-probe the mask/eye-keypoint stages would
-    silently exclude a photo whose folder came back (Codex #1388 P2
-    r3664348758). Anything the DB no longer knows about is dropped
-    from the returned set — a photo that was purged since classify
-    can't be filtered either.
+    Downstream stages (extract_masks, eye_keypoints) use this to expand
+    the classify-observed ``source_offline_state["skipped_photo_ids"]``
+    set from photo-ID-scoped exclusion to folder-scoped exclusion.
+    Classify only ever adds a photo to that set after calling
+    ``_prepare_image``; the non-reclassify cache branch short-circuits
+    before that call, so cached photos in the same offline folder
+    never enter the seed set (Codex #1388 P2 r3664694179). Filtering
+    by folder catches them too — otherwise they slip through and force
+    mask/eye-keypoint stages to reopen the dead source, the exact
+    downstream-hammering pattern the classify pause is meant to
+    prevent.
 
-    The IN-clause lookup is chunked under SQLite's bind-variable limit
+    Each unique folder path is probed once (dead mount → ``isdir``
+    False for every child, so a single probe suffices for either
+    mount- or folder-scoped outages). Anything the DB no longer knows
+    about is silently dropped — a photo that was purged since
+    classify can't be filtered by folder either.
+
+    The seed lookup is chunked under SQLite's bind-variable limit
     (999 on legacy builds this repo explicitly accommodates — see
-    ``db.py``'s ``_SQLITE_PARAM_CHUNK_SIZE``). Without chunking a large
-    offline folder would raise ``OperationalError: too many SQL
-    variables`` before the mask/eye-keypoint stages could get past this
-    filter and continue with photos from healthy folders (Codex #1388
-    P2 r3664525158).
+    ``db.py``'s ``_SQLITE_PARAM_CHUNK_SIZE``). Without chunking a
+    large offline folder would raise ``OperationalError: too many
+    SQL variables`` before the mask/eye-keypoint stages could get
+    past this filter and continue with photos from healthy folders
+    (Codex #1388 P2 r3664525158).
     """
-    if not photo_ids:
+    if not seed_photo_ids:
         return set()
-    ids = [int(pid) for pid in photo_ids]
+    ids = [int(pid) for pid in seed_photo_ids]
     _CHUNK = 900
-    still_offline: set = set()
+    probe_cache: dict = {}
+    still_offline_folder_ids: set = set()
     for i in range(0, len(ids), _CHUNK):
         chunk = ids[i:i + _CHUNK]
         placeholders = ",".join("?" * len(chunk))
         rows = thread_db.conn.execute(
-            f"SELECT p.id, f.path "
+            f"SELECT DISTINCT p.folder_id, f.path "
             f"FROM photos p JOIN folders f ON p.folder_id = f.id "
             f"WHERE p.id IN ({placeholders})",
             chunk,
         ).fetchall()
         for row in rows:
-            pid = row["id"] if hasattr(row, "keys") else row[0]
+            fid = row["folder_id"] if hasattr(row, "keys") else row[0]
             path = row["path"] if hasattr(row, "keys") else row[1]
-            # ``isdir`` False covers both a still-missing folder and a
-            # mount-scoped outage (dead mount → isdir False for every
-            # child), so a single probe suffices for either scope.
-            if not path or not os.path.isdir(path):
-                still_offline.add(pid)
-    return still_offline
+            if not path:
+                still_offline_folder_ids.add(fid)
+                continue
+            if path not in probe_cache:
+                probe_cache[path] = os.path.isdir(path)
+            if not probe_cache[path]:
+                still_offline_folder_ids.add(fid)
+    return still_offline_folder_ids
 
 
 @dataclass
@@ -5408,23 +5418,30 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                 # how "healthy folders keep processing" stays true without
                 # dragging the missing folder's photos along.
                 #
-                # Re-probe before filtering: the aggregate skipped set
-                # accumulates across every classifier spec, and a folder
-                # that dropped for spec A can recover before mask
-                # extraction runs. Without the re-probe we'd silently
-                # exclude photos whose folder came back (Codex #1388 P2
+                # Filter by FOLDER, not by photo id: the classify seed
+                # only accumulates photos that reached ``_prepare_image``,
+                # so the non-reclassify cache branch — which appends the
+                # cached prediction to raw_results and ``continue``s
+                # without any disk touch — never contributes its photos
+                # to the seed set. An ID-only filter would leave those
+                # cached photos in place, and mask/eye-keypoint stages
+                # would reopen the same dead source (Codex #1388 P2
+                # r3664694179). Re-probing per folder also handles the
+                # multi-spec recovery case where a folder that dropped
+                # for spec A comes back before mask extraction runs, so
+                # its photos aren't silently excluded (Codex #1388 P2
                 # r3664348758).
                 source_skipped_photo_ids = source_offline_state.get(
                     "skipped_photo_ids") or set()
                 if source_skipped_photo_ids:
-                    source_skipped_photo_ids = _still_offline_photo_ids(
+                    still_offline_folder_ids = _still_offline_folder_ids(
                         thread_db, source_skipped_photo_ids,
                     )
-                if source_skipped_photo_ids:
-                    photos = [
-                        p for p in photos
-                        if p["id"] not in source_skipped_photo_ids
-                    ]
+                    if still_offline_folder_ids:
+                        photos = [
+                            p for p in photos
+                            if p["folder_id"] not in still_offline_folder_ids
+                        ]
 
                 # Build a map of photo_id -> primary detection (highest confidence)
                 # from the detections table. Only photos with detections and without
@@ -6108,20 +6125,23 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                 # same downstream-hammering pattern the classify pause is
                 # meant to prevent (Codex #1388 P2 r3664058173).
                 #
-                # Re-probe so a folder that recovered between classify
-                # and this stage is not left out (Codex #1388 P2
-                # r3664348758).
+                # Filter by FOLDER, not by photo id — cached photos
+                # never populate the classify seed set, so an ID-only
+                # filter would leave them in the worklist (Codex #1388
+                # P2 r3664694179). Re-probing per folder also lets a
+                # folder that recovered between classify and this stage
+                # rejoin (Codex #1388 P2 r3664348758).
                 source_skipped_photo_ids = source_offline_state.get(
                     "skipped_photo_ids") or set()
                 if source_skipped_photo_ids:
-                    source_skipped_photo_ids = _still_offline_photo_ids(
+                    still_offline_folder_ids = _still_offline_folder_ids(
                         thread_db, source_skipped_photo_ids,
                     )
-                if source_skipped_photo_ids:
-                    photos_for_stage = [
-                        p for p in photos_for_stage
-                        if p["id"] not in source_skipped_photo_ids
-                    ]
+                    if still_offline_folder_ids:
+                        photos_for_stage = [
+                            p for p in photos_for_stage
+                            if p["folder_id"] not in still_offline_folder_ids
+                        ]
                 total = len(photos_for_stage)
                 start_time = time.time()
                 processed = {"count": 0}

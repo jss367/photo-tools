@@ -12851,20 +12851,21 @@ def test_mount_root_offline_false_for_empty_ordinary_local_dir(tmp_path):
     )
 
 
-def test_still_offline_photo_ids_prunes_recovered_folders(tmp_path):
-    """Photos whose folder is now readable must drop out of the skip set.
+def test_still_offline_folder_ids_prunes_recovered_folders(tmp_path):
+    """Folders that recovered must drop out of the still-offline set.
 
     Codex #1388 P2 (r3664348758): the aggregate
     ``source_offline_state["skipped_photo_ids"]`` accumulates across every
     classifier spec, and a folder that dropped for spec A can recover
     before mask extraction runs. Without a re-probe, the downstream
-    filter would silently exclude the now-readable photo and it would
-    never get its masks. Pin that ``_still_offline_photo_ids`` returns
-    only photos whose folder is still missing at re-probe time.
+    filter would silently exclude photos in the now-readable folder and
+    they would never get their masks. Pin that
+    ``_still_offline_folder_ids`` returns only folders that are still
+    missing at re-probe time.
     """
     import config as cfg
     from db import Database
-    from pipeline_job import _still_offline_photo_ids
+    from pipeline_job import _still_offline_folder_ids
 
     cfg.CONFIG_PATH = str(tmp_path / "config.json")
     db = Database(str(tmp_path / "test.db"))
@@ -12887,22 +12888,82 @@ def test_still_offline_photo_ids_prunes_recovered_folders(tmp_path):
     # Now delete the "gone" folder — folder A recovered, folder B is
     # still missing. This is the multi-model recovery shape: both
     # photo IDs entered the aggregate skipped set for an earlier
-    # classifier spec, but only one of them is still unreachable now.
+    # classifier spec, but only one of the two folders is still
+    # unreachable now.
     os.rmdir(gone_folder)
 
-    still_offline = _still_offline_photo_ids(db, {healthy_id, gone_id})
-    assert still_offline == {gone_id}, (
-        f"A recovered folder must drop its photo from the still-offline "
-        f"set so downstream stages can process it; only the folder that "
-        f"remains missing should stay in the set. Got {still_offline!r}."
+    still_offline = _still_offline_folder_ids(db, {healthy_id, gone_id})
+    assert still_offline == {gone_folder_id}, (
+        f"A recovered folder must drop out of the still-offline set so "
+        f"downstream stages can process its photos; only the folder that "
+        f"remains missing should stay. Got {still_offline!r} (expected "
+        f"{{gone_folder_id={gone_folder_id}}})."
     )
 
     # And the empty-input path is a no-op — no DB query needed.
-    assert _still_offline_photo_ids(db, set()) == set()
-    assert _still_offline_photo_ids(db, []) == set()
+    assert _still_offline_folder_ids(db, set()) == set()
+    assert _still_offline_folder_ids(db, []) == set()
 
 
-def test_still_offline_photo_ids_chunks_large_id_sets(tmp_path):
+def test_still_offline_folder_ids_expands_beyond_seed_photos(tmp_path):
+    """A seed photo's folder scopes filtering for ALL photos in that folder.
+
+    Codex #1388 P2 (r3664694179): in a non-reclassify run, photos with
+    cached classifier results take the cache branch without calling
+    ``_prepare_image``, so their IDs never enter
+    ``source_offline_state["skipped_photo_ids"]``. If another photo in
+    the same folder reveals the folder is unavailable, an ID-only filter
+    still leaves those cached photos in the downstream mask/eye-keypoint
+    worklists, and the stages reopen the missing source. Pin that the
+    helper returns the whole *folder* — not just the seed photos — so
+    the caller can filter by ``folder_id`` and catch cached siblings.
+    """
+    import config as cfg
+    from db import Database
+    from pipeline_job import _still_offline_folder_ids
+
+    cfg.CONFIG_PATH = str(tmp_path / "config.json")
+    db = Database(str(tmp_path / "test.db"))
+
+    gone_folder = tmp_path / "vanished"
+    gone_folder.mkdir()
+    gone_folder_id = db.add_folder(str(gone_folder))
+
+    # ``seed`` is the photo classify observed as unreachable via
+    # ``_prepare_image``. ``cached_sibling`` is a photo in the SAME
+    # folder that took the cache branch and never touched disk, so it
+    # never entered the seed set.
+    seed = db.add_photo(gone_folder_id, "seed.jpg", ".jpg", 1000, 100.0)
+    cached_sibling = db.add_photo(
+        gone_folder_id, "cached.jpg", ".jpg", 1000, 101.0,
+    )
+
+    os.rmdir(gone_folder)
+
+    still_offline = _still_offline_folder_ids(db, {seed})
+    assert still_offline == {gone_folder_id}, (
+        f"Seeding with the reached photo alone must still surface the "
+        f"whole folder as offline so cached siblings can be filtered by "
+        f"folder_id. Got {still_offline!r}."
+    )
+    # And the returned set is what a downstream filter uses to exclude
+    # the cached sibling — assert the filter shape callers apply.
+    photos_for_stage = [
+        {"id": seed, "folder_id": gone_folder_id},
+        {"id": cached_sibling, "folder_id": gone_folder_id},
+    ]
+    filtered = [
+        p for p in photos_for_stage
+        if p["folder_id"] not in still_offline
+    ]
+    assert filtered == [], (
+        f"Cached siblings in an offline folder must be dropped by the "
+        f"folder-scoped filter — otherwise the mask/eye-keypoint stages "
+        f"would reopen the dead source. Got {filtered!r}."
+    )
+
+
+def test_still_offline_folder_ids_chunks_large_id_sets(tmp_path):
     """Query in bounded chunks so SQLite's bind-variable limit can't 500 us.
 
     Codex #1388 P2 (r3664525158): an offline folder can hold more photos
@@ -12911,13 +12972,12 @@ def test_still_offline_photo_ids_chunks_large_id_sets(tmp_path):
     ``id IN (?,?,…)`` here would raise ``OperationalError: too many SQL
     variables`` before mask/eye-keypoint stages could get past the
     downstream filter and continue with photos from healthy folders.
-    Exercise well over 999 IDs and pin that the caller still gets a
-    correct still-offline set — no exception, and every photo whose
-    folder is missing is returned.
+    Exercise well over 999 IDs and pin that the caller still gets the
+    offline folder back — no exception.
     """
     import config as cfg
     from db import Database
-    from pipeline_job import _still_offline_photo_ids
+    from pipeline_job import _still_offline_folder_ids
 
     cfg.CONFIG_PATH = str(tmp_path / "config.json")
     db = Database(str(tmp_path / "test.db"))
@@ -12935,10 +12995,10 @@ def test_still_offline_photo_ids_chunks_large_id_sets(tmp_path):
 
     os.rmdir(gone_folder)
 
-    still_offline = _still_offline_photo_ids(db, photo_ids)
-    assert still_offline == set(photo_ids), (
-        f"Chunked lookup must still return every photo whose folder is "
-        f"unreadable; got {len(still_offline)} of {len(photo_ids)}."
+    still_offline = _still_offline_folder_ids(db, photo_ids)
+    assert still_offline == {gone_folder_id}, (
+        f"Chunked lookup must still surface the unreachable folder; got "
+        f"{still_offline!r}."
     )
 
 

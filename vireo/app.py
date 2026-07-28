@@ -15910,7 +15910,13 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
     @app.route("/api/darktable/status")
     def api_darktable_status():
         import config as cfg
-        from develop import darktable_search_paths, find_darktable, find_dng_converter
+        from develop import (
+            darktable_search_paths,
+            darktable_tools_dir,
+            darktable_uses_tools_dir,
+            find_darktable,
+            find_dng_converter,
+        )
 
         configured = cfg.get("darktable_bin")
         binary = find_darktable(configured)
@@ -15921,17 +15927,17 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         # actually probes: shutil.which("darktable-cli") first, then the
         # filesystem candidates. darktable_search_paths() covers only the
         # latter, and on Linux it lists just the AppImages already present in
-        # ~/.vireo/tools/darktable — so a box with none yet would get an empty
-        # "we checked here" list, on exactly the platform the download targets.
-        # Hence compose here rather than returning that list raw. The platform
-        # check below mirrors darktable_search_paths()'s own branching so the
-        # directory is named on, and only on, the platform that probes it.
+        # our tools dir — so a box with none yet would get an empty "we checked
+        # here" list, on exactly the platform the download targets. Hence
+        # compose here rather than returning that list raw.
+        # darktable_uses_tools_dir() is the same predicate darktable_search_paths()
+        # branches on, so the directory is named on, and only on, the platform
+        # that probes it. It cannot already be in the list: the detector only
+        # ever emits files *inside* the directory, never the directory itself.
         checked_paths = ["$PATH (darktable-cli)"]
         checked_paths.extend(darktable_search_paths())
-        if os.name != "nt" and sys.platform != "darwin":
-            tools_dir = os.path.expanduser("~/.vireo/tools/darktable")
-            if tools_dir not in checked_paths:
-                checked_paths.append(tools_dir)
+        if darktable_uses_tools_dir():
+            checked_paths.append(darktable_tools_dir())
 
         return jsonify({
             "available": binary is not None,

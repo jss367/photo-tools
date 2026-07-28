@@ -49,6 +49,27 @@ def _mtime_or_missing(path):
         return -1.0
 
 
+def darktable_tools_dir():
+    """Where Vireo installs darktable itself; probed by darktable_search_paths.
+
+    A function rather than a module constant so tests (and any caller that
+    relocates HOME) can patch os.path.expanduser and still be obeyed; a
+    constant would freeze the expansion at import time.
+    """
+    return os.path.expanduser("~/.vireo/tools/darktable")
+
+
+def darktable_uses_tools_dir():
+    """True on the platforms where we install darktable into our own tools dir.
+
+    darktable_search_paths() branches on this same predicate, so the two cannot
+    drift: callers that need to name the directory (the status route telling
+    the user where we looked, the downloader deciding where to write) ask here
+    instead of re-deriving the platform test.
+    """
+    return os.name != "nt" and sys.platform != "darwin"
+
+
 def darktable_search_paths():
     """Filesystem locations probed for darktable-cli, in priority order.
 
@@ -68,27 +89,16 @@ def darktable_search_paths():
     candidates = []
     # Windows is os.name == "nt" *and* sys.platform == "win32", and macOS is
     # neither, so these branches are mutually exclusive on every real platform
-    # and their order is immaterial there. Don't reorder anyway:
-    # test_find_darktable_detects_standard_windows_install patches os.name on
-    # its own, leaving sys.platform as the host's value, so a leading darwin
-    # branch would shadow the Windows candidates on a Mac.
-    if os.name == "nt":
-        for env_var in ("PROGRAMFILES", "PROGRAMFILES(X86)", "PROGRAMW6432"):
-            base = os.environ.get(env_var)
-            if base:
-                candidates.extend([
-                    os.path.join(base, "darktable", "bin", "darktable-cli.exe"),
-                    os.path.join(base, "darktable", "darktable-cli.exe"),
-                ])
-    elif sys.platform == "darwin":
-        candidates.extend([
-            "/Applications/darktable.app/Contents/MacOS/darktable-cli",
-            os.path.expanduser("~/Applications/darktable.app/Contents/MacOS/darktable-cli"),
-        ])
-    else:
+    # and their order is immaterial there. The tools-dir branch leads because
+    # its predicate is the shared darktable_uses_tools_dir(); that predicate
+    # already excludes os.name == "nt", so
+    # test_find_darktable_detects_standard_windows_install — which patches
+    # os.name on its own, leaving sys.platform as the host's value — still
+    # reaches the Windows candidates on a Mac.
+    if darktable_uses_tools_dir():
         # Linux: an AppImage we installed ourselves. Newest mtime wins, since
         # installers are kept and this directory accumulates versions.
-        tools_dir = os.path.expanduser("~/.vireo/tools/darktable")
+        tools_dir = darktable_tools_dir()
         if os.path.isdir(tools_dir):
             appimages = [
                 os.path.join(tools_dir, n)
@@ -97,6 +107,20 @@ def darktable_search_paths():
             ]
             appimages.sort(key=_mtime_or_missing, reverse=True)
             candidates.extend(appimages)
+    elif os.name == "nt":
+        for env_var in ("PROGRAMFILES", "PROGRAMFILES(X86)", "PROGRAMW6432"):
+            base = os.environ.get(env_var)
+            if base:
+                candidates.extend([
+                    os.path.join(base, "darktable", "bin", "darktable-cli.exe"),
+                    os.path.join(base, "darktable", "darktable-cli.exe"),
+                ])
+    else:
+        # macOS: the .app bundle, system-wide or per-user.
+        candidates.extend([
+            "/Applications/darktable.app/Contents/MacOS/darktable-cli",
+            os.path.expanduser("~/Applications/darktable.app/Contents/MacOS/darktable-cli"),
+        ])
     return candidates
 
 

@@ -197,7 +197,7 @@ def test_api_darktable_status_checked_paths_mentions_path_probe(app_and_db):
     assert any('PATH' in p for p in data['checked_paths'])
 
 
-def test_api_darktable_status_checked_paths_never_empty(app_and_db):
+def test_api_darktable_status_checked_paths_never_empty(app_and_db, monkeypatch):
     """Never render an empty 'we checked here' list.
 
     darktable_search_paths() returns [] on a Linux box with no AppImage
@@ -205,14 +205,29 @@ def test_api_darktable_status_checked_paths_never_empty(app_and_db):
     """
     import develop
     app, _ = app_and_db
-    original = develop.darktable_search_paths
-    develop.darktable_search_paths = lambda: []
-    try:
-        data = app.test_client().get('/api/darktable/status').get_json()
-    finally:
-        develop.darktable_search_paths = original
+    monkeypatch.setattr(develop, "darktable_search_paths", lambda: [])
+
+    data = app.test_client().get('/api/darktable/status').get_json()
 
     assert data['checked_paths'], "checked_paths must never be empty"
+
+
+def test_api_darktable_status_checked_paths_includes_detector_candidates(app_and_db, monkeypatch):
+    """The real detector candidates reach the response, in priority order.
+
+    Asserting the whole list rather than membership also pins ordering, which
+    users read as "we tried these, in this sequence". Pinned to macOS so the
+    tools dir is not appended and the expected list is exact on any host.
+    """
+    import develop
+    app, _ = app_and_db
+    monkeypatch.setattr(develop, "darktable_search_paths", lambda: ["/sentinel/darktable-cli"])
+    monkeypatch.setattr(os, "name", "posix")
+    monkeypatch.setattr(sys, "platform", "darwin")
+
+    data = app.test_client().get('/api/darktable/status').get_json()
+
+    assert data['checked_paths'] == ["$PATH (darktable-cli)", "/sentinel/darktable-cli"]
 
 
 def test_api_darktable_status_checked_paths_names_linux_tools_dir(app_and_db, monkeypatch):

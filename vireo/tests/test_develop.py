@@ -1,6 +1,8 @@
 import os
 import sys
 
+import pytest
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 
@@ -515,6 +517,15 @@ def test_darktable_search_paths_linux_ignores_non_appimages(tmp_path, monkeypatc
     assert darktable_search_paths() == [str(appimage)]
 
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason=(
+        "Windows has no POSIX exec bit — os.access(_, X_OK) returns True for "
+        "any readable file regardless of chmod, so the abandoned 0o644 "
+        "AppImage cannot be distinguished from the installed 0o755 one here. "
+        "The gate itself is only reachable on the Linux branch in production."
+    ),
+)
 def test_darktable_search_paths_linux_ignores_non_executable_appimages(tmp_path, monkeypatch):
     """A download cancelled during digest verification leaves the AppImage at
     its final path but with the default non-executable mode (hand_off never

@@ -901,6 +901,16 @@ def test_download_with_resume_cancels_midstream(tmp_path):
     assert requests["n"] == 1, f"expected a single request, got {requests['n']}"
 
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason=(
+        "socket.shutdown(SHUT_RDWR) from another thread does not reliably "
+        "unblock a Python recv() on Windows — the blocked read only surfaces "
+        "once the peer actually closes, so this timing assertion is not a "
+        "meaningful check of the watcher there.  The mechanism still runs "
+        "in production; only the sub-5s timing property is Linux/macOS-only."
+    ),
+)
 def test_download_with_resume_cancel_interrupts_stalled_read(tmp_path):
     """A Stop press during a stalled resp.read must not wait for the socket timeout.
 

@@ -1,0 +1,32 @@
+{
+  "tag_name": "release-5.6.0",
+  "assets": [
+    {"name": "Darktable-5.6.0-aarch64.AppImage", "size": 170895880,
+     "digest": "sha256:147943bd2eedc33c8d31eb3e6b87b591ac9ca285d00282b2655d8d19caecfca0",
+     "browser_download_url": "https://github.com/darktable-org/darktable/releases/download/release-5.6.0/Darktable-5.6.0-aarch64.AppImage"},
+    {"name": "Darktable-5.6.0-aarch64.AppImage.zsync", "size": 292297,
+     "digest": "sha256:52a2b5da0dd55c984f3d4c6e77bbd1119b4561cf17c80146a09c9e498ae56da4",
+     "browser_download_url": "https://github.com/darktable-org/darktable/releases/download/release-5.6.0/Darktable-5.6.0-aarch64.AppImage.zsync"},
+    {"name": "darktable-5.6.0-arm64.dmg", "size": 87094261,
+     "digest": "sha256:49aec447e891ab481e436b4c0231fc3c8d0001aad220762ae8e765d3bda5d102",
+     "browser_download_url": "https://github.com/darktable-org/darktable/releases/download/release-5.6.0/darktable-5.6.0-arm64.dmg"},
+    {"name": "darktable-5.6.0-x86_64.dmg", "size": 92795715,
+     "digest": "sha256:24c83655af0d81c2f8cb78b97531a03bb6a650349b7fd49c1679080db675cbcb",
+     "browser_download_url": "https://github.com/darktable-org/darktable/releases/download/release-5.6.0/darktable-5.6.0-x86_64.dmg"},
+    {"name": "darktable-5.6.0-win64.exe", "size": 141543364,
+     "digest": "sha256:b42989195dfff44540c0b767b407987329ca99853612304cbbf14c48d1d3f803",
+     "browser_download_url": "https://github.com/darktable-org/darktable/releases/download/release-5.6.0/darktable-5.6.0-win64.exe"},
+    {"name": "darktable-5.6.0-woa64.exe", "size": 106943215,
+     "digest": "sha256:b7737d54d6ee007816ae0a1fad3ca3677588735e1432887a917bc55f818f5268",
+     "browser_download_url": "https://github.com/darktable-org/darktable/releases/download/release-5.6.0/darktable-5.6.0-woa64.exe"},
+    {"name": "Darktable-5.6.0-x86_64.AppImage", "size": 177752568,
+     "digest": "sha256:cbad7bf4be2607e1725db156d73c799d267a79fc29a572c3136a5deb9c9be948",
+     "browser_download_url": "https://github.com/darktable-org/darktable/releases/download/release-5.6.0/Darktable-5.6.0-x86_64.AppImage"},
+    {"name": "Darktable-5.6.0-x86_64.AppImage.zsync", "size": 304013,
+     "digest": "sha256:35b038a00c6a8a73bf1b7e2a9ad1d05db471d59ec3feec9edb3df594aee715b9",
+     "browser_download_url": "https://github.com/darktable-org/darktable/releases/download/release-5.6.0/Darktable-5.6.0-x86_64.AppImage.zsync"},
+    {"name": "darktable-5.6.0.tar.xz", "size": 8179036,
+     "digest": "sha256:157d6d3847af8afcabe78944454786f73a886e08a504b4bd6114c2065fe006e4",
+     "browser_download_url": "https://github.com/darktable-org/darktable/releases/download/release-5.6.0/darktable-5.6.0.tar.xz"}
+  ]
+}

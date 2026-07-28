@@ -7406,6 +7406,73 @@ def test_import_photos_retry_rejects_second_concurrent_retry(
         wait_for_job_via_client(client, first_retry.get_json()["job_id"])
 
 
+def test_import_photos_retry_rejects_second_retry_while_first_is_pausing(
+        app_and_db, tmp_path, monkeypatch):
+    """``pause_job`` publishes ``pausing`` immediately, but the worker
+    keeps running until it reaches a checkpoint — so the first retry is
+    still actively copying/writing while its public status is
+    ``pausing``. Treating that state as inactive would let a second
+    retry slip in and race the chained after-import / NAS move against
+    the still-running first one. See PR #1387 Codex review."""
+    import import_job
+    from wait import wait_for_job_via_client
+
+    app, _ = app_and_db
+    card = _import_card(tmp_path)
+    with app.test_client() as client:
+        parent_id = _post_import(
+            client, card, tmp_path / "archive", None,
+        )
+        wait_for_job_via_client(client, parent_id)
+
+        # Signal from inside the worker so we know its public status
+        # has advanced from ``queued`` to ``running`` before we try to
+        # pause it — ``pause_job`` requires ``running``.
+        first_retry_running = threading.Event()
+        release_first_retry = threading.Event()
+
+        def blocking_result(job, runner, db_path, workspace_id, params):
+            first_retry_running.set()
+            assert release_first_retry.wait(timeout=5)
+            return {
+                "ok": True, "cancelled": False, "photo_ids": [],
+                "discovered": 0, "copied": 0, "verified": 0,
+                "skipped_duplicate": 0, "failed": 0,
+                "safe_to_format": True, "unsafe_files": [],
+                "folders": {}, "errors": [],
+            }
+
+        monkeypatch.setattr(import_job, "run_import_job", blocking_result)
+
+        first_retry = client.post("/api/jobs/import-photos", json={
+            "sources": [card],
+            "destination": str(tmp_path / "archive"),
+            "after_import": None,
+            "parent_import_job_id": parent_id,
+        })
+        assert first_retry.status_code == 200, first_retry.get_json()
+        first_retry_id = first_retry.get_json()["job_id"]
+
+        # Wait until the worker is running, then request a pause. The
+        # worker is still blocked in ``blocking_result``, so the job
+        # sits in ``pausing`` (never advances to ``paused``).
+        assert first_retry_running.wait(timeout=5)
+        assert app._job_runner.pause_job(first_retry_id) is True
+        assert app._job_runner.get(first_retry_id)["status"] == "pausing"
+
+        second_retry = client.post("/api/jobs/import-photos", json={
+            "sources": [card],
+            "destination": str(tmp_path / "archive"),
+            "after_import": None,
+            "parent_import_job_id": parent_id,
+        })
+        assert second_retry.status_code == 409, second_retry.get_json()
+        assert "already in flight" in second_retry.get_json()["error"]
+
+        release_first_retry.set()
+        wait_for_job_via_client(client, first_retry_id)
+
+
 def test_import_photos_remote_and_destination_mutually_exclusive(
         app_and_db, tmp_path, monkeypatch):
     app, _ = app_and_db

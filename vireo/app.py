@@ -25196,7 +25196,15 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             for other in runner.list_jobs():
                 if other.get("type") != "import":
                     continue
-                if other.get("status") not in ("queued", "running", "paused"):
+                # ``pausing`` is a live status: ``pause_job`` publishes
+                # it immediately, but the worker keeps running until it
+                # reaches ``is_cancelled`` and only then flips to
+                # ``paused``. Treating ``pausing`` as inactive would let a
+                # second retry slip in during that window and race the
+                # first one's chained processing / NAS move.
+                if other.get("status") not in (
+                    "queued", "running", "pausing", "paused",
+                ):
                     continue
                 other_cfg = other.get("config") or {}
                 other_root = (

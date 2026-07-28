@@ -805,9 +805,11 @@ def test_download_with_resume_no_range_stalls_correctly(tmp_path):
     finally:
         server.shutdown()
 
+
 def test_download_with_resume_reports_bytes(tmp_path):
     """byte_callback gets real byte counts — this is what the progress bar reads."""
     import http.server
+
     from taxonomy import _download_with_resume
 
     payload = b"x" * 500_000
@@ -841,14 +843,23 @@ def test_download_with_resume_reports_bytes(tmp_path):
 
 
 def test_download_with_resume_cancels_midstream(tmp_path):
-    """should_cancel aborts and keeps a non-empty .partial for resume."""
+    """should_cancel aborts, keeps a non-empty .partial, and does not retry.
+
+    Cancellation must escape the retry machinery, not fall into it.  If the
+    DownloadCancelled re-raise is removed the generic handler treats a cancel
+    as a dropped connection: the user is told "Connection lost ... retrying"
+    right after pressing Cancel, and the download is re-requested.
+    """
     import http.server
+
     from taxonomy import DownloadCancelled, _download_with_resume
 
     payload = b"x" * 500_000
+    requests = {"n": 0}
 
     class Handler(http.server.BaseHTTPRequestHandler):
         def do_GET(self):
+            requests["n"] += 1
             self.send_response(200)
             self.send_header("Content-Length", str(len(payload)))
             self.end_headers()
@@ -859,6 +870,7 @@ def test_download_with_resume_cancels_midstream(tmp_path):
 
     server, port = _start_test_server(Handler)
     calls = {"n": 0}
+    messages = []
 
     def cancel_after_two_chunks():
         calls["n"] += 1
@@ -869,6 +881,7 @@ def test_download_with_resume_cancels_midstream(tmp_path):
         with pytest.raises(DownloadCancelled):
             _download_with_resume(
                 f"http://127.0.0.1:{port}/x", str(dest), chunk_size=4096,
+                progress_callback=messages.append,
                 should_cancel=cancel_after_two_chunks,
             )
     finally:
@@ -880,6 +893,61 @@ def test_download_with_resume_cancels_midstream(tmp_path):
     # Non-empty proves we cancelled mid-stream, not before the first read —
     # open(..., "wb") would create a 0-byte file either way.
     assert partial.stat().st_size > 0
+    # A cancel is not a network error: the user must never be told the
+    # connection dropped or that we are retrying.
+    assert not [m for m in messages if "retrying" in m], messages
+    assert not [m for m in messages if "Connection lost" in m], messages
+    # And we really stopped — no second attempt was made against the server.
+    assert requests["n"] == 1, f"expected a single request, got {requests['n']}"
+
+
+def test_download_with_resume_cancels_during_retry_backoff(tmp_path):
+    """A cancel that lands during the retry wait aborts instead of sleeping it out.
+
+    The backoff is polled in short slices so Cancel feels immediate.  With a
+    single time.sleep(3) the user would wait out the full backoff and the
+    download would be re-requested before anyone noticed the cancel.
+    """
+    import http.server
+    import time
+
+    from taxonomy import DownloadCancelled, _download_with_resume
+
+    requests = {"n": 0}
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            requests["n"] += 1
+            self.send_response(500)
+            self.end_headers()
+
+        def log_message(self, *a):
+            pass
+
+    server, port = _start_test_server(Handler)
+
+    # should_cancel is only consulted inside the read loop (never reached on a
+    # 500) and inside the backoff, so this is False for the whole first attempt
+    # and True from the moment the backoff starts.
+    def cancel_once_the_first_attempt_failed():
+        return requests["n"] >= 1
+
+    try:
+        dest = tmp_path / "out.bin"
+        started = time.monotonic()
+        with pytest.raises(DownloadCancelled):
+            _download_with_resume(
+                f"http://127.0.0.1:{port}/x", str(dest), max_stalled=2,
+                should_cancel=cancel_once_the_first_attempt_failed,
+            )
+        elapsed = time.monotonic() - started
+    finally:
+        server.shutdown()
+
+    # Well under the 3 s backoff: we noticed the cancel, we did not sleep it off.
+    assert elapsed < 1.5, f"cancel took {elapsed:.2f}s — backoff was not polled"
+    # And the retry never went out.
+    assert requests["n"] == 1, f"expected a single request, got {requests['n']}"
 
 
 def test_download_with_resume_bytes_include_resume_offset(tmp_path):
@@ -891,6 +959,7 @@ def test_download_with_resume_bytes_include_resume_offset(tmp_path):
     finishing at less than the real file size.
     """
     import http.server
+
     from taxonomy import _download_with_resume
 
     payload = b"C" * 300_000
@@ -955,6 +1024,7 @@ def test_download_with_resume_bytes_reset_when_server_ignores_range(tmp_path):
     would double-count the discarded bytes.
     """
     import http.server
+
     from taxonomy import _download_with_resume
 
     payload = b"E" * 200_000
@@ -1002,6 +1072,7 @@ def test_download_with_resume_throttles_byte_callback(tmp_path):
     must not emit ~700 events (and at 4 KB chunks, ~45000).
     """
     import http.server
+
     from taxonomy import _download_with_resume
 
     payload = b"y" * 500_000
@@ -1037,6 +1108,64 @@ def test_download_with_resume_throttles_byte_callback(tmp_path):
     assert len(seen) <= 20, f"expected throttled events, got {len(seen)}"
     # Still ends on an exact final count.
     assert seen[-1] == len(payload)
+
+
+def test_download_with_resume_throttle_interval_gates_emits(tmp_path):
+    """The emit interval is what paces the bar — pin both ends of it.
+
+    The unconditional final emit alone satisfies "the callback fired", so a
+    throttle window stretched to effectively-infinite still looks healthy from
+    the outside while the real 178 MB download shows a bar frozen at 0% until
+    the very last byte.  Driving the interval to 0 and to a huge value proves
+    the comparison actually gates each chunk.
+    """
+    import http.server
+
+    from taxonomy import _download_with_resume
+
+    payload = b"z" * 500_000
+    chunk_size = 4096
+    chunk_count = len(payload) // chunk_size  # 122
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, *a):
+            pass
+
+    def run(interval, out_name):
+        server, port = _start_test_server(Handler)
+        seen = []
+        try:
+            _download_with_resume(
+                f"http://127.0.0.1:{port}/x", str(tmp_path / out_name),
+                chunk_size=chunk_size,
+                byte_callback=lambda done, total: seen.append(done),
+                _emit_interval=interval,
+            )
+        finally:
+            server.shutdown()
+        assert seen[-1] == len(payload)
+        return seen
+
+    # No throttle: every chunk emits.  A read may return short, so the loop
+    # runs at least chunk_count times — the count tracks chunks, not a
+    # hard-coded 1 or 2.
+    ungated = run(0, "ungated.bin")
+    assert len(ungated) >= chunk_count, (
+        f"with _emit_interval=0 expected ~{chunk_count} emits, got {len(ungated)}"
+    )
+
+    # Throttle wider than any plausible download: only the final unconditional
+    # emit survives.
+    gated = run(1e9, "gated.bin")
+    assert len(gated) == 1, (
+        f"with a huge _emit_interval only the final emit should fire, got {len(gated)}"
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -42,7 +42,8 @@ class DownloadCancelled(Exception):
 
 def _download_with_resume(url, dest_path, progress_callback=None,
                           max_stalled=3, chunk_size=256 * 1024,
-                          *, byte_callback=None, should_cancel=None):
+                          *, byte_callback=None, should_cancel=None,
+                          _emit_interval=0.25):
     """Download a file with retry and resume support.
 
     Streams to ``dest_path + ".partial"``, resuming from the last byte on
@@ -61,6 +62,14 @@ def _download_with_resume(url, dest_path, progress_callback=None,
             byte-level progress.  Throttled to ~4 Hz.
         should_cancel: optional ``callback() -> bool``.  When it returns True
             the download aborts, leaving the ``.partial`` file for resume.
+        _emit_interval: minimum seconds between byte_callback emits (private;
+            for tests).
+
+    Neither ``byte_callback`` nor ``should_cancel`` may raise: they are called
+    inside the transfer's ``try`` block, so an exception from either is caught
+    by the generic handler and misreported to the user as a network failure,
+    triggering a full retry (and discarding the partial when the server
+    answers 200).  Callers must swallow their own errors.
     """
     partial_path = dest_path + ".partial"
     attempt = 0
@@ -123,7 +132,7 @@ def _download_with_resume(url, dest_path, progress_callback=None,
                         received += len(chunk)
                         if byte_callback is not None:
                             now = time.monotonic()
-                            if now - last_emit >= 0.25:
+                            if now - last_emit >= _emit_interval:
                                 last_emit = now
                                 byte_callback(progress_base + received, expected_total)
                     if byte_callback is not None:
@@ -166,9 +175,13 @@ def _download_with_resume(url, dest_path, progress_callback=None,
                     f"try again and the download will resume."
                 ) from e
 
+            # Poll the backoff in short slices so Cancel is felt within ~0.5 s
+            # instead of after the full 3 s wait.  `from None`: the user asked
+            # to stop, so the network error we were backing off from is not the
+            # cause and must not be chained onto the cancel.
             for _ in range(6):
                 if should_cancel is not None and should_cancel():
-                    raise DownloadCancelled("Download cancelled")
+                    raise DownloadCancelled("Download cancelled") from None
                 time.sleep(0.5)
             continue
 

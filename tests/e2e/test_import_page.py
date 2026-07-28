@@ -174,6 +174,92 @@ def run_two_file_preview(live_server, page):
     )
 
 
+# Stubs a four-file copy-mode preview split across two subfolders:
+# card-a (both files are duplicates) and card-b (one duplicate, one new).
+# The mixed layout is what exercises the "one folder is entirely duplicates
+# while another still has content" case for the hide-duplicates filter.
+MULTI_FOLDER_MIXED_PREVIEW_STUB = """
+        () => {
+          const originalFetch = window.fetch.bind(window);
+          window.__fullPreviewCalls = 0;
+          window.__dupCalls = 0;
+          window.__destCalls = 0;
+          const THUMB = 'data:image/gif;base64,R0lGODlhAQABAAAAACw=';
+          const FILES = [
+            {path: '/tmp/cards/card-a/A1.jpg', filename: 'A1.jpg', subfolder: 'card-a', size: 1234, extension: '.jpg', thumb_url: THUMB},
+            {path: '/tmp/cards/card-a/A2.jpg', filename: 'A2.jpg', subfolder: 'card-a', size: 1234, extension: '.jpg', thumb_url: THUMB},
+            {path: '/tmp/cards/card-b/B1.jpg', filename: 'B1.jpg', subfolder: 'card-b', size: 1234, extension: '.jpg', thumb_url: THUMB},
+            {path: '/tmp/cards/card-b/B2.jpg', filename: 'B2.jpg', subfolder: 'card-b', size: 1234, extension: '.jpg', thumb_url: THUMB},
+          ];
+          const DUPES = [
+            '/tmp/cards/card-a/A1.jpg',
+            '/tmp/cards/card-a/A2.jpg',
+            '/tmp/cards/card-b/B2.jpg',
+          ];
+          window.fetch = (input, init) => {
+            const target = typeof input === 'string' ? input : input.url;
+            if (target && target.indexOf('/api/import/folder-preview') === 0) {
+              const body = JSON.parse(init.body || '{}');
+              if (body.summary_only) {
+                return Promise.resolve(new Response(JSON.stringify({
+                  total_count: 4,
+                  total_size: 4936,
+                  type_breakdown: {'.jpg': 4},
+                  duplicate_count: 0,
+                  files: [],
+                }), {status: 200, headers: {'Content-Type': 'application/json'}}));
+              }
+              window.__fullPreviewCalls += 1;
+              return Promise.resolve(new Response(JSON.stringify({
+                total_count: 4,
+                total_size: 4936,
+                type_breakdown: {'.jpg': 4},
+                duplicate_count: 0,
+                files: FILES,
+              }), {status: 200, headers: {'Content-Type': 'application/json'}}));
+            }
+            if (target && target.indexOf('/api/import/check-duplicates') === 0) {
+              window.__dupCalls += 1;
+              const frame = 'data: ' + JSON.stringify({
+                duplicates: DUPES, checked: FILES.length, total: FILES.length,
+              }) + '\\n\\n' + 'data: ' + JSON.stringify({
+                done: true, duplicate_count: DUPES.length, checked: FILES.length, total: FILES.length,
+              }) + '\\n\\n';
+              return Promise.resolve(new Response(frame, {
+                status: 200,
+                headers: {'Content-Type': 'text/event-stream'},
+              }));
+            }
+            if (target && target.indexOf('/api/import/destination-preview') === 0) {
+              window.__destCalls += 1;
+              return Promise.resolve(new Response(JSON.stringify({
+                folders: [{path: '2026/2026-07-11', full_path: '/archive/2026/2026-07-11', count: 1, exists: false}],
+                total_photos: 1, total_folders: 1, new_folders: 1, existing_folders: 0, managed_archive: null,
+                files: [{path: '/tmp/cards/card-b/B1.jpg', folder: '2026/2026-07-11', full_folder: '/archive/2026/2026-07-11'}],
+              }), {status: 200, headers: {'Content-Type': 'application/json'}}));
+            }
+            return originalFetch(input, init);
+          };
+        }
+        """
+
+
+def run_multi_folder_mixed_preview(live_server, page):
+    """Load /import with the multi-folder stub and wait for it to settle."""
+    url = live_server["url"]
+    page.goto(f"{url}/import")
+    page.evaluate(MULTI_FOLDER_MIXED_PREVIEW_STUB)
+
+    page.locator("#modeCopy").check()
+    page.locator("#destInput").fill("/archive")
+    page.locator("#sourceInput").fill("/tmp/cards")
+    page.locator("#btnAddSource").click()
+
+    page.wait_for_function(
+        "window.__fullPreviewCalls >= 1 && window.__dupCalls >= 1 && window.__destCalls >= 1"
+    )
+
+
 def test_import_preview_runs_automatically_after_source_selection(live_server, page):
     run_two_file_preview(live_server, page)
 
@@ -513,6 +599,54 @@ def test_hide_duplicates_survives_a_repreview_that_still_has_duplicates(
     expect(page.locator("#importPreviewGrid")).not_to_contain_text(
         "IMG_0002.jpg",
     )
+
+
+def test_hide_duplicates_keeps_all_duplicate_folder_headers_visible(
+    live_server, page,
+):
+    """When one folder of a multi-folder preview is made entirely of
+    duplicates, enabling the filter must not silently drop that folder.
+
+    Otherwise the surviving folders' headers own their hidden files, but
+    the all-duplicate folder disappears without a trace — the user is
+    given no evidence the folder or its duplicate count ever existed. The
+    header stays visible as "folder (0) · N duplicates hidden" so the
+    hidden count is always accounted for somewhere the user can see.
+    """
+    run_multi_folder_mixed_preview(live_server, page)
+
+    grid = page.locator("#importPreviewGrid")
+    # Off (default): both headers with full counts and all four tiles.
+    expect(grid).to_contain_text("card-a (2)")
+    expect(grid).to_contain_text("card-b (2)")
+    expect(grid).to_contain_text("A1.jpg")
+    expect(grid).to_contain_text("A2.jpg")
+    expect(grid).to_contain_text("B1.jpg")
+    expect(grid).to_contain_text("B2.jpg")
+
+    page.locator("#chkHideDuplicates").check()
+
+    # card-a is entirely duplicates — the header must survive with (0) and
+    # the hidden count so the folder never silently vanishes.
+    expect(grid).to_contain_text("card-a (0) · 2 duplicates hidden")
+    # card-b keeps only its non-duplicate tile plus its hidden count.
+    expect(grid).to_contain_text("card-b (1) · 1 duplicate hidden")
+    expect(grid).to_contain_text("B1.jpg")
+    expect(grid).not_to_contain_text("A1.jpg")
+    expect(grid).not_to_contain_text("A2.jpg")
+    expect(grid).not_to_contain_text("B2.jpg")
+
+    # The global "all N are duplicates" empty state is reserved for the
+    # case where every folder went to zero — a partially filtered preview
+    # like this one still has visible tiles, so it must not fire.
+    expect(grid).not_to_contain_text("All 4 files are duplicates")
+
+    # Unchecking restores the full multi-folder grid unchanged.
+    page.locator("#chkHideDuplicates").uncheck()
+    expect(grid).to_contain_text("card-a (2)")
+    expect(grid).to_contain_text("card-b (2)")
+    expect(grid).to_contain_text("A1.jpg")
+    expect(grid).to_contain_text("B2.jpg")
 
 
 def test_import_auto_preview_clears_grid_when_selection_becomes_invalid(

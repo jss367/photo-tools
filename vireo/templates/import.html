@@ -2042,20 +2042,34 @@ function renderImportPreviewGrid(files, duplicatePaths, destinationFiles) {
     groups[key].push({ file: f, isDuplicate: duplicateFlags[i] });
   });
 
+  let anyTilesRendered = false;
+
   Object.keys(groups).sort().forEach((subfolder) => {
     const all = groups[subfolder];
     const shown = hidingDuplicates ? all.filter((e) => !e.isDuplicate) : all;
-    if (!shown.length) return;
+    const hiddenHere = all.length - shown.length;
+    // Nothing to show and nothing hidden — no reason to render a header.
+    // (Only reachable if a group somehow started empty, which shouldn't
+    // happen since groups are built from `files`.)
+    if (!shown.length && !hiddenHere) return;
     const groupEl = document.createElement('div');
     groupEl.className = 'import-preview-folder';
     const header = document.createElement('div');
     header.className = 'import-preview-folder-header';
-    const hiddenHere = all.length - shown.length;
     header.textContent = subfolder + ' (' + shown.length + ')' +
       (hiddenHere ? ' · ' + hiddenHere.toLocaleString() + ' duplicate' +
         (hiddenHere === 1 ? '' : 's') + ' hidden' : '');
     groupEl.appendChild(header);
 
+    // A folder made entirely of duplicates still gets its header — a
+    // silent drop would leave the user with no evidence the folder or its
+    // hidden count existed while other headers own their hidden files.
+    if (!shown.length) {
+      grid.appendChild(groupEl);
+      return;
+    }
+
+    anyTilesRendered = true;
     const thumbsEl = document.createElement('div');
     thumbsEl.className = 'import-preview-thumbs';
     shown.forEach((entry) => {
@@ -2107,9 +2121,11 @@ function renderImportPreviewGrid(files, duplicatePaths, destinationFiles) {
     groupEl.appendChild(thumbsEl);
     grid.appendChild(groupEl);
   });
-  // Every file was a duplicate, so the filter emptied the grid. Say so
-  // instead of leaving a blank panel that reads like "no files found".
-  if (!grid.children.length) {
+  // Every folder ended up fully filtered, so replace the wall of
+  // "(0) · N hidden" headers with a single clearer message that also
+  // tells the user how to see the tiles again.
+  if (!anyTilesRendered) {
+    grid.innerHTML = '';
     const empty = document.createElement('div');
     empty.className = 'import-preview-empty';
     empty.textContent = 'All ' + files.length.toLocaleString() + ' file' +

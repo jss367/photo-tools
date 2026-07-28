@@ -5,6 +5,8 @@ import os
 import sys
 import tempfile
 
+import pytest
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from db import Database
@@ -802,6 +804,239 @@ def test_download_with_resume_no_range_stalls_correctly(tmp_path):
             )
     finally:
         server.shutdown()
+
+def test_download_with_resume_reports_bytes(tmp_path):
+    """byte_callback gets real byte counts — this is what the progress bar reads."""
+    import http.server
+    from taxonomy import _download_with_resume
+
+    payload = b"x" * 500_000
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, *a):
+            pass
+
+    server, port = _start_test_server(Handler)
+    try:
+        seen = []
+        dest = tmp_path / "out.bin"
+        # chunk_size small enough to force several loop iterations
+        _download_with_resume(
+            f"http://127.0.0.1:{port}/x", str(dest), chunk_size=4096,
+            byte_callback=lambda done, total: seen.append((done, total)),
+        )
+    finally:
+        server.shutdown()
+
+    assert seen, "byte_callback was never called"
+    assert seen[-1][0] == len(payload)
+    assert seen[-1][1] == len(payload)          # from Content-Length
+    assert [d for d, _ in seen] == sorted(d for d, _ in seen)
+
+
+def test_download_with_resume_cancels_midstream(tmp_path):
+    """should_cancel aborts and keeps a non-empty .partial for resume."""
+    import http.server
+    from taxonomy import DownloadCancelled, _download_with_resume
+
+    payload = b"x" * 500_000
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, *a):
+            pass
+
+    server, port = _start_test_server(Handler)
+    calls = {"n": 0}
+
+    def cancel_after_two_chunks():
+        calls["n"] += 1
+        return calls["n"] > 2
+
+    try:
+        dest = tmp_path / "out.bin"
+        with pytest.raises(DownloadCancelled):
+            _download_with_resume(
+                f"http://127.0.0.1:{port}/x", str(dest), chunk_size=4096,
+                should_cancel=cancel_after_two_chunks,
+            )
+    finally:
+        server.shutdown()
+
+    assert not dest.exists()
+    partial = tmp_path / "out.bin.partial"
+    assert partial.exists()
+    # Non-empty proves we cancelled mid-stream, not before the first read —
+    # open(..., "wb") would create a 0-byte file either way.
+    assert partial.stat().st_size > 0
+
+
+def test_download_with_resume_bytes_include_resume_offset(tmp_path):
+    """On a 206 resume, progress counts bytes already on disk and totals the full file.
+
+    Content-Length on a 206 is only the *remaining* length, so the implementation
+    has to add the resume offset back to both the running count and the total.
+    Without that, a resumed download would show the bar restarting at zero and
+    finishing at less than the real file size.
+    """
+    import http.server
+    from taxonomy import _download_with_resume
+
+    payload = b"C" * 300_000
+    first_chunk = 100_000
+    call_count = [0]
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                # Promise the whole file but hang up after first_chunk bytes.
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload[:first_chunk])
+                return
+
+            # Later attempts honour Range with a real 206.
+            range_header = self.headers.get("Range", "")
+            assert range_header.startswith("bytes="), "expected a Range request"
+            start = int(range_header.split("=")[1].split("-")[0])
+            remaining = payload[start:]
+            self.send_response(206)
+            self.send_header("Content-Length", str(len(remaining)))
+            self.send_header("Content-Range",
+                             f"bytes {start}-{len(payload) - 1}/{len(payload)}")
+            self.end_headers()
+            self.wfile.write(remaining)
+
+        def log_message(self, *a):
+            pass
+
+    server, port = _start_test_server(Handler)
+    seen = []
+    try:
+        dest = tmp_path / "out.bin"
+        _download_with_resume(
+            f"http://127.0.0.1:{port}/x", str(dest), chunk_size=4096,
+            byte_callback=lambda done, total: seen.append((call_count[0], done, total)),
+        )
+    finally:
+        server.shutdown()
+
+    assert open(dest, "rb").read() == payload
+
+    resumed = [e for e in seen if e[0] >= 2]
+    assert resumed, "no byte_callback events during the resumed attempt"
+    # Every event on the resumed attempt reports the FULL file size, never the
+    # 200_000-byte remainder from Content-Length.
+    assert {total for _, _, total in resumed} == {len(payload)}
+    # Progress picks up from the resume offset instead of restarting at zero.
+    assert resumed[0][1] >= first_chunk
+    assert all(done <= len(payload) for _, done, _ in seen)
+    assert seen[-1][1] == len(payload)
+
+
+def test_download_with_resume_bytes_reset_when_server_ignores_range(tmp_path):
+    """A 200 after a partial write restarts the count — the bar must not exceed 100%.
+
+    mode == "wb" truncates the partial in this branch, but downloaded_before is
+    deliberately kept as the stall baseline.  Reusing it as the display base
+    would double-count the discarded bytes.
+    """
+    import http.server
+    from taxonomy import _download_with_resume
+
+    payload = b"E" * 200_000
+    first_chunk = 50_000
+    call_count = [0]
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            call_count[0] += 1
+            self.send_response(200)  # never 206: this server ignores Range
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            if call_count[0] == 1:
+                self.wfile.write(payload[:first_chunk])
+                return
+            self.wfile.write(payload)
+
+        def log_message(self, *a):
+            pass
+
+    server, port = _start_test_server(Handler)
+    seen = []
+    try:
+        dest = tmp_path / "out.bin"
+        _download_with_resume(
+            f"http://127.0.0.1:{port}/x", str(dest), chunk_size=4096,
+            byte_callback=lambda done, total: seen.append((done, total)),
+        )
+    finally:
+        server.shutdown()
+
+    assert open(dest, "rb").read() == payload
+    assert seen, "byte_callback was never called"
+    # The reported total is always the real file size, never inflated by the
+    # bytes that were thrown away.
+    assert {total for _, total in seen} == {len(payload)}
+    assert all(done <= len(payload) for done, _ in seen)
+    assert seen[-1] == (len(payload), len(payload))
+
+
+def test_download_with_resume_throttles_byte_callback(tmp_path):
+    """byte_callback is rate-limited, not fired once per chunk.
+
+    The SSE subscriber queue is bounded, so a 178 MB download at 256 KB chunks
+    must not emit ~700 events (and at 4 KB chunks, ~45000).
+    """
+    import http.server
+    from taxonomy import _download_with_resume
+
+    payload = b"y" * 500_000
+    chunk_size = 4096
+    chunk_count = len(payload) // chunk_size  # 122
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, *a):
+            pass
+
+    server, port = _start_test_server(Handler)
+    seen = []
+    try:
+        dest = tmp_path / "out.bin"
+        _download_with_resume(
+            f"http://127.0.0.1:{port}/x", str(dest), chunk_size=chunk_size,
+            byte_callback=lambda done, total: seen.append(done),
+        )
+    finally:
+        server.shutdown()
+
+    # At ~4 Hz this loop would have to take 5+ seconds on localhost to reach 20
+    # events; one-per-chunk would be 120+.  Deliberately loose so it can't go
+    # flaky on a slow machine, while still failing outright if the throttle is
+    # removed.
+    assert chunk_count > 100, "payload/chunk_size no longer forces many iterations"
+    assert len(seen) <= 20, f"expected throttled events, got {len(seen)}"
+    # Still ends on an exact final count.
+    assert seen[-1] == len(payload)
 
 
 # ---------------------------------------------------------------------------

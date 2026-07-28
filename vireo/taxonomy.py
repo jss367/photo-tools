@@ -36,8 +36,13 @@ log = logging.getLogger(__name__)
 _ssl_ctx = ssl.create_default_context(cafile=certifi.where())
 
 
+class DownloadCancelled(Exception):
+    """Raised when should_cancel() asked us to stop."""
+
+
 def _download_with_resume(url, dest_path, progress_callback=None,
-                          max_stalled=3, chunk_size=256 * 1024):
+                          max_stalled=3, chunk_size=256 * 1024,
+                          *, byte_callback=None, should_cancel=None):
     """Download a file with retry and resume support.
 
     Streams to ``dest_path + ".partial"``, resuming from the last byte on
@@ -52,6 +57,10 @@ def _download_with_resume(url, dest_path, progress_callback=None,
         progress_callback: optional ``callback(message)`` for status updates.
         max_stalled: Give up after this many consecutive zero-progress retries.
         chunk_size: Bytes per read chunk (default 256 KB).
+        byte_callback: optional ``callback(downloaded, total_or_None)`` for
+            byte-level progress.  Throttled to ~4 Hz.
+        should_cancel: optional ``callback() -> bool``.  When it returns True
+            the download aborts, leaving the ``.partial`` file for resume.
     """
     partial_path = dest_path + ".partial"
     attempt = 0
@@ -92,14 +101,33 @@ def _download_with_resume(url, dest_path, progress_callback=None,
                 expected_bytes = int(content_length) if content_length else None
 
                 mode = "ab" if resp.status == 206 else "wb"
+                # Bytes already on disk that we are keeping. Distinct from
+                # downloaded_before, which stays put as the stall baseline even
+                # when mode == "wb" truncates the partial.
+                progress_base = downloaded_before if resp.status == 206 else 0
+                expected_total = (
+                    expected_bytes + progress_base
+                    if expected_bytes is not None
+                    else None
+                )
                 received = 0
                 with open(partial_path, mode) as f:
+                    last_emit = 0.0
                     while True:
+                        if should_cancel is not None and should_cancel():
+                            raise DownloadCancelled("Download cancelled")
                         chunk = resp.read(chunk_size)
                         if not chunk:
                             break
                         f.write(chunk)
                         received += len(chunk)
+                        if byte_callback is not None:
+                            now = time.monotonic()
+                            if now - last_emit >= 0.25:
+                                last_emit = now
+                                byte_callback(progress_base + received, expected_total)
+                    if byte_callback is not None:
+                        byte_callback(progress_base + received, expected_total)
 
                 # Check for truncated response
                 if expected_bytes is not None and received < expected_bytes:
@@ -108,6 +136,8 @@ def _download_with_resume(url, dest_path, progress_callback=None,
                         f"{expected_bytes} bytes"
                     )
 
+        except DownloadCancelled:
+            raise
         except Exception as e:
             current_size = os.path.getsize(partial_path) if os.path.exists(partial_path) else 0
             gained = current_size - downloaded_before
@@ -136,7 +166,10 @@ def _download_with_resume(url, dest_path, progress_callback=None,
                     f"try again and the download will resume."
                 ) from e
 
-            time.sleep(3)
+            for _ in range(6):
+                if should_cancel is not None and should_cancel():
+                    raise DownloadCancelled("Download cancelled")
+                time.sleep(0.5)
             continue
 
         # Success — rename partial to final

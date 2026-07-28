@@ -8,7 +8,7 @@
 The "RAW Development (darktable)" panel in Settings shows two red rows when the
 tools are missing:
 
-```
+```text
 ✗ darktable-cli not found        Install darktable or set the path below
 ✗ Adobe DNG Converter not found  Install it or set the path below
 ```
@@ -81,7 +81,7 @@ reject every legitimate download.
 The GitHub releases API returns a `digest` field per asset, and darktable's
 release assets have one:
 
-```
+```text
 darktable-5.6.0-arm64.dmg  →  sha256:49aec447e891ab481e436b4c0231fc3c8d0001aad220762ae8e765d3bda5d102
 ```
 
@@ -424,7 +424,7 @@ at `:2776-2820`: POST, reveal a progress div, `safeEventSource` on
 
 ## Data flow
 
-```
+```text
 loadDarktableStatus()
   → GET /api/darktable/status          (already exists)
   → GET /api/darktable/install/available

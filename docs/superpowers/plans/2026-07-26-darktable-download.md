@@ -585,7 +585,7 @@ def _download_with_resume(url, dest_path, progress_callback=None,
 
 Add to the docstring's Args:
 
-```
+```text
         byte_callback: optional ``callback(downloaded, total_or_None)`` for
             byte-level progress.  Throttled to ~4 Hz by the caller's clock.
         should_cancel: optional ``callback() -> bool``.  When it returns True
@@ -1516,7 +1516,7 @@ server-side so the URL it downloads is never a stale client-supplied value.
 
 Insert into `vireo/tests/contracts/routes.txt` in sorted position (next to line 38's `GET /api/darktable/status`), matching the file's existing column alignment:
 
-```
+```text
 GET          /api/darktable/install/available
 ```
 
@@ -1695,7 +1695,7 @@ In `vireo/app.py`, after `api_job_download_taxonomy`:
 
 Add to `vireo/tests/contracts/routes.txt` next to the other download jobs (line ~258):
 
-```
+```text
 POST         /api/jobs/download-darktable
 ```
 

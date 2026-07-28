@@ -413,6 +413,135 @@ def test_resolve_release_never_raises_on_a_malformed_body(monkeypatch, payload, 
 
 
 # --------------------------------------------------------------------------
+# resolve_release_cached — cache-hit, TTL expiry, and "only successes cached"
+# --------------------------------------------------------------------------
+
+@pytest.fixture
+def _clean_release_cache():
+    """Reset the module-level cache before and after each cache test.
+
+    Cache state leaks across tests would otherwise turn a hit into a miss
+    (or vice versa) depending on which test ran first.
+    """
+    import darktable_install
+
+    darktable_install._release_cache.update(at=0.0, value=None)
+    yield
+    darktable_install._release_cache.update(at=0.0, value=None)
+
+
+def test_resolve_release_cached_hits_return_the_stored_value(
+    monkeypatch, _clean_release_cache,
+):
+    """A second call within the TTL must not hit the network."""
+    import darktable_install
+    from darktable_install import resolve_release_cached
+
+    calls = _stub_github(monkeypatch, json.dumps(_release()).encode("utf-8"))
+    _on_supported_platform(monkeypatch)
+
+    # Freeze the clock so the second call is guaranteed to be inside the TTL.
+    monkeypatch.setattr(darktable_install.time, "monotonic", lambda: 100.0)
+
+    first, first_reason = resolve_release_cached()
+    second, second_reason = resolve_release_cached()
+
+    assert first_reason is None and second_reason is None
+    assert first is second
+    assert len(calls) == 1
+
+
+def test_resolve_release_cached_expires_after_ttl(
+    monkeypatch, _clean_release_cache,
+):
+    """Past _RELEASE_CACHE_SECS the cache must be re-fetched, not served stale.
+
+    Without this the panel could keep showing a build for ten minutes after
+    darktable-org shipped a new release, and the POST would then 409 the user
+    who confirmed the stale one.
+    """
+    import darktable_install
+    from darktable_install import resolve_release_cached
+
+    calls = _stub_github(monkeypatch, json.dumps(_release()).encode("utf-8"))
+    _on_supported_platform(monkeypatch)
+
+    clock = {"now": 100.0}
+    monkeypatch.setattr(darktable_install.time, "monotonic", lambda: clock["now"])
+
+    resolve_release_cached()
+    clock["now"] += darktable_install._RELEASE_CACHE_SECS + 1
+    resolve_release_cached()
+
+    assert len(calls) == 2
+
+
+def test_resolve_release_cached_only_caches_successes(
+    monkeypatch, _clean_release_cache,
+):
+    """A transient failure must not pin the fallback link and its reason
+    string. The user who fixed their network within the TTL would otherwise
+    keep being told GitHub is unreachable long after it started working."""
+    import urllib.error
+    import urllib.request
+
+    import darktable_install
+    from darktable_install import REASON_UNREACHABLE, resolve_release_cached
+
+    _on_supported_platform(monkeypatch)
+    monkeypatch.setattr(darktable_install.time, "monotonic", lambda: 100.0)
+
+    call_count = {"n": 0}
+
+    def flaky(req, timeout=None, context=None):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            raise urllib.error.URLError("no route to host")
+        return _FakeResponse(json.dumps(_release()).encode("utf-8"))
+
+    monkeypatch.setattr(urllib.request, "urlopen", flaky)
+
+    first, first_reason = resolve_release_cached()
+    assert first is None
+    assert first_reason == REASON_UNREACHABLE
+    assert darktable_install._release_cache["value"] is None
+
+    second, second_reason = resolve_release_cached()
+    assert second is not None
+    assert second_reason is None
+    assert call_count["n"] == 2
+
+
+def test_update_release_cache_overwrites_a_stale_entry(_clean_release_cache):
+    """The download endpoint calls update_release_cache after its own uncached
+    resolve_release proves the cached value stale; the next /install/available
+    must see the fresh asset instead of the ten-minute-old one."""
+    from darktable_install import resolve_release_cached, update_release_cache
+
+    fresh = {"version": "9.9.9", "name": "fresh.dmg", "size": 1, "url": "https://example/x", "digest": None}
+    update_release_cache(fresh)
+
+    cached, reason = resolve_release_cached()
+    assert reason is None
+    assert cached is fresh
+
+
+def test_update_release_cache_ignores_a_falsy_release(_clean_release_cache):
+    """A failed resolution must never pin the fallback link — mirrors
+    resolve_release_cached's own only-cache-successes rule."""
+    import darktable_install
+    from darktable_install import update_release_cache
+
+    update_release_cache(None)
+    assert darktable_install._release_cache["value"] is None
+
+    fresh = {"version": "9.9.9", "name": "fresh.dmg", "size": 1, "url": "https://example/x"}
+    update_release_cache(fresh)
+    update_release_cache({})
+    assert darktable_install._release_cache["value"] is fresh
+
+
+# --------------------------------------------------------------------------
 # verify_digest
 # --------------------------------------------------------------------------
 

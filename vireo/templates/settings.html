@@ -2163,12 +2163,28 @@ async function validateInatToken() {
   }
 }
 
+// Platform must describe the Flask host (which will run the installer), not
+// the browser device (which could be a phone or a different desktop on the
+// LAN). /api/darktable/install/available carries the host's sys.platform;
+// window._dtAsset caches it once we have looked, and installPlatform() falls
+// back to the browser as a last resort so the panel is never blank before
+// the first API round-trip.
+function darktableInstallPlatform() {
+  var asset = window._dtAsset || {};
+  if (typeof asset.platform === 'string' && asset.platform) return asset.platform;
+  var ua = navigator.userAgent || '';
+  if (/Windows/.test(ua)) return 'win32';
+  if (/Mac/.test(ua)) return 'darwin';
+  if (/Linux/.test(ua) && !/Android/.test(ua)) return 'linux';
+  return '';
+}
+
 function darktableIsLinux() {
-  return /Linux/.test(navigator.userAgent) && !/Android/.test(navigator.userAgent);
+  return darktableInstallPlatform() === 'linux';
 }
 
 function darktableIsWindows() {
-  return /Windows/.test(navigator.userAgent);
+  return darktableInstallPlatform() === 'win32';
 }
 
 async function loadDarktableStatus() {
@@ -2241,6 +2257,10 @@ async function renderDarktableGetOption() {
   } catch(e) {
     info = { available: false, reason: 'Could not check for a darktable release.' };
   }
+  // Publish _dtAsset before any darktableIsLinux()/darktableIsWindows() call
+  // so those helpers see the server-derived platform for the Flask host
+  // rather than falling back to navigator.userAgent.
+  window._dtAsset = info;
 
   if (!info.available) {
     // Never a dead button: a plain link, plus the reason verbatim. "GitHub
@@ -2254,7 +2274,6 @@ async function renderDarktableGetOption() {
   }
 
   var label = darktableIsLinux() ? 'Download and set up' : 'Download installer';
-  window._dtAsset = info;
   host.innerHTML = '<button class="btn" onclick="downloadDarktable()">' + label + '</button>' +
     '<span style="color:var(--text-dim);font-size:12px;margin-left:8px;">' +
     'darktable ' + escapeHtml(info.version) + ' &mdash; ' + escapeHtml(info.name) + ', ' +

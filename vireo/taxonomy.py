@@ -50,6 +50,12 @@ class DownloadCancelled(Exception):
 # format; a compliant server puts the total after the slash.
 _CONTENT_RANGE_TOTAL_RE = re.compile(r"bytes\s*\*/(\d+)", re.IGNORECASE)
 
+# `Content-Range: bytes <start>-<end>/<total>` — the header a 206 response
+# uses to describe which bytes the body actually spans. If the server (or an
+# intermediary) resumes from a different byte than we asked for, appending
+# would splice mismatched content into the partial file.
+_CONTENT_RANGE_START_RE = re.compile(r"bytes\s+(\d+)\s*-", re.IGNORECASE)
+
 
 def _content_range_total(headers):
     """Total resource size advertised by a Content-Range: bytes */<total>.
@@ -63,6 +69,28 @@ def _content_range_total(headers):
     if not header:
         return None
     match = _CONTENT_RANGE_TOTAL_RE.search(header)
+    if not match:
+        return None
+    try:
+        return int(match.group(1))
+    except (TypeError, ValueError):
+        return None
+
+
+def _content_range_start(headers):
+    """First byte covered by a Content-Range: bytes <start>-<end>/<total>.
+
+    Returns None when the header is absent or malformed. Used to detect a
+    206 that begins at a different byte than the client's Range request so
+    the caller can restart from scratch rather than splice mismatched bytes
+    onto its existing ``.partial``.
+    """
+    if headers is None:
+        return None
+    header = headers.get("Content-Range")
+    if not header:
+        return None
+    match = _CONTENT_RANGE_START_RE.search(header)
     if not match:
         return None
     try:
@@ -189,10 +217,30 @@ def _download_with_resume(url, dest_path, progress_callback=None,
                     expected_bytes = int(content_length) if content_length else None
 
                     mode = "ab" if resp.status == 206 else "wb"
+                    # A 206 must begin exactly at ``downloaded_before`` — the
+                    # byte we asked to resume from. A proxy or rebuilt artifact
+                    # can return a valid range that starts elsewhere; appending
+                    # that body onto our ``.partial`` would silently splice
+                    # mismatched bytes into the file. On mismatch, restart
+                    # from scratch. (For darktable installs the SHA256 check
+                    # catches it; download_taxa() has no digest and would fail
+                    # later as an opaque gzip/CSV parse error.)
+                    if mode == "ab":
+                        range_start = _content_range_start(resp.headers)
+                        if (
+                            range_start is not None
+                            and range_start != downloaded_before
+                        ):
+                            log.warning(
+                                "Server resumed at byte %d, expected %d;"
+                                " restarting download",
+                                range_start, downloaded_before,
+                            )
+                            mode = "wb"
                     # Bytes already on disk that we are keeping. Distinct from
                     # downloaded_before, which stays put as the stall baseline even
                     # when mode == "wb" truncates the partial.
-                    progress_base = downloaded_before if resp.status == 206 else 0
+                    progress_base = downloaded_before if mode == "ab" else 0
                     expected_total = (
                         expected_bytes + progress_base
                         if expected_bytes is not None
@@ -273,9 +321,27 @@ def _download_with_resume(url, dest_path, progress_callback=None,
                     return dest_path
                 # Stale or unverifiable partial: delete so the next iteration
                 # restarts from byte 0 rather than sending the same doomed
-                # Range header on every attempt.
-                with contextlib.suppress(OSError):
+                # Range header on every attempt.  If the removal fails
+                # (permission denied, Windows lock, read-only dir),
+                # ``downloaded_before`` stays > 0 next iteration, the same
+                # Range is sent, the server answers 416 again, and the loop
+                # would spin forever — count it as a stall so ``max_stalled``
+                # eventually breaks us out with a real error.
+                try:
                     os.remove(partial_path)
+                except OSError as remove_error:
+                    stalled_count += 1
+                    log.warning(
+                        "Could not remove stale partial %s after 416: %s"
+                        " (stalled %d/%d)",
+                        partial_path, remove_error, stalled_count, max_stalled,
+                    )
+                    if stalled_count >= max_stalled:
+                        raise RuntimeError(
+                            f"Server rejected resume range and the partial "
+                            f"file {partial_path} could not be removed: "
+                            f"{remove_error}"
+                        ) from e
                 log.warning(
                     "Server returned 416 but partial size (%d) does not match"
                     " advertised total (%r); restarting download",

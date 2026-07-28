@@ -503,6 +503,7 @@ class JobRunner:
                 j.get("type") == job_type
                 and j.get("singleton_key") == singleton_key
                 and j.get("status") in ("running", "queued", "pausing", "paused")
+                and jid not in self._cancelled
             ):
                 return jid, j
         return None, None

@@ -15959,7 +15959,15 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
 
         Always 200: when this cannot answer, the panel shows a plain
         "Get darktable" link and the reason, rather than a dead button.
+
+        Includes the Flask host's ``platform`` (linux/darwin/win32) so the
+        UI's "Download installer" vs "Download and set up" label and its
+        Gatekeeper/SmartScreen warnings describe the machine that will
+        actually run the installer — not the browser device, which can be
+        a phone or a different desktop on the LAN.
         """
+        import sys
+
         import darktable_install
 
         try:
@@ -15971,6 +15979,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             return jsonify({
                 "available": False,
                 "reason": darktable_install.REASON_UNREACHABLE,
+                "platform": sys.platform,
             })
 
         if not release:
@@ -15978,9 +15987,13 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             # message: "we could not reach GitHub" and "no build exists for
             # your platform" are different facts and users act on them
             # differently.
-            return jsonify({"available": False, "reason": reason})
+            return jsonify({
+                "available": False,
+                "reason": reason,
+                "platform": sys.platform,
+            })
 
-        return jsonify({"available": True, **release})
+        return jsonify({"available": True, "platform": sys.platform, **release})
 
     @app.route("/api/exiftool/status")
     def api_exiftool_status():

@@ -349,6 +349,15 @@ contract this spec is built on. The server recovers the user-deselected count as
 `previewed_count - len(include_paths)`; §5 uses that for the `unsafe_files`
 message and `checked_count` for the summary line.
 
+**Known imprecision.** `checked_count` is a snapshot of what the preview promised,
+and reality can move underneath it in one direction: a file shown as
+"Duplicate — skipped" whose archive twin is deleted between preview and import
+stays in `include_paths` (correctly) and *is* copied, so the summary can read "500
+selected · 501 copied". This is harmless for card safety — the extra file is
+archived, not stranded — but it is a real gap in the "what was checked is exactly
+what was imported" contract, and the copy should not be written to imply the two
+can never differ.
+
 Three states for `include_paths`:
 
 | State | Meaning |
@@ -383,8 +392,14 @@ client-side checks in §3 are conveniences, not the enforcement point.
 - `include_paths` is a list of non-empty strings (reject non-list, non-string
   members, empty strings, and `null`)
 - `include_paths` is non-empty when present
-- `previewed_count` and `checked_count` are non-negative integers, present whenever
-  `include_paths` is, with `checked_count <= previewed_count`
+- `previewed_count` and `checked_count` are non-negative integers, with
+  `checked_count <= previewed_count`
+- **the three fields are all-or-nothing.** Requiring the counts whenever
+  `include_paths` is present is not sufficient — the converse matters too. A body
+  carrying `previewed_count` without `include_paths` would fabricate a
+  "files added after preview" figure in §6 and then evaluate
+  `include_paths - discovered_paths` against `None`, killing the job with a
+  `TypeError`. Reject any partial combination.
 - **booleans are rejected for both counts.** `isinstance(True, int)` is `True` in
   Python, so a naive integer check accepts `{"previewed_count": true}` as `1`.
   Test `type(v) is int` or exclude `bool` explicitly.
@@ -398,6 +413,11 @@ client-side checks in §3 are conveniences, not the enforcement point.
 already-validated `sources` directories, checked with `os.path.commonpath`. Any
 path that does not → `400`. Import must not become a path-admission escape hatch
 because a client asked for a file outside the folders the user actually chose.
+
+`os.path.commonpath` **raises** `ValueError` on a mix of absolute and relative
+paths rather than returning a verdict, so a client sending a relative string would
+produce a `500` instead of the specified `400`. Wrap the call and treat the
+exception as a containment failure.
 
 **Containment is lexical: `os.path.normpath` on both sides, never `realpath`.**
 This is a deliberate choice with a documented limit, not an oversight.
@@ -440,9 +460,9 @@ today and a 5,000-entry path list would bloat the job row for nothing.
 `_run_remote_import_job` (`import_job.py:523`) at line 1987 whenever
 `params.remote_target` is set, and that function has its own duplicated discovery
 loop and its own `discovered = len(files)` at `import_job.py:646`, with its own
-`safe_to_format` at 1932/1942. The same filter goes in both, at the same relative
-position. Wiring only `run_import_job` would leave remote imports rsyncing every
-deselected file.
+verdict blocks at 1924-1933 and 1934-1943. The same filter goes in both, at the
+same relative position. Wiring only `run_import_job` would leave remote imports
+rsyncing every deselected file.
 
 In `run_import_job` the filter goes **after** `discovered = len(files)`
 (`import_job.py:2117`) and **before** `DuplicateChecker.prepare()`
@@ -512,10 +532,25 @@ if params.include_paths is not None and params.previewed_count is not None:
     if deselected > 0:
         unsafe_files.append({
             "path": "Deselected files",
-            "reason": f"{deselected} files you deselected were not copied — "
-                      "the card still holds the only copies of them",
+            "reason": f"{deselected} files you deselected were not copied",
         })
 ```
+
+Earlier drafts appended *"— the card still holds the only copies of them"*. That is
+false whenever a deselected file is byte-identical to a selected one, which is a
+common reason to deselect: the archive does receive those bytes. Asserting it is
+the same class of false accusation this section eliminates for catalog duplicates.
+The shorter wording is true in every case.
+
+**These entries attribute the gap; they do not fully explain it.** The red pill is
+caused by `discovered - (copied + skipped_duplicate)`, while the entries derive
+from `previewed_count` and the drift sets — the two coincide only in simple cases.
+Deselect X, have X vanish, and have a new file Y arrive: `vanished` is empty (X was
+never in `include_paths`), `appeared` clamps to zero, and the only line rendered
+reads "1 files you deselected were not copied" — numerically equal to the gap, so
+it presents as complete while the actually-unimported file is Y. The implementation
+must not claim exhaustiveness in its copy; a fully-attributed ledger would have to
+derive from the gap directly rather than from these three signals.
 
 Deriving the count from `previewed_count - len(include_paths)` rather than from
 `discovered` is what keeps duplicates and newly-appeared files out of it: both
@@ -541,14 +576,44 @@ if appeared > 0:
 This is the same signal §6 reports; routing it through `unsafe_files` as well is
 what connects it to the formatting warning it causes.
 
+**Scope note:** these entries close the bare-pill paths *this spec introduces*. Two
+pre-existing ones remain and are not in scope — `partial_scope` (`recursive=False`
+or a narrowed `file_types`) can produce `safe_to_format=False` with an empty
+`unsafe_files`, and the remote path appends its `<remote>` entry only when
+`discovered > 0` (`import_job.py:1911-1915`). The tests below assert the new paths,
+not universal coverage.
+
 **A vanished in-scope file must force `safe_to_format` false.** The existing
 equality cannot catch this on its own. If 100 files are previewed and one
 disappears before the job runs, discovery finds 99, `discovered` is 99, the filter
 keeps 99, and `copied + skipped_duplicate == 99 == discovered` — a clean **safe to
 format** verdict on a card where a file the user asked for was never archived.
 
-`safe_to_format` therefore gains `not vanished_paths` alongside the existing
-conditions, with a matching entry:
+**`not vanished_paths` must be added to *two* condition blocks per path, not one.**
+Each copy path computes two verdicts with nearly identical conditions:
+
+| Path | `safe_to_format` | `unverified_duplicates_only` |
+|---|---|---|
+| local | `import_job.py:3312-3320` | `3321-3329` |
+| remote | `1924-1933` | `1934-1943` |
+
+Every other condition this spec relies on — deselection, files appearing — breaks
+`(copied + skipped_duplicate) == discovered`, which **both** blocks require, so
+they are covered incidentally. `vanished_paths` is the only new condition
+independent of that equality, so patching `safe_to_format` alone leaves it live in
+the second block.
+
+That is a data-loss path, not a cosmetic gap. `unverified_duplicates_only` renders
+as an amber pill reading *"Import complete — keep the card until likely duplicates
+are verified"* (`import.html:2613`), which asserts that duplicate verification is
+the **sole** remaining blocker. With `trust_likely_duplicates` on and one in-scope
+file gone at job time, `safe_to_format` correctly goes false but the amber pill
+appears — and its stated remedy is to re-run with `verify_by_hash`. On that re-run
+the vanished file is absent from the fresh preview too, so `include_paths ==
+discovered_paths`, everything verifies, and the pill goes **green** over a card
+whose missing file was never archived.
+
+With that covered, the condition and its entry:
 
 ```python
 if vanished_paths:
@@ -674,10 +739,20 @@ independent of checkboxes.
   stays safe to format; this is the regression guard for the pre-verdict click
   window
 - **files appearing after the preview produce their own `unsafe_files` entry**, so
-  the red pill is never bare
+  none of the paths this spec introduces leaves the red pill bare
 - **a vanished in-scope file forces `safe_to_format` false** even though the ledger
   equality still balances — the 100-previewed/99-discovered case, with its own
   `unsafe_files` entry
+- **the same case also forces `unverified_duplicates_only` false** with
+  `trust_likely_duplicates=True` — the amber "keep the card until likely duplicates
+  are verified" pill must not appear, since its remedy launders the missing file
+  into a green verdict. Assert on **both** verdict blocks in **both** copy paths
+  (`3312-3320`/`3321-3329` local, `1924-1933`/`1934-1943` remote); this is the
+  data-loss regression guard
+- partial field combinations `400`: `previewed_count` without `include_paths`,
+  `include_paths` without the counts
+- a relative path in `include_paths` returns `400`, not a `500` from
+  `commonpath`'s `ValueError`
 - the step summary's selected figure comes from `checked_count`, not
   `len(include_paths)`, so a card with duplicates doesn't overstate it
 - a client repeating a path in `include_paths` does not inflate the deselected
@@ -743,6 +818,14 @@ independent of checkboxes.
 - **Identifying which files appeared** after a preview (§6), and reporting an exact
   rather than net count. Both require shipping the full previewed path set for no
   change in the user's available action.
+- **Unsupported extensions in the preview grid.** `discover_source_files`
+  (`vireo/ingest.py:333-394`) filters to `SUPPORTED_EXTENSIONS` and drops dotfiles,
+  so `.MOV`/`.MP4`/`.XMP` on a card never enter `discovered` and the green
+  safe-to-format pill can appear over a card still holding un-copied video. This
+  predates the feature, but a grid of 1,234 checkboxes with an "N of M selected"
+  readout materially strengthens the implication that the display enumerates the
+  card — worth a follow-up under the `CORE_PHILOSOPHY.md` transparency rule, and
+  worth revisiting here if any of that copy is touched.
 - **In-place selection** (both folder and snapshot modes). Deferred per *Scope*;
   needs `vireo/scanner.py` taught to honor `restrict_files` without
   `restrict_dirs`. Controls are hidden with an explanation rather than shown and

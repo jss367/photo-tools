@@ -1981,6 +1981,33 @@ function importDestinationMap(destinationFiles) {
   return map;
 }
 
+// Duplicate identity is per-occurrence, not per-path. When source folders
+// overlap (e.g. `/card` and `/card/DCIM`) the same file path can appear
+// twice in `files`; the server's `check-duplicates` stream flags only the
+// *later* occurrence as an intra-import duplicate — the first is what will
+// actually be copied. A path-set membership test would tag both tiles as
+// duplicates, so enabling the filter would hide the to-copy file too and
+// the grid could claim every tile is a duplicate while the summary still
+// reports one file remaining. Match the server's ordering by walking
+// `files` in reverse and consuming duplicate-count credits per path.
+function computeDuplicateFlags(files, duplicatePaths) {
+  const flags = new Array(files.length).fill(false);
+  const remaining = new Map();
+  (duplicatePaths || []).forEach((p) => {
+    remaining.set(p, (remaining.get(p) || 0) + 1);
+  });
+  if (!remaining.size) return flags;
+  for (let i = files.length - 1; i >= 0; i -= 1) {
+    const p = files[i] && files[i].path;
+    const count = remaining.get(p) || 0;
+    if (count > 0) {
+      flags[i] = true;
+      remaining.set(p, count - 1);
+    }
+  }
+  return flags;
+}
+
 function renderImportPreviewGrid(files, duplicatePaths, destinationFiles) {
   const grid = document.getElementById('importPreviewGrid');
   if (!grid) return;
@@ -1989,7 +2016,6 @@ function renderImportPreviewGrid(files, duplicatePaths, destinationFiles) {
     importThumbSchedulerCancel = null;
   }
   grid.innerHTML = '';
-  const dupes = new Set(duplicatePaths || []);
   const destMap = importDestinationMap(destinationFiles);
   if (!files || !files.length) {
     lastImportPreviewRender = null;
@@ -2004,20 +2030,21 @@ function renderImportPreviewGrid(files, duplicatePaths, destinationFiles) {
     duplicatePaths: duplicatePaths,
     destinationFiles: destinationFiles,
   };
-  const dupeCount = files.filter((f) => dupes.has(f.path)).length;
+  const duplicateFlags = computeDuplicateFlags(files, duplicatePaths);
+  const dupeCount = duplicateFlags.reduce((n, isDup) => n + (isDup ? 1 : 0), 0);
   updateHideDuplicatesControl(dupeCount);
   const hidingDuplicates = dupeCount > 0 && hideDuplicatesEnabled();
 
   const groups = {};
-  files.forEach((f) => {
+  files.forEach((f, i) => {
     const key = f.subfolder || 'Source';
     if (!groups[key]) groups[key] = [];
-    groups[key].push(f);
+    groups[key].push({ file: f, isDuplicate: duplicateFlags[i] });
   });
 
   Object.keys(groups).sort().forEach((subfolder) => {
     const all = groups[subfolder];
-    const shown = hidingDuplicates ? all.filter((f) => !dupes.has(f.path)) : all;
+    const shown = hidingDuplicates ? all.filter((e) => !e.isDuplicate) : all;
     if (!shown.length) return;
     const groupEl = document.createElement('div');
     groupEl.className = 'import-preview-folder';
@@ -2031,8 +2058,9 @@ function renderImportPreviewGrid(files, duplicatePaths, destinationFiles) {
 
     const thumbsEl = document.createElement('div');
     thumbsEl.className = 'import-preview-thumbs';
-    shown.forEach((f) => {
-      const isDuplicate = dupes.has(f.path);
+    shown.forEach((entry) => {
+      const f = entry.file;
+      const isDuplicate = entry.isDuplicate;
       const isUnavailable = f.available === false;
       const card = document.createElement('div');
       card.className = 'import-preview-thumb' +

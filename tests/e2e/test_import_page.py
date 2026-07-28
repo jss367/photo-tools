@@ -358,6 +358,140 @@ def test_hide_duplicates_resets_when_the_preview_cannot_run(live_server, page):
     page.locator("#fileTypePreset").select_option("both")
 
 
+def test_hide_duplicates_preserves_first_occurrence_from_overlapping_sources(
+    live_server, page,
+):
+    """Overlapping sources yield the same path twice in the preview.
+
+    The `/api/import/check-duplicates` stream flags only the *later*
+    occurrence as an intra-import duplicate — the first is the tile that
+    will actually be copied and land in the archive. Hiding by path-set
+    membership would drop both tiles, silently claiming the to-copy file
+    is a duplicate too. Match the summary: hide one tile, keep the other.
+    """
+    url = live_server["url"]
+    page.goto(f"{url}/import")
+    page.evaluate(
+        """
+        () => {
+          const originalFetch = window.fetch.bind(window);
+          window.__fullPreviewCalls = 0;
+          window.fetch = (input, init) => {
+            const target = typeof input === 'string' ? input : input.url;
+            if (target && target.indexOf('/api/import/folder-preview') === 0) {
+              const body = JSON.parse(init.body || '{}');
+              if (body.summary_only) {
+                return Promise.resolve(new Response(JSON.stringify({
+                  total_count: 2,
+                  total_size: 2468,
+                  type_breakdown: {'.jpg': 2},
+                  duplicate_count: 0,
+                  files: [],
+                }), {status: 200, headers: {'Content-Type': 'application/json'}}));
+              }
+              window.__fullPreviewCalls += 1;
+              // Same path arrives twice — mimics scanning /card and
+              // /card/DCIM together, the exact overlap that surfaces this
+              // per-occurrence bug.
+              return Promise.resolve(new Response(JSON.stringify({
+                total_count: 2,
+                total_size: 2468,
+                type_breakdown: {'.jpg': 2},
+                duplicate_count: 0,
+                files: [
+                  {
+                    path: '/tmp/card/DCIM/IMG_0001.jpg',
+                    filename: 'IMG_0001.jpg',
+                    subfolder: 'card/DCIM',
+                    size: 1234,
+                    extension: '.jpg',
+                    thumb_url: 'data:image/gif;base64,R0lGODlhAQABAAAAACw=',
+                  },
+                  {
+                    path: '/tmp/card/DCIM/IMG_0001.jpg',
+                    filename: 'IMG_0001.jpg',
+                    subfolder: 'card/DCIM',
+                    size: 1234,
+                    extension: '.jpg',
+                    thumb_url: 'data:image/gif;base64,R0lGODlhAQABAAAAACw=',
+                  },
+                ],
+              }), {status: 200, headers: {'Content-Type': 'application/json'}}));
+            }
+            if (target && target.indexOf('/api/import/check-duplicates') === 0) {
+              // The real checker only flags the second occurrence as an
+              // intra-import duplicate, so the returned list carries the
+              // path exactly once.
+              const frame = 'data: ' + JSON.stringify({
+                duplicates: ['/tmp/card/DCIM/IMG_0001.jpg'],
+                checked: 2,
+                total: 2,
+              }) + '\\n\\n' + 'data: ' + JSON.stringify({
+                done: true,
+                duplicate_count: 1,
+                checked: 2,
+                total: 2,
+              }) + '\\n\\n';
+              return Promise.resolve(new Response(frame, {
+                status: 200,
+                headers: {'Content-Type': 'text/event-stream'},
+              }));
+            }
+            if (target && target.indexOf('/api/import/destination-preview') === 0) {
+              return Promise.resolve(new Response(JSON.stringify({
+                folders: [{
+                  path: '2026/2026-07-11',
+                  full_path: '/archive/2026/2026-07-11',
+                  count: 1,
+                  exists: false,
+                }],
+                total_photos: 1,
+                total_folders: 1,
+                new_folders: 1,
+                existing_folders: 0,
+                managed_archive: null,
+                files: [{
+                  path: '/tmp/card/DCIM/IMG_0001.jpg',
+                  folder: '2026/2026-07-11',
+                  full_folder: '/archive/2026/2026-07-11',
+                }],
+              }), {status: 200, headers: {'Content-Type': 'application/json'}}));
+            }
+            return originalFetch(input, init);
+          };
+        }
+        """
+    )
+
+    page.locator("#modeCopy").check()
+    page.locator("#destInput").fill("/archive")
+    page.locator("#sourceInput").fill("/tmp/card")
+    page.locator("#btnAddSource").click()
+    page.wait_for_function("window.__fullPreviewCalls >= 1")
+
+    grid = page.locator("#importPreviewGrid")
+    # Off by default: both occurrences render, one badged Duplicate.
+    expect(page.locator("#previewSummary")).to_contain_text(
+        "1 already in your library"
+    )
+    expect(page.locator("#hideDuplicatesLabel")).to_have_text(
+        "Hide duplicates (1)"
+    )
+    expect(grid.locator(".import-preview-thumb")).to_have_count(2)
+    expect(grid.locator(".import-preview-thumb.duplicate")).to_have_count(1)
+
+    # Turn on the filter: the second occurrence (the tile the server
+    # actually flagged) hides; the first stays, matching what the import
+    # will copy. Set-based hiding would erroneously drop both.
+    page.locator("#chkHideDuplicates").check()
+    expect(grid.locator(".import-preview-thumb")).to_have_count(1)
+    expect(grid.locator(".import-preview-thumb.duplicate")).to_have_count(0)
+    expect(grid).to_contain_text("1 duplicate hidden")
+    # Filter never claims "all X are duplicates" when a to-copy tile
+    # survives — that phrasing would contradict the summary line.
+    expect(grid).not_to_contain_text("are duplicates")
+
+
 def test_hide_duplicates_survives_a_repreview_that_still_has_duplicates(
     live_server, page,
 ):

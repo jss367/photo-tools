@@ -22956,6 +22956,29 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             "subpath": remote_archive_config.get("subpath", ""),
         }
 
+    def _move_target_snapshot(target):
+        """Freeze the parts of a chained after_process_move target that
+        decide where files land, for retry-time comparison.
+
+        ``local_archive_root`` and ``mount_path`` set the local staging
+        →NAS boundary the move sweeps across; ``host``/``user``/
+        ``port``/``remote_path`` set where the NAS transfer actually
+        lands. All are captured so any Settings edit that would
+        redirect the chained move triggers a decline on retry. Returns
+        None when no chained-move target is present.
+        """
+        if target is None:
+            return None
+        return {
+            "id": target.get("id", ""),
+            "host": target.get("host", ""),
+            "user": target.get("user", ""),
+            "port": int(target.get("port") or 22),
+            "remote_path": target.get("remote_path", ""),
+            "mount_path": target.get("mount_path", ""),
+            "local_archive_root": target.get("local_archive_root", ""),
+        }
+
     def _validate_parent_import_job(parent_id, active_ws, db):
         """Resolve a retry's parent_import_job_id into the scope this
         retry is allowed to inherit.
@@ -24351,6 +24374,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         # both go through this check.
         if parent_config is not None:
             parent_snapshot = parent_config.get("remote_target_snapshot")
+            parent_remote_target_id = parent_config.get("remote_target_id")
             if parent_snapshot is not None:
                 current_snapshot = _remote_target_snapshot(
                     remote_archive_config,
@@ -24362,6 +24386,23 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                         "Verify Settings → Remote targets and start a new "
                         "import instead of retrying."
                     )
+            elif parent_remote_target_id:
+                # Parent job was a remote import from before the
+                # snapshot check landed, so its persisted config
+                # records only the target ID. Both retry helpers
+                # reconstruct the request from that ID, and
+                # ``_resolve_remote_archive_target`` then walks the
+                # CURRENT Settings entry — a Settings edit since the
+                # original run would silently redirect the transfer
+                # to a different host/root/mount. Refuse the retry
+                # instead of trusting the current resolution.
+                return json_error(
+                    "The original remote import predates the recovery-"
+                    "retry safety check (no remote-target snapshot was "
+                    "recorded). Verify Settings → Remote targets still "
+                    "point at the intended host, then start a new "
+                    "import instead of retrying."
+                )
 
         # Snapshot the chosen saved process's stage flags at enqueue time
         # so a mid-import edit or delete can't silently change (or void)
@@ -24388,6 +24429,40 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         )
         if move_err is not None:
             return move_err
+
+        # A retry with a chained NAS move must land on the same
+        # host/root/mount as the parent. When the parent recorded a
+        # ``target_snapshot`` for the chained target, verify the
+        # currently-resolved target matches — a Settings edit since
+        # enqueue-time could otherwise silently redirect the chained
+        # transfer even though the primary snapshot check above
+        # accepted the request. When the parent had a chained move but
+        # no snapshot (predates this check), refuse rather than trust
+        # the current resolution — same reasoning as the primary
+        # remote-target legacy check.
+        if parent_config is not None:
+            parent_move_cfg = parent_config.get("after_process_move") or {}
+            parent_move_snapshot = parent_move_cfg.get("target_snapshot")
+            parent_move_target_id = parent_move_cfg.get("remote_target_id")
+            if parent_move_snapshot is not None:
+                current_move_snapshot = _move_target_snapshot(
+                    move_target_snapshot,
+                )
+                if current_move_snapshot != parent_move_snapshot:
+                    return json_error(
+                        "The chained NAS-move target for the original "
+                        "import has changed (host, path, mount, or archive "
+                        "root differs). Verify Settings → Remote targets "
+                        "and start a new import instead of retrying."
+                    )
+            elif parent_move_target_id:
+                return json_error(
+                    "The original import's chained NAS-move target "
+                    "predates the recovery-retry safety check (no target "
+                    "snapshot was recorded). Verify Settings → Remote "
+                    "targets still point at the intended host, then start "
+                    "a new import instead of retrying."
+                )
 
         active_ws, created_workspace, workspace_err = (
             _prepare_import_workspace(db, body)
@@ -24447,6 +24522,15 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             job_config["after_process_move"] = {
                 "remote_target_id": move_target_snapshot["id"],
                 "target_name": move_target_snapshot["name"],
+                # Persisted alongside the id so a recovery retry can
+                # detect a Settings edit that would redirect the
+                # chained transfer to a different host or root.
+                # Parallels ``remote_target_snapshot`` for the primary
+                # remote destination. See the parent-verification
+                # block above.
+                "target_snapshot": _move_target_snapshot(
+                    move_target_snapshot,
+                ),
             }
 
         def _chain_after_import(job, result):

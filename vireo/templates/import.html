@@ -2950,16 +2950,31 @@ function retryBodyFromFinishedJob(job) {
   // resolution still matches the parent's snapshot. Skip when the
   // parent has no id (defensive; production always has one).
   if (!job.id) return null;
+  // Preserve `""` when the parent's config explicitly stored an empty
+  // folder_template — that means "copy directly into the archive root",
+  // and `||` here would silently redirect the retry to a date-tree the
+  // user didn't ask for. Fall back to the default only when the key is
+  // truly absent/nullish. Same treatment on the Jobs page.
+  const folderTemplate = cfg.folder_template != null
+    ? cfg.folder_template : '%Y/%Y-%m-%d';
+  // Preserve the parent's duplicate-skip semantics. Forcing skip_duplicates
+  // on for every retry means a failed file that happens to match some
+  // existing catalog entry — including from an unrelated card — is
+  // silently skipped again instead of getting the copy the user asked
+  // for; that hits imports the user deliberately configured with
+  // duplicate skipping OFF particularly hard. The copy layer treats
+  // byte-identical prior successes already sitting at the destination
+  // path as adoptable skips regardless of this flag, so preserving the
+  // parent value still avoids re-copying files that landed successfully.
+  const parentSkipDuplicates = cfg.skip_duplicates != null
+    ? !!cfg.skip_duplicates : true;
   const body = {
     sources: cfg.sources.slice(),
     destination: cfg.destination,
     recursive: cfg.recursive !== false,
-    folder_template: cfg.folder_template || '%Y/%Y-%m-%d',
+    folder_template: folderTemplate,
     file_types: cfg.file_types || 'both',
-    // A recovery run must preserve already-landed files. Even if the
-    // original import intentionally allowed duplicates, the retry's job is
-    // to fill the failed gaps, not copy every successful file again.
-    skip_duplicates: true,
+    skip_duplicates: parentSkipDuplicates,
     verify_by_hash: !!cfg.verify_by_hash,
     trust_likely_duplicates: !!cfg.trust_likely_duplicates,
     after_import: cfg.after_import == null ? null : cfg.after_import,

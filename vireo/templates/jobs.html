@@ -388,13 +388,23 @@
     // host/root/mount. Without a parent id the server rejects the
     // carry list, so the retry couldn't chain properly.
     if (!job.id) return null;
+    // See import.html retryBodyFromFinishedJob for the full rationale:
+    // an empty custom folder_template means "copy into the archive
+    // root" and must not be overwritten by the default; the parent's
+    // skip_duplicates setting must not be forced on, or a failed file
+    // that matches some other catalog entry gets skipped again instead
+    // of copied.
+    var folderTemplate = cfg.folder_template != null
+      ? cfg.folder_template : '%Y/%Y-%m-%d';
+    var parentSkipDuplicates = cfg.skip_duplicates != null
+      ? !!cfg.skip_duplicates : true;
     var body = {
       sources: cfg.sources.slice(),
       destination: cfg.destination,
       recursive: cfg.recursive !== false,
-      folder_template: cfg.folder_template || '%Y/%Y-%m-%d',
+      folder_template: folderTemplate,
       file_types: cfg.file_types || 'both',
-      skip_duplicates: true,
+      skip_duplicates: parentSkipDuplicates,
       verify_by_hash: !!cfg.verify_by_hash,
       trust_likely_duplicates: !!cfg.trust_likely_duplicates,
       after_import: cfg.after_import == null ? null : cfg.after_import,

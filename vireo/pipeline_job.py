@@ -6210,6 +6210,13 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
             runner.update_step(job["id"], "eye_keypoints", status="running")
             _update_stages(runner, job["id"], stages)
 
+            # See the offline branch below and the finalizer at the bottom
+            # of this stage — a source-offline outage detected here must
+            # survive the default "completed" step update that would
+            # otherwise erase it (Codex #1388 P2 r3665289978).
+            ek_offline_latched = False
+            ek_offline_summary = None
+
             try:
                 import config as cfg
                 from pipeline import (
@@ -6324,6 +6331,7 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                         p["id"] for p in photos_for_stage
                         if _row_folder_id(p) in still_offline_folder_ids
                     }
+                    total_before = len(photos_for_stage)
                     photos_for_stage = [
                         p for p in photos_for_stage
                         if _row_folder_id(p) not in still_offline_folder_ids
@@ -6352,6 +6360,34 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                     source_offline_state["skipped_photo_ids"] = (
                         set(prior_skipped) | dropped_ids
                     )
+                    # When classify and extract_masks were fully cached
+                    # / skipped and eye-keypoints is the first source
+                    # reader, the finalizer below would otherwise
+                    # reduce ``total`` and report "No eligible photos"
+                    # — a green, collapsed row on a run that produced
+                    # no keypoints (Codex #1388 P2 r3665289978).
+                    # Surface the outage as a fatal stage failure only
+                    # when no upstream stage already owns it.
+                    already_flagged_upstream = any(
+                        e.startswith("[classify] Fatal:")
+                        or e.startswith("[extract_masks] Fatal:")
+                        for e in errors
+                    )
+                    if not already_flagged_upstream:
+                        errors.append(
+                            f"[eye_keypoints] Fatal: "
+                            f"{len(dropped_ids)} of {total_before} "
+                            f"photos unreachable (source offline). "
+                            f"Reconnect the missing folder(s) and run "
+                            f"Process again to detect eye keypoints "
+                            f"on the rest."
+                        )
+                        stages["eye_keypoints"]["status"] = "failed"
+                        ek_offline_latched = True
+                        ek_offline_summary = (
+                            f"{len(dropped_ids)} of {total_before} "
+                            f"photos unreachable (source offline)"
+                        )
                     if dropped_ids:
                         log.warning(
                             "Eye-keypoints: dropped %d photo(s) from "
@@ -6470,11 +6506,37 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                     abort_check=lambda: _should_abort(abort),
                 )
 
-                stages["eye_keypoints"]["status"] = "completed"
-                if _should_abort(abort):
+                if ek_offline_latched:
+                    # A source-offline outage was already recorded above
+                    # (status latched to "failed", ``[eye_keypoints]
+                    # Fatal:`` appended). Preserve that verdict through
+                    # the default step update instead of flipping the
+                    # row to "completed" / "No eligible photos" — the
+                    # end-of-run rollup only reads stage statuses and
+                    # step statuses, so anything less here would erase
+                    # the outage from the Jobs page (Codex #1388 P2
+                    # r3665289978).
+                    stages["eye_keypoints"]["status"] = "failed"
+                    ek_fatal = next(
+                        (e for e in reversed(errors)
+                         if e.startswith("[eye_keypoints] Fatal:")),
+                        None,
+                    )
+                    runner.update_step(
+                        job["id"], "eye_keypoints",
+                        status="failed",
+                        summary=ek_offline_summary,
+                        error=ek_fatal,
+                    )
+                    result["stages"]["eye_keypoints"] = {
+                        "processed": processed["count"], "total": total,
+                        "source_offline": True,
+                    }
+                elif _should_abort(abort):
                     # Match the classify- and extract_masks-cancel summaries so
                     # the job tree distinguishes a user cancel from a clean
                     # finish that happened to process the same count.
+                    stages["eye_keypoints"]["status"] = "completed"
                     summary = (
                         f"Cancelled ({processed['count']} of {total} processed)"
                         if total else "Cancelled"
@@ -6488,6 +6550,7 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                         "cancelled": True,
                     }
                 else:
+                    stages["eye_keypoints"]["status"] = "completed"
                     summary = (
                         f"{processed['count']} of {total} photos processed"
                         if total else "No eligible photos"

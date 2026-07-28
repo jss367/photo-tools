@@ -16563,3 +16563,87 @@ def test_pipeline_extract_masks_offline_survives_finalizer_override(
         f"The extract_masks Fatal error must name the outage as "
         f"source-offline; got {em_fatal[0]!r}"
     )
+
+
+def test_pipeline_eye_keypoints_offline_branch_latches_failed_status():
+    """An eye-keypoints-owned outage must stay ``failed`` through finalization.
+
+    Codex #1388 P2 (r3665289978): when classify is fully cached (or skipped)
+    and mask extraction is already satisfied, ``eye_keypoints_stage`` can be
+    the first stage that opens the source. If a folder is offline the current
+    filter drops those photos and reduces ``total`` — but unlike the mask-
+    stage branch it records no error and latches no failed/skipped status.
+    The finalizer then reports ``completed`` (often ``"No eligible photos"``)
+    and the whole job succeeds without producing the requested eye keypoints.
+
+    The full pipeline path to this branch requires a large amount of DB
+    seeding (masks, predictions, labels_fingerprint bookkeeping) that would
+    dwarf the fix under test. Instead, this test asserts the source-of-
+    truth: the eye_keypoints_stage source-offline branch and its finalizer
+    both name ``ek_offline_latched`` and mirror the extract_masks pattern
+    exactly. Regressing this fix — deleting the latch, removing the Fatal
+    error append, or forgetting the failed status in the finalizer — has to
+    fail this test.
+    """
+    import inspect
+
+    import pipeline_job
+
+    src = inspect.getsource(pipeline_job.run_pipeline_job)
+    eye_stage_marker = "def eye_keypoints_stage():"
+    assert eye_stage_marker in src, (
+        "Setup sanity: eye_keypoints_stage no longer defined inline in "
+        "run_pipeline_job; the offline-latch invariants below need to be "
+        "moved to wherever the stage now lives."
+    )
+    eye_src = src[src.index(eye_stage_marker):]
+    # Trim to just this stage: the next inline stage definition starts
+    # with ``def regroup_stage():`` a few thousand lines later.
+    regroup_marker = "def regroup_stage():"
+    if regroup_marker in eye_src:
+        eye_src = eye_src[: eye_src.index(regroup_marker)]
+
+    # 1) The latch itself must exist and default to False.
+    assert "ek_offline_latched = False" in eye_src, (
+        "eye_keypoints_stage must initialize ek_offline_latched so the "
+        "offline branch below has a clean default to flip. Without the "
+        "latch, the finalizer would overwrite the failed status with "
+        "'completed' (Codex #1388 P2 r3665289978)."
+    )
+    # 2) The offline branch must append a Fatal-prefixed error and set
+    #    status=failed under the "no upstream already flagged" guard.
+    assert "[eye_keypoints] Fatal:" in eye_src, (
+        "eye_keypoints_stage must append a '[eye_keypoints] Fatal:' entry "
+        "to errors when it owns a source-offline outage — the end-of-run "
+        "rollup selects the headline error by that marker; otherwise the "
+        "job would surface an unrelated per-photo warning as the failure."
+    )
+    assert 'stages["eye_keypoints"]["status"] = "failed"' in eye_src, (
+        "eye_keypoints_stage must set the stage status to 'failed' in "
+        "its offline branch. Without this the run finishes 'successfully' "
+        "with no keypoints (Codex #1388 P2 r3665289978)."
+    )
+    assert "ek_offline_latched = True" in eye_src, (
+        "The offline branch must set ek_offline_latched=True so the "
+        "finalizer's default 'completed' path doesn't erase the failure."
+    )
+    # 3) The upstream-flag check has to consider BOTH classify and
+    #    extract_masks: eye_keypoints runs after both, and either can
+    #    already own the outage.
+    assert (
+        '[classify] Fatal:' in eye_src
+        and '[extract_masks] Fatal:' in eye_src
+    ), (
+        "The 'already_flagged_upstream' guard must match [classify] Fatal:"
+        " AND [extract_masks] Fatal: so eye_keypoints doesn't double-count "
+        "an outage some upstream stage already surfaced."
+    )
+    # 4) The finalizer must branch on the latch: without this branch,
+    #    the default ``stages["eye_keypoints"]["status"] = "completed"``
+    #    line would overwrite the "failed" status set above.
+    assert "if ek_offline_latched:" in eye_src, (
+        "The finalizer must special-case ek_offline_latched to preserve "
+        "the failed status through step_update; otherwise the step row "
+        "renders as a green, collapsed 'completed' on a run that produced "
+        "no keypoints."
+    )

@@ -1,6 +1,7 @@
 import hashlib
 import json
 import os
+import subprocess
 import sys
 
 import pytest
@@ -649,3 +650,403 @@ def test_verify_digest_reports_an_unreadable_file_instead_of_raising(tmp_path):
     ok, detail = verify_digest(str(tmp_path / "does-not-exist.bin"), "sha256:" + HELLO_SHA256)
     assert not ok
     assert "read" in detail.lower()
+
+
+# --- Task 7: install_dir / is_quarantined / hand_off / download / free_space_bytes ---
+
+
+def _completed(returncode=0, stderr=""):
+    """A stand-in for subprocess.run's return value.
+
+    Returning None here instead (a bare recording lambda) would make any test
+    that inspects the exit status pass by accident, so the fake keeps the one
+    field the caller reads.
+    """
+    return subprocess.CompletedProcess(args=[], returncode=returncode, stdout="", stderr=stderr)
+
+
+def test_install_dir_is_under_vireo_home():
+    from darktable_install import install_dir
+
+    assert install_dir().endswith(os.path.join(".vireo", "tools", "darktable"))
+
+
+def test_install_dir_is_exactly_the_directory_develop_probes(monkeypatch):
+    """Downloading anywhere else would 'install' darktable and still report it
+    missing: darktable_search_paths only lists AppImages in that one dir."""
+    import develop
+    from darktable_install import install_dir
+
+    assert install_dir() == develop.darktable_tools_dir()
+
+    # ...by asking develop every call, not by re-deriving the same string: a
+    # copy would silently keep the old path the day that one moves, and would
+    # ignore a relocated HOME because expansion happened at import time.
+    monkeypatch.setattr(develop, "darktable_tools_dir", lambda: "/somewhere/else")
+    assert install_dir() == "/somewhere/else"
+
+
+def test_hand_off_linux_makes_appimage_executable_and_returns_bin_path(tmp_path):
+    from darktable_install import hand_off
+
+    appimage = tmp_path / "Darktable-5.6.0-x86_64.AppImage"
+    appimage.write_bytes(b"stub")
+    appimage.chmod(0o644)
+
+    result = hand_off(str(appimage), platform_name="linux")
+
+    assert os.access(str(appimage), os.X_OK)
+    assert result["bin_path"] == str(appimage)
+    assert result["action"] == "installed"
+    assert result["location"] == str(appimage)
+
+
+def test_hand_off_macos_opens_dmg_and_sets_no_bin_path(tmp_path, monkeypatch):
+    """macOS cannot know the final path — the user drags the app themselves."""
+    import darktable_install
+    from darktable_install import hand_off
+
+    calls = []
+    monkeypatch.setattr(darktable_install.subprocess, "run",
+                        lambda *a, **k: calls.append(a) or _completed(0))
+
+    dmg = tmp_path / "darktable-5.6.0-arm64.dmg"
+    dmg.write_bytes(b"stub")
+    result = hand_off(str(dmg), platform_name="darwin")
+
+    assert calls, "expected the DMG to be opened"
+    assert list(calls[0][0]) == ["open", str(dmg)]
+    assert result["bin_path"] is None
+    assert result["action"] == "opened-installer"
+    assert result["location"] == str(dmg)
+
+
+def test_hand_off_windows_launches_the_installer_and_sets_no_bin_path(tmp_path, monkeypatch):
+    import darktable_install
+    from darktable_install import hand_off
+
+    opened = []
+    monkeypatch.setattr(darktable_install.os, "startfile",
+                        lambda p: opened.append(p), raising=False)
+
+    exe = tmp_path / "darktable-5.6.0-win64.exe"
+    exe.write_bytes(b"stub")
+    result = hand_off(str(exe), platform_name="win32")
+
+    assert opened == [str(exe)]
+    assert result["bin_path"] is None
+    assert result["action"] == "opened-installer"
+
+
+def test_hand_off_says_so_when_the_installer_could_not_be_opened(tmp_path, monkeypatch):
+    """A corrupt DMG makes `open` fail. Reporting "opened-installer" anyway
+    would leave the user waiting for a window that never appears."""
+    import darktable_install
+    from darktable_install import hand_off
+
+    monkeypatch.setattr(darktable_install.subprocess, "run",
+                        lambda *a, **k: _completed(1, "no mountable file systems"))
+
+    dmg = tmp_path / "darktable-5.6.0-arm64.dmg"
+    dmg.write_bytes(b"stub")
+
+    with pytest.raises(RuntimeError) as exc:
+        hand_off(str(dmg), platform_name="darwin")
+    # The download is still on disk, so the message must name it.
+    assert str(dmg) in str(exc.value)
+
+
+def test_hand_off_default_platform_agrees_with_develop(tmp_path, monkeypatch):
+    """With no override, hand_off must branch the same way darktable_search_paths
+    does — otherwise we chmod a file nothing probes, or open an AppImage."""
+    import darktable_install
+    import develop
+    from darktable_install import hand_off
+
+    monkeypatch.setattr(darktable_install.subprocess, "run", lambda *a, **k: _completed(0))
+    monkeypatch.setattr(darktable_install.os, "startfile", lambda p: None, raising=False)
+
+    artifact = tmp_path / "artifact.bin"
+    artifact.write_bytes(b"stub")
+    artifact.chmod(0o644)
+
+    result = hand_off(str(artifact))
+
+    if develop.darktable_uses_tools_dir():
+        assert result["bin_path"] == str(artifact)
+        assert os.access(str(artifact), os.X_OK)
+    else:
+        assert result["bin_path"] is None
+        assert not os.access(str(artifact), os.X_OK)
+
+
+def test_is_quarantined_false_for_plain_file(tmp_path):
+    """Warn about Gatekeeper only when the attribute is really present.
+
+    urllib downloads are not quarantined (LaunchServices applies that, not
+    urllib), so an unconditional warning would scare users about a dialog
+    they will never see.
+    """
+    from darktable_install import is_quarantined
+
+    f = tmp_path / "a.bin"
+    f.write_bytes(b"x")
+    assert is_quarantined(str(f)) is False
+
+
+def test_is_quarantined_true_when_xattr_reports_the_attribute(tmp_path, monkeypatch):
+    import darktable_install
+    from darktable_install import is_quarantined
+
+    monkeypatch.setattr(darktable_install.sys, "platform", "darwin")
+    seen = []
+    monkeypatch.setattr(darktable_install.subprocess, "run",
+                        lambda *a, **k: seen.append(a[0]) or _completed(0, ""))
+
+    f = tmp_path / "a.bin"
+    f.write_bytes(b"x")
+    assert is_quarantined(str(f)) is True
+    assert seen == [["xattr", "-p", "com.apple.quarantine", str(f)]]
+
+
+def test_is_quarantined_false_when_xattr_is_missing(tmp_path, monkeypatch):
+    """Never raise: a missing tool must not fail an otherwise good install."""
+    import darktable_install
+    from darktable_install import is_quarantined
+
+    monkeypatch.setattr(darktable_install.sys, "platform", "darwin")
+
+    def boom(*a, **k):
+        raise FileNotFoundError("xattr")
+
+    monkeypatch.setattr(darktable_install.subprocess, "run", boom)
+
+    f = tmp_path / "a.bin"
+    f.write_bytes(b"x")
+    assert is_quarantined(str(f)) is False
+
+
+def test_is_quarantined_does_not_shell_out_off_macos(tmp_path, monkeypatch):
+    import darktable_install
+    from darktable_install import is_quarantined
+
+    monkeypatch.setattr(darktable_install.sys, "platform", "linux")
+
+    # Recorded, not raised: is_quarantined swallows every exception, so a stub
+    # that raises would be absorbed and the test would pass with the check gone.
+    seen = []
+    monkeypatch.setattr(darktable_install.subprocess, "run",
+                        lambda *a, **k: seen.append(a) or _completed(0))
+
+    f = tmp_path / "a.bin"
+    f.write_bytes(b"x")
+    assert is_quarantined(str(f)) is False
+    assert seen == [], "xattr is macOS-only; do not run it elsewhere"
+
+
+def _asset(payload, **overrides):
+    asset = {
+        "name": "darktable-5.6.0-arm64.dmg",
+        "url": "https://github.com/darktable-org/darktable/releases/download/"
+               "release-5.6.0/darktable-5.6.0-arm64.dmg",
+        "size": len(payload),
+        "digest": "sha256:" + hashlib.sha256(payload).hexdigest(),
+    }
+    asset.update(overrides)
+    return asset
+
+
+def _stub_download(monkeypatch, payload=b"", *, record=None, raises=None):
+    """Replace the real network download. No test may touch the network."""
+    import taxonomy
+
+    def fake(url, dest_path, **kwargs):
+        if record is not None:
+            record.append({"url": url, "dest_path": dest_path, **kwargs})
+        if raises is not None:
+            # Mirror the real function: a cancelled download leaves its
+            # .partial behind (0 bytes when cancelled before the first read).
+            open(dest_path + ".partial", "wb").close()
+            raise raises
+        with open(dest_path, "wb") as f:
+            f.write(payload)
+        return dest_path
+
+    monkeypatch.setattr(taxonomy, "_download_with_resume", fake)
+
+
+def test_download_writes_the_asset_and_returns_the_verification_detail(tmp_path, monkeypatch):
+    from darktable_install import download
+
+    payload = b"darktable" * 100
+    _stub_download(monkeypatch, payload)
+
+    path, detail = download(_asset(payload), dest_dir=str(tmp_path))
+
+    assert path == str(tmp_path / "darktable-5.6.0-arm64.dmg")
+    assert open(path, "rb").read() == payload
+    assert "SHA256 matches" in detail
+
+
+def test_download_defaults_to_install_dir_and_creates_it(tmp_path, monkeypatch):
+    import darktable_install
+    from darktable_install import download
+
+    payload = b"x" * 64
+    _stub_download(monkeypatch, payload)
+    target = tmp_path / "nested" / "tools" / "darktable"
+    monkeypatch.setattr(darktable_install, "install_dir", lambda: str(target))
+
+    path, _detail = download(_asset(payload))
+
+    assert path == str(target / "darktable-5.6.0-arm64.dmg")
+    assert os.path.isfile(path)
+
+
+def test_download_deletes_the_file_and_raises_on_a_size_mismatch(tmp_path, monkeypatch):
+    """A wrong-length artifact must never reach an installer."""
+    from darktable_install import download
+
+    payload = b"short"
+    _stub_download(monkeypatch, payload)
+
+    with pytest.raises(RuntimeError) as exc:
+        download(_asset(payload, size=999999), dest_dir=str(tmp_path))
+
+    assert "size mismatch" in str(exc.value).lower()
+    assert not os.path.exists(str(tmp_path / "darktable-5.6.0-arm64.dmg")), (
+        "the bad download must be deleted, not left for the installer"
+    )
+
+
+def test_download_deletes_the_file_and_raises_on_a_digest_mismatch(tmp_path, monkeypatch):
+    from darktable_install import download
+
+    payload = b"y" * 32
+    _stub_download(monkeypatch, payload)
+    wrong = "sha256:" + hashlib.sha256(b"something else").hexdigest()
+
+    with pytest.raises(RuntimeError) as exc:
+        download(_asset(payload, digest=wrong), dest_dir=str(tmp_path))
+
+    assert "mismatch" in str(exc.value).lower()
+    assert not os.path.exists(str(tmp_path / "darktable-5.6.0-arm64.dmg")), (
+        "the bad download must be deleted, not left for the installer"
+    )
+
+
+def test_download_returns_the_unverified_detail_verbatim(tmp_path, monkeypatch):
+    """verify_digest returns ok=True for a *missing* digest too, so download
+    must pass its sentence through rather than inventing 'verified' wording."""
+    from darktable_install import download, verify_digest
+
+    payload = b"z" * 16
+    _stub_download(monkeypatch, payload)
+
+    path, detail = download(_asset(payload, digest=None), dest_dir=str(tmp_path))
+
+    assert detail == verify_digest(path, None)[1]
+    assert "could not be verified" in detail
+    assert "matches" not in detail
+
+
+def test_download_forwards_progress_and_cancellation_hooks(tmp_path, monkeypatch):
+    """byte_callback and should_cancel are keyword-only on _download_with_resume;
+    dropping either silently kills the progress bar and the Cancel button."""
+    from darktable_install import download
+
+    payload = b"w" * 8
+    record = []
+    _stub_download(monkeypatch, payload, record=record)
+
+    def on_bytes(done, total):
+        pass
+
+    def cancelled():
+        return False
+
+    download(_asset(payload), dest_dir=str(tmp_path),
+             byte_callback=on_bytes, should_cancel=cancelled)
+
+    assert len(record) == 1
+    assert record[0]["url"] == _asset(payload)["url"]
+    assert record[0]["byte_callback"] is on_bytes
+    assert record[0]["should_cancel"] is cancelled
+
+
+def test_download_propagates_cancellation_and_keeps_the_empty_partial(tmp_path, monkeypatch):
+    """should_cancel is checked before the first read, so an immediately
+    cancelled download leaves a 0-byte .partial. That is a normal resume
+    state, not corruption: keep it and let the cancel surface as itself."""
+    import taxonomy
+    from darktable_install import download
+
+    _stub_download(monkeypatch, raises=taxonomy.DownloadCancelled("Download cancelled"))
+
+    with pytest.raises(taxonomy.DownloadCancelled):
+        download(_asset(b"q" * 8), dest_dir=str(tmp_path), should_cancel=lambda: True)
+
+    partial = tmp_path / "darktable-5.6.0-arm64.dmg.partial"
+    assert partial.exists(), "the .partial must survive for resume"
+    assert partial.stat().st_size == 0
+    assert not (tmp_path / "darktable-5.6.0-arm64.dmg").exists()
+
+
+def test_free_space_bytes_creates_the_directory_and_reports_free_not_total(
+    tmp_path, monkeypatch
+):
+    import collections
+
+    import darktable_install
+
+    usage = collections.namedtuple("usage", "total used free")
+    seen = []
+    monkeypatch.setattr(darktable_install.shutil, "disk_usage",
+                        lambda p: seen.append(p) or usage(total=100, used=70, free=30))
+
+    target = tmp_path / "made" / "here"
+    assert darktable_install.free_space_bytes(str(target)) == 30
+    assert os.path.isdir(str(target))
+    assert seen == [str(target)]
+
+
+def test_free_space_bytes_returns_a_real_number_on_this_filesystem(tmp_path):
+    from darktable_install import free_space_bytes
+
+    assert free_space_bytes(str(tmp_path / "sub")) > 0
+
+
+def test_download_refuses_an_asset_name_that_escapes_the_directory(tmp_path, monkeypatch):
+    """The name is API-supplied. Joining it unchecked would let one write
+    outside the tools dir — every other field from that response is already
+    constrained, and this one must be too."""
+    from darktable_install import download
+
+    payload = b"p" * 8
+    called = []
+    _stub_download(monkeypatch, payload, record=called)
+
+    with pytest.raises(RuntimeError) as exc:
+        download(_asset(payload, name="../escaped.dmg"), dest_dir=str(tmp_path / "dl"))
+
+    assert "suspicious" in str(exc.value).lower()
+    assert called == [], "nothing should be fetched for a rejected name"
+    assert not os.path.exists(str(tmp_path / "escaped.dmg"))
+
+
+def test_hand_off_does_not_write_config(tmp_path, monkeypatch):
+    """bin_path is *returned* so the job handler writes darktable_bin in one
+    place, next to the message that tells the user it happened."""
+    import config as cfg
+    from darktable_install import hand_off
+
+    def boom(*a, **k):
+        raise AssertionError("hand_off must not write config")
+
+    monkeypatch.setattr(cfg, "set", boom)
+    monkeypatch.setattr(cfg, "save", boom)
+
+    appimage = tmp_path / "Darktable-5.6.0-x86_64.AppImage"
+    appimage.write_bytes(b"stub")
+    result = hand_off(str(appimage), platform_name="linux")
+    assert result["bin_path"] == str(appimage)

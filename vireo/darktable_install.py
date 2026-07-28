@@ -14,15 +14,24 @@ download.  See docs/superpowers/specs/2026-07-26-darktable-download-design.md.
 import hashlib
 import json
 import logging
+import os
 import platform
 import posixpath
 import re
+import shutil
 import ssl
+import stat
+import subprocess
 import sys
 import urllib.parse
 import urllib.request
 
 import certifi
+
+try:
+    from . import develop
+except ImportError:
+    import develop
 
 log = logging.getLogger(__name__)
 
@@ -277,3 +286,164 @@ def verify_digest(path, expected):
         f"SHA256 mismatch — expected {want}, got {actual}. The download does not match "
         "the digest GitHub published, so it was truncated, corrupted or replaced."
     )
+
+
+def install_dir():
+    """Where downloads land, on every platform.
+
+    Also where the ``.partial`` resume file lives and which filesystem the
+    free-space check measures.  Installers are kept after hand-off — the user
+    may want to re-run them.
+
+    Delegates to develop.darktable_tools_dir() rather than re-deriving the
+    path: on Linux that is the *only* directory darktable_search_paths probes,
+    so downloading anywhere else would install darktable and still report it
+    missing.
+    """
+    return develop.darktable_tools_dir()
+
+
+def is_quarantined(path):
+    """True if macOS tagged the file with com.apple.quarantine.
+
+    Measured behaviour: urllib downloads are NOT quarantined (LaunchServices
+    applies that attribute for browser-style downloads), so this is normally
+    False and the Gatekeeper warning stays hidden.  Checked rather than
+    assumed in either direction.
+
+    Never raises: a platform without the attribute, or without the xattr tool,
+    is simply "not quarantined" — an install that otherwise worked must not
+    fail over a cosmetic warning.
+    """
+    if sys.platform != "darwin":
+        return False
+    try:
+        result = subprocess.run(
+            ["xattr", "-p", "com.apple.quarantine", path],
+            capture_output=True, text=True, timeout=10,
+        )
+        return result.returncode == 0
+    except Exception:
+        log.debug("Could not check the quarantine attribute of %s", path, exc_info=True)
+        return False
+
+
+def _installs_into_tools_dir(platform_name=None):
+    """True where the downloaded artifact *is* the runnable binary.
+
+    With no override this is develop.darktable_uses_tools_dir() verbatim, so
+    hand_off cannot branch differently from the directory darktable_search_paths
+    probes.  ``platform_name`` is an explicit-platform override for tests and
+    for callers that already know which build they fetched.
+    """
+    if platform_name is None:
+        return develop.darktable_uses_tools_dir()
+    return platform_name not in ("darwin", "win32")
+
+
+def hand_off(path, platform_name=None):
+    """Hand the downloaded artifact to the platform.
+
+    Returns ``{action, location, bin_path}``.  Does NOT write config: bin_path
+    is returned so the job handler writes darktable_bin in one place, next to
+    the message that tells the user it happened.
+
+    Raises RuntimeError if the installer could not be opened.  The message
+    names the downloaded file, because it is still on disk and opening it by
+    hand is the user's way forward — reporting "opened-installer" anyway would
+    leave them waiting for a window that never appears.
+    """
+    if _installs_into_tools_dir(platform_name):
+        # Linux: the AppImage we just downloaded is the program itself.  It is
+        # deliberately left as-is rather than pre-extracted; see the AppImage
+        # note in docs/superpowers/plans/2026-07-26-darktable-download.md.
+        mode = os.stat(path).st_mode
+        os.chmod(path, mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+        return {"action": "installed", "location": path, "bin_path": path}
+
+    if (platform_name or sys.platform) == "darwin":
+        # No capture_output: `open` hands the file to LaunchServices and exits,
+        # and piping its streams risks blocking on a handle the launched app
+        # inherits.  The exit status is the part we need.
+        result = subprocess.run(["open", path], timeout=30)
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"Downloaded to {path}, but macOS could not open it "
+                f"(exit code {result.returncode}). Open it yourself to install darktable."
+            )
+    else:
+        try:
+            os.startfile(path)
+        except OSError as exc:
+            raise RuntimeError(
+                f"Downloaded to {path}, but Windows could not open it ({exc}). "
+                "Open it yourself to install darktable."
+            ) from exc
+
+    # The user chooses where the app lands, so we cannot know bin_path here.
+    # Detection (Task 1) finds it on the next re-check.
+    return {"action": "opened-installer", "location": path, "bin_path": None}
+
+
+def download(asset, dest_dir=None, byte_callback=None, should_cancel=None):
+    """Download one resolved asset, verify it, and return ``(path, detail)``.
+
+    ``detail`` is verify_digest's sentence, returned verbatim: ok=True covers
+    both "the digest matched" and "GitHub published no digest", and only that
+    sentence distinguishes them.  Callers must show it rather than deriving
+    their own "verified" wording from the boolean.
+
+    Raises RuntimeError on a size or digest mismatch, deleting the bad file: a
+    wrong artifact must never be handed to an installer.  A cancellation
+    propagates as taxonomy.DownloadCancelled with the ``.partial`` left in
+    place for resume — should_cancel is checked before the first read, so an
+    immediately cancelled download leaves a 0-byte ``.partial``, which is a
+    normal resume state and not a corrupt-download signal.
+    """
+    try:
+        from .taxonomy import _download_with_resume
+    except ImportError:
+        from taxonomy import _download_with_resume
+
+    # The name comes from the GitHub API, so it is joined only after being
+    # reduced to a bare filename: a name carrying path separators would
+    # otherwise write outside the tools directory.
+    name = os.path.basename(asset["name"])
+    if name != asset["name"] or name in ("", ".", ".."):
+        raise RuntimeError(
+            f"Refusing to download an asset with a suspicious name: {asset['name']!r}"
+        )
+
+    dest_dir = dest_dir or install_dir()
+    os.makedirs(dest_dir, exist_ok=True)
+    dest = os.path.join(dest_dir, name)
+
+    _download_with_resume(
+        asset["url"], dest,
+        byte_callback=byte_callback,
+        should_cancel=should_cancel,
+    )
+
+    actual_size = os.path.getsize(dest)
+    if asset.get("size") and actual_size != asset["size"]:
+        os.remove(dest)
+        raise RuntimeError(
+            f"Size mismatch — expected {asset['size']} bytes, got {actual_size}"
+        )
+
+    ok, detail = verify_digest(dest, asset.get("digest"))
+    if not ok:
+        os.remove(dest)
+        raise RuntimeError(detail)
+    return dest, detail
+
+
+def free_space_bytes(path):
+    """Bytes free on the filesystem holding path (creating it if needed).
+
+    shutil.disk_usage rather than os.statvfs: it works on all three platforms
+    (statvfs does not exist on Windows) and reports the same non-root-reserved
+    free figure, so there is nothing to fall back to.
+    """
+    os.makedirs(path, exist_ok=True)
+    return shutil.disk_usage(path).free

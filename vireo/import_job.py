@@ -1834,9 +1834,8 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
                     # re-read just to link their folder, and the walk is
                     # slow enough that silence reads as a hang. See the
                     # module docstring.
-                    _emit(
-                        _dup_link_phase(lex_dup_dirs), emitted, discovered,
-                    )
+                    _phase_prefix = _dup_link_phase(lex_dup_dirs)
+                    _emit(_phase_prefix, emitted, discovered)
                     scan(
                         destination, db,
                         restrict_dirs=sorted(lex_dup_dirs),
@@ -1845,9 +1844,11 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
                         thumb_cache_dir=params.thumb_cache_dir,
                         skip_working_copies=True,
                         cancel_check=lambda: runner.is_cancelled(job["id"]),
-                        status_callback=lambda msg, **kw: _emit(
-                            f"{_dup_link_phase(lex_dup_dirs)} — {msg}",
-                            emitted, discovered,
+                        status_callback=(
+                            lambda msg, _p=_phase_prefix, _e=emitted,
+                            _d=discovered, **kw: _emit(
+                                f"{_p} — {msg}", _e, _d,
+                            )
                         ),
                     )
                     linked_dup_dirs.update(lex_dup_dirs)
@@ -3179,9 +3180,8 @@ def run_import_job(job, runner, db_path, workspace_id, params):
                     # Name the phase and stream scanner's own discovery
                     # counter into it, or the UI sits on the batch's
                     # "N already present" line looking hung.
-                    _emit(
-                        _dup_link_phase(lex_dup_dirs), emitted, discovered,
-                    )
+                    _phase_prefix = _dup_link_phase(lex_dup_dirs)
+                    _emit(_phase_prefix, emitted, discovered)
                     # Same rationale as the fresh-batch scan above: pass
                     # ``vireo_dir`` / ``thumb_cache_dir`` so pairing keeps
                     # cache context, and defer per-batch WC extraction to
@@ -3194,9 +3194,11 @@ def run_import_job(job, runner, db_path, workspace_id, params):
                         thumb_cache_dir=params.thumb_cache_dir,
                         skip_working_copies=True,
                         cancel_check=lambda: runner.is_cancelled(job["id"]),
-                        status_callback=lambda msg, **kw: _emit(
-                            f"{_dup_link_phase(lex_dup_dirs)} — {msg}",
-                            emitted, discovered,
+                        status_callback=(
+                            lambda msg, _p=_phase_prefix, _e=emitted,
+                            _d=discovered, **kw: _emit(
+                                f"{_p} — {msg}", _e, _d,
+                            )
                         ),
                     )
                     linked_dup_dirs.update(lex_dup_dirs)

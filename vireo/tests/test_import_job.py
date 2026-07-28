@@ -5333,9 +5333,8 @@ def test_remote_import_dup_link_scan_does_not_reread_unchanged_twins(
     ``test_duplicate_only_import_does_not_reread_unchanged_twins``: the
     remote path runs its own dup-link scan, and it must skip already-
     cataloged, unchanged twins too."""
-    from import_job import ImportParams, run_import_job
-
     import scanner
+    from import_job import ImportParams, run_import_job
 
     ra = _remote_archive_for(tmp_path)
     calls = _remote_calls(ra)

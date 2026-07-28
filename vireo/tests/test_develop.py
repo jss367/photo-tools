@@ -697,6 +697,7 @@ def test_develop_photo_appimage_direct_first_when_fuse_works(tmp_path, monkeypat
     import develop
 
     develop._APPIMAGE_MODE_CACHE.clear()
+    develop._APPIMAGE_APPRUN_CACHE.clear()
 
     raw = tmp_path / "bird.NEF"
     raw.touch()
@@ -728,34 +729,125 @@ def test_develop_photo_appimage_direct_first_when_fuse_works(tmp_path, monkeypat
     assert develop._APPIMAGE_MODE_CACHE[str(fake_bin)] == "direct"
 
 
-def test_develop_photo_appimage_falls_back_to_extract_on_fuse_failure(tmp_path, monkeypatch):
-    """When the AppImage runtime fails with a FUSE error, retry once with
-    APPIMAGE_EXTRACT_AND_RUN=1 and cache the answer so subsequent photos skip
-    the probe. Without the cache, every photo in a batch would pay the retry.
+def test_develop_photo_appimage_falls_back_to_persistent_extraction_on_fuse_failure(tmp_path, monkeypatch):
+    """When the AppImage runtime fails with a FUSE error, extract the bundle
+    once to a persistent tree and route every following photo through the
+    extracted AppRun — never APPIMAGE_EXTRACT_AND_RUN. Setting that flag
+    would make the runtime unpack the whole ~178 MB squashfs into a temp dir
+    for every photo in the batch, which is exactly the cost the persistent
+    extraction is here to avoid.
     """
     import subprocess
 
     import develop
 
     develop._APPIMAGE_MODE_CACHE.clear()
+    develop._APPIMAGE_APPRUN_CACHE.clear()
 
     raw = tmp_path / "bird.NEF"
     raw.touch()
     fake_bin = _write_appimage(tmp_path / "Darktable-5.6.0-x86_64.AppImage")
     out = tmp_path / "out" / "bird.jpg"
 
-    calls = []
     fuse_stderr = (
         "AppImages require FUSE to run.\n"
         "You might still be able to extract the contents of this AppImage "
         "if you run it with the --appimage-extract option.\n"
     )
+    expected_apprun = os.path.join(
+        str(fake_bin) + ".extracted", "squashfs-root", "AppRun",
+    )
+
+    calls = []
 
     def fake_run(cmd, **kwargs):
         env = kwargs.get("env") or {}
-        calls.append(env.get("APPIMAGE_EXTRACT_AND_RUN"))
-        if env.get("APPIMAGE_EXTRACT_AND_RUN") != "1":
+        calls.append({
+            "argv0": cmd[0],
+            "argv": list(cmd),
+            "extract_flag": env.get("APPIMAGE_EXTRACT_AND_RUN"),
+            "cwd": kwargs.get("cwd"),
+        })
+        if cmd == [str(fake_bin), "--appimage-extract"]:
+            # Simulate the AppImage runtime's --appimage-extract producing
+            # squashfs-root/AppRun in the current working directory.
+            root = os.path.join(kwargs["cwd"], "squashfs-root")
+            os.makedirs(root, exist_ok=True)
+            apprun = os.path.join(root, "AppRun")
+            with open(apprun, "w") as f:
+                f.write("#!/bin/sh\nexec /usr/bin/darktable-cli \"$@\"\n")
+            os.chmod(apprun, 0o755)
+            return _fake_completed(0)
+        if cmd[0] == str(fake_bin):
             # First call: simulate the runtime's FUSE failure.
+            return _fake_completed(1, stdout="", stderr=fuse_stderr)
+        # Extracted AppRun run: write the output and succeed.
+        os.makedirs(os.path.dirname(cmd[-1]), exist_ok=True)
+        with open(cmd[-1], "w") as f:
+            f.write("jpg")
+        return _fake_completed(0)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = develop.develop_photo(str(fake_bin), str(raw), str(out))
+    assert result["success"] is True
+    # 1) probe against the AppImage, 2) --appimage-extract, 3) AppRun run.
+    assert [c["argv0"] for c in calls] == [
+        str(fake_bin), str(fake_bin), expected_apprun,
+    ]
+    assert calls[1]["argv"] == [str(fake_bin), "--appimage-extract"]
+    # APPIMAGE_EXTRACT_AND_RUN must NEVER get set on this path — the point of
+    # persistent extraction is to avoid the AppImage runtime unpacking again.
+    assert all(c["extract_flag"] is None for c in calls)
+    assert develop._APPIMAGE_MODE_CACHE[str(fake_bin)] == "extracted"
+    assert develop._APPIMAGE_APPRUN_CACHE[str(fake_bin)] == expected_apprun
+
+    # Second call for the same binary skips both the FUSE probe and the
+    # extract subprocess: only the extracted AppRun is invoked. Anything
+    # else would still be paying per-photo cost.
+    calls.clear()
+    out2 = tmp_path / "out" / "bird2.jpg"
+    result2 = develop.develop_photo(str(fake_bin), str(raw), str(out2))
+    assert result2["success"] is True
+    assert [c["argv0"] for c in calls] == [expected_apprun]
+    assert calls[0]["extract_flag"] is None
+
+
+def test_develop_photo_appimage_extract_failure_falls_back_to_per_run_flag(tmp_path, monkeypatch):
+    """If the one-time --appimage-extract cannot produce a usable AppRun
+    (unwritable dir, subprocess failure, truncated output), develop must
+    still succeed by setting APPIMAGE_EXTRACT_AND_RUN=1 on every call. The
+    fallback is slower per-photo, but shipping a broken FUSE-less path when
+    a working one exists would be worse.
+    """
+    import subprocess
+
+    import develop
+
+    develop._APPIMAGE_MODE_CACHE.clear()
+    develop._APPIMAGE_APPRUN_CACHE.clear()
+
+    raw = tmp_path / "bird.NEF"
+    raw.touch()
+    fake_bin = _write_appimage(tmp_path / "Darktable-5.6.0-x86_64.AppImage")
+    out = tmp_path / "out" / "bird.jpg"
+
+    fuse_stderr = "AppImages require FUSE to run.\n"
+
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        env = kwargs.get("env") or {}
+        calls.append({
+            "argv": list(cmd),
+            "extract_flag": env.get("APPIMAGE_EXTRACT_AND_RUN"),
+        })
+        if cmd == [str(fake_bin), "--appimage-extract"]:
+            # Extraction subprocess "runs" but leaves no AppRun on disk —
+            # simulates a truncated / corrupted download or a permission
+            # error surfaced only inside the runtime.
+            return _fake_completed(1, stdout="", stderr="extract failed")
+        if env.get("APPIMAGE_EXTRACT_AND_RUN") != "1":
             return _fake_completed(1, stdout="", stderr=fuse_stderr)
         os.makedirs(os.path.dirname(cmd[-1]), exist_ok=True)
         with open(cmd[-1], "w") as f:
@@ -766,16 +858,69 @@ def test_develop_photo_appimage_falls_back_to_extract_on_fuse_failure(tmp_path, 
 
     result = develop.develop_photo(str(fake_bin), str(raw), str(out))
     assert result["success"] is True
-    assert calls == [None, "1"], "expected one probe then one fallback"
-    assert develop._APPIMAGE_MODE_CACHE[str(fake_bin)] == "extract"
+    # probe → extract (fails) → per-run flag fallback
+    assert calls[0]["extract_flag"] is None
+    assert calls[1]["argv"] == [str(fake_bin), "--appimage-extract"]
+    assert calls[2]["extract_flag"] == "1"
+    assert develop._APPIMAGE_MODE_CACHE[str(fake_bin)] == "extract-per-run"
+    assert str(fake_bin) not in develop._APPIMAGE_APPRUN_CACHE
 
-    # Second call for the same binary skips the probe and goes straight to
-    # extract mode — no more wasted probe subprocess per photo.
+    # Second call takes the cached fallback path: no re-probe, no re-extract,
+    # just the flagged call. Still costs an unpack per photo, but that is
+    # explicitly the last-resort cache value.
     calls.clear()
     out2 = tmp_path / "out" / "bird2.jpg"
     result2 = develop.develop_photo(str(fake_bin), str(raw), str(out2))
     assert result2["success"] is True
-    assert calls == ["1"]
+    assert len(calls) == 1
+    assert calls[0]["extract_flag"] == "1"
+
+
+def test_develop_photo_appimage_extracted_cache_recovers_from_deleted_tree(tmp_path, monkeypatch):
+    """If the persistent extraction disappears between photos (user cleared
+    tmp, reinstall, etc.), the develop must re-probe rather than silently
+    invoking a stale path — pointing subprocess at a missing AppRun would
+    surface as a confusing FileNotFoundError instead of a fresh, successful
+    extraction.
+    """
+    import subprocess
+
+    import develop
+
+    develop._APPIMAGE_MODE_CACHE.clear()
+    develop._APPIMAGE_APPRUN_CACHE.clear()
+
+    raw = tmp_path / "bird.NEF"
+    raw.touch()
+    fake_bin = _write_appimage(tmp_path / "Darktable-5.6.0-x86_64.AppImage")
+    out = tmp_path / "out" / "bird.jpg"
+
+    # Pre-seed the cache with a path that does not exist on disk.
+    ghost_apprun = str(tmp_path / "ghosts" / "squashfs-root" / "AppRun")
+    develop._APPIMAGE_MODE_CACHE[str(fake_bin)] = "extracted"
+    develop._APPIMAGE_APPRUN_CACHE[str(fake_bin)] = ghost_apprun
+
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(list(cmd))
+        # Whatever runs now must not be the ghost path.
+        assert cmd[0] != ghost_apprun
+        # Direct-run probe path succeeds so we finish the first develop
+        # without touching FUSE at all.
+        os.makedirs(os.path.dirname(cmd[-1]), exist_ok=True)
+        with open(cmd[-1], "w") as f:
+            f.write("jpg")
+        return _fake_completed(0)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = develop.develop_photo(str(fake_bin), str(raw), str(out))
+    assert result["success"] is True
+    # Stale cache entries were purged: mode reset to "direct" after the
+    # fresh probe, AppRun path evicted entirely.
+    assert develop._APPIMAGE_MODE_CACHE[str(fake_bin)] == "direct"
+    assert str(fake_bin) not in develop._APPIMAGE_APPRUN_CACHE
 
 
 def test_develop_photo_appimage_non_fuse_failure_is_not_retried(tmp_path, monkeypatch):
@@ -788,6 +933,7 @@ def test_develop_photo_appimage_non_fuse_failure_is_not_retried(tmp_path, monkey
     import develop
 
     develop._APPIMAGE_MODE_CACHE.clear()
+    develop._APPIMAGE_APPRUN_CACHE.clear()
 
     raw = tmp_path / "bird.NEF"
     raw.touch()
@@ -811,6 +957,103 @@ def test_develop_photo_appimage_non_fuse_failure_is_not_retried(tmp_path, monkey
     assert calls == [None], "must not retry when the failure is not FUSE-shaped"
     # Nothing cached — a transient darktable error should not lock the mode.
     assert str(fake_bin) not in develop._APPIMAGE_MODE_CACHE
+    assert str(fake_bin) not in develop._APPIMAGE_APPRUN_CACHE
+
+
+def test_extract_appimage_once_reuses_existing_apprun(tmp_path, monkeypatch):
+    """Second call for the same AppImage must NOT re-run the extract
+    subprocess: the whole point of the persistent extraction is to make the
+    ~178 MB unpack happen exactly once per install.
+    """
+    import subprocess
+
+    import develop
+
+    fake_bin = _write_appimage(tmp_path / "Darktable-5.6.0-x86_64.AppImage")
+
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(list(cmd))
+        root = os.path.join(kwargs["cwd"], "squashfs-root")
+        os.makedirs(root, exist_ok=True)
+        apprun = os.path.join(root, "AppRun")
+        with open(apprun, "w") as f:
+            f.write("#!/bin/sh\nexec /usr/bin/darktable-cli \"$@\"\n")
+        os.chmod(apprun, 0o755)
+        return _fake_completed(0)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    first = develop._extract_appimage_once(str(fake_bin))
+    assert first is not None
+    assert os.path.isfile(first)
+    assert len(calls) == 1
+
+    # Second call: same AppRun, no new subprocess. The extraction on disk
+    # already satisfies the freshness check (mtime >= source), so no work.
+    second = develop._extract_appimage_once(str(fake_bin))
+    assert second == first
+    assert len(calls) == 1, "must not re-extract when a valid tree is present"
+
+
+def test_extract_appimage_once_re_extracts_when_source_is_newer(tmp_path, monkeypatch):
+    """When the AppImage is replaced (Vireo installs a newer build), the
+    stale extracted tree must be discarded and rebuilt — otherwise a batch
+    keeps invoking the old darktable version even after the user upgraded.
+    """
+    import subprocess
+
+    import develop
+
+    fake_bin = _write_appimage(tmp_path / "Darktable-5.6.0-x86_64.AppImage")
+
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(list(cmd))
+        root = os.path.join(kwargs["cwd"], "squashfs-root")
+        os.makedirs(root, exist_ok=True)
+        apprun = os.path.join(root, "AppRun")
+        with open(apprun, "w") as f:
+            f.write("#!/bin/sh\nexec /usr/bin/darktable-cli \"$@\"\n")
+        os.chmod(apprun, 0o755)
+        return _fake_completed(0)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    first = develop._extract_appimage_once(str(fake_bin))
+    assert first is not None
+
+    # Make the source AppImage newer than its extraction.
+    future = os.path.getmtime(first) + 10
+    os.utime(str(fake_bin), (future, future))
+
+    second = develop._extract_appimage_once(str(fake_bin))
+    assert second == first  # same target dir
+    assert len(calls) == 2, "newer source must trigger a re-extract"
+
+
+def test_extract_appimage_once_returns_none_when_subprocess_fails(tmp_path, monkeypatch):
+    """A subprocess failure or missing AppRun after --appimage-extract must
+    surface as None so the caller can pick the APPIMAGE_EXTRACT_AND_RUN
+    fallback, not confidently return a broken path.
+    """
+    import subprocess
+
+    import develop
+
+    fake_bin = _write_appimage(tmp_path / "Darktable-5.6.0-x86_64.AppImage")
+
+    def fake_run(cmd, **kwargs):
+        return _fake_completed(1, stdout="", stderr="oh no")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    assert develop._extract_appimage_once(str(fake_bin)) is None
+    # The failed extraction dir must be cleaned up so a later successful
+    # run does not find half-written state.
+    assert not os.path.exists(str(fake_bin) + ".extracted")
 
 
 def test_develop_photo_omits_appimage_extract_and_run_for_plain_binary(tmp_path, monkeypatch):
@@ -821,6 +1064,7 @@ def test_develop_photo_omits_appimage_extract_and_run_for_plain_binary(tmp_path,
     import develop
 
     develop._APPIMAGE_MODE_CACHE.clear()
+    develop._APPIMAGE_APPRUN_CACHE.clear()
 
     raw = tmp_path / "bird.NEF"
     raw.touch()
@@ -846,3 +1090,4 @@ def test_develop_photo_omits_appimage_extract_and_run_for_plain_binary(tmp_path,
     assert "APPIMAGE_EXTRACT_AND_RUN" not in captured["env"]
     assert set(os.environ) <= set(captured["env"])
     assert str(plain_bin) not in develop._APPIMAGE_MODE_CACHE
+    assert str(plain_bin) not in develop._APPIMAGE_APPRUN_CACHE

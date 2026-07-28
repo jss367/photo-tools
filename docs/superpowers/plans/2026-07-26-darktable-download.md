@@ -1223,6 +1223,9 @@ def download(asset, dest_dir=None, byte_callback=None, should_cancel=None):
     """
     from taxonomy import _download_with_resume
 
+    # NOTE from Task 4: should_cancel is checked BEFORE the first read, so an
+    # immediately-cancelled download leaves a 0-byte .partial. Do not treat an
+    # empty .partial as a corrupt-download signal — it is a normal resume state.
     dest_dir = dest_dir or install_dir()
     os.makedirs(dest_dir, exist_ok=True)
     dest = os.path.join(dest_dir, asset["name"])
@@ -1533,6 +1536,9 @@ In `vireo/app.py`, after `api_job_download_taxonomy`:
             )
 
         def work(job):
+            # NOTE from Task 4: byte_callback runs on the download thread
+            # inside the write loop. Keep it cheap — a queue put, never a DB
+            # write or anything that can block the transfer.
             def on_bytes(done, total):
                 runner.push_event(job["id"], "progress", progress_event(
                     phase="Downloading darktable",
@@ -1731,6 +1737,10 @@ async function downloadDarktable() {
   }
 
   safeEventSource('/api/jobs/' + resp.job_id + '/stream', {
+    // NOTE from Task 4: p.current can move BACKWARDS. When a server ignores
+    // Range, the retry truncates the .partial and restarts from 0, so the bar
+    // must tolerate a decreasing current rather than assuming monotonicity.
+    // That is honest — the bytes really were discarded — so do not clamp it.
     onProgress: function(p) {
       if (p.total) {
         fill.style.width = Math.round((p.current / p.total) * 100) + '%';

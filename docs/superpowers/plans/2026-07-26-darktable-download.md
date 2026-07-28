@@ -1015,6 +1015,21 @@ Download URLs are allowlisted to GitHub hosts under darktable-org/darktable."
 - Modify: `vireo/darktable_install.py`
 - Test: `vireo/tests/test_darktable_install.py`
 
+**Contract note for Tasks 7, 9 and 10: `ok=True` does NOT always mean
+"verified".** The no-digest-published case also returns `True`, because refusing
+would break the feature over something the user cannot fix. So downstream code
+must surface `detail` **verbatim** and must never render its own "Verified ✓"
+from the boolean — doing so would claim an integrity guarantee that was not
+obtained, which is precisely what this function's wording exists to prevent.
+
+**The mismatch test below is vacuous on its own** — verified by mutation.
+`"0"*64` differs from the real hash at character 0, so comparing only a prefix
+(`actual[:8] == want[:8]`) still passes it. Add a test parametrized over
+single-character differences at indices 0, 31, 32 and 63. Also test that a
+non-SHA256 algorithm prefix fails closed *and says so distinctly from a
+mismatch* — including a `blake2s:<64 hex>` value shaped exactly like a SHA256,
+where only the algorithm name can catch it.
+
 - [ ] **Step 1: Write the failing tests**
 
 Append to `vireo/tests/test_darktable_install.py`:

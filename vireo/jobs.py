@@ -405,21 +405,29 @@ class JobRunner:
         Returns:
             job_id string
         """
-        # Monotonic suffix (shared with enqueue_pipeline) so two same-type
-        # starts in the same millisecond can't collide — a collision makes
-        # the second registration overwrite the first in _jobs/_events and
-        # clobber its history row.
-        with self._lock:
-            self._enqueue_counter += 1
-            seq = self._enqueue_counter
-        job_id = f"{job_type}-{int(time.time() * 1000)}-{seq}"
-        now = datetime.now().isoformat()
+        job, work_fn = self._register_and_prepare(
+            job_type, work_fn,
+            config=config, workspace_id=workspace_id,
+            ephemeral=ephemeral, runtime_warning=runtime_warning,
+            counts_for_badge=counts_for_badge, pausable=pausable,
+            blocks_local_transitions=blocks_local_transitions,
+        )
+        thread = threading.Thread(
+            target=self._run_job, args=(job, work_fn), daemon=True
+        )
+        log.info("Job %s started type=%s", job["id"], job_type)
+        thread.start()
+        return job["id"]
 
-        job = {
+    def _make_job_dict(self, job_id, job_type, *, config, workspace_id,
+                       ephemeral, counts_for_badge, pausable,
+                       blocks_local_transitions, runtime_warning,
+                       singleton_key=None, now=None):
+        return {
             "id": job_id,
             "type": job_type,
             "status": "running",
-            "started_at": now,
+            "started_at": now or datetime.now().isoformat(),
             "finished_at": None,
             "progress": {"current": 0, "total": 0, "current_file": ""},
             "result": None,
@@ -432,6 +440,7 @@ class JobRunner:
             "pausable": bool(pausable),
             "blocks_local_transitions": bool(blocks_local_transitions),
             "runtime_warning": runtime_warning,
+            "singleton_key": singleton_key,
             # Pre-seeded so later writes from worker threads update an
             # existing key instead of inserting a new one: key insertion
             # while a request handler iterates the same dict (jsonify of
@@ -443,18 +452,119 @@ class JobRunner:
             "_fatal_error": None,
         }
 
+    def _register_and_prepare(self, job_type, work_fn, *, config, workspace_id,
+                              ephemeral, runtime_warning, counts_for_badge,
+                              pausable, blocks_local_transitions,
+                              singleton_key=None):
+        """Allocate an id and register the job dict under the runner lock.
+
+        Returns the (job, work_fn) pair the caller should hand to a thread.
+        Kept separate from start()/start_singleton so both paths share the
+        same registration semantics.
+        """
+        # Monotonic suffix (shared with enqueue_pipeline) so two same-type
+        # starts in the same millisecond can't collide — a collision makes
+        # the second registration overwrite the first in _jobs/_events and
+        # clobber its history row.
         with self._lock:
+            self._enqueue_counter += 1
+            seq = self._enqueue_counter
+            job_id = f"{job_type}-{int(time.time() * 1000)}-{seq}"
+            job = self._make_job_dict(
+                job_id, job_type,
+                config=config, workspace_id=workspace_id,
+                ephemeral=ephemeral, counts_for_badge=counts_for_badge,
+                pausable=pausable,
+                blocks_local_transitions=blocks_local_transitions,
+                runtime_warning=runtime_warning,
+                singleton_key=singleton_key,
+            )
+            self._prune_finished_jobs()
+            self._jobs[job_id] = job
+            self._events[job_id] = deque(maxlen=1000)
+            self._subscribers[job_id] = []
+        return job, work_fn
+
+    def _find_singleton_locked(self, job_type, singleton_key):
+        """Find an active singleton job by (job_type, singleton_key).
+
+        Must be called with self._lock held. Returns (job_id, job_dict) or
+        (None, None). "Active" means running/queued/pausing/paused — a
+        completed/failed/cancelled job releases the slot.
+
+        A ``singleton_key`` of None is not a valid key: without this guard,
+        every plain ``start()`` job (which stores singleton_key=None) would
+        match a lookup for the same job_type with key=None.
+        """
+        if singleton_key is None:
+            return None, None
+        for jid, j in self._jobs.items():
+            if (
+                j.get("type") == job_type
+                and j.get("singleton_key") == singleton_key
+                and j.get("status") in ("running", "queued", "pausing", "paused")
+                and jid not in self._cancelled
+            ):
+                return jid, j
+        return None, None
+
+    def start_singleton(self, job_type, work_fn, *, singleton_key,
+                        config=None, workspace_id=None, ephemeral=False,
+                        runtime_warning=None, counts_for_badge=True,
+                        pausable=False, blocks_local_transitions=True):
+        """Start a job unless one with the same (type, singleton_key) is active.
+
+        The existence check AND the new-job registration happen under a
+        single ``self._lock`` acquisition so two concurrent callers cannot
+        both see "no existing job" and both start a worker — a race that
+        the earlier check-then-start pattern still had even with an
+        explicit ``list_jobs()`` guard.
+
+        Returns ``(job_id, joined_existing, existing_snapshot)``:
+        - ``joined_existing`` True means work_fn was NOT invoked; job_id is
+          the id of the already-active singleton and ``existing_snapshot``
+          is a read-only copy of its state (so callers can inspect its
+          stored config to decide whether joining is actually appropriate).
+        - ``joined_existing`` False means a fresh job was registered and
+          its worker thread was started; ``existing_snapshot`` is None.
+        """
+        # Compute the joined snapshot / register a new job under one lock
+        # acquisition so the check-and-start is genuinely atomic.
+        with self._lock:
+            existing_id, existing = self._find_singleton_locked(
+                job_type, singleton_key,
+            )
+            if existing_id is not None:
+                return existing_id, True, self._snapshot_job(existing)
+            # No active singleton — register inline while still holding the
+            # lock so a second caller arriving between our check and our
+            # registration cannot slip in and register its own.
+            self._enqueue_counter += 1
+            seq = self._enqueue_counter
+            job_id = f"{job_type}-{int(time.time() * 1000)}-{seq}"
+            job = self._make_job_dict(
+                job_id, job_type,
+                config=config, workspace_id=workspace_id,
+                ephemeral=ephemeral, counts_for_badge=counts_for_badge,
+                pausable=pausable,
+                blocks_local_transitions=blocks_local_transitions,
+                runtime_warning=runtime_warning,
+                singleton_key=singleton_key,
+            )
             self._prune_finished_jobs()
             self._jobs[job_id] = job
             self._events[job_id] = deque(maxlen=1000)
             self._subscribers[job_id] = []
 
         thread = threading.Thread(
-            target=self._run_job, args=(job, work_fn), daemon=True
+            target=self._run_job, args=(job, work_fn), daemon=True,
         )
-        log.info("Job %s started type=%s", job_id, job_type)
+        log.info(
+            "Job %s started type=%s singleton_key=%s",
+            job_id, job_type, singleton_key,
+        )
         thread.start()
-        return job_id
+        return job_id, False, None
 
     def _prune_finished_jobs(self):
         """Remove completed/failed jobs older than _JOB_RETENTION_SECS.

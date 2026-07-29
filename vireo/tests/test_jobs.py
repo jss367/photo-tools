@@ -520,6 +520,176 @@ def test_job_runner_list_jobs():
     assert len(jobs) >= 2
 
 
+def test_start_singleton_returns_existing_when_active():
+    """A second start_singleton for the same (type, key) while the first
+    is running must NOT create a second worker — that is the whole point
+    of the guard."""
+    from jobs import JobRunner
+
+    runner = JobRunner()
+    release = threading.Event()
+    workers = []
+
+    def work(job):
+        workers.append(job['id'])
+        assert release.wait(timeout=5), "worker never released"
+        return {'ok': True}
+
+    first_id, first_joined, first_snap = runner.start_singleton(
+        'download-x', work, singleton_key='k',
+        config={'note': 'first'},
+    )
+    assert first_joined is False
+    assert first_snap is None
+
+    second_id, second_joined, second_snap = runner.start_singleton(
+        'download-x', work, singleton_key='k',
+        config={'note': 'second-should-be-ignored'},
+    )
+    assert second_joined is True
+    assert second_id == first_id
+    # The snapshot must reflect the ORIGINAL registration's config,
+    # not the caller's — otherwise the artifact-identity check the
+    # endpoint layers on top of this would see whichever caller ran
+    # last and could not detect a mismatched join.
+    assert second_snap['config'] == {'note': 'first'}
+
+    release.set()
+    wait_for_job_via_runner(runner, first_id)
+    assert len(workers) == 1, (
+        f"exactly one worker must run, got {len(workers)}"
+    )
+
+
+def test_start_singleton_starts_a_fresh_job_once_the_first_finishes():
+    """The singleton is per-active-run, not forever: a completed job
+    releases the slot so retry from Settings can start a new download."""
+    from jobs import JobRunner
+
+    runner = JobRunner()
+
+    def quick(job):
+        return {'ok': True}
+
+    first_id, first_joined, _ = runner.start_singleton(
+        'download-x', quick, singleton_key='k',
+    )
+    assert first_joined is False
+    wait_for_job_via_runner(runner, first_id)
+
+    second_id, second_joined, second_snap = runner.start_singleton(
+        'download-x', quick, singleton_key='k',
+    )
+    assert second_joined is False, (
+        "a completed job must not pin the singleton — otherwise Retry stays broken"
+    )
+    assert second_snap is None
+    assert second_id != first_id
+    wait_for_job_via_runner(runner, second_id)
+
+
+def test_start_singleton_check_and_start_are_atomic_under_thread_pressure():
+    """Fire many concurrent start_singleton calls at once and confirm only
+    ONE worker was ever created. This is the specific race the earlier
+    list_jobs()+start() pattern had: two callers could both see "no
+    existing" and both start a worker."""
+    from jobs import JobRunner
+
+    runner = JobRunner()
+    release = threading.Event()
+    workers = []
+    workers_lock = threading.Lock()
+
+    def work(job):
+        with workers_lock:
+            workers.append(job['id'])
+        assert release.wait(timeout=10), "worker never released"
+        return {'ok': True}
+
+    ids = []
+    ids_lock = threading.Lock()
+    barrier = threading.Barrier(16)
+
+    def fire():
+        barrier.wait()
+        jid, _joined, _snap = runner.start_singleton(
+            'download-x', work, singleton_key='k',
+        )
+        with ids_lock:
+            ids.append(jid)
+
+    threads = [threading.Thread(target=fire) for _ in range(16)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert len(set(ids)) == 1, (
+        f"all callers must converge on one id, got {set(ids)}"
+    )
+    release.set()
+    wait_for_job_via_runner(runner, ids[0])
+    assert len(workers) == 1, (
+        f"exactly one worker may run for a singleton, got {len(workers)}"
+    )
+
+
+def test_start_singleton_isolates_different_keys():
+    """Two singletons with different keys must coexist — the guard is
+    per-(type, key), not per-type. Otherwise unrelated singleton flows
+    would starve each other."""
+    from jobs import JobRunner
+
+    runner = JobRunner()
+    release = threading.Event()
+
+    def hold(job):
+        assert release.wait(timeout=5)
+        return {'ok': True}
+
+    a_id, a_joined, _ = runner.start_singleton(
+        'download-x', hold, singleton_key='alpha',
+    )
+    b_id, b_joined, _ = runner.start_singleton(
+        'download-x', hold, singleton_key='beta',
+    )
+    assert a_joined is False
+    assert b_joined is False
+    assert a_id != b_id
+
+    release.set()
+    wait_for_job_via_runner(runner, a_id)
+    wait_for_job_via_runner(runner, b_id)
+
+
+def test_start_singleton_does_not_match_plain_start_jobs_without_a_key():
+    """A regular start() call stores singleton_key=None; a start_singleton
+    lookup for the SAME job_type with any real key must NOT match it —
+    otherwise the guard would incorrectly join arbitrary jobs of the
+    same type that were never opting into singleton behavior."""
+    from jobs import JobRunner
+
+    runner = JobRunner()
+    release = threading.Event()
+
+    def hold(job):
+        assert release.wait(timeout=5)
+        return {'ok': True}
+
+    plain_id = runner.start('download-x', hold)
+    sing_id, joined, _ = runner.start_singleton(
+        'download-x', hold, singleton_key='k',
+    )
+    assert joined is False, (
+        "start_singleton must not join a plain start() job with key=None"
+    )
+    assert sing_id != plain_id
+
+    release.set()
+    wait_for_job_via_runner(runner, plain_id)
+    wait_for_job_via_runner(runner, sing_id)
+
+
 def test_job_progress_events():
     """Job progress updates are captured in the events queue."""
     from jobs import JobRunner

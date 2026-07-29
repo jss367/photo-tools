@@ -16009,12 +16009,35 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
     @app.route("/api/darktable/status")
     def api_darktable_status():
         import config as cfg
-        from develop import find_darktable, find_dng_converter
+        from develop import (
+            darktable_search_paths,
+            darktable_tools_dir,
+            darktable_uses_tools_dir,
+            find_darktable,
+            find_dng_converter,
+        )
 
         configured = cfg.get("darktable_bin")
         binary = find_darktable(configured)
         dng_configured = cfg.get("dng_converter_bin")
         dng_binary = find_dng_converter(dng_configured)
+
+        # What we tell the user we checked has to match what find_darktable
+        # actually probes: shutil.which("darktable-cli") first, then the
+        # filesystem candidates. darktable_search_paths() covers only the
+        # latter, and on Linux it lists just the AppImages already present in
+        # our tools dir — so a box with none yet would get an empty "we checked
+        # here" list, on exactly the platform the download targets. Hence
+        # compose here rather than returning that list raw.
+        # darktable_uses_tools_dir() is the same predicate darktable_search_paths()
+        # branches on, so the directory is named on, and only on, the platform
+        # that probes it. It cannot already be in the list: the detector only
+        # ever emits files *inside* the directory, never the directory itself.
+        checked_paths = ["$PATH (darktable-cli)"]
+        checked_paths.extend(darktable_search_paths())
+        if darktable_uses_tools_dir():
+            checked_paths.append(darktable_tools_dir())
+
         return jsonify({
             "available": binary is not None,
             "bin": binary or "",
@@ -16026,7 +16049,50 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             "style": cfg.get("darktable_style"),
             "output_format": cfg.get("darktable_output_format"),
             "output_dir": cfg.get("darktable_output_dir"),
+            "checked_paths": checked_paths,
         })
+
+    @app.route("/api/darktable/install/available")
+    def api_darktable_install_available():
+        """What a download would fetch, for the confirmation dialog.
+
+        Always 200: when this cannot answer, the panel shows a plain
+        "Get darktable" link and the reason, rather than a dead button.
+
+        Includes the Flask host's ``platform`` (linux/darwin/win32) so the
+        UI's "Download installer" vs "Download and set up" label and its
+        Gatekeeper/SmartScreen warnings describe the machine that will
+        actually run the installer — not the browser device, which can be
+        a phone or a different desktop on the LAN.
+        """
+        import sys
+
+        import darktable_install
+
+        try:
+            release, reason = darktable_install.resolve_release_cached()
+        except Exception as e:
+            # resolve_release is documented never to raise; this is belt and
+            # braces so an unexpected bug still degrades to a link, not a 500.
+            log.warning("darktable release lookup failed: %s", e)
+            return jsonify({
+                "available": False,
+                "reason": darktable_install.REASON_UNREACHABLE,
+                "platform": sys.platform,
+            })
+
+        if not release:
+            # Pass the reason through verbatim. Do NOT substitute a generic
+            # message: "we could not reach GitHub" and "no build exists for
+            # your platform" are different facts and users act on them
+            # differently.
+            return jsonify({
+                "available": False,
+                "reason": reason,
+                "platform": sys.platform,
+            })
+
+        return jsonify({"available": True, "platform": sys.platform, **release})
 
     @app.route("/api/exiftool/status")
     def api_exiftool_status():
@@ -18444,6 +18510,285 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             return {"ok": True, "keywords_retyped": updated}
 
         job_id = runner.start("download-taxonomy", work, workspace_id=active_ws)
+        return jsonify({"job_id": job_id})
+
+    @app.route("/api/jobs/download-darktable", methods=["POST"])
+    def api_job_download_darktable():
+        """Download the latest darktable build and hand it to the platform."""
+        import darktable_install
+        from job_contract import progress_event
+
+        runner = app._job_runner
+        active_ws = _get_db()._active_workspace_id
+
+        # Read the identity the user confirmed BEFORE any other check.  If a
+        # download is already running and we are about to join it, the join
+        # must be conditional on this matching the running job's stored
+        # artifact — otherwise a second tab that saw a fresh release would
+        # join an old, stale download and receive different bytes than the
+        # dialog confirmed.
+        body = request.get_json(silent=True) or {}
+        expected_name = body.get("expected_name")
+        expected_version = body.get("expected_version")
+        # digest is compared verbatim (the API sends "sha256:<hex>"); None on
+        # either side means the client did not send one, not that they match.
+        expected_digest = body.get("expected_digest")
+        # Size is the fallback identity for digestless releases: if GitHub
+        # deletes and re-uploads an asset under the same tag+filename during
+        # the availability cache's TTL, name/version match but bytes differ,
+        # and without a digest the name/version check alone would silently
+        # accept the swap.  Compare when the client sent one — an int on the
+        # wire, coerced defensively so a stray string does not throw here.
+        try:
+            expected_size = int(body["expected_size"]) if body.get("expected_size") is not None else None
+        except (TypeError, ValueError):
+            expected_size = None
+
+        def _artifact_matches(stored):
+            """True when the stored artifact identity matches expected_*."""
+            if not stored:
+                return not expected_name
+            if expected_name and expected_name != stored.get("asset_name"):
+                return False
+            if expected_version and expected_version != stored.get("asset_version"):
+                return False
+            if expected_digest and expected_digest != stored.get("asset_digest"):
+                return False
+            return not (
+                expected_size is not None
+                and stored.get("asset_size") is not None
+                and expected_size != stored.get("asset_size")
+            )
+
+        # resolve_release(), never the cached variant: this re-resolves
+        # server-side so the URL we actually download can't be a ten-minute-old
+        # value from whatever /install/available last showed.
+        try:
+            asset, reason = darktable_install.resolve_release()
+        except Exception as e:
+            # resolve_release is documented never to raise; belt and braces so
+            # an unexpected bug degrades to a message, not a 500.
+            log.warning("darktable release lookup failed: %s", e)
+            asset, reason = None, darktable_install.REASON_UNREACHABLE
+        if not asset:
+            # Surface the specific reason. resolve_release distinguishes
+            # "could not reach GitHub" from "no build for your platform";
+            # collapsing them here would tell a user behind a proxy that their
+            # platform is unsupported, which is false.
+            return json_error(reason or darktable_install.REASON_UNREACHABLE)
+
+        # Bind the download to the exact artifact the user confirmed.  Between
+        # /install/available populating its 10-minute cache and this POST,
+        # darktable-org can publish a new release; the confirmation dialog
+        # still names the cached version and digest, but resolve_release() just
+        # returned the newer asset.  Downloading it here without another
+        # confirmation would silently swap the artifact the user OK'd for a
+        # different one.  code=darktable_asset_changed lets the client re-fetch
+        # availability and re-prompt with the fresh identity.
+        if expected_name and (
+            expected_name != asset.get("name")
+            or (expected_version and expected_version != asset.get("version"))
+            or (expected_digest and expected_digest != asset.get("digest"))
+            or (
+                expected_size is not None
+                and asset.get("size") is not None
+                and expected_size != asset.get("size")
+            )
+        ):
+            # Refresh the availability cache with the release we just resolved.
+            # Without this, the UI's Re-check would fetch /install/available,
+            # get the same ten-minute-old cached asset back, re-confirm it, and
+            # get bounced by the same 409 in a loop until the TTL expires.
+            darktable_install.update_release_cache(asset)
+            return json_error(
+                (
+                    "The darktable release changed since this dialog opened. "
+                    f"Confirmation showed {expected_name}; the current release "
+                    f"is {asset.get('name')}. Re-check to see the new build "
+                    "before downloading."
+                ),
+                status=409,
+                code="darktable_asset_changed",
+            )
+
+        # Refuse before spending 87MB, and say what is needed vs what is free.
+        # 2x the asset size, per the design's error table: the artifact is kept
+        # after hand-off and the installer still has to unpack alongside it, so
+        # a check for exactly the download size would succeed and then strand
+        # the user on a full disk.
+        target = darktable_install.install_dir()
+        try:
+            free = darktable_install.free_space_bytes(target)
+        except OSError as e:
+            # free_space_bytes creates the directory, so this is where a
+            # read-only or otherwise unusable ~/.vireo surfaces. Name the
+            # directory and the OS error: a 500 would tell the user nothing.
+            log.warning("Cannot use the darktable download directory %s: %s", target, e)
+            return json_error(
+                f"Cannot use the download directory {target}: {e.strerror or e}"
+            )
+        asset_size = asset.get("size") or 0
+        # A previous cancelled-during-verify attempt leaves the full artifact
+        # already sitting at the final destination — download() fast-paths to
+        # verify in that case and spends zero download bytes.  Counting those
+        # bytes as still-to-be-downloaded blocks the promised retry with a
+        # "not enough space" error even though the retry only needs unpacking
+        # headroom.  Gate on the API-supplied size (same rule download() uses)
+        # so an unrelated file the user dropped in the tools directory does
+        # not get credited against the check.
+        #
+        # A cancelled- or connection-lost-during-transfer attempt leaves a
+        # ``.partial`` sibling that _download_with_resume will resume from,
+        # so those bytes are also already on disk and the retry only needs
+        # ``asset_size - partial_size`` more download bytes plus the unpack
+        # headroom.  Cap the credit at ``asset_size`` — a ``.partial`` bigger
+        # than the API-published size is a sign of a stale file from a
+        # different release, and crediting more than we can actually reuse
+        # would let the retry through only for the disk to fill mid-transfer.
+        reusable_bytes = 0
+        asset_name = asset.get("name") or ""
+        if asset_name:
+            existing_dest = os.path.join(target, os.path.basename(asset_name))
+            existing_partial = existing_dest + ".partial"
+            try:
+                if os.path.isfile(existing_dest) and os.path.getsize(existing_dest) == asset_size:
+                    reusable_bytes = asset_size
+                elif os.path.isfile(existing_partial) and asset_size:
+                    reusable_bytes = min(os.path.getsize(existing_partial), asset_size)
+            except OSError:
+                reusable_bytes = 0
+        needed = max(0, asset_size * 2 - reusable_bytes)
+        if free < needed:
+            return json_error(
+                f"Not enough disk space: {needed // (1024 * 1024)} MB needed in "
+                f"{target}, {free // (1024 * 1024)} MB free."
+            )
+
+        def work(job):
+            try:
+                from .taxonomy import DownloadCancelled
+            except ImportError:
+                from taxonomy import DownloadCancelled
+
+            # byte_callback runs on the download thread inside the write loop,
+            # so this must stay cheap — a queue put, never a DB write or
+            # anything else that can stall the transfer.
+            def on_bytes(done, total):
+                runner.push_event(job["id"], "progress", progress_event(
+                    phase="Downloading darktable",
+                    current=done,
+                    total=total or asset.get("size") or 0,
+                    current_file=asset["name"],
+                ))
+
+            path, verify_detail = darktable_install.download(
+                asset,
+                byte_callback=on_bytes,
+                should_cancel=lambda: runner.is_cancelled(job["id"]),
+            )
+
+            # total=0 on purpose: the UI treats a non-zero total as a byte
+            # count and would render "Verifying: 0 of 0 MB" instead of the
+            # verification detail. That detail is passed through verbatim —
+            # it is the only thing that distinguishes "the digest matched"
+            # from "GitHub published no digest to check against".
+            runner.push_event(job["id"], "progress", progress_event(
+                phase="Verifying", current=0, total=0, current_file=verify_detail,
+            ))
+
+            # A Stop press after verification and before hand_off would open
+            # the installer anyway (Linux would also chmod the AppImage), then
+            # jobs.py would still label the job "cancelled" — the user would
+            # see cancellation but the side effect they cancelled happened.
+            # begin_uncancellable is the atomic version of that check: it
+            # returns False (leaving the cancel flag intact so _run_job
+            # records the job as cancelled) if a cancel is already pending,
+            # otherwise it enters the uninterruptible phase so a Cancel that
+            # arrives during hand_off is rejected rather than flipping the
+            # terminal status once the side effect has already committed.
+            if not runner.begin_uncancellable(job["id"]):
+                raise DownloadCancelled("Download cancelled")
+
+            result = darktable_install.hand_off(path)
+
+            # The single place config is mutated, right next to the field that
+            # tells the user it happened. hand_off deliberately does not write
+            # it. bin_path is only set where the download IS the binary
+            # (Linux AppImage); after an installer hand-off the user chooses
+            # where the app lands, so there is nothing truthful to record.
+            #
+            # Route the write through _settings_write_lock and the raw
+            # read-modify-write pattern the settings endpoints use.  cfg.set()
+            # takes only config._lock, so a concurrent /api/config save (or an
+            # autosave from the All-settings region) could otherwise interleave
+            # its own read-modify-write with this one and either lose
+            # darktable_bin or overwrite whatever field the user just changed.
+            config_written = False
+            if result.get("bin_path"):
+                import config as cfg
+
+                with _settings_write_lock:
+                    raw = _read_raw_config_file()
+                    raw["darktable_bin"] = result["bin_path"]
+                    cfg.save(raw)
+                config_written = True
+
+            return {
+                "version": asset["version"],
+                "downloaded_to": path,
+                "verified": verify_detail,
+                "action": result["action"],
+                "bin_path": result.get("bin_path"),
+                "config_written": config_written,
+                "quarantined": darktable_install.is_quarantined(path),
+            }
+
+        # Atomic singleton: the earlier check-then-start pattern (list_jobs()
+        # followed by runner.start()) let two concurrent POSTs both see "no
+        # existing job" and both start a worker on the same .partial.
+        # start_singleton does the existence check and the registration under
+        # one lock acquisition, so a second POST arriving between the check
+        # and the start joins the first instead of racing it.
+        #
+        # The stored config carries the artifact identity so a later POST for
+        # a DIFFERENT artifact (e.g. a new release published while an older
+        # download is still in flight) can be rejected instead of quietly
+        # joining a download of the wrong bytes.
+        job_id, joined, existing_snapshot = runner.start_singleton(
+            "download-darktable", work,
+            singleton_key="darktable-download",
+            config={
+                "asset_name": asset["name"],
+                "asset_version": asset["version"],
+                "asset_digest": asset.get("digest"),
+                "asset_size": asset.get("size"),
+            },
+            workspace_id=active_ws,
+        )
+        if joined:
+            # Only join a running download whose artifact matches what THIS
+            # request confirmed. Without this check, a fresh POST for a new
+            # release would silently receive an old release's bytes from an
+            # already-running worker.
+            existing_config = (existing_snapshot or {}).get("config") or {}
+            if not _artifact_matches(existing_config):
+                # Same reason as above: the cache may hold whatever asset the
+                # first tab's download targeted, so a Re-check without this
+                # refresh would re-render the stale identity and the user
+                # would re-confirm it into the same 409.
+                darktable_install.update_release_cache(asset)
+                return json_error(
+                    (
+                        "A different darktable download is already in progress "
+                        f"({existing_config.get('asset_name') or 'unknown'}). "
+                        f"Confirmation showed {asset.get('name')}. Wait for the "
+                        "in-flight download to finish (or cancel it) before "
+                        "starting this one."
+                    ),
+                    status=409,
+                    code="darktable_asset_changed",
+                )
+            return jsonify({"job_id": job_id, "joined_existing": True})
         return jsonify({"job_id": job_id})
 
     # -- Labels API routes --

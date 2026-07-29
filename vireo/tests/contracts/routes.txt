@@ -35,6 +35,7 @@ GET          /api/collections/<int:collection_id>/photos
 GET          /api/config
 GET          /api/coverage
 GET          /api/culling/results
+GET          /api/darktable/install/available
 GET          /api/darktable/status
 GET          /api/dashboard/options
 GET          /api/detection-cache/stats
@@ -257,6 +258,7 @@ POST         /api/jobs/capture-time
 POST         /api/jobs/classify
 POST         /api/jobs/cull
 POST         /api/jobs/develop
+POST         /api/jobs/download-darktable
 POST         /api/jobs/download-hf-model
 POST         /api/jobs/download-model
 POST         /api/jobs/download-taxonomy

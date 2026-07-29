@@ -14,15 +14,20 @@ Usage:
 """
 
 import argparse
+import contextlib
 import csv
 import gzip
 import io
 import json
 import logging
 import os
+import re
+import socket
 import ssl
+import threading
 import time
 import unicodedata
+import urllib.error
 import urllib.request
 import zipfile
 from datetime import date
@@ -36,8 +41,68 @@ log = logging.getLogger(__name__)
 _ssl_ctx = ssl.create_default_context(cafile=certifi.where())
 
 
+class DownloadCancelled(Exception):
+    """Raised when should_cancel() asked us to stop."""
+
+
+# `Content-Range: bytes */<total>` — the header a 416 response uses to tell
+# the client what the actual size of the resource is. RFC 7233 §4.2 pins the
+# format; a compliant server puts the total after the slash.
+_CONTENT_RANGE_TOTAL_RE = re.compile(r"bytes\s*\*/(\d+)", re.IGNORECASE)
+
+# `Content-Range: bytes <start>-<end>/<total>` — the header a 206 response
+# uses to describe which bytes the body actually spans. If the server (or an
+# intermediary) resumes from a different byte than we asked for, appending
+# would splice mismatched content into the partial file.
+_CONTENT_RANGE_START_RE = re.compile(r"bytes\s+(\d+)\s*-", re.IGNORECASE)
+
+
+def _content_range_total(headers):
+    """Total resource size advertised by a Content-Range: bytes */<total>.
+
+    Returns None when the header is absent or malformed — the caller falls
+    back to restarting the download from scratch, which is the safe outcome.
+    """
+    if headers is None:
+        return None
+    header = headers.get("Content-Range")
+    if not header:
+        return None
+    match = _CONTENT_RANGE_TOTAL_RE.search(header)
+    if not match:
+        return None
+    try:
+        return int(match.group(1))
+    except (TypeError, ValueError):
+        return None
+
+
+def _content_range_start(headers):
+    """First byte covered by a Content-Range: bytes <start>-<end>/<total>.
+
+    Returns None when the header is absent or malformed. Used to detect a
+    206 that begins at a different byte than the client's Range request so
+    the caller can restart from scratch rather than splice mismatched bytes
+    onto its existing ``.partial``.
+    """
+    if headers is None:
+        return None
+    header = headers.get("Content-Range")
+    if not header:
+        return None
+    match = _CONTENT_RANGE_START_RE.search(header)
+    if not match:
+        return None
+    try:
+        return int(match.group(1))
+    except (TypeError, ValueError):
+        return None
+
+
 def _download_with_resume(url, dest_path, progress_callback=None,
-                          max_stalled=3, chunk_size=256 * 1024):
+                          max_stalled=3, chunk_size=256 * 1024,
+                          *, byte_callback=None, should_cancel=None,
+                          _emit_interval=0.25):
     """Download a file with retry and resume support.
 
     Streams to ``dest_path + ".partial"``, resuming from the last byte on
@@ -52,6 +117,18 @@ def _download_with_resume(url, dest_path, progress_callback=None,
         progress_callback: optional ``callback(message)`` for status updates.
         max_stalled: Give up after this many consecutive zero-progress retries.
         chunk_size: Bytes per read chunk (default 256 KB).
+        byte_callback: optional ``callback(downloaded, total_or_None)`` for
+            byte-level progress.  Throttled to ~4 Hz.
+        should_cancel: optional ``callback() -> bool``.  When it returns True
+            the download aborts, leaving the ``.partial`` file for resume.
+        _emit_interval: minimum seconds between byte_callback emits (private;
+            for tests).
+
+    Neither ``byte_callback`` nor ``should_cancel`` may raise: they are called
+    inside the transfer's ``try`` block, so an exception from either is caught
+    by the generic handler and misreported to the user as a network failure,
+    triggering a full retry (and discarding the partial when the server
+    answers 200).  Callers must swallow their own errors.
     """
     partial_path = dest_path + ".partial"
     attempt = 0
@@ -81,34 +158,215 @@ def _download_with_resume(url, dest_path, progress_callback=None,
                     log.info("Retrying download (attempt %d)", attempt)
 
             with urllib.request.urlopen(req, timeout=120, context=_ssl_ctx) as resp:
-                # If server returned 200 (not 206), it doesn't support Range —
-                # start from scratch.  Don't reset downloaded_before: it's the
-                # stall-detection baseline (did we get further than last time?).
-                if resp.status == 200 and downloaded_before > 0:
-                    log.info("Server does not support Range; restarting download")
-
-                # Determine expected size so we can detect truncated responses
-                content_length = resp.headers.get("Content-Length")
-                expected_bytes = int(content_length) if content_length else None
-
-                mode = "ab" if resp.status == 206 else "wb"
-                received = 0
-                with open(partial_path, mode) as f:
-                    while True:
-                        chunk = resp.read(chunk_size)
-                        if not chunk:
-                            break
-                        f.write(chunk)
-                        received += len(chunk)
-
-                # Check for truncated response
-                if expected_bytes is not None and received < expected_bytes:
-                    raise OSError(
-                        f"Incomplete download: got {received} of "
-                        f"{expected_bytes} bytes"
+                # Interrupt a stalled resp.read from a watcher thread when the
+                # caller asks to cancel.  Without this, a Stop press during a
+                # stalled read is not felt until the socket read returns or
+                # the 120 s timeout expires — up to two minutes on the
+                # unreliable-network scenario where cancellation is most
+                # needed.  resp.close() would only set a flag; it does not
+                # unblock a blocked recv on the underlying socket.  A
+                # socket.shutdown(SHUT_RDWR) does — it forces the kernel to
+                # return the pending recv with an error, which the outer
+                # handler then reclassifies as DownloadCancelled (see the
+                # should_cancel() check below).
+                cancel_watcher_stop = threading.Event()
+                watcher = None
+                if should_cancel is not None:
+                    # Default-argument bind so the closure captures THIS
+                    # iteration's stop event / resp / cancel callback rather
+                    # than the outer-scope names — otherwise a late thread
+                    # could observe the next iteration's variables (and ruff
+                    # B023 objects to the same issue).
+                    def _close_on_cancel(
+                        _stop=cancel_watcher_stop,
+                        _resp=resp,
+                        _cancel=should_cancel,
+                    ):
+                        while not _stop.wait(0.25):
+                            if _cancel():
+                                # SocketIO -> raw socket.  Not part of the
+                                # public API, but the only reliable way to
+                                # break a recv from another thread — see
+                                # the module comment above.
+                                sock = getattr(getattr(_resp, "fp", None),
+                                               "raw", None)
+                                sock = getattr(sock, "_sock", None)
+                                if sock is not None:
+                                    # Already closed or half-closed — the
+                                    # blocked read will surface the error
+                                    # regardless.
+                                    with contextlib.suppress(OSError):
+                                        sock.shutdown(socket.SHUT_RDWR)
+                                return
+                    watcher = threading.Thread(
+                        target=_close_on_cancel, daemon=True,
+                        name="download-cancel-watcher",
                     )
+                    watcher.start()
 
+                try:
+                    # If server returned 200 (not 206), it doesn't support
+                    # Range — start from scratch.  Don't reset
+                    # downloaded_before: it's the stall-detection baseline
+                    # (did we get further than last time?).
+                    if resp.status == 200 and downloaded_before > 0:
+                        log.info("Server does not support Range; restarting download")
+
+                    # Determine expected size so we can detect truncated responses
+                    content_length = resp.headers.get("Content-Length")
+                    expected_bytes = int(content_length) if content_length else None
+
+                    mode = "ab" if resp.status == 206 else "wb"
+                    # A 206 must begin exactly at ``downloaded_before`` — the
+                    # byte we asked to resume from. A proxy or rebuilt artifact
+                    # can return a valid range that starts elsewhere; appending
+                    # that body onto our ``.partial`` would silently splice
+                    # mismatched bytes into the file. On mismatch, restart
+                    # from scratch. (For darktable installs the SHA256 check
+                    # catches it; download_taxa() has no digest and would fail
+                    # later as an opaque gzip/CSV parse error.)
+                    if mode == "ab":
+                        range_start = _content_range_start(resp.headers)
+                        if (
+                            range_start is not None
+                            and range_start != downloaded_before
+                        ):
+                            log.warning(
+                                "Server resumed at byte %d, expected %d;"
+                                " restarting download",
+                                range_start, downloaded_before,
+                            )
+                            mode = "wb"
+                    # Bytes already on disk that we are keeping. Distinct from
+                    # downloaded_before, which stays put as the stall baseline even
+                    # when mode == "wb" truncates the partial.
+                    progress_base = downloaded_before if mode == "ab" else 0
+                    expected_total = (
+                        expected_bytes + progress_base
+                        if expected_bytes is not None
+                        else None
+                    )
+                    received = 0
+                    with open(partial_path, mode) as f:
+                        last_emit = 0.0
+                        while True:
+                            if should_cancel is not None and should_cancel():
+                                raise DownloadCancelled("Download cancelled")
+                            chunk = resp.read(chunk_size)
+                            if not chunk:
+                                break
+                            f.write(chunk)
+                            received += len(chunk)
+                            if byte_callback is not None:
+                                now = time.monotonic()
+                                if now - last_emit >= _emit_interval:
+                                    last_emit = now
+                                    byte_callback(progress_base + received, expected_total)
+                        if byte_callback is not None:
+                            byte_callback(progress_base + received, expected_total)
+
+                    # Check for truncated response
+                    if expected_bytes is not None and received < expected_bytes:
+                        raise OSError(
+                            f"Incomplete download: got {received} of "
+                            f"{expected_bytes} bytes"
+                        )
+                finally:
+                    cancel_watcher_stop.set()
+                    if watcher is not None:
+                        watcher.join(timeout=2)
+
+        except DownloadCancelled:
+            raise
         except Exception as e:
+            # 416 Requested Range Not Satisfiable: our Range starts at or
+            # past the end of the resource.  Reachable when cancellation
+            # lands after the final chunk is written but before the
+            # empty-read break — the loop's cancel check raises, leaving a
+            # ``.partial`` already at the full size, so the next attempt
+            # asks for ``bytes=<full>-``.  Without this branch the retry
+            # loop would burn ``max_stalled`` attempts against a permanent
+            # 416 and give up despite promising "try again and the download
+            # will resume".  Verify the total via Content-Range and, when
+            # sizes agree, promote the partial to the final path.  On
+            # mismatch (the release was rebuilt) delete the stale partial
+            # and let the next iteration re-download from byte 0 — that is
+            # safer than shipping bytes of the wrong artifact to the
+            # caller's digest check.
+            if (
+                isinstance(e, urllib.error.HTTPError)
+                and e.code == 416
+                and downloaded_before > 0
+            ):
+                total = _content_range_total(getattr(e, "headers", None))
+                current_size = (
+                    os.path.getsize(partial_path)
+                    if os.path.exists(partial_path)
+                    else 0
+                )
+                if total is not None and current_size == total:
+                    if os.path.exists(dest_path):
+                        os.remove(dest_path)
+                    os.rename(partial_path, dest_path)
+                    if byte_callback is not None:
+                        byte_callback(current_size, total)
+                    mb = current_size // (1024 * 1024)
+                    log.info(
+                        "Server reported 416 with matching total (%d bytes);"
+                        " promoting complete .partial to %s",
+                        total, dest_path,
+                    )
+                    if progress_callback:
+                        progress_callback(f"Downloaded {mb} MB")
+                    return dest_path
+                # Stale or unverifiable partial: delete so the next iteration
+                # restarts from byte 0 rather than sending the same doomed
+                # Range header on every attempt.  If the removal fails
+                # (permission denied, Windows lock, read-only dir),
+                # ``downloaded_before`` stays > 0 next iteration, the same
+                # Range is sent, the server answers 416 again, and the loop
+                # would spin forever — count it as a stall so ``max_stalled``
+                # eventually breaks us out with a real error.
+                try:
+                    os.remove(partial_path)
+                except OSError as remove_error:
+                    stalled_count += 1
+                    log.warning(
+                        "Could not remove stale partial %s after 416: %s"
+                        " (stalled %d/%d)",
+                        partial_path, remove_error, stalled_count, max_stalled,
+                    )
+                    if stalled_count >= max_stalled:
+                        raise RuntimeError(
+                            f"Server rejected resume range and the partial "
+                            f"file {partial_path} could not be removed: "
+                            f"{remove_error}"
+                        ) from e
+                log.warning(
+                    "Server returned 416 but partial size (%d) does not match"
+                    " advertised total (%r); restarting download",
+                    current_size, total,
+                )
+                if progress_callback:
+                    progress_callback(
+                        f"Resume rejected by server (attempt {attempt}), "
+                        f"restarting download..."
+                    )
+                # Poll cancellation during the backoff so Stop feels
+                # responsive on a rejected-resume loop too.
+                for _ in range(6):
+                    if should_cancel is not None and should_cancel():
+                        raise DownloadCancelled("Download cancelled") from None
+                    time.sleep(0.5)
+                continue
+
+            # The watcher thread closes ``resp`` on cancel, which surfaces
+            # here as a socket error.  Reclassify it before the stall
+            # detection can turn "user pressed Stop" into "download stalled
+            # after N attempts" — the user asked to cancel, so ``from None``
+            # keeps that unrelated network error out of the traceback.
+            if should_cancel is not None and should_cancel():
+                raise DownloadCancelled("Download cancelled") from None
             current_size = os.path.getsize(partial_path) if os.path.exists(partial_path) else 0
             gained = current_size - downloaded_before
 
@@ -136,7 +394,14 @@ def _download_with_resume(url, dest_path, progress_callback=None,
                     f"try again and the download will resume."
                 ) from e
 
-            time.sleep(3)
+            # Poll the backoff in short slices so Cancel is felt within ~0.5 s
+            # instead of after the full 3 s wait.  `from None`: the user asked
+            # to stop, so the network error we were backing off from is not the
+            # cause and must not be chained onto the cancel.
+            for _ in range(6):
+                if should_cancel is not None and should_cancel():
+                    raise DownloadCancelled("Download cancelled") from None
+                time.sleep(0.5)
             continue
 
         # Success — rename partial to final

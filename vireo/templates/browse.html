@@ -3466,6 +3466,32 @@ function refreshBrowseSidebarCounts() {
   loadCollectionCounts();
 }
 
+var folderHealthRefreshSeq = 0;
+async function refreshBrowseAfterFolderHealthChange() {
+  var seq = ++folderHealthRefreshSeq;
+  browseScopeGen++;
+
+  // Refresh the scope controls first. If the selected folder just went
+  // offline it disappears from /api/folders; clear that stale scope before
+  // reloading the grid so Browse falls back to the available workspace.
+  await Promise.all([loadFolders(), loadKeywords(), loadCollections()]);
+  if (seq !== folderHealthRefreshSeq) return;
+  if (activeFolderId &&
+      !document.querySelector('#folderTree .tree-item[data-folder-id="' + activeFolderId + '"]')) {
+    activeFolderId = null;
+  }
+
+  await resetAndLoad();
+  if (seq !== folderHealthRefreshSeq) return;
+  loadCollectionCounts();
+  loadSummary();
+  if (timelineMode) loadCalendarData();
+}
+
+document.addEventListener('vireo:folder-health-changed', function() {
+  refreshBrowseAfterFolderHealthChange();
+});
+
 async function filterByCollection(id, options) {
   // The sidebar collection list is rendered from the initial /photos payload,
   // so a slow /api/filters/fields (or workspace) round-trip leaves clickable

@@ -11566,6 +11566,15 @@ async function loadMissingFolders() {
     const resp = await fetch('/api/folders/check-health', { method: 'POST' });
     if (!resp.ok) throw new Error('check failed');
     const data = await resp.json();
+    // Folder health is part of the effective photo dataset: ok→missing hides
+    // a folder's photos, while missing→ok makes them available again. Notify
+    // the current page so a long-lived Browse view does not keep showing the
+    // pre-check empty grid after a drive or network share reconnects.
+    if (data.changed) {
+      document.dispatchEvent(new CustomEvent('vireo:folder-health-changed', {
+        detail: { changed: data.changed },
+      }));
+    }
     const folders = data.missing;
     if (folders.length === 0) {
       container.textContent = '';

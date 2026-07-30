@@ -1,6 +1,35 @@
 from playwright.sync_api import expect
 
 
+def test_reconnected_folders_refresh_empty_browse(live_server, page, tmp_path):
+    """A health check that restores folders must repopulate an open Browse."""
+    db = live_server["db"]
+    park = tmp_path / "park"
+    yard = tmp_path / "yard"
+    park.mkdir()
+    yard.mkdir()
+    folder_ids = live_server["data"]["folders"]
+    db.conn.executemany(
+        "UPDATE folders SET path = ?, status = 'missing' WHERE id = ?",
+        [(str(park), folder_ids[0]), (str(yard), folder_ids[1])],
+    )
+    db.conn.commit()
+
+    page.goto(f"{live_server['url']}/browse")
+    expect(page.locator("#welcomeState")).to_be_visible()
+    expect(page.locator(".grid-card")).to_have_count(0)
+
+    with page.expect_response(
+        lambda response: response.url.endswith("/api/folders/check-health")
+    ) as health_response:
+        page.evaluate("openMissingFoldersModal()")
+
+    assert health_response.value.json()["changed"] == 2
+    expect(page.locator(".grid-card")).to_have_count(5)
+    expect(page.locator("#welcomeState")).to_be_hidden()
+    expect(page.locator("#filterSummary")).to_contain_text("of 5")
+
+
 def test_keyword_search_empty_state_and_clear(live_server, page):
     """A zero-result keyword search must not look like an empty library."""
     url = live_server["url"]

@@ -2883,26 +2883,41 @@ async function bootstrapBrowse() {
     // in either case.
     if (activeCollectionId) initParams.set('collection_id', activeCollectionId);
     initParams.set('per_page', perPage);
+    // Snapshot the health-refresh generation before issuing /api/browse/init.
+    // If a vireo:folder-health-changed event fires while this request is in
+    // flight, refreshBrowseAfterFolderHealthChange() will have already
+    // reloaded folders/keywords/collections and the grid from the fresh
+    // post-flip state. Populating ``photos`` / rendering the sidebars from
+    // this pre-flip response afterwards would silently overwrite that
+    // fresher refresh with stale data — leaving the grid empty until
+    // another event or a manual reload (Codex review r3685515800).
+    var bootstrapHealthSeq = folderHealthRefreshSeq;
     var data = await safeFetch('/api/browse/init?' + initParams.toString());
+    var healthChangedDuringInit = folderHealthRefreshSeq !== bootstrapHealthSeq;
 
-    // Populate everything from a single response
-    photos = data.photos || [];
-    totalPhotos = data.total || 0;
-    currentPage = 2; // next page to load
-    if (photos.length >= totalPhotos) allLoaded = true;
+    if (!healthChangedDuringInit) {
+      // Populate everything from a single response
+      photos = data.photos || [];
+      totalPhotos = data.total || 0;
+      currentPage = 2; // next page to load
+      if (photos.length >= totalPhotos) allLoaded = true;
 
-    renderFolderTree(data.folders || []);
-    renderKeywordTree(data.keywords || []);
-    renderCollectionList(data.collections || []);
-    loadCollectionCounts();
-    renderGrid();
-    updateFilterSummary();
-    loadSummary();
+      renderFolderTree(data.folders || []);
+      renderKeywordTree(data.keywords || []);
+      renderCollectionList(data.collections || []);
+      loadCollectionCounts();
+      renderGrid();
+      updateFilterSummary();
+      loadSummary();
+    }
     refreshPendingSyncBanner();
 
     document.getElementById('loadingState').style.display = 'none';
-    // Lazy-load collection photo counts to avoid N+1 on init
-    loadCollectionCounts();
+    // Lazy-load collection photo counts to avoid N+1 on init. Skip this
+    // when the health refresh already ran — it issued its own
+    // loadCollectionCounts() and repeating the call here would just fire
+    // another round-trip for the same data.
+    if (!healthChangedDuringInit) loadCollectionCounts();
     bootstrapSucceeded = true;
 
     // Universal filter bar: registry + persisted/deep-linked state load

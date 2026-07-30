@@ -2129,11 +2129,22 @@ def run_import_job(job, runner, db_path, workspace_id, params):
     discovered = len(files)
     # Snapshot BEFORE filtering — drift is measured against what the card
     # actually holds, and computing it post-filter makes files-appeared zero.
+    # NOTE for later tasks: this is a set while ``discovered`` is a raw list
+    # length, so overlapping sources (``/card`` plus ``/card/DCIM``) enumerate
+    # a file twice and make ``len(discovered_paths) < discovered``. Do not
+    # assume the two agree.
     # (noqa: F841 — both are consumed by the card-safety and drift checks
     # added later in this PR; drop the noqa when the first usage lands.)
     discovered_paths = {str(f) for f in files}  # noqa: F841
     if params.include_paths is not None:
-        files = [f for f in files if str(f) in params.include_paths]
+        # Matching is exact string equality against ``str(f)`` as produced by
+        # ``discover_source_files``. The caller's paths come from that same
+        # enumeration over the same raw source strings (the ``path`` field of
+        # ``/api/import/folder-preview``), and NEITHER side resolves symlinks
+        # or otherwise normalizes. Realpath-ing ``params.sources`` here would
+        # silently empty this filter and copy nothing.
+        include = set(params.include_paths)
+        files = [f for f in files if str(f) in include]
     queued = len(files)  # noqa: F841
 
     checker = None

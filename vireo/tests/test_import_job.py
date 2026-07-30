@@ -6166,18 +6166,36 @@ def test_include_paths_imports_only_selected_files(tmp_path):
         ("DSC_0003.jpg", datetime(2026, 7, 3, 12, 0, 0), "blue"),
     ])
     keep = {str(card / "DSC_0001.jpg"), str(card / "DSC_0003.jpg")}
+    archive = tmp_path / "archive"
 
     db, _, result = _run_import(tmp_path, ImportParams(
-        sources=[str(card)], destination=str(tmp_path / "archive"),
+        sources=[str(card)], destination=str(archive),
         include_paths=keep, previewed_count=3, checked_count=2,
     ))
 
     assert result["copied"] == 2
+    # No copy failed — otherwise "the deselected file is absent" below would
+    # also hold for a no-op filter whose third copy merely broke.
+    assert result["failed"] == 0
     # discovered stays the full card — it backs the card-safety verdict.
     assert result["discovered"] == 3
-    assert {r["filename"] for r in _photo_rows(db)} == {
-        "DSC_0001.jpg", "DSC_0003.jpg",
+
+    # The selected files landed in the archive and the deselected one did not.
+    expected = {
+        str(archive / "2026" / "2026-07-03" / "DSC_0001.jpg"),
+        str(archive / "2026" / "2026-07-03" / "DSC_0003.jpg"),
     }
+    for path in expected:
+        assert os.path.isfile(path), f"missing archive file: {path}"
+    deselected = str(archive / "2026" / "2026-07-03" / "DSC_0002.jpg")
+    assert not os.path.exists(deselected), (
+        f"deselected file was copied to the archive: {deselected}"
+    )
+
+    rows = _photo_rows(db)
+    assert {
+        os.path.join(r["folder_path"], r["filename"]) for r in rows
+    } == expected
 
 
 def test_include_paths_absent_imports_everything(tmp_path):
@@ -6192,4 +6210,23 @@ def test_include_paths_absent_imports_everything(tmp_path):
         sources=[str(card)], destination=str(tmp_path / "archive"),
     ))
     assert result["copied"] == 2
+    assert result["discovered"] == 2
+
+
+def test_include_paths_empty_set_imports_nothing(tmp_path):
+    """An empty selection is 'nothing chosen', not 'no opinion'.
+
+    Truthiness here instead of ``is not None`` would import the whole card.
+    """
+    from import_job import ImportParams
+
+    card = _make_card(tmp_path, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+        ("DSC_0002.jpg", datetime(2026, 7, 3, 11, 0, 0), "green"),
+    ])
+    _, _, result = _run_import(tmp_path, ImportParams(
+        sources=[str(card)], destination=str(tmp_path / "archive"),
+        include_paths=set(), previewed_count=2, checked_count=0,
+    ))
+    assert result["copied"] == 0
     assert result["discovered"] == 2

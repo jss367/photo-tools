@@ -6154,3 +6154,42 @@ def test_remote_import_cancel_mid_batch_does_not_start_rsync(
         f"no card files should have landed on the mount after "
         f"cancellation, but found: {landed}"
     )
+
+
+def test_include_paths_imports_only_selected_files(tmp_path):
+    """include_paths restricts the copy set; discovered still counts the card."""
+    from import_job import ImportParams
+
+    card = _make_card(tmp_path, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+        ("DSC_0002.jpg", datetime(2026, 7, 3, 11, 0, 0), "green"),
+        ("DSC_0003.jpg", datetime(2026, 7, 3, 12, 0, 0), "blue"),
+    ])
+    keep = {str(card / "DSC_0001.jpg"), str(card / "DSC_0003.jpg")}
+
+    db, _, result = _run_import(tmp_path, ImportParams(
+        sources=[str(card)], destination=str(tmp_path / "archive"),
+        include_paths=keep, previewed_count=3, checked_count=2,
+    ))
+
+    assert result["copied"] == 2
+    # discovered stays the full card — it backs the card-safety verdict.
+    assert result["discovered"] == 3
+    assert {r["filename"] for r in _photo_rows(db)} == {
+        "DSC_0001.jpg", "DSC_0003.jpg",
+    }
+
+
+def test_include_paths_absent_imports_everything(tmp_path):
+    """No selection means no opinion — current behavior is unchanged."""
+    from import_job import ImportParams
+
+    card = _make_card(tmp_path, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+        ("DSC_0002.jpg", datetime(2026, 7, 3, 11, 0, 0), "green"),
+    ])
+    _, _, result = _run_import(tmp_path, ImportParams(
+        sources=[str(card)], destination=str(tmp_path / "archive"),
+    ))
+    assert result["copied"] == 2
+    assert result["discovered"] == 2

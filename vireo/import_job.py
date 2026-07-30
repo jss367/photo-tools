@@ -214,6 +214,18 @@ class ImportParams:
     # to format until they have been byte-verified.
     trust_likely_duplicates: bool = False
     recursive: bool = True
+    # Per-file selection (copy mode only — see the import-file-selection spec).
+    # ``include_paths`` is NOT the set of checked boxes: it is
+    # ``previewed - user-deselected`` and deliberately still contains files the
+    # UI rendered as unchecked duplicates, so the duplicate checker can see,
+    # skip and COUNT them. Dropping them here makes them land in no ledger
+    # bucket and falsely reports a fully-archived card as unsafe to format.
+    include_paths: set | None = None
+    # Size of the previewed set and the count the UI showed as checked. Both
+    # are transport for values the job cannot reconstruct; ``previewed_count``
+    # additionally gates a card-safety condition, so it is not just reporting.
+    previewed_count: int | None = None
+    checked_count: int | None = None
     # After-import process strategy name. Stored in the job config for the
     # PR 3 chaining hook; unused by the import job itself.
     after_import: str | None = None
@@ -2115,6 +2127,14 @@ def run_import_job(job, runner, db_path, workspace_id, params):
             onerror=_discovery_onerror,
         ))
     discovered = len(files)
+    # Snapshot BEFORE filtering — drift is measured against what the card
+    # actually holds, and computing it post-filter makes files-appeared zero.
+    # (noqa: F841 — both are consumed by the card-safety and drift checks
+    # added later in this PR; drop the noqa when the first usage lands.)
+    discovered_paths = {str(f) for f in files}  # noqa: F841
+    if params.include_paths is not None:
+        files = [f for f in files if str(f) in params.include_paths]
+    queued = len(files)  # noqa: F841
 
     checker = None
     if params.skip_duplicates:

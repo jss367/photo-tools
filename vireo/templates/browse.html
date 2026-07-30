@@ -2027,6 +2027,13 @@ var keywordAutocompletePromise = null;
 var keywordAutocompleteStates = {};
 var collectionCountRefreshTimer = null;
 var collectionCountLoadGen = 0;
+// Same superseded-response guard as loadCollectionCounts, extended to the
+// summary and calendar loaders so a slow /api/browse/summary or
+// /api/photos/calendar response cannot overwrite the panel or heatmap
+// after a newer scope selection triggered a fresh load
+// (CodeRabbit review r3684913398).
+var summaryLoadGen = 0;
+var calendarDataLoadGen = 0;
 var collectionsById = {};
 var browseCompareIds = [];
 var browseCompareOffset = 0;
@@ -3469,7 +3476,13 @@ function refreshBrowseSidebarCounts() {
 var folderHealthRefreshSeq = 0;
 async function refreshBrowseAfterFolderHealthChange() {
   var seq = ++folderHealthRefreshSeq;
-  browseScopeGen++;
+  // A health-driven dataset refresh is not a user scope change: bumping
+  // browseScopeGen here would make any in-flight sidebar click
+  // (filterByFolder/filterByKeyword/filterByCollection) or the initial
+  // collection deep-link replay look stale, and its own guard would then
+  // silently discard the requested scope — leaving Browse on the workspace
+  // grid instead of the user's newer selection (Codex review r3684907518).
+  // folderHealthRefreshSeq below is the only counter this refresh needs.
 
   // Refresh the scope controls first. If the selected folder just went
   // offline it disappears from /api/folders; clear that stale scope before
@@ -3481,7 +3494,11 @@ async function refreshBrowseAfterFolderHealthChange() {
     activeFolderId = null;
   }
 
-  await resetAndLoad();
+  // Preserve the active collection: resetAndLoad's default is to clear
+  // ``activeCollectionId`` for non-dashboard scopes, which would kick a user
+  // viewing a normal collection back to the unscoped workspace grid whenever
+  // folder health changes (CodeRabbit review r3684913393).
+  await resetAndLoad({ preserveCollection: true });
   if (seq !== folderHealthRefreshSeq) return;
   loadCollectionCounts();
   loadSummary();
@@ -4111,6 +4128,11 @@ async function saveCollection() {
 /* ---------- Photo Loading ---------- */
 async function resetAndLoad(options) {
   var preserveAnchor = !!(options && options.preserveAnchor);
+  // Callers that need the current collection scope to survive a reset
+  // (folder-health refresh) pass ``preserveCollection: true``. Without it
+  // the default clear below would drop a normal (non-dashboard) collection
+  // and send the user back to the unscoped workspace grid.
+  var preserveCollection = !!(options && options.preserveCollection);
   var anchor = preserveAnchor ? captureSelectedPhotoAnchor() : null;
   var restoreEpoch = anchor ? ++anchorRestoreEpoch : null;
   photos = [];
@@ -4131,15 +4153,21 @@ async function resetAndLoad(options) {
   // Dashboard-scoped collections are the exception: there the collection is an
   // explicit composable restriction that filters combine WITH, so it must
   // survive filter-driven reloads (dashboard drill-down deep links).
-  if (!dashboardCollectionScope) activeCollectionId = null;
+  if (!dashboardCollectionScope && !preserveCollection) activeCollectionId = null;
+  var preservedCollectionId = preserveCollection ? activeCollectionId : null;
   if (anchor) hideDetailPanel();
   else closeDetail();
   document.getElementById('grid').innerHTML = '';
   document.getElementById('gridContainer').scrollTop = 0;
 
   function resetRequestIsCurrent() {
-    return resetLoadEpoch === loadEpoch &&
-      (activeCollectionId == null || dashboardCollectionScope);
+    if (resetLoadEpoch !== loadEpoch) return false;
+    if (activeCollectionId == null) return true;
+    if (dashboardCollectionScope) return true;
+    // Explicitly preserved collection: the reset is still current as long as
+    // the caller-chosen scope hasn't been replaced by a newer sidebar click.
+    if (preserveCollection && activeCollectionId === preservedCollectionId) return true;
+    return false;
   }
   function anchorScanShouldContinue() {
     return resetRequestIsCurrent() && anchorRestoreEpoch === restoreEpoch;
@@ -4334,6 +4362,7 @@ function toggleTimelineMode() {
 }
 
 async function loadCalendarData() {
+  var gen = ++calendarDataLoadGen;
   var params = new URLSearchParams();
   params.set('year', calendarYear);
   if (activeFolderId) params.set('folder_id', activeFolderId);
@@ -4354,7 +4383,9 @@ async function loadCalendarData() {
   if (rules) params.set('rules', JSON.stringify(rules));
   appendVisualScopeParams(params);
 
-  calendarData = await safeFetch('/api/photos/calendar?' + params.toString());
+  var data = await safeFetch('/api/photos/calendar?' + params.toString());
+  if (gen !== calendarDataLoadGen) return;
+  calendarData = data;
   renderCalendar();
 }
 
@@ -6672,6 +6703,7 @@ function closeDetail() {
 }
 
 async function loadSummary() {
+  var gen = ++summaryLoadGen;
   var params = new URLSearchParams();
   if (activeFolderId) params.set('folder_id', activeFolderId);
   var rules = getBrowseRules();
@@ -6681,6 +6713,7 @@ async function loadSummary() {
 
   try {
     var data = await safeFetch('/api/browse/summary?' + params.toString(), {}, { toast: false });
+    if (gen !== summaryLoadGen) return;
     renderSummary(data);
   } catch(e) {}
 }

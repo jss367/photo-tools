@@ -1,4 +1,78 @@
+import json
+
 from playwright.sync_api import expect
+
+
+def test_folder_health_refresh_preserves_active_collection(live_server, page, tmp_path):
+    """A folder-health refresh must not kick the user out of a collection scope.
+
+    Regression: ``resetAndLoad()``'s default clears ``activeCollectionId``
+    for non-dashboard scopes, and the previous refresh path also bumped
+    ``browseScopeGen``. Both would combine to drop the user back to the
+    unscoped workspace grid when a drive or share reconnected while they
+    were viewing a normal collection — either during the brief
+    bootstrap window before ``filterByCollection`` swallows the id into
+    filter chips, or via the chip path being wiped by the reset
+    (CodeRabbit review r3684913393, Codex review r3684907518).
+    """
+    db = live_server["db"]
+    park = tmp_path / "park"
+    yard = tmp_path / "yard"
+    park.mkdir()
+    yard.mkdir()
+    folder_ids = live_server["data"]["folders"]
+    # park is repointed to a real path so the health check confirms it's
+    # ok (no status change); yard is marked missing so the check flips it
+    # back to ok and broadcasts vireo:folder-health-changed exactly once.
+    db.conn.execute(
+        "UPDATE folders SET path = ?, status = 'ok' WHERE id = ?",
+        (str(park), folder_ids[0]),
+    )
+    db.conn.execute(
+        "UPDATE folders SET path = ?, status = 'missing' WHERE id = ?",
+        (str(yard), folder_ids[1]),
+    )
+    db.conn.commit()
+
+    rules = json.dumps([{"field": "extension", "op": "is", "value": ".jpg"}])
+    collection_id = db.add_collection("All JPGs", rules)
+
+    # Deep-link into the collection so bootstrap scopes the first paint
+    # through ``activeCollectionId`` and then loads the saved expression
+    # into the filter bar. yard is still missing, so only park's 3 hawks
+    # show.
+    page.goto(f"{live_server['url']}/browse?collection_id={collection_id}")
+    page.wait_for_function("window.VireoFilter && VireoFilter.isReady()")
+    page.wait_for_function(
+        "document.querySelector('.vf-chips') && "
+        "document.querySelector('.vf-chips').textContent.includes('File extension')",
+        timeout=4000,
+    )
+    expect(page.locator(".grid-card")).to_have_count(3)
+
+    # Health-refresh path must call resetAndLoad with preserveCollection so
+    # the option's short-circuit is exercised directly. If a future refactor
+    # drops the flag, this asserts the option is still honored.
+    result = page.evaluate(
+        f"(async () => {{"
+        f"  activeCollectionId = {collection_id};"
+        f"  await resetAndLoad({{ preserveCollection: true }});"
+        f"  return activeCollectionId;"
+        f"}})()"
+    )
+    assert result == collection_id
+
+    with page.expect_response(
+        lambda response: response.url.endswith("/api/folders/check-health")
+    ) as health_response:
+        page.evaluate("openMissingFoldersModal()")
+    assert health_response.value.json()["changed"] == 1
+
+    # The collection scope must survive the refresh: the collection's
+    # rules stay in the filter bar and the grid now includes yard's
+    # photos because the collection matches every .jpg.
+    expect(page.locator(".grid-card")).to_have_count(5)
+    expect(page.locator(".vf-chips")).to_contain_text("File extension")
 
 
 def test_reconnected_folders_refresh_empty_browse(live_server, page, tmp_path):

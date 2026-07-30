@@ -2860,6 +2860,9 @@ async function bootstrapBrowse() {
   // Prevent the IntersectionObserver from triggering loadPhotos() while bootstrap is in flight
   loading = true;
   var bootstrapSucceeded = false;
+  // Declared out here so the finally-region guard below can read it even
+  // if /api/browse/init throws before the assignment inside the try.
+  var healthChangedDuringInit = false;
   try {
     applyBrowseConfig(await _cfgPromise);
     var pageParams = new URLSearchParams(window.location.search);
@@ -2893,7 +2896,7 @@ async function bootstrapBrowse() {
     // another event or a manual reload (Codex review r3685515800).
     var bootstrapHealthSeq = folderHealthRefreshSeq;
     var data = await safeFetch('/api/browse/init?' + initParams.toString());
-    var healthChangedDuringInit = folderHealthRefreshSeq !== bootstrapHealthSeq;
+    healthChangedDuringInit = folderHealthRefreshSeq !== bootstrapHealthSeq;
 
     if (!healthChangedDuringInit) {
       // Populate everything from a single response
@@ -3087,12 +3090,23 @@ async function bootstrapBrowse() {
   } catch(e) {
     document.getElementById('loadingState').textContent = 'Error loading.';
   }
-  loading = false;
-  if (bootstrapSucceeded) {
-    rearmInfiniteScrollObserver();
-    // Make sure a tall viewport still gets its second page even when the
-    // sentinel callback does not fire after the initial layout.
-    requestAnimationFrame(ensureViewportHydrated);
+  // If a folder-health event fired while /api/browse/init was in flight,
+  // refreshBrowseAfterFolderHealthChange() has already taken over the load
+  // state: its resetAndLoad() → loadPhotos() chain owns ``loading`` and
+  // rearms the intersection observer itself when it settles. Clearing
+  // ``loading`` here would release the mutex that concurrent loadPhotos
+  // still holds, letting the newly-rearmed observer fire a second page-1
+  // request against the same ``loadEpoch``; both responses append and the
+  // grid ends up with duplicated cards and off-by-one pagination
+  // (Codex review r3685627307).
+  if (!healthChangedDuringInit) {
+    loading = false;
+    if (bootstrapSucceeded) {
+      rearmInfiniteScrollObserver();
+      // Make sure a tall viewport still gets its second page even when the
+      // sentinel callback does not fire after the initial layout.
+      requestAnimationFrame(ensureViewportHydrated);
+    }
   }
 }
 

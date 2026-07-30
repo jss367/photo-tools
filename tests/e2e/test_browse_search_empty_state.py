@@ -299,6 +299,231 @@ def test_check_health_dispatch_ignores_cross_workspace_flips(
     expect(page.locator(".grid-card")).to_have_count(5)
 
 
+def test_bootstrap_defers_load_lock_release_during_health_refresh(
+    live_server, page, tmp_path
+):
+    """Bootstrap must not release the load lock owned by a concurrent
+    health refresh.
+
+    Regression (Codex review r3685627307): if a folder-health event
+    fires while ``/api/browse/init`` is in flight, the health-refresh
+    handler runs ``resetAndLoad()`` → ``loadPhotos()`` which owns the
+    ``loading`` mutex. When init later returns, bootstrap already
+    guarded the render block on ``healthChangedDuringInit`` — but its
+    finally-region still unconditionally cleared ``loading`` and rearmed
+    the intersection observer. That released the mutex the concurrent
+    ``loadPhotos`` still held, letting the observer fire a duplicate
+    page-1 request against the same ``loadEpoch`` and appending the same
+    photos twice.
+    """
+    db = live_server["db"]
+    park = tmp_path / "park"
+    yard = tmp_path / "yard"
+    park.mkdir()
+    yard.mkdir()
+    folder_ids = live_server["data"]["folders"]
+    # Both folders missing initially so bootstrap's /api/browse/init
+    # returns an empty grid; the simulated health event then restores
+    # them and triggers the refresh path.
+    db.conn.executemany(
+        "UPDATE folders SET path = ?, status = 'missing' WHERE id = ?",
+        [
+            (str(tmp_path / "gone-park"), folder_ids[0]),
+            (str(tmp_path / "gone-yard"), folder_ids[1]),
+        ],
+    )
+    db.conn.commit()
+
+    # Hold /api/browse/init so the health event fires strictly during
+    # its in-flight window. Only intercept the FIRST init request —
+    # bootstrap re-issues nothing, but we don't want to catch anything
+    # else if the router matches loosely.
+    held_init = []
+
+    def _hold_first_init(route):
+        if not held_init:
+            held_init.append(route)
+        else:
+            route.continue_()
+
+    page.route("**/api/browse/init**", _hold_first_init)
+
+    page.goto(f"{live_server['url']}/browse")
+    for _ in range(50):
+        if held_init:
+            break
+        page.wait_for_timeout(100)
+    assert held_init, "init request was never issued"
+
+    # Restore the folders in the DB, then dispatch the event exactly the
+    # way loadMissingFolders/checkMissingFolders would. The refresh
+    # handler will reload folders/keywords/collections and then call
+    # resetAndLoad → loadPhotos.
+    db.conn.executemany(
+        "UPDATE folders SET path = ?, status = 'ok' WHERE id = ?",
+        [(str(park), folder_ids[0]), (str(yard), folder_ids[1])],
+    )
+    db.conn.commit()
+    page.evaluate(
+        "document.dispatchEvent(new CustomEvent('vireo:folder-health-changed', "
+        "{detail: {restored: [], wentMissing: [], source: 'test'}}))"
+    )
+
+    # Wait for the health-refresh chain's loadPhotos to populate the
+    # grid. The 5 photos come from the two restored folders.
+    page.wait_for_function("photos.length === 5", timeout=15000)
+
+    # Now release init. Bootstrap sees healthChangedDuringInit=true and
+    # must skip both the render block AND the load-lock release; the
+    # health refresh's own loadPhotos finally will clear ``loading``.
+    held_init[0].continue_()
+
+    # Give bootstrap's remaining code (VireoFilter.init promise chain +
+    # finally region) a chance to run so any load-lock release would land
+    # before we assert.
+    page.wait_for_timeout(400)
+
+    # The grid must show exactly 5 photos with no duplicates. If bootstrap
+    # had released the mutex, the observer could have double-fetched page 1
+    # and produced 10 (or 5 with duplicates in ``photos``).
+    expect(page.locator(".grid-card")).to_have_count(5)
+    unique_photos = page.evaluate("new Set(photos.map(p => p.id)).size")
+    assert unique_photos == page.evaluate("photos.length"), (
+        "duplicate photos in grid — bootstrap released the load lock and "
+        "the intersection observer double-fetched page 1"
+    )
+
+
+def test_poll_defers_snapshot_update_to_in_flight_check_health_post(
+    live_server, page, tmp_path
+):
+    """A GET /api/folders/missing whose response arrives while a
+    check-health POST is in flight must not update the snapshot or
+    dispatch vireo:folder-health-changed — the POST is the freshness
+    authority for the post-mutation state.
+
+    Regression (Codex review r3685627312): the previous fix used a
+    single shared ``_missingFoldersObservationGen`` bumped by both GET
+    and POST. A GET fired by ``closeMissingFoldersModal()`` after the
+    modal's POST was still running would bump the gen, and the POST's
+    equality check would then fail on completion — dropping the POST's
+    result even though it's the request that actually mutated folder
+    status. Give the POST its own mutation gen and an in-flight counter
+    so GETs defer to it and only POSTs supersede POSTs.
+    """
+    db = live_server["db"]
+    park = tmp_path / "park"
+    yard = tmp_path / "yard"
+    park.mkdir()
+    yard.mkdir()
+    folder_ids = live_server["data"]["folders"]
+    db.conn.execute(
+        "UPDATE folders SET path = ?, status = 'missing' WHERE id = ?",
+        (str(tmp_path / "gone-park"), folder_ids[0]),
+    )
+    db.conn.execute(
+        "UPDATE folders SET path = ?, status = 'ok' WHERE id = ?",
+        (str(yard), folder_ids[1]),
+    )
+    db.conn.commit()
+
+    page.goto(f"{live_server['url']}/browse")
+    # Wait for the initial /api/folders/missing poll to seed the snapshot
+    # with park's id.
+    page.wait_for_function(
+        f"typeof _missingFoldersLastIds !== 'undefined' && "
+        f"_missingFoldersLastIds !== null && "
+        f"_missingFoldersLastIds.length === 1 && "
+        f"_missingFoldersLastIds[0] === {folder_ids[0]}"
+    )
+    # Instrument event dispatches so we can count them.
+    page.evaluate(
+        "window._folderHealthEvents = [];"
+        "document.addEventListener('vireo:folder-health-changed', "
+        "  function(e) { window._folderHealthEvents.push(e.detail.source); });"
+    )
+
+    # Hold the check-health POST so a subsequent GET can race ahead.
+    held_post = []
+
+    def _hold_post(route):
+        if route.request.method == "POST":
+            held_post.append(route)
+        else:
+            route.continue_()
+
+    page.route("**/api/folders/check-health", _hold_post)
+
+    # Kick off the POST (loadMissingFolders → POST /api/folders/check-health).
+    # Fire-and-forget: page.evaluate awaits any returned promise, and the
+    # held POST would never resolve — so wrap the call so evaluate returns
+    # undefined synchronously and lets us drive the release manually below.
+    page.evaluate(
+        "() => { window._pendingLoadMissing = loadMissingFolders(); }"
+    )
+    for _ in range(50):
+        if held_post:
+            break
+        page.wait_for_timeout(100)
+    assert held_post, "check-health POST was never issued"
+    # In-flight counter must reflect the held POST.
+    assert page.evaluate("_missingFoldersMutationInFlight") == 1
+
+    # Restore park in the DB now, so the GET (issued next) observes the
+    # post-restore state — worse than the pre-fix bug's exact ordering
+    # but simpler to set up: even with a "fresher-looking" GET result,
+    # the POST must still be applied as the authority. Under the old
+    # single-gen scheme the GET would bump the gen and the POST's
+    # completion check would fail, so the POST's dispatch would never
+    # fire. With the fix, the GET is skipped while the POST is in flight.
+    db.conn.execute(
+        "UPDATE folders SET path = ?, status = 'ok' WHERE id = ?",
+        (str(park), folder_ids[0]),
+    )
+    db.conn.commit()
+
+    events_before_get = page.evaluate("window._folderHealthEvents.length")
+    snapshot_before_get = page.evaluate("[..._missingFoldersLastIds]")
+
+    # Fire the racing GET and await its completion in-page — the GET's
+    # URL (/api/folders/missing) isn't intercepted, so it returns fast.
+    # By the time this evaluate resolves, the GET's response handler
+    # has run and either updated state (bug) or deferred to the POST (fix).
+    page.evaluate(
+        "(async () => { await checkMissingFolders(); })()"
+    )
+    # Belt-and-suspenders: give any microtasks a chance to settle.
+    page.wait_for_timeout(200)
+
+    # The GET's response landed while the POST is still in flight — it
+    # must have skipped snapshot update AND dispatch.
+    assert (
+        page.evaluate("[..._missingFoldersLastIds]") == snapshot_before_get
+    ), "racing GET updated snapshot while POST was in flight"
+    assert (
+        page.evaluate("window._folderHealthEvents.length") == events_before_get
+    ), "racing GET dispatched folder-health-changed while POST was in flight"
+    # In-flight counter still shows the held POST.
+    assert page.evaluate("_missingFoldersMutationInFlight") == 1
+
+    # Now release the POST. It observes park as ok → dispatches
+    # 'check-health' and updates the snapshot to [].
+    held_post[0].continue_()
+    page.wait_for_function(
+        f"window._folderHealthEvents.length > {events_before_get}",
+        timeout=10000,
+    )
+    events_after = page.evaluate("window._folderHealthEvents")
+    assert "check-health" in events_after[events_before_get:], (
+        "POST's dispatch was dropped even though it's the freshness authority"
+    )
+    assert page.evaluate("_missingFoldersLastIds") == [], (
+        "POST's snapshot update was dropped even though it's the freshness authority"
+    )
+    # In-flight counter drops back to zero after POST settles.
+    page.wait_for_function("_missingFoldersMutationInFlight === 0", timeout=5000)
+
+
 def test_keyword_search_empty_state_and_clear(live_server, page):
     """A zero-result keyword search must not look like an empty library."""
     url = live_server["url"]

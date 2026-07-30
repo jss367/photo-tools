@@ -318,7 +318,7 @@ the selection is discarded rather than carried across as stale state.
 
 ### 3. Wire protocol
 
-`startImport()` adds two fields to the `/api/jobs/import-photos` POST body only.
+`startImport()` adds three fields to the `/api/jobs/import-photos` POST body only.
 `/api/jobs/import-in-place` is unchanged, and the page never sends either field to
 it (per *Scope*).
 
@@ -393,7 +393,9 @@ client-side checks in §3 are conveniences, not the enforcement point.
   members, empty strings, and `null`)
 - `include_paths` is non-empty when present
 - `previewed_count` and `checked_count` are non-negative integers, with
-  `checked_count <= previewed_count`
+  `checked_count <= len(include_paths)` — the tighter bound is the correct one,
+  since every checked file is by construction in the job's scope; comparing against
+  `previewed_count` would admit a client claiming more checked files than it sent
 - **the three fields are all-or-nothing.** Requiring the counts whenever
   `include_paths` is present is not sufficient — the converse matters too. A body
   carrying `previewed_count` without `include_paths` would fabricate a
@@ -447,10 +449,20 @@ future reader does not "fix" it into a regression.
 
 ### 5. Job execution
 
-`ImportParams` (`vireo/import_job.py:202`) gains two fields:
-`include_paths: set | None = None` and `previewed_count: int | None = None`. The
-latter is the transport for §6 — drift is computed against `discovered_paths`,
-which only exists inside the job body, so the count has to travel with the params.
+`ImportParams` (`vireo/import_job.py:202`) gains three fields, matching the three
+in §3:
+
+```python
+include_paths: set | None = None
+previewed_count: int | None = None
+checked_count: int | None = None
+```
+
+The counts are transport for values the job cannot reconstruct: drift is computed
+against `discovered_paths`, which only exists inside the job body, and
+`checked_count` cannot be derived from `include_paths` because that set contains
+unchecked duplicates (§3). `previewed_count` additionally gates the deselection
+verdict condition below, so it is load-bearing for card safety, not just reporting.
 
 **Do not persist `include_paths` into `job_config`** (`app.py:23883`). The other
 params are recorded there by convention, but there is no re-run-from-config path
@@ -482,10 +494,10 @@ This position is load-bearing in both directions:
   card." Filtering above it would shrink `discovered`, satisfy
   `(copied + skipped_duplicate) == discovered`, and report **safe to format** on a
   card whose deselected originals have not been copied anywhere. That is card
-  formatting data loss. Placed after, the equality fails automatically on any
-  deselection — and still holds when the user selected everything, which is
-  genuinely safe. No new `partial_scope` flag is needed; the existing guard does
-  the right thing on its own.
+  formatting data loss. Placed after, the equality fails on a deselection in the
+  ordinary case — but **not in every case**, which is why deselection also gets an
+  explicit verdict condition below rather than being left to fall out of the
+  arithmetic.
 - **Before `prepare()`** — the dedup preflight does not hash files nobody selected.
 
 **Why duplicates must stay in `include_paths`.** `import_job.py:2150` states the
@@ -589,7 +601,32 @@ disappears before the job runs, discovery finds 99, `discovered` is 99, the filt
 keeps 99, and `copied + skipped_duplicate == 99 == discovered` — a clean **safe to
 format** verdict on a card where a file the user asked for was never archived.
 
-**`not vanished_paths` must be added to *two* condition blocks per path, not one.**
+**Deselection needs its own condition; the ledger equality does not reliably catch
+it.** The equality compares `discovered` against what was processed, and both
+shrink together when a deselected file also disappears from the card:
+
+- preview finds 100, user deselects X → `include_paths` = 99
+- X vanishes before the job runs
+- discovery finds 99, all of them in `include_paths`, all processed
+- `copied + skipped_duplicate == 99 == discovered` — equality **holds**
+- `vanished_paths` is empty, because X was never in `include_paths`
+
+Both verdict blocks then pass, and the green branch sets
+`unsafe.style.display = 'none'` (`import.html:2611`), hiding the "1 file
+deselected" entry that was computed. The user is told *"every file is verified in
+the archive"* about an import where one file deliberately wasn't.
+
+So `deselected == 0` becomes an explicit condition, where
+`deselected = previewed_count - len(include_paths)`. This is the same value §5
+already computes for the `unsafe_files` entry; it just has to gate the verdict too
+rather than only annotate it.
+
+The general lesson, having now produced two data-loss paths this way: **every
+safety-relevant intent in this feature must be its own condition.** Relying on the
+ledger equality to catch things emergently works until two errors cancel.
+
+**`not vanished_paths` and `deselected == 0` must both be added to *two* condition
+blocks per path, not one.**
 Each copy path computes two verdicts with nearly identical conditions:
 
 | Path | `safe_to_format` | `unverified_duplicates_only` |
@@ -743,6 +780,11 @@ independent of checkboxes.
 - **a vanished in-scope file forces `safe_to_format` false** even though the ledger
   equality still balances — the 100-previewed/99-discovered case, with its own
   `unsafe_files` entry
+- **deselect one file, then delete that same file before the job runs** — the
+  ledger equality still balances (99 processed of 99 discovered) and
+  `vanished_paths` is empty, so both verdicts must be forced false by the explicit
+  `deselected == 0` condition rather than by arithmetic; assert across both blocks
+  and both copy paths
 - **the same case also forces `unverified_duplicates_only` false** with
   `trust_likely_duplicates=True` — the amber "keep the card until likely duplicates
   are verified" pill must not appear, since its remedy launders the missing file

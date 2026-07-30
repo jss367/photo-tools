@@ -532,21 +532,33 @@ def _linkable_twin_dirs(rows, under_destination):
     return dirs
 
 
-def _selection_blocks_format(deselected, vanished_paths):
+def _selection_blocks_format(*, deselected, vanished_paths):
     """True when the user's selection means the card is NOT fully archived.
 
     Deliberately separate from the ``(copied + skipped_duplicate) ==
     discovered`` ledger check. That equality catches these cases *usually*,
-    and three data-loss bugs came from trusting "usually":
+    and three data-loss bugs in review came from trusting "usually":
+      - the selection filter applied above ``discovered`` instead of below
+        it, so a partial import still balanced the equality;
+      - a vanished selected file blocked ``safe_to_format`` but not
+        ``unverified_duplicates_only``, whose amber pill's stated remedy
+        (re-run with ``verify_by_hash``) then turns it green;
       - deselect X, then X also vanishes -> discovered shrinks too, equality
         balances, nothing is wrong arithmetically, and a file the user
         excluded is reported as archived.
     Do not delete either condition because the other "already covers it".
 
-    Both card-safety verdicts on both copy paths (local and remote) call
-    this, so a new condition added here lands in all four. Do not inline it.
+    ``deselected != 0`` rather than ``> 0``: a negative count means the
+    caller previewed fewer files than it selected, which is self-inconsistent
+    input, and this module fails closed on inconsistency.
+
+    Intended as the single home for selection-based card-safety conditions:
+    every card-safety verdict on every copy path should call this so a new
+    condition added here reaches all of them. Currently wired into both
+    verdicts on the local path; the remote path's pair follows in a later
+    task. Do not inline the condition at a call site.
     """
-    return deselected > 0 or bool(vanished_paths)
+    return deselected != 0 or bool(vanished_paths)
 
 
 def _run_remote_import_job(job, runner, db, workspace_id, params):
@@ -2144,35 +2156,58 @@ def run_import_job(job, runner, db_path, workspace_id, params):
             onerror=_discovery_onerror,
         ))
     discovered = len(files)
+    # Coerce ONCE, above the filter, and use this set everywhere below.
+    # ``ImportParams.include_paths`` is typed ``set | None`` but a JSON
+    # payload deserializes to a list, and the drift math below does set
+    # arithmetic on it (``- discovered_paths``), which raises TypeError on a
+    # list before a single file is copied. Deduping here also keeps
+    # ``len(include_paths)`` agreeing with the set the filter actually used,
+    # so a payload with repeats can't skew ``deselected``.
+    include_paths = (
+        set(params.include_paths) if params.include_paths is not None else None
+    )
     # Snapshot BEFORE filtering — drift is measured against what the card
     # actually holds, and computing it post-filter makes files-appeared zero.
     # NOTE for later tasks: this is a set while ``discovered`` is a raw list
     # length, so overlapping sources (``/card`` plus ``/card/DCIM``) enumerate
     # a file twice and make ``len(discovered_paths) < discovered``. Do not
     # assume the two agree.
-    # (``queued`` below keeps its noqa — it is consumed by the drift
-    # reporting added later in this PR.)
     discovered_paths = {str(f) for f in files}
-    if params.include_paths is not None:
+    if include_paths is not None:
         # Matching is exact string equality against ``str(f)`` as produced by
         # ``discover_source_files``. The caller's paths come from that same
         # enumeration over the same raw source strings (the ``path`` field of
         # ``/api/import/folder-preview``), and NEITHER side resolves symlinks
         # or otherwise normalizes. Realpath-ing ``params.sources`` here would
         # silently empty this filter and copy nothing.
-        include = set(params.include_paths)
-        files = [f for f in files if str(f) in include]
+        files = [f for f in files if str(f) in include_paths]
+    # (noqa: F841 — ``queued`` is consumed by the drift reporting added later
+    # in this PR; drop the noqa when that usage lands.)
     queued = len(files)  # noqa: F841
 
     # Selection drift. Computed against the pre-filter snapshot.
-    # ``appeared`` is unused until the drift-reporting task lands
-    # (noqa: F841); the other two gate the card-safety verdicts below.
     deselected = 0
     vanished_paths = set()
-    appeared = 0  # noqa: F841
-    if params.include_paths is not None and params.previewed_count is not None:
-        deselected = params.previewed_count - len(params.include_paths)
-        vanished_paths = params.include_paths - discovered_paths
+    appeared = 0  # noqa: F841 — consumed by the drift-reporting task.
+    if include_paths is not None:
+        # Deliberately NOT gated on ``previewed_count``. A selected file the
+        # card no longer holds is drift whether or not the caller told us how
+        # big the preview was, the ledger equality cannot see it (discovered
+        # shrinks in step with copied), and ``include_paths`` without
+        # ``previewed_count`` is constructible today — both fields are
+        # independently optional on ``ImportParams``. Gating this would fail
+        # OPEN on exactly the case this code exists to close.
+        vanished_paths = include_paths - discovered_paths
+    if include_paths is not None and params.previewed_count is not None:
+        # ``deselected`` is compared with ``!= 0``, not ``> 0``: a negative
+        # value means the caller previewed fewer files than it selected,
+        # which is self-inconsistent, and this module fails closed on
+        # inconsistency rather than reading it as "nothing deselected".
+        deselected = params.previewed_count - len(include_paths)
+        # The clamp conflates "no new files" with "fewer files than
+        # previewed"; that second case is not lost, it surfaces as a negative
+        # ``deselected`` above, which blocks the card-safety verdicts.
+        # ``appeared`` is a report count, so a negative would be meaningless.
         appeared = max(0, len(discovered_paths) - params.previewed_count)  # noqa: F841
 
     checker = None
@@ -3376,7 +3411,8 @@ def run_import_job(job, runner, db_path, workspace_id, params):
         and not partial_scope
         and unverified_duplicate == 0
         and (copied + skipped_duplicate) == discovered
-        and not _selection_blocks_format(deselected, vanished_paths)
+        and not _selection_blocks_format(
+            deselected=deselected, vanished_paths=vanished_paths)
     )
     unverified_duplicates_only = (
         unverified_duplicate > 0
@@ -3386,7 +3422,8 @@ def run_import_job(job, runner, db_path, workspace_id, params):
         and not dup_link_failed
         and not partial_scope
         and (copied + skipped_duplicate) == discovered
-        and not _selection_blocks_format(deselected, vanished_paths)
+        and not _selection_blocks_format(
+            deselected=deselected, vanished_paths=vanished_paths)
     )
     result = {
         "discovered": discovered,

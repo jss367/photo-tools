@@ -6233,6 +6233,12 @@ def test_include_paths_empty_set_imports_nothing(tmp_path):
 
 
 def test_deselection_makes_card_unsafe_to_format(tmp_path):
+    """End-to-end assertion, but NOT the guard for this commit's condition:
+    it also passes with the feature removed, because the ledger equality
+    already fails here (2 discovered, 1 copied). The real guard is
+    ``test_deselected_then_vanished_file_makes_card_unsafe``, where the
+    equality balances — delete that one and the protection is gone.
+    """
     from import_job import ImportParams
 
     card = _make_card(tmp_path, [
@@ -6323,17 +6329,21 @@ def test_deselected_then_vanished_file_makes_card_unsafe(tmp_path):
     assert result["unverified_duplicates_only"] is False
 
 
-def _seed_likely_twin(tmp_path, db, name="IMG_0400.jpg"):
+def _seed_likely_twin(tmp_path, db, name="IMG_0400.jpg", card_name="card"):
     """Card file + a catalog row matching name/size/capture-time with
     DIFFERENT bytes. With trust_likely_duplicates=True this drives
     unverified_duplicate > 0 — the precondition that makes
     unverified_duplicates_only reachable at all. Lifted from
     test_trust_likely_duplicates_skips_metadata_match_without_byte_check.
+
+    ``card_name`` is parameterized (and the catalog folder derived from it)
+    so a caller can seed two independent cards under one ``tmp_path``
+    without silently merging them into ``_make_card``'s default ``card``.
     """
     from PIL.ExifTags import Base as ExifBase
 
     dt = datetime(2026, 5, 1, 10, 15, 30)
-    card = tmp_path / "card"
+    card = tmp_path / card_name
     card.mkdir(exist_ok=True)
     card_file = card / name
     img = Image.new("RGB", (16, 16), "red")
@@ -6342,14 +6352,14 @@ def _seed_likely_twin(tmp_path, db, name="IMG_0400.jpg"):
     img.save(str(card_file), exif=exif)
     card_bytes = card_file.read_bytes()
 
-    library = tmp_path / "library"
+    library = tmp_path / f"{card_name}_library"
     library.mkdir(exist_ok=True)
     (library / name).write_bytes(
         card_bytes[:-1] + bytes([card_bytes[-1] ^ 0xFF]))
 
     fid = db.conn.execute(
         "INSERT INTO folders (path, name, status) VALUES (?, ?, 'ok')",
-        (str(library), "library"),
+        (str(library), library.name),
     ).lastrowid
     db.conn.execute(
         "INSERT INTO photos (folder_id, filename, extension, file_size,"
@@ -6413,5 +6423,77 @@ def test_vanished_file_also_blocks_the_amber_verdict(tmp_path):
     assert result["unverified_duplicate"] == 1
     assert result["copied"] + result["skipped_duplicate"] == result["discovered"]
 
+    assert result["safe_to_format"] is False
+    assert result["unverified_duplicates_only"] is False
+
+
+def test_vanished_file_without_previewed_count_makes_card_unsafe(tmp_path):
+    """``vanished_paths`` must not be gated on ``previewed_count``.
+
+    Both fields are independently optional on ``ImportParams``, so a caller
+    can send a selection without a preview size. The ledger equality cannot
+    catch the vanished file (discovered=1, copied=1, balanced), so gating
+    the vanished-path check on ``previewed_count`` fails OPEN on exactly the
+    case this condition exists to close.
+    """
+    from import_job import ImportParams
+
+    card = _make_card(tmp_path, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+    ])
+    _, _, result = _run_import(tmp_path, ImportParams(
+        sources=[str(card)], destination=str(tmp_path / "archive"),
+        include_paths={str(card / "DSC_0001.jpg"), str(card / "GONE.jpg")},
+        previewed_count=None, checked_count=None,
+    ))
+    assert result["copied"] == 1
+    assert result["discovered"] == 1
+    assert result["safe_to_format"] is False
+    assert result["unverified_duplicates_only"] is False
+
+
+def test_include_paths_accepts_a_list(tmp_path):
+    """A JSON payload deserializes ``include_paths`` to a list.
+
+    The drift math does set arithmetic on it, so without coercing once above
+    the filter this raises TypeError before a single file is copied. The
+    repeat also proves ``deselected`` counts the deduped set: previewed=2
+    minus 1 distinct selected path is a real deselection.
+    """
+    from import_job import ImportParams
+
+    card = _make_card(tmp_path, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+        ("DSC_0002.jpg", datetime(2026, 7, 3, 11, 0, 0), "green"),
+    ])
+    kept = str(card / "DSC_0001.jpg")
+    _, _, result = _run_import(tmp_path, ImportParams(
+        sources=[str(card)], destination=str(tmp_path / "archive"),
+        include_paths=[kept, kept],   # list, with a duplicate entry
+        previewed_count=2, checked_count=1,
+    ))
+    assert result["copied"] == 1
+    assert result["safe_to_format"] is False
+
+
+def test_negative_deselected_count_makes_card_unsafe(tmp_path):
+    """A payload previewing fewer files than it selected is self-inconsistent.
+
+    ``deselected`` goes negative, and ``> 0`` would read that as "nothing
+    deselected" and let the card go green. This module fails closed on
+    inconsistent input.
+    """
+    from import_job import ImportParams
+
+    card = _make_card(tmp_path, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+    ])
+    _, _, result = _run_import(tmp_path, ImportParams(
+        sources=[str(card)], destination=str(tmp_path / "archive"),
+        include_paths={str(card / "DSC_0001.jpg")},
+        previewed_count=0, checked_count=1,
+    ))
+    assert result["copied"] == 1
+    assert result["discovered"] == 1
     assert result["safe_to_format"] is False
     assert result["unverified_duplicates_only"] is False

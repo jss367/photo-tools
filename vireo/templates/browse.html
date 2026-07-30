@@ -8550,13 +8550,36 @@ document.addEventListener('contextmenu', function(e) {
   photoId = parseInt(photoId, 10);
   if (isNaN(photoId)) return;
 
+  // Snapshot the health-refresh generation BEFORE any await. If a
+  // vireo:folder-health-changed event fires while this loader is awaiting
+  // /api/photos/<id> or its folder-scoped /api/browse/init,
+  // refreshBrowseAfterFolderHealthChange() has already reloaded folders,
+  // keywords, collections, and the grid from the fresh post-flip state and
+  // owns the ``loading`` mutex. Rendering pre-flip data from initData or
+  // releasing ``loading`` here would either clobber that fresher refresh
+  // or let the intersection observer fire a duplicate page-1 request
+  // against the same loadEpoch (Codex review r3686696351).
+  var deepLinkHealthSeq = folderHealthRefreshSeq;
+  var isDeepLinkHealthCurrent = function() {
+    return folderHealthRefreshSeq === deepLinkHealthSeq;
+  };
+
   // Prevent the IntersectionObserver from triggering loadPhotos() while deep-link is loading
   loading = true;
   var deepLinkLoaded = false;
   try {
     applyBrowseConfig(await _cfgPromise);
+    if (!isDeepLinkHealthCurrent()) return;
     var photo = await safeFetch('/api/photos/' + photoId, {}, { toast: false });
-    if (!photo || !photo.folder_id) { loading = false; return; }
+    if (!isDeepLinkHealthCurrent()) return;
+    if (!photo || !photo.folder_id) {
+      // Don't release ``loading`` if a concurrent health refresh owns it
+      // (its loadPhotos would then race the intersection observer). The
+      // isDeepLinkHealthCurrent check above already returns early in that
+      // case, so reaching here means it's safe to release.
+      loading = false;
+      return;
+    }
 
     // Navigate to the photo's folder
     activeFolderId = photo.folder_id;
@@ -8576,7 +8599,35 @@ document.addEventListener('contextmenu', function(e) {
     // Load pages until the target photo is found or all pages exhausted
     // (bootstrapBrowse was skipped, so we also need folder/keyword trees)
     var initData = await safeFetch('/api/browse/init?folder_id=' + photo.folder_id + '&per_page=' + perPage + '&sort=' + document.getElementById('sortSelect').value, {}, { toast: false });
+    if (!isDeepLinkHealthCurrent()) return;
     if (initData) {
+      // Seed the navbar's missing-folder snapshot from init's workspace-scoped
+      // view so the first /api/folders/missing observation has a baseline to
+      // compare against. bootstrapBrowse() does the same seed but returns
+      // immediately for ?photo_id=..., so without this the deep-link path
+      // leaves _missingFoldersLastIds null: a background _folder_health_loop
+      // flip that runs between init and the first navbar poll then lands
+      // silently (null-baseline branch), later polls see the same IDs and
+      // never dispatch, and Browse stays stuck on the pre-flip state
+      // indefinitely. When a poll already landed with a differing baseline,
+      // dispatch the init→now transition so
+      // refreshBrowseAfterFolderHealthChange takes over — the subsequent
+      // isDeepLinkHealthCurrent check will then skip our stale render
+      // (Codex review r3686696347).
+      if (typeof _missingFoldersLastIds !== 'undefined' &&
+          Array.isArray(initData.missing_folder_ids)) {
+        var initMissingIds = initData.missing_folder_ids
+          .slice()
+          .sort(function(a, b) { return a - b; });
+        if (_missingFoldersLastIds === null) {
+          _missingFoldersLastIds = initMissingIds;
+        } else if (_missingFolderIdsDiffer(initMissingIds, _missingFoldersLastIds) &&
+                   typeof _dispatchFolderHealthChangeFromIds === 'function') {
+          _dispatchFolderHealthChangeFromIds(
+            initMissingIds, _missingFoldersLastIds, 'deep-link-reconcile');
+          if (!isDeepLinkHealthCurrent()) return;
+        }
+      }
       renderFolderTree(initData.folders || []);
       renderKeywordTree(initData.keywords || []);
       renderCollectionList(initData.collections || []);
@@ -8594,8 +8645,12 @@ document.addEventListener('contextmenu', function(e) {
     // above intentionally blocks IntersectionObserver-driven loads, but
     // loadPhotos() also honors it; clear it before this explicit paging pass
     // or a target beyond the first page spins in a resolved Promise loop.
+    // Same freshness guard as above — don't release ``loading`` if a health
+    // refresh took ownership while init was in flight.
+    if (!isDeepLinkHealthCurrent()) return;
     loading = false;
     var el = await loadUntilPhotoRendered(photoId);
+    if (!isDeepLinkHealthCurrent()) return;
 
     // Update folder tree active state
     document.querySelectorAll('#folderTree .tree-item').forEach(function(el) {
@@ -8645,10 +8700,17 @@ document.addEventListener('contextmenu', function(e) {
       }).catch(function() {});
     }
   } catch(e) { /* ignore deep-link errors silently */ }
-  loading = false;
-  if (deepLinkLoaded) {
-    rearmInfiniteScrollObserver();
-    requestAnimationFrame(ensureViewportHydrated);
+  // A concurrent refreshBrowseAfterFolderHealthChange() owns ``loading``
+  // and rearms the observer itself when its loadPhotos settles; releasing
+  // ``loading`` here would let a second page-1 request race against the
+  // same loadEpoch, producing duplicate cards and off-by-one pagination
+  // (Codex review r3686696351).
+  if (isDeepLinkHealthCurrent()) {
+    loading = false;
+    if (deepLinkLoaded) {
+      rearmInfiniteScrollObserver();
+      requestAnimationFrame(ensureViewportHydrated);
+    }
   }
 })();
 

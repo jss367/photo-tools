@@ -3119,9 +3119,14 @@ function renderCollectionList(collections) {
 }
 
 /* ---------- Folder Tree ---------- */
-async function loadFolders() {
+async function loadFolders(opts) {
   try {
     var data = await safeFetch('/api/folders', {}, { toast: false });
+    // Callers that fire this alongside other refreshes can pass a
+    // ``shouldRender`` guard so a slow response cannot overwrite a newer
+    // render — see refreshBrowseAfterFolderHealthChange
+    // (Codex review r3685193225).
+    if (opts && opts.shouldRender && !opts.shouldRender()) return;
     renderFolderTree(data);
   } catch(e) {}
 }
@@ -3226,9 +3231,10 @@ function filterByFolder(folderId) {
 }
 
 /* ---------- Keyword Tree ---------- */
-async function loadKeywords() {
+async function loadKeywords(opts) {
   try {
     var data = await safeFetch('/api/keywords', {}, { toast: false });
+    if (opts && opts.shouldRender && !opts.shouldRender()) return;
     renderKeywordTree(data);
   } catch(e) {}
 }
@@ -3319,9 +3325,10 @@ async function filterByKeyword(name) {
 }
 
 /* ---------- Collections ---------- */
-async function loadCollections() {
+async function loadCollections(opts) {
   try {
     var data = await safeFetch('/api/collections', {}, { toast: false });
+    if (opts && opts.shouldRender && !opts.shouldRender()) return;
     renderCollectionList(data);
   } catch(e) {}
 }
@@ -3487,8 +3494,21 @@ async function refreshBrowseAfterFolderHealthChange() {
   // Refresh the scope controls first. If the selected folder just went
   // offline it disappears from /api/folders; clear that stale scope before
   // reloading the grid so Browse falls back to the available workspace.
-  await Promise.all([loadFolders(), loadKeywords(), loadCollections()]);
-  if (seq !== folderHealthRefreshSeq) return;
+  //
+  // Pass ``shouldRender`` into each loader: without it, two overlapping
+  // health events (a folder flapping, or the modal check racing the
+  // ten-minute poll) can complete out of order — the older fetch's
+  // render*Tree call would clobber the newer render, and the post-await
+  // seq check would fire too late to undo the DOM mutation. Guarding
+  // *before* render means only the winning generation's data ever reaches
+  // the tree (Codex review r3685193225).
+  var isCurrent = function() { return seq === folderHealthRefreshSeq; };
+  await Promise.all([
+    loadFolders({ shouldRender: isCurrent }),
+    loadKeywords({ shouldRender: isCurrent }),
+    loadCollections({ shouldRender: isCurrent }),
+  ]);
+  if (!isCurrent()) return;
   if (activeFolderId &&
       !document.querySelector('#folderTree .tree-item[data-folder-id="' + activeFolderId + '"]')) {
     activeFolderId = null;
@@ -3499,7 +3519,7 @@ async function refreshBrowseAfterFolderHealthChange() {
   // viewing a normal collection back to the unscoped workspace grid whenever
   // folder health changes (CodeRabbit review r3684913393).
   await resetAndLoad({ preserveCollection: true });
-  if (seq !== folderHealthRefreshSeq) return;
+  if (!isCurrent()) return;
   loadCollectionCounts();
   loadSummary();
   if (timelineMode) loadCalendarData();

@@ -11143,14 +11143,30 @@ let _missingBannerDismissedCount = 0;
 // never reach the page (Codex review r3685083009).
 let _missingFoldersLastIds = null;
 
-function _missingFolderIdsChanged(currentIds) {
-  if (_missingFoldersLastIds === null) return false;
-  const prev = _missingFoldersLastIds;
-  if (prev.length !== currentIds.length) return true;
+function _missingFolderIdsDiffer(prev, curr) {
+  if (prev.length !== curr.length) return true;
   for (let i = 0; i < prev.length; i++) {
-    if (prev[i] !== currentIds[i]) return true;
+    if (prev[i] !== curr[i]) return true;
   }
   return false;
+}
+
+// Fire vireo:folder-health-changed based on the transition of the
+// workspace-scoped missing-folder ID set — not on the modal POST's
+// ``changed`` count, which reflects a global scan and would trigger a
+// spurious Browse reset when a folder in another workspace flipped
+// (Codex review r3685295409). Returns whether an event was dispatched.
+function _dispatchFolderHealthChangeFromIds(prevIds, currentIds, source) {
+  if (prevIds === null) return false;
+  if (!_missingFolderIdsDiffer(prevIds, currentIds)) return false;
+  const prevSet = new Set(prevIds);
+  const currSet = new Set(currentIds);
+  const restored = prevIds.filter(id => !currSet.has(id));
+  const wentMissing = currentIds.filter(id => !prevSet.has(id));
+  document.dispatchEvent(new CustomEvent('vireo:folder-health-changed', {
+    detail: { restored, wentMissing, source },
+  }));
+  return true;
 }
 
 async function checkMissingFolders() {
@@ -11159,15 +11175,7 @@ async function checkMissingFolders() {
     if (!resp.ok) return;
     const folders = await resp.json();
     const currentIds = folders.map(f => f.id).sort((a, b) => a - b);
-    if (_missingFolderIdsChanged(currentIds)) {
-      const prevSet = new Set(_missingFoldersLastIds);
-      const currSet = new Set(currentIds);
-      const restored = _missingFoldersLastIds.filter(id => !currSet.has(id));
-      const wentMissing = currentIds.filter(id => !prevSet.has(id));
-      document.dispatchEvent(new CustomEvent('vireo:folder-health-changed', {
-        detail: { restored, wentMissing, source: 'poll' },
-      }));
-    }
+    _dispatchFolderHealthChangeFromIds(_missingFoldersLastIds, currentIds, 'poll');
     _missingFoldersLastIds = currentIds;
     const banner = document.getElementById('missingFoldersBanner');
     const msg = document.getElementById('missingFoldersMsg');
@@ -11596,22 +11604,44 @@ async function loadMissingFolders() {
     const resp = await fetch('/api/folders/check-health', { method: 'POST' });
     if (!resp.ok) throw new Error('check failed');
     const data = await resp.json();
+    const folders = data.missing;
     // Folder health is part of the effective photo dataset: ok→missing hides
     // a folder's photos, while missing→ok makes them available again. Notify
     // the current page so a long-lived Browse view does not keep showing the
     // pre-check empty grid after a drive or network share reconnects.
-    if (data.changed) {
-      document.dispatchEvent(new CustomEvent('vireo:folder-health-changed', {
-        detail: { changed: data.changed, source: 'check-health' },
-      }));
-    }
-    const folders = data.missing;
+    //
+    // Dispatch on the workspace-scoped missing-ID transition rather than
+    // ``data.changed``. Two motivations, both from Codex review of 31acc79:
+    //   * ``check_folder_health()`` scans every folder in the database and
+    //     returns a global change count, so a flip in another workspace's
+    //     folder would trigger a needless Browse reset here — clearing the
+    //     user's active selection and detail view even though the active
+    //     dataset did not change (r3685295409).
+    //   * When the modal is used to relocate a missing folder, the
+    //     ``/api/folders/<id>/relocate`` endpoint has already flipped the
+    //     folder to ``ok`` by the time this POST runs, so ``data.changed``
+    //     is zero — but the workspace's missing set did change and Browse
+    //     still needs to repopulate (r3685295405).
+    const prevIds = _missingFoldersLastIds;
+    const currentIds = folders.map(f => f.id).sort((a, b) => a - b);
     // Keep the poll snapshot in sync with what this POST just observed on
     // the server — closeMissingFoldersModal() and the 10-minute interval
     // both call checkMissingFolders() next, and without this the poll
     // would see (last-poll ≠ post-POST) and fire a second redundant
     // vireo:folder-health-changed for the same transition.
-    _missingFoldersLastIds = folders.map(f => f.id).sort((a, b) => a - b);
+    _missingFoldersLastIds = currentIds;
+    const dispatched = _dispatchFolderHealthChangeFromIds(
+      prevIds, currentIds, 'check-health');
+    // Narrow initial-load race: the user opened this modal before the
+    // page-load ``checkMissingFolders()`` finished, so no ID baseline
+    // exists yet. Preserve the pre-fix behavior in that window — a
+    // status flip in the active workspace still needs to reach Browse.
+    // Cross-workspace flips remain filtered as soon as any poll runs.
+    if (!dispatched && prevIds === null && data.changed) {
+      document.dispatchEvent(new CustomEvent('vireo:folder-health-changed', {
+        detail: { restored: [], wentMissing: [], source: 'check-health' },
+      }));
+    }
     if (folders.length === 0) {
       container.textContent = '';
       const ok = document.createElement('p');

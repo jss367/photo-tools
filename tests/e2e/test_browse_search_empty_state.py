@@ -158,6 +158,147 @@ def test_background_health_recovery_refreshes_browse(live_server, page, tmp_path
     expect(page.locator("#filterSummary")).to_contain_text("of 5")
 
 
+def test_relocation_refreshes_browse_when_check_health_reports_no_change(
+    live_server, page, tmp_path
+):
+    """Relocating a missing folder via the modal must refresh Browse even
+    though ``/api/folders/check-health`` reports ``changed=0``.
+
+    ``/api/folders/<id>/relocate`` flips the folder's status to ``ok``
+    before ``loadMissingFolders()`` runs its check-health POST, so the
+    server sees no transition and ``data.changed`` is zero. The
+    workspace's missing set still shrank, and Browse must repopulate —
+    otherwise the just-relocated folder's photos stay hidden until the
+    next 10-minute poll or a manual reload (Codex review r3685295405).
+    """
+    db = live_server["db"]
+    park = tmp_path / "park"
+    yard = tmp_path / "yard"
+    park.mkdir()
+    yard.mkdir()
+    folder_ids = live_server["data"]["folders"]
+    # park is missing (pointed at a non-existent path); yard is ok and
+    # anchors its 2 photos in the initial grid so the reappearance of
+    # park's 3 photos is visible in the count.
+    db.conn.execute(
+        "UPDATE folders SET path = ?, status = 'missing' WHERE id = ?",
+        (str(tmp_path / "gone-park"), folder_ids[0]),
+    )
+    db.conn.execute(
+        "UPDATE folders SET path = ?, status = 'ok' WHERE id = ?",
+        (str(yard), folder_ids[1]),
+    )
+    db.conn.commit()
+
+    page.goto(f"{live_server['url']}/browse")
+    # Wait for the initial /api/folders/missing poll so
+    # _missingFoldersLastIds has park's id as its baseline; otherwise the
+    # workspace-scoped ID diff has nothing to compare against and the
+    # post-relocate check-health response would be treated as first-load
+    # (no dispatch).
+    page.wait_for_function(
+        f"typeof _missingFoldersLastIds !== 'undefined' && "
+        f"_missingFoldersLastIds !== null && "
+        f"_missingFoldersLastIds.length === 1 && "
+        f"_missingFoldersLastIds[0] === {folder_ids[0]}"
+    )
+    expect(page.locator(".grid-card")).to_have_count(2)
+
+    # Simulate what /api/folders/<id>/relocate does server-side: flip
+    # park's status back to ``ok``. The real endpoint uses ``let``-scoped
+    # module state that page.evaluate cannot reach; the post-relocate
+    # UI path (confirmRelocate → loadMissingFolders) is what matters
+    # for this regression, so re-enter it directly below.
+    db.conn.execute(
+        "UPDATE folders SET path = ?, status = 'ok' WHERE id = ?",
+        (str(park), folder_ids[0]),
+    )
+    db.conn.commit()
+
+    with page.expect_response(
+        lambda response: response.url.endswith("/api/folders/check-health")
+    ) as health_response:
+        page.evaluate("loadMissingFolders()")
+
+    # check-health sees no transition — park is already ``ok`` from the
+    # (simulated) relocate. Without the workspace-scoped ID-diff dispatch
+    # this would leave Browse showing only yard's 2 photos.
+    assert health_response.value.json()["changed"] == 0
+    expect(page.locator(".grid-card")).to_have_count(5)
+    expect(page.locator("#filterSummary")).to_contain_text("of 5")
+
+
+def test_check_health_dispatch_ignores_cross_workspace_flips(
+    live_server, page, tmp_path
+):
+    """A folder flip in another workspace must not reset the active Browse.
+
+    ``db.check_folder_health()`` scans every folder in the database and
+    returns a global change count, while ``data.missing`` and Browse are
+    scoped to the active workspace. Dispatching on ``data.changed`` would
+    then blow away the active selection whenever a folder in an
+    unrelated workspace transitioned (Codex review r3685295409).
+    """
+    db = live_server["db"]
+    park = tmp_path / "park"
+    yard = tmp_path / "yard"
+    park.mkdir()
+    yard.mkdir()
+    folder_ids = live_server["data"]["folders"]
+    db.conn.execute(
+        "UPDATE folders SET path = ?, status = 'ok' WHERE id = ?",
+        (str(park), folder_ids[0]),
+    )
+    db.conn.execute(
+        "UPDATE folders SET path = ?, status = 'ok' WHERE id = ?",
+        (str(yard), folder_ids[1]),
+    )
+
+    # Add a folder linked only to Field Work whose disk path is already
+    # gone — the next check_folder_health() will flip its status to
+    # ``missing`` and bump the global change count without affecting the
+    # active Default workspace's missing set.
+    field_ws = db.conn.execute(
+        "SELECT id FROM workspaces WHERE name = 'Field Work'"
+    ).fetchone()["id"]
+    other_folder_id = db.conn.execute(
+        "INSERT INTO folders (path, name, status) VALUES (?, ?, 'ok')",
+        (str(tmp_path / "gone-field-folder"), "field"),
+    ).lastrowid
+    db.conn.execute(
+        "INSERT INTO workspace_folders (workspace_id, folder_id, is_root) "
+        "VALUES (?, ?, 1)",
+        (field_ws, other_folder_id),
+    )
+    db.conn.commit()
+
+    page.goto(f"{live_server['url']}/browse")
+    page.wait_for_function(
+        "typeof _missingFoldersLastIds !== 'undefined' && "
+        "_missingFoldersLastIds !== null && _missingFoldersLastIds.length === 0"
+    )
+    expect(page.locator(".grid-card")).to_have_count(5)
+
+    # Instrument the dispatch: the event must NOT fire, since only the
+    # Field Work folder transitioned and the active workspace's missing
+    # set is still empty.
+    page.evaluate(
+        "window._folderHealthEvents = 0;"
+        "document.addEventListener('vireo:folder-health-changed', "
+        "  function() { window._folderHealthEvents++; });"
+    )
+
+    with page.expect_response(
+        lambda response: response.url.endswith("/api/folders/check-health")
+    ) as health_response:
+        page.evaluate("openMissingFoldersModal()")
+
+    assert health_response.value.json()["changed"] == 1
+    assert page.evaluate("window._folderHealthEvents") == 0
+    # And the grid stays exactly as it was — no reset, no scope loss.
+    expect(page.locator(".grid-card")).to_have_count(5)
+
+
 def test_keyword_search_empty_state_and_clear(live_server, page):
     """A zero-result keyword search must not look like an empty library."""
     url = live_server["url"]

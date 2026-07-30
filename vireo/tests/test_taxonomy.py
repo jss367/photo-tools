@@ -2105,6 +2105,77 @@ def test_load_local_taxonomy_cache_is_keyed_by_path(tmp_path, monkeypatch):
     assert tax_mod.load_local_taxonomy().is_taxon("second species")
 
 
+def test_load_local_taxonomy_retries_when_file_changes_during_parse(tmp_path, monkeypatch):
+    """A rewrite mid-parse must not cache stale content under the new stat key.
+
+    Without a retry, the post-parse stat would record the new file's metadata
+    while the parsed object still holds the old snapshot. Future calls with a
+    stat that matches the cached key would then keep returning the stale
+    taxonomy indefinitely.
+    """
+    import taxonomy as tax_mod
+
+    tax_mod.clear_taxonomy_cache()
+    persistent = tmp_path / "persistent.json"
+    _write_taxonomy_json(persistent, "first species")
+    monkeypatch.setattr(tax_mod, "TAXONOMY_JSON_PATH", str(persistent))
+
+    real_init = tax_mod.Taxonomy.__init__
+    call_count = {"n": 0}
+
+    def racing_init(self, path):
+        call_count["n"] += 1
+        real_init(self, path)
+        # Race only the first parse; the retry then reads a stable file.
+        if call_count["n"] == 1:
+            _write_taxonomy_json(persistent, "second species that is longer")
+            os.utime(persistent, (2e9, 2e9))
+
+    monkeypatch.setattr(tax_mod.Taxonomy, "__init__", racing_init)
+
+    result = tax_mod.load_local_taxonomy()
+
+    assert result is not None
+    assert result.is_taxon("second species that is longer")
+    assert call_count["n"] == 2
+
+    again = tax_mod.load_local_taxonomy()
+    assert again is result
+    assert call_count["n"] == 2
+
+
+def test_load_local_taxonomy_skips_cache_when_file_keeps_changing(tmp_path, monkeypatch):
+    """A file that keeps moving must not be cached under a mismatched stat.
+
+    When retries exhaust, the parse still returns so the caller sees fresh
+    data, but the cache stays empty so the next call re-checks instead of
+    stranding the process on a stale snapshot.
+    """
+    import taxonomy as tax_mod
+
+    tax_mod.clear_taxonomy_cache()
+    persistent = tmp_path / "persistent.json"
+    _write_taxonomy_json(persistent, "test species")
+    monkeypatch.setattr(tax_mod, "TAXONOMY_JSON_PATH", str(persistent))
+
+    real_init = tax_mod.Taxonomy.__init__
+    counter = {"n": 0}
+
+    def always_racing_init(self, path):
+        counter["n"] += 1
+        real_init(self, path)
+        os.utime(persistent, (counter["n"] + 1e9, counter["n"] + 1e9))
+
+    monkeypatch.setattr(tax_mod.Taxonomy, "__init__", always_racing_init)
+
+    result = tax_mod.load_local_taxonomy()
+
+    assert result is not None
+    assert counter["n"] == tax_mod._TAXONOMY_PARSE_RETRY_LIMIT
+    with tax_mod._taxonomy_cache_lock:
+        assert tax_mod._taxonomy_cache is None
+
+
 def test_taxonomy_save_keeps_cached_instance_current(tmp_path, monkeypatch):
     """save() rewrites the file; the cache must not serve a pre-save copy.
 

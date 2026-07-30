@@ -457,6 +457,14 @@ def find_taxonomy_json():
 _taxonomy_cache_lock = threading.Lock()
 _taxonomy_cache = None  # (path, stat_key, Taxonomy)
 
+# Cap on how many times _load_taxonomy_cached will re-parse a file that
+# keeps changing mid-read. A rewrite during parse means the parsed object
+# does not correspond to the post-parse stat, so caching that pair would
+# serve stale data forever. If the file is still moving after this many
+# tries, we return the last parse without caching it and let the next
+# call try again.
+_TAXONOMY_PARSE_RETRY_LIMIT = 3
+
 
 def clear_taxonomy_cache():
     """Drop the cached Taxonomy so the next load re-reads from disk."""
@@ -483,8 +491,22 @@ def _load_taxonomy_cached(path):
         cached = _taxonomy_cache
         if cached is not None and cached[0] == path and cached[1] == stat_key:
             return cached[2]
-        taxonomy = Taxonomy(path)
-        _taxonomy_cache = (path, _taxonomy_stat_key(path), taxonomy)
+        # Bracket the parse with a pre- and post-stat: if a background
+        # download rewrites the file while Taxonomy(path) is reading it,
+        # the parsed data is a stale snapshot even though a fresh
+        # post-parse stat would look current. Caching that pair would
+        # keep serving the old taxonomy indefinitely. Retry a few times
+        # to get a stable read; if the file keeps changing, return the
+        # latest parse but skip the cache so the next call re-checks.
+        taxonomy = None
+        for _ in range(_TAXONOMY_PARSE_RETRY_LIMIT):
+            pre_stat = _taxonomy_stat_key(path)
+            taxonomy = Taxonomy(path)
+            post_stat = _taxonomy_stat_key(path)
+            if pre_stat == post_stat:
+                _taxonomy_cache = (path, post_stat, taxonomy)
+                return taxonomy
+        _taxonomy_cache = None
         return taxonomy
 
 

@@ -11736,7 +11736,23 @@ async function loadMissingFolders() {
     // stale POST run past its guard used to overwrite the newer POST's
     // "Checking folders…" placeholder with pre-mutation rows or a false
     // failure message (Codex review r3686095489).
-    if (myMutationGen !== _missingFoldersMutationGen) return;
+    //
+    // But *client-side* issuance order isn't a freshness guarantee for
+    // /api/folders/check-health, which mutates the DB and then reads the
+    // post-mutation missing set: if the filesystem changed between the
+    // two server-side scans, the discarded response can represent the
+    // final committed state while the newer-issued POST's already-
+    // dispatched result is now stale. Successful superseded requests
+    // scheduled no reconciliation, leaving the snapshot, banner, and
+    // Browse grid wrong until the ten-minute poll. Schedule a poll to
+    // fire once every in-flight POST has settled — the same wait-for-
+    // settle helper the catch path uses — so one GET reconciles with
+    // whatever the server actually committed last (Codex review
+    // r3686912886).
+    if (myMutationGen !== _missingFoldersMutationGen) {
+      _scheduleMissingFoldersRecovery();
+      return;
+    }
     const prevIds = _missingFoldersLastIds;
     const currentIds = folders.map(f => f.id).sort((a, b) => a - b);
     // Keep the poll snapshot in sync with what this POST just observed

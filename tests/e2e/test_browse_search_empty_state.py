@@ -834,6 +834,111 @@ def test_load_folders_generation_guard_prevents_stale_render(
     )
 
 
+def test_health_refresh_awaits_config_before_loading_photos(
+    live_server, page, tmp_path
+):
+    """A health event fired while /api/config is pending must not load
+    photos with the hard-coded default ``perPage``.
+
+    Regression (Codex review r3686912883): the health-refresh handler used
+    to call ``resetAndLoad({ preserveCollection: true })`` unconditionally,
+    which calls ``loadPhotos()`` against ``perPage = 50`` (the JS default).
+    Bootstrap later applies the configured page size via
+    ``applyBrowseConfig(await _cfgPromise)`` — its own init render is
+    dropped by the health-generation guard, but the ``perPage`` variable
+    it wrote is not. Subsequent pagination then computes offsets against
+    the new size while page 1 was loaded with 50, silently skipping or
+    duplicating photos across the boundary.
+    """
+    import config as cfg
+
+    # Configure a non-default page size. Tiny value so the mismatch would
+    # be dramatic if the fix regressed.
+    saved = cfg.load()
+    saved["photos_per_page"] = 3
+    cfg.save(saved)
+
+    db = live_server["db"]
+    park = tmp_path / "park"
+    yard = tmp_path / "yard"
+    park.mkdir()
+    yard.mkdir()
+    folder_ids = live_server["data"]["folders"]
+    db.conn.executemany(
+        "UPDATE folders SET path = ?, status = 'missing' WHERE id = ?",
+        [(str(park), folder_ids[0]), (str(yard), folder_ids[1])],
+    )
+    db.conn.commit()
+
+    # Hold /api/config so bootstrap and refreshBrowseAfterFolderHealthChange
+    # are both stuck awaiting ``_cfgPromise`` when the health event fires.
+    held_cfg = []
+
+    def _hold_first_cfg(route):
+        if route.request.method == "GET" and not held_cfg:
+            held_cfg.append(route)
+        else:
+            route.continue_()
+
+    page.route("**/api/config", _hold_first_cfg)
+
+    # Capture every /api/photos request the client issues so we can inspect
+    # the per_page value the health refresh's loadPhotos ended up sending.
+    photos_requests = []
+    page.on(
+        "request",
+        lambda req: (
+            photos_requests.append(req.url)
+            if "/api/photos" in req.url and "per_page=" in req.url
+            else None
+        ),
+    )
+
+    page.goto(f"{live_server['url']}/browse")
+    for _ in range(50):
+        if held_cfg:
+            break
+        page.wait_for_timeout(100)
+    assert held_cfg, "/api/config was never requested"
+
+    # Restore folders on disk and dispatch the health event while /api/config
+    # is still pending. Under the pre-fix code, refreshBrowseAfterFolderHealthChange
+    # would immediately call resetAndLoad → loadPhotos using perPage=50.
+    db.conn.executemany(
+        "UPDATE folders SET path = ?, status = 'ok' WHERE id = ?",
+        [(str(park), folder_ids[0]), (str(yard), folder_ids[1])],
+    )
+    db.conn.commit()
+    page.evaluate(
+        "document.dispatchEvent(new CustomEvent('vireo:folder-health-changed', "
+        "{detail: {restored: [], wentMissing: [], source: 'test'}}))"
+    )
+
+    # Give the refresh handler a chance to reach its first await. With the
+    # fix in place it awaits _cfgPromise; without the fix it would already
+    # have fired /api/photos with per_page=50.
+    page.wait_for_timeout(300)
+
+    # Release /api/config so bootstrap and the refresh handler resume with
+    # the configured perPage=3 applied.
+    held_cfg[0].continue_()
+
+    # Wait for the refresh to complete (page 1 fetched from restored folders).
+    page.wait_for_function("photos.length > 0", timeout=10000)
+
+    # Any /api/photos request issued by the health refresh must have used
+    # the configured per_page=3, never the hard-coded 50 that used to leak
+    # through when the event fired before config resolved.
+    assert photos_requests, "health refresh never fetched /api/photos"
+    for url in photos_requests:
+        assert "per_page=3" in url, (
+            f"health-refresh loadPhotos used unconfigured perPage: {url}"
+        )
+        assert "per_page=50" not in url, (
+            f"health-refresh loadPhotos leaked the hard-coded 50: {url}"
+        )
+
+
 def test_missing_folders_recovery_skips_check_when_mutations_hang(
     live_server, page
 ):

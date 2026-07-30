@@ -3626,6 +3626,19 @@ async function refreshBrowseAfterFolderHealthChange() {
   // grid instead of the user's newer selection (Codex review r3684907518).
   // folderHealthRefreshSeq below is the only counter this refresh needs.
 
+  // Apply the effective ``perPage`` (and other cfg values) before any
+  // loadPhotos call. Without this, a health event that fires while
+  // ``_cfgPromise`` is still pending calls resetAndLoad → loadPhotos with
+  // the hard-coded default (50), and bootstrap later applies the configured
+  // size — its own init response is discarded by the health-generation
+  // guard, but the perPage variable it wrote is not, so subsequent
+  // pagination computes offsets against the new size while the health
+  // refresh loaded page 1 with the old size: photos are silently skipped
+  // or duplicated across the boundary (Codex review r3686912883).
+  // applyBrowseConfig is idempotent — safe to call again after bootstrap.
+  try { applyBrowseConfig(await _cfgPromise); } catch (e) {}
+  if (seq !== folderHealthRefreshSeq) return;
+
   // Refresh the scope controls first. If the selected folder just went
   // offline it disappears from /api/folders; clear that stale scope before
   // reloading the grid so Browse falls back to the available workspace.

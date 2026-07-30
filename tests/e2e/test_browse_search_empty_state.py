@@ -394,6 +394,236 @@ def test_bootstrap_defers_load_lock_release_during_health_refresh(
     )
 
 
+def test_bootstrap_seeds_missing_snapshot_from_init_response(
+    live_server, page, tmp_path
+):
+    """/api/browse/init must seed ``_missingFoldersLastIds`` so the first
+    /api/folders/missing observation has a baseline to diff against.
+
+    Regression (Codex review r3686191141): if the background
+    ``_folder_health_loop`` flips folders in the active workspace
+    between ``/api/browse/init`` and the first ``/api/folders/missing``
+    poll, the poll used to return with ``_missingFoldersLastIds ===
+    null`` and its null-baseline early-return silently swallowed the
+    transition. Later polls then saw the post-flip IDs equal to the
+    baseline set by that first poll and never dispatched, leaving the
+    just-rendered Browse grid stuck showing pre-flip state until another
+    transition or a reload. Seeding the baseline from init closes the
+    window.
+    """
+    db = live_server["db"]
+    park = tmp_path / "park"
+    yard = tmp_path / "yard"
+    park.mkdir()
+    yard.mkdir()
+    folder_ids = live_server["data"]["folders"]
+    # park is missing at init time; the init response's
+    # ``missing_folder_ids`` must include park's id so the client seeds
+    # its snapshot with [park].
+    db.conn.execute(
+        "UPDATE folders SET path = ?, status = 'missing' WHERE id = ?",
+        (str(tmp_path / "gone-park"), folder_ids[0]),
+    )
+    db.conn.execute(
+        "UPDATE folders SET path = ?, status = 'ok' WHERE id = ?",
+        (str(yard), folder_ids[1]),
+    )
+    db.conn.commit()
+
+    page.goto(f"{live_server['url']}/browse")
+
+    # After bootstrap settles, the snapshot must equal init's
+    # workspace-scoped missing set — [park] — regardless of whether the
+    # navbar's own initial poll landed first or the init response did.
+    page.wait_for_function(
+        f"typeof _missingFoldersLastIds !== 'undefined' && "
+        f"_missingFoldersLastIds !== null && "
+        f"_missingFoldersLastIds.length === 1 && "
+        f"_missingFoldersLastIds[0] === {folder_ids[0]}"
+    )
+
+    # Instrument dispatches so we can verify the next poll transitions
+    # the seeded [park] → [] state into a folder-health-changed event.
+    page.evaluate(
+        "window._folderHealthEvents = [];"
+        "document.addEventListener('vireo:folder-health-changed', "
+        "  function(e) { window._folderHealthEvents.push(e.detail.source); });"
+    )
+
+    # Server-side background loop restores park (no client involvement,
+    # no /api/folders/check-health POST). The next poll must diff the
+    # seeded [park] against the newly-observed [] and dispatch, so
+    # Browse repopulates with park's photos.
+    db.conn.execute(
+        "UPDATE folders SET path = ?, status = 'ok' WHERE id = ?",
+        (str(park), folder_ids[0]),
+    )
+    db.conn.commit()
+
+    page.evaluate("checkMissingFolders()")
+
+    page.wait_for_function(
+        "window._folderHealthEvents.length > 0", timeout=5000
+    )
+    assert page.evaluate("_missingFoldersLastIds") == []
+    expect(page.locator(".grid-card")).to_have_count(5)
+
+
+def test_bootstrap_defers_lock_release_when_init_rejects(
+    live_server, page, tmp_path
+):
+    """Bootstrap must not release the load lock when /api/browse/init
+    rejects while a concurrent health refresh owns it.
+
+    Regression (Codex review r3686191138): the finally-region guard on
+    ``healthChangedDuringInit`` used to be assigned only in the try's
+    success path (after the init await). If a folder-health event fired
+    during init AND init then rejected, the assignment was skipped and
+    the guard treated the flag as false — clearing ``loading`` even
+    though the health refresh's ``loadPhotos`` still held the mutex,
+    letting the intersection observer fire a duplicate page-1 request
+    against the same ``loadEpoch``.
+    """
+    db = live_server["db"]
+    park = tmp_path / "park"
+    yard = tmp_path / "yard"
+    park.mkdir()
+    yard.mkdir()
+    folder_ids = live_server["data"]["folders"]
+    db.conn.executemany(
+        "UPDATE folders SET path = ?, status = 'missing' WHERE id = ?",
+        [
+            (str(tmp_path / "gone-park"), folder_ids[0]),
+            (str(tmp_path / "gone-yard"), folder_ids[1]),
+        ],
+    )
+    db.conn.commit()
+
+    # Fail the first init request with a 500 so bootstrap's catch runs;
+    # allow subsequent /api/browse/init requests (there are none in normal
+    # bootstrap flow, but keeps the route robust).
+    aborted_init = []
+
+    def _fail_first_init(route):
+        if not aborted_init:
+            aborted_init.append(route)
+            route.fulfill(status=500, body='{"error": "simulated"}',
+                          content_type="application/json")
+        else:
+            route.continue_()
+
+    page.route("**/api/browse/init**", _fail_first_init)
+
+    page.goto(f"{live_server['url']}/browse")
+    for _ in range(50):
+        if aborted_init:
+            break
+        page.wait_for_timeout(100)
+    assert aborted_init, "init request was never issued"
+
+    # Now restore the folders and dispatch the health-change event.
+    # refreshBrowseAfterFolderHealthChange bumps folderHealthRefreshSeq,
+    # reloads the sidebars, and runs resetAndLoad → loadPhotos.
+    db.conn.executemany(
+        "UPDATE folders SET path = ?, status = 'ok' WHERE id = ?",
+        [(str(park), folder_ids[0]), (str(yard), folder_ids[1])],
+    )
+    db.conn.commit()
+    page.evaluate(
+        "document.dispatchEvent(new CustomEvent('vireo:folder-health-changed', "
+        "{detail: {restored: [], wentMissing: [], source: 'test'}}))"
+    )
+
+    # Wait for the health refresh's loadPhotos to populate the grid.
+    page.wait_for_function("photos.length === 5", timeout=15000)
+
+    # Bootstrap's catch has already run (init rejected synchronously via
+    # the 500). Its finally-region MUST have deferred to the concurrent
+    # refresh — no duplicate cards, no double-fetch.
+    expect(page.locator(".grid-card")).to_have_count(5)
+    unique_photos = page.evaluate("new Set(photos.map(p => p.id)).size")
+    assert unique_photos == page.evaluate("photos.length"), (
+        "duplicate photos in grid — bootstrap's catch released the load "
+        "lock even though the concurrent health refresh owned it"
+    )
+
+
+def test_check_health_null_baseline_ignores_cross_workspace_flip(
+    live_server, page, tmp_path
+):
+    """The null-baseline fallback in loadMissingFolders() must gate on
+    ``workspace_changed``, not on the global ``changed`` count.
+
+    Regression (Codex review r3686191131): when the user opened the
+    missing-folders modal before any /api/folders/missing poll or
+    /api/browse/init seeded ``_missingFoldersLastIds``, the modal POST
+    ran with ``prevIds === null`` and dispatched
+    ``vireo:folder-health-changed`` whenever ``data.changed > 0`` — even
+    when the transition was in another workspace. That would reset the
+    active Browse grid, selection, and detail panel for a change that
+    never touched the active dataset.
+    """
+    db = live_server["db"]
+    park = tmp_path / "park"
+    yard = tmp_path / "yard"
+    park.mkdir()
+    yard.mkdir()
+    folder_ids = live_server["data"]["folders"]
+    db.conn.execute(
+        "UPDATE folders SET path = ?, status = 'ok' WHERE id = ?",
+        (str(park), folder_ids[0]),
+    )
+    db.conn.execute(
+        "UPDATE folders SET path = ?, status = 'ok' WHERE id = ?",
+        (str(yard), folder_ids[1]),
+    )
+
+    # A folder linked only to Field Work whose disk path is gone — the
+    # check-health scan will flip it to ``missing`` and bump the global
+    # ``changed`` count without changing the active workspace's set.
+    field_ws = db.conn.execute(
+        "SELECT id FROM workspaces WHERE name = 'Field Work'"
+    ).fetchone()["id"]
+    other_folder_id = db.conn.execute(
+        "INSERT INTO folders (path, name, status) VALUES (?, ?, 'ok')",
+        (str(tmp_path / "gone-field-folder"), "field"),
+    ).lastrowid
+    db.conn.execute(
+        "INSERT INTO workspace_folders (workspace_id, folder_id, is_root) "
+        "VALUES (?, ?, 1)",
+        (field_ws, other_folder_id),
+    )
+    db.conn.commit()
+
+    page.goto(f"{live_server['url']}/browse")
+    # Wait for the grid to fully render.
+    expect(page.locator(".grid-card")).to_have_count(5)
+
+    # Force null-baseline: reset the snapshot AFTER load so the modal
+    # POST hits the fallback branch. Then instrument the dispatch.
+    page.evaluate(
+        "_missingFoldersLastIds = null;"
+        "window._folderHealthEvents = 0;"
+        "document.addEventListener('vireo:folder-health-changed', "
+        "  function() { window._folderHealthEvents++; });"
+    )
+
+    with page.expect_response(
+        lambda response: response.url.endswith("/api/folders/check-health")
+    ) as health_response:
+        page.evaluate("openMissingFoldersModal()")
+
+    # The server reports a global change (Field Work's folder flipped)
+    # but the workspace-scoped diff is empty.
+    body = health_response.value.json()
+    assert body["changed"] == 1
+    assert body["workspace_changed"] is False
+    # The null-baseline fallback saw workspace_changed=false and did not
+    # dispatch. The grid stays as-is; no reset, no scope loss.
+    assert page.evaluate("window._folderHealthEvents") == 0
+    expect(page.locator(".grid-card")).to_have_count(5)
+
+
 def test_poll_defers_snapshot_update_to_in_flight_check_health_post(
     live_server, page, tmp_path
 ):

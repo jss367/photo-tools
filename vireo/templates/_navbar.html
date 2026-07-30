@@ -11713,11 +11713,17 @@ async function loadMissingFolders() {
     const dispatched = _dispatchFolderHealthChangeFromIds(
       prevIds, currentIds, 'check-health');
     // Narrow initial-load race: the user opened this modal before the
-    // page-load ``checkMissingFolders()`` finished, so no ID baseline
-    // exists yet. Preserve the pre-fix behavior in that window — a
-    // status flip in the active workspace still needs to reach Browse.
-    // Cross-workspace flips remain filtered as soon as any poll runs.
-    if (!dispatched && prevIds === null && data.changed) {
+    // page-load ``checkMissingFolders()`` finished AND before /api/browse/init
+    // seeded the snapshot, so no ID baseline exists yet. Preserve the pre-fix
+    // behavior in that window — a status flip in the active workspace still
+    // needs to reach Browse — but gate on ``workspace_changed`` (server-side
+    // computed pre-vs-post-check diff of THIS workspace's missing set)
+    // instead of ``data.changed`` (a global count across all workspaces).
+    // Without the workspace-scoped gate this fallback would fire for a
+    // cross-workspace flip and blow away the active selection / detail view
+    // for a transition that never touched the active dataset
+    // (Codex review r3686191131).
+    if (!dispatched && prevIds === null && data.workspace_changed) {
       document.dispatchEvent(new CustomEvent('vireo:folder-health-changed', {
         detail: { restored: [], wentMissing: [], source: 'check-health' },
       }));

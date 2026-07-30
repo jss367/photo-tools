@@ -2863,6 +2863,21 @@ async function bootstrapBrowse() {
   // Declared out here so the finally-region guard below can read it even
   // if /api/browse/init throws before the assignment inside the try.
   var healthChangedDuringInit = false;
+  // Snapshot the health-refresh generation before any await so we can
+  // detect a concurrent refresh from BOTH the try's success path and
+  // its catch. If a vireo:folder-health-changed event fires while
+  // /api/browse/init is in flight, refreshBrowseAfterFolderHealthChange()
+  // will have already reloaded folders/keywords/collections and the grid
+  // from the fresh post-flip state. Populating ``photos`` / rendering the
+  // sidebars from this pre-flip response afterwards would silently
+  // overwrite that fresher refresh with stale data — leaving the grid
+  // empty until another event or a manual reload (Codex review
+  // r3685515800). Snapshotting here (outside the try) also lets the
+  // catch below recompute the flag when the init request rejects: the
+  // in-try assignment used to be skipped by the throw, leaving the
+  // finally-region guard to release the load lock the concurrent health
+  // refresh's ``loadPhotos`` still owned (Codex review r3686191138).
+  var bootstrapHealthSeq = folderHealthRefreshSeq;
   try {
     applyBrowseConfig(await _cfgPromise);
     var pageParams = new URLSearchParams(window.location.search);
@@ -2886,17 +2901,25 @@ async function bootstrapBrowse() {
     // in either case.
     if (activeCollectionId) initParams.set('collection_id', activeCollectionId);
     initParams.set('per_page', perPage);
-    // Snapshot the health-refresh generation before issuing /api/browse/init.
-    // If a vireo:folder-health-changed event fires while this request is in
-    // flight, refreshBrowseAfterFolderHealthChange() will have already
-    // reloaded folders/keywords/collections and the grid from the fresh
-    // post-flip state. Populating ``photos`` / rendering the sidebars from
-    // this pre-flip response afterwards would silently overwrite that
-    // fresher refresh with stale data — leaving the grid empty until
-    // another event or a manual reload (Codex review r3685515800).
-    var bootstrapHealthSeq = folderHealthRefreshSeq;
     var data = await safeFetch('/api/browse/init?' + initParams.toString());
     healthChangedDuringInit = folderHealthRefreshSeq !== bootstrapHealthSeq;
+
+    // Seed the navbar's missing-folder snapshot from init's workspace-scoped
+    // view so the first /api/folders/missing observation has a baseline to
+    // compare against. Without this, a background _folder_health_loop flip
+    // that runs between /api/browse/init and the first navbar poll leaves
+    // the poll's null-baseline branch returning false — later polls then
+    // see the same IDs and never dispatch, so Browse stays showing the
+    // pre-flip state until another transition or a reload (Codex review
+    // r3686191141). Only seed if still null — a poll (or modal POST) that
+    // already landed is a fresher source of truth than this init snapshot.
+    if (typeof _missingFoldersLastIds !== 'undefined' &&
+        _missingFoldersLastIds === null &&
+        Array.isArray(data.missing_folder_ids)) {
+      _missingFoldersLastIds = data.missing_folder_ids
+        .slice()
+        .sort(function(a, b) { return a - b; });
+    }
 
     if (!healthChangedDuringInit) {
       // Populate everything from a single response
@@ -2908,7 +2931,6 @@ async function bootstrapBrowse() {
       renderFolderTree(data.folders || []);
       renderKeywordTree(data.keywords || []);
       renderCollectionList(data.collections || []);
-      loadCollectionCounts();
       renderGrid();
       updateFilterSummary();
       loadSummary();
@@ -3088,6 +3110,15 @@ async function bootstrapBrowse() {
       }
     }).catch(function() {});
   } catch(e) {
+    // /api/browse/init rejected — recompute healthChangedDuringInit so the
+    // finally-region guard below correctly defers to a concurrent health
+    // refresh that owns the load lock. The assignment inside the try was
+    // skipped by the throw, and without recomputing here we would clear
+    // ``loading`` even though the health refresh's ``loadPhotos`` still
+    // holds the mutex, letting the intersection observer fire a duplicate
+    // page-1 request against the same ``loadEpoch``
+    // (Codex review r3686191138).
+    healthChangedDuringInit = folderHealthRefreshSeq !== bootstrapHealthSeq;
     document.getElementById('loadingState').textContent = 'Error loading.';
   }
   // If a folder-health event fired while /api/browse/init was in flight,

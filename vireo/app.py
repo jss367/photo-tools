@@ -4814,6 +4814,14 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         folders = db.get_folder_tree()
         keywords = db.get_keyword_tree()
         collections = db.get_collections()
+        # Snapshot the active workspace's missing-folder IDs so the client's
+        # navbar can seed ``_missingFoldersLastIds`` from this init response.
+        # Without a baseline, the first /api/folders/missing observation
+        # returns false when a background _folder_health_loop flip runs
+        # between init and the poll — later polls then see the same IDs and
+        # never dispatch, leaving Browse stuck showing the pre-flip state
+        # (Codex review r3686191141).
+        missing_folder_ids = [f["id"] for f in db.get_missing_folders()]
 
         photo_dicts = [dict(p) for p in photos]
         _attach_location_statuses(db, photo_dicts)
@@ -4868,6 +4876,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 "folders": [dict(f) for f in folders],
                 "keywords": [dict(k) for k in keywords],
                 "collections": collection_dicts,
+                "missing_folder_ids": missing_folder_ids,
             }
         )
 
@@ -5817,6 +5826,16 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
     @app.route("/api/folders/check-health", methods=["POST"])
     def api_folders_check_health():
         db = _get_db()
+        # ``check_folder_health()`` scans every folder in the DB and returns a
+        # global change count, but the client needs to know whether the
+        # ACTIVE workspace's missing set changed. Snapshot the workspace-
+        # scoped missing IDs before and after so the client's null-baseline
+        # fallback in loadMissingFolders() (fired when the modal opens before
+        # any poll seeds the snapshot) can distinguish a cross-workspace
+        # flip — which must NOT reset the active Browse — from a real
+        # active-workspace transition that still needs to notify Browse
+        # (Codex review r3686191131).
+        ws_missing_before = {f["id"] for f in db.get_missing_folders()}
         changed = db.check_folder_health()
         # A folder flipping ok→missing turns every one of its photos into a
         # ghost, and missing→ok resurrects them. Either transition would
@@ -5825,8 +5844,10 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         if changed:
             _invalidate_missing_originals_cache()
         missing = db.get_missing_folders()
+        ws_missing_after = {f["id"] for f in missing}
         return jsonify({
             "changed": changed,
+            "workspace_changed": ws_missing_before != ws_missing_after,
             "missing": [dict(f) for f in missing],
         })
 

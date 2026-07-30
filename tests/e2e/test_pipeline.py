@@ -608,3 +608,36 @@ def test_pipeline_shared_card_not_done_until_all_substages_complete(live_server,
         }});
     """)
     expect(page.locator("#pillClassify")).to_contain_text("Done")
+
+
+def test_pipeline_extract_card_reports_unreadable_photos(live_server, page):
+    """The Extract card must show what actually happened to the photos.
+
+    Two failures met here in production: the card read `masks_created` /
+    `scored_count`, field names the backend never emits, so its summary was
+    always blank; and unreadable sources were counted as ordinary skips. A
+    dropped share therefore rendered as an empty, green "Done!" card while
+    311 of 706 photos went unmasked — and every unmasked photo is then
+    hard-rejected in Process Review as `no_subject_mask`.
+    """
+    url = live_server["url"]
+    page.goto(f"{url}/pipeline")
+    page.evaluate("""
+        _onPipelineComplete({
+          status: 'failed',
+          result: {
+            stages: {extract_masks: {
+              masked: 395, skipped: 0, unreadable: 311, failed: 0, total: 706,
+            }},
+            errors: [
+              '[extract_masks] Fatal: 311 of 706 photos unreachable — ' +
+              'volume /Volumes/Photography is not mounted.',
+            ],
+          },
+        });
+    """)
+    summary = page.locator("#txtMasks")
+    expect(summary).to_contain_text("395 masked")
+    expect(summary).to_contain_text("311 unreadable")
+    expect(page.locator("#pillExtract")).to_contain_text("Failed")
+    expect(page.locator("#statusExtract")).to_contain_text("unreachable")

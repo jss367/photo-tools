@@ -2697,6 +2697,24 @@ function _showPipelineError(messages) {
   banner.scrollIntoView({behavior: 'smooth', block: 'nearest'});
 }
 
+// Per-photo outcomes for the Extract card, in the order the user cares
+// about. `masked`/`skipped`/`unreadable`/`failed`/`total` are what both the
+// pipeline stage and /api/jobs/extract-masks actually emit — this card used
+// to read `masks_created`/`scored_count`, names no backend has ever sent, so
+// its summary rendered empty on every run.
+function _extractMasksSummary(ext) {
+  if (!ext) return '';
+  var parts = [];
+  if (ext.masked) parts.push(ext.masked + ' masked');
+  if (ext.skipped) parts.push(ext.skipped + ' skipped');
+  // Distinct from "skipped": a skip means SAM looked and found no subject,
+  // unreadable means the source file never opened (dropped share, corrupt
+  // file). Both leave the photo unmasked, but only one is the user's to fix.
+  if (ext.unreadable) parts.push(ext.unreadable + ' unreadable');
+  if (ext.failed) parts.push(ext.failed + ' failed');
+  return parts.join(', ') || 'No photos needed masks';
+}
+
 function _onPipelineComplete(result) {
   if (result.status === 'cancelled') {
     var actionStatus = document.getElementById('pipelineActionStatus');
@@ -2788,16 +2806,31 @@ function _onPipelineComplete(result) {
 
   // Extract card
   if (stageResults.extract_masks) {
-    document.getElementById('numExtract').className = 'stage-num complete';
     var ext = stageResults.extract_masks;
-    var extSummary = [];
-    if (ext.masks_created) extSummary.push(ext.masks_created + ' masks');
-    if (ext.scored_count) extSummary.push(ext.scored_count + ' sharpness');
-    document.getElementById('txtMasks').textContent = extSummary.join(', ');
+    document.getElementById('txtMasks').textContent = _extractMasksSummary(ext);
+    // A photo the stage couldn't read or that errored ends the run with no
+    // mask, and scoring hard-rejects every unmasked photo as
+    // `no_subject_mask`. Marking the card complete/"Done!" in that state
+    // sends the user to Process Review with no idea why two-thirds of their
+    // encounters are rejects.
+    var extClean = !ext.unreadable && !ext.failed;
+    document.getElementById('numExtract').className =
+      extClean ? 'stage-num complete' : 'stage-num';
     var statusExt = document.getElementById('statusExtract');
     var fillExt = document.getElementById('fillExtract');
     if (fillExt) fillExt.style.width = '100%';
-    if (statusExt) { statusExt.textContent = 'Done!'; statusExt.className = 'status-msg ok'; }
+    if (statusExt) {
+      if (extClean) {
+        statusExt.textContent = 'Done!';
+        statusExt.className = 'status-msg ok';
+      } else {
+        // The errors loop below replaces this with the stage's actionable
+        // message ("Failed: [extract_masks] …"); this is the fallback for a
+        // stage that reported bad counts without an error entry.
+        statusExt.textContent = 'Some photos have no mask';
+        statusExt.className = 'status-msg error';
+      }
+    }
   }
 
   // Eye Keypoints card
@@ -3870,11 +3903,8 @@ async function runExtractStep(collectionId) {
             status.className = 'status-msg ok';
             num.className = 'stage-num complete';
             if (result.result) {
-              var r = result.result;
-              var summary = [];
-              if (r.masks_created) summary.push(r.masks_created + ' masks');
-              if (r.scored_count) summary.push(r.scored_count + ' sharpness');
-              document.getElementById('txtMasks').textContent = summary.join(', ');
+              document.getElementById('txtMasks').textContent =
+                _extractMasksSummary(result.result);
             }
             resolve(true);
           } else {

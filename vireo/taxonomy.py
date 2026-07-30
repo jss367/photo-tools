@@ -421,6 +421,12 @@ DWCA_URL = "https://www.inaturalist.org/taxa/inaturalist-taxonomy.dwca.zip"
 # directory is an ephemeral _MEI* extraction dir that's rebuilt per run.
 TAXONOMY_JSON_PATH = os.path.expanduser("~/.vireo/taxonomy.json")
 
+# Fallback for dev checkouts that downloaded a taxonomy.json next to this
+# module before the persistent path existed. Named so tests (and the browser
+# suite, which must not pick up a developer's ~500MB local copy) can
+# monkeypatch it instead of patching os.path.dirname globally.
+LEGACY_TAXONOMY_JSON_PATH = os.path.join(os.path.dirname(__file__), "taxonomy.json")
+
 
 def find_taxonomy_json():
     """Return the first existing taxonomy.json path, or the persistent path.
@@ -435,10 +441,66 @@ def find_taxonomy_json():
     """
     if os.path.exists(TAXONOMY_JSON_PATH):
         return TAXONOMY_JSON_PATH
-    legacy_path = os.path.join(os.path.dirname(__file__), "taxonomy.json")
-    if os.path.exists(legacy_path):
-        return legacy_path
+    if os.path.exists(LEGACY_TAXONOMY_JSON_PATH):
+        return LEGACY_TAXONOMY_JSON_PATH
     return TAXONOMY_JSON_PATH
+
+
+# Process-wide cache for the parsed taxonomy. A full iNaturalist
+# taxonomy.json is ~500MB of JSON that expands to a couple of GB of dicts
+# and takes seconds to parse, and request handlers (notably
+# /api/predictions/compare) plus accept/replace call load_local_taxonomy()
+# on every invocation. Re-parsing per call made those requests take
+# seconds-to-minutes and let concurrent requests each allocate their own
+# copy. Keyed by (path, mtime_ns, size) so a re-downloaded taxonomy is
+# still picked up without restarting the app.
+_taxonomy_cache_lock = threading.Lock()
+_taxonomy_cache = None  # (path, stat_key, Taxonomy)
+
+
+def clear_taxonomy_cache():
+    """Drop the cached Taxonomy so the next load re-reads from disk."""
+    global _taxonomy_cache
+    with _taxonomy_cache_lock:
+        _taxonomy_cache = None
+
+
+def _taxonomy_stat_key(path):
+    st = os.stat(path)
+    return (st.st_mtime_ns, st.st_size)
+
+
+def _load_taxonomy_cached(path):
+    """Return the parsed Taxonomy for ``path``, reusing the cached instance.
+
+    The parse happens under the lock on purpose: without it, two requests
+    arriving together would each build a multi-GB structure and thrash swap
+    instead of one waiting for the other's result.
+    """
+    global _taxonomy_cache
+    stat_key = _taxonomy_stat_key(path)
+    with _taxonomy_cache_lock:
+        cached = _taxonomy_cache
+        if cached is not None and cached[0] == path and cached[1] == stat_key:
+            return cached[2]
+        taxonomy = Taxonomy(path)
+        _taxonomy_cache = (path, _taxonomy_stat_key(path), taxonomy)
+        return taxonomy
+
+
+def _restamp_taxonomy_cache(taxonomy):
+    """Refresh the cache key after ``taxonomy`` rewrote its own file."""
+    global _taxonomy_cache
+    with _taxonomy_cache_lock:
+        cached = _taxonomy_cache
+        if cached is None or cached[2] is not taxonomy:
+            return
+        try:
+            _taxonomy_cache = (
+                cached[0], _taxonomy_stat_key(cached[0]), taxonomy,
+            )
+        except OSError:
+            _taxonomy_cache = None
 
 
 def load_local_taxonomy():
@@ -449,16 +511,16 @@ def load_local_taxonomy():
     write) no longer disables taxonomy features if a valid legacy file
     is present. Returns a Taxonomy instance on success, or None if no
     readable taxonomy file exists.
+
+    The returned instance is shared across callers and cached until the
+    file on disk changes — treat it as read-mostly.
     """
-    candidates = [
-        TAXONOMY_JSON_PATH,
-        os.path.join(os.path.dirname(__file__), "taxonomy.json"),
-    ]
+    candidates = [TAXONOMY_JSON_PATH, LEGACY_TAXONOMY_JSON_PATH]
     for path in candidates:
         if not os.path.exists(path):
             continue
         try:
-            return Taxonomy(path)
+            return _load_taxonomy_cached(path)
         except Exception as e:
             log.warning(
                 "Failed to load taxonomy from %s: %s — trying next candidate",
@@ -644,6 +706,11 @@ class Taxonomy:
         with open(self._path, "w") as f:
             json.dump(data, f)
         self._dirty = False
+        # This instance is the one the cache hands out, and it already holds
+        # everything we just wrote. Re-stamp the cache key so the rewrite
+        # doesn't look like an external change and force a needless re-parse
+        # of the file we authored.
+        _restamp_taxonomy_cache(self)
         log.info("Saved updated taxonomy with new alternate names")
 
     def get_hierarchy(self, name):

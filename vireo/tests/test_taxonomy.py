@@ -1511,15 +1511,10 @@ def test_load_local_taxonomy_falls_back_when_persistent_corrupt(tmp_path, monkey
 
     monkeypatch.setattr(tax_mod, "TAXONOMY_JSON_PATH", str(corrupt))
     # Redirect the "package-dir legacy" candidate path to our tmp fixture.
-    orig_dirname = tax_mod.os.path.dirname
-
-    def fake_dirname(p):
-        if p == tax_mod.__file__:
-            return str(tmp_path)
-        return orig_dirname(p)
-
     legacy.rename(tmp_path / "taxonomy.json")
-    monkeypatch.setattr(tax_mod.os.path, "dirname", fake_dirname)
+    monkeypatch.setattr(
+        tax_mod, "LEGACY_TAXONOMY_JSON_PATH", str(tmp_path / "taxonomy.json"),
+    )
 
     result = tax_mod.load_local_taxonomy()
     assert result is not None, "should fall back to legacy copy on corrupt persistent"
@@ -1533,14 +1528,9 @@ def test_load_local_taxonomy_returns_none_when_no_file(tmp_path, monkeypatch):
     monkeypatch.setattr(
         tax_mod, "TAXONOMY_JSON_PATH", str(tmp_path / "nonexistent.json"),
     )
-    orig_dirname = tax_mod.os.path.dirname
-
-    def fake_dirname(p):
-        if p == tax_mod.__file__:
-            return str(tmp_path)
-        return orig_dirname(p)
-
-    monkeypatch.setattr(tax_mod.os.path, "dirname", fake_dirname)
+    monkeypatch.setattr(
+        tax_mod, "LEGACY_TAXONOMY_JSON_PATH", str(tmp_path / "taxonomy.json"),
+    )
     assert tax_mod.load_local_taxonomy() is None
 
 
@@ -2031,3 +2021,107 @@ def test_populate_taxa_db_from_json_enables_auto_detect(tmp_path):
         "SELECT type FROM keywords WHERE id = ?", (kid,)
     ).fetchone()
     assert row["type"] == "taxonomy"
+
+
+def _write_taxonomy_json(path, common_name):
+    """Write a minimal but valid taxonomy.json containing one species."""
+    path.write_text(
+        '{"last_updated":"2026-07-30","source":"test",'
+        '"taxa_by_common":{"' + common_name + '":{"taxon_id":1,'
+        '"scientific_name":"Test species","common_name":"Test",'
+        '"rank":"species","lineage_names":["Animalia","Test species"],'
+        '"lineage_ranks":["kingdom","species"]}},'
+        '"taxa_by_scientific":{}}'
+    )
+
+
+def test_load_local_taxonomy_reuses_parsed_instance(tmp_path, monkeypatch):
+    """Repeated loads reuse the parsed taxonomy instead of re-parsing the file.
+
+    A real iNaturalist taxonomy.json is ~500MB, and ``/api/predictions/compare``
+    calls load_local_taxonomy() on every request. Re-parsing per request made
+    the Compare page take seconds-to-minutes and allocated a fresh multi-GB
+    structure each time.
+    """
+    import taxonomy as tax_mod
+
+    tax_mod.clear_taxonomy_cache()
+    persistent = tmp_path / "persistent.json"
+    _write_taxonomy_json(persistent, "test species")
+    monkeypatch.setattr(tax_mod, "TAXONOMY_JSON_PATH", str(persistent))
+
+    parses = []
+    real_init = tax_mod.Taxonomy.__init__
+
+    def counting_init(self, path):
+        parses.append(path)
+        real_init(self, path)
+
+    monkeypatch.setattr(tax_mod.Taxonomy, "__init__", counting_init)
+
+    first = tax_mod.load_local_taxonomy()
+    second = tax_mod.load_local_taxonomy()
+
+    assert first is not None
+    assert second is first
+    assert len(parses) == 1
+
+
+def test_load_local_taxonomy_reloads_after_file_changes(tmp_path, monkeypatch):
+    """A re-downloaded taxonomy.json is picked up without restarting."""
+    import taxonomy as tax_mod
+
+    tax_mod.clear_taxonomy_cache()
+    persistent = tmp_path / "persistent.json"
+    _write_taxonomy_json(persistent, "old species")
+    monkeypatch.setattr(tax_mod, "TAXONOMY_JSON_PATH", str(persistent))
+
+    first = tax_mod.load_local_taxonomy()
+    assert first.is_taxon("old species")
+
+    _write_taxonomy_json(persistent, "new species that is much longer")
+    os.utime(persistent, (1e9, 1e9))
+
+    second = tax_mod.load_local_taxonomy()
+    assert second is not first
+    assert second.is_taxon("new species that is much longer")
+    assert not second.is_taxon("old species")
+
+
+def test_load_local_taxonomy_cache_is_keyed_by_path(tmp_path, monkeypatch):
+    """Switching to a different taxonomy file does not serve the stale one."""
+    import taxonomy as tax_mod
+
+    tax_mod.clear_taxonomy_cache()
+    first_path = tmp_path / "first.json"
+    second_path = tmp_path / "second.json"
+    _write_taxonomy_json(first_path, "first species")
+    _write_taxonomy_json(second_path, "second species")
+
+    monkeypatch.setattr(tax_mod, "TAXONOMY_JSON_PATH", str(first_path))
+    assert tax_mod.load_local_taxonomy().is_taxon("first species")
+
+    monkeypatch.setattr(tax_mod, "TAXONOMY_JSON_PATH", str(second_path))
+    assert tax_mod.load_local_taxonomy().is_taxon("second species")
+
+
+def test_taxonomy_save_keeps_cached_instance_current(tmp_path, monkeypatch):
+    """save() rewrites the file; the cache must not serve a pre-save copy.
+
+    The instance mutated by api_lookup() is the cached one, so after it
+    persists itself the next load should keep returning that same object
+    rather than re-parsing the file it just wrote.
+    """
+    import taxonomy as tax_mod
+
+    tax_mod.clear_taxonomy_cache()
+    persistent = tmp_path / "persistent.json"
+    _write_taxonomy_json(persistent, "test species")
+    monkeypatch.setattr(tax_mod, "TAXONOMY_JSON_PATH", str(persistent))
+
+    tax = tax_mod.load_local_taxonomy()
+    tax._api_misses.add("nothing here")
+    tax._dirty = True
+    tax.save()
+
+    assert tax_mod.load_local_taxonomy() is tax

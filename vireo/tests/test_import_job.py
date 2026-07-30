@@ -6230,3 +6230,188 @@ def test_include_paths_empty_set_imports_nothing(tmp_path):
     ))
     assert result["copied"] == 0
     assert result["discovered"] == 2
+
+
+def test_deselection_makes_card_unsafe_to_format(tmp_path):
+    from import_job import ImportParams
+
+    card = _make_card(tmp_path, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+        ("DSC_0002.jpg", datetime(2026, 7, 3, 11, 0, 0), "green"),
+    ])
+    _, _, result = _run_import(tmp_path, ImportParams(
+        sources=[str(card)], destination=str(tmp_path / "archive"),
+        include_paths={str(card / "DSC_0001.jpg")},
+        previewed_count=2, checked_count=1,
+    ))
+    assert result["safe_to_format"] is False
+    assert result["unverified_duplicates_only"] is False
+
+
+def test_full_selection_of_card_with_duplicates_is_safe_to_format(tmp_path):
+    """THE duplicate-accounting regression guard.
+
+    Duplicates stay in include_paths, so the checker counts them as
+    skipped_duplicate and the ledger balances. If someone "fixes"
+    include_paths to mean the checked boxes, this goes false and Vireo
+    tells the user not to format a card that is fully archived.
+    """
+    from import_job import ImportParams
+
+    archive = tmp_path / "archive"
+    card = _make_card(tmp_path, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+        ("DSC_0002.jpg", datetime(2026, 7, 3, 11, 0, 0), "green"),
+    ])
+    # First import puts both in the archive.
+    _run_import(tmp_path, ImportParams(
+        sources=[str(card)], destination=str(archive),
+    ))
+    # Second import of the same card: everything is a duplicate.
+    all_paths = {str(card / "DSC_0001.jpg"), str(card / "DSC_0002.jpg")}
+    _, _, result = _run_import(
+        tmp_path, ImportParams(
+            sources=[str(card)], destination=str(archive),
+            include_paths=all_paths, previewed_count=2, checked_count=0,
+        ),
+    )
+    assert result["copied"] == 0
+    assert result["skipped_duplicate"] == 2
+    assert result["safe_to_format"] is True
+
+
+def test_vanished_in_scope_file_makes_card_unsafe(tmp_path):
+    """The ledger equality still balances here — 1 processed of 1 discovered —
+    so this needs its own condition."""
+    from import_job import ImportParams
+
+    card = _make_card(tmp_path, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+    ])
+    gone = str(card / "DSC_0002.jpg")  # previewed, then deleted
+    _, _, result = _run_import(tmp_path, ImportParams(
+        sources=[str(card)], destination=str(tmp_path / "archive"),
+        include_paths={str(card / "DSC_0001.jpg"), gone},
+        previewed_count=2, checked_count=2,
+    ))
+    assert result["copied"] == 1
+    assert result["discovered"] == 1
+    assert result["safe_to_format"] is False
+    assert result["unverified_duplicates_only"] is False
+
+
+def test_deselected_then_vanished_file_makes_card_unsafe(tmp_path):
+    """Deselect X, then X disappears before the job.
+
+    discovered=1, queued=1, copied=1 → the equality balances. vanished_paths
+    is empty because X was never in include_paths. Only the explicit
+    ``deselected == 0`` condition catches this.
+    """
+    from import_job import ImportParams
+
+    card = _make_card(tmp_path, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+    ])
+    _, _, result = _run_import(tmp_path, ImportParams(
+        sources=[str(card)], destination=str(tmp_path / "archive"),
+        include_paths={str(card / "DSC_0001.jpg")},
+        previewed_count=2, checked_count=1,   # DSC_0002 previewed, deselected, gone
+    ))
+    assert result["copied"] == 1
+    assert result["discovered"] == 1
+    assert result["safe_to_format"] is False
+    assert result["unverified_duplicates_only"] is False
+
+
+def _seed_likely_twin(tmp_path, db, name="IMG_0400.jpg"):
+    """Card file + a catalog row matching name/size/capture-time with
+    DIFFERENT bytes. With trust_likely_duplicates=True this drives
+    unverified_duplicate > 0 — the precondition that makes
+    unverified_duplicates_only reachable at all. Lifted from
+    test_trust_likely_duplicates_skips_metadata_match_without_byte_check.
+    """
+    from PIL.ExifTags import Base as ExifBase
+
+    dt = datetime(2026, 5, 1, 10, 15, 30)
+    card = tmp_path / "card"
+    card.mkdir(exist_ok=True)
+    card_file = card / name
+    img = Image.new("RGB", (16, 16), "red")
+    exif = img.getexif()
+    exif[ExifBase.DateTimeOriginal] = dt.strftime("%Y:%m:%d %H:%M:%S")
+    img.save(str(card_file), exif=exif)
+    card_bytes = card_file.read_bytes()
+
+    library = tmp_path / "library"
+    library.mkdir(exist_ok=True)
+    (library / name).write_bytes(
+        card_bytes[:-1] + bytes([card_bytes[-1] ^ 0xFF]))
+
+    fid = db.conn.execute(
+        "INSERT INTO folders (path, name, status) VALUES (?, ?, 'ok')",
+        (str(library), "library"),
+    ).lastrowid
+    db.conn.execute(
+        "INSERT INTO photos (folder_id, filename, extension, file_size,"
+        " timestamp) VALUES (?, ?, '.jpg', ?, ?)",
+        (fid, name, len(card_bytes), "2026-05-01T10:15:30"),
+    )
+    db.conn.commit()
+    return card, card_file
+
+
+def test_deselected_then_vanished_also_blocks_the_amber_verdict(tmp_path):
+    """NON-VACUOUS guard for the second verdict block.
+
+    unverified_duplicates_only's FIRST condition is unverified_duplicate > 0,
+    so any test without a likely-duplicate asserts nothing — the verdict is
+    already False and a patch to safe_to_format alone would pass. This setup
+    makes it True on the baseline, and the ledger equality HOLDS (0 copied +
+    1 skipped == 1 discovered), so only the explicit deselected == 0
+    condition can flip it.
+    """
+    from import_job import ImportParams, run_import_job
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    card, card_file = _seed_likely_twin(tmp_path, db)
+
+    result = run_import_job(
+        _make_job(), FakeRunner(), db_path, db._active_workspace_id,
+        ImportParams(
+            sources=[str(card)], destination=str(tmp_path / "archive"),
+            trust_likely_duplicates=True,
+            include_paths={str(card_file)},
+            previewed_count=2, checked_count=1,  # a 2nd file was deselected, then vanished
+        ),
+    )
+    # Preconditions: without these the assertions below are vacuous.
+    assert result["unverified_duplicate"] == 1
+    assert result["copied"] + result["skipped_duplicate"] == result["discovered"]
+
+    assert result["safe_to_format"] is False
+    assert result["unverified_duplicates_only"] is False
+
+
+def test_vanished_file_also_blocks_the_amber_verdict(tmp_path):
+    """Same non-vacuous shape, for the vanished_paths condition."""
+    from import_job import ImportParams, run_import_job
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    card, card_file = _seed_likely_twin(tmp_path, db)
+
+    result = run_import_job(
+        _make_job(), FakeRunner(), db_path, db._active_workspace_id,
+        ImportParams(
+            sources=[str(card)], destination=str(tmp_path / "archive"),
+            trust_likely_duplicates=True,
+            include_paths={str(card_file), str(card / "GONE.jpg")},
+            previewed_count=2, checked_count=2,
+        ),
+    )
+    assert result["unverified_duplicate"] == 1
+    assert result["copied"] + result["skipped_duplicate"] == result["discovered"]
+
+    assert result["safe_to_format"] is False
+    assert result["unverified_duplicates_only"] is False

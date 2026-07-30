@@ -532,6 +532,23 @@ def _linkable_twin_dirs(rows, under_destination):
     return dirs
 
 
+def _selection_blocks_format(deselected, vanished_paths):
+    """True when the user's selection means the card is NOT fully archived.
+
+    Deliberately separate from the ``(copied + skipped_duplicate) ==
+    discovered`` ledger check. That equality catches these cases *usually*,
+    and three data-loss bugs came from trusting "usually":
+      - deselect X, then X also vanishes -> discovered shrinks too, equality
+        balances, nothing is wrong arithmetically, and a file the user
+        excluded is reported as archived.
+    Do not delete either condition because the other "already covers it".
+
+    Both card-safety verdicts on both copy paths (local and remote) call
+    this, so a new condition added here lands in all four. Do not inline it.
+    """
+    return deselected > 0 or bool(vanished_paths)
+
+
 def _run_remote_import_job(job, runner, db, workspace_id, params):
     """Import to a remote (SSH) archive destination (Task 2.7).
 
@@ -2133,9 +2150,9 @@ def run_import_job(job, runner, db_path, workspace_id, params):
     # length, so overlapping sources (``/card`` plus ``/card/DCIM``) enumerate
     # a file twice and make ``len(discovered_paths) < discovered``. Do not
     # assume the two agree.
-    # (noqa: F841 — both are consumed by the card-safety and drift checks
-    # added later in this PR; drop the noqa when the first usage lands.)
-    discovered_paths = {str(f) for f in files}  # noqa: F841
+    # (``queued`` below keeps its noqa — it is consumed by the drift
+    # reporting added later in this PR.)
+    discovered_paths = {str(f) for f in files}
     if params.include_paths is not None:
         # Matching is exact string equality against ``str(f)`` as produced by
         # ``discover_source_files``. The caller's paths come from that same
@@ -2146,6 +2163,17 @@ def run_import_job(job, runner, db_path, workspace_id, params):
         include = set(params.include_paths)
         files = [f for f in files if str(f) in include]
     queued = len(files)  # noqa: F841
+
+    # Selection drift. Computed against the pre-filter snapshot.
+    # ``appeared`` is unused until the drift-reporting task lands
+    # (noqa: F841); the other two gate the card-safety verdicts below.
+    deselected = 0
+    vanished_paths = set()
+    appeared = 0  # noqa: F841
+    if params.include_paths is not None and params.previewed_count is not None:
+        deselected = params.previewed_count - len(params.include_paths)
+        vanished_paths = params.include_paths - discovered_paths
+        appeared = max(0, len(discovered_paths) - params.previewed_count)  # noqa: F841
 
     checker = None
     if params.skip_duplicates:
@@ -3348,6 +3376,7 @@ def run_import_job(job, runner, db_path, workspace_id, params):
         and not partial_scope
         and unverified_duplicate == 0
         and (copied + skipped_duplicate) == discovered
+        and not _selection_blocks_format(deselected, vanished_paths)
     )
     unverified_duplicates_only = (
         unverified_duplicate > 0
@@ -3357,6 +3386,7 @@ def run_import_job(job, runner, db_path, workspace_id, params):
         and not dup_link_failed
         and not partial_scope
         and (copied + skipped_duplicate) == discovered
+        and not _selection_blocks_format(deselected, vanished_paths)
     )
     result = {
         "discovered": discovered,

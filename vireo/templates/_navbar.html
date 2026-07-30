@@ -11198,6 +11198,31 @@ function _dispatchFolderHealthChangeFromIds(prevIds, currentIds, source) {
   return true;
 }
 
+// Shared banner-update helper used by both the GET poll
+// (checkMissingFolders) and the modal POST (loadMissingFolders). The POST
+// must NOT delegate to checkMissingFolders here: if the user closes the
+// modal while its POST is still pending, closeMissingFoldersModal fires a
+// GET that our own _missingFoldersMutationInFlight guard rejects, and a
+// tail-call checkMissingFolders() from the POST body is rejected too —
+// its GET starts while the in-flight counter is still > 0, then finishes
+// after our finally bumps the mutation epoch (stale by both checks). The
+// banner would then keep showing the pre-check state until the next
+// 10-minute poll (Codex review r3686095481). Updating from the POST's
+// authoritative response bypasses the guards entirely.
+function _updateMissingFoldersBanner(folders) {
+  const banner = document.getElementById('missingFoldersBanner');
+  const msg = document.getElementById('missingFoldersMsg');
+  if (!banner || !msg) return;
+  if (folders.length > 0 && folders.length !== _missingBannerDismissedCount) {
+    const s = folders.length === 1 ? '' : 's';
+    msg.textContent = `${folders.length} folder${s} can’t be found on disk.`;
+    banner.style.display = 'flex';
+  } else if (folders.length === 0) {
+    banner.style.display = 'none';
+    _missingBannerDismissedCount = 0;
+  }
+}
+
 async function checkMissingFolders() {
   const myGen = ++_missingFoldersObservationGen;
   const mutationEpochAtStart = _missingFoldersMutationEpoch;
@@ -11217,25 +11242,15 @@ async function checkMissingFolders() {
     // truth. Skip snapshot + dispatch + banner so a pre-commit read
     // can't paint the banner ahead of the POST or fire a false
     // ``wentMissing`` for a transition the POST will handle
-    // (Codex review r3685627312). The POST refreshes the banner via
-    // its own tail call to checkMissingFolders() when it settles the
-    // list to empty; the periodic 10-minute poll picks up any
-    // remaining drift.
+    // (Codex review r3685627312). The POST paints the banner directly
+    // from its own authoritative response via _updateMissingFoldersBanner
+    // — see r3686095481 for why it can't safely delegate back here.
     if (_missingFoldersMutationInFlight > 0 ||
         mutationEpochAtStart !== _missingFoldersMutationEpoch) return;
     const currentIds = folders.map(f => f.id).sort((a, b) => a - b);
     _dispatchFolderHealthChangeFromIds(_missingFoldersLastIds, currentIds, 'poll');
     _missingFoldersLastIds = currentIds;
-    const banner = document.getElementById('missingFoldersBanner');
-    const msg = document.getElementById('missingFoldersMsg');
-    if (folders.length > 0 && folders.length !== _missingBannerDismissedCount) {
-      const s = folders.length === 1 ? '' : 's';
-      msg.textContent = `${folders.length} folder${s} can\u2019t be found on disk.`;
-      banner.style.display = 'flex';
-    } else if (folders.length === 0) {
-      banner.style.display = 'none';
-      _missingBannerDismissedCount = 0;
-    }
+    _updateMissingFoldersBanner(folders);
   } catch (e) { /* ignore */ }
 }
 
@@ -11680,31 +11695,41 @@ async function loadMissingFolders() {
     //     is zero — but the workspace's missing set did change and Browse
     //     still needs to repopulate (r3685295405).
     // A newer POST superseded this one (rare — modal reopened before this
-    // POST finished). Skip snapshot + dispatch so its result becomes the
-    // authority. The modal rows below still render, because the user
-    // opened this modal and is waiting on this POST's data.
-    if (myMutationGen === _missingFoldersMutationGen) {
-      const prevIds = _missingFoldersLastIds;
-      const currentIds = folders.map(f => f.id).sort((a, b) => a - b);
-      // Keep the poll snapshot in sync with what this POST just observed
-      // on the server — closeMissingFoldersModal() and the 10-minute
-      // interval both call checkMissingFolders() next, and without this
-      // the poll would see (last-poll ≠ post-POST) and fire a second
-      // redundant vireo:folder-health-changed for the same transition.
-      _missingFoldersLastIds = currentIds;
-      const dispatched = _dispatchFolderHealthChangeFromIds(
-        prevIds, currentIds, 'check-health');
-      // Narrow initial-load race: the user opened this modal before the
-      // page-load ``checkMissingFolders()`` finished, so no ID baseline
-      // exists yet. Preserve the pre-fix behavior in that window — a
-      // status flip in the active workspace still needs to reach Browse.
-      // Cross-workspace flips remain filtered as soon as any poll runs.
-      if (!dispatched && prevIds === null && data.changed) {
-        document.dispatchEvent(new CustomEvent('vireo:folder-health-changed', {
-          detail: { restored: [], wentMissing: [], source: 'check-health' },
-        }));
-      }
+    // POST finished). Skip *everything* below — snapshot, dispatch,
+    // banner, modal rendering. The newer POST is the freshness authority
+    // and will paint the correct rows/error when it settles; letting a
+    // stale POST run past its guard used to overwrite the newer POST's
+    // "Checking folders…" placeholder with pre-mutation rows or a false
+    // failure message (Codex review r3686095489).
+    if (myMutationGen !== _missingFoldersMutationGen) return;
+    const prevIds = _missingFoldersLastIds;
+    const currentIds = folders.map(f => f.id).sort((a, b) => a - b);
+    // Keep the poll snapshot in sync with what this POST just observed
+    // on the server — closeMissingFoldersModal() and the 10-minute
+    // interval both call checkMissingFolders() next, and without this
+    // the poll would see (last-poll ≠ post-POST) and fire a second
+    // redundant vireo:folder-health-changed for the same transition.
+    _missingFoldersLastIds = currentIds;
+    const dispatched = _dispatchFolderHealthChangeFromIds(
+      prevIds, currentIds, 'check-health');
+    // Narrow initial-load race: the user opened this modal before the
+    // page-load ``checkMissingFolders()`` finished, so no ID baseline
+    // exists yet. Preserve the pre-fix behavior in that window — a
+    // status flip in the active workspace still needs to reach Browse.
+    // Cross-workspace flips remain filtered as soon as any poll runs.
+    if (!dispatched && prevIds === null && data.changed) {
+      document.dispatchEvent(new CustomEvent('vireo:folder-health-changed', {
+        detail: { restored: [], wentMissing: [], source: 'check-health' },
+      }));
     }
+    // Update the banner directly from this POST's authoritative response
+    // rather than tail-calling checkMissingFolders(). See the helper's
+    // comment for the race that made the delegation unrecoverable when
+    // the modal was closed mid-POST (Codex review r3686095481). Runs for
+    // both empty and non-empty results so the banner is right regardless
+    // of whether closeMissingFoldersModal's own GET was rejected by our
+    // in-flight guard.
+    _updateMissingFoldersBanner(folders);
     if (folders.length === 0) {
       container.textContent = '';
       const ok = document.createElement('p');
@@ -11714,7 +11739,6 @@ async function loadMissingFolders() {
       check.style.cssText = 'font-size:18px;line-height:1;';
       ok.append(check, document.createTextNode('All folders are accounted for.'));
       container.appendChild(ok);
-      checkMissingFolders();  // update banner
       return;
     }
     // Paths are user-controlled: build rows with DOM methods instead of
@@ -11746,7 +11770,12 @@ async function loadMissingFolders() {
       container.appendChild(row);
     });
   } catch (e) {
-    container.innerHTML = '<p style="color:var(--text-secondary);">Failed to check folders.</p>';
+    // Same stale guard as the success path — a superseded POST must not
+    // overwrite the newer POST's in-flight "Checking folders…" placeholder
+    // with a false failure message (Codex review r3686095489).
+    if (myMutationGen === _missingFoldersMutationGen) {
+      container.innerHTML = '<p style="color:var(--text-secondary);">Failed to check folders.</p>';
+    }
   } finally {
     // Decrement + bump epoch in the finally so any GET whose ``await``
     // straddled this POST — start OR end — sees the change and defers

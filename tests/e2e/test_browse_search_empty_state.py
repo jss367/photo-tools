@@ -104,6 +104,60 @@ def test_reconnected_folders_refresh_empty_browse(live_server, page, tmp_path):
     expect(page.locator("#filterSummary")).to_contain_text("of 5")
 
 
+def test_background_health_recovery_refreshes_browse(live_server, page, tmp_path):
+    """The 10-minute /api/folders/missing poll must refresh Browse when a
+    server-side background reconnect flips a folder missing→ok.
+
+    Regression: the folder-health event only fired from the modal's
+    /api/folders/check-health POST. The server's own _folder_health_loop
+    runs independently every 10 minutes and can restore a folder with no
+    client involvement; without a diff in the periodic
+    ``checkMissingFolders()`` poll a long-lived Browse view kept its
+    pre-flip empty grid until the user reopened the modal or reloaded
+    (Codex review r3685083009).
+    """
+    db = live_server["db"]
+    park = tmp_path / "park"
+    yard = tmp_path / "yard"
+    park.mkdir()
+    yard.mkdir()
+    folder_ids = live_server["data"]["folders"]
+    db.conn.executemany(
+        "UPDATE folders SET path = ?, status = 'missing' WHERE id = ?",
+        [(str(park), folder_ids[0]), (str(yard), folder_ids[1])],
+    )
+    db.conn.commit()
+
+    page.goto(f"{live_server['url']}/browse")
+    expect(page.locator("#welcomeState")).to_be_visible()
+    expect(page.locator(".grid-card")).to_have_count(0)
+
+    # Wait for the initial poll snapshot to be recorded — otherwise the
+    # next checkMissingFolders() would see _missingFoldersLastIds === null
+    # and treat the first-since-load state as "no change".
+    page.wait_for_function(
+        "typeof _missingFoldersLastIds !== 'undefined' && "
+        "_missingFoldersLastIds !== null && _missingFoldersLastIds.length === 2"
+    )
+
+    # Simulate the server-side _folder_health_loop restoring both folders.
+    # This mutates DB state without ever touching /api/folders/check-health.
+    db.conn.execute(
+        "UPDATE folders SET status = 'ok' WHERE id IN (?, ?)",
+        (folder_ids[0], folder_ids[1]),
+    )
+    db.conn.commit()
+
+    # Fire the periodic poll manually (the real code runs it on a 10-minute
+    # interval). It must diff the missing set, detect the missing→ok
+    # transition, and dispatch vireo:folder-health-changed.
+    page.evaluate("checkMissingFolders()")
+
+    expect(page.locator(".grid-card")).to_have_count(5)
+    expect(page.locator("#welcomeState")).to_be_hidden()
+    expect(page.locator("#filterSummary")).to_contain_text("of 5")
+
+
 def test_keyword_search_empty_state_and_clear(live_server, page):
     """A zero-result keyword search must not look like an empty library."""
     url = live_server["url"]

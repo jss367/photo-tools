@@ -11133,12 +11133,42 @@ function formatDuration(seconds) {
 <script>
 /* ---------- Missing Folders Banner ---------- */
 let _missingBannerDismissedCount = 0;
+// Snapshot of missing-folder ids from the last /api/folders/missing poll.
+// The server's own _folder_health_loop (app.py) flips folders ok\u2194missing on
+// its 10-minute cadence with no client involvement, so the modal's
+// /api/folders/check-health POST is only one of two paths that mutate this
+// set. Without a diff here a long-lived Browse view would keep serving its
+// pre-flip photo grid until the user manually reopened the modal or
+// reloaded \u2014 the background reconnect that just restored the folder would
+// never reach the page (Codex review r3685083009).
+let _missingFoldersLastIds = null;
+
+function _missingFolderIdsChanged(currentIds) {
+  if (_missingFoldersLastIds === null) return false;
+  const prev = _missingFoldersLastIds;
+  if (prev.length !== currentIds.length) return true;
+  for (let i = 0; i < prev.length; i++) {
+    if (prev[i] !== currentIds[i]) return true;
+  }
+  return false;
+}
 
 async function checkMissingFolders() {
   try {
     const resp = await fetch('/api/folders/missing');
     if (!resp.ok) return;
     const folders = await resp.json();
+    const currentIds = folders.map(f => f.id).sort((a, b) => a - b);
+    if (_missingFolderIdsChanged(currentIds)) {
+      const prevSet = new Set(_missingFoldersLastIds);
+      const currSet = new Set(currentIds);
+      const restored = _missingFoldersLastIds.filter(id => !currSet.has(id));
+      const wentMissing = currentIds.filter(id => !prevSet.has(id));
+      document.dispatchEvent(new CustomEvent('vireo:folder-health-changed', {
+        detail: { restored, wentMissing, source: 'poll' },
+      }));
+    }
+    _missingFoldersLastIds = currentIds;
     const banner = document.getElementById('missingFoldersBanner');
     const msg = document.getElementById('missingFoldersMsg');
     if (folders.length > 0 && folders.length !== _missingBannerDismissedCount) {
@@ -11572,10 +11602,16 @@ async function loadMissingFolders() {
     // pre-check empty grid after a drive or network share reconnects.
     if (data.changed) {
       document.dispatchEvent(new CustomEvent('vireo:folder-health-changed', {
-        detail: { changed: data.changed },
+        detail: { changed: data.changed, source: 'check-health' },
       }));
     }
     const folders = data.missing;
+    // Keep the poll snapshot in sync with what this POST just observed on
+    // the server — closeMissingFoldersModal() and the 10-minute interval
+    // both call checkMissingFolders() next, and without this the poll
+    // would see (last-poll ≠ post-POST) and fire a second redundant
+    // vireo:folder-health-changed for the same transition.
+    _missingFoldersLastIds = folders.map(f => f.id).sort((a, b) => a - b);
     if (folders.length === 0) {
       container.textContent = '';
       const ok = document.createElement('p');

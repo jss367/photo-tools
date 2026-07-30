@@ -3631,8 +3631,18 @@ async function refreshBrowseAfterFolderHealthChange() {
   if (timelineMode) loadCalendarData();
 }
 
+// Track the currently-running refresh so awaiters (the photo deep-link
+// loader in particular) can wait for it to settle before re-snapshotting
+// their generation counter and retrying. Without this, a health event
+// that fires while ``?photo_id=…`` is awaiting ``_cfgPromise`` /
+// ``/api/photos/<id>`` / ``/api/browse/init`` used to cancel the deep
+// link permanently — the refresh has no idea what folder the target
+// photo lives in, so Browse fell back to the unscoped workspace grid
+// without scrolling to the requested photo (and VireoFilter was left
+// uninitialized) (Codex review r3686778061).
+var _activeFolderHealthRefresh = Promise.resolve();
 document.addEventListener('vireo:folder-health-changed', function() {
-  refreshBrowseAfterFolderHealthChange();
+  _activeFolderHealthRefresh = refreshBrowseAfterFolderHealthChange();
 });
 
 async function filterByCollection(id, options) {
@@ -8543,13 +8553,12 @@ document.addEventListener('contextmenu', function(e) {
 });
 
 /* ---------- Deep-link: scroll to photo_id if present in URL ---------- */
-(async function() {
-  var params = new URLSearchParams(window.location.search);
-  var photoId = params.get('photo_id');
-  if (!photoId) return;
-  photoId = parseInt(photoId, 10);
-  if (isNaN(photoId)) return;
-
+// Cap retry loops so a folder that keeps flapping (health event on every
+// interval) can't spin this indefinitely — after this many stale
+// interruptions, fall through to whatever refreshBrowseAfterFolderHealthChange
+// last rendered rather than deep-link forever (Codex review r3686778061).
+var _DEEP_LINK_MAX_RETRIES = 5;
+async function _runPhotoDeepLink(photoId) {
   // Snapshot the health-refresh generation BEFORE any await. If a
   // vireo:folder-health-changed event fires while this loader is awaiting
   // /api/photos/<id> or its folder-scoped /api/browse/init,
@@ -8563,22 +8572,28 @@ document.addEventListener('contextmenu', function(e) {
   var isDeepLinkHealthCurrent = function() {
     return folderHealthRefreshSeq === deepLinkHealthSeq;
   };
+  // Signal to the outer retry loop whether we bailed out due to a
+  // concurrent health refresh (retryable) versus completed / errored
+  // (terminal). Returning a boolean keeps the existing return-early
+  // pattern intact — every ``return`` inside the try body is a stale
+  // detection.
+  var wasSuperseded = false;
 
   // Prevent the IntersectionObserver from triggering loadPhotos() while deep-link is loading
   loading = true;
   var deepLinkLoaded = false;
   try {
     applyBrowseConfig(await _cfgPromise);
-    if (!isDeepLinkHealthCurrent()) return;
+    if (!isDeepLinkHealthCurrent()) { wasSuperseded = true; return wasSuperseded; }
     var photo = await safeFetch('/api/photos/' + photoId, {}, { toast: false });
-    if (!isDeepLinkHealthCurrent()) return;
+    if (!isDeepLinkHealthCurrent()) { wasSuperseded = true; return wasSuperseded; }
     if (!photo || !photo.folder_id) {
       // Don't release ``loading`` if a concurrent health refresh owns it
       // (its loadPhotos would then race the intersection observer). The
       // isDeepLinkHealthCurrent check above already returns early in that
       // case, so reaching here means it's safe to release.
       loading = false;
-      return;
+      return wasSuperseded;
     }
 
     // Navigate to the photo's folder
@@ -8599,7 +8614,7 @@ document.addEventListener('contextmenu', function(e) {
     // Load pages until the target photo is found or all pages exhausted
     // (bootstrapBrowse was skipped, so we also need folder/keyword trees)
     var initData = await safeFetch('/api/browse/init?folder_id=' + photo.folder_id + '&per_page=' + perPage + '&sort=' + document.getElementById('sortSelect').value, {}, { toast: false });
-    if (!isDeepLinkHealthCurrent()) return;
+    if (!isDeepLinkHealthCurrent()) { wasSuperseded = true; return wasSuperseded; }
     if (initData) {
       // Seed the navbar's missing-folder snapshot from init's workspace-scoped
       // view so the first /api/folders/missing observation has a baseline to
@@ -8625,7 +8640,7 @@ document.addEventListener('contextmenu', function(e) {
                    typeof _dispatchFolderHealthChangeFromIds === 'function') {
           _dispatchFolderHealthChangeFromIds(
             initMissingIds, _missingFoldersLastIds, 'deep-link-reconcile');
-          if (!isDeepLinkHealthCurrent()) return;
+          if (!isDeepLinkHealthCurrent()) { wasSuperseded = true; return wasSuperseded; }
         }
       }
       renderFolderTree(initData.folders || []);
@@ -8647,10 +8662,10 @@ document.addEventListener('contextmenu', function(e) {
     // or a target beyond the first page spins in a resolved Promise loop.
     // Same freshness guard as above — don't release ``loading`` if a health
     // refresh took ownership while init was in flight.
-    if (!isDeepLinkHealthCurrent()) return;
+    if (!isDeepLinkHealthCurrent()) { wasSuperseded = true; return wasSuperseded; }
     loading = false;
     var el = await loadUntilPhotoRendered(photoId);
-    if (!isDeepLinkHealthCurrent()) return;
+    if (!isDeepLinkHealthCurrent()) { wasSuperseded = true; return wasSuperseded; }
 
     // Update folder tree active state
     document.querySelectorAll('#folderTree .tree-item').forEach(function(el) {
@@ -8711,6 +8726,30 @@ document.addEventListener('contextmenu', function(e) {
       rearmInfiniteScrollObserver();
       requestAnimationFrame(ensureViewportHydrated);
     }
+  }
+  return wasSuperseded;
+}
+
+(async function() {
+  var params = new URLSearchParams(window.location.search);
+  var photoId = params.get('photo_id');
+  if (!photoId) return;
+  photoId = parseInt(photoId, 10);
+  if (isNaN(photoId)) return;
+
+  // If a folder-health refresh interrupts us, wait for it to finish and
+  // retry — otherwise the deep-link is silently abandoned and Browse is
+  // left on whatever the refresh happened to load (usually the unscoped
+  // workspace grid, with the target photo never scrolled into view and
+  // VireoFilter uninitialized) (Codex review r3686778061).
+  for (var attempt = 0; attempt < _DEEP_LINK_MAX_RETRIES; attempt++) {
+    var wasSuperseded = await _runPhotoDeepLink(photoId);
+    if (!wasSuperseded) return;
+    // Await the refresh that stole the load so the next attempt starts
+    // from a settled state and its pre-await snapshot is guaranteed to
+    // match the current generation (unless yet another refresh fires
+    // during the retry, which the loop handles).
+    try { await _activeFolderHealthRefresh; } catch (e) { /* ignore */ }
   }
 })();
 

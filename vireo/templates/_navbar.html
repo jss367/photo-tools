@@ -11223,6 +11223,30 @@ function _updateMissingFoldersBanner(folders) {
   }
 }
 
+// Wait for every in-flight POST mutation to settle, then run one
+// ``checkMissingFolders()``. Used by loadMissingFolders's catch block
+// to guarantee its recovery poll isn't swallowed by its own in-flight
+// counter — which would happen when two POSTs overlap and the newer
+// one fails while the older one is still pending. A firehose safety
+// bound (100 × 50ms = 5s) keeps this from spinning forever if a hung
+// fetch somehow leaves the counter stuck (Codex review r3686778064).
+let _missingFoldersRecoveryScheduled = false;
+function _scheduleMissingFoldersRecovery() {
+  if (_missingFoldersRecoveryScheduled) return;
+  _missingFoldersRecoveryScheduled = true;
+  let attempts = 0;
+  const tick = function() {
+    if (_missingFoldersMutationInFlight === 0 || attempts >= 100) {
+      _missingFoldersRecoveryScheduled = false;
+      checkMissingFolders();
+      return;
+    }
+    attempts++;
+    setTimeout(tick, 50);
+  };
+  setTimeout(tick, 0);
+}
+
 async function checkMissingFolders() {
   const myGen = ++_missingFoldersObservationGen;
   const mutationEpochAtStart = _missingFoldersMutationEpoch;
@@ -11791,7 +11815,15 @@ async function loadMissingFolders() {
     // once ``_missingFoldersMutationInFlight`` has been decremented (and
     // ``_missingFoldersMutationEpoch`` bumped) — otherwise its own
     // in-flight guard rejects it (Codex review r3686605299).
-    setTimeout(checkMissingFolders, 0);
+    //
+    // Additionally, wait for *every* overlapping POST to settle before
+    // running the poll: if a newer POST failed while an older POST is
+    // still pending, decrementing our own counter only takes it from
+    // 2→1, checkMissingFolders still sees ``> 0`` and rejects, and the
+    // older POST is later discarded by its mutation-gen guard — leaving
+    // no request to update the snapshot until the ten-minute interval
+    // (Codex review r3686778064).
+    _scheduleMissingFoldersRecovery();
   } finally {
     // Decrement + bump epoch in the finally so any GET whose ``await``
     // straddled this POST — start OR end — sees the change and defers

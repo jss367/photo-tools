@@ -11782,6 +11782,16 @@ async function loadMissingFolders() {
     if (myMutationGen === _missingFoldersMutationGen) {
       container.innerHTML = '<p style="color:var(--text-secondary);">Failed to check folders.</p>';
     }
+    // When the POST fails (network drop, lost response) the server may have
+    // still committed the folder-status flip before the connection died —
+    // and page-load / modal-close GETs that started while we were in flight
+    // were discarded by our mutation guard. Without a follow-up poll the
+    // banner and Browse grid stay stuck on the pre-POST snapshot until the
+    // ten-minute interval. Schedule a poll AFTER the finally so it runs
+    // once ``_missingFoldersMutationInFlight`` has been decremented (and
+    // ``_missingFoldersMutationEpoch`` bumped) — otherwise its own
+    // in-flight guard rejects it (Codex review r3686605299).
+    setTimeout(checkMissingFolders, 0);
   } finally {
     // Decrement + bump epoch in the finally so any GET whose ``await``
     // straddled this POST — start OR end — sees the change and defers

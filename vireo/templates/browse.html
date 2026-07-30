@@ -2892,16 +2892,27 @@ async function bootstrapBrowse() {
   // finally-region guard to release the load lock the concurrent health
   // refresh's ``loadPhotos`` still owned (Codex review r3686191138).
   var bootstrapHealthSeq = folderHealthRefreshSeq;
+  // Parse URL scope params BEFORE the first await. A folder-health event that
+  // fires while ``_cfgPromise`` is still pending runs
+  // refreshBrowseAfterFolderHealthChange(), which calls resetAndLoad() from
+  // the current ``activeFolderId`` / ``activeCollectionId``. If those were
+  // still null the refresh loads the unscoped workspace grid, and then this
+  // bootstrap's folder-scoped init response is thrown away by the
+  // healthChangedDuringInit guard below — for a plain collection deep link
+  // the browseFilterInitPromise.then replay reopens it, but a folder-only
+  // deep link has no such replay, so Browse would render unscoped despite
+  // ``?folder_id=N`` in the URL (Codex review r3686605296). Assigning here
+  // means any concurrent refresh sees the right scope.
+  var pageParams = new URLSearchParams(window.location.search);
+  var initialFolderId = parseInt(pageParams.get('folder_id'), 10);
+  if (!isNaN(initialFolderId)) activeFolderId = initialFolderId;
+  var initialCollectionId = parseInt(pageParams.get('collection_id'), 10);
+  if (!isNaN(initialCollectionId)) {
+    activeCollectionId = initialCollectionId;
+    dashboardCollectionScope = pageParams.get('dashboard_scope') === '1';
+  }
   try {
     applyBrowseConfig(await _cfgPromise);
-    var pageParams = new URLSearchParams(window.location.search);
-    var initialFolderId = parseInt(pageParams.get('folder_id'), 10);
-    if (!isNaN(initialFolderId)) activeFolderId = initialFolderId;
-    var initialCollectionId = parseInt(pageParams.get('collection_id'), 10);
-    if (!isNaN(initialCollectionId)) {
-      activeCollectionId = initialCollectionId;
-      dashboardCollectionScope = pageParams.get('dashboard_scope') === '1';
-    }
     // Legacy filter deep-link params (rating_min/flag/keyword/dates/…) are
     // compiled into an initial rule tree by VireoFilter.init below, which
     // reloads through /api/photos/query — the bootstrap endpoint is

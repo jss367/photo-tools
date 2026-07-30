@@ -2927,12 +2927,31 @@ async function bootstrapBrowse() {
     // pre-flip state until another transition or a reload (Codex review
     // r3686191141). Only seed if still null — a poll (or modal POST) that
     // already landed is a fresher source of truth than this init snapshot.
+    //
+    // When a poll DID land first with a non-null baseline that differs
+    // from init's, the flip committed between init's baseline read and
+    // the poll's observation. The poll wrote its post-flip snapshot to
+    // ``_missingFoldersLastIds`` without dispatching (null prev), and
+    // init returned with pre-flip photos/folders that we're about to
+    // render below. Left alone, later polls see the same post-flip IDs
+    // and never dispatch — Browse would stay stuck on the stale init
+    // paint forever. Dispatch the init→now transition here so
+    // refreshBrowseAfterFolderHealthChange takes over, and mark the
+    // health-changed flag so the guarded render path skips init's data
+    // (Codex review r3686452019).
     if (typeof _missingFoldersLastIds !== 'undefined' &&
-        _missingFoldersLastIds === null &&
         Array.isArray(data.missing_folder_ids)) {
-      _missingFoldersLastIds = data.missing_folder_ids
+      var initMissingIds = data.missing_folder_ids
         .slice()
         .sort(function(a, b) { return a - b; });
+      if (_missingFoldersLastIds === null) {
+        _missingFoldersLastIds = initMissingIds;
+      } else if (_missingFolderIdsDiffer(initMissingIds, _missingFoldersLastIds) &&
+                 typeof _dispatchFolderHealthChangeFromIds === 'function') {
+        var dispatched = _dispatchFolderHealthChangeFromIds(
+          initMissingIds, _missingFoldersLastIds, 'bootstrap-reconcile');
+        if (dispatched) healthChangedDuringInit = true;
+      }
     }
 
     if (!healthChangedDuringInit) {

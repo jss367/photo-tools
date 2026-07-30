@@ -197,6 +197,57 @@ def test_dashboard_and_browse_share_collection_date_scope(app_and_db):
     assert query_resp.get_json()["ids"] == [photos[2]["id"]]
 
 
+def test_browse_init_captures_missing_baseline_before_folder_tree(
+    app_and_db, monkeypatch,
+):
+    """/api/browse/init must snapshot missing-folder IDs BEFORE reading the
+    folder tree.
+
+    Each SELECT here reads its own committed snapshot (no explicit read
+    transaction), so a ``_folder_health_loop`` commit landing between the
+    two used to produce a split-snapshot response: folders reflected the
+    pre-flip state while ``missing_folder_ids`` reflected the post-flip
+    state. The client seeded ``_missingFoldersLastIds`` from that fresher
+    baseline, so subsequent /api/folders/missing polls saw no diff and
+    never dispatched ``vireo:folder-health-changed`` — Browse stayed
+    stuck on the pre-flip folders and grid until another transition or a
+    reload (Codex review r3686317681). Taking the baseline first guarantees
+    it is at least as OLD as the folder data: any lingering inconsistency
+    now points the "wrong" way, so the very next poll finds a diff and
+    drives a refresh.
+    """
+    from db import Database
+
+    app, _ = app_and_db
+    client = app.test_client()
+
+    call_order = []
+    real_missing = Database.get_missing_folders
+    real_tree = Database.get_folder_tree
+
+    def spy_missing(self):
+        call_order.append("missing")
+        return real_missing(self)
+
+    def spy_tree(self):
+        call_order.append("tree")
+        return real_tree(self)
+
+    monkeypatch.setattr(Database, "get_missing_folders", spy_missing)
+    monkeypatch.setattr(Database, "get_folder_tree", spy_tree)
+
+    resp = client.get("/api/browse/init")
+    assert resp.status_code == 200
+
+    assert "missing" in call_order and "tree" in call_order, (
+        f"expected both reads to run, got {call_order}"
+    )
+    assert call_order.index("missing") < call_order.index("tree"), (
+        "get_missing_folders must run before get_folder_tree so the client's "
+        f"baseline is never fresher than the folder data; call order was {call_order}"
+    )
+
+
 def test_dashboard_options_flags_degraded_collections(app_and_db):
     """Collections whose rules can't compile are flagged so the scope
     picker can disable them instead of 400ing /api/stats and /api/coverage."""

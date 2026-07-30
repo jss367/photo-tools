@@ -2852,6 +2852,20 @@ function clearActiveSelectionAndDetail() {
 }
 
 /* ---------- Bootstrap ---------- */
+// ``folderHealthRefreshSeq`` must be *initialized* before ``bootstrapBrowse()``
+// is invoked, not merely declared. ``var`` hoists the declaration to the top
+// of the script but leaves the value ``undefined`` until this line executes;
+// the paired assignment lives further down at the health-refresh helpers.
+// Bootstrap synchronously reads ``folderHealthRefreshSeq`` into
+// ``bootstrapHealthSeq`` before its first await, so with the initialization
+// happening later, the snapshot was ``undefined``, the outer script then
+// ran the ``= 0`` assignment while bootstrap was awaiting ``/api/browse/init``,
+// and the post-await comparison ``0 !== undefined`` was always true. That
+// made ``healthChangedDuringInit`` fire on every normal load, skipping the
+// render block and leaving Browse empty until VireoFilter.init happened to
+// re-fetch. Initialize here so the pre-await snapshot reads the same ``0``
+// the rest of the script sees (Codex review r3686317674).
+var folderHealthRefreshSeq = 0;
 bootstrapBrowse();
 
 async function bootstrapBrowse() {
@@ -3540,7 +3554,9 @@ function refreshBrowseSidebarCounts() {
   loadCollectionCounts();
 }
 
-var folderHealthRefreshSeq = 0;
+// ``folderHealthRefreshSeq`` is initialized above the bootstrapBrowse()
+// invocation so the pre-await snapshot inside bootstrap reads ``0`` instead
+// of ``undefined`` (Codex review r3686317674).
 async function refreshBrowseAfterFolderHealthChange() {
   var seq = ++folderHealthRefreshSeq;
   // A health-driven dataset refresh is not a user scope change: bumping

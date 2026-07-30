@@ -754,6 +754,28 @@ def test_poll_defers_snapshot_update_to_in_flight_check_health_post(
     page.wait_for_function("_missingFoldersMutationInFlight === 0", timeout=5000)
 
 
+def test_bootstrap_renders_grid_from_init_on_plain_load(live_server, page):
+    """A plain /browse load must render grid cards from init's response.
+
+    Regression: ``bootstrapBrowse()`` synchronously reads
+    ``folderHealthRefreshSeq`` into ``bootstrapHealthSeq`` before its first
+    await. When the paired ``var folderHealthRefreshSeq = 0;`` initialization
+    lived further down the script (past the bootstrapBrowse() invocation),
+    hoisting made the snapshot ``undefined``; the outer script's ``= 0``
+    assignment then ran while bootstrap was awaiting /api/browse/init, and
+    the post-await ``folderHealthRefreshSeq !== bootstrapHealthSeq`` check
+    became ``0 !== undefined`` = true on every normal load. That skipped
+    bootstrap's render block, leaving Browse empty until VireoFilter.init
+    happened to trigger its own reload — which, without an active filter,
+    it does not (Codex review r3686317674).
+    """
+    page.goto(f"{live_server['url']}/browse")
+    # Bootstrap's own render must populate the grid — plain /browse has no
+    # filter/collection deep-link fallback to hide the regression.
+    page.locator(".grid-card").first.wait_for(state="visible", timeout=5000)
+    expect(page.locator(".grid-card")).to_have_count(5)
+
+
 def test_keyword_search_empty_state_and_clear(live_server, page):
     """A zero-result keyword search must not look like an empty library."""
     url = live_server["url"]

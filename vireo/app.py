@@ -4783,6 +4783,30 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             if coll_row is not None and coll_row["visual_json"] is not None:
                 visual_first_paint = True
 
+        # Snapshot the active workspace's missing-folder IDs so the client's
+        # navbar can seed ``_missingFoldersLastIds`` from this init response.
+        # Without a baseline, the first /api/folders/missing observation
+        # returns false when a background _folder_health_loop flip runs
+        # between init and the poll — later polls then see the same IDs and
+        # never dispatch, leaving Browse stuck showing the pre-flip state
+        # (Codex review r3686191141).
+        #
+        # Take this snapshot BEFORE the photo / folder / keyword / collection
+        # reads. Each SELECT reads its own committed snapshot (no explicit
+        # transaction here), so ``_folder_health_loop`` committing between
+        # the folder read and the missing-folder read used to produce a
+        # split-snapshot response: folders reflected the pre-flip state
+        # while ``missing_folder_ids`` reflected the post-flip state. When
+        # the client seeded ``_missingFoldersLastIds`` from that fresher
+        # baseline, the subsequent /api/folders/missing polls saw no diff
+        # and never dispatched vireo:folder-health-changed, so Browse's
+        # sidebar/grid stayed stuck showing the pre-flip folders until
+        # another health transition or a reload (Codex review r3686317681).
+        # Taking the baseline first guarantees it is at least as OLD as the
+        # folder data — any inconsistency now points the "wrong" way, so
+        # the very next poll finds a diff and drives a refresh.
+        missing_folder_ids = [f["id"] for f in db.get_missing_folders()]
+
         # First paint is scope-only (folder / collection / sort); metadata
         # filter deep links compile into the filter bar client-side, which
         # reloads through /api/photos/query once initialized (Phase 5 —
@@ -4814,14 +4838,6 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         folders = db.get_folder_tree()
         keywords = db.get_keyword_tree()
         collections = db.get_collections()
-        # Snapshot the active workspace's missing-folder IDs so the client's
-        # navbar can seed ``_missingFoldersLastIds`` from this init response.
-        # Without a baseline, the first /api/folders/missing observation
-        # returns false when a background _folder_health_loop flip runs
-        # between init and the poll — later polls then see the same IDs and
-        # never dispatch, leaving Browse stuck showing the pre-flip state
-        # (Codex review r3686191141).
-        missing_folder_ids = [f["id"] for f in db.get_missing_folders()]
 
         photo_dicts = [dict(p) for p in photos]
         _attach_location_statuses(db, photo_dicts)

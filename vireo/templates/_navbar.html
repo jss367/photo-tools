@@ -11230,15 +11230,26 @@ function _updateMissingFoldersBanner(folders) {
 // one fails while the older one is still pending. A firehose safety
 // bound (100 × 50ms = 5s) keeps this from spinning forever if a hung
 // fetch somehow leaves the counter stuck (Codex review r3686778064).
+//
+// If the counter never reaches zero within 5s we drop the recovery
+// entirely instead of firing ``checkMissingFolders()`` anyway: its
+// own in-flight guard would reject the GET, wasting a round-trip and
+// giving the false impression that recovery ran. The 10-minute
+// background poll is the only remaining fallback for a genuinely
+// hung POST (Codex review r3686842771).
 let _missingFoldersRecoveryScheduled = false;
 function _scheduleMissingFoldersRecovery() {
   if (_missingFoldersRecoveryScheduled) return;
   _missingFoldersRecoveryScheduled = true;
   let attempts = 0;
   const tick = function() {
-    if (_missingFoldersMutationInFlight === 0 || attempts >= 100) {
+    if (_missingFoldersMutationInFlight === 0) {
       _missingFoldersRecoveryScheduled = false;
       checkMissingFolders();
+      return;
+    }
+    if (attempts >= 100) {
+      _missingFoldersRecoveryScheduled = false;
       return;
     }
     attempts++;

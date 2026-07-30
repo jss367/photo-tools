@@ -754,6 +754,138 @@ def test_poll_defers_snapshot_update_to_in_flight_check_health_post(
     page.wait_for_function("_missingFoldersMutationInFlight === 0", timeout=5000)
 
 
+def test_load_folders_generation_guard_prevents_stale_render(
+    live_server, page, tmp_path
+):
+    """Two overlapping ``loadFolders()`` calls: the later one's response must
+    win the folder-tree render even if the earlier one arrives last.
+
+    Regression (Codex review r3686842772): ``refreshBrowseSidebarCounts()``
+    and every mutation-triggered ``loadFolders()`` fire without any
+    ``shouldRender`` guard. Without an internal generation counter shared
+    across every caller, a slow pre-transition response can arrive after a
+    guarded ``refreshBrowseAfterFolderHealthChange()`` has already
+    repainted the tree with the freshly-restored folders — putting the
+    just-cleared missing folder back into the sidebar and letting the user
+    click it into an empty stale scope.
+    """
+    db = live_server["db"]
+    folder_ids = live_server["data"]["folders"]
+
+    page.goto(f"{live_server['url']}/browse")
+    page.locator(".grid-card").first.wait_for(state="visible", timeout=5000)
+    initial_count = page.evaluate(
+        "document.querySelectorAll('#folderTree .tree-item').length"
+    )
+    assert initial_count >= 2, "test fixture must ship at least two folders"
+
+    # Hold the FIRST post-bootstrap /api/folders response so we can fire a
+    # newer loadFolders() while the older one is still in flight, then let
+    # the older response come back last.
+    held = []
+
+    def _hold_first_folders(route):
+        if route.request.method == "GET" and not held:
+            held.append(route)
+        else:
+            route.continue_()
+
+    page.route("**/api/folders", _hold_first_folders)
+
+    # Kick off the older ("stale") call. Do NOT await the returned promise —
+    # ``page.evaluate`` would otherwise block until the held response returns.
+    page.evaluate("() => { window._staleLoad = loadFolders(); }")
+    for _ in range(50):
+        if held:
+            break
+        page.wait_for_timeout(100)
+    assert held, "older /api/folders request was never issued"
+
+    # Meanwhile, drop one folder in the DB so the second (newer) call reads
+    # a shorter tree. The newer call is unrouted, so its response returns
+    # immediately with the mutated data.
+    db.conn.execute("DELETE FROM folders WHERE id = ?", (folder_ids[-1],))
+    db.conn.commit()
+
+    page.evaluate("() => { window._freshLoad = loadFolders(); }")
+    # Wait for the newer render to repaint the tree with the shorter list.
+    page.wait_for_function(
+        f"document.querySelectorAll('#folderTree .tree-item').length "
+        f"=== {initial_count - 1}",
+        timeout=10000,
+    )
+    fresh_count = page.evaluate(
+        "document.querySelectorAll('#folderTree .tree-item').length"
+    )
+
+    # Release the older, stale response. Under the pre-fix code the older
+    # ``renderFolderTree(data)`` would clobber the tree back to its
+    # pre-mutation shape; the generation guard must drop it silently.
+    held[0].continue_()
+    # Belt-and-suspenders: give the older response's handler a chance to run.
+    page.wait_for_timeout(300)
+
+    final_count = page.evaluate(
+        "document.querySelectorAll('#folderTree .tree-item').length"
+    )
+    assert final_count == fresh_count, (
+        f"stale loadFolders response repainted the tree "
+        f"(expected {fresh_count} items, got {final_count})"
+    )
+
+
+def test_missing_folders_recovery_skips_check_when_mutations_hang(
+    live_server, page
+):
+    """When the mutation counter never returns to zero (a hung POST), the
+    recovery poll must NOT fire ``checkMissingFolders()`` — its own
+    in-flight guard would reject the GET, wasting a round-trip and
+    masking the drop.
+
+    Regression (Codex review r3686842771): the previous escape hatch
+    (``attempts >= 100``) issued a stale ``checkMissingFolders()`` call
+    anyway, guaranteed to be rejected by its ``_missingFoldersMutationInFlight
+    > 0`` guard. The 10-minute background poll is the only remaining
+    fallback for a genuinely hung POST; fire-and-drop instead of
+    fire-and-be-rejected.
+    """
+    page.goto(f"{live_server['url']}/browse")
+    # Wait for the initial poll to settle so the counter is at rest.
+    page.wait_for_function("_missingFoldersMutationInFlight === 0", timeout=10000)
+
+    # Count subsequent /api/folders/missing requests so we can prove none
+    # were issued by the recovery timer.
+    page.evaluate(
+        "window._missingRequestCount = 0;"
+        "const _origFetch = window.fetch;"
+        "window.fetch = function(url, opts) {"
+        "  if (typeof url === 'string' && url.indexOf('/api/folders/missing') !== -1) {"
+        "    window._missingRequestCount++;"
+        "  }"
+        "  return _origFetch.apply(this, arguments);"
+        "};"
+    )
+
+    # Pin the mutation counter above zero to simulate a POST that never
+    # resolves. The recovery timer wakes up every 50ms for 100 attempts.
+    page.evaluate("_missingFoldersMutationInFlight = 5;")
+    page.evaluate("_scheduleMissingFoldersRecovery();")
+
+    # Sleep past the escape-hatch window (100 × 50ms = 5s) with headroom
+    # for scheduler jitter.
+    page.wait_for_timeout(6500)
+
+    # Escape hatch must have released the scheduled flag without firing a
+    # request the mutation guard would immediately reject.
+    assert page.evaluate("_missingFoldersRecoveryScheduled") is False, (
+        "recovery flag was not cleared after escape-hatch window elapsed"
+    )
+    assert page.evaluate("window._missingRequestCount") == 0, (
+        "recovery fired a stale /api/folders/missing GET the mutation guard "
+        "would have rejected"
+    )
+
+
 def test_bootstrap_renders_grid_from_init_on_plain_load(live_server, page):
     """A plain /browse load must render grid cards from init's response.
 

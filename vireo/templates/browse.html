@@ -2034,6 +2034,20 @@ var collectionCountLoadGen = 0;
 // (CodeRabbit review r3684913398).
 var summaryLoadGen = 0;
 var calendarDataLoadGen = 0;
+// Internal generation counters shared across every caller of the sidebar
+// loaders. Without these, ``refreshBrowseSidebarCounts()`` and the various
+// mutation-triggered ``loadKeywords()``/``loadCollections()`` calls fire
+// without any freshness guard, so a slow pre-transition response can arrive
+// after a guarded ``refreshBrowseAfterFolderHealthChange`` render and
+// repaint the sidebar with data that no longer reflects the current health
+// state — reintroducing the offline-folder-in-tree symptom the health
+// refresh was meant to fix (Codex review r3686842772). Every loader checks
+// its captured generation after ``await`` and skips ``render*`` when a
+// newer call has since started, so last-started always wins regardless of
+// which call site issued it.
+var folderLoadGen = 0;
+var keywordLoadGen = 0;
+var collectionLoadGen = 0;
 var collectionsById = {};
 var browseCompareIds = [];
 var browseCompareOffset = 0;
@@ -3224,8 +3238,13 @@ function renderCollectionList(collections) {
 
 /* ---------- Folder Tree ---------- */
 async function loadFolders(opts) {
+  var myGen = ++folderLoadGen;
   try {
     var data = await safeFetch('/api/folders', {}, { toast: false });
+    // Internal freshness guard: a later ``loadFolders()`` call — from any
+    // site — has advanced the generation, so its response is the truth
+    // and ours would just overwrite it with stale data.
+    if (myGen !== folderLoadGen) return;
     // Callers that fire this alongside other refreshes can pass a
     // ``shouldRender`` guard so a slow response cannot overwrite a newer
     // render — see refreshBrowseAfterFolderHealthChange
@@ -3336,8 +3355,13 @@ function filterByFolder(folderId) {
 
 /* ---------- Keyword Tree ---------- */
 async function loadKeywords(opts) {
+  var myGen = ++keywordLoadGen;
   try {
     var data = await safeFetch('/api/keywords', {}, { toast: false });
+    // See loadFolders — same shared-generation freshness guard so an older
+    // response cannot overwrite the keyword tree that a newer caller has
+    // already repainted.
+    if (myGen !== keywordLoadGen) return;
     if (opts && opts.shouldRender && !opts.shouldRender()) return;
     renderKeywordTree(data);
   } catch(e) {}
@@ -3430,8 +3454,13 @@ async function filterByKeyword(name) {
 
 /* ---------- Collections ---------- */
 async function loadCollections(opts) {
+  var myGen = ++collectionLoadGen;
   try {
     var data = await safeFetch('/api/collections', {}, { toast: false });
+    // See loadFolders — same shared-generation freshness guard so an older
+    // response cannot overwrite the collection list that a newer caller
+    // has already repainted.
+    if (myGen !== collectionLoadGen) return;
     if (opts && opts.shouldRender && !opts.shouldRender()) return;
     renderCollectionList(data);
   } catch(e) {}

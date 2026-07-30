@@ -2204,10 +2204,16 @@ def run_import_job(job, runner, db_path, workspace_id, params):
         # which is self-inconsistent, and this module fails closed on
         # inconsistency rather than reading it as "nothing deselected".
         deselected = params.previewed_count - len(include_paths)
-        # The clamp conflates "no new files" with "fewer files than
-        # previewed"; that second case is not lost, it surfaces as a negative
-        # ``deselected`` above, which blocks the card-safety verdicts.
-        # ``appeared`` is a report count, so a negative would be meaningless.
+        # The clamp conflates "no new files" with "the card holds fewer
+        # files than were previewed". That second case is not lost: some
+        # previewed file must be missing, and it is caught either by
+        # ``vanished_paths`` (if it was selected) or by a positive
+        # ``deselected`` (if it was not, since ``include_paths`` is then a
+        # proper subset of the previewed set). NOT by a negative
+        # ``deselected`` — previewed=3 with all three selected and one
+        # vanished gives ``deselected == 0``, and only ``vanished_paths``
+        # blocks it. ``appeared`` is a report count, so a negative would be
+        # meaningless.
         appeared = max(0, len(discovered_paths) - params.previewed_count)  # noqa: F841
 
     checker = None

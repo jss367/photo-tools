@@ -6456,9 +6456,12 @@ def test_include_paths_accepts_a_list(tmp_path):
     """A JSON payload deserializes ``include_paths`` to a list.
 
     The drift math does set arithmetic on it, so without coercing once above
-    the filter this raises TypeError before a single file is copied. The
-    repeat also proves ``deselected`` counts the deduped set: previewed=2
-    minus 1 distinct selected path is a real deselection.
+    the filter this raises TypeError before a single file is copied. That
+    crash is all this test guards: its ``safe_to_format`` assertion still
+    passes under a raw ``len(params.include_paths)``, because the ledger
+    equality already fails here (1 copied, 2 discovered). The guard for the
+    dedupe is ``test_repeated_include_path_does_not_mask_a_deselection``,
+    where the equality balances.
     """
     from import_job import ImportParams
 
@@ -6495,5 +6498,34 @@ def test_negative_deselected_count_makes_card_unsafe(tmp_path):
     ))
     assert result["copied"] == 1
     assert result["discovered"] == 1
+    assert result["safe_to_format"] is False
+    assert result["unverified_duplicates_only"] is False
+
+
+def test_repeated_include_path_does_not_mask_a_deselection(tmp_path):
+    """THE dedupe guard: a repeat must not inflate the selected count.
+
+    Three files previewed; the payload carries A twice and B once, so a raw
+    ``len(params.include_paths)`` reads 3 and computes ``deselected == 0``
+    even though only two distinct files were selected. The third previewed
+    file is not on the card any more, so ``vanished_paths`` is empty too,
+    and the ledger balances (2 copied of 2 discovered) — every other guard
+    is silent. Only counting the deduped set keeps the card unsafe.
+    """
+    from import_job import ImportParams
+
+    card = _make_card(tmp_path, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+        ("DSC_0002.jpg", datetime(2026, 7, 3, 11, 0, 0), "green"),
+    ])
+    a, b = str(card / "DSC_0001.jpg"), str(card / "DSC_0002.jpg")
+    _, _, result = _run_import(tmp_path, ImportParams(
+        sources=[str(card)], destination=str(tmp_path / "archive"),
+        include_paths=[a, a, b], previewed_count=3, checked_count=3,
+    ))
+    # Preconditions: without these the assertion below is vacuous.
+    assert result["copied"] + result["skipped_duplicate"] == result["discovered"]
+    assert result["copied"] == 2
+
     assert result["safe_to_format"] is False
     assert result["unverified_duplicates_only"] is False

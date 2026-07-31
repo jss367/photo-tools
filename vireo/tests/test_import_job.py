@@ -6834,4 +6834,39 @@ def test_step_summary_selected_figure_comes_from_checked_count(tmp_path):
         runner=runner,
     )
     summaries = [kw.get("summary", "") for _, _, kw in runner.step_updates]
-    assert any("1 selected of 2 discovered" in s for s in summaries)
+    # Full equality, not a substring: the discovered total has to survive in
+    # the selection form too. A ``"1 selected"`` substring check would pass
+    # with ``of 2 discovered`` quietly dropped, leaving the user a selected
+    # figure with nothing to read it against.
+    assert "1 selected of 2 discovered, 2 copied, 0 already present, 0 failed" \
+        in summaries
+
+
+def test_step_summary_without_selection_is_unchanged(tmp_path):
+    """The no-selection wording is the one every user sees today.
+
+    Pinned as full equality against the string ``main`` emits (verified by
+    running this assertion on ``main``), because the selection prefix was
+    added by composing around this tail — a substring assertion would pass
+    if the ``of N discovered`` tail were dropped to make room for it. The
+    discovered total appears exactly once in each of the two forms: in the
+    tail here, in the prefix when a selection is present.
+    """
+    from import_job import ImportParams
+
+    card = _make_card(tmp_path, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+        ("DSC_0002.jpg", datetime(2026, 7, 3, 11, 0, 0), "green"),
+    ])
+    runner = FakeRunner()
+    _run_import(
+        tmp_path,
+        ImportParams(
+            sources=[str(card)], destination=str(tmp_path / "archive"),
+        ),
+        runner=runner,
+    )
+    summaries = [kw.get("summary", "") for _, _, kw in runner.step_updates]
+    assert "2 copied, 0 already present, 0 failed of 2 discovered" in summaries
+    # No selection means no selection prefix.
+    assert not any("selected" in s for s in summaries)

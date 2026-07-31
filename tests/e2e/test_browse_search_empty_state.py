@@ -1201,6 +1201,70 @@ def test_health_refresh_skips_stale_reset_when_load_folders_fails(
     expect(page.locator(".grid-card")).to_have_count(2)
 
 
+def test_health_refresh_retry_preserves_unrelated_transition_ids(
+    live_server, page, tmp_path
+):
+    """A folder-tree retry must not reset an unaffected leaf-folder grid."""
+    db = live_server["db"]
+    park = tmp_path / "park"
+    yard = tmp_path / "yard"
+    park.mkdir()
+    yard.mkdir()
+    folder_ids = live_server["data"]["folders"]
+    db.conn.executemany(
+        "UPDATE folders SET path = ?, status = 'ok' WHERE id = ?",
+        [(str(park), folder_ids[0]), (str(yard), folder_ids[1])],
+    )
+    db.conn.commit()
+
+    page.goto(f"{live_server['url']}/browse?folder_id={folder_ids[0]}")
+    expect(page.locator(".grid-card")).to_have_count(3)
+    page.locator(".grid-card").first.click()
+    page.wait_for_function(
+        "document.getElementById('detailContent').classList.contains('visible')",
+        timeout=3000,
+    )
+    selected_id = page.evaluate("selectedPhotoId")
+    load_epoch = page.evaluate("loadEpoch")
+
+    fail_state = {"fired": False}
+
+    def _fail_first_folders(route):
+        if route.request.method == "GET" and not fail_state["fired"]:
+            fail_state["fired"] = True
+            route.fulfill(status=500, body="fail")
+        else:
+            route.continue_()
+
+    page.route("**/api/folders", _fail_first_folders)
+    db.conn.execute(
+        "UPDATE folders SET status = 'missing' WHERE id = ?",
+        (folder_ids[1],),
+    )
+    db.conn.commit()
+    page.evaluate(
+        "document.dispatchEvent(new CustomEvent('vireo:folder-health-changed', "
+        f"{{detail: {{restored: [], wentMissing: [{folder_ids[1]}], "
+        "source: 'test'}}))"
+    )
+
+    # The first folder load fails; the scheduled retry succeeds and removes
+    # yard from the tree. It must carry the original wentMissing id so park
+    # remains recognized as unaffected and its grid is not reset.
+    page.wait_for_function(
+        f"!document.querySelector("
+        f"'#folderTree .tree-item[data-folder-id=\"{folder_ids[1]}\"]')",
+        timeout=5000,
+    )
+    assert fail_state["fired"], "the first folder-tree request did not fail"
+    assert page.evaluate("loadEpoch") == load_epoch
+    assert page.evaluate("selectedPhotoId") == selected_id
+    assert page.evaluate(
+        "document.getElementById('detailContent').classList.contains('visible')"
+    )
+    expect(page.locator(".grid-card")).to_have_count(3)
+
+
 def test_missing_folders_recovery_skips_check_when_mutations_hang(
     live_server, page
 ):

@@ -3717,9 +3717,16 @@ async function refreshBrowseAfterFolderHealthChange(detail) {
   // schedule a retry via the same event listener rather than committing
   // to a decision from stale data (Codex review r3687062925).
   if (loaded[0] === null) {
+    var retryDetail = Object.assign({}, detail || {}, {
+      source: 'refresh-retry'
+    });
     setTimeout(function() {
       document.dispatchEvent(new CustomEvent('vireo:folder-health-changed', {
-        detail: { source: 'refresh-retry' }
+        // Preserve restored/wentMissing ids so the successful retry can still
+        // distinguish an unrelated sibling transition from one that affects
+        // the active folder scope. Dropping them makes the conservative
+        // no-id fallback reset an unaffected grid and selection.
+        detail: retryDetail
       }));
     }, 2000);
     return;

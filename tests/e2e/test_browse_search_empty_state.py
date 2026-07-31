@@ -1070,6 +1070,50 @@ def test_load_collections_renders_older_success_after_newer_failure(
     ).to_have_count(1, timeout=5000)
 
 
+def test_load_keywords_renders_older_success_after_newer_failure(
+    live_server, page
+):
+    """A failed superseder must not suppress the newest successful tree."""
+    db = live_server["db"]
+    page.goto(f"{live_server['url']}/browse")
+    page.wait_for_function("!loading", timeout=5000)
+
+    held = []
+    request_count = 0
+
+    def _hold_success_then_fail(route):
+        nonlocal request_count
+        request_count += 1
+        if request_count == 1:
+            held.append(route)
+        elif request_count == 2:
+            route.fulfill(status=500, body="fail")
+        else:
+            route.continue_()
+
+    page.route("**/api/keywords", _hold_success_then_fail)
+    page.evaluate(
+        "() => { window._olderSuccessfulKeywordLoad = "
+        "loadKeywords({ shouldRender: () => true }); }"
+    )
+    for _ in range(50):
+        if held:
+            break
+        page.wait_for_timeout(100)
+    assert held, "older keyword-tree request was never issued"
+
+    keyword_name = "Fallback keyword"
+    keyword_id = db.add_keyword(keyword_name)
+    db.tag_photo(live_server["data"]["photos"][0], keyword_id)
+    page.evaluate("() => { window._failedKeywordLoad = loadKeywords(); }")
+    page.wait_for_timeout(200)
+    held[0].continue_()
+
+    expect(
+        page.locator(f'#keywordTree .tree-item[data-keyword="{keyword_name}"]')
+    ).to_have_count(1, timeout=5000)
+
+
 def test_health_refresh_awaits_config_before_loading_photos(
     live_server, page, tmp_path
 ):
@@ -1476,6 +1520,49 @@ def test_bounded_folder_retries_reconcile_on_next_normal_poll(live_server, page)
     page.evaluate("() => window._activeFolderHealthRefresh")
     assert page.evaluate("_missingFoldersReconciliationPending") is False
     assert len(folder_requests) == 2
+
+
+def test_failed_health_grid_reload_reconciles_on_next_normal_poll(
+    live_server, page
+):
+    """A transient first-page failure must remain pending for reconciliation."""
+    page.goto(f"{live_server['url']}/browse")
+    expect(page.locator(".grid-card")).to_have_count(5)
+    page.wait_for_function(
+        "typeof _missingFoldersLastIds !== 'undefined' && "
+        "_missingFoldersLastIds !== null"
+    )
+
+    photo_requests = []
+    fail_photos = {"value": True}
+
+    def _fail_photos(route):
+        photo_requests.append(route.request.url)
+        if fail_photos["value"]:
+            route.fulfill(status=500, body="fail")
+        else:
+            route.continue_()
+
+    page.route("**/api/photos/query", _fail_photos)
+    page.evaluate(
+        "document.dispatchEvent(new CustomEvent('vireo:folder-health-changed', {"
+        "detail: {restored: [], wentMissing: [], source: 'test'}}))"
+    )
+    page.evaluate("() => window._activeFolderHealthRefresh")
+
+    expect(page.locator(".grid-card")).to_have_count(0)
+    assert len(photo_requests) == 1
+    assert page.evaluate("_missingFoldersReconciliationPending") is True
+
+    # The missing-folder IDs are unchanged, but the pending marker forces a
+    # synthetic health event and retries the failed page-one grid load.
+    fail_photos["value"] = False
+    page.evaluate("checkMissingFolders()")
+    page.evaluate("() => window._activeFolderHealthRefresh")
+
+    expect(page.locator(".grid-card")).to_have_count(5)
+    assert len(photo_requests) == 2
+    assert page.evaluate("_missingFoldersReconciliationPending") is False
 
 
 def test_missing_folders_recovery_skips_check_when_mutations_hang(

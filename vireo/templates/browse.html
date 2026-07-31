@@ -2054,6 +2054,8 @@ var folderLoadGen = 0;
 var folderLoadStates = {};
 var folderRenderDecisionGen = 0;
 var keywordLoadGen = 0;
+var keywordLoadStates = {};
+var keywordRenderDecisionGen = 0;
 var collectionLoadGen = 0;
 var collectionLoadStates = {};
 var collectionRenderDecisionGen = 0;
@@ -3399,17 +3401,50 @@ function filterByFolder(folderId) {
 }
 
 /* ---------- Keyword Tree ---------- */
+function reconcileKeywordLoadRenders() {
+  // Do not discard the newest usable keyword response merely because a
+  // later request started. Pending newer generations still block it, while
+  // failed newer generations fall back to the newest success just like the
+  // folder and collection loaders.
+  var gen = keywordLoadGen;
+  while (gen > keywordRenderDecisionGen) {
+    var state = keywordLoadStates[gen];
+    if (!state || state.status === 'pending') return;
+    if (state.status === 'success') {
+      var shouldRender = !state.shouldRender || state.shouldRender();
+      keywordRenderDecisionGen = gen;
+      if (shouldRender) renderKeywordTree(state.data);
+      Object.keys(keywordLoadStates).forEach(function(key) {
+        if (Number(key) <= keywordLoadGen) delete keywordLoadStates[key];
+      });
+      return;
+    }
+    gen--;
+  }
+}
+
 async function loadKeywords(opts) {
   var myGen = ++keywordLoadGen;
+  keywordLoadStates[myGen] = {
+    status: 'pending',
+    shouldRender: opts && opts.shouldRender
+  };
   try {
     var data = await safeFetch('/api/keywords', {}, { toast: false });
-    // See loadFolders — same shared-generation freshness guard so an older
-    // response cannot overwrite the keyword tree that a newer caller has
-    // already repainted.
-    if (myGen !== keywordLoadGen) return;
-    if (opts && opts.shouldRender && !opts.shouldRender()) return;
-    renderKeywordTree(data);
-  } catch(e) {}
+    var state = keywordLoadStates[myGen];
+    if (!state) return data;
+    state.status = 'success';
+    state.data = data;
+    reconcileKeywordLoadRenders();
+    return data;
+  } catch(e) {
+    var failedState = keywordLoadStates[myGen];
+    if (failedState) {
+      failedState.status = 'failure';
+      reconcileKeywordLoadRenders();
+    }
+    return null;
+  }
 }
 
 function renderKeywordTree(keywords) {
@@ -3837,8 +3872,21 @@ async function refreshBrowseAfterFolderHealthChange(detail) {
   // ``activeCollectionId`` for non-dashboard scopes, which would kick a user
   // viewing a normal collection back to the unscoped workspace grid whenever
   // folder health changes (CodeRabbit review r3684913393).
-  await resetAndLoad({ preserveCollection: true, preserveAnchor: true });
+  var gridReloadStatus = await resetAndLoad({
+    preserveCollection: true,
+    preserveAnchor: true
+  });
   if (!isCurrent()) return;
+  if (gridReloadStatus === false) {
+    // resetAndLoad has already cleared the pre-transition grid. Keep the
+    // navbar reconciliation marker set so an unchanged normal poll retries
+    // after a transient first-page query/collection failure instead of
+    // leaving Browse empty indefinitely.
+    if (typeof window.markMissingFoldersReconciliationPending === 'function') {
+      window.markMissingFoldersReconciliationPending();
+    }
+    return;
+  }
   loadCollectionCounts();
   loadSummary();
   if (timelineMode) loadCalendarData();
@@ -4526,15 +4574,17 @@ async function resetAndLoad(options) {
 
   if (anchor) anchorScanDepth++;
   try {
-    await loadPhotos();
-    if (!resetRequestIsCurrent() || !anchor) return;
+    var initialLoadStatus = await loadPhotos();
+    if (initialLoadStatus !== true) return initialLoadStatus;
+    if (!resetRequestIsCurrent()) return null;
+    if (!anchor) return true;
 
     var card = await loadUntilPhotoRendered(anchor.photoId, anchorScanShouldContinue);
-    if (!resetRequestIsCurrent()) return;
-    if (!anchorRestoreIsPending(anchor, restoreEpoch)) return;
+    if (!resetRequestIsCurrent()) return null;
+    if (!anchorRestoreIsPending(anchor, restoreEpoch)) return true;
     if (!card) {
       clearActiveSelectionAndDetail();
-      return;
+      return true;
     }
 
     selectedPhotoId = anchor.photoId;
@@ -4548,6 +4598,7 @@ async function resetAndLoad(options) {
       restorePhotoAnchor(anchor);
       updateScrollPosition();
     });
+    return true;
   } finally {
     if (anchor) {
       anchorScanDepth = Math.max(0, anchorScanDepth - 1);
@@ -4579,7 +4630,8 @@ function buildCurrentBrowseParams() {
 }
 
 async function loadPhotos(options) {
-  if (loading || allLoaded) return;
+  if (loading) return null;
+  if (allLoaded) return true;
   loading = true;
   var epoch = loadEpoch;
   var loadSucceeded = false;
@@ -4635,7 +4687,7 @@ async function loadPhotos(options) {
 
   try {
     var data = await safeFetch(url, fetchOptions);
-    if (epoch !== loadEpoch) return;  // grid was reset mid-flight; drop stale response
+    if (epoch !== loadEpoch) return null;  // grid was reset mid-flight; drop stale response
     totalPhotos = data.total;
     if (window.VireoFilter && VireoFilter.setResultTotal) VireoFilter.setResultTotal(totalPhotos);
     if (window.VireoFilter && VireoFilter.setVisualInfo) {
@@ -4674,7 +4726,7 @@ async function loadPhotos(options) {
     }
     loadSucceeded = true;
   } catch(e) {
-    if (epoch !== loadEpoch) return;
+    if (epoch !== loadEpoch) return null;
     if (showLoading && loadingState) {
       loadingState.textContent = 'Error loading photos.';
     }
@@ -4694,6 +4746,7 @@ async function loadPhotos(options) {
       }
     }
   }
+  return loadSucceeded;
 }
 
 /* ---------- Calendar Heatmap ---------- */

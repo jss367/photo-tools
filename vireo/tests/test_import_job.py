@@ -7064,3 +7064,84 @@ def test_local_import_detects_mount_loss_during_the_final_file(
     assert result["safe_to_format"] is False, result
     # The shadow copy must not be cataloged as an archive photo.
     assert _photo_rows(db) == [], _photo_rows(db)
+
+
+def test_local_import_refuses_when_share_detached_before_run_starts(
+        tmp_path, monkeypatch):
+    """A share detached BEFORE baseline capture must still be refused.
+
+    Every check in this file so far assumes ``ismount == True`` at least
+    for baseline capture: the transition-only guard fires only on
+    True → False. A share that was already down when the run started
+    baselines False, no transition can fire against a False baseline,
+    and the persistent ``/mnt/<name>`` stub still passes the per-batch
+    check — the same silent-shadow-write shape this PR opened, just
+    with the timing shifted earlier so no within-run probe can see it.
+
+    Cross-run history (mount roots ever observed live, persisted in
+    ``db_meta``) is what closes that hole: a second run to the same
+    destination baselines True by seeding, and the still-False current
+    state fires the transition just as it would mid-run. A hand-made
+    local ``/mnt/photos`` never enters the known-set (no run ever
+    observed it as a live mount), so its baseline stays False and it
+    stays a valid destination. See PR #1396 review
+    (Codex P1 r3687401636).
+    """
+    import pipeline_job as _pj
+    from import_job import ImportParams, run_import_job
+
+    card = _make_card(tmp_path, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+        ("DSC_0002.jpg", datetime(2026, 7, 4, 9, 0, 0), "blue"),
+    ])
+    dest = str(tmp_path / "mnt_NAS")
+    os.makedirs(dest, exist_ok=True)
+
+    monkeypatch.setattr(
+        _pj, "_archive_mount_root_candidates",
+        lambda path: [dest] if str(path).startswith(dest) else [],
+    )
+    state = {"mounted": True}
+    real_ismount = os.path.ismount
+    monkeypatch.setattr(
+        os.path, "ismount",
+        lambda p: state["mounted"] if str(p) == dest else real_ismount(p),
+    )
+
+    # First run: share is live, files copy, persistent record captures
+    # that ``dest`` was seen mounted.
+    db_path = str(tmp_path / "test.db")
+    db1 = Database(db_path)
+    ws_id = db1._active_workspace_id
+    first = run_import_job(
+        _make_job("import-first"), FakeRunner(), db_path, ws_id,
+        ImportParams(sources=[str(card)], destination=dest),
+    )
+    assert first["copied"] == 2, first
+    assert first["failed"] == 0, first
+    # Sanity: the DB now knows this destination as a mount root.
+    assert dest in _pj._load_known_mount_roots(db1)
+
+    # Second run: same destination, share detached BEFORE the run starts.
+    # Without the persisted history the baseline would be False and the
+    # guard would silently disarm.
+    state["mounted"] = False
+    card2 = _make_card(tmp_path, [
+        ("DSC_0003.jpg", datetime(2026, 7, 5, 8, 0, 0), "green"),
+        ("DSC_0004.jpg", datetime(2026, 7, 6, 7, 0, 0), "yellow"),
+    ], card_name="card2")
+    result = run_import_job(
+        _make_job("import-second"), FakeRunner(), db_path, ws_id,
+        ImportParams(sources=[str(card2)], destination=dest),
+    )
+
+    assert result["copied"] == 0, result
+    assert result["failed"] == 2, result
+    assert result["safe_to_format"] is False, result
+    # Either the batch-level or per-file guard may notice first; the
+    # substring common to both messages is "detached" / "no longer
+    # mounted", so key the assertion on either.
+    assert any(
+        "no longer mounted" in u["reason"] or "detached" in u["reason"]
+        for u in result["unsafe_files"]
+    ), result["unsafe_files"]

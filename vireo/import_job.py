@@ -717,7 +717,9 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
     """
     from pipeline_job import (
         _archive_mount_baseline,
+        _load_known_mount_roots,
         _missing_archive_mount_root,
+        _record_known_mount_roots,
         _unmounted_since_baseline,
     )
     from scanner import scan
@@ -738,7 +740,16 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
     # pre-copy phases would otherwise be baked in as "never mounted" and
     # disarm the guard. See ``_archive_mount_baseline`` and PR #1396
     # review (Codex P1 r3687336684).
-    mount_baseline = _archive_mount_baseline(destination)
+    #
+    # Cross-run mount history: seed the baseline True for mount roots we
+    # previously observed live, then persist any candidate we see live
+    # this run. Without this, an SMB share that detached BEFORE the run
+    # started never earns a True → False transition; rsync would still
+    # push to the NAS while the per-batch mount-side scan reads a fresh
+    # local shadow. See PR #1396 review (Codex P1 r3687401636).
+    known_mount_roots = _load_known_mount_roots(db)
+    mount_baseline = _archive_mount_baseline(destination, known_mount_roots)
+    _record_known_mount_roots(db, mount_baseline)
 
     # Reject cataloged twins that live under the card being imported: a stale
     # scan of the mounted card can leave a photos row whose ``folder_path``
@@ -2251,7 +2262,9 @@ def run_import_job(job, runner, db_path, workspace_id, params):
     """
     from pipeline_job import (
         _archive_mount_baseline,
+        _load_known_mount_roots,
         _missing_archive_mount_root,
+        _record_known_mount_roots,
         _unmounted_since_baseline,
     )
     from scanner import scan
@@ -2303,7 +2316,19 @@ def run_import_job(job, runner, db_path, workspace_id, params):
     # Keying on the transition (rather than "is it mounted?") is what lets
     # an ordinary local directory at a mount-shaped path stay usable: it
     # is False here and stays False, so it never trips the check.
-    mount_baseline = _archive_mount_baseline(destination)
+    #
+    # ``known_mounted_roots`` seeds True from a persistent record of
+    # mount roots ever observed live. Without it, a share that detached
+    # BEFORE the run started (baseline is False from the outset) escapes
+    # the guard: no True → False transition can fire against a False
+    # baseline, so the persistent ``/mnt/<name>`` stub still passes the
+    # per-batch check and copies land on the local disk. Cross-run
+    # history closes that hole; a hand-made local dir is never observed
+    # as a live mount and stays out of the known-set. See PR #1396
+    # review (Codex P1 r3687401636).
+    known_mount_roots = _load_known_mount_roots(db)
+    mount_baseline = _archive_mount_baseline(destination, known_mount_roots)
+    _record_known_mount_roots(db, mount_baseline)
 
     # Reject cataloged twins that live under the card being imported. The
     # /api/jobs/import-photos route already refuses destinations that sit

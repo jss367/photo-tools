@@ -6692,6 +6692,11 @@ def test_selection_entry_grammar_matches_the_count(tmp_path):
         "at least 2 files arrived after your preview and were not "
         "imported — re-preview to include them"
     )
+    # Pin the KEY to a nonzero value, not just the sentence: every other
+    # ``files_appeared`` assertion in this file expects 0, so hard-coding the
+    # key to 0 would pass them all while the frontend readout that consumes
+    # it silently stopped reporting drift.
+    assert result2["files_appeared"] == 2
 
 
 def test_no_selection_blocked_result_leaves_the_pill_bare(tmp_path):
@@ -6754,7 +6759,20 @@ def test_no_selection_blocked_result_leaves_the_pill_bare(tmp_path):
         assert any(e.startswith(expected + ": ") for e in result["errors"]), name
 
 
-def test_drift_signals_and_progress_denominator(tmp_path):
+def test_progress_total_is_the_queued_work_not_the_card(tmp_path):
+    """One of three files selected: the bar is sized 1, not 3.
+
+    Progress must run on the work actually enqueued. Against the full card a
+    half-deselected import runs to completion with the bar stalled part-way
+    — a finished job that looks hung.
+
+    The copy-loop emits are asserted separately from the discovery emit, and
+    with no truthiness filter on the way in. Three weaker shapes were tried
+    and each let a real mutation through: ``3 not in totals`` accepts any
+    other wrong number; ``if d.get("total")`` discards a zeroed total before
+    it can be seen; and set equality over ALL emits accepts a zeroed
+    copy-loop total by hiding it behind the discovery emit's legitimate 0.
+    """
     from import_job import ImportParams
 
     card = _make_card(tmp_path, [
@@ -6772,11 +6790,17 @@ def test_drift_signals_and_progress_denominator(tmp_path):
         ),
         runner=runner,
     )
-    totals = {d.get("total") for _, kind, d in runner.events
-              if kind == "progress" and d.get("total")}
-    # Progress runs on the queued workload (1), never the full card (3) —
-    # otherwise a finished import sits at 33% and looks hung.
-    assert 3 not in totals
+    events = [d for _, kind, d in runner.events if kind == "progress"]
+    # The discovery emit is the only one entitled to a 0 total — the count
+    # isn't known yet when it fires.
+    assert [d["total"] for d in events
+            if d["phase"] == "Discovering files"] == [0]
+    # Every remaining emit is a copy-loop emit (one per file, one per batch)
+    # and every one of them must be sized by the queued work.
+    copy_totals = [d["total"] for d in events
+                   if d["phase"] != "Discovering files"]
+    assert copy_totals, "no copy-loop progress was emitted at all"
+    assert set(copy_totals) == {1}
 
 
 def test_ordinary_deselection_reports_no_files_appeared(tmp_path):
@@ -6870,3 +6894,61 @@ def test_step_summary_without_selection_is_unchanged(tmp_path):
     assert "2 copied, 0 already present, 0 failed of 2 discovered" in summaries
     # No selection means no selection prefix.
     assert not any("selected" in s for s in summaries)
+
+
+def test_step_summary_claims_a_selection_only_when_one_was_applied(tmp_path):
+    """``include_paths`` and ``checked_count`` are independently optional.
+
+    It is ``include_paths`` alone that filters the copy set, so the summary's
+    selection form has to be gated on BOTH fields. Keyed on ``checked_count``
+    by itself, a payload carrying a count but no paths copies the whole card
+    while reporting "1 selected of 2 discovered" — a selection claimed for a
+    run where none was applied. Both divergent combinations are asserted:
+    each one alone kills a different half of the conjunction.
+    """
+    from import_job import ImportParams
+
+    # checked_count without include_paths: nothing was filtered, so nothing
+    # may be claimed. Both files are copied.
+    count_only = tmp_path / "count_only"
+    count_only.mkdir()
+    card = _make_card(count_only, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+        ("DSC_0002.jpg", datetime(2026, 7, 3, 11, 0, 0), "green"),
+    ])
+    runner = FakeRunner()
+    _, _, result = _run_import(
+        count_only,
+        ImportParams(
+            sources=[str(card)], destination=str(count_only / "archive"),
+            checked_count=1,
+        ),
+        runner=runner,
+    )
+    assert result["copied"] == 2, "no include_paths means no filtering"
+    summaries = [kw.get("summary", "") for _, _, kw in runner.step_updates]
+    assert "2 copied, 0 already present, 0 failed of 2 discovered" in summaries
+    assert not any("selected" in s for s in summaries)
+
+    # include_paths without checked_count: the copy set IS filtered, but
+    # there is no trustworthy figure to quote, so it degrades to the plain
+    # form rather than printing "None selected".
+    paths_only = tmp_path / "paths_only"
+    paths_only.mkdir()
+    card2 = _make_card(paths_only, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+        ("DSC_0002.jpg", datetime(2026, 7, 3, 11, 0, 0), "green"),
+    ])
+    runner2 = FakeRunner()
+    _, _, result2 = _run_import(
+        paths_only,
+        ImportParams(
+            sources=[str(card2)], destination=str(paths_only / "archive"),
+            include_paths={str(card2 / "DSC_0001.jpg")},
+        ),
+        runner=runner2,
+    )
+    assert result2["copied"] == 1, "include_paths must still filter"
+    summaries2 = [kw.get("summary", "") for _, _, kw in runner2.step_updates]
+    assert "1 copied, 0 already present, 0 failed of 2 discovered" in summaries2
+    assert not any("selected" in s for s in summaries2)

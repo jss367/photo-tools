@@ -3345,32 +3345,39 @@ def run_import_job(job, runner, db_path, workspace_id, params):
     status = "cancelled" if cancelled else (
         "failed" if failed else "completed"
     )
+    # Two forms; the discovered total appears exactly once in each.
+    #
+    #   no selection: "5 copied, 0 already present, 0 failed of
+    #                  5 discovered"   (byte-identical to before)
+    #   selection:    "1 selected of 3 discovered, 1 copied,
+    #                  0 already present, 0 failed"
+    #
+    # Dropping the tail from the no-selection form to make room for the
+    # prefix would leave every user who never touches a checkbox with counts
+    # and no total to read them against.
+    #
+    # The gate is conjunctive, and must stay that way: ``include_paths`` and
+    # ``checked_count`` are independently optional on ``ImportParams``, and
+    # it is ``include_paths`` alone that decides whether the copy set was
+    # filtered above. Keying this on ``checked_count`` by itself would let
+    # ``ImportParams(sources=..., checked_count=3)`` — no ``include_paths``,
+    # so the whole card is copied — report "3 selected of 5 discovered",
+    # claiming a selection for a run where none was applied.
+    #
+    # The selected figure is ``checked_count``, NOT ``len(include_paths)``:
+    # that set also carries files the user left unchecked because they were
+    # flagged duplicates, so it would overstate what was chosen.
+    if include_paths is not None and params.checked_count is not None:
+        summary = (f"{params.checked_count} selected of {discovered} "
+                   f"discovered, {copied} copied, "
+                   f"{skipped_duplicate} already present, {failed} failed")
+    else:
+        summary = (f"{copied} copied, {skipped_duplicate} already present, "
+                   f"{failed} failed of {discovered} discovered")
     runner.update_step(
         job["id"], "import",
         status="failed" if status == "failed" else "completed",
-        summary=(
-            # Two forms; the discovered total appears exactly once in each.
-            #
-            #   no selection: "5 copied, 0 already present, 0 failed of
-            #                  5 discovered"   (byte-identical to before)
-            #   selection:    "1 selected of 3 discovered, 1 copied,
-            #                  0 already present, 0 failed"
-            #
-            # Dropping the tail from the no-selection form to make room for
-            # the prefix would leave every user who never touches a checkbox
-            # with counts and no total to read them against.
-            #
-            # The selected figure is ``checked_count``, NOT
-            # ``len(include_paths)``: that set also carries files the user
-            # left unchecked because they were flagged duplicates, so it
-            # would overstate what was chosen.
-            (f"{params.checked_count} selected of {discovered} discovered, "
-             f"{copied} copied, {skipped_duplicate} already present, "
-             f"{failed} failed")
-            if params.checked_count is not None else
-            (f"{copied} copied, {skipped_duplicate} already present, "
-             f"{failed} failed of {discovered} discovered")
-        ),
+        summary=summary,
     )
 
     # Discovery/enumeration errors must flip safe_to_format off — a

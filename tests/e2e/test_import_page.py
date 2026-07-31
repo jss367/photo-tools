@@ -1503,6 +1503,101 @@ def test_failed_import_result_offers_preconfigured_retry(live_server, page):
     # this binding an API caller could inject arbitrary IDs into the
     # after-import chain scope.
     assert body["parent_import_job_id"] == "import-original"
+    # A whole-folder parent has no ``include_paths`` on its config, so
+    # the retry body must not fabricate one either — the endpoint's
+    # selection gate is conjunctive and would 400 on a stray
+    # ``include_paths`` sent without both counts. Same for the two
+    # counts.
+    assert "include_paths" not in body
+    assert "previewed_count" not in body
+    assert "checked_count" not in body
+
+
+def test_failed_import_retry_preserves_parent_include_paths(live_server, page):
+    """When the failed parent import was a per-file selection, the retry
+    request must echo the parent's ``include_paths`` plus its two count
+    fields. Without this the retry either fails the source-drift
+    check or, past that, silently re-imports the files the user
+    deliberately deselected on the parent run — the "Retry failed files"
+    button then quietly widens scope."""
+    url = live_server["url"]
+    captured = {}
+
+    def start_import(route):
+        captured["body"] = json.loads(route.request.post_data or "{}")
+        route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({"job_id": "import-retry"}),
+        )
+
+    page.route("**/api/jobs/import-photos", start_import)
+    page.goto(f"{url}/import")
+    page.evaluate(
+        """
+        () => {
+          lastFinishedImportJob = {
+            id: 'import-original',
+            type: 'import',
+            status: 'failed',
+            config: {
+              sources: ['/Volumes/CARD/DCIM'],
+              destination: '/Volumes/Photography/Raw Files/USA',
+              recursive: true,
+              folder_template: '%Y/%Y-%m-%d',
+              file_types: 'both',
+              skip_duplicates: true,
+              verify_by_hash: false,
+              trust_likely_duplicates: false,
+              after_import: null,
+              tags: [],
+              location_from_gps: false,
+              allow_missing_exiftool: false,
+              remote_target_id: null,
+              remote_subpath: null,
+              include_paths: [
+                '/Volumes/CARD/DCIM/DSC_0001.NEF',
+                '/Volumes/CARD/DCIM/DSC_0002.NEF',
+              ],
+              previewed_count: 5,
+              checked_count: 2,
+            },
+            result: {
+              photo_ids: [201],
+              failed: 1,
+            },
+          };
+          renderResult({
+            discovered: 5,
+            copied: 1,
+            verified: 1,
+            skipped_duplicate: 0,
+            failed: 1,
+            safe_to_format: false,
+            unsafe_files: [{
+              path: '/Volumes/CARD/DCIM/DSC_0002.NEF',
+              reason: 'copy verification failed',
+            }],
+            folders: {},
+            errors: ['copy verification failed'],
+          }, 'failed');
+        }
+        """
+    )
+
+    page.locator("#btnRetryImport").click()
+    expect(page.locator("#progressCard")).to_be_visible()
+
+    body = captured["body"]
+    # The three selection fields must travel together — the server 400s
+    # on a partial set — and the retry must carry the parent's exact
+    # selection so it stays scoped to the same files.
+    assert body["include_paths"] == [
+        "/Volumes/CARD/DCIM/DSC_0001.NEF",
+        "/Volumes/CARD/DCIM/DSC_0002.NEF",
+    ]
+    assert body["previewed_count"] == 5
+    assert body["checked_count"] == 2
 
 
 def test_import_copy_start_sends_restored_options(live_server, page):

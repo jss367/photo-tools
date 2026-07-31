@@ -25476,14 +25476,24 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             ),
         }
         if include_paths is not None:
-            # The two counts only — deliberately NOT ``include_paths``. There
-            # is no re-run-from-config path, so the path list would buy
-            # nothing while bloating the persisted job row by up to a few
-            # thousand entries. The counts are two ints and answer the
-            # question a stored job row is actually read for: "why did this
-            # run copy 40 files when the card held 300?"
             job_config["previewed_count"] = previewed_count
             job_config["checked_count"] = checked_count
+            # Persist the actual path list so a recovery retry can
+            # reconstruct the original selection. Without this a
+            # ``retryBodyFromFinishedJob``-driven retry would either be
+            # rejected by the source-signature drift check (parent
+            # snapshot is now over the pre-selection set — see
+            # ``_capture_source_snapshots`` — but the ``include_paths``
+            # the parent actually ran is the useful thing to compare
+            # against a retry that also filters) or, once that hurdle is
+            # cleared, silently re-import the files the user deliberately
+            # deselected. Stored as a sorted list so the JSON round-trips
+            # deterministically; the set is rebuilt in ``_apply_selection``.
+            # Size cost is bounded by ``previewed_count`` (thousands of
+            # short path strings in the worst realistic case) and is
+            # accepted deliberately as the price of a retry that stays
+            # true to the parent's scope.
+            job_config["include_paths"] = sorted(include_paths)
         if move_target_snapshot is not None:
             job_config["after_process_move"] = {
                 "remote_target_id": move_target_snapshot["id"],

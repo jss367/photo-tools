@@ -6469,6 +6469,105 @@ def test_import_photos_carry_photo_ids_defaults_to_none(app_and_db, tmp_path):
     assert config["root_import_job_id"] is None
 
 
+def test_import_photos_persists_include_paths_for_retry(
+        app_and_db, tmp_path):
+    """A per-file import stores ``include_paths`` on ``job_config`` so a
+    recovery retry can reconstruct the parent's selection. Without this,
+    ``retryBodyFromFinishedJob`` would either fabricate a retry that
+    re-imports files the user deliberately deselected (once the source-
+    signature check accepts it) or, before that, has nothing to prove
+    the parent's scope with. Persisted alongside ``previewed_count`` and
+    ``checked_count`` because the three fields travel together through
+    the endpoint's validation gate."""
+    card = _import_card(tmp_path,
+                        names=("DSC_0001.jpg", "DSC_0002.jpg", "DSC_0003.jpg"))
+    kept = sorted([
+        os.path.join(card, "DSC_0001.jpg"),
+        os.path.join(card, "DSC_0002.jpg"),
+    ])
+    app, _ = app_and_db
+    client = app.test_client()
+    resp = client.post("/api/jobs/import-photos", json={
+        "sources": [card],
+        "destination": str(tmp_path / "archive"),
+        "after_import": None,
+        "include_paths": kept,
+        "previewed_count": 3,
+        "checked_count": 2,
+    })
+    assert resp.status_code == 200, resp.get_json()
+    config = _job_config(client, resp.get_json()["job_id"])
+    # Stored as a sorted list so JSON round-trips deterministically.
+    assert config["include_paths"] == kept
+    assert config["previewed_count"] == 3
+    assert config["checked_count"] == 2
+
+
+def test_import_photos_omits_include_paths_when_absent(app_and_db, tmp_path):
+    """A whole-folder import (no per-file selection) must not persist an
+    ``include_paths`` key. The endpoint's selection gate is conjunctive
+    on the three fields; a stray ``include_paths`` on a follow-up retry
+    without the two counts would trip validation."""
+    app, _ = app_and_db
+    client = app.test_client()
+    resp = client.post("/api/jobs/import-photos", json={
+        "sources": [_import_card(tmp_path)],
+        "destination": str(tmp_path / "archive"),
+        "after_import": None,
+    })
+    assert resp.status_code == 200, resp.get_json()
+    config = _job_config(client, resp.get_json()["job_id"])
+    assert "include_paths" not in config
+    assert "previewed_count" not in config
+    assert "checked_count" not in config
+
+
+def test_import_photos_retry_after_include_paths_passes_snapshot_check(
+        app_and_db, tmp_path):
+    """Regression: an unchanged card must not be rejected when the parent
+    used ``include_paths``. Parent's ``source_snapshots`` is captured
+    before ``_apply_selection`` filters the copy set, so its signature
+    covers the full discovered file list — the same enumeration the retry
+    performs. Capturing after filtering (an easy mistake) would store a
+    signature over the selected subset only, and the retry's full-
+    discovery signature would never match: every per-file import would
+    strand its failed files behind a bogus 'source contents have changed'
+    verdict."""
+    from wait import wait_for_job_via_client
+
+    card = _import_card(tmp_path,
+                        names=("DSC_0001.jpg", "DSC_0002.jpg", "DSC_0003.jpg"))
+    kept = sorted([
+        os.path.join(card, "DSC_0001.jpg"),
+        os.path.join(card, "DSC_0002.jpg"),
+    ])
+    app, _ = app_and_db
+    with app.test_client() as client:
+        parent_id = client.post("/api/jobs/import-photos", json={
+            "sources": [card],
+            "destination": str(tmp_path / "archive"),
+            "after_import": None,
+            "include_paths": kept,
+            "previewed_count": 3,
+            "checked_count": 2,
+        }).get_json()["job_id"]
+        wait_for_job_via_client(client, parent_id)
+
+        # Retry against the same, unchanged card. The parent stored a
+        # snapshot over three files; the retry re-enumerates three files.
+        # The signatures must agree.
+        resp = client.post("/api/jobs/import-photos", json={
+            "sources": [card],
+            "destination": str(tmp_path / "archive"),
+            "after_import": None,
+            "parent_import_job_id": parent_id,
+            "include_paths": kept,
+            "previewed_count": 3,
+            "checked_count": 2,
+        })
+        assert resp.status_code == 200, resp.get_json()
+
+
 def test_import_photos_retry_persists_parent_import_job_id(
         app_and_db, tmp_path):
     """A recovery retry stores its parent's id on ``job_config`` so the
@@ -8145,14 +8244,14 @@ def test_import_photos_selection_is_honored_end_to_end(app_and_db, tmp_path):
     assert landed == ["a.jpg"], landed
 
 
-def test_import_job_config_records_counts_but_never_the_path_list(
+def test_import_job_config_records_counts_and_path_list(
         app_and_db, tmp_path):
-    """Two ints for debugging; the path list stays out of the job row.
-
-    There is no re-run-from-config path, so persisting up to a few thousand
-    ``include_paths`` entries per import would be pure bloat. The counts
-    answer the question a stored job row is read for ("why did this copy 1
-    of 2?") for two ints.
+    """A per-file import persists all three selection fields on the job
+    row: the two counts explain the ledger for anyone reading history
+    ("why did this copy 1 of 2?") and ``include_paths`` lets a recovery
+    retry reconstruct the parent's exact scope without silently
+    re-importing files the user deselected. The path list is stored
+    sorted so JSON round-trips deterministically.
     """
     app, _ = app_and_db
     with app.test_client() as client:
@@ -8163,9 +8262,11 @@ def test_import_job_config_records_counts_but_never_the_path_list(
         job = wait_for_job_via_client(client, resp.get_json()["job_id"])
 
     config = job["config"]
-    assert "include_paths" not in config, config
     assert config["previewed_count"] == 2, config
     assert config["checked_count"] == 1, config
+    # The list matches the request's include_paths, stored sorted.
+    expected = sorted([os.path.join(str(tmp_path / "card"), "a.jpg")])
+    assert config["include_paths"] == expected, config
 
 
 def test_import_job_config_omits_the_counts_when_nothing_was_selected(

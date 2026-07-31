@@ -1117,6 +1117,24 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
             onerror=_discovery_onerror,
         ))
     discovered = len(files)
+    # Snapshot the discovered source metadata NOW — before selection filters
+    # the copy set, before any copy work, and before duplicate hashing. The
+    # retry-side signature check re-enumerates each source in full and
+    # compares the current signature to what the parent recorded; capturing
+    # the snapshot AFTER ``_apply_selection`` would mean a per-file import
+    # only ever stored a signature over its selected subset, and the retry's
+    # full-enumeration signature would never match — an unchanged card
+    # would be rejected as drifted, and correcting that by having retry
+    # also filter would leave nothing gating a card whose deselected files
+    # were replaced or removed. Pre-selection capture keeps both sides on
+    # the same enumeration. Capturing before copy also matters so a card
+    # ejected or momentarily unreadable mid-run doesn't backfill ``-1``
+    # sizes for files we successfully enumerated — reinserting the card
+    # and retrying is a common recovery workflow, and the retry-side
+    # signature check must have a snapshot taken from the source as
+    # observed at run start to accept it.
+    source_snapshots = _capture_source_snapshots(files, params.sources)
+
     # Selection: filter the copy set and measure drift. Shared with the local
     # path — see ``_apply_selection`` for why each condition is shaped the
     # way it is. Destructured BY NAME, not by position: four of the six
@@ -1132,14 +1150,6 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
     deselected = _sel.deselected
     vanished_paths = _sel.vanished_paths
     appeared = _sel.appeared
-
-    # Snapshot the discovered source metadata NOW — before any copy work
-    # or duplicate hashing — so a card ejected or momentarily unreadable
-    # mid-run doesn't backfill ``-1`` sizes for files we successfully
-    # enumerated. Reinserting the card and retrying is a common recovery
-    # workflow, and the retry-side signature check must have a snapshot
-    # taken from the source as-observed at run start to accept it.
-    source_snapshots = _capture_source_snapshots(files, params.sources)
 
     checker = None
     if params.skip_duplicates:
@@ -2890,6 +2900,16 @@ def run_import_job(job, runner, db_path, workspace_id, params):
             onerror=_discovery_onerror,
         ))
     discovered = len(files)
+    # Snapshot the discovered source metadata NOW — before selection filters
+    # the copy set, before any copy work, and before duplicate hashing. See
+    # the matching block in ``run_import_job`` for the full rationale: retry
+    # re-enumerates each source in full and would refuse an unchanged card
+    # if the parent's stored signature only covered the selected subset,
+    # and pre-copy capture keeps a mid-run ejection from backfilling ``-1``
+    # sizes over a snapshot that would otherwise refuse the natural
+    # reinsert-and-retry recovery.
+    source_snapshots = _capture_source_snapshots(files, params.sources)
+
     # Selection: filter the copy set and measure drift. Shared with the
     # remote path — see ``_apply_selection`` for why each condition is
     # shaped the way it is. Destructured BY NAME, not by position: four of
@@ -2905,14 +2925,6 @@ def run_import_job(job, runner, db_path, workspace_id, params):
     deselected = _sel.deselected
     vanished_paths = _sel.vanished_paths
     appeared = _sel.appeared
-
-    # Snapshot the discovered source metadata NOW — before any copy work
-    # or duplicate hashing — so a card ejected or momentarily unreadable
-    # mid-run doesn't backfill ``-1`` sizes for files we successfully
-    # enumerated. Reinserting the card and retrying is a common recovery
-    # workflow, and the retry-side signature check must have a snapshot
-    # taken from the source as-observed at run start to accept it.
-    source_snapshots = _capture_source_snapshots(files, params.sources)
 
     checker = None
     if params.skip_duplicates:

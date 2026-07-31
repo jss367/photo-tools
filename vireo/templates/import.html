@@ -3659,6 +3659,24 @@ function retryBodyFromFinishedJob(job) {
     carry.push(pid);
   });
   if (carry.length) body.carry_photo_ids = carry;
+  // Recover the parent's per-file selection so the retry stays scoped to
+  // the same files the user originally chose. Without this the retry
+  // would either be rejected by the source-signature drift check (the
+  // parent's ``source_snapshots`` are captured pre-filter, so the
+  // signatures agree, but the parent's ``include_paths`` is the real
+  // ground truth for what should get copied) or — worse — silently
+  // re-import the files the user deliberately deselected on the parent
+  // run. All three fields travel together (see the server-side
+  // ``include_paths, previewed_count and checked_count must be sent
+  // together`` gate); sending a subset would 400. Parents from before
+  // ``include_paths`` was persisted omit it and simply retry as before.
+  if (Array.isArray(cfg.include_paths) && cfg.include_paths.length
+      && typeof cfg.previewed_count === 'number'
+      && typeof cfg.checked_count === 'number') {
+    body.include_paths = cfg.include_paths.slice();
+    body.previewed_count = cfg.previewed_count;
+    body.checked_count = cfg.checked_count;
+  }
   if (cfg.remote_target_id) {
     delete body.destination;
     body.remote_target_id = cfg.remote_target_id;

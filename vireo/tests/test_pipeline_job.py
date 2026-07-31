@@ -16563,3 +16563,65 @@ def test_pipeline_extract_masks_offline_survives_finalizer_override(
         f"The extract_masks Fatal error must name the outage as "
         f"source-offline; got {em_fatal[0]!r}"
     )
+
+
+def test_archive_mount_baseline_records_only_real_mount_points(
+        tmp_path, monkeypatch):
+    """The baseline distinguishes a real mount from an ordinary directory.
+
+    An ordinary ``/mnt/photos`` that was never a mount must record False,
+    so the staleness check below can never fire for it. That is what keeps
+    the guard from refusing legitimate local destinations.
+    """
+    import os as _os
+
+    import pipeline_job as _pj
+
+    mounted = str(tmp_path / "mounted")
+    plain = str(tmp_path / "plain")
+    _os.makedirs(mounted)
+    _os.makedirs(plain)
+
+    monkeypatch.setattr(
+        _pj, "_archive_mount_root_candidates",
+        lambda path: [mounted, plain],
+    )
+    real_ismount = _os.path.ismount
+    monkeypatch.setattr(
+        _os.path, "ismount",
+        lambda p: True if str(p) == mounted else real_ismount(p),
+    )
+
+    baseline = _pj._archive_mount_baseline("/anything")
+
+    assert baseline == {mounted: True, plain: False}, baseline
+
+
+def test_unmounted_since_baseline_fires_only_for_a_lost_mount(
+        tmp_path, monkeypatch):
+    """Only a root that WAS mounted and no longer is counts as lost."""
+    import os as _os
+
+    import pipeline_job as _pj
+
+    lost = str(tmp_path / "lost")
+    never = str(tmp_path / "never")
+    still = str(tmp_path / "still")
+    for p in (lost, never, still):
+        _os.makedirs(p)
+
+    real_ismount = _os.path.ismount
+    monkeypatch.setattr(
+        _os.path, "ismount",
+        lambda p: True if str(p) == still else real_ismount(p),
+    )
+
+    # ``lost`` was mounted at baseline and now is not -> reported.
+    assert _pj._unmounted_since_baseline({lost: True}) == lost
+    # ``never`` was not a mount to begin with -> an ordinary directory,
+    # never reported no matter what.
+    assert _pj._unmounted_since_baseline({never: False}) is None
+    # ``still`` is mounted now as it was then -> nothing lost.
+    assert _pj._unmounted_since_baseline({still: True}) is None
+    # Empty baseline (destination not mount-shaped at all).
+    assert _pj._unmounted_since_baseline({}) is None

@@ -715,7 +715,11 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
     reason ``"enable verify_by_hash for remote verification"`` — the card is
     off-loaded but its landing wasn't independently hash-confirmed.
     """
-    from pipeline_job import _missing_archive_mount_root
+    from pipeline_job import (
+        _archive_mount_baseline,
+        _missing_archive_mount_root,
+        _unmounted_since_baseline,
+    )
     from scanner import scan
 
     rt = params.remote_target
@@ -928,6 +932,11 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
     def _missing_mount_root():
         return _missing_archive_mount_root(destination)
 
+    # Baseline for the persistent-mount-point case the check above cannot
+    # see (Linux keeps ``/mnt/<name>`` after an unmount). Mirrors the
+    # local path; see ``_archive_mount_baseline``.
+    mount_baseline = _archive_mount_baseline(destination)
+
     def _record_checker(source_file, dest_folder=None, file_hash=None):
         """Register a landed/adopted file's identity with the intra-run checker.
 
@@ -1021,11 +1030,34 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
                 emitted, discovered,
             )
             continue
-        # Mirrors the local path: the mount-root guard above only catches
-        # a mount point that vanished, so a stale-but-present mount, a
-        # read-only parent, or a permission change still reaches this
-        # call. An uncaught OSError here kills the background job; book
-        # it per file and let the run finish with an honest result.
+        # Persistent-mount-point case (Linux ``/mnt/<name>`` survives the
+        # unmount), which the vanished-root check above structurally
+        # cannot see. Same baseline-transition logic as the local path so
+        # an ordinary directory at a mount-shaped path is never refused.
+        # Matters more here, not less: rsync keeps pushing to the NAS
+        # while the batch scan reads a local shadow, so the import lands
+        # bytes remotely and catalogs nothing.
+        stale_mount_root = _unmounted_since_baseline(mount_baseline)
+        if stale_mount_root:
+            for source_file in batch:
+                emitted += 1
+                _fail(
+                    rel, source_file,
+                    f"archive mount root {stale_mount_root} is no longer "
+                    "mounted (it was at the start of this import; the "
+                    "directory persists but the share has detached, so "
+                    "cataloging here would read a local shadow of the "
+                    "archive)",
+                )
+            _emit(
+                f"{rel}: archive unmounted", emitted, discovered,
+            )
+            continue
+        # Mirrors the local path: the checks above only catch a mount
+        # point that vanished or detached, so a stale-but-registered
+        # mount, a read-only parent, or a permission change still reaches
+        # this call. An uncaught OSError here kills the background job;
+        # book it per file and let the run finish with an honest result.
         try:
             os.makedirs(dest_folder, exist_ok=True)
         except OSError as e:
@@ -2215,7 +2247,11 @@ def run_import_job(job, runner, db_path, workspace_id, params):
     is committed per batch; cancellation and crashes leave every already-
     verified file cataloged and nothing else.
     """
-    from pipeline_job import _missing_archive_mount_root
+    from pipeline_job import (
+        _archive_mount_baseline,
+        _missing_archive_mount_root,
+        _unmounted_since_baseline,
+    )
     from scanner import scan
 
     db = Database(db_path)
@@ -2523,6 +2559,13 @@ def run_import_job(job, runner, db_path, workspace_id, params):
     # these bytes" and not just "the bytes are somewhere on disk".
     dup_link_failed = False
 
+    # Which of the destination's mount-root candidates are live mounts
+    # right now. Taken once, before any copying, because the guard in the
+    # loop keys on a mounted → unmounted *transition*: an ordinary local
+    # directory that happens to sit at a mount-shaped path is False here
+    # and stays False, so it is never mistaken for a detached share.
+    mount_baseline = _archive_mount_baseline(destination)
+
     for rel, batch in batches:
         if runner.is_cancelled(job["id"]):
             cancelled = True
@@ -2589,9 +2632,34 @@ def run_import_job(job, runner, db_path, workspace_id, params):
                 f"{rel}: archive unavailable", emitted, discovered,
             )
             continue
-        # The guard above only recognizes a mount point that *vanished*.
-        # A stale-but-present mount (Linux keeps ``/mnt/<name>`` after an
-        # unmount), a read-only or permission-changed parent, or a full
+        # The check above only sees a mount point that VANISHED. Linux
+        # keeps ``/mnt/<name>`` as an empty directory after the share
+        # detaches, so there the destination still "exists" and
+        # ``os.makedirs`` below would happily build the archive tree on
+        # the system disk and copy the card into it — bytes that vanish
+        # under the real share the moment it remounts, after
+        # safe_to_format may already have gone green. Catch that by
+        # comparing against the baseline taken at job start: only a
+        # mounted → unmounted transition counts, so an ordinary local
+        # directory that merely looks mount-shaped is never refused.
+        stale_mount_root = _unmounted_since_baseline(mount_baseline)
+        if stale_mount_root:
+            for source_file in batch:
+                emitted += 1
+                _fail(
+                    rel, source_file,
+                    f"archive mount root {stale_mount_root} is no longer "
+                    "mounted (it was at the start of this import; the "
+                    "directory persists but the share has detached, so "
+                    "copying here would write to the local disk under a "
+                    "stale mount point)",
+                )
+            _emit(
+                f"{rel}: archive unmounted", emitted, discovered,
+            )
+            continue
+        # A stale-but-registered mount (ismount still true while reads
+        # fail), a read-only or permission-changed parent, or a full
         # disk all still surface here — and an uncaught OSError out of
         # this call tears down the whole background job, which is exactly
         # how the 2026-07-30 import died after two hours. Whatever the

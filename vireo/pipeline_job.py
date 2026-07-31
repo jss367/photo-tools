@@ -149,6 +149,51 @@ def _archive_mount_root_candidates(path: str) -> list[str]:
     return seen
 
 
+def _archive_mount_baseline(path: str) -> dict[str, bool]:
+    """Snapshot whether ``path``'s mount-root candidates are live mounts.
+
+    Pairs with ``_unmounted_since_baseline`` to catch the case
+    ``_missing_archive_mount_root`` structurally cannot see: a mount point
+    that *persists* as an empty directory after the share detaches. Linux
+    ``/mnt/<name>`` behaves that way (macOS removes ``/Volumes/<share>``,
+    which is why ``lexists`` is enough there), so on Linux an unmounted
+    archive looks exactly like a valid empty destination — ``os.makedirs``
+    succeeds and the import writes onto the system disk under the stale
+    mount point. See PR #1394 review (Codex P1 r3687190865).
+
+    ``os.path.ismount`` is the right primitive rather than a hand-rolled
+    ``st_dev`` comparison: on POSIX it already compares the directory's
+    device against its parent's, and ``_archive_mount_root_candidates``
+    deliberately returns Windows drive letters with a trailing separator
+    so ismount accepts them.
+
+    Recording the *baseline* is what makes this safe. An ordinary local
+    directory that merely looks mount-shaped (a plain ``/mnt/photos`` the
+    user created by hand) is False here and stays False, so it can never
+    trip the staleness check — a bare "is it mounted?" test would refuse
+    that destination outright and break working setups.
+    """
+    return {
+        root: os.path.ismount(root)
+        for root in _archive_mount_root_candidates(path)
+    }
+
+
+def _unmounted_since_baseline(baseline: dict[str, bool]) -> str | None:
+    """Return a root that was mounted at baseline and no longer is.
+
+    Deliberately one-directional: only a True → False transition counts.
+    A root that was never a mount is an ordinary directory and is ignored,
+    and a root still reporting mounted is left to the existing offline
+    probes (a stale-but-registered SMB mount keeps ``ismount`` True while
+    every read raises EIO — see ``_mount_root_offline``).
+    """
+    for root, was_mounted in baseline.items():
+        if was_mounted and not os.path.ismount(root):
+            return root
+    return None
+
+
 def _missing_archive_mount_root(path: str) -> str | None:
     """Return a likely missing mount root that must not be auto-created.
 

@@ -6681,3 +6681,142 @@ def test_local_import_survives_makedirs_failure(tmp_path):
     assert any(
         "2026-07-03" in u["reason"] for u in result["unsafe_files"]
     ), result["unsafe_files"]
+
+
+def test_local_import_stops_when_mount_point_persists_after_unmount(
+        tmp_path, monkeypatch):
+    """A Linux-shaped unmount must stop the import, not shadow-write.
+
+    ``_missing_archive_mount_root`` only sees a mount point that vanished
+    (macOS ejects remove ``/Volumes/<share>``). Linux keeps ``/mnt/<name>``
+    as an empty directory, so the destination still "exists", os.makedirs
+    succeeds, and the remaining card files land on the system disk under
+    a stale mount point — where safe_to_format could go green over photos
+    that disappear the moment the real archive remounts.
+    See PR #1394 review (Codex P1 r3687190865).
+    """
+    import pipeline_job as _pj
+    from import_job import ImportParams
+
+    card = _make_card(tmp_path, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+        ("DSC_0002.jpg", datetime(2026, 7, 4, 9, 0, 0), "blue"),
+    ])
+    dest = str(tmp_path / "mnt_NAS")
+    os.makedirs(dest, exist_ok=True)
+
+    # The destination is a real mount at job start, then the share drops
+    # while leaving the directory in place.
+    monkeypatch.setattr(
+        _pj, "_archive_mount_root_candidates",
+        lambda path: [dest] if str(path).startswith(dest) else [],
+    )
+    real_ismount = os.path.ismount
+    probes = {"n": 0}
+
+    def fake_ismount(p):
+        if str(p) == dest:
+            probes["n"] += 1
+            # Mounted for the baseline and the first batch; gone after.
+            return probes["n"] <= 2
+        return real_ismount(p)
+
+    monkeypatch.setattr(os.path, "ismount", fake_ismount)
+
+    db, ws_id, result = _run_import(tmp_path, ImportParams(
+        sources=[str(card)], destination=dest,
+    ))
+
+    assert result["copied"] == 1, result
+    assert result["failed"] == 1, result
+    assert result["safe_to_format"] is False, result
+    assert any(
+        "no longer mounted" in u["reason"] for u in result["unsafe_files"]
+    ), result["unsafe_files"]
+
+
+def test_local_import_allows_a_plain_directory_that_looks_mount_shaped(
+        tmp_path, monkeypatch):
+    """An ordinary directory under /mnt must still be a valid destination.
+
+    The guard keys on a mounted → unmounted transition precisely so a
+    hand-made local ``/mnt/photos`` (never a mount, so ismount is False
+    throughout) is not refused. A bare "is it mounted?" check would break
+    this setup.
+    """
+    import pipeline_job as _pj
+    from import_job import ImportParams
+
+    card = _make_card(tmp_path, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+        ("DSC_0002.jpg", datetime(2026, 7, 4, 9, 0, 0), "blue"),
+    ])
+    dest = str(tmp_path / "mnt_photos")
+    os.makedirs(dest, exist_ok=True)
+
+    # Mount-shaped path, but ismount is False the whole way through.
+    monkeypatch.setattr(
+        _pj, "_archive_mount_root_candidates",
+        lambda path: [dest] if str(path).startswith(dest) else [],
+    )
+
+    db, ws_id, result = _run_import(tmp_path, ImportParams(
+        sources=[str(card)], destination=dest,
+    ))
+
+    assert result["copied"] == 2, result
+    assert result["failed"] == 0, result
+
+
+def test_remote_import_stops_when_mount_point_persists_after_unmount(
+        tmp_path, monkeypatch):
+    """Same persistent-unmount guard on the remote path.
+
+    Worse here than locally: rsync keeps succeeding against the NAS while
+    the per-batch scan reads the empty local shadow, so the bytes land
+    remotely and the catalog records nothing.
+    """
+    import pipeline_job as _pj
+    from import_job import ImportParams, run_import_job
+
+    ra = _remote_archive_for(tmp_path)
+    calls = _remote_calls(ra)
+    _install_fake_remote_rsync(monkeypatch, calls, verify=None)
+
+    card = _make_card(tmp_path, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+        ("DSC_0002.jpg", datetime(2026, 7, 4, 9, 0, 0), "blue"),
+    ])
+    mount_base = ra["mount_base"]
+
+    monkeypatch.setattr(
+        _pj, "_archive_mount_root_candidates",
+        lambda path: [mount_base] if str(path).startswith(mount_base) else [],
+    )
+    real_ismount = os.path.ismount
+    probes = {"n": 0}
+
+    def fake_ismount(p):
+        if str(p) == mount_base:
+            probes["n"] += 1
+            return probes["n"] <= 2
+        return real_ismount(p)
+
+    monkeypatch.setattr(os.path, "ismount", fake_ismount)
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws_id = db._active_workspace_id
+    result = run_import_job(
+        _make_job(), FakeRunner(), db_path, ws_id,
+        ImportParams(
+            sources=[str(card)], destination=mount_base, remote_target=ra,
+        ),
+    )
+
+    assert result["copied"] == 1, result
+    assert result["failed"] == 1, result
+    assert result["safe_to_format"] is False, result
+    assert any(
+        "no longer mounted" in u["reason"] for u in result["unsafe_files"]
+    ), result["unsafe_files"]

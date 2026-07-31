@@ -2038,6 +2038,8 @@ var collectionCountLoadGen = 0;
 // after a newer scope selection triggered a fresh load
 // (CodeRabbit review r3684913398).
 var summaryLoadGen = 0;
+var summaryLoadStates = {};
+var summaryRenderDecisionGen = 0;
 var calendarDataLoadGen = 0;
 // Internal generation counters shared across every caller of the sidebar
 // loaders. Without these, ``refreshBrowseSidebarCounts()`` and the various
@@ -2983,7 +2985,8 @@ async function bootstrapBrowse() {
       var initWasStale = _reconcileMissingFoldersInitSnapshot(
         data.missing_folder_ids,
         missingSnapshotVersionAtInitStart,
-        'bootstrap-reconcile');
+        'bootstrap-reconcile',
+        data.folder_health_version);
       if (initWasStale) healthChangedDuringInit = true;
     }
 
@@ -7107,20 +7110,58 @@ function closeDetail() {
   loadSummary();
 }
 
-async function loadSummary() {
-  var gen = ++summaryLoadGen;
+function buildSummaryParams() {
   var params = new URLSearchParams();
   if (activeFolderId) params.set('folder_id', activeFolderId);
   var rules = getBrowseRules();
   if (rules) params.set('rules', JSON.stringify(rules));
   appendVisualScopeParams(params);
   if (activeCollectionId) params.set('collection_id', activeCollectionId);
+  return params;
+}
+
+function reconcileSummaryLoadRenders() {
+  var gen = summaryLoadGen;
+  while (gen > summaryRenderDecisionGen) {
+    var state = summaryLoadStates[gen];
+    if (!state || state.status === 'pending') return;
+    if (state.status === 'success') {
+      var currentKey = buildSummaryParams().toString();
+      summaryRenderDecisionGen = gen;
+      if (state.key === currentKey) renderSummary(state.data);
+      Object.keys(summaryLoadStates).forEach(function(key) {
+        if (Number(key) <= summaryLoadGen) delete summaryLoadStates[key];
+      });
+      return;
+    }
+    gen--;
+  }
+}
+
+async function loadSummary() {
+  var gen = ++summaryLoadGen;
+  var params = buildSummaryParams();
+  summaryLoadStates[gen] = {
+    status: 'pending',
+    key: params.toString()
+  };
 
   try {
     var data = await safeFetch('/api/browse/summary?' + params.toString(), {}, { toast: false });
-    if (gen !== summaryLoadGen) return;
-    renderSummary(data);
-  } catch(e) {}
+    var state = summaryLoadStates[gen];
+    if (!state) return data;
+    state.status = 'success';
+    state.data = data;
+    reconcileSummaryLoadRenders();
+    return data;
+  } catch(e) {
+    var failedState = summaryLoadStates[gen];
+    if (failedState) {
+      failedState.status = 'failure';
+      reconcileSummaryLoadRenders();
+    }
+    return null;
+  }
 }
 
 function renderSummary(data) {
@@ -8908,7 +8949,8 @@ async function _runPhotoDeepLink(photoId) {
         _reconcileMissingFoldersInitSnapshot(
           initData.missing_folder_ids,
           missingSnapshotVersionAtInitStart,
-          'deep-link-reconcile');
+          'deep-link-reconcile',
+          initData.folder_health_version);
         if (!isDeepLinkHealthCurrent()) { wasSuperseded = true; return wasSuperseded; }
       }
       renderFolderTree(initData.folders || []);

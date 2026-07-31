@@ -4807,6 +4807,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         # remains to repair the mixed response (Codex reviews r3686317681 and
         # r3687501744).
         missing_folder_ids = [f["id"] for f in db.get_missing_folders()]
+        folder_health_version = db.get_folder_health_version()
 
         # First paint is scope-only (folder / collection / sort); metadata
         # filter deep links compile into the filter bar client-side, which
@@ -4896,6 +4897,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 "keywords": [dict(k) for k in keywords],
                 "collections": collection_dicts,
                 "missing_folder_ids": missing_folder_ids,
+                "folder_health_version": folder_health_version,
             }
         )
         # End the read transaction after every value in the response has been
@@ -5322,8 +5324,16 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
     @app.route("/api/folders/missing")
     def api_folders_missing():
         db = _get_db()
+        # Keep the rows and their monotonic observation marker on one read
+        # snapshot so clients can compare this response with /api/browse/init
+        # independent of network delivery order.
+        db.conn.execute("BEGIN")
         missing = db.get_missing_folders()
-        return jsonify([dict(f) for f in missing])
+        health_version = db.get_folder_health_version()
+        response = jsonify([dict(f) for f in missing])
+        response.headers["X-Vireo-Folder-Health-Version"] = str(health_version)
+        db.conn.rollback()
+        return response
 
     _MISSING_ORIGINALS_STALE_SECONDS = 30 * 60
     _MISSING_ORIGINALS_BACKOFF_SECONDS = 30 * 60
@@ -5867,13 +5877,18 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         # next full scan.
         if changed:
             _invalidate_missing_originals_cache()
+        db.conn.execute("BEGIN")
         missing = db.get_missing_folders()
         ws_missing_after = {f["id"] for f in missing}
-        return jsonify({
+        health_version = db.get_folder_health_version()
+        response = jsonify({
             "changed": changed,
             "workspace_changed": ws_missing_before != ws_missing_after,
             "missing": [dict(f) for f in missing],
+            "folder_health_version": health_version,
         })
+        db.conn.rollback()
+        return response
 
     @app.route("/api/photos/missing/delete-sidecars", methods=["POST"])
     def api_photos_missing_delete_sidecars():

@@ -721,6 +721,109 @@ def test_bootstrap_snapshot_invalidates_older_inflight_poll(
     expect(page.locator(".grid-card")).to_have_count(2)
 
 
+def test_newer_init_server_snapshot_supersedes_delivered_old_poll(
+    live_server, page, tmp_path
+):
+    """Server observation order wins when the old poll is delivered first."""
+    db = live_server["db"]
+    park = tmp_path / "park"
+    yard = tmp_path / "yard"
+    park.mkdir()
+    yard.mkdir()
+    folder_ids = live_server["data"]["folders"]
+    db.conn.executemany(
+        "UPDATE folders SET path = ?, status = 'ok' WHERE id = ?",
+        [(str(park), folder_ids[0]), (str(yard), folder_ids[1])],
+    )
+    db.conn.commit()
+
+    # Hold real fetch responses in page JavaScript. Playwright route handlers
+    # are serialized, so trying to hold both responses at that layer deadlocks
+    # the second request instead of producing the intended delivery ordering.
+    page.add_init_script(
+        """
+        (() => {
+          const originalFetch = window.fetch.bind(window);
+          const controls = {
+            configs: [],
+            configsReleased: false,
+            missing: null,
+            init: null,
+          };
+          window._snapshotFetchControls = controls;
+          window.fetch = function(input, options) {
+            const url = typeof input === 'string' ? input : input.url;
+            let kind = null;
+            if (url.indexOf('/api/config') !== -1) kind = 'config';
+            else if (url.indexOf('/api/folders/missing') !== -1) kind = 'missing';
+            else if (url.indexOf('/api/browse/init') !== -1) kind = 'init';
+            if (!kind) return originalFetch(input, options);
+            return new Promise((resolve, reject) => {
+              originalFetch(input, options).then(response => {
+                const held = {response: response, release: () => resolve(response)};
+                if (kind === 'config') {
+                  if (controls.configsReleased) held.release();
+                  else controls.configs.push(held);
+                } else {
+                  controls[kind] = held;
+                }
+              }, reject);
+            });
+          };
+        })();
+        """
+    )
+    page.goto(f"{live_server['url']}/browse")
+    page.wait_for_function(
+        "_snapshotFetchControls.configs.length > 0 && "
+        "_snapshotFetchControls.missing !== null",
+        timeout=5000,
+    )
+
+    # The poll has already observed version N with no missing folders. Move
+    # the server to N+1, then let init read and hold that newer response.
+    db.conn.execute(
+        "UPDATE folders SET status = 'missing' WHERE id = ?", (folder_ids[0],)
+    )
+    db.conn.commit()
+    page.evaluate(
+        "_snapshotFetchControls.configsReleased = true;"
+        "_snapshotFetchControls.configs.splice(0).forEach(item => item.release());"
+    )
+    page.wait_for_function(
+        "_snapshotFetchControls.init !== null", timeout=5000
+    )
+
+    # Deliver the old poll before applying the already-read newer init. A
+    # client-only request-generation scheme accepts this [] baseline; the
+    # init response must still supersede it via its higher server version.
+    page.evaluate("_snapshotFetchControls.missing.release()")
+    page.wait_for_function(
+        "_missingFoldersLastIds !== null && "
+        "_missingFoldersLastIds.length === 0"
+    )
+    old_server_version = page.evaluate("_missingFoldersServerVersion")
+
+    page.evaluate(
+        "window._folderHealthEvents = [];"
+        "document.addEventListener('vireo:folder-health-changed', "
+        "function(e) { window._folderHealthEvents.push(e.detail.source); });"
+    )
+    page.evaluate("_snapshotFetchControls.init.release()")
+    page.wait_for_function(
+        f"browseDatasetReady && _missingFoldersLastIds.length === 1 && "
+        f"_missingFoldersLastIds[0] === {folder_ids[0]}",
+        timeout=10000,
+    )
+
+    assert page.evaluate("_missingFoldersServerVersion") > old_server_version
+    assert page.evaluate("window._folderHealthEvents") == []
+    assert page.locator("#missingFoldersBanner").evaluate(
+        "(el) => getComputedStyle(el).display"
+    ) == "flex"
+    expect(page.locator(".grid-card")).to_have_count(2)
+
+
 def test_bootstrap_defers_lock_release_when_init_rejects(
     live_server, page, tmp_path
 ):
@@ -1232,6 +1335,47 @@ def test_load_keywords_renders_older_success_after_newer_failure(
     expect(
         page.locator(f'#keywordTree .tree-item[data-keyword="{keyword_name}"]')
     ).to_have_count(1, timeout=5000)
+
+
+def test_load_summary_renders_older_success_after_newer_failure(
+    live_server, page
+):
+    """An identical-scope failed superseder must retain a usable summary."""
+    page.goto(f"{live_server['url']}/browse")
+    page.wait_for_function("browseDatasetReady", timeout=5000)
+    expect(page.locator("#summaryPhotoCount")).to_have_text("5", timeout=5000)
+
+    held = []
+    request_count = 0
+
+    def _hold_success_then_fail(route):
+        nonlocal request_count
+        request_count += 1
+        if request_count == 1:
+            held.append(route)
+        elif request_count == 2:
+            route.fulfill(status=500, body="fail")
+        else:
+            route.continue_()
+
+    page.route("**/api/browse/summary**", _hold_success_then_fail)
+    page.evaluate(
+        "() => {"
+        "  document.getElementById('summaryPhotoCount').textContent = 'stale';"
+        "  window._olderSuccessfulSummaryLoad = loadSummary();"
+        "}"
+    )
+    for _ in range(50):
+        if held:
+            break
+        page.wait_for_timeout(100)
+    assert held, "older summary request was never issued"
+
+    page.evaluate("() => { window._failedSummaryLoad = loadSummary(); }")
+    page.wait_for_timeout(200)
+    held[0].continue_()
+
+    expect(page.locator("#summaryPhotoCount")).to_have_text("5", timeout=5000)
 
 
 def test_health_refresh_awaits_config_before_loading_photos(

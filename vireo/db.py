@@ -1175,6 +1175,48 @@ class Database:
                 ON collections(workspace_id);
             CREATE INDEX IF NOT EXISTS idx_pending_workspace
                 ON pending_changes(workspace_id);
+
+            -- Monotonic observation marker shared by folder-health endpoints.
+            -- Clients use it to order responses by the SQLite snapshot they
+            -- observed rather than by request start or network delivery.
+            INSERT OR IGNORE INTO db_meta(key, value)
+                VALUES ('folder_health_version', '0');
+            CREATE TRIGGER IF NOT EXISTS trg_folder_health_version_insert
+            AFTER INSERT ON folders
+            BEGIN
+                UPDATE db_meta
+                SET value = CAST(value AS INTEGER) + 1
+                WHERE key = 'folder_health_version';
+            END;
+            CREATE TRIGGER IF NOT EXISTS trg_folder_health_version_delete
+            AFTER DELETE ON folders
+            BEGIN
+                UPDATE db_meta
+                SET value = CAST(value AS INTEGER) + 1
+                WHERE key = 'folder_health_version';
+            END;
+            CREATE TRIGGER IF NOT EXISTS trg_folder_health_version_status
+            AFTER UPDATE OF status ON folders
+            WHEN OLD.status IS NOT NEW.status
+            BEGIN
+                UPDATE db_meta
+                SET value = CAST(value AS INTEGER) + 1
+                WHERE key = 'folder_health_version';
+            END;
+            CREATE TRIGGER IF NOT EXISTS trg_folder_health_version_ws_insert
+            AFTER INSERT ON workspace_folders
+            BEGIN
+                UPDATE db_meta
+                SET value = CAST(value AS INTEGER) + 1
+                WHERE key = 'folder_health_version';
+            END;
+            CREATE TRIGGER IF NOT EXISTS trg_folder_health_version_ws_delete
+            AFTER DELETE ON workspace_folders
+            BEGIN
+                UPDATE db_meta
+                SET value = CAST(value AS INTEGER) + 1
+                WHERE key = 'folder_health_version';
+            END;
         """
         )
         cur = self.conn.cursor()
@@ -3532,6 +3574,11 @@ class Database:
                ORDER BY f.path""",
             (self._ws_id(),),
         ).fetchall()
+
+    def get_folder_health_version(self):
+        """Return the monotonic version for folder-health-visible changes."""
+        value = self.get_meta("folder_health_version")
+        return int(value or 0)
 
     def get_missing_photos(
         self,

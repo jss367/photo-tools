@@ -11190,6 +11190,16 @@ window.markMissingFoldersReconciliationPending = function() {
 // applied (init is newer) from one that landed while init was in flight
 // (the later observation remains authoritative).
 let _missingFoldersSnapshotVersion = 0;
+// Monotonic SQLite-backed observation marker returned by every server
+// endpoint that can establish the missing-folder baseline. Unlike client
+// request generations, this orders responses even when an older server read
+// is delivered before a newer init response is applied.
+let _missingFoldersServerVersion = null;
+
+function _parseFolderHealthVersion(value) {
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : null;
+}
 
 function _missingFolderIdsDiffer(prev, curr) {
   if (prev.length !== curr.length) return true;
@@ -11249,13 +11259,23 @@ function _updateMissingFoldersBanner(folders) {
 // the version changed in flight, keep that later observation and dispatch
 // init→current so Browse discards its stale init payload.
 function _reconcileMissingFoldersInitSnapshot(
-  initIds, snapshotVersionAtStart, source
+  initIds, snapshotVersionAtStart, source, initServerVersion
 ) {
   const currentIds = initIds.slice().sort((a, b) => a - b);
-  const initIsNewer = _missingFoldersLastIds === null ||
-    snapshotVersionAtStart === _missingFoldersSnapshotVersion;
+  const serverVersion = _parseFolderHealthVersion(initServerVersion);
+  let initIsNewer;
+  if (_missingFoldersServerVersion === null || serverVersion === null) {
+    initIsNewer = _missingFoldersLastIds === null ||
+      snapshotVersionAtStart === _missingFoldersSnapshotVersion;
+  } else if (serverVersion !== _missingFoldersServerVersion) {
+    initIsNewer = serverVersion > _missingFoldersServerVersion;
+  } else {
+    initIsNewer = _missingFoldersLastIds === null ||
+      snapshotVersionAtStart === _missingFoldersSnapshotVersion;
+  }
   if (initIsNewer) {
     _missingFoldersLastIds = currentIds;
+    if (serverVersion !== null) _missingFoldersServerVersion = serverVersion;
     _missingFoldersSnapshotVersion++;
     _updateMissingFoldersBanner(currentIds.map(id => ({ id })));
     return false;
@@ -11306,6 +11326,8 @@ async function checkMissingFolders() {
   try {
     const resp = await fetch('/api/folders/missing');
     if (!resp.ok) return;
+    const serverVersion = _parseFolderHealthVersion(
+      resp.headers.get('X-Vireo-Folder-Health-Version'));
     const folders = await resp.json();
     // A newer GET started while this fetch was pending \u2014 its result
     // supersedes ours (Codex review r3685515796). Skip the whole
@@ -11324,11 +11346,16 @@ async function checkMissingFolders() {
     // — see r3686095481 for why it can't safely delegate back here.
     if (_missingFoldersMutationInFlight > 0 ||
         mutationEpochAtStart !== _missingFoldersMutationEpoch) return;
-    // /api/browse/init can install a newer workspace snapshot while this
-    // GET is in flight even when no newer GET/POST exists. Do not let the
-    // pre-init poll overwrite that baseline, repaint the banner backwards,
-    // or dispatch a reverse health transition.
-    if (snapshotVersionAtStart !== _missingFoldersSnapshotVersion) return;
+    // Prefer the server's monotonic observation ordering. The client version
+    // remains the compatibility/tie-break guard when the response lacks the
+    // marker or observed the same SQLite health version.
+    if (_missingFoldersServerVersion !== null && serverVersion !== null) {
+      if (serverVersion < _missingFoldersServerVersion) return;
+      if (serverVersion === _missingFoldersServerVersion &&
+          snapshotVersionAtStart !== _missingFoldersSnapshotVersion) return;
+    } else if (snapshotVersionAtStart !== _missingFoldersSnapshotVersion) {
+      return;
+    }
     const currentIds = folders.map(f => f.id).sort((a, b) => a - b);
     const dispatched = _dispatchFolderHealthChangeFromIds(
       _missingFoldersLastIds, currentIds, 'poll');
@@ -11347,6 +11374,7 @@ async function checkMissingFolders() {
     }
     _missingFoldersReconciliationPending = false;
     _missingFoldersLastIds = currentIds;
+    if (serverVersion !== null) _missingFoldersServerVersion = serverVersion;
     _missingFoldersSnapshotVersion++;
     _updateMissingFoldersBanner(folders);
   } catch (e) { /* ignore */ }
@@ -11775,6 +11803,8 @@ async function loadMissingFolders() {
     if (!resp.ok) throw new Error('check failed');
     const data = await resp.json();
     const folders = data.missing;
+    const serverVersion = _parseFolderHealthVersion(
+      data.folder_health_version);
     // Folder health is part of the effective photo dataset: ok→missing hides
     // a folder's photos, while missing→ok makes them available again. Notify
     // the current page so a long-lived Browse view does not keep showing the
@@ -11816,6 +11846,11 @@ async function loadMissingFolders() {
       _scheduleMissingFoldersRecovery();
       return;
     }
+    if (_missingFoldersServerVersion !== null && serverVersion !== null &&
+        serverVersion < _missingFoldersServerVersion) {
+      _scheduleMissingFoldersRecovery();
+      return;
+    }
     const prevIds = _missingFoldersLastIds;
     const currentIds = folders.map(f => f.id).sort((a, b) => a - b);
     // Keep the poll snapshot in sync with what this POST just observed
@@ -11824,6 +11859,7 @@ async function loadMissingFolders() {
     // the poll would see (last-poll ≠ post-POST) and fire a second
     // redundant vireo:folder-health-changed for the same transition.
     _missingFoldersLastIds = currentIds;
+    if (serverVersion !== null) _missingFoldersServerVersion = serverVersion;
     _missingFoldersSnapshotVersion++;
     const dispatched = _dispatchFolderHealthChangeFromIds(
       prevIds, currentIds, 'check-health');

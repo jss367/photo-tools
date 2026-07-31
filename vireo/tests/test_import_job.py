@@ -5451,6 +5451,70 @@ def test_remote_import_dup_link_scan_does_not_reread_unchanged_twins(
     )
 
 
+def test_remote_import_dup_only_batch_does_not_reread_dest_folder_twins(
+        tmp_path, monkeypatch):
+    """A duplicate-only remote batch whose twins sit in the batch's OWN
+    destination folder must not re-read them.
+
+    ``test_remote_import_dup_link_scan_does_not_reread_unchanged_twins``
+    parks its twins in ``unsorted`` — a different folder from the batch
+    destination — so that test's batch scan walks an empty
+    ``dest_folder`` and reads nothing either way. The common real case is
+    re-importing a card into the same date folder it originally landed
+    in, where ``dest_folder`` already holds every twin. With no fresh
+    landings the batch scan passes ``restrict_files=None``, so it walks
+    the whole destination folder; without ``incremental=True`` it
+    re-reads and re-hashes every already-cataloged file there. On a
+    network archive that turns a zero-copy import into an hours-long
+    rescan.
+    """
+    import scanner
+    from import_job import ImportParams, run_import_job
+
+    ra = _remote_archive_for(tmp_path)
+    calls = _remote_calls(ra)
+    _install_fake_remote_rsync(monkeypatch, calls, verify=None)
+
+    card = _make_card(tmp_path, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+        ("DSC_0002.jpg", datetime(2026, 7, 3, 11, 0, 0), "green"),
+    ])
+
+    # The twins live in the very folder this card's files map to, which is
+    # what re-importing an already-imported card looks like.
+    dest_folder = os.path.join(ra["mount_base"], "2026", "2026-07-03")
+    os.makedirs(dest_folder, exist_ok=True)
+    import shutil as _shutil
+    for name in ("DSC_0001.jpg", "DSC_0002.jpg"):
+        _shutil.copy2(str(card / name), os.path.join(dest_folder, name))
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws_id = db._active_workspace_id
+    scanner.scan(ra["mount_base"], db)
+    _mark_exif_extracted(db)
+    assert len(_photo_rows(db)) == 2
+
+    read_paths = _count_feature_computations(monkeypatch)
+    result = run_import_job(
+        _make_job(), FakeRunner(), db_path, ws_id,
+        ImportParams(
+            sources=[str(card)], destination=ra["mount_base"],
+            remote_target=ra, verify_by_hash=True,
+        ),
+    )
+
+    assert calls["rsync"] == [], calls["rsync"]
+    assert result["skipped_duplicate"] == 2, result
+    assert result["copied"] == 0, result
+    assert result["failed"] == 0, result
+    assert dest_folder in _ws_linked_folder_paths(db, ws_id)
+    assert read_paths == [], (
+        "remote duplicate-only import re-read already-cataloged, unchanged "
+        f"twins in the destination folder: {read_paths}"
+    )
+
+
 def test_remote_import_scans_adopted_duplicate_in_mixed_batch(
         tmp_path, monkeypatch):
     """A retry / crash-recovery batch that (a) copies one fresh file AND

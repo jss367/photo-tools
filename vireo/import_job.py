@@ -1516,10 +1516,22 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
             # files never become photo rows. See PR #1113 review.
             scan_files = landed_paths | set(adopted_paths.keys())
             try:
+                # ``incremental=True`` is what keeps a duplicate-only batch
+                # affordable. With no fresh landings and no adopted paths,
+                # ``restrict_files`` is None and this call walks the whole
+                # ``dest_folder`` — and re-importing a card into the same
+                # date folder it originally landed in means that folder
+                # already holds every twin. Non-incrementally that re-read
+                # and re-hashed all of them, turning a zero-copy import
+                # into an hours-long rescan on a network archive. Fresh
+                # landings are unaffected: they have no catalog row yet, so
+                # the skip path can't fire for them. Mirrors the dup-link
+                # scan below and the local path's equivalent.
                 scan(
                     destination, db,
                     restrict_dirs=[dest_folder],
                     restrict_files=(scan_files or None),
+                    incremental=True,
                     vireo_dir=params.vireo_dir,
                     thumb_cache_dir=params.thumb_cache_dir,
                     skip_working_copies=True,

@@ -20,7 +20,10 @@ from PIL import Image
 from playwright.sync_api import expect
 from werkzeug.serving import make_server
 
+sys.path.insert(0, os.path.dirname(__file__))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "vireo"))
+
+from _e2e_server import InFlightMiddleware  # noqa: E402
 
 
 def _write_jpeg(path, size=(64, 64), color="red"):
@@ -60,8 +63,11 @@ def fresh_server(tmp_path, monkeypatch):
 
     # threaded=True for the same reason as the shared ``live_server``
     # fixture in conftest.py: a single-threaded server makes every page
-    # load queue behind whatever else the page requested.
-    server = make_server("127.0.0.1", 0, app, threaded=True)
+    # load queue behind whatever else the page requested. The tracker
+    # wrapper lets teardown drain in-flight handlers that outlived the
+    # request the test was watching — see InFlightMiddleware's docstring.
+    tracker = InFlightMiddleware(app)
+    server = make_server("127.0.0.1", 0, tracker, threaded=True)
     port = server.socket.getsockname()[1]
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -75,6 +81,7 @@ def fresh_server(tmp_path, monkeypatch):
 
     server.shutdown()
     thread.join(timeout=5)
+    tracker.drain(timeout=10)
 
 
 def _clear_new_images_cache():

@@ -7,7 +7,10 @@ import pytest
 from PIL import Image
 from werkzeug.serving import make_server
 
+sys.path.insert(0, os.path.dirname(__file__))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'vireo'))
+
+from _e2e_server import InFlightMiddleware  # noqa: E402
 
 
 def _seed_classifier_model(home_dir):
@@ -148,7 +151,8 @@ def live_server(tmp_path, monkeypatch):
     # ``load`` — and therefore ``page.goto`` — can stall on a busy machine.
     # Per-request connections come from ``_get_db()`` via Flask ``g``, the
     # same isolation waitress relies on.
-    server = make_server("127.0.0.1", 0, app, threaded=True)
+    tracker = InFlightMiddleware(app)
+    server = make_server("127.0.0.1", 0, tracker, threaded=True)
     port = server.socket.getsockname()[1]
     thread = threading.Thread(target=server.serve_forever)
     thread.daemon = True
@@ -164,6 +168,14 @@ def live_server(tmp_path, monkeypatch):
     finally:
         server.shutdown()
         thread.join(timeout=5)
+        # Requests handled in daemon threads (Werkzeug's ThreadedWSGIServer
+        # sets daemon_threads=True) are not joined by server_close(). Tests
+        # that observe a request with page.expect_request return before its
+        # response, so a handler like /api/files/reveal can still be inside
+        # subprocess.run when teardown starts. Drain it before closing the
+        # app instance and Database — otherwise the still-running handler
+        # can race the next test's fixture setup.
+        tracker.drain(timeout=10)
         server.server_close()
         if hasattr(app, "_cleanup_app_resources"):
             app._cleanup_app_resources()

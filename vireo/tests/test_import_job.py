@@ -6712,14 +6712,15 @@ def test_local_import_stops_when_mount_point_persists_after_unmount(
         lambda path: [dest] if str(path).startswith(dest) else [],
     )
     real_ismount = os.path.ismount
-    probes = {"n": 0}
+    first_landed = os.path.join(dest, "2026", "2026-07-03", "DSC_0001.jpg")
 
     def fake_ismount(p):
-        if str(p) == dest:
-            probes["n"] += 1
-            # Mounted for the baseline and the first batch; gone after.
-            return probes["n"] <= 2
-        return real_ismount(p)
+        if str(p) != dest:
+            return real_ismount(p)
+        # Mounted until the first batch's file has landed, detached after.
+        # Keyed on observable state rather than a probe count, so adding
+        # or removing a probe elsewhere can't silently retime the test.
+        return not os.path.exists(first_landed)
 
     monkeypatch.setattr(os.path, "ismount", fake_ismount)
 
@@ -6794,13 +6795,16 @@ def test_remote_import_stops_when_mount_point_persists_after_unmount(
         lambda path: [mount_base] if str(path).startswith(mount_base) else [],
     )
     real_ismount = os.path.ismount
-    probes = {"n": 0}
+    first_landed = os.path.join(
+        mount_base, "2026", "2026-07-03", "DSC_0001.jpg")
 
     def fake_ismount(p):
-        if str(p) == mount_base:
-            probes["n"] += 1
-            return probes["n"] <= 2
-        return real_ismount(p)
+        if str(p) != mount_base:
+            return real_ismount(p)
+        # Detaches once the first batch has landed. Keyed on observable
+        # state rather than a probe count so the test can't be retimed by
+        # a probe being added elsewhere.
+        return not os.path.exists(first_landed)
 
     monkeypatch.setattr(os.path, "ismount", fake_ismount)
 
@@ -6942,3 +6946,66 @@ def test_remote_import_takes_mount_baseline_before_discovery(
     assert all(
         "no longer mounted" in u["reason"] for u in non_remote
     ), result["unsafe_files"]
+
+
+def test_local_import_detects_mount_loss_inside_a_single_batch(
+        tmp_path, monkeypatch):
+    """A detach mid-batch must not ride out to the end of the batch.
+
+    Batch-boundary probing alone leaves a whole folder unguarded, and when
+    there is only ONE batch there is no later boundary at all — every
+    remaining file is copied, hash-verified and cataloged into the local
+    shadow, and safe_to_format can still go green over a card that is the
+    only real copy. See PR #1396 review (Codex P1 r3687401641).
+    """
+    import pipeline_job as _pj
+    from import_job import ImportParams
+
+    # One batch: four files, same capture date. Distinct colours so each
+    # is genuinely copied — identical bytes would route files 2-4 through
+    # the intra-run duplicate gate and never exercise the copy path.
+    card = _make_card(tmp_path, [
+        (f"DSC_000{i}.jpg", datetime(2026, 7, 3, 10, i, 0), colour)
+        for i, colour in enumerate(
+            ("red", "green", "blue", "yellow"), start=1)
+    ])
+    dest = str(tmp_path / "mnt_NAS")
+    os.makedirs(dest, exist_ok=True)
+
+    monkeypatch.setattr(
+        _pj, "_archive_mount_root_candidates",
+        lambda path: [dest] if str(path).startswith(dest) else [],
+    )
+
+    state = {"mounted": True, "probes": 0}
+    real_ismount = os.path.ismount
+
+    def fake_ismount(p):
+        if str(p) != dest:
+            return real_ismount(p)
+        state["probes"] += 1
+        # Baseline + batch-level check + first two files stay mounted;
+        # the share drops partway through the single batch.
+        if state["probes"] > 4:
+            state["mounted"] = False
+        return state["mounted"]
+
+    monkeypatch.setattr(os.path, "ismount", fake_ismount)
+
+    db, ws_id, result = _run_import(tmp_path, ImportParams(
+        sources=[str(card)], destination=dest,
+    ))
+
+    assert result["discovered"] == 4, result
+    # Whatever the split, nothing may be left claiming a successful
+    # archive copy, and the card must not be declared safe to format.
+    assert result["copied"] == 0, result
+    assert result["failed"] == 4, result
+    assert result["safe_to_format"] is False, result
+    assert any(
+        "detached" in u["reason"] for u in result["unsafe_files"]
+    ), result["unsafe_files"]
+
+    # Nothing from this run may be cataloged under the shadow directory.
+    rows = _photo_rows(db)
+    assert rows == [], rows

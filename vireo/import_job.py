@@ -2718,11 +2718,29 @@ def run_import_job(job, runner, db_path, workspace_id, params):
         # bytes, never the just-written archive copy.
         landed = []
         dup_dirs = set()
+        # Sticky once tripped: a batch can hold hundreds of files (the
+        # 2026-07-26 folder held 200), and when it is the only batch there
+        # is no later batch boundary to catch a detach. Probing per file
+        # keeps the blast radius at one file instead of a whole folder.
+        # One ismount call is nothing next to copying and hashing a RAW.
+        mount_lost = None
 
         for source_file in batch:
             if runner.is_cancelled(job["id"]):
                 cancelled = True
                 break
+            if not mount_lost:
+                mount_lost = _unmounted_since_baseline(mount_baseline)
+            if mount_lost:
+                emitted += 1
+                _fail(
+                    rel, source_file,
+                    f"archive mount root {mount_lost} detached while this "
+                    "batch was copying (the directory persists but the "
+                    "share is gone, so further writes would land on the "
+                    "local disk under a stale mount point)",
+                )
+                continue
             emitted += 1
             _emit(
                 f"{rel}: importing", emitted, discovered, source_file.name,
@@ -3066,6 +3084,23 @@ def run_import_job(job, runner, db_path, workspace_id, params):
                  src_size, src_mtime_ns),
             )
             _record_checker(source_file, dest_folder, file_hash)
+
+        # Anything that landed BEFORE the detach is sitting in the local
+        # shadow, not on the archive. Roll those out of copied/
+        # skipped_duplicate into failed and drop them: cataloging them
+        # would record archive paths for bytes that vanish when the real
+        # share remounts, and leaving them booked as copied could let
+        # safe_to_format go green over a card that is still the only
+        # copy. Emptying ``landed`` also skips the catalog scan below.
+        if mount_lost and landed:
+            for entry in landed:
+                _reclassify_landed_failed(
+                    rel, entry,
+                    f"archive mount root {mount_lost} detached mid-batch; "
+                    "this file landed in a local shadow of the archive, "
+                    "not on the share",
+                )
+            landed = []
 
         # --- Catalog this batch (even when cancelled mid-batch: what
         # landed on disk must be cataloged before we stop, so every

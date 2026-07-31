@@ -2171,14 +2171,21 @@ def test_a_single_render_pass_produces_a_correct_folder_header(
 
     #importPreviewGrid ships display:none and previewImport() re-hides it
     before every run, so anything that reads layout to build the header
-    tally has to run after the grid is shown again. The later passes would
-    paper over a mistake here, but they are not guaranteed: with
-    chkSkipDuplicates on and a destination that fails to resolve, the
-    files-only pass is the only one there is, and the user would be left
-    with a dead, unticked header over a fully selected folder.
+    tally has to run after the grid is shown again. A later pass would
+    paper over a mistake here, but a later pass is not guaranteed: with
+    Skip duplicates OFF, the only re-render is the one gated on
+    `destData && destData.files`, and renderDestStructure() returns null
+    before it even fetches whenever the destination doesn't resolve. That
+    leaves the files-only pass as the only one there is, and the user with
+    a dead, unticked header over a fully selected folder.
 
-    Copy mode explicitly -- the header checkbox only exists there -- and the
-    renderer is driven directly so the assertion lands on a single pass.
+    (With Skip duplicates ON there are always at least two passes -- the
+    stream-drained render is unconditional -- so that is NOT the case this
+    guards.)
+
+    Copy mode explicitly, since the header checkbox only exists there, and
+    the renderer is driven directly so the assertion lands on exactly one
+    pass rather than on whichever one previewImport() happens to end with.
     """
     page.goto(f"{live_server['url']}/import")
     _suppress_auto_preview(page)
@@ -2794,6 +2801,12 @@ def test_in_place_mode_hides_selection_and_explains_why(live_server, page):
     missing, broken, or gated behind a setting they haven't found -- the
     same unexplained-control failure the disabled-state work already had to
     fix twice.
+
+    BOTH halves of the note are pinned. The descriptive half alone leaves
+    the user knowing selection doesn't apply but not where it does, which
+    is the half this whole task exists for; and the pointer has to quote
+    the radio's own label, since a user scanning for the note's words has
+    to be able to find the control it names.
     """
     page.goto(f"{live_server['url']}/import")
     _stub_preview(page, _files(3))
@@ -2801,9 +2814,17 @@ def test_in_place_mode_hides_selection_and_explains_why(live_server, page):
     _preview(page)
 
     expect(page.locator(".import-preview-thumb .thumb-check")).to_have_count(0)
-    expect(page.locator("#selectionUnavailableNote")).to_be_visible()
-    expect(page.locator("#selectionUnavailableNote")).to_contain_text(
-        "In-place import catalogs every file")
+    note = page.locator("#selectionUnavailableNote")
+    expect(note).to_be_visible()
+    expect(note).to_contain_text("Add in place catalogs every file")
+    expect(note).to_contain_text("File selection is available in Copy to"
+                                 " archive mode.")
+    # Not a paraphrase of the radio: the note has to name the control the
+    # user will go looking for, exactly as the control names itself.
+    expect(page.locator("label", has=page.locator("#modeCopy"))
+           ).to_contain_text("Copy to archive")
+    expect(page.locator("label", has=page.locator("#modeInPlace"))
+           ).to_contain_text("Add in place")
     # The other two selection controls go with them: a folder header that
     # bulk-toggles nothing, and a master checkbox over no boxes.
     expect(page.locator(".import-preview-folder-header .folder-check")
@@ -2928,11 +2949,11 @@ def test_snapshot_mode_hides_selection_and_says_what_it_will_import(
         live_server, page):
     """Snapshot mode is not in-place mode, and the note must not claim it is.
 
-    The mode radios are DISABLED here, so "selection is available when
-    copying files" would point at a control the user cannot reach, and
-    "catalogs every file in the folder" is wrong twice over: this import
-    adds exactly the frozen list that was captured, which is a subset of
-    the folder.
+    Both mode radios are DISABLED here, so pointing at Copy to archive
+    would name a control the user cannot reach, and "every file it finds in
+    your source folders" is wrong twice over: this import posts a
+    snapshot_id and adds exactly the frozen list that was captured, which
+    is a subset of what those folders hold.
     """
     page.goto(f"{live_server['url']}/import")  # warm the app before routing
     _stub_snapshot_import(page, _files(3))
@@ -2944,9 +2965,16 @@ def test_snapshot_mode_hides_selection_and_says_what_it_will_import(
     expect(page.locator("#selectAllRow")).not_to_be_visible()
     note = page.locator("#selectionUnavailableNote")
     expect(note).to_be_visible()
-    expect(note).to_contain_text("captured list")
-    expect(note).not_to_contain_text("copying files")
-    expect(note).not_to_contain_text("every file in the folder")
+    expect(note).to_contain_text("adds exactly the captured list")
+    # Both halves again: "what it adds" and "what happens to the files".
+    # The summary line above happens to repeat the second one today, but a
+    # note that only half-explains itself shouldn't depend on that.
+    expect(note).to_contain_text("leaving the originals where they are")
+    expect(note).not_to_contain_text("Copy to archive")
+    expect(note).not_to_contain_text("your source folders")
+    # The disabled radios are what make naming Copy to archive wrong here.
+    expect(page.locator("#modeCopy")).to_be_disabled()
+    expect(page.locator("#modeInPlace")).to_be_disabled()
 
 
 def test_snapshot_mode_withholds_selection_even_if_the_mode_radio_flips(

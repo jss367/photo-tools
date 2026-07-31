@@ -689,18 +689,27 @@ function importSelectionEnabled() {
 // Why the boxes aren't there. An unexplained absence is the same class of
 // failure as an unexplained disabled control: the user cannot tell whether
 // selection is missing, broken, or hidden behind a setting they haven't
-// found. The two strings must stay distinct — in snapshot mode both mode
-// radios are DISABLED, so pointing at copy mode would name a control the
-// user cannot reach, and the import adds the captured list rather than
-// everything in the folder.
+// found. Both strings therefore carry two halves — where selection DOES
+// live, and what this mode will do instead — and both halves are pinned by
+// tests.
+//
+// "Copy to archive" is the radio's own label, quoted exactly: a user
+// scanning the screen for the words the note used cannot find "when copying
+// files". Plural "source folders" because Add in place walks every source
+// added, recursively when Include subfolders is on.
+//
+// The two strings must stay distinct. In snapshot mode both mode radios are
+// DISABLED, so naming Copy to archive would point at a control the user
+// cannot reach, and that import adds exactly the captured list rather than
+// everything the source folders hold.
 function selectionUnavailableText() {
   if (newImagesSnapshotId !== null) {
     return 'File selection is not available for this import. It adds exactly'
       + ' the captured list of newly detected images, leaving the originals'
       + ' where they are.';
   }
-  return 'File selection is available when copying files. In-place import'
-    + ' catalogs every file in the folder.';
+  return 'File selection is available in Copy to archive mode. Add in place'
+    + ' catalogs every file it finds in your source folders.';
 }
 
 function updateImportMode() {

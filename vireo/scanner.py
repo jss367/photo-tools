@@ -276,6 +276,12 @@ def _pair_raw_jpeg_companions(db, vireo_dir=None, thumb_cache_dir=None):
     When both IMG_001.cr3 and IMG_001.jpg exist in the same folder,
     keep the raw as the primary photo and set companion_path to the JPEG filename.
     Delete the duplicate JPEG-only photo record.
+
+    Returns the number of companion rows merged away. Callers that count
+    indexed photos must subtract this: both files were counted on the way
+    in, but only the RAW row survives, so the scan would otherwise claim
+    two photos where the catalog holds one — and RAW+JPEG is the common
+    shooting mode, so that overstates nearly every import.
     """
     raw_exts = {".nef", ".cr2", ".cr3", ".arw", ".raf", ".dng", ".rw2", ".orf"}
     jpeg_exts = {".jpg", ".jpeg"}
@@ -304,6 +310,11 @@ def _pair_raw_jpeg_companions(db, vireo_dir=None, thumb_cache_dir=None):
     # us "all DB changes durable, then all FS changes" — commit failure
     # aborts both halves.
     post_commit_fs_actions = []
+    # Companion rows merged away, reported to the caller so it can correct
+    # its indexed count. Counted at the DELETE but only returned after the
+    # commit below succeeds — the whole loop shares one transaction, so a
+    # commit failure rolls every deletion back and none of them happened.
+    merged = 0
 
     for (_folder_id, _base), members in groups.items():
         if len(members) < 2:
@@ -664,6 +675,7 @@ def _pair_raw_jpeg_companions(db, vireo_dir=None, thumb_cache_dir=None):
         # Remove keyword associations then the duplicate JPEG record
         db.conn.execute("DELETE FROM photo_keywords WHERE photo_id = ?", (companion["id"],))
         db.conn.execute("DELETE FROM photos WHERE id = ?", (companion["id"],))
+        merged += 1
         # The companion's rowid is now free for SQLite to hand to the next
         # insert. Its derivatives must be unlinked so the next photo to
         # inherit the id can't adopt the companion's thumbnail / working
@@ -710,6 +722,7 @@ def _pair_raw_jpeg_companions(db, vireo_dir=None, thumb_cache_dir=None):
     # is durable and doesn't leak into the caller's next write.
     if db.conn.in_transaction:
         commit_with_retry(db.conn)
+    return merged
 
 
 def _invalidate_raw_display_cache(vireo_dir, photo_id):
@@ -1454,6 +1467,7 @@ def backfill_working_copies(db, vireo_dir, progress_callback=None,
 
 _EMPTY_SCAN_COUNTS = {
     "discovered": 0, "indexed": 0, "vanished": 0, "skipped_uncataloged": 0,
+    "merged_companions": 0,
 }
 
 
@@ -1539,8 +1553,11 @@ def scan(root, db, progress_callback=None, incremental=False, extract_full_metad
         incremental scan revalidated without changing, so this is "rows
         this run vouched for", not "rows newly created"), ``vanished``
         (discovered but gone by the time we stat'd them, the shape a
-        network share dropping mid-scan takes), and
-        ``skipped_uncataloged`` (update-only scans declining to insert).
+        network share dropping mid-scan takes), ``skipped_uncataloged``
+        (update-only scans declining to insert), and
+        ``merged_companions`` (JPEGs folded into a same-basename RAW's
+        row, which are discounted from ``indexed`` because they stop
+        being photos of their own).
         Build user-facing counts from ``indexed``, never from the progress
         counter — progress advances for skipped files too.
     """
@@ -2556,9 +2573,16 @@ def scan(root, db, progress_callback=None, incremental=False, extract_full_metad
     # counts — otherwise update_folder_counts()'s commit would persist
     # half-applied pairing or working-copy records.
     try:
-        _pair_raw_jpeg_companions(
+        # A JPEG merged into its RAW's row stops being its own photo, so
+        # discount it: both files were counted on the way in but only the
+        # RAW survives. Applied to the sink immediately (not just the
+        # returned dict) so a caller reading counts after a later failure
+        # in this block still sees the corrected number.
+        _merged = _pair_raw_jpeg_companions(
             db, vireo_dir=vireo_dir, thumb_cache_dir=thumb_cache_dir,
         )
+        counts["merged_companions"] += _merged
+        counts["indexed"] -= _merged
 
         # Extract working copies for RAW photos (after pairing so companion is known).
         # Scope to the folders the caller just scanned so a fresh import doesn't
@@ -2615,13 +2639,19 @@ def scan(root, db, progress_callback=None, incremental=False, extract_full_metad
     # and a miscounted summary is no reason to fail the run.
     vanished_count = counts["vanished"]
     skipped_uncataloged_count = counts["skipped_uncataloged"]
+    merged_count = counts["merged_companions"]
     indexed_count = counts["indexed"]
-    if indexed_count + vanished_count + skipped_uncataloged_count != processed_count:
+    accounted = (
+        indexed_count + vanished_count + skipped_uncataloged_count
+        + merged_count
+    )
+    if accounted != processed_count:
         log.error(
             "Scan count invariant broken: indexed=%d + vanished=%d + "
-            "skipped=%d != processed=%d (a file disposition is unclassified)",
+            "skipped=%d + merged=%d != processed=%d (a file disposition is "
+            "unclassified)",
             indexed_count, vanished_count, skipped_uncataloged_count,
-            processed_count,
+            merged_count, processed_count,
         )
 
     # Report what reached the catalog, not what the walk turned up. These
@@ -2630,11 +2660,13 @@ def scan(root, db, progress_callback=None, incremental=False, extract_full_metad
     # precisely when the scan achieved nothing — an archive share that
     # dropped mid-scan logged "984 photos indexed" having indexed zero.
     summary = f"Scan complete: {indexed_count} photos indexed"
+    if merged_count:
+        summary += f", {merged_count} JPEG(s) merged into their RAW"
     if vanished_count:
         summary += f", {vanished_count} vanished"
     if skipped_uncataloged_count:
         summary += f", {skipped_uncataloged_count} uncataloged (skipped)"
-    if vanished_count or skipped_uncataloged_count:
+    if merged_count or vanished_count or skipped_uncataloged_count:
         summary += f" of {total} discovered"
     log.info(summary)
     return counts

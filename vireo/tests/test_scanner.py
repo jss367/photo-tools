@@ -5686,3 +5686,62 @@ def test_scan_counts_photos_committed_before_a_post_insert_hook_raised(
         f"sink says {counts['indexed']} indexed but {committed} rows are "
         "committed in the catalog"
     )
+
+
+def test_scan_indexed_count_excludes_jpegs_merged_into_raw_companions(tmp_path):
+    """A JPEG merged into its RAW's row is not a separate indexed photo.
+
+    ``_pair_raw_jpeg_companions`` runs after the per-file loop and deletes
+    the JPEG's photo row, keeping it as the RAW's companion. Both files
+    incremented the counter on the way through, so without an adjustment
+    the scan claims two photos where the catalog holds one. Shooting
+    RAW+JPEG is the common case, so this would overstate nearly every
+    import.
+    """
+    from db import Database
+    from scanner import scan
+
+    img_dir = tmp_path / "photos"
+    img_dir.mkdir()
+    Image.new("RGB", (200, 100), color="green").save(
+        str(img_dir / "IMG_001.jpg"))
+    with open(str(img_dir / "IMG_001.cr3"), "wb") as f:
+        f.write(b"\x00" * 200)
+
+    db = Database(str(tmp_path / "test.db"))
+    result = scan(str(img_dir), db)
+
+    rows = db.conn.execute("SELECT COUNT(*) FROM photos").fetchone()[0]
+    assert rows == 1, rows
+    assert result["discovered"] == 2, result
+    assert result["indexed"] == rows, (
+        f"claimed {result['indexed']} photos indexed but the catalog holds "
+        f"{rows}"
+    )
+
+
+def test_scan_indexed_count_keeps_unpaired_jpegs(tmp_path):
+    """Only the merged companion is discounted, not every JPEG."""
+    from db import Database
+    from scanner import scan
+
+    img_dir = tmp_path / "photos"
+    img_dir.mkdir()
+    Image.new("RGB", (200, 100), color="green").save(
+        str(img_dir / "IMG_001.jpg"))
+    with open(str(img_dir / "IMG_001.cr3"), "wb") as f:
+        f.write(b"\x00" * 200)
+    # A JPEG with no RAW of the same basename stays its own photo.
+    Image.new("RGB", (200, 100), color="blue").save(
+        str(img_dir / "IMG_002.jpg"))
+
+    db = Database(str(tmp_path / "test.db"))
+    result = scan(str(img_dir), db)
+
+    rows = db.conn.execute("SELECT COUNT(*) FROM photos").fetchone()[0]
+    assert rows == 2, rows
+    assert result["discovered"] == 3, result
+    assert result["indexed"] == rows, (
+        f"claimed {result['indexed']} photos indexed but the catalog holds "
+        f"{rows}"
+    )

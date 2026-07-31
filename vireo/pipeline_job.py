@@ -280,25 +280,10 @@ def _source_offline_reason(
     return "folder", f"folder {folder_path} is unreadable"
 
 
-def _preflight_candidacy_floor(effective_cfg, pipeline_cfg) -> float:
-    """Lowest detection confidence the mask worklist can reach.
-
-    Weak-detection rescue lets contextually-supported frames below
-    ``detector_confidence`` into masking, so the pre-flight has to look that
-    far down too or it silently drops rescued frames from both outcome sets.
-    """
-    detector_confidence = effective_cfg.get("detector_confidence", 0.2)
-    if not pipeline_cfg.get("weak_detection_rescue_enabled", True):
-        return detector_confidence
-    return min(
-        detector_confidence,
-        pipeline_cfg.get("weak_detection_confidence", 0.12),
-    )
-
-
 def _preflight_mask_outcomes(
     thread_db, dropped_photos, sam2_variant, dinov2_variant,
-    candidacy_floor,
+    detector_confidence, contextual_weak_ids=None,
+    weak_detection_confidence=None,
 ):
     """Split pre-flight-dropped photos into ``(already_masked, at_risk)``.
 
@@ -310,15 +295,17 @@ def _preflight_mask_outcomes(
       never have been read for masking, so an outage doesn't change its
       fate. It lands in neither set: counting it would turn an unrelated
       outage into a Fatal Extract failure and tell the user to reconnect for
-      photos that would still have no mask candidate. ``candidacy_floor``
-      is the *lowest* confidence the worklist can reach — with weak-detection
-      rescue on, that is ``weak_detection_confidence``, not
-      ``detector_confidence``. The rescue's contextual anchor-species test
-      can't be replayed here (the photo is already out of ``photos``), so
-      this errs toward counting a weak frame as at risk: over-reporting an
-      outage is visible and correctable, while under-reporting reproduces
-      the silent completion this whole stage-reporting change exists to
-      prevent.
+      photos that would still have no mask candidate. Weak-rescued frames
+      (photos in ``contextual_weak_ids``) apply the loop's lower
+      ``weak_detection_confidence`` floor with the MDv6/animal filter —
+      matching the exact second branch of the mask loop's detection lookup.
+      Ordinary photos take the strict ``detector_confidence`` floor with
+      the full-image synthetic filter. A weak-confidence detection alone is
+      NOT enough to count as at-risk: the loop requires ``contextual_weak_
+      runs`` to have surfaced the frame first (matching-anchor-species gate
+      included), so counting arbitrary weak-conf offline photos as at-risk
+      inflates the outage report for photos the mask worklist would never
+      read (Codex #1392 P2 r3687403366).
     * **Cache validity** — the same test the loop's cache branch applies:
       a ``photo_masks`` row for this variant whose stored prompt and detector
       still match the current primary detection, whose file is on disk, and
@@ -331,16 +318,36 @@ def _preflight_mask_outcomes(
     Only the at-risk set is unmasked-and-unreachable, so only it should
     drive the unreadable count, the reconnect message, and the failure latch.
     """
+    contextual_weak_ids = contextual_weak_ids or set()
     already_masked: set = set()
     at_risk: set = set()
     for photo in dropped_photos:
         photo_id = photo["id"]
-        dets = [
-            d for d in thread_db.get_detections(
-                photo_id, min_conf=candidacy_floor,
-            )
-            if d["detector_model"] != "full-image"
-        ]
+        # Mirror ``extract_masks_stage``'s per-photo detection lookup: a
+        # weak-rescued photo takes the lower floor with the MDv6/animal
+        # filter, everyone else takes the strict floor with the full-image
+        # filter. Applying only the lower floor to every photo would count
+        # unrelated sub-threshold detections as at-risk, inflating outages
+        # for photos the loop would never open.
+        if (
+            photo_id in contextual_weak_ids
+            and weak_detection_confidence is not None
+        ):
+            dets = [
+                d for d in thread_db.get_detections(
+                    photo_id,
+                    min_conf=weak_detection_confidence,
+                    detector_model="megadetector-v6",
+                )
+                if d["category"] == "animal"
+            ]
+        else:
+            dets = [
+                d for d in thread_db.get_detections(
+                    photo_id, min_conf=detector_confidence,
+                )
+                if d["detector_model"] != "full-image"
+            ]
         if not dets:
             continue
         primary = dets[0]
@@ -404,14 +411,24 @@ def _extract_masks_early_exit(
     page renders error text from the step fields, so without it a row failed
     by a dead source shows only the benign "no detections" summary — hiding
     the reconnect instruction and blaming detections for the failure.
+
+    ``preflight_unreadable > 0`` fails the stage on its own, not only when
+    ``offline_latched`` is set. The pre-flight branch deliberately does not
+    re-latch when classify already emitted a source-offline Fatal (to avoid
+    a duplicate error entry), but the extract stage still had unreadable
+    photos — so its row on the Jobs page must show failed too, with the
+    outage detail attached (Codex #1392 P2 r3687403367). Callers pass the
+    extract-owned outage message even when it wasn't appended to
+    ``errors`` so the step can carry it here.
     """
+    should_fail = offline_latched or preflight_unreadable > 0
     step_extra = (
         {"error": outage_error, "error_count": preflight_unreadable}
-        if offline_latched and outage_error else {}
+        if should_fail and outage_error else {}
     )
     return (
-        "failed" if offline_latched else "skipped",
-        "failed" if offline_latched else "completed",
+        "failed" if should_fail else "skipped",
+        "failed" if should_fail else "completed",
         step_extra,
         {
             "masked": preflight_masked, "skipped": 0, "failed": 0,
@@ -5654,6 +5671,70 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
 
                 photos = _filter_excluded(thread_db.get_collection_photos(collection_id, per_page=999999))
 
+                # The mask loop applies two detection-confidence floors: a
+                # strict one for ordinary photos, and a lower
+                # ``weak_detection_confidence`` floor with an MDv6/animal
+                # filter for photos rescued by ``contextual_weak_runs``. The
+                # pre-flight offline probe below has to know both, and know
+                # the *precise* rescue set — a plain "look this low"
+                # candidacy floor over-counts unrelated sub-threshold photos
+                # as at-risk, inflating the outage report (Codex #1392 P2
+                # r3687403366). Compute them on the pre-filter ``photos``
+                # list so the eligibility set covers photos we're about to
+                # drop, and mirror the loop's anchor-species gate exactly.
+                detector_confidence = effective_cfg.get("detector_confidence", 0.2)
+                weak_rescue_enabled = pipeline_cfg.get(
+                    "weak_detection_rescue_enabled", True,
+                )
+                weak_detection_confidence = pipeline_cfg.get(
+                    "weak_detection_confidence", 0.12,
+                )
+
+                contextual_weak_ids: set = set()
+                if (
+                    weak_rescue_enabled
+                    and weak_detection_confidence < detector_confidence
+                    and photos
+                ):
+                    from weak_detections import contextual_weak_runs
+                    raw_mdv6_dets = thread_db.get_detections_for_photos(
+                        [p["id"] for p in photos],
+                        min_conf=weak_detection_confidence,
+                        detector_model="megadetector-v6",
+                    )
+                    weak_runs = contextual_weak_runs(
+                        photos,
+                        raw_mdv6_dets,
+                        detector_confidence=detector_confidence,
+                        weak_confidence=weak_detection_confidence,
+                        max_gap=pipeline_cfg.get("burst_time_gap", 3.0),
+                    )
+                    weak_scope_ids = {
+                        photo_id
+                        for run in weak_runs
+                        for photo_id in (
+                            run["left_photo_id"],
+                            *run["photo_ids"],
+                            run["right_photo_id"],
+                        )
+                    }
+                    if weak_scope_ids:
+                        # Mask only frames that pass the same matching-species
+                        # anchor gate as encounter grouping. Candidate weak
+                        # runs with conflicting or unclassified anchors remain
+                        # ordinary sub-threshold detections throughout.
+                        from pipeline import load_photo_features
+                        weak_features = load_photo_features(
+                            thread_db,
+                            config=effective_cfg,
+                            photo_ids=weak_scope_ids,
+                        )
+                        contextual_weak_ids = {
+                            feature["id"]
+                            for feature in weak_features
+                            if feature.get("subject_uncertain")
+                        }
+
                 # Drop photos whose folder is offline. Without this we'd
                 # render_proxy every one of them, they'd all skip with
                 # proxy=None, and the stage summary would land as "N
@@ -5734,8 +5815,14 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                     already_masked_ids, at_risk_dropped_ids = (
                         _preflight_mask_outcomes(
                             thread_db, dropped, sam2_variant, dinov2_variant,
-                            _preflight_candidacy_floor(
-                                effective_cfg, pipeline_cfg,
+                            detector_confidence,
+                            contextual_weak_ids=contextual_weak_ids,
+                            weak_detection_confidence=(
+                                weak_detection_confidence
+                                if weak_rescue_enabled
+                                and weak_detection_confidence
+                                < detector_confidence
+                                else None
                             ),
                         )
                     )
@@ -5754,16 +5841,18 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                     already_flagged_classify = any(
                         e.startswith("[classify] Fatal:") for e in errors
                     )
-                    if at_risk_dropped_ids and not already_flagged_classify:
-                        # Classify didn't already own this outage
-                        # (e.g. fully-cached run where classify made no
-                        # image reads). Surface the source-offline
-                        # failure at this stage instead — a fatal-
-                        # prefixed error keeps the end-of-run rollup
-                        # from picking an unrelated warning as the
-                        # headline error, and marking the stage
-                        # ``failed`` prevents the pipeline from
-                        # finishing "successfully" with no masks made.
+                    if at_risk_dropped_ids:
+                        # Build the extract-owned outage message on every
+                        # outage — even when classify already flagged it. It
+                        # only gets appended to the job-level ``errors`` list
+                        # when this stage owns the outage (to avoid a
+                        # duplicate Fatal entry), but the early-exit step
+                        # needs it either way so the Jobs page can render
+                        # the reconnect instruction on the extract row
+                        # (Codex #1392 P2 r3687403367). Without carrying it
+                        # over on the classify-already-flagged path, the
+                        # early-exit's failed step would have no error text
+                        # at all and blame detections instead.
                         em_offline_preflight_error = (
                             f"[extract_masks] Fatal: "
                             f"{len(at_risk_dropped_ids)} of {total_before} "
@@ -5771,14 +5860,25 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                             f"Reconnect the missing folder(s) and run "
                             f"Process again to extract the rest."
                         )
-                        errors.append(em_offline_preflight_error)
-                        stages["extract_masks"]["status"] = "failed"
-                        # Survive the em_failed==0 finalizer at the bottom
-                        # of this stage — the offline photos were removed
-                        # from the worklist above, so the per-photo failure
-                        # counter would otherwise flip the stage back to
-                        # ``completed`` (Codex #1388 P1 r3665130244).
-                        em_offline_latched = True
+                        if not already_flagged_classify:
+                            # Classify didn't already own this outage
+                            # (e.g. fully-cached run where classify made no
+                            # image reads). Surface the source-offline
+                            # failure at this stage — a fatal-prefixed error
+                            # keeps the end-of-run rollup from picking an
+                            # unrelated warning as the headline error, and
+                            # marking the stage ``failed`` prevents the
+                            # pipeline from finishing "successfully" with
+                            # no masks made.
+                            errors.append(em_offline_preflight_error)
+                            stages["extract_masks"]["status"] = "failed"
+                            # Survive the em_failed==0 finalizer at the
+                            # bottom of this stage — the offline photos
+                            # were removed from the worklist above, so the
+                            # per-photo failure counter would otherwise
+                            # flip the stage back to ``completed`` (Codex
+                            # #1388 P1 r3665130244).
+                            em_offline_latched = True
                     log.warning(
                         "Extract-masks: dropped %d photo(s) from %d "
                         "offline folder(s); source not reachable.",
@@ -5807,65 +5907,13 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                 # from "rows exist but every confidence is below
                 # detector_confidence" — the user's remediation differs
                 # (download weights vs lower the threshold).
-                detector_confidence = effective_cfg.get("detector_confidence", 0.2)
-                weak_rescue_enabled = pipeline_cfg.get(
-                    "weak_detection_rescue_enabled", True,
-                )
-                weak_detection_confidence = pipeline_cfg.get(
-                    "weak_detection_confidence", 0.12,
-                )
-
-                # Recompute the same contextual-weak set that classify_stage
-                # and load_photo_features use, so a bracketed weak frame that
-                # got classified above also gets SAM masks + quality features
-                # here. Without this, scoring.hard_reject_reasons drops the
-                # rescued frame with `no_subject_mask` on a first-time pipeline
-                # run (predictions land, but the mask worklist skipped it) —
-                # partially undoing the rescue.
-                contextual_weak_ids: set = set()
-                if (
-                    weak_rescue_enabled
-                    and weak_detection_confidence < detector_confidence
-                    and photos
-                ):
-                    from weak_detections import contextual_weak_runs
-                    raw_mdv6_dets = thread_db.get_detections_for_photos(
-                        [p["id"] for p in photos],
-                        min_conf=weak_detection_confidence,
-                        detector_model="megadetector-v6",
-                    )
-                    weak_runs = contextual_weak_runs(
-                        photos,
-                        raw_mdv6_dets,
-                        detector_confidence=detector_confidence,
-                        weak_confidence=weak_detection_confidence,
-                        max_gap=pipeline_cfg.get("burst_time_gap", 3.0),
-                    )
-                    weak_scope_ids = {
-                        photo_id
-                        for run in weak_runs
-                        for photo_id in (
-                            run["left_photo_id"],
-                            *run["photo_ids"],
-                            run["right_photo_id"],
-                        )
-                    }
-                    if weak_scope_ids:
-                        # Mask only frames that pass the same matching-species
-                        # anchor gate as encounter grouping. Candidate weak
-                        # runs with conflicting or unclassified anchors remain
-                        # ordinary sub-threshold detections throughout.
-                        from pipeline import load_photo_features
-                        weak_features = load_photo_features(
-                            thread_db,
-                            config=effective_cfg,
-                            photo_ids=weak_scope_ids,
-                        )
-                        contextual_weak_ids = {
-                            feature["id"]
-                            for feature in weak_features
-                            if feature.get("subject_uncertain")
-                        }
+                #
+                # ``detector_confidence`` / ``weak_rescue_enabled`` /
+                # ``weak_detection_confidence`` / ``contextual_weak_ids`` are
+                # captured above (before the pre-flight offline probe) so
+                # ``_preflight_mask_outcomes`` can apply the same weak-rescue
+                # eligibility the loop uses.  Reusing them here keeps that
+                # single-sourced.
 
                 photo_det_map = {}
                 photos_with_detections = 0

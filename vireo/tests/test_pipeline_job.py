@@ -17634,17 +17634,147 @@ def test_extract_masks_early_exit_carries_outage_detail_to_the_step():
     )
 
 
+def test_extract_masks_early_exit_fails_when_preflight_unreadable_without_latch():
+    """A classify-owned outage still fails the extract early exit.
+
+    When classify has already emitted a source-offline Fatal, the pre-flight
+    intentionally does not re-latch (to avoid a duplicate error), so
+    ``offline_latched`` stays False even though ``preflight_unreadable > 0``.
+    Prior shape: the early exit reported ``skipped``/``completed``, leaving
+    a green Jobs row that hid the fact the extract stage had unreachable
+    photos of its own (Codex #1392 P2 r3687403367). It must fail on
+    ``preflight_unreadable > 0`` too, and carry the extract-owned outage
+    detail so the row shows the reconnect instruction.
+    """
+    from pipeline_job import _extract_masks_early_exit
+
+    outage = "[extract_masks] Fatal: 2 of 5 photos unreachable."
+    stage, step_status, step_extra, _payload = _extract_masks_early_exit(
+        "no_detections", subthreshold=0, preflight_unreadable=2,
+        preflight_masked=0, offline_latched=False, outage_error=outage,
+    )
+    assert stage == "failed", (
+        f"An early exit with unreadable photos is not a benign skip; "
+        f"got {stage!r}"
+    )
+    assert step_status == "failed", (
+        f"The runner step must show failed too; got {step_status!r}"
+    )
+    assert step_extra.get("error") == outage, (
+        f"The step needs the outage detail so the Jobs row shows the "
+        f"reconnect instruction; got {step_extra!r}"
+    )
+    assert step_extra.get("error_count") == 2
+
+
 def test_extract_masks_preflight_counts_rescued_weak_detections(
     tmp_path, monkeypatch,
 ):
-    """A weak frame the rescue path would have masked still counts.
+    """A weak burst frame the rescue path would have masked still counts.
 
-    With weak-detection rescue enabled the worklist reaches detections below
-    `detector_confidence`, so a pre-flight predicate that queries only at the
-    main threshold silently drops those photos from both outcome sets. If
-    every at-risk photo on a dead source is a rescued frame, the outage never
-    latches at all — the silent completion this PR exists to prevent
-    (Codex #1392 P2).
+    With weak-detection rescue enabled the mask worklist reaches detections
+    below ``detector_confidence`` — but only for frames ``contextual_weak_
+    runs`` surfaces with matching-anchor-species classifications. A pre-flight
+    predicate that queries only at the main threshold silently drops those
+    frames from both outcome sets; if every at-risk photo on a dead source is
+    a rescued frame, the outage never latches at all — the silent completion
+    this PR exists to prevent (Codex #1392 P2 r3687355839).
+
+    The isolated-weak case is guarded separately below: an offline photo with
+    a weak-confidence detection but no rescuing anchor context would never be
+    read by the mask loop, so it must NOT inflate the outage report
+    (Codex #1392 P2 r3687403366).
+    """
+    import config as cfg
+    from db import Database
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cfg.CONFIG_PATH = str(tmp_path / "config.json")
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws_id = db._active_workspace_id
+    folder_path = str(tmp_path / "photos")
+    os.makedirs(folder_path, exist_ok=True)
+    folder_id = db.add_folder(folder_path)
+
+    # Bracketed burst: two high-confidence anchors classified with the same
+    # species, and a weak middle frame between them — the pattern
+    # ``contextual_weak_runs`` picks up. Both anchor detections carry the
+    # same prediction so ``load_photo_features`` marks the middle frame
+    # ``subject_uncertain`` (i.e. an eligible rescue).
+    photo_ids = []
+    detection_ids = []
+    for index, confidence in enumerate((0.9, 0.15, 0.9)):
+        filename = f"burst{index}.jpg"
+        pid = db.add_photo(
+            folder_id, filename, ".jpg", 1000, 1_000_000.0 + index,
+            timestamp=f"2026-07-18T08:36:3{index}",
+        )
+        _drop_jpeg(folder_path, filename)
+        det_id = db.write_detection_batch(
+            pid,
+            "megadetector-v6",
+            [{
+                "box": {"x": 0.1, "y": 0.1, "w": 0.5, "h": 0.5},
+                "confidence": confidence,
+                "category": "animal",
+            }],
+        )[0]
+        photo_ids.append(pid)
+        detection_ids.append(det_id)
+
+    db.add_prediction(
+        detection_ids[0], "Great-tailed Grackle", 0.9, "inat21",
+    )
+    db.add_prediction(
+        detection_ids[-1], "Great-tailed Grackle", 0.9, "inat21",
+    )
+
+    collection_id = db.add_collection(
+        "Rescued weak burst",
+        json.dumps([{"field": "photo_ids", "value": photo_ids}]),
+    )
+
+    _stub_extract_masks_heavy_ops(monkeypatch)
+
+    import shutil
+    shutil.rmtree(folder_path, ignore_errors=True)
+
+    _runner, result = _run_extract_masks_only(db_path, ws_id, collection_id)
+
+    em = result["stages"]["extract_masks"]
+    # All three photos are mask candidates: two via strict detection, one
+    # via contextual weak rescue. All three must show up as unreadable — a
+    # stage that reports 2 unreadable of 3 would silently drop the rescued
+    # frame, exactly the bug this test guards against.
+    assert em.get("unreadable") == 3, (
+        f"Rescued weak frame on a dead source must still count as "
+        f"unreadable; got {em!r}"
+    )
+    assert em["total"] == 3, (
+        f"Total must cover the rescued candidate too; got {em!r}"
+    )
+    assert any(
+        "3 of 3" in e and "unreachable" in e for e in result["errors"]
+    ), (
+        f"The reconnect message must claim every dropped candidate — "
+        f"rescued frame included; got {result['errors']!r}"
+    )
+
+
+def test_extract_masks_preflight_ignores_isolated_weak_detections(
+    tmp_path, monkeypatch,
+):
+    """An offline weak-conf photo without a rescuing burst must not inflate
+    the outage.
+
+    ``contextual_weak_runs`` needs matching-anchor-species neighbours to
+    surface a weak frame; a lone weak detection would never enter the mask
+    worklist online. A pre-flight that just checks ``weak_detection_
+    confidence`` counts it as at-risk anyway, turning an unrelated folder
+    outage into a Fatal Extract failure and demanding a reconnect for a
+    photo that still wouldn't get a mask (Codex #1392 P2 r3687403366).
     """
     import config as cfg
     from db import Database
@@ -17664,15 +17794,17 @@ def test_extract_masks_preflight_counts_rescued_weak_detections(
     Image.new("RGB", (16, 16), "black").save(
         os.path.join(folder_path, "weak.jpg")
     )
-    # Between weak_detection_confidence (0.12) and detector_confidence (0.2).
+    # Between weak_detection_confidence (0.12) and detector_confidence (0.2)
+    # — but isolated, so contextual_weak_runs won't surface it and the mask
+    # loop would never read it online.
     db.save_detections(
         pid,
         [{"box": {"x": 0.1, "y": 0.1, "w": 0.5, "h": 0.5},
           "confidence": 0.15, "category": "animal"}],
-        detector_model="MegaDetector",
+        detector_model="megadetector-v6",
     )
     collection_id = db.add_collection(
-        "Rescued weak frame",
+        "Isolated weak frame",
         json.dumps([{"field": "photo_ids", "value": [pid]}]),
     )
 
@@ -17684,7 +17816,13 @@ def test_extract_masks_preflight_counts_rescued_weak_detections(
     _runner, result = _run_extract_masks_only(db_path, ws_id, collection_id)
 
     em = result["stages"]["extract_masks"]
-    assert em.get("unreadable") == 1, (
-        f"A rescuable weak frame on a dead source is still unreachable; got "
-        f"{em!r}"
+    assert em.get("unreadable") == 0, (
+        f"An isolated weak detection isn't a mask candidate — an outage "
+        f"must not report it as unreachable; got {em!r}"
+    )
+    assert not any(
+        "unreachable" in e for e in result["errors"]
+    ), (
+        f"No reconnect instruction belongs to an unrelated outage; got "
+        f"{result['errors']!r}"
     )

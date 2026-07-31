@@ -17139,9 +17139,13 @@ def test_pipeline_extract_masks_offline_survives_finalizer_override(
 def test_extract_masks_early_exit_preserves_latched_offline_failure():
     from pipeline_job import _extract_masks_early_exit
 
-    status, payload = _extract_masks_early_exit(
+    status, step_status, payload = _extract_masks_early_exit(
         "no_detections", subthreshold=0, preflight_unreadable=311,
         offline_latched=True,
+    )
+    assert step_status == "failed", (
+        f"An outage exit is a terminal failure on the job tree; got "
+        f"{step_status!r}"
     )
     assert status == "failed", (
         "A pre-flight outage already latched a failure and appended a Fatal "
@@ -17157,12 +17161,20 @@ def test_extract_masks_early_exit_preserves_latched_offline_failure():
 def test_extract_masks_early_exit_is_a_benign_skip_without_an_outage():
     from pipeline_job import _extract_masks_early_exit
 
-    status, payload = _extract_masks_early_exit(
+    status, step_status, payload = _extract_masks_early_exit(
         "weights_missing", subthreshold=4, preflight_unreadable=0,
         offline_latched=False,
     )
     assert status == "skipped", (
         f"No outage means the early exit stays a benign skip; got {status!r}"
+    )
+    # JobRunner.update_step only finalizes completed/failed/cancelled, and
+    # the Jobs page only renders summaries for those. Sending "skipped" to
+    # the runner leaves a hollow pending-style row with no duration and no
+    # explanation of why the stage did nothing (Codex #1392 P2).
+    assert step_status == "completed", (
+        f"A benign skip still has to close out the runner step; got "
+        f"{step_status!r}"
     )
     assert payload["unreadable"] == 0
     assert payload["total"] == 0
@@ -17248,4 +17260,69 @@ def test_extract_masks_outage_rollup_counts_only_offline_photos(
         for e in result["errors"]
     ), (
         f"The corrupt file needs its own rollup; got {result['errors']!r}"
+    )
+
+
+def test_extract_masks_preflight_skips_photos_that_already_have_a_mask(
+    tmp_path, monkeypatch,
+):
+    """An offline photo that already carries a mask is not "unreadable".
+
+    The unreadable count exists to explain `no_subject_mask` rejections in
+    Process Review. A photo with an active mask for the configured variant
+    will not be rejected for that, so counting it makes the stage overstate
+    the damage from an outage it was never harmed by (Codex #1392 P2).
+    """
+    import config as cfg
+    from db import Database
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cfg.CONFIG_PATH = str(tmp_path / "config.json")
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws_id = db._active_workspace_id
+    folder_path = str(tmp_path / "photos")
+    os.makedirs(folder_path, exist_ok=True)
+    folder_id = db.add_folder(folder_path)
+
+    unmasked = _add_photo_with_detection(db, folder_id, folder_path, "a.jpg")
+    masked = _add_photo_with_detection(db, folder_id, folder_path, "b.jpg")
+    collection_id = db.add_collection(
+        "Half already masked",
+        json.dumps([{"field": "photo_ids", "value": [unmasked, masked]}]),
+    )
+
+    pipeline_cfg = db.get_effective_config(cfg.load()).get("pipeline", {})
+    sam2_variant = pipeline_cfg.get("sam2_variant")
+    dinov2_variant = pipeline_cfg.get("dinov2_variant")
+
+    mask_dir = tmp_path / ".vireo" / "masks"
+    os.makedirs(mask_dir, exist_ok=True)
+    mask_file = str(mask_dir / f"{masked}.{sam2_variant}.png")
+    from PIL import Image
+    Image.new("L", (4, 4), 255).save(mask_file)
+    db.upsert_photo_mask(
+        masked, sam2_variant, mask_file, "MegaDetector", 0.1, 0.1, 0.5, 0.5,
+    )
+    db.set_active_mask_variant(masked, sam2_variant)
+    db.conn.execute(
+        "UPDATE photos SET dino_embedding_variant=? WHERE id=?",
+        (dinov2_variant, masked),
+    )
+    db.conn.commit()
+
+    _stub_extract_masks_heavy_ops(monkeypatch)
+
+    # The source is gone before the stage starts, so the pre-flight probe
+    # drops both photos.
+    import shutil
+    shutil.rmtree(folder_path, ignore_errors=True)
+
+    _runner, result = _run_extract_masks_only(db_path, ws_id, collection_id)
+
+    em = result["stages"]["extract_masks"]
+    assert em.get("unreadable") == 1, (
+        f"Only the photo without a mask is at risk of a `no_subject_mask` "
+        f"rejection; got {em!r}"
     )

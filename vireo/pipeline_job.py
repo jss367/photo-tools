@@ -280,11 +280,44 @@ def _source_offline_reason(
     return "folder", f"folder {folder_path} is unreadable"
 
 
+def _photos_with_active_mask(
+    thread_db, photo_ids, sam2_variant, dinov2_variant,
+) -> set:
+    """Subset of ``photo_ids`` already carrying a usable mask on disk.
+
+    "Usable" means the photos row is active on the configured SAM variant
+    with matching DINO state and the mask file still exists — the state that
+    makes scoring treat the photo as masked rather than hard-rejecting it
+    with ``no_subject_mask``. Deliberately does NOT re-check the stored SAM
+    prompt against the current detection: a stale prompt means the mask is
+    out of date, not absent, so the photo is still not at risk of the
+    rejection this count is about.
+
+    Chunked to stay under SQLite's bound-parameter ceiling.
+    """
+    found: set = set()
+    ids = [pid for pid in photo_ids if pid is not None]
+    for start in range(0, len(ids), 500):
+        chunk = ids[start:start + 500]
+        placeholders = ",".join("?" * len(chunk))
+        rows = thread_db.conn.execute(
+            f"SELECT id, mask_path FROM photos WHERE id IN ({placeholders}) "
+            "AND active_mask_variant = ? AND dino_embedding_variant = ? "
+            "AND mask_path IS NOT NULL",
+            (*chunk, sam2_variant, dinov2_variant),
+        ).fetchall()
+        for row in rows:
+            if row["mask_path"] and os.path.isfile(row["mask_path"]):
+                found.add(row["id"])
+    return found
+
+
 def _extract_masks_early_exit(
     reason_key: str, subthreshold: int, preflight_unreadable: int,
     offline_latched: bool,
-) -> tuple[str, dict]:
-    """Stage status + result payload for an ``extract_masks`` early return.
+) -> tuple[str, str, dict]:
+    """Stage status, runner step status, and result payload for an
+    ``extract_masks`` early return.
 
     The stage bails out early when nothing in the worklist carries a
     qualifying detection. That is normally a benign ``skipped``, but the
@@ -297,9 +330,16 @@ def _extract_masks_early_exit(
     The total counts the pre-flight-dropped photos for the same reason the
     finalizer does: reporting ``unreadable`` against a hard-coded zero total
     publishes an impossible tally.
+
+    The runner step status is deliberately not the stage status for a benign
+    exit. ``JobRunner.update_step`` only finalizes ``completed``/``failed``/
+    ``cancelled``, and the Jobs page only renders a summary for those, so
+    sending ``skipped`` would leave a hollow pending-style row with no
+    duration and no explanation of why the stage did nothing.
     """
     return (
         "failed" if offline_latched else "skipped",
+        "failed" if offline_latched else "completed",
         {
             "masked": 0, "skipped": 0, "failed": 0,
             "total": preflight_unreadable,
@@ -5596,7 +5636,18 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                     total_before = len(photos)
                     photos = kept
                     dropped_ids = {p["id"] for p in dropped}
-                    em_preflight_unreadable = len(dropped_ids)
+                    # The unreadable count exists to explain `no_subject_mask`
+                    # rejections in Process Review. A dropped photo that
+                    # already carries an active mask for the configured
+                    # variant won't be rejected for that, so counting it
+                    # overstates the damage from an outage that never harmed
+                    # it (Codex #1392 P2).
+                    em_preflight_unreadable = len(dropped_ids) - len(
+                        _photos_with_active_mask(
+                            thread_db, dropped_ids,
+                            sam2_variant, dinov2_variant,
+                        )
+                    )
                     # Publish so eye_keypoints (later downstream) sees
                     # the same offline set without having to re-probe
                     # every folder from scratch.
@@ -5896,13 +5947,15 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                         em_reason = "no_detections"
                     else:
                         em_reason = "weights_missing"
-                    exit_status, exit_payload = _extract_masks_early_exit(
-                        em_reason, photos_subthreshold_only,
-                        em_preflight_unreadable, em_offline_latched,
+                    exit_status, exit_step_status, exit_payload = (
+                        _extract_masks_early_exit(
+                            em_reason, photos_subthreshold_only,
+                            em_preflight_unreadable, em_offline_latched,
+                        )
                     )
                     stages["extract_masks"]["status"] = exit_status
                     runner.update_step(
-                        job["id"], "extract_masks", status=exit_status,
+                        job["id"], "extract_masks", status=exit_step_status,
                         summary=summary,
                     )
                     result["stages"]["extract_masks"] = exit_payload
@@ -5931,13 +5984,15 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                     )
                     log.warning("Pipeline extract-masks: %s", reason)
                     errors.append(f"[extract_masks] {reason}")
-                    exit_status, exit_payload = _extract_masks_early_exit(
-                        "all_subthreshold", photos_subthreshold_only,
-                        em_preflight_unreadable, em_offline_latched,
+                    exit_status, exit_step_status, exit_payload = (
+                        _extract_masks_early_exit(
+                            "all_subthreshold", photos_subthreshold_only,
+                            em_preflight_unreadable, em_offline_latched,
+                        )
                     )
                     stages["extract_masks"]["status"] = exit_status
                     runner.update_step(
-                        job["id"], "extract_masks", status=exit_status,
+                        job["id"], "extract_masks", status=exit_step_status,
                         summary=summary,
                     )
                     result["stages"]["extract_masks"] = exit_payload

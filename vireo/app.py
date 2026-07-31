@@ -25972,6 +25972,10 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         return jsonify({
             "active": active,
             "history": history,
+            # Vireo is overriding the system's idle-sleep setting while a
+            # job runs (issue #1397). Surfacing it keeps that visible
+            # rather than silent — see CORE_PHILOSOPHY "no black boxes".
+            "keeping_awake": app._job_runner.sleep_blocker.active,
             "active_workspace_id": db._active_workspace_id,
             "workspace_names": ws_names,
         })

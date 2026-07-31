@@ -8,9 +8,25 @@ import time
 from collections import deque
 from datetime import datetime
 
+import power
 from job_contract import failure_event
 
 log = logging.getLogger(__name__)
+
+# Job types that must NOT hold an idle-sleep assertion. Everything else
+# does, including types added later: over-protecting a short job costs a
+# few seconds of battery, while under-protecting a long one costs the
+# whole run (issue #1397 — a 2h16m import suspended twelve minutes in,
+# whose network share did not survive the sleep/DarkWake cycling).
+#
+# Ephemeral jobs are excluded wholesale — they are transient background
+# work surfaced for transparency, and losing one to sleep is harmless.
+_NO_SLEEP_ASSERTION_JOB_TYPES = frozenset({
+    "missing_originals_scan",
+    "working_copy_backfill",
+    "thumb_path_backfill",
+    "verify-models",
+})
 
 # How long to keep completed/failed jobs in memory before eviction (seconds)
 _JOB_RETENTION_SECS = 3600  # 1 hour
@@ -56,6 +72,14 @@ class JobRunner:
         # the result. Cleared by _prune_finished_jobs alongside
         # _cancelled.
         self._uncancellable = set()
+        # Held while any sleep-blocking job runs; see issue #1397. Resolved
+        # through the module rather than bound at import so tests (and any
+        # future platform override) can substitute the inhibitor.
+        self.sleep_blocker = power.SleepBlocker(
+            start_inhibitor=lambda reason: power.start_platform_inhibitor(
+                reason
+            ),
+        )
         self._db_path = None
         # Pending pipeline work, keyed by job_id. Populated by
         # ``enqueue_pipeline`` and consumed by ``_try_promote_queued``
@@ -588,8 +612,20 @@ class JobRunner:
             self._pause_requested.discard(jid)
             self._uncancellable.discard(jid)
 
+    def _blocks_sleep(self, job):
+        """Whether this job should keep the machine awake while it runs."""
+        if job.get("ephemeral"):
+            return False
+        return job.get("type") not in _NO_SLEEP_ASSERTION_JOB_TYPES
+
     def _run_job(self, job, work_fn):
         start_time = time.time()
+        holds_sleep_assertion = self._blocks_sleep(job)
+        if holds_sleep_assertion:
+            # Acquired before the work starts and released in the outer
+            # finally, so a crash, cancel, or early return can't strand
+            # the inhibitor and hold the machine awake indefinitely.
+            self.sleep_blocker.acquire()
         try:
             result = work_fn(job)
             # Atomically check cancellation and set final status under the
@@ -648,6 +684,12 @@ class JobRunner:
             if job["status"] == "failed":
                 log.exception("Job %s failed", job["id"])
         finally:
+            # First thing in the finally, deliberately: everything below
+            # (history persistence, SSE publish, pipeline promotion) can
+            # raise, and a stranded inhibitor would hold the machine awake
+            # until Vireo exits.
+            if holds_sleep_assertion:
+                self.sleep_blocker.release()
             elapsed = time.time() - start_time
             job["finished_at"] = datetime.now().isoformat()
             job["_ended_at"] = time.time()

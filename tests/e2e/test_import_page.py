@@ -3012,3 +3012,273 @@ def test_snapshot_mode_withholds_selection_even_if_the_mode_radio_flips(
            ).to_have_count(0)
     expect(page.locator("#selectAllRow")).not_to_be_visible()
     expect(page.locator("#selectionUnavailableNote")).to_be_visible()
+
+
+def _capture_start(page):
+    """Intercept the import job POST and stash its parsed body.
+
+    Matches both job routes, so a test can assert on what in-place mode
+    sends as well as what copy mode does. EventSource is stubbed out
+    because watchJob() opens one against the fake job id the moment the
+    POST resolves.
+    """
+    page.evaluate(
+        """() => {
+          const f = window.fetch;
+          window.__body = null;
+          window.__url = null;
+          window.fetch = (input, init) => {
+            const t = typeof input === 'string' ? input : input.url;
+            if (t && t.indexOf('/api/jobs/import-') === 0) {
+              window.__url = t;
+              window.__body = JSON.parse(init.body);
+              return Promise.resolve(new Response(
+                JSON.stringify({job_id: 'import-x'}), {status: 200,
+                headers: {'Content-Type': 'application/json'}}));
+            }
+            return f(input, init);
+          };
+          window.EventSource = function () {
+            this.close = () => {};
+            this.addEventListener = () => {};
+          };
+        }"""
+    )
+
+
+def _await_duplicate_verdicts(page, count):
+    """Block until the check-duplicates stream has actually landed.
+
+    _preview() returns on the files-only render; the duplicate stream is
+    still draining behind it. Every assertion about include_paths turns on
+    whether a card carries the duplicate class by the time Start is clicked,
+    so waiting for the badge -- not for _preview() -- is what makes these
+    tests deterministic.
+    """
+    expect(page.locator(".import-preview-thumb.duplicate")).to_have_count(count)
+
+
+def test_start_import_sends_include_paths_with_duplicates_retained(
+        live_server, page):
+    """include_paths keeps a file the UI shows as an unchecked duplicate --
+    the job needs it to count the duplicate and keep the ledger balanced."""
+    page.goto(f"{live_server['url']}/import")
+    files = _files(3)
+    _stub_preview(page, files, duplicates=[files[2]["path"]])
+    _capture_start(page)
+    # Fill the destination BEFORE previewing. #destInput is wired into
+    # wireDestStructureInvalidation, so filling it after selecting schedules a
+    # re-preview whose success path resets importDeselected -- the selection
+    # assertions would then flake.
+    page.locator("#destInput").fill("/tmp/archive")
+    _preview(page)
+    _await_duplicate_verdicts(page, 1)
+    page.locator(".import-preview-thumb .thumb-check").first.click()
+    page.locator("#btnStart").click()
+
+    body = page.evaluate("() => window.__body")
+    assert set(body["include_paths"]) == {files[1]["path"], files[2]["path"]}
+    assert body["previewed_count"] == 3
+    assert body["checked_count"] == 1
+
+
+def test_a_duplicate_unchecked_before_verdicts_still_reaches_the_job(
+        live_server, page):
+    """At first render verdicts have not arrived, so duplicate cards are still
+    enabled and clickable. A click there writes the path into importDeselected
+    and nothing removes it -- the eligibleDeselections filter is what stops
+    that path being dropped from include_paths, where it would land in no
+    ledger bucket and falsely report a fully-archived card as unsafe to
+    format.
+    """
+    page.goto(f"{live_server['url']}/import")
+    files = _files(3)
+    _stub_preview(page, files, duplicates=[files[2]["path"]])
+    page.locator("#destInput").fill("/tmp/archive")   # before preview -- see above
+    _preview(page)
+    _await_duplicate_verdicts(page, 1)
+    _capture_start(page)
+    # Simulate the pre-verdict click: the path IS a duplicate, but the user
+    # unchecked it before the stream landed, so it sits in importDeselected.
+    page.evaluate("(p) => importDeselected.add(p)", files[2]["path"])
+    page.locator("#btnStart").click()
+
+    body = page.evaluate("() => window.__body")
+    assert files[2]["path"] in body["include_paths"]
+    # And it is not silently counted as a file the user chose to copy.
+    assert body["checked_count"] == 2
+
+
+def test_in_place_start_sends_no_selection_fields(live_server, page):
+    """The in-place route ignores these fields, but sending them is still a
+    lie: do_scan() catalogues whatever is on disk when it runs, so a request
+    carrying a file list promises a narrowing that never happens.
+
+    The `importPreviewCapturedSignature !== null` guard is NOT what protects
+    this. previewImport() captures the signature before its `if (!copyMode)`
+    return, so an in-place preview leaves it set; only the copy-mode branch
+    keeps the fields out. Hence the wait for the in-place summary below --
+    without it the assertion would pass against a null signature and prove
+    nothing.
+    """
+    page.goto(f"{live_server['url']}/import")
+    _stub_preview(page, _files(3))
+    _capture_start(page)
+    page.locator("#destInput").fill("/tmp/archive")
+    _preview(page)
+    expect(page.locator("#btnStart")).to_have_text("Start import (3 files)")
+
+    page.locator("#modeInPlace").check()
+    # The debounced in-place preview has completed and captured a signature.
+    expect(page.locator("#previewSummary")).to_have_text(
+        "3 files found · originals will stay in place")
+    page.locator("#btnStart").click()
+
+    assert page.evaluate("() => window.__url").endswith("/import-in-place")
+    body = page.evaluate("() => window.__body")
+    assert "include_paths" not in body
+    assert "previewed_count" not in body
+    assert "checked_count" not in body
+
+
+def test_the_selection_payload_follows_a_re_preview(live_server, page):
+    """A completed preview owns the selection, and the payload has to hear
+    about it in both directions: a deselection made before the re-preview is
+    gone, and one made after it counts."""
+    page.goto(f"{live_server['url']}/import")
+    files = _files(3)
+    _stub_preview(page, files)
+    _capture_start(page)
+    page.locator("#destInput").fill("/tmp/archive")
+    _preview(page)
+    page.locator(".import-preview-thumb .thumb-check").nth(1).click()
+    expect(page.locator("#previewSelectedCount")).to_have_text("2 of 3 selected")
+
+    page.locator("#btnPreview").click()
+    expect(page.locator("#previewSelectedCount")).to_have_text("3 of 3 selected")
+    page.locator(".import-preview-thumb .thumb-check").nth(0).click()
+    expect(page.locator("#previewSelectedCount")).to_have_text("2 of 3 selected")
+    page.locator("#btnStart").click()
+
+    body = page.evaluate("() => window.__body")
+    assert set(body["include_paths"]) == {files[1]["path"], files[2]["path"]}
+    assert body["previewed_count"] == 3
+    assert body["checked_count"] == 2
+
+
+def test_a_fully_duplicate_card_sends_every_path_and_zero_checked(
+        live_server, page):
+    """Nothing is copied, so checked_count is 0 -- but every path still has to
+    reach the job, because it is the copy loop that counts a skipped duplicate
+    and only a balanced ledger yields "safe to format"."""
+    page.goto(f"{live_server['url']}/import")
+    files = _files(3)
+    _stub_preview(page, files, duplicates=[f["path"] for f in files])
+    _capture_start(page)
+    page.locator("#destInput").fill("/tmp/archive")
+    _preview(page)
+    _await_duplicate_verdicts(page, 3)
+    expect(page.locator("#btnStart")).to_have_text("Start import (0 files)")
+    page.locator("#btnStart").click()
+
+    body = page.evaluate("() => window.__body")
+    assert set(body["include_paths"]) == {f["path"] for f in files}
+    assert body["previewed_count"] == 3
+    assert body["checked_count"] == 0
+
+
+def test_a_file_discovered_under_two_sources_is_counted_once(
+        live_server, page):
+    """/api/import/folder-preview appends per source with no cross-source
+    dedup, so nested sources (/card and /card/DCIM) emit the same file twice
+    and the grid draws two cards for it. Both counts must be counts of FILES,
+    not of cards: the route rejects checked_count > len(set(include_paths)),
+    and one file the user ticked once cannot be two files selected.
+    """
+    page.goto(f"{live_server['url']}/import")
+    files = _files(2)
+    twin = dict(files[1], subfolder="DCIM")
+    _stub_preview(page, files + [twin])
+    _capture_start(page)
+    page.locator("#destInput").fill("/tmp/archive")
+    _preview(page)
+    expect(page.locator(".import-preview-thumb")).to_have_count(3)
+    # Both readouts are counts of files too. "3 of 3 selected" over an import
+    # that copies two files is the same lie as the payload's, and the button
+    # is the last thing the user reads before committing to the run.
+    expect(page.locator("#previewSelectedCount")).to_have_text("2 of 2 selected")
+    expect(page.locator("#btnStart")).to_have_text("Start import (2 files)")
+    # And the master checkbox, which compares the two counts rather than
+    # printing them. Card-counted eligibility (3) against a file-counted
+    # checked (2) leaves it DASHED over a fully-selected preview -- a partial
+    # selection the user would go hunting for and never find.
+    master = page.locator("#chkSelectAllImport")
+    expect(master).to_be_checked()
+    expect(master).to_have_js_property("indeterminate", False)
+    page.locator("#btnStart").click()
+
+    body = page.evaluate("() => window.__body")
+    assert set(body["include_paths"]) == {f["path"] for f in files}
+    assert body["previewed_count"] == 2
+    assert body["checked_count"] == 2
+    # The route's own invariant, asserted the way it is enforced.
+    assert body["checked_count"] <= len(set(body["include_paths"]))
+
+
+def test_copy_mode_with_no_preview_run_sends_no_selection_fields(
+        live_server, page):
+    """The first of updateStartGate()'s four preview states, and it is
+    reachable: a mode switch leaves importPreviewCapturedSignature null and
+    Start live, so a click before the 350ms debounce lands here. There is no
+    file list to send -- the import copies everything, which is what the
+    screen says -- and sending one anyway means include_paths: [], which the
+    route rejects outright ("include_paths must be a non-empty list").
+    """
+    page.goto(f"{live_server['url']}/import")
+    _suppress_auto_preview(page)
+    _capture_start(page)
+    page.locator("#modeCopy").check()
+    page.locator("#sourceInput").fill("/tmp/card")
+    page.locator("#btnAddSource").click()
+    page.locator("#destInput").fill("/tmp/archive")
+    # No preview has run, so no count belongs on the button either.
+    expect(page.locator("#btnStart")).to_have_text("Start import")
+    expect(page.locator("#btnStart")).to_be_enabled()
+    page.locator("#btnStart").click()
+
+    # Really the copy route -- otherwise this would pass for the in-place
+    # reason and prove nothing about the guard.
+    assert page.evaluate("() => window.__url").endswith("/import-photos")
+    body = page.evaluate("() => window.__body")
+    assert "include_paths" not in body
+    assert "previewed_count" not in body
+    assert "checked_count" not in body
+
+
+def test_snapshot_start_sends_no_selection_fields(live_server, page):
+    """The snapshot import posts a snapshot_id against a frozen server-side
+    list; there is nothing for include_paths to narrow, and the page draws no
+    checkboxes to build one from.
+
+    Asserted directly rather than left to ride on the in-place test: the two
+    share only the `copyMode` predicate, and a change that split them would
+    take this case with it silently. The signature assertion is the point --
+    new-images-preview captures one, so `!== null` is true here and the
+    copy-mode placement is the only thing keeping the fields out.
+    """
+    page.goto(f"{live_server['url']}/import")  # warm the app before routing
+    _stub_snapshot_import(page, _files(3))
+    page.goto(f"{live_server['url']}/import?new_images=42")
+    expect(page.locator("#importPreviewGrid")).to_be_visible()
+    _capture_start(page)
+    assert page.evaluate("() => importPreviewCapturedSignature !== null")
+
+    expect(page.locator("#btnStart")).to_be_enabled()
+    page.locator("#btnStart").click()
+
+    assert page.evaluate("() => window.__url").endswith("/import-in-place")
+    body = page.evaluate("() => window.__body")
+    assert body["source_snapshot_id"] == 42
+    assert "include_paths" not in body
+    assert "previewed_count" not in body
+    assert "checked_count" not in body

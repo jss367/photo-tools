@@ -2341,13 +2341,21 @@ function rerenderImportPreviewGridSafe() {
 // the new check-duplicates stream drains — and the numbers drive the master
 // checkbox, so a stale count doesn't just print a wrong figure: it disables
 // a live control over cards that carry no badge to explain it.
+//
+// Counted over UNIQUE paths, not over cards. /api/import/folder-preview
+// appends per source with no cross-source dedup, so two nested sources
+// (/card and /card/DCIM) discover the same file twice and the grid draws two
+// cards for it — one file, which the import copies once. Counting cards
+// would put "Start import (3 files)" on a run that copies 2, and would send
+// a checked_count the route rejects: it enforces
+// checked_count <= len(set(include_paths)).
 function importEligibleCount() {
-  return importSelectableCardPaths(importGridCards()).length;
+  return new Set(importSelectableCardPaths(importGridCards())).size;
 }
 
 function importCheckedCount() {
-  return importSelectableCardPaths(importGridCards())
-    .filter(p => !importDeselected.has(p)).length;
+  return new Set(importSelectableCardPaths(importGridCards())
+    .filter(p => !importDeselected.has(p))).size;
 }
 
 function updateImportSelectionUI() {
@@ -2355,8 +2363,11 @@ function updateImportSelectionUI() {
   if (el) {
     // The CHECKED count — what will actually be copied. Never the
     // include_paths count, which is larger because it retains duplicates.
+    // Both halves count unique paths, for the nested-sources reason on
+    // importEligibleCount(): a file discovered twice is still one file, and
+    // "3 of 3" over a two-file import is the same lie as the numerator's.
     el.textContent = importCheckedCount().toLocaleString() + ' of '
-      + importPreviewedPaths.length.toLocaleString() + ' selected';
+      + new Set(importPreviewedPaths).size.toLocaleString() + ' selected';
   }
   const master = document.getElementById('chkSelectAllImport');
   if (master) {
@@ -2951,6 +2962,43 @@ async function startImport() {
     body.verify_by_hash = document.getElementById('chkVerifyByHash').checked;
     body.trust_likely_duplicates =
       document.getElementById('chkTrustLikelyDuplicates').checked;
+    // Only a COMPLETED preview describes a file list; with none the import
+    // sends no selection at all and copies everything, which is what the
+    // screen says. This branch is copy-mode only for a second reason:
+    // previewImport() captures the signature BEFORE its `if (!copyMode)`
+    // return, so an in-place preview leaves it non-null and the guard alone
+    // would post a file list to a route that scans whatever is on disk.
+    if (importPreviewCapturedSignature !== null) {
+      // include_paths is NOT the checked boxes. A deselection only counts if
+      // the file was eligible in the first place, so a click landing on a
+      // duplicate before its verdict arrived is discarded here — nothing
+      // else ever removes it from importDeselected. Duplicates must reach
+      // the job or they land in no ledger bucket: skipped_duplicate is only
+      // incremented inside the copy loop over the FILTERED list, so a
+      // duplicate dropped here makes copied + skipped_duplicate fall short
+      // of discovered and a fully-archived card is reported unsafe to
+      // format, blaming the user for deselecting files they never touched.
+      //
+      // Eligibility is read off the rendered cards, like every other
+      // selection readout on this page — see importSelectableCardPaths().
+      // importGridCards() and not importVisibleCards() to match
+      // importCheckedCount(), which walks the same set: checked_count and
+      // include_paths are compared to each other by the route, so they must
+      // be derived from the same cards or the relation between them stops
+      // being a property of the code and becomes a coincidence of which
+      // cards the hide-duplicates checkbox happens to be hiding.
+      const selectable = new Set(importSelectableCardPaths(importGridCards()));
+      const eligibleDeselections = new Set(
+        Array.from(importDeselected).filter(p => selectable.has(p)));
+      body.include_paths = importPreviewedPaths.filter(
+        p => !eligibleDeselections.has(p));
+      // UNIQUE, for the nested-sources reason on importEligibleCount():
+      // folder-preview appends per source, so /card and /card/DCIM emit the
+      // same file twice and previewed_count would over-count the discovery
+      // the job is asked to compare itself against.
+      body.previewed_count = new Set(importPreviewedPaths).size;
+      body.checked_count = importCheckedCount();
+    }
   }
   // For new-workspace imports where the user hasn't touched the After
   // Import dropdown, the visible selection was prefilled from the

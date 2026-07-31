@@ -559,9 +559,10 @@ def _selection_blocks_format(*, deselected, vanished_paths):
 
     Intended as the single home for selection-based card-safety conditions:
     every card-safety verdict on every copy path should call this so a new
-    condition added here reaches all of them. Currently wired into both
-    verdicts on the local path; the remote path's pair follows in a later
-    task. Do not inline the condition at a call site.
+    condition added here reaches all of them. All four verdicts do —
+    ``safe_to_format`` and ``unverified_duplicates_only``, on both the local
+    (``run_import_job``) and remote (``_run_remote_import_job``) copy paths.
+    Do not inline the condition at a call site.
     """
     return deselected != 0 or bool(vanished_paths)
 

@@ -3881,6 +3881,52 @@ def _remote_calls(remote_archive):
     }
 
 
+def _run_remote_import(root, monkeypatch, params_kwargs, *, runner=None):
+    """Remote counterpart to ``_run_import``, for tests that only need the
+    happy-path transport seams (fake rsync, verification always OK).
+
+    Builds a fake NAS target under ``root`` (mount at ``root/mount``),
+    installs the transport seams, and runs the job against a fresh db at
+    ``root/test.db``. ``destination``, ``remote_target`` and
+    ``verify_by_hash`` are OWNED by this helper and must not be passed in
+    ``params_kwargs`` (each would collide); ``params_kwargs`` supplies
+    ``sources`` and everything else.
+
+    ``verify_by_hash`` is forced True because with it off
+    ``remote_unverified`` makes both card-safety verdicts False for free, and
+    every safety assertion built on this helper would pass vacuously.
+
+    RETURN SHAPE DIFFERS FROM ``_run_import``, deliberately and visibly:
+    this returns ``(result, calls)``; ``_run_import`` returns
+    ``(db, ws_id, result)``. Do not copy a destructuring from one to the
+    other. A test that needs the ``Database`` or the ``FakeRunner`` should
+    construct them itself — pass the runner in via ``runner=`` and keep its
+    own reference — or call ``run_import_job`` directly, as the tests that
+    need a hand-built remote-archive dict do.
+    """
+    from import_job import ImportParams, run_import_job
+
+    ra = _remote_archive_for(root)
+    calls = _remote_calls(ra)
+    _install_fake_remote_rsync(monkeypatch, calls, verify=None)
+    db_path = str(root / "test.db")
+    db = Database(db_path)
+    result = run_import_job(
+        _make_job(), runner or FakeRunner(), db_path,
+        db._active_workspace_id,
+        ImportParams(
+            destination=ra["mount_base"], remote_target=ra,
+            verify_by_hash=True, **params_kwargs,
+        ),
+    )
+    return result, calls
+
+
+def _summaries(runner):
+    """Every step summary the job pushed, in order."""
+    return [kw.get("summary", "") for _, _, kw in runner.step_updates]
+
+
 def test_remote_import_rsyncs_to_remote_and_catalogs_at_mount(
         tmp_path, monkeypatch):
     """A remote destination rsyncs the card into ``remote_path/subpath`` and
@@ -6857,7 +6903,7 @@ def test_step_summary_selected_figure_comes_from_checked_count(tmp_path):
         ),
         runner=runner,
     )
-    summaries = [kw.get("summary", "") for _, _, kw in runner.step_updates]
+    summaries = _summaries(runner)
     # Full equality, not a substring: the discovered total has to survive in
     # the selection form too. A ``"1 selected"`` substring check would pass
     # with ``of 2 discovered`` quietly dropped, leaving the user a selected
@@ -6890,7 +6936,7 @@ def test_step_summary_without_selection_is_unchanged(tmp_path):
         ),
         runner=runner,
     )
-    summaries = [kw.get("summary", "") for _, _, kw in runner.step_updates]
+    summaries = _summaries(runner)
     assert "2 copied, 0 already present, 0 failed of 2 discovered" in summaries
     # No selection means no selection prefix.
     assert not any("selected" in s for s in summaries)
@@ -6926,7 +6972,7 @@ def test_step_summary_claims_a_selection_only_when_one_was_applied(tmp_path):
         runner=runner,
     )
     assert result["copied"] == 2, "no include_paths means no filtering"
-    summaries = [kw.get("summary", "") for _, _, kw in runner.step_updates]
+    summaries = _summaries(runner)
     assert "2 copied, 0 already present, 0 failed of 2 discovered" in summaries
     assert not any("selected" in s for s in summaries)
 
@@ -6949,7 +6995,7 @@ def test_step_summary_claims_a_selection_only_when_one_was_applied(tmp_path):
         runner=runner2,
     )
     assert result2["copied"] == 1, "include_paths must still filter"
-    summaries2 = [kw.get("summary", "") for _, _, kw in runner2.step_updates]
+    summaries2 = _summaries(runner2)
     assert "1 copied, 0 already present, 0 failed of 2 discovered" in summaries2
     assert not any("selected" in s for s in summaries2)
 
@@ -6965,39 +7011,6 @@ def test_step_summary_claims_a_selection_only_when_one_was_applied(tmp_path):
 # ``remote_unverified`` is True, both verdicts are already False, and the
 # card-safety assertions would pass on a remote path with no selection
 # handling at all.
-
-
-def _run_remote_import(root, monkeypatch, params_kwargs, *, runner=None,
-                       db_path=None, verify=None):
-    """Remote counterpart to ``_run_import``.
-
-    Builds a fake NAS target under ``root`` (mount at ``root/mount``),
-    installs the rsync/verify transport seams, and runs the job.
-    ``destination`` and ``remote_target`` are owned by this helper;
-    ``params_kwargs`` supplies ``sources`` and everything else.
-
-    Returns ``(db, result, runner, calls)``.
-    """
-    from import_job import ImportParams, run_import_job
-
-    ra = _remote_archive_for(root)
-    calls = _remote_calls(ra)
-    _install_fake_remote_rsync(monkeypatch, calls, verify=verify)
-    db_path = db_path or str(root / "test.db")
-    db = Database(db_path)
-    runner = runner or FakeRunner()
-    result = run_import_job(
-        _make_job(), runner, db_path, db._active_workspace_id,
-        ImportParams(
-            destination=ra["mount_base"], remote_target=ra,
-            verify_by_hash=True, **params_kwargs,
-        ),
-    )
-    return db, result, runner, calls
-
-
-def _summaries(runner):
-    return [kw.get("summary", "") for _, _, kw in runner.step_updates]
 
 
 def test_remote_import_honors_include_paths_and_card_safety(
@@ -7083,7 +7096,7 @@ def test_remote_include_paths_absent_imports_everything(tmp_path, monkeypatch):
         ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
         ("DSC_0002.jpg", datetime(2026, 7, 3, 11, 0, 0), "green"),
     ])
-    _, result, _, _ = _run_remote_import(
+    result, _ = _run_remote_import(
         tmp_path, monkeypatch, {"sources": [str(card)]})
     assert result["copied"] == 2
     assert result["discovered"] == 2
@@ -7099,7 +7112,7 @@ def test_remote_include_paths_empty_set_imports_nothing(tmp_path, monkeypatch):
         ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
         ("DSC_0002.jpg", datetime(2026, 7, 3, 11, 0, 0), "green"),
     ])
-    _, result, _, calls = _run_remote_import(tmp_path, monkeypatch, {
+    result, calls = _run_remote_import(tmp_path, monkeypatch, {
         "sources": [str(card)],
         "include_paths": set(), "previewed_count": 2, "checked_count": 0,
     })
@@ -7122,13 +7135,13 @@ def test_remote_full_selection_of_duplicates_is_safe_to_format(
         ("DSC_0002.jpg", datetime(2026, 7, 3, 11, 0, 0), "green"),
     ])
     # First import puts both on the NAS (and in the catalog).
-    _, first, _, _ = _run_remote_import(
+    first, _ = _run_remote_import(
         tmp_path, monkeypatch, {"sources": [str(card)]})
     assert first["copied"] == 2
 
     # Second import of the same card: everything is a duplicate. Same db and
     # same mount, so the twins are found.
-    _, result, _, _ = _run_remote_import(tmp_path, monkeypatch, {
+    result, _ = _run_remote_import(tmp_path, monkeypatch, {
         "sources": [str(card)],
         "include_paths": {str(card / "DSC_0001.jpg"),
                           str(card / "DSC_0002.jpg")},
@@ -7146,7 +7159,7 @@ def test_remote_vanished_in_scope_file_makes_card_unsafe(
     card = _make_card(tmp_path, [
         ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
     ])
-    _, result, _, _ = _run_remote_import(tmp_path, monkeypatch, {
+    result, _ = _run_remote_import(tmp_path, monkeypatch, {
         "sources": [str(card)],
         "include_paths": {str(card / "DSC_0001.jpg"),
                           str(card / "DSC_0002.jpg")},   # previewed, deleted
@@ -7168,7 +7181,7 @@ def test_remote_vanished_file_without_previewed_count_is_unsafe(
     card = _make_card(tmp_path, [
         ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
     ])
-    _, result, _, _ = _run_remote_import(tmp_path, monkeypatch, {
+    result, _ = _run_remote_import(tmp_path, monkeypatch, {
         "sources": [str(card)],
         "include_paths": {str(card / "DSC_0001.jpg"),
                           str(card / "GONE.jpg")},
@@ -7190,7 +7203,7 @@ def test_remote_negative_deselected_count_makes_card_unsafe(
     card = _make_card(tmp_path, [
         ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
     ])
-    _, result, _, _ = _run_remote_import(tmp_path, monkeypatch, {
+    result, _ = _run_remote_import(tmp_path, monkeypatch, {
         "sources": [str(card)],
         "include_paths": {str(card / "DSC_0001.jpg")},
         "previewed_count": 0, "checked_count": 1,
@@ -7216,7 +7229,7 @@ def test_remote_include_paths_accepts_a_list(tmp_path, monkeypatch):
         ("DSC_0002.jpg", datetime(2026, 7, 3, 11, 0, 0), "green"),
     ])
     kept = str(card / "DSC_0001.jpg")
-    _, result, _, _ = _run_remote_import(tmp_path, monkeypatch, {
+    result, _ = _run_remote_import(tmp_path, monkeypatch, {
         "sources": [str(card)],
         "include_paths": [kept, kept],   # list, with a duplicate entry
         "previewed_count": 2, "checked_count": 1,
@@ -7239,7 +7252,7 @@ def test_remote_repeated_include_path_does_not_mask_a_deselection(
         ("DSC_0002.jpg", datetime(2026, 7, 3, 11, 0, 0), "green"),
     ])
     a, b = str(card / "DSC_0001.jpg"), str(card / "DSC_0002.jpg")
-    _, result, _, _ = _run_remote_import(tmp_path, monkeypatch, {
+    result, _ = _run_remote_import(tmp_path, monkeypatch, {
         "sources": [str(card)],
         "include_paths": [a, a, b],
         "previewed_count": 3, "checked_count": 3,
@@ -7304,7 +7317,7 @@ def test_remote_selection_entries_explain_themselves(tmp_path, monkeypatch):
         include_paths = {str(card / fn) for fn in included}
         if extra:
             include_paths.add(str(card / extra))
-        _, result, _, _ = _run_remote_import(root, monkeypatch, {
+        result, _ = _run_remote_import(root, monkeypatch, {
             "sources": [str(card)], "include_paths": include_paths,
             "previewed_count": previewed,
             "checked_count": len(include_paths),
@@ -7324,7 +7337,7 @@ def test_remote_selection_entries_explain_themselves(tmp_path, monkeypatch):
         ("DSC_0002.jpg", datetime(2026, 7, 3, 11, 0, 0), "green"),
         ("DSC_0003.jpg", datetime(2026, 7, 3, 12, 0, 0), "blue"),
     ])
-    _, result, _, _ = _run_remote_import(plural_root, monkeypatch, {
+    result, _ = _run_remote_import(plural_root, monkeypatch, {
         "sources": [str(card)],
         "include_paths": {str(card / "DSC_0001.jpg"),
                           str(card / "GONE_A.jpg"),
@@ -7354,7 +7367,7 @@ def test_remote_selection_drift_counts_are_reported(tmp_path, monkeypatch):
         ("DSC_0002.jpg", datetime(2026, 7, 3, 11, 0, 0), "green"),
         ("DSC_0003.jpg", datetime(2026, 7, 3, 12, 0, 0), "blue"),
     ])
-    _, result, _, _ = _run_remote_import(appeared_root, monkeypatch, {
+    result, _ = _run_remote_import(appeared_root, monkeypatch, {
         "sources": [str(card)],
         "include_paths": {str(card / "DSC_0001.jpg")},
         "previewed_count": 1, "checked_count": 1,
@@ -7369,7 +7382,7 @@ def test_remote_selection_drift_counts_are_reported(tmp_path, monkeypatch):
     card2 = _make_card(vanished_root, [
         ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
     ])
-    _, result2, _, _ = _run_remote_import(vanished_root, monkeypatch, {
+    result2, _ = _run_remote_import(vanished_root, monkeypatch, {
         "sources": [str(card2)],
         "include_paths": {str(card2 / "DSC_0001.jpg"),
                           str(card2 / "GONE_A.jpg"),
@@ -7387,7 +7400,7 @@ def test_remote_ordinary_deselection_reports_no_drift(tmp_path, monkeypatch):
         ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
         ("DSC_0002.jpg", datetime(2026, 7, 3, 11, 0, 0), "green"),
     ])
-    _, result, _, _ = _run_remote_import(tmp_path, monkeypatch, {
+    result, _ = _run_remote_import(tmp_path, monkeypatch, {
         "sources": [str(card)],
         "include_paths": {str(card / "DSC_0001.jpg")},
         "previewed_count": 2, "checked_count": 1,
@@ -7403,7 +7416,7 @@ def test_remote_drift_keys_present_without_any_selection(
     card = _make_card(tmp_path, [
         ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
     ])
-    _, result, _, _ = _run_remote_import(
+    result, _ = _run_remote_import(
         tmp_path, monkeypatch, {"sources": [str(card)]})
     assert result["files_appeared"] == 0
     assert result["files_vanished"] == 0
@@ -7603,7 +7616,7 @@ def test_remote_step_summary_claims_a_selection_only_when_applied(
         ("DSC_0002.jpg", datetime(2026, 7, 3, 11, 0, 0), "green"),
     ])
     runner = FakeRunner()
-    _, result, _, _ = _run_remote_import(count_only, monkeypatch, {
+    result, _ = _run_remote_import(count_only, monkeypatch, {
         "sources": [str(card)], "checked_count": 1,
     }, runner=runner)
     assert result["copied"] == 2, "no include_paths means no filtering"
@@ -7621,7 +7634,7 @@ def test_remote_step_summary_claims_a_selection_only_when_applied(
         ("DSC_0002.jpg", datetime(2026, 7, 3, 11, 0, 0), "green"),
     ])
     runner2 = FakeRunner()
-    _, result2, _, _ = _run_remote_import(paths_only, monkeypatch, {
+    result2, _ = _run_remote_import(paths_only, monkeypatch, {
         "sources": [str(card2)],
         "include_paths": {str(card2 / "DSC_0001.jpg")},
     }, runner=runner2)

@@ -1,13 +1,63 @@
 # vireo/tests/test_taxonomy.py
+import gc
 import gzip
 import json
 import os
+import stat
 import sys
 import tempfile
+import weakref
+
+import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from db import Database
+
+
+@pytest.fixture(autouse=True)
+def _isolate_taxonomy_state(tmp_path, monkeypatch):
+    """Keep the real filesystem and a leftover cache out of every test here.
+
+    Both taxonomy candidates resolve at import time, so a developer with a
+    real ~/.vireo/taxonomy.json or an in-checkout vireo/taxonomy.json (a full
+    iNaturalist dump is ~500MB) had tests that expect a load to fail quietly
+    pick up that file instead — asserting None and counting parses against
+    whatever happened to be on the host. Point both at names that do not
+    exist; tests needing a candidate present aim the constant at their own
+    fixture file.
+
+    Also clears the process-wide parse cache on both sides of the test, so
+    one test's cached instance or memoized failure cannot decide another
+    test's outcome.
+    """
+    import taxonomy as tax_mod
+
+    monkeypatch.setattr(
+        tax_mod, "TAXONOMY_JSON_PATH", str(tmp_path / "absent-persistent.json"),
+    )
+    monkeypatch.setattr(
+        tax_mod, "LEGACY_TAXONOMY_JSON_PATH", str(tmp_path / "absent-legacy.json"),
+    )
+    tax_mod.clear_taxonomy_cache()
+    yield
+    tax_mod.clear_taxonomy_cache()
+
+
+def _fake_dwca_download(url, path, progress_callback=None):
+    """Write a minimal but valid DWCA archive so download_taxonomy() completes."""
+    import zipfile as _zf
+    with _zf.ZipFile(path, "w") as zf:
+        zf.writestr(
+            "taxa.csv",
+            "id,parentNameUsageID,scientificName,taxonRank\n"
+            "1,,Test species,species\n",
+        )
+        zf.writestr(
+            "VernacularNames-english.csv",
+            "id,vernacularName,language\n"
+            "1,Test,en\n",
+        )
 
 
 def _create_mock_taxonomy(tmpdir):
@@ -804,6 +854,535 @@ def test_download_with_resume_no_range_stalls_correctly(tmp_path):
         server.shutdown()
 
 
+def test_download_with_resume_reports_bytes(tmp_path):
+    """byte_callback gets real byte counts — this is what the progress bar reads."""
+    import http.server
+
+    from taxonomy import _download_with_resume
+
+    payload = b"x" * 500_000
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, *a):
+            pass
+
+    server, port = _start_test_server(Handler)
+    try:
+        seen = []
+        dest = tmp_path / "out.bin"
+        # chunk_size small enough to force several loop iterations
+        _download_with_resume(
+            f"http://127.0.0.1:{port}/x", str(dest), chunk_size=4096,
+            byte_callback=lambda done, total: seen.append((done, total)),
+        )
+    finally:
+        server.shutdown()
+
+    assert seen, "byte_callback was never called"
+    assert seen[-1][0] == len(payload)
+    assert seen[-1][1] == len(payload)          # from Content-Length
+    assert [d for d, _ in seen] == sorted(d for d, _ in seen)
+
+
+def test_download_with_resume_cancels_midstream(tmp_path):
+    """should_cancel aborts, keeps a non-empty .partial, and does not retry.
+
+    Cancellation must escape the retry machinery, not fall into it.  If the
+    DownloadCancelled re-raise is removed the generic handler treats a cancel
+    as a dropped connection: the user is told "Connection lost ... retrying"
+    right after pressing Cancel, and the download is re-requested.
+    """
+    import http.server
+
+    from taxonomy import DownloadCancelled, _download_with_resume
+
+    payload = b"x" * 500_000
+    requests = {"n": 0}
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            requests["n"] += 1
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, *a):
+            pass
+
+    server, port = _start_test_server(Handler)
+    calls = {"n": 0}
+    messages = []
+
+    def cancel_after_two_chunks():
+        calls["n"] += 1
+        return calls["n"] > 2
+
+    try:
+        dest = tmp_path / "out.bin"
+        with pytest.raises(DownloadCancelled):
+            _download_with_resume(
+                f"http://127.0.0.1:{port}/x", str(dest), chunk_size=4096,
+                progress_callback=messages.append,
+                should_cancel=cancel_after_two_chunks,
+            )
+    finally:
+        server.shutdown()
+
+    assert not dest.exists()
+    partial = tmp_path / "out.bin.partial"
+    assert partial.exists()
+    # Non-empty proves we cancelled mid-stream, not before the first read —
+    # open(..., "wb") would create a 0-byte file either way.
+    assert partial.stat().st_size > 0
+    # A cancel is not a network error: the user must never be told the
+    # connection dropped or that we are retrying.
+    assert not [m for m in messages if "retrying" in m], messages
+    assert not [m for m in messages if "Connection lost" in m], messages
+    # And we really stopped — no second attempt was made against the server.
+    assert requests["n"] == 1, f"expected a single request, got {requests['n']}"
+
+
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason=(
+        "socket.shutdown(SHUT_RDWR) from another thread does not reliably "
+        "unblock a Python recv() on Windows — the blocked read only surfaces "
+        "once the peer actually closes, so this timing assertion is not a "
+        "meaningful check of the watcher there.  The mechanism still runs "
+        "in production; only the sub-5s timing property is Linux/macOS-only."
+    ),
+)
+def test_download_with_resume_cancel_interrupts_stalled_read(tmp_path):
+    """A Stop press during a stalled resp.read must not wait for the socket timeout.
+
+    Before the watcher thread, cancellation was polled only between reads, so a
+    stalled connection let the flag sit unnoticed until the 120 s urlopen timeout
+    expired — the Settings progress UI stayed running for two minutes on the
+    exact unreliable-network scenario cancellation is for.  The watcher now
+    closes resp when should_cancel goes true, unblocking the read immediately.
+    """
+    import http.server
+    import threading
+    import time
+
+    from taxonomy import DownloadCancelled, _download_with_resume
+
+    # Promise 8 MB in Content-Length but only send 1 KB and hang.  resp.read
+    # of 8 MB has to keep reading until it gets Content-Length bytes or the
+    # connection closes — after the 1 KB flush the read blocks on the socket.
+    stop_hanging = threading.Event()
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Length", str(8 * 1024 * 1024))
+            self.end_headers()
+            self.wfile.write(b"x" * 1024)
+            self.wfile.flush()
+            # Hold the connection open until the test releases it — this is
+            # what makes resp.read block on the client side.
+            stop_hanging.wait(timeout=30)
+
+        def log_message(self, *a):
+            pass
+
+    server, port = _start_test_server(Handler)
+    cancel_flag = threading.Event()
+
+    def fire_cancel_after_read_starts():
+        # A short wait so we are already inside the blocked resp.read when
+        # the flag flips: much longer than the initial header exchange, much
+        # shorter than the socket timeout.
+        time.sleep(0.5)
+        cancel_flag.set()
+    threading.Thread(target=fire_cancel_after_read_starts, daemon=True).start()
+
+    try:
+        dest = tmp_path / "out.bin"
+        started = time.monotonic()
+        with pytest.raises(DownloadCancelled):
+            _download_with_resume(
+                f"http://127.0.0.1:{port}/x", str(dest),
+                chunk_size=8 * 1024 * 1024,  # bigger than the server ever sends
+                should_cancel=cancel_flag.is_set,
+            )
+        elapsed = time.monotonic() - started
+    finally:
+        stop_hanging.set()
+        server.shutdown()
+
+    # Well under the 120 s socket timeout — the watcher closed resp within
+    # its poll interval and the read exited immediately after.
+    assert elapsed < 5, (
+        f"cancel took {elapsed:.2f}s — the watcher did not close a stalled read"
+    )
+
+
+def test_download_with_resume_cancels_during_retry_backoff(tmp_path):
+    """A cancel that lands during the retry wait aborts instead of sleeping it out.
+
+    The backoff is polled in short slices so Cancel feels immediate.  With a
+    single time.sleep(3) the user would wait out the full backoff and the
+    download would be re-requested before anyone noticed the cancel.
+    """
+    import http.server
+    import time
+
+    from taxonomy import DownloadCancelled, _download_with_resume
+
+    requests = {"n": 0}
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            requests["n"] += 1
+            self.send_response(500)
+            self.end_headers()
+
+        def log_message(self, *a):
+            pass
+
+    server, port = _start_test_server(Handler)
+
+    # should_cancel is only consulted inside the read loop (never reached on a
+    # 500) and inside the backoff, so this is False for the whole first attempt
+    # and True from the moment the backoff starts.
+    def cancel_once_the_first_attempt_failed():
+        return requests["n"] >= 1
+
+    try:
+        dest = tmp_path / "out.bin"
+        started = time.monotonic()
+        with pytest.raises(DownloadCancelled):
+            _download_with_resume(
+                f"http://127.0.0.1:{port}/x", str(dest), max_stalled=2,
+                should_cancel=cancel_once_the_first_attempt_failed,
+            )
+        elapsed = time.monotonic() - started
+    finally:
+        server.shutdown()
+
+    # Well under the 3 s backoff: we noticed the cancel, we did not sleep it off.
+    assert elapsed < 1.5, f"cancel took {elapsed:.2f}s — backoff was not polled"
+    # And the retry never went out.
+    assert requests["n"] == 1, f"expected a single request, got {requests['n']}"
+
+
+def test_download_with_resume_bytes_include_resume_offset(tmp_path):
+    """On a 206 resume, progress counts bytes already on disk and totals the full file.
+
+    Content-Length on a 206 is only the *remaining* length, so the implementation
+    has to add the resume offset back to both the running count and the total.
+    Without that, a resumed download would show the bar restarting at zero and
+    finishing at less than the real file size.
+    """
+    import http.server
+
+    from taxonomy import _download_with_resume
+
+    payload = b"C" * 300_000
+    first_chunk = 100_000
+    call_count = [0]
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                # Promise the whole file but hang up after first_chunk bytes.
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload[:first_chunk])
+                return
+
+            # Later attempts honour Range with a real 206.
+            range_header = self.headers.get("Range", "")
+            assert range_header.startswith("bytes="), "expected a Range request"
+            start = int(range_header.split("=")[1].split("-")[0])
+            remaining = payload[start:]
+            self.send_response(206)
+            self.send_header("Content-Length", str(len(remaining)))
+            self.send_header("Content-Range",
+                             f"bytes {start}-{len(payload) - 1}/{len(payload)}")
+            self.end_headers()
+            self.wfile.write(remaining)
+
+        def log_message(self, *a):
+            pass
+
+    server, port = _start_test_server(Handler)
+    seen = []
+    try:
+        dest = tmp_path / "out.bin"
+        _download_with_resume(
+            f"http://127.0.0.1:{port}/x", str(dest), chunk_size=4096,
+            byte_callback=lambda done, total: seen.append((call_count[0], done, total)),
+        )
+    finally:
+        server.shutdown()
+
+    assert open(dest, "rb").read() == payload
+
+    resumed = [e for e in seen if e[0] >= 2]
+    assert resumed, "no byte_callback events during the resumed attempt"
+    # Every event on the resumed attempt reports the FULL file size, never the
+    # 200_000-byte remainder from Content-Length.
+    assert {total for _, _, total in resumed} == {len(payload)}
+    # Progress picks up from the resume offset instead of restarting at zero.
+    assert resumed[0][1] >= first_chunk
+    assert all(done <= len(payload) for _, done, _ in seen)
+    assert seen[-1][1] == len(payload)
+
+
+def test_download_with_resume_bytes_reset_when_server_ignores_range(tmp_path):
+    """A 200 after a partial write restarts the count — the bar must not exceed 100%.
+
+    mode == "wb" truncates the partial in this branch, but downloaded_before is
+    deliberately kept as the stall baseline.  Reusing it as the display base
+    would double-count the discarded bytes.
+    """
+    import http.server
+
+    from taxonomy import _download_with_resume
+
+    payload = b"E" * 200_000
+    first_chunk = 50_000
+    call_count = [0]
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            call_count[0] += 1
+            self.send_response(200)  # never 206: this server ignores Range
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            if call_count[0] == 1:
+                self.wfile.write(payload[:first_chunk])
+                return
+            self.wfile.write(payload)
+
+        def log_message(self, *a):
+            pass
+
+    server, port = _start_test_server(Handler)
+    seen = []
+    try:
+        dest = tmp_path / "out.bin"
+        _download_with_resume(
+            f"http://127.0.0.1:{port}/x", str(dest), chunk_size=4096,
+            byte_callback=lambda done, total: seen.append((done, total)),
+        )
+    finally:
+        server.shutdown()
+
+    assert open(dest, "rb").read() == payload
+    assert seen, "byte_callback was never called"
+    # The reported total is always the real file size, never inflated by the
+    # bytes that were thrown away.
+    assert {total for _, total in seen} == {len(payload)}
+    assert all(done <= len(payload) for done, _ in seen)
+    assert seen[-1] == (len(payload), len(payload))
+
+
+def test_download_with_resume_throttles_byte_callback(tmp_path):
+    """byte_callback is rate-limited, not fired once per chunk.
+
+    The SSE subscriber queue is bounded, so a 178 MB download at 256 KB chunks
+    must not emit ~700 events (and at 4 KB chunks, ~45000).
+    """
+    import http.server
+
+    from taxonomy import _download_with_resume
+
+    payload = b"y" * 500_000
+    chunk_size = 4096
+    chunk_count = len(payload) // chunk_size  # 122
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, *a):
+            pass
+
+    server, port = _start_test_server(Handler)
+    seen = []
+    try:
+        dest = tmp_path / "out.bin"
+        _download_with_resume(
+            f"http://127.0.0.1:{port}/x", str(dest), chunk_size=chunk_size,
+            byte_callback=lambda done, total: seen.append(done),
+        )
+    finally:
+        server.shutdown()
+
+    # At ~4 Hz this loop would have to take 5+ seconds on localhost to reach 20
+    # events; one-per-chunk would be 120+.  Deliberately loose so it can't go
+    # flaky on a slow machine, while still failing outright if the throttle is
+    # removed.
+    assert chunk_count > 100, "payload/chunk_size no longer forces many iterations"
+    assert len(seen) <= 20, f"expected throttled events, got {len(seen)}"
+    # Still ends on an exact final count.
+    assert seen[-1] == len(payload)
+
+
+def test_download_with_resume_throttle_interval_gates_emits(tmp_path):
+    """The emit interval is what paces the bar — pin both ends of it.
+
+    The unconditional final emit alone satisfies "the callback fired", so a
+    throttle window stretched to effectively-infinite still looks healthy from
+    the outside while the real 178 MB download shows a bar frozen at 0% until
+    the very last byte.  Driving the interval to 0 and to a huge value proves
+    the comparison actually gates each chunk.
+    """
+    import http.server
+
+    from taxonomy import _download_with_resume
+
+    payload = b"z" * 500_000
+    chunk_size = 4096
+    chunk_count = len(payload) // chunk_size  # 122
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, *a):
+            pass
+
+    def run(interval, out_name):
+        server, port = _start_test_server(Handler)
+        seen = []
+        try:
+            _download_with_resume(
+                f"http://127.0.0.1:{port}/x", str(tmp_path / out_name),
+                chunk_size=chunk_size,
+                byte_callback=lambda done, total: seen.append(done),
+                _emit_interval=interval,
+            )
+        finally:
+            server.shutdown()
+        assert seen[-1] == len(payload)
+        return seen
+
+    # No throttle: every chunk emits.  A read may return short, so the loop
+    # runs at least chunk_count times — the count tracks chunks, not a
+    # hard-coded 1 or 2.
+    ungated = run(0, "ungated.bin")
+    assert len(ungated) >= chunk_count, (
+        f"with _emit_interval=0 expected ~{chunk_count} emits, got {len(ungated)}"
+    )
+
+    # Throttle wider than any plausible download: only the final unconditional
+    # emit survives.
+    gated = run(1e9, "gated.bin")
+    assert len(gated) == 1, (
+        f"with a huge _emit_interval only the final emit should fire, got {len(gated)}"
+    )
+
+
+def test_download_with_resume_promotes_complete_partial_on_416(tmp_path):
+    """Cancellation between writing the final chunk and the empty-read break
+    leaves a ``.partial`` at exactly the full asset size.  The next attempt
+    sends ``Range: bytes=<total>-`` and gets 416; without promotion the retry
+    loop would burn through ``max_stalled`` attempts against a permanent 416
+    despite the UI promising "try again and the download will resume".
+    """
+    import http.server
+
+    from taxonomy import _download_with_resume
+
+    content = b"y" * 4096
+    call_count = [0]
+
+    # Pre-seed the .partial so the first attempt sends Range: bytes=<total>-.
+    dest = tmp_path / "out.bin"
+    partial = tmp_path / "out.bin.partial"
+    partial.write_bytes(content)
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            call_count[0] += 1
+            self.send_response(416)
+            self.send_header(
+                "Content-Range", f"bytes */{len(content)}",
+            )
+            self.end_headers()
+
+        def log_message(self, *a):
+            pass
+
+    server, port = _start_test_server(Handler)
+    try:
+        _download_with_resume(f"http://127.0.0.1:{port}/x", str(dest))
+    finally:
+        server.shutdown()
+
+    # Partial was promoted to the final path with the correct bytes; the
+    # download did not retry into a stall.
+    assert dest.exists()
+    assert not partial.exists()
+    assert dest.read_bytes() == content
+    assert call_count[0] == 1
+
+
+def test_download_with_resume_restarts_when_416_total_mismatches(tmp_path):
+    """A rebuilt release changes the asset size, so a 416 whose Content-Range
+    total does not match the partial means the partial is stale — delete it
+    and restart from scratch instead of promoting bytes of the wrong artifact.
+    """
+    import http.server
+
+    from taxonomy import _download_with_resume
+
+    fresh = b"Z" * 3000
+    partial = tmp_path / "out.bin.partial"
+    partial.write_bytes(b"X" * 2000)  # stale bytes from a previous release
+    call_count = [0]
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            call_count[0] += 1
+            range_header = self.headers.get("Range")
+            if range_header:
+                # First call: reject the stale-partial resume with 416,
+                # advertising the true total.
+                self.send_response(416)
+                self.send_header("Content-Range", f"bytes */{len(fresh)}")
+                self.end_headers()
+                return
+            # Second call: no Range header (partial was deleted); serve the
+            # fresh release from scratch.
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(fresh)))
+            self.end_headers()
+            self.wfile.write(fresh)
+
+        def log_message(self, *a):
+            pass
+
+    server, port = _start_test_server(Handler)
+    try:
+        dest = tmp_path / "out.bin"
+        _download_with_resume(f"http://127.0.0.1:{port}/x", str(dest))
+    finally:
+        server.shutdown()
+
+    assert dest.read_bytes() == fresh
+    assert call_count[0] >= 2
+
+
 # ---------------------------------------------------------------------------
 # classify_to_keypoint_group — taxonomy routing for eye-focus detection
 # ---------------------------------------------------------------------------
@@ -980,15 +1559,10 @@ def test_load_local_taxonomy_falls_back_when_persistent_corrupt(tmp_path, monkey
 
     monkeypatch.setattr(tax_mod, "TAXONOMY_JSON_PATH", str(corrupt))
     # Redirect the "package-dir legacy" candidate path to our tmp fixture.
-    orig_dirname = tax_mod.os.path.dirname
-
-    def fake_dirname(p):
-        if p == tax_mod.__file__:
-            return str(tmp_path)
-        return orig_dirname(p)
-
     legacy.rename(tmp_path / "taxonomy.json")
-    monkeypatch.setattr(tax_mod.os.path, "dirname", fake_dirname)
+    monkeypatch.setattr(
+        tax_mod, "LEGACY_TAXONOMY_JSON_PATH", str(tmp_path / "taxonomy.json"),
+    )
 
     result = tax_mod.load_local_taxonomy()
     assert result is not None, "should fall back to legacy copy on corrupt persistent"
@@ -1002,14 +1576,9 @@ def test_load_local_taxonomy_returns_none_when_no_file(tmp_path, monkeypatch):
     monkeypatch.setattr(
         tax_mod, "TAXONOMY_JSON_PATH", str(tmp_path / "nonexistent.json"),
     )
-    orig_dirname = tax_mod.os.path.dirname
-
-    def fake_dirname(p):
-        if p == tax_mod.__file__:
-            return str(tmp_path)
-        return orig_dirname(p)
-
-    monkeypatch.setattr(tax_mod.os.path, "dirname", fake_dirname)
+    monkeypatch.setattr(
+        tax_mod, "LEGACY_TAXONOMY_JSON_PATH", str(tmp_path / "taxonomy.json"),
+    )
     assert tax_mod.load_local_taxonomy() is None
 
 
@@ -1500,3 +2069,1303 @@ def test_populate_taxa_db_from_json_enables_auto_detect(tmp_path):
         "SELECT type FROM keywords WHERE id = ?", (kid,)
     ).fetchone()
     assert row["type"] == "taxonomy"
+
+
+def _write_taxonomy_json(path, common_name):
+    """Write a minimal but valid taxonomy.json containing one species."""
+    path.write_text(
+        '{"last_updated":"2026-07-30","source":"test",'
+        '"taxa_by_common":{"' + common_name + '":{"taxon_id":1,'
+        '"scientific_name":"Test species","common_name":"Test",'
+        '"rank":"species","lineage_names":["Animalia","Test species"],'
+        '"lineage_ranks":["kingdom","species"]}},'
+        '"taxa_by_scientific":{}}'
+    )
+
+
+def test_load_local_taxonomy_reuses_parsed_instance(tmp_path, monkeypatch):
+    """Repeated loads reuse the parsed taxonomy instead of re-parsing the file.
+
+    A real iNaturalist taxonomy.json is ~500MB, and ``/api/predictions/compare``
+    calls load_local_taxonomy() on every request. Re-parsing per request made
+    the Compare page take seconds-to-minutes and allocated a fresh multi-GB
+    structure each time.
+    """
+    import taxonomy as tax_mod
+
+    tax_mod.clear_taxonomy_cache()
+    persistent = tmp_path / "persistent.json"
+    _write_taxonomy_json(persistent, "test species")
+    monkeypatch.setattr(tax_mod, "TAXONOMY_JSON_PATH", str(persistent))
+
+    parses = []
+    real_init = tax_mod.Taxonomy.__init__
+
+    def counting_init(self, path):
+        parses.append(path)
+        real_init(self, path)
+
+    monkeypatch.setattr(tax_mod.Taxonomy, "__init__", counting_init)
+
+    first = tax_mod.load_local_taxonomy()
+    second = tax_mod.load_local_taxonomy()
+
+    assert first is not None
+    assert second is first
+    assert len(parses) == 1
+
+
+def test_load_local_taxonomy_reloads_after_file_changes(tmp_path, monkeypatch):
+    """A re-downloaded taxonomy.json is picked up without restarting."""
+    import taxonomy as tax_mod
+
+    tax_mod.clear_taxonomy_cache()
+    persistent = tmp_path / "persistent.json"
+    _write_taxonomy_json(persistent, "old species")
+    monkeypatch.setattr(tax_mod, "TAXONOMY_JSON_PATH", str(persistent))
+
+    first = tax_mod.load_local_taxonomy()
+    assert first.is_taxon("old species")
+
+    _write_taxonomy_json(persistent, "new species that is much longer")
+    os.utime(persistent, (1e9, 1e9))
+
+    second = tax_mod.load_local_taxonomy()
+    assert second is not first
+    assert second.is_taxon("new species that is much longer")
+    assert not second.is_taxon("old species")
+
+
+def test_load_local_taxonomy_cache_is_keyed_by_path(tmp_path, monkeypatch):
+    """Switching to a different taxonomy file does not serve the stale one."""
+    import taxonomy as tax_mod
+
+    tax_mod.clear_taxonomy_cache()
+    first_path = tmp_path / "first.json"
+    second_path = tmp_path / "second.json"
+    _write_taxonomy_json(first_path, "first species")
+    _write_taxonomy_json(second_path, "second species")
+
+    monkeypatch.setattr(tax_mod, "TAXONOMY_JSON_PATH", str(first_path))
+    assert tax_mod.load_local_taxonomy().is_taxon("first species")
+
+    monkeypatch.setattr(tax_mod, "TAXONOMY_JSON_PATH", str(second_path))
+    assert tax_mod.load_local_taxonomy().is_taxon("second species")
+
+
+def test_load_local_taxonomy_detects_metadata_preserving_replacement(
+    tmp_path, monkeypatch,
+):
+    """A ``cp -p`` / ``rsync -t`` style swap with the old mtime and matching
+    size must still invalidate the cache.
+
+    An external updater can atomically install a taxonomy while preserving
+    the previous mtime and hitting the same byte length; without file
+    identity in the cache key the pair ``(mtime_ns, size)`` matches and
+    ``_load_taxonomy_cached()`` keeps handing back the old snapshot forever.
+    """
+    import taxonomy as tax_mod
+
+    tax_mod.clear_taxonomy_cache()
+    persistent = tmp_path / "persistent.json"
+    # Common names padded to the same length so the two taxonomy files
+    # serialize to the same byte count — that is the exact case where
+    # (mtime_ns, size) alone cannot tell them apart.
+    old_common = "a" * 30
+    new_common = "b" * 30
+    _write_taxonomy_json(persistent, old_common)
+    monkeypatch.setattr(tax_mod, "TAXONOMY_JSON_PATH", str(persistent))
+
+    first = tax_mod.load_local_taxonomy()
+    assert first.is_taxon(old_common)
+    old_stat = os.stat(persistent)
+
+    # Atomically replace via rename onto the target — new inode, but stamp
+    # the old mtime back so mtime and size match the pre-replacement values.
+    replacement = tmp_path / "replacement.json"
+    _write_taxonomy_json(replacement, new_common)
+    assert os.stat(replacement).st_size == old_stat.st_size, (
+        "test setup: the padded names must yield equal-size JSON files"
+    )
+    os.replace(str(replacement), str(persistent))
+    os.utime(persistent, ns=(old_stat.st_mtime_ns, old_stat.st_mtime_ns))
+    new_stat = os.stat(persistent)
+    assert new_stat.st_mtime_ns == old_stat.st_mtime_ns
+    assert new_stat.st_size == old_stat.st_size
+
+    second = tax_mod.load_local_taxonomy()
+    assert second is not first
+    assert second.is_taxon(new_common)
+    assert not second.is_taxon(old_common)
+
+
+def test_taxonomy_stat_key_includes_file_identity(tmp_path):
+    """The stat key must change when the file is atomically replaced,
+    even if mtime and size are preserved.
+
+    Direct guard on ``_taxonomy_stat_key`` for the metadata-preserving
+    replacement case — the integration test above depends on this
+    property, and asserting it in isolation makes a future regression
+    fail here first with an obvious diff.
+    """
+    import taxonomy as tax_mod
+
+    target = tmp_path / "taxonomy.json"
+    target.write_text("x" * 128)
+    before_stat = os.stat(target)
+    before_key = tax_mod._taxonomy_stat_key(str(target))
+
+    replacement = tmp_path / "replacement.json"
+    replacement.write_text("y" * 128)
+    os.replace(str(replacement), str(target))
+    os.utime(target, ns=(before_stat.st_mtime_ns, before_stat.st_mtime_ns))
+    after_stat = os.stat(target)
+    after_key = tax_mod._taxonomy_stat_key(str(target))
+
+    # Preconditions: mtime and size did not move, so a key made of just
+    # (mtime_ns, size) would compare equal.
+    assert after_stat.st_mtime_ns == before_stat.st_mtime_ns
+    assert after_stat.st_size == before_stat.st_size
+    # The key must still change — that is what makes the cache pick up
+    # the replacement.
+    assert after_key != before_key
+
+
+def test_load_local_taxonomy_retries_when_file_changes_during_parse(tmp_path, monkeypatch):
+    """A rewrite mid-parse must not cache stale content under the new stat key.
+
+    Without a retry, the post-parse stat would record the new file's metadata
+    while the parsed object still holds the old snapshot. Future calls with a
+    stat that matches the cached key would then keep returning the stale
+    taxonomy indefinitely.
+    """
+    import taxonomy as tax_mod
+
+    tax_mod.clear_taxonomy_cache()
+    persistent = tmp_path / "persistent.json"
+    _write_taxonomy_json(persistent, "first species")
+    monkeypatch.setattr(tax_mod, "TAXONOMY_JSON_PATH", str(persistent))
+
+    real_init = tax_mod.Taxonomy.__init__
+    call_count = {"n": 0}
+
+    def racing_init(self, path):
+        call_count["n"] += 1
+        real_init(self, path)
+        # Race only the first parse; the retry then reads a stable file.
+        if call_count["n"] == 1:
+            _write_taxonomy_json(persistent, "second species that is longer")
+            os.utime(persistent, (2e9, 2e9))
+
+    monkeypatch.setattr(tax_mod.Taxonomy, "__init__", racing_init)
+
+    result = tax_mod.load_local_taxonomy()
+
+    assert result is not None
+    assert result.is_taxon("second species that is longer")
+    assert call_count["n"] == 2
+
+    again = tax_mod.load_local_taxonomy()
+    assert again is result
+    assert call_count["n"] == 2
+
+
+def test_load_local_taxonomy_skips_cache_when_file_keeps_changing(tmp_path, monkeypatch):
+    """A file that keeps moving must not be cached under a mismatched stat.
+
+    When retries exhaust, the parse still returns so the caller sees fresh
+    data, but the cache stays empty so the next call re-checks instead of
+    stranding the process on a stale snapshot.
+    """
+    import taxonomy as tax_mod
+
+    tax_mod.clear_taxonomy_cache()
+    persistent = tmp_path / "persistent.json"
+    _write_taxonomy_json(persistent, "test species")
+    monkeypatch.setattr(tax_mod, "TAXONOMY_JSON_PATH", str(persistent))
+
+    real_init = tax_mod.Taxonomy.__init__
+    counter = {"n": 0}
+
+    def always_racing_init(self, path):
+        counter["n"] += 1
+        real_init(self, path)
+        os.utime(persistent, (counter["n"] + 1e9, counter["n"] + 1e9))
+
+    monkeypatch.setattr(tax_mod.Taxonomy, "__init__", always_racing_init)
+
+    result = tax_mod.load_local_taxonomy()
+
+    assert result is not None
+    assert counter["n"] == tax_mod._TAXONOMY_PARSE_RETRY_LIMIT
+    with tax_mod._taxonomy_cache_lock:
+        assert tax_mod._taxonomy_cache is None
+
+
+def test_load_local_taxonomy_releases_stale_instance_before_reparse(tmp_path, monkeypatch):
+    """A stale cache entry must not stay reachable while the replacement parses.
+
+    A parsed iNaturalist taxonomy is ~2.8GB. If the old instance is still
+    held by ``_taxonomy_cache`` (or by a local reference inside
+    ``_load_taxonomy_cached``) while ``Taxonomy(path)`` allocates the
+    replacement, peak RSS doubles, and each retry on a file that keeps
+    changing stacks another live copy on top. Assert both the module
+    slot and any local reference are cleared before the next
+    ``Taxonomy(path)`` call runs.
+    """
+    import taxonomy as tax_mod
+
+    tax_mod.clear_taxonomy_cache()
+    persistent = tmp_path / "persistent.json"
+    _write_taxonomy_json(persistent, "first species")
+    monkeypatch.setattr(tax_mod, "TAXONOMY_JSON_PATH", str(persistent))
+
+    first = tax_mod.load_local_taxonomy()
+    assert first is not None
+
+    _write_taxonomy_json(persistent, "second species that is longer")
+    os.utime(persistent, (2e9, 2e9))
+
+    real_init = tax_mod.Taxonomy.__init__
+    observed = []
+
+    def observing_init(self, path):
+        # By the time we are inside the constructor for the replacement,
+        # neither the module-level cache slot nor any live reference to
+        # the previously cached instance should be reachable from this
+        # function's frame — otherwise both instances share peak RSS.
+        observed.append(tax_mod._taxonomy_cache)
+        real_init(self, path)
+
+    monkeypatch.setattr(tax_mod.Taxonomy, "__init__", observing_init)
+
+    second = tax_mod.load_local_taxonomy()
+
+    assert second is not None
+    assert second is not first
+    assert observed == [None]
+
+
+def test_load_local_taxonomy_releases_between_retries(tmp_path, monkeypatch):
+    """Retries after mid-parse rewrites must not stack live copies.
+
+    Without dropping the previous retry's instance before the next
+    ``Taxonomy(path)`` call, a file that keeps changing would hold N
+    parsed taxonomies live at once (peak RSS ≈ N × 2.8GB on a real
+    iNaturalist dump). Track every constructed instance with a
+    weakref; only the caller's returned instance should still be
+    alive after the final retry.
+    """
+    import taxonomy as tax_mod
+
+    tax_mod.clear_taxonomy_cache()
+    persistent = tmp_path / "persistent.json"
+    _write_taxonomy_json(persistent, "test species")
+    monkeypatch.setattr(tax_mod, "TAXONOMY_JSON_PATH", str(persistent))
+
+    tracked = []
+    real_init = tax_mod.Taxonomy.__init__
+    counter = {"n": 0}
+
+    def racing_init(self, path):
+        counter["n"] += 1
+        tracked.append(weakref.ref(self))
+        real_init(self, path)
+        # Move the file every time so every retry sees a mismatched stat.
+        os.utime(persistent, (counter["n"] + 1e9, counter["n"] + 1e9))
+
+    monkeypatch.setattr(tax_mod.Taxonomy, "__init__", racing_init)
+
+    result = tax_mod.load_local_taxonomy()
+
+    assert result is not None
+    assert counter["n"] == tax_mod._TAXONOMY_PARSE_RETRY_LIMIT
+    gc.collect()
+    live = [ref for ref in tracked if ref() is result]
+    dead = [ref for ref in tracked if ref() is None]
+    # The final instance is the one returned; every earlier retry's
+    # instance should be unreachable, meaning the loop dropped its ref
+    # before allocating the next parse.
+    assert len(live) == 1
+    assert len(dead) == tax_mod._TAXONOMY_PARSE_RETRY_LIMIT - 1
+
+
+def test_taxonomy_save_keeps_cached_instance_current(tmp_path, monkeypatch):
+    """save() rewrites the file; the cache must not serve a pre-save copy.
+
+    The instance mutated by api_lookup() is the cached one, so after it
+    persists itself the next load should keep returning that same object
+    rather than re-parsing the file it just wrote.
+    """
+    import taxonomy as tax_mod
+
+    tax_mod.clear_taxonomy_cache()
+    persistent = tmp_path / "persistent.json"
+    _write_taxonomy_json(persistent, "test species")
+    monkeypatch.setattr(tax_mod, "TAXONOMY_JSON_PATH", str(persistent))
+
+    tax = tax_mod.load_local_taxonomy()
+    tax._api_misses.add("nothing here")
+    tax._dirty = True
+    tax.save()
+
+    assert tax_mod.load_local_taxonomy() is tax
+
+
+def test_taxonomy_save_leaves_original_intact_when_write_fails(tmp_path, monkeypatch):
+    """An interrupted save must not destroy the existing taxonomy.
+
+    save() used to truncate the target with open(path, "w") before
+    serializing ~500MB into it, so a crash — or any concurrent reader,
+    now including _load_taxonomy_cached — saw a half-written file.
+    """
+    import taxonomy as tax_mod
+
+    tax_mod.clear_taxonomy_cache()
+    persistent = tmp_path / "persistent.json"
+    _write_taxonomy_json(persistent, "test species")
+    monkeypatch.setattr(tax_mod, "TAXONOMY_JSON_PATH", str(persistent))
+    original = persistent.read_text()
+
+    tax = tax_mod.load_local_taxonomy()
+    tax._api_misses.add("nothing here")
+    tax._dirty = True
+
+    def exploding_dump(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(tax_mod.json, "dump", exploding_dump)
+
+    with pytest.raises(OSError):
+        tax.save()
+
+    assert persistent.read_text() == original
+    assert not list(tmp_path.glob("*.tmp")), "no temp file may survive"
+    tax_mod.clear_taxonomy_cache()
+    assert tax_mod.load_local_taxonomy().is_taxon("test species")
+
+
+def test_taxonomy_save_replaces_file_without_truncating_it(tmp_path, monkeypatch):
+    """The target is never observed empty: the new bytes land via rename."""
+    import taxonomy as tax_mod
+
+    tax_mod.clear_taxonomy_cache()
+    persistent = tmp_path / "persistent.json"
+    _write_taxonomy_json(persistent, "test species")
+    monkeypatch.setattr(tax_mod, "TAXONOMY_JSON_PATH", str(persistent))
+
+    tax = tax_mod.load_local_taxonomy()
+    tax._api_misses.add("nothing here")
+    tax._dirty = True
+
+    real_dump = tax_mod.json.dump
+    target_during_write = []
+
+    def observing_dump(data, fp, *args, **kwargs):
+        # Mid-serialize, the file callers read must still parse.
+        with open(persistent) as f:
+            target_during_write.append(json.load(f))
+        return real_dump(data, fp, *args, **kwargs)
+
+    monkeypatch.setattr(tax_mod.json, "dump", observing_dump)
+    tax.save()
+
+    assert len(target_during_write) == 1
+    assert "test species" in target_during_write[0]["taxa_by_common"]
+    assert json.loads(persistent.read_text())["api_misses"] == ["nothing here"]
+
+
+def test_load_local_taxonomy_keeps_fallback_cached_when_preferred_is_corrupt(
+    tmp_path, monkeypatch,
+):
+    """The corrupt-persistent fallback must not defeat the cache.
+
+    load_local_taxonomy() parses the preferred candidate, fails, and falls
+    back to the legacy one. Evicting the legacy entry on the way past would
+    re-parse a multi-GB file on every compare/accept request.
+    """
+    import taxonomy as tax_mod
+
+    tax_mod.clear_taxonomy_cache()
+    corrupt = tmp_path / "persistent.json"
+    corrupt.write_text("{ not valid json")
+    legacy = tmp_path / "taxonomy.json"
+    _write_taxonomy_json(legacy, "legacy species")
+    monkeypatch.setattr(tax_mod, "TAXONOMY_JSON_PATH", str(corrupt))
+    monkeypatch.setattr(tax_mod, "LEGACY_TAXONOMY_JSON_PATH", str(legacy))
+
+    parses = []
+    real_init = tax_mod.Taxonomy.__init__
+
+    def counting_init(self, path):
+        parses.append(path)
+        real_init(self, path)
+
+    monkeypatch.setattr(tax_mod.Taxonomy, "__init__", counting_init)
+
+    first = tax_mod.load_local_taxonomy()
+    second = tax_mod.load_local_taxonomy()
+
+    assert first.is_taxon("legacy species")
+    assert second is first
+    # Each call attempts the corrupt preferred file; only the first should
+    # have to parse the legacy fallback.
+    assert parses.count(str(legacy)) == 1
+
+
+def test_load_local_taxonomy_rechecks_stat_after_acquiring_lock(tmp_path, monkeypatch):
+    """A caller that waited on the lock must not evict what it was waiting for.
+
+    Statting before the lock lets a caller compare a pre-wait stat against an
+    entry another caller refreshed while it waited, conclude it is stale, and
+    re-parse ~2.8GB for nothing.
+    """
+    import taxonomy as tax_mod
+
+    tax_mod.clear_taxonomy_cache()
+    persistent = tmp_path / "persistent.json"
+    _write_taxonomy_json(persistent, "old species")
+    monkeypatch.setattr(tax_mod, "TAXONOMY_JSON_PATH", str(persistent))
+
+    winner = tax_mod.load_local_taxonomy()
+    assert winner.is_taxon("old species")
+
+    # Build the instance the "other caller" installs, plus the bytes and stat
+    # key that go with it, before the parse counter is armed — otherwise this
+    # setup parse is itself counted.
+    _write_taxonomy_json(persistent, "new species that is longer")
+    os.utime(persistent, (4e9, 4e9))
+    refreshed = tax_mod.Taxonomy(str(persistent))
+    new_bytes = persistent.read_text()
+    # Restore the old file so the call under test starts from the old stat.
+    _write_taxonomy_json(persistent, "old species")
+    os.utime(persistent, (1e9, 1e9))
+
+    parses = []
+    real_init = tax_mod.Taxonomy.__init__
+
+    def counting_init(self, path):
+        parses.append(path)
+        real_init(self, path)
+
+    class RacingLock:
+        """Simulates another caller refreshing the cache while we wait."""
+
+        def __init__(self, inner):
+            self._inner = inner
+            self.fired = False
+
+        def __enter__(self):
+            self._inner.acquire()
+            if not self.fired:
+                self.fired = True
+                persistent.write_text(new_bytes)
+                os.utime(persistent, (4e9, 4e9))
+                # Key it off the file as it stands now: the stat key covers
+                # inode and ctime, so it has to be read after the last write.
+                tax_mod._taxonomy_cache = (
+                    str(persistent),
+                    tax_mod._taxonomy_stat_key(str(persistent)),
+                    refreshed,
+                )
+            return self
+
+        def __exit__(self, *exc):
+            self._inner.release()
+            return False
+
+    racing = RacingLock(tax_mod._taxonomy_cache_lock)
+    monkeypatch.setattr(tax_mod, "_taxonomy_cache_lock", racing)
+    monkeypatch.setattr(tax_mod.Taxonomy, "__init__", counting_init)
+
+    result = tax_mod.load_local_taxonomy()
+
+    assert result.is_taxon("new species that is longer")
+    # The entry the racing caller installed is served as-is; statting before
+    # the lock would have judged it stale and re-parsed the file.
+    assert parses == []
+
+
+def test_taxonomy_save_writes_through_a_symlinked_path(tmp_path, monkeypatch):
+    """Saving must update a symlink's target, not replace the symlink."""
+    import taxonomy as tax_mod
+
+    tax_mod.clear_taxonomy_cache()
+    real = tmp_path / "real-taxonomy.json"
+    _write_taxonomy_json(real, "test species")
+    link = tmp_path / "linked.json"
+    link.symlink_to(real)
+    monkeypatch.setattr(tax_mod, "TAXONOMY_JSON_PATH", str(link))
+
+    tax = tax_mod.load_local_taxonomy()
+    tax._api_misses.add("nothing here")
+    tax._dirty = True
+    tax.save()
+
+    assert link.is_symlink(), "os.replace must not swap the link for a file"
+    # Compare resolved paths: Windows readlink() returns an
+    # extended-length "\\\\?\\C:\\..." form that never equals the
+    # plain path the link was created with.
+    assert link.resolve() == real.resolve()
+    assert json.loads(real.read_text())["api_misses"] == ["nothing here"]
+    assert not list(tmp_path.glob("*.tmp")), "no temp file may survive"
+
+
+def test_load_local_taxonomy_retries_parse_exception_from_mid_write(
+    tmp_path, monkeypatch,
+):
+    """A parse exception from a mid-write read must be retried, not propagated.
+
+    Taxonomy.save() writes atomically now, but an interrupted download, an
+    external tool rewriting the file, or the same taxonomy on a filesystem
+    that can't do atomic renames all still expose a partial JSON document.
+    A single unlucky read raising json.JSONDecodeError would bubble out of
+    _load_taxonomy_cached, load_local_taxonomy() would log a warning and
+    fall through to the next (usually stale or nonexistent) candidate, and
+    the very next call would have parsed the same file cleanly.
+    """
+    import taxonomy as tax_mod
+
+    tax_mod.clear_taxonomy_cache()
+    persistent = tmp_path / "persistent.json"
+    _write_taxonomy_json(persistent, "test species")
+    monkeypatch.setattr(tax_mod, "TAXONOMY_JSON_PATH", str(persistent))
+
+    real_init = tax_mod.Taxonomy.__init__
+    attempts = {"n": 0}
+
+    def flaky_init(self, path):
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            # A partial read means the writer was mid-rewrite, so the file
+            # has moved. That drift is what makes the retry worth doing —
+            # see the stably-corrupt test for the case that must not retry.
+            _write_taxonomy_json(persistent, "test species")
+            os.utime(persistent, (5e9, 5e9))
+            raise ValueError("simulated mid-write JSONDecodeError")
+        real_init(self, path)
+
+    monkeypatch.setattr(tax_mod.Taxonomy, "__init__", flaky_init)
+
+    result = tax_mod.load_local_taxonomy()
+
+    assert result is not None
+    assert result.is_taxon("test species")
+    assert attempts["n"] == 2
+
+
+def test_load_local_taxonomy_raises_when_every_parse_attempt_fails(
+    tmp_path, monkeypatch,
+):
+    """A file that raises on every retry surfaces a clean error, not None.
+
+    Silently returning None would let load_local_taxonomy() log a generic
+    "failed to load" warning and fall through to the next candidate; a
+    persistent-corruption failure that repeats every retry is worth
+    surfacing so the caller can see the last exception's message.
+    """
+    import taxonomy as tax_mod
+
+    tax_mod.clear_taxonomy_cache()
+    persistent = tmp_path / "persistent.json"
+    _write_taxonomy_json(persistent, "test species")
+    monkeypatch.setattr(tax_mod, "TAXONOMY_JSON_PATH", str(persistent))
+    monkeypatch.setattr(
+        tax_mod, "LEGACY_TAXONOMY_JSON_PATH", str(tmp_path / "missing.json"),
+    )
+
+    def always_raise(self, path):
+        raise ValueError("persistent corruption")
+
+    monkeypatch.setattr(tax_mod.Taxonomy, "__init__", always_raise)
+
+    # load_local_taxonomy() catches the exception and moves to the next
+    # candidate; with no fallback present the final result is None. What
+    # matters is that the private helper raises so the outer function can
+    # log the concrete failure per candidate.
+    with pytest.raises(ValueError):
+        tax_mod._load_taxonomy_cached(str(persistent))
+
+    # And the outer function still returns None cleanly, so callers that
+    # tolerate no taxonomy at all keep working.
+    assert tax_mod.load_local_taxonomy() is None
+
+
+def test_load_local_taxonomy_does_not_retry_a_stably_corrupt_file(
+    tmp_path, monkeypatch,
+):
+    """A file that is simply corrupt is read once, not once per retry.
+
+    Truncated JSON only raises at the *end* of the parse, so each retry
+    reads most of a ~500MB file. Retrying a read that cannot succeed puts
+    that cost back on every compare/accept request — the exact latency this
+    cache exists to remove. Only a file that demonstrably moved between
+    attempts is worth re-reading.
+    """
+    import taxonomy as tax_mod
+
+    tax_mod.clear_taxonomy_cache()
+    persistent = tmp_path / "persistent.json"
+    _write_taxonomy_json(persistent, "test species")
+    monkeypatch.setattr(tax_mod, "TAXONOMY_JSON_PATH", str(persistent))
+
+    attempts = {"n": 0}
+
+    def always_raising_init(self, path):
+        attempts["n"] += 1
+        raise ValueError("persistent corruption")
+
+    monkeypatch.setattr(tax_mod.Taxonomy, "__init__", always_raising_init)
+
+    with pytest.raises(ValueError, match="persistent corruption"):
+        tax_mod._load_taxonomy_cached(str(persistent))
+
+    assert attempts["n"] == 1, "an unchanged corrupt file must be read once"
+
+
+def test_load_local_taxonomy_skips_reparsing_known_corrupt_preferred(
+    tmp_path, monkeypatch,
+):
+    """A corrupt preferred candidate is parsed once, then short-circuited.
+
+    Without this, every compare/accept request would re-attempt the corrupt
+    parse (spamming warnings and burning CPU) and, more importantly, force
+    the cache-eviction logic to keep the fallback alive during the parse to
+    avoid re-parsing it. The failure record is what lets us safely evict the
+    fallback before parsing new preferred files.
+    """
+    import taxonomy as tax_mod
+
+    tax_mod.clear_taxonomy_cache()
+    corrupt = tmp_path / "persistent.json"
+    corrupt.write_text("{ not valid json")
+    legacy = tmp_path / "taxonomy.json"
+    _write_taxonomy_json(legacy, "legacy species")
+    monkeypatch.setattr(tax_mod, "TAXONOMY_JSON_PATH", str(corrupt))
+    monkeypatch.setattr(tax_mod, "LEGACY_TAXONOMY_JSON_PATH", str(legacy))
+
+    parses = []
+    real_init = tax_mod.Taxonomy.__init__
+
+    def counting_init(self, path):
+        parses.append(path)
+        real_init(self, path)
+
+    monkeypatch.setattr(tax_mod.Taxonomy, "__init__", counting_init)
+
+    first = tax_mod.load_local_taxonomy()
+    second = tax_mod.load_local_taxonomy()
+    third = tax_mod.load_local_taxonomy()
+
+    assert first.is_taxon("legacy species")
+    assert second is first
+    assert third is first
+    # Corrupt file is parsed once (recording the failure); subsequent calls
+    # short-circuit rather than re-attempting.
+    assert parses.count(str(corrupt)) == 1
+    # Legacy is parsed once and served from cache thereafter.
+    assert parses.count(str(legacy)) == 1
+
+
+def test_load_local_taxonomy_retries_corrupt_preferred_after_it_changes(
+    tmp_path, monkeypatch,
+):
+    """A repaired preferred file is picked up — the failure record is cleared."""
+    import taxonomy as tax_mod
+
+    tax_mod.clear_taxonomy_cache()
+    preferred = tmp_path / "persistent.json"
+    preferred.write_text("{ not valid json")
+    legacy = tmp_path / "taxonomy.json"
+    _write_taxonomy_json(legacy, "legacy species")
+    monkeypatch.setattr(tax_mod, "TAXONOMY_JSON_PATH", str(preferred))
+    monkeypatch.setattr(tax_mod, "LEGACY_TAXONOMY_JSON_PATH", str(legacy))
+
+    first = tax_mod.load_local_taxonomy()
+    assert first.is_taxon("legacy species")
+    # Same stat → still short-circuited (no re-parse of the corrupt file).
+    assert tax_mod.load_local_taxonomy() is first
+
+    # Repair the preferred file. Its stat changes, so the failure record
+    # is discarded and the new content is parsed.
+    _write_taxonomy_json(preferred, "preferred species that is longer")
+    os.utime(preferred, (5e9, 5e9))
+
+    result = tax_mod.load_local_taxonomy()
+    assert result is not first
+    assert result.is_taxon("preferred species that is longer")
+
+
+def test_load_local_taxonomy_keeps_fallback_across_transient_preferred_failure(
+    tmp_path, monkeypatch,
+):
+    """A cross-path fallback survives a preferred file that keeps failing.
+
+    Transient errors are deliberately not memoized (a chmod repair would not
+    change the file), so a preferred file with, say, wrong permissions is
+    re-attempted on every request. Evicting cross-path entries on the way
+    past would drop the cached legacy taxonomy each time and re-parse ~500MB
+    of fallback per compare or accept.
+
+    The migration case that motivates dropping a cross-path entry — legacy
+    cached while a newly-downloaded preferred file parses — is covered by
+    download_taxonomy() clearing the cache before it builds its replacement.
+    """
+    import taxonomy as tax_mod
+
+    tax_mod.clear_taxonomy_cache()
+    preferred = tmp_path / "persistent.json"
+    _write_taxonomy_json(preferred, "preferred species")
+    legacy = tmp_path / "taxonomy.json"
+    _write_taxonomy_json(legacy, "legacy species")
+    monkeypatch.setattr(tax_mod, "TAXONOMY_JSON_PATH", str(preferred))
+    monkeypatch.setattr(tax_mod, "LEGACY_TAXONOMY_JSON_PATH", str(legacy))
+
+    parses = []
+    real_init = tax_mod.Taxonomy.__init__
+
+    def failing_preferred_init(self, path):
+        parses.append(path)
+        if path == str(preferred):
+            raise PermissionError(13, "Permission denied")
+        real_init(self, path)
+
+    monkeypatch.setattr(tax_mod.Taxonomy, "__init__", failing_preferred_init)
+
+    results = [tax_mod.load_local_taxonomy() for _ in range(3)]
+
+    assert all(r.is_taxon("legacy species") for r in results)
+    assert results[1] is results[0] and results[2] is results[0]
+    # The preferred file is retried every call (its failure is not memoized),
+    # but the fallback must be parsed exactly once for the process.
+    assert parses.count(str(preferred)) == 3
+    assert parses.count(str(legacy)) == 1
+
+
+def test_clear_taxonomy_cache_also_clears_failure_records(tmp_path, monkeypatch):
+    """clear_taxonomy_cache() must reset failure tracking too.
+
+    Otherwise a test that clears the cache and then repairs a formerly-corrupt
+    file would still short-circuit on the stale failure record.
+    """
+    import taxonomy as tax_mod
+
+    tax_mod.clear_taxonomy_cache()
+    preferred = tmp_path / "persistent.json"
+    preferred.write_text("{ not valid json")
+    monkeypatch.setattr(tax_mod, "TAXONOMY_JSON_PATH", str(preferred))
+    monkeypatch.setattr(
+        tax_mod, "LEGACY_TAXONOMY_JSON_PATH", str(tmp_path / "missing.json"),
+    )
+
+    assert tax_mod.load_local_taxonomy() is None
+    with tax_mod._taxonomy_cache_lock:
+        assert str(preferred) in tax_mod._taxonomy_failed_stats
+
+    tax_mod.clear_taxonomy_cache()
+    with tax_mod._taxonomy_cache_lock:
+        assert tax_mod._taxonomy_failed_stats == {}
+
+
+def test_exhausted_retries_chain_the_last_parse_error(tmp_path, monkeypatch):
+    """"File kept changing" alone doesn't say which byte was malformed."""
+    import taxonomy as tax_mod
+
+    tax_mod.clear_taxonomy_cache()
+    persistent = tmp_path / "persistent.json"
+    _write_taxonomy_json(persistent, "test species")
+    monkeypatch.setattr(tax_mod, "TAXONOMY_JSON_PATH", str(persistent))
+
+    counter = {"n": 0}
+
+    def always_racing_and_raising(self, path):
+        counter["n"] += 1
+        os.utime(persistent, (counter["n"] + 6e9, counter["n"] + 6e9))
+        raise ValueError(f"malformed at byte {counter['n']}")
+
+    monkeypatch.setattr(tax_mod.Taxonomy, "__init__", always_racing_and_raising)
+
+    with pytest.raises(ValueError, match="kept changing") as excinfo:
+        tax_mod._load_taxonomy_cached(str(persistent))
+
+    # The concrete failure travels as text, not as a chained exception: a
+    # chained exception's traceback pins the Taxonomy.__init__ frame and the
+    # multi-GB dict json.load() decoded into it.
+    assert "malformed at byte" in str(excinfo.value)
+    assert excinfo.value.__cause__ is None
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="Windows chmod only toggles the read-only bit, so 0o640 is unrepresentable",
+)
+def test_taxonomy_save_preserves_target_permissions(tmp_path, monkeypatch):
+    """Renaming a fresh temp file must not reset the taxonomy's mode."""
+    import taxonomy as tax_mod
+
+    tax_mod.clear_taxonomy_cache()
+    persistent = tmp_path / "persistent.json"
+    _write_taxonomy_json(persistent, "test species")
+    os.chmod(persistent, 0o640)
+    monkeypatch.setattr(tax_mod, "TAXONOMY_JSON_PATH", str(persistent))
+
+    tax = tax_mod.load_local_taxonomy()
+    tax._api_misses.add("nothing here")
+    tax._dirty = True
+    tax.save()
+
+    assert stat.S_IMODE(os.stat(persistent).st_mode) == 0o640
+    assert json.loads(persistent.read_text())["api_misses"] == ["nothing here"]
+
+
+def test_transient_open_failure_is_not_memoized_as_corruption(tmp_path, monkeypatch):
+    """A read that fails on OS grounds must get another chance.
+
+    The usual repairs for an unreadable file — restoring a permission bit,
+    fd pressure passing — change ctime at most, not mtime or size. Keying a
+    failure record to that stat would leave taxonomy features off until the
+    contents changed or the process restarted.
+    """
+    import taxonomy as tax_mod
+
+    tax_mod.clear_taxonomy_cache()
+    persistent = tmp_path / "persistent.json"
+    _write_taxonomy_json(persistent, "test species")
+    monkeypatch.setattr(tax_mod, "TAXONOMY_JSON_PATH", str(persistent))
+
+    real_init = tax_mod.Taxonomy.__init__
+    calls = {"n": 0}
+
+    def unreadable_once(self, path):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise PermissionError(13, "Permission denied", path)
+        real_init(self, path)
+
+    monkeypatch.setattr(tax_mod.Taxonomy, "__init__", unreadable_once)
+
+    # First call fails and must not be remembered as corruption.
+    assert tax_mod.load_local_taxonomy() is None
+    with tax_mod._taxonomy_cache_lock:
+        assert str(persistent) not in tax_mod._taxonomy_failed_stats
+
+    # Access restored, file untouched: the next call reopens it.
+    result = tax_mod.load_local_taxonomy()
+    assert result is not None
+    assert result.is_taxon("test species")
+    assert calls["n"] == 2
+
+
+def test_content_failure_is_still_memoized(tmp_path, monkeypatch):
+    """A malformed file is remembered, so it isn't re-read every request."""
+    import taxonomy as tax_mod
+
+    tax_mod.clear_taxonomy_cache()
+    persistent = tmp_path / "persistent.json"
+    persistent.write_text("{ not valid json")
+    monkeypatch.setattr(tax_mod, "TAXONOMY_JSON_PATH", str(persistent))
+
+    parses = []
+    real_init = tax_mod.Taxonomy.__init__
+
+    def counting_init(self, path):
+        parses.append(path)
+        real_init(self, path)
+
+    monkeypatch.setattr(tax_mod.Taxonomy, "__init__", counting_init)
+
+    assert tax_mod.load_local_taxonomy() is None
+    assert tax_mod.load_local_taxonomy() is None
+    assert len(parses) == 1
+    with tax_mod._taxonomy_cache_lock:
+        assert str(persistent) in tax_mod._taxonomy_failed_stats
+
+
+def test_schema_invalid_preferred_file_is_memoized(tmp_path, monkeypatch):
+    """Valid JSON in the wrong shape must be remembered like malformed JSON.
+
+    Taxonomy() walks the decoded document, so a top-level list raises
+    AttributeError rather than ValueError. Left unmemoized, every request
+    would evict the cached fallback, re-attempt the preferred file, and
+    re-parse the multi-GB legacy one to rediscover the same failure.
+    """
+    import taxonomy as tax_mod
+
+    tax_mod.clear_taxonomy_cache()
+    preferred = tmp_path / "persistent.json"
+    preferred.write_text("[1, 2, 3]")  # parses as JSON, wrong shape
+    legacy = tmp_path / "taxonomy.json"
+    _write_taxonomy_json(legacy, "legacy species")
+    monkeypatch.setattr(tax_mod, "TAXONOMY_JSON_PATH", str(preferred))
+    monkeypatch.setattr(tax_mod, "LEGACY_TAXONOMY_JSON_PATH", str(legacy))
+
+    parses = []
+    real_init = tax_mod.Taxonomy.__init__
+
+    def counting_init(self, path):
+        parses.append(path)
+        real_init(self, path)
+
+    monkeypatch.setattr(tax_mod.Taxonomy, "__init__", counting_init)
+
+    for _ in range(3):
+        assert tax_mod.load_local_taxonomy().is_taxon("legacy species")
+
+    assert parses.count(str(preferred)) == 1, "schema failure must be memoized"
+    assert parses.count(str(legacy)) == 1, "the fallback must survive"
+    with tax_mod._taxonomy_cache_lock:
+        assert str(preferred) in tax_mod._taxonomy_failed_stats
+
+
+def test_memory_error_during_parse_is_not_memoized(tmp_path, monkeypatch):
+    """Running out of memory on a ~2.8GB parse is environmental, not corruption."""
+    import taxonomy as tax_mod
+
+    tax_mod.clear_taxonomy_cache()
+    persistent = tmp_path / "persistent.json"
+    _write_taxonomy_json(persistent, "test species")
+    monkeypatch.setattr(tax_mod, "TAXONOMY_JSON_PATH", str(persistent))
+
+    real_init = tax_mod.Taxonomy.__init__
+    calls = {"n": 0}
+
+    def oom_once(self, path):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise MemoryError("cannot allocate taxonomy")
+        real_init(self, path)
+
+    monkeypatch.setattr(tax_mod.Taxonomy, "__init__", oom_once)
+
+    assert tax_mod.load_local_taxonomy() is None
+    with tax_mod._taxonomy_cache_lock:
+        assert str(persistent) not in tax_mod._taxonomy_failed_stats
+
+    result = tax_mod.load_local_taxonomy()
+    assert result is not None
+    assert result.is_taxon("test species")
+    assert calls["n"] == 2
+
+
+def test_download_taxonomy_writes_atomically(tmp_path, monkeypatch):
+    """A concurrent reader never sees a half-written taxonomy.json.
+
+    ``download_taxonomy()`` used to serialize ~500MB straight into the
+    output path with ``open(path, "w")``, exposing a partial JSON document
+    to any request that read the file during the write window. That
+    window is longer than ``_load_taxonomy_cached``'s bounded retry loop
+    can wait out. Verify that an interrupted write leaves the pre-existing
+    file intact and that no ``.tmp`` sibling is left behind.
+    """
+    import taxonomy as tax_mod
+
+    output_path = tmp_path / "taxonomy.json"
+    _write_taxonomy_json(output_path, "pre-existing species")
+    original_text = output_path.read_text()
+
+    monkeypatch.setattr(tax_mod, "_download_with_resume", _fake_dwca_download)
+
+    real_dump = tax_mod.json.dump
+
+    def exploding_dump(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(tax_mod.json, "dump", exploding_dump)
+
+    with pytest.raises(OSError):
+        tax_mod.download_taxonomy(str(output_path))
+
+    assert output_path.read_text() == original_text, (
+        "interrupted download must not clobber the existing taxonomy"
+    )
+    assert not list(tmp_path.glob("*.tmp")), (
+        "failed atomic write must clean up its sibling temp file"
+    )
+
+    # Now let the write succeed and verify the target ends up updated
+    # through the .tmp -> os.replace path.
+    monkeypatch.setattr(tax_mod.json, "dump", real_dump)
+    result = tax_mod.download_taxonomy(str(output_path))
+    assert result["taxa_by_common"], "the successful write should produce content"
+    written = json.loads(output_path.read_text())
+    assert written["taxa_by_common"] == result["taxa_by_common"]
+    assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_atomic_write_creates_a_new_target_without_a_mode_to_copy(tmp_path):
+    """A first-time write has no existing file to copy permissions from.
+
+    download_taxonomy() hits this on a fresh install; the mode copy must
+    degrade quietly rather than fail the write.
+    """
+    import taxonomy as tax_mod
+
+    target = tmp_path / "brand-new.json"
+    assert not target.exists()
+
+    tax_mod._write_taxonomy_json_atomically(str(target), {"taxa_by_common": {}})
+
+    assert json.loads(target.read_text()) == {"taxa_by_common": {}}
+    assert not list(tmp_path.glob("*.tmp")), "no temp file may survive"
+
+
+def test_atomic_write_is_shared_by_both_taxonomy_writers(tmp_path, monkeypatch):
+    """save() and download_taxonomy() must not drift apart again.
+
+    They had two separate temp-file-and-rename implementations that differed
+    on fsync and permission handling; both now route through one helper.
+    """
+    import taxonomy as tax_mod
+
+    calls = []
+    real_writer = tax_mod._write_taxonomy_json_atomically
+
+    def recording_writer(path, data):
+        calls.append(path)
+        return real_writer(path, data)
+
+    monkeypatch.setattr(
+        tax_mod, "_write_taxonomy_json_atomically", recording_writer,
+    )
+
+    tax_mod.clear_taxonomy_cache()
+    persistent = tmp_path / "persistent.json"
+    _write_taxonomy_json(persistent, "test species")
+    monkeypatch.setattr(tax_mod, "TAXONOMY_JSON_PATH", str(persistent))
+
+    tax = tax_mod.load_local_taxonomy()
+    tax._api_misses.add("nothing here")
+    tax._dirty = True
+    tax.save()
+
+    assert calls == [str(persistent)]
+
+    # And the download path routes through it too — asserted by behaviour
+    # rather than by grepping the source, which a rename would break without
+    # anything actually regressing.
+    calls.clear()
+    download_target = tmp_path / "downloaded.json"
+    monkeypatch.setattr(tax_mod, "_download_with_resume", _fake_dwca_download)
+    tax_mod.download_taxonomy(str(download_target))
+    assert calls == [str(download_target)]
+
+
+def test_overlapping_atomic_writes_do_not_share_a_temp_file(tmp_path, monkeypatch):
+    """Concurrent writers must not collide on one temp path.
+
+    Two POSTs to the download endpoint start two workers — it uses
+    runner.start(), not start_singleton() — so both can be serializing at
+    once. With a fixed "<target>.tmp" one writer renames the inode out from
+    under the other, exposing a partial target and then failing the second
+    when its pathname has vanished.
+    """
+    import taxonomy as tax_mod
+
+    target = tmp_path / "taxonomy.json"
+    _write_taxonomy_json(target, "original species")
+
+    # Record the temp *paths* mkstemp hands out. os.fdopen(fd).name is the
+    # integer fd, not a path, so reading it off the file object would compare
+    # two file descriptors and pass no matter what the filenames were.
+    seen_temp_paths = []
+    real_mkstemp = tax_mod.tempfile.mkstemp
+
+    def recording_mkstemp(*args, **kwargs):
+        fd, tmp = real_mkstemp(*args, **kwargs)
+        seen_temp_paths.append(tmp)
+        return fd, tmp
+
+    monkeypatch.setattr(tax_mod.tempfile, "mkstemp", recording_mkstemp)
+
+    real_dump = tax_mod.json.dump
+    barrier = {"inner_done": False}
+
+    def dump_and_reenter(data, fp, *args, **kwargs):
+        if not barrier["inner_done"]:
+            # Start a second write while this one still holds its fd open.
+            barrier["inner_done"] = True
+            tax_mod._write_taxonomy_json_atomically(
+                str(target), {"taxa_by_common": {"inner species": {}}},
+            )
+        return real_dump(data, fp, *args, **kwargs)
+
+    import unittest.mock as mock
+    with mock.patch.object(tax_mod.json, "dump", dump_and_reenter):
+        tax_mod._write_taxonomy_json_atomically(
+            str(target), {"taxa_by_common": {"outer species": {}}},
+        )
+
+    assert len(seen_temp_paths) == 2
+    assert seen_temp_paths[0] != seen_temp_paths[1], (
+        "each write needs its own temp file"
+    )
+    assert all(p.endswith(".tmp") for p in seen_temp_paths)
+    # The outer write renamed last, so it wins — and the target is whole.
+    assert json.loads(target.read_text())["taxa_by_common"] == {"outer species": {}}
+    assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_load_local_taxonomy_with_explicit_path_does_not_fall_back(
+    tmp_path, monkeypatch,
+):
+    """path= pins the load to one artifact, with no legacy fallback.
+
+    The post-download retype must fail loudly when the file it just wrote
+    won't parse. Falling back would retype keywords from a stale legacy
+    copy while the taxa tables hold the new download's data — two taxonomy
+    versions mixed, reported as success.
+    """
+    import taxonomy as tax_mod
+
+    tax_mod.clear_taxonomy_cache()
+    preferred = tmp_path / "persistent.json"
+    preferred.write_text("{ not valid json")
+    legacy = tmp_path / "taxonomy.json"
+    _write_taxonomy_json(legacy, "legacy species")
+    monkeypatch.setattr(tax_mod, "TAXONOMY_JSON_PATH", str(preferred))
+    monkeypatch.setattr(tax_mod, "LEGACY_TAXONOMY_JSON_PATH", str(legacy))
+
+    # Default behaviour still falls back — other callers rely on it.
+    assert tax_mod.load_local_taxonomy().is_taxon("legacy species")
+
+    # Pinned to the broken artifact, it reports failure instead.
+    assert tax_mod.load_local_taxonomy(path=str(preferred)) is None
+
+
+def test_load_local_taxonomy_with_explicit_path_still_caches(tmp_path, monkeypatch):
+    """A pinned load shares the same cache as the default path."""
+    import taxonomy as tax_mod
+
+    tax_mod.clear_taxonomy_cache()
+    preferred = tmp_path / "persistent.json"
+    _write_taxonomy_json(preferred, "preferred species")
+    monkeypatch.setattr(tax_mod, "TAXONOMY_JSON_PATH", str(preferred))
+
+    parses = []
+    real_init = tax_mod.Taxonomy.__init__
+
+    def counting_init(self, path):
+        parses.append(path)
+        real_init(self, path)
+
+    monkeypatch.setattr(tax_mod.Taxonomy, "__init__", counting_init)
+
+    pinned = tax_mod.load_local_taxonomy(path=str(preferred))
+    default = tax_mod.load_local_taxonomy()
+
+    assert pinned is default
+    assert len(parses) == 1
+
+
+def test_download_taxonomy_evicts_cache_before_rebuilding(tmp_path, monkeypatch):
+    """Old ~2.8GB parse must not stay reachable through the cache during build.
+
+    The post-download retype routes through load_local_taxonomy() which
+    evicts on parse, but that runs *after* download_taxonomy() has already
+    built its ~2.8GB dict. During the build, the cache's old reference and
+    the new dict would coexist, roughly doubling peak RSS and putting a
+    routine refresh in reach of OOM. Verify eviction happens *before* the
+    build starts.
+    """
+    import taxonomy as tax_mod
+
+    tax_mod.clear_taxonomy_cache()
+    persistent = tmp_path / "taxonomy.json"
+    _write_taxonomy_json(persistent, "old species")
+    monkeypatch.setattr(tax_mod, "TAXONOMY_JSON_PATH", str(persistent))
+
+    # Seed the cache from the current file so we can observe eviction.
+    cached_before = tax_mod.load_local_taxonomy()
+    assert cached_before is not None
+    with tax_mod._taxonomy_cache_lock:
+        assert tax_mod._taxonomy_cache is not None
+
+    observed_cache_state = []
+
+    def observing_download(url, path, progress_callback=None):
+        with tax_mod._taxonomy_cache_lock:
+            observed_cache_state.append(tax_mod._taxonomy_cache)
+        import zipfile as _zf
+        with _zf.ZipFile(path, "w") as zf:
+            zf.writestr(
+                "taxa.csv",
+                "id,parentNameUsageID,scientificName,taxonRank\n"
+                "1,,Test species,species\n",
+            )
+            zf.writestr(
+                "VernacularNames-english.csv",
+                "id,vernacularName,language\n"
+                "1,New species,en\n",
+            )
+
+    monkeypatch.setattr(tax_mod, "_download_with_resume", observing_download)
+
+    tax_mod.download_taxonomy(str(persistent))
+
+    assert observed_cache_state, "observing hook must have fired"
+    assert observed_cache_state[0] is None, (
+        "cache must be evicted BEFORE download_taxonomy() begins building "
+        "its ~2.8GB replacement, otherwise both are live at once"
+    )
+
+
+def test_deleted_preferred_file_releases_its_cached_parse(tmp_path, monkeypatch):
+    """A cached parse whose file is gone must not stay resident.
+
+    _load_taxonomy_cached keeps cross-path entries on purpose — a live
+    fallback is not stale — so nothing else would drop this one. A full
+    taxonomy is ~2.8GB, and rolling back to the legacy file would otherwise
+    hold the deleted file's parse alive while allocating the legacy one.
+    """
+    import taxonomy as tax_mod
+
+    tax_mod.clear_taxonomy_cache()
+    preferred = tmp_path / "persistent.json"
+    _write_taxonomy_json(preferred, "preferred species")
+    legacy = tmp_path / "taxonomy.json"
+    _write_taxonomy_json(legacy, "legacy species")
+    monkeypatch.setattr(tax_mod, "TAXONOMY_JSON_PATH", str(preferred))
+    monkeypatch.setattr(tax_mod, "LEGACY_TAXONOMY_JSON_PATH", str(legacy))
+
+    first = tax_mod.load_local_taxonomy()
+    assert first.is_taxon("preferred species")
+
+    cache_during_legacy_parse = []
+    real_init = tax_mod.Taxonomy.__init__
+
+    def observing_init(self, path):
+        if path == str(legacy):
+            cache_during_legacy_parse.append(tax_mod._taxonomy_cache)
+        real_init(self, path)
+
+    monkeypatch.setattr(tax_mod.Taxonomy, "__init__", observing_init)
+
+    preferred.unlink()
+    second = tax_mod.load_local_taxonomy()
+
+    assert second.is_taxon("legacy species")
+    assert cache_during_legacy_parse == [None], (
+        "the deleted file's parse must be released before the fallback loads"
+    )
+
+
+def test_deleted_taxonomy_with_no_fallback_releases_the_cache(tmp_path, monkeypatch):
+    """With nothing to fall back to, the dead entry still has to go."""
+    import taxonomy as tax_mod
+
+    tax_mod.clear_taxonomy_cache()
+    preferred = tmp_path / "persistent.json"
+    _write_taxonomy_json(preferred, "preferred species")
+    monkeypatch.setattr(tax_mod, "TAXONOMY_JSON_PATH", str(preferred))
+
+    assert tax_mod.load_local_taxonomy().is_taxon("preferred species")
+    with tax_mod._taxonomy_cache_lock:
+        assert tax_mod._taxonomy_cache is not None
+
+    preferred.unlink()
+
+    assert tax_mod.load_local_taxonomy() is None
+    with tax_mod._taxonomy_cache_lock:
+        assert tax_mod._taxonomy_cache is None, (
+            "an unservable taxonomy must not stay resident for the process"
+        )

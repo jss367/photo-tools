@@ -8,6 +8,8 @@ photo has a pending prediction.
 
 import pytest
 
+from e2e.leaflet_stub import stub_leaflet
+
 
 def _wait_bar(page):
     page.wait_for_selector("#vireoFilterBar", timeout=15000)
@@ -30,6 +32,7 @@ def test_map_page_uses_filter_bar(live_server, page):
             "UPDATE photos SET latitude=37.7, longitude=-122.4 WHERE id IN (?, ?)",
             (photos["hawk1.jpg"], photos["robin1.jpg"]))
 
+    page.route("https://unpkg.com/**", stub_leaflet)
     page.goto(live_server["url"] + "/map")
     _wait_bar(page)
     assert _total(page) == 2
@@ -190,6 +193,7 @@ def test_handoff_carries_expression_to_map(live_server, page):
             "UPDATE photos SET latitude=37.7, longitude=-122.4 WHERE id = ?",
             (photos["hawk1.jpg"],))
 
+    page.route("https://unpkg.com/**", stub_leaflet)
     page.goto(live_server["url"] + "/browse")
     _wait_bar(page)
     search = page.locator(".vf-search input")

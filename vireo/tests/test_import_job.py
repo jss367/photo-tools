@@ -211,6 +211,264 @@ def test_duplicate_only_import_links_matched_folders(tmp_path):
     assert len(_photo_rows(db)) == 1
 
 
+def _mark_exif_extracted(db):
+    """Stand in for a successful ExifTool pass over the cataloged rows.
+
+    ExifTool isn't installed in CI, so rows scanned there keep
+    ``exif_data`` NULL — which scanner reads as "metadata was never
+    extracted" and re-processes on the next incremental scan whatever
+    the mtime says. That retry path is deliberate and tested in
+    test_scanner.py; the tests below are about the duplicate-link scan,
+    so give the rows the marker a real extraction would have written.
+    """
+    db.conn.execute(
+        "UPDATE photos SET exif_data = '{}' WHERE exif_data IS NULL",
+    )
+    db.conn.commit()
+
+
+def _count_feature_computations(monkeypatch):
+    """Record every file scanner re-reads to derive phash/file_hash.
+
+    ``_compute_file_features`` opens the image and hashes every byte, so
+    it is the direct proxy for "did the scan actually read this file off
+    the archive volume".
+    """
+    import scanner
+
+    read_paths = []
+    real = scanner._compute_file_features
+
+    def _counting(path_str):
+        read_paths.append(path_str)
+        return real(path_str)
+
+    monkeypatch.setattr(scanner, "_compute_file_features", _counting)
+    return read_paths
+
+
+def test_duplicate_only_import_does_not_reread_unchanged_twins(
+    tmp_path, monkeypatch,
+):
+    """The duplicate-folder link scan must not re-read twins that are
+    already cataloged and unchanged.
+
+    The link scan exists to create/link the matched folders and to
+    self-heal uncataloged strays — neither needs the bytes of a file the
+    catalog already knows. Running it non-incrementally re-hashed every
+    file in the matched archive folder, so importing a card of pure
+    duplicates re-read the whole folder: on a network archive that turned
+    a zero-copy import into an hours-long rescan.
+    """
+    import shutil
+
+    import scanner
+    from import_job import ImportParams, run_import_job
+
+    archive = tmp_path / "archive"
+    twin_dir = archive / "2026" / "2026-07-03"
+    twin_dir.mkdir(parents=True)
+    names = ["IMG_0400.jpg", "IMG_0401.jpg", "IMG_0402.jpg"]
+    for i, name in enumerate(names):
+        Image.new("RGB", (16, 16), ("red", "green", "blue")[i]).save(
+            str(twin_dir / name),
+        )
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws_id = db._active_workspace_id
+    # Catalog the archive exactly as a normal scan would, so the rows
+    # carry the file_mtime/metadata an incremental pass needs to skip on.
+    scanner.scan(str(archive), db)
+    _mark_exif_extracted(db)
+    assert len(_photo_rows(db)) == 3
+
+    # The card holds byte-identical copies of all three cataloged files.
+    card = tmp_path / "card"
+    card.mkdir()
+    for name in names:
+        shutil.copy2(str(twin_dir / name), str(card / name))
+
+    read_paths = _count_feature_computations(monkeypatch)
+    result = run_import_job(
+        _make_job(), FakeRunner(), db_path, ws_id,
+        ImportParams(sources=[str(card)], destination=str(archive)),
+    )
+
+    assert result["copied"] == 0
+    assert result["skipped_duplicate"] == 3
+    assert result["failed"] == 0
+    # The folder is still linked — the scan did its actual job.
+    assert str(twin_dir) in _ws_linked_folder_paths(db, ws_id)
+    assert read_paths == [], (
+        "duplicate-only import re-read already-cataloged, unchanged twins: "
+        f"{read_paths}"
+    )
+
+
+def test_duplicate_only_import_reports_the_link_scan_phase(tmp_path):
+    """The dup-link scan walks the matched archive folders, which on a
+    network archive takes minutes. It must say so: without a phase emit
+    the UI sits on the last copy message while the job looks hung."""
+    import shutil
+
+    import scanner
+    from import_job import ImportParams, run_import_job
+
+    archive = tmp_path / "archive"
+    twin_dir = archive / "2026" / "2026-07-03"
+    twin_dir.mkdir(parents=True)
+    twin_file = twin_dir / "IMG_0600.jpg"
+    Image.new("RGB", (16, 16), "red").save(str(twin_file))
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws_id = db._active_workspace_id
+    scanner.scan(str(archive), db)
+
+    card = tmp_path / "card"
+    card.mkdir()
+    shutil.copy2(str(twin_file), str(card / "IMG_0600.jpg"))
+
+    runner = FakeRunner()
+    result = run_import_job(
+        _make_job(), runner, db_path, ws_id,
+        ImportParams(sources=[str(card)], destination=str(archive)),
+    )
+    assert result["skipped_duplicate"] == 1
+
+    phases = [
+        data.get("phase", "")
+        for _jid, kind, data in runner.events if kind == "progress"
+    ]
+    assert any("already in your library" in p for p in phases), (
+        "import must report the duplicate-folder link scan as its own "
+        f"phase; got {phases}"
+    )
+
+
+def test_duplicate_only_import_still_catalogs_stray_in_twin_folder(
+    tmp_path, monkeypatch,
+):
+    """Skipping unchanged twins must not cost the link scan its other
+    job: a file sitting in the matched folder that the catalog has never
+    seen still gets self-healed in, and it is the ONLY file re-read."""
+    import shutil
+
+    import scanner
+    from import_job import ImportParams, run_import_job
+
+    archive = tmp_path / "archive"
+    twin_dir = archive / "2026" / "2026-07-03"
+    twin_dir.mkdir(parents=True)
+    twin_file = twin_dir / "IMG_0500.jpg"
+    Image.new("RGB", (16, 16), "red").save(str(twin_file))
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws_id = db._active_workspace_id
+    scanner.scan(str(archive), db)
+    _mark_exif_extracted(db)
+
+    # A stray lands in the twin folder AFTER the catalog was built.
+    stray = twin_dir / "IMG_0501.jpg"
+    Image.new("RGB", (16, 16), "green").save(str(stray))
+
+    card = tmp_path / "card"
+    card.mkdir()
+    shutil.copy2(str(twin_file), str(card / "IMG_0500.jpg"))
+
+    read_paths = _count_feature_computations(monkeypatch)
+    result = run_import_job(
+        _make_job(), FakeRunner(), db_path, ws_id,
+        ImportParams(sources=[str(card)], destination=str(archive)),
+    )
+
+    assert result["skipped_duplicate"] == 1
+    row_paths = {
+        os.path.join(r["folder_path"], r["filename"]) for r in _photo_rows(db)
+    }
+    assert str(stray) in row_paths, (
+        "link scan must still self-heal uncataloged strays in the twin folder"
+    )
+    assert read_paths == [str(stray)], (
+        "only the uncataloged stray should be read off the archive: "
+        f"{read_paths}"
+    )
+
+
+def test_duplicate_only_import_skips_twins_cataloged_in_other_workspace(
+    tmp_path, monkeypatch,
+):
+    """The dup-link scan must skip twins whose folder is cataloged but
+    not yet linked to the active workspace — the exact case this scan
+    exists to repair.
+
+    Regression for PR #1385 Codex review. The scan initially scoped its
+    incremental "skip on mtime" lookup to the active workspace, so a
+    folder cataloged in a different workspace (or previously known but
+    not yet workspace-linked here) would still be re-opened and
+    re-hashed on every file inside it, defeating the fix for the very
+    "cataloged, unchanged twins" case the PR targets. The sibling test
+    ``test_duplicate_only_import_does_not_reread_unchanged_twins``
+    happens to also link the twin folder to the active workspace during
+    setup, so this test forces the "cataloged elsewhere" state
+    explicitly by seeding in one workspace and running the import from
+    a fresh one.
+    """
+    import shutil
+
+    import scanner
+    from import_job import ImportParams, run_import_job
+
+    archive = tmp_path / "archive"
+    twin_dir = archive / "2026" / "2026-07-03"
+    twin_dir.mkdir(parents=True)
+    names = ["IMG_0700.jpg", "IMG_0701.jpg", "IMG_0702.jpg"]
+    for i, name in enumerate(names):
+        Image.new("RGB", (16, 16), ("red", "green", "blue")[i]).save(
+            str(twin_dir / name),
+        )
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    seed_ws = db._active_workspace_id
+    # Seed the catalog by scanning under the default workspace so rows
+    # carry the file_mtime/metadata an incremental pass needs to skip on.
+    scanner.scan(str(archive), db)
+    _mark_exif_extracted(db)
+    assert len(_photo_rows(db)) == 3
+    assert str(twin_dir) in _ws_linked_folder_paths(db, seed_ws)
+
+    # A fresh workspace has never seen this folder — the exact state the
+    # dup-link scan is intended to repair.
+    fresh_ws = db.create_workspace("Fresh")
+    assert str(twin_dir) not in _ws_linked_folder_paths(db, fresh_ws)
+
+    card = tmp_path / "card"
+    card.mkdir()
+    for name in names:
+        shutil.copy2(str(twin_dir / name), str(card / name))
+
+    read_paths = _count_feature_computations(monkeypatch)
+    result = run_import_job(
+        _make_job(), FakeRunner(), db_path, fresh_ws,
+        ImportParams(sources=[str(card)], destination=str(archive)),
+    )
+
+    assert result["copied"] == 0
+    assert result["skipped_duplicate"] == 3, result
+    assert result["failed"] == 0, result
+    # The folder is now linked to the fresh workspace — the scan did its
+    # actual job of workspace-linking the matched folder.
+    assert str(twin_dir) in _ws_linked_folder_paths(db, fresh_ws)
+    assert read_paths == [], (
+        "duplicate-only import re-read twins whose folder was cataloged "
+        "but not yet linked to the active workspace: "
+        f"{read_paths}"
+    )
+
+
 def test_duplicate_only_import_links_alias_spelled_twin(tmp_path):
     """When a twin folder is cataloged through a symlink alias but the
     import ``destination`` resolves to a different (real) spelling, the
@@ -5196,6 +5454,202 @@ def test_remote_import_links_verified_twin_folder_in_other_layout(
     }
 
 
+def test_remote_import_dup_link_scan_does_not_reread_unchanged_twins(
+        tmp_path, monkeypatch):
+    """Remote mirror of
+    ``test_duplicate_only_import_does_not_reread_unchanged_twins``: the
+    remote path runs its own dup-link scan, and it must skip already-
+    cataloged, unchanged twins too."""
+    import scanner
+    from import_job import ImportParams, run_import_job
+
+    ra = _remote_archive_for(tmp_path)
+    calls = _remote_calls(ra)
+    _install_fake_remote_rsync(monkeypatch, calls, verify=None)
+
+    card = _make_card(tmp_path, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+        ("DSC_0002.jpg", datetime(2026, 7, 3, 11, 0, 0), "green"),
+    ])
+
+    twin_folder = os.path.join(ra["mount_base"], "unsorted")
+    os.makedirs(twin_folder, exist_ok=True)
+    import shutil as _shutil
+    for name in ("DSC_0001.jpg", "DSC_0002.jpg"):
+        _shutil.copy2(str(card / name), os.path.join(twin_folder, name))
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws_id = db._active_workspace_id
+    # Catalog the twins the way a real scan would, so the rows carry the
+    # file_mtime/metadata an incremental pass needs to skip on.
+    scanner.scan(ra["mount_base"], db)
+    _mark_exif_extracted(db)
+    assert len(_photo_rows(db)) == 2
+
+    read_paths = _count_feature_computations(monkeypatch)
+    result = run_import_job(
+        _make_job(), FakeRunner(), db_path, ws_id,
+        ImportParams(
+            sources=[str(card)], destination=ra["mount_base"],
+            remote_target=ra, verify_by_hash=True,
+        ),
+    )
+
+    assert calls["rsync"] == [], calls["rsync"]
+    assert result["skipped_duplicate"] == 2, result
+    assert result["failed"] == 0, result
+    assert twin_folder in _ws_linked_folder_paths(db, ws_id)
+    assert read_paths == [], (
+        "remote duplicate-only import re-read already-cataloged, unchanged "
+        f"twins: {read_paths}"
+    )
+
+
+def test_remote_import_dup_only_batch_does_not_reread_dest_folder_twins(
+        tmp_path, monkeypatch):
+    """A duplicate-only remote batch whose twins sit in the batch's OWN
+    destination folder must not re-read them.
+
+    ``test_remote_import_dup_link_scan_does_not_reread_unchanged_twins``
+    parks its twins in ``unsorted`` — a different folder from the batch
+    destination — so that test's batch scan walks an empty
+    ``dest_folder`` and reads nothing either way. The common real case is
+    re-importing a card into the same date folder it originally landed
+    in, where ``dest_folder`` already holds every twin. With no fresh
+    landings the batch scan passes ``restrict_files=None``, so it walks
+    the whole destination folder; without ``incremental=True`` it
+    re-reads and re-hashes every already-cataloged file there. On a
+    network archive that turns a zero-copy import into an hours-long
+    rescan.
+    """
+    import scanner
+    from import_job import ImportParams, run_import_job
+
+    ra = _remote_archive_for(tmp_path)
+    calls = _remote_calls(ra)
+    _install_fake_remote_rsync(monkeypatch, calls, verify=None)
+
+    card = _make_card(tmp_path, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+        ("DSC_0002.jpg", datetime(2026, 7, 3, 11, 0, 0), "green"),
+    ])
+
+    # The twins live in the very folder this card's files map to, which is
+    # what re-importing an already-imported card looks like.
+    dest_folder = os.path.join(ra["mount_base"], "2026", "2026-07-03")
+    os.makedirs(dest_folder, exist_ok=True)
+    import shutil as _shutil
+    for name in ("DSC_0001.jpg", "DSC_0002.jpg"):
+        _shutil.copy2(str(card / name), os.path.join(dest_folder, name))
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws_id = db._active_workspace_id
+    scanner.scan(ra["mount_base"], db)
+    _mark_exif_extracted(db)
+    assert len(_photo_rows(db)) == 2
+
+    read_paths = _count_feature_computations(monkeypatch)
+    result = run_import_job(
+        _make_job(), FakeRunner(), db_path, ws_id,
+        ImportParams(
+            sources=[str(card)], destination=ra["mount_base"],
+            remote_target=ra, verify_by_hash=True,
+        ),
+    )
+
+    assert calls["rsync"] == [], calls["rsync"]
+    assert result["skipped_duplicate"] == 2, result
+    assert result["copied"] == 0, result
+    assert result["failed"] == 0, result
+    assert dest_folder in _ws_linked_folder_paths(db, ws_id)
+    assert read_paths == [], (
+        "remote duplicate-only import re-read already-cataloged, unchanged "
+        f"twins in the destination folder: {read_paths}"
+    )
+
+
+def test_remote_import_landing_refreshes_stale_row_with_matching_mtime(
+        tmp_path, monkeypatch):
+    """A fresh landing at a destination path that carries a stale catalog
+    row must overwrite the row's ``file_hash`` even when the newly
+    transferred bytes inherit the same ``file_mtime`` the stale row
+    remembers.
+
+    ``scanner.scan()``'s incremental fast path treats a path as unchanged
+    when the on-disk ``file_mtime`` matches the catalog row's
+    ``file_mtime``. rsync ``-a`` (and ``shutil.copy2`` in the fake
+    harness) preserves the source's mtime on the destination, so a source
+    card whose file happens to share an mtime with a stale row — an
+    orphan left after the actual file was deleted, then re-landed by a
+    fresh import — would otherwise slip through incremental with its
+    stale ``file_hash`` intact. The subsequent
+    ``scan_h`` vs ``src_h_norm`` cross-check would then reject the
+    landing as a mount-hash mismatch and no retry could fix it (mtime has
+    not moved). The batch scan must therefore run non-incrementally
+    whenever it targets landed/adopted paths, matching the local path.
+    """
+    import scanner
+    from import_job import ImportParams, run_import_job
+
+    ra = _remote_archive_for(tmp_path)
+    calls = _remote_calls(ra)
+    _install_fake_remote_rsync(monkeypatch, calls, verify=None)
+
+    # Stale row: seed the destination path with red bytes and catalog
+    # them, then delete the file so the fresh landing goes through the
+    # "no collision" branch.
+    dest_folder = os.path.join(ra["mount_base"], "2026", "2026-07-03")
+    os.makedirs(dest_folder, exist_ok=True)
+    stale_target = os.path.join(dest_folder, "DSC_0001.jpg")
+    Image.new("RGB", (16, 16), "red").save(stale_target)
+    pinned_mtime = datetime(2026, 7, 3, 10, 0, 0).timestamp()
+    os.utime(stale_target, (pinned_mtime, pinned_mtime))
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws_id = db._active_workspace_id
+    scanner.scan(ra["mount_base"], db)
+    _mark_exif_extracted(db)
+    stale_row = db.conn.execute(
+        "SELECT id, file_hash FROM photos WHERE filename = ?",
+        ("DSC_0001.jpg",),
+    ).fetchone()
+    assert stale_row is not None
+    stale_hash = stale_row["file_hash"]
+
+    os.remove(stale_target)
+
+    # Card file with byte-different content but the SAME mtime the stale
+    # row remembers, so shutil.copy2 in the fake rsync lands bytes that
+    # match the incremental fast path's "unchanged" trigger.
+    card = _make_card(tmp_path, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "green"),
+    ])
+
+    result = run_import_job(
+        _make_job(), FakeRunner(), db_path, ws_id,
+        ImportParams(
+            sources=[str(card)], destination=ra["mount_base"],
+            remote_target=ra, verify_by_hash=True,
+        ),
+    )
+
+    assert result["failed"] == 0, result
+    assert result["copied"] == 1, result
+    assert result["safe_to_format"] is True, result
+    updated_row = db.conn.execute(
+        "SELECT file_hash FROM photos WHERE filename = ?",
+        ("DSC_0001.jpg",),
+    ).fetchone()
+    assert updated_row["file_hash"] != stale_hash, (
+        "stale catalog row was not refreshed after a fresh landing at the "
+        "same path with a matching mtime; the batch scan's incremental "
+        "fast path skipped the freshly transferred file"
+    )
+
+
 def test_remote_import_scans_adopted_duplicate_in_mixed_batch(
         tmp_path, monkeypatch):
     """A retry / crash-recovery batch that (a) copies one fresh file AND
@@ -7987,3 +8441,1072 @@ def test_selection_filter_matches_unresolved_paths_remote(
     assert calls["rsync"], "nothing was rsynced at all"
     assert result["files_vanished"] == 0
     assert result["safe_to_format"] is True
+
+
+
+def test_local_import_refuses_when_mount_root_absent(tmp_path, monkeypatch):
+    """The LOCAL copy path needs the same mount-root guard as the remote one.
+
+    ``_run_remote_import_job`` refuses to ``os.makedirs`` into an absent
+    mount root (PR #1113), but ``run_import_job``'s own batch loop had no
+    such check — it called ``os.makedirs(dest_folder)`` unconditionally.
+    On a platform where the mount point survives unmount (Linux
+    ``/mnt/<name>``) that silently builds a shadow tree on the internal
+    disk and copies the card into it, where the photos look imported but
+    vanish the moment the real share remounts.
+    """
+    import pipeline_job as _pj
+    from import_job import ImportParams
+
+    card = _make_card(tmp_path, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+        ("DSC_0002.jpg", datetime(2026, 7, 3, 11, 0, 0), "green"),
+    ])
+    dest = str(tmp_path / "Volumes_NAS_Photos")
+
+    # The real helper only fires for /Volumes/* | /mnt/* | /media/*/*
+    # shapes, so stub it to call our tmp destination's root missing —
+    # same approach as test_remote_import_refuses_when_mount_root_absent.
+    monkeypatch.setattr(
+        _pj, "_missing_archive_mount_root", lambda path: "/Volumes/NAS",
+    )
+
+    db, ws_id, result = _run_import(tmp_path, ImportParams(
+        sources=[str(card)], destination=dest,
+    ))
+
+    assert result["copied"] == 0, result
+    assert result["failed"] == 2, result
+    assert result["safe_to_format"] is False, result
+    assert result["unsafe_files"], result
+    assert all(
+        "/Volumes/NAS" in u["reason"] and "not available" in u["reason"]
+        for u in result["unsafe_files"]
+    ), result["unsafe_files"]
+    assert not os.path.exists(dest), (
+        f"shadow directory was created at {dest}: the guard failed to "
+        "stop os.makedirs"
+    )
+
+
+def test_local_import_stops_when_mount_disappears_mid_run(
+        tmp_path, monkeypatch):
+    """A mount that drops *during* a long import must stop the next batch.
+
+    The guard was a start-of-job preflight computed once outside the
+    batch loop, so an archive that unmounted two hours into a run (the
+    2026-07-30 SMB outage) sailed straight into ``os.makedirs``. Re-check
+    per batch so the outage is caught when it happens.
+    """
+    import pipeline_job as _pj
+    from import_job import ImportParams
+
+    # Two dates -> two batches, so the mount can drop between them.
+    card = _make_card(tmp_path, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+        ("DSC_0002.jpg", datetime(2026, 7, 4, 9, 0, 0), "blue"),
+    ])
+    dest = str(tmp_path / "archive")
+    os.makedirs(dest, exist_ok=True)
+
+    calls = {"n": 0}
+
+    def flaky_mount(path):
+        calls["n"] += 1
+        # Mounted for the first batch, gone for every batch after it.
+        return None if calls["n"] == 1 else "/Volumes/NAS"
+
+    monkeypatch.setattr(_pj, "_missing_archive_mount_root", flaky_mount)
+
+    db, ws_id, result = _run_import(tmp_path, ImportParams(
+        sources=[str(card)], destination=dest,
+    ))
+
+    assert calls["n"] >= 2, (
+        "the mount root was checked once for the whole job, so a mid-run "
+        "unmount can never be detected; it must be re-checked per batch"
+    )
+    assert result["copied"] == 1, result
+    assert result["failed"] == 1, result
+    assert result["safe_to_format"] is False, result
+    assert any(
+        "/Volumes/NAS" in u["reason"] and "not available" in u["reason"]
+        for u in result["unsafe_files"]
+    ), result["unsafe_files"]
+
+
+def test_remote_import_stops_when_mount_disappears_mid_run(
+        tmp_path, monkeypatch):
+    """Same mid-run re-check for the remote path, whose guard was also
+    computed once outside the batch loop."""
+    import pipeline_job as _pj
+    from import_job import ImportParams, run_import_job
+
+    ra = _remote_archive_for(tmp_path)
+    calls = _remote_calls(ra)
+    _install_fake_remote_rsync(monkeypatch, calls, verify=None)
+
+    card = _make_card(tmp_path, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+        ("DSC_0002.jpg", datetime(2026, 7, 4, 9, 0, 0), "blue"),
+    ])
+
+    probes = {"n": 0}
+
+    def flaky_mount(path):
+        probes["n"] += 1
+        return None if probes["n"] == 1 else "/Volumes/NAS"
+
+    monkeypatch.setattr(_pj, "_missing_archive_mount_root", flaky_mount)
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws_id = db._active_workspace_id
+    result = run_import_job(
+        _make_job(), FakeRunner(), db_path, ws_id,
+        ImportParams(
+            sources=[str(card)], destination=ra["mount_base"],
+            remote_target=ra,
+        ),
+    )
+
+    assert probes["n"] >= 2, (
+        "remote mount root was checked once for the whole job; a mid-run "
+        "unmount can never be detected"
+    )
+    assert result["copied"] == 1, result
+    assert result["failed"] == 1, result
+    assert result["safe_to_format"] is False, result
+
+
+def test_local_import_mount_loss_still_advances_progress(tmp_path, monkeypatch):
+    """A batch rejected by the mount guard must still count its files as
+    emitted.
+
+    ``emitted`` only advances inside the per-file copy loop, which the
+    guard skips. Without bumping it there, an import whose share drops
+    after the first batch leaves the progress bar frozen at the last
+    copied file while the job silently fails hundreds more — a stalled
+    bar reads as "still working", which is the opposite of what happened.
+    """
+    import pipeline_job as _pj
+    from import_job import ImportParams
+
+    card = _make_card(tmp_path, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+        ("DSC_0002.jpg", datetime(2026, 7, 4, 9, 0, 0), "blue"),
+        ("DSC_0003.jpg", datetime(2026, 7, 5, 9, 0, 0), "green"),
+    ])
+    dest = str(tmp_path / "archive")
+    os.makedirs(dest, exist_ok=True)
+
+    calls = {"n": 0}
+
+    def flaky_mount(path):
+        calls["n"] += 1
+        return None if calls["n"] == 1 else "/Volumes/NAS"
+
+    monkeypatch.setattr(_pj, "_missing_archive_mount_root", flaky_mount)
+
+    runner = FakeRunner()
+    db, ws_id, result = _run_import(
+        tmp_path,
+        ImportParams(sources=[str(card)], destination=dest),
+        runner=runner,
+    )
+
+    assert result["discovered"] == 3, result
+    progress = [
+        data for _jid, etype, data in runner.events if etype == "progress"
+    ]
+    assert progress, "no progress events emitted"
+    assert progress[-1]["current"] == 3, (
+        f"progress stalled at {progress[-1]['current']} of 3 after the "
+        "mount dropped; every discovered file must be accounted for"
+    )
+
+
+def test_local_import_survives_makedirs_failure(tmp_path):
+    """``os.makedirs`` on the destination must never kill the job.
+
+    The mount-root guard only recognizes a vacated mount point. It can't
+    see a stale-but-present mount (Linux ``/mnt/<name>``), a read-only
+    parent, or a permission change — and the 2026-07-30 incident was
+    precisely an uncaught ``PermissionError`` out of this call, which
+    tore down the whole background job after two hours of work. Whatever
+    the cause, it belongs in the per-file failure bucket with the card
+    still marked unsafe to format.
+    """
+    from import_job import ImportParams
+
+    card = _make_card(tmp_path, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+    ])
+    dest = str(tmp_path / "archive")
+    # A regular FILE where the batch's destination folder must go, so the
+    # real os.makedirs raises FileExistsError on every platform.
+    os.makedirs(os.path.join(dest, "2026"), exist_ok=True)
+    with open(os.path.join(dest, "2026", "2026-07-03"), "w") as fh:
+        fh.write("not a directory")
+
+    db, ws_id, result = _run_import(tmp_path, ImportParams(
+        sources=[str(card)], destination=dest,
+    ))
+
+    assert result["copied"] == 0, result
+    assert result["failed"] == 1, result
+    assert result["safe_to_format"] is False, result
+    assert any(
+        "2026-07-03" in u["reason"] for u in result["unsafe_files"]
+    ), result["unsafe_files"]
+
+
+def test_local_import_stops_when_mount_point_persists_after_unmount(
+        tmp_path, monkeypatch):
+    """A Linux-shaped unmount must stop the import, not shadow-write.
+
+    ``_missing_archive_mount_root`` only sees a mount point that vanished
+    (macOS ejects remove ``/Volumes/<share>``). Linux keeps ``/mnt/<name>``
+    as an empty directory, so the destination still "exists", os.makedirs
+    succeeds, and the remaining card files land on the system disk under
+    a stale mount point — where safe_to_format could go green over photos
+    that disappear the moment the real archive remounts.
+    See PR #1394 review (Codex P1 r3687190865).
+    """
+    import pipeline_job as _pj
+    from import_job import ImportParams
+
+    card = _make_card(tmp_path, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+        ("DSC_0002.jpg", datetime(2026, 7, 4, 9, 0, 0), "blue"),
+    ])
+    dest = str(tmp_path / "mnt_NAS")
+    os.makedirs(dest, exist_ok=True)
+
+    # The destination is a real mount at job start, then the share drops
+    # while leaving the directory in place.
+    monkeypatch.setattr(
+        _pj, "_archive_mount_root_candidates",
+        lambda path: [dest] if str(path).startswith(dest) else [],
+    )
+    real_ismount = os.path.ismount
+    second_batch_dir = os.path.join(dest, "2026", "2026-07-04")
+
+    def fake_ismount(p):
+        if str(p) != dest:
+            return real_ismount(p)
+        # Detach cleanly BETWEEN batches: still mounted while batch one
+        # copies and catalogs, gone by the time batch two starts writing.
+        # Keyed on observable state (has batch two's folder been created)
+        # rather than a probe count, so adding or removing a probe cannot
+        # silently retime the test — and deliberately later than "batch
+        # one's file landed", which would instead exercise a mid-batch
+        # detach and correctly fail batch one too.
+        return not os.path.exists(second_batch_dir)
+
+    monkeypatch.setattr(os.path, "ismount", fake_ismount)
+
+    db, ws_id, result = _run_import(tmp_path, ImportParams(
+        sources=[str(card)], destination=dest,
+    ))
+
+    assert result["copied"] == 1, result
+    assert result["failed"] == 1, result
+    assert result["safe_to_format"] is False, result
+    # "detached" is common to the batch-level and per-file guard messages.
+    # Which one fires depends on exactly when the share drops relative to
+    # the batch boundary, and this test cares that the detach is reported
+    # at all, not which probe noticed it first.
+    assert any(
+        "detached" in u["reason"] for u in result["unsafe_files"]
+    ), result["unsafe_files"]
+
+
+def test_local_import_allows_a_plain_directory_that_looks_mount_shaped(
+        tmp_path, monkeypatch):
+    """An ordinary directory under /mnt must still be a valid destination.
+
+    The guard keys on a mounted → unmounted transition precisely so a
+    hand-made local ``/mnt/photos`` (never a mount, so ismount is False
+    throughout) is not refused. A bare "is it mounted?" check would break
+    this setup.
+    """
+    import pipeline_job as _pj
+    from import_job import ImportParams
+
+    card = _make_card(tmp_path, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+        ("DSC_0002.jpg", datetime(2026, 7, 4, 9, 0, 0), "blue"),
+    ])
+    dest = str(tmp_path / "mnt_photos")
+    os.makedirs(dest, exist_ok=True)
+
+    # Mount-shaped path, but ismount is False the whole way through.
+    monkeypatch.setattr(
+        _pj, "_archive_mount_root_candidates",
+        lambda path: [dest] if str(path).startswith(dest) else [],
+    )
+
+    db, ws_id, result = _run_import(tmp_path, ImportParams(
+        sources=[str(card)], destination=dest,
+    ))
+
+    assert result["copied"] == 2, result
+    assert result["failed"] == 0, result
+
+
+def test_remote_import_stops_when_mount_point_persists_after_unmount(
+        tmp_path, monkeypatch):
+    """Same persistent-unmount guard on the remote path.
+
+    Worse here than locally: rsync keeps succeeding against the NAS while
+    the per-batch scan reads the empty local shadow, so the bytes land
+    remotely and the catalog records nothing.
+    """
+    import pipeline_job as _pj
+    from import_job import ImportParams, run_import_job
+
+    ra = _remote_archive_for(tmp_path)
+    calls = _remote_calls(ra)
+    _install_fake_remote_rsync(monkeypatch, calls, verify=None)
+
+    card = _make_card(tmp_path, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+        ("DSC_0002.jpg", datetime(2026, 7, 4, 9, 0, 0), "blue"),
+    ])
+    mount_base = ra["mount_base"]
+
+    monkeypatch.setattr(
+        _pj, "_archive_mount_root_candidates",
+        lambda path: [mount_base] if str(path).startswith(mount_base) else [],
+    )
+    real_ismount = os.path.ismount
+    first_landed = os.path.join(
+        mount_base, "2026", "2026-07-03", "DSC_0001.jpg")
+
+    def fake_ismount(p):
+        if str(p) != mount_base:
+            return real_ismount(p)
+        # Detaches once the first batch has landed. Keyed on observable
+        # state rather than a probe count so the test can't be retimed by
+        # a probe being added elsewhere.
+        return not os.path.exists(first_landed)
+
+    monkeypatch.setattr(os.path, "ismount", fake_ismount)
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws_id = db._active_workspace_id
+    result = run_import_job(
+        _make_job(), FakeRunner(), db_path, ws_id,
+        ImportParams(
+            sources=[str(card)], destination=mount_base, remote_target=ra,
+        ),
+    )
+
+    assert result["copied"] == 1, result
+    assert result["failed"] == 1, result
+    assert result["safe_to_format"] is False, result
+    assert any(
+        "no longer mounted" in u["reason"] for u in result["unsafe_files"]
+    ), result["unsafe_files"]
+
+
+def test_local_import_takes_mount_baseline_before_discovery(
+        tmp_path, monkeypatch):
+    """The baseline must predate discovery, not follow it.
+
+    Discovery, catalog-index construction and timestamp extraction all run
+    before the copy loop and are slow against a network archive — the
+    2026-07-30 incident spent eight minutes just enumerating the
+    destination. A share that detaches during that window would be
+    recorded as ``False`` by a late baseline, so the mounted -> unmounted
+    transition never fires and the guard is silently disarmed for the
+    whole run. See PR #1396 review (Codex P1 r3687336684).
+    """
+    import import_job as _ij
+    import pipeline_job as _pj
+    from import_job import ImportParams
+
+    card = _make_card(tmp_path, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+        ("DSC_0002.jpg", datetime(2026, 7, 4, 9, 0, 0), "blue"),
+    ])
+    dest = str(tmp_path / "mnt_NAS")
+    os.makedirs(dest, exist_ok=True)
+
+    monkeypatch.setattr(
+        _pj, "_archive_mount_root_candidates",
+        lambda path: [dest] if str(path).startswith(dest) else [],
+    )
+
+    state = {"mounted": True}
+    real_ismount = os.path.ismount
+    monkeypatch.setattr(
+        os.path, "ismount",
+        lambda p: state["mounted"] if str(p) == dest else real_ismount(p),
+    )
+
+    # The share drops WHILE discovery is running.
+    real_discover = _ij.discover_source_files
+
+    def discover_then_detach(*a, **kw):
+        result = list(real_discover(*a, **kw))
+        state["mounted"] = False
+        return result
+
+    monkeypatch.setattr(_ij, "discover_source_files", discover_then_detach)
+
+    db, ws_id, result = _run_import(tmp_path, ImportParams(
+        sources=[str(card)], destination=dest,
+    ))
+
+    assert result["copied"] == 0, result
+    assert result["failed"] == 2, result
+    assert result["safe_to_format"] is False, result
+    assert all(
+        "no longer mounted" in u["reason"] for u in result["unsafe_files"]
+    ), result["unsafe_files"]
+
+
+def test_remote_import_takes_mount_baseline_before_discovery(
+        tmp_path, monkeypatch):
+    """Remote path takes its baseline before discovery too.
+
+    Same disarming window as the local path — Codex flagged both in
+    PR #1396 review (P1 r3687336684).
+    """
+    import import_job as _ij
+    import pipeline_job as _pj
+    from import_job import ImportParams, run_import_job
+
+    ra = _remote_archive_for(tmp_path)
+    calls = _remote_calls(ra)
+    _install_fake_remote_rsync(monkeypatch, calls, verify=None)
+
+    card = _make_card(tmp_path, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+        ("DSC_0002.jpg", datetime(2026, 7, 4, 9, 0, 0), "blue"),
+    ])
+    mount_base = ra["mount_base"]
+
+    monkeypatch.setattr(
+        _pj, "_archive_mount_root_candidates",
+        lambda path: [mount_base] if str(path).startswith(mount_base) else [],
+    )
+    state = {"mounted": True}
+    real_ismount = os.path.ismount
+    monkeypatch.setattr(
+        os.path, "ismount",
+        lambda p: state["mounted"] if str(p) == mount_base else real_ismount(p),
+    )
+
+    real_discover = _ij.discover_source_files
+
+    def discover_then_detach(*a, **kw):
+        result = list(real_discover(*a, **kw))
+        state["mounted"] = False
+        return result
+
+    monkeypatch.setattr(_ij, "discover_source_files", discover_then_detach)
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws_id = db._active_workspace_id
+    result = run_import_job(
+        _make_job(), FakeRunner(), db_path, ws_id,
+        ImportParams(
+            sources=[str(card)], destination=mount_base, remote_target=ra,
+        ),
+    )
+
+    assert result["copied"] == 0, result
+    assert result["failed"] == 2, result
+    assert result["safe_to_format"] is False, result
+    # Drop the ``<remote>`` honesty-gate marker (verify_by_hash advice) so
+    # the mount reason is asserted over a non-empty set rather than
+    # vacuously — same filtering as
+    # ``test_remote_import_refuses_when_mount_root_absent``.
+    non_remote = [u for u in result["unsafe_files"] if u["path"] != "<remote>"]
+    assert non_remote, result["unsafe_files"]
+    assert all(
+        "no longer mounted" in u["reason"] for u in non_remote
+    ), result["unsafe_files"]
+
+
+def test_local_import_detects_mount_loss_inside_a_single_batch(
+        tmp_path, monkeypatch):
+    """A detach mid-batch must not ride out to the end of the batch.
+
+    Batch-boundary probing alone leaves a whole folder unguarded, and when
+    there is only ONE batch there is no later boundary at all — every
+    remaining file is copied, hash-verified and cataloged into the local
+    shadow, and safe_to_format can still go green over a card that is the
+    only real copy. See PR #1396 review (Codex P1 r3687401641).
+    """
+    import pipeline_job as _pj
+    from import_job import ImportParams
+
+    # One batch: four files, same capture date. Distinct colours so each
+    # is genuinely copied — identical bytes would route files 2-4 through
+    # the intra-run duplicate gate and never exercise the copy path.
+    card = _make_card(tmp_path, [
+        (f"DSC_000{i}.jpg", datetime(2026, 7, 3, 10, i, 0), colour)
+        for i, colour in enumerate(
+            ("red", "green", "blue", "yellow"), start=1)
+    ])
+    dest = str(tmp_path / "mnt_NAS")
+    os.makedirs(dest, exist_ok=True)
+
+    monkeypatch.setattr(
+        _pj, "_archive_mount_root_candidates",
+        lambda path: [dest] if str(path).startswith(dest) else [],
+    )
+
+    state = {"mounted": True, "probes": 0}
+    real_ismount = os.path.ismount
+
+    def fake_ismount(p):
+        if str(p) != dest:
+            return real_ismount(p)
+        state["probes"] += 1
+        # Baseline + batch-level check + first two files stay mounted;
+        # the share drops partway through the single batch.
+        if state["probes"] > 4:
+            state["mounted"] = False
+        return state["mounted"]
+
+    monkeypatch.setattr(os.path, "ismount", fake_ismount)
+
+    db, ws_id, result = _run_import(tmp_path, ImportParams(
+        sources=[str(card)], destination=dest,
+    ))
+
+    assert result["discovered"] == 4, result
+    # Whatever the split, nothing may be left claiming a successful
+    # archive copy, and the card must not be declared safe to format.
+    assert result["copied"] == 0, result
+    assert result["failed"] == 4, result
+    assert result["safe_to_format"] is False, result
+    assert any(
+        "detached" in u["reason"] for u in result["unsafe_files"]
+    ), result["unsafe_files"]
+
+    # Nothing from this run may be cataloged under the shadow directory.
+    rows = _photo_rows(db)
+    assert rows == [], rows
+
+
+def test_local_import_detects_mount_loss_during_the_final_file(
+        tmp_path, monkeypatch):
+    """A detach during the LAST file's copy must still be caught.
+
+    The pre-file probe runs before each copy, so with a single-file batch
+    (or on the last file of any batch) there is no next iteration to trip
+    it. Without a post-loop probe the copy, hash verification and catalog
+    scan all succeed against the local shadow and safe_to_format can go
+    true. See PR #1396 review (Codex P1 r3687456172).
+    """
+    import pipeline_job as _pj
+    from import_job import ImportParams
+
+    # A single file -> a single batch -> exactly one loop iteration.
+    card = _make_card(tmp_path, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+    ])
+    dest = str(tmp_path / "mnt_NAS")
+    os.makedirs(dest, exist_ok=True)
+
+    monkeypatch.setattr(
+        _pj, "_archive_mount_root_candidates",
+        lambda path: [dest] if str(path).startswith(dest) else [],
+    )
+    real_ismount = os.path.ismount
+    landed_path = os.path.join(dest, "2026", "2026-07-03", "DSC_0001.jpg")
+
+    def fake_ismount(p):
+        if str(p) != dest:
+            return real_ismount(p)
+        # Mounted right up until the file lands — i.e. the share drops
+        # while that final copy is in flight.
+        return not os.path.exists(landed_path)
+
+    monkeypatch.setattr(os.path, "ismount", fake_ismount)
+
+    db, ws_id, result = _run_import(tmp_path, ImportParams(
+        sources=[str(card)], destination=dest,
+    ))
+
+    assert result["copied"] == 0, result
+    assert result["failed"] == 1, result
+    assert result["safe_to_format"] is False, result
+    # The shadow copy must not be cataloged as an archive photo.
+    assert _photo_rows(db) == [], _photo_rows(db)
+
+
+def test_local_import_refuses_when_share_detached_before_run_starts(
+        tmp_path, monkeypatch):
+    """A share detached BEFORE baseline capture must still be refused.
+
+    Every check in this file so far assumes ``ismount == True`` at least
+    for baseline capture: the transition-only guard fires only on
+    True → False. A share that was already down when the run started
+    baselines False, no transition can fire against a False baseline,
+    and the persistent ``/mnt/<name>`` stub still passes the per-batch
+    check — the same silent-shadow-write shape this PR opened, just
+    with the timing shifted earlier so no within-run probe can see it.
+
+    Cross-run history (mount roots ever observed live, persisted in
+    ``db_meta``) is what closes that hole: a second run to the same
+    destination baselines True by seeding, and the still-False current
+    state fires the transition just as it would mid-run. A hand-made
+    local ``/mnt/photos`` never enters the known-set (no run ever
+    observed it as a live mount), so its baseline stays False and it
+    stays a valid destination. See PR #1396 review
+    (Codex P1 r3687401636).
+    """
+    import pipeline_job as _pj
+    from import_job import ImportParams, run_import_job
+
+    card = _make_card(tmp_path, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+        ("DSC_0002.jpg", datetime(2026, 7, 4, 9, 0, 0), "blue"),
+    ])
+    dest = str(tmp_path / "mnt_NAS")
+    os.makedirs(dest, exist_ok=True)
+
+    monkeypatch.setattr(
+        _pj, "_archive_mount_root_candidates",
+        lambda path: [dest] if str(path).startswith(dest) else [],
+    )
+    state = {"mounted": True}
+    real_ismount = os.path.ismount
+    monkeypatch.setattr(
+        os.path, "ismount",
+        lambda p: state["mounted"] if str(p) == dest else real_ismount(p),
+    )
+
+    # First run: share is live, files copy, persistent record captures
+    # that ``dest`` was seen mounted.
+    db_path = str(tmp_path / "test.db")
+    db1 = Database(db_path)
+    ws_id = db1._active_workspace_id
+    first = run_import_job(
+        _make_job("import-first"), FakeRunner(), db_path, ws_id,
+        ImportParams(sources=[str(card)], destination=dest),
+    )
+    assert first["copied"] == 2, first
+    assert first["failed"] == 0, first
+    # Sanity: the DB now knows this destination as a mount root.
+    assert dest in _pj._load_known_mount_roots(db1)
+
+    # Second run: same destination, share detached BEFORE the run starts.
+    # Without the persisted history the baseline would be False and the
+    # guard would silently disarm.
+    state["mounted"] = False
+    card2 = _make_card(tmp_path, [
+        ("DSC_0003.jpg", datetime(2026, 7, 5, 8, 0, 0), "green"),
+        ("DSC_0004.jpg", datetime(2026, 7, 6, 7, 0, 0), "yellow"),
+    ], card_name="card2")
+    result = run_import_job(
+        _make_job("import-second"), FakeRunner(), db_path, ws_id,
+        ImportParams(sources=[str(card2)], destination=dest),
+    )
+
+    assert result["copied"] == 0, result
+    assert result["failed"] == 2, result
+    assert result["safe_to_format"] is False, result
+    # Either the batch-level or per-file guard may notice first; the
+    # substring common to both messages is "detached" / "no longer
+    # mounted", so key the assertion on either.
+    assert any(
+        "no longer mounted" in u["reason"] or "detached" in u["reason"]
+        for u in result["unsafe_files"]
+    ), result["unsafe_files"]
+
+
+def test_local_import_invalidates_duplicate_skips_when_mount_detaches(
+        tmp_path, monkeypatch):
+    """A duplicate-only batch must not vouch for a detached archive.
+
+    An accepted duplicate never enters ``landed``, so reclassifying only
+    landed entries leaves the skip standing. A duplicate-only batch can
+    then satisfy ``copied + skipped_duplicate == discovered`` and report
+    safe_to_format=True while the real archive holds none of the bytes —
+    the card gets erased and the shadow disappears on remount.
+    See PR #1396 review (Codex P1 r3687506040).
+    """
+    import shutil
+
+    import import_job as _ij
+    import pipeline_job as _pj
+    from import_job import ImportParams, run_import_job
+    from scanner import compute_file_hash
+
+    dest = tmp_path / "mnt_NAS"
+    dest_dir = dest / "2026" / "2026-07-03"
+    dest_dir.mkdir(parents=True)
+    dest_file = dest_dir / "IMG_0100.jpg"
+    Image.new("RGB", (16, 16), "red").save(str(dest_file))
+    ts = datetime(2026, 7, 3, 10, 0, 0).timestamp()
+    os.utime(str(dest_file), (ts, ts))
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws_id = db._active_workspace_id
+    fid = db.conn.execute(
+        "INSERT INTO folders (path, name, status) VALUES (?, ?, 'ok')",
+        (str(dest_dir), dest_dir.name),
+    ).lastrowid
+    db.conn.execute(
+        "INSERT INTO photos (folder_id, filename, extension, file_size,"
+        " file_hash) VALUES (?, ?, '.jpg', ?, ?)",
+        (fid, "IMG_0100.jpg", os.path.getsize(str(dest_file)),
+         compute_file_hash(str(dest_file))),
+    )
+    db.conn.commit()
+
+    card = tmp_path / "card"
+    card.mkdir()
+    shutil.copy2(str(dest_file), str(card / "IMG_0100.jpg"))
+
+    monkeypatch.setattr(
+        _pj, "_archive_mount_root_candidates",
+        lambda path: [str(dest)] if str(path).startswith(str(dest)) else [],
+    )
+    state = {"mounted": True}
+    real_ismount = os.path.ismount
+    monkeypatch.setattr(
+        os.path, "ismount",
+        lambda p: (
+            state["mounted"] if str(p) == str(dest) else real_ismount(p)
+        ),
+    )
+
+    # The share drops while the duplicate gate is consulting the twin —
+    # after the per-file probe has already passed. Both lookup helpers are
+    # wrapped because which one runs depends on whether the checker
+    # produced a hash token or a metadata-key token.
+    def _detach_after(fn):
+        def wrapper(*a, **kw):
+            rows = fn(*a, **kw)
+            state["mounted"] = False
+            return rows
+        return wrapper
+
+    monkeypatch.setattr(
+        _ij, "_key_twin_rows", _detach_after(_ij._key_twin_rows))
+    monkeypatch.setattr(
+        _ij, "_hash_twin_rows", _detach_after(_ij._hash_twin_rows))
+
+    result = run_import_job(
+        _make_job(), FakeRunner(), db_path, ws_id, ImportParams(
+            sources=[str(card)], destination=str(dest),
+        ),
+    )
+
+    assert result["copied"] == 0, result
+    assert result["skipped_duplicate"] == 0, (
+        "a duplicate accepted against a detached archive still counted as "
+        f"safely already-present: {result}"
+    )
+    assert result["failed"] == 1, result
+    assert result["safe_to_format"] is False, result
+
+
+def test_local_import_mount_loss_is_sticky_across_batches(
+        tmp_path, monkeypatch):
+    """Same rationale as the remote-path sticky test: a batch's mount-
+    detach rollback undoes ``dup_skips`` / ``landed`` but not the
+    identities the same batch installed in the job-wide checker (and
+    ``run_dest_folders`` / ``run_verified_hashes``) via
+    ``_record_checker`` — ``DuplicateChecker`` exposes no removal API. If
+    the share remounts before a later batch, a byte-identical card file
+    would hit the intra-run fast path and be counted as a duplicate of a
+    rolled-back landing whose archive bytes never made it. See PR #1400
+    review (Codex P2 r3688614624).
+    """
+    import shutil
+
+    import pipeline_job as _pj
+    from import_job import ImportParams, run_import_job
+
+    dest = tmp_path / "mnt_NAS"
+    dest.mkdir()
+    day1_dir = dest / "2026" / "2026-07-03"
+    day1_dir.mkdir(parents=True)
+    # A twin file already at the batch 1 destination — the adopt branch
+    # matches it and calls ``_record_checker`` with dest_folder + hash,
+    # populating the job-wide checker's ``_seen_hashes`` and the intra-
+    # run cache. Those are what leak past the rollback.
+    twin_path = day1_dir / "IMG_0100.jpg"
+    Image.new("RGB", (16, 16), "red").save(str(twin_path))
+    ts1 = datetime(2026, 7, 3, 10, 0, 0).timestamp()
+    os.utime(str(twin_path), (ts1, ts1))
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws_id = db._active_workspace_id
+
+    card = tmp_path / "card"
+    card.mkdir()
+    # Batch 1 (2026-07-03): matches the adopted twin.
+    file_a = card / "IMG_0100.jpg"
+    shutil.copy2(str(twin_path), str(file_a))
+    os.utime(str(file_a), (ts1, ts1))
+    # Batch 2 (2026-07-04): byte-identical to A. Without the sticky
+    # fix, this hits the intra-run fast path against A's stale entry.
+    file_b = card / "IMG_0200.jpg"
+    shutil.copy2(str(twin_path), str(file_b))
+    ts2 = datetime(2026, 7, 4, 10, 0, 0).timestamp()
+    os.utime(str(file_b), (ts2, ts2))
+
+    monkeypatch.setattr(
+        _pj, "_archive_mount_root_candidates",
+        lambda path: [str(dest)] if str(path).startswith(str(dest)) else [],
+    )
+    real_ismount = os.path.ismount
+    monkeypatch.setattr(
+        os.path, "ismount",
+        lambda p: True if str(p) == str(dest) else real_ismount(p),
+    )
+
+    # Sequence the mount-probe returns so batch 1 detaches AFTER its
+    # per-file loop and batch 2 would see a REMOUNTED share at its
+    # batch-boundary probe. Local path call sites (per batch):
+    #   batch-boundary, per-file (1x), post-loop.
+    seq = iter([None, None, str(dest), None, None, None])
+
+    def fake_unmounted(baseline):
+        try:
+            return next(seq)
+        except StopIteration:
+            return None
+
+    monkeypatch.setattr(_pj, "_unmounted_since_baseline", fake_unmounted)
+
+    result = run_import_job(
+        _make_job(), FakeRunner(), db_path, ws_id, ImportParams(
+            sources=[str(card)], destination=str(dest),
+        ),
+    )
+
+    assert result["copied"] == 0, result
+    assert result["skipped_duplicate"] == 0, (
+        "file B in batch 2 was counted as a duplicate of A's rolled-back "
+        f"adopt via the stale intra-run cache: {result}"
+    )
+    assert result["failed"] == 2, result
+    assert result["safe_to_format"] is False, result
+
+
+def test_remote_import_invalidates_duplicate_skips_when_mount_detaches(
+        tmp_path, monkeypatch):
+    """The remote path needs the local path's duplicate-skip rollback.
+
+    A twin-verified skip increments ``skipped_duplicate``, never enters
+    ``landed`` or ``adopted_paths``, and can be satisfied by a shadow file
+    left on the persistent mount stub by an earlier failed import — so
+    rsync is skipped entirely and ``copied + skipped_duplicate ==
+    discovered`` holds against bytes that are not on the NAS. With
+    ``verify_by_hash`` on, the ``<remote>`` honesty gate stops masking it
+    and safe_to_format can go true over a card that is the only real
+    copy. See PR #1396 review (Codex P1 r3688498501 / r3688501706).
+    """
+    import shutil
+
+    import import_job as _ij
+    import pipeline_job as _pj
+    from import_job import ImportParams, run_import_job
+    from scanner import compute_file_hash
+
+    ra = _remote_archive_for(tmp_path)
+    calls = _remote_calls(ra)
+    _install_fake_remote_rsync(monkeypatch, calls, verify=None)
+    mount_base = ra["mount_base"]
+
+    # A shadow twin sitting on the mount stub, already cataloged — what an
+    # earlier failed import would have left behind.
+    twin_dir = os.path.join(mount_base, "2026", "2026-07-03")
+    os.makedirs(twin_dir, exist_ok=True)
+    twin_file = os.path.join(twin_dir, "IMG_0100.jpg")
+    Image.new("RGB", (16, 16), "red").save(twin_file)
+    ts = datetime(2026, 7, 3, 10, 0, 0).timestamp()
+    os.utime(twin_file, (ts, ts))
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws_id = db._active_workspace_id
+    fid = db.conn.execute(
+        "INSERT INTO folders (path, name, status) VALUES (?, ?, 'ok')",
+        (twin_dir, "2026-07-03"),
+    ).lastrowid
+    db.conn.execute(
+        "INSERT INTO photos (folder_id, filename, extension, file_size,"
+        " file_hash) VALUES (?, ?, '.jpg', ?, ?)",
+        (fid, "IMG_0100.jpg", os.path.getsize(twin_file),
+         compute_file_hash(twin_file)),
+    )
+    db.conn.commit()
+
+    card = tmp_path / "card"
+    card.mkdir()
+    shutil.copy2(twin_file, str(card / "IMG_0100.jpg"))
+
+    monkeypatch.setattr(
+        _pj, "_archive_mount_root_candidates",
+        lambda path: [mount_base] if str(path).startswith(mount_base) else [],
+    )
+    state = {"mounted": True}
+    real_ismount = os.path.ismount
+    monkeypatch.setattr(
+        os.path, "ismount",
+        lambda p: (
+            state["mounted"] if str(p) == mount_base else real_ismount(p)
+        ),
+    )
+
+    # Detach while the duplicate gate consults the twin — i.e. after the
+    # batch-boundary probe has already passed.
+    def _detach_after(fn):
+        def wrapper(*a, **kw):
+            rows = fn(*a, **kw)
+            state["mounted"] = False
+            return rows
+        return wrapper
+
+    monkeypatch.setattr(
+        _ij, "_key_twin_rows", _detach_after(_ij._key_twin_rows))
+    monkeypatch.setattr(
+        _ij, "_hash_twin_rows", _detach_after(_ij._hash_twin_rows))
+
+    result = run_import_job(
+        _make_job(), FakeRunner(), db_path, ws_id, ImportParams(
+            sources=[str(card)], destination=mount_base,
+            remote_target=ra, verify_by_hash=True,
+        ),
+    )
+
+    assert result["copied"] == 0, result
+    assert result["skipped_duplicate"] == 0, (
+        "a duplicate accepted against a detached archive still counted as "
+        f"safely already-present: {result}"
+    )
+    assert result["failed"] == 1, result
+    assert result["safe_to_format"] is False, result
+
+
+def test_remote_import_mount_loss_is_sticky_across_batches(
+        tmp_path, monkeypatch):
+    """Mount loss must be sticky for the rest of the run.
+
+    A batch's mount-detach rollback undoes ``dup_skips`` / ``to_transfer``
+    / ``adopted_paths`` but not the identities the same batch already
+    installed in the job-wide checker (and in ``run_dest_folders`` /
+    ``run_verified_hashes``) via ``_record_checker`` — and
+    ``DuplicateChecker`` exposes no removal API, so those entries cannot
+    be surgically undone. If the share remounts before a later batch, a
+    byte-identical card file in that later batch would hit the intra-run
+    fast path at line 1237 and be counted as a duplicate of an adopted
+    or queued file whose archive claim was rolled back, with no backing
+    NAS copy. Refusing every remaining batch keeps the stale cache from
+    being consulted. See PR #1400 review (Codex P2 r3688614624).
+    """
+    import shutil
+
+    import pipeline_job as _pj
+    from import_job import ImportParams, run_import_job
+
+    ra = _remote_archive_for(tmp_path)
+    calls = _remote_calls(ra)
+    _install_fake_remote_rsync(monkeypatch, calls, verify=None)
+    mount_base = ra["mount_base"]
+
+    # Adopted twin already at the batch 1 destination (crash-recovery
+    # shape). The adopt branch matches its bytes and calls
+    # ``_record_checker`` with dest_folder + hash — populating both the
+    # job-wide checker's ``_seen_hashes`` and the intra-run
+    # ``run_dest_folders`` / ``run_verified_hashes``. Those are the
+    # entries the fix has to keep unreachable after the rollback.
+    day1_dir = os.path.join(mount_base, "2026", "2026-07-03")
+    os.makedirs(day1_dir)
+    twin_path = os.path.join(day1_dir, "IMG_0100.jpg")
+    Image.new("RGB", (16, 16), "red").save(twin_path)
+    ts1 = datetime(2026, 7, 3, 10, 0, 0).timestamp()
+    os.utime(twin_path, (ts1, ts1))
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws_id = db._active_workspace_id
+
+    card = tmp_path / "card"
+    card.mkdir()
+    # Batch 1 (2026-07-03): matches the adopted twin.
+    file_a = card / "IMG_0100.jpg"
+    shutil.copy2(twin_path, str(file_a))
+    os.utime(str(file_a), (ts1, ts1))
+    # Batch 2 (2026-07-04): BYTE-IDENTICAL to A. Without the sticky fix
+    # this hits the intra-run fast path against A's stale entry in
+    # ``run_dest_folders`` and is counted as ``skipped_duplicate`` even
+    # though A's landing was rolled back and the NAS holds nothing for
+    # it. With the fix, batch 2 is refused at the top of the loop.
+    file_b = card / "IMG_0200.jpg"
+    shutil.copy2(twin_path, str(file_b))
+    ts2 = datetime(2026, 7, 4, 10, 0, 0).timestamp()
+    os.utime(str(file_b), (ts2, ts2))
+
+    monkeypatch.setattr(
+        _pj, "_archive_mount_root_candidates",
+        lambda path: [mount_base] if str(path).startswith(mount_base) else [],
+    )
+
+    # Baseline captured at job start uses ismount — leave the mount root
+    # reporting live so the baseline is True. The per-batch detach/remount
+    # timing is driven through ``_unmounted_since_baseline`` below.
+    real_ismount = os.path.ismount
+    monkeypatch.setattr(
+        os.path, "ismount",
+        lambda p: True if str(p) == mount_base else real_ismount(p),
+    )
+
+    # Sequence the mount-probe returns so batch 1 detaches AFTER the
+    # per-file loop (post the adopt-branch _record_checker) and batch 2
+    # would see a REMOUNTED share at its batch-boundary probe. Without
+    # the sticky fix, batch 2 then reaches the dup gate and consults the
+    # stale intra-run cache; with it, ``mount_ever_lost`` already fired
+    # in batch 1 and batch 2's per-file fail loop runs before any probe.
+    #
+    # Call sites (remote path):
+    #   batch 1: batch-boundary, per-file (1x), post-loop
+    #   batch 2 without the fix: batch-boundary, per-file (1x), post-loop
+    seq = iter([None, None, mount_base, None, None, None])
+
+    def fake_unmounted(baseline):
+        try:
+            return next(seq)
+        except StopIteration:
+            return None
+
+    monkeypatch.setattr(_pj, "_unmounted_since_baseline", fake_unmounted)
+
+    result = run_import_job(
+        _make_job(), FakeRunner(), db_path, ws_id, ImportParams(
+            sources=[str(card)], destination=mount_base,
+            remote_target=ra, verify_by_hash=True,
+        ),
+    )
+
+    # File A was adopted in batch 1 then rolled back on detach; file B
+    # in batch 2 must NOT be counted as skipped_duplicate against A's
+    # stale intra-run cache entry. Both end up failed.
+    assert result["copied"] == 0, result
+    assert result["skipped_duplicate"] == 0, (
+        "file B in batch 2 was counted as a duplicate of A's rolled-back "
+        f"adopt via the stale intra-run cache: {result}"
+    )
+    assert result["failed"] == 2, result
+    assert result["safe_to_format"] is False, result
+
+    # No rsync happened either — both batches short-circuited before the
+    # transfer step.
+    assert calls["rsync"] == [], calls["rsync"]

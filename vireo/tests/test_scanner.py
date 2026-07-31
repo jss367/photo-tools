@@ -2536,6 +2536,82 @@ def test_incremental_rescan_skips_small_jpeg_dims_not_raw(tmp_path, monkeypatch)
     assert all(image_path not in batch for batch in called_with)
 
 
+def test_restricted_scan_reports_discovery_progress(tmp_path, monkeypatch):
+    """Enumerating a restricted dir must emit a discovery heartbeat
+    WHILE the enumeration is still running, not only after it finishes.
+
+    The recursive/non-recursive branches already emit heartbeats. The
+    restrict_dirs branch did not, so a caller that streams status to a
+    UI (the import job's duplicate-folder link scan) showed nothing at
+    all while the enumeration ran — minutes of apparent hang on a
+    network archive with a folder of ~1000 files.
+
+    A materialized-then-iterate variant (``list(safe_iter_dir(...))``)
+    would emit heartbeats too, but only after the whole slow scandir
+    finishes — the exact silence this exists to break. The spy below
+    records how many entries the underlying iterator had yielded at the
+    moment each heartbeat fired: at least one heartbeat must fire before
+    the iterator is exhausted (PR #1385 Codex / CodeRabbit review).
+    """
+    import scanner
+    from db import Database
+    from image_loader import safe_iter_dir as real_safe_iter_dir
+
+    root = tmp_path / "archive"
+    day = root / "2026-07-03"
+    day.mkdir(parents=True)
+    # One real image (the only file the scan is allowed to process) plus
+    # enough same-extension siblings to cross the heartbeat interval
+    # multiple times.
+    real = day / "IMG_0000.jpg"
+    Image.new("RGB", (16, 16), color="red").save(str(real), "JPEG")
+    for i in range(1, 1201):
+        (day / f"IMG_{i:04d}.jpg").touch()
+
+    yields = [0]
+
+    def spy_iter_dir(top, onerror=None):
+        for entry in real_safe_iter_dir(top, onerror=onerror):
+            yields[0] += 1
+            yield entry
+
+    monkeypatch.setattr(scanner, "safe_iter_dir", spy_iter_dir)
+
+    db = Database(str(tmp_path / "test.db"))
+    statuses = []  # list of (msg, yields_when_emitted)
+    scanner.scan(
+        str(root), db,
+        restrict_dirs=[str(day)],
+        restrict_files={str(real)},
+        status_callback=lambda msg, **kw: statuses.append((msg, yields[0])),
+    )
+
+    total_yielded = yields[0]
+    discovery = [
+        (msg, at) for msg, at in statuses
+        if msg.startswith("Discovering files")
+    ]
+    assert len(discovery) >= 2, (
+        "restricted discovery must emit progress while it enumerates, not "
+        f"just a single opening message; got {statuses}"
+    )
+    # At least one heartbeat must have fired mid-enumeration — after the
+    # generator started yielding but before it was exhausted. The scan
+    # emits an "opening" heartbeat before any yield (at ``yields == 0``),
+    # so that one doesn't count; the "closing" heartbeats after
+    # enumeration is done (``at == total_yielded``) don't count either.
+    # A materialized-then-iterate variant would only land in those two
+    # buckets — no true in-flight ticks — leaving the UI silent through
+    # the entire slow scandir walk this heartbeat exists to break.
+    in_flight = [at for _, at in discovery if 0 < at < total_yielded]
+    assert in_flight, (
+        "heartbeats never fired mid-enumeration — the UI would be silent "
+        "through the whole slow scandir walk this heartbeat exists to "
+        f"break (iterator total: {total_yielded}, heartbeats at: "
+        f"{[at for _, at in discovery]})"
+    )
+
+
 def test_scan_restrict_files_ignores_files_not_in_list(tmp_path, monkeypatch):
     """When scan is called with restrict_files, files in restrict_dirs
     that are not in the list are left untouched — even if they're brand
@@ -5460,3 +5536,280 @@ def test_recycled_id_purge_backdates_below_a_negative_source_mtime(tmp_path):
         "source file_mtime of 0.0, so the freshness guard would still "
         "serve the previous owner's pixels"
     )
+
+
+def test_scan_reports_photos_actually_indexed_not_files_discovered(
+        tmp_path, caplog):
+    """The scan summary must count photos indexed, not files discovered.
+
+    When a network archive unmounts mid-scan, every discovered file
+    vanishes before its ``stat()`` and is skipped. The summary used to
+    log the *discovered* total, so a scan that indexed nothing still
+    reported "984 photos indexed" (see the 2026-07-30 SMB outage) — the
+    cheap-proxy count CORE_PHILOSOPHY.md rules out. Report the real
+    indexed count and surface the skipped remainder.
+    """
+    import logging
+
+    from db import Database
+    from scanner import scan
+
+    root = str(tmp_path / "photos")
+    _create_test_images(root, {'': ['a.jpg', 'b.jpg', 'c.jpg', 'd.jpg']})
+
+    # scan() calls progress_callback(0, total) at the exact seam between
+    # discovery and the processing loop — the same window the unmount hit
+    # in production. Deleting here makes the files genuinely vanish
+    # rather than mocking the stat() failure.
+    def vanish_after_discovery(current, total):
+        if current == 0:
+            os.remove(os.path.join(root, 'c.jpg'))
+            os.remove(os.path.join(root, 'd.jpg'))
+
+    db = Database(str(tmp_path / "test.db"))
+    with caplog.at_level(logging.INFO, logger='scanner'):
+        caplog.clear()
+        result = scan(root, db, progress_callback=vanish_after_discovery)
+
+    assert result["discovered"] == 4, result
+    assert result["indexed"] == 2, result
+    assert result["vanished"] == 2, result
+
+    msgs = [r.message for r in caplog.records]
+    assert any("2 photos indexed" in m for m in msgs), msgs
+    assert any("2 vanished" in m for m in msgs), msgs
+    assert not any("4 photos indexed" in m for m in msgs), msgs
+
+
+def test_scan_reports_indexed_count_on_a_clean_run(tmp_path):
+    """With nothing vanishing, indexed == discovered and vanished == 0."""
+    from db import Database
+    from scanner import scan
+
+    root = str(tmp_path / "photos")
+    _create_test_images(root, {'': ['a.jpg', 'b.jpg']})
+
+    db = Database(str(tmp_path / "test.db"))
+    result = scan(root, db)
+
+    assert result["discovered"] == 2, result
+    assert result["indexed"] == 2, result
+    assert result["vanished"] == 0, result
+
+
+def test_scan_counts_are_readable_even_when_the_scan_raises(tmp_path):
+    """Counts must be reachable on the failure path, not just the return.
+
+    scan() commits photo rows incrementally and can raise *after* many of
+    them landed (cancellation, a post-loop pairing pass, a DB error). If
+    the only way to learn the indexed count is the return value, every
+    caller has to report 0 for a run that actually cataloged thousands —
+    the same class of wrong number as over-reporting. Callers pass a
+    ``counts`` dict that scan() fills as it goes.
+    """
+    from db import Database
+    from scanner import ScanCancelled, scan
+
+    root = str(tmp_path / "photos")
+    _create_test_images(root, {'': [f"p{i}.jpg" for i in range(6)]})
+
+    # Trip cancellation once two photos have actually been committed.
+    state = {"committed": 0}
+
+    def photo_cb(photo_id, path_str):
+        state["committed"] += 1
+
+    counts = {}
+    db = Database(str(tmp_path / "test.db"))
+    with pytest.raises(ScanCancelled):
+        scan(
+            root, db,
+            counts=counts,
+            photo_callback=photo_cb,
+            cancel_check=lambda: state["committed"] >= 2,
+        )
+
+    assert counts["discovered"] == 6, counts
+    assert counts["indexed"] == state["committed"], counts
+    assert counts["indexed"] >= 2, counts
+    assert counts["indexed"] < 6, counts
+
+
+def test_scan_counts_sink_matches_the_returned_counts(tmp_path):
+    """On a clean run the caller-supplied sink and the return value agree."""
+    from db import Database
+    from scanner import scan
+
+    root = str(tmp_path / "photos")
+    _create_test_images(root, {'': ['a.jpg', 'b.jpg']})
+
+    counts = {}
+    db = Database(str(tmp_path / "test.db"))
+    result = scan(root, db, counts=counts)
+
+    assert result == counts, (result, counts)
+    assert counts["indexed"] == 2, counts
+
+
+def test_scan_counts_photos_committed_before_a_post_insert_hook_raised(
+        tmp_path):
+    """The indexed count must match the catalog, not lag behind it.
+
+    ``db.add_photo()`` commits the row, but several fallible steps run
+    after it — cache invalidation, XMP keyword import, duplicate
+    auto-resolve, ``photo_callback``. A malformed sidecar or a failing
+    callback raising in that window leaves the photo durably in the
+    catalog while the counts sink is short, so the failure summary
+    under-reports rows that really did land.
+    """
+    from db import Database
+    from scanner import scan
+
+    root = str(tmp_path / "photos")
+    _create_test_images(root, {'': ['a.jpg', 'b.jpg', 'c.jpg', 'd.jpg']})
+
+    seen = {"n": 0}
+
+    def exploding_callback(photo_id, path_str):
+        seen["n"] += 1
+        if seen["n"] == 3:
+            raise RuntimeError("post-insert hook failed")
+
+    counts = {}
+    db = Database(str(tmp_path / "test.db"))
+    with pytest.raises(RuntimeError):
+        scan(root, db, counts=counts, photo_callback=exploding_callback)
+
+    committed = db.conn.execute("SELECT COUNT(*) FROM photos").fetchone()[0]
+    assert committed == 3, committed
+    assert counts["indexed"] == committed, (
+        f"sink says {counts['indexed']} indexed but {committed} rows are "
+        "committed in the catalog"
+    )
+
+
+def test_scan_indexed_count_excludes_jpegs_merged_into_raw_companions(tmp_path):
+    """A JPEG merged into its RAW's row is not a separate indexed photo.
+
+    ``_pair_raw_jpeg_companions`` runs after the per-file loop and deletes
+    the JPEG's photo row, keeping it as the RAW's companion. Both files
+    incremented the counter on the way through, so without an adjustment
+    the scan claims two photos where the catalog holds one. Shooting
+    RAW+JPEG is the common case, so this would overstate nearly every
+    import.
+    """
+    from db import Database
+    from scanner import scan
+
+    img_dir = tmp_path / "photos"
+    img_dir.mkdir()
+    Image.new("RGB", (200, 100), color="green").save(
+        str(img_dir / "IMG_001.jpg"))
+    with open(str(img_dir / "IMG_001.cr3"), "wb") as f:
+        f.write(b"\x00" * 200)
+
+    db = Database(str(tmp_path / "test.db"))
+    result = scan(str(img_dir), db)
+
+    rows = db.conn.execute("SELECT COUNT(*) FROM photos").fetchone()[0]
+    assert rows == 1, rows
+    assert result["discovered"] == 2, result
+    assert result["indexed"] == rows, (
+        f"claimed {result['indexed']} photos indexed but the catalog holds "
+        f"{rows}"
+    )
+
+
+def test_scan_indexed_count_keeps_unpaired_jpegs(tmp_path):
+    """Only the merged companion is discounted, not every JPEG."""
+    from db import Database
+    from scanner import scan
+
+    img_dir = tmp_path / "photos"
+    img_dir.mkdir()
+    Image.new("RGB", (200, 100), color="green").save(
+        str(img_dir / "IMG_001.jpg"))
+    with open(str(img_dir / "IMG_001.cr3"), "wb") as f:
+        f.write(b"\x00" * 200)
+    # A JPEG with no RAW of the same basename stays its own photo.
+    Image.new("RGB", (200, 100), color="blue").save(
+        str(img_dir / "IMG_002.jpg"))
+
+    db = Database(str(tmp_path / "test.db"))
+    result = scan(str(img_dir), db)
+
+    rows = db.conn.execute("SELECT COUNT(*) FROM photos").fetchone()[0]
+    assert rows == 2, rows
+    assert result["discovered"] == 3, result
+    assert result["indexed"] == rows, (
+        f"claimed {result['indexed']} photos indexed but the catalog holds "
+        f"{rows}"
+    )
+
+
+def _leave_unpaired_pair(db, monkeypatch, folder, basename="OLD_001"):
+    """Catalog a RAW+JPEG pair without merging it.
+
+    Simulates a pair left unmerged by an interrupted scan or an older
+    build — the state ``_pair_raw_jpeg_companions`` exists to clean up on
+    a later run, whether or not that run scanned this folder.
+    """
+    import scanner as _sc
+    from scanner import scan
+
+    folder.mkdir(parents=True, exist_ok=True)
+    Image.new("RGB", (32, 32), color="red").save(
+        str(folder / f"{basename}.jpg"))
+    with open(str(folder / f"{basename}.cr3"), "wb") as f:
+        f.write(b"\x00" * 200)
+
+    monkeypatch.setattr(
+        _sc, "_pair_raw_jpeg_companions", lambda *a, **k: set())
+    scan(str(folder), db)
+    monkeypatch.undo()
+
+
+def test_scan_does_not_discount_pairs_outside_its_own_scope(
+        tmp_path, monkeypatch):
+    """Only companions this scan counted may be discounted.
+
+    ``_pair_raw_jpeg_companions`` queries the whole photos table, so it
+    merges pending pairs anywhere in the catalog — including folders this
+    invocation never looked at. Subtracting that global total makes a
+    scoped scan undercount photos it really did index.
+    """
+    from db import Database
+    from scanner import scan
+
+    db = Database(str(tmp_path / "test.db"))
+    _leave_unpaired_pair(db, monkeypatch, tmp_path / "elsewhere")
+
+    # A different folder, two fresh JPEGs, no pairs of its own.
+    target = tmp_path / "target"
+    target.mkdir()
+    for name in ("NEW_001.jpg", "NEW_002.jpg"):
+        Image.new("RGB", (32, 32), color="blue").save(str(target / name))
+
+    result = scan(str(target), db)
+
+    assert result["discovered"] == 2, result
+    assert result["indexed"] == 2, (
+        f"scan indexed 2 new photos but reported {result['indexed']} after "
+        "an unrelated pair elsewhere in the catalog was merged"
+    )
+
+
+def test_scan_indexed_count_never_goes_negative(tmp_path, monkeypatch):
+    """Codex's example: an empty root plus one pending pair returned -1."""
+    from db import Database
+    from scanner import scan
+
+    db = Database(str(tmp_path / "test.db"))
+    _leave_unpaired_pair(db, monkeypatch, tmp_path / "elsewhere")
+
+    empty = tmp_path / "empty"
+    empty.mkdir()
+
+    result = scan(str(empty), db)
+
+    assert result["indexed"] == 0, result

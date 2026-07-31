@@ -27,6 +27,11 @@
   font-size: 11px; background: var(--accent); color: var(--accent-text);
   padding: 2px 8px; border-radius: 10px; font-variant-numeric: tabular-nums;
 }
+.jobs-awake-note {
+  padding: 8px 16px; font-size: 12px; line-height: 1.4;
+  color: var(--text-secondary);
+  border-bottom: 1px solid var(--border-primary);
+}
 .jobs-filter-bar {
   padding: 8px 16px; display: flex; gap: 8px;
   border-bottom: 1px solid var(--border-subtle);
@@ -121,6 +126,13 @@
 .job-detail-meta {
   font-size: 12px; color: var(--text-muted); display: flex; gap: 16px;
   flex-wrap: wrap; padding: 8px 24px; border-bottom: 1px solid var(--border-subtle);
+}
+.job-pause-banner {
+  font-size: 13px; padding: 8px 12px; margin: 8px 0;
+  background: color-mix(in srgb, var(--warning, #d99a24) 12%, transparent);
+  border-left: 3px solid var(--warning, #d99a24);
+  color: var(--text-primary);
+  border-radius: 3px;
 }
 .btn-cancel {
   font-size: 12px; padding: 4px 12px; border-radius: 4px; cursor: pointer;
@@ -275,6 +287,13 @@
         <option value="failed">Failed</option>
       </select>
     </div>
+    <!-- Vireo overrides the system idle-sleep setting while jobs run
+         (issue #1397). Say so, and be specific about the limit: closing
+         the lid still sleeps the machine and will still kill the job. -->
+    <div class="jobs-awake-note" id="keepingAwakeNote" style="display:none;"
+         title="Long jobs die if the machine sleeps — a network share often does not survive it.">
+      Keeping this computer awake while jobs run. Closing the lid will still sleep it.
+    </div>
     <div class="jobs-list-content" id="jobListContent">
       <div style="padding:24px;text-align:center;color:var(--text-ghost);font-size:13px;">Loading...</div>
     </div>
@@ -378,6 +397,97 @@
     return job && job.config && typeof job.config === 'object' ? job.config : {};
   }
 
+  // A retry job carries its parent's id in ``config.parent_import_job_id``
+  // and the original failed import's id in ``config.root_import_job_id``
+  // (see api_job_import_photos). Suppresses the Retry button on the
+  // original failed import while any active-or-recently-launched retry
+  // in that chain is still in flight — a second click would otherwise
+  // enqueue a parallel import of the same source and destination,
+  // letting the after-import chains and any ``after_process_move`` race
+  // with the first retry's move (which may already have relocated the
+  // folders). Matches either field so a retry-of-retry — whose direct
+  // ``parent_import_job_id`` points at the first retry, not the
+  // original failed import — still blocks the original's Retry button.
+  function hasActiveRetryFor(parentId) {
+    if (!parentId) return false;
+    return activeJobs.some(function(candidate) {
+      if (!candidate || candidate.type !== 'import') return false;
+      var status = candidate.status;
+      if (status === 'completed' || status === 'failed' ||
+          status === 'cancelled') return false;
+      var cfg = jobConfig(candidate);
+      if (!cfg) return false;
+      return cfg.parent_import_job_id === parentId ||
+             cfg.root_import_job_id === parentId;
+    });
+  }
+
+  function importRetryBody(job) {
+    var cfg = jobConfig(job);
+    if (!job || job.type !== 'import' || cfg.mode === 'in_place' ||
+        !Array.isArray(cfg.sources) || !cfg.sources.length) return null;
+    // parent_import_job_id lets the server bind carry_photo_ids to this
+    // parent's imported scope and, when the parent used a remote
+    // target, verify the target still resolves to the enqueue-time
+    // host/root/mount. Without a parent id the server rejects the
+    // carry list, so the retry couldn't chain properly.
+    if (!job.id) return null;
+    // See import.html retryBodyFromFinishedJob for the full rationale:
+    // an empty custom folder_template means "copy into the archive
+    // root" and must not be overwritten by the default; the parent's
+    // skip_duplicates setting must not be forced on, or a failed file
+    // that matches some other catalog entry gets skipped again instead
+    // of copied.
+    var folderTemplate = cfg.folder_template != null
+      ? cfg.folder_template : '%Y/%Y-%m-%d';
+    var parentSkipDuplicates = cfg.skip_duplicates != null
+      ? !!cfg.skip_duplicates : true;
+    var body = {
+      sources: cfg.sources.slice(),
+      destination: cfg.destination,
+      recursive: cfg.recursive !== false,
+      folder_template: folderTemplate,
+      file_types: cfg.file_types || 'both',
+      skip_duplicates: parentSkipDuplicates,
+      verify_by_hash: !!cfg.verify_by_hash,
+      trust_likely_duplicates: !!cfg.trust_likely_duplicates,
+      after_import: cfg.after_import == null ? null : cfg.after_import,
+      tags: Array.isArray(cfg.tags) ? cfg.tags.slice() : [],
+      location_from_gps: !!cfg.location_from_gps,
+      allow_missing_exiftool: !!cfg.allow_missing_exiftool,
+      parent_import_job_id: job.id,
+    };
+    // Recover the complete original scope. See import.html for the full
+    // rationale; the summary: the parent's failed run skipped chaining
+    // entirely, so previously-landed files still need processing, and
+    // on repeated retries the accumulated carry list has to keep
+    // growing rather than reset to only the last retry's landed files.
+    var parentCarry = Array.isArray(cfg.carry_photo_ids)
+      ? cfg.carry_photo_ids : [];
+    var parentImported = Array.isArray(job.result && job.result.photo_ids)
+      ? job.result.photo_ids : [];
+    var carry = [];
+    var carrySeen = {};
+    parentCarry.concat(parentImported).forEach(function(pid) {
+      if (typeof pid !== 'number' || !Number.isInteger(pid) || pid <= 0) return;
+      if (carrySeen[pid]) return;
+      carrySeen[pid] = true;
+      carry.push(pid);
+    });
+    if (carry.length) body.carry_photo_ids = carry;
+    if (cfg.remote_target_id) {
+      delete body.destination;
+      body.remote_target_id = cfg.remote_target_id;
+      body.remote_subpath = cfg.remote_subpath;
+    }
+    if (cfg.after_process_move && cfg.after_process_move.remote_target_id) {
+      body.after_process_move = {
+        remote_target_id: cfg.after_process_move.remote_target_id,
+      };
+    }
+    return body;
+  }
+
   function jobCollectionText(job) {
     var cfg = jobConfig(job);
     if (cfg.collection_name) return 'Collection: ' + cfg.collection_name;
@@ -442,6 +552,39 @@
       html += '<span>' + esc(visibleProgress.label) + ': ' + progressPct(visibleProgress) + '%</span>';
     }
     html += '</div>';
+
+    var failedImportCount = job.result && Number(job.result.failed || 0);
+    if (!isLive && failedImportCount > 0 && importRetryBody(job)) {
+      var retryInFlight = hasActiveRetryFor(job.id);
+      html += '<div style="padding:10px 0 2px;font-size:12px;color:var(--text-muted);">';
+      if (retryInFlight) {
+        // Same failed job, retry already running. A second Start would
+        // race the first — same source, same destination, same carry
+        // scope — so surface the in-flight status instead of a live
+        // button. Re-enables automatically when the retry finishes and
+        // ``activeJobs`` no longer contains it.
+        html += '<button class="btn-retry" disabled aria-disabled="true" ' +
+          'title="A retry for this import is already running">' +
+          'Retry in progress…</button>';
+        html += '<span style="margin-left:8px;">Retry already launched for this job; wait for it to finish before starting another.</span>';
+      } else {
+        html += '<button class="btn-retry" data-retry-import-job="' +
+          escapeAttr(job.id) + '">Retry ' + failedImportCount + ' failed file' +
+          (failedImportCount === 1 ? '' : 's') + '</button>';
+        html += '<span style="margin-left:8px;">Same source and destination; successful files are skipped.</span>';
+      }
+      html += '</div>';
+    }
+
+    // Pause reason banner: when classify (or any pipeline stage) parks the
+    // job on an outage it can't recover from on its own — a dropped share,
+    // missing volume — it publishes ``pause_reason`` on job.progress. Without
+    // this banner the user only sees a generic "paused" pill and can't tell
+    // what to fix before pressing Resume.
+    var pauseReason = job.progress && job.progress.pause_reason;
+    if (pauseReason && (job.status === 'pausing' || job.status === 'paused')) {
+      html += '<div class="job-pause-banner">' + esc(pauseReason) + '</div>';
+    }
 
     // Steps
     var steps = job.steps || job.tree || [];
@@ -632,6 +775,10 @@
         activeJobs = data.active || [];
         activeWsId = data.active_workspace_id || null;
         workspaceNames = data.workspace_names || {};
+        var awakeNote = document.getElementById('keepingAwakeNote');
+        if (awakeNote) {
+          awakeNote.style.display = data.keeping_awake ? '' : 'none';
+        }
         // Drop optimistic-cancel state for jobs that have left the active
         // list (server has finalized them; their next render comes from
         // historyJobs which never shows a cancel button).
@@ -891,6 +1038,65 @@
 
   // Event delegation for detail pane clicks (step toggle, pause/resume, cancel)
   document.getElementById('jobDetailPane').addEventListener('click', function(e) {
+    var retryImportBtn = e.target.closest('[data-retry-import-job]');
+    if (retryImportBtn) {
+      var retryJobId = retryImportBtn.getAttribute('data-retry-import-job');
+      var retryJob = activeJobs.concat(historyJobs).find(function(job) {
+        return job.id === retryJobId;
+      });
+      var retryBody = importRetryBody(retryJob);
+      if (!retryBody) {
+        if (typeof showToast === 'function') {
+          showToast('The original import settings are no longer available.', 'error');
+        }
+        return;
+      }
+      // Backstop the render-time gate: a click landing between poll
+      // ticks could otherwise fire a second retry for the same parent
+      // while the first is still active. Same rationale as the disabled
+      // button above; keeps the parallel-launch race closed even when
+      // ``activeJobs`` refreshed just after render.
+      if (hasActiveRetryFor(retryJobId)) {
+        if (typeof showToast === 'function') {
+          showToast(
+            'A retry for this import is already running; wait for it to finish.',
+            'info',
+          );
+        }
+        return;
+      }
+      // Preserve the original count-specific label so the error path
+      // below can restore it exactly — dropping to a generic "Retry
+      // failed files" would silently hide the real failed-file count.
+      var retryOriginalLabel = retryImportBtn.textContent;
+      retryImportBtn.disabled = true;
+      retryImportBtn.textContent = 'Starting retry…';
+      fetch('/api/jobs/import-photos', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(retryBody),
+      }).then(function(response) {
+        return response.json().catch(function() { return {}; }).then(function(data) {
+          if (!response.ok) {
+            throw new Error(data.error || 'Retry failed to start');
+          }
+          return data;
+        });
+      }).then(function(data) {
+        if (typeof showToast === 'function') {
+          showToast('Import retry started. Successful files will be skipped.', 'info');
+        }
+        selectedJobId = data.job_id;
+        selectedSource = 'active';
+        currentView = data.job_id;
+        fetchJobs();
+      }).catch(function(error) {
+        retryImportBtn.disabled = false;
+        retryImportBtn.textContent = retryOriginalLabel;
+        if (typeof showToast === 'function') showToast(error.message, 'error');
+      });
+      return;
+    }
     var stepHeader = e.target.closest('[data-toggle-step]');
     if (stepHeader) {
       toggleStep(stepHeader.getAttribute('data-toggle-step'));

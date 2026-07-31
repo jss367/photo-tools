@@ -3847,6 +3847,25 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             repaired_location_ancestors,
         )
 
+    # Parsing taxonomy.json is expensive for a full iNaturalist download.
+    # Cache the startup instance so overlapping one-time migrations and the
+    # immediate background species pass do not each parse it independently.
+    _taxonomy_not_loaded = object()
+    _startup_taxonomy = _taxonomy_not_loaded
+
+    def _load_startup_taxonomy():
+        nonlocal _startup_taxonomy
+        # Do not cache a miss: a concurrent first-run taxonomy download can
+        # make the file available before the background retry starts.
+        if (
+            _startup_taxonomy is _taxonomy_not_loaded
+            or _startup_taxonomy is None
+        ):
+            from taxonomy import load_local_taxonomy
+
+            _startup_taxonomy = load_local_taxonomy()
+        return _startup_taxonomy
+
     def _sync_mark_species_only(db, log_label):
         """Load taxonomy and run mark_species_keywords synchronously.
 
@@ -3856,9 +3875,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         that depends on hierarchy leaves being correctly typed as
         taxonomy/is_species.
         """
-        from taxonomy import load_local_taxonomy
-
-        tax = load_local_taxonomy()
+        tax = _load_startup_taxonomy()
         if tax is None:
             log.debug(
                 "[%s] taxonomy not loaded; deferring species marking",
@@ -3895,7 +3912,40 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
     # association remains permanently skipped. When taxonomy isn't
     # loaded yet (or marking fails), defer the repair to a later boot
     # rather than stamping the marker over an unmarked hierarchy.
-    if _sync_mark_species_only(init_db, "sync-startup-species-mark"):
+    duplicate_repair_key = Database._DUPLICATE_PHOTO_SPECIES_REPAIR_KEY
+    duplicate_repair_pending = init_db.get_meta(duplicate_repair_key) != "1"
+    if duplicate_repair_pending:
+        # The legacy bug always left a typed top-level species/taxonomy tag
+        # beside another tag on the same photo. If no such pair exists, the
+        # repair is structurally impossible and it is safe to stamp the
+        # one-shot marker without parsing a potentially huge taxonomy file.
+        possible_duplicate = init_db.conn.execute(
+            """SELECT 1
+               FROM photo_keywords species_pk
+               JOIN keywords species_k
+                 ON species_k.id = species_pk.keyword_id
+               WHERE (species_k.is_species = 1
+                      OR species_k.type = 'taxonomy')
+                 AND EXISTS (
+                     SELECT 1
+                     FROM photo_keywords other_pk
+                     WHERE other_pk.photo_id = species_pk.photo_id
+                       AND other_pk.keyword_id != species_pk.keyword_id
+                 )
+               LIMIT 1"""
+        ).fetchone()
+        if possible_duplicate is None:
+            init_db.set_meta(duplicate_repair_key, "1")
+            duplicate_repair_pending = False
+            log.info(
+                "Skipped duplicate-species startup repair: "
+                "no possible duplicate associations"
+            )
+
+    if (
+        duplicate_repair_pending
+        and _sync_mark_species_only(init_db, "sync-startup-species-mark")
+    ):
         init_db.repair_duplicate_photo_species()
     # One-time rewrite of the previous miss-threshold defaults (0.25 / 0.15)
     # to the new defaults (0.20 / 0.12) in both ~/.vireo/config.json and
@@ -3978,9 +4028,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         """Load taxonomy, mark species keywords, and run the one-shot
         Wildlife backfill. Returns silently on any failure so callers
         can choose between sync (block startup) and async (log only)."""
-        from taxonomy import load_local_taxonomy
-
-        tax = load_local_taxonomy()
+        tax = _load_startup_taxonomy()
         if tax is None:
             # No taxonomy yet — leave the marker unset so the backfill
             # retries on a future boot once taxonomy is downloaded.
@@ -4030,7 +4078,8 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         finally:
             bg_db.close()
 
-    threading.Thread(target=_mark_species, daemon=True).start()
+    if not os.environ.get("VIREO_DISABLE_STARTUP_BACKFILL_TIMERS"):
+        threading.Thread(target=_mark_species, daemon=True).start()
 
     def _folder_health_loop():
         """Periodically check folder health."""
@@ -4711,6 +4760,14 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         folder_id = request.args.get("folder_id", None, type=int)
         collection_id = request.args.get("collection_id", None, type=int)
 
+        # Keep the combined first-paint payload on one SQLite read snapshot.
+        # Independent SELECT snapshots can straddle a background folder-health
+        # commit and combine pre-transition photos/missing IDs with a
+        # post-transition folder tree. Since the navbar poll may already have
+        # completed, there is no guaranteed immediate observation to repair
+        # that split response.
+        db.conn.execute("BEGIN")
+
         # ``db.get_photos(collection_id=...)`` / ``count_filtered_photos`` both
         # expand only ``collections.rules`` — the same rules-only path guarded
         # elsewhere by ``_reject_visual_collection``. A visual-only collection
@@ -4734,6 +4791,24 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             if coll_row is not None and coll_row["visual_json"] is not None:
                 visual_first_paint = True
 
+        # Snapshot the active workspace's missing-folder IDs so the client's
+        # navbar can seed ``_missingFoldersLastIds`` from this init response.
+        # Without a baseline, the first /api/folders/missing observation
+        # returns false when a background _folder_health_loop flip runs
+        # between init and the poll — later polls then see the same IDs and
+        # never dispatch, leaving Browse stuck showing the pre-flip state
+        # (Codex review r3686191141).
+        #
+        # This is the first read in the explicit transaction above, so every
+        # photo / folder / keyword / collection read below shares the same
+        # health snapshot. Ordering alone is insufficient: if the background
+        # health loop commits after this query but before get_folder_tree(),
+        # and the navbar's initial poll already finished, no immediate poll
+        # remains to repair the mixed response (Codex reviews r3686317681 and
+        # r3687501744).
+        missing_folder_ids = [f["id"] for f in db.get_missing_folders()]
+        folder_health_version = db.get_folder_health_version()
+
         # First paint is scope-only (folder / collection / sort); metadata
         # filter deep links compile into the filter bar client-side, which
         # reloads through /api/photos/query once initialized (Phase 5 —
@@ -4751,6 +4826,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     sort=sort,
                 )
             except ValueError as exc:
+                db.conn.rollback()
                 return json_error(str(exc), 400)
             if not any([folder_id, collection_id]):
                 total = db.count_photos()
@@ -4761,6 +4837,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                         collection_id=collection_id,
                     )
                 except ValueError as exc:
+                    db.conn.rollback()
                     return json_error(str(exc), 400)
         folders = db.get_folder_tree()
         keywords = db.get_keyword_tree()
@@ -4810,7 +4887,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 )
             collection_dicts.append(d)
 
-        return jsonify(
+        response = jsonify(
             {
                 "photos": photo_dicts,
                 "total": total,
@@ -4819,8 +4896,15 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 "folders": [dict(f) for f in folders],
                 "keywords": [dict(k) for k in keywords],
                 "collections": collection_dicts,
+                "missing_folder_ids": missing_folder_ids,
+                "folder_health_version": folder_health_version,
             }
         )
+        # End the read transaction after every value in the response has been
+        # materialized. rollback() is intentional: this endpoint is read-only
+        # and it releases the snapshot without implying a write commit.
+        db.conn.rollback()
+        return response
 
     @app.route("/api/pipeline/slots")
     def api_pipeline_slots():
@@ -5240,8 +5324,16 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
     @app.route("/api/folders/missing")
     def api_folders_missing():
         db = _get_db()
+        # Keep the rows and their monotonic observation marker on one read
+        # snapshot so clients can compare this response with /api/browse/init
+        # independent of network delivery order.
+        db.conn.execute("BEGIN")
         missing = db.get_missing_folders()
-        return jsonify([dict(f) for f in missing])
+        health_version = db.get_folder_health_version()
+        response = jsonify([dict(f) for f in missing])
+        response.headers["X-Vireo-Folder-Health-Version"] = str(health_version)
+        db.conn.rollback()
+        return response
 
     _MISSING_ORIGINALS_STALE_SECONDS = 30 * 60
     _MISSING_ORIGINALS_BACKOFF_SECONDS = 30 * 60
@@ -5768,6 +5860,16 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
     @app.route("/api/folders/check-health", methods=["POST"])
     def api_folders_check_health():
         db = _get_db()
+        # ``check_folder_health()`` scans every folder in the DB and returns a
+        # global change count, but the client needs to know whether the
+        # ACTIVE workspace's missing set changed. Snapshot the workspace-
+        # scoped missing IDs before and after so the client's null-baseline
+        # fallback in loadMissingFolders() (fired when the modal opens before
+        # any poll seeds the snapshot) can distinguish a cross-workspace
+        # flip — which must NOT reset the active Browse — from a real
+        # active-workspace transition that still needs to notify Browse
+        # (Codex review r3686191131).
+        ws_missing_before = {f["id"] for f in db.get_missing_folders()}
         changed = db.check_folder_health()
         # A folder flipping ok→missing turns every one of its photos into a
         # ghost, and missing→ok resurrects them. Either transition would
@@ -5775,11 +5877,18 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         # next full scan.
         if changed:
             _invalidate_missing_originals_cache()
+        db.conn.execute("BEGIN")
         missing = db.get_missing_folders()
-        return jsonify({
+        ws_missing_after = {f["id"] for f in missing}
+        health_version = db.get_folder_health_version()
+        response = jsonify({
             "changed": changed,
+            "workspace_changed": ws_missing_before != ws_missing_after,
             "missing": [dict(f) for f in missing],
+            "folder_health_version": health_version,
         })
+        db.conn.rollback()
+        return response
 
     @app.route("/api/photos/missing/delete-sidecars", methods=["POST"])
     def api_photos_missing_delete_sidecars():
@@ -15960,12 +16069,35 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
     @app.route("/api/darktable/status")
     def api_darktable_status():
         import config as cfg
-        from develop import find_darktable, find_dng_converter
+        from develop import (
+            darktable_search_paths,
+            darktable_tools_dir,
+            darktable_uses_tools_dir,
+            find_darktable,
+            find_dng_converter,
+        )
 
         configured = cfg.get("darktable_bin")
         binary = find_darktable(configured)
         dng_configured = cfg.get("dng_converter_bin")
         dng_binary = find_dng_converter(dng_configured)
+
+        # What we tell the user we checked has to match what find_darktable
+        # actually probes: shutil.which("darktable-cli") first, then the
+        # filesystem candidates. darktable_search_paths() covers only the
+        # latter, and on Linux it lists just the AppImages already present in
+        # our tools dir — so a box with none yet would get an empty "we checked
+        # here" list, on exactly the platform the download targets. Hence
+        # compose here rather than returning that list raw.
+        # darktable_uses_tools_dir() is the same predicate darktable_search_paths()
+        # branches on, so the directory is named on, and only on, the platform
+        # that probes it. It cannot already be in the list: the detector only
+        # ever emits files *inside* the directory, never the directory itself.
+        checked_paths = ["$PATH (darktable-cli)"]
+        checked_paths.extend(darktable_search_paths())
+        if darktable_uses_tools_dir():
+            checked_paths.append(darktable_tools_dir())
+
         return jsonify({
             "available": binary is not None,
             "bin": binary or "",
@@ -15977,7 +16109,50 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             "style": cfg.get("darktable_style"),
             "output_format": cfg.get("darktable_output_format"),
             "output_dir": cfg.get("darktable_output_dir"),
+            "checked_paths": checked_paths,
         })
+
+    @app.route("/api/darktable/install/available")
+    def api_darktable_install_available():
+        """What a download would fetch, for the confirmation dialog.
+
+        Always 200: when this cannot answer, the panel shows a plain
+        "Get darktable" link and the reason, rather than a dead button.
+
+        Includes the Flask host's ``platform`` (linux/darwin/win32) so the
+        UI's "Download installer" vs "Download and set up" label and its
+        Gatekeeper/SmartScreen warnings describe the machine that will
+        actually run the installer — not the browser device, which can be
+        a phone or a different desktop on the LAN.
+        """
+        import sys
+
+        import darktable_install
+
+        try:
+            release, reason = darktable_install.resolve_release_cached()
+        except Exception as e:
+            # resolve_release is documented never to raise; this is belt and
+            # braces so an unexpected bug still degrades to a link, not a 500.
+            log.warning("darktable release lookup failed: %s", e)
+            return jsonify({
+                "available": False,
+                "reason": darktable_install.REASON_UNREACHABLE,
+                "platform": sys.platform,
+            })
+
+        if not release:
+            # Pass the reason through verbatim. Do NOT substitute a generic
+            # message: "we could not reach GitHub" and "no build exists for
+            # your platform" are different facts and users act on them
+            # differently.
+            return jsonify({
+                "available": False,
+                "reason": reason,
+                "platform": sys.platform,
+            })
+
+        return jsonify({"available": True, "platform": sys.platform, **release})
 
     @app.route("/api/exiftool/status")
     def api_exiftool_status():
@@ -17782,31 +17957,118 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
 
         # Transparency: if the destination is (or sits inside) a folder Vireo
         # already manages, surface it as an existing archive so the UI can
-        # frame the import as a merge rather than a fresh copy. Pure catalog
-        # read — no file I/O beyond the tracked-folder probe.
-        from move import _tracked_destination_ancestor, _tracked_destination_overlap
+        # frame the import as a merge rather than a fresh copy. Do NOT accept
+        # the inverse relationship (a tracked folder somewhere below the
+        # selected destination): selecting a broad mount such as
+        # /Volumes/Photography while a managed archive lives at
+        # /Volumes/Photography/Raw Files/USA does not mean a new import into
+        # /Volumes/Photography/2026 will merge into that nested archive.
+        # Calling the overlap helper here produced exactly that contradictory
+        # preview. Pure catalog read — no file I/O beyond the tracked-folder
+        # probe.
+        from move import _tracked_destination_ancestor
         db = _get_db()
-        tracked = (_tracked_destination_overlap(db, -1, destination)
-                   or _tracked_destination_ancestor(db, -1, destination))
-        result["managed_archive"] = None
-        if tracked:
-            from db import _subtree_prefix
-            prefix = _subtree_prefix(tracked["path"])
+        from db import _subtree_prefix
+
+        def _archive_photo_count(archive_path):
+            prefix = _subtree_prefix(archive_path)
             # Count only ok/partial folders — the same set ingest treats as
-            # "the archive" — so the callout's "N photos" matches what the merge
-            # actually considers present. Pure catalog read; no on-disk check.
-            count = db.conn.execute(
+            # "the archive" — so the callout's "N photos" matches what the
+            # merge actually considers present. Pure catalog read; no on-disk
+            # check.
+            return db.conn.execute(
                 """SELECT COUNT(*) AS c
                      FROM photos p JOIN folders f ON f.id = p.folder_id
                     WHERE (f.path = ?
                            OR substr(REPLACE(f.path, '\\', '/'), 1, ?) = ?)
                       AND f.status IN ('ok', 'partial')""",
-                (tracked["path"], len(prefix), prefix),
+                (archive_path, len(prefix), prefix),
             ).fetchone()["c"]
-            result["managed_archive"] = {
-                "path": tracked["path"],
-                "photo_count": count,
+
+        managed_archives = []
+        managed_archive = None
+
+        dest_tracked = _tracked_destination_ancestor(db, -1, destination)
+        if dest_tracked is not None:
+            # The destination itself is (or sits inside) a tracked archive, so
+            # every generated folder lands inside it — full coverage.
+            managed_archive = {
+                "path": dest_tracked["path"],
+                "photo_count": _archive_photo_count(dest_tracked["path"]),
             }
+            managed_archives = [dict(managed_archive, coverage="full")]
+        else:
+            # The destination itself may sit above every tracked archive while
+            # the folder template still maps generated files into one — e.g.
+            # destination /Photography with a tracked root /Photography/2026
+            # and template 2026/%Y-%m-%d lands every file inside the managed
+            # /Photography/2026 archive. Checking only the destination's
+            # ancestors leaves managed_archive None even though the import IS
+            # a merge into a tracked archive. Walk the concrete full_path
+            # values from preview_destination() so we catch that case, while
+            # still avoiding the sibling-folder false positive the
+            # destination-only guard was written to prevent (a broad mount
+            # whose tracked archive is a sibling of the generated folders
+            # never becomes an ancestor of any full_path).
+            #
+            # Do NOT collapse mixed coverage to a single archive. A source
+            # spanning multiple date-templated folders can split so that some
+            # generated folders land inside a tracked archive and others land
+            # outside it, or land in DIFFERENT tracked archives — for example
+            # files from 2025 and 2026 with destination /Photography, template
+            # %Y/%Y-%m-%d, and only /Photography/2026 tracked (2025 files land
+            # outside the archive), or the same source but with both
+            # /Photography/2025 and /Photography/2026 tracked (each subset
+            # lands in a different archive). Breaking at the first match and
+            # asserting "this import lands inside archive X" for the whole
+            # preview lies about the other subsets. Aggregate the matches and
+            # expose partial/multiple overlaps distinctly.
+            folder_entries = result.get("folders") or []
+            per_archive = {}  # archive_path -> matched_folder_count
+            unmatched = 0
+            considered = 0
+            for entry in folder_entries:
+                full_path = entry.get("full_path")
+                if not full_path:
+                    continue
+                considered += 1
+                candidate = _tracked_destination_ancestor(db, -1, full_path)
+                if candidate is None:
+                    unmatched += 1
+                else:
+                    key = candidate["path"]
+                    per_archive[key] = per_archive.get(key, 0) + 1
+            for archive_path, matched in per_archive.items():
+                # A single archive covers "all" generated folders only when it
+                # matched every considered entry AND nothing landed outside a
+                # tracked archive AND no other tracked archive claimed any
+                # folder. Anything else is a partial overlap for that archive.
+                full = (
+                    unmatched == 0
+                    and len(per_archive) == 1
+                    and matched == considered
+                    and considered > 0
+                )
+                managed_archives.append({
+                    "path": archive_path,
+                    "photo_count": _archive_photo_count(archive_path),
+                    "coverage": "full" if full else "partial",
+                })
+            if (
+                len(managed_archives) == 1
+                and managed_archives[0]["coverage"] == "full"
+            ):
+                managed_archive = {
+                    "path": managed_archives[0]["path"],
+                    "photo_count": managed_archives[0]["photo_count"],
+                }
+
+        result["managed_archive"] = managed_archive
+        # ``managed_archives`` is the authoritative list — the UI should
+        # prefer it so partial or multi-archive overlaps are described
+        # honestly. ``managed_archive`` stays populated only for the
+        # single-archive full-coverage case so older clients keep working.
+        result["managed_archives"] = managed_archives
         return jsonify(result)
 
     @app.route("/api/import/folder-preview/thumbnail")
@@ -18244,8 +18506,8 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         def work(job):
             from taxonomy import (
                 TAXONOMY_JSON_PATH,
-                Taxonomy,
                 download_taxonomy,
+                load_local_taxonomy,
                 populate_taxa_db_from_json,
                 seed_informal_groups,
             )
@@ -18297,7 +18559,24 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             # retype for free (it's idempotent).
             progress_cb("Retyping existing keywords...")
             try:
-                tax = Taxonomy(TAXONOMY_JSON_PATH)
+                # Go through load_local_taxonomy() rather than constructing
+                # Taxonomy directly: it drops the cached instance before
+                # parsing the replacement. Constructing here bypassed that,
+                # so a refresh held the old ~2.8GB parse alive alongside the
+                # new one and could OOM. It also seeds the cache, so the
+                # next compare/accept request reuses this parse instead of
+                # paying for its own.
+                #
+                # Pin it to the file we just downloaded. Without path=, a
+                # transient failure parsing the new file would fall back to
+                # a legacy copy, and we would retype keywords from the old
+                # taxonomy while the taxa tables hold the new one — mixing
+                # versions and reporting success.
+                tax = load_local_taxonomy(path=TAXONOMY_JSON_PATH)
+                if tax is None:
+                    raise RuntimeError(
+                        f"taxonomy unreadable after download: {TAXONOMY_JSON_PATH}"
+                    )
                 updated = bg_db.mark_species_keywords(tax)
                 bg_db.repair_duplicate_photo_species()
                 log.info("Retyped %d existing keywords as taxonomy after download", updated)
@@ -18308,6 +18587,285 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             return {"ok": True, "keywords_retyped": updated}
 
         job_id = runner.start("download-taxonomy", work, workspace_id=active_ws)
+        return jsonify({"job_id": job_id})
+
+    @app.route("/api/jobs/download-darktable", methods=["POST"])
+    def api_job_download_darktable():
+        """Download the latest darktable build and hand it to the platform."""
+        import darktable_install
+        from job_contract import progress_event
+
+        runner = app._job_runner
+        active_ws = _get_db()._active_workspace_id
+
+        # Read the identity the user confirmed BEFORE any other check.  If a
+        # download is already running and we are about to join it, the join
+        # must be conditional on this matching the running job's stored
+        # artifact — otherwise a second tab that saw a fresh release would
+        # join an old, stale download and receive different bytes than the
+        # dialog confirmed.
+        body = request.get_json(silent=True) or {}
+        expected_name = body.get("expected_name")
+        expected_version = body.get("expected_version")
+        # digest is compared verbatim (the API sends "sha256:<hex>"); None on
+        # either side means the client did not send one, not that they match.
+        expected_digest = body.get("expected_digest")
+        # Size is the fallback identity for digestless releases: if GitHub
+        # deletes and re-uploads an asset under the same tag+filename during
+        # the availability cache's TTL, name/version match but bytes differ,
+        # and without a digest the name/version check alone would silently
+        # accept the swap.  Compare when the client sent one — an int on the
+        # wire, coerced defensively so a stray string does not throw here.
+        try:
+            expected_size = int(body["expected_size"]) if body.get("expected_size") is not None else None
+        except (TypeError, ValueError):
+            expected_size = None
+
+        def _artifact_matches(stored):
+            """True when the stored artifact identity matches expected_*."""
+            if not stored:
+                return not expected_name
+            if expected_name and expected_name != stored.get("asset_name"):
+                return False
+            if expected_version and expected_version != stored.get("asset_version"):
+                return False
+            if expected_digest and expected_digest != stored.get("asset_digest"):
+                return False
+            return not (
+                expected_size is not None
+                and stored.get("asset_size") is not None
+                and expected_size != stored.get("asset_size")
+            )
+
+        # resolve_release(), never the cached variant: this re-resolves
+        # server-side so the URL we actually download can't be a ten-minute-old
+        # value from whatever /install/available last showed.
+        try:
+            asset, reason = darktable_install.resolve_release()
+        except Exception as e:
+            # resolve_release is documented never to raise; belt and braces so
+            # an unexpected bug degrades to a message, not a 500.
+            log.warning("darktable release lookup failed: %s", e)
+            asset, reason = None, darktable_install.REASON_UNREACHABLE
+        if not asset:
+            # Surface the specific reason. resolve_release distinguishes
+            # "could not reach GitHub" from "no build for your platform";
+            # collapsing them here would tell a user behind a proxy that their
+            # platform is unsupported, which is false.
+            return json_error(reason or darktable_install.REASON_UNREACHABLE)
+
+        # Bind the download to the exact artifact the user confirmed.  Between
+        # /install/available populating its 10-minute cache and this POST,
+        # darktable-org can publish a new release; the confirmation dialog
+        # still names the cached version and digest, but resolve_release() just
+        # returned the newer asset.  Downloading it here without another
+        # confirmation would silently swap the artifact the user OK'd for a
+        # different one.  code=darktable_asset_changed lets the client re-fetch
+        # availability and re-prompt with the fresh identity.
+        if expected_name and (
+            expected_name != asset.get("name")
+            or (expected_version and expected_version != asset.get("version"))
+            or (expected_digest and expected_digest != asset.get("digest"))
+            or (
+                expected_size is not None
+                and asset.get("size") is not None
+                and expected_size != asset.get("size")
+            )
+        ):
+            # Refresh the availability cache with the release we just resolved.
+            # Without this, the UI's Re-check would fetch /install/available,
+            # get the same ten-minute-old cached asset back, re-confirm it, and
+            # get bounced by the same 409 in a loop until the TTL expires.
+            darktable_install.update_release_cache(asset)
+            return json_error(
+                (
+                    "The darktable release changed since this dialog opened. "
+                    f"Confirmation showed {expected_name}; the current release "
+                    f"is {asset.get('name')}. Re-check to see the new build "
+                    "before downloading."
+                ),
+                status=409,
+                code="darktable_asset_changed",
+            )
+
+        # Refuse before spending 87MB, and say what is needed vs what is free.
+        # 2x the asset size, per the design's error table: the artifact is kept
+        # after hand-off and the installer still has to unpack alongside it, so
+        # a check for exactly the download size would succeed and then strand
+        # the user on a full disk.
+        target = darktable_install.install_dir()
+        try:
+            free = darktable_install.free_space_bytes(target)
+        except OSError as e:
+            # free_space_bytes creates the directory, so this is where a
+            # read-only or otherwise unusable ~/.vireo surfaces. Name the
+            # directory and the OS error: a 500 would tell the user nothing.
+            log.warning("Cannot use the darktable download directory %s: %s", target, e)
+            return json_error(
+                f"Cannot use the download directory {target}: {e.strerror or e}"
+            )
+        asset_size = asset.get("size") or 0
+        # A previous cancelled-during-verify attempt leaves the full artifact
+        # already sitting at the final destination — download() fast-paths to
+        # verify in that case and spends zero download bytes.  Counting those
+        # bytes as still-to-be-downloaded blocks the promised retry with a
+        # "not enough space" error even though the retry only needs unpacking
+        # headroom.  Gate on the API-supplied size (same rule download() uses)
+        # so an unrelated file the user dropped in the tools directory does
+        # not get credited against the check.
+        #
+        # A cancelled- or connection-lost-during-transfer attempt leaves a
+        # ``.partial`` sibling that _download_with_resume will resume from,
+        # so those bytes are also already on disk and the retry only needs
+        # ``asset_size - partial_size`` more download bytes plus the unpack
+        # headroom.  Cap the credit at ``asset_size`` — a ``.partial`` bigger
+        # than the API-published size is a sign of a stale file from a
+        # different release, and crediting more than we can actually reuse
+        # would let the retry through only for the disk to fill mid-transfer.
+        reusable_bytes = 0
+        asset_name = asset.get("name") or ""
+        if asset_name:
+            existing_dest = os.path.join(target, os.path.basename(asset_name))
+            existing_partial = existing_dest + ".partial"
+            try:
+                if os.path.isfile(existing_dest) and os.path.getsize(existing_dest) == asset_size:
+                    reusable_bytes = asset_size
+                elif os.path.isfile(existing_partial) and asset_size:
+                    reusable_bytes = min(os.path.getsize(existing_partial), asset_size)
+            except OSError:
+                reusable_bytes = 0
+        needed = max(0, asset_size * 2 - reusable_bytes)
+        if free < needed:
+            return json_error(
+                f"Not enough disk space: {needed // (1024 * 1024)} MB needed in "
+                f"{target}, {free // (1024 * 1024)} MB free."
+            )
+
+        def work(job):
+            try:
+                from .taxonomy import DownloadCancelled
+            except ImportError:
+                from taxonomy import DownloadCancelled
+
+            # byte_callback runs on the download thread inside the write loop,
+            # so this must stay cheap — a queue put, never a DB write or
+            # anything else that can stall the transfer.
+            def on_bytes(done, total):
+                runner.push_event(job["id"], "progress", progress_event(
+                    phase="Downloading darktable",
+                    current=done,
+                    total=total or asset.get("size") or 0,
+                    current_file=asset["name"],
+                ))
+
+            path, verify_detail = darktable_install.download(
+                asset,
+                byte_callback=on_bytes,
+                should_cancel=lambda: runner.is_cancelled(job["id"]),
+            )
+
+            # total=0 on purpose: the UI treats a non-zero total as a byte
+            # count and would render "Verifying: 0 of 0 MB" instead of the
+            # verification detail. That detail is passed through verbatim —
+            # it is the only thing that distinguishes "the digest matched"
+            # from "GitHub published no digest to check against".
+            runner.push_event(job["id"], "progress", progress_event(
+                phase="Verifying", current=0, total=0, current_file=verify_detail,
+            ))
+
+            # A Stop press after verification and before hand_off would open
+            # the installer anyway (Linux would also chmod the AppImage), then
+            # jobs.py would still label the job "cancelled" — the user would
+            # see cancellation but the side effect they cancelled happened.
+            # begin_uncancellable is the atomic version of that check: it
+            # returns False (leaving the cancel flag intact so _run_job
+            # records the job as cancelled) if a cancel is already pending,
+            # otherwise it enters the uninterruptible phase so a Cancel that
+            # arrives during hand_off is rejected rather than flipping the
+            # terminal status once the side effect has already committed.
+            if not runner.begin_uncancellable(job["id"]):
+                raise DownloadCancelled("Download cancelled")
+
+            result = darktable_install.hand_off(path)
+
+            # The single place config is mutated, right next to the field that
+            # tells the user it happened. hand_off deliberately does not write
+            # it. bin_path is only set where the download IS the binary
+            # (Linux AppImage); after an installer hand-off the user chooses
+            # where the app lands, so there is nothing truthful to record.
+            #
+            # Route the write through _settings_write_lock and the raw
+            # read-modify-write pattern the settings endpoints use.  cfg.set()
+            # takes only config._lock, so a concurrent /api/config save (or an
+            # autosave from the All-settings region) could otherwise interleave
+            # its own read-modify-write with this one and either lose
+            # darktable_bin or overwrite whatever field the user just changed.
+            config_written = False
+            if result.get("bin_path"):
+                import config as cfg
+
+                with _settings_write_lock:
+                    raw = _read_raw_config_file()
+                    raw["darktable_bin"] = result["bin_path"]
+                    cfg.save(raw)
+                config_written = True
+
+            return {
+                "version": asset["version"],
+                "downloaded_to": path,
+                "verified": verify_detail,
+                "action": result["action"],
+                "bin_path": result.get("bin_path"),
+                "config_written": config_written,
+                "quarantined": darktable_install.is_quarantined(path),
+            }
+
+        # Atomic singleton: the earlier check-then-start pattern (list_jobs()
+        # followed by runner.start()) let two concurrent POSTs both see "no
+        # existing job" and both start a worker on the same .partial.
+        # start_singleton does the existence check and the registration under
+        # one lock acquisition, so a second POST arriving between the check
+        # and the start joins the first instead of racing it.
+        #
+        # The stored config carries the artifact identity so a later POST for
+        # a DIFFERENT artifact (e.g. a new release published while an older
+        # download is still in flight) can be rejected instead of quietly
+        # joining a download of the wrong bytes.
+        job_id, joined, existing_snapshot = runner.start_singleton(
+            "download-darktable", work,
+            singleton_key="darktable-download",
+            config={
+                "asset_name": asset["name"],
+                "asset_version": asset["version"],
+                "asset_digest": asset.get("digest"),
+                "asset_size": asset.get("size"),
+            },
+            workspace_id=active_ws,
+        )
+        if joined:
+            # Only join a running download whose artifact matches what THIS
+            # request confirmed. Without this check, a fresh POST for a new
+            # release would silently receive an old release's bytes from an
+            # already-running worker.
+            existing_config = (existing_snapshot or {}).get("config") or {}
+            if not _artifact_matches(existing_config):
+                # Same reason as above: the cache may hold whatever asset the
+                # first tab's download targeted, so a Re-check without this
+                # refresh would re-render the stale identity and the user
+                # would re-confirm it into the same 409.
+                darktable_install.update_release_cache(asset)
+                return json_error(
+                    (
+                        "A different darktable download is already in progress "
+                        f"({existing_config.get('asset_name') or 'unknown'}). "
+                        f"Confirmation showed {asset.get('name')}. Wait for the "
+                        "in-flight download to finish (or cancel it) before "
+                        "starting this one."
+                    ),
+                    status=409,
+                    code="darktable_asset_changed",
+                )
+            return jsonify({"job_id": job_id, "joined_existing": True})
         return jsonify({"job_id": job_id})
 
     # -- Labels API routes --
@@ -19411,6 +19969,13 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             # fails mid-scan doesn't inflate the baseline with phantom
             # files the next root would start above.
             scan_acc = {"prior": 0, "last_current": 0, "last_total": 0}
+            # Photos that actually reached the catalog, summed across roots
+            # from each scan()'s counts sink. Kept separate from the
+            # progress accumulator above: progress counts every file the
+            # scan disposes of (including ones skipped because they
+            # vanished under a dropped mount), which is what a progress bar
+            # needs but overstates the result line.
+            indexed_acc = {"n": 0}
 
             def progress_cb(current, total):
                 scan_acc["last_current"] = current
@@ -19506,6 +20071,12 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     "current_file": phase,
                     "rate": 0,
                 })
+                # Counts sink rather than the return value: scan() commits
+                # rows as it goes and can raise (or be cancelled) after
+                # thousands have landed. Reading the sink in `finally`
+                # credits that work on every exit path — a root that dies
+                # late would otherwise report zero photos indexed.
+                root_counts = {}
                 try:
                     do_scan(
                         root, thread_db,
@@ -19517,6 +20088,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                         thumb_cache_dir=app.config["THUMB_CACHE_DIR"],
                         cancel_check=cancel_check,
                         repair_missing_metadata=repair_missing_metadata,
+                        counts=root_counts,
                     )
                 except Exception as exc:
                     if isinstance(exc, ScanCancelled) and cancel_check():
@@ -19530,6 +20102,11 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     if msg not in job["errors"]:
                         job["errors"].append(msg)
                 finally:
+                    # Credit whatever this root indexed regardless of how
+                    # it exited — completed, raised, or cancelled. The
+                    # rows are committed either way, so the summary must
+                    # count them either way.
+                    indexed_acc["n"] += root_counts.get("indexed", 0)
                     # scanner.scan commits photo rows incrementally, so
                     # even a mid-scan failure can leave DB state that
                     # invalidates cached new-image counts. A failure
@@ -19573,7 +20150,12 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     advance_scan_acc()
 
             if cancelled or cancel_check():
-                photo_count = job["progress"].get("current", 0)
+                # Same indexed count as the completed path, not the
+                # progress counter. Otherwise "N photos" would mean two
+                # different things depending on which branch produced it,
+                # and a cancelled scan of a dropped share would report a
+                # full house of photos it never cataloged.
+                photo_count = indexed_acc["n"]
                 runner.update_step(
                     job["id"], "scan", status="cancelled",
                     summary=f"{photo_count} photos (cancelled)",
@@ -19584,11 +20166,13 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 )
                 return {"photos_indexed": photo_count, "cancelled": True}
 
-            # Use cumulative processed count, not planned total — on a
-            # clean run they're equal; on mixed-outcome runs "current"
-            # reflects the actual photos indexed while "total" includes
-            # planned-but-unprocessed files from the failed root(s).
-            photo_count = job["progress"].get("current", 0)
+            # Count what the scans reported as indexed, not the progress
+            # counter. On a clean run they agree; they diverge exactly when
+            # the run went wrong — progress advances for files that were
+            # discovered and then skipped (vanished under a mount that
+            # dropped mid-scan), so "N photos" would read as a success
+            # line for a scan that cataloged nothing.
+            photo_count = indexed_acc["n"]
             # Unique roots that hit any failure class. Counting unique
             # roots (not error entries) avoids inflating the "N of M"
             # summary when a single root raises in both scan and cache
@@ -22217,6 +22801,245 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             )
         return jsonify(res)
 
+    # --- NAS setup wizard (/api/remote-setup/*) --------------------------
+    # Synchronous discovery/setup endpoints behind the Settings-page wizard
+    # (docs/superpowers/specs/2026-07-26-nas-setup-wizard-design.md). All of
+    # them are loopback-only: the app already binds 127.0.0.1 via waitress,
+    # but the install-key route carries a NAS password, so defense in depth
+    # is cheap and the consistent rule is simplest.
+
+    def _remote_setup_forbidden():
+        if request.remote_addr not in ("127.0.0.1", "::1"):
+            return json_error(
+                "remote setup is only available from this machine", 403)
+        return None
+
+    def _remote_setup_conn_args(body):
+        """Validate and extract {host, user, port} shared by the wizard's
+        SSH-touching endpoints. Returns (args, None) or (None, response)."""
+        host = (body.get("host") or "").strip()
+        user = (body.get("user") or "").strip()
+        port = body.get("port", 22)
+        if not host or not user:
+            return None, json_error("host and user are required")
+        try:
+            port = int(port)
+        except (TypeError, ValueError):
+            return None, json_error("port must be an integer")
+        if not 1 <= port <= 65535:
+            return None, json_error("port must be between 1 and 65535")
+        return {"host": host, "user": user, "port": port}, None
+
+    def _remote_setup_ssh_bin():
+        import config as cfg
+        import move as move_mod
+
+        effective_cfg = _get_db().get_effective_config(cfg.load())
+        return move_mod.resolve_ssh_bin(effective_cfg.get("ssh_bin", "") or "")
+
+    @app.route("/api/remote-setup/mounts")
+    def api_remote_setup_mounts():
+        """Mounted network shares the wizard can offer as NAS candidates."""
+        import remote_setup
+
+        forbidden = _remote_setup_forbidden()
+        if forbidden:
+            return forbidden
+        if not remote_setup.platform_supported():
+            return jsonify({"mounts": [], "unsupported_platform": True})
+        return jsonify({"mounts": remote_setup.list_network_mounts()})
+
+    @app.route("/api/remote-setup/ssh-check", methods=["POST"])
+    def api_remote_setup_ssh_check():
+        """Port reachability + current key-auth status for a candidate NAS.
+
+        Also ensures the Vireo keypair exists (idempotent, local-only) and
+        returns its public line: the wizard's Terminal-fallback expander
+        builds its authorized_keys one-liner from ``pub_key_line`` and must
+        work without install-key (no password) ever being called.
+        """
+        import remote_setup
+
+        forbidden = _remote_setup_forbidden()
+        if forbidden:
+            return forbidden
+        conn, err = _remote_setup_conn_args(request.get_json(silent=True) or {})
+        if err:
+            return err
+        try:
+            _priv, pub = remote_setup.ensure_vireo_key()
+            with open(pub) as f:
+                pub_key_line = f.read().strip()
+        except (RuntimeError, OSError) as exc:
+            return json_error(f"could not prepare the Vireo SSH key: {exc}")
+        result = {
+            "port_open": remote_setup.port_reachable(conn["host"], conn["port"]),
+            "pub_key_line": pub_key_line,
+            "key_path": _priv,
+            "key_auth_ok": False,
+        }
+        ssh_bin = _remote_setup_ssh_bin()
+        if not ssh_bin:
+            result["ssh_missing"] = True
+        elif result["port_open"]:
+            result["key_auth_ok"] = remote_setup.key_auth_works(
+                host=conn["host"], user=conn["user"], port=conn["port"],
+                key=_priv, ssh_bin=ssh_bin)
+        return jsonify(result)
+
+    @app.route("/api/remote-setup/install-key", methods=["POST"])
+    def api_remote_setup_install_key():
+        """Authorize this Mac's Vireo key on the NAS using a password, once.
+
+        The password is request-scoped only: written to the ssh pty and
+        nowhere else — never config, DB, logs, or this response.
+        """
+        import remote_setup
+
+        forbidden = _remote_setup_forbidden()
+        if forbidden:
+            return forbidden
+        body = request.get_json(silent=True) or {}
+        conn, err = _remote_setup_conn_args(body)
+        if err:
+            return err
+        password = body.get("password") or ""
+        if not password:
+            return json_error("password is required")
+        ssh_bin = _remote_setup_ssh_bin()
+        if not ssh_bin:
+            return json_error("no OpenSSH client found — set its path under "
+                              "Settings > Paths")
+        try:
+            priv, pub = remote_setup.ensure_vireo_key()
+            with open(pub) as f:
+                pub_key_line = f.read().strip()
+        except (RuntimeError, OSError) as exc:
+            return json_error(f"could not prepare the Vireo SSH key: {exc}")
+        argv = remote_setup.build_install_argv(
+            host=conn["host"], user=conn["user"], port=conn["port"],
+            key_pub_line=pub_key_line, ssh_bin=ssh_bin)
+        res = remote_setup.install_key_with_password(
+            spawn_argv=argv, password=password)
+        out = {"ok": bool(res.get("ok")), "error": res.get("error")}
+        if res.get("detail"):
+            out["detail"] = res["detail"]
+        if out["ok"]:
+            out["key_auth_ok"] = remote_setup.key_auth_works(
+                host=conn["host"], user=conn["user"], port=conn["port"],
+                key=priv, ssh_bin=ssh_bin)
+            try:
+                fp = subprocess.run(
+                    ["ssh-keygen", "-lf", pub], capture_output=True,
+                    text=True, timeout=10)
+                if fp.returncode == 0:
+                    out["fingerprint"] = fp.stdout.strip()
+            except (OSError, subprocess.SubprocessError):
+                pass
+        return jsonify(out)
+
+    @app.route("/api/remote-setup/locate-share", methods=["POST"])
+    def api_remote_setup_locate_share():
+        """Nonce-verified NAS-side path for a mounted share. Proof, not a
+        guess — the chained move deletes local originals, so a same-named
+        share on the wrong volume must be impossible to configure here."""
+        import remote_setup
+
+        forbidden = _remote_setup_forbidden()
+        if forbidden:
+            return forbidden
+        body = request.get_json(silent=True) or {}
+        conn, err = _remote_setup_conn_args(body)
+        if err:
+            return err
+        mount_path = (body.get("mount_path") or "").strip()
+        share = (body.get("share") or "").strip()
+        if not share:
+            return json_error("share is required")
+        if not os.path.isabs(mount_path) or not os.path.isdir(mount_path):
+            return json_error("mount_path must be an existing absolute path")
+        ssh_bin = _remote_setup_ssh_bin()
+        if not ssh_bin:
+            return json_error("no OpenSSH client found — set its path under "
+                              "Settings > Paths")
+        priv, _pub = remote_setup.vireo_key_paths()
+        try:
+            remote_path = remote_setup.locate_share(
+                mount_point=mount_path, share=share, host=conn["host"],
+                user=conn["user"], port=conn["port"], key=priv,
+                ssh_bin=ssh_bin)
+        except remote_setup.MountNotWritable:
+            return json_error(
+                "the mounted volume is not writable — the wizard (and the "
+                "move workflow it sets up) needs write access to the share")
+        return jsonify({"remote_path": remote_path})
+
+    @app.route("/api/remote-setup/list-remote-dirs", methods=["POST"])
+    def api_remote_setup_list_remote_dirs():
+        """SSH-backed directory listing for the wizard's fallback browser."""
+        import remote_setup
+
+        forbidden = _remote_setup_forbidden()
+        if forbidden:
+            return forbidden
+        body = request.get_json(silent=True) or {}
+        conn, err = _remote_setup_conn_args(body)
+        if err:
+            return err
+        path = (body.get("path") or "").strip()
+        if not path.startswith("/"):
+            return json_error("path must be absolute")
+        ssh_bin = _remote_setup_ssh_bin()
+        if not ssh_bin:
+            return json_error("no OpenSSH client found — set its path under "
+                              "Settings > Paths")
+        priv, _pub = remote_setup.vireo_key_paths()
+        return jsonify({"dirs": remote_setup.list_remote_dirs(
+            path=path, host=conn["host"], user=conn["user"],
+            port=conn["port"], key=priv, ssh_bin=ssh_bin)})
+
+    @app.route("/api/remote-setup/disk-free")
+    def api_remote_setup_disk_free():
+        """Free bytes on the volume containing ``path`` (archive-root step)."""
+        forbidden = _remote_setup_forbidden()
+        if forbidden:
+            return forbidden
+        path = (request.args.get("path") or "").strip()
+        if not os.path.isabs(path) or not os.path.isdir(path):
+            return json_error("path must be an existing absolute path")
+        return jsonify({"free_bytes": shutil.disk_usage(path).free})
+
+    @app.route("/api/remote-setup/check-archive-root", methods=["POST"])
+    def api_remote_setup_check_archive_root():
+        """True if ``path`` resolves (through symlinks or case-only aliases)
+        into ``mount_path``. Exposes the same filesystem-aware containment
+        check ``_coerce_remote_target`` runs at save time so the wizard's
+        archive-root step can reject aliased folders up front instead of
+        letting the save silently blank ``local_archive_root``, which would
+        leave the target unable to offer the chained move the wizard was
+        meant to configure. A purely-lexical check on the client can't see
+        symlinks, so this has to be server-side."""
+        import move as move_mod
+
+        forbidden = _remote_setup_forbidden()
+        if forbidden:
+            return forbidden
+        body = request.get_json(silent=True) or {}
+        path = (body.get("path") or "").strip()
+        mount_path = (body.get("mount_path") or "").strip()
+        if not path or not mount_path:
+            return json_error("path and mount_path are required")
+        if not os.path.isabs(path) or not os.path.isabs(mount_path):
+            return json_error("both paths must be absolute")
+        try:
+            inside = bool(move_mod._path_equal_or_descends(path, mount_path))
+        except (OSError, ValueError):
+            # realpath failed (unreadable / cross-device on Windows) — the
+            # save-time validator is the authoritative check, so let the
+            # user proceed rather than block on a transient FS hiccup.
+            inside = False
+        return jsonify({"inside_mount": inside})
+
     @app.route("/api/jobs/import-full", methods=["POST"])
     def api_job_import_full():
         """Full-chain import: copy files -> scan -> create collection."""
@@ -22619,13 +23442,290 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         except Exception as e:
             return None, None, json_error(str(e))
 
-    def _validate_after_import(value, db):
+    def _remote_target_snapshot(remote_archive_config):
+        """Freeze the parts of a resolved remote target that decide where
+        files land, for retry-time comparison against the parent job.
+
+        Returns None when the current request is not a remote-archive
+        import — a retry that swapped from remote to local (or vice
+        versa) will already fail the exact-equal comparison against a
+        parent snapshot of the opposite shape. See
+        ``api_job_import_photos``'s parent_import_job_id check.
+        """
+        if remote_archive_config is None:
+            return None
+        target = remote_archive_config["target"]
+        return {
+            "host": target.get("host", ""),
+            "user": target.get("user", ""),
+            "port": int(target.get("port") or 22),
+            "remote_path": target.get("remote_path", ""),
+            "mount_path": target.get("mount_path", ""),
+            "subpath": remote_archive_config.get("subpath", ""),
+        }
+
+    def _move_target_snapshot(target):
+        """Freeze the parts of a chained after_process_move target that
+        decide where files land, for retry-time comparison.
+
+        ``local_archive_root`` and ``mount_path`` set the local staging
+        →NAS boundary the move sweeps across; ``host``/``user``/
+        ``port``/``remote_path`` set where the NAS transfer actually
+        lands. All are captured so any Settings edit that would
+        redirect the chained move triggers a decline on retry. Returns
+        None when no chained-move target is present.
+        """
+        if target is None:
+            return None
+        return {
+            "id": target.get("id", ""),
+            "host": target.get("host", ""),
+            "user": target.get("user", ""),
+            "port": int(target.get("port") or 22),
+            "remote_path": target.get("remote_path", ""),
+            "mount_path": target.get("mount_path", ""),
+            "local_archive_root": target.get("local_archive_root", ""),
+        }
+
+    def _capture_photo_fingerprints_for_ids(db, ids):
+        """Return the current fingerprint string for each ID.
+
+        Same shape as ``import_job._capture_photo_fingerprints`` (which
+        owns the string format via ``_fingerprint_for_row``) but at
+        request time on caller-supplied IDs, so a recovery retry can
+        detect when SQLite has reused an ID for an unrelated photo
+        since the parent import ran. The fingerprint includes
+        ``file_size`` and ``file_hash`` alongside the path, catching
+        the case where a delete-then-import put an unrelated file at
+        the same path — path alone would then match falsely and the
+        retry's after-import chain (and any ``after_process_move``)
+        would sweep up the imposter.
+
+        Size and hash come from **the file on disk right now**, not the
+        catalog. When a destination file is overwritten at the same
+        path between the parent run and this retry without a rescan,
+        ``photos.file_size`` / ``photos.file_hash`` still carry the
+        parent's values — comparing two copies of the same cached row
+        would then admit the changed bytes into the retry's chain and
+        NAS-move scope. Reading the file forces a byte-identity check
+        that catches a stealth overwrite; a missing or unreadable file
+        yields empty size/hash so the fingerprint won't match the
+        parent's and the retry fails-closed. Missing IDs are simply
+        absent from the result — the caller decides how to treat that.
+        """
+        from import_job import _fingerprint_for_row
+        from scanner import compute_file_hash
+
+        cleaned = []
+        for pid in ids or []:
+            if isinstance(pid, int) and not isinstance(pid, bool) and pid > 0:
+                cleaned.append(pid)
+        if not cleaned:
+            return {}
+        fingerprints = {}
+        # SQLite default bound-param cap is 999; 500 stays well under
+        # that and mirrors the sibling helper in import_job.
+        for start in range(0, len(cleaned), 500):
+            chunk = cleaned[start:start + 500]
+            placeholders = ",".join("?" for _ in chunk)
+            rows = db.conn.execute(
+                f"""SELECT p.id AS id,
+                           f.path AS folder_path,
+                           p.filename AS filename
+                    FROM photos p
+                    JOIN folders f ON f.id = p.folder_id
+                    WHERE p.id IN ({placeholders})""",
+                list(chunk),
+            ).fetchall()
+            for row in rows:
+                folder_path = row["folder_path"] or ""
+                filename = row["filename"] or ""
+                if not folder_path or not filename:
+                    continue
+                file_path = os.path.join(folder_path, filename)
+                current_size = None
+                current_hash = ""
+                try:
+                    current_size = os.path.getsize(file_path)
+                except OSError:
+                    # Missing / unreadable file falls through with
+                    # empty size + hash so the fingerprint won't
+                    # match the parent's stored value.
+                    pass
+                if current_size is not None:
+                    # Match the scanner's empty-file convention: a zero-byte
+                    # file's stored ``file_hash`` is NULL (rendered as
+                    # ``h=`` in ``_fingerprint_for_row``), not the SHA-256
+                    # of empty content. Hashing it here would produce a
+                    # different fingerprint from the parent's and stall
+                    # an otherwise-valid retry of an import that had
+                    # successfully landed a zero-byte image. See PR #1387
+                    # Codex review; scanner.py resets ``file_hash`` on
+                    # ``size == 0 and hash == EMPTY_FILE_SHA256``.
+                    if current_size == 0:
+                        current_hash = ""
+                    else:
+                        try:
+                            current_hash = compute_file_hash(file_path)
+                        except OSError:
+                            current_hash = ""
+                fp = _fingerprint_for_row({
+                    "folder_path": folder_path,
+                    "filename": filename,
+                    "file_size": current_size,
+                    "file_hash": current_hash,
+                })
+                if fp is None:
+                    continue
+                fingerprints[row["id"]] = fp
+        return fingerprints
+
+    def _validate_parent_import_job(parent_id, active_ws, db):
+        """Resolve a retry's parent_import_job_id into the scope this
+        retry is allowed to inherit.
+
+        Returns ``(parent_config, allowed_ids, allowed_fingerprints,
+        parent_source_snapshots, None)`` on success or ``(None, None,
+        None, None, error_response)`` when the parent can't be used.
+        ``parent_config`` is the parent job's persisted config dict (it
+        also carries ``root_import_job_id`` when the parent is itself
+        a retry, so the caller can persist a single root pointer
+        regardless of how deep the retry chain goes); ``allowed_ids``
+        is the set of photo IDs a retry may include in
+        ``carry_photo_ids`` — the parent's own imported IDs plus any
+        the parent itself inherited from an earlier retry.
+        ``allowed_fingerprints`` maps those IDs to the stable
+        ``folder_path/filename|size|hash`` recorded at parent-run time,
+        so the retry can refuse a carry ID whose current row belongs to
+        an unrelated photo that happened to reuse the numeric ID.
+        ``parent_source_snapshots`` is the parent's
+        ``result["source_snapshots"]`` (``{source_str: {count,
+        signature}}``) so the caller can verify the retry's sources
+        still hold the same contents the parent enumerated — refusing
+        a retry against a different SD card mounted at the same path,
+        or a source whose files were edited between runs.
+
+        Cross-workspace parents are refused: photos and folders live
+        globally, so a caller who names a parent from another workspace
+        would smuggle that workspace's photos into this workspace's
+        after-import chain and (with after_process_move) its NAS
+        transfer scope. Falls through to job_history when the runner
+        has already pruned the finished job.
+        """
+        runner = app._job_runner
+        parent = runner.get(parent_id)
+        parent_config = None
+        parent_result = None
+        parent_workspace = None
+        parent_type = None
+        parent_status = None
+        if parent is not None:
+            parent_config = parent.get("config") or {}
+            parent_result = parent.get("result") or {}
+            parent_workspace = parent.get("workspace_id")
+            parent_type = parent.get("type")
+            parent_status = parent.get("status")
+        else:
+            row = db.conn.execute(
+                "SELECT type, status, workspace_id, config, result "
+                "FROM job_history WHERE id = ?",
+                (parent_id,),
+            ).fetchone()
+            if row is None:
+                return None, None, None, None, json_error(
+                    "parent_import_job_id not found — the original import "
+                    "may have aged out of history; start a new import",
+                    404,
+                )
+            parent_type = row["type"]
+            parent_status = row["status"]
+            parent_workspace = row["workspace_id"]
+            try:
+                parent_config = json.loads(row["config"] or "{}") or {}
+            except (json.JSONDecodeError, TypeError):
+                parent_config = {}
+            try:
+                parent_result = json.loads(row["result"] or "{}") or {}
+            except (json.JSONDecodeError, TypeError):
+                parent_result = {}
+        if parent_type != "import":
+            return None, None, None, None, json_error(
+                "parent_import_job_id must reference an import job "
+                f"(got type {parent_type!r})"
+            )
+        if parent_status not in {"completed", "failed", "cancelled"}:
+            return None, None, None, None, json_error(
+                "parent_import_job_id is still active "
+                f"(status {parent_status!r}); wait for the original import "
+                "to finish before retrying",
+                409,
+            )
+        if parent_workspace != active_ws:
+            return None, None, None, None, json_error(
+                "parent_import_job_id belongs to a different workspace "
+                "than the active one; switch workspaces or start a new "
+                "import instead of retrying"
+            )
+        allowed_ids = set()
+        for source in (
+            parent_result.get("photo_ids") or [],
+            parent_result.get("carried_photo_ids") or [],
+            parent_config.get("carry_photo_ids") or [],
+        ):
+            for pid in source:
+                if (
+                    isinstance(pid, int)
+                    and not isinstance(pid, bool)
+                    and pid > 0
+                ):
+                    allowed_ids.add(pid)
+        # Stable-identity map so the retry can verify each carried ID
+        # still points at the same file. ``photos.id`` is a bare
+        # ``INTEGER PRIMARY KEY`` — SQLite is free to reuse the numeric
+        # ID after a delete, so an ID that legitimately named one of the
+        # parent's imports can later name an unrelated photo. Merges
+        # every fingerprint hop persisted alongside the ID sources
+        # above; missing keys just fall through the verify step below
+        # (legacy parents from before this fix keep working with the
+        # same integer-ID trust).
+        allowed_fingerprints = {}
+        for source in (
+            parent_result.get("photo_fingerprints") or {},
+            parent_result.get("carried_photo_fingerprints") or {},
+            parent_config.get("carry_photo_fingerprints") or {},
+        ):
+            if not isinstance(source, dict):
+                continue
+            for key, value in source.items():
+                try:
+                    pid = int(key)
+                except (TypeError, ValueError):
+                    continue
+                if pid <= 0 or not isinstance(value, str) or not value:
+                    continue
+                allowed_fingerprints.setdefault(pid, value)
+        parent_source_snapshots = parent_result.get("source_snapshots")
+        if not isinstance(parent_source_snapshots, dict):
+            parent_source_snapshots = None
+        return (
+            parent_config,
+            allowed_ids,
+            allowed_fingerprints,
+            parent_source_snapshots,
+            None,
+        )
+
+    def _validate_after_import(value, db, *, allow_missing=False):
         """Return a JSON error response for a bad after_import spec, else None.
 
         Shared by both import endpoints: null means import-only; a non-null
         value must be a saved-process id that exists, so chained processing
         can't fail hours later on a dangling id the enqueue step could have
-        caught.
+        caught. ``allow_missing`` waives the existence check — used by the
+        recovery-retry path when the parent import already captured a
+        frozen ``after_import_snapshot`` for this exact id, so a Settings
+        delete between the failed run and the retry no longer strands the
+        retry outright.
         """
         if value is None:
             return None
@@ -22634,7 +23734,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 "after_import must be a process id or null, got "
                 f"{type(value).__name__}"
             )
-        if db.get_saved_process(value) is None:
+        if not allow_missing and db.get_saved_process(value) is None:
             return json_error(f"unknown process id: {value}")
         return None
 
@@ -22948,16 +24048,41 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         )
         return collection_id, collection_name
 
-    def _record_import_collection(result, workspace_id):
-        """Attach a collection to a complete, successful import result."""
-        photo_ids = result.get("photo_ids") or []
-        if not result.get("ok") or result.get("cancelled") or not photo_ids:
+    def _record_import_collection(result, workspace_id, chain_photo_ids=None):
+        """Attach a collection to a complete, successful import result.
+
+        ``chain_photo_ids`` optionally extends the collection scope beyond
+        the files newly imported by this run. Recovery-retry imports pass
+        the photo IDs earlier attempts already landed so the after-import
+        chain processes the complete original scope instead of only the
+        newly-recovered files. The carry list is recorded on the result as
+        ``carried_photo_ids`` for transparency; ``result["photo_ids"]``
+        keeps meaning "files this run imported", so downstream counters
+        and retry helpers don't double-count on repeated retries.
+        """
+        photo_ids = list(result.get("photo_ids") or [])
+        seen = set(photo_ids)
+        carried = []
+        if chain_photo_ids:
+            for pid in chain_photo_ids:
+                if pid in seen:
+                    continue
+                seen.add(pid)
+                carried.append(pid)
+        if carried:
+            result["carried_photo_ids"] = carried
+        collection_ids = photo_ids + carried
+        if (
+            not result.get("ok")
+            or result.get("cancelled")
+            or not collection_ids
+        ):
             return None, None
         try:
             thread_db = Database(db_path)
             thread_db.set_active_workspace(workspace_id)
             collection_id, collection_name = _create_import_collection(
-                thread_db, photo_ids,
+                thread_db, collection_ids,
             )
             result["collection_id"] = collection_id
             result["collection_name"] = collection_name
@@ -23164,7 +24289,15 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 )
                 return
 
-            thread_db, col_id = _record_import_collection(result, active_ws)
+            carry_photo_ids = list(
+                (job.get("config") or {}).get("carry_photo_ids") or []
+            )
+            thread_db, col_id = _record_import_collection(
+                result, active_ws, chain_photo_ids=carry_photo_ids,
+            )
+            chain_scope = photo_ids + list(
+                result.get("carried_photo_ids") or []
+            )
 
             if after_import is None:
                 result["after_import_skipped"] = "import-only"
@@ -23175,7 +24308,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             if result.get("cancelled"):
                 result["after_import_skipped"] = "import cancelled"
                 return
-            if not photo_ids:
+            if not chain_scope:
                 result["after_import_skipped"] = "no photos"
                 return
             if col_id is None:
@@ -23868,7 +25001,72 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             after_import = (
                 effective_cfg.get("pipeline", {}).get("default_process_id")
             )
-        err = _validate_after_import(after_import, db)
+        # Recovery-retry imports carry forward the photo IDs a previous
+        # attempt already landed, so the after-import chain covers the
+        # complete original scope even though those files are skipped as
+        # duplicates in this run. Validated at request time so a
+        # malformed retry body is rejected before a job is created.
+        #
+        # ``parent_import_job_id`` binds this retry to the failed run
+        # whose scope it inherits: the server verifies the parent is an
+        # import job in the same workspace, then constrains
+        # ``carry_photo_ids`` to IDs the parent actually imported (or
+        # itself inherited from an earlier retry). Without this binding
+        # an API caller could inject arbitrary positive integers into
+        # the after-import chain scope — those IDs would then flow into
+        # ``_record_import_collection``'s scope and, with an
+        # ``after_process_move`` chain, into the folder lookup that
+        # decides which folders the NAS transfer sweeps up, potentially
+        # moving folders outside the active workspace. Refuse the
+        # request rather than silently permit it.
+        #
+        # Resolved BEFORE ``_validate_after_import`` so a retry whose saved
+        # process was deleted between the failed run and this retry can
+        # still start: the parent's frozen ``after_import_snapshot`` is a
+        # legitimate substitute for the deleted process's stage flags, and
+        # rejecting the retry with "unknown process id" here would strand
+        # every deleted-process retry outright.
+        parent_id_raw = body.get("parent_import_job_id")
+        parent_config = None
+        parent_allowed_ids = None
+        parent_allowed_fingerprints = None
+        parent_source_snapshots = None
+        if parent_id_raw is not None:
+            if not isinstance(parent_id_raw, str) or not parent_id_raw.strip():
+                return json_error(
+                    "parent_import_job_id must be a non-empty string"
+                )
+            if "new_workspace_name" in body:
+                return json_error(
+                    "A recovery retry cannot create a new workspace; "
+                    "retry in the original import's workspace or start "
+                    "a new import instead."
+                )
+            (
+                parent_config,
+                parent_allowed_ids,
+                parent_allowed_fingerprints,
+                parent_source_snapshots,
+                parent_err,
+            ) = _validate_parent_import_job(
+                parent_id_raw.strip(), db._active_workspace_id, db,
+            )
+            if parent_err is not None:
+                return parent_err
+
+        # Skip the "process still exists" check ONLY when the parent has a
+        # frozen snapshot for THIS exact process id — that snapshot will
+        # substitute for db.resolve_process() below. A retry that changed
+        # the process id must still go through normal existence validation.
+        parent_has_snapshot_for_after_import = (
+            parent_config is not None
+            and parent_config.get("after_import") == after_import
+            and parent_config.get("after_import_snapshot") is not None
+        )
+        err = _validate_after_import(
+            after_import, db,
+            allow_missing=parent_has_snapshot_for_after_import,
+        )
         if err is not None:
             return err
 
@@ -23885,6 +25083,211 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         if tag_options_err is not None:
             return tag_options_err
 
+        carry_raw = body.get("carry_photo_ids")
+        if carry_raw is None:
+            carry_photo_ids = None
+        else:
+            if not isinstance(carry_raw, list) or not all(
+                isinstance(x, int) and not isinstance(x, bool) and x > 0
+                for x in carry_raw
+            ):
+                return json_error(
+                    "carry_photo_ids must be a list of positive integers"
+                )
+            # A caller-supplied carry list must be bound to a real
+            # parent import job. See parent_import_job_id above.
+            if parent_allowed_ids is None:
+                return json_error(
+                    "carry_photo_ids requires parent_import_job_id "
+                    "(the failed import this retry inherits scope from)"
+                )
+            invalid = [pid for pid in carry_raw if pid not in parent_allowed_ids]
+            if invalid:
+                return json_error(
+                    "carry_photo_ids contains IDs the parent import did "
+                    f"not land or inherit: {invalid[:5]}"
+                )
+            # Stable-identity re-check for each carried ID. ``photos.id``
+            # is a bare ``INTEGER PRIMARY KEY`` — SQLite reuses freed IDs
+            # on the next insert, so an ID that legitimately named one of
+            # the parent's imports at parent-run time can, after a delete,
+            # name an unrelated photo by retry-run time. Compare each
+            # carried ID's CURRENT ``folder_path/filename`` against the
+            # fingerprint recorded when the parent landed it; refuse a
+            # mismatch rather than letting the after-import chain (and
+            # any ``after_process_move``) sweep up the unrelated row.
+            # Parents from before this fix carry no fingerprints at all
+            # (empty dict), and are exempted — hard-rejecting every
+            # legacy failed job's retry would be a bigger regression than
+            # the narrow race window this protects.
+            if parent_allowed_fingerprints:
+                current_fingerprints = _capture_photo_fingerprints_for_ids(
+                    db, carry_raw,
+                )
+                stale = []
+                for pid in carry_raw:
+                    expected = parent_allowed_fingerprints.get(pid)
+                    if expected is None:
+                        # Parent tracked fingerprints for some IDs but not
+                        # this one — an ID the parent's ``allowed_ids``
+                        # blessed but never fingerprinted (e.g. inherited
+                        # from a legacy grandparent). Accept, matching
+                        # the same rationale as the empty-dict case above.
+                        continue
+                    current = current_fingerprints.get(pid)
+                    if current != expected:
+                        stale.append(pid)
+                if stale:
+                    return json_error(
+                        "carry_photo_ids no longer matches the files the "
+                        "parent import landed (the numeric IDs now point "
+                        "at different photos, likely because the parent's "
+                        f"photos were deleted and re-imported): {stale[:5]}"
+                    )
+            # Preserve caller order but deduplicate — the chain does not
+            # need repeats and a giant duplicated list wastes work.
+            seen_carry = set()
+            carry_photo_ids = []
+            for pid in carry_raw:
+                if pid in seen_carry:
+                    continue
+                seen_carry.add(pid)
+                carry_photo_ids.append(pid)
+
+        # A recovery retry must not silently import files the parent
+        # never saw. Without this guard a retry against a source whose
+        # contents changed since the failed run — a different SD card
+        # mounted at the same path, or new photos added to the same
+        # card — would silently enumerate every current file and copy
+        # the newly-appeared ones, then flow their IDs into the
+        # carried processing / NAS-move scope. The button says "Retry
+        # failed files", not "Import whatever's at this path now".
+        #
+        # Each parent source's ``count`` + ``signature`` (sha256 over
+        # the sorted ``(rel_path, size, mtime_ns)`` list) is captured
+        # at parent DISCOVERY time in
+        # ``import_job._capture_source_snapshots`` and persisted on
+        # ``result["source_snapshots"]``. ``mtime_ns`` is in the tuple
+        # so a same-size in-place replacement doesn't slip past the
+        # size check; discovery-time capture keeps a card ejected
+        # mid-copy from stamping ``-1`` sizes that would refuse a
+        # legitimate reinsert-and-retry recovery. Here we recompute
+        # the current signature for every retry source that shares a
+        # path with a parent source and refuse the retry when any
+        # signature has drifted. Legacy parents from before this fix
+        # have no snapshots and fall through unchanged.
+        if parent_source_snapshots:
+            from import_job import _capture_source_snapshots
+            from ingest import discover_source_files
+
+            # Fail-closed on retry sources the parent never enumerated:
+            # skipping validation for unknown paths would let a retry
+            # import every file at that path (no prior catalog entry
+            # gates them via ``skip_duplicates``) and stream those IDs
+            # into the after-import chain / NAS-move scope, even though
+            # the "Retry failed files" button only ever promised the
+            # parent's failed files. See PR #1387 Codex review.
+            parent_sources = {
+                src for src, snapshot in parent_source_snapshots.items()
+                if isinstance(snapshot, dict) and snapshot
+            }
+            requested_sources = set(sources)
+            unknown_sources = sorted(requested_sources - parent_sources)
+            if unknown_sources:
+                unknown_source_text = ", ".join(unknown_sources[:3])
+                return json_error(
+                    "Retry submitted source paths the original import "
+                    "never enumerated (a different card mounted at the "
+                    "same path, or a new source added): "
+                    f"{unknown_source_text}. Start a new import instead "
+                    "of retrying."
+                )
+            missing_sources = sorted(parent_sources - requested_sources)
+            if missing_sources:
+                missing_source_text = ", ".join(missing_sources[:3])
+                return json_error(
+                    "A recovery retry must include every source from the "
+                    "original import. These sources are missing: "
+                    f"{missing_source_text}. Reconnect all original "
+                    "sources, or start a new import instead of retrying."
+                )
+
+            drifted_sources = []
+            for src in sources:
+                parent_snap = parent_source_snapshots.get(src)
+                # Reuse the same discovery + snapshot helpers the parent
+                # ran through so a mismatch here reflects a genuine
+                # source change, not a difference in enumeration logic.
+                try:
+                    current_files = discover_source_files(
+                        src, file_types, recursive=recursive,
+                    )
+                except Exception:
+                    log.exception(
+                        "Failed to re-enumerate source for retry snapshot "
+                        "check: %s", src,
+                    )
+                    drifted_sources.append(src)
+                    continue
+                current_snap = _capture_source_snapshots(
+                    current_files, [src],
+                ).get(src) or {}
+                if current_snap.get("signature") != parent_snap.get(
+                    "signature",
+                ):
+                    drifted_sources.append(src)
+            if drifted_sources:
+                return json_error(
+                    "The source contents have changed since the original "
+                    "import (a different SD card at the same path, or new "
+                    "or missing files). Retrying would import files the "
+                    "original run never saw. Verify the source, then "
+                    "start a new import instead of retrying: "
+                    f"{drifted_sources[:3]}"
+                )
+
+        # A retry that keeps the same remote target must land on the
+        # same host/root/mount as the failed run — otherwise the retry
+        # would copy the remaining files to a different NAS, or (if
+        # only the mount changed) skip prior successes based on the
+        # old catalog view while transferring failures to a new
+        # location. When the parent recorded a remote_target_snapshot,
+        # verify that the current resolution matches; refuse the retry
+        # if the target has been edited since. The Import-page and
+        # Jobs-page retry helpers both send parent_import_job_id, so
+        # both go through this check.
+        if parent_config is not None:
+            parent_snapshot = parent_config.get("remote_target_snapshot")
+            parent_remote_target_id = parent_config.get("remote_target_id")
+            if parent_snapshot is not None:
+                current_snapshot = _remote_target_snapshot(
+                    remote_archive_config,
+                )
+                if current_snapshot != parent_snapshot:
+                    return json_error(
+                        "The remote target for the original import has "
+                        "changed (host, path, mount, or subpath differs). "
+                        "Verify Settings → Remote targets and start a new "
+                        "import instead of retrying."
+                    )
+            elif parent_remote_target_id:
+                # Parent job was a remote import from before the
+                # snapshot check landed, so its persisted config
+                # records only the target ID. Both retry helpers
+                # reconstruct the request from that ID, and
+                # ``_resolve_remote_archive_target`` then walks the
+                # CURRENT Settings entry — a Settings edit since the
+                # original run would silently redirect the transfer
+                # to a different host/root/mount. Refuse the retry
+                # instead of trusting the current resolution.
+                return json_error(
+                    "The original remote import predates the recovery-"
+                    "retry safety check (no remote-target snapshot was "
+                    "recorded). Verify Settings → Remote targets still "
+                    "point at the intended host, then start a new "
+                    "import instead of retrying."
+                )
+
         # Snapshot the chosen saved process's stage flags at enqueue time
         # so a mid-import edit or delete can't silently change (or void)
         # the after-import run the user already accepted. An archive-copy
@@ -23892,12 +25295,35 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         # chain hook fires the pipeline_job's actual toggles are still up
         # for grabs — resolving here freezes them (mirrors the remote-
         # transport snapshot below).
+        #
+        # A recovery retry must inherit the parent's frozen snapshot when
+        # the retry still points at the same process id: the original
+        # enqueue already froze the stages the user accepted, and
+        # resolving again would silently pick up any Settings edit made
+        # after the failure (or fail outright if the process was
+        # deleted). Re-resolve only when the retry deliberately switches
+        # to a different process id — then the user is asking for
+        # whatever that process currently is.
         after_import_snapshot = None
         if after_import is not None:
-            try:
-                after_import_snapshot = db.resolve_process(after_import)
-            except ValueError as e:
-                return json_error(str(e), 404)
+            reused_parent_snapshot = None
+            if parent_config is not None:
+                parent_after_import = parent_config.get("after_import")
+                parent_snapshot_process = (
+                    parent_config.get("after_import_snapshot")
+                )
+                if (
+                    parent_snapshot_process is not None
+                    and parent_after_import == after_import
+                ):
+                    reused_parent_snapshot = parent_snapshot_process
+            if reused_parent_snapshot is not None:
+                after_import_snapshot = reused_parent_snapshot
+            else:
+                try:
+                    after_import_snapshot = db.resolve_process(after_import)
+                except ValueError as e:
+                    return json_error(str(e), 404)
 
         # Validate the optional NAS move that chains after processing
         # completes. Requires after_import (the move fires from the process
@@ -23910,6 +25336,40 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         )
         if move_err is not None:
             return move_err
+
+        # A retry with a chained NAS move must land on the same
+        # host/root/mount as the parent. When the parent recorded a
+        # ``target_snapshot`` for the chained target, verify the
+        # currently-resolved target matches — a Settings edit since
+        # enqueue-time could otherwise silently redirect the chained
+        # transfer even though the primary snapshot check above
+        # accepted the request. When the parent had a chained move but
+        # no snapshot (predates this check), refuse rather than trust
+        # the current resolution — same reasoning as the primary
+        # remote-target legacy check.
+        if parent_config is not None:
+            parent_move_cfg = parent_config.get("after_process_move") or {}
+            parent_move_snapshot = parent_move_cfg.get("target_snapshot")
+            parent_move_target_id = parent_move_cfg.get("remote_target_id")
+            if parent_move_snapshot is not None:
+                current_move_snapshot = _move_target_snapshot(
+                    move_target_snapshot,
+                )
+                if current_move_snapshot != parent_move_snapshot:
+                    return json_error(
+                        "The chained NAS-move target for the original "
+                        "import has changed (host, path, mount, or archive "
+                        "root differs). Verify Settings → Remote targets "
+                        "and start a new import instead of retrying."
+                    )
+            elif parent_move_target_id:
+                return json_error(
+                    "The original import's chained NAS-move target "
+                    "predates the recovery-retry safety check (no target "
+                    "snapshot was recorded). Verify Settings → Remote "
+                    "targets still point at the intended host, then start "
+                    "a new import instead of retrying."
+                )
 
         active_ws, created_workspace, workspace_err = (
             _prepare_import_workspace(db, body)
@@ -23951,6 +25411,13 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             "trust_likely_duplicates": trust_likely_duplicates,
             "recursive": recursive,
             "after_import": after_import,
+            # Persist the enqueue-time snapshot alongside the process id so a
+            # recovery retry can reuse the exact stages the user accepted.
+            # Without this a retry silently re-resolves the current process
+            # (an edit or delete between the failed run and the retry would
+            # otherwise change or void what runs); see the reuse block above
+            # and the corresponding remote-target snapshot handling.
+            "after_import_snapshot": after_import_snapshot,
             "tags": import_tags,
             "location_from_gps": location_from_gps,
             "allow_missing_exiftool": bool(
@@ -23958,8 +25425,55 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             ),
             "remote_target_id": remote_target_id or None,
             "remote_subpath": remote_subpath or None,
+            "remote_target_snapshot": _remote_target_snapshot(
+                remote_archive_config,
+            ),
             "workspace_id": active_ws,
             "created_workspace": created_workspace,
+            "carry_photo_ids": carry_photo_ids,
+            # Fingerprint sidecar to carry_photo_ids so a retry-of-retry
+            # can still verify the inherited scope by stable identity
+            # even after the grandparent's job has aged out of history.
+            # Keyed by str(id) for JSON round-tripping; empty for
+            # first-attempt imports or legacy parents with no
+            # fingerprints of their own.
+            "carry_photo_fingerprints": (
+                {
+                    str(pid): parent_allowed_fingerprints[pid]
+                    for pid in (carry_photo_ids or [])
+                    if parent_allowed_fingerprints
+                    and pid in parent_allowed_fingerprints
+                }
+                if parent_allowed_fingerprints
+                else {}
+            ),
+            # Persist the parent's id so the Jobs page's parallel-retry
+            # gate (``hasActiveRetryFor``) can recognize this retry as
+            # belonging to that parent and suppress a second Retry button
+            # click while this run is still in flight. Without the field
+            # on ``job_config`` the gate reads ``undefined`` on every
+            # active job, so reselecting the failed parent renders a
+            # live Retry button that would race the in-flight retry.
+            "parent_import_job_id": (
+                parent_id_raw.strip() if parent_id_raw else None
+            ),
+            # Root of the retry chain: the original failed import that
+            # every retry (and retry-of-retry) descends from. Persisted
+            # separately from ``parent_import_job_id`` so the Jobs page
+            # can gate parallel launches on the original selection even
+            # when the active job's direct parent is another retry.
+            # Without this a retry-of-retry's ``parent_import_job_id``
+            # points at the first retry, so reselecting the original
+            # failed import still renders a live Retry button that would
+            # race the in-flight retry. Inherits the parent's root when
+            # the parent already carries one; otherwise the parent IS
+            # the root of this chain.
+            "root_import_job_id": (
+                (parent_config.get("root_import_job_id")
+                 or parent_id_raw.strip())
+                if parent_config is not None and parent_id_raw
+                else None
+            ),
         }
         if include_paths is not None:
             # The two counts only — deliberately NOT ``include_paths``. There
@@ -23974,6 +25488,15 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             job_config["after_process_move"] = {
                 "remote_target_id": move_target_snapshot["id"],
                 "target_name": move_target_snapshot["name"],
+                # Persisted alongside the id so a recovery retry can
+                # detect a Settings edit that would redirect the
+                # chained transfer to a different host or root.
+                # Parallels ``remote_target_snapshot`` for the primary
+                # remote destination. See the parent-verification
+                # block above.
+                "target_snapshot": _move_target_snapshot(
+                    move_target_snapshot,
+                ),
             }
 
         def _chain_after_import(job, result):
@@ -23985,7 +25508,24 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             photos gets one, including the import-only choice.
             """
             photo_ids = result.get("photo_ids") or []
-            thread_db, col_id = _record_import_collection(result, active_ws)
+            carry_photo_ids = list(
+                (job.get("config") or {}).get("carry_photo_ids") or []
+            )
+            thread_db, col_id = _record_import_collection(
+                result, active_ws, chain_photo_ids=carry_photo_ids,
+            )
+            # Recovery-retry imports may carry forward files earlier
+            # attempts landed. The original failed run skipped its
+            # after-import chain because ``ok`` was False, so those files
+            # were never processed. Roll them into the chain scope now so
+            # the collection AND the folder-based after-move both cover
+            # the complete original import, not just the newly-recovered
+            # files. ``carried_photo_ids`` on the result is the validated
+            # subset actually included, so a stale ID never leaks into
+            # this scope.
+            chain_scope = photo_ids + list(
+                result.get("carried_photo_ids") or []
+            )
 
             if after_import is None:
                 result["after_import_skipped"] = "import-only"
@@ -23996,7 +25536,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             if result.get("cancelled"):
                 result["after_import_skipped"] = "import cancelled"
                 return
-            if not photo_ids:
+            if not chain_scope:
                 result["after_import_skipped"] = "no new photos"
                 return
             if col_id is None:
@@ -24011,13 +25551,14 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 # non-nested set: moving an ancestor also moves its
                 # descendants. The target itself is the enqueue-time
                 # snapshot, so a Settings edit mid-chain can't redirect the
-                # move.
+                # move. Uses ``chain_scope`` so a recovery retry moves the
+                # folders holding the original run's successful files too.
                 after_move = None
                 if move_target_snapshot is not None:
                     from import_chain import minimal_move_set
                     folder_rows = []
-                    for i in range(0, len(photo_ids), 500):
-                        chunk = photo_ids[i:i + 500]
+                    for i in range(0, len(chain_scope), 500):
+                        chunk = chain_scope[i:i + 500]
                         ph = ",".join("?" * len(chunk))
                         folder_rows.extend(thread_db.conn.execute(
                             "SELECT DISTINCT f.id, f.path FROM photos p "
@@ -24157,6 +25698,54 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     log.exception(
                         "Failed to invalidate missing-originals cache "
                         "after import-photos job",
+                    )
+
+        # Server-side retry-exclusivity gate: refuse a retry whose
+        # root ancestor already has an active retry in flight, even
+        # when the Jobs-page UI gate was bypassed (two tabs, a stale
+        # UI that didn't observe the sibling retry yet, or a direct
+        # API caller). Without this an overlapping retry can enqueue
+        # a second import against the same source and destination and
+        # race the chained after-import / NAS move against the first
+        # one. Runs after all snapshot validation so a rejected
+        # request costs no worker thread. Best-effort against
+        # exact-simultaneous starts — ``list_jobs`` releases the
+        # runner lock before ``start`` takes it — which is acceptable
+        # for the double-click / two-tab case this fix targets; the
+        # follow-up work is to fold both under one runner-side call.
+        # See PR #1387 Codex review.
+        retry_root = job_config.get("root_import_job_id")
+        if retry_root:
+            for other in runner.list_jobs():
+                if other.get("type") != "import":
+                    continue
+                # ``pausing`` is a live status: ``pause_job`` publishes
+                # it immediately, but the worker keeps running until it
+                # reaches ``is_cancelled`` and only then flips to
+                # ``paused``. Treating ``pausing`` as inactive would let a
+                # second retry slip in during that window and race the
+                # first one's chained processing / NAS move.
+                if other.get("status") not in (
+                    "queued", "running", "pausing", "paused",
+                ):
+                    continue
+                other_cfg = other.get("config") or {}
+                other_root = (
+                    other_cfg.get("root_import_job_id")
+                    or other_cfg.get("parent_import_job_id")
+                )
+                # Only reject a competing RETRY — one whose own
+                # ancestry root matches ours. The failed parent itself
+                # (still in ``_jobs`` briefly after finishing) has no
+                # ancestry field so it never matches here, letting the
+                # first retry through. The parent's own liveness is
+                # gated separately by ``_validate_parent_import_job``.
+                if other_root and other_root == retry_root:
+                    return json_error(
+                        "Another retry for the same failed import is "
+                        "already in flight; wait for it to finish "
+                        "before starting a new one.",
+                        409,
                     )
 
         job_id = runner.start(
@@ -24533,6 +26122,10 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         return jsonify({
             "active": active,
             "history": history,
+            # Vireo is overriding the system's idle-sleep setting while a
+            # job runs (issue #1397). Surfacing it keeps that visible
+            # rather than silent — see CORE_PHILOSOPHY "no black boxes".
+            "keeping_awake": app._job_runner.sleep_blocker.active,
             "active_workspace_id": db._active_workspace_id,
             "workspace_names": ws_names,
         })
@@ -25928,6 +27521,14 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             masked = 0
             skipped = 0
             failed = 0
+            # A source file that never opened is not the same as "SAM found
+            # no subject here", even though both leave the photo unmasked.
+            # Only the second is an answer about the photo; the first means
+            # we never looked. Folding them together let a dropped share
+            # finish this job green while every unmasked photo went on to be
+            # hard-rejected in Process Review as `no_subject_mask`
+            # (Codex #1392 P1). Mirrors extract_masks_stage in pipeline_job.
+            unreadable = 0
             job["_start_time"] = time.time()
 
             for i, photo in enumerate(photos):
@@ -25979,7 +27580,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     # Load working-resolution proxy
                     proxy = render_proxy(image_path, longest_edge=proxy_longest_edge)
                     if proxy is None:
-                        skipped += 1
+                        unreadable += 1
                         continue
 
                     # Parse detection box
@@ -26099,7 +27700,27 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     },
                 )
 
-            return {"masked": masked, "skipped": skipped, "failed": failed, "total": total}
+            # Opt into JobRunner's ok/errors convention when photos went
+            # unmasked. Styling the card honestly isn't enough: the Jobs
+            # page, job history, API clients and the completion event all
+            # read the job status, and "completed" there tells the user their
+            # library was processed when some of it was never opened
+            # (Codex #1392).
+            job_errors = []
+            if unreadable:
+                job_errors.append(
+                    f"{unreadable} of {total} photos could not be read, so "
+                    f"they have no mask and Process Review rejects them as "
+                    f"`no_subject_mask`. Reconnect the source and run Extract "
+                    f"again."
+                )
+            if failed:
+                job_errors.append(
+                    f"{failed} of {total} photos failed mask extraction"
+                )
+            return {"masked": masked, "skipped": skipped, "failed": failed,
+                    "unreadable": unreadable, "total": total,
+                    "ok": not job_errors, "errors": job_errors}
 
         job_id = runner.start(
             "extract-masks",
@@ -31206,4 +32827,20 @@ if __name__ == "__main__":
     # when we actually call it.
     import multiprocessing
     multiprocessing.freeze_support()
+    # --pty-spawn-helper: pty setup shim dispatched by remote_setup's
+    # install-key path. In the packaged (PyInstaller --onefile) build
+    # sys.executable is this same binary, so remote_setup can't shell
+    # out via `[python, "-c", helper]` and instead re-executes us with
+    # this flag. Must run BEFORE argparse — the wrapped ssh argv follows
+    # and would otherwise get rejected as unknown options.
+    if len(sys.argv) >= 3 and sys.argv[1] == "--pty-spawn-helper":
+        import fcntl
+        import termios
+        os.setsid()
+        fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+        a = termios.tcgetattr(0)
+        a[3] &= ~(termios.ECHO | termios.ECHOE | termios.ECHOK
+                  | termios.ECHONL)
+        termios.tcsetattr(0, termios.TCSANOW, a)
+        os.execvp(sys.argv[2], sys.argv[2:])
     main()

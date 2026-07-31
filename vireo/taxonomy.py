@@ -14,15 +14,22 @@ Usage:
 """
 
 import argparse
+import contextlib
 import csv
 import gzip
 import io
 import json
 import logging
 import os
+import re
+import socket
 import ssl
+import stat as stat_module
+import tempfile
+import threading
 import time
 import unicodedata
+import urllib.error
 import urllib.request
 import zipfile
 from datetime import date
@@ -36,8 +43,68 @@ log = logging.getLogger(__name__)
 _ssl_ctx = ssl.create_default_context(cafile=certifi.where())
 
 
+class DownloadCancelled(Exception):
+    """Raised when should_cancel() asked us to stop."""
+
+
+# `Content-Range: bytes */<total>` — the header a 416 response uses to tell
+# the client what the actual size of the resource is. RFC 7233 §4.2 pins the
+# format; a compliant server puts the total after the slash.
+_CONTENT_RANGE_TOTAL_RE = re.compile(r"bytes\s*\*/(\d+)", re.IGNORECASE)
+
+# `Content-Range: bytes <start>-<end>/<total>` — the header a 206 response
+# uses to describe which bytes the body actually spans. If the server (or an
+# intermediary) resumes from a different byte than we asked for, appending
+# would splice mismatched content into the partial file.
+_CONTENT_RANGE_START_RE = re.compile(r"bytes\s+(\d+)\s*-", re.IGNORECASE)
+
+
+def _content_range_total(headers):
+    """Total resource size advertised by a Content-Range: bytes */<total>.
+
+    Returns None when the header is absent or malformed — the caller falls
+    back to restarting the download from scratch, which is the safe outcome.
+    """
+    if headers is None:
+        return None
+    header = headers.get("Content-Range")
+    if not header:
+        return None
+    match = _CONTENT_RANGE_TOTAL_RE.search(header)
+    if not match:
+        return None
+    try:
+        return int(match.group(1))
+    except (TypeError, ValueError):
+        return None
+
+
+def _content_range_start(headers):
+    """First byte covered by a Content-Range: bytes <start>-<end>/<total>.
+
+    Returns None when the header is absent or malformed. Used to detect a
+    206 that begins at a different byte than the client's Range request so
+    the caller can restart from scratch rather than splice mismatched bytes
+    onto its existing ``.partial``.
+    """
+    if headers is None:
+        return None
+    header = headers.get("Content-Range")
+    if not header:
+        return None
+    match = _CONTENT_RANGE_START_RE.search(header)
+    if not match:
+        return None
+    try:
+        return int(match.group(1))
+    except (TypeError, ValueError):
+        return None
+
+
 def _download_with_resume(url, dest_path, progress_callback=None,
-                          max_stalled=3, chunk_size=256 * 1024):
+                          max_stalled=3, chunk_size=256 * 1024,
+                          *, byte_callback=None, should_cancel=None,
+                          _emit_interval=0.25):
     """Download a file with retry and resume support.
 
     Streams to ``dest_path + ".partial"``, resuming from the last byte on
@@ -52,6 +119,18 @@ def _download_with_resume(url, dest_path, progress_callback=None,
         progress_callback: optional ``callback(message)`` for status updates.
         max_stalled: Give up after this many consecutive zero-progress retries.
         chunk_size: Bytes per read chunk (default 256 KB).
+        byte_callback: optional ``callback(downloaded, total_or_None)`` for
+            byte-level progress.  Throttled to ~4 Hz.
+        should_cancel: optional ``callback() -> bool``.  When it returns True
+            the download aborts, leaving the ``.partial`` file for resume.
+        _emit_interval: minimum seconds between byte_callback emits (private;
+            for tests).
+
+    Neither ``byte_callback`` nor ``should_cancel`` may raise: they are called
+    inside the transfer's ``try`` block, so an exception from either is caught
+    by the generic handler and misreported to the user as a network failure,
+    triggering a full retry (and discarding the partial when the server
+    answers 200).  Callers must swallow their own errors.
     """
     partial_path = dest_path + ".partial"
     attempt = 0
@@ -81,34 +160,215 @@ def _download_with_resume(url, dest_path, progress_callback=None,
                     log.info("Retrying download (attempt %d)", attempt)
 
             with urllib.request.urlopen(req, timeout=120, context=_ssl_ctx) as resp:
-                # If server returned 200 (not 206), it doesn't support Range —
-                # start from scratch.  Don't reset downloaded_before: it's the
-                # stall-detection baseline (did we get further than last time?).
-                if resp.status == 200 and downloaded_before > 0:
-                    log.info("Server does not support Range; restarting download")
-
-                # Determine expected size so we can detect truncated responses
-                content_length = resp.headers.get("Content-Length")
-                expected_bytes = int(content_length) if content_length else None
-
-                mode = "ab" if resp.status == 206 else "wb"
-                received = 0
-                with open(partial_path, mode) as f:
-                    while True:
-                        chunk = resp.read(chunk_size)
-                        if not chunk:
-                            break
-                        f.write(chunk)
-                        received += len(chunk)
-
-                # Check for truncated response
-                if expected_bytes is not None and received < expected_bytes:
-                    raise OSError(
-                        f"Incomplete download: got {received} of "
-                        f"{expected_bytes} bytes"
+                # Interrupt a stalled resp.read from a watcher thread when the
+                # caller asks to cancel.  Without this, a Stop press during a
+                # stalled read is not felt until the socket read returns or
+                # the 120 s timeout expires — up to two minutes on the
+                # unreliable-network scenario where cancellation is most
+                # needed.  resp.close() would only set a flag; it does not
+                # unblock a blocked recv on the underlying socket.  A
+                # socket.shutdown(SHUT_RDWR) does — it forces the kernel to
+                # return the pending recv with an error, which the outer
+                # handler then reclassifies as DownloadCancelled (see the
+                # should_cancel() check below).
+                cancel_watcher_stop = threading.Event()
+                watcher = None
+                if should_cancel is not None:
+                    # Default-argument bind so the closure captures THIS
+                    # iteration's stop event / resp / cancel callback rather
+                    # than the outer-scope names — otherwise a late thread
+                    # could observe the next iteration's variables (and ruff
+                    # B023 objects to the same issue).
+                    def _close_on_cancel(
+                        _stop=cancel_watcher_stop,
+                        _resp=resp,
+                        _cancel=should_cancel,
+                    ):
+                        while not _stop.wait(0.25):
+                            if _cancel():
+                                # SocketIO -> raw socket.  Not part of the
+                                # public API, but the only reliable way to
+                                # break a recv from another thread — see
+                                # the module comment above.
+                                sock = getattr(getattr(_resp, "fp", None),
+                                               "raw", None)
+                                sock = getattr(sock, "_sock", None)
+                                if sock is not None:
+                                    # Already closed or half-closed — the
+                                    # blocked read will surface the error
+                                    # regardless.
+                                    with contextlib.suppress(OSError):
+                                        sock.shutdown(socket.SHUT_RDWR)
+                                return
+                    watcher = threading.Thread(
+                        target=_close_on_cancel, daemon=True,
+                        name="download-cancel-watcher",
                     )
+                    watcher.start()
 
+                try:
+                    # If server returned 200 (not 206), it doesn't support
+                    # Range — start from scratch.  Don't reset
+                    # downloaded_before: it's the stall-detection baseline
+                    # (did we get further than last time?).
+                    if resp.status == 200 and downloaded_before > 0:
+                        log.info("Server does not support Range; restarting download")
+
+                    # Determine expected size so we can detect truncated responses
+                    content_length = resp.headers.get("Content-Length")
+                    expected_bytes = int(content_length) if content_length else None
+
+                    mode = "ab" if resp.status == 206 else "wb"
+                    # A 206 must begin exactly at ``downloaded_before`` — the
+                    # byte we asked to resume from. A proxy or rebuilt artifact
+                    # can return a valid range that starts elsewhere; appending
+                    # that body onto our ``.partial`` would silently splice
+                    # mismatched bytes into the file. On mismatch, restart
+                    # from scratch. (For darktable installs the SHA256 check
+                    # catches it; download_taxa() has no digest and would fail
+                    # later as an opaque gzip/CSV parse error.)
+                    if mode == "ab":
+                        range_start = _content_range_start(resp.headers)
+                        if (
+                            range_start is not None
+                            and range_start != downloaded_before
+                        ):
+                            log.warning(
+                                "Server resumed at byte %d, expected %d;"
+                                " restarting download",
+                                range_start, downloaded_before,
+                            )
+                            mode = "wb"
+                    # Bytes already on disk that we are keeping. Distinct from
+                    # downloaded_before, which stays put as the stall baseline even
+                    # when mode == "wb" truncates the partial.
+                    progress_base = downloaded_before if mode == "ab" else 0
+                    expected_total = (
+                        expected_bytes + progress_base
+                        if expected_bytes is not None
+                        else None
+                    )
+                    received = 0
+                    with open(partial_path, mode) as f:
+                        last_emit = 0.0
+                        while True:
+                            if should_cancel is not None and should_cancel():
+                                raise DownloadCancelled("Download cancelled")
+                            chunk = resp.read(chunk_size)
+                            if not chunk:
+                                break
+                            f.write(chunk)
+                            received += len(chunk)
+                            if byte_callback is not None:
+                                now = time.monotonic()
+                                if now - last_emit >= _emit_interval:
+                                    last_emit = now
+                                    byte_callback(progress_base + received, expected_total)
+                        if byte_callback is not None:
+                            byte_callback(progress_base + received, expected_total)
+
+                    # Check for truncated response
+                    if expected_bytes is not None and received < expected_bytes:
+                        raise OSError(
+                            f"Incomplete download: got {received} of "
+                            f"{expected_bytes} bytes"
+                        )
+                finally:
+                    cancel_watcher_stop.set()
+                    if watcher is not None:
+                        watcher.join(timeout=2)
+
+        except DownloadCancelled:
+            raise
         except Exception as e:
+            # 416 Requested Range Not Satisfiable: our Range starts at or
+            # past the end of the resource.  Reachable when cancellation
+            # lands after the final chunk is written but before the
+            # empty-read break — the loop's cancel check raises, leaving a
+            # ``.partial`` already at the full size, so the next attempt
+            # asks for ``bytes=<full>-``.  Without this branch the retry
+            # loop would burn ``max_stalled`` attempts against a permanent
+            # 416 and give up despite promising "try again and the download
+            # will resume".  Verify the total via Content-Range and, when
+            # sizes agree, promote the partial to the final path.  On
+            # mismatch (the release was rebuilt) delete the stale partial
+            # and let the next iteration re-download from byte 0 — that is
+            # safer than shipping bytes of the wrong artifact to the
+            # caller's digest check.
+            if (
+                isinstance(e, urllib.error.HTTPError)
+                and e.code == 416
+                and downloaded_before > 0
+            ):
+                total = _content_range_total(getattr(e, "headers", None))
+                current_size = (
+                    os.path.getsize(partial_path)
+                    if os.path.exists(partial_path)
+                    else 0
+                )
+                if total is not None and current_size == total:
+                    if os.path.exists(dest_path):
+                        os.remove(dest_path)
+                    os.rename(partial_path, dest_path)
+                    if byte_callback is not None:
+                        byte_callback(current_size, total)
+                    mb = current_size // (1024 * 1024)
+                    log.info(
+                        "Server reported 416 with matching total (%d bytes);"
+                        " promoting complete .partial to %s",
+                        total, dest_path,
+                    )
+                    if progress_callback:
+                        progress_callback(f"Downloaded {mb} MB")
+                    return dest_path
+                # Stale or unverifiable partial: delete so the next iteration
+                # restarts from byte 0 rather than sending the same doomed
+                # Range header on every attempt.  If the removal fails
+                # (permission denied, Windows lock, read-only dir),
+                # ``downloaded_before`` stays > 0 next iteration, the same
+                # Range is sent, the server answers 416 again, and the loop
+                # would spin forever — count it as a stall so ``max_stalled``
+                # eventually breaks us out with a real error.
+                try:
+                    os.remove(partial_path)
+                except OSError as remove_error:
+                    stalled_count += 1
+                    log.warning(
+                        "Could not remove stale partial %s after 416: %s"
+                        " (stalled %d/%d)",
+                        partial_path, remove_error, stalled_count, max_stalled,
+                    )
+                    if stalled_count >= max_stalled:
+                        raise RuntimeError(
+                            f"Server rejected resume range and the partial "
+                            f"file {partial_path} could not be removed: "
+                            f"{remove_error}"
+                        ) from e
+                log.warning(
+                    "Server returned 416 but partial size (%d) does not match"
+                    " advertised total (%r); restarting download",
+                    current_size, total,
+                )
+                if progress_callback:
+                    progress_callback(
+                        f"Resume rejected by server (attempt {attempt}), "
+                        f"restarting download..."
+                    )
+                # Poll cancellation during the backoff so Stop feels
+                # responsive on a rejected-resume loop too.
+                for _ in range(6):
+                    if should_cancel is not None and should_cancel():
+                        raise DownloadCancelled("Download cancelled") from None
+                    time.sleep(0.5)
+                continue
+
+            # The watcher thread closes ``resp`` on cancel, which surfaces
+            # here as a socket error.  Reclassify it before the stall
+            # detection can turn "user pressed Stop" into "download stalled
+            # after N attempts" — the user asked to cancel, so ``from None``
+            # keeps that unrelated network error out of the traceback.
+            if should_cancel is not None and should_cancel():
+                raise DownloadCancelled("Download cancelled") from None
             current_size = os.path.getsize(partial_path) if os.path.exists(partial_path) else 0
             gained = current_size - downloaded_before
 
@@ -136,7 +396,14 @@ def _download_with_resume(url, dest_path, progress_callback=None,
                     f"try again and the download will resume."
                 ) from e
 
-            time.sleep(3)
+            # Poll the backoff in short slices so Cancel is felt within ~0.5 s
+            # instead of after the full 3 s wait.  `from None`: the user asked
+            # to stop, so the network error we were backing off from is not the
+            # cause and must not be chained onto the cancel.
+            for _ in range(6):
+                if should_cancel is not None and should_cancel():
+                    raise DownloadCancelled("Download cancelled") from None
+                time.sleep(0.5)
             continue
 
         # Success — rename partial to final
@@ -156,6 +423,12 @@ DWCA_URL = "https://www.inaturalist.org/taxa/inaturalist-taxonomy.dwca.zip"
 # directory is an ephemeral _MEI* extraction dir that's rebuilt per run.
 TAXONOMY_JSON_PATH = os.path.expanduser("~/.vireo/taxonomy.json")
 
+# Fallback for dev checkouts that downloaded a taxonomy.json next to this
+# module before the persistent path existed. Named so tests (and the browser
+# suite, which must not pick up a developer's ~500MB local copy) can
+# monkeypatch it instead of patching os.path.dirname globally.
+LEGACY_TAXONOMY_JSON_PATH = os.path.join(os.path.dirname(__file__), "taxonomy.json")
+
 
 def find_taxonomy_json():
     """Return the first existing taxonomy.json path, or the persistent path.
@@ -170,13 +443,300 @@ def find_taxonomy_json():
     """
     if os.path.exists(TAXONOMY_JSON_PATH):
         return TAXONOMY_JSON_PATH
-    legacy_path = os.path.join(os.path.dirname(__file__), "taxonomy.json")
-    if os.path.exists(legacy_path):
-        return legacy_path
+    if os.path.exists(LEGACY_TAXONOMY_JSON_PATH):
+        return LEGACY_TAXONOMY_JSON_PATH
     return TAXONOMY_JSON_PATH
 
 
-def load_local_taxonomy():
+# Process-wide cache for the parsed taxonomy. A full iNaturalist
+# taxonomy.json is ~500MB of JSON that expands to a couple of GB of dicts
+# and takes seconds to parse, and request handlers (notably
+# /api/predictions/compare) plus accept/replace call load_local_taxonomy()
+# on every invocation. Re-parsing per call made those requests take
+# seconds-to-minutes and let concurrent requests each allocate their own
+# copy. Keyed by (path, mtime_ns, size) so a re-downloaded taxonomy is
+# still picked up without restarting the app.
+_taxonomy_cache_lock = threading.Lock()
+_taxonomy_cache = None  # (path, stat_key, Taxonomy)
+
+# Per-path record of parses that failed (e.g., corrupt JSON). Keyed by path
+# and validated against the current stat key on lookup, so a repaired or
+# re-downloaded file automatically drops its old failure record. Without
+# this, a corrupt preferred candidate would be re-parsed on every request
+# — expensive on its own, and the trigger for a worse problem: it prevents
+# us from evicting the fallback cache before parsing, because the corrupt
+# case would otherwise re-parse the multi-GB fallback each time.
+_taxonomy_failed_stats = {}  # {path: stat_key}
+
+
+class _KnownCorruptTaxonomy(Exception):
+    """Raised when a path is known to have failed to parse at its current stat."""
+
+
+# Parse failures that are environmental rather than the file's fault, so a
+# later attempt at the same bytes can legitimately succeed: a read permission
+# bit, momentary fd exhaustion, an allocation failure on a ~2.8GB parse. These
+# must stay retryable — memoizing them against (mtime_ns, size) would key the
+# record to a stat the repair does not change. Everything else (malformed JSON
+# raising ValueError, or valid JSON in the wrong shape raising AttributeError
+# or TypeError as the parser walks it) is the content itself and cannot fix
+# itself without a rewrite, which does change the stat.
+_TRANSIENT_TAXONOMY_ERRORS = (OSError, MemoryError)
+
+
+# Cap on how many times _load_taxonomy_cached will re-parse a file that
+# keeps changing mid-read. A rewrite during parse means the parsed object
+# does not correspond to the post-parse stat, so caching that pair would
+# serve stale data forever. If the file is still moving after this many
+# tries, we return the last parse without caching it and let the next
+# call try again.
+_TAXONOMY_PARSE_RETRY_LIMIT = 3
+
+
+def clear_taxonomy_cache():
+    """Drop the cached Taxonomy so the next load re-reads from disk."""
+    global _taxonomy_cache
+    with _taxonomy_cache_lock:
+        _taxonomy_cache = None
+        _taxonomy_failed_stats.clear()
+
+
+def _write_taxonomy_json_atomically(path, data):
+    """Serialize ``data`` to ``path`` via a temp sibling and an atomic rename.
+
+    Both taxonomy writers use this. `open(path, "w")` truncates the target
+    for as long as it takes to serialize ~500MB, and anything reading it in
+    that window — including _load_taxonomy_cached from a concurrent request
+    — gets a partial document that will not parse; its retry loop is bounded
+    and cannot wait out an in-place write. Rename is atomic within a
+    filesystem, so a reader sees the whole old file or the whole new one,
+    and an interrupted write leaves the previous taxonomy intact.
+
+    Renames onto the *resolved* target: os.replace() would otherwise swap a
+    symlink for a regular file, detaching a taxonomy linked in from
+    elsewhere and leaving a duplicate ~500MB copy. Keeping the temp file
+    beside the resolved target also keeps the rename within one filesystem,
+    which is what makes it atomic.
+    """
+    target = os.path.realpath(path)
+    # A unique temp name per write, not a fixed "<target>.tmp". Two writes
+    # can overlap — POSTing the download endpoint twice starts two workers,
+    # since it uses runner.start() rather than start_singleton() — and a
+    # shared name lets one writer rename its inode out from under the other,
+    # exposing a partial target and then failing the second writer when its
+    # pathname has vanished.
+    fd, tmp_path = tempfile.mkstemp(
+        dir=os.path.dirname(target) or ".",
+        prefix=f"{os.path.basename(target)}.",
+        suffix=".tmp",
+    )
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f)
+            # Closing only hands the bytes to the page cache. Without fsync,
+            # a crash just after the rename can expose the target with
+            # unflushed content — the half-written taxonomy this whole dance
+            # exists to prevent.
+            f.flush()
+            os.fsync(f.fileno())
+        # mkstemp creates 0600; open(path, "w") kept the target's mode.
+        # Carry it over when there is a target to copy from, so writing
+        # cannot silently loosen or tighten access. With no existing target
+        # (a first download) the file stays 0600 — ~/.vireo is single-user
+        # data, so private is the right default there.
+        with contextlib.suppress(OSError):
+            os.chmod(tmp_path, stat_module.S_IMODE(os.stat(target).st_mode))
+        os.replace(tmp_path, target)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.remove(tmp_path)
+        raise
+
+
+def _taxonomy_stat_key(path):
+    st = os.stat(path)
+    # Identity and ctime, not just (mtime, size). A metadata-preserving
+    # install — shutil.copy2, rsync -t, a restore from backup — can land
+    # different content at the same size and mtime, and we would serve the
+    # stale parse forever (and keep rejecting a repaired file as corrupt,
+    # since _taxonomy_failed_stats uses the same key). The inode and device
+    # change under an atomic rename; ctime changes on an in-place rewrite or
+    # a permission repair.
+    return (
+        st.st_mtime_ns, st.st_size, st.st_dev, st.st_ino, st.st_ctime_ns,
+    )
+
+
+def _load_taxonomy_cached(path):
+    """Return the parsed Taxonomy for ``path``, reusing the cached instance.
+
+    The parse happens under the lock on purpose: without it, two requests
+    arriving together would each build a multi-GB structure and thrash swap
+    instead of one waiting for the other's result.
+    """
+    global _taxonomy_cache
+    with _taxonomy_cache_lock:
+        # Stat inside the lock. Read before it, a caller that then waits on
+        # the lock compares a pre-wait stat against an entry another caller
+        # refreshed while it waited, decides that entry is stale, evicts it
+        # and re-parses ~2.8GB for nothing.
+        stat_key = _taxonomy_stat_key(path)
+
+        # Short-circuit a path we've already established is corrupt at this
+        # stat. Without this, load_local_taxonomy() would attempt the parse
+        # (and log a warning) on every request for as long as the file stays
+        # broken. This also lets the eviction below evict cross-path fallback
+        # entries safely: even if the current parse fails, a subsequent call
+        # skips it here instead of re-parsing the multi-GB fallback to
+        # rediscover it's still broken.
+        failed_stat = _taxonomy_failed_stats.get(path)
+        if failed_stat == stat_key:
+            raise _KnownCorruptTaxonomy(path)
+        if failed_stat is not None:
+            # File has changed since it last failed; give it another chance.
+            _taxonomy_failed_stats.pop(path, None)
+
+        cached = _taxonomy_cache
+        if cached is not None and cached[0] == path and cached[1] == stat_key:
+            return cached[2]
+        # We're about to parse. A parsed iNaturalist taxonomy is ~2.8GB, so
+        # letting any prior instance stay reachable through _taxonomy_cache
+        # (or the local ``cached`` tuple) while Taxonomy(path) allocates its
+        # replacement doubles peak RSS — and a rewrite mid-parse stacks
+        # another live copy on top of that per retry.
+        #
+        # Only evict an entry for *this* path. A cross-path entry is a live
+        # fallback, not a stale copy, and dropping it here is not safe: the
+        # failure memo covers content failures, but deliberately does not
+        # cover transient ones (see _TRANSIENT_TAXONOMY_ERRORS). So a
+        # preferred file that keeps raising OSError — wrong permissions, say
+        # — is re-attempted on every request, and an unconditional evict
+        # would drop the cached legacy taxonomy each time and re-parse
+        # ~500MB of fallback per compare or accept.
+        #
+        # The migration case that motivated evicting cross-path (a cached
+        # legacy still live while the newly-appeared preferred file parses)
+        # is already covered: download_taxonomy() clears the cache before it
+        # builds a replacement, so the normal path never holds both. A manual
+        # drop-in can still hold two instances for one parse; that is a
+        # one-off, where the fallback re-parse would be per-request forever.
+        if cached is not None and cached[0] == path:
+            _taxonomy_cache = None
+        cached = None
+        # Bracket the parse with a pre- and post-stat: if a background
+        # download rewrites the file while Taxonomy(path) is reading it,
+        # the parsed data is a stale snapshot even though a fresh
+        # post-parse stat would look current. Caching that pair would
+        # keep serving the old taxonomy indefinitely. Retry a few times
+        # to get a stable read; if the file keeps changing, return the
+        # latest parse but skip the cache so the next call re-checks.
+        taxonomy = None
+        # Keep only the *text* of a failed parse, never the exception. Its
+        # traceback holds the Taxonomy.__init__ frame, which still
+        # references the multi-GB dict json.load() just decoded — so
+        # retaining it across the loop would keep a failed attempt alive
+        # through the next allocation, defeating the between-retry release
+        # right below.
+        last_error_text = None
+        for _ in range(_TAXONOMY_PARSE_RETRY_LIMIT):
+            # Same peak-RSS reason: release the previous retry's
+            # instance before Taxonomy(path) builds the next one, so a
+            # file that keeps changing does not pile up N live copies.
+            taxonomy = None
+            pre_stat = _taxonomy_stat_key(path)
+            try:
+                taxonomy = Taxonomy(path)
+            except Exception as parse_error:
+                last_error_text = f"{type(parse_error).__name__}: {parse_error}"
+                # A rewrite caught mid-stream — from an atomic-save gap
+                # on another platform, an interrupted download, or an
+                # external tool — leaves a partial JSON document that
+                # Taxonomy() cannot parse. That is the same kind of
+                # transient instability the stat-drift check retries
+                # against; propagating here would surface as a spurious
+                # failure that the very next call could succeed at, and
+                # load_local_taxonomy() would silently fall through to
+                # a stale or nonexistent alternate candidate instead.
+                #
+                # Only retry when the file actually moved, though. A file
+                # that is simply corrupt fails identically every time, and
+                # retrying re-reads most of ~500MB two more times on every
+                # request — reinstating the latency and allocation pressure
+                # this cache exists to remove, for a read that cannot
+                # succeed. Truncated JSON only raises at the end of the
+                # parse, so this is the expensive case, not the cheap one.
+                try:
+                    file_moved = _taxonomy_stat_key(path) != pre_stat
+                except OSError:
+                    # Cannot even stat it now; a re-read will not fare
+                    # better, so report the parse failure we already have.
+                    file_moved = False
+                if not file_moved:
+                    # Durable failure at this stat. Record it so subsequent
+                    # requests short-circuit before hitting the parse and,
+                    # crucially, before the eviction above would drop a
+                    # still-valid fallback in a corrupt-preferred scenario.
+                    #
+                    # Only memoize a *content* failure, though — see
+                    # _TRANSIENT_TAXONOMY_ERRORS. Memoizing an environmental
+                    # failure would key the record to a stat its repair does
+                    # not change, leaving taxonomy features off until the
+                    # contents happen to change or the process restarts.
+                    if not isinstance(parse_error, _TRANSIENT_TAXONOMY_ERRORS):
+                        _taxonomy_failed_stats[path] = pre_stat
+                    raise
+                continue
+            post_stat = _taxonomy_stat_key(path)
+            if pre_stat == post_stat:
+                _taxonomy_cache = (path, post_stat, taxonomy)
+                return taxonomy
+        # Retries exhausted. Nothing was cached for this path above, so
+        # there is no stale entry left to clear — and clearing here would
+        # evict a different path's still-valid entry. If every attempt
+        # raised, surface a clean error rather than returning None and
+        # letting the caller misread it as "file was fine but empty".
+        if taxonomy is None:
+            # Carry the last parse failure's message: load_local_taxonomy()
+            # logs this, and "file kept changing" alone doesn't tell you
+            # which byte of which file was malformed. The message rather
+            # than the exception, so no traceback pins the decoded document.
+            detail = f" (last error: {last_error_text})" if last_error_text else ""
+            raise ValueError(
+                f"Unable to parse {path}: file kept changing during read{detail}"
+            )
+        return taxonomy
+
+
+def _drop_cached_taxonomy_path(path):
+    """Release the cached parse for ``path`` (and its failure memo, if any).
+
+    Used when the file has gone away: the entry can never be served again,
+    and a full taxonomy is ~2.8GB of otherwise unreachable memory.
+    """
+    global _taxonomy_cache
+    with _taxonomy_cache_lock:
+        _taxonomy_failed_stats.pop(path, None)
+        cached = _taxonomy_cache
+        if cached is not None and cached[0] == path:
+            _taxonomy_cache = None
+
+
+def _restamp_taxonomy_cache(taxonomy):
+    """Refresh the cache key after ``taxonomy`` rewrote its own file."""
+    global _taxonomy_cache
+    with _taxonomy_cache_lock:
+        cached = _taxonomy_cache
+        if cached is None or cached[2] is not taxonomy:
+            return
+        try:
+            _taxonomy_cache = (
+                cached[0], _taxonomy_stat_key(cached[0]), taxonomy,
+            )
+        except OSError:
+            _taxonomy_cache = None
+
+
+def load_local_taxonomy(path=None):
     """Load a Taxonomy from disk, falling back across known paths.
 
     Tries ~/.vireo/taxonomy.json first, then the package-dir legacy path.
@@ -184,16 +744,36 @@ def load_local_taxonomy():
     write) no longer disables taxonomy features if a valid legacy file
     is present. Returns a Taxonomy instance on success, or None if no
     readable taxonomy file exists.
+
+    The returned instance is shared across callers and cached until the
+    file on disk changes — treat it as read-mostly.
+
+    Args:
+        path: load only this file, with no fallback. Use it when a
+            specific artifact has to be the one loaded: the post-download
+            retype must fail loudly if the file it just wrote won't parse,
+            rather than quietly retyping keywords from a stale legacy copy
+            while the taxa tables hold the new download's data.
     """
-    candidates = [
-        TAXONOMY_JSON_PATH,
-        os.path.join(os.path.dirname(__file__), "taxonomy.json"),
-    ]
+    candidates = [path] if path else [TAXONOMY_JSON_PATH, LEGACY_TAXONOMY_JSON_PATH]
     for path in candidates:
         if not os.path.exists(path):
+            # The file backing a cached parse is gone, so that ~2.8GB object
+            # can never be served again. Release it here: _load_taxonomy_cached
+            # deliberately keeps cross-path entries (a live fallback is not
+            # stale), so a rollback to the legacy file would otherwise hold the
+            # deleted file's parse alive while allocating the legacy one — and
+            # with no fallback at all it would stay resident for the life of
+            # the process.
+            _drop_cached_taxonomy_path(path)
             continue
         try:
-            return Taxonomy(path)
+            return _load_taxonomy_cached(path)
+        except _KnownCorruptTaxonomy:
+            # We've already logged the real error for this stat; skip
+            # quietly on subsequent requests so a persistently-broken
+            # preferred file doesn't flood the log.
+            continue
         except Exception as e:
             log.warning(
                 "Failed to load taxonomy from %s: %s — trying next candidate",
@@ -376,9 +956,13 @@ class Taxonomy:
             data = json.load(f)
         data["taxa_by_common"] = self._by_common
         data["api_misses"] = sorted(self._api_misses)
-        with open(self._path, "w") as f:
-            json.dump(data, f)
+        _write_taxonomy_json_atomically(self._path, data)
         self._dirty = False
+        # This instance is the one the cache hands out, and it already holds
+        # everything we just wrote. Re-stamp the cache key so the rewrite
+        # doesn't look like an external change and force a needless re-parse
+        # of the file we authored.
+        _restamp_taxonomy_cache(self)
         log.info("Saved updated taxonomy with new alternate names")
 
     def get_hierarchy(self, name):
@@ -936,6 +1520,17 @@ def download_taxonomy(output_path, progress_callback=None):
         if progress_callback:
             progress_callback(msg)
 
+    # Drop the cache's own reference to the old parse before we start
+    # building the replacement. A cached iNat dump is ~2.8GB, so letting
+    # it stay strongly reachable through _taxonomy_cache while this
+    # function also holds the ~2.8GB dict it is about to write can double
+    # peak RSS. The post-download retype already routes through
+    # load_local_taxonomy() (which re-evicts on parse), but that runs
+    # *after* the build. Evicting here covers the overlap. Concurrent
+    # requests that borrowed the taxonomy still keep it alive until they
+    # return; this only releases the cache's own reference.
+    clear_taxonomy_cache()
+
     # Download zip to a file (resumable) instead of holding in memory
     zip_dir = os.path.dirname(output_path) or "."
     os.makedirs(zip_dir, exist_ok=True)
@@ -1091,8 +1686,7 @@ def download_taxonomy(output_path, progress_callback=None):
         _status(
             f"Writing taxonomy ({len(taxa_by_common):,} common + {len(taxa_by_scientific):,} scientific names)..."
         )
-        with open(output_path, "w") as f:
-            json.dump(result, f)
+        _write_taxonomy_json_atomically(output_path, result)
         _status(
             f"Taxonomy complete: {len(taxa_by_common):,} common names, {len(taxa_by_scientific):,} scientific names"
         )

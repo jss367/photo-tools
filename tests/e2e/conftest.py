@@ -1,11 +1,11 @@
 import json
 import os
 import sys
-import threading
 
 import pytest
 from PIL import Image
-from werkzeug.serving import make_server
+
+from e2e.threaded_server import start_server, stop_server
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'vireo'))
 
@@ -127,6 +127,23 @@ def live_server(tmp_path, monkeypatch):
     monkeypatch.setattr(
         models, "DEFAULT_MODELS_DIR", str(tmp_path / ".vireo" / "models"),
     )
+
+    # Pin the taxonomy candidates to tmp_path too. Both resolve at import
+    # time, so patching HOME does not move them: a developer with a real
+    # ~/.vireo/taxonomy.json or an in-checkout vireo/taxonomy.json (a full
+    # iNaturalist dump is ~500MB) has every compare/review request parse it,
+    # which changes both request timing and the categories those pages
+    # render. CI has no such file, so without this the browser suite passes
+    # there and fails on a working machine.
+    import taxonomy as tax_mod
+    monkeypatch.setattr(
+        tax_mod, "TAXONOMY_JSON_PATH",
+        str(tmp_path / ".vireo" / "taxonomy.json"),
+    )
+    monkeypatch.setattr(
+        tax_mod, "LEGACY_TAXONOMY_JSON_PATH", str(tmp_path / "taxonomy.json"),
+    )
+
     _seed_classifier_model(str(tmp_path))
 
     db_path = str(tmp_path / "test.db")
@@ -138,23 +155,28 @@ def live_server(tmp_path, monkeypatch):
 
     app = create_app(db_path=db_path, thumb_cache_dir=thumb_dir)
 
-    server = make_server("127.0.0.1", 0, app)
-    port = server.socket.getsockname()[1]
-    thread = threading.Thread(target=server.serve_forever)
-    thread.daemon = True
-    thread.start()
+    # Threaded, or the whole page load serializes behind one request:
+    # make_server defaults to a single-threaded BaseWSGIServer, while the
+    # shipped app runs waitress with 16 threads precisely so "page loads
+    # [don't] queue behind [a slow request] and the app appears frozen"
+    # (see main() in app.py). With a pool of one, a navbar poll that takes
+    # a moment (``/api/workspaces/active/new-images`` blocks up to 0.5s on
+    # a cold cache) holds the server while the page's thumbnails wait, so
+    # ``load`` — and therefore ``page.goto`` — can stall on a busy machine.
+    # Per-request connections come from ``_get_db()`` via Flask ``g``, the
+    # same isolation waitress relies on. ``stop_server`` drains in-flight
+    # handlers so the teardown below still runs with nothing in flight.
+    server, thread, url = start_server(app)
 
     try:
         yield {
-            "url": f"http://127.0.0.1:{port}",
+            "url": url,
             "app": app,
             "db": db,
             "data": seed_data,
         }
     finally:
-        server.shutdown()
-        thread.join(timeout=5)
-        server.server_close()
+        stop_server(server, thread)
         if hasattr(app, "_cleanup_app_resources"):
             app._cleanup_app_resources()
         db.close()

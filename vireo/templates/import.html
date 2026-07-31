@@ -44,6 +44,17 @@ body { display: flex; flex-direction: column; height: 100vh; }
   font-size: 11px; color: var(--text-secondary); overflow-wrap: anywhere;
   margin-top: 4px; width: 100%;
 }
+.field-required { color: var(--danger); font-size: 10px; font-weight: 600; }
+.field-error {
+  display: none; width: 100%; margin: -2px 0 8px; padding-left: 2px;
+  color: var(--danger); font-size: 12px; font-weight: 600;
+}
+.field-error.visible { display: block; }
+.input-invalid { border-color: var(--danger) !important; }
+.destination-mode-hint {
+  font-size: 11px; color: var(--text-secondary); margin: -2px 0 10px;
+  overflow-wrap: anywhere;
+}
 .recent-destinations { margin: -2px 0 8px 0; }
 .recent-destinations-label { font-size: 11px; color: var(--text-secondary); margin-bottom: 4px; }
 .recent-destination-list { display: flex; flex-wrap: wrap; gap: 4px; }
@@ -55,7 +66,14 @@ body { display: flex; flex-direction: column; height: 100vh; }
   font-size: 12px; color: var(--text-secondary); cursor: pointer;
 }
 .preview-selection-row input { accent-color: var(--accent); }
+.preview-filter { display: inline-flex; align-items: center; gap: 6px; margin-top: 8px; font-size: 12px; color: var(--text-secondary); }
 .import-preview-grid { display: flex; flex-direction: column; gap: 12px; margin-top: 12px; max-height: 520px; overflow-y: auto; }
+.import-preview-collapsed {
+  padding: 9px 11px; border-radius: 6px; color: var(--text-secondary);
+  background: var(--bg-tertiary); border: 1px solid var(--border-primary);
+  font-size: 12px;
+}
+.import-preview-empty { font-size: 12px; color: var(--text-secondary); }
 .import-preview-folder { display: flex; flex-direction: column; gap: 6px; }
 .import-preview-folder-header {
   font-size: 12px; font-weight: 600; color: var(--text-secondary);
@@ -128,7 +146,13 @@ body { display: flex; flex-direction: column; height: 100vh; }
 .pill-warn { background: color-mix(in srgb, var(--warning, #bf8700) 18%, transparent); color: var(--warning, #9a6700); }
 .unsafe-list { margin: 6px 0 0 0; padding-left: 18px; font-size: 12px; color: var(--text-secondary); }
 .result-links a { color: var(--accent); font-size: 12px; }
-#importError { color: var(--danger); font-size: 12px; margin-top: 6px; display: none; }
+#importError {
+  color: var(--danger); font-size: 13px; font-weight: 600;
+  margin: 0 0 10px; padding: 9px 11px; display: none;
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--danger) 10%, transparent);
+  border: 1px solid color-mix(in srgb, var(--danger) 35%, transparent);
+}
 .warn { font-size: 12px; color: var(--warning, #bf8700); margin-top: 6px; }
 .staging-items { display: flex; flex-direction: column; gap: 8px; margin-top: 8px; }
 .staging-item { border: 1px solid var(--border-primary); border-radius: 6px; padding: 10px; background: var(--bg-tertiary); }
@@ -336,8 +360,11 @@ body { display: flex; flex-direction: column; height: 100vh; }
       <div class="row">
         <label>Archive destination</label>
         <select id="destMode" class="input-fixed" onchange="onImportDestModeChange()">
-          <option value="local" selected>Local path</option>
+          <option value="local" selected>Local or mounted path</option>
         </select>
+      </div>
+      <div class="destination-mode-hint" id="destModeHint">
+        Use this for folders on this Mac and NAS volumes mounted in Finder.
       </div>
       <div id="destLocalRows">
       <div class="row">
@@ -355,9 +382,13 @@ body { display: flex; flex-direction: column; height: 100vh; }
       </div>
       <div id="destRemoteRows" style="display:none;">
         <div class="row">
-          <label>Remote subpath</label>
-          <input type="text" id="remoteSubpath" class="input-fixed" placeholder="2026/trip" oninput="updateRemoteDestPreview()">
+          <label for="remoteSubpath">Folder inside NAS <span class="field-required">Required</span></label>
+          <input type="text" id="remoteSubpath" class="input-fixed"
+                 placeholder="Raw Files/USA" aria-required="true"
+                 aria-describedby="remoteSubpathError remoteDestPreview"
+                 oninput="updateRemoteDestPreview()">
         </div>
+        <div class="field-error" id="remoteSubpathError" role="alert"></div>
         <div class="remote-preview" id="remoteDestPreview"></div>
       </div>
       <div class="row">
@@ -410,9 +441,11 @@ body { display: flex; flex-direction: column; height: 100vh; }
 
     <div class="card">
       <div class="row">
-        <button class="btn" id="btnPreview" onclick="previewImport()">Preview import</button>
-        <button class="btn btn-primary" id="btnStart" onclick="startImport()">Start import</button>
+        <button class="btn" type="button" id="btnPreview" onclick="previewImport()">Preview import</button>
+        <button class="btn btn-primary" type="button" id="btnStart"
+                aria-describedby="importError" onclick="startImport()">Start import</button>
       </div>
+      <div id="importError" role="alert" aria-live="assertive"></div>
       <div class="preview-summary" id="previewSummary"></div>
       <label class="preview-selection-row" id="selectAllRow" style="display:none;">
         <input type="checkbox" id="chkSelectAllImport" checked>
@@ -422,8 +455,11 @@ body { display: flex; flex-direction: column; height: 100vh; }
            selectionUnavailableText(): the wording differs between in-place
            and snapshot mode, and one source for it beats two. -->
       <div class="preview-summary" id="selectionUnavailableNote" style="display:none;"></div>
+      <label class="preview-filter" id="hideDuplicatesRow" style="display:none;">
+        <input type="checkbox" id="chkHideDuplicates" onchange="onHideDuplicatesToggle()">
+        <span id="hideDuplicatesLabel">Hide duplicates</span>
+      </label>
       <div id="importPreviewGrid" class="import-preview-grid" style="display:none;"></div>
-      <div id="importError"></div>
     </div>
 
     <div class="card" id="progressCard" style="display:none;">
@@ -444,6 +480,11 @@ body { display: flex; flex-direction: column; height: 100vh; }
       <div id="chainInfo" class="hint" style="margin-top:8px;"></div>
       <div id="taggingInfo" class="hint" style="margin-top:8px;"></div>
       <div id="modelWarning" class="warn" style="display:none;"></div>
+      <div class="row" id="retryImportRow" style="display:none;margin-top:10px;">
+        <button class="btn btn-primary" type="button" id="btnRetryImport"
+                onclick="retryFailedImport()">Retry failed files</button>
+        <span class="hint" id="retryImportHint"></span>
+      </div>
       <div class="result-links" style="margin-top:8px;">
         <a href="/browse">Open Browse</a> &nbsp;·&nbsp; <a href="/jobs">Open Jobs</a>
       </div>
@@ -506,6 +547,9 @@ let destStructureSeq = 0;
 let importPreviewSeq = 0;
 let importPreviewTimer = null;
 let importThumbSchedulerCancel = null;
+// Last args passed to renderImportPreviewGrid, so the "Hide duplicates"
+// filter can re-render locally.
+let lastImportPreviewRender = null;
 let importTags = [];
 // User intent ONLY: paths the user explicitly unchecked. Duplicate verdicts
 // are a separate eligibility overlay and are never written in here — see the
@@ -541,6 +585,7 @@ let importStartPending = false;
 let newImagesStartBlocked = false;
 let importExiftoolReady = null;
 let importExiftoolRequired = true;
+let lastFinishedImportJob = null;
 
 async function loadImportReadiness() {
   const status = document.getElementById('importExiftoolStatus');
@@ -580,6 +625,7 @@ async function loadImportReadiness() {
     advanced.style.display = 'none';
     repairSection.style.display = 'none';
   }
+  updateStartGate();
 }
 
 async function installImportExiftool() {
@@ -746,6 +792,7 @@ function updateImportMode() {
   refreshSourceCounts();
   scheduleImportPreview();
   updateAfterMoveUI();
+  updateStartGate();
 }
 
 function selectedFileTypes() {
@@ -841,7 +888,8 @@ function wireDestStructureInvalidation() {
   [
     'chkRecursive', 'fileTypePreset', 'destMode', 'remoteSubpath',
     'chkSkipDuplicates', 'chkTrustLikelyDuplicates', 'chkVerifyByHash', 'destInput',
-    'folderTemplatePreset', 'folderTemplate',
+    'folderTemplatePreset', 'folderTemplate', 'newWorkspaceName',
+    'chkAllowMissingExiftool',
   ].forEach((id) => {
     const el = document.getElementById(id);
     if (!el) return;
@@ -849,6 +897,9 @@ function wireDestStructureInvalidation() {
       hideDestStructure();
       scheduleImportPreview();
       updateAfterMoveUI();
+      if (id === 'destInput' || id === 'destMode') {
+        updateDestinationModeHint();
+      }
       // Immediately, not after the 350ms debounce: for the 350ms between the
       // toggle and the re-preview the rendered grid describes the OLD
       // options, and Start would happily send the selection made against it.
@@ -909,6 +960,7 @@ function updateWorkspaceMode() {
   // ...and the resync can change whether a process chains at all, which
   // gates the "Then move to NAS" row.
   updateAfterMoveUI();
+  updateStartGate();
 }
 
 function importRemoteTargetId() {
@@ -960,25 +1012,50 @@ function updateRemoteDestPreview() {
   const el = document.getElementById('remoteDestPreview');
   if (!el) return;
   el.textContent = '';
+  const input = document.getElementById('remoteSubpath');
+  const errorEl = document.getElementById('remoteSubpathError');
   const t = importRemoteTarget();
-  if (!t) return;
-  const subResult = normalizeRemoteSubpath(document.getElementById('remoteSubpath').value);
+  if (!t) {
+    if (errorEl) {
+      errorEl.textContent = 'Choose a configured NAS target.';
+      errorEl.classList.add('visible');
+    }
+    if (input) input.classList.add('input-invalid');
+    updateStartGate();
+    return;
+  }
+  const subResult = normalizeRemoteSubpath(input.value);
+  let fieldError = '';
   if (subResult.error) {
-    el.appendChild(remotePreviewWarn('Warning: ' + subResult.error));
+    fieldError = subResult.error + ' Enter a folder such as Raw Files/USA.';
   } else if (!subResult.value) {
-    const hint = document.createElement('div');
-    hint.textContent = 'Name the archive folder under ' + t.remote_path + ', e.g. 2026/kenya-trip.';
-    el.appendChild(hint);
+    fieldError = 'Enter the folder inside ' + t.remote_path +
+      ', for example Raw Files/USA.';
   } else {
     const line = document.createElement('div');
-    line.textContent = 'Archive over SSH to: ';
+    line.textContent = 'Vireo will send files directly over SSH to: ';
     const span = document.createElement('span');
     span.style.fontFamily = 'monospace';
     span.textContent = rsyncDestSpec(
       t.user, t.host, t.remote_path.replace(/\/+$/, '') + '/' + subResult.value);
     line.appendChild(span);
     el.appendChild(line);
+    if (t.mount_path) {
+      const catalogLine = document.createElement('div');
+      catalogLine.textContent = 'The same folder is cataloged at: ';
+      const catalogPath = document.createElement('span');
+      catalogPath.style.fontFamily = 'monospace';
+      catalogPath.textContent =
+        t.mount_path.replace(/\/+$/, '') + '/' + subResult.value;
+      catalogLine.appendChild(catalogPath);
+      el.appendChild(catalogLine);
+    }
   }
+  if (errorEl) {
+    errorEl.textContent = fieldError;
+    errorEl.classList.toggle('visible', !!fieldError);
+  }
+  if (input) input.classList.toggle('input-invalid', !!fieldError);
   if (!importRsyncAvailable) {
     el.appendChild(remotePreviewWarn('Warning: no GNU rsync found. Install GNU rsync or set its path under Settings > Paths.'));
   }
@@ -987,6 +1064,7 @@ function updateRemoteDestPreview() {
   } else if (!importIsAbsolutePath(t.mount_path)) {
     el.appendChild(remotePreviewWarn('Warning: this target local mount path must be absolute.'));
   }
+  updateStartGate();
 }
 
 function remoteArchiveSelectionReady() {
@@ -997,14 +1075,39 @@ function remoteArchiveSelectionReady() {
   return !subResult.error && !!subResult.value;
 }
 
+function updateDestinationModeHint() {
+  const hint = document.getElementById('destModeHint');
+  if (!hint) return;
+  const target = importRemoteTarget();
+  if (target) {
+    hint.textContent = 'Direct SSH transfer to ' + target.remote_path +
+      '. The folder inside that root is required below.';
+    return;
+  }
+  const destination =
+    (document.getElementById('destInput')?.value || '').trim();
+  const mountedTarget = importRemoteTargets.find((item) => {
+    const mount = String(item.mount_path || '').replace(/\/+$/, '');
+    return mount && (
+      destination === mount || destination.indexOf(mount + '/') === 0
+    );
+  });
+  hint.textContent = mountedTarget
+    ? 'Using ' + mountedTarget.name + ' through its Finder-mounted path ' +
+      mountedTarget.mount_path + '. Files are copied through the mounted volume.'
+    : 'Use this for folders on this Mac and NAS volumes mounted in Finder.';
+}
+
 function onImportDestModeChange() {
   const remoteId = importRemoteTargetId();
   const localRows = document.getElementById('destLocalRows');
   const remoteRows = document.getElementById('destRemoteRows');
   if (localRows) localRows.style.display = remoteId ? 'none' : '';
   if (remoteRows) remoteRows.style.display = remoteId ? '' : 'none';
+  updateDestinationModeHint();
   updateRemoteDestPreview();
   updateAfterMoveUI();
+  updateStartGate();
 }
 
 async function loadImportRemoteTargets() {
@@ -1026,7 +1129,7 @@ async function loadImportRemoteTargets() {
   importRemoteTargets.forEach((t) => {
     const opt = document.createElement('option');
     opt.value = 'remote:' + t.id;
-    opt.textContent = t.name + ' - ' + t.user + '@' + t.host + ' (SSH)';
+    opt.textContent = t.name + ' — direct transfer over SSH';
     sel.appendChild(opt);
   });
   onImportDestModeChange();
@@ -1066,6 +1169,13 @@ function renderSources() {
       hideDestStructure();
       if (!sources.length) {
         clearImportPreviewGrid();
+        // Emptying the source list ends this card's session, so the
+        // filter retires with it — the row is already hidden here, and
+        // carrying the choice into whatever card is added next would
+        // filter that one on arrival without the user opting in. Note
+        // this is deliberately NOT in clearImportPreviewGrid(): ordinary
+        // re-previews clear the grid too and must keep the opt-in.
+        retireHideDuplicatesOptIn();
         document.getElementById('previewSummary').textContent = '';
       }
       renderSources();
@@ -1077,6 +1187,7 @@ function renderSources() {
     div.appendChild(btn);
     list.appendChild(div);
   });
+  updateStartGate();
 }
 
 function selectedSourceCountOptions() {
@@ -1612,7 +1723,11 @@ function updateAfterMoveUI() {
     if (importIsAbsolutePath(destination)) {
       unavailable.textContent =
         "Move to NAS unavailable: the destination is not inside any remote "
-        + "target's local archive root. Set one under Settings > Remote targets.";
+        + "target's local archive root. ";
+      const setup = document.createElement('a');
+      setup.href = '/settings#nas-setup';
+      setup.textContent = 'Set up remote target…';
+      unavailable.appendChild(setup);
       unavailable.style.display = '';
     }
     return;
@@ -1816,10 +1931,98 @@ let _globalDefaultProcessId = null;
 // default rather than sticking on whatever placeholder was showing.
 let _workspaceDefaultProcessId = null;
 
-function showError(msg) {
+function importFormProblem() {
+  if (!sources.length && newImagesSnapshotId === null) {
+    return {
+      message: 'Add at least one source folder.',
+      target: document.getElementById('sourceCard'),
+    };
+  }
+  const allowMissingExiftool =
+    !!document.getElementById('chkAllowMissingExiftool')?.checked;
+  if (
+    importExiftoolRequired && importExiftoolReady === false
+    && !allowMissingExiftool
+  ) {
+    return {
+      message: 'Repair ExifTool before importing, or use Advanced → Import without metadata.',
+      target: document.getElementById('exiftoolCard'),
+    };
+  }
+  if (document.getElementById('workspaceNew')?.checked) {
+    const name =
+      (document.getElementById('newWorkspaceName')?.value || '').trim();
+    if (!name) {
+      return {
+        message: 'Enter a name for the new workspace.',
+        target: document.getElementById('newWorkspaceName'),
+      };
+    }
+  }
+  const copyMode =
+    newImagesSnapshotId === null && selectedImportMode() === 'copy';
+  if (!copyMode) return null;
+  const fileTypes = selectedFileTypes();
+  if (Array.isArray(fileTypes) && !fileTypes.length) {
+    return {
+      message: 'Choose at least one file extension.',
+      target: document.getElementById('fileTypePreset'),
+    };
+  }
+  const remoteId = importRemoteTargetId();
+  if (remoteId) {
+    const target = importRemoteTarget();
+    const subResult = normalizeRemoteSubpath(
+      document.getElementById('remoteSubpath').value);
+    if (!target) {
+      return {
+        message: 'Choose a configured NAS target.',
+        target: document.getElementById('destMode'),
+      };
+    }
+    if (!importRsyncAvailable) {
+      return {
+        message: 'Direct NAS transfer needs GNU rsync. Repair its path in Settings, or use the mounted Local path.',
+        target: document.getElementById('destMode'),
+      };
+    }
+    if (!target.mount_path || !importIsAbsolutePath(target.mount_path)) {
+      return {
+        message: 'This NAS target needs an absolute mounted path in Settings before Vireo can catalog imported files.',
+        target: document.getElementById('destMode'),
+      };
+    }
+    if (subResult.error || !subResult.value) {
+      return {
+        message: subResult.error
+          ? subResult.error + ' Enter a folder such as Raw Files/USA.'
+          : 'Enter the folder inside ' + target.remote_path +
+            ', for example Raw Files/USA.',
+        target: document.getElementById('remoteSubpath'),
+      };
+    }
+  } else {
+    const destination =
+      (document.getElementById('destInput').value || '').trim();
+    if (!destination) {
+      return {
+        message: 'Choose a destination folder.',
+        target: document.getElementById('destInput'),
+      };
+    }
+  }
+  return null;
+}
+
+function showError(msg, target) {
   const el = document.getElementById('importError');
   el.textContent = msg;
   el.style.display = msg ? 'block' : 'none';
+  if (msg && target) {
+    const focusTarget = target.focus ? target : null;
+    target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    if (focusTarget) focusTarget.focus({ preventScroll: true });
+  }
 }
 
 function formatBytes(n) {
@@ -2063,10 +2266,51 @@ function clearImportPreviewGrid() {
     importThumbSchedulerCancel();
     importThumbSchedulerCancel = null;
   }
+  lastImportPreviewRender = null;
+  updateHideDuplicatesControl(0);
   const grid = document.getElementById('importPreviewGrid');
   if (!grid) return;
   grid.style.display = 'none';
   grid.innerHTML = '';
+}
+
+// The "Hide duplicates" row only makes sense once a preview has actually
+// flagged duplicates — before the duplicate check runs (or with dedup off)
+// there is nothing to hide, so the control stays hidden rather than
+// implying a filter that would do nothing.
+function updateHideDuplicatesControl(dupCount) {
+  const row = document.getElementById('hideDuplicatesRow');
+  const label = document.getElementById('hideDuplicatesLabel');
+  if (!row || !label) return;
+  row.style.display = dupCount > 0 ? '' : 'none';
+  label.textContent = 'Hide duplicates (' + dupCount.toLocaleString() + ')';
+}
+
+function hideDuplicatesEnabled() {
+  const el = document.getElementById('chkHideDuplicates');
+  return !!(el && el.checked);
+}
+
+// Drop the opt-in once a settled preview has nothing to hide, so the next
+// card that does carry duplicates starts unfiltered instead of inheriting
+// a choice made for a different card while the row was hidden.
+//
+// Only call this where the duplicate picture is FINAL. Every preview
+// renders the grid with an empty duplicate list before its check
+// finishes, so clearing on any zero count (including inside
+// updateHideDuplicatesControl) would silently flip the filter off every
+// time an import option change schedules a fresh preview.
+function retireHideDuplicatesOptIn() {
+  const el = document.getElementById('chkHideDuplicates');
+  if (el) el.checked = false;
+}
+
+// Re-run the last grid render with the current filter state. Purely a view
+// toggle — it never re-requests the preview or the duplicate check.
+function rerenderImportPreviewGrid() {
+  if (!lastImportPreviewRender) return;
+  const last = lastImportPreviewRender;
+  renderImportPreviewGrid(last.files, last.duplicatePaths, last.destinationFiles);
 }
 
 function importDestinationMap(destinationFiles) {
@@ -2077,6 +2321,33 @@ function importDestinationMap(destinationFiles) {
   return map;
 }
 
+// Duplicate identity is per-occurrence, not per-path. When source folders
+// overlap (e.g. `/card` and `/card/DCIM`) the same file path can appear
+// twice in `files`; the server's `check-duplicates` stream flags only the
+// *later* occurrence as an intra-import duplicate — the first is what will
+// actually be copied. A path-set membership test would tag both tiles as
+// duplicates, so enabling the filter would hide the to-copy file too and
+// the grid could claim every tile is a duplicate while the summary still
+// reports one file remaining. Match the server's ordering by walking
+// `files` in reverse and consuming duplicate-count credits per path.
+function computeDuplicateFlags(files, duplicatePaths) {
+  const flags = new Array(files.length).fill(false);
+  const remaining = new Map();
+  (duplicatePaths || []).forEach((p) => {
+    remaining.set(p, (remaining.get(p) || 0) + 1);
+  });
+  if (!remaining.size) return flags;
+  for (let i = files.length - 1; i >= 0; i -= 1) {
+    const p = files[i] && files[i].path;
+    const count = remaining.get(p) || 0;
+    if (count > 0) {
+      flags[i] = true;
+      remaining.set(p, count - 1);
+    }
+  }
+  return flags;
+}
+
 function renderImportPreviewGrid(files, duplicatePaths, destinationFiles) {
   const grid = document.getElementById('importPreviewGrid');
   if (!grid) return;
@@ -2085,12 +2356,24 @@ function renderImportPreviewGrid(files, duplicatePaths, destinationFiles) {
     importThumbSchedulerCancel = null;
   }
   grid.innerHTML = '';
-  const dupes = new Set(duplicatePaths || []);
   const destMap = importDestinationMap(destinationFiles);
   if (!files || !files.length) {
+    lastImportPreviewRender = null;
+    updateHideDuplicatesControl(0);
     grid.style.display = 'none';
     return;
   }
+  // Remember the inputs so the filter toggle can re-render without
+  // re-running the preview or the duplicate check.
+  lastImportPreviewRender = {
+    files: files,
+    duplicatePaths: duplicatePaths,
+    destinationFiles: destinationFiles,
+  };
+  const duplicateFlags = computeDuplicateFlags(files, duplicatePaths);
+  const dupeCount = duplicateFlags.reduce((n, isDup) => n + (isDup ? 1 : 0), 0);
+  updateHideDuplicatesControl(dupeCount);
+  const hidingDuplicates = dupeCount > 0 && hideDuplicatesEnabled();
 
   const skipDupes = document.getElementById('chkSkipDuplicates').checked;
   // The cards are still drawn in every mode — the preview is the honest list
@@ -2098,14 +2381,49 @@ function renderImportPreviewGrid(files, duplicatePaths, destinationFiles) {
   // the user can change that list are withheld.
   const selectionEnabled = importSelectionEnabled();
 
+  // Duplicate-heavy retries should foreground the work Vireo will actually
+  // perform. Rendering hundreds of skipped cards obscures the one failed
+  // file and schedules a thumbnail request for every duplicate. When the
+  // user has opted into hiding duplicates, collapse them into one summary
+  // and render only pending/unavailable items; otherwise fall back to the
+  // per-folder view so each duplicate still surfaces as its own tile.
+  const pendingFiles = files.filter((f, i) => !duplicateFlags[i]);
+  const duplicateCount = files.length - pendingFiles.length;
   const groups = {};
-  files.forEach((f) => {
+  files.forEach((f, i) => {
     const key = f.subfolder || 'Source';
     if (!groups[key]) groups[key] = [];
-    groups[key].push(f);
+    groups[key].push({ file: f, isDuplicate: duplicateFlags[i] });
   });
 
+  if (hidingDuplicates && duplicateCount) {
+    const collapsed = document.createElement('div');
+    collapsed.className = 'import-preview-collapsed';
+    collapsed.setAttribute('data-testid', 'collapsed-duplicate-preview');
+    collapsed.textContent = duplicateCount.toLocaleString() +
+      ' duplicate' + (duplicateCount === 1 ? '' : 's') +
+      ' hidden — ' + (duplicateCount === 1 ? 'it will' : 'they will') +
+      ' be skipped. ' + (
+        pendingFiles.length
+          ? pendingFiles.length.toLocaleString() +
+            ' file' + (pendingFiles.length === 1 ? '' : 's') +
+            ' to import ' + (pendingFiles.length === 1 ? 'is' : 'are') +
+            ' shown below.'
+          : 'Nothing else will be imported from this selection.'
+      );
+    grid.appendChild(collapsed);
+  }
+
+  let anyTilesRendered = false;
+
   Object.keys(groups).sort().forEach((subfolder) => {
+    const all = groups[subfolder];
+    const shown = hidingDuplicates ? all.filter((e) => !e.isDuplicate) : all;
+    const hiddenHere = all.length - shown.length;
+    // Nothing to show and nothing hidden — no reason to render a header.
+    // (Only reachable if a group somehow started empty, which shouldn't
+    // happen since groups are built from `files`.)
+    if (!shown.length && !hiddenHere) return;
     const groupEl = document.createElement('div');
     groupEl.className = 'import-preview-folder';
     const header = document.createElement('div');
@@ -2132,14 +2450,32 @@ function renderImportPreviewGrid(files, duplicatePaths, destinationFiles) {
       header.appendChild(folderCheck);
     }
     const headerLabel = document.createElement('span');
-    headerLabel.textContent = subfolder + ' (' + groups[subfolder].length + ')';
+    // Stamped as data, not recovered from the rendered text: with "Hide
+    // duplicates" on, the label carries a "· N duplicates hidden" suffix and
+    // the trailing-count regex refreshImportFolderHeaders() used to strip
+    // would leave the checkbox tooltip naming the folder
+    // "card-a (0) · 2 duplicates hidden".
+    headerLabel.dataset.folder = subfolder;
+    headerLabel.textContent = subfolder + ' (' + shown.length + ')' +
+      (hiddenHere ? ' · ' + hiddenHere.toLocaleString() + ' duplicate' +
+        (hiddenHere === 1 ? '' : 's') + ' hidden' : '');
     header.appendChild(headerLabel);
     groupEl.appendChild(header);
 
+    // A folder made entirely of duplicates still gets its header — a
+    // silent drop would leave the user with no evidence the folder or its
+    // hidden count existed while other headers own their hidden files.
+    if (!shown.length) {
+      grid.appendChild(groupEl);
+      return;
+    }
+
+    anyTilesRendered = true;
     const thumbsEl = document.createElement('div');
     thumbsEl.className = 'import-preview-thumbs';
-    groups[subfolder].forEach((f) => {
-      const isDuplicate = dupes.has(f.path);
+    shown.forEach((entry) => {
+      const f = entry.file;
+      const isDuplicate = entry.isDuplicate;
       const isUnavailable = f.available === false;
       const card = document.createElement('div');
       card.className = 'import-preview-thumb' +
@@ -2203,6 +2539,25 @@ function renderImportPreviewGrid(files, duplicatePaths, destinationFiles) {
     groupEl.appendChild(thumbsEl);
     grid.appendChild(groupEl);
   });
+  // Every folder ended up fully filtered, so replace the wall of
+  // "(0) · N hidden" headers with a single clearer message that also
+  // tells the user how to see the tiles again. When the collapsed
+  // duplicate banner is already visible it already carries the count and
+  // outcome, so keep it and skip the fallback message.
+  if (!anyTilesRendered) {
+    const collapsedBanner = grid.querySelector('.import-preview-collapsed');
+    grid.innerHTML = '';
+    if (collapsedBanner) {
+      grid.appendChild(collapsedBanner);
+    } else {
+      const empty = document.createElement('div');
+      empty.className = 'import-preview-empty';
+      empty.textContent = 'All ' + files.length.toLocaleString() + ' file' +
+        (files.length === 1 ? ' is a duplicate' : 's are duplicates') +
+        ' — uncheck "Hide duplicates" to see them.';
+      grid.appendChild(empty);
+    }
+  }
   grid.style.display = '';
   // After the grid is shown, not before: importVisibleCards() reads
   // offsetParent, which is null for every card while the grid is still
@@ -2274,9 +2629,16 @@ function refreshImportFolderHeaders() {
     // snaps back is worse than an honestly dead one.
     folderCheck.disabled = paths.length === 0;
     // Name the folder. refreshImportFolderHeaders() has no `subfolder` in
-    // scope, so recover it from the label the renderer put beside the box.
+    // scope, so read it off the label the renderer put beside the box —
+    // from its data attribute, not by stripping the trailing count out of
+    // its text: with "Hide duplicates" on, that text ends in
+    // "· N duplicates hidden" (#1382) and the regex left the tooltip
+    // reading "Every file in card-a (0) · 2 duplicates hidden is a…".
     const labelEl = folderCheck.parentNode.querySelector('span');
-    const name = (labelEl ? labelEl.textContent : '').replace(/ \(\d+\)$/, '');
+    const name = labelEl
+      ? (labelEl.dataset.folder
+         ?? labelEl.textContent.replace(/ \(\d+\)$/, ''))
+      : '';
     folderCheck.title = paths.length === 0
       ? 'Every file in ' + name + ' is a duplicate that will be skipped'
       : 'Select or deselect every file in ' + name;
@@ -2314,25 +2676,46 @@ function toggleImportSelection(path, checked, shiftKey) {
   rerenderImportPreviewGridSafe();
 }
 
-// The hide-duplicates-checkbox branch adds rerenderImportPreviewGrid(). Until
-// it merges, fall back to a targeted DOM refresh.
+// Redraw the boxes after a selection change.
+//
+// This used to branch on `typeof rerenderImportPreviewGrid === 'function'`
+// against a targeted DOM fallback, because the hide-duplicates filter (#1382)
+// had not merged yet and there was no full re-render to call. It has merged;
+// the fallback is dead code and is gone.
+//
+// A targeted refresh is still what happens, and deliberately so: a full
+// renderImportPreviewGrid() would rebuild every card on every checkbox click,
+// which drops each <img> and re-runs setupImportThumbnailScheduler() over the
+// whole grid. On the 985-file card #1382 was written for, that is a visible
+// flash of empty tiles per click. Selection state is derived, so only the
+// boxes and the headers can change; the tiles cannot.
+//
+// The one thing a targeted refresh cannot do is honor a change in WHICH cards
+// exist — that only happens when the filter itself is toggled, which calls
+// rerenderImportPreviewGrid() directly (see onHideDuplicatesToggle).
 function rerenderImportPreviewGridSafe() {
-  if (typeof rerenderImportPreviewGrid === 'function') {
-    rerenderImportPreviewGrid();
-  } else {
-    const skipDupes = document.getElementById('chkSkipDuplicates').checked;
-    importGridCards().forEach((el) => {
-      const cb = el.querySelector('.thumb-check');
-      if (!cb) return;
-      const isDup = el.classList.contains('duplicate');
-      cb.checked = !importDeselected.has(el.dataset.path) && !(isDup && skipDupes);
-      cb.disabled = isDup && skipDupes;
-    });
-  }
-  // Unconditional: the sibling's rerenderImportPreviewGrid() is not known to
-  // refresh folder headers, and a header left claiming "all selected" after a
-  // per-file click is exactly the stale readout this function exists to stop.
+  const skipDupes = document.getElementById('chkSkipDuplicates').checked;
+  importGridCards().forEach((el) => {
+    const cb = el.querySelector('.thumb-check');
+    if (!cb) return;
+    const isDup = el.classList.contains('duplicate');
+    cb.checked = !importDeselected.has(el.dataset.path) && !(isDup && skipDupes);
+    cb.disabled = isDup && skipDupes;
+  });
+  // A header left claiming "all selected" after a per-file click is exactly
+  // the stale readout this function exists to stop.
   refreshImportFolderHeaders();
+}
+
+// #chkHideDuplicates changes which cards EXIST, not just which boxes are
+// ticked, so it needs the full re-render rather than the targeted refresh
+// above. Every selection readout on this page is derived from the rendered
+// cards (importGridCards()), so the readouts have to resync afterwards or the
+// select-all row, the "N of M selected" line and the Start label go on
+// describing a grid that is no longer there.
+function onHideDuplicatesToggle() {
+  rerenderImportPreviewGrid();
+  updateImportSelectionUI();
 }
 
 // Counted off the rendered cards, like every other readout on this page.
@@ -2459,7 +2842,26 @@ function updateStartGate() {
     // safe-to-format verdict on it.
     reason = 'No files selected';
   }
-  btn.disabled = reason !== null || newImagesStartBlocked;
+  // Form validity, from #1387's importFormProblem(). That PR landed its own
+  // single owner of this button (updateStartAvailability()) on main while
+  // this branch was landing updateStartGate() here; both assigned
+  // btn.disabled, so keeping both would have made the button read whichever
+  // ran last. They answer different questions and both have to be able to
+  // hold it shut — "is the FORM complete" (no destination, no file types,
+  // unrepaired ExifTool, an unusable NAS target) and "does the PREVIEW still
+  // describe what would be copied". So this function owns both, and
+  // updateStartAvailability() is gone.
+  //
+  // The two report through different channels on purpose: a lifecycle
+  // `reason` replaces the LABEL, because it describes something the page is
+  // doing and the user only has to wait; a form `problem` names a field the
+  // user must go fix, and belongs in the tooltip next to the inline error
+  // #1387 already renders beside that field. A form problem must not
+  // overwrite "Importing…".
+  const problem = importFormProblem();
+  btn.disabled = reason !== null || newImagesStartBlocked || !!problem;
+  btn.title = problem ? problem.message : '';
+  btn.setAttribute('aria-disabled', btn.disabled ? 'true' : 'false');
   const checked = importCheckedCount();
   btn.textContent = reason
     || (copyMode && importPreviewCapturedSignature !== null
@@ -2536,9 +2938,14 @@ function resolvedCopyDestination() {
     const t = importRemoteTarget();
     if (!t || !t.mount_path || !importIsAbsolutePath(t.mount_path)) return '';
     const sub = normalizeRemoteSubpath(document.getElementById('remoteSubpath').value);
-    if (sub.error) return '';
+    // The mount root by itself is not a valid remote selection: the SSH
+    // importer requires a folder below the configured remote root. Rendering
+    // a destination preview for the bare mount made an invalid form look
+    // complete and could surface an unrelated managed archive nested below
+    // that mount.
+    if (sub.error || !sub.value) return '';
     const base = t.mount_path.replace(/\/+$/, '');
-    return sub.value ? base + '/' + sub.value : base;
+    return base + '/' + sub.value;
   }
   const local = (document.getElementById('destInput').value || '').trim();
   return importIsAbsolutePath(local) ? local : '';
@@ -2630,7 +3037,16 @@ async function renderDestStructure(excludePaths) {
   // when there is no folder table to draw.
   applyFolderTemplateSamples(data.template_samples);
   const folders = data.folders || [];
-  if (!folders.length && !data.managed_archive) return data;
+  const archives = Array.isArray(data.managed_archives)
+    ? data.managed_archives
+    : (data.managed_archive
+        ? [{
+            path: data.managed_archive.path,
+            photo_count: data.managed_archive.photo_count,
+            coverage: 'full',
+          }]
+        : []);
+  if (!folders.length && !archives.length) return data;
 
   const headline = document.createElement('div');
   headline.className = 'structure-headline';
@@ -2640,21 +3056,34 @@ async function renderDestStructure(excludePaths) {
     ' (' + data.new_folders + ' new, ' + data.existing_folders + ' existing)';
   el.appendChild(headline);
 
-  if (data.managed_archive) {
+  // Phrase each callout in terms of where the generated folders land,
+  // not the selected destination — the backend flags an archive whenever
+  // *some* generated folders sit inside it (including when the
+  // destination is above the archive but the template maps files back
+  // into it). Coverage 'full' means every generated folder lands inside
+  // this archive; 'partial' means only some do — either because part of
+  // the source lands outside every tracked archive, or because multiple
+  // archives split the generated folders between them. Say so, so the
+  // caller does not read "lands inside X" as "all of it lands inside X".
+  const multipleArchives = archives.length > 1;
+  archives.forEach((arch) => {
     const callout = document.createElement('div');
     callout.className = 'managed-archive-callout';
     const label = document.createElement('span');
-    label.textContent = 'Merging into a managed archive at ';
+    const partial = arch.coverage === 'partial' || multipleArchives;
+    label.textContent = partial
+      ? 'Some files imported here will land inside the managed archive rooted at '
+      : 'Files imported here land inside the managed archive rooted at ';
     const path = document.createElement('span');
     path.style.fontFamily = 'monospace';
-    path.textContent = data.managed_archive.path;
+    path.textContent = arch.path;
     const tail = document.createElement('span');
-    tail.textContent = ' — ' + data.managed_archive.photo_count +
-      ' photo' + (data.managed_archive.photo_count === 1 ? '' : 's') +
+    tail.textContent = ' — ' + arch.photo_count +
+      ' photo' + (arch.photo_count === 1 ? '' : 's') +
       ' already cataloged there.';
     callout.append(label, path, tail);
     el.appendChild(callout);
-  }
+  });
 
   const table = document.createElement('table');
   table.className = 'structure-table';
@@ -2721,7 +3150,12 @@ async function previewImport(opts) {
   importPreviewFailed = false;
   updateStartGate();
   const summary = document.getElementById('previewSummary');
+  // Both bail-outs below are settled: the run stops before discovery, so
+  // nothing can be hidden and the opt-in must not linger behind the
+  // now-hidden row. (Contrast the in-flight path further down, which
+  // keeps the opt-in until the duplicate count is actually known.)
   if (!sources.length && newImagesSnapshotId === null) {
+    retireHideDuplicatesOptIn();
     summary.textContent = '';
     showError('Add at least one source folder.');
     endImportPreviewFlight(requestSeq);
@@ -2730,6 +3164,7 @@ async function previewImport(opts) {
   const copyMode = newImagesSnapshotId === null && selectedImportMode() === 'copy';
   const fileTypes = copyMode ? selectedFileTypes() : 'both';
   if (copyMode && Array.isArray(fileTypes) && !fileTypes.length) {
+    retireHideDuplicatesOptIn();
     summary.textContent = '';
     showError('Choose at least one file extension.');
     endImportPreviewFlight(requestSeq);
@@ -2779,12 +3214,30 @@ async function previewImport(opts) {
     if (!files.length) {
       summary.textContent = 'No importable files found.';
       clearImportPreviewGrid();
+      // A completed preview with zero files is a final "nothing to hide"
+      // state — like snapshot / in-place / dedup-off below — so retire the
+      // opt-in. Otherwise the row hides while the checkbox stays checked,
+      // and the next card that does surface duplicates gets filtered
+      // silently instead of opt-in.
+      retireHideDuplicatesOptIn();
       updateImportSelectionUI();
       return;
     }
-    renderImportPreviewGrid(files, [], null);
-    updateImportSelectionUI();
+    // The three branches below all settle without a duplicate check —
+    // in-place/snapshot imports have no duplicate concept and a dedup-off
+    // copy skips nothing — so each is a final "nothing to hide" state and
+    // retires the opt-in. The fall-through path does NOT: its duplicate
+    // count is still unknown until the check below completes.
+    //
+    // Each branch renders and then resyncs the selection readouts. The
+    // renderer draws the boxes; updateImportSelectionUI() owns the
+    // select-all row, the "N of M selected" line and the Start gate, and it
+    // reads the cards the renderer just drew, so it has to follow every
+    // render rather than sit once above the branches.
     if (snapshotMode) {
+      renderImportPreviewGrid(files, [], null);
+      updateImportSelectionUI();
+      retireHideDuplicatesOptIn();
       const unavailable = Number(data.unavailable_count || 0);
       summary.textContent = Number(data.total_count || files.length).toLocaleString() +
         ' captured file' + (Number(data.total_count || files.length) === 1 ? '' : 's') +
@@ -2793,10 +3246,16 @@ async function previewImport(opts) {
       return;
     }
     if (!copyMode) {
+      renderImportPreviewGrid(files, [], null);
+      updateImportSelectionUI();
+      retireHideDuplicatesOptIn();
       summary.textContent = files.length + ' files found · originals will stay in place';
       return;
     }
     if (!document.getElementById('chkSkipDuplicates').checked) {
+      renderImportPreviewGrid(files, [], null);
+      updateImportSelectionUI();
+      retireHideDuplicatesOptIn();
       summary.textContent = files.length + ' files found · duplicates will be copied';
       // No dedup gate, so every discovered file lands — pass no exclusions
       // so the folder-structure counts match the full copy set.
@@ -2811,7 +3270,12 @@ async function previewImport(opts) {
     // until the stream drains: submitting mid-stream would send a selection
     // that doesn't match the boxes the user is looking at.
     importDupStreamPending = true;
-    updateStartGate();
+    // updateImportSelectionUI(), not a bare updateStartGate(): since #1387
+    // this path renders nothing until the stream drains, so between here and
+    // then the grid is empty while "N of M selected" would still be showing
+    // the PREVIOUS card's tally. Over SMB with verify_by_hash that window is
+    // minutes long. Resync it against the grid that is actually on screen.
+    updateImportSelectionUI();
     // check-duplicates streams results; collect flagged paths as they arrive.
     // Pass verify_by_hash so the preview and the import agree on which files
     // are duplicates — otherwise a renamed/metadata-colliding file counted
@@ -2852,6 +3316,8 @@ async function previewImport(opts) {
       return;
     }
     const dupCount = duplicatePaths.length;
+    // The check ran to completion, so this count is final.
+    if (dupCount === 0) retireHideDuplicatesOptIn();
     summary.textContent = files.length + ' files found · ' + dupCount +
       ' already in your library (will be skipped) · ' +
       (files.length - dupCount) + ' to copy';
@@ -2909,16 +3375,13 @@ function renderFolderTable(el, folders) {
 async function startImport() {
   showError('');
   addImportTagFromInput();
-  if (!sources.length && newImagesSnapshotId === null) {
-    showError('Add at least one source folder.');
+  const problem = importFormProblem();
+  if (problem) {
+    showError(problem.message, problem.target);
+    updateStartGate();
     return;
   }
   const allowMissingExiftool = !!document.getElementById('chkAllowMissingExiftool')?.checked;
-  if (importExiftoolRequired && importExiftoolReady === false && !allowMissingExiftool) {
-    showError('Repair ExifTool before importing, or use Advanced → Import without metadata.');
-    document.getElementById('exiftoolCard')?.scrollIntoView({ behavior: 'smooth', block: 'center' });
-    return;
-  }
   const copyMode = newImagesSnapshotId === null && selectedImportMode() === 'copy';
   const body = newImagesSnapshotId !== null ? {
     source_snapshot_id: newImagesSnapshotId,
@@ -3040,8 +3503,8 @@ async function startImport() {
     document.getElementById('resultCard').style.display = 'none';
     watchJob(activeJobId);
   } catch (e) {
-    showError(String(e.message || e));
     importStartPending = false;
+    showError(String(e.message || e), document.getElementById('btnStart'));
     updateStartGate();
   }
 }
@@ -3091,11 +3554,148 @@ async function finishJob(jobId) {
     showError('Import ended but its result could not be loaded — check the Jobs page.');
     return;
   }
+  lastFinishedImportJob = job;
   renderResult(job.result, job.status);
+}
+
+function retryBodyFromFinishedJob(job) {
+  const cfg = (job && job.config) || {};
+  // Recovery retry always POSTs to /api/jobs/import-photos, which rejects
+  // requests without a destination. An in-place import finishes with a
+  // non-empty sources list but cfg.destination === null / cfg.mode ===
+  // "in_place", so exposing the retry action there would offer a run that
+  // cannot start. Gate on the persisted job type/mode the same way the
+  // Jobs page does.
+  if (!job || job.type !== 'import' || cfg.mode === 'in_place') return null;
+  if (!Array.isArray(cfg.sources) || !cfg.sources.length) return null;
+  // The server binds the retry's carry list to this parent (below) and
+  // — when the parent used a remote target — verifies the current
+  // resolution still matches the parent's snapshot. Skip when the
+  // parent has no id (defensive; production always has one).
+  if (!job.id) return null;
+  // Preserve `""` when the parent's config explicitly stored an empty
+  // folder_template — that means "copy directly into the archive root",
+  // and `||` here would silently redirect the retry to a date-tree the
+  // user didn't ask for. Fall back to the default only when the key is
+  // truly absent/nullish. Same treatment on the Jobs page.
+  const folderTemplate = cfg.folder_template != null
+    ? cfg.folder_template : '%Y/%Y-%m-%d';
+  // Preserve the parent's duplicate-skip semantics. Forcing skip_duplicates
+  // on for every retry means a failed file that happens to match some
+  // existing catalog entry — including from an unrelated card — is
+  // silently skipped again instead of getting the copy the user asked
+  // for; that hits imports the user deliberately configured with
+  // duplicate skipping OFF particularly hard. The copy layer treats
+  // byte-identical prior successes already sitting at the destination
+  // path as adoptable skips regardless of this flag, so preserving the
+  // parent value still avoids re-copying files that landed successfully.
+  const parentSkipDuplicates = cfg.skip_duplicates != null
+    ? !!cfg.skip_duplicates : true;
+  const body = {
+    sources: cfg.sources.slice(),
+    destination: cfg.destination,
+    recursive: cfg.recursive !== false,
+    folder_template: folderTemplate,
+    file_types: cfg.file_types || 'both',
+    skip_duplicates: parentSkipDuplicates,
+    verify_by_hash: !!cfg.verify_by_hash,
+    trust_likely_duplicates: !!cfg.trust_likely_duplicates,
+    after_import: cfg.after_import == null ? null : cfg.after_import,
+    tags: Array.isArray(cfg.tags) ? cfg.tags.slice() : [],
+    location_from_gps: !!cfg.location_from_gps,
+    allow_missing_exiftool: !!cfg.allow_missing_exiftool,
+    parent_import_job_id: job.id,
+  };
+  // Carry forward the complete original import scope so the after-import
+  // process runs on ALL files the user meant to import, not only the
+  // ones this retry newly landed. The parent's failed run skipped
+  // chaining entirely (its result.ok was false), so those photos are
+  // still unprocessed even though they're on disk. On a retry-of-retry
+  // the parent's own carry list must persist too, otherwise the second
+  // retry would forget everything the first retry inherited from the
+  // original attempt.
+  const parentCarry = Array.isArray(cfg.carry_photo_ids)
+    ? cfg.carry_photo_ids : [];
+  const parentImported = Array.isArray(job.result && job.result.photo_ids)
+    ? job.result.photo_ids : [];
+  const carry = [];
+  const carrySeen = new Set();
+  parentCarry.concat(parentImported).forEach((pid) => {
+    if (typeof pid !== 'number' || !Number.isInteger(pid) || pid <= 0) return;
+    if (carrySeen.has(pid)) return;
+    carrySeen.add(pid);
+    carry.push(pid);
+  });
+  if (carry.length) body.carry_photo_ids = carry;
+  if (cfg.remote_target_id) {
+    delete body.destination;
+    body.remote_target_id = cfg.remote_target_id;
+    body.remote_subpath = cfg.remote_subpath;
+  }
+  if (cfg.after_process_move && cfg.after_process_move.remote_target_id) {
+    body.after_process_move = {
+      remote_target_id: cfg.after_process_move.remote_target_id,
+    };
+  }
+  return body;
+}
+
+async function retryFailedImport() {
+  const button = document.getElementById('btnRetryImport');
+  const hint = document.getElementById('retryImportHint');
+  const body = retryBodyFromFinishedJob(lastFinishedImportJob);
+  if (!body) {
+    hint.textContent = 'The original import settings are no longer available. Start a new import from the source card.';
+    return;
+  }
+  button.disabled = true;
+  button.textContent = 'Starting retry…';
+  hint.textContent = 'Already imported files will be skipped.';
+  // Flip the in-flight flag BEFORE the retry request goes out — not after
+  // its response arrives. Retry validation synchronously re-enumerates
+  // sources and hashes every carried destination file to guard against
+  // stealth overwrites, which pushes the fetch to a materially non-trivial
+  // wall-clock. If the main Start button remains enabled during that
+  // window, a click launches an ordinary import (no ``parent_import_job_id``
+  // in its body) that the server-side retry exclusivity gate can't catch,
+  // and the two runs race over the same card and destination. Mirror what
+  // startImport() does: flag first, updateStartGate(), then fetch;
+  // clear the flag on failure so the button re-enables. See PR #1387
+  // Codex review.
+  importStartPending = true;
+  updateStartGate();
+  try {
+    const resp = await fetch('/api/jobs/import-photos', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok) throw new Error(data.error || 'retry failed to start');
+    activeJobId = data.job_id;
+    document.getElementById('progressCard').style.display = '';
+    document.getElementById('resultCard').style.display = 'none';
+    document.getElementById('progressCard').scrollIntoView({
+      behavior: 'smooth', block: 'center',
+    });
+    watchJob(activeJobId);
+  } catch (e) {
+    importStartPending = false;
+    updateStartGate();
+    button.disabled = false;
+    button.textContent = 'Retry failed files';
+    hint.textContent = String(e.message || e);
+  }
 }
 
 function renderResult(res, status) {
   document.getElementById('resultCard').style.display = '';
+  const retryRow = document.getElementById('retryImportRow');
+  const retryButton = document.getElementById('btnRetryImport');
+  const retryHint = document.getElementById('retryImportHint');
+  retryRow.style.display = 'none';
+  retryHint.textContent = '';
+  retryButton.disabled = false;
   const pill = document.getElementById('safeToFormatPill');
   const unsafe = document.getElementById('unsafeList');
   unsafe.innerHTML = '';
@@ -3204,6 +3804,15 @@ function renderResult(res, status) {
     res.skipped_duplicate + ' duplicates skipped · ' + res.failed + ' failed' +
     (status && status !== 'completed' ? ' · job ' + status : '');
   renderFolderTable(document.getElementById('resultFolders'), res.folders || {});
+
+  const failedCount = Number(res.failed || 0);
+  if (failedCount > 0 && retryBodyFromFinishedJob(lastFinishedImportJob)) {
+    retryRow.style.display = '';
+    retryButton.textContent = 'Retry ' + failedCount + ' failed file' +
+      (failedCount === 1 ? '' : 's');
+    retryHint.textContent =
+      'Uses the same source and destination; successful files are skipped.';
+  }
 
   renderChainInfo(res);
   renderTaggingInfo(res);

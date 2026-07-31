@@ -7144,13 +7144,63 @@ def test_create_app_repairs_duplicate_species_after_taxonomy_marking(
     fake_tax.lookup.side_effect = lambda name: (
         {"taxon_id": 2912} if name == "Verdin" else None
     )
-    with patch("taxonomy.load_local_taxonomy", return_value=fake_tax):
+    with patch(
+        "taxonomy.load_local_taxonomy", return_value=fake_tax,
+    ) as load_taxonomy:
         create_app(db_path=db_path, thumb_cache_dir=thumb_dir, api_token="test")
 
+    assert load_taxonomy.call_count == 1, (
+        "overlapping synchronous startup migrations must share one taxonomy parse"
+    )
     db2 = Database(db_path, initialize_schema=False)
     tagged_ids = {row["id"] for row in db2.get_photo_keywords(pid)}
     assert nested in tagged_ids
     assert root not in tagged_ids
+    assert db2.get_meta(Database._DUPLICATE_PHOTO_SPECIES_REPAIR_KEY) == "1"
+    db2.close()
+
+
+def test_create_app_skips_taxonomy_when_duplicate_repair_is_impossible(
+    tmp_path, monkeypatch,
+):
+    """An empty/non-species catalog must not parse taxonomy.json merely to
+    stamp the one-time duplicate-species repair marker."""
+    from unittest.mock import patch
+
+    from db import Database
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    import config as cfg
+    import models
+    from app import create_app
+
+    monkeypatch.setattr(cfg, "CONFIG_PATH", str(tmp_path / "config.json"))
+    monkeypatch.setattr(models, "DEFAULT_MODELS_DIR", str(tmp_path / "vireo-models"))
+    monkeypatch.setattr(models, "CONFIG_PATH", str(tmp_path / "models.json"))
+
+    db_path = str(tmp_path / "test.db")
+    thumb_dir = str(tmp_path / "thumbs")
+    os.makedirs(thumb_dir)
+
+    db = Database(db_path)
+    ws_id = db.ensure_default_workspace()
+    db.set_active_workspace(ws_id)
+    db.set_meta(Database._WILDLIFE_BACKFILL_DONE_KEY, "1")
+    db.conn.execute(
+        "DELETE FROM db_meta WHERE key = ?",
+        (Database._DUPLICATE_PHOTO_SPECIES_REPAIR_KEY,),
+    )
+    db.conn.commit()
+    db.close()
+
+    with patch("taxonomy.load_local_taxonomy") as load_taxonomy:
+        app = create_app(
+            db_path=db_path, thumb_cache_dir=thumb_dir, api_token="test",
+        )
+        assert app is not None
+
+    load_taxonomy.assert_not_called()
+    db2 = Database(db_path, initialize_schema=False)
     assert db2.get_meta(Database._DUPLICATE_PHOTO_SPECIES_REPAIR_KEY) == "1"
     db2.close()
 
@@ -7647,24 +7697,51 @@ def test_api_photos_missing_stale_in_flight_result_is_discarded(
 
 def test_api_photos_missing_automatic_skips_during_heavy_job(app_and_db):
     """Automatic idle checks must not start while heavy jobs are running."""
+    import threading
     import time
 
     app, db = app_and_db
     client = app.test_client()
 
+    # Hold the scan job in the running queue until the assertion runs. A
+    # ``time.sleep`` in the work function is not reliable under load: on a
+    # slow CI runner the main thread can be preempted long enough for the
+    # sleep to elapse and the job to transition to ``completed`` before the
+    # heavy-job check runs, at which point the automatic scan is no longer
+    # suppressed.
+    release = threading.Event()
+
+    def _hold_running(job):
+        release.wait(timeout=5.0)
+        return {"ok": True}
+
     scan_job = app._job_runner.start(
         "scan",
-        lambda job: (time.sleep(0.2), {"ok": True})[1],
+        _hold_running,
         workspace_id=db._active_workspace_id,
         ephemeral=True,
     )
-    resp = client.post("/api/photos/missing/check", json={"automatic": True})
-    assert resp.status_code == 200
-    data = resp.get_json()
-    assert data["suppressed"] is True
-    assert data["reason"] == "heavy_job_active"
-    assert data["status"] == "skipped"
-    wait_for_job_via_client(client, scan_job)
+    try:
+        # Give the runner a moment to move the job to "running" so
+        # _missing_originals_heavy_job_active sees it.
+        for _ in range(50):
+            jobs = app._job_runner.list_jobs()
+            if any(
+                j.get("id") == scan_job and j.get("status") in ("running", "queued")
+                for j in jobs
+            ):
+                break
+            time.sleep(0.02)
+
+        resp = client.post("/api/photos/missing/check", json={"automatic": True})
+        assert resp.status_code == 200, resp.get_data(as_text=True)
+        data = resp.get_json()
+        assert data["suppressed"] is True, data
+        assert data["reason"] == "heavy_job_active", data
+        assert data["status"] == "skipped", data
+    finally:
+        release.set()
+        wait_for_job_via_client(client, scan_job)
 
 
 def test_api_photos_missing_automatic_skips_during_missing_originals_scan(app_and_db):
@@ -13868,6 +13945,44 @@ def test_import_page_returns_200(app_and_db):
     assert 'id="safeToFormatPill"' in html
     assert "/api/jobs/import-in-place" in html
     assert "/api/jobs/import-photos" in html
+
+
+def test_import_page_surfaces_destination_errors_and_recovery_actions(
+    app_and_db,
+):
+    """Import validation belongs beside the field and before the preview,
+    while failed copy runs offer a preconfigured recovery action."""
+    app, _ = app_and_db
+    html = app.test_client().get("/import").data.decode()
+
+    assert 'id="remoteSubpathError"' in html
+    assert 'aria-required="true"' in html
+    assert "Folder inside NAS" in html
+    assert "Local or mounted path" in html
+    assert "updateStartAvailability" in html
+    assert "importFormProblem" in html
+    assert html.index('id="importError"') < html.index('id="importPreviewGrid"')
+    assert 'id="retryImportRow"' in html
+    assert "retryFailedImport" in html
+    assert "Already imported files will be skipped" in html
+
+
+def test_import_page_collapses_duplicate_thumbnails(app_and_db):
+    """A one-file retry must not render or fetch thumbnails for every
+    catalogued duplicate on the card."""
+    app, _ = app_and_db
+    html = app.test_client().get("/import").data.decode()
+
+    assert "collapsed-duplicate-preview" in html
+    assert "duplicateCount.toLocaleString()" in html
+    assert "const pendingFiles = files.filter" in html
+    # Copy-with-dedup waits for the duplicate stream before rendering the
+    # grid; in-place and no-dedup branches still render immediately.
+    marker = "if (snapshotMode) {"
+    preview_prefix = html[
+        html.index("async function previewImport"):html.index(marker)
+    ]
+    assert "renderImportPreviewGrid(files, [], null)" not in preview_prefix
 
 
 def test_import_page_resolves_default_process_client_side(app_and_db):

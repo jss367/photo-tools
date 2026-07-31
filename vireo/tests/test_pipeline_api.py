@@ -2642,6 +2642,239 @@ def test_destination_preview_inside_managed_archive_flags_ancestor(setup, tmp_pa
         assert data["managed_archive"]["photo_count"] == 1
 
 
+def test_destination_preview_above_managed_archive_does_not_claim_merge(
+    setup, tmp_path,
+):
+    """A broad destination root must not claim it will merge into a managed
+    archive nested somewhere below it.
+
+    The import page can target a mounted NAS root while an existing library
+    lives several segments below that root. The resulting folder may be a
+    sibling of the library, so treating descendant overlap as a merge makes
+    the callout contradict the exact-folder table.
+    """
+    app, db_path = setup
+    mount_root = tmp_path / "Photography"
+    managed = mount_root / "Raw Files" / "USA" / "2026"
+    shoot = managed / "2026-07-26"
+    shoot.mkdir(parents=True)
+    old = shoot / "old.jpg"
+    Image.new("RGB", (16, 16), "green").save(old)
+
+    from db import Database
+    seed = Database(db_path)
+    managed_id = seed.add_folder(str(managed))
+    shoot_id = seed.add_folder(
+        str(shoot), parent_id=managed_id, workspace_root=False,
+    )
+    seed.add_photo(
+        shoot_id, old.name, ".jpg", old.stat().st_size, old.stat().st_mtime,
+    )
+    seed.close()
+
+    src = tmp_path / "card"
+    src.mkdir()
+    new = src / "new.jpg"
+    Image.new("RGB", (16, 16), "blue").save(new)
+    mtime = datetime(2026, 7, 27, 9, 30, 0).timestamp()
+    os.utime(str(new), (mtime, mtime))
+
+    with app.test_client() as c:
+        resp = c.post("/api/import/destination-preview", json={
+            "sources": [str(src)],
+            "destination": str(mount_root),
+            "folder_template": "%Y/%Y-%m-%d",
+        })
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["managed_archive"] is None
+        assert data["folders"][0]["full_path"] == str(
+            mount_root / "2026" / "2026-07-27"
+        )
+
+
+def test_destination_preview_generated_folder_inside_managed_archive_flags_merge(
+    setup, tmp_path,
+):
+    """When the selected destination sits ABOVE a tracked archive but the
+    folder template maps generated files INTO that archive, the preview must
+    surface the archive as a merge (not stay silent because the destination
+    itself isn't inside a tracked folder).
+
+    Example: destination /Photography with tracked root /Photography/2026 and
+    template 2026/%Y-%m-%d — the generated folder /Photography/2026/2026-07-28
+    is inside the tracked archive even though the destination isn't.
+    """
+    app, db_path = setup
+    root = tmp_path / "Photography"
+    managed = root / "2026"
+    existing = managed / "2026-01-01"
+    existing.mkdir(parents=True)
+    old = existing / "old.jpg"
+    Image.new("RGB", (16, 16), "green").save(old)
+
+    from db import Database
+    seed = Database(db_path)
+    managed_id = seed.add_folder(str(managed))
+    existing_id = seed.add_folder(
+        str(existing), parent_id=managed_id, workspace_root=False,
+    )
+    seed.add_photo(
+        existing_id, old.name, ".jpg",
+        old.stat().st_size, old.stat().st_mtime,
+    )
+    seed.close()
+
+    src = tmp_path / "card"
+    src.mkdir()
+    new = src / "new.jpg"
+    Image.new("RGB", (16, 16), "blue").save(new)
+    mtime = datetime(2026, 7, 28, 9, 30, 0).timestamp()
+    os.utime(str(new), (mtime, mtime))
+
+    with app.test_client() as c:
+        resp = c.post("/api/import/destination-preview", json={
+            "sources": [str(src)],
+            # Destination is /Photography (ABOVE the tracked /Photography/2026),
+            # but the template pushes generated files into 2026/... — i.e.
+            # inside the tracked archive.
+            "destination": str(root),
+            "folder_template": "2026/%Y-%m-%d",
+        })
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["managed_archive"] is not None
+        assert data["managed_archive"]["path"] == str(managed)
+        assert data["managed_archive"]["photo_count"] == 1
+        assert data["folders"][0]["full_path"] == str(
+            managed / "2026-07-28"
+        )
+
+
+def test_destination_preview_partial_managed_archive_overlap(setup, tmp_path):
+    """When only some generated folders land inside a tracked archive, the
+    preview must NOT claim the whole import merges into it — the callout
+    lies about the files landing outside the archive.
+
+    Example: destination /Photography, template %Y/%Y-%m-%d, only
+    /Photography/2026 tracked. Files from 2025 land in /Photography/2025/...
+    (outside the archive) while files from 2026 land in /Photography/2026/...
+    (inside it). ``managed_archives`` must record 2026 as coverage='partial'
+    and ``managed_archive`` (the legacy single-archive field) must be None.
+    """
+    app, db_path = setup
+    root = tmp_path / "Photography"
+    managed = root / "2026"
+    existing = managed / "2026-01-01"
+    existing.mkdir(parents=True)
+    old = existing / "old.jpg"
+    Image.new("RGB", (16, 16), "green").save(old)
+
+    from db import Database
+    seed = Database(db_path)
+    managed_id = seed.add_folder(str(managed))
+    existing_id = seed.add_folder(
+        str(existing), parent_id=managed_id, workspace_root=False,
+    )
+    seed.add_photo(
+        existing_id, old.name, ".jpg",
+        old.stat().st_size, old.stat().st_mtime,
+    )
+    seed.close()
+
+    src = tmp_path / "card"
+    src.mkdir()
+    inside = src / "in-2026.jpg"
+    outside = src / "in-2025.jpg"
+    Image.new("RGB", (16, 16), "blue").save(inside)
+    Image.new("RGB", (16, 16), "red").save(outside)
+    inside_mtime = datetime(2026, 7, 28, 9, 30, 0).timestamp()
+    outside_mtime = datetime(2025, 6, 30, 9, 30, 0).timestamp()
+    os.utime(str(inside), (inside_mtime, inside_mtime))
+    os.utime(str(outside), (outside_mtime, outside_mtime))
+
+    with app.test_client() as c:
+        resp = c.post("/api/import/destination-preview", json={
+            "sources": [str(src)],
+            "destination": str(root),
+            "folder_template": "%Y/%Y-%m-%d",
+        })
+        assert resp.status_code == 200
+        data = resp.get_json()
+        # Legacy single-archive field stays None — the merge does NOT cover
+        # every generated folder.
+        assert data["managed_archive"] is None
+        archives = data.get("managed_archives") or []
+        assert len(archives) == 1
+        assert archives[0]["path"] == str(managed)
+        assert archives[0]["photo_count"] == 1
+        assert archives[0]["coverage"] == "partial"
+
+
+def test_destination_preview_multiple_managed_archives(setup, tmp_path):
+    """When generated folders split across MULTIPLE tracked archives, each is
+    reported so the UI does not silently pin the whole import to one of them.
+    """
+    app, db_path = setup
+    root = tmp_path / "Photography"
+    managed_2025 = root / "2025"
+    managed_2026 = root / "2026"
+    prior_25 = managed_2025 / "2025-01-01"
+    prior_26 = managed_2026 / "2026-01-01"
+    prior_25.mkdir(parents=True)
+    prior_26.mkdir(parents=True)
+    old_25 = prior_25 / "old-25.jpg"
+    old_26 = prior_26 / "old-26.jpg"
+    Image.new("RGB", (16, 16), "green").save(old_25)
+    Image.new("RGB", (16, 16), "olive").save(old_26)
+
+    from db import Database
+    seed = Database(db_path)
+    m25 = seed.add_folder(str(managed_2025))
+    m26 = seed.add_folder(str(managed_2026))
+    d25 = seed.add_folder(str(prior_25), parent_id=m25, workspace_root=False)
+    d26 = seed.add_folder(str(prior_26), parent_id=m26, workspace_root=False)
+    seed.add_photo(
+        d25, old_25.name, ".jpg",
+        old_25.stat().st_size, old_25.stat().st_mtime,
+    )
+    seed.add_photo(
+        d26, old_26.name, ".jpg",
+        old_26.stat().st_size, old_26.stat().st_mtime,
+    )
+    seed.close()
+
+    src = tmp_path / "card"
+    src.mkdir()
+    in25 = src / "in-2025.jpg"
+    in26 = src / "in-2026.jpg"
+    Image.new("RGB", (16, 16), "blue").save(in25)
+    Image.new("RGB", (16, 16), "red").save(in26)
+    os.utime(
+        str(in25),
+        (datetime(2025, 6, 30, 9, 30, 0).timestamp(),) * 2,
+    )
+    os.utime(
+        str(in26),
+        (datetime(2026, 7, 28, 9, 30, 0).timestamp(),) * 2,
+    )
+
+    with app.test_client() as c:
+        resp = c.post("/api/import/destination-preview", json={
+            "sources": [str(src)],
+            "destination": str(root),
+            "folder_template": "%Y/%Y-%m-%d",
+        })
+        assert resp.status_code == 200
+        data = resp.get_json()
+        # No single archive covers every generated folder.
+        assert data["managed_archive"] is None
+        archives = data.get("managed_archives") or []
+        paths = sorted(a["path"] for a in archives)
+        assert paths == sorted([str(managed_2025), str(managed_2026)])
+        assert all(a["coverage"] == "partial" for a in archives)
+
+
 def _wait_for_job(client, job_id, timeout=30.0):
     """Poll the job-status endpoint until the job completes or fails."""
     deadline = time.time() + timeout

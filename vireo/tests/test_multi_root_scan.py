@@ -335,21 +335,18 @@ def test_failed_root_does_not_inflate_cumulative_progress(app_and_db, tmp_path, 
     data = _wait_for_terminal(client, job_id)
 
     assert data["status"] == "failed"
-    # The scan summary should reflect photos ACTUALLY indexed, not the
-    # inflated planned total. Good root contributes 2, bad root
-    # contributes its processed count (3), so the summary should cite
-    # a number consistent with that — and critically, must NOT include
-    # the 7 phantom planned-but-unprocessed files from the bad root.
+    # The scan summary reflects photos ACTUALLY indexed. The good root
+    # indexes 2. The bad root reports progress for 3 files but never
+    # reaches the real scanner, so it indexes nothing and contributes 0 —
+    # reported progress is not evidence a photo was cataloged. Either way
+    # the 7 planned-but-unprocessed files must never appear.
     scan_step = next(s for s in data["steps"] if s["id"] == "scan")
     summary = scan_step.get("summary", "")
     # Extract the leading "<N> photos" number.
     leading_n = int(summary.split()[0])
-    # Planned total across both roots was 10 + 2 = 12. With the bug,
-    # photo_count would be 12 (inflated). With the fix it's <= 5 (3
-    # processed from bad + 2 from good).
-    assert leading_n < 12, (
-        f"photo_count inflated by phantom planned-but-unprocessed files: "
-        f"summary={summary!r}"
+    assert leading_n == 2, (
+        f"summary should credit only the 2 photos the good root actually "
+        f"indexed: summary={summary!r}"
     )
 
 
@@ -595,3 +592,103 @@ def test_cache_invalidation_failure_flips_job_to_failed(app_and_db, tmp_path, mo
         "cache invalidation" in e and "exploded" in e
         for e in data["errors"]
     ), data["errors"]
+
+
+def test_scan_summary_excludes_files_that_vanished_mid_scan(
+        app_and_db, tmp_path, monkeypatch):
+    """The "N photos" scan summary must count photos indexed, not files
+    walked.
+
+    ``job["progress"]["current"]`` is a progress counter: it advances for
+    every file the scan disposes of, including ones it skipped because
+    they vanished. Using it as the summary meant an archive share that
+    unmounted mid-scan reported a full "984 photos" success line having
+    indexed nothing (2026-07-30). The summary must answer "how many
+    photos are in the catalog because of this run".
+    """
+    app, db = app_and_db
+    client = app.test_client()
+
+    root = str(tmp_path / "archive")
+    for i in range(4):
+        _make_photo(root, f"p_{i}.jpg")
+
+    import scanner as real_scanner
+    real_scan = real_scanner.scan
+
+    def vanishing_scan(scan_root, sdb, *args, progress_callback=None, **kwargs):
+        # Wrap the app's progress callback so two files disappear at the
+        # discovery/processing seam — the real scanner then hits real
+        # stat() failures, exactly as it did when the SMB mount dropped.
+        def wrapped(current, total):
+            if current == 0:
+                os.remove(os.path.join(scan_root, "p_2.jpg"))
+                os.remove(os.path.join(scan_root, "p_3.jpg"))
+            if progress_callback is not None:
+                progress_callback(current, total)
+
+        return real_scan(
+            scan_root, sdb, *args, progress_callback=wrapped, **kwargs
+        )
+
+    monkeypatch.setattr("scanner.scan", vanishing_scan)
+
+    resp = client.post("/api/jobs/scan", json={"roots": [root]})
+    job_id = resp.get_json()["job_id"]
+    data = _wait_for_terminal(client, job_id)
+
+    scan_step = next(s for s in data["steps"] if s["id"] == "scan")
+    summary = scan_step.get("summary", "")
+    leading_n = int(summary.split()[0])
+    assert leading_n == 2, (
+        f"summary counts vanished files as indexed: {summary!r} (only 2 of "
+        "4 files survived to be cataloged)"
+    )
+
+    # And the claim is checkable against the catalog it describes. Scope
+    # to this root — the app_and_db fixture's catalog outlives one test.
+    indexed = db.conn.execute(
+        "SELECT COUNT(*) FROM photos p JOIN folders f ON f.id = p.folder_id "
+        "WHERE f.path = ?",
+        (root,),
+    ).fetchone()[0]
+    assert indexed == 2, indexed
+
+
+def test_scan_summary_credits_photos_indexed_before_a_root_raised(
+        app_and_db, tmp_path, monkeypatch):
+    """A root that raises after indexing must still be credited.
+
+    scan() commits rows incrementally and can raise after the per-file
+    loop finished (the pairing / working-copy / preview passes all run
+    inside its try block). Reporting 0 photos for a run that cataloged
+    everything is the same kind of false status as reporting 984 for a
+    run that cataloged nothing — just in the other direction.
+    """
+    app, db = app_and_db
+    client = app.test_client()
+
+    root = str(tmp_path / "late_failure")
+    for i in range(3):
+        _make_photo(root, f"q_{i}.jpg")
+
+    import scanner as real_scanner
+    real_scan = real_scanner.scan
+
+    def scan_then_raise(scan_root, sdb, *args, **kwargs):
+        real_scan(scan_root, sdb, *args, **kwargs)
+        raise RuntimeError("post-loop pass blew up after indexing")
+
+    monkeypatch.setattr("scanner.scan", scan_then_raise)
+
+    resp = client.post("/api/jobs/scan", json={"roots": [root]})
+    job_id = resp.get_json()["job_id"]
+    data = _wait_for_terminal(client, job_id)
+
+    assert data["status"] == "failed", data
+    scan_step = next(s for s in data["steps"] if s["id"] == "scan")
+    summary = scan_step.get("summary", "")
+    assert int(summary.split()[0]) == 3, (
+        f"photos indexed before the failure were dropped from the "
+        f"summary: {summary!r}"
+    )

@@ -276,6 +276,19 @@ def _pair_raw_jpeg_companions(db, vireo_dir=None, thumb_cache_dir=None):
     When both IMG_001.cr3 and IMG_001.jpg exist in the same folder,
     keep the raw as the primary photo and set companion_path to the JPEG filename.
     Delete the duplicate JPEG-only photo record.
+
+    Returns the set of companion photo ids merged away. Callers that count
+    indexed photos must discount these: both files were counted on the way
+    in, but only the RAW row survives, so the scan would otherwise claim
+    two photos where the catalog holds one — and RAW+JPEG is the common
+    shooting mode, so that overstates nearly every import.
+
+    Ids, not a bare count, because this query covers the *whole* photos
+    table: it also merges pairs left pending anywhere else in the catalog
+    (an interrupted earlier scan, an older build). A caller must intersect
+    with the ids it actually counted, or a scoped scan would be debited
+    for merges it had nothing to do with and could report a negative
+    total.
     """
     raw_exts = {".nef", ".cr2", ".cr3", ".arw", ".raf", ".dng", ".rw2", ".orf"}
     jpeg_exts = {".jpg", ".jpeg"}
@@ -304,6 +317,12 @@ def _pair_raw_jpeg_companions(db, vireo_dir=None, thumb_cache_dir=None):
     # us "all DB changes durable, then all FS changes" — commit failure
     # aborts both halves.
     post_commit_fs_actions = []
+    # Companion rows merged away, reported to the caller so it can correct
+    # its indexed count. Collected at the DELETE but only returned after
+    # the commit below succeeds — the whole loop shares one transaction,
+    # so a commit failure rolls every deletion back and none of them
+    # happened.
+    merged_ids = set()
 
     for (_folder_id, _base), members in groups.items():
         if len(members) < 2:
@@ -664,6 +683,7 @@ def _pair_raw_jpeg_companions(db, vireo_dir=None, thumb_cache_dir=None):
         # Remove keyword associations then the duplicate JPEG record
         db.conn.execute("DELETE FROM photo_keywords WHERE photo_id = ?", (companion["id"],))
         db.conn.execute("DELETE FROM photos WHERE id = ?", (companion["id"],))
+        merged_ids.add(companion["id"])
         # The companion's rowid is now free for SQLite to hand to the next
         # insert. Its derivatives must be unlinked so the next photo to
         # inherit the id can't adopt the companion's thumbnail / working
@@ -710,6 +730,7 @@ def _pair_raw_jpeg_companions(db, vireo_dir=None, thumb_cache_dir=None):
     # is durable and doesn't leak into the caller's next write.
     if db.conn.in_transaction:
         commit_with_retry(db.conn)
+    return merged_ids
 
 
 def _invalidate_raw_display_cache(vireo_dir, photo_id):
@@ -1452,7 +1473,13 @@ def backfill_working_copies(db, vireo_dir, progress_callback=None,
     }
 
 
-def scan(root, db, progress_callback=None, incremental=False, extract_full_metadata=True, photo_callback=None, skip_paths=None, status_callback=None, recursive=True, restrict_dirs=None, restrict_files=None, vireo_dir=None, thumb_cache_dir=None, permission_error_callback=None, cancel_check=None, skip_working_copies=False, repair_missing_metadata=False, register_restrict_dirs_as_roots=True, allow_photo_inserts=True):
+_EMPTY_SCAN_COUNTS = {
+    "discovered": 0, "indexed": 0, "vanished": 0, "skipped_uncataloged": 0,
+    "merged_companions": 0,
+}
+
+
+def scan(root, db, progress_callback=None, incremental=False, extract_full_metadata=True, photo_callback=None, skip_paths=None, status_callback=None, recursive=True, restrict_dirs=None, restrict_files=None, vireo_dir=None, thumb_cache_dir=None, permission_error_callback=None, cancel_check=None, skip_working_copies=False, repair_missing_metadata=False, register_restrict_dirs_as_roots=True, allow_photo_inserts=True, counts=None):
     """Walk a folder tree, discover photos, read metadata, populate database.
 
     Args:
@@ -1521,7 +1548,31 @@ def scan(root, db, progress_callback=None, incremental=False, extract_full_metad
             Files without an existing ``photos`` row are skipped. This gives
             Process metadata repair a mechanically enforced no-admission
             contract while retaining the shared metadata refresh code.
+        counts: optional dict the scan fills in as it runs, with the same
+            keys it returns. Because scan() commits incrementally and can
+            raise after many photos have landed (cancellation, a post-loop
+            pass, a DB error), the return value alone would force callers
+            to report zero for a run that really did catalog thousands.
+            Pass a dict here to read accurate counts on any exit path.
+
+    Returns:
+        dict with ``discovered`` (files the walk turned up), ``indexed``
+        (files that ended this run with a catalog row — including ones an
+        incremental scan revalidated without changing, so this is "rows
+        this run vouched for", not "rows newly created"), ``vanished``
+        (discovered but gone by the time we stat'd them, the shape a
+        network share dropping mid-scan takes), ``skipped_uncataloged``
+        (update-only scans declining to insert), and
+        ``merged_companions`` (JPEGs folded into a same-basename RAW's
+        row, which are discounted from ``indexed`` because they stop
+        being photos of their own).
+        Build user-facing counts from ``indexed``, never from the progress
+        counter — progress advances for skipped files too.
     """
+    # Same object the caller passed (so it can read counts after an
+    # exception) or a fresh one; either way start from a known shape.
+    counts = {} if counts is None else counts
+    counts.update(_EMPTY_SCAN_COUNTS)
     root_path = Path(root)
     # Don't open the root at all if the root is, or sits inside, an
     # other-app data bundle. prune_scan_dirs below only filters
@@ -1534,14 +1585,18 @@ def scan(root, db, progress_callback=None, incremental=False, extract_full_metad
     # follows symlinks and stat's the target, so for a directly selected
     # bundle (or a symlink to one), the existence test alone is enough
     # to trip the TCC prompt — mirroring the restrict_dirs branch below.
+    # Both bail-outs below return the same counts shape as a completed
+    # scan (all zeros) rather than None, so callers can total up
+    # ``indexed`` across roots without special-casing the roots that
+    # never ran. See the summary block at the end of this function.
     if is_excluded_scan_path(root_path):
         log.info(
             "Skipping other-app data bundle as scan root: %s", root_path,
         )
-        return
+        return counts
     if not root_path.is_dir():
         log.warning("Root path does not exist or is not a directory: %s", root)
-        return
+        return counts
 
     def _check_cancelled():
         if cancel_check is not None and cancel_check():
@@ -1619,6 +1674,14 @@ def scan(root, db, progress_callback=None, incremental=False, extract_full_metad
         # Only enumerate files in the specified directories (non-recursive).
         # root is still used as the folder hierarchy root for _ensure_folder.
         restrict_files_set = set(restrict_files) if restrict_files is not None else None
+        # Heartbeat counter, same interval as the recursive branch below.
+        # A restricted dir is not necessarily small — the import job's
+        # duplicate-folder link scan points this at archive day-folders
+        # holding a whole card's worth of files, and on a network mount
+        # that enumeration runs for minutes. Without the emit the caller
+        # has nothing to show between "Discovering files..." and the
+        # finished count.
+        checked = 0
         for d in restrict_dirs:
             _check_cancelled()
             dp = Path(d)
@@ -1652,9 +1715,21 @@ def scan(root, db, progress_callback=None, incremental=False, extract_full_metad
                 # callers like pipeline_job's repair scan (``except
                 # (OSError, RuntimeError)``) keep their loud failure
                 # semantics — we deliberately don't catch that raise.
-                entries = list(safe_iter_dir(str(dp), onerror=_on_walk_error))
-                for f in entries:
+                #
+                # Consume the generator directly rather than materializing
+                # with ``list(...)``: on a slow network mount the scandir
+                # walk that backs safe_iter_dir takes minutes for a full
+                # day-folder, and materializing here would delay every
+                # heartbeat below until after that wait — the same silent
+                # hang the heartbeat exists to break (PR #1385 Codex /
+                # CodeRabbit review).
+                for f in safe_iter_dir(str(dp), onerror=_on_walk_error):
                     _check_cancelled()
+                    checked += 1
+                    if checked % 500 == 0 and status_callback:
+                        _emit_status(
+                            f"Discovering files... ({len(image_files)} found)"
+                        )
                     if (f.is_file()
                             and f.suffix.lower() in SUPPORTED_EXTENSIONS
                             and not f.name.startswith(".")
@@ -1729,6 +1804,7 @@ def scan(root, db, progress_callback=None, incremental=False, extract_full_metad
     _check_cancelled()
 
     total = len(image_files)
+    counts["discovered"] = total
     log.info("Found %d images in %s", total, root)
     if progress_callback:
         progress_callback(0, total)
@@ -1747,13 +1823,32 @@ def scan(root, db, progress_callback=None, incremental=False, extract_full_metad
             row["id"]: row["file_hash"]
             for row in db.conn.execute("SELECT id, file_hash FROM photos")
         }
-        # Build a path-based lookup: we need folder path + filename
+        # Path-based lookup keyed by absolute path, driving the
+        # incremental "skip on mtime" fast path. Queried GLOBALLY (not
+        # workspace-scoped, unlike ``db.get_photos()`` / ``db.get_folder_tree()``)
+        # so a twin already in the catalog still hits the skip path even
+        # when its folder is not yet linked as a ``workspace_folders``
+        # row in the active workspace. That is exactly the case the
+        # import job's duplicate-folder link scan exists to repair:
+        # scoping the lookup to the active workspace re-opened and
+        # re-hashed every already-known twin just to link the folder
+        # (PR #1385 Codex review). The sibling lookups above
+        # (``existing_file_hashes``, ``exif_extracted``,
+        # ``summary_needs_extract`` below) are already global for the
+        # same reason.
         existing_by_path = {}
-        folders = {f["id"]: f["path"] for f in db.get_folder_tree()}
-        for p in all_photos:
-            folder_path = folders.get(p["folder_id"], "")
-            full_path = os.path.join(folder_path, p["filename"])
-            existing_by_path[full_path] = p
+        folder_paths = {
+            row["id"]: row["path"]
+            for row in db.conn.execute("SELECT id, path FROM folders")
+        }
+        for row in db.conn.execute(
+            "SELECT id, folder_id, filename, extension, file_size, "
+            "file_mtime, xmp_mtime, timestamp, width, height FROM photos"
+        ):
+            folder_path = folder_paths.get(row["folder_id"], "")
+            if not folder_path:
+                continue
+            existing_by_path[os.path.join(folder_path, row["filename"])] = row
         # Track which photos have had ExifTool metadata extracted (exif_data
         # is non-NULL). Photos with NULL exif_data need re-extraction.
         for row in db.conn.execute("SELECT id FROM photos WHERE exif_data IS NOT NULL"):
@@ -1913,6 +2008,23 @@ def scan(root, db, progress_callback=None, incremental=False, extract_full_metad
     # Handle XMP-only changes inline; collect files needing metadata extraction.
     files_to_process = []
     processed_count = 0
+    # ``processed_count`` advances for every file the scan *disposes of*,
+    # including ones it deliberately skips — that is what a progress bar
+    # needs to reach 100%. It is NOT the number of photos indexed, and the
+    # two diverge exactly when something is wrong (a share that unmounts
+    # mid-scan makes every remaining file vanish). Every ``processed_count``
+    # bump below is therefore paired with a bump of exactly one bucket in
+    # ``counts``, so the summary reports what actually landed in the
+    # catalog. Classifying at each site (rather than deriving one bucket by
+    # subtraction) means a disposition added later has to state which
+    # bucket it belongs to instead of silently defaulting to "indexed" —
+    # the invariant check after the loop enforces it.
+    #
+    # The ids behind ``counts["indexed"]``. Needed because the companion
+    # pairing pass below runs against the entire photos table, so its
+    # merges must be intersected with what *this* invocation counted (see
+    # ``_pair_raw_jpeg_companions``).
+    indexed_photo_ids = set()
     try:
         # Eagerly register the explicit scan targets so they end up linked
         # to the active workspace even when zero photos are inserted (e.g.
@@ -1944,6 +2056,7 @@ def scan(root, db, progress_callback=None, incremental=False, extract_full_metad
                 # walk has the same guard for broken symlinks).
                 log.info("File vanished during scan, skipping: %s", image_path)
                 processed_count += 1
+                counts["vanished"] += 1
                 if progress_callback:
                     progress_callback(processed_count, total)
                 continue
@@ -1995,6 +2108,8 @@ def scan(root, db, progress_callback=None, incremental=False, extract_full_metad
                         and not empty_hash_needs_repair
                     ):
                         processed_count += 1
+                        counts["indexed"] += 1
+                        indexed_photo_ids.add(existing["id"])
                         if photo_callback:
                             photo_callback(existing["id"], full_path_str)
                         if progress_callback:
@@ -2026,6 +2141,8 @@ def scan(root, db, progress_callback=None, incremental=False, extract_full_metad
                         and not empty_hash_needs_repair
                     ):
                         processed_count += 1
+                        counts["indexed"] += 1
+                        indexed_photo_ids.add(existing["id"])
                         if photo_callback:
                             photo_callback(existing["id"], full_path_str)
                         if progress_callback:
@@ -2142,6 +2259,7 @@ def scan(root, db, progress_callback=None, incremental=False, extract_full_metad
             except OSError:
                 log.info("File vanished during scan, skipping: %s", image_path)
                 processed_count += 1
+                counts["vanished"] += 1
                 if progress_callback:
                     progress_callback(processed_count, total)
                 continue
@@ -2234,6 +2352,7 @@ def scan(root, db, progress_callback=None, incremental=False, extract_full_metad
                     "Update-only scan skipped uncataloged file: %s", image_path,
                 )
                 processed_count += 1
+                counts["skipped_uncataloged"] += 1
                 if progress_callback:
                     progress_callback(processed_count, total)
                 continue
@@ -2249,6 +2368,16 @@ def scan(root, db, progress_callback=None, incremental=False, extract_full_metad
                 width=width,
                 height=height,
             )
+            # Credit the photo the moment its row is durable — add_photo
+            # commits before returning. Several fallible steps run below
+            # (cache invalidation, XMP keyword import, duplicate
+            # auto-resolve, photo_callback), and one of them raising must
+            # not leave the sink reporting fewer photos than the catalog
+            # actually holds. ``processed_count`` stays at the end of the
+            # iteration: it drives the progress bar, which should only
+            # advance once the file is genuinely done with.
+            counts["indexed"] += 1
+            indexed_photo_ids.add(photo_id)
 
             # A brand-new row may have claimed a *recycled* rowid (see
             # ``purge_cached_files_for_recycled_id``). Cached derivatives
@@ -2461,9 +2590,23 @@ def scan(root, db, progress_callback=None, incremental=False, extract_full_metad
     # counts — otherwise update_folder_counts()'s commit would persist
     # half-applied pairing or working-copy records.
     try:
-        _pair_raw_jpeg_companions(
+        # A JPEG merged into its RAW's row stops being its own photo, so
+        # discount it: both files were counted on the way in but only the
+        # RAW survives. Applied to the sink immediately (not just the
+        # returned dict) so a caller reading counts after a later failure
+        # in this block still sees the corrected number.
+        _merged_ids = _pair_raw_jpeg_companions(
             db, vireo_dir=vireo_dir, thumb_cache_dir=thumb_cache_dir,
         )
+        # Discount only companions THIS scan counted. The pairing pass
+        # queries the whole photos table, so it also cleans up pairs left
+        # pending elsewhere in the catalog (an interrupted earlier scan,
+        # an older build). Debiting a scoped scan for those would make it
+        # undercount, and scanning a root with no new files while one
+        # stale pair was pending would report -1 photos indexed.
+        _mine = _merged_ids & indexed_photo_ids
+        counts["merged_companions"] += len(_mine)
+        counts["indexed"] -= len(_mine)
 
         # Extract working copies for RAW photos (after pairing so companion is known).
         # Scope to the folders the caller just scanned so a fresh import doesn't
@@ -2512,4 +2655,42 @@ def scan(root, db, progress_callback=None, incremental=False, extract_full_metad
         raise
     finally:
         db.update_folder_counts()
-    log.info("Scan complete: %d photos indexed", total)
+
+    # Every file the loop disposed of landed in exactly one bucket. If this
+    # ever trips, a new disposition was added without classifying it, and
+    # the summary below would silently over-claim by that many photos —
+    # log it rather than raising, since the scan's real work is committed
+    # and a miscounted summary is no reason to fail the run.
+    vanished_count = counts["vanished"]
+    skipped_uncataloged_count = counts["skipped_uncataloged"]
+    merged_count = counts["merged_companions"]
+    indexed_count = counts["indexed"]
+    accounted = (
+        indexed_count + vanished_count + skipped_uncataloged_count
+        + merged_count
+    )
+    if accounted != processed_count:
+        log.error(
+            "Scan count invariant broken: indexed=%d + vanished=%d + "
+            "skipped=%d + merged=%d != processed=%d (a file disposition is "
+            "unclassified)",
+            indexed_count, vanished_count, skipped_uncataloged_count,
+            merged_count, processed_count,
+        )
+
+    # Report what reached the catalog, not what the walk turned up. These
+    # used to be the same number ("Scan complete: %d photos indexed" logged
+    # ``total``), which reads as a success line and stays reassuring
+    # precisely when the scan achieved nothing — an archive share that
+    # dropped mid-scan logged "984 photos indexed" having indexed zero.
+    summary = f"Scan complete: {indexed_count} photos indexed"
+    if merged_count:
+        summary += f", {merged_count} JPEG(s) merged into their RAW"
+    if vanished_count:
+        summary += f", {vanished_count} vanished"
+    if skipped_uncataloged_count:
+        summary += f", {skipped_uncataloged_count} uncataloged (skipped)"
+    if merged_count or vanished_count or skipped_uncataloged_count:
+        summary += f" of {total} discovered"
+    log.info(summary)
+    return counts

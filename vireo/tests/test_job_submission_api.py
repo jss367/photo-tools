@@ -339,6 +339,9 @@ def test_job_sync_returns_job_id(app_and_db):
     data = resp.get_json()
     assert "job_id" in data
     assert data["job_id"].startswith("sync-")
+    # Do not let this worker outlive the fixture and race into a later
+    # test's process-wide monkeypatch of sync.sync_to_xmp.
+    wait_for_job_via_runner(app._job_runner, data["job_id"])
 
 
 def test_job_sync_accepts_selected_change_ids(app_and_db):
@@ -355,6 +358,10 @@ def test_job_sync_accepts_selected_change_ids(app_and_db):
     data = resp.get_json()
     assert "job_id" in data
     assert data["job_id"].startswith("sync-")
+    # The endpoint is asynchronous, but the test still owns the worker it
+    # starts. Join it before monkeypatch teardown so it cannot leak into the
+    # serialization tests below.
+    wait_for_job_via_runner(app._job_runner, data["job_id"])
 
 
 def test_job_sync_rejects_empty_selected_change_ids(app_and_db):

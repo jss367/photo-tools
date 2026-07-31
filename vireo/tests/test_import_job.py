@@ -2,6 +2,7 @@
 import os
 import sys
 from datetime import datetime
+from pathlib import Path
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -156,8 +157,8 @@ def test_run_import_job_copies_verifies_and_catalogs(tmp_path):
 
 def test_duplicate_only_import_links_matched_folders(tmp_path):
     """Importing a card of only already-cataloged duplicates must still
-    scan + link the matched destination folders to the active workspace,
-    even though no fresh files were copied."""
+    link the matched destination folders to the active workspace without
+    scanning them or copying fresh files."""
     from import_dedup import compute_file_hash
     from import_job import ImportParams
 
@@ -205,7 +206,7 @@ def test_duplicate_only_import_links_matched_folders(tmp_path):
     assert result["copied"] == 0
     assert result["skipped_duplicate"] == 1
     assert result["failed"] == 0
-    # The matched folder got scanned and linked despite zero fresh copies.
+    # The matched folder was linked despite zero fresh copies.
     assert str(dest_dir) in _ws_linked_folder_paths(db, ws_id)
     # Still exactly one photo row — no re-import of known bytes.
     assert len(_photo_rows(db)) == 1
@@ -218,8 +219,8 @@ def _mark_exif_extracted(db):
     ``exif_data`` NULL — which scanner reads as "metadata was never
     extracted" and re-processes on the next incremental scan whatever
     the mtime says. That retry path is deliberate and tested in
-    test_scanner.py; the tests below are about the duplicate-link scan,
-    so give the rows the marker a real extraction would have written.
+    test_scanner.py; the tests below are about avoiding archive reads, so
+    give the rows the marker a real extraction would have written.
     """
     db.conn.execute(
         "UPDATE photos SET exif_data = '{}' WHERE exif_data IS NULL",
@@ -250,16 +251,7 @@ def _count_feature_computations(monkeypatch):
 def test_duplicate_only_import_does_not_reread_unchanged_twins(
     tmp_path, monkeypatch,
 ):
-    """The duplicate-folder link scan must not re-read twins that are
-    already cataloged and unchanged.
-
-    The link scan exists to create/link the matched folders and to
-    self-heal uncataloged strays — neither needs the bytes of a file the
-    catalog already knows. Running it non-incrementally re-hashed every
-    file in the matched archive folder, so importing a card of pure
-    duplicates re-read the whole folder: on a network archive that turned
-    a zero-copy import into an hours-long rescan.
-    """
+    """Direct duplicate-folder linking must not read cataloged twin bytes."""
     import shutil
 
     import scanner
@@ -298,7 +290,7 @@ def test_duplicate_only_import_does_not_reread_unchanged_twins(
     assert result["copied"] == 0
     assert result["skipped_duplicate"] == 3
     assert result["failed"] == 0
-    # The folder is still linked — the scan did its actual job.
+    # The folder is still linked without archive reads.
     assert str(twin_dir) in _ws_linked_folder_paths(db, ws_id)
     assert read_paths == [], (
         "duplicate-only import re-read already-cataloged, unchanged twins: "
@@ -306,10 +298,11 @@ def test_duplicate_only_import_does_not_reread_unchanged_twins(
     )
 
 
-def test_duplicate_only_import_reports_the_link_scan_phase(tmp_path):
-    """The dup-link scan walks the matched archive folders, which on a
-    network archive takes minutes. It must say so: without a phase emit
-    the UI sits on the last copy message while the job looks hung."""
+def test_duplicate_only_import_does_not_scan_matched_folder(
+        tmp_path, monkeypatch):
+    """A duplicate-only import links the cataloged folder without asking
+    scanner to enumerate it. This is the SMB/NAS regression: even an
+    incremental scan performs metadata calls for every directory entry."""
     import shutil
 
     import scanner
@@ -330,29 +323,29 @@ def test_duplicate_only_import_reports_the_link_scan_phase(tmp_path):
     card.mkdir()
     shutil.copy2(str(twin_file), str(card / "IMG_0600.jpg"))
 
+    def unexpected_scan(*args, **kwargs):
+        raise AssertionError("duplicate-only import must not scan the archive")
+
+    monkeypatch.setattr(scanner, "scan", unexpected_scan)
+
     runner = FakeRunner()
     result = run_import_job(
         _make_job(), runner, db_path, ws_id,
         ImportParams(sources=[str(card)], destination=str(archive)),
     )
     assert result["skipped_duplicate"] == 1
-
-    phases = [
-        data.get("phase", "")
-        for _jid, kind, data in runner.events if kind == "progress"
-    ]
-    assert any("already in your library" in p for p in phases), (
-        "import must report the duplicate-folder link scan as its own "
-        f"phase; got {phases}"
-    )
+    assert result["failed"] == 0
+    assert str(twin_dir) in _ws_linked_folder_paths(db, ws_id)
 
 
-def test_duplicate_only_import_still_catalogs_stray_in_twin_folder(
+def test_duplicate_only_import_leaves_stray_for_explicit_rescan(
     tmp_path, monkeypatch,
 ):
-    """Skipping unchanged twins must not cost the link scan its other
-    job: a file sitting in the matched folder that the catalog has never
-    seen still gets self-healed in, and it is the ONLY file re-read."""
+    """Import must not hide folder health or repair unrelated archive files.
+
+    A partial matched folder stays partial and its uncataloged stray remains
+    untouched until an explicit rescan repairs both conditions.
+    """
     import shutil
 
     import scanner
@@ -369,6 +362,11 @@ def test_duplicate_only_import_still_catalogs_stray_in_twin_folder(
     ws_id = db._active_workspace_id
     scanner.scan(str(archive), db)
     _mark_exif_extracted(db)
+    db.conn.execute(
+        "UPDATE folders SET status = 'partial' WHERE path = ?",
+        (str(twin_dir),),
+    )
+    db.conn.commit()
 
     # A stray lands in the twin folder AFTER the catalog was built.
     stray = twin_dir / "IMG_0501.jpg"
@@ -388,34 +386,31 @@ def test_duplicate_only_import_still_catalogs_stray_in_twin_folder(
     row_paths = {
         os.path.join(r["folder_path"], r["filename"]) for r in _photo_rows(db)
     }
-    assert str(stray) in row_paths, (
-        "link scan must still self-heal uncataloged strays in the twin folder"
-    )
-    assert read_paths == [str(stray)], (
-        "only the uncataloged stray should be read off the archive: "
-        f"{read_paths}"
-    )
+    assert str(stray) not in row_paths
+    assert read_paths == []
+    status = db.conn.execute(
+        "SELECT status FROM folders WHERE path = ?", (str(twin_dir),),
+    ).fetchone()["status"]
+    assert status == "partial"
+
+    # The existing explicit rescan workflow still performs the repair.
+    scanner.scan(str(archive), db, incremental=True)
+    row_paths = {
+        os.path.join(r["folder_path"], r["filename"]) for r in _photo_rows(db)
+    }
+    assert str(stray) in row_paths
+    assert read_paths == [str(stray)]
+    status = db.conn.execute(
+        "SELECT status FROM folders WHERE path = ?", (str(twin_dir),),
+    ).fetchone()["status"]
+    assert status == "ok"
 
 
 def test_duplicate_only_import_skips_twins_cataloged_in_other_workspace(
     tmp_path, monkeypatch,
 ):
-    """The dup-link scan must skip twins whose folder is cataloged but
-    not yet linked to the active workspace — the exact case this scan
-    exists to repair.
-
-    Regression for PR #1385 Codex review. The scan initially scoped its
-    incremental "skip on mtime" lookup to the active workspace, so a
-    folder cataloged in a different workspace (or previously known but
-    not yet workspace-linked here) would still be re-opened and
-    re-hashed on every file inside it, defeating the fix for the very
-    "cataloged, unchanged twins" case the PR targets. The sibling test
-    ``test_duplicate_only_import_does_not_reread_unchanged_twins``
-    happens to also link the twin folder to the active workspace during
-    setup, so this test forces the "cataloged elsewhere" state
-    explicitly by seeding in one workspace and running the import from
-    a fresh one.
-    """
+    """A folder cataloged in another workspace is directly linked into the
+    active one without reading its already-known photos."""
     import shutil
 
     import scanner
@@ -440,8 +435,7 @@ def test_duplicate_only_import_skips_twins_cataloged_in_other_workspace(
     assert len(_photo_rows(db)) == 3
     assert str(twin_dir) in _ws_linked_folder_paths(db, seed_ws)
 
-    # A fresh workspace has never seen this folder — the exact state the
-    # dup-link scan is intended to repair.
+    # A fresh workspace has never seen this folder.
     fresh_ws = db.create_workspace("Fresh")
     assert str(twin_dir) not in _ws_linked_folder_paths(db, fresh_ws)
 
@@ -459,8 +453,7 @@ def test_duplicate_only_import_skips_twins_cataloged_in_other_workspace(
     assert result["copied"] == 0
     assert result["skipped_duplicate"] == 3, result
     assert result["failed"] == 0, result
-    # The folder is now linked to the fresh workspace — the scan did its
-    # actual job of workspace-linking the matched folder.
+    # The folder is now linked to the fresh workspace without archive reads.
     assert str(twin_dir) in _ws_linked_folder_paths(db, fresh_ws)
     assert read_paths == [], (
         "duplicate-only import re-read twins whose folder was cataloged "
@@ -1891,13 +1884,9 @@ def test_checker_record_oserror_does_not_kill_job(tmp_path, monkeypatch):
         assert r["hash_status"] == "ok"
 
 
-def test_dup_link_scan_failure_marks_unsafe(tmp_path, monkeypatch):
-    """When the workspace-linking scan for a duplicate-only batch raises,
-    swallowing it would leave safe_to_format=true even though the
-    imported duplicates are not visible in the active workspace. The
-    failure must surface: safe_to_format false, ok false, and the
-    failing folder(s) recorded in unsafe_files."""
-    import scanner as scanner_mod
+def test_dup_workspace_link_failure_marks_unsafe(tmp_path, monkeypatch):
+    """A direct workspace-link failure must keep safe_to_format false and
+    identify the folder whose existing catalog rows could not be exposed."""
     from import_dedup import compute_file_hash
     from import_job import ImportParams, run_import_job
 
@@ -1934,27 +1923,14 @@ def test_dup_link_scan_failure_marks_unsafe(tmp_path, monkeypatch):
     import shutil
     shutil.copy2(str(dest_file), str(card / "IMG_0A80.jpg"))
 
-    real_scan = scanner_mod.scan
+    real_link = Database.add_workspace_folder
 
-    def flaky_scan(root, db_arg, **kwargs):
-        # The dup-link scan is called WITHOUT restrict_files, with a
-        # restrict_dirs pointing at our seeded dest_dir. Anything else
-        # (the fresh-copy path) passes through untouched.
-        restrict_dirs = kwargs.get("restrict_dirs") or []
-        if (
-            "restrict_files" not in kwargs
-            or kwargs["restrict_files"] is None
-        ) and any(
-            os.path.normpath(str(d)) == str(dest_dir)
-            for d in restrict_dirs
-        ):
-            # Not RuntimeError — that's reserved for cancellation
-            # (``scanner.scan`` raises ``RuntimeError("scan cancelled")``).
-            # A dup-link scan crash is a distinct failure mode.
-            raise OSError("simulated dup-link scan failure")
-        return real_scan(root, db_arg, **kwargs)
+    def flaky_link(self, workspace_id, folder_id, *, is_root=True):
+        if folder_id == fid:
+            raise OSError("simulated workspace-link failure")
+        return real_link(self, workspace_id, folder_id, is_root=is_root)
 
-    monkeypatch.setattr(scanner_mod, "scan", flaky_scan)
+    monkeypatch.setattr(Database, "add_workspace_folder", flaky_link)
 
     result = run_import_job(
         _make_job(), FakeRunner(), db_path, ws_id,
@@ -1974,17 +1950,10 @@ def test_dup_link_scan_failure_marks_unsafe(tmp_path, monkeypatch):
     assert str(dest_dir) not in _ws_linked_folder_paths(db, ws_id)
 
 
-def test_dup_link_scan_non_cancel_runtime_error_marks_unsafe(
+def test_dup_workspace_link_runtime_error_marks_unsafe(
         tmp_path, monkeypatch):
-    """A non-cancellation ``RuntimeError`` from the dup-link scan (a
-    library-level RuntimeError, or a RecursionError which inherits from
-    RuntimeError) must not be routed to the cancellation branch — the
-    runner was never cancelled, and treating the job as cancelled would
-    hide the workspace-link failure from ``ok``/``safe_to_format`` and
-    let the UI serve an import result that looks successful even though
-    the imported duplicates never became visible. See PR #1107 review.
-    """
-    import scanner as scanner_mod
+    """A RuntimeError from the direct link is a real import failure, not
+    scanner cancellation, and must leave the matched folder unlinked."""
     from import_dedup import compute_file_hash
     from import_job import ImportParams, run_import_job
 
@@ -2018,25 +1987,14 @@ def test_dup_link_scan_non_cancel_runtime_error_marks_unsafe(
     import shutil
     shutil.copy2(str(dest_file), str(card / "IMG_0B81.jpg"))
 
-    real_scan = scanner_mod.scan
+    real_link = Database.add_workspace_folder
 
-    def flaky_scan(root, db_arg, **kwargs):
-        restrict_dirs = kwargs.get("restrict_dirs") or []
-        if (
-            "restrict_files" not in kwargs
-            or kwargs["restrict_files"] is None
-        ) and any(
-            os.path.normpath(str(d)) == str(dest_dir)
-            for d in restrict_dirs
-        ):
-            # A non-sentinel RuntimeError — the runner was never
-            # cancelled. RecursionError (a RuntimeError subclass) or a
-            # library-level RuntimeError bubbling out of the scan would
-            # look like this at the handler.
-            raise RuntimeError("library exploded during scan")
-        return real_scan(root, db_arg, **kwargs)
+    def flaky_link(self, workspace_id, folder_id, *, is_root=True):
+        if folder_id == fid:
+            raise RuntimeError("database link exploded")
+        return real_link(self, workspace_id, folder_id, is_root=is_root)
 
-    monkeypatch.setattr(scanner_mod, "scan", flaky_scan)
+    monkeypatch.setattr(Database, "add_workspace_folder", flaky_link)
 
     result = run_import_job(
         _make_job(), FakeRunner(), db_path, ws_id,
@@ -2044,8 +2002,7 @@ def test_dup_link_scan_non_cancel_runtime_error_marks_unsafe(
     )
 
     assert result["skipped_duplicate"] == 1
-    # The whole point: not routed to cancellation; instead reported as a
-    # dup-link failure so ``safe_to_format`` reflects reality.
+    # Direct-link errors are not cancellation sentinels.
     assert result["cancelled"] is False
     assert result["safe_to_format"] is False
     assert result["ok"] is False
@@ -3222,8 +3179,8 @@ def test_source_equals_dest_file_is_rejected(tmp_path):
 
 
 def test_import_invalidates_new_images_cache(tmp_path):
-    """After per-batch and dup-link scans, run_import_job must invalidate
-    the /new-images cache for the touched destination folders. Otherwise
+    """Per-batch scans and duplicate-folder links must invalidate the
+    /new-images cache for the touched destination folders. Otherwise
     a workspace whose cache was warm before the import keeps reporting
     the just-imported files as new until TTL expires or another full
     scan runs. Mirrors the try/finally in api_job_scan / api_job_import_full
@@ -3262,6 +3219,56 @@ def test_import_invalidates_new_images_cache(tmp_path):
         "workspace linked to the destination folder after its restricted "
         "scans (mirrors pipeline_job / api_job_scan / api_job_import_full)"
     )
+
+
+def test_zero_byte_destination_collision_is_adopted_and_cataloged(tmp_path):
+    """A crash-recovery zero-byte destination has no hash-index identity.
+
+    It must enter the exact-file landed scan instead of the cataloged-twin
+    link path, because the previous run may have died before creating even
+    the destination folder row.
+    """
+    from import_job import ImportParams, run_import_job
+
+    card = tmp_path / "card"
+    card.mkdir()
+    source_file = card / "EMPTY.jpg"
+    source_file.touch()
+    timestamp = datetime(2026, 7, 3, 10, 0, 0).timestamp()
+    os.utime(str(source_file), (timestamp, timestamp))
+
+    archive = tmp_path / "archive"
+    dest_dir = archive / "2026" / "2026-07-03"
+    dest_dir.mkdir(parents=True)
+    dest_file = dest_dir / source_file.name
+    dest_file.touch()
+    os.utime(str(dest_file), (timestamp, timestamp))
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws_id = db._active_workspace_id
+    assert db.conn.execute(
+        "SELECT id FROM folders WHERE path = ?", (str(dest_dir),),
+    ).fetchone() is None
+
+    result = run_import_job(
+        _make_job(), FakeRunner(), db_path, ws_id,
+        ImportParams(sources=[str(card)], destination=str(archive)),
+    )
+
+    assert result["copied"] == 0, result
+    assert result["skipped_duplicate"] == 1, result
+    assert result["failed"] == 0, result
+    assert result["safe_to_format"] is True, result
+    row = db.conn.execute(
+        """SELECT p.id, p.hash_status FROM photos p
+           JOIN folders f ON f.id = p.folder_id
+           WHERE f.path = ? AND p.filename = ?""",
+        (str(dest_dir), source_file.name),
+    ).fetchone()
+    assert row is not None
+    assert row["hash_status"] == "ok"
+    assert str(dest_dir) in _ws_linked_folder_paths(db, ws_id)
 
 
 def test_import_promotes_missing_destination_folder_to_ok(tmp_path):
@@ -3360,7 +3367,7 @@ def test_duplicate_only_import_promotes_missing_twin_folder(tmp_path):
     """A duplicate-only import that matches a cataloged twin whose folder
     row is stale-marked ``'missing'`` (but the folder is still on disk
     under the import destination) must promote that folder to ``'ok'``
-    before its dup-link scan runs — otherwise the archive stays filtered
+    as part of its direct link — otherwise the archive stays filtered
     out of workspace queries even though safe_to_format goes green.
     See PR #1107 review.
     """
@@ -3414,7 +3421,7 @@ def test_duplicate_only_import_promotes_missing_twin_folder(tmp_path):
     ).fetchone()["status"]
     assert status == "ok", (
         "duplicate-only import must promote a matched 'missing'-marked "
-        "twin folder to 'ok' before its dup-link scan runs"
+        "twin folder to 'ok' as part of its direct workspace link"
     )
     # And the folder is linked to the active workspace.
     assert str(twin_dir) in _ws_linked_folder_paths(db, ws_id)
@@ -3424,7 +3431,7 @@ def test_duplicate_only_import_links_twin_folder_when_destination_is_symlink(tmp
     """A duplicate-only import whose ``destination`` is a symlink to the
     twin's on-disk archive root must still resolve containment through
     the link and link the twin folder. A lexical prefix check would drop
-    the twin from ``dup_dirs``, the duplicate-link scan would never run,
+    the twin from ``dup_dirs``, the direct workspace link would never run,
     and the imported duplicate would stay filtered out of the active
     workspace even though safe_to_format flipped green. See PR #1107
     review.
@@ -3832,18 +3839,18 @@ def test_key_duplicate_links_only_byte_verified_twin_folder(tmp_path):
     # bytes and links its folder into the workspace UI.
     assert ws_folder_is_root.get(str(verified_dir)) == 1
     # The key-collision folder was NEVER byte-verified against the
-    # card. Before the fix, it was passed to the duplicate-link scan
-    # as a restrict_dir and workspace-linked as its own top-level root
+    # card. Before the verified-row filter, it could be passed to folder
+    # linking and workspace-linked as its own top-level root
     # (``is_root=1``), pulling an unrelated archive folder into the
     # workspace UI. It must NOT surface as a workspace root here, and
     # after the restricted-scan cascade fix (PR #1107, line 1186) it
     # must not appear in ``workspace_folders`` at all.
     assert str(collision_dir) not in ws_folder_is_root
 
-    # Stronger: the collision folder was never scanned this run, so
-    # its pre-seeded row's ``file_hash`` is still NULL. Before the
-    # fix, the dup-link scan visited the collision folder and would
-    # have populated ``file_hash`` from its on-disk bytes.
+    # Neither folder was scanned. The verified folder is linked because the
+    # duplicate gate compared its bytes directly for this run; that proof
+    # does not turn archive repair into an import side effect. The unrelated
+    # collision remains both unlinked and untouched.
     photo_hashes = {
         row["folder_path"]: row["file_hash"]
         for row in db.conn.execute(
@@ -3851,10 +3858,7 @@ def test_key_duplicate_links_only_byte_verified_twin_folder(tmp_path):
             "FROM photos p JOIN folders f ON f.id = p.folder_id"
         )
     }
-    assert photo_hashes.get(str(verified_dir)) is not None, (
-        "verified twin's folder WAS scanned — its file_hash must "
-        "be populated"
-    )
+    assert photo_hashes.get(str(verified_dir)) is None
     assert photo_hashes.get(str(collision_dir)) is None, (
         "key-collision folder must NOT be scanned by a duplicate-"
         "only import: its bytes were never proven to match the card"
@@ -5291,16 +5295,13 @@ def test_remote_import_no_verify_fails_on_mount_hash_mismatch(
             rows["DSC_0001.jpg"])
 
 
-def test_remote_import_dup_only_batch_records_failure_when_scan_raises(
+def test_remote_import_dup_only_batch_does_not_scan_mount(
         tmp_path, monkeypatch):
-    """A duplicate-only remote batch (every card file matched a
-    cataloged twin) still needs ``scan()`` to link the twin folder into
-    the workspace. If ``landed`` is empty (no fresh copies) but
-    ``dup_skipped > 0`` and ``scan()`` raises, no per-file failure was
-    recorded and ``safe_to_format`` could flip green while the duplicate
-    folder never became visible in the workspace. The exception handler
-    must record a batch-level failure for that case, mirroring the local
-    path's ``dup_link_failed`` gate. See PR #1113 review."""
+    """A remote duplicate-only batch neither transfers nor scans files.
+
+    Its cataloged twin folder is linked directly, so a mounted SMB archive
+    cannot turn the no-op batch into a whole-directory metadata walk.
+    """
     import scanner as _scanner
     from import_job import ImportParams, run_import_job
 
@@ -5317,11 +5318,9 @@ def test_remote_import_dup_only_batch_records_failure_when_scan_raises(
     card_file = str(card / "DSC_0001.jpg")
     src_hash = _hash(card_file)
 
-    # Seed an archive folder that owns the byte-identical twin (outside
-    # any import source — the check that Codex asked for filters
-    # source-backed twins, so we need a real off-card twin).
-    archive_twin_dir = tmp_path / "archive_twin"
-    archive_twin_dir.mkdir()
+    # Seed a byte-identical twin beneath the mounted archive destination.
+    archive_twin_dir = Path(ra["mount_base"]) / "unsorted"
+    archive_twin_dir.mkdir(parents=True)
     twin_path = archive_twin_dir / "DSC_0001.jpg"
     import shutil as _shutil
     _shutil.copy2(card_file, str(twin_path))
@@ -5329,8 +5328,10 @@ def test_remote_import_dup_only_batch_records_failure_when_scan_raises(
     # match token.
     db_path = str(tmp_path / "test.db")
     db = Database(db_path)
-    ws_id = db._active_workspace_id
     _scanner.scan(str(archive_twin_dir), db)
+    # Run from a fresh workspace so the import must perform the link.
+    ws_id = db.create_workspace("Fresh")
+    assert str(archive_twin_dir) not in _ws_linked_folder_paths(db, ws_id)
     # Sanity: the twin row is present with the right hash.
     twin_rows = db.conn.execute(
         "SELECT p.file_hash, f.path FROM photos p "
@@ -5340,52 +5341,35 @@ def test_remote_import_dup_only_batch_records_failure_when_scan_raises(
     assert twin_rows and twin_rows[0]["file_hash"] == src_hash, [
         dict(r) for r in twin_rows]
 
-    # Now monkeypatch scan() to raise ONLY on the import job's
-    # per-batch call (the dup-only batch's twin-folder link scan). The
-    # patched scan is bound after the pre-seed above, so it doesn't
-    # interfere with our own setup.
-    orig_scan = _scanner.scan
-
+    # Any import-time scanner call is the regression.
     def failing_scan(*args, **kwargs):
-        raise RuntimeError("scan blew up (simulated NAS mount error)")
+        raise AssertionError("duplicate-only remote import scanned the mount")
 
     monkeypatch.setattr(_scanner, "scan", failing_scan)
-
-    try:
-        result = run_import_job(
-            _make_job(), FakeRunner(), db_path, ws_id,
-            ImportParams(
-                sources=[str(card)], destination=ra["mount_base"],
-                remote_target=ra, verify_by_hash=True,
-            ),
-        )
-    finally:
-        monkeypatch.setattr(_scanner, "scan", orig_scan)
+    result = run_import_job(
+        _make_job(), FakeRunner(), db_path, ws_id,
+        ImportParams(
+            sources=[str(card)], destination=ra["mount_base"],
+            remote_target=ra, verify_by_hash=True,
+        ),
+    )
 
     # rsync never ran — the file was accepted as a duplicate against the
-    # off-card twin.
+    # off-card twin, and the folder was linked without scanning.
     assert calls["rsync"] == [], calls["rsync"]
-    # A duplicate-only batch whose scan() raised must NOT report
-    # safe_to_format=True. The batch-level failure marker forces
-    # failed>0, which flips safe_to_format False.
-    assert result["failed"] >= 1, result
-    assert result["safe_to_format"] is False, result
+    assert result["failed"] == 0, result
+    assert result["safe_to_format"] is True, result
     assert result["skipped_duplicate"] == 1, result
-    assert any(
-        "duplicate-only batch" in u["reason"]
-        for u in result["unsafe_files"]
-    ), result["unsafe_files"]
+    assert str(archive_twin_dir) in _ws_linked_folder_paths(db, ws_id)
 
 
 def test_remote_import_links_verified_twin_folder_in_other_layout(
         tmp_path, monkeypatch):
     """A verified duplicate skip's twin folder may live under the mount
     destination in a DIFFERENT sub-folder than this run's template output
-    (e.g. an older ``unsorted`` or ``%Y-%m-%d`` layout). Without carrying
-    the verified twin dir into a follow-up dup-link scan, the card is
-    skipped as a duplicate but the twin folder never becomes visible in
-    the active workspace — safe_to_format could go green over folders
-    the UI won't show. See PR #1113 review."""
+    (e.g. an older ``unsorted`` or ``%Y-%m-%d`` layout). Link that cataloged
+    folder directly so it becomes visible without an archive scan. See
+    PR #1113 review."""
     from import_dedup import compute_file_hash as _hash
     from import_job import ImportParams, run_import_job
 
@@ -5454,12 +5438,9 @@ def test_remote_import_links_verified_twin_folder_in_other_layout(
     }
 
 
-def test_remote_import_dup_link_scan_does_not_reread_unchanged_twins(
+def test_remote_import_direct_dup_link_does_not_read_unchanged_twins(
         tmp_path, monkeypatch):
-    """Remote mirror of
-    ``test_duplicate_only_import_does_not_reread_unchanged_twins``: the
-    remote path runs its own dup-link scan, and it must skip already-
-    cataloged, unchanged twins too."""
+    """Remote duplicate links must not read cataloged twin bytes."""
     import scanner
     from import_job import ImportParams, run_import_job
 
@@ -5506,23 +5487,10 @@ def test_remote_import_dup_link_scan_does_not_reread_unchanged_twins(
     )
 
 
-def test_remote_import_dup_only_batch_does_not_reread_dest_folder_twins(
+def test_remote_import_dup_only_batch_does_not_read_dest_folder_twins(
         tmp_path, monkeypatch):
-    """A duplicate-only remote batch whose twins sit in the batch's OWN
-    destination folder must not re-read them.
-
-    ``test_remote_import_dup_link_scan_does_not_reread_unchanged_twins``
-    parks its twins in ``unsorted`` — a different folder from the batch
-    destination — so that test's batch scan walks an empty
-    ``dest_folder`` and reads nothing either way. The common real case is
-    re-importing a card into the same date folder it originally landed
-    in, where ``dest_folder`` already holds every twin. With no fresh
-    landings the batch scan passes ``restrict_files=None``, so it walks
-    the whole destination folder; without ``incremental=True`` it
-    re-reads and re-hashes every already-cataloged file there. On a
-    network archive that turns a zero-copy import into an hours-long
-    rescan.
-    """
+    """A duplicate-only remote batch does not read twins in its own date
+    folder; it skips the batch scan and links their cataloged folder."""
     import scanner
     from import_job import ImportParams, run_import_job
 
@@ -5717,6 +5685,59 @@ def test_remote_import_scans_adopted_duplicate_in_mixed_batch(
         r for r in rows if os.path.join(r["folder_path"], r["filename"]) == seeded
     )
     assert adopted_row["id"] in result["photo_ids"], result["photo_ids"]
+
+
+def test_remote_adopted_only_scan_failure_counts_each_file_once(
+        tmp_path, monkeypatch):
+    """A failed adopted-only scan reports the source file exactly once.
+
+    The validation pass below the scan already converts every adopted path
+    without a catalog row from ``skipped_duplicate`` to ``failed``. A second
+    folder-level failure would inflate the terminal ledger to N+1 entries.
+    """
+    import shutil as _shutil
+
+    import scanner as scanner_module
+    from import_job import ImportParams, run_import_job
+
+    ra = _remote_archive_for(tmp_path)
+    calls = _remote_calls(ra)
+    _install_fake_remote_rsync(monkeypatch, calls, verify=None)
+
+    card = _make_card(tmp_path, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+    ])
+    dest_folder = os.path.join(
+        ra["mount_base"], "2026", "2026-07-03",
+    )
+    os.makedirs(dest_folder, exist_ok=True)
+    _shutil.copy2(
+        str(card / "DSC_0001.jpg"),
+        os.path.join(dest_folder, "DSC_0001.jpg"),
+    )
+
+    def failing_scan(*args, **kwargs):
+        raise OSError("simulated adopted-only catalog scan failure")
+
+    monkeypatch.setattr(scanner_module, "scan", failing_scan)
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws_id = db._active_workspace_id
+    result = run_import_job(
+        _make_job(), FakeRunner(), db_path, ws_id,
+        ImportParams(
+            sources=[str(card)], destination=ra["mount_base"],
+            remote_target=ra, verify_by_hash=True,
+        ),
+    )
+
+    assert result["discovered"] == 1, result
+    assert result["copied"] == 0, result
+    assert result["skipped_duplicate"] == 0, result
+    assert result["failed"] == 1, result
+    assert len(result["unsafe_files"]) == 1, result
+    assert result["safe_to_format"] is False, result
 
 
 def test_remote_import_result_carries_imported_photo_ids(
@@ -6060,13 +6081,8 @@ def test_progress_events_carry_live_per_folder_counts(tmp_path):
 def test_remote_import_links_alias_spelled_twin_folder(tmp_path, monkeypatch):
     """A verified duplicate skip whose twin was cataloged through a symlink
     alias of the mount base is accepted via ``_path_under_destination``'s
-    realpath check, but the follow-up dup-link scan cannot pass the alias
-    to ``scan(destination, restrict_dirs=[alias])`` — scanner's
-    ``_ensure_folder`` walks parents lexically and would recurse toward
-    ``/`` before creating the workspace link, marking the import failed/
-    unsafe. The remote path must mirror the local split: link alias-
-    spelled dup dirs directly via ``add_workspace_folder`` rather than
-    scanning them. See PR #1113 review."""
+    realpath check. The remote path links that existing alias-spelled
+    catalog row directly. See PR #1113 review."""
     if not hasattr(os, "symlink"):
         return
     from import_dedup import compute_file_hash as _hash
@@ -6093,10 +6109,8 @@ def test_remote_import_links_alias_spelled_twin_folder(tmp_path, monkeypatch):
 
     # Alias root points at the same physical directory via symlink. The
     # twin's cataloged folder path is spelled through the alias — NOT
-    # lexically under the mount base — so scanner._ensure_folder's parent
-    # walk would recurse toward / rather than stopping at the destination
-    # root; the remote dup-link scan must link this folder directly via
-    # add_workspace_folder without calling scan() on the alias path.
+    # lexically under the mount base. Direct linking is independent of that
+    # spelling and does not call scan() on the alias path.
     try:
         alias_root = str(tmp_path / "mount_alias")
         os.symlink(real_mount_base, alias_root)
@@ -6133,9 +6147,7 @@ def test_remote_import_links_alias_spelled_twin_folder(tmp_path, monkeypatch):
     assert calls["rsync"] == [], calls["rsync"]
     assert result["skipped_duplicate"] == 1, result
     # The alias-spelled twin folder MUST be linked into the active
-    # workspace — without the alias/lex split, the dup-link scan would
-    # blow up on _ensure_folder's parent walk and the job would report
-    # failed/unsafe.
+    # workspace through its existing catalog row.
     assert result["failed"] == 0, result
     assert result["safe_to_format"] is True, result
     linked_after = _ws_linked_folder_paths(db, ws_id)
@@ -6236,11 +6248,7 @@ def test_remote_import_links_case_only_twin_folder(tmp_path, monkeypatch):
     assert calls["rsync"] == [], calls["rsync"]
     assert result["skipped_duplicate"] == 1, result
     # The case-only-alias twin folder MUST be linked into the active
-    # workspace via the direct-link path. Without the case-only fix, the
-    # dup-link scan would receive the differently-cased folder path as a
-    # restrict_dir and scanner's parent-walk would blow up before the
-    # workspace_folders row was created — flipping safe_to_format to
-    # False on a legitimately verified duplicate-only run.
+    # workspace via the direct-link path, independent of path case.
     assert result["failed"] == 0, result
     assert result["safe_to_format"] is True, result
     linked_after = _ws_linked_folder_paths(db, ws_id)

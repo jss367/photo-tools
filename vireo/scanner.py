@@ -1452,7 +1452,12 @@ def backfill_working_copies(db, vireo_dir, progress_callback=None,
     }
 
 
-def scan(root, db, progress_callback=None, incremental=False, extract_full_metadata=True, photo_callback=None, skip_paths=None, status_callback=None, recursive=True, restrict_dirs=None, restrict_files=None, vireo_dir=None, thumb_cache_dir=None, permission_error_callback=None, cancel_check=None, skip_working_copies=False, repair_missing_metadata=False, register_restrict_dirs_as_roots=True, allow_photo_inserts=True):
+_EMPTY_SCAN_COUNTS = {
+    "discovered": 0, "indexed": 0, "vanished": 0, "skipped_uncataloged": 0,
+}
+
+
+def scan(root, db, progress_callback=None, incremental=False, extract_full_metadata=True, photo_callback=None, skip_paths=None, status_callback=None, recursive=True, restrict_dirs=None, restrict_files=None, vireo_dir=None, thumb_cache_dir=None, permission_error_callback=None, cancel_check=None, skip_working_copies=False, repair_missing_metadata=False, register_restrict_dirs_as_roots=True, allow_photo_inserts=True, counts=None):
     """Walk a folder tree, discover photos, read metadata, populate database.
 
     Args:
@@ -1521,7 +1526,28 @@ def scan(root, db, progress_callback=None, incremental=False, extract_full_metad
             Files without an existing ``photos`` row are skipped. This gives
             Process metadata repair a mechanically enforced no-admission
             contract while retaining the shared metadata refresh code.
+        counts: optional dict the scan fills in as it runs, with the same
+            keys it returns. Because scan() commits incrementally and can
+            raise after many photos have landed (cancellation, a post-loop
+            pass, a DB error), the return value alone would force callers
+            to report zero for a run that really did catalog thousands.
+            Pass a dict here to read accurate counts on any exit path.
+
+    Returns:
+        dict with ``discovered`` (files the walk turned up), ``indexed``
+        (files that ended this run with a catalog row — including ones an
+        incremental scan revalidated without changing, so this is "rows
+        this run vouched for", not "rows newly created"), ``vanished``
+        (discovered but gone by the time we stat'd them, the shape a
+        network share dropping mid-scan takes), and
+        ``skipped_uncataloged`` (update-only scans declining to insert).
+        Build user-facing counts from ``indexed``, never from the progress
+        counter — progress advances for skipped files too.
     """
+    # Same object the caller passed (so it can read counts after an
+    # exception) or a fresh one; either way start from a known shape.
+    counts = {} if counts is None else counts
+    counts.update(_EMPTY_SCAN_COUNTS)
     root_path = Path(root)
     # Don't open the root at all if the root is, or sits inside, an
     # other-app data bundle. prune_scan_dirs below only filters
@@ -1534,14 +1560,18 @@ def scan(root, db, progress_callback=None, incremental=False, extract_full_metad
     # follows symlinks and stat's the target, so for a directly selected
     # bundle (or a symlink to one), the existence test alone is enough
     # to trip the TCC prompt — mirroring the restrict_dirs branch below.
+    # Both bail-outs below return the same counts shape as a completed
+    # scan (all zeros) rather than None, so callers can total up
+    # ``indexed`` across roots without special-casing the roots that
+    # never ran. See the summary block at the end of this function.
     if is_excluded_scan_path(root_path):
         log.info(
             "Skipping other-app data bundle as scan root: %s", root_path,
         )
-        return
+        return counts
     if not root_path.is_dir():
         log.warning("Root path does not exist or is not a directory: %s", root)
-        return
+        return counts
 
     def _check_cancelled():
         if cancel_check is not None and cancel_check():
@@ -1749,6 +1779,7 @@ def scan(root, db, progress_callback=None, incremental=False, extract_full_metad
     _check_cancelled()
 
     total = len(image_files)
+    counts["discovered"] = total
     log.info("Found %d images in %s", total, root)
     if progress_callback:
         progress_callback(0, total)
@@ -1952,6 +1983,17 @@ def scan(root, db, progress_callback=None, incremental=False, extract_full_metad
     # Handle XMP-only changes inline; collect files needing metadata extraction.
     files_to_process = []
     processed_count = 0
+    # ``processed_count`` advances for every file the scan *disposes of*,
+    # including ones it deliberately skips — that is what a progress bar
+    # needs to reach 100%. It is NOT the number of photos indexed, and the
+    # two diverge exactly when something is wrong (a share that unmounts
+    # mid-scan makes every remaining file vanish). Every ``processed_count``
+    # bump below is therefore paired with a bump of exactly one bucket in
+    # ``counts``, so the summary reports what actually landed in the
+    # catalog. Classifying at each site (rather than deriving one bucket by
+    # subtraction) means a disposition added later has to state which
+    # bucket it belongs to instead of silently defaulting to "indexed" —
+    # the invariant check after the loop enforces it.
     try:
         # Eagerly register the explicit scan targets so they end up linked
         # to the active workspace even when zero photos are inserted (e.g.
@@ -1983,6 +2025,7 @@ def scan(root, db, progress_callback=None, incremental=False, extract_full_metad
                 # walk has the same guard for broken symlinks).
                 log.info("File vanished during scan, skipping: %s", image_path)
                 processed_count += 1
+                counts["vanished"] += 1
                 if progress_callback:
                     progress_callback(processed_count, total)
                 continue
@@ -2034,6 +2077,7 @@ def scan(root, db, progress_callback=None, incremental=False, extract_full_metad
                         and not empty_hash_needs_repair
                     ):
                         processed_count += 1
+                        counts["indexed"] += 1
                         if photo_callback:
                             photo_callback(existing["id"], full_path_str)
                         if progress_callback:
@@ -2065,6 +2109,7 @@ def scan(root, db, progress_callback=None, incremental=False, extract_full_metad
                         and not empty_hash_needs_repair
                     ):
                         processed_count += 1
+                        counts["indexed"] += 1
                         if photo_callback:
                             photo_callback(existing["id"], full_path_str)
                         if progress_callback:
@@ -2181,6 +2226,7 @@ def scan(root, db, progress_callback=None, incremental=False, extract_full_metad
             except OSError:
                 log.info("File vanished during scan, skipping: %s", image_path)
                 processed_count += 1
+                counts["vanished"] += 1
                 if progress_callback:
                     progress_callback(processed_count, total)
                 continue
@@ -2273,6 +2319,7 @@ def scan(root, db, progress_callback=None, incremental=False, extract_full_metad
                     "Update-only scan skipped uncataloged file: %s", image_path,
                 )
                 processed_count += 1
+                counts["skipped_uncataloged"] += 1
                 if progress_callback:
                     progress_callback(processed_count, total)
                 continue
@@ -2465,6 +2512,7 @@ def scan(root, db, progress_callback=None, incremental=False, extract_full_metad
                 photo_callback(photo_id, str(image_path))
 
             processed_count += 1
+            counts["indexed"] += 1
             if progress_callback:
                 progress_callback(processed_count, total)
     except BaseException:
@@ -2551,4 +2599,34 @@ def scan(root, db, progress_callback=None, incremental=False, extract_full_metad
         raise
     finally:
         db.update_folder_counts()
-    log.info("Scan complete: %d photos indexed", total)
+
+    # Every file the loop disposed of landed in exactly one bucket. If this
+    # ever trips, a new disposition was added without classifying it, and
+    # the summary below would silently over-claim by that many photos —
+    # log it rather than raising, since the scan's real work is committed
+    # and a miscounted summary is no reason to fail the run.
+    vanished_count = counts["vanished"]
+    skipped_uncataloged_count = counts["skipped_uncataloged"]
+    indexed_count = counts["indexed"]
+    if indexed_count + vanished_count + skipped_uncataloged_count != processed_count:
+        log.error(
+            "Scan count invariant broken: indexed=%d + vanished=%d + "
+            "skipped=%d != processed=%d (a file disposition is unclassified)",
+            indexed_count, vanished_count, skipped_uncataloged_count,
+            processed_count,
+        )
+
+    # Report what reached the catalog, not what the walk turned up. These
+    # used to be the same number ("Scan complete: %d photos indexed" logged
+    # ``total``), which reads as a success line and stays reassuring
+    # precisely when the scan achieved nothing — an archive share that
+    # dropped mid-scan logged "984 photos indexed" having indexed zero.
+    summary = f"Scan complete: {indexed_count} photos indexed"
+    if vanished_count:
+        summary += f", {vanished_count} vanished"
+    if skipped_uncataloged_count:
+        summary += f", {skipped_uncataloged_count} uncataloged (skipped)"
+    if vanished_count or skipped_uncataloged_count:
+        summary += f" of {total} discovered"
+    log.info(summary)
+    return counts

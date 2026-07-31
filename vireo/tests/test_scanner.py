@@ -5536,3 +5536,116 @@ def test_recycled_id_purge_backdates_below_a_negative_source_mtime(tmp_path):
         "source file_mtime of 0.0, so the freshness guard would still "
         "serve the previous owner's pixels"
     )
+
+
+def test_scan_reports_photos_actually_indexed_not_files_discovered(
+        tmp_path, caplog):
+    """The scan summary must count photos indexed, not files discovered.
+
+    When a network archive unmounts mid-scan, every discovered file
+    vanishes before its ``stat()`` and is skipped. The summary used to
+    log the *discovered* total, so a scan that indexed nothing still
+    reported "984 photos indexed" (see the 2026-07-30 SMB outage) — the
+    cheap-proxy count CORE_PHILOSOPHY.md rules out. Report the real
+    indexed count and surface the skipped remainder.
+    """
+    import logging
+
+    from db import Database
+    from scanner import scan
+
+    root = str(tmp_path / "photos")
+    _create_test_images(root, {'': ['a.jpg', 'b.jpg', 'c.jpg', 'd.jpg']})
+
+    # scan() calls progress_callback(0, total) at the exact seam between
+    # discovery and the processing loop — the same window the unmount hit
+    # in production. Deleting here makes the files genuinely vanish
+    # rather than mocking the stat() failure.
+    def vanish_after_discovery(current, total):
+        if current == 0:
+            os.remove(os.path.join(root, 'c.jpg'))
+            os.remove(os.path.join(root, 'd.jpg'))
+
+    db = Database(str(tmp_path / "test.db"))
+    with caplog.at_level(logging.INFO, logger='scanner'):
+        caplog.clear()
+        result = scan(root, db, progress_callback=vanish_after_discovery)
+
+    assert result["discovered"] == 4, result
+    assert result["indexed"] == 2, result
+    assert result["vanished"] == 2, result
+
+    msgs = [r.message for r in caplog.records]
+    assert any("2 photos indexed" in m for m in msgs), msgs
+    assert any("2 vanished" in m for m in msgs), msgs
+    assert not any("4 photos indexed" in m for m in msgs), msgs
+
+
+def test_scan_reports_indexed_count_on_a_clean_run(tmp_path):
+    """With nothing vanishing, indexed == discovered and vanished == 0."""
+    from db import Database
+    from scanner import scan
+
+    root = str(tmp_path / "photos")
+    _create_test_images(root, {'': ['a.jpg', 'b.jpg']})
+
+    db = Database(str(tmp_path / "test.db"))
+    result = scan(root, db)
+
+    assert result["discovered"] == 2, result
+    assert result["indexed"] == 2, result
+    assert result["vanished"] == 0, result
+
+
+def test_scan_counts_are_readable_even_when_the_scan_raises(tmp_path):
+    """Counts must be reachable on the failure path, not just the return.
+
+    scan() commits photo rows incrementally and can raise *after* many of
+    them landed (cancellation, a post-loop pairing pass, a DB error). If
+    the only way to learn the indexed count is the return value, every
+    caller has to report 0 for a run that actually cataloged thousands —
+    the same class of wrong number as over-reporting. Callers pass a
+    ``counts`` dict that scan() fills as it goes.
+    """
+    from db import Database
+    from scanner import ScanCancelled, scan
+
+    root = str(tmp_path / "photos")
+    _create_test_images(root, {'': [f"p{i}.jpg" for i in range(6)]})
+
+    # Trip cancellation once two photos have actually been committed.
+    state = {"committed": 0}
+
+    def photo_cb(photo_id, path_str):
+        state["committed"] += 1
+
+    counts = {}
+    db = Database(str(tmp_path / "test.db"))
+    with pytest.raises(ScanCancelled):
+        scan(
+            root, db,
+            counts=counts,
+            photo_callback=photo_cb,
+            cancel_check=lambda: state["committed"] >= 2,
+        )
+
+    assert counts["discovered"] == 6, counts
+    assert counts["indexed"] == state["committed"], counts
+    assert counts["indexed"] >= 2, counts
+    assert counts["indexed"] < 6, counts
+
+
+def test_scan_counts_sink_matches_the_returned_counts(tmp_path):
+    """On a clean run the caller-supplied sink and the return value agree."""
+    from db import Database
+    from scanner import scan
+
+    root = str(tmp_path / "photos")
+    _create_test_images(root, {'': ['a.jpg', 'b.jpg']})
+
+    counts = {}
+    db = Database(str(tmp_path / "test.db"))
+    result = scan(root, db, counts=counts)
+
+    assert result == counts, (result, counts)
+    assert counts["indexed"] == 2, counts

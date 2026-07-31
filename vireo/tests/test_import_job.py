@@ -6464,3 +6464,220 @@ def test_remote_import_cancel_mid_batch_does_not_start_rsync(
         f"no card files should have landed on the mount after "
         f"cancellation, but found: {landed}"
     )
+
+
+def test_local_import_refuses_when_mount_root_absent(tmp_path, monkeypatch):
+    """The LOCAL copy path needs the same mount-root guard as the remote one.
+
+    ``_run_remote_import_job`` refuses to ``os.makedirs`` into an absent
+    mount root (PR #1113), but ``run_import_job``'s own batch loop had no
+    such check — it called ``os.makedirs(dest_folder)`` unconditionally.
+    On a platform where the mount point survives unmount (Linux
+    ``/mnt/<name>``) that silently builds a shadow tree on the internal
+    disk and copies the card into it, where the photos look imported but
+    vanish the moment the real share remounts.
+    """
+    import pipeline_job as _pj
+    from import_job import ImportParams
+
+    card = _make_card(tmp_path, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+        ("DSC_0002.jpg", datetime(2026, 7, 3, 11, 0, 0), "green"),
+    ])
+    dest = str(tmp_path / "Volumes_NAS_Photos")
+
+    # The real helper only fires for /Volumes/* | /mnt/* | /media/*/*
+    # shapes, so stub it to call our tmp destination's root missing —
+    # same approach as test_remote_import_refuses_when_mount_root_absent.
+    monkeypatch.setattr(
+        _pj, "_missing_archive_mount_root", lambda path: "/Volumes/NAS",
+    )
+
+    db, ws_id, result = _run_import(tmp_path, ImportParams(
+        sources=[str(card)], destination=dest,
+    ))
+
+    assert result["copied"] == 0, result
+    assert result["failed"] == 2, result
+    assert result["safe_to_format"] is False, result
+    assert result["unsafe_files"], result
+    assert all(
+        "/Volumes/NAS" in u["reason"] and "not available" in u["reason"]
+        for u in result["unsafe_files"]
+    ), result["unsafe_files"]
+    assert not os.path.exists(dest), (
+        f"shadow directory was created at {dest}: the guard failed to "
+        "stop os.makedirs"
+    )
+
+
+def test_local_import_stops_when_mount_disappears_mid_run(
+        tmp_path, monkeypatch):
+    """A mount that drops *during* a long import must stop the next batch.
+
+    The guard was a start-of-job preflight computed once outside the
+    batch loop, so an archive that unmounted two hours into a run (the
+    2026-07-30 SMB outage) sailed straight into ``os.makedirs``. Re-check
+    per batch so the outage is caught when it happens.
+    """
+    import pipeline_job as _pj
+    from import_job import ImportParams
+
+    # Two dates -> two batches, so the mount can drop between them.
+    card = _make_card(tmp_path, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+        ("DSC_0002.jpg", datetime(2026, 7, 4, 9, 0, 0), "blue"),
+    ])
+    dest = str(tmp_path / "archive")
+    os.makedirs(dest, exist_ok=True)
+
+    calls = {"n": 0}
+
+    def flaky_mount(path):
+        calls["n"] += 1
+        # Mounted for the first batch, gone for every batch after it.
+        return None if calls["n"] == 1 else "/Volumes/NAS"
+
+    monkeypatch.setattr(_pj, "_missing_archive_mount_root", flaky_mount)
+
+    db, ws_id, result = _run_import(tmp_path, ImportParams(
+        sources=[str(card)], destination=dest,
+    ))
+
+    assert calls["n"] >= 2, (
+        "the mount root was checked once for the whole job, so a mid-run "
+        "unmount can never be detected; it must be re-checked per batch"
+    )
+    assert result["copied"] == 1, result
+    assert result["failed"] == 1, result
+    assert result["safe_to_format"] is False, result
+    assert any(
+        "/Volumes/NAS" in u["reason"] and "not available" in u["reason"]
+        for u in result["unsafe_files"]
+    ), result["unsafe_files"]
+
+
+def test_remote_import_stops_when_mount_disappears_mid_run(
+        tmp_path, monkeypatch):
+    """Same mid-run re-check for the remote path, whose guard was also
+    computed once outside the batch loop."""
+    import pipeline_job as _pj
+    from import_job import ImportParams, run_import_job
+
+    ra = _remote_archive_for(tmp_path)
+    calls = _remote_calls(ra)
+    _install_fake_remote_rsync(monkeypatch, calls, verify=None)
+
+    card = _make_card(tmp_path, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+        ("DSC_0002.jpg", datetime(2026, 7, 4, 9, 0, 0), "blue"),
+    ])
+
+    probes = {"n": 0}
+
+    def flaky_mount(path):
+        probes["n"] += 1
+        return None if probes["n"] == 1 else "/Volumes/NAS"
+
+    monkeypatch.setattr(_pj, "_missing_archive_mount_root", flaky_mount)
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws_id = db._active_workspace_id
+    result = run_import_job(
+        _make_job(), FakeRunner(), db_path, ws_id,
+        ImportParams(
+            sources=[str(card)], destination=ra["mount_base"],
+            remote_target=ra,
+        ),
+    )
+
+    assert probes["n"] >= 2, (
+        "remote mount root was checked once for the whole job; a mid-run "
+        "unmount can never be detected"
+    )
+    assert result["copied"] == 1, result
+    assert result["failed"] == 1, result
+    assert result["safe_to_format"] is False, result
+
+
+def test_local_import_mount_loss_still_advances_progress(tmp_path, monkeypatch):
+    """A batch rejected by the mount guard must still count its files as
+    emitted.
+
+    ``emitted`` only advances inside the per-file copy loop, which the
+    guard skips. Without bumping it there, an import whose share drops
+    after the first batch leaves the progress bar frozen at the last
+    copied file while the job silently fails hundreds more — a stalled
+    bar reads as "still working", which is the opposite of what happened.
+    """
+    import pipeline_job as _pj
+    from import_job import ImportParams
+
+    card = _make_card(tmp_path, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+        ("DSC_0002.jpg", datetime(2026, 7, 4, 9, 0, 0), "blue"),
+        ("DSC_0003.jpg", datetime(2026, 7, 5, 9, 0, 0), "green"),
+    ])
+    dest = str(tmp_path / "archive")
+    os.makedirs(dest, exist_ok=True)
+
+    calls = {"n": 0}
+
+    def flaky_mount(path):
+        calls["n"] += 1
+        return None if calls["n"] == 1 else "/Volumes/NAS"
+
+    monkeypatch.setattr(_pj, "_missing_archive_mount_root", flaky_mount)
+
+    runner = FakeRunner()
+    db, ws_id, result = _run_import(
+        tmp_path,
+        ImportParams(sources=[str(card)], destination=dest),
+        runner=runner,
+    )
+
+    assert result["discovered"] == 3, result
+    progress = [
+        data for _jid, etype, data in runner.events if etype == "progress"
+    ]
+    assert progress, "no progress events emitted"
+    assert progress[-1]["current"] == 3, (
+        f"progress stalled at {progress[-1]['current']} of 3 after the "
+        "mount dropped; every discovered file must be accounted for"
+    )
+
+
+def test_local_import_survives_makedirs_failure(tmp_path):
+    """``os.makedirs`` on the destination must never kill the job.
+
+    The mount-root guard only recognizes a vacated mount point. It can't
+    see a stale-but-present mount (Linux ``/mnt/<name>``), a read-only
+    parent, or a permission change — and the 2026-07-30 incident was
+    precisely an uncaught ``PermissionError`` out of this call, which
+    tore down the whole background job after two hours of work. Whatever
+    the cause, it belongs in the per-file failure bucket with the card
+    still marked unsafe to format.
+    """
+    from import_job import ImportParams
+
+    card = _make_card(tmp_path, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+    ])
+    dest = str(tmp_path / "archive")
+    # A regular FILE where the batch's destination folder must go, so the
+    # real os.makedirs raises FileExistsError on every platform.
+    os.makedirs(os.path.join(dest, "2026"), exist_ok=True)
+    with open(os.path.join(dest, "2026", "2026-07-03"), "w") as fh:
+        fh.write("not a directory")
+
+    db, ws_id, result = _run_import(tmp_path, ImportParams(
+        sources=[str(card)], destination=dest,
+    ))
+
+    assert result["copied"] == 0, result
+    assert result["failed"] == 1, result
+    assert result["safe_to_format"] is False, result
+    assert any(
+        "2026-07-03" in u["reason"] for u in result["unsafe_files"]
+    ), result["unsafe_files"]

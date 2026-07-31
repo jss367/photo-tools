@@ -2842,3 +2842,69 @@ def test_content_failure_is_still_memoized(tmp_path, monkeypatch):
     assert len(parses) == 1
     with tax_mod._taxonomy_cache_lock:
         assert str(persistent) in tax_mod._taxonomy_failed_stats
+
+
+def test_schema_invalid_preferred_file_is_memoized(tmp_path, monkeypatch):
+    """Valid JSON in the wrong shape must be remembered like malformed JSON.
+
+    Taxonomy() walks the decoded document, so a top-level list raises
+    AttributeError rather than ValueError. Left unmemoized, every request
+    would evict the cached fallback, re-attempt the preferred file, and
+    re-parse the multi-GB legacy one to rediscover the same failure.
+    """
+    import taxonomy as tax_mod
+
+    tax_mod.clear_taxonomy_cache()
+    preferred = tmp_path / "persistent.json"
+    preferred.write_text("[1, 2, 3]")  # parses as JSON, wrong shape
+    legacy = tmp_path / "taxonomy.json"
+    _write_taxonomy_json(legacy, "legacy species")
+    monkeypatch.setattr(tax_mod, "TAXONOMY_JSON_PATH", str(preferred))
+    monkeypatch.setattr(tax_mod, "LEGACY_TAXONOMY_JSON_PATH", str(legacy))
+
+    parses = []
+    real_init = tax_mod.Taxonomy.__init__
+
+    def counting_init(self, path):
+        parses.append(path)
+        real_init(self, path)
+
+    monkeypatch.setattr(tax_mod.Taxonomy, "__init__", counting_init)
+
+    for _ in range(3):
+        assert tax_mod.load_local_taxonomy().is_taxon("legacy species")
+
+    assert parses.count(str(preferred)) == 1, "schema failure must be memoized"
+    assert parses.count(str(legacy)) == 1, "the fallback must survive"
+    with tax_mod._taxonomy_cache_lock:
+        assert str(preferred) in tax_mod._taxonomy_failed_stats
+
+
+def test_memory_error_during_parse_is_not_memoized(tmp_path, monkeypatch):
+    """Running out of memory on a ~2.8GB parse is environmental, not corruption."""
+    import taxonomy as tax_mod
+
+    tax_mod.clear_taxonomy_cache()
+    persistent = tmp_path / "persistent.json"
+    _write_taxonomy_json(persistent, "test species")
+    monkeypatch.setattr(tax_mod, "TAXONOMY_JSON_PATH", str(persistent))
+
+    real_init = tax_mod.Taxonomy.__init__
+    calls = {"n": 0}
+
+    def oom_once(self, path):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise MemoryError("cannot allocate taxonomy")
+        real_init(self, path)
+
+    monkeypatch.setattr(tax_mod.Taxonomy, "__init__", oom_once)
+
+    assert tax_mod.load_local_taxonomy() is None
+    with tax_mod._taxonomy_cache_lock:
+        assert str(persistent) not in tax_mod._taxonomy_failed_stats
+
+    result = tax_mod.load_local_taxonomy()
+    assert result is not None
+    assert result.is_taxon("test species")
+    assert calls["n"] == 2

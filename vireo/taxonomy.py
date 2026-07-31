@@ -472,6 +472,17 @@ class _KnownCorruptTaxonomy(Exception):
     """Raised when a path is known to have failed to parse at its current stat."""
 
 
+# Parse failures that are environmental rather than the file's fault, so a
+# later attempt at the same bytes can legitimately succeed: a read permission
+# bit, momentary fd exhaustion, an allocation failure on a ~2.8GB parse. These
+# must stay retryable — memoizing them against (mtime_ns, size) would key the
+# record to a stat the repair does not change. Everything else (malformed JSON
+# raising ValueError, or valid JSON in the wrong shape raising AttributeError
+# or TypeError as the parser walks it) is the content itself and cannot fix
+# itself without a rewrite, which does change the stat.
+_TRANSIENT_TAXONOMY_ERRORS = (OSError, MemoryError)
+
+
 # Cap on how many times _load_taxonomy_cached will re-parse a file that
 # keeps changing mid-read. A rewrite during parse means the parsed object
 # does not correspond to the post-parse stat, so caching that pair would
@@ -558,7 +569,7 @@ def _load_taxonomy_cached(path):
             pre_stat = _taxonomy_stat_key(path)
             try:
                 taxonomy = Taxonomy(path)
-            except (ValueError, OSError) as parse_error:
+            except Exception as parse_error:
                 last_error = parse_error
                 # A rewrite caught mid-stream — from an atomic-save gap
                 # on another platform, an interrupted download, or an
@@ -589,16 +600,12 @@ def _load_taxonomy_cached(path):
                     # crucially, before the eviction above would drop a
                     # still-valid fallback in a corrupt-preferred scenario.
                     #
-                    # Only memoize a *content* failure, though. An OSError
-                    # can be transient — a read permission bit, a momentary
-                    # fd exhaustion — and the usual repair (chmod, or the
-                    # fd pressure passing) changes ctime at most, not mtime
-                    # or size. Memoizing it would key the record to a stat
-                    # that never changes, leaving taxonomy features off
-                    # until the contents happen to change or the process
-                    # restarts. A ValueError is the file's own content and
-                    # cannot fix itself without a rewrite.
-                    if isinstance(parse_error, ValueError):
+                    # Only memoize a *content* failure, though — see
+                    # _TRANSIENT_TAXONOMY_ERRORS. Memoizing an environmental
+                    # failure would key the record to a stat its repair does
+                    # not change, leaving taxonomy features off until the
+                    # contents happen to change or the process restarts.
+                    if not isinstance(parse_error, _TRANSIENT_TAXONOMY_ERRORS):
                         _taxonomy_failed_stats[path] = pre_stat
                     raise
                 continue

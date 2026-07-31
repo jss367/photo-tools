@@ -4,6 +4,19 @@ import re
 from playwright.sync_api import expect
 
 
+def _suppress_auto_preview(page):
+    """Stop the 350ms debounced auto-preview from firing.
+
+    For tests that only care about the Start payload. Their source folders
+    don't exist, so a debounced preview that does land completes with zero
+    files -- a real, completed preview -- and updateStartGate() correctly
+    disables Start with "No files to import". Whether it lands at all is a
+    race against how fast Playwright drives the form, so suppress it rather
+    than let the machine's speed decide.
+    """
+    page.evaluate("() => { window.scheduleImportPreview = () => {}; }")
+
+
 def test_import_source_browse_button_adds_source_folder(live_server, page):
     url = live_server["url"]
     page.goto(f"{url}/import")
@@ -844,6 +857,7 @@ def test_import_copy_start_sends_restored_options(live_server, page):
     page.route("**/api/remote-targets", remote_targets)
     page.route("**/api/jobs/import-photos", start_import)
     page.goto(f"{url}/import")
+    _suppress_auto_preview(page)
 
     page.locator("#modeCopy").check()
     page.locator("#sourceInput").fill("/tmp/card-a")
@@ -975,6 +989,7 @@ def test_import_new_workspace_forwards_explicit_after_import(live_server, page):
 
     page.route("**/api/jobs/import-photos", start_import)
     page.goto(f"{url}/import")
+    _suppress_auto_preview(page)
 
     page.locator("#modeCopy").check()
     page.locator("#sourceInput").fill("/tmp/card-a")
@@ -2031,15 +2046,15 @@ def test_select_all_does_not_deselect_ineligible_duplicates(
 
 def test_a_stale_duplicate_verdict_cannot_disable_a_fresh_card(
         live_server, page):
-    """importDuplicatePaths outlives the render it came from.
+    """A retained duplicate verdict outlives the render it came from.
 
-    It is assigned only when the whole check-duplicates stream drains, and
-    never cleared, so a re-preview's FIRST render pass draws every card
-    enabled while the module set still holds the previous run's verdicts.
-    Anything that re-derives checkbox state from that set instead of from the
-    card turns an unrelated click into a disabled, unchecked box with no
-    badge explaining why -- and over SMB with verify_by_hash the window
-    between the first pass and the new verdicts is minutes.
+    Verdicts only exist once the whole check-duplicates stream drains, so a
+    re-preview's FIRST render pass draws every card enabled while the
+    previous run's verdicts are the only ones anything could have kept.
+    Anything that re-derives checkbox state from a retained set instead of
+    from the card turns an unrelated click into a disabled, unchecked box
+    with no badge explaining why -- and over SMB with verify_by_hash the
+    window between the first pass and the new verdicts is minutes.
     """
     page.goto(f"{live_server['url']}/import")
     files = _files(3)
@@ -2049,7 +2064,6 @@ def test_a_stale_duplicate_verdict_cannot_disable_a_fresh_card(
 
     # The re-preview's first pass: same files, no verdicts yet.
     page.evaluate("(f) => renderImportPreviewGrid(f, [], null)", files)
-    assert page.evaluate("() => importDuplicatePaths.size") == 1
     for f in files:
         expect(_box(page, f["path"])).to_be_enabled()
         expect(_box(page, f["path"])).to_be_checked()
@@ -2070,7 +2084,7 @@ def test_a_stale_duplicate_verdict_cannot_shrink_a_bulk_toggle(
         live_server, page):
     """Same stale window, the bulk paths.
 
-    A bulk toggle that reads importDuplicatePaths would quietly skip a card
+    A bulk toggle that reads a retained verdict set would quietly skip a card
     the renderer drew as an ordinary selectable file: the user hits
     "deselect all" and one box stays ticked with nothing to explain it.
     """
@@ -2080,7 +2094,6 @@ def test_a_stale_duplicate_verdict_cannot_shrink_a_bulk_toggle(
     _preview(page)
 
     page.evaluate("(f) => renderImportPreviewGrid(f, [], null)", files)
-    assert page.evaluate("() => importDuplicatePaths.size") == 1
 
     page.locator("#chkSelectAllImport").uncheck()
     for f in files:
@@ -2093,10 +2106,10 @@ def test_a_stale_duplicate_verdict_cannot_shrink_a_bulk_toggle(
 
 def test_a_stale_duplicate_verdict_cannot_kill_the_master_checkbox(
         live_server, page):
-    """The counters are the third way the stale set reaches the screen.
+    """The counters are the third way a stale verdict reaches the screen.
 
-    An all-duplicate previous run leaves importDuplicatePaths covering every
-    path. Counters reading that set report zero eligible over a grid of
+    An all-duplicate previous run leaves verdicts covering every path.
+    Counters reading a retained set report zero eligible over a grid of
     ticked, enabled, badge-free boxes -- which prints "0 of 2 selected" and,
     since fix 6 disables the master at zero eligible, hands the user a dead
     control captioned "every discovered file is a duplicate" while two
@@ -2111,7 +2124,6 @@ def test_a_stale_duplicate_verdict_cannot_kill_the_master_checkbox(
     # The re-preview's first pass: same files, no verdicts yet.
     page.evaluate("(f) => renderImportPreviewGrid(f, [], null)", files)
     page.evaluate("() => updateImportSelectionUI()")
-    assert page.evaluate("() => importDuplicatePaths.size") == 2
 
     master = page.locator("#chkSelectAllImport")
     expect(master).to_be_enabled()
@@ -2209,3 +2221,380 @@ def test_duplicate_badge_and_checkbox_do_not_overlap(live_server, page):
                     or bb["y"] + bb["height"] <= cb["y"])
     assert horizontal_gap or vertical_gap, (
         f"checkbox {cb} overlaps duplicate badge {bb}")
+
+
+# --- Task 10: Start gating and the preview lifecycle -----------------------
+
+
+def test_start_is_disabled_when_all_importable_files_are_unchecked(
+        live_server, page):
+    page.goto(f"{live_server['url']}/import")
+    _stub_preview(page, _files(3))
+    _preview(page)
+
+    page.locator("#chkSelectAllImport").click()   # select none
+    # Assert the LABEL as well as `disabled`. Start is transiently disabled
+    # while a preview runs and while the duplicate stream drains, so
+    # `to_be_disabled()` on its own can pass on a state that has nothing to do
+    # with the selection and then settle to enabled.
+    expect(page.locator("#btnStart")).to_have_text("No files selected")
+    expect(page.locator("#btnStart")).to_be_disabled()
+
+
+def test_start_stays_enabled_when_every_file_is_a_duplicate(live_server, page):
+    """Zero checked, zero eligible — the user must still be able to run the
+    import to get the safe-to-format verdict on an already-archived card."""
+    page.goto(f"{live_server['url']}/import")
+    files = _files(2)
+    _stub_preview(page, files, duplicates=[f["path"] for f in files])
+    _preview(page)
+
+    # The count settles the timing: _preview() returns on the FIRST render
+    # pass, before any verdict has landed, and at that moment both files look
+    # eligible. Waiting for "0 files" means the assertion below is made
+    # against the all-duplicate state and not the pre-verdict one.
+    expect(page.locator("#btnStart")).to_have_text("Start import (0 files)")
+    expect(page.locator("#btnStart")).to_be_enabled()
+
+
+def test_changing_a_source_after_selecting_disables_start(live_server, page):
+    """Toggling a signature input must gate Start immediately.
+
+    #chkRecursive is wired into wireDestStructureInvalidation, which fires
+    scheduleImportPreview() on a 350ms debounce. Suppress that entirely: if the
+    auto-preview starts, updateStartGate checks importPreviewInFlight BEFORE
+    staleness and the label reads "Previewing…" instead, making the assertion
+    timing-dependent.
+    """
+    page.goto(f"{live_server['url']}/import")
+    _stub_preview(page, _files(3))
+    _preview(page)
+    page.locator(".import-preview-thumb .thumb-check").first.click()
+
+    page.evaluate("() => { window.scheduleImportPreview = () => {}; }")
+    page.locator("#chkRecursive").click()   # invalidates the signature
+    expect(page.locator("#btnStart")).to_be_disabled()
+    expect(page.locator("#btnStart")).to_have_text(
+        "Preview again before importing")
+
+
+def test_start_is_disabled_while_a_preview_is_in_flight(live_server, page):
+    """The window between clearImportPreviewGrid() and the render is the
+    5,000-file hazard: state must not reset to 'no preview run' there."""
+    page.goto(f"{live_server['url']}/import")
+    _stub_preview(page, _files(3))
+    _preview(page)
+    page.locator(".import-preview-thumb .thumb-check").first.click()
+
+    page.evaluate(
+        """() => {
+          const f = window.fetch;
+          window.__release = null;
+          window.fetch = (input, init) => {
+            const t = typeof input === 'string' ? input : input.url;
+            if (t && t.indexOf('/api/import/folder-preview') === 0) {
+              return new Promise((res) => { window.__release = res; });
+            }
+            return f(input, init);
+          };
+        }"""
+    )
+    page.locator("#btnPreview").click()
+    expect(page.locator("#btnStart")).to_have_text("Previewing…")
+    expect(page.locator("#btnStart")).to_be_disabled()
+    # The prior selection survives the in-flight window.
+    assert page.evaluate("() => importDeselected.size") == 1
+
+
+def test_start_is_disabled_while_the_duplicate_stream_is_draining(
+        live_server, page):
+    """Checkbox eligibility is not final until verdicts land, so submitting
+    mid-stream would send an include_paths that doesn't match the screen."""
+    page.goto(f"{live_server['url']}/import")
+    page.locator("#modeCopy").check()
+    page.evaluate(
+        """(files) => {
+          const f = window.fetch.bind(window);
+          window.fetch = (input, init) => {
+            const t = typeof input === 'string' ? input : input.url;
+            if (t && t.indexOf('/api/import/folder-preview') === 0) {
+              return Promise.resolve(new Response(JSON.stringify({
+                total_count: files.length, total_size: 0,
+                type_breakdown: {'.jpg': files.length},
+                duplicate_count: 0, files: files,
+              }), {status: 200, headers: {'Content-Type': 'application/json'}}));
+            }
+            if (t && t.indexOf('/api/import/check-duplicates') === 0) {
+              return new Promise(() => {});   // stream never drains
+            }
+            return f(input, init);
+          };
+          window.pickDirectory = async () => ['/tmp/card'];
+        }""",
+        _files(3),
+    )
+    _preview(page)
+    expect(page.locator("#btnStart")).to_have_text("Checking duplicates…")
+    expect(page.locator("#btnStart")).to_be_disabled()
+
+
+def test_zero_file_preview_disables_start(live_server, page):
+    """A completed preview that found nothing is NOT 'no preview run' —
+    otherwise later arrivals would be imported unseen.
+
+    _preview() can't be used here: it waits for the grid to become visible
+    and a zero-file preview never renders one.
+    """
+    page.goto(f"{live_server['url']}/import")
+    _stub_preview(page, [])
+    page.locator("[data-testid='import-source-browse-btn']").click()
+    page.locator("#btnPreview").click()
+    expect(page.locator("#previewSummary")).to_have_text(
+        "No importable files found.")
+    expect(page.locator("#btnStart")).to_have_text("No files to import")
+    expect(page.locator("#btnStart")).to_be_disabled()
+
+
+def test_with_skip_duplicates_off_every_card_is_checked_and_enabled(
+        live_server, page):
+    """The duplicate stream returns early in this mode, so there are no
+    verdicts and the derived-checked rule yields all-on."""
+    page.goto(f"{live_server['url']}/import")
+    files = _files(3)
+    _stub_preview(page, files, duplicates=[files[1]["path"]])
+    page.locator("#chkSkipDuplicates").uncheck()
+    _preview(page)
+
+    boxes = page.locator(".import-preview-thumb .thumb-check")
+    for i in range(3):
+        expect(boxes.nth(i)).to_be_checked()
+        expect(boxes.nth(i)).to_be_enabled()
+
+
+def test_selected_count_readout(live_server, page):
+    page.goto(f"{live_server['url']}/import")
+    _stub_preview(page, _files(4))
+    _preview(page)
+    page.locator(".import-preview-thumb .thumb-check").first.click()
+
+    expect(page.locator("#previewSelectedCount")).to_have_text("3 of 4 selected")
+
+
+def test_a_failed_preview_disables_start(live_server, page):
+    """previewImport() clears the grid before it fetches, so a preview that
+    throws leaves an EMPTY screen behind a signature that still matches.
+
+    Without an explicit failure state the gate reads "not stale, nothing
+    eligible" and re-enables Start over a grid the user can no longer see.
+    """
+    page.goto(f"{live_server['url']}/import")
+    _stub_preview(page, _files(3))
+    _preview(page)
+
+    page.evaluate(
+        """() => {
+          const f = window.fetch.bind(window);
+          window.fetch = (input, init) => {
+            const t = typeof input === 'string' ? input : input.url;
+            if (t && t.indexOf('/api/import/folder-preview') === 0) {
+              return Promise.resolve(new Response(
+                JSON.stringify({error: 'disk went away'}),
+                {status: 500, headers: {'Content-Type': 'application/json'}}));
+            }
+            return f(input, init);
+          };
+        }"""
+    )
+    page.locator("#btnPreview").click()
+    expect(page.locator("#importPreviewGrid")).not_to_be_visible()
+    # The LABEL, not just `disabled`: previewImport() disables Start the
+    # moment it starts, so asserting `disabled` alone passes on the in-flight
+    # state and never observes what the failure settles to.
+    expect(page.locator("#btnStart")).to_have_text(
+        "Preview again before importing")
+    expect(page.locator("#btnStart")).to_be_disabled()
+
+
+def test_a_superseded_preview_does_not_reopen_the_gate(live_server, page):
+    """An older run finishing must not clear the newer run's in-flight flag.
+
+    Both runs share the module-level lifecycle flags, so the older run's
+    `finally` has to check that it still owns them — otherwise a slow first
+    walk completing hands the user an enabled Start while the second walk is
+    still running, and the screen is blank.
+    """
+    page.goto(f"{live_server['url']}/import")
+    _stub_preview(page, _files(3))
+    _preview(page)
+
+    page.evaluate(
+        """() => {
+          const f = window.fetch.bind(window);
+          window.__rejects = [];
+          window.fetch = (input, init) => {
+            const t = typeof input === 'string' ? input : input.url;
+            if (t && t.indexOf('/api/import/folder-preview') === 0) {
+              return new Promise((res, rej) => { window.__rejects.push(rej); });
+            }
+            return f(input, init);
+          };
+          previewImport();
+          previewImport();
+        }"""
+    )
+    # Run 1 fails; run 2 is still walking the disk and owns the gate.
+    page.evaluate("() => window.__rejects[0](new Error('card ejected'))")
+    expect(page.locator("#btnStart")).to_have_text("Previewing…")
+    expect(page.locator("#btnStart")).to_be_disabled()
+
+
+def test_start_is_disabled_while_an_import_is_running(live_server, page):
+    """No second submission while one import is in flight.
+
+    Two distinct states have to close the button: the POST is in flight and
+    activeJobId is still null, and then the job id has arrived. Both read
+    "Importing…" to the user; only the gate distinguishes them.
+    """
+    page.goto(f"{live_server['url']}/import")
+    page.evaluate(
+        """() => {
+          const f = window.fetch.bind(window);
+          window.__resolveStart = null;
+          window.fetch = (input, init) => {
+            const t = typeof input === 'string' ? input : input.url;
+            if (t && t.indexOf('/api/jobs/import-in-place') === 0) {
+              return new Promise((res) => { window.__resolveStart = res; });
+            }
+            return f(input, init);
+          };
+          // Keep the job alive: a real stream would complete and re-enable.
+          window.EventSource = function () {
+            this.close = () => {};
+            this.addEventListener = () => {};
+          };
+          window.scheduleImportPreview = () => {};
+        }"""
+    )
+    page.locator("#sourceInput").fill("/tmp/card-a")
+    page.locator("#btnAddSource").click()
+    page.locator("#btnStart").click()
+
+    # The POST has not answered yet, so activeJobId is still null.
+    expect(page.locator("#btnStart")).to_have_text("Importing…")
+    expect(page.locator("#btnStart")).to_be_disabled()
+
+    page.evaluate(
+        """() => window.__resolveStart(new Response(
+             JSON.stringify({job_id: 'gate-test'}),
+             {status: 200, headers: {'Content-Type': 'application/json'}}))"""
+    )
+    # #progressCard is shown in the same synchronous block that sets
+    # activeJobId, so waiting on it means the assertions below observe the
+    # job-id state rather than the still-true pending flag.
+    expect(page.locator("#progressCard")).to_be_visible()
+    expect(page.locator("#btnStart")).to_have_text("Importing…")
+    expect(page.locator("#btnStart")).to_be_disabled()
+
+
+def test_start_is_re_enabled_when_the_import_finishes(live_server, page):
+    """finishJob() owns the end of the import.
+
+    The gate reads activeJobId, so finishJob has to drop it — otherwise the
+    button that used to be re-enabled by hand stays shut for the rest of the
+    page's life and the user has to reload to import again.
+    """
+    page.goto(f"{live_server['url']}/import")
+    page.evaluate(
+        """() => {
+          const f = window.fetch.bind(window);
+          window.fetch = (input, init) => {
+            const t = typeof input === 'string' ? input : input.url;
+            if (t && t.indexOf('/api/jobs/import-in-place') === 0) {
+              return Promise.resolve(new Response(
+                JSON.stringify({job_id: 'gate-done'}),
+                {status: 200, headers: {'Content-Type': 'application/json'}}));
+            }
+            if (t && t.indexOf('/api/jobs/gate-done') === 0) {
+              return Promise.resolve(new Response(
+                JSON.stringify({status: 'completed'}),
+                {status: 200, headers: {'Content-Type': 'application/json'}}));
+            }
+            return f(input, init);
+          };
+          window.EventSource = function () {
+            this.close = () => {};
+            this.addEventListener = (name, fn) => {
+              if (name === 'complete') setTimeout(() => fn({}), 0);
+            };
+          };
+          window.scheduleImportPreview = () => {};
+        }"""
+    )
+    page.locator("#sourceInput").fill("/tmp/card-a")
+    page.locator("#btnAddSource").click()
+    page.locator("#btnStart").click()
+
+    # The job really started: #progressCard is shown in the same synchronous
+    # block that sets activeJobId. Without this the assertions below could
+    # pass on the never-clicked initial state.
+    expect(page.locator("#progressCard")).to_be_visible()
+    # ...and finishJob() dropped it again. (The error banner would be the
+    # more direct proof that finishJob ran, but initImportPage() calls
+    # updateImportMode() -> showError('') after several awaits, so on a busy
+    # machine page startup can wipe the banner after the fact.)
+    expect(page.locator("#btnStart")).to_have_text("Start import")
+    expect(page.locator("#btnStart")).to_be_enabled()
+
+
+def test_a_completed_preview_replaces_the_previous_selection(live_server, page):
+    """A finished preview OWNS the selection.
+
+    Deselections are recorded against the paths a particular preview
+    discovered. Carrying them into the next preview would silently exclude
+    files from a run the user never made that choice for -- and the boxes on
+    screen would agree, because they're derived from the same set.
+    """
+    page.goto(f"{live_server['url']}/import")
+    _stub_preview(page, _files(3))
+    _preview(page)
+    page.locator(".import-preview-thumb .thumb-check").first.click()
+    expect(page.locator("#previewSelectedCount")).to_have_text("2 of 3 selected")
+
+    page.locator("#btnPreview").click()
+    expect(page.locator("#previewSelectedCount")).to_have_text("3 of 3 selected")
+    boxes = page.locator(".import-preview-thumb .thumb-check")
+    for i in range(3):
+        expect(boxes.nth(i)).to_be_checked()
+
+
+def test_removing_the_last_source_gates_start_immediately(live_server, page):
+    """Not after the 350ms re-preview debounce.
+
+    Dropping a source changes the preview signature, so the grid that is
+    still on screen no longer describes the import. Nothing re-previews here
+    (there are no sources left), so if the gate waited for the debounced
+    preview to run it would never fire at all.
+    """
+    page.goto(f"{live_server['url']}/import")
+    _stub_preview(page, _files(3))
+    _preview(page)
+    expect(page.locator("#btnStart")).to_have_text("Start import (3 files)")
+
+    page.locator("#sourceList .source-item button[title='Remove']").click()
+    expect(page.locator("#btnStart")).to_have_text(
+        "Preview again before importing")
+    expect(page.locator("#btnStart")).to_be_disabled()
+
+
+def test_start_is_blocked_when_the_captured_image_list_fails_to_load(
+        live_server, page):
+    """Snapshot mode: Start stays shut when there is no list behind it.
+
+    The new-images flow imports exactly one frozen list of paths. If that
+    list can't be loaded there is nothing to import, and a live Start would
+    post a snapshot id the server has already rejected.
+    """
+    page.goto(f"{live_server['url']}/import?new_images=not-a-snapshot-id")
+    expect(page.locator("#newImagesImportSource")).to_contain_text(
+        "could not be loaded")
+    expect(page.locator("#btnStart")).to_be_disabled()

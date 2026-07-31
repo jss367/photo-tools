@@ -61,6 +61,11 @@ body { display: flex; flex-direction: column; height: 100vh; }
 .recent-destination-list .btn { font-size: 11px; padding: 2px 8px; max-width: 100%; overflow: hidden; text-overflow: ellipsis; }
 .input-fixed { max-width: 240px; flex: 0 1 240px; }
 .preview-summary { font-size: 12px; color: var(--text-secondary); margin-top: 6px; }
+.preview-selection-row {
+  display: flex; align-items: center; gap: 6px; margin-top: 6px;
+  font-size: 12px; color: var(--text-secondary); cursor: pointer;
+}
+.preview-selection-row input { accent-color: var(--accent); }
 .preview-filter { display: inline-flex; align-items: center; gap: 6px; margin-top: 8px; font-size: 12px; color: var(--text-secondary); }
 .import-preview-grid { display: flex; flex-direction: column; gap: 12px; margin-top: 12px; max-height: 520px; overflow-y: auto; }
 .import-preview-collapsed {
@@ -70,13 +75,19 @@ body { display: flex; flex-direction: column; height: 100vh; }
 }
 .import-preview-empty { font-size: 12px; color: var(--text-secondary); }
 .import-preview-folder { display: flex; flex-direction: column; gap: 6px; }
-.import-preview-folder-header { font-size: 12px; font-weight: 600; color: var(--text-secondary); overflow-wrap: anywhere; }
+.import-preview-folder-header {
+  font-size: 12px; font-weight: 600; color: var(--text-secondary);
+  overflow-wrap: anywhere; display: flex; align-items: center; gap: 6px;
+}
+.import-preview-folder-header .folder-check { flex: none; accent-color: var(--accent); }
 .import-preview-thumbs { display: grid; grid-template-columns: repeat(auto-fill, minmax(104px, 1fr)); gap: 8px; }
 .import-preview-thumb {
   position: relative; min-width: 0; overflow: hidden; border-radius: 6px;
   background: var(--bg-tertiary); border: 1px solid var(--border-primary);
 }
 .import-preview-thumb.duplicate { opacity: 0.55; }
+.import-preview-thumb .thumb-check { position: absolute; top: 4px; left: 4px; z-index: 2; accent-color: var(--accent); }
+.import-preview-thumb .thumb-check:disabled { opacity: 0.5; cursor: not-allowed; }
 .import-preview-thumb-img { aspect-ratio: 1; background: var(--bg-primary); overflow: hidden; }
 .import-preview-thumb-img img { width: 100%; height: 100%; object-fit: cover; display: block; }
 .import-preview-thumb.skeleton .import-preview-thumb-img::after {
@@ -88,8 +99,11 @@ body { display: flex; flex-direction: column; height: 100vh; }
   0% { background-position: 200% 0; }
   100% { background-position: -200% 0; }
 }
+/* Anchored right, not left: the checkbox owns the top-left corner and the
+   badge is the only thing that explains why that checkbox is disabled.
+   Stacking them hides the explanation. */
 .import-preview-badge {
-  position: absolute; top: 6px; left: 6px; border-radius: 3px; padding: 2px 5px;
+  position: absolute; top: 6px; right: 6px; border-radius: 3px; padding: 2px 5px;
   background: rgba(0,0,0,0.72); color: #fff; font-size: 9px; font-weight: 700;
   letter-spacing: 0; text-transform: uppercase;
 }
@@ -433,8 +447,16 @@ body { display: flex; flex-direction: column; height: 100vh; }
       </div>
       <div id="importError" role="alert" aria-live="assertive"></div>
       <div class="preview-summary" id="previewSummary"></div>
+      <label class="preview-selection-row" id="selectAllRow" style="display:none;">
+        <input type="checkbox" id="chkSelectAllImport" checked>
+        <span id="previewSelectedCount"></span>
+      </label>
+      <!-- Text is set by updateImportSelectionUI() from
+           selectionUnavailableText(): the wording differs between in-place
+           and snapshot mode, and one source for it beats two. -->
+      <div class="preview-summary" id="selectionUnavailableNote" style="display:none;"></div>
       <label class="preview-filter" id="hideDuplicatesRow" style="display:none;">
-        <input type="checkbox" id="chkHideDuplicates" onchange="rerenderImportPreviewGrid()">
+        <input type="checkbox" id="chkHideDuplicates" onchange="onHideDuplicatesToggle()">
         <span id="hideDuplicatesLabel">Hide duplicates</span>
       </label>
       <div id="importPreviewGrid" class="import-preview-grid" style="display:none;"></div>
@@ -529,10 +551,40 @@ let importThumbSchedulerCancel = null;
 // filter can re-render locally.
 let lastImportPreviewRender = null;
 let importTags = [];
+// User intent ONLY: paths the user explicitly unchecked. Duplicate verdicts
+// are a separate eligibility overlay and are never written in here — see the
+// import-file-selection spec §1. Keeping these separate is what makes the
+// checkbox state safe to re-derive on every render.
+let importDeselected = new Set();
+let importPreviewedPaths = [];
+let importSelectionAnchor = null;
 let newImagesSnapshotId = null;
+// Preview lifecycle, read only by updateStartGate(). The four states below
+// must stay distinguishable — collapsing "no preview run" with "in flight"
+// is what would let a user who picked 100 of 5,000 files hit Start during the
+// disk walk and copy all 5,000, because previewImport() clears the grid
+// BEFORE the walk and the signature at that moment still matches the UI.
+//   null captured signature .. no preview has completed; Start imports
+//                              everything, which is the pre-selection
+//                              behaviour and is safe because nothing on
+//                              screen claims otherwise.
+//   captured + unchanged .... the grid on screen is what will be imported.
+//   captured + changed ...... the controls moved on; the grid is a lie.
+//   in flight / draining .... the grid is empty or incomplete.
+let importPreviewInFlight = false;
+let importDupStreamPending = false;
+let importPreviewFailed = false;
+let importPreviewCapturedSignature = null;
+// True between POSTing the import job and learning its id — activeJobId is
+// still null across that await, and without this the gate would re-enable
+// Start and allow a double submit.
+let importStartPending = false;
+// Owned by the new-images (snapshot) flow: Start is blocked while the frozen
+// list loads, when the capture found nothing, and after a load failure. It
+// contributes no label — #newImagesImportSource already says why.
+let newImagesStartBlocked = false;
 let importExiftoolReady = null;
 let importExiftoolRequired = true;
-let importStartInFlight = false;
 let lastFinishedImportJob = null;
 
 async function loadImportReadiness() {
@@ -573,7 +625,7 @@ async function loadImportReadiness() {
     advanced.style.display = 'none';
     repairSection.style.display = 'none';
   }
-  updateStartAvailability();
+  updateStartGate();
 }
 
 async function installImportExiftool() {
@@ -664,6 +716,48 @@ function selectedImportMode() {
   return checked ? checked.value : 'in_place';
 }
 
+// SINGLE DEFINITION of "per-file selection applies here". Read by the
+// renderer (which draws the boxes), updateImportSelectionUI() (which shows
+// the select-all row and the explanatory note) and updateStartGate() (which
+// counts the selection into the button label). Three copies of this
+// expression would be three chances for the boxes and the readouts about
+// them to disagree.
+//
+// Copy mode only. The in-place path runs through do_scan(restrict_files=…),
+// which vireo/scanner.py honours only alongside restrict_dirs, and filling
+// restrict_dirs would change which directories get registered as workspace
+// roots — a core scanner change, deliberately deferred. The snapshot
+// (new-images) flow is a third state: it imports exactly one frozen list.
+function importSelectionEnabled() {
+  return newImagesSnapshotId === null && selectedImportMode() === 'copy';
+}
+
+// Why the boxes aren't there. An unexplained absence is the same class of
+// failure as an unexplained disabled control: the user cannot tell whether
+// selection is missing, broken, or hidden behind a setting they haven't
+// found. Both strings therefore carry two halves — where selection DOES
+// live, and what this mode will do instead — and both halves are pinned by
+// tests.
+//
+// "Copy to archive" is the radio's own label, quoted exactly: a user
+// scanning the screen for the words the note used cannot find "when copying
+// files". Plural "source folders" because Add in place walks every source
+// added, recursively when Include subfolders is on.
+//
+// The two strings must stay distinct. In snapshot mode both mode radios are
+// DISABLED, so naming Copy to archive would point at a control the user
+// cannot reach, and that import adds exactly the captured list rather than
+// everything the source folders hold.
+function selectionUnavailableText() {
+  if (newImagesSnapshotId !== null) {
+    return 'File selection is not available for this import. It adds exactly'
+      + ' the captured list of newly detected images, leaving the originals'
+      + ' where they are.';
+  }
+  return 'File selection is available in Copy to archive mode. Add in place'
+    + ' catalogs every file it finds in your source folders.';
+}
+
 function updateImportMode() {
   if (newImagesSnapshotId !== null) {
     document.getElementById('modeInPlace').checked = true;
@@ -677,6 +771,20 @@ function updateImportMode() {
   document.getElementById('previewSummary').textContent = '';
   hideDestStructure();
   clearImportPreviewGrid();
+  // A mode switch throws the rendered preview away, so the lifecycle has to
+  // hear about it. Staleness alone can't: copy -> in place -> copy inside the
+  // 350ms re-preview debounce restores the EXACT signature the completed
+  // preview captured, so the check reports "current" over a grid that no
+  // longer exists — live Start, invisible grid, and a select-all still
+  // reading "3 of 3 selected", all at once.
+  //
+  // Here and not in clearImportPreviewGrid(): the zero-file branch of
+  // previewImport() calls that AFTER capturing the signature, so resetting
+  // there would push a completed empty preview back into "no preview run"
+  // and re-enable Start over it.
+  importPreviewCapturedSignature = null;
+  importPreviewedPaths = [];
+  updateImportSelectionUI();
   showError('');
   updateFileTypeControls();
   updateWorkspaceMode();
@@ -684,7 +792,7 @@ function updateImportMode() {
   refreshSourceCounts();
   scheduleImportPreview();
   updateAfterMoveUI();
-  updateStartAvailability();
+  updateStartGate();
 }
 
 function selectedFileTypes() {
@@ -792,7 +900,10 @@ function wireDestStructureInvalidation() {
       if (id === 'destInput' || id === 'destMode') {
         updateDestinationModeHint();
       }
-      updateStartAvailability();
+      // Immediately, not after the 350ms debounce: for the 350ms between the
+      // toggle and the re-preview the rendered grid describes the OLD
+      // options, and Start would happily send the selection made against it.
+      updateStartGate();
     };
     el.addEventListener('change', onPreviewOptionChange);
     el.addEventListener('input', onPreviewOptionChange);
@@ -801,8 +912,61 @@ function wireDestStructureInvalidation() {
     el.addEventListener('change', () => {
       hideDestStructure();
       scheduleImportPreview();
-      updateStartAvailability();
+      updateStartGate();
     });
+  });
+}
+
+// Called from initImportPage() alongside wireDestStructureInvalidation():
+// #chkSelectAllImport is static template markup, so it already exists, and
+// wiring before the first await closes the window where a preview could
+// render with a dead master checkbox.
+function wireImportSelectAll() {
+  const master = document.getElementById('chkSelectAllImport');
+  if (!master) return;
+  master.addEventListener('change', () => {
+    // Every rendered card, hidden or not — this is "select all", not
+    // "select visible". Eligibility still comes off the cards, so a stale
+    // duplicate verdict can't silently exclude files from a bulk action.
+    //
+    // SCOPE NOTE: this walks importGridCards() while importFolderPaths()
+    // walks importVisibleCards(). Still equivalent — but NOT for the
+    // reason this note used to give, so read the whole thing before
+    // relying on it.
+    //
+    // It used to argue that the only cards anything hides are skipped
+    // duplicates, which both scopes exclude. #1382's hide-duplicates
+    // filter has since landed and that premise is false: it can hide a
+    // duplicate card while chkSkipDuplicates is OFF, i.e. a card that IS
+    // eligible. The predicted symptom was that such a card would count
+    // toward this master's denominator while belonging to no folder
+    // header, leaving the master dashed after every header was ticked.
+    //
+    // Measured against exactly that state (six files, two flagged, Skip
+    // duplicates OFF and Hide duplicates ON, then every folder header
+    // ticked): master.checked true, master.indeterminate false. It does
+    // not reproduce — because #1382 does not hide those cards, it OMITS
+    // them from the render. Both scopes read the DOM, so a card that was
+    // never drawn is missing from both, and they stayed equal at 4 and 4.
+    // The conclusion survives; the argument for it did not.
+    //
+    // (That state is also unreachable from the UI: unchecking Skip
+    // duplicates retires the opt-in and re-previews with no duplicate
+    // flags, so the row hides and all six cards come back — measured too.
+    // It took a forced render to put the scopes under the load this note
+    // is about.)
+    //
+    // The condition to re-check is therefore unchanged in shape but not
+    // in wording: does anything draw a card that this master counts and
+    // no folder header owns? Omitting cards is safe. Hiding them in
+    // place would not be.
+    importSelectableCardPaths(importGridCards())
+      .forEach(p => {
+        if (master.checked) importDeselected.delete(p);
+        else importDeselected.add(p);
+      });
+    updateImportSelectionUI();
+    rerenderImportPreviewGridSafe();
   });
 }
 
@@ -817,7 +981,7 @@ function updateWorkspaceMode() {
   // ...and the resync can change whether a process chains at all, which
   // gates the "Then move to NAS" row.
   updateAfterMoveUI();
-  updateStartAvailability();
+  updateStartGate();
 }
 
 function importRemoteTargetId() {
@@ -878,7 +1042,7 @@ function updateRemoteDestPreview() {
       errorEl.classList.add('visible');
     }
     if (input) input.classList.add('input-invalid');
-    updateStartAvailability();
+    updateStartGate();
     return;
   }
   const subResult = normalizeRemoteSubpath(input.value);
@@ -921,7 +1085,7 @@ function updateRemoteDestPreview() {
   } else if (!importIsAbsolutePath(t.mount_path)) {
     el.appendChild(remotePreviewWarn('Warning: this target local mount path must be absolute.'));
   }
-  updateStartAvailability();
+  updateStartGate();
 }
 
 function remoteArchiveSelectionReady() {
@@ -964,7 +1128,7 @@ function onImportDestModeChange() {
   updateDestinationModeHint();
   updateRemoteDestPreview();
   updateAfterMoveUI();
-  updateStartAvailability();
+  updateStartGate();
 }
 
 async function loadImportRemoteTargets() {
@@ -1044,7 +1208,7 @@ function renderSources() {
     div.appendChild(btn);
     list.appendChild(div);
   });
-  updateStartAvailability();
+  updateStartGate();
 }
 
 function selectedSourceCountOptions() {
@@ -1871,15 +2035,6 @@ function importFormProblem() {
   return null;
 }
 
-function updateStartAvailability() {
-  const button = document.getElementById('btnStart');
-  if (!button) return;
-  const problem = importFormProblem();
-  button.disabled = importStartInFlight || !!problem;
-  button.title = problem ? problem.message : '';
-  button.setAttribute('aria-disabled', button.disabled ? 'true' : 'false');
-}
-
 function showError(msg, target) {
   const el = document.getElementById('importError');
   el.textContent = msg;
@@ -2113,6 +2268,13 @@ function clearScheduledImportPreview() {
 function scheduleImportPreview() {
   clearScheduledImportPreview();
   showError('');
+  // Everything that schedules a re-preview has just changed something the
+  // rendered grid was drawn from — a source, the mode, a duplicate option.
+  // Gate Start here rather than waiting 350ms for the preview to start, so
+  // the button can never be live over a grid that no longer describes the
+  // import. (wireDestStructureInvalidation also calls this directly; the
+  // call is a pure recompute, so running it twice costs nothing.)
+  updateStartGate();
   if (!sources.length) return;
   importPreviewTimer = setTimeout(() => {
     importPreviewTimer = null;
@@ -2234,6 +2396,12 @@ function renderImportPreviewGrid(files, duplicatePaths, destinationFiles) {
   updateHideDuplicatesControl(dupeCount);
   const hidingDuplicates = dupeCount > 0 && hideDuplicatesEnabled();
 
+  const skipDupes = document.getElementById('chkSkipDuplicates').checked;
+  // The cards are still drawn in every mode — the preview is the honest list
+  // of what will be imported either way. Only the controls that would claim
+  // the user can change that list are withheld.
+  const selectionEnabled = importSelectionEnabled();
+
   // Duplicate-heavy retries should foreground the work Vireo will actually
   // perform. Rendering hundreds of skipped cards obscures the one failed
   // file and schedules a thumbnail request for every duplicate. When the
@@ -2281,9 +2449,38 @@ function renderImportPreviewGrid(files, duplicatePaths, destinationFiles) {
     groupEl.className = 'import-preview-folder';
     const header = document.createElement('div');
     header.className = 'import-preview-folder-header';
-    header.textContent = subfolder + ' (' + shown.length + ')' +
+    if (selectionEnabled) {
+      const folderCheck = document.createElement('input');
+      folderCheck.type = 'checkbox';
+      folderCheck.className = 'folder-check';
+      // Checked/indeterminate/disabled/title are all set by
+      // refreshImportFolderHeaders() once the cards exist and the grid is
+      // visible. It derives the tally from the rendered cards — including
+      // their duplicate class — so the header and the boxes below it read
+      // from exactly the same source and cannot disagree.
+      folderCheck.addEventListener('change', () => {
+        importFolderPaths(header.parentNode).forEach((p) => {
+          if (folderCheck.checked) importDeselected.delete(p);
+          else importDeselected.add(p);
+        });
+        updateImportSelectionUI();
+        rerenderImportPreviewGridSafe();
+      });
+      // Omitted, not hidden: the header is a flex row with a gap, so a
+      // zero-width box would still indent the folder name off its grid.
+      header.appendChild(folderCheck);
+    }
+    const headerLabel = document.createElement('span');
+    // Stamped as data, not recovered from the rendered text: with "Hide
+    // duplicates" on, the label carries a "· N duplicates hidden" suffix and
+    // the trailing-count regex refreshImportFolderHeaders() used to strip
+    // would leave the checkbox tooltip naming the folder
+    // "card-a (0) · 2 duplicates hidden".
+    headerLabel.dataset.folder = subfolder;
+    headerLabel.textContent = subfolder + ' (' + shown.length + ')' +
       (hiddenHere ? ' · ' + hiddenHere.toLocaleString() + ' duplicate' +
         (hiddenHere === 1 ? '' : 's') + ' hidden' : '');
+    header.appendChild(headerLabel);
     groupEl.appendChild(header);
 
     // A folder made entirely of duplicates still gets its header — a
@@ -2308,6 +2505,23 @@ function renderImportPreviewGrid(files, duplicatePaths, destinationFiles) {
       card.dataset.path = f.path || '';
       if (f.thumb_url) card.dataset.thumbUrl = f.thumb_url;
       card.title = f.path || f.filename || '';
+
+      if (selectionEnabled) {
+        const check = document.createElement('input');
+        check.type = 'checkbox';
+        check.className = 'thumb-check';
+        // Derived, never seeded. The renderer runs up to three times per
+        // preview and duplicate verdicts arrive late; recomputing from state
+        // each pass means a late verdict just changes the answer.
+        check.checked = !importDeselected.has(f.path)
+          && !(isDuplicate && skipDupes);
+        check.disabled = isDuplicate && skipDupes;
+        check.addEventListener('click', (e) => {
+          e.stopPropagation();
+          toggleImportSelection(f.path, check.checked, e.shiftKey);
+        });
+        card.appendChild(check);
+      }
 
       const imgWrap = document.createElement('div');
       imgWrap.className = 'import-preview-thumb-img';
@@ -2366,7 +2580,326 @@ function renderImportPreviewGrid(files, duplicatePaths, destinationFiles) {
     }
   }
   grid.style.display = '';
+  // After the grid is shown, not before: importVisibleCards() reads
+  // offsetParent, which is null for every card while the grid is still
+  // display:none — the state it inherits from the template on first render.
+  refreshImportFolderHeaders();
   setupImportThumbnailScheduler();
+}
+
+// Every card in the rendered grid, in render order.
+function importGridCards() {
+  const grid = document.getElementById('importPreviewGrid');
+  return grid ? Array.from(grid.querySelectorAll('.import-preview-thumb')) : [];
+}
+
+// Only the cards the user can actually see: a shift-range must not reach
+// through a card that isn't on screen and toggle it.
+//
+// This was written expecting the hide-duplicates filter (#1382) to hide
+// cards in place with CSS. It doesn't — it OMITS them from the render, so
+// with the filter on there is no card in the DOM to skip and this
+// offsetParent test currently excludes nothing (measured: with two of six
+// files filtered, every card the grid holds has a non-null offsetParent).
+// Kept as the defensive scope it is: it costs one layout read, and the day
+// something does hide a card in place, a range that swept through it would
+// toggle files the user could not see.
+function importVisibleCards(root) {
+  const scope = root || document.getElementById('importPreviewGrid');
+  if (!scope) return [];
+  return Array.from(scope.querySelectorAll('.import-preview-thumb'))
+    .filter(el => el.offsetParent !== null);
+}
+
+// Duplicate-ness is read off the CARD, and there is deliberately no
+// module-level set of duplicate paths to read instead. Such a set could only
+// be assigned once the whole check-duplicates stream had drained, so during a
+// re-preview it would still hold the PREVIOUS run's verdicts while the cards
+// on screen carry none. Consulting it here would disable a card the renderer
+// drew enabled — and with no badge, since the badge is drawn from the same
+// argument the card was, leaving the user with a dead control and no
+// explanation. Over SMB with verify_by_hash that window is minutes long.
+function importSelectableCardPaths(cards) {
+  const skipDupes = document.getElementById('chkSkipDuplicates').checked;
+  return cards
+    .filter(el => !(el.classList.contains('duplicate') && skipDupes))
+    .map(el => el.dataset.path)
+    .filter(p => !!p);
+}
+
+// The selectable paths in one rendered folder group. Skipped duplicates are
+// excluded: they're already ineligible, so a bulk toggle must neither select
+// them (it can't) nor record a deselection for them (that would turn an
+// eligibility verdict into user intent, and it would outlive the verdict).
+function importFolderPaths(groupEl) {
+  if (!groupEl) return [];
+  return importSelectableCardPaths(importVisibleCards(groupEl));
+}
+
+// Folder headers are a tally of the cards under them, so they have to be
+// recomputed after ANY selection change — including a single per-file click,
+// which otherwise leaves the header claiming "all selected".
+function refreshImportFolderHeaders() {
+  const grid = document.getElementById('importPreviewGrid');
+  if (!grid) return;
+  grid.querySelectorAll('.import-preview-folder').forEach((groupEl) => {
+    const folderCheck = groupEl.querySelector('.folder-check');
+    if (!folderCheck) return;
+    const paths = importFolderPaths(groupEl);
+    const onCount = paths.filter(p => !importDeselected.has(p)).length;
+    // "All", not "any" — matches chkSelectAll on pipeline.html so the same
+    // widget means the same thing on both pages. Consequence: clicking a
+    // dashed header SELECTS the rest of the folder rather than clearing it,
+    // which is also the conventional web behaviour for a tri-state parent.
+    folderCheck.checked = paths.length > 0 && onCount === paths.length;
+    // Tri-state: "some" must not read as "all". Only settable from JS.
+    folderCheck.indeterminate = onCount > 0 && onCount < paths.length;
+    // Nothing to toggle — an enabled control that silently does nothing and
+    // snaps back is worse than an honestly dead one.
+    folderCheck.disabled = paths.length === 0;
+    // Name the folder. refreshImportFolderHeaders() has no `subfolder` in
+    // scope, so read it off the label the renderer put beside the box —
+    // from its data attribute, not by stripping the trailing count out of
+    // its text: with "Hide duplicates" on, that text ends in
+    // "· N duplicates hidden" (#1382) and the regex left the tooltip
+    // reading "Every file in card-a (0) · 2 duplicates hidden is a…".
+    const labelEl = folderCheck.parentNode.querySelector('span');
+    const name = labelEl
+      ? (labelEl.dataset.folder
+         ?? labelEl.textContent.replace(/ \(\d+\)$/, ''))
+      : '';
+    folderCheck.title = paths.length === 0
+      ? 'Every file in ' + name + ' is a duplicate that will be skipped'
+      : 'Select or deselect every file in ' + name;
+  });
+}
+
+function toggleImportSelection(path, checked, shiftKey) {
+  // Range runs over VISIBLE RENDER order — not importPreviewedPaths order,
+  // which is the API's. The renderer groups by subfolder and sorts the group
+  // keys, so the two diverge whenever subfolders don't arrive alphabetically,
+  // and a range computed from the wrong one toggles cards the user didn't
+  // drag across. Hidden cards are excluded for the same reason.
+  const cards = importVisibleCards();
+  const visible = cards.map(el => el.dataset.path);
+  let targets = [path];
+  if (shiftKey && importSelectionAnchor !== null) {
+    const a = visible.indexOf(importSelectionAnchor);
+    const b = visible.indexOf(path);
+    if (a !== -1 && b !== -1) {
+      // min/max, not a..b: the anchor can sit after the click target.
+      targets = visible.slice(Math.min(a, b), Math.max(a, b) + 1);
+    }
+  }
+  const selectable = new Set(importSelectableCardPaths(cards));
+  targets
+    .filter(p => selectable.has(p))
+    .forEach(p => {
+      if (checked) importDeselected.delete(p);
+      else importDeselected.add(p);
+    });
+  // Re-anchor on every click, shift-click included, so the next range starts
+  // from where this one ended.
+  importSelectionAnchor = path;
+  updateImportSelectionUI();
+  rerenderImportPreviewGridSafe();
+}
+
+// Redraw the boxes after a selection change.
+//
+// This used to branch on `typeof rerenderImportPreviewGrid === 'function'`
+// against a targeted DOM fallback, because the hide-duplicates filter (#1382)
+// had not merged yet and there was no full re-render to call. It has merged;
+// the fallback is dead code and is gone.
+//
+// A targeted refresh is still what happens, and deliberately so. The live
+// path works — driven through rerenderImportPreviewGrid(), per-file toggles,
+// folder headers, select-all and shift-ranges all behave and the headers do
+// get refreshed — but it rebuilds every card on every checkbox click, which
+// drops each <img> and re-runs setupImportThumbnailScheduler() over the whole
+// grid. Measured on a six-card preview: 6 thumbnail requests per click
+// through the full re-render, 0 through this refresh. That is linear in card
+// size, and #1382 exists for 985-file cards. Selection state is derived, so
+// only the boxes and the headers can change; the tiles cannot.
+//
+// The one thing a targeted refresh cannot do is honor a change in WHICH cards
+// exist — that only happens when the filter itself is toggled, which calls
+// rerenderImportPreviewGrid() directly (see onHideDuplicatesToggle).
+function rerenderImportPreviewGridSafe() {
+  const skipDupes = document.getElementById('chkSkipDuplicates').checked;
+  importGridCards().forEach((el) => {
+    const cb = el.querySelector('.thumb-check');
+    if (!cb) return;
+    const isDup = el.classList.contains('duplicate');
+    cb.checked = !importDeselected.has(el.dataset.path) && !(isDup && skipDupes);
+    cb.disabled = isDup && skipDupes;
+  });
+  // A header left claiming "all selected" after a per-file click is exactly
+  // the stale readout this function exists to stop.
+  refreshImportFolderHeaders();
+}
+
+// #chkHideDuplicates changes which cards EXIST, not just which boxes are
+// ticked, so it needs the full re-render rather than the targeted refresh
+// above. Every selection readout on this page is derived from the rendered
+// cards (importGridCards()), so the readouts have to resync afterwards or the
+// select-all row, the "N of M selected" line and the Start label go on
+// describing a grid that is no longer there.
+function onHideDuplicatesToggle() {
+  rerenderImportPreviewGrid();
+  updateImportSelectionUI();
+}
+
+// Counted off the rendered cards, like every other readout on this page.
+// Counting against a retained set of duplicate paths would under-report
+// during a re-preview — such a set holds the previous run's verdicts until
+// the new check-duplicates stream drains — and the numbers drive the master
+// checkbox, so a stale count doesn't just print a wrong figure: it disables
+// a live control over cards that carry no badge to explain it.
+//
+// Counted over UNIQUE paths, not over cards. /api/import/folder-preview
+// appends per source with no cross-source dedup, so two nested sources
+// (/card and /card/DCIM) discover the same file twice and the grid draws two
+// cards for it — one file, which the import copies once. Counting cards
+// would put "Start import (3 files)" on a run that copies 2, and would send
+// a checked_count the route rejects: it enforces
+// checked_count <= len(set(include_paths)).
+function importEligibleCount() {
+  return new Set(importSelectableCardPaths(importGridCards())).size;
+}
+
+function importCheckedCount() {
+  return new Set(importSelectableCardPaths(importGridCards())
+    .filter(p => !importDeselected.has(p))).size;
+}
+
+function updateImportSelectionUI() {
+  const el = document.getElementById('previewSelectedCount');
+  if (el) {
+    // The CHECKED count — what will actually be copied. Never the
+    // include_paths count, which is larger because it retains duplicates.
+    // Both halves count unique paths, for the nested-sources reason on
+    // importEligibleCount(): a file discovered twice is still one file, and
+    // "3 of 3" over a two-file import is the same lie as the numerator's.
+    el.textContent = importCheckedCount().toLocaleString() + ' of '
+      + new Set(importPreviewedPaths).size.toLocaleString() + ' selected';
+  }
+  const master = document.getElementById('chkSelectAllImport');
+  if (master) {
+    // Denominator is the ELIGIBLE count, not importPreviewedPaths.length:
+    // with "everything selected except two skipped duplicates" the master
+    // must read as full, not as a partial selection the user has to go
+    // hunting for.
+    // Tri-state rule is "all", matching chkSelectAll on pipeline.html
+    // (selected === total) so the same widget means the same thing on both
+    // pages; `indeterminate` is what carries "some".
+    const eligible = importEligibleCount();
+    const checked = importCheckedCount();
+    master.checked = eligible > 0 && checked === eligible;
+    master.indeterminate = checked > 0 && checked < eligible;
+    // Nothing selectable (every discovered file is a skipped duplicate):
+    // a live control that does nothing on click is a black box.
+    master.disabled = eligible === 0;
+    master.title = eligible === 0
+      ? 'Every discovered file is a duplicate that will be skipped'
+      : 'Select or deselect every file in this preview';
+  }
+  const row = document.getElementById('selectAllRow');
+  // The selectionEnabled check matters: without it a later call to this
+  // function can re-show the select-all row in in-place mode after the
+  // renderer has already left the per-file boxes out.
+  const selectionEnabled = importSelectionEnabled();
+  if (row) {
+    row.style.display =
+      (selectionEnabled && importPreviewedPaths.length) ? '' : 'none';
+  }
+  // Owned here rather than by the renderer, and NOT gated on a rendered
+  // grid: updateImportMode() throws the preview away, so a note that only
+  // ever moved inside renderImportPreviewGrid() would survive a switch to
+  // copy mode and sit there contradicting the controls the user is about to
+  // get. This function is on every path that changes the mode.
+  const note = document.getElementById('selectionUnavailableNote');
+  if (note) {
+    note.textContent = selectionUnavailableText();
+    note.style.display = selectionEnabled ? 'none' : '';
+  }
+  updateStartGate();
+}
+
+// SINGLE OWNER of #btnStart.disabled and its label. Every other site that
+// touches the button must call this instead of assigning directly, or the
+// two will race — finishJob() re-enabling the button after an import would
+// otherwise undo a gate that wants it disabled.
+//
+// Preview state is FOUR-valued and the values must not collapse:
+//   no preview run ....... enabled; the import sends no include_paths and
+//                          copies everything, which is what the screen says.
+//   preview current ...... enabled.
+//   preview stale ........ disabled; the controls moved on and the grid no
+//                          longer describes what would be copied.
+//   preview in flight .... disabled; the grid is cleared before the disk
+//                          walk starts, and on a 5,000-file card that walk
+//                          is long enough to click through.
+function updateStartGate() {
+  const btn = document.getElementById('btnStart');
+  if (!btn) return;
+  // Same predicate as the boxes themselves — see importSelectionEnabled().
+  // The label counts the selection, so it must not outlive the controls
+  // that produce one: "Start import (3 files)" in in-place mode would be a
+  // promise the request never makes, since the scan catalogues whatever is
+  // on disk when it runs rather than the three cards on screen.
+  const copyMode = importSelectionEnabled();
+  let reason = null;
+  if (activeJobId !== null || importStartPending) reason = 'Importing…';
+  else if (copyMode && importPreviewInFlight) reason = 'Previewing…';
+  else if (copyMode && importPreviewCapturedSignature !== null
+           && importPreviewSignatureChanged(importPreviewCapturedSignature)) {
+    reason = 'Preview again before importing';
+  } else if (copyMode && importDupStreamPending) reason = 'Checking duplicates…';
+  else if (copyMode && importPreviewFailed) {
+    // The failed run already cleared the grid, so the screen shows nothing
+    // while the signature still matches — "not stale, nothing eligible"
+    // would read as safe and re-enable Start over an empty preview.
+    reason = 'Preview again before importing';
+  } else if (copyMode && importPreviewCapturedSignature !== null
+             && importPreviewedPaths.length === 0) {
+    // A completed preview that found nothing is NOT "no preview run". Leaving
+    // Start live here would import whatever lands on the card later, unseen.
+    reason = 'No files to import';
+  } else if (copyMode && importEligibleCount() > 0
+             && importCheckedCount() === 0) {
+    // The `importEligibleCount() > 0` qualifier is load-bearing: an
+    // already-archived card renders zero checked through no choice of the
+    // user's, and blocking Start there would remove the only way to get the
+    // safe-to-format verdict on it.
+    reason = 'No files selected';
+  }
+  // Form validity, from #1387's importFormProblem(). That PR landed its own
+  // single owner of this button (updateStartAvailability()) on main while
+  // this branch was landing updateStartGate() here; both assigned
+  // btn.disabled, so keeping both would have made the button read whichever
+  // ran last. They answer different questions and both have to be able to
+  // hold it shut — "is the FORM complete" (no destination, no file types,
+  // unrepaired ExifTool, an unusable NAS target) and "does the PREVIEW still
+  // describe what would be copied". So this function owns both, and
+  // updateStartAvailability() is gone.
+  //
+  // The two report through different channels on purpose: a lifecycle
+  // `reason` replaces the LABEL, because it describes something the page is
+  // doing and the user only has to wait; a form `problem` names a field the
+  // user must go fix, and belongs in the tooltip next to the inline error
+  // #1387 already renders beside that field. A form problem must not
+  // overwrite "Importing…".
+  const problem = importFormProblem();
+  btn.disabled = reason !== null || newImagesStartBlocked || !!problem;
+  btn.title = problem ? problem.message : '';
+  btn.setAttribute('aria-disabled', btn.disabled ? 'true' : 'false');
+  const checked = importCheckedCount();
+  btn.textContent = reason
+    || (copyMode && importPreviewCapturedSignature !== null
+        ? 'Start import (' + checked.toLocaleString() + ' file'
+          + (checked === 1 ? '' : 's') + ')'
+        : 'Start import');
 }
 
 function setupImportThumbnailScheduler() {
@@ -2619,6 +3152,17 @@ async function renderDestStructure(excludePaths) {
   return data;
 }
 
+// Clear the lifecycle flags, but ONLY if this run still owns them. A
+// superseded run finishing (its fetch finally failing, its stream draining)
+// must not hand the user an enabled Start while the newer run is still
+// walking the disk behind a cleared grid.
+function endImportPreviewFlight(requestSeq) {
+  if (requestSeq !== importPreviewSeq) return;
+  importPreviewInFlight = false;
+  importDupStreamPending = false;
+  updateStartGate();
+}
+
 async function previewImport(opts) {
   clearScheduledImportPreview();
   showError('');
@@ -2626,6 +3170,17 @@ async function previewImport(opts) {
   clearImportPreviewGrid();
   importPreviewSeq += 1;
   const requestSeq = importPreviewSeq;
+  // In flight from HERE, before the disk walk. The selection itself is NOT
+  // reset here and must never be: clearImportPreviewGrid() has already wiped
+  // the cards, so between this line and the render the signature still
+  // matches the UI and the staleness check cannot catch a stale screen. A
+  // user who picked 100 of 5,000 files, toggled a file-type box and clicked
+  // Start during the walk would copy all 5,000. The completed preview
+  // REPLACES the selection on success instead.
+  importPreviewInFlight = true;
+  importDupStreamPending = false;
+  importPreviewFailed = false;
+  updateStartGate();
   const summary = document.getElementById('previewSummary');
   // Both bail-outs below are settled: the run stops before discovery, so
   // nothing can be hidden and the opt-in must not linger behind the
@@ -2635,6 +3190,7 @@ async function previewImport(opts) {
     retireHideDuplicatesOptIn();
     summary.textContent = '';
     showError('Add at least one source folder.');
+    endImportPreviewFlight(requestSeq);
     return;
   }
   const copyMode = newImagesSnapshotId === null && selectedImportMode() === 'copy';
@@ -2643,6 +3199,7 @@ async function previewImport(opts) {
     retireHideDuplicatesOptIn();
     summary.textContent = '';
     showError('Choose at least one file extension.');
+    endImportPreviewFlight(requestSeq);
     return;
   }
   const requestSignature = importPreviewSignature();
@@ -2676,6 +3233,16 @@ async function previewImport(opts) {
       return;
     }
     const files = data.files || [];
+    // SUCCESS. This is the only place the selection is replaced: a completed
+    // preview owns it, so what the user last saw and what Start would send
+    // are the same list. Doing this at the top of the function instead is the
+    // 5,000-file hazard described there.
+    importPreviewCapturedSignature = requestSignature;
+    importDeselected = new Set();
+    importPreviewedPaths = files.map(f => f.path);
+    // The walk is over — the duplicate stream, if any, is gated separately
+    // so the label can say "Checking duplicates…" rather than "Previewing…".
+    importPreviewInFlight = false;
     if (!files.length) {
       summary.textContent = 'No importable files found.';
       clearImportPreviewGrid();
@@ -2685,6 +3252,7 @@ async function previewImport(opts) {
       // and the next card that does surface duplicates gets filtered
       // silently instead of opt-in.
       retireHideDuplicatesOptIn();
+      updateImportSelectionUI();
       return;
     }
     // The three branches below all settle without a duplicate check —
@@ -2692,8 +3260,15 @@ async function previewImport(opts) {
     // copy skips nothing — so each is a final "nothing to hide" state and
     // retires the opt-in. The fall-through path does NOT: its duplicate
     // count is still unknown until the check below completes.
+    //
+    // Each branch renders and then resyncs the selection readouts. The
+    // renderer draws the boxes; updateImportSelectionUI() owns the
+    // select-all row, the "N of M selected" line and the Start gate, and it
+    // reads the cards the renderer just drew, so it has to follow every
+    // render rather than sit once above the branches.
     if (snapshotMode) {
       renderImportPreviewGrid(files, [], null);
+      updateImportSelectionUI();
       retireHideDuplicatesOptIn();
       const unavailable = Number(data.unavailable_count || 0);
       summary.textContent = Number(data.total_count || files.length).toLocaleString() +
@@ -2704,12 +3279,14 @@ async function previewImport(opts) {
     }
     if (!copyMode) {
       renderImportPreviewGrid(files, [], null);
+      updateImportSelectionUI();
       retireHideDuplicatesOptIn();
       summary.textContent = files.length + ' files found · originals will stay in place';
       return;
     }
     if (!document.getElementById('chkSkipDuplicates').checked) {
       renderImportPreviewGrid(files, [], null);
+      updateImportSelectionUI();
       retireHideDuplicatesOptIn();
       summary.textContent = files.length + ' files found · duplicates will be copied';
       // No dedup gate, so every discovered file lands — pass no exclusions
@@ -2721,6 +3298,16 @@ async function previewImport(opts) {
       return;
     }
     summary.textContent = files.length + ' files found — checking for duplicates…';
+    // Eligibility is not final until the verdicts land, so Start stays shut
+    // until the stream drains: submitting mid-stream would send a selection
+    // that doesn't match the boxes the user is looking at.
+    importDupStreamPending = true;
+    // updateImportSelectionUI(), not a bare updateStartGate(): since #1387
+    // this path renders nothing until the stream drains, so between here and
+    // then the grid is empty while "N of M selected" would still be showing
+    // the PREVIOUS card's tally. Over SMB with verify_by_hash that window is
+    // minutes long. Resync it against the grid that is actually on screen.
+    updateImportSelectionUI();
     // check-duplicates streams results; collect flagged paths as they arrive.
     // Pass verify_by_hash so the preview and the import agree on which files
     // are duplicates — otherwise a renamed/metadata-colliding file counted
@@ -2766,7 +3353,9 @@ async function previewImport(opts) {
     summary.textContent = files.length + ' files found · ' + dupCount +
       ' already in your library (will be skipped) · ' +
       (files.length - dupCount) + ' to copy';
+    importDupStreamPending = false;
     renderImportPreviewGrid(files, duplicatePaths, null);
+    updateImportSelectionUI();
     // Skipped duplicates aren't copied, so exclude them from the
     // folder-structure preview — the new/existing folder counts must
     // reflect the files that will actually land in the archive.
@@ -2781,10 +3370,15 @@ async function previewImport(opts) {
     if (importPreviewSignatureChanged(requestSignature)) return;
     summary.textContent = '';
     showError(String(e.message || e));
+    // The grid was cleared at the top and nothing replaced it, so the screen
+    // shows no preview at all while the signature still matches — the
+    // staleness check would call that "current". Say so explicitly.
+    importPreviewFailed = true;
   } finally {
     if (requestSeq === importPreviewSeq && btnPreview) {
       btnPreview.disabled = false;
     }
+    endImportPreviewFlight(requestSeq);
   }
 }
 
@@ -2816,7 +3410,7 @@ async function startImport() {
   const problem = importFormProblem();
   if (problem) {
     showError(problem.message, problem.target);
-    updateStartAvailability();
+    updateStartGate();
     return;
   }
   const allowMissingExiftool = !!document.getElementById('chkAllowMissingExiftool')?.checked;
@@ -2863,6 +3457,43 @@ async function startImport() {
     body.verify_by_hash = document.getElementById('chkVerifyByHash').checked;
     body.trust_likely_duplicates =
       document.getElementById('chkTrustLikelyDuplicates').checked;
+    // Only a COMPLETED preview describes a file list; with none the import
+    // sends no selection at all and copies everything, which is what the
+    // screen says. This branch is copy-mode only for a second reason:
+    // previewImport() captures the signature BEFORE its `if (!copyMode)`
+    // return, so an in-place preview leaves it non-null and the guard alone
+    // would post a file list to a route that scans whatever is on disk.
+    if (importPreviewCapturedSignature !== null) {
+      // include_paths is NOT the checked boxes. A deselection only counts if
+      // the file was eligible in the first place, so a click landing on a
+      // duplicate before its verdict arrived is discarded here — nothing
+      // else ever removes it from importDeselected. Duplicates must reach
+      // the job or they land in no ledger bucket: skipped_duplicate is only
+      // incremented inside the copy loop over the FILTERED list, so a
+      // duplicate dropped here makes copied + skipped_duplicate fall short
+      // of discovered and a fully-archived card is reported unsafe to
+      // format, blaming the user for deselecting files they never touched.
+      //
+      // Eligibility is read off the rendered cards, like every other
+      // selection readout on this page — see importSelectableCardPaths().
+      // importGridCards() and not importVisibleCards() to match
+      // importCheckedCount(), which walks the same set: checked_count and
+      // include_paths are compared to each other by the route, so they must
+      // be derived from the same cards or the relation between them stops
+      // being a property of the code and becomes a coincidence of which
+      // cards the hide-duplicates checkbox happens to be hiding.
+      const selectable = new Set(importSelectableCardPaths(importGridCards()));
+      const eligibleDeselections = new Set(
+        Array.from(importDeselected).filter(p => selectable.has(p)));
+      body.include_paths = importPreviewedPaths.filter(
+        p => !eligibleDeselections.has(p));
+      // UNIQUE, for the nested-sources reason on importEligibleCount():
+      // folder-preview appends per source, so /card and /card/DCIM emit the
+      // same file twice and previewed_count would over-count the discovery
+      // the job is asked to compare itself against.
+      body.previewed_count = new Set(importPreviewedPaths).size;
+      body.checked_count = importCheckedCount();
+    }
   }
   // For new-workspace imports where the user hasn't touched the After
   // Import dropdown, the visible selection was prefilled from the
@@ -2883,8 +3514,8 @@ async function startImport() {
   // archive copy + chained process + eligible target) — a hidden row means
   // a stale checkbox must not send anything.
   body.after_process_move = afterMoveRequest();
-  importStartInFlight = true;
-  updateStartAvailability();
+  importStartPending = true;
+  updateStartGate();
   try {
     const resp = await fetch(copyMode ? '/api/jobs/import-photos' : '/api/jobs/import-in-place', {
       method: 'POST',
@@ -2898,13 +3529,15 @@ async function startImport() {
       if (activeName) activeName.textContent = '(' + data.workspace.name + ')';
     }
     activeJobId = data.job_id;
+    importStartPending = false;
+    updateStartGate();
     document.getElementById('progressCard').style.display = '';
     document.getElementById('resultCard').style.display = 'none';
     watchJob(activeJobId);
   } catch (e) {
-    importStartInFlight = false;
+    importStartPending = false;
     showError(String(e.message || e), document.getElementById('btnStart'));
-    updateStartAvailability();
+    updateStartGate();
   }
 }
 
@@ -2943,8 +3576,12 @@ async function finishJob(jobId) {
     }
     await new Promise(r => setTimeout(r, 1000));
   }
-  importStartInFlight = false;
-  updateStartAvailability();
+  // The job is over, so drop the id the gate reads as "Importing…". Nothing
+  // else consumes activeJobId once watchJob() has its stream, and leaving it
+  // set would keep Start disabled for the rest of the page's life.
+  activeJobId = null;
+  importStartPending = false;
+  updateStartGate();
   if (!job || !job.result) {
     showError('Import ended but its result could not be loaded — check the Jobs page.');
     return;
@@ -3022,6 +3659,24 @@ function retryBodyFromFinishedJob(job) {
     carry.push(pid);
   });
   if (carry.length) body.carry_photo_ids = carry;
+  // Recover the parent's per-file selection so the retry stays scoped to
+  // the same files the user originally chose. Without this the retry
+  // would either be rejected by the source-signature drift check (the
+  // parent's ``source_snapshots`` are captured pre-filter, so the
+  // signatures agree, but the parent's ``include_paths`` is the real
+  // ground truth for what should get copied) or — worse — silently
+  // re-import the files the user deliberately deselected on the parent
+  // run. All three fields travel together (see the server-side
+  // ``include_paths, previewed_count and checked_count must be sent
+  // together`` gate); sending a subset would 400. Parents from before
+  // ``include_paths`` was persisted omit it and simply retry as before.
+  if (Array.isArray(cfg.include_paths) && cfg.include_paths.length
+      && typeof cfg.previewed_count === 'number'
+      && typeof cfg.checked_count === 'number') {
+    body.include_paths = cfg.include_paths.slice();
+    body.previewed_count = cfg.previewed_count;
+    body.checked_count = cfg.checked_count;
+  }
   if (cfg.remote_target_id) {
     delete body.destination;
     body.remote_target_id = cfg.remote_target_id;
@@ -3054,11 +3709,11 @@ async function retryFailedImport() {
   // window, a click launches an ordinary import (no ``parent_import_job_id``
   // in its body) that the server-side retry exclusivity gate can't catch,
   // and the two runs race over the same card and destination. Mirror what
-  // startImport() does: flag first, updateStartAvailability(), then fetch;
+  // startImport() does: flag first, updateStartGate(), then fetch;
   // clear the flag on failure so the button re-enables. See PR #1387
   // Codex review.
-  importStartInFlight = true;
-  updateStartAvailability();
+  importStartPending = true;
+  updateStartGate();
   try {
     const resp = await fetch('/api/jobs/import-photos', {
       method: 'POST',
@@ -3075,8 +3730,8 @@ async function retryFailedImport() {
     });
     watchJob(activeJobId);
   } catch (e) {
-    importStartInFlight = false;
-    updateStartAvailability();
+    importStartPending = false;
+    updateStartGate();
     button.disabled = false;
     button.textContent = 'Retry failed files';
     hint.textContent = String(e.message || e);
@@ -3330,8 +3985,8 @@ async function createNewImagesImportSnapshot(onPending) {
 
 async function activateNewImagesImport(snapshotId) {
   const sourceNote = document.getElementById('newImagesImportSource');
-  const startButton = document.getElementById('btnStart');
-  startButton.disabled = true;
+  newImagesStartBlocked = true;
+  updateStartGate();
   sourceNote.style.display = '';
   sourceNote.textContent = 'Loading the captured list of newly detected images…';
 
@@ -3365,14 +4020,15 @@ async function activateNewImagesImport(snapshotId) {
   renderSources();
   updateImportMode();
   document.getElementById('btnPreview').textContent = 'Refresh preview';
-  startButton.disabled = Number(data.file_count || 0) === 0;
+  newImagesStartBlocked = Number(data.file_count || 0) === 0;
+  updateStartGate();
   await previewImport({ automatic: true });
 }
 
 async function initNewImagesImport(deepLinkId) {
   const sourceNote = document.getElementById('newImagesImportSource');
-  const startButton = document.getElementById('btnStart');
-  startButton.disabled = true;
+  newImagesStartBlocked = true;
+  updateStartGate();
   sourceNote.style.display = '';
   try {
     let snapshotId = deepLinkId;
@@ -3397,7 +4053,8 @@ async function initNewImagesImport(deepLinkId) {
   } catch (e) {
     sourceNote.textContent = 'The list of newly detected images could not be loaded.';
     showError(String(e.message || e));
-    startButton.disabled = true;
+    newImagesStartBlocked = true;
+    updateStartGate();
   }
 }
 
@@ -3410,6 +4067,7 @@ async function initImportPage() {
   // template, or file-type controls without the rendered structure
   // being invalidated.
   wireDestStructureInvalidation();
+  wireImportSelectAll();
   await loadImportReadiness();
   // Native menu deep link: File > Import Folder... routes here as
   // /import?mode=copy&pick=source so it lands in Copy-to-archive with the

@@ -24749,6 +24749,67 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             if not os.path.isdir(s):
                 return json_error(f"source directory not found: {s}")
 
+        include_paths = body.get("include_paths")
+        previewed_count = body.get("previewed_count")
+        checked_count = body.get("checked_count")
+
+        # All three travel together or none do. A partial set would fabricate
+        # drift figures and then blow up on None inside the job.
+        provided = [v is not None
+                    for v in (include_paths, previewed_count, checked_count)]
+        if any(provided) and not all(provided):
+            return json_error(
+                "include_paths, previewed_count and checked_count must be "
+                "sent together", 400,
+            )
+
+        if include_paths is not None:
+            if not isinstance(include_paths, list) or not include_paths:
+                return json_error("include_paths must be a non-empty list", 400)
+            if any(not isinstance(p, str) or not p for p in include_paths):
+                return json_error(
+                    "include_paths must contain non-empty strings", 400,
+                )
+            # bool is a subclass of int — {"previewed_count": true} would
+            # otherwise sail through as 1.
+            for name, val in (("previewed_count", previewed_count),
+                              ("checked_count", checked_count)):
+                if type(val) is not int or val < 0:
+                    return json_error(
+                        f"{name} must be a non-negative integer", 400,
+                    )
+            include_paths = set(include_paths)
+            if len(include_paths) > previewed_count:
+                return json_error(
+                    "include_paths cannot exceed previewed_count", 400,
+                )
+            if checked_count > len(include_paths):
+                return json_error(
+                    "checked_count cannot exceed include_paths", 400,
+                )
+
+            # Containment is LEXICAL by design. normpath catches the real
+            # threat (a client naming files outside the chosen folders:
+            # "/src/../etc/passwd" collapses and fails). It deliberately does
+            # not resolve symlinks — discover_source_files returns symlinked
+            # files inside a source and ingest() copies them today, so
+            # realpath here would newly reject working imports. Do not
+            # "harden" this without reading the spec's §4.
+            norm_sources = [os.path.normpath(s) for s in sources]
+            for p in include_paths:
+                np = os.path.normpath(p)
+                try:
+                    ok = any(os.path.commonpath([np, s]) == s
+                             for s in norm_sources)
+                except ValueError:
+                    # Mixed absolute/relative — a containment failure, not a 500.
+                    ok = False
+                if not ok:
+                    return json_error(
+                        f"include_paths contains a path outside the selected "
+                        f"source folders: {p}", 400,
+                    )
+
         # Remote (SSH) archive destination — mirrors the pipeline route's
         # remote-target request shape (remote_target_id + subpath). The card
         # is rsynced to remote_path/subpath and cataloged at
@@ -25414,6 +25475,25 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 else None
             ),
         }
+        if include_paths is not None:
+            job_config["previewed_count"] = previewed_count
+            job_config["checked_count"] = checked_count
+            # Persist the actual path list so a recovery retry can
+            # reconstruct the original selection. Without this a
+            # ``retryBodyFromFinishedJob``-driven retry would either be
+            # rejected by the source-signature drift check (parent
+            # snapshot is now over the pre-selection set — see
+            # ``_capture_source_snapshots`` — but the ``include_paths``
+            # the parent actually ran is the useful thing to compare
+            # against a retry that also filters) or, once that hurdle is
+            # cleared, silently re-import the files the user deliberately
+            # deselected. Stored as a sorted list so the JSON round-trips
+            # deterministically; the set is rebuilt in ``_apply_selection``.
+            # Size cost is bounded by ``previewed_count`` (thousands of
+            # short path strings in the worst realistic case) and is
+            # accepted deliberately as the price of a retry that stays
+            # true to the parent's scope.
+            job_config["include_paths"] = sorted(include_paths)
         if move_target_snapshot is not None:
             job_config["after_process_move"] = {
                 "remote_target_id": move_target_snapshot["id"],
@@ -25596,6 +25676,9 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 remote_target=remote_target,
                 vireo_dir=vireo_dir,
                 thumb_cache_dir=thumb_cache_dir,
+                include_paths=include_paths,
+                previewed_count=previewed_count,
+                checked_count=checked_count,
             )
             try:
                 result = run_import_job(

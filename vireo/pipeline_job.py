@@ -280,9 +280,25 @@ def _source_offline_reason(
     return "folder", f"folder {folder_path} is unreadable"
 
 
+def _preflight_candidacy_floor(effective_cfg, pipeline_cfg) -> float:
+    """Lowest detection confidence the mask worklist can reach.
+
+    Weak-detection rescue lets contextually-supported frames below
+    ``detector_confidence`` into masking, so the pre-flight has to look that
+    far down too or it silently drops rescued frames from both outcome sets.
+    """
+    detector_confidence = effective_cfg.get("detector_confidence", 0.2)
+    if not pipeline_cfg.get("weak_detection_rescue_enabled", True):
+        return detector_confidence
+    return min(
+        detector_confidence,
+        pipeline_cfg.get("weak_detection_confidence", 0.12),
+    )
+
+
 def _preflight_mask_outcomes(
     thread_db, dropped_photos, sam2_variant, dinov2_variant,
-    detector_confidence,
+    candidacy_floor,
 ):
     """Split pre-flight-dropped photos into ``(already_masked, at_risk)``.
 
@@ -294,7 +310,15 @@ def _preflight_mask_outcomes(
       never have been read for masking, so an outage doesn't change its
       fate. It lands in neither set: counting it would turn an unrelated
       outage into a Fatal Extract failure and tell the user to reconnect for
-      photos that would still have no mask candidate.
+      photos that would still have no mask candidate. ``candidacy_floor``
+      is the *lowest* confidence the worklist can reach — with weak-detection
+      rescue on, that is ``weak_detection_confidence``, not
+      ``detector_confidence``. The rescue's contextual anchor-species test
+      can't be replayed here (the photo is already out of ``photos``), so
+      this errs toward counting a weak frame as at risk: over-reporting an
+      outage is visible and correctable, while under-reporting reproduces
+      the silent completion this whole stage-reporting change exists to
+      prevent.
     * **Cache validity** — the same test the loop's cache branch applies:
       a ``photo_masks`` row for this variant whose stored prompt and detector
       still match the current primary detection, whose file is on disk, and
@@ -313,7 +337,7 @@ def _preflight_mask_outcomes(
         photo_id = photo["id"]
         dets = [
             d for d in thread_db.get_detections(
-                photo_id, min_conf=detector_confidence,
+                photo_id, min_conf=candidacy_floor,
             )
             if d["detector_model"] != "full-image"
         ]
@@ -5710,7 +5734,9 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                     already_masked_ids, at_risk_dropped_ids = (
                         _preflight_mask_outcomes(
                             thread_db, dropped, sam2_variant, dinov2_variant,
-                            effective_cfg.get("detector_confidence", 0.2),
+                            _preflight_candidacy_floor(
+                                effective_cfg, pipeline_cfg,
+                            ),
                         )
                     )
                     em_preflight_unreadable = len(at_risk_dropped_ids)

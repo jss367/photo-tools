@@ -17632,3 +17632,59 @@ def test_extract_masks_early_exit_carries_outage_detail_to_the_step():
     assert step_extra == {}, (
         f"A benign skip carries no error fields; got {step_extra!r}"
     )
+
+
+def test_extract_masks_preflight_counts_rescued_weak_detections(
+    tmp_path, monkeypatch,
+):
+    """A weak frame the rescue path would have masked still counts.
+
+    With weak-detection rescue enabled the worklist reaches detections below
+    `detector_confidence`, so a pre-flight predicate that queries only at the
+    main threshold silently drops those photos from both outcome sets. If
+    every at-risk photo on a dead source is a rescued frame, the outage never
+    latches at all — the silent completion this PR exists to prevent
+    (Codex #1392 P2).
+    """
+    import config as cfg
+    from db import Database
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cfg.CONFIG_PATH = str(tmp_path / "config.json")
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws_id = db._active_workspace_id
+    folder_path = str(tmp_path / "photos")
+    os.makedirs(folder_path, exist_ok=True)
+    folder_id = db.add_folder(folder_path)
+
+    from PIL import Image
+    pid = db.add_photo(folder_id, "weak.jpg", ".jpg", 1000, 7_000_000.0)
+    Image.new("RGB", (16, 16), "black").save(
+        os.path.join(folder_path, "weak.jpg")
+    )
+    # Between weak_detection_confidence (0.12) and detector_confidence (0.2).
+    db.save_detections(
+        pid,
+        [{"box": {"x": 0.1, "y": 0.1, "w": 0.5, "h": 0.5},
+          "confidence": 0.15, "category": "animal"}],
+        detector_model="MegaDetector",
+    )
+    collection_id = db.add_collection(
+        "Rescued weak frame",
+        json.dumps([{"field": "photo_ids", "value": [pid]}]),
+    )
+
+    _stub_extract_masks_heavy_ops(monkeypatch)
+
+    import shutil
+    shutil.rmtree(folder_path, ignore_errors=True)
+
+    _runner, result = _run_extract_masks_only(db_path, ws_id, collection_id)
+
+    em = result["stages"]["extract_masks"]
+    assert em.get("unreadable") == 1, (
+        f"A rescuable weak frame on a dead source is still unreachable; got "
+        f"{em!r}"
+    )

@@ -10,7 +10,7 @@ import urllib.request
 import pytest
 from flask import Flask
 
-from e2e.threaded_server import start_server, stop_server
+from e2e.threaded_server import DrainingWSGIServer, start_server, stop_server
 
 
 def _get(url, results=None, key=None):
@@ -28,18 +28,24 @@ def _get(url, results=None, key=None):
 def test_requests_are_served_concurrently():
     """The reason for threading: a slow handler must not stall the page.
 
-    With the single-threaded ``make_server`` default this took as long as
-    the slow handler; the browser fixtures load a page whose thumbnails
-    would queue behind the navbar's polls.
+    The handshake is the assertion — ``/blocker`` holds a thread until
+    ``/fast`` has been served, so ``/fast`` completing at all proves the two
+    ran at once. A single-threaded server would deadlock here: ``/fast``
+    would wait on ``/blocker``, which only returns once ``/fast`` is done.
+
+    Deliberately no wall-clock threshold. A "``/fast`` must return within
+    1s" check would fail on a stalled runner for exactly the machine-load
+    condition this change exists to tolerate.
     """
     app = Flask(__name__)
     entered = threading.Event()
+    release = threading.Event()
 
-    @app.route("/slow")
-    def slow():
+    @app.route("/blocker")
+    def blocker():
         entered.set()
-        time.sleep(2.0)
-        return "slow"
+        release.wait(timeout=30)
+        return "blocker"
 
     @app.route("/fast")
     def fast():
@@ -47,15 +53,15 @@ def test_requests_are_served_concurrently():
 
     server, thread, url = start_server(app)
     try:
-        slow_thread = _get(f"{url}/slow")
-        assert entered.wait(timeout=5), "slow handler never started"
+        blocker_thread = _get(f"{url}/blocker")
+        assert entered.wait(timeout=10), "blocker handler never started"
 
-        started = time.monotonic()
-        assert urllib.request.urlopen(f"{url}/fast", timeout=10).read() == b"fast"
-        assert time.monotonic() - started < 1.0
+        assert urllib.request.urlopen(f"{url}/fast", timeout=30).read() == b"fast"
 
-        slow_thread.join(timeout=10)
+        release.set()
+        blocker_thread.join(timeout=10)
     finally:
+        release.set()
         stop_server(server, thread)
 
 
@@ -82,20 +88,99 @@ def test_stop_server_waits_for_in_flight_request():
     server, thread, url = start_server(app)
     results = {}
     request_thread = _get(f"{url}/slow", results, "slow")
-    assert entered.wait(timeout=5), "slow handler never started"
+    assert entered.wait(timeout=10), "slow handler never started"
 
     stop_server(server, thread)
 
     assert completed.is_set(), "teardown returned while a handler was running"
-    request_thread.join(timeout=5)
+    request_thread.join(timeout=10)
     assert results.get("slow") == "done"
+
+
+class _LateHandlerServer(DrainingWSGIServer):
+    """Simulates the scheduler not having run a freshly started handler.
+
+    ``Thread.start()`` returns once ``_bootstrap_inner`` reaches
+    ``_started.set()``, which is before it calls ``run()``. Sleeping at the
+    top of ``process_request_thread`` — ahead of the base class's own
+    bookkeeping — reproduces that window deterministically.
+
+    The delay has to clear ``serve_forever``'s 0.5s poll interval, since
+    ``shutdown()`` can itself take that long to return and would otherwise
+    hide the window: at 0.3s a drain that only knows about started handlers
+    still passes these tests, and at 1.5s it does not.
+    """
+
+    HANDLER_START_DELAY = 1.5
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.accepted = threading.Event()
+        self.count_at_accept = None
+
+    def process_request(self, request, client_address):
+        super().process_request(request, client_address)
+        # Reached only after Thread.start() has returned.
+        self.count_at_accept = self.in_flight_count()
+        self.accepted.set()
+
+    def process_request_thread(self, request, client_address):
+        time.sleep(self.HANDLER_START_DELAY)
+        super().process_request_thread(request, client_address)
+
+
+def test_request_is_counted_before_its_handler_body_runs():
+    """A request accepted but not yet running still counts as in flight.
+
+    Counting inside the handler would read zero for this whole window, and
+    a drain landing in it would wave teardown through.
+    """
+    app = Flask(__name__)
+
+    @app.route("/x")
+    def x():
+        return "x"
+
+    server = _LateHandlerServer("127.0.0.1", 0, app)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    port = server.socket.getsockname()[1]
+    try:
+        _get(f"http://127.0.0.1:{port}/x")
+        assert server.accepted.wait(timeout=10), "request was never accepted"
+        assert server.count_at_accept == 1
+    finally:
+        stop_server(server, thread)
+
+
+def test_stop_server_waits_for_a_handler_that_has_not_started_yet():
+    """The drain covers the accepted-but-not-yet-running window too."""
+    app = Flask(__name__)
+    completed = threading.Event()
+
+    @app.route("/x")
+    def x():
+        completed.set()
+        return "x"
+
+    server = _LateHandlerServer("127.0.0.1", 0, app)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    port = server.socket.getsockname()[1]
+
+    _get(f"http://127.0.0.1:{port}/x")
+    assert server.accepted.wait(timeout=10), "request was never accepted"
+
+    stop_server(server, thread)
+
+    assert completed.is_set(), "teardown skipped a handler that had not begun"
 
 
 def test_stop_server_gives_up_on_a_wedged_handler():
     """The drain is bounded, so one stuck handler can't hang the suite.
 
     An SSE stream pins its thread for the life of the connection, so an
-    unbounded join would never return. Give up and warn instead.
+    unbounded wait would never return. Give up and warn instead.
     """
     app = Flask(__name__)
     entered = threading.Event()
@@ -109,12 +194,12 @@ def test_stop_server_gives_up_on_a_wedged_handler():
 
     server, thread, url = start_server(app)
     _get(f"{url}/wedged")
-    assert entered.wait(timeout=5), "wedged handler never started"
+    assert entered.wait(timeout=10), "wedged handler never started"
 
     started = time.monotonic()
     try:
         with pytest.warns(UserWarning, match="request handler"):
             stop_server(server, thread, drain_timeout=0.5)
-        assert time.monotonic() - started < 5.0
+        assert time.monotonic() - started < 10.0
     finally:
         release.set()

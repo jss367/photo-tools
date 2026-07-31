@@ -1,6 +1,6 @@
 """A threaded test WSGI server whose teardown waits for in-flight requests.
 
-The browser fixtures need ``threaded=True`` — the shipped app serves through
+The browser fixtures need a threaded server — the shipped app serves through
 waitress with 16 threads, and a single-threaded test server makes every page
 load queue behind whatever else the page requested.
 
@@ -32,36 +32,65 @@ class DrainingWSGIServer(ThreadedWSGIServer):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self._live_lock = threading.Lock()
+        self._in_flight_cond = threading.Condition()
+        self._in_flight = 0
         self._live_threads = set()
+
+    def process_request(self, request, client_address):
+        # Count the request here, on the accept loop, *before* ThreadingMixIn
+        # creates the handler thread. Counting inside the handler instead
+        # would leave a window with no coverage: Thread.start() waits only
+        # for _bootstrap_inner to reach _started.set(), which happens before
+        # it calls run(), so start() can return while the handler body has
+        # not begun. A drain racing that window would see nothing in flight
+        # and let teardown proceed under a request that is about to run.
+        with self._in_flight_cond:
+            self._in_flight += 1
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self._finish()
+            raise
 
     def process_request_thread(self, request, client_address):
         current = threading.current_thread()
-        with self._live_lock:
+        with self._in_flight_cond:
             self._live_threads.add(current)
         try:
             super().process_request_thread(request, client_address)
         finally:
-            with self._live_lock:
-                self._live_threads.discard(current)
+            self._finish(current)
+
+    def _finish(self, thread=None):
+        with self._in_flight_cond:
+            self._live_threads.discard(thread)
+            self._in_flight -= 1
+            if self._in_flight <= 0:
+                self._in_flight_cond.notify_all()
+
+    def in_flight_count(self):
+        with self._in_flight_cond:
+            return self._in_flight
 
     def drain(self, timeout=10.0):
-        """Wait for in-flight handlers. Returns the ones still running.
+        """Wait for in-flight requests. Returns a label per straggler.
 
-        Bounded on purpose: an unbounded join would hang the whole suite on
+        Bounded on purpose: an unbounded wait would hang the whole suite on
         a wedged handler, and an SSE stream (which pins its thread for the
-        life of the connection) would never return at all.
+        life of the connection) would never finish at all.
         """
         deadline = time.monotonic() + timeout
-        while True:
-            with self._live_lock:
-                live = [t for t in self._live_threads if t.is_alive()]
-            if not live:
-                return []
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                return live
-            live[0].join(timeout=remaining)
+        with self._in_flight_cond:
+            while self._in_flight > 0:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    named = sorted(t.name for t in self._live_threads)
+                    # A counted request whose handler has not reached its
+                    # body yet has no thread to name.
+                    unnamed = self._in_flight - len(named)
+                    return named + ["<handler not started>"] * max(unnamed, 0)
+                self._in_flight_cond.wait(timeout=remaining)
+        return []
 
 
 def start_server(app, host="127.0.0.1", port=0):
@@ -88,8 +117,7 @@ def stop_server(server, thread, drain_timeout=10.0):
             "E2E server still had %d request handler(s) running after %.0fs: %s. "
             "Teardown is proceeding, so this test's app resources may be closed "
             "underneath them." % (
-                len(stragglers), drain_timeout,
-                ", ".join(sorted(t.name for t in stragglers)),
+                len(stragglers), drain_timeout, ", ".join(stragglers),
             ),
             stacklevel=2,
         )

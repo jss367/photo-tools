@@ -2538,6 +2538,9 @@ def test_load_local_taxonomy_raises_when_every_parse_attempt_fails(
     persistent = tmp_path / "persistent.json"
     _write_taxonomy_json(persistent, "test species")
     monkeypatch.setattr(tax_mod, "TAXONOMY_JSON_PATH", str(persistent))
+    monkeypatch.setattr(
+        tax_mod, "LEGACY_TAXONOMY_JSON_PATH", str(tmp_path / "missing.json"),
+    )
 
     def always_raise(self, path):
         raise ValueError("persistent corruption")
@@ -2588,13 +2591,16 @@ def test_load_local_taxonomy_does_not_retry_a_stably_corrupt_file(
     assert attempts["n"] == 1, "an unchanged corrupt file must be read once"
 
 
-def test_corrupt_preferred_file_costs_one_parse_attempt_per_call(
+def test_load_local_taxonomy_skips_reparsing_known_corrupt_preferred(
     tmp_path, monkeypatch,
 ):
-    """The corrupt-preferred fallback stays cheap on every request.
+    """A corrupt preferred candidate is parsed once, then short-circuited.
 
-    The preferred candidate is attempted once (not once per retry) and the
-    legacy fallback is parsed once for the whole process.
+    Without this, every compare/accept request would re-attempt the corrupt
+    parse (spamming warnings and burning CPU) and, more importantly, force
+    the cache-eviction logic to keep the fallback alive during the parse to
+    avoid re-parsing it. The failure record is what lets us safely evict the
+    fallback before parsing new preferred files.
     """
     import taxonomy as tax_mod
 
@@ -2615,8 +2621,116 @@ def test_corrupt_preferred_file_costs_one_parse_attempt_per_call(
 
     monkeypatch.setattr(tax_mod.Taxonomy, "__init__", counting_init)
 
-    for _ in range(3):
-        assert tax_mod.load_local_taxonomy().is_taxon("legacy species")
+    first = tax_mod.load_local_taxonomy()
+    second = tax_mod.load_local_taxonomy()
+    third = tax_mod.load_local_taxonomy()
 
-    assert parses.count(str(corrupt)) == 3, "one attempt per call, not per retry"
-    assert parses.count(str(legacy)) == 1, "the fallback is parsed once"
+    assert first.is_taxon("legacy species")
+    assert second is first
+    assert third is first
+    # Corrupt file is parsed once (recording the failure); subsequent calls
+    # short-circuit rather than re-attempting.
+    assert parses.count(str(corrupt)) == 1
+    # Legacy is parsed once and served from cache thereafter.
+    assert parses.count(str(legacy)) == 1
+
+
+def test_load_local_taxonomy_retries_corrupt_preferred_after_it_changes(
+    tmp_path, monkeypatch,
+):
+    """A repaired preferred file is picked up — the failure record is cleared."""
+    import taxonomy as tax_mod
+
+    tax_mod.clear_taxonomy_cache()
+    preferred = tmp_path / "persistent.json"
+    preferred.write_text("{ not valid json")
+    legacy = tmp_path / "taxonomy.json"
+    _write_taxonomy_json(legacy, "legacy species")
+    monkeypatch.setattr(tax_mod, "TAXONOMY_JSON_PATH", str(preferred))
+    monkeypatch.setattr(tax_mod, "LEGACY_TAXONOMY_JSON_PATH", str(legacy))
+
+    first = tax_mod.load_local_taxonomy()
+    assert first.is_taxon("legacy species")
+    # Same stat → still short-circuited (no re-parse of the corrupt file).
+    assert tax_mod.load_local_taxonomy() is first
+
+    # Repair the preferred file. Its stat changes, so the failure record
+    # is discarded and the new content is parsed.
+    _write_taxonomy_json(preferred, "preferred species that is longer")
+    os.utime(preferred, (5e9, 5e9))
+
+    result = tax_mod.load_local_taxonomy()
+    assert result is not first
+    assert result.is_taxon("preferred species that is longer")
+
+
+def test_load_local_taxonomy_evicts_fallback_before_parsing_preferred(
+    tmp_path, monkeypatch,
+):
+    """When the preferred file appears, the fallback is dropped before the parse.
+
+    A parsed iNaturalist taxonomy is ~2.8GB. Holding the cached legacy
+    instance live through ``Taxonomy(preferred_path)`` would double peak RSS
+    to ~5.6GB and can OOM during a normal migration (preferred download
+    completes while legacy is still cached). The eviction must happen
+    before the constructor allocates.
+    """
+    import taxonomy as tax_mod
+
+    tax_mod.clear_taxonomy_cache()
+    preferred = tmp_path / "persistent.json"
+    legacy = tmp_path / "taxonomy.json"
+    _write_taxonomy_json(legacy, "legacy species")
+    monkeypatch.setattr(tax_mod, "TAXONOMY_JSON_PATH", str(preferred))
+    monkeypatch.setattr(tax_mod, "LEGACY_TAXONOMY_JSON_PATH", str(legacy))
+
+    # First load: preferred doesn't exist, so legacy is cached.
+    first = tax_mod.load_local_taxonomy()
+    assert first.is_taxon("legacy species")
+
+    # Preferred file arrives (as if a background download just finished).
+    _write_taxonomy_json(preferred, "preferred species that is longer")
+
+    real_init = tax_mod.Taxonomy.__init__
+    observed_cache = []
+
+    def observing_init(self, path):
+        # By the time we're inside the constructor for the preferred file,
+        # the cached legacy instance must not still be reachable through
+        # _taxonomy_cache — otherwise both instances share peak RSS.
+        if path == str(preferred):
+            observed_cache.append(tax_mod._taxonomy_cache)
+        real_init(self, path)
+
+    monkeypatch.setattr(tax_mod.Taxonomy, "__init__", observing_init)
+
+    result = tax_mod.load_local_taxonomy()
+
+    assert result.is_taxon("preferred species that is longer")
+    assert result is not first
+    assert observed_cache == [None]
+
+
+def test_clear_taxonomy_cache_also_clears_failure_records(tmp_path, monkeypatch):
+    """clear_taxonomy_cache() must reset failure tracking too.
+
+    Otherwise a test that clears the cache and then repairs a formerly-corrupt
+    file would still short-circuit on the stale failure record.
+    """
+    import taxonomy as tax_mod
+
+    tax_mod.clear_taxonomy_cache()
+    preferred = tmp_path / "persistent.json"
+    preferred.write_text("{ not valid json")
+    monkeypatch.setattr(tax_mod, "TAXONOMY_JSON_PATH", str(preferred))
+    monkeypatch.setattr(
+        tax_mod, "LEGACY_TAXONOMY_JSON_PATH", str(tmp_path / "missing.json"),
+    )
+
+    assert tax_mod.load_local_taxonomy() is None
+    with tax_mod._taxonomy_cache_lock:
+        assert str(preferred) in tax_mod._taxonomy_failed_stats
+
+    tax_mod.clear_taxonomy_cache()
+    with tax_mod._taxonomy_cache_lock:
+        assert tax_mod._taxonomy_failed_stats == {}

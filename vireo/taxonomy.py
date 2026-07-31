@@ -457,6 +457,20 @@ def find_taxonomy_json():
 _taxonomy_cache_lock = threading.Lock()
 _taxonomy_cache = None  # (path, stat_key, Taxonomy)
 
+# Per-path record of parses that failed (e.g., corrupt JSON). Keyed by path
+# and validated against the current stat key on lookup, so a repaired or
+# re-downloaded file automatically drops its old failure record. Without
+# this, a corrupt preferred candidate would be re-parsed on every request
+# — expensive on its own, and the trigger for a worse problem: it prevents
+# us from evicting the fallback cache before parsing, because the corrupt
+# case would otherwise re-parse the multi-GB fallback each time.
+_taxonomy_failed_stats = {}  # {path: stat_key}
+
+
+class _KnownCorruptTaxonomy(Exception):
+    """Raised when a path is known to have failed to parse at its current stat."""
+
+
 # Cap on how many times _load_taxonomy_cached will re-parse a file that
 # keeps changing mid-read. A rewrite during parse means the parsed object
 # does not correspond to the post-parse stat, so caching that pair would
@@ -471,6 +485,7 @@ def clear_taxonomy_cache():
     global _taxonomy_cache
     with _taxonomy_cache_lock:
         _taxonomy_cache = None
+        _taxonomy_failed_stats.clear()
 
 
 def _taxonomy_stat_key(path):
@@ -492,24 +507,38 @@ def _load_taxonomy_cached(path):
         # refreshed while it waited, decides that entry is stale, evicts it
         # and re-parses ~2.8GB for nothing.
         stat_key = _taxonomy_stat_key(path)
+
+        # Short-circuit a path we've already established is corrupt at this
+        # stat. Without this, load_local_taxonomy() would attempt the parse
+        # (and log a warning) on every request for as long as the file stays
+        # broken. This also lets the eviction below evict cross-path fallback
+        # entries safely: even if the current parse fails, a subsequent call
+        # skips it here instead of re-parsing the multi-GB fallback to
+        # rediscover it's still broken.
+        failed_stat = _taxonomy_failed_stats.get(path)
+        if failed_stat == stat_key:
+            raise _KnownCorruptTaxonomy(path)
+        if failed_stat is not None:
+            # File has changed since it last failed; give it another chance.
+            _taxonomy_failed_stats.pop(path, None)
+
         cached = _taxonomy_cache
         if cached is not None and cached[0] == path and cached[1] == stat_key:
             return cached[2]
-        # An entry for this same path is now outdated. A parsed iNaturalist
-        # taxonomy is ~2.8GB, so if we let the old instance stay reachable
-        # through _taxonomy_cache (or the local ``cached`` tuple) while
-        # Taxonomy(path) allocates its replacement, peak RSS doubles — and a
-        # rewrite mid-parse would stack another live copy on top of that per
-        # retry. Drop every reference we hold before entering the parse loop.
+        # We're about to parse. A parsed iNaturalist taxonomy is ~2.8GB, so
+        # letting any prior instance stay reachable through _taxonomy_cache
+        # (or the local ``cached`` tuple) while Taxonomy(path) allocates its
+        # replacement doubles peak RSS — and a rewrite mid-parse stacks
+        # another live copy on top of that per retry.
         #
-        # An entry for a *different* path is not stale and must survive: when
-        # the preferred candidate exists but is corrupt, load_local_taxonomy()
-        # parses it, fails, and falls back to the legacy one. Evicting the
-        # legacy entry here would make that fallback re-parse a multi-GB file
-        # on every single compare/accept request — exactly the cost this cache
-        # exists to remove.
-        if cached is not None and cached[0] == path:
-            _taxonomy_cache = None
+        # Evict cross-path entries too (e.g. a cached legacy fallback when
+        # we're now parsing the preferred file that just appeared): holding
+        # both live during the parse can OOM during a normal migration. This
+        # is safe because the failure cache above prevents a corrupt preferred
+        # file from triggering a re-parse of the fallback on every request —
+        # once the corrupt parse fails, subsequent calls short-circuit before
+        # they ever touch the fallback slot.
+        _taxonomy_cache = None
         cached = None
         # Bracket the parse with a pre- and post-stat: if a background
         # download rewrites the file while Taxonomy(path) is reading it,
@@ -552,6 +581,11 @@ def _load_taxonomy_cached(path):
                     # better, so report the parse failure we already have.
                     file_moved = False
                 if not file_moved:
+                    # Durable failure at this stat. Record it so subsequent
+                    # requests short-circuit before hitting the parse and,
+                    # crucially, before the eviction above would drop a
+                    # still-valid fallback in a corrupt-preferred scenario.
+                    _taxonomy_failed_stats[path] = pre_stat
                     raise
                 continue
             post_stat = _taxonomy_stat_key(path)
@@ -603,6 +637,11 @@ def load_local_taxonomy():
             continue
         try:
             return _load_taxonomy_cached(path)
+        except _KnownCorruptTaxonomy:
+            # We've already logged the real error for this stat; skip
+            # quietly on subsequent requests so a persistently-broken
+            # preferred file doesn't flood the log.
+            continue
         except Exception as e:
             log.warning(
                 "Failed to load taxonomy from %s: %s — trying next candidate",

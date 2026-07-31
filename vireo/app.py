@@ -18506,8 +18506,8 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         def work(job):
             from taxonomy import (
                 TAXONOMY_JSON_PATH,
-                Taxonomy,
                 download_taxonomy,
+                load_local_taxonomy,
                 populate_taxa_db_from_json,
                 seed_informal_groups,
             )
@@ -18559,7 +18559,24 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             # retype for free (it's idempotent).
             progress_cb("Retyping existing keywords...")
             try:
-                tax = Taxonomy(TAXONOMY_JSON_PATH)
+                # Go through load_local_taxonomy() rather than constructing
+                # Taxonomy directly: it drops the cached instance before
+                # parsing the replacement. Constructing here bypassed that,
+                # so a refresh held the old ~2.8GB parse alive alongside the
+                # new one and could OOM. It also seeds the cache, so the
+                # next compare/accept request reuses this parse instead of
+                # paying for its own.
+                #
+                # Pin it to the file we just downloaded. Without path=, a
+                # transient failure parsing the new file would fall back to
+                # a legacy copy, and we would retype keywords from the old
+                # taxonomy while the taxa tables hold the new one — mixing
+                # versions and reporting success.
+                tax = load_local_taxonomy(path=TAXONOMY_JSON_PATH)
+                if tax is None:
+                    raise RuntimeError(
+                        f"taxonomy unreadable after download: {TAXONOMY_JSON_PATH}"
+                    )
                 updated = bg_db.mark_species_keywords(tax)
                 bg_db.repair_duplicate_photo_species()
                 log.info("Retyped %d existing keywords as taxonomy after download", updated)

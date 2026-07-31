@@ -24,6 +24,8 @@ import os
 import re
 import socket
 import ssl
+import stat as stat_module
+import tempfile
 import threading
 import time
 import unicodedata
@@ -421,6 +423,12 @@ DWCA_URL = "https://www.inaturalist.org/taxa/inaturalist-taxonomy.dwca.zip"
 # directory is an ephemeral _MEI* extraction dir that's rebuilt per run.
 TAXONOMY_JSON_PATH = os.path.expanduser("~/.vireo/taxonomy.json")
 
+# Fallback for dev checkouts that downloaded a taxonomy.json next to this
+# module before the persistent path existed. Named so tests (and the browser
+# suite, which must not pick up a developer's ~500MB local copy) can
+# monkeypatch it instead of patching os.path.dirname globally.
+LEGACY_TAXONOMY_JSON_PATH = os.path.join(os.path.dirname(__file__), "taxonomy.json")
+
 
 def find_taxonomy_json():
     """Return the first existing taxonomy.json path, or the persistent path.
@@ -435,13 +443,300 @@ def find_taxonomy_json():
     """
     if os.path.exists(TAXONOMY_JSON_PATH):
         return TAXONOMY_JSON_PATH
-    legacy_path = os.path.join(os.path.dirname(__file__), "taxonomy.json")
-    if os.path.exists(legacy_path):
-        return legacy_path
+    if os.path.exists(LEGACY_TAXONOMY_JSON_PATH):
+        return LEGACY_TAXONOMY_JSON_PATH
     return TAXONOMY_JSON_PATH
 
 
-def load_local_taxonomy():
+# Process-wide cache for the parsed taxonomy. A full iNaturalist
+# taxonomy.json is ~500MB of JSON that expands to a couple of GB of dicts
+# and takes seconds to parse, and request handlers (notably
+# /api/predictions/compare) plus accept/replace call load_local_taxonomy()
+# on every invocation. Re-parsing per call made those requests take
+# seconds-to-minutes and let concurrent requests each allocate their own
+# copy. Keyed by (path, mtime_ns, size) so a re-downloaded taxonomy is
+# still picked up without restarting the app.
+_taxonomy_cache_lock = threading.Lock()
+_taxonomy_cache = None  # (path, stat_key, Taxonomy)
+
+# Per-path record of parses that failed (e.g., corrupt JSON). Keyed by path
+# and validated against the current stat key on lookup, so a repaired or
+# re-downloaded file automatically drops its old failure record. Without
+# this, a corrupt preferred candidate would be re-parsed on every request
+# — expensive on its own, and the trigger for a worse problem: it prevents
+# us from evicting the fallback cache before parsing, because the corrupt
+# case would otherwise re-parse the multi-GB fallback each time.
+_taxonomy_failed_stats = {}  # {path: stat_key}
+
+
+class _KnownCorruptTaxonomy(Exception):
+    """Raised when a path is known to have failed to parse at its current stat."""
+
+
+# Parse failures that are environmental rather than the file's fault, so a
+# later attempt at the same bytes can legitimately succeed: a read permission
+# bit, momentary fd exhaustion, an allocation failure on a ~2.8GB parse. These
+# must stay retryable — memoizing them against (mtime_ns, size) would key the
+# record to a stat the repair does not change. Everything else (malformed JSON
+# raising ValueError, or valid JSON in the wrong shape raising AttributeError
+# or TypeError as the parser walks it) is the content itself and cannot fix
+# itself without a rewrite, which does change the stat.
+_TRANSIENT_TAXONOMY_ERRORS = (OSError, MemoryError)
+
+
+# Cap on how many times _load_taxonomy_cached will re-parse a file that
+# keeps changing mid-read. A rewrite during parse means the parsed object
+# does not correspond to the post-parse stat, so caching that pair would
+# serve stale data forever. If the file is still moving after this many
+# tries, we return the last parse without caching it and let the next
+# call try again.
+_TAXONOMY_PARSE_RETRY_LIMIT = 3
+
+
+def clear_taxonomy_cache():
+    """Drop the cached Taxonomy so the next load re-reads from disk."""
+    global _taxonomy_cache
+    with _taxonomy_cache_lock:
+        _taxonomy_cache = None
+        _taxonomy_failed_stats.clear()
+
+
+def _write_taxonomy_json_atomically(path, data):
+    """Serialize ``data`` to ``path`` via a temp sibling and an atomic rename.
+
+    Both taxonomy writers use this. `open(path, "w")` truncates the target
+    for as long as it takes to serialize ~500MB, and anything reading it in
+    that window — including _load_taxonomy_cached from a concurrent request
+    — gets a partial document that will not parse; its retry loop is bounded
+    and cannot wait out an in-place write. Rename is atomic within a
+    filesystem, so a reader sees the whole old file or the whole new one,
+    and an interrupted write leaves the previous taxonomy intact.
+
+    Renames onto the *resolved* target: os.replace() would otherwise swap a
+    symlink for a regular file, detaching a taxonomy linked in from
+    elsewhere and leaving a duplicate ~500MB copy. Keeping the temp file
+    beside the resolved target also keeps the rename within one filesystem,
+    which is what makes it atomic.
+    """
+    target = os.path.realpath(path)
+    # A unique temp name per write, not a fixed "<target>.tmp". Two writes
+    # can overlap — POSTing the download endpoint twice starts two workers,
+    # since it uses runner.start() rather than start_singleton() — and a
+    # shared name lets one writer rename its inode out from under the other,
+    # exposing a partial target and then failing the second writer when its
+    # pathname has vanished.
+    fd, tmp_path = tempfile.mkstemp(
+        dir=os.path.dirname(target) or ".",
+        prefix=f"{os.path.basename(target)}.",
+        suffix=".tmp",
+    )
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f)
+            # Closing only hands the bytes to the page cache. Without fsync,
+            # a crash just after the rename can expose the target with
+            # unflushed content — the half-written taxonomy this whole dance
+            # exists to prevent.
+            f.flush()
+            os.fsync(f.fileno())
+        # mkstemp creates 0600; open(path, "w") kept the target's mode.
+        # Carry it over when there is a target to copy from, so writing
+        # cannot silently loosen or tighten access. With no existing target
+        # (a first download) the file stays 0600 — ~/.vireo is single-user
+        # data, so private is the right default there.
+        with contextlib.suppress(OSError):
+            os.chmod(tmp_path, stat_module.S_IMODE(os.stat(target).st_mode))
+        os.replace(tmp_path, target)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.remove(tmp_path)
+        raise
+
+
+def _taxonomy_stat_key(path):
+    st = os.stat(path)
+    # Identity and ctime, not just (mtime, size). A metadata-preserving
+    # install — shutil.copy2, rsync -t, a restore from backup — can land
+    # different content at the same size and mtime, and we would serve the
+    # stale parse forever (and keep rejecting a repaired file as corrupt,
+    # since _taxonomy_failed_stats uses the same key). The inode and device
+    # change under an atomic rename; ctime changes on an in-place rewrite or
+    # a permission repair.
+    return (
+        st.st_mtime_ns, st.st_size, st.st_dev, st.st_ino, st.st_ctime_ns,
+    )
+
+
+def _load_taxonomy_cached(path):
+    """Return the parsed Taxonomy for ``path``, reusing the cached instance.
+
+    The parse happens under the lock on purpose: without it, two requests
+    arriving together would each build a multi-GB structure and thrash swap
+    instead of one waiting for the other's result.
+    """
+    global _taxonomy_cache
+    with _taxonomy_cache_lock:
+        # Stat inside the lock. Read before it, a caller that then waits on
+        # the lock compares a pre-wait stat against an entry another caller
+        # refreshed while it waited, decides that entry is stale, evicts it
+        # and re-parses ~2.8GB for nothing.
+        stat_key = _taxonomy_stat_key(path)
+
+        # Short-circuit a path we've already established is corrupt at this
+        # stat. Without this, load_local_taxonomy() would attempt the parse
+        # (and log a warning) on every request for as long as the file stays
+        # broken. This also lets the eviction below evict cross-path fallback
+        # entries safely: even if the current parse fails, a subsequent call
+        # skips it here instead of re-parsing the multi-GB fallback to
+        # rediscover it's still broken.
+        failed_stat = _taxonomy_failed_stats.get(path)
+        if failed_stat == stat_key:
+            raise _KnownCorruptTaxonomy(path)
+        if failed_stat is not None:
+            # File has changed since it last failed; give it another chance.
+            _taxonomy_failed_stats.pop(path, None)
+
+        cached = _taxonomy_cache
+        if cached is not None and cached[0] == path and cached[1] == stat_key:
+            return cached[2]
+        # We're about to parse. A parsed iNaturalist taxonomy is ~2.8GB, so
+        # letting any prior instance stay reachable through _taxonomy_cache
+        # (or the local ``cached`` tuple) while Taxonomy(path) allocates its
+        # replacement doubles peak RSS — and a rewrite mid-parse stacks
+        # another live copy on top of that per retry.
+        #
+        # Only evict an entry for *this* path. A cross-path entry is a live
+        # fallback, not a stale copy, and dropping it here is not safe: the
+        # failure memo covers content failures, but deliberately does not
+        # cover transient ones (see _TRANSIENT_TAXONOMY_ERRORS). So a
+        # preferred file that keeps raising OSError — wrong permissions, say
+        # — is re-attempted on every request, and an unconditional evict
+        # would drop the cached legacy taxonomy each time and re-parse
+        # ~500MB of fallback per compare or accept.
+        #
+        # The migration case that motivated evicting cross-path (a cached
+        # legacy still live while the newly-appeared preferred file parses)
+        # is already covered: download_taxonomy() clears the cache before it
+        # builds a replacement, so the normal path never holds both. A manual
+        # drop-in can still hold two instances for one parse; that is a
+        # one-off, where the fallback re-parse would be per-request forever.
+        if cached is not None and cached[0] == path:
+            _taxonomy_cache = None
+        cached = None
+        # Bracket the parse with a pre- and post-stat: if a background
+        # download rewrites the file while Taxonomy(path) is reading it,
+        # the parsed data is a stale snapshot even though a fresh
+        # post-parse stat would look current. Caching that pair would
+        # keep serving the old taxonomy indefinitely. Retry a few times
+        # to get a stable read; if the file keeps changing, return the
+        # latest parse but skip the cache so the next call re-checks.
+        taxonomy = None
+        # Keep only the *text* of a failed parse, never the exception. Its
+        # traceback holds the Taxonomy.__init__ frame, which still
+        # references the multi-GB dict json.load() just decoded — so
+        # retaining it across the loop would keep a failed attempt alive
+        # through the next allocation, defeating the between-retry release
+        # right below.
+        last_error_text = None
+        for _ in range(_TAXONOMY_PARSE_RETRY_LIMIT):
+            # Same peak-RSS reason: release the previous retry's
+            # instance before Taxonomy(path) builds the next one, so a
+            # file that keeps changing does not pile up N live copies.
+            taxonomy = None
+            pre_stat = _taxonomy_stat_key(path)
+            try:
+                taxonomy = Taxonomy(path)
+            except Exception as parse_error:
+                last_error_text = f"{type(parse_error).__name__}: {parse_error}"
+                # A rewrite caught mid-stream — from an atomic-save gap
+                # on another platform, an interrupted download, or an
+                # external tool — leaves a partial JSON document that
+                # Taxonomy() cannot parse. That is the same kind of
+                # transient instability the stat-drift check retries
+                # against; propagating here would surface as a spurious
+                # failure that the very next call could succeed at, and
+                # load_local_taxonomy() would silently fall through to
+                # a stale or nonexistent alternate candidate instead.
+                #
+                # Only retry when the file actually moved, though. A file
+                # that is simply corrupt fails identically every time, and
+                # retrying re-reads most of ~500MB two more times on every
+                # request — reinstating the latency and allocation pressure
+                # this cache exists to remove, for a read that cannot
+                # succeed. Truncated JSON only raises at the end of the
+                # parse, so this is the expensive case, not the cheap one.
+                try:
+                    file_moved = _taxonomy_stat_key(path) != pre_stat
+                except OSError:
+                    # Cannot even stat it now; a re-read will not fare
+                    # better, so report the parse failure we already have.
+                    file_moved = False
+                if not file_moved:
+                    # Durable failure at this stat. Record it so subsequent
+                    # requests short-circuit before hitting the parse and,
+                    # crucially, before the eviction above would drop a
+                    # still-valid fallback in a corrupt-preferred scenario.
+                    #
+                    # Only memoize a *content* failure, though — see
+                    # _TRANSIENT_TAXONOMY_ERRORS. Memoizing an environmental
+                    # failure would key the record to a stat its repair does
+                    # not change, leaving taxonomy features off until the
+                    # contents happen to change or the process restarts.
+                    if not isinstance(parse_error, _TRANSIENT_TAXONOMY_ERRORS):
+                        _taxonomy_failed_stats[path] = pre_stat
+                    raise
+                continue
+            post_stat = _taxonomy_stat_key(path)
+            if pre_stat == post_stat:
+                _taxonomy_cache = (path, post_stat, taxonomy)
+                return taxonomy
+        # Retries exhausted. Nothing was cached for this path above, so
+        # there is no stale entry left to clear — and clearing here would
+        # evict a different path's still-valid entry. If every attempt
+        # raised, surface a clean error rather than returning None and
+        # letting the caller misread it as "file was fine but empty".
+        if taxonomy is None:
+            # Carry the last parse failure's message: load_local_taxonomy()
+            # logs this, and "file kept changing" alone doesn't tell you
+            # which byte of which file was malformed. The message rather
+            # than the exception, so no traceback pins the decoded document.
+            detail = f" (last error: {last_error_text})" if last_error_text else ""
+            raise ValueError(
+                f"Unable to parse {path}: file kept changing during read{detail}"
+            )
+        return taxonomy
+
+
+def _drop_cached_taxonomy_path(path):
+    """Release the cached parse for ``path`` (and its failure memo, if any).
+
+    Used when the file has gone away: the entry can never be served again,
+    and a full taxonomy is ~2.8GB of otherwise unreachable memory.
+    """
+    global _taxonomy_cache
+    with _taxonomy_cache_lock:
+        _taxonomy_failed_stats.pop(path, None)
+        cached = _taxonomy_cache
+        if cached is not None and cached[0] == path:
+            _taxonomy_cache = None
+
+
+def _restamp_taxonomy_cache(taxonomy):
+    """Refresh the cache key after ``taxonomy`` rewrote its own file."""
+    global _taxonomy_cache
+    with _taxonomy_cache_lock:
+        cached = _taxonomy_cache
+        if cached is None or cached[2] is not taxonomy:
+            return
+        try:
+            _taxonomy_cache = (
+                cached[0], _taxonomy_stat_key(cached[0]), taxonomy,
+            )
+        except OSError:
+            _taxonomy_cache = None
+
+
+def load_local_taxonomy(path=None):
     """Load a Taxonomy from disk, falling back across known paths.
 
     Tries ~/.vireo/taxonomy.json first, then the package-dir legacy path.
@@ -449,16 +744,36 @@ def load_local_taxonomy():
     write) no longer disables taxonomy features if a valid legacy file
     is present. Returns a Taxonomy instance on success, or None if no
     readable taxonomy file exists.
+
+    The returned instance is shared across callers and cached until the
+    file on disk changes — treat it as read-mostly.
+
+    Args:
+        path: load only this file, with no fallback. Use it when a
+            specific artifact has to be the one loaded: the post-download
+            retype must fail loudly if the file it just wrote won't parse,
+            rather than quietly retyping keywords from a stale legacy copy
+            while the taxa tables hold the new download's data.
     """
-    candidates = [
-        TAXONOMY_JSON_PATH,
-        os.path.join(os.path.dirname(__file__), "taxonomy.json"),
-    ]
+    candidates = [path] if path else [TAXONOMY_JSON_PATH, LEGACY_TAXONOMY_JSON_PATH]
     for path in candidates:
         if not os.path.exists(path):
+            # The file backing a cached parse is gone, so that ~2.8GB object
+            # can never be served again. Release it here: _load_taxonomy_cached
+            # deliberately keeps cross-path entries (a live fallback is not
+            # stale), so a rollback to the legacy file would otherwise hold the
+            # deleted file's parse alive while allocating the legacy one — and
+            # with no fallback at all it would stay resident for the life of
+            # the process.
+            _drop_cached_taxonomy_path(path)
             continue
         try:
-            return Taxonomy(path)
+            return _load_taxonomy_cached(path)
+        except _KnownCorruptTaxonomy:
+            # We've already logged the real error for this stat; skip
+            # quietly on subsequent requests so a persistently-broken
+            # preferred file doesn't flood the log.
+            continue
         except Exception as e:
             log.warning(
                 "Failed to load taxonomy from %s: %s — trying next candidate",
@@ -641,9 +956,13 @@ class Taxonomy:
             data = json.load(f)
         data["taxa_by_common"] = self._by_common
         data["api_misses"] = sorted(self._api_misses)
-        with open(self._path, "w") as f:
-            json.dump(data, f)
+        _write_taxonomy_json_atomically(self._path, data)
         self._dirty = False
+        # This instance is the one the cache hands out, and it already holds
+        # everything we just wrote. Re-stamp the cache key so the rewrite
+        # doesn't look like an external change and force a needless re-parse
+        # of the file we authored.
+        _restamp_taxonomy_cache(self)
         log.info("Saved updated taxonomy with new alternate names")
 
     def get_hierarchy(self, name):
@@ -1201,6 +1520,17 @@ def download_taxonomy(output_path, progress_callback=None):
         if progress_callback:
             progress_callback(msg)
 
+    # Drop the cache's own reference to the old parse before we start
+    # building the replacement. A cached iNat dump is ~2.8GB, so letting
+    # it stay strongly reachable through _taxonomy_cache while this
+    # function also holds the ~2.8GB dict it is about to write can double
+    # peak RSS. The post-download retype already routes through
+    # load_local_taxonomy() (which re-evicts on parse), but that runs
+    # *after* the build. Evicting here covers the overlap. Concurrent
+    # requests that borrowed the taxonomy still keep it alive until they
+    # return; this only releases the cache's own reference.
+    clear_taxonomy_cache()
+
     # Download zip to a file (resumable) instead of holding in memory
     zip_dir = os.path.dirname(output_path) or "."
     os.makedirs(zip_dir, exist_ok=True)
@@ -1356,8 +1686,7 @@ def download_taxonomy(output_path, progress_callback=None):
         _status(
             f"Writing taxonomy ({len(taxa_by_common):,} common + {len(taxa_by_scientific):,} scientific names)..."
         )
-        with open(output_path, "w") as f:
-            json.dump(result, f)
+        _write_taxonomy_json_atomically(output_path, result)
         _status(
             f"Taxonomy complete: {len(taxa_by_common):,} common names, {len(taxa_by_scientific):,} scientific names"
         )

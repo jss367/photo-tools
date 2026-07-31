@@ -127,6 +127,23 @@ def live_server(tmp_path, monkeypatch):
     monkeypatch.setattr(
         models, "DEFAULT_MODELS_DIR", str(tmp_path / ".vireo" / "models"),
     )
+
+    # Pin the taxonomy candidates to tmp_path too. Both resolve at import
+    # time, so patching HOME does not move them: a developer with a real
+    # ~/.vireo/taxonomy.json or an in-checkout vireo/taxonomy.json (a full
+    # iNaturalist dump is ~500MB) has every compare/review request parse it,
+    # which changes both request timing and the categories those pages
+    # render. CI has no such file, so without this the browser suite passes
+    # there and fails on a working machine.
+    import taxonomy as tax_mod
+    monkeypatch.setattr(
+        tax_mod, "TAXONOMY_JSON_PATH",
+        str(tmp_path / ".vireo" / "taxonomy.json"),
+    )
+    monkeypatch.setattr(
+        tax_mod, "LEGACY_TAXONOMY_JSON_PATH", str(tmp_path / "taxonomy.json"),
+    )
+
     _seed_classifier_model(str(tmp_path))
 
     db_path = str(tmp_path / "test.db")

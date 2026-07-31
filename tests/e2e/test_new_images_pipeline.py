@@ -13,12 +13,12 @@ temp folder.
 """
 import os
 import sys
-import threading
 
 import pytest
 from PIL import Image
 from playwright.sync_api import expect
-from werkzeug.serving import make_server
+
+from e2e.threaded_server import start_server, stop_server
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "vireo"))
 
@@ -58,20 +58,19 @@ def fresh_server(tmp_path, monkeypatch):
 
     app = create_app(db_path=db_path, thumb_cache_dir=thumb_dir)
 
-    server = make_server("127.0.0.1", 0, app)
-    port = server.socket.getsockname()[1]
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
+    # Threaded, for the same reason as the shared ``live_server`` fixture in
+    # conftest.py: a single-threaded server makes every page load queue
+    # behind whatever else the page requested.
+    server, thread, url = start_server(app)
 
     yield {
-        "url": f"http://127.0.0.1:{port}",
+        "url": url,
         "db": db,
         "photo_dir": photo_dir,
         "app": app,
     }
 
-    server.shutdown()
-    thread.join(timeout=5)
+    stop_server(server, thread)
 
 
 def _clear_new_images_cache():

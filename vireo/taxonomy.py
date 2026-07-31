@@ -1600,8 +1600,26 @@ def download_taxonomy(output_path, progress_callback=None):
         _status(
             f"Writing taxonomy ({len(taxa_by_common):,} common + {len(taxa_by_scientific):,} scientific names)..."
         )
-        with open(output_path, "w") as f:
-            json.dump(result, f)
+        # Write to a sibling and rename over the target rather than
+        # truncating in place. `open(output_path, "w")` empties the file
+        # for as long as it takes to serialize ~500MB, and anything
+        # reading it in that window — including _load_taxonomy_cached from
+        # a concurrent /api/predictions/compare request — sees a partial
+        # JSON document that fails to parse. The bounded retry loop over
+        # there can't wait out a multi-second in-place write. Rename onto
+        # the resolved target so we replace the file the symlink points
+        # to, matching Taxonomy.save() and keeping the rename within one
+        # filesystem (which is what makes it atomic).
+        target = os.path.realpath(output_path)
+        tmp_path = f"{target}.tmp"
+        try:
+            with open(tmp_path, "w") as f:
+                json.dump(result, f)
+            os.replace(tmp_path, target)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.remove(tmp_path)
+            raise
         _status(
             f"Taxonomy complete: {len(taxa_by_common):,} common names, {len(taxa_by_scientific):,} scientific names"
         )

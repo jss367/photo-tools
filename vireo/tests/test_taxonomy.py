@@ -2908,3 +2908,64 @@ def test_memory_error_during_parse_is_not_memoized(tmp_path, monkeypatch):
     assert result is not None
     assert result.is_taxon("test species")
     assert calls["n"] == 2
+
+
+def test_download_taxonomy_writes_atomically(tmp_path, monkeypatch):
+    """A concurrent reader never sees a half-written taxonomy.json.
+
+    ``download_taxonomy()`` used to serialize ~500MB straight into the
+    output path with ``open(path, "w")``, exposing a partial JSON document
+    to any request that read the file during the write window. That
+    window is longer than ``_load_taxonomy_cached``'s bounded retry loop
+    can wait out. Verify that an interrupted write leaves the pre-existing
+    file intact and that no ``.tmp`` sibling is left behind.
+    """
+    import taxonomy as tax_mod
+
+    output_path = tmp_path / "taxonomy.json"
+    _write_taxonomy_json(output_path, "pre-existing species")
+    original_text = output_path.read_text()
+
+    def fake_download(url, path, progress_callback=None):
+        # Build a minimal but valid DWCA archive with one taxon so the
+        # parse steps run to completion and we reach the write block.
+        import zipfile as _zf
+        with _zf.ZipFile(path, "w") as zf:
+            zf.writestr(
+                "taxa.csv",
+                "id,parentNameUsageID,scientificName,taxonRank\n"
+                "1,,Test species,species\n",
+            )
+            zf.writestr(
+                "VernacularNames-english.csv",
+                "id,vernacularName,language\n"
+                "1,Test,en\n",
+            )
+
+    monkeypatch.setattr(tax_mod, "_download_with_resume", fake_download)
+
+    real_dump = tax_mod.json.dump
+
+    def exploding_dump(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(tax_mod.json, "dump", exploding_dump)
+
+    with pytest.raises(OSError):
+        tax_mod.download_taxonomy(str(output_path))
+
+    assert output_path.read_text() == original_text, (
+        "interrupted download must not clobber the existing taxonomy"
+    )
+    assert not (tmp_path / "taxonomy.json.tmp").exists(), (
+        "failed atomic write must clean up its sibling temp file"
+    )
+
+    # Now let the write succeed and verify the target ends up updated
+    # through the .tmp -> os.replace path.
+    monkeypatch.setattr(tax_mod.json, "dump", real_dump)
+    result = tax_mod.download_taxonomy(str(output_path))
+    assert result["taxa_by_common"], "the successful write should produce content"
+    written = json.loads(output_path.read_text())
+    assert written["taxa_by_common"] == result["taxa_by_common"]
+    assert not (tmp_path / "taxonomy.json.tmp").exists()

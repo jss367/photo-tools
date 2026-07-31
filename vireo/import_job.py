@@ -733,6 +733,13 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
     except OSError:
         destination = os.path.normpath(str(params.destination))
 
+    # Live-mount baseline for the destination, captured before discovery
+    # for the same reason as the local path: a detach during the slow
+    # pre-copy phases would otherwise be baked in as "never mounted" and
+    # disarm the guard. See ``_archive_mount_baseline`` and PR #1396
+    # review (Codex P1 r3687336684).
+    mount_baseline = _archive_mount_baseline(destination)
+
     # Reject cataloged twins that live under the card being imported: a stale
     # scan of the mounted card can leave a photos row whose ``folder_path``
     # IS the card, and re-hashing it just re-reads the very source we're
@@ -931,11 +938,6 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
     # See PR #1113 review.
     def _missing_mount_root():
         return _missing_archive_mount_root(destination)
-
-    # Baseline for the persistent-mount-point case the check above cannot
-    # see (Linux keeps ``/mnt/<name>`` after an unmount). Mirrors the
-    # local path; see ``_archive_mount_baseline``.
-    mount_baseline = _archive_mount_baseline(destination)
 
     def _record_checker(source_file, dest_folder=None, file_hash=None):
         """Register a landed/adopted file's identity with the intra-run checker.
@@ -2288,6 +2290,21 @@ def run_import_job(job, runner, db_path, workspace_id, params):
     except OSError:
         destination = os.path.normpath(str(params.destination))
 
+    # Which of the destination's mount-root candidates are live mounts.
+    # Captured HERE — immediately after normalization, before discovery,
+    # catalog-index construction or timestamp extraction — because all of
+    # those are slow against a network archive (the 2026-07-30 incident
+    # spent eight minutes just enumerating the destination). A share that
+    # detached during that window would be recorded as already-unmounted,
+    # the mounted → unmounted transition would never fire, and the guard
+    # would be silently disarmed for the rest of the run. See PR #1396
+    # review (Codex P1 r3687336684).
+    #
+    # Keying on the transition (rather than "is it mounted?") is what lets
+    # an ordinary local directory at a mount-shaped path stay usable: it
+    # is False here and stays False, so it never trips the check.
+    mount_baseline = _archive_mount_baseline(destination)
+
     # Reject cataloged twins that live under the card being imported. The
     # /api/jobs/import-photos route already refuses destinations that sit
     # inside a source (formatting the card would erase the archive copy),
@@ -2558,13 +2575,6 @@ def run_import_job(job, runner, db_path, workspace_id, params):
     # explicitly so safe_to_format reflects "workspace can actually see
     # these bytes" and not just "the bytes are somewhere on disk".
     dup_link_failed = False
-
-    # Which of the destination's mount-root candidates are live mounts
-    # right now. Taken once, before any copying, because the guard in the
-    # loop keys on a mounted → unmounted *transition*: an ordinary local
-    # directory that happens to sit at a mount-shaped path is False here
-    # and stays False, so it is never mistaken for a detached share.
-    mount_baseline = _archive_mount_baseline(destination)
 
     for rel, batch in batches:
         if runner.is_cancelled(job["id"]):

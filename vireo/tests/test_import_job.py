@@ -6820,3 +6820,125 @@ def test_remote_import_stops_when_mount_point_persists_after_unmount(
     assert any(
         "no longer mounted" in u["reason"] for u in result["unsafe_files"]
     ), result["unsafe_files"]
+
+
+def test_local_import_takes_mount_baseline_before_discovery(
+        tmp_path, monkeypatch):
+    """The baseline must predate discovery, not follow it.
+
+    Discovery, catalog-index construction and timestamp extraction all run
+    before the copy loop and are slow against a network archive — the
+    2026-07-30 incident spent eight minutes just enumerating the
+    destination. A share that detaches during that window would be
+    recorded as ``False`` by a late baseline, so the mounted -> unmounted
+    transition never fires and the guard is silently disarmed for the
+    whole run. See PR #1396 review (Codex P1 r3687336684).
+    """
+    import import_job as _ij
+    import pipeline_job as _pj
+    from import_job import ImportParams
+
+    card = _make_card(tmp_path, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+        ("DSC_0002.jpg", datetime(2026, 7, 4, 9, 0, 0), "blue"),
+    ])
+    dest = str(tmp_path / "mnt_NAS")
+    os.makedirs(dest, exist_ok=True)
+
+    monkeypatch.setattr(
+        _pj, "_archive_mount_root_candidates",
+        lambda path: [dest] if str(path).startswith(dest) else [],
+    )
+
+    state = {"mounted": True}
+    real_ismount = os.path.ismount
+    monkeypatch.setattr(
+        os.path, "ismount",
+        lambda p: state["mounted"] if str(p) == dest else real_ismount(p),
+    )
+
+    # The share drops WHILE discovery is running.
+    real_discover = _ij.discover_source_files
+
+    def discover_then_detach(*a, **kw):
+        result = list(real_discover(*a, **kw))
+        state["mounted"] = False
+        return result
+
+    monkeypatch.setattr(_ij, "discover_source_files", discover_then_detach)
+
+    db, ws_id, result = _run_import(tmp_path, ImportParams(
+        sources=[str(card)], destination=dest,
+    ))
+
+    assert result["copied"] == 0, result
+    assert result["failed"] == 2, result
+    assert result["safe_to_format"] is False, result
+    assert all(
+        "no longer mounted" in u["reason"] for u in result["unsafe_files"]
+    ), result["unsafe_files"]
+
+
+def test_remote_import_takes_mount_baseline_before_discovery(
+        tmp_path, monkeypatch):
+    """Remote path takes its baseline before discovery too.
+
+    Same disarming window as the local path — Codex flagged both in
+    PR #1396 review (P1 r3687336684).
+    """
+    import import_job as _ij
+    import pipeline_job as _pj
+    from import_job import ImportParams, run_import_job
+
+    ra = _remote_archive_for(tmp_path)
+    calls = _remote_calls(ra)
+    _install_fake_remote_rsync(monkeypatch, calls, verify=None)
+
+    card = _make_card(tmp_path, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+        ("DSC_0002.jpg", datetime(2026, 7, 4, 9, 0, 0), "blue"),
+    ])
+    mount_base = ra["mount_base"]
+
+    monkeypatch.setattr(
+        _pj, "_archive_mount_root_candidates",
+        lambda path: [mount_base] if str(path).startswith(mount_base) else [],
+    )
+    state = {"mounted": True}
+    real_ismount = os.path.ismount
+    monkeypatch.setattr(
+        os.path, "ismount",
+        lambda p: state["mounted"] if str(p) == mount_base else real_ismount(p),
+    )
+
+    real_discover = _ij.discover_source_files
+
+    def discover_then_detach(*a, **kw):
+        result = list(real_discover(*a, **kw))
+        state["mounted"] = False
+        return result
+
+    monkeypatch.setattr(_ij, "discover_source_files", discover_then_detach)
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws_id = db._active_workspace_id
+    result = run_import_job(
+        _make_job(), FakeRunner(), db_path, ws_id,
+        ImportParams(
+            sources=[str(card)], destination=mount_base, remote_target=ra,
+        ),
+    )
+
+    assert result["copied"] == 0, result
+    assert result["failed"] == 2, result
+    assert result["safe_to_format"] is False, result
+    # Drop the ``<remote>`` honesty-gate marker (verify_by_hash advice) so
+    # the mount reason is asserted over a non-empty set rather than
+    # vacuously — same filtering as
+    # ``test_remote_import_refuses_when_mount_root_absent``.
+    non_remote = [u for u in result["unsafe_files"] if u["path"] != "<remote>"]
+    assert non_remote, result["unsafe_files"]
+    assert all(
+        "no longer mounted" in u["reason"] for u in non_remote
+    ), result["unsafe_files"]

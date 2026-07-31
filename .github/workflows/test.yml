@@ -24,7 +24,7 @@ jobs:
     steps:
       - name: Classify changed files
         id: filter
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         with:
           script: |
             const files = await github.paginate(github.rest.pulls.listFiles, {
@@ -88,12 +88,12 @@ jobs:
           echo "No Python application, script, or test files changed."
           echo "Build-only paths changed: ${{ needs.changes.outputs.build }}"
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         if: needs.changes.outputs.python == 'true'
 
       - name: Set up Python
         if: needs.changes.outputs.python == 'true'
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.14"
 
@@ -117,7 +117,7 @@ jobs:
       - name: Cache MegaDetector weights
         id: cache-mdv6
         if: needs.changes.outputs.python == 'true'
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.vireo/models/megadetector-v6
           key: megadetector-v6-${{ runner.os }}-v1
@@ -240,12 +240,12 @@ jobs:
         if: needs.changes.outputs.python != 'true'
         run: echo "No Python application, script, or test files changed."
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         if: needs.changes.outputs.python == 'true'
 
       - name: Set up Python
         if: needs.changes.outputs.python == 'true'
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.14"
 
@@ -271,12 +271,12 @@ jobs:
         if: needs.changes.outputs.python != 'true'
         run: echo "No application or browser-test files changed."
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         if: needs.changes.outputs.python == 'true'
 
       - name: Set up Python
         if: needs.changes.outputs.python == 'true'
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.14"
 
@@ -317,7 +317,7 @@ jobs:
         if: needs.changes.outputs.build != 'true'
         run: echo "No Tauri or build files changed."
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         if: needs.changes.outputs.build == 'true'
 
       - uses: dtolnay/rust-toolchain@stable
@@ -347,10 +347,10 @@ jobs:
         if: needs.changes.outputs.python != 'true'
         run: echo "No application files changed."
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         if: needs.changes.outputs.python == 'true'
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         if: needs.changes.outputs.python == 'true'
         with:
           python-version: "3.14"
@@ -373,12 +373,12 @@ jobs:
         if: needs.changes.outputs.website != 'true'
         run: echo "No website files changed."
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         if: needs.changes.outputs.website == 'true'
 
       - name: Set up Node.js
         if: needs.changes.outputs.website == 'true'
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version: "20"
           cache: npm

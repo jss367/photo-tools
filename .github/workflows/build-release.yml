@@ -52,7 +52,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       # ── Version sync ──────────────────────────────────────
       - name: Sync version from tag
@@ -68,7 +68,7 @@ jobs:
 
       # ── Python & sidecar ──────────────────────────────────
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           # Windows: PyInstaller --onefile DLL loading bug with 3.14
           python-version: ${{ runner.os == 'Windows' && '3.13' || env.PYTHON_VERSION }}
@@ -170,7 +170,7 @@ jobs:
 
       # ── Node.js (for Tauri CLI) ───────────────────────────
       - name: Set up Node.js ${{ env.NODE_VERSION }}
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: npm
@@ -484,7 +484,7 @@ jobs:
       - name: Upload Windows application binaries for signing
         id: upload_windows_binaries
         if: runner.os == 'Windows' && steps.win_signing.outputs.should_sign == 'true'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: vireo-windows-binaries-unsigned
           path: windows-binaries-unsigned/*
@@ -572,7 +572,7 @@ jobs:
       - name: Upload unsigned Windows signing input
         id: upload_windows_installers
         if: runner.os == 'Windows' && steps.win_signing.outputs.should_sign == 'true'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: vireo-windows-installers-unsigned
           path: windows-installers-unsigned/*
@@ -637,7 +637,7 @@ jobs:
       # ── Upload artifacts ──────────────────────────────────
       - name: Upload build artifacts
         if: runner.os != 'Windows'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: vireo-${{ matrix.label }}
           path: |
@@ -657,7 +657,7 @@ jobs:
 
       - name: Upload unsigned Windows CI artifacts
         if: runner.os == 'Windows' && steps.win_signing.outputs.should_sign != 'true'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: vireo-${{ matrix.label }}
           path: |
@@ -670,7 +670,7 @@ jobs:
 
       - name: Upload signed Windows artifacts
         if: runner.os == 'Windows' && steps.win_signing.outputs.should_sign == 'true'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: ${{ inputs.sign_windows_candidate && inputs.tag_name == '' && 'vireo-windows-x86_64-signed-candidate' || 'vireo-windows-x86_64' }}
           path: signed-windows/**/*
@@ -686,10 +686,10 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           path: artifacts
           merge-multiple: false
@@ -771,13 +771,13 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           ref: main
           token: ${{ secrets.WEBSITE_PR_TOKEN }}
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 

@@ -60,7 +60,7 @@ jobs:
             || true
           gh pr edit "$PR" --repo "$REPO" --add-label "$AGENT_LABEL"
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Fire routine
         uses: ./.github/actions/fire-routine
@@ -91,7 +91,7 @@ jobs:
           || github.actor == 'chatgpt-codex-connector[bot]')
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Fire routine
         uses: ./.github/actions/fire-routine
@@ -117,7 +117,7 @@ jobs:
           || github.actor == 'chatgpt-codex-connector[bot]')
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Check for open review threads
         id: threads
@@ -190,7 +190,7 @@ jobs:
             echo "is_fork=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         if: steps.fork-check.outputs.is_fork == 'false'
 
       - name: Check for open review threads
@@ -264,7 +264,7 @@ jobs:
           echo "pr_number=$pr_number" >> "$GITHUB_OUTPUT"
           echo "should_fix=true" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         if: steps.pr.outputs.should_fix == 'true'
 
       - name: Fire routine
@@ -334,7 +334,7 @@ jobs:
             echo "pr_csv=$pr_csv" >> "$GITHUB_OUTPUT"
           fi
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         if: steps.conflicts.outputs.has_conflicts == 'true'
 
       - name: Fire routine

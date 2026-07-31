@@ -101,3 +101,27 @@ def wait_for_job_via_runner(runner, job_id, *, wait_for_history=False, **kwargs)
                            description=f"job {job_id} persistence",
                            **kwargs)
     return job
+
+
+def wait_for_job_phase(runner, job_id, phase, *, timeout=30.0, poll=0.01):
+    """Block until the runner reports ``job["progress"]["phase"] == phase``.
+
+    A hand-rolled ``time.time() + 2`` deadline was tight enough to flake on
+    macOS CI, where the worker thread's first push_event can lag behind the
+    HTTP response that returned the job id. 30s matches wait_for_job's
+    default and never bites a healthy run.
+    """
+    deadline = time.monotonic() + timeout
+    last_phase = None
+    while True:
+        job = runner.get(job_id)
+        if job is not None:
+            last_phase = job.get("progress", {}).get("phase")
+            if last_phase == phase:
+                return job
+        if time.monotonic() >= deadline:
+            pytest.fail(
+                f"job {job_id} did not reach phase {phase!r} within "
+                f"{timeout}s; last_phase={last_phase!r}"
+            )
+        time.sleep(poll)

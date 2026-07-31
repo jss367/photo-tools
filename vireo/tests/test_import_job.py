@@ -6671,6 +6671,28 @@ def test_selection_entry_grammar_matches_the_count(tmp_path):
         "when the import ran"
     )
 
+    # ``appeared`` has singular coverage above; pin its plural forms here so
+    # all three of its conditionals (``_plural``, the verb, the pronoun) are
+    # held from both sides. A fresh root is required: reusing ``tmp_path``
+    # would reuse this run's db/archive and turn the copy into a duplicate
+    # skip.
+    plural_root = tmp_path / "appeared_plural"
+    plural_root.mkdir()
+    card2 = _make_card(plural_root, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+        ("DSC_0002.jpg", datetime(2026, 7, 3, 11, 0, 0), "green"),
+        ("DSC_0003.jpg", datetime(2026, 7, 3, 12, 0, 0), "blue"),
+    ])
+    _, _, result2 = _run_import(plural_root, ImportParams(
+        sources=[str(card2)], destination=str(plural_root / "archive"),
+        include_paths={str(card2 / "DSC_0001.jpg")},
+        previewed_count=1, checked_count=1,
+    ))
+    assert _unsafe_reason(result2, "Files added after preview") == (
+        "at least 2 files arrived after your preview and were not "
+        "imported — re-preview to include them"
+    )
+
 
 def test_no_selection_blocked_result_leaves_the_pill_bare(tmp_path):
     """The invariant: a selection-blocked card always states a reason.
@@ -6730,3 +6752,86 @@ def test_no_selection_blocked_result_leaves_the_pill_bare(tmp_path):
         assert expected in _unsafe_paths(result), name
         # Entries are mirrored into ``errors``; both surfaces must speak.
         assert any(e.startswith(expected + ": ") for e in result["errors"]), name
+
+
+def test_drift_signals_and_progress_denominator(tmp_path):
+    from import_job import ImportParams
+
+    card = _make_card(tmp_path, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+        ("DSC_0002.jpg", datetime(2026, 7, 3, 11, 0, 0), "green"),
+        ("DSC_0003.jpg", datetime(2026, 7, 3, 12, 0, 0), "blue"),
+    ])
+    runner = FakeRunner()
+    _run_import(
+        tmp_path,
+        ImportParams(
+            sources=[str(card)], destination=str(tmp_path / "archive"),
+            include_paths={str(card / "DSC_0001.jpg")},
+            previewed_count=3, checked_count=1,
+        ),
+        runner=runner,
+    )
+    totals = {d.get("total") for _, kind, d in runner.events
+              if kind == "progress" and d.get("total")}
+    # Progress runs on the queued workload (1), never the full card (3) —
+    # otherwise a finished import sits at 33% and looks hung.
+    assert 3 not in totals
+
+
+def test_ordinary_deselection_reports_no_files_appeared(tmp_path):
+    from import_job import ImportParams
+
+    card = _make_card(tmp_path, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+        ("DSC_0002.jpg", datetime(2026, 7, 3, 11, 0, 0), "green"),
+    ])
+    _, _, result = _run_import(tmp_path, ImportParams(
+        sources=[str(card)], destination=str(tmp_path / "archive"),
+        include_paths={str(card / "DSC_0001.jpg")},
+        previewed_count=2, checked_count=1,
+    ))
+    assert result["files_appeared"] == 0
+    assert result["files_vanished"] == 0
+
+
+def test_mixed_appear_and_vanish_never_reports_a_negative_count(tmp_path):
+    """files_appeared is a net delta clamped at zero. Without the clamp, more
+    vanishing than arriving renders "-3 files were added"."""
+    from import_job import ImportParams
+
+    card = _make_card(tmp_path, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+    ])
+    _, _, result = _run_import(tmp_path, ImportParams(
+        sources=[str(card)], destination=str(tmp_path / "archive"),
+        include_paths={str(card / "DSC_0001.jpg"),
+                       str(card / "GONE_A.jpg"), str(card / "GONE_B.jpg")},
+        previewed_count=3, checked_count=3,
+    ))
+    assert result["files_appeared"] == 0
+    assert result["files_vanished"] == 2
+
+
+def test_step_summary_selected_figure_comes_from_checked_count(tmp_path):
+    """Not len(include_paths) — that set retains unchecked duplicates and
+    would overstate what the user chose."""
+    from import_job import ImportParams
+
+    card = _make_card(tmp_path, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+        ("DSC_0002.jpg", datetime(2026, 7, 3, 11, 0, 0), "green"),
+    ])
+    runner = FakeRunner()
+    _run_import(
+        tmp_path,
+        ImportParams(
+            sources=[str(card)], destination=str(tmp_path / "archive"),
+            include_paths={str(card / "DSC_0001.jpg"),
+                           str(card / "DSC_0002.jpg")},
+            previewed_count=2, checked_count=1,
+        ),
+        runner=runner,
+    )
+    summaries = [kw.get("summary", "") for _, _, kw in runner.step_updates]
+    assert any("1 selected of 2 discovered" in s for s in summaries)

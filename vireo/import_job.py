@@ -2186,9 +2186,12 @@ def run_import_job(job, runner, db_path, workspace_id, params):
         # or otherwise normalizes. Realpath-ing ``params.sources`` here would
         # silently empty this filter and copy nothing.
         files = [f for f in files if str(f) in include_paths]
-    # (noqa: F841 — ``queued`` is consumed by the drift reporting added later
-    # in this PR; drop the noqa when that usage lands.)
-    queued = len(files)  # noqa: F841
+    # Progress denominator. Deliberately NOT ``discovered``: that counts the
+    # whole card, so a half-deselected import would run to completion with
+    # the bar stalled near 50% — a finished job that looks hung. ``queued``
+    # is the work actually enqueued; ``discovered`` keeps backing the
+    # card-safety verdict below. Two denominators, on purpose.
+    queued = len(files)
 
     # Selection drift. Computed against the pre-filter snapshot.
     deselected = 0
@@ -2450,7 +2453,7 @@ def run_import_job(job, runner, db_path, workspace_id, params):
                 break
             emitted += 1
             _emit(
-                f"{rel}: importing", emitted, discovered, source_file.name,
+                f"{rel}: importing", emitted, queued, source_file.name,
             )
 
             # Duplicate gate.
@@ -3302,7 +3305,7 @@ def run_import_job(job, runner, db_path, workspace_id, params):
         _emit(
             f"{rel}: {_counts(rel)['copied']} copied · "
             f"{_counts(rel)['skipped_duplicate']} already present",
-            emitted, discovered,
+            emitted, queued,
         )
 
         if cancelled:
@@ -3346,8 +3349,15 @@ def run_import_job(job, runner, db_path, workspace_id, params):
         job["id"], "import",
         status="failed" if status == "failed" else "completed",
         summary=(
-            f"{copied} copied, {skipped_duplicate} already present, "
-            f"{failed} failed of {discovered} discovered"
+            # The selected figure is ``checked_count``, NOT
+            # ``len(include_paths)``: that set also carries files the user
+            # left unchecked because they were flagged duplicates, so it
+            # would overstate what was chosen. With no selection
+            # (``checked_count is None``) the wording is unchanged.
+            (f"{params.checked_count} selected of {discovered} discovered, "
+             if params.checked_count is not None else "")
+            + f"{copied} copied, {skipped_duplicate} already present, "
+              f"{failed} failed"
         ),
     )
 
@@ -3519,6 +3529,11 @@ def run_import_job(job, runner, db_path, workspace_id, params):
         "folders": folder_counts,
         "cancelled": cancelled,
         "discovery_errors": len(discovery_errors),
+        # Selection drift, for the caller's readout. ``files_appeared`` is a
+        # clamped net delta (card size minus previewed count), so it reads 0
+        # — never negative — when more files vanished than arrived.
+        "files_appeared": appeared,
+        "files_vanished": len(vanished_paths),
         # JobRunner's mixed-outcome convention: a run with any failed
         # file, unseen source subtree, or workspace-link scan failure is
         # recorded "failed" (with per-file / per-operation reasons),

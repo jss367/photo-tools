@@ -2477,3 +2477,75 @@ def test_taxonomy_save_writes_through_a_symlinked_path(tmp_path, monkeypatch):
     assert os.readlink(link) == str(real)
     assert json.loads(real.read_text())["api_misses"] == ["nothing here"]
     assert not (tmp_path / "real-taxonomy.json.tmp").exists()
+
+
+def test_load_local_taxonomy_retries_parse_exception_from_mid_write(
+    tmp_path, monkeypatch,
+):
+    """A parse exception from a mid-write read must be retried, not propagated.
+
+    Taxonomy.save() writes atomically now, but an interrupted download, an
+    external tool rewriting the file, or the same taxonomy on a filesystem
+    that can't do atomic renames all still expose a partial JSON document.
+    A single unlucky read raising json.JSONDecodeError would bubble out of
+    _load_taxonomy_cached, load_local_taxonomy() would log a warning and
+    fall through to the next (usually stale or nonexistent) candidate, and
+    the very next call would have parsed the same file cleanly.
+    """
+    import taxonomy as tax_mod
+
+    tax_mod.clear_taxonomy_cache()
+    persistent = tmp_path / "persistent.json"
+    _write_taxonomy_json(persistent, "test species")
+    monkeypatch.setattr(tax_mod, "TAXONOMY_JSON_PATH", str(persistent))
+
+    real_init = tax_mod.Taxonomy.__init__
+    attempts = {"n": 0}
+
+    def flaky_init(self, path):
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            raise ValueError("simulated mid-write JSONDecodeError")
+        real_init(self, path)
+
+    monkeypatch.setattr(tax_mod.Taxonomy, "__init__", flaky_init)
+
+    result = tax_mod.load_local_taxonomy()
+
+    assert result is not None
+    assert result.is_taxon("test species")
+    assert attempts["n"] == 2
+
+
+def test_load_local_taxonomy_raises_when_every_parse_attempt_fails(
+    tmp_path, monkeypatch,
+):
+    """A file that raises on every retry surfaces a clean error, not None.
+
+    Silently returning None would let load_local_taxonomy() log a generic
+    "failed to load" warning and fall through to the next candidate; a
+    persistent-corruption failure that repeats every retry is worth
+    surfacing so the caller can see the last exception's message.
+    """
+    import taxonomy as tax_mod
+
+    tax_mod.clear_taxonomy_cache()
+    persistent = tmp_path / "persistent.json"
+    _write_taxonomy_json(persistent, "test species")
+    monkeypatch.setattr(tax_mod, "TAXONOMY_JSON_PATH", str(persistent))
+
+    def always_raise(self, path):
+        raise ValueError("persistent corruption")
+
+    monkeypatch.setattr(tax_mod.Taxonomy, "__init__", always_raise)
+
+    # load_local_taxonomy() catches the exception and moves to the next
+    # candidate; with no fallback present the final result is None. What
+    # matters is that the private helper raises so the outer function can
+    # log the concrete failure per candidate.
+    with pytest.raises(ValueError):
+        tax_mod._load_taxonomy_cached(str(persistent))
+
+    # And the outer function still returns None cleanly, so callers that
+    # tolerate no taxonomy at all keep working.
+    assert tax_mod.load_local_taxonomy() is None

@@ -525,14 +525,32 @@ def _load_taxonomy_cached(path):
             # file that keeps changing does not pile up N live copies.
             taxonomy = None
             pre_stat = _taxonomy_stat_key(path)
-            taxonomy = Taxonomy(path)
+            try:
+                taxonomy = Taxonomy(path)
+            except (ValueError, OSError):
+                # A rewrite caught mid-stream — from an atomic-save gap
+                # on another platform, an interrupted download, or an
+                # external tool — leaves a partial JSON document that
+                # Taxonomy() cannot parse. That is the same kind of
+                # transient instability the stat-drift check retries
+                # against; propagating here would surface as a spurious
+                # failure that the very next call could succeed at, and
+                # load_local_taxonomy() would silently fall through to
+                # a stale or nonexistent alternate candidate instead.
+                continue
             post_stat = _taxonomy_stat_key(path)
             if pre_stat == post_stat:
                 _taxonomy_cache = (path, post_stat, taxonomy)
                 return taxonomy
         # Retries exhausted. Nothing was cached for this path above, so
         # there is no stale entry left to clear — and clearing here would
-        # evict a different path's still-valid entry.
+        # evict a different path's still-valid entry. If every attempt
+        # raised, surface a clean error rather than returning None and
+        # letting the caller misread it as "file was fine but empty".
+        if taxonomy is None:
+            raise ValueError(
+                f"Unable to parse {path}: file kept changing during read"
+            )
         return taxonomy
 
 

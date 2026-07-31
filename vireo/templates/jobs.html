@@ -27,6 +27,11 @@
   font-size: 11px; background: var(--accent); color: var(--accent-text);
   padding: 2px 8px; border-radius: 10px; font-variant-numeric: tabular-nums;
 }
+.jobs-awake-note {
+  padding: 8px 16px; font-size: 12px; line-height: 1.4;
+  color: var(--text-secondary);
+  border-bottom: 1px solid var(--border-primary);
+}
 .jobs-filter-bar {
   padding: 8px 16px; display: flex; gap: 8px;
   border-bottom: 1px solid var(--border-subtle);
@@ -281,6 +286,13 @@
         <option value="completed">Completed</option>
         <option value="failed">Failed</option>
       </select>
+    </div>
+    <!-- Vireo overrides the system idle-sleep setting while jobs run
+         (issue #1397). Say so, and be specific about the limit: closing
+         the lid still sleeps the machine and will still kill the job. -->
+    <div class="jobs-awake-note" id="keepingAwakeNote" style="display:none;"
+         title="Long jobs die if the machine sleeps — a network share often does not survive it.">
+      Keeping this computer awake while jobs run. Closing the lid will still sleep it.
     </div>
     <div class="jobs-list-content" id="jobListContent">
       <div style="padding:24px;text-align:center;color:var(--text-ghost);font-size:13px;">Loading...</div>
@@ -763,6 +775,10 @@
         activeJobs = data.active || [];
         activeWsId = data.active_workspace_id || null;
         workspaceNames = data.workspace_names || {};
+        var awakeNote = document.getElementById('keepingAwakeNote');
+        if (awakeNote) {
+          awakeNote.style.display = data.keeping_awake ? '' : 'none';
+        }
         // Drop optimistic-cancel state for jobs that have left the active
         // list (server has finalized them; their next render comes from
         // historyJobs which never shows a cancel button).

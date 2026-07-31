@@ -222,26 +222,31 @@ def test_job_cull_passes_thumb_cache_parent_as_vireo_dir(tmp_path, monkeypatch):
     app = create_app(db_path=db_path, thumb_cache_dir=thumb_dir)
 
     captured = {}
+    empty_result = {
+        "species_groups": [],
+        "total_photos": 0,
+        "suggested_keepers": 0,
+        "suggested_rejects": 0,
+        "photos_missing_phash": 0,
+    }
 
-    def spy(db, **kwargs):
-        captured.update(kwargs)
-        return {
-            "species_groups": [],
-            "total_photos": 0,
-            "suggested_keepers": 0,
-            "suggested_rejects": 0,
-            "photos_missing_phash": 0,
-        }
+    def spy(spy_db, **kwargs):
+        # culling.analyze_for_culling is monkeypatched globally, so any other
+        # test's still-running cull job in the same xdist worker would race
+        # into this spy and poison `captured` with its own vireo_dir. Only
+        # record calls that came from this test's Database instance.
+        if getattr(spy_db, "_db_path", None) == db_path:
+            captured.update(kwargs)
+        return empty_result
 
     monkeypatch.setattr(culling_module, "analyze_for_culling", spy)
 
     client = app.test_client()
     resp = client.post("/api/jobs/cull", json={})
     assert resp.status_code == 200
+    job_id = resp.get_json()["job_id"]
 
-    deadline = time.time() + 5.0
-    while "vireo_dir" not in captured and time.time() < deadline:
-        time.sleep(0.02)
+    wait_for_job_via_client(client, job_id)
 
     assert "vireo_dir" in captured, "analyze_for_culling was never called"
     assert captured["vireo_dir"] == str(thumb_parent), (

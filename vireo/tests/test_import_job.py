@@ -7653,6 +7653,20 @@ def test_remote_step_summary_claims_a_selection_only_when_applied(
 # format-the-card verdict on whichever path the author wasn't looking at.
 
 
+# The four ``unsafe_files`` entries the selection logic owns. Order within
+# this subset is user-visible — ``renderResult`` lists entries as it finds
+# them — so parity compares it. The filter matters: comparing the raw
+# ``unsafe_files`` order would drag in copy-failure and unverified-duplicate
+# entries, whose relative ordering legitimately differs between the two
+# paths, and the resulting noise would force the check to be dropped.
+_SELECTION_UNSAFE_PATHS = {
+    "Deselected files",
+    "Selection count mismatch",
+    "Files missing at import time",
+    "Files added after preview",
+}
+
+
 def _selection_observables(result, runner):
     """The selection-visible surface of an import run, normalized so the
     local and remote paths are directly comparable.
@@ -7677,6 +7691,11 @@ def _selection_observables(result, runner):
         "files_appeared": result["files_appeared"],
         "files_vanished": result["files_vanished"],
         "unsafe": {(u["path"], u["reason"]) for u in result["unsafe_files"]},
+        # A set erases render order, and render order is user-visible. Without
+        # this, emitting the drift lines in a different order on one path is a
+        # real one-sided divergence that passes every test in this file.
+        "unsafe_order": [u["path"] for u in result["unsafe_files"]
+                         if u["path"] in _SELECTION_UNSAFE_PATHS],
         "summary": import_summaries[-1] if import_summaries else None,
         # The discovery emit legitimately fires before the count is known,
         # so it is excluded; every other emit is sized by the queued work.
@@ -7768,6 +7787,10 @@ _SELECTION_PARITY_SCENARIOS = [
      _sel(["DSC_0001.jpg", "DSC_0002.jpg", "DSC_0003.jpg"], 2, 3)),
     ("mixed_appear_and_vanish", _PARITY_CARD,
      _sel(["DSC_0001.jpg"], 2, 2, extra=["GONE.jpg"])),
+    # Deselect AND vanish: the compound red pill, and the only scenario that
+    # emits two selection entries, so it is what pins their render order.
+    ("deselected_and_vanished", _PARITY_CARD,
+     _sel(["DSC_0001.jpg"], 3, 2, extra=["GONE.jpg"])),
     ("include_paths_without_checked_count", _PARITY_CARD,
      lambda card: {"include_paths": {str(card / "DSC_0001.jpg")},
                    "previewed_count": 3, "checked_count": None}),
@@ -7777,9 +7800,9 @@ _SELECTION_PARITY_SCENARIOS = [
 
 
 def test_selection_parity_scenarios_are_distinct():
-    """Guard for the parity test below: if two scenarios collapse onto the
-    same payload, the parametrization silently shrinks and a branch stops
-    being covered."""
+    """Guard for the parity test below: two scenarios that collapse onto the
+    same payload still both run, but the list covers one fewer branch than
+    its length suggests — a coverage gap that reads as coverage."""
     seen = set()
     for name, _specs, builder in _SELECTION_PARITY_SCENARIOS:
         class _C:
@@ -7792,10 +7815,6 @@ def test_selection_parity_scenarios_are_distinct():
         assert key not in seen, f"{name} duplicates an earlier scenario"
         seen.add(key)
     assert len(seen) == len(_SELECTION_PARITY_SCENARIOS)
-
-
-def _selection_parity_ids():
-    return [s[0] for s in _SELECTION_PARITY_SCENARIOS]
 
 
 def test_local_and_remote_selection_results_agree(tmp_path, monkeypatch):
@@ -7865,10 +7884,17 @@ def test_selection_parity_scenarios_actually_exercise_the_branches(
         "appeared": "Files added after preview",
         "negative_deselected": "Selection count mismatch",
         "mixed_appear_and_vanish": "Files missing at import time",
+        "deselected_and_vanished": "Files missing at import time",
     }
     for name, path in reds.items():
         assert seen[name]["safe_to_format"] is False, name
         assert path in {p for p, _ in seen[name]["unsafe"]}, name
+
+    # The compound case emits BOTH lines, in the order the helper appends
+    # them — this is the render order parity now compares.
+    assert seen["deselected_and_vanished"]["unsafe_order"] == [
+        "Deselected files", "Files missing at import time",
+    ]
 
     # Drift counters are nonzero where the scenario says they should be.
     assert seen["appeared"]["files_appeared"] == 2

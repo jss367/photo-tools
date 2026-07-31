@@ -574,6 +574,18 @@ class _Selection(NamedTuple):
     ``files`` is the copy set after filtering; ``queued`` is its length as
     the progress denominator; the rest is drift, feeding the card-safety
     verdict, the ``unsafe_files`` lines, and the caller's readout.
+
+    Both copy paths destructure this BY NAME (``sel.queued``), never by
+    position. Four of the six fields are plain ints and two are sets, so a
+    positional unpack that transposed a same-typed pair would still run and
+    still type-check, and the local/remote parity test would not see it: that
+    test compares the two paths to *each other*, so a transposition applied
+    to both is invisible to it. (Measured, not assumed — swapping
+    ``queued``/``deselected`` or ``queued``/``appeared`` in a positional
+    unpack survives parity; only a cross-type swap like
+    ``files``/``include_paths`` fails it.) Reordering these fields is
+    therefore safe today; keep it that way by not reintroducing a positional
+    unpack.
     """
 
     files: list
@@ -910,9 +922,19 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
     discovered = len(files)
     # Selection: filter the copy set and measure drift. Shared with the local
     # path — see ``_apply_selection`` for why each condition is shaped the
-    # way it is.
-    (files, include_paths, queued, deselected, vanished_paths,
-     appeared) = _apply_selection(files, params)
+    # way it is. Destructured BY NAME, not by position: four of the six
+    # fields are plain ints and two are sets, so a positional unpack that
+    # transposed a same-typed pair (``queued``/``deselected``,
+    # ``queued``/``appeared``) would still run, still type-check, and still
+    # pass the local/remote parity test — which compares the two paths to
+    # each other and so cannot see a transposition applied to both.
+    _sel = _apply_selection(files, params)
+    files = _sel.files
+    include_paths = _sel.include_paths
+    queued = _sel.queued
+    deselected = _sel.deselected
+    vanished_paths = _sel.vanished_paths
+    appeared = _sel.appeared
 
     checker = None
     if params.skip_duplicates:
@@ -2406,9 +2428,19 @@ def run_import_job(job, runner, db_path, workspace_id, params):
     discovered = len(files)
     # Selection: filter the copy set and measure drift. Shared with the
     # remote path — see ``_apply_selection`` for why each condition is
-    # shaped the way it is.
-    (files, include_paths, queued, deselected, vanished_paths,
-     appeared) = _apply_selection(files, params)
+    # shaped the way it is. Destructured BY NAME, not by position: four of
+    # the six fields are plain ints and two are sets, so a positional unpack
+    # that transposed a same-typed pair (``queued``/``deselected``,
+    # ``queued``/``appeared``) would still run, still type-check, and still
+    # pass the local/remote parity test — which compares the two paths to
+    # each other and so cannot see a transposition applied to both.
+    _sel = _apply_selection(files, params)
+    files = _sel.files
+    include_paths = _sel.include_paths
+    queued = _sel.queued
+    deselected = _sel.deselected
+    vanished_paths = _sel.vanished_paths
+    appeared = _sel.appeared
 
     checker = None
     if params.skip_duplicates:

@@ -4760,6 +4760,14 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         folder_id = request.args.get("folder_id", None, type=int)
         collection_id = request.args.get("collection_id", None, type=int)
 
+        # Keep the combined first-paint payload on one SQLite read snapshot.
+        # Independent SELECT snapshots can straddle a background folder-health
+        # commit and combine pre-transition photos/missing IDs with a
+        # post-transition folder tree. Since the navbar poll may already have
+        # completed, there is no guaranteed immediate observation to repair
+        # that split response.
+        db.conn.execute("BEGIN")
+
         # ``db.get_photos(collection_id=...)`` / ``count_filtered_photos`` both
         # expand only ``collections.rules`` — the same rules-only path guarded
         # elsewhere by ``_reject_visual_collection``. A visual-only collection
@@ -4783,6 +4791,24 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             if coll_row is not None and coll_row["visual_json"] is not None:
                 visual_first_paint = True
 
+        # Snapshot the active workspace's missing-folder IDs so the client's
+        # navbar can seed ``_missingFoldersLastIds`` from this init response.
+        # Without a baseline, the first /api/folders/missing observation
+        # returns false when a background _folder_health_loop flip runs
+        # between init and the poll — later polls then see the same IDs and
+        # never dispatch, leaving Browse stuck showing the pre-flip state
+        # (Codex review r3686191141).
+        #
+        # This is the first read in the explicit transaction above, so every
+        # photo / folder / keyword / collection read below shares the same
+        # health snapshot. Ordering alone is insufficient: if the background
+        # health loop commits after this query but before get_folder_tree(),
+        # and the navbar's initial poll already finished, no immediate poll
+        # remains to repair the mixed response (Codex reviews r3686317681 and
+        # r3687501744).
+        missing_folder_ids = [f["id"] for f in db.get_missing_folders()]
+        folder_health_version = db.get_folder_health_version()
+
         # First paint is scope-only (folder / collection / sort); metadata
         # filter deep links compile into the filter bar client-side, which
         # reloads through /api/photos/query once initialized (Phase 5 —
@@ -4800,6 +4826,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     sort=sort,
                 )
             except ValueError as exc:
+                db.conn.rollback()
                 return json_error(str(exc), 400)
             if not any([folder_id, collection_id]):
                 total = db.count_photos()
@@ -4810,6 +4837,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                         collection_id=collection_id,
                     )
                 except ValueError as exc:
+                    db.conn.rollback()
                     return json_error(str(exc), 400)
         folders = db.get_folder_tree()
         keywords = db.get_keyword_tree()
@@ -4859,7 +4887,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 )
             collection_dicts.append(d)
 
-        return jsonify(
+        response = jsonify(
             {
                 "photos": photo_dicts,
                 "total": total,
@@ -4868,8 +4896,15 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 "folders": [dict(f) for f in folders],
                 "keywords": [dict(k) for k in keywords],
                 "collections": collection_dicts,
+                "missing_folder_ids": missing_folder_ids,
+                "folder_health_version": folder_health_version,
             }
         )
+        # End the read transaction after every value in the response has been
+        # materialized. rollback() is intentional: this endpoint is read-only
+        # and it releases the snapshot without implying a write commit.
+        db.conn.rollback()
+        return response
 
     @app.route("/api/pipeline/slots")
     def api_pipeline_slots():
@@ -5289,8 +5324,16 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
     @app.route("/api/folders/missing")
     def api_folders_missing():
         db = _get_db()
+        # Keep the rows and their monotonic observation marker on one read
+        # snapshot so clients can compare this response with /api/browse/init
+        # independent of network delivery order.
+        db.conn.execute("BEGIN")
         missing = db.get_missing_folders()
-        return jsonify([dict(f) for f in missing])
+        health_version = db.get_folder_health_version()
+        response = jsonify([dict(f) for f in missing])
+        response.headers["X-Vireo-Folder-Health-Version"] = str(health_version)
+        db.conn.rollback()
+        return response
 
     _MISSING_ORIGINALS_STALE_SECONDS = 30 * 60
     _MISSING_ORIGINALS_BACKOFF_SECONDS = 30 * 60
@@ -5817,6 +5860,16 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
     @app.route("/api/folders/check-health", methods=["POST"])
     def api_folders_check_health():
         db = _get_db()
+        # ``check_folder_health()`` scans every folder in the DB and returns a
+        # global change count, but the client needs to know whether the
+        # ACTIVE workspace's missing set changed. Snapshot the workspace-
+        # scoped missing IDs before and after so the client's null-baseline
+        # fallback in loadMissingFolders() (fired when the modal opens before
+        # any poll seeds the snapshot) can distinguish a cross-workspace
+        # flip — which must NOT reset the active Browse — from a real
+        # active-workspace transition that still needs to notify Browse
+        # (Codex review r3686191131).
+        ws_missing_before = {f["id"] for f in db.get_missing_folders()}
         changed = db.check_folder_health()
         # A folder flipping ok→missing turns every one of its photos into a
         # ghost, and missing→ok resurrects them. Either transition would
@@ -5824,11 +5877,18 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         # next full scan.
         if changed:
             _invalidate_missing_originals_cache()
+        db.conn.execute("BEGIN")
         missing = db.get_missing_folders()
-        return jsonify({
+        ws_missing_after = {f["id"] for f in missing}
+        health_version = db.get_folder_health_version()
+        response = jsonify({
             "changed": changed,
+            "workspace_changed": ws_missing_before != ws_missing_after,
             "missing": [dict(f) for f in missing],
+            "folder_health_version": health_version,
         })
+        db.conn.rollback()
+        return response
 
     @app.route("/api/photos/missing/delete-sidecars", methods=["POST"])
     def api_photos_missing_delete_sidecars():

@@ -1,16 +1,13 @@
 import json
 import os
 import sys
-import threading
 
 import pytest
 from PIL import Image
-from werkzeug.serving import make_server
 
-sys.path.insert(0, os.path.dirname(__file__))
+from e2e.threaded_server import start_server, stop_server
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'vireo'))
-
-from _e2e_server import InFlightMiddleware  # noqa: E402
 
 
 def _seed_classifier_model(home_dir):
@@ -141,7 +138,7 @@ def live_server(tmp_path, monkeypatch):
 
     app = create_app(db_path=db_path, thumb_cache_dir=thumb_dir)
 
-    # threaded=True or the whole page load serializes behind one request.
+    # Threaded, or the whole page load serializes behind one request:
     # make_server defaults to a single-threaded BaseWSGIServer, while the
     # shipped app runs waitress with 16 threads precisely so "page loads
     # [don't] queue behind [a slow request] and the app appears frozen"
@@ -150,33 +147,19 @@ def live_server(tmp_path, monkeypatch):
     # a cold cache) holds the server while the page's thumbnails wait, so
     # ``load`` — and therefore ``page.goto`` — can stall on a busy machine.
     # Per-request connections come from ``_get_db()`` via Flask ``g``, the
-    # same isolation waitress relies on.
-    tracker = InFlightMiddleware(app)
-    server = make_server("127.0.0.1", 0, tracker, threaded=True)
-    port = server.socket.getsockname()[1]
-    thread = threading.Thread(target=server.serve_forever)
-    thread.daemon = True
-    thread.start()
+    # same isolation waitress relies on. ``stop_server`` drains in-flight
+    # handlers so the teardown below still runs with nothing in flight.
+    server, thread, url = start_server(app)
 
     try:
         yield {
-            "url": f"http://127.0.0.1:{port}",
+            "url": url,
             "app": app,
             "db": db,
             "data": seed_data,
         }
     finally:
-        server.shutdown()
-        thread.join(timeout=5)
-        # Requests handled in daemon threads (Werkzeug's ThreadedWSGIServer
-        # sets daemon_threads=True) are not joined by server_close(). Tests
-        # that observe a request with page.expect_request return before its
-        # response, so a handler like /api/files/reveal can still be inside
-        # subprocess.run when teardown starts. Drain it before closing the
-        # app instance and Database — otherwise the still-running handler
-        # can race the next test's fixture setup.
-        tracker.drain(timeout=10)
-        server.server_close()
+        stop_server(server, thread)
         if hasattr(app, "_cleanup_app_resources"):
             app._cleanup_app_resources()
         db.close()

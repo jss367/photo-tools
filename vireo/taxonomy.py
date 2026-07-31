@@ -613,7 +613,13 @@ def _load_taxonomy_cached(path):
         # to get a stable read; if the file keeps changing, return the
         # latest parse but skip the cache so the next call re-checks.
         taxonomy = None
-        last_error = None
+        # Keep only the *text* of a failed parse, never the exception. Its
+        # traceback holds the Taxonomy.__init__ frame, which still
+        # references the multi-GB dict json.load() just decoded — so
+        # retaining it across the loop would keep a failed attempt alive
+        # through the next allocation, defeating the between-retry release
+        # right below.
+        last_error_text = None
         for _ in range(_TAXONOMY_PARSE_RETRY_LIMIT):
             # Same peak-RSS reason: release the previous retry's
             # instance before Taxonomy(path) builds the next one, so a
@@ -623,7 +629,7 @@ def _load_taxonomy_cached(path):
             try:
                 taxonomy = Taxonomy(path)
             except Exception as parse_error:
-                last_error = parse_error
+                last_error_text = f"{type(parse_error).__name__}: {parse_error}"
                 # A rewrite caught mid-stream — from an atomic-save gap
                 # on another platform, an interrupted download, or an
                 # external tool — leaves a partial JSON document that
@@ -672,12 +678,14 @@ def _load_taxonomy_cached(path):
         # raised, surface a clean error rather than returning None and
         # letting the caller misread it as "file was fine but empty".
         if taxonomy is None:
-            # Chain the last parse failure: load_local_taxonomy() logs this,
-            # and "file kept changing" alone doesn't tell you which byte of
-            # which file was malformed.
+            # Carry the last parse failure's message: load_local_taxonomy()
+            # logs this, and "file kept changing" alone doesn't tell you
+            # which byte of which file was malformed. The message rather
+            # than the exception, so no traceback pins the decoded document.
+            detail = f" (last error: {last_error_text})" if last_error_text else ""
             raise ValueError(
-                f"Unable to parse {path}: file kept changing during read"
-            ) from last_error
+                f"Unable to parse {path}: file kept changing during read{detail}"
+            )
         return taxonomy
 
 

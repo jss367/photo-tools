@@ -15,6 +15,51 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from db import Database
 
 
+@pytest.fixture(autouse=True)
+def _isolate_taxonomy_state(tmp_path, monkeypatch):
+    """Keep the real filesystem and a leftover cache out of every test here.
+
+    Both taxonomy candidates resolve at import time, so a developer with a
+    real ~/.vireo/taxonomy.json or an in-checkout vireo/taxonomy.json (a full
+    iNaturalist dump is ~500MB) had tests that expect a load to fail quietly
+    pick up that file instead — asserting None and counting parses against
+    whatever happened to be on the host. Point both at names that do not
+    exist; tests needing a candidate present aim the constant at their own
+    fixture file.
+
+    Also clears the process-wide parse cache on both sides of the test, so
+    one test's cached instance or memoized failure cannot decide another
+    test's outcome.
+    """
+    import taxonomy as tax_mod
+
+    monkeypatch.setattr(
+        tax_mod, "TAXONOMY_JSON_PATH", str(tmp_path / "absent-persistent.json"),
+    )
+    monkeypatch.setattr(
+        tax_mod, "LEGACY_TAXONOMY_JSON_PATH", str(tmp_path / "absent-legacy.json"),
+    )
+    tax_mod.clear_taxonomy_cache()
+    yield
+    tax_mod.clear_taxonomy_cache()
+
+
+def _fake_dwca_download(url, path, progress_callback=None):
+    """Write a minimal but valid DWCA archive so download_taxonomy() completes."""
+    import zipfile as _zf
+    with _zf.ZipFile(path, "w") as zf:
+        zf.writestr(
+            "taxa.csv",
+            "id,parentNameUsageID,scientificName,taxonRank\n"
+            "1,,Test species,species\n",
+        )
+        zf.writestr(
+            "VernacularNames-english.csv",
+            "id,vernacularName,language\n"
+            "1,Test,en\n",
+        )
+
+
 def _create_mock_taxonomy(tmpdir):
     """Create a small taxonomy.json for testing without downloading."""
     taxonomy = {
@@ -2475,7 +2520,10 @@ def test_taxonomy_save_writes_through_a_symlinked_path(tmp_path, monkeypatch):
     tax.save()
 
     assert link.is_symlink(), "os.replace must not swap the link for a file"
-    assert os.readlink(link) == str(real)
+    # Compare resolved paths: Windows readlink() returns an
+    # extended-length "\\\\?\\C:\\..." form that never equals the
+    # plain path the link was created with.
+    assert link.resolve() == real.resolve()
     assert json.loads(real.read_text())["api_misses"] == ["nothing here"]
     assert not list(tmp_path.glob("*.tmp")), "no temp file may survive"
 
@@ -2758,10 +2806,17 @@ def test_exhausted_retries_chain_the_last_parse_error(tmp_path, monkeypatch):
     with pytest.raises(ValueError, match="kept changing") as excinfo:
         tax_mod._load_taxonomy_cached(str(persistent))
 
-    assert isinstance(excinfo.value.__cause__, ValueError)
-    assert "malformed at byte" in str(excinfo.value.__cause__)
+    # The concrete failure travels as text, not as a chained exception: a
+    # chained exception's traceback pins the Taxonomy.__init__ frame and the
+    # multi-GB dict json.load() decoded into it.
+    assert "malformed at byte" in str(excinfo.value)
+    assert excinfo.value.__cause__ is None
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="Windows chmod only toggles the read-only bit, so 0o640 is unrepresentable",
+)
 def test_taxonomy_save_preserves_target_permissions(tmp_path, monkeypatch):
     """Renaming a fresh temp file must not reset the taxonomy's mode."""
     import taxonomy as tax_mod
@@ -2926,23 +2981,7 @@ def test_download_taxonomy_writes_atomically(tmp_path, monkeypatch):
     _write_taxonomy_json(output_path, "pre-existing species")
     original_text = output_path.read_text()
 
-    def fake_download(url, path, progress_callback=None):
-        # Build a minimal but valid DWCA archive with one taxon so the
-        # parse steps run to completion and we reach the write block.
-        import zipfile as _zf
-        with _zf.ZipFile(path, "w") as zf:
-            zf.writestr(
-                "taxa.csv",
-                "id,parentNameUsageID,scientificName,taxonRank\n"
-                "1,,Test species,species\n",
-            )
-            zf.writestr(
-                "VernacularNames-english.csv",
-                "id,vernacularName,language\n"
-                "1,Test,en\n",
-            )
-
-    monkeypatch.setattr(tax_mod, "_download_with_resume", fake_download)
+    monkeypatch.setattr(tax_mod, "_download_with_resume", _fake_dwca_download)
 
     real_dump = tax_mod.json.dump
 
@@ -3018,13 +3057,18 @@ def test_atomic_write_is_shared_by_both_taxonomy_writers(tmp_path, monkeypatch):
     tax.save()
 
     assert calls == [str(persistent)]
-    import inspect
-    download_src = inspect.getsource(tax_mod.download_taxonomy)
-    assert "_write_taxonomy_json_atomically(output_path, result)" in download_src
-    assert 'open(output_path, "w")' not in download_src
+
+    # And the download path routes through it too — asserted by behaviour
+    # rather than by grepping the source, which a rename would break without
+    # anything actually regressing.
+    calls.clear()
+    download_target = tmp_path / "downloaded.json"
+    monkeypatch.setattr(tax_mod, "_download_with_resume", _fake_dwca_download)
+    tax_mod.download_taxonomy(str(download_target))
+    assert calls == [str(download_target)]
 
 
-def test_overlapping_atomic_writes_do_not_share_a_temp_file(tmp_path):
+def test_overlapping_atomic_writes_do_not_share_a_temp_file(tmp_path, monkeypatch):
     """Concurrent writers must not collide on one temp path.
 
     Two POSTs to the download endpoint start two workers — it uses
@@ -3038,12 +3082,23 @@ def test_overlapping_atomic_writes_do_not_share_a_temp_file(tmp_path):
     target = tmp_path / "taxonomy.json"
     _write_taxonomy_json(target, "original species")
 
-    seen_temp_names = []
+    # Record the temp *paths* mkstemp hands out. os.fdopen(fd).name is the
+    # integer fd, not a path, so reading it off the file object would compare
+    # two file descriptors and pass no matter what the filenames were.
+    seen_temp_paths = []
+    real_mkstemp = tax_mod.tempfile.mkstemp
+
+    def recording_mkstemp(*args, **kwargs):
+        fd, tmp = real_mkstemp(*args, **kwargs)
+        seen_temp_paths.append(tmp)
+        return fd, tmp
+
+    monkeypatch.setattr(tax_mod.tempfile, "mkstemp", recording_mkstemp)
+
     real_dump = tax_mod.json.dump
     barrier = {"inner_done": False}
 
     def dump_and_reenter(data, fp, *args, **kwargs):
-        seen_temp_names.append(fp.name)
         if not barrier["inner_done"]:
             # Start a second write while this one still holds its fd open.
             barrier["inner_done"] = True
@@ -3058,10 +3113,11 @@ def test_overlapping_atomic_writes_do_not_share_a_temp_file(tmp_path):
             str(target), {"taxa_by_common": {"outer species": {}}},
         )
 
-    assert len(seen_temp_names) == 2
-    assert seen_temp_names[0] != seen_temp_names[1], (
+    assert len(seen_temp_paths) == 2
+    assert seen_temp_paths[0] != seen_temp_paths[1], (
         "each write needs its own temp file"
     )
+    assert all(p.endswith(".tmp") for p in seen_temp_paths)
     # The outer write renamed last, so it wins — and the target is whole.
     assert json.loads(target.read_text())["taxa_by_common"] == {"outer species": {}}
     assert not list(tmp_path.glob("*.tmp"))

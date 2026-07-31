@@ -801,10 +801,15 @@ def test_load_folders_generation_guard_prevents_stale_render(
         page.wait_for_timeout(100)
     assert held, "older /api/folders request was never issued"
 
-    # Meanwhile, drop one folder in the DB so the second (newer) call reads
-    # a shorter tree. The newer call is unrouted, so its response returns
-    # immediately with the mutated data.
-    db.conn.execute("DELETE FROM folders WHERE id = ?", (folder_ids[-1],))
+    # Meanwhile, mark one folder missing so the second (newer) call reads a
+    # shorter visible tree. Do not delete the row: fixture photos still
+    # reference it and production health transitions preserve folder rows.
+    # The newer call is unrouted, so its response returns immediately with
+    # the mutated data.
+    db.conn.execute(
+        "UPDATE folders SET status = 'missing' WHERE id = ?",
+        (folder_ids[-1],),
+    )
     db.conn.commit()
 
     page.evaluate("() => { window._freshLoad = loadFolders(); }")
@@ -882,17 +887,16 @@ def test_health_refresh_awaits_config_before_loading_photos(
 
     page.route("**/api/config", _hold_first_cfg)
 
-    # Capture every /api/photos request the client issues so we can inspect
+    # Capture every photo-query request the client issues so we can inspect
     # the per_page value the health refresh's loadPhotos ended up sending.
-    photos_requests = []
-    page.on(
-        "request",
-        lambda req: (
-            photos_requests.append(req.url)
-            if "/api/photos" in req.url and "per_page=" in req.url
-            else None
-        ),
-    )
+    # The current Browse API sends pagination in a JSON POST body.
+    photo_query_page_sizes = []
+
+    def _capture_photo_query(req):
+        if req.method == "POST" and req.url.endswith("/api/photos/query"):
+            photo_query_page_sizes.append(req.post_data_json.get("per_page"))
+
+    page.on("request", _capture_photo_query)
 
     page.goto(f"{live_server['url']}/browse")
     for _ in range(50):
@@ -926,17 +930,120 @@ def test_health_refresh_awaits_config_before_loading_photos(
     # Wait for the refresh to complete (page 1 fetched from restored folders).
     page.wait_for_function("photos.length > 0", timeout=10000)
 
-    # Any /api/photos request issued by the health refresh must have used
+    # Any photo-query request issued by the health refresh must have used
     # the configured per_page=3, never the hard-coded 50 that used to leak
     # through when the event fired before config resolved.
-    assert photos_requests, "health refresh never fetched /api/photos"
-    for url in photos_requests:
-        assert "per_page=3" in url, (
-            f"health-refresh loadPhotos used unconfigured perPage: {url}"
-        )
-        assert "per_page=50" not in url, (
-            f"health-refresh loadPhotos leaked the hard-coded 50: {url}"
-        )
+    assert photo_query_page_sizes, "health refresh never queried photos"
+    assert all(size == 3 for size in photo_query_page_sizes), (
+        "health-refresh loadPhotos used unconfigured perPage: "
+        f"{photo_query_page_sizes}"
+    )
+
+
+def test_health_refresh_uses_its_folder_response_when_render_is_superseded(
+    live_server, page, tmp_path
+):
+    """A superseded health-owned folder render must still clear a dead scope."""
+    db = live_server["db"]
+    park = tmp_path / "park"
+    yard = tmp_path / "yard"
+    park.mkdir()
+    yard.mkdir()
+    folder_ids = live_server["data"]["folders"]
+    db.conn.executemany(
+        "UPDATE folders SET path = ?, status = 'ok' WHERE id = ?",
+        [(str(park), folder_ids[0]), (str(yard), folder_ids[1])],
+    )
+    db.conn.commit()
+
+    page.goto(f"{live_server['url']}/browse?folder_id={folder_ids[0]}")
+    expect(page.locator(".grid-card")).to_have_count(3)
+
+    held = []
+
+    def _hold_folder_loads(route):
+        held.append(route)
+
+    page.route("**/api/folders", _hold_folder_loads)
+    park.rmdir()
+
+    with page.expect_response(
+        lambda response: response.url.endswith("/api/folders/check-health")
+    ):
+        page.evaluate("openMissingFoldersModal()")
+
+    # The health event owns the first folder load. Start a second caller so
+    # the shared generation suppresses the first load's DOM render.
+    for _ in range(50):
+        if held:
+            break
+        page.wait_for_timeout(100)
+    assert len(held) == 1, "health refresh did not request the folder tree"
+    page.evaluate("() => { window._winningFolderLoad = loadFolders(); }")
+    for _ in range(50):
+        if len(held) == 2:
+            break
+        page.wait_for_timeout(100)
+    assert len(held) == 2, "competing folder load was not issued"
+
+    # Release only the suppressed health-owned response. The competing render
+    # is still pending, so the DOM remains stale; the refresh must use the
+    # returned rows themselves to see that the active folder disappeared.
+    held[0].continue_()
+    page.wait_for_function("activeFolderId === null", timeout=10000)
+    expect(page.locator(".grid-card")).to_have_count(2)
+
+    held[1].continue_()
+    page.wait_for_function(
+        f"!document.querySelector("
+        f"'#folderTree .tree-item[data-folder-id=\"{folder_ids[0]}\"]')",
+        timeout=5000,
+    )
+
+
+def test_unrelated_folder_health_change_preserves_leaf_selection(
+    live_server, page, tmp_path
+):
+    """A sibling folder transition must not reset a leaf-folder Browse view."""
+    db = live_server["db"]
+    park = tmp_path / "park"
+    yard = tmp_path / "yard"
+    park.mkdir()
+    yard.mkdir()
+    folder_ids = live_server["data"]["folders"]
+    db.conn.executemany(
+        "UPDATE folders SET path = ?, status = 'ok' WHERE id = ?",
+        [(str(park), folder_ids[0]), (str(yard), folder_ids[1])],
+    )
+    db.conn.commit()
+
+    page.goto(f"{live_server['url']}/browse?folder_id={folder_ids[0]}")
+    expect(page.locator(".grid-card")).to_have_count(3)
+    first = page.locator(".grid-card").first
+    first.click()
+    page.wait_for_function(
+        "document.getElementById('detailContent').classList.contains('visible')",
+        timeout=3000,
+    )
+    selected_id = page.evaluate("selectedPhotoId")
+    load_epoch = page.evaluate("loadEpoch")
+
+    # Only the unrelated yard folder changes health. The park-scoped grid is
+    # identical, so the health refresh should update sidebars/counts without
+    # rebuilding the grid or discarding the focused photo and detail panel.
+    yard.rmdir()
+    with page.expect_response(
+        lambda response: response.url.endswith("/api/folders/check-health")
+    ):
+        page.evaluate("openMissingFoldersModal()")
+    page.evaluate("() => window._activeFolderHealthRefresh")
+
+    assert page.evaluate("loadEpoch") == load_epoch
+    assert page.evaluate("selectedPhotoId") == selected_id
+    assert page.evaluate(
+        "document.getElementById('detailContent').classList.contains('visible')"
+    )
+    expect(page.locator(".grid-card")).to_have_count(3)
 
 
 def test_missing_folders_recovery_skips_check_when_mutations_hang(

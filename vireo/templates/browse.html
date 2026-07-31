@@ -2048,6 +2048,7 @@ var calendarDataLoadGen = 0;
 var folderLoadGen = 0;
 var keywordLoadGen = 0;
 var collectionLoadGen = 0;
+var browseFolderRows = [];
 var collectionsById = {};
 var browseCompareIds = [];
 var browseCompareOffset = 0;
@@ -3244,17 +3245,21 @@ async function loadFolders(opts) {
     // Internal freshness guard: a later ``loadFolders()`` call — from any
     // site — has advanced the generation, so its response is the truth
     // and ours would just overwrite it with stale data.
-    if (myGen !== folderLoadGen) return;
+    if (myGen !== folderLoadGen) return data;
     // Callers that fire this alongside other refreshes can pass a
     // ``shouldRender`` guard so a slow response cannot overwrite a newer
     // render — see refreshBrowseAfterFolderHealthChange
     // (Codex review r3685193225).
-    if (opts && opts.shouldRender && !opts.shouldRender()) return;
+    if (opts && opts.shouldRender && !opts.shouldRender()) return data;
     renderFolderTree(data);
-  } catch(e) {}
+    return data;
+  } catch(e) {
+    return null;
+  }
 }
 
 function renderFolderTree(folders) {
+  browseFolderRows = folders.slice();
   var byParent = {};
   folders.forEach(function(f) {
     var pid = f.parent_id || 'root';
@@ -3616,7 +3621,35 @@ function refreshBrowseSidebarCounts() {
 // ``folderHealthRefreshSeq`` is initialized above the bootstrapBrowse()
 // invocation so the pre-await snapshot inside bootstrap reads ``0`` instead
 // of ``undefined`` (Codex review r3686317674).
-async function refreshBrowseAfterFolderHealthChange() {
+function folderRowsContainScope(rows, folderId, scopeId) {
+  var byId = {};
+  (rows || []).forEach(function(row) { byId[row.id] = row; });
+  var currentId = folderId;
+  var seen = {};
+  while (currentId != null && !seen[currentId]) {
+    if (currentId === scopeId) return true;
+    seen[currentId] = true;
+    var row = byId[currentId];
+    currentId = row ? row.parent_id : null;
+  }
+  return false;
+}
+
+function folderHealthTouchesActiveScope(detail, beforeRows, afterRows) {
+  if (!activeFolderId) return true;
+  var restored = detail && Array.isArray(detail.restored) ? detail.restored : [];
+  var wentMissing = detail && Array.isArray(detail.wentMissing) ? detail.wentMissing : [];
+  var changedIds = restored.concat(wentMissing);
+  // The null-baseline fallback intentionally carries no ids. Conservatively
+  // reload because the server only knows that this workspace changed.
+  if (!changedIds.length) return true;
+  return changedIds.some(function(folderId) {
+    return folderRowsContainScope(beforeRows, folderId, activeFolderId) ||
+      folderRowsContainScope(afterRows, folderId, activeFolderId);
+  });
+}
+
+async function refreshBrowseAfterFolderHealthChange(detail) {
   var seq = ++folderHealthRefreshSeq;
   // A health-driven dataset refresh is not a user scope change: bumping
   // browseScopeGen here would make any in-flight sidebar click
@@ -3651,22 +3684,43 @@ async function refreshBrowseAfterFolderHealthChange() {
   // *before* render means only the winning generation's data ever reaches
   // the tree (Codex review r3685193225).
   var isCurrent = function() { return seq === folderHealthRefreshSeq; };
-  await Promise.all([
+  var beforeFolderRows = browseFolderRows.slice();
+  var loaded = await Promise.all([
     loadFolders({ shouldRender: isCurrent }),
     loadKeywords({ shouldRender: isCurrent }),
     loadCollections({ shouldRender: isCurrent }),
   ]);
   if (!isCurrent()) return;
+  // Use the health-owned response rather than the DOM. A later unrelated
+  // loadFolders() call may supersede this render while still being in flight;
+  // in that window the DOM is intentionally old even though this response
+  // already proves whether the selected folder is available.
+  var currentFolderRows = Array.isArray(loaded[0])
+    ? loaded[0]
+    : browseFolderRows.slice();
+  var activeScopeWasAffected = folderHealthTouchesActiveScope(
+    detail, beforeFolderRows, currentFolderRows);
   if (activeFolderId &&
-      !document.querySelector('#folderTree .tree-item[data-folder-id="' + activeFolderId + '"]')) {
+      !currentFolderRows.some(function(folder) { return folder.id === activeFolderId; })) {
     activeFolderId = null;
+    activeScopeWasAffected = true;
+  }
+
+  // A transition in an unrelated folder cannot change a leaf-folder result
+  // set. Keep its selection, detail panel, and scroll position intact while
+  // still refreshing workspace-wide sidebar and summary counts.
+  if (!activeScopeWasAffected) {
+    loadCollectionCounts();
+    loadSummary();
+    if (timelineMode) loadCalendarData();
+    return;
   }
 
   // Preserve the active collection: resetAndLoad's default is to clear
   // ``activeCollectionId`` for non-dashboard scopes, which would kick a user
   // viewing a normal collection back to the unscoped workspace grid whenever
   // folder health changes (CodeRabbit review r3684913393).
-  await resetAndLoad({ preserveCollection: true });
+  await resetAndLoad({ preserveCollection: true, preserveAnchor: true });
   if (!isCurrent()) return;
   loadCollectionCounts();
   loadSummary();
@@ -3683,8 +3737,9 @@ async function refreshBrowseAfterFolderHealthChange() {
 // without scrolling to the requested photo (and VireoFilter was left
 // uninitialized) (Codex review r3686778061).
 var _activeFolderHealthRefresh = Promise.resolve();
-document.addEventListener('vireo:folder-health-changed', function() {
-  _activeFolderHealthRefresh = refreshBrowseAfterFolderHealthChange();
+document.addEventListener('vireo:folder-health-changed', function(event) {
+  _activeFolderHealthRefresh = refreshBrowseAfterFolderHealthChange(
+    event && event.detail);
 });
 
 async function filterByCollection(id, options) {

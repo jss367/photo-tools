@@ -5745,3 +5745,71 @@ def test_scan_indexed_count_keeps_unpaired_jpegs(tmp_path):
         f"claimed {result['indexed']} photos indexed but the catalog holds "
         f"{rows}"
     )
+
+
+def _leave_unpaired_pair(db, monkeypatch, folder, basename="OLD_001"):
+    """Catalog a RAW+JPEG pair without merging it.
+
+    Simulates a pair left unmerged by an interrupted scan or an older
+    build — the state ``_pair_raw_jpeg_companions`` exists to clean up on
+    a later run, whether or not that run scanned this folder.
+    """
+    import scanner as _sc
+    from scanner import scan
+
+    folder.mkdir(parents=True, exist_ok=True)
+    Image.new("RGB", (32, 32), color="red").save(
+        str(folder / f"{basename}.jpg"))
+    with open(str(folder / f"{basename}.cr3"), "wb") as f:
+        f.write(b"\x00" * 200)
+
+    monkeypatch.setattr(
+        _sc, "_pair_raw_jpeg_companions", lambda *a, **k: set())
+    scan(str(folder), db)
+    monkeypatch.undo()
+
+
+def test_scan_does_not_discount_pairs_outside_its_own_scope(
+        tmp_path, monkeypatch):
+    """Only companions this scan counted may be discounted.
+
+    ``_pair_raw_jpeg_companions`` queries the whole photos table, so it
+    merges pending pairs anywhere in the catalog — including folders this
+    invocation never looked at. Subtracting that global total makes a
+    scoped scan undercount photos it really did index.
+    """
+    from db import Database
+    from scanner import scan
+
+    db = Database(str(tmp_path / "test.db"))
+    _leave_unpaired_pair(db, monkeypatch, tmp_path / "elsewhere")
+
+    # A different folder, two fresh JPEGs, no pairs of its own.
+    target = tmp_path / "target"
+    target.mkdir()
+    for name in ("NEW_001.jpg", "NEW_002.jpg"):
+        Image.new("RGB", (32, 32), color="blue").save(str(target / name))
+
+    result = scan(str(target), db)
+
+    assert result["discovered"] == 2, result
+    assert result["indexed"] == 2, (
+        f"scan indexed 2 new photos but reported {result['indexed']} after "
+        "an unrelated pair elsewhere in the catalog was merged"
+    )
+
+
+def test_scan_indexed_count_never_goes_negative(tmp_path, monkeypatch):
+    """Codex's example: an empty root plus one pending pair returned -1."""
+    from db import Database
+    from scanner import scan
+
+    db = Database(str(tmp_path / "test.db"))
+    _leave_unpaired_pair(db, monkeypatch, tmp_path / "elsewhere")
+
+    empty = tmp_path / "empty"
+    empty.mkdir()
+
+    result = scan(str(empty), db)
+
+    assert result["indexed"] == 0, result

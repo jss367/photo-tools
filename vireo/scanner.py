@@ -277,11 +277,18 @@ def _pair_raw_jpeg_companions(db, vireo_dir=None, thumb_cache_dir=None):
     keep the raw as the primary photo and set companion_path to the JPEG filename.
     Delete the duplicate JPEG-only photo record.
 
-    Returns the number of companion rows merged away. Callers that count
-    indexed photos must subtract this: both files were counted on the way
+    Returns the set of companion photo ids merged away. Callers that count
+    indexed photos must discount these: both files were counted on the way
     in, but only the RAW row survives, so the scan would otherwise claim
     two photos where the catalog holds one — and RAW+JPEG is the common
     shooting mode, so that overstates nearly every import.
+
+    Ids, not a bare count, because this query covers the *whole* photos
+    table: it also merges pairs left pending anywhere else in the catalog
+    (an interrupted earlier scan, an older build). A caller must intersect
+    with the ids it actually counted, or a scoped scan would be debited
+    for merges it had nothing to do with and could report a negative
+    total.
     """
     raw_exts = {".nef", ".cr2", ".cr3", ".arw", ".raf", ".dng", ".rw2", ".orf"}
     jpeg_exts = {".jpg", ".jpeg"}
@@ -311,10 +318,11 @@ def _pair_raw_jpeg_companions(db, vireo_dir=None, thumb_cache_dir=None):
     # aborts both halves.
     post_commit_fs_actions = []
     # Companion rows merged away, reported to the caller so it can correct
-    # its indexed count. Counted at the DELETE but only returned after the
-    # commit below succeeds — the whole loop shares one transaction, so a
-    # commit failure rolls every deletion back and none of them happened.
-    merged = 0
+    # its indexed count. Collected at the DELETE but only returned after
+    # the commit below succeeds — the whole loop shares one transaction,
+    # so a commit failure rolls every deletion back and none of them
+    # happened.
+    merged_ids = set()
 
     for (_folder_id, _base), members in groups.items():
         if len(members) < 2:
@@ -675,7 +683,7 @@ def _pair_raw_jpeg_companions(db, vireo_dir=None, thumb_cache_dir=None):
         # Remove keyword associations then the duplicate JPEG record
         db.conn.execute("DELETE FROM photo_keywords WHERE photo_id = ?", (companion["id"],))
         db.conn.execute("DELETE FROM photos WHERE id = ?", (companion["id"],))
-        merged += 1
+        merged_ids.add(companion["id"])
         # The companion's rowid is now free for SQLite to hand to the next
         # insert. Its derivatives must be unlinked so the next photo to
         # inherit the id can't adopt the companion's thumbnail / working
@@ -722,7 +730,7 @@ def _pair_raw_jpeg_companions(db, vireo_dir=None, thumb_cache_dir=None):
     # is durable and doesn't leak into the caller's next write.
     if db.conn.in_transaction:
         commit_with_retry(db.conn)
-    return merged
+    return merged_ids
 
 
 def _invalidate_raw_display_cache(vireo_dir, photo_id):
@@ -2011,6 +2019,12 @@ def scan(root, db, progress_callback=None, incremental=False, extract_full_metad
     # subtraction) means a disposition added later has to state which
     # bucket it belongs to instead of silently defaulting to "indexed" —
     # the invariant check after the loop enforces it.
+    #
+    # The ids behind ``counts["indexed"]``. Needed because the companion
+    # pairing pass below runs against the entire photos table, so its
+    # merges must be intersected with what *this* invocation counted (see
+    # ``_pair_raw_jpeg_companions``).
+    indexed_photo_ids = set()
     try:
         # Eagerly register the explicit scan targets so they end up linked
         # to the active workspace even when zero photos are inserted (e.g.
@@ -2095,6 +2109,7 @@ def scan(root, db, progress_callback=None, incremental=False, extract_full_metad
                     ):
                         processed_count += 1
                         counts["indexed"] += 1
+                        indexed_photo_ids.add(existing["id"])
                         if photo_callback:
                             photo_callback(existing["id"], full_path_str)
                         if progress_callback:
@@ -2127,6 +2142,7 @@ def scan(root, db, progress_callback=None, incremental=False, extract_full_metad
                     ):
                         processed_count += 1
                         counts["indexed"] += 1
+                        indexed_photo_ids.add(existing["id"])
                         if photo_callback:
                             photo_callback(existing["id"], full_path_str)
                         if progress_callback:
@@ -2361,6 +2377,7 @@ def scan(root, db, progress_callback=None, incremental=False, extract_full_metad
             # iteration: it drives the progress bar, which should only
             # advance once the file is genuinely done with.
             counts["indexed"] += 1
+            indexed_photo_ids.add(photo_id)
 
             # A brand-new row may have claimed a *recycled* rowid (see
             # ``purge_cached_files_for_recycled_id``). Cached derivatives
@@ -2578,11 +2595,18 @@ def scan(root, db, progress_callback=None, incremental=False, extract_full_metad
         # RAW survives. Applied to the sink immediately (not just the
         # returned dict) so a caller reading counts after a later failure
         # in this block still sees the corrected number.
-        _merged = _pair_raw_jpeg_companions(
+        _merged_ids = _pair_raw_jpeg_companions(
             db, vireo_dir=vireo_dir, thumb_cache_dir=thumb_cache_dir,
         )
-        counts["merged_companions"] += _merged
-        counts["indexed"] -= _merged
+        # Discount only companions THIS scan counted. The pairing pass
+        # queries the whole photos table, so it also cleans up pairs left
+        # pending elsewhere in the catalog (an interrupted earlier scan,
+        # an older build). Debiting a scoped scan for those would make it
+        # undercount, and scanning a root with no new files while one
+        # stale pair was pending would report -1 photos indexed.
+        _mine = _merged_ids & indexed_photo_ids
+        counts["merged_companions"] += len(_mine)
+        counts["indexed"] -= len(_mine)
 
         # Extract working copies for RAW photos (after pairing so companion is known).
         # Scope to the folders the caller just scanned so a fresh import doesn't

@@ -17483,6 +17483,178 @@ def test_extract_masks_cancelled_total_covers_preflight_drops(
     )
 
 
+def test_extract_masks_cancelled_step_warning_covers_unreadable(
+    tmp_path, monkeypatch,
+):
+    """A cancel after a source dropped must still surface the unreadable
+    count as a step warning.
+
+    The mid-loop updates and the normal finalizer both feed
+    ``em_failed + em_unreadable`` (and preflight unreadables) into the
+    runner's ``error_count`` so the Jobs page badges the row for the
+    reader. The cancel branch passed only ``em_failed``, so a cancel
+    arriving after the pre-flight had dropped photos left a completed
+    Extract row with a zero warning count next to a result that recorded
+    positive ``unreadable`` (Codex #1392 P2 r3687499188).
+    """
+    import config as cfg
+    import pipeline_job as pj
+    from db import Database
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cfg.CONFIG_PATH = str(tmp_path / "config.json")
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws_id = db._active_workspace_id
+
+    dead_path = str(tmp_path / "aa_dead")
+    live_path = str(tmp_path / "zz_live")
+    os.makedirs(dead_path, exist_ok=True)
+    os.makedirs(live_path, exist_ok=True)
+    dead_folder = db.add_folder(dead_path)
+    live_folder = db.add_folder(live_path)
+
+    photo_ids = [
+        _add_photo_with_detection(db, dead_folder, dead_path, "aa0.jpg"),
+        _add_photo_with_detection(db, dead_folder, dead_path, "aa1.jpg"),
+        _add_photo_with_detection(db, live_folder, live_path, "zz0.jpg"),
+    ]
+    collection_id = db.add_collection(
+        "Cancel-after-outage warning count",
+        json.dumps([{"field": "photo_ids", "value": photo_ids}]),
+    )
+
+    _stub_extract_masks_heavy_ops(monkeypatch)
+
+    # Kill the shared source before the run so pre-flight drops both.
+    import shutil
+    shutil.rmtree(dead_path, ignore_errors=True)
+
+    import masking
+    import numpy as np
+
+    def render_then_cancel(image_path, longest_edge=None):
+        pj._should_abort_cancel_flag = True
+        return np.zeros((16, 16, 3), dtype=np.uint8)
+
+    monkeypatch.setattr(masking, "render_proxy", render_then_cancel)
+    original_should_abort = pj._should_abort
+    monkeypatch.setattr(
+        pj, "_should_abort",
+        lambda event: getattr(pj, "_should_abort_cancel_flag", False)
+        or original_should_abort(event),
+    )
+
+    runner, result = _run_extract_masks_only(db_path, ws_id, collection_id)
+    if hasattr(pj, "_should_abort_cancel_flag"):
+        del pj._should_abort_cancel_flag
+
+    em = result["stages"]["extract_masks"]
+    assert em.get("cancelled") is True, f"Expected cancelled; got {em!r}"
+    assert em["unreadable"] >= 2, (
+        f"Cancelled result must include the pre-flight drops in "
+        f"``unreadable``; got {em!r}"
+    )
+
+    final = _extract_masks_final_update(runner)
+    assert final["status"] == "completed", (
+        f"Cancel branch finalizes as completed; got {final!r}"
+    )
+    # Before the fix ``error_count`` was ``em_failed`` (zero here), so a
+    # cancel-after-outage Extract row rendered zero warnings alongside a
+    # result recording two unreadable photos. Aligning it with the mid-
+    # loop and finalizer paths (which include unreadable + preflight
+    # unreadable) is the fix (Codex #1392 P2 r3687499188).
+    assert final.get("error_count", 0) >= em["unreadable"], (
+        f"error_count must at least cover the unreadable photos so the "
+        f"Jobs row warns; got final={final!r}, em={em!r}"
+    )
+
+
+def test_extract_masks_preflight_error_denominator_matches_stage_total(
+    tmp_path, monkeypatch,
+):
+    """The preflight Fatal message and the stage result must describe
+    the same population.
+
+    ``at_risk_dropped_ids`` counts mask candidates only — photos with no
+    qualifying detection are dropped from it, because an outage doesn't
+    change their fate (the loop would never have read them for masking).
+    The denominator in the message, however, was ``total_before`` — the
+    whole collection worklist. A collection with 1 mask candidate on an
+    offline folder and additional no-detection photos published messages
+    like "1 of 4 photos unreachable" alongside a stage result reporting
+    ``total: 2``, and the reader had no way to reconcile them
+    (Codex #1392 P2 r3687499184).
+    """
+    import config as cfg
+    from db import Database
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cfg.CONFIG_PATH = str(tmp_path / "config.json")
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws_id = db._active_workspace_id
+
+    dead_path = str(tmp_path / "aa_dead")
+    live_path = str(tmp_path / "zz_live")
+    os.makedirs(dead_path, exist_ok=True)
+    os.makedirs(live_path, exist_ok=True)
+    dead_folder = db.add_folder(dead_path)
+    live_folder = db.add_folder(live_path)
+
+    # 1 mask candidate on the offline folder + 1 mask candidate on the
+    # healthy folder + 2 no-detection photos on the healthy folder.
+    # Mask-candidate total = 2; whole-collection total = 4.
+    photo_ids = [
+        _add_photo_with_detection(db, dead_folder, dead_path, "aa0.jpg"),
+        _add_photo_with_detection(db, live_folder, live_path, "zz0.jpg"),
+    ]
+    for filename in ("zz1.jpg", "zz2.jpg"):
+        pid = db.add_photo(
+            live_folder, filename, ".jpg", 1000,
+            1_000_000.0 + hash(filename) % 1000,
+        )
+        _drop_jpeg(live_path, filename)
+        photo_ids.append(pid)
+
+    collection_id = db.add_collection(
+        "Mixed detections plus outage",
+        json.dumps([{"field": "photo_ids", "value": photo_ids}]),
+    )
+
+    _stub_extract_masks_heavy_ops(monkeypatch)
+
+    import shutil
+    shutil.rmtree(dead_path, ignore_errors=True)
+
+    _runner, result = _run_extract_masks_only(db_path, ws_id, collection_id)
+
+    em = result["stages"]["extract_masks"]
+    assert em["total"] == 2, (
+        f"Stage total must count only mask candidates (1 kept + 1 "
+        f"dropped mask candidate); got {em!r}"
+    )
+    fatal = next(
+        (e for e in result["errors"]
+         if e.startswith("[extract_masks] Fatal:")),
+        None,
+    )
+    assert fatal is not None, (
+        f"Expected an extract_masks Fatal preflight error; got "
+        f"{result['errors']!r}"
+    )
+    # Before the fix the denominator was ``total_before`` — the whole
+    # collection worklist — so the message read "1 of 4 photos
+    # unreachable" while the stage result reported total: 2.
+    assert "1 of 2 photos unreachable" in fatal, (
+        f"Denominator must match the mask-candidate stage total; got "
+        f"{fatal!r}"
+    )
+
+
 def _seed_cached_mask(db, tmp_path, photo_id, sam2_variant, dinov2_variant,
                       prompt=(0.1, 0.1, 0.5, 0.5), detector="MegaDetector"):
     """Give `photo_id` a complete, active mask for the configured variant."""

@@ -5841,44 +5841,19 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                     already_flagged_classify = any(
                         e.startswith("[classify] Fatal:") for e in errors
                     )
-                    if at_risk_dropped_ids:
-                        # Build the extract-owned outage message on every
-                        # outage — even when classify already flagged it. It
-                        # only gets appended to the job-level ``errors`` list
-                        # when this stage owns the outage (to avoid a
-                        # duplicate Fatal entry), but the early-exit step
-                        # needs it either way so the Jobs page can render
-                        # the reconnect instruction on the extract row
-                        # (Codex #1392 P2 r3687403367). Without carrying it
-                        # over on the classify-already-flagged path, the
-                        # early-exit's failed step would have no error text
-                        # at all and blame detections instead.
-                        em_offline_preflight_error = (
-                            f"[extract_masks] Fatal: "
-                            f"{len(at_risk_dropped_ids)} of {total_before} "
-                            f"photos unreachable (source offline). "
-                            f"Reconnect the missing folder(s) and run "
-                            f"Process again to extract the rest."
-                        )
-                        if not already_flagged_classify:
-                            # Classify didn't already own this outage
-                            # (e.g. fully-cached run where classify made no
-                            # image reads). Surface the source-offline
-                            # failure at this stage — a fatal-prefixed error
-                            # keeps the end-of-run rollup from picking an
-                            # unrelated warning as the headline error, and
-                            # marking the stage ``failed`` prevents the
-                            # pipeline from finishing "successfully" with
-                            # no masks made.
-                            errors.append(em_offline_preflight_error)
-                            stages["extract_masks"]["status"] = "failed"
-                            # Survive the em_failed==0 finalizer at the
-                            # bottom of this stage — the offline photos
-                            # were removed from the worklist above, so the
-                            # per-photo failure counter would otherwise
-                            # flip the stage back to ``completed`` (Codex
-                            # #1388 P1 r3665130244).
-                            em_offline_latched = True
+                    if at_risk_dropped_ids and not already_flagged_classify:
+                        # Latch the outage immediately so the finalizer
+                        # doesn't flip the stage back to ``completed``
+                        # (offline photos were removed above, so
+                        # ``em_failed`` is zero at the bottom of the loop
+                        # regardless — Codex #1388 P1 r3665130244).
+                        # The Fatal error string itself is built below
+                        # once ``total`` (the kept mask-candidate count) is
+                        # known, so its denominator matches the stage
+                        # result's ``total`` instead of the whole
+                        # collection worklist (Codex #1392 P2 r3687499184).
+                        stages["extract_masks"]["status"] = "failed"
+                        em_offline_latched = True
                     log.warning(
                         "Extract-masks: dropped %d photo(s) from %d "
                         "offline folder(s); source not reachable.",
@@ -6000,6 +5975,30 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
 
                 folders = {f["id"]: f["path"] for f in thread_db.get_folder_tree()}
                 total = len(photos_to_process)
+                # Now that ``total`` is known, build the preflight outage
+                # message. The denominator has to be the mask-candidate
+                # total (loop total + preflight-dropped mask candidates),
+                # matching the stage result's ``total``. Using
+                # ``total_before`` — the whole collection worklist —
+                # produced messages like "1 of 100 photos unreachable"
+                # when only 1 was a mask candidate and the result showed
+                # ``total: 1``, so the reader couldn't reconcile the two
+                # (Codex #1392 P2 r3687499184).
+                if em_preflight_unreadable > 0:
+                    em_offline_preflight_error = (
+                        f"[extract_masks] Fatal: "
+                        f"{em_preflight_unreadable} of "
+                        f"{total + em_preflight_unreadable + em_preflight_masked} "
+                        f"photos unreachable (source offline). "
+                        f"Reconnect the missing folder(s) and run "
+                        f"Process again to extract the rest."
+                    )
+                    # Latch was set above only when this stage owns the
+                    # outage (classify didn't already emit a Fatal), so
+                    # this gate mirrors the previous append-in-preflight
+                    # condition and avoids a duplicate Fatal entry.
+                    if em_offline_latched:
+                        errors.append(em_offline_preflight_error)
                 masked = 0
                 skipped = 0
                 em_failed = 0
@@ -6457,7 +6456,18 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                         job["id"], "extract_masks", status="completed",
                         progress={"current": processed, "total": total},
                         summary=em_summary,
-                        error_count=em_failed,
+                        # Warnings on the Jobs page render off the step's
+                        # ``error_count`` — the mid-loop updates and the
+                        # normal finalizer both include unreadable counts,
+                        # so the cancel branch has to as well or a cancel
+                        # that arrives after a source dropped shows a
+                        # zero-warning row alongside a result that records
+                        # positive ``unreadable`` (Codex #1392 P2
+                        # r3687499188).
+                        error_count=(
+                            em_failed + em_unreadable
+                            + em_preflight_unreadable
+                        ),
                     )
                     result["stages"]["extract_masks"] = {
                         "masked": masked + em_preflight_masked,

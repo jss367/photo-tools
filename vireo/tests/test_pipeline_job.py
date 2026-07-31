@@ -17399,3 +17399,73 @@ def test_extract_masks_preflight_fully_cached_folder_does_not_fail_stage(
     assert final["status"] != "failed", (
         f"A fully-cached offline folder must not fail the stage; got {final!r}"
     )
+
+
+def test_extract_masks_cancelled_total_covers_preflight_drops(
+    tmp_path, monkeypatch,
+):
+    """A cancelled run must not publish impossible counters either.
+
+    The cancel branch folds pre-flight drops into `unreadable` but reported
+    the post-filter loop total beside it, so a cancel after an outage could
+    persist "3 unreadable, total: 1" (Codex #1392 P2).
+    """
+    import config as cfg
+    import pipeline_job as pj
+    from db import Database
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cfg.CONFIG_PATH = str(tmp_path / "config.json")
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws_id = db._active_workspace_id
+
+    dead_path = str(tmp_path / "aa_dead")
+    live_path = str(tmp_path / "zz_live")
+    os.makedirs(dead_path, exist_ok=True)
+    os.makedirs(live_path, exist_ok=True)
+    dead_folder = db.add_folder(dead_path)
+    live_folder = db.add_folder(live_path)
+
+    photo_ids = [
+        _add_photo_with_detection(db, dead_folder, dead_path, "aa0.jpg"),
+        _add_photo_with_detection(db, dead_folder, dead_path, "aa1.jpg"),
+        _add_photo_with_detection(db, live_folder, live_path, "zz0.jpg"),
+    ]
+    collection_id = db.add_collection(
+        "Cancelled after an outage",
+        json.dumps([{"field": "photo_ids", "value": photo_ids}]),
+    )
+
+    _stub_extract_masks_heavy_ops(monkeypatch)
+
+    # The dead folder is gone before the run, so pre-flight drops its two.
+    import shutil
+    shutil.rmtree(dead_path, ignore_errors=True)
+
+    # Cancel as soon as the surviving healthy photo is reached.
+    import masking
+    import numpy as np
+
+    def render_then_cancel(image_path, longest_edge=None):
+        pj._should_abort_cancel_flag = True
+        return np.zeros((16, 16, 3), dtype=np.uint8)
+
+    monkeypatch.setattr(masking, "render_proxy", render_then_cancel)
+    original_should_abort = pj._should_abort
+    monkeypatch.setattr(
+        pj, "_should_abort",
+        lambda event: getattr(pj, "_should_abort_cancel_flag", False)
+        or original_should_abort(event),
+    )
+
+    _runner, result = _run_extract_masks_only(db_path, ws_id, collection_id)
+    if hasattr(pj, "_should_abort_cancel_flag"):
+        del pj._should_abort_cancel_flag
+
+    em = result["stages"]["extract_masks"]
+    assert em.get("cancelled") is True, f"Expected a cancelled result; got {em!r}"
+    assert em["total"] >= em.get("unreadable", 0), (
+        f"Cancelled totals must still cover the photos they report; got {em!r}"
+    )

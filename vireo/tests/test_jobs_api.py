@@ -7972,3 +7972,14 @@ def test_extract_masks_route_reports_unreadable_sources(
     assert result.get("skipped") == 0, (
         f"Unreadable photos must not inflate the skip count; got {result!r}"
     )
+    # The pipeline card can style itself honestly, but the Jobs page,
+    # history, API clients and the completion event all read the job status.
+    # Opt into the runner's ok=False convention so they agree (Codex #1392).
+    assert data["status"] == "failed", (
+        f"A job that left photos unmasked must not report success; got "
+        f"{data['status']!r}"
+    )
+    assert result.get("ok") is False
+    assert any("could not be read" in e for e in (result.get("errors") or [])), (
+        f"The job needs an actionable error, not just a counter; got {result!r}"
+    )

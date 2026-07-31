@@ -6323,7 +6323,11 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                     result["stages"]["extract_masks"] = {
                         "masked": masked, "skipped": skipped, "failed": em_failed,
                         "unreadable": em_unreadable + em_preflight_unreadable,
-                        "total": total, "cancelled": True,
+                        # Preflight-inclusive, matching the normal finalizer:
+                        # the loop total alone can't cover photos that never
+                        # reached the loop (Codex #1392 P2).
+                        "total": total + em_preflight_unreadable,
+                        "cancelled": True,
                     }
                 else:
                     # Reported count spans both the photos this loop failed to

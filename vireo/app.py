@@ -27520,8 +27520,27 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     },
                 )
 
+            # Opt into JobRunner's ok/errors convention when photos went
+            # unmasked. Styling the card honestly isn't enough: the Jobs
+            # page, job history, API clients and the completion event all
+            # read the job status, and "completed" there tells the user their
+            # library was processed when some of it was never opened
+            # (Codex #1392).
+            job_errors = []
+            if unreadable:
+                job_errors.append(
+                    f"{unreadable} of {total} photos could not be read, so "
+                    f"they have no mask and Process Review rejects them as "
+                    f"`no_subject_mask`. Reconnect the source and run Extract "
+                    f"again."
+                )
+            if failed:
+                job_errors.append(
+                    f"{failed} of {total} photos failed mask extraction"
+                )
             return {"masked": masked, "skipped": skipped, "failed": failed,
-                    "unreadable": unreadable, "total": total}
+                    "unreadable": unreadable, "total": total,
+                    "ok": not job_errors, "errors": job_errors}
 
         job_id = runner.start(
             "extract-masks",

@@ -555,7 +555,16 @@ def _write_taxonomy_json_atomically(path, data):
 
 def _taxonomy_stat_key(path):
     st = os.stat(path)
-    return (st.st_mtime_ns, st.st_size)
+    # Identity and ctime, not just (mtime, size). A metadata-preserving
+    # install — shutil.copy2, rsync -t, a restore from backup — can land
+    # different content at the same size and mtime, and we would serve the
+    # stale parse forever (and keep rejecting a repaired file as corrupt,
+    # since _taxonomy_failed_stats uses the same key). The inode and device
+    # change under an atomic rename; ctime changes on an in-place rewrite or
+    # a permission repair.
+    return (
+        st.st_mtime_ns, st.st_size, st.st_dev, st.st_ino, st.st_ctime_ns,
+    )
 
 
 def _load_taxonomy_cached(path):
@@ -596,14 +605,23 @@ def _load_taxonomy_cached(path):
         # replacement doubles peak RSS — and a rewrite mid-parse stacks
         # another live copy on top of that per retry.
         #
-        # Evict cross-path entries too (e.g. a cached legacy fallback when
-        # we're now parsing the preferred file that just appeared): holding
-        # both live during the parse can OOM during a normal migration. This
-        # is safe because the failure cache above prevents a corrupt preferred
-        # file from triggering a re-parse of the fallback on every request —
-        # once the corrupt parse fails, subsequent calls short-circuit before
-        # they ever touch the fallback slot.
-        _taxonomy_cache = None
+        # Only evict an entry for *this* path. A cross-path entry is a live
+        # fallback, not a stale copy, and dropping it here is not safe: the
+        # failure memo covers content failures, but deliberately does not
+        # cover transient ones (see _TRANSIENT_TAXONOMY_ERRORS). So a
+        # preferred file that keeps raising OSError — wrong permissions, say
+        # — is re-attempted on every request, and an unconditional evict
+        # would drop the cached legacy taxonomy each time and re-parse
+        # ~500MB of fallback per compare or accept.
+        #
+        # The migration case that motivated evicting cross-path (a cached
+        # legacy still live while the newly-appeared preferred file parses)
+        # is already covered: download_taxonomy() clears the cache before it
+        # builds a replacement, so the normal path never holds both. A manual
+        # drop-in can still hold two instances for one parse; that is a
+        # one-off, where the fallback re-parse would be per-request forever.
+        if cached is not None and cached[0] == path:
+            _taxonomy_cache = None
         cached = None
         # Bracket the parse with a pre- and post-stat: if a background
         # download rewrites the file while Taxonomy(path) is reading it,

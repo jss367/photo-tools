@@ -2459,7 +2459,6 @@ def test_load_local_taxonomy_rechecks_stat_after_acquiring_lock(tmp_path, monkey
     os.utime(persistent, (4e9, 4e9))
     refreshed = tax_mod.Taxonomy(str(persistent))
     new_bytes = persistent.read_text()
-    new_stat = tax_mod._taxonomy_stat_key(str(persistent))
     # Restore the old file so the call under test starts from the old stat.
     _write_taxonomy_json(persistent, "old species")
     os.utime(persistent, (1e9, 1e9))
@@ -2484,7 +2483,13 @@ def test_load_local_taxonomy_rechecks_stat_after_acquiring_lock(tmp_path, monkey
                 self.fired = True
                 persistent.write_text(new_bytes)
                 os.utime(persistent, (4e9, 4e9))
-                tax_mod._taxonomy_cache = (str(persistent), new_stat, refreshed)
+                # Key it off the file as it stands now: the stat key covers
+                # inode and ctime, so it has to be read after the last write.
+                tax_mod._taxonomy_cache = (
+                    str(persistent),
+                    tax_mod._taxonomy_stat_key(str(persistent)),
+                    refreshed,
+                )
             return self
 
         def __exit__(self, *exc):
@@ -2713,51 +2718,50 @@ def test_load_local_taxonomy_retries_corrupt_preferred_after_it_changes(
     assert result.is_taxon("preferred species that is longer")
 
 
-def test_load_local_taxonomy_evicts_fallback_before_parsing_preferred(
+def test_load_local_taxonomy_keeps_fallback_across_transient_preferred_failure(
     tmp_path, monkeypatch,
 ):
-    """When the preferred file appears, the fallback is dropped before the parse.
+    """A cross-path fallback survives a preferred file that keeps failing.
 
-    A parsed iNaturalist taxonomy is ~2.8GB. Holding the cached legacy
-    instance live through ``Taxonomy(preferred_path)`` would double peak RSS
-    to ~5.6GB and can OOM during a normal migration (preferred download
-    completes while legacy is still cached). The eviction must happen
-    before the constructor allocates.
+    Transient errors are deliberately not memoized (a chmod repair would not
+    change the file), so a preferred file with, say, wrong permissions is
+    re-attempted on every request. Evicting cross-path entries on the way
+    past would drop the cached legacy taxonomy each time and re-parse ~500MB
+    of fallback per compare or accept.
+
+    The migration case that motivates dropping a cross-path entry — legacy
+    cached while a newly-downloaded preferred file parses — is covered by
+    download_taxonomy() clearing the cache before it builds its replacement.
     """
     import taxonomy as tax_mod
 
     tax_mod.clear_taxonomy_cache()
     preferred = tmp_path / "persistent.json"
+    _write_taxonomy_json(preferred, "preferred species")
     legacy = tmp_path / "taxonomy.json"
     _write_taxonomy_json(legacy, "legacy species")
     monkeypatch.setattr(tax_mod, "TAXONOMY_JSON_PATH", str(preferred))
     monkeypatch.setattr(tax_mod, "LEGACY_TAXONOMY_JSON_PATH", str(legacy))
 
-    # First load: preferred doesn't exist, so legacy is cached.
-    first = tax_mod.load_local_taxonomy()
-    assert first.is_taxon("legacy species")
-
-    # Preferred file arrives (as if a background download just finished).
-    _write_taxonomy_json(preferred, "preferred species that is longer")
-
+    parses = []
     real_init = tax_mod.Taxonomy.__init__
-    observed_cache = []
 
-    def observing_init(self, path):
-        # By the time we're inside the constructor for the preferred file,
-        # the cached legacy instance must not still be reachable through
-        # _taxonomy_cache — otherwise both instances share peak RSS.
+    def failing_preferred_init(self, path):
+        parses.append(path)
         if path == str(preferred):
-            observed_cache.append(tax_mod._taxonomy_cache)
+            raise PermissionError(13, "Permission denied")
         real_init(self, path)
 
-    monkeypatch.setattr(tax_mod.Taxonomy, "__init__", observing_init)
+    monkeypatch.setattr(tax_mod.Taxonomy, "__init__", failing_preferred_init)
 
-    result = tax_mod.load_local_taxonomy()
+    results = [tax_mod.load_local_taxonomy() for _ in range(3)]
 
-    assert result.is_taxon("preferred species that is longer")
-    assert result is not first
-    assert observed_cache == [None]
+    assert all(r.is_taxon("legacy species") for r in results)
+    assert results[1] is results[0] and results[2] is results[0]
+    # The preferred file is retried every call (its failure is not memoized),
+    # but the fallback must be parsed exactly once for the process.
+    assert parses.count(str(preferred)) == 3
+    assert parses.count(str(legacy)) == 1
 
 
 def test_clear_taxonomy_cache_also_clears_failure_records(tmp_path, monkeypatch):

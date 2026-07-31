@@ -1472,6 +1472,17 @@ def download_taxonomy(output_path, progress_callback=None):
         if progress_callback:
             progress_callback(msg)
 
+    # Drop the cache's own reference to the old parse before we start
+    # building the replacement. A cached iNat dump is ~2.8GB, so letting
+    # it stay strongly reachable through _taxonomy_cache while this
+    # function also holds the ~2.8GB dict it is about to write can double
+    # peak RSS. The post-download retype already routes through
+    # load_local_taxonomy() (which re-evicts on parse), but that runs
+    # *after* the build. Evicting here covers the overlap. Concurrent
+    # requests that borrowed the taxonomy still keep it alive until they
+    # return; this only releases the cache's own reference.
+    clear_taxonomy_cache()
+
     # Download zip to a file (resumable) instead of holding in memory
     zip_dir = os.path.dirname(output_path) or "."
     os.makedirs(zip_dir, exist_ok=True)

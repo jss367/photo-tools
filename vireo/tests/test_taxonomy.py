@@ -3117,3 +3117,55 @@ def test_load_local_taxonomy_with_explicit_path_still_caches(tmp_path, monkeypat
 
     assert pinned is default
     assert len(parses) == 1
+
+
+def test_download_taxonomy_evicts_cache_before_rebuilding(tmp_path, monkeypatch):
+    """Old ~2.8GB parse must not stay reachable through the cache during build.
+
+    The post-download retype routes through load_local_taxonomy() which
+    evicts on parse, but that runs *after* download_taxonomy() has already
+    built its ~2.8GB dict. During the build, the cache's old reference and
+    the new dict would coexist, roughly doubling peak RSS and putting a
+    routine refresh in reach of OOM. Verify eviction happens *before* the
+    build starts.
+    """
+    import taxonomy as tax_mod
+
+    tax_mod.clear_taxonomy_cache()
+    persistent = tmp_path / "taxonomy.json"
+    _write_taxonomy_json(persistent, "old species")
+    monkeypatch.setattr(tax_mod, "TAXONOMY_JSON_PATH", str(persistent))
+
+    # Seed the cache from the current file so we can observe eviction.
+    cached_before = tax_mod.load_local_taxonomy()
+    assert cached_before is not None
+    with tax_mod._taxonomy_cache_lock:
+        assert tax_mod._taxonomy_cache is not None
+
+    observed_cache_state = []
+
+    def observing_download(url, path, progress_callback=None):
+        with tax_mod._taxonomy_cache_lock:
+            observed_cache_state.append(tax_mod._taxonomy_cache)
+        import zipfile as _zf
+        with _zf.ZipFile(path, "w") as zf:
+            zf.writestr(
+                "taxa.csv",
+                "id,parentNameUsageID,scientificName,taxonRank\n"
+                "1,,Test species,species\n",
+            )
+            zf.writestr(
+                "VernacularNames-english.csv",
+                "id,vernacularName,language\n"
+                "1,New species,en\n",
+            )
+
+    monkeypatch.setattr(tax_mod, "_download_with_resume", observing_download)
+
+    tax_mod.download_taxonomy(str(persistent))
+
+    assert observed_cache_state, "observing hook must have fired"
+    assert observed_cache_state[0] is None, (
+        "cache must be evicted BEFORE download_taxonomy() begins building "
+        "its ~2.8GB replacement, otherwise both are live at once"
+    )

@@ -2176,6 +2176,96 @@ def test_load_local_taxonomy_skips_cache_when_file_keeps_changing(tmp_path, monk
         assert tax_mod._taxonomy_cache is None
 
 
+def test_load_local_taxonomy_releases_stale_instance_before_reparse(tmp_path, monkeypatch):
+    """A stale cache entry must not stay reachable while the replacement parses.
+
+    A parsed iNaturalist taxonomy is ~2.8GB. If the old instance is still
+    held by ``_taxonomy_cache`` (or by a local reference inside
+    ``_load_taxonomy_cached``) while ``Taxonomy(path)`` allocates the
+    replacement, peak RSS doubles, and each retry on a file that keeps
+    changing stacks another live copy on top. Assert both the module
+    slot and any local reference are cleared before the next
+    ``Taxonomy(path)`` call runs.
+    """
+    import taxonomy as tax_mod
+
+    tax_mod.clear_taxonomy_cache()
+    persistent = tmp_path / "persistent.json"
+    _write_taxonomy_json(persistent, "first species")
+    monkeypatch.setattr(tax_mod, "TAXONOMY_JSON_PATH", str(persistent))
+
+    first = tax_mod.load_local_taxonomy()
+    assert first is not None
+
+    _write_taxonomy_json(persistent, "second species that is longer")
+    os.utime(persistent, (2e9, 2e9))
+
+    real_init = tax_mod.Taxonomy.__init__
+    observed = []
+
+    def observing_init(self, path):
+        # By the time we are inside the constructor for the replacement,
+        # neither the module-level cache slot nor any live reference to
+        # the previously cached instance should be reachable from this
+        # function's frame — otherwise both instances share peak RSS.
+        observed.append(tax_mod._taxonomy_cache)
+        real_init(self, path)
+
+    monkeypatch.setattr(tax_mod.Taxonomy, "__init__", observing_init)
+
+    second = tax_mod.load_local_taxonomy()
+
+    assert second is not None
+    assert second is not first
+    assert observed == [None]
+
+
+def test_load_local_taxonomy_releases_between_retries(tmp_path, monkeypatch):
+    """Retries after mid-parse rewrites must not stack live copies.
+
+    Without dropping the previous retry's instance before the next
+    ``Taxonomy(path)`` call, a file that keeps changing would hold N
+    parsed taxonomies live at once (peak RSS ≈ N × 2.8GB on a real
+    iNaturalist dump). Track every constructed instance with a
+    weakref; only the caller's returned instance should still be
+    alive after the final retry.
+    """
+    import gc
+    import weakref
+    import taxonomy as tax_mod
+
+    tax_mod.clear_taxonomy_cache()
+    persistent = tmp_path / "persistent.json"
+    _write_taxonomy_json(persistent, "test species")
+    monkeypatch.setattr(tax_mod, "TAXONOMY_JSON_PATH", str(persistent))
+
+    tracked = []
+    real_init = tax_mod.Taxonomy.__init__
+    counter = {"n": 0}
+
+    def racing_init(self, path):
+        counter["n"] += 1
+        tracked.append(weakref.ref(self))
+        real_init(self, path)
+        # Move the file every time so every retry sees a mismatched stat.
+        os.utime(persistent, (counter["n"] + 1e9, counter["n"] + 1e9))
+
+    monkeypatch.setattr(tax_mod.Taxonomy, "__init__", racing_init)
+
+    result = tax_mod.load_local_taxonomy()
+
+    assert result is not None
+    assert counter["n"] == tax_mod._TAXONOMY_PARSE_RETRY_LIMIT
+    gc.collect()
+    live = [ref for ref in tracked if ref() is result]
+    dead = [ref for ref in tracked if ref() is None]
+    # The final instance is the one returned; every earlier retry's
+    # instance should be unreachable, meaning the loop dropped its ref
+    # before allocating the next parse.
+    assert len(live) == 1
+    assert len(dead) == tax_mod._TAXONOMY_PARSE_RETRY_LIMIT - 1
+
+
 def test_taxonomy_save_keeps_cached_instance_current(tmp_path, monkeypatch):
     """save() rewrites the file; the cache must not serve a pre-save copy.
 

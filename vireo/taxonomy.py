@@ -491,6 +491,16 @@ def _load_taxonomy_cached(path):
         cached = _taxonomy_cache
         if cached is not None and cached[0] == path and cached[1] == stat_key:
             return cached[2]
+        # A cache miss means the previous entry is stale. A parsed
+        # iNaturalist taxonomy is ~2.8GB, so if we let the old instance
+        # stay reachable through _taxonomy_cache (or the local ``cached``
+        # tuple) while Taxonomy(path) allocates its replacement, peak
+        # RSS doubles — and a rewrite mid-parse would stack another live
+        # copy on top of that per retry. Drop every reference we hold
+        # before entering the parse loop so the old instance can be
+        # collected before the new one is built.
+        _taxonomy_cache = None
+        cached = None
         # Bracket the parse with a pre- and post-stat: if a background
         # download rewrites the file while Taxonomy(path) is reading it,
         # the parsed data is a stale snapshot even though a fresh
@@ -500,6 +510,10 @@ def _load_taxonomy_cached(path):
         # latest parse but skip the cache so the next call re-checks.
         taxonomy = None
         for _ in range(_TAXONOMY_PARSE_RETRY_LIMIT):
+            # Same peak-RSS reason: release the previous retry's
+            # instance before Taxonomy(path) builds the next one, so a
+            # file that keeps changing does not pile up N live copies.
+            taxonomy = None
             pre_stat = _taxonomy_stat_key(path)
             taxonomy = Taxonomy(path)
             post_stat = _taxonomy_stat_key(path)

@@ -2899,11 +2899,16 @@ def test_a_single_render_pass_produces_a_correct_folder_header(
 
 
 def test_shift_range_does_not_reach_through_a_hidden_card(live_server, page):
-    """The sibling hide-duplicates branch hides cards rather than re-render.
+    """A range is what the user dragged across on screen, so a card that is
+    not on screen must not be swept up by it.
 
-    A range is what the user dragged across on screen, so a card that isn't
-    on screen must not be swept up by it. Hidden here the way a CSS filter
-    would hide it, since that branch hasn't merged yet.
+    The hide here is synthetic, and stays synthetic on purpose. It was
+    written expecting #1382's hide-duplicates filter to hide cards with CSS;
+    that filter landed omitting them from the render instead, so nothing in
+    the product currently produces a display:none card and this is the only
+    thing exercising importVisibleCards()'s offsetParent test. See
+    test_shift_range_over_the_real_hide_duplicates_filter for the same
+    property under the filter as it actually shipped.
     """
     page.goto(f"{live_server['url']}/import")
     files = _files(4)
@@ -2922,6 +2927,128 @@ def test_shift_range_does_not_reach_through_a_hidden_card(live_server, page):
     expect(_box(page, files[1]["path"])).to_be_checked()
     expect(_box(page, files[2]["path"])).not_to_be_checked()
     expect(_box(page, files[3]["path"])).to_be_checked()
+
+
+def _hide_duplicates_preview(page, n, dup_idx, prefixes=None):
+    """Preview `n` files with `dup_idx` flagged, then switch the filter on."""
+    if prefixes is None:
+        files = _files(n)
+    else:
+        files = []
+        for prefix, count in prefixes:
+            base = len(files)
+            for f in _files(count, prefix=f'/tmp/card/{prefix}/DSC_'):
+                f["subfolder"] = prefix
+                f["path"] = f'/tmp/card/{prefix}/DSC_{base:04d}.jpg'
+                f["filename"] = f'DSC_{base:04d}.jpg'
+                base += 1
+                files.append(f)
+    dupes = [files[i]["path"] for i in dup_idx]
+    _stub_preview(page, files, duplicates=dupes)
+    _preview(page)
+    expect(page.locator("#hideDuplicatesRow")).to_be_visible()
+    page.locator("#chkHideDuplicates").check()
+    return files, dupes
+
+
+def test_shift_range_over_the_real_hide_duplicates_filter(live_server, page):
+    """The same property as the synthetic-hide test, under #1382 as shipped.
+
+    The filter omits flagged cards from the render rather than hiding them,
+    so a range that runs over the surviving cards must close over the gap
+    the removed one left -- and must not record a deselection for it, which
+    would outlive the filter and reappear the moment it is switched off.
+    """
+    page.goto(f"{live_server['url']}/import")
+    files, _ = _hide_duplicates_preview(page, 5, (2,))
+
+    expect(page.locator(".import-preview-thumb")).to_have_count(4)
+    _box(page, files[1]["path"]).click()
+    _box(page, files[3]["path"]).click(modifiers=["Shift"])
+
+    expect(_box(page, files[0]["path"])).to_be_checked()
+    expect(_box(page, files[1]["path"])).not_to_be_checked()
+    expect(_box(page, files[3]["path"])).not_to_be_checked()
+    expect(_box(page, files[4]["path"])).to_be_checked()
+    # The card the filter removed was never in scope, so it collected no
+    # deselection to carry back when the filter comes off.
+    assert page.evaluate("() => Array.from(importDeselected)") == [
+        files[1]["path"], files[3]["path"],
+    ]
+
+
+def test_hide_duplicates_keeps_the_master_and_its_headers_in_agreement(
+        live_server, page):
+    """Ticking every folder header must fill the master, not dash it.
+
+    chkSelectAllImport counts importGridCards() while a folder header counts
+    importVisibleCards(). A card that one scope sees and the other does not
+    would leave the master permanently indeterminate with no header left to
+    tick. #1382 is the only thing that removes cards from a rendered
+    preview, so it is the thing that could break that -- it doesn't, because
+    it omits them from the render rather than hiding them, which takes them
+    out of both scopes at once.
+    """
+    page.goto(f"{live_server['url']}/import")
+    _hide_duplicates_preview(
+        page, 6, (1, 4), prefixes=[("a", 3), ("b", 3)])
+
+    headers = page.locator(".import-preview-folder-header .folder-check")
+    expect(headers).to_have_count(2)
+    for i in range(2):
+        if not headers.nth(i).is_checked():
+            headers.nth(i).click()
+        expect(headers.nth(i)).to_be_checked()
+
+    master = page.locator("#chkSelectAllImport")
+    expect(master).to_be_checked()
+    expect(master).to_have_js_property("indeterminate", False)
+
+
+def test_a_fully_filtered_folder_header_still_names_its_folder(
+        live_server, page):
+    """The tooltip must name the folder, not the whole header line.
+
+    #1382 renders an all-duplicate folder as "a (0) · 2 duplicates hidden",
+    and the folder name used to be recovered by stripping a trailing " (N)"
+    off that text -- which this suffix defeats, leaving the checkbox
+    claiming "Every file in a (0) · 2 duplicates hidden is a duplicate…".
+    """
+    page.goto(f"{live_server['url']}/import")
+    _hide_duplicates_preview(
+        page, 4, (0, 1, 2), prefixes=[("a", 2), ("b", 2)])
+
+    headers = page.locator(".import-preview-folder-header")
+    expect(headers.nth(0)).to_have_text("a (0) · 2 duplicates hidden")
+    expect(headers.nth(1)).to_have_text("b (1) · 1 duplicate hidden")
+    expect(headers.nth(0).locator(".folder-check")).to_have_attribute(
+        "title", "Every file in a is a duplicate that will be skipped")
+    expect(headers.nth(1).locator(".folder-check")).to_have_attribute(
+        "title", "Select or deselect every file in b")
+
+
+def test_hide_duplicates_does_not_re_request_the_thumbnails_per_click(
+        live_server, page):
+    """A selection click refreshes the boxes, it does not rebuild the grid.
+
+    rerenderImportPreviewGridSafe() used to fall back to a targeted DOM
+    refresh only because #1382's rerenderImportPreviewGrid() had not merged.
+    It has, and calling it here would work -- but a full re-render drops
+    every <img> and re-runs the thumbnail scheduler, once per checkbox
+    click, over a grid #1382 sized for 985 files.
+    """
+    page.goto(f"{live_server['url']}/import")
+    files = _files(6)
+    _stub_preview(page, files)
+    _preview(page)
+
+    hits = []
+    page.on("request", lambda r: hits.append(r.url)
+            if "folder-preview/thumbnail" in r.url else None)
+    _box(page, files[0]["path"]).click()
+    _box(page, files[2]["path"]).click()
+    page.wait_for_timeout(300)
+    assert hits == [], f"selection clicks re-requested thumbnails: {hits}"
 
 
 def test_duplicate_badge_and_checkbox_do_not_overlap(live_server, page):

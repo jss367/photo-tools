@@ -930,15 +930,36 @@ function wireImportSelectAll() {
     // duplicate verdict can't silently exclude files from a bulk action.
     //
     // SCOPE NOTE: this walks importGridCards() while importFolderPaths()
-    // walks importVisibleCards(). Still equivalent, and the in-place work
-    // did not change that: hiding selection withholds the CONTROLS
-    // (checkboxes, folder headers, this row) and leaves every card
-    // rendered and visible, so it adds no card that is hidden while
-    // chkSkipDuplicates is OFF — the case that would let a card count
+    // walks importVisibleCards(). Still equivalent — but NOT for the
+    // reason this note used to give, so read the whole thing before
+    // relying on it.
+    //
+    // It used to argue that the only cards anything hides are skipped
+    // duplicates, which both scopes exclude. #1382's hide-duplicates
+    // filter has since landed and that premise is false: it can hide a
+    // duplicate card while chkSkipDuplicates is OFF, i.e. a card that IS
+    // eligible. The predicted symptom was that such a card would count
     // toward this master's denominator while belonging to no folder
-    // header, leaving the master dashed after ticking every header. The
-    // only cards anything hides are still skipped duplicates, which both
-    // scopes exclude. Re-check if a future change hides cards in place.
+    // header, leaving the master dashed after every header was ticked.
+    //
+    // Measured against exactly that state (six files, two flagged, Skip
+    // duplicates OFF and Hide duplicates ON, then every folder header
+    // ticked): master.checked true, master.indeterminate false. It does
+    // not reproduce — because #1382 does not hide those cards, it OMITS
+    // them from the render. Both scopes read the DOM, so a card that was
+    // never drawn is missing from both, and they stayed equal at 4 and 4.
+    // The conclusion survives; the argument for it did not.
+    //
+    // (That state is also unreachable from the UI: unchecking Skip
+    // duplicates retires the opt-in and re-previews with no duplicate
+    // flags, so the row hides and all six cards come back — measured too.
+    // It took a forced render to put the scopes under the load this note
+    // is about.)
+    //
+    // The condition to re-check is therefore unchanged in shape but not
+    // in wording: does anything draw a card that this master counts and
+    // no folder header owns? Omitting cards is safe. Hiding them in
+    // place would not be.
     importSelectableCardPaths(importGridCards())
       .forEach(p => {
         if (master.checked) importDeselected.delete(p);
@@ -2572,9 +2593,17 @@ function importGridCards() {
   return grid ? Array.from(grid.querySelectorAll('.import-preview-thumb')) : [];
 }
 
-// Only the cards the user can actually see. The sibling
-// hide-duplicates-checkbox branch hides duplicate cards in place; a
-// shift-range must not reach through a hidden card and toggle it.
+// Only the cards the user can actually see: a shift-range must not reach
+// through a card that isn't on screen and toggle it.
+//
+// This was written expecting the hide-duplicates filter (#1382) to hide
+// cards in place with CSS. It doesn't — it OMITS them from the render, so
+// with the filter on there is no card in the DOM to skip and this
+// offsetParent test currently excludes nothing (measured: with two of six
+// files filtered, every card the grid holds has a non-null offsetParent).
+// Kept as the defensive scope it is: it costs one layout read, and the day
+// something does hide a card in place, a range that swept through it would
+// toggle files the user could not see.
 function importVisibleCards(root) {
   const scope = root || document.getElementById('importPreviewGrid');
   if (!scope) return [];
@@ -2683,12 +2712,15 @@ function toggleImportSelection(path, checked, shiftKey) {
 // had not merged yet and there was no full re-render to call. It has merged;
 // the fallback is dead code and is gone.
 //
-// A targeted refresh is still what happens, and deliberately so: a full
-// renderImportPreviewGrid() would rebuild every card on every checkbox click,
-// which drops each <img> and re-runs setupImportThumbnailScheduler() over the
-// whole grid. On the 985-file card #1382 was written for, that is a visible
-// flash of empty tiles per click. Selection state is derived, so only the
-// boxes and the headers can change; the tiles cannot.
+// A targeted refresh is still what happens, and deliberately so. The live
+// path works — driven through rerenderImportPreviewGrid(), per-file toggles,
+// folder headers, select-all and shift-ranges all behave and the headers do
+// get refreshed — but it rebuilds every card on every checkbox click, which
+// drops each <img> and re-runs setupImportThumbnailScheduler() over the whole
+// grid. Measured on a six-card preview: 6 thumbnail requests per click
+// through the full re-render, 0 through this refresh. That is linear in card
+// size, and #1382 exists for 985-file cards. Selection state is derived, so
+// only the boxes and the headers can change; the tiles cannot.
 //
 // The one thing a targeted refresh cannot do is honor a change in WHICH cards
 // exist — that only happens when the filter itself is toggled, which calls

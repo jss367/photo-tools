@@ -2349,3 +2349,131 @@ def test_taxonomy_save_replaces_file_without_truncating_it(tmp_path, monkeypatch
     assert len(target_during_write) == 1
     assert "test species" in target_during_write[0]["taxa_by_common"]
     assert json.loads(persistent.read_text())["api_misses"] == ["nothing here"]
+
+
+def test_load_local_taxonomy_keeps_fallback_cached_when_preferred_is_corrupt(
+    tmp_path, monkeypatch,
+):
+    """The corrupt-persistent fallback must not defeat the cache.
+
+    load_local_taxonomy() parses the preferred candidate, fails, and falls
+    back to the legacy one. Evicting the legacy entry on the way past would
+    re-parse a multi-GB file on every compare/accept request.
+    """
+    import taxonomy as tax_mod
+
+    tax_mod.clear_taxonomy_cache()
+    corrupt = tmp_path / "persistent.json"
+    corrupt.write_text("{ not valid json")
+    legacy = tmp_path / "taxonomy.json"
+    _write_taxonomy_json(legacy, "legacy species")
+    monkeypatch.setattr(tax_mod, "TAXONOMY_JSON_PATH", str(corrupt))
+    monkeypatch.setattr(tax_mod, "LEGACY_TAXONOMY_JSON_PATH", str(legacy))
+
+    parses = []
+    real_init = tax_mod.Taxonomy.__init__
+
+    def counting_init(self, path):
+        parses.append(path)
+        real_init(self, path)
+
+    monkeypatch.setattr(tax_mod.Taxonomy, "__init__", counting_init)
+
+    first = tax_mod.load_local_taxonomy()
+    second = tax_mod.load_local_taxonomy()
+
+    assert first.is_taxon("legacy species")
+    assert second is first
+    # Each call attempts the corrupt preferred file; only the first should
+    # have to parse the legacy fallback.
+    assert parses.count(str(legacy)) == 1
+
+
+def test_load_local_taxonomy_rechecks_stat_after_acquiring_lock(tmp_path, monkeypatch):
+    """A caller that waited on the lock must not evict what it was waiting for.
+
+    Statting before the lock lets a caller compare a pre-wait stat against an
+    entry another caller refreshed while it waited, conclude it is stale, and
+    re-parse ~2.8GB for nothing.
+    """
+    import taxonomy as tax_mod
+
+    tax_mod.clear_taxonomy_cache()
+    persistent = tmp_path / "persistent.json"
+    _write_taxonomy_json(persistent, "old species")
+    monkeypatch.setattr(tax_mod, "TAXONOMY_JSON_PATH", str(persistent))
+
+    winner = tax_mod.load_local_taxonomy()
+    assert winner.is_taxon("old species")
+
+    # Build the instance the "other caller" installs, plus the bytes and stat
+    # key that go with it, before the parse counter is armed — otherwise this
+    # setup parse is itself counted.
+    _write_taxonomy_json(persistent, "new species that is longer")
+    os.utime(persistent, (4e9, 4e9))
+    refreshed = tax_mod.Taxonomy(str(persistent))
+    new_bytes = persistent.read_text()
+    new_stat = tax_mod._taxonomy_stat_key(str(persistent))
+    # Restore the old file so the call under test starts from the old stat.
+    _write_taxonomy_json(persistent, "old species")
+    os.utime(persistent, (1e9, 1e9))
+
+    parses = []
+    real_init = tax_mod.Taxonomy.__init__
+
+    def counting_init(self, path):
+        parses.append(path)
+        real_init(self, path)
+
+    class RacingLock:
+        """Simulates another caller refreshing the cache while we wait."""
+
+        def __init__(self, inner):
+            self._inner = inner
+            self.fired = False
+
+        def __enter__(self):
+            self._inner.acquire()
+            if not self.fired:
+                self.fired = True
+                persistent.write_text(new_bytes)
+                os.utime(persistent, (4e9, 4e9))
+                tax_mod._taxonomy_cache = (str(persistent), new_stat, refreshed)
+            return self
+
+        def __exit__(self, *exc):
+            self._inner.release()
+            return False
+
+    racing = RacingLock(tax_mod._taxonomy_cache_lock)
+    monkeypatch.setattr(tax_mod, "_taxonomy_cache_lock", racing)
+    monkeypatch.setattr(tax_mod.Taxonomy, "__init__", counting_init)
+
+    result = tax_mod.load_local_taxonomy()
+
+    assert result.is_taxon("new species that is longer")
+    # The entry the racing caller installed is served as-is; statting before
+    # the lock would have judged it stale and re-parsed the file.
+    assert parses == []
+
+
+def test_taxonomy_save_writes_through_a_symlinked_path(tmp_path, monkeypatch):
+    """Saving must update a symlink's target, not replace the symlink."""
+    import taxonomy as tax_mod
+
+    tax_mod.clear_taxonomy_cache()
+    real = tmp_path / "real-taxonomy.json"
+    _write_taxonomy_json(real, "test species")
+    link = tmp_path / "linked.json"
+    link.symlink_to(real)
+    monkeypatch.setattr(tax_mod, "TAXONOMY_JSON_PATH", str(link))
+
+    tax = tax_mod.load_local_taxonomy()
+    tax._api_misses.add("nothing here")
+    tax._dirty = True
+    tax.save()
+
+    assert link.is_symlink(), "os.replace must not swap the link for a file"
+    assert os.readlink(link) == str(real)
+    assert json.loads(real.read_text())["api_misses"] == ["nothing here"]
+    assert not (tmp_path / "real-taxonomy.json.tmp").exists()

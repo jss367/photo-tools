@@ -486,20 +486,30 @@ def _load_taxonomy_cached(path):
     instead of one waiting for the other's result.
     """
     global _taxonomy_cache
-    stat_key = _taxonomy_stat_key(path)
     with _taxonomy_cache_lock:
+        # Stat inside the lock. Read before it, a caller that then waits on
+        # the lock compares a pre-wait stat against an entry another caller
+        # refreshed while it waited, decides that entry is stale, evicts it
+        # and re-parses ~2.8GB for nothing.
+        stat_key = _taxonomy_stat_key(path)
         cached = _taxonomy_cache
         if cached is not None and cached[0] == path and cached[1] == stat_key:
             return cached[2]
-        # A cache miss means the previous entry is stale. A parsed
-        # iNaturalist taxonomy is ~2.8GB, so if we let the old instance
-        # stay reachable through _taxonomy_cache (or the local ``cached``
-        # tuple) while Taxonomy(path) allocates its replacement, peak
-        # RSS doubles — and a rewrite mid-parse would stack another live
-        # copy on top of that per retry. Drop every reference we hold
-        # before entering the parse loop so the old instance can be
-        # collected before the new one is built.
-        _taxonomy_cache = None
+        # An entry for this same path is now outdated. A parsed iNaturalist
+        # taxonomy is ~2.8GB, so if we let the old instance stay reachable
+        # through _taxonomy_cache (or the local ``cached`` tuple) while
+        # Taxonomy(path) allocates its replacement, peak RSS doubles — and a
+        # rewrite mid-parse would stack another live copy on top of that per
+        # retry. Drop every reference we hold before entering the parse loop.
+        #
+        # An entry for a *different* path is not stale and must survive: when
+        # the preferred candidate exists but is corrupt, load_local_taxonomy()
+        # parses it, fails, and falls back to the legacy one. Evicting the
+        # legacy entry here would make that fallback re-parse a multi-GB file
+        # on every single compare/accept request — exactly the cost this cache
+        # exists to remove.
+        if cached is not None and cached[0] == path:
+            _taxonomy_cache = None
         cached = None
         # Bracket the parse with a pre- and post-stat: if a background
         # download rewrites the file while Taxonomy(path) is reading it,
@@ -520,7 +530,9 @@ def _load_taxonomy_cached(path):
             if pre_stat == post_stat:
                 _taxonomy_cache = (path, post_stat, taxonomy)
                 return taxonomy
-        _taxonomy_cache = None
+        # Retries exhausted. Nothing was cached for this path above, so
+        # there is no stale entry left to clear — and clearing here would
+        # evict a different path's still-valid entry.
         return taxonomy
 
 
@@ -746,11 +758,18 @@ class Taxonomy:
         # is atomic within a filesystem, so a reader sees either the whole old
         # file or the whole new one, and an interrupted save leaves the
         # existing taxonomy intact rather than a half-written stub.
-        tmp_path = f"{self._path}.tmp"
+        # Rename onto the resolved target, not the path we were handed:
+        # os.replace() would swap a symlink for a regular file, silently
+        # detaching a taxonomy that was linked in from elsewhere and leaving
+        # a duplicate ~500MB copy behind. open(path, "w") wrote through the
+        # link. Keeping the temp file beside the resolved target also keeps
+        # the rename within one filesystem, which is what makes it atomic.
+        target = os.path.realpath(self._path)
+        tmp_path = f"{target}.tmp"
         try:
             with open(tmp_path, "w") as f:
                 json.dump(data, f)
-            os.replace(tmp_path, self._path)
+            os.replace(tmp_path, target)
         except BaseException:
             with contextlib.suppress(OSError):
                 os.remove(tmp_path)

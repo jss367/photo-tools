@@ -925,6 +925,26 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
     run_dest_folders = {}
     run_verified_hashes = {}
 
+    # Sticky across the rest of the run once a mounted → unmounted
+    # transition is observed. The per-batch rollback below undoes
+    # ``to_transfer`` / ``adopted_paths`` / ``dup_skips`` / ``dup_dirs``
+    # but not the identities the same batch already installed in the
+    # job-wide ``checker`` (and in ``run_dest_folders`` /
+    # ``run_verified_hashes``) via ``_record_checker`` — and
+    # ``DuplicateChecker`` exposes no removal API, so those entries
+    # cannot be surgically undone. If the share remounts before a later
+    # batch (another date group, or after the 200-file batch boundary),
+    # a same-content card file in that later batch would hit the intra-
+    # run fast path at line 1237 and be counted as a duplicate of an
+    # adopted or queued file whose archive claim was just rolled back —
+    # so it is not transferred even though no backing archive copy
+    # exists, and ``copied + skipped_duplicate == discovered`` could
+    # again make ``safe_to_format`` go green over a card that is still
+    # the only real copy. Refusing every remaining batch once a detach
+    # has been observed keeps the stale intra-run cache from ever being
+    # consulted. See PR #1400 review (Codex P2 r3688614624).
+    mount_ever_lost = None
+
     # Mount-root check (Task 2.7 late follow-up): when a saved remote
     # target's local mount root is not mounted (for example ``/Volumes/NAS``
     # or ``/mnt/NAS`` is absent because the share isn't attached), a naive
@@ -982,6 +1002,29 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
         if runner.is_cancelled(job["id"]):
             cancelled = True
             break
+
+        # A detach observed in an earlier batch is sticky: the intra-run
+        # duplicate cache and the job-wide checker hold identities for
+        # files whose archive claim was rolled back, and consulting them
+        # against a remounted share would count fresh card files as
+        # duplicates of transfers that never happened. Fail every
+        # remaining file in the run rather than risk a stale-cache hit.
+        # See PR #1400 review (Codex P2 r3688614624).
+        if mount_ever_lost:
+            for source_file in batch:
+                emitted += 1
+                _fail(
+                    rel, source_file,
+                    f"archive mount root {mount_ever_lost} detached "
+                    "earlier in this import; the intra-run duplicate "
+                    "cache still holds identities for files whose "
+                    "archive claim was rolled back, so no further batch "
+                    "can be trusted to consult it",
+                )
+            _emit(
+                f"{rel}: archive unmounted", emitted, discovered,
+            )
+            continue
 
         dest_folder = (
             os.path.normpath(os.path.join(destination, rel))
@@ -1149,10 +1192,37 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
         # to catch that case at enqueue time — the file that was already
         # queued backs this skip. See PR #1113 review.
         queued_src_hashes = {}
+        # Accepted duplicate skips for this batch —
+        # (source_file, counted_unverified). A skip asserts the archive
+        # already holds these bytes, which a detach invalidates: the twin
+        # it matched may be a shadow file on the persistent mount stub
+        # left by an earlier failed import. These never enter ``landed``
+        # or ``adopted_paths``, so they need their own rollback or a
+        # duplicate-only batch reports every file accounted for and the
+        # card looks safe to erase. Mirrors the local path's ``dup_skips``.
+        # See PR #1396 review (Codex P1 r3688498501 / r3688501706).
+        dup_skips = []
+        # Sticky once tripped. The remote copy is one rsync per batch
+        # rather than a per-file write, but the duplicate/adoption
+        # decisions above happen per file and each one reads the mount —
+        # so the mount has to be re-checked at that granularity too.
+        mount_lost = None
         for source_file in batch:
             if runner.is_cancelled(job["id"]):
                 cancelled = True
                 break
+            if not mount_lost:
+                mount_lost = _unmounted_since_baseline(mount_baseline)
+            if mount_lost:
+                emitted += 1
+                _fail(
+                    rel, source_file,
+                    f"archive mount root {mount_lost} detached while this "
+                    "batch was being prepared (the directory persists but "
+                    "the share is gone, so neither a transfer nor a "
+                    "duplicate match against it can be trusted)",
+                )
+                continue
             emitted += 1
             _emit(f"{rel}: importing", emitted, discovered, source_file.name)
             if checker is not None:
@@ -1174,6 +1244,7 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
                             unverified_duplicate += 1
                             dup_skipped += 1
                             _counts(rel)["skipped_duplicate"] += 1
+                            dup_skips.append((source_file, True))
                             dup_dirs.update(_linkable_twin_dirs(
                                 likely_rows, _path_under_destination,
                             ))
@@ -1258,6 +1329,7 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
                         skipped_duplicate += 1
                         dup_skipped += 1
                         _counts(rel)["skipped_duplicate"] += 1
+                        dup_skips.append((source_file, False))
                         # Preserve the verified twin folders so the follow-
                         # up dup-link scan can pull them into the active
                         # workspace. Without this a verified duplicate-only
@@ -1324,6 +1396,7 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
                 skipped_duplicate += 1
                 dup_skipped += 1
                 _counts(rel)["skipped_duplicate"] += 1
+                dup_skips.append((source_file, False))
                 _record_checker(source_file, dest_folder, src_hash)
                 continue
             stem, suffix = os.path.splitext(source_file.name)
@@ -1352,6 +1425,7 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
                         skipped_duplicate += 1
                         dup_skipped += 1
                         _counts(rel)["skipped_duplicate"] += 1
+                        dup_skips.append((source_file, False))
                         _record_checker(source_file, dest_folder, src_hash)
                         adopted = True
                         break
@@ -1368,6 +1442,7 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
                         skipped_duplicate += 1
                         dup_skipped += 1
                         _counts(rel)["skipped_duplicate"] += 1
+                        dup_skips.append((source_file, False))
                         claimed_basenames[candidate_key] = src_hash
                         # Track the adopted mount path + source-side hash
                         # so the restricted scan below picks it up (mixed
@@ -1406,6 +1481,53 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
         # confirmed the NAS bytes — and blind hash_status='ok' stamping would
         # flip safe_to_format green over storage we never touched. See PR
         # #1113 review.
+        # The per-file probe runs before each file is decided, so it
+        # cannot see a detach that happens while the last (or only) file
+        # is being considered. Probe once more here — before the transfer
+        # and before anything is cataloged — so the whole batch is
+        # covered. As on the local path this is the last probe that can
+        # help: a detach after it races the transfer and catalog scan,
+        # which no amount of probing can prevent.
+        if not mount_lost:
+            mount_lost = _unmounted_since_baseline(mount_baseline)
+
+        # A detach invalidates every accepted "already present" claim in
+        # this batch: the twin each one matched may be a shadow file on
+        # the mount stub rather than a real object on the NAS. Roll them
+        # back into failed, and drop the queued transfers and adoptions
+        # too — with the mount gone we can neither verify what the NAS
+        # holds nor trust the mount-side paths we were about to catalog.
+        if mount_lost:
+            for skipped_file, counted_unverified in dup_skips:
+                skipped_duplicate -= 1
+                dup_skipped -= 1
+                _counts(rel)["skipped_duplicate"] -= 1
+                if counted_unverified:
+                    unverified_duplicate -= 1
+                _fail(
+                    rel, skipped_file,
+                    f"archive mount root {mount_lost} detached mid-batch; "
+                    "the duplicate this file matched cannot be confirmed "
+                    "to be on the archive rather than in a local shadow",
+                )
+            dup_skips = []
+            dup_dirs = set()
+            for queued_file, _dest_basename, _queued_hash in to_transfer:
+                _fail(
+                    rel, queued_file,
+                    f"archive mount root {mount_lost} detached before this "
+                    "file was transferred",
+                )
+            to_transfer = []
+            adopted_paths = {}
+            # Trip the run-wide sticky flag so every remaining batch is
+            # refused at the top of the loop rather than allowed to
+            # consult the intra-run duplicate cache (which still holds
+            # identities for the files just rolled back above; the
+            # checker has no removal API). See PR #1400 review (Codex
+            # P2 r3688614624).
+            mount_ever_lost = mount_lost
+
         landed = []   # (dest_path, card_source, src_hash, src_size, src_mtime_ns)
         # Honor cancellation before any network transfer starts. The break
         # inside the per-file queue-building loop above sets ``cancelled``
@@ -2552,6 +2674,21 @@ def run_import_job(job, runner, db_path, workspace_id, params):
     run_verified_hashes = {}
     linked_dup_dirs = set()    # dup-twin dirs already scanned+linked
 
+    # Sticky across the rest of the run once a mounted → unmounted
+    # transition is observed. The per-batch rollback below undoes
+    # ``dup_skips`` and ``landed`` but not the identities the same batch
+    # already installed in the job-wide ``checker`` (and in
+    # ``run_dest_folders`` / ``run_verified_hashes``) via
+    # ``_record_checker`` — and ``DuplicateChecker`` exposes no removal
+    # API, so those entries cannot be surgically undone. If the share
+    # remounts before a later batch, a same-content card file would hit
+    # the intra-run fast path and be counted as a duplicate of a landing
+    # whose archive claim was rolled back. Refusing every remaining
+    # batch keeps the stale intra-run cache from ever being consulted.
+    # Same rationale as the remote path (see PR #1400 review, Codex P2
+    # r3688614624).
+    mount_ever_lost = None
+
     def _counts(rel):
         return folder_counts.setdefault(
             rel, {"copied": 0, "skipped_duplicate": 0, "failed": 0},
@@ -2627,6 +2764,29 @@ def run_import_job(job, runner, db_path, workspace_id, params):
         if runner.is_cancelled(job["id"]):
             cancelled = True
             break
+
+        # A detach observed in an earlier batch is sticky for the rest
+        # of the run: the intra-run duplicate cache and the job-wide
+        # checker hold identities for files whose landing was rolled
+        # back, and consulting them against a remounted share would
+        # count fresh card files as duplicates of copies that never
+        # completed. Refuse every remaining file rather than risk a
+        # stale-cache hit. See PR #1400 review (Codex P2 r3688614624).
+        if mount_ever_lost:
+            for source_file in batch:
+                emitted += 1
+                _fail(
+                    rel, source_file,
+                    f"archive mount root {mount_ever_lost} detached "
+                    "earlier in this import; the intra-run duplicate "
+                    "cache still holds identities for files whose "
+                    "landing was rolled back, so no further batch can "
+                    "be trusted to consult it",
+                )
+            _emit(
+                f"{rel}: archive unmounted", emitted, discovered,
+            )
+            continue
 
         # Normalize so the "/" strftime puts in ``rel`` (e.g. "2026/07-03")
         # lines up with what scanner stores. Scanner wraps paths in
@@ -3199,6 +3359,14 @@ def run_import_job(job, runner, db_path, workspace_id, params):
                     "not on the share",
                 )
             landed = []
+
+        # Trip the run-wide sticky flag so every remaining batch is
+        # refused at the top of the loop rather than allowed to consult
+        # the intra-run duplicate cache (which still holds identities
+        # for the files just rolled back above; the checker has no
+        # removal API). See PR #1400 review (Codex P2 r3688614624).
+        if mount_lost:
+            mount_ever_lost = mount_lost
 
         # --- Catalog this batch (even when cancelled mid-batch: what
         # landed on disk must be cataloged before we stop, so every

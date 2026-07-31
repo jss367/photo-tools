@@ -403,6 +403,166 @@ def _source_offline_reason(
     return "folder", f"folder {folder_path} is unreadable"
 
 
+def _preflight_mask_outcomes(
+    thread_db, dropped_photos, sam2_variant, dinov2_variant,
+    detector_confidence, contextual_weak_ids=None,
+    weak_detection_confidence=None,
+):
+    """Split pre-flight-dropped photos into ``(already_masked, at_risk)``.
+
+    The pre-flight removes photos on an unreachable source before the mask
+    loop runs, so their outcome has to be derived rather than observed. This
+    mirrors the loop's own two gates so the derivation can't drift from it:
+
+    * **Worklist candidacy** — a photo with no qualifying detection would
+      never have been read for masking, so an outage doesn't change its
+      fate. It lands in neither set: counting it would turn an unrelated
+      outage into a Fatal Extract failure and tell the user to reconnect for
+      photos that would still have no mask candidate. Weak-rescued frames
+      (photos in ``contextual_weak_ids``) apply the loop's lower
+      ``weak_detection_confidence`` floor with the MDv6/animal filter —
+      matching the exact second branch of the mask loop's detection lookup.
+      Ordinary photos take the strict ``detector_confidence`` floor with
+      the full-image synthetic filter. A weak-confidence detection alone is
+      NOT enough to count as at-risk: the loop requires ``contextual_weak_
+      runs`` to have surfaced the frame first (matching-anchor-species gate
+      included), so counting arbitrary weak-conf offline photos as at-risk
+      inflates the outage report for photos the mask worklist would never
+      read (Codex #1392 P2 r3687403366).
+    * **Cache validity** — the same test the loop's cache branch applies:
+      a ``photo_masks`` row for this variant whose stored prompt and detector
+      still match the current primary detection, whose file is on disk, and
+      whose photos row is active on the configured SAM *and* DINO variants.
+      A stale prompt means the mask must be regenerated, which an offline
+      source makes impossible — so it is at risk, not a cache hit. Treating
+      it as a hit would suppress the outage and leave scoring using a mask
+      and embedding derived from a detection that no longer applies.
+
+    Only the at-risk set is unmasked-and-unreachable, so only it should
+    drive the unreadable count, the reconnect message, and the failure latch.
+    """
+    contextual_weak_ids = contextual_weak_ids or set()
+    already_masked: set = set()
+    at_risk: set = set()
+    for photo in dropped_photos:
+        photo_id = photo["id"]
+        # Mirror ``extract_masks_stage``'s per-photo detection lookup: a
+        # weak-rescued photo takes the lower floor with the MDv6/animal
+        # filter, everyone else takes the strict floor with the full-image
+        # filter. Applying only the lower floor to every photo would count
+        # unrelated sub-threshold detections as at-risk, inflating outages
+        # for photos the loop would never open.
+        if (
+            photo_id in contextual_weak_ids
+            and weak_detection_confidence is not None
+        ):
+            dets = [
+                d for d in thread_db.get_detections(
+                    photo_id,
+                    min_conf=weak_detection_confidence,
+                    detector_model="megadetector-v6",
+                )
+                if d["category"] == "animal"
+            ]
+        else:
+            dets = [
+                d for d in thread_db.get_detections(
+                    photo_id, min_conf=detector_confidence,
+                )
+                if d["detector_model"] != "full-image"
+            ]
+        if not dets:
+            continue
+        primary = dets[0]
+        existing = thread_db.get_photo_mask(photo_id, sam2_variant)
+        if existing is None or not existing["path"]:
+            at_risk.add(photo_id)
+            continue
+        cached_prompt = (
+            existing["prompt_x"], existing["prompt_y"],
+            existing["prompt_w"], existing["prompt_h"],
+        )
+        live_prompt = (
+            primary["box_x"], primary["box_y"],
+            primary["box_w"], primary["box_h"],
+        )
+        state = thread_db.conn.execute(
+            "SELECT active_mask_variant, dino_embedding_variant "
+            "FROM photos WHERE id = ?",
+            (photo_id,),
+        ).fetchone()
+        if (
+            existing["detector_model"] == primary["detector_model"]
+            and cached_prompt == live_prompt
+            and os.path.isfile(existing["path"])
+            and state is not None
+            and state["active_mask_variant"] == sam2_variant
+            and state["dino_embedding_variant"] == dinov2_variant
+        ):
+            already_masked.add(photo_id)
+        else:
+            at_risk.add(photo_id)
+    return already_masked, at_risk
+
+
+def _extract_masks_early_exit(
+    reason_key: str, subthreshold: int, preflight_unreadable: int,
+    preflight_masked: int, offline_latched: bool, outage_error=None,
+) -> tuple[str, str, dict, dict]:
+    """Stage status, runner step status, and result payload for an
+    ``extract_masks`` early return.
+
+    The stage bails out early when nothing in the worklist carries a
+    qualifying detection. That is normally a benign ``skipped``, but the
+    pre-flight source-offline branch may already have latched a ``failed``
+    status and appended a Fatal error. Overwriting it with ``skipped`` lets
+    the end-of-run rollup — which reads only stage statuses — finish the job
+    green while the dropped photos stay unmasked and get hard-rejected in
+    Process Review as ``no_subject_mask`` (Codex #1392 P1).
+
+    The total counts the pre-flight-dropped photos for the same reason the
+    finalizer does: reporting ``unreadable`` against a hard-coded zero total
+    publishes an impossible tally.
+
+    The runner step status is deliberately not the stage status for a benign
+    exit. ``JobRunner.update_step`` only finalizes ``completed``/``failed``/
+    ``cancelled``, and the Jobs page only renders a summary for those, so
+    sending ``skipped`` would leave a hollow pending-style row with no
+    duration and no explanation of why the stage did nothing.
+
+    A latched exit also carries the outage detail onto the step. The Jobs
+    page renders error text from the step fields, so without it a row failed
+    by a dead source shows only the benign "no detections" summary — hiding
+    the reconnect instruction and blaming detections for the failure.
+
+    ``preflight_unreadable > 0`` fails the stage on its own, not only when
+    ``offline_latched`` is set. The pre-flight branch deliberately does not
+    re-latch when classify already emitted a source-offline Fatal (to avoid
+    a duplicate error entry), but the extract stage still had unreadable
+    photos — so its row on the Jobs page must show failed too, with the
+    outage detail attached (Codex #1392 P2 r3687403367). Callers pass the
+    extract-owned outage message even when it wasn't appended to
+    ``errors`` so the step can carry it here.
+    """
+    should_fail = offline_latched or preflight_unreadable > 0
+    step_extra = (
+        {"error": outage_error, "error_count": preflight_unreadable}
+        if should_fail and outage_error else {}
+    )
+    return (
+        "failed" if should_fail else "skipped",
+        "failed" if should_fail else "completed",
+        step_extra,
+        {
+            "masked": preflight_masked, "skipped": 0, "failed": 0,
+            "total": preflight_unreadable + preflight_masked,
+            "unreadable": preflight_unreadable,
+            "subthreshold": subthreshold,
+            "reason": reason_key,
+        },
+    )
+
+
 def _still_offline_folder_ids_of(thread_db, folder_ids) -> set:
     """Return the folder IDs whose stored ``folders.path`` is unreachable.
 
@@ -5591,6 +5751,22 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
             # would complete "successfully" with the missing masks folded
             # away in ``errors`` (Codex #1388 P1 r3665130244).
             em_offline_latched = False
+            # Photos the pre-flight probe removed from the worklist because
+            # their folder was already unreachable. They never reach the
+            # per-photo loop, so without carrying the count forward every
+            # counter reads zero on a stage that simultaneously reports
+            # unreachable photos — which the Extract card then rendered as
+            # "No photos needed masks" (Codex #1392 P2).
+            em_preflight_unreadable = 0
+            # Dropped photos that already carried a usable mask. They are a
+            # successful outcome — the online cache-hit path counts exactly
+            # this state as ``masked`` — so they belong in the counters
+            # instead of vanishing from the stage's coverage entirely
+            # (Codex #1392 P2).
+            em_preflight_masked = 0
+            # The pre-flight outage message, kept so an early exit can put it
+            # on the failed step instead of a benign "no detections" summary.
+            em_offline_preflight_error = None
 
             try:
                 import config as cfg
@@ -5617,6 +5793,70 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                 os.makedirs(masks_dir, exist_ok=True)
 
                 photos = _filter_excluded(thread_db.get_collection_photos(collection_id, per_page=999999))
+
+                # The mask loop applies two detection-confidence floors: a
+                # strict one for ordinary photos, and a lower
+                # ``weak_detection_confidence`` floor with an MDv6/animal
+                # filter for photos rescued by ``contextual_weak_runs``. The
+                # pre-flight offline probe below has to know both, and know
+                # the *precise* rescue set — a plain "look this low"
+                # candidacy floor over-counts unrelated sub-threshold photos
+                # as at-risk, inflating the outage report (Codex #1392 P2
+                # r3687403366). Compute them on the pre-filter ``photos``
+                # list so the eligibility set covers photos we're about to
+                # drop, and mirror the loop's anchor-species gate exactly.
+                detector_confidence = effective_cfg.get("detector_confidence", 0.2)
+                weak_rescue_enabled = pipeline_cfg.get(
+                    "weak_detection_rescue_enabled", True,
+                )
+                weak_detection_confidence = pipeline_cfg.get(
+                    "weak_detection_confidence", 0.12,
+                )
+
+                contextual_weak_ids: set = set()
+                if (
+                    weak_rescue_enabled
+                    and weak_detection_confidence < detector_confidence
+                    and photos
+                ):
+                    from weak_detections import contextual_weak_runs
+                    raw_mdv6_dets = thread_db.get_detections_for_photos(
+                        [p["id"] for p in photos],
+                        min_conf=weak_detection_confidence,
+                        detector_model="megadetector-v6",
+                    )
+                    weak_runs = contextual_weak_runs(
+                        photos,
+                        raw_mdv6_dets,
+                        detector_confidence=detector_confidence,
+                        weak_confidence=weak_detection_confidence,
+                        max_gap=pipeline_cfg.get("burst_time_gap", 3.0),
+                    )
+                    weak_scope_ids = {
+                        photo_id
+                        for run in weak_runs
+                        for photo_id in (
+                            run["left_photo_id"],
+                            *run["photo_ids"],
+                            run["right_photo_id"],
+                        )
+                    }
+                    if weak_scope_ids:
+                        # Mask only frames that pass the same matching-species
+                        # anchor gate as encounter grouping. Candidate weak
+                        # runs with conflicting or unclassified anchors remain
+                        # ordinary sub-threshold detections throughout.
+                        from pipeline import load_photo_features
+                        weak_features = load_photo_features(
+                            thread_db,
+                            config=effective_cfg,
+                            photo_ids=weak_scope_ids,
+                        )
+                        contextual_weak_ids = {
+                            feature["id"]
+                            for feature in weak_features
+                            if feature.get("subject_uncertain")
+                        }
 
                 # Drop photos whose folder is offline. Without this we'd
                 # render_proxy every one of them, they'd all skip with
@@ -5679,9 +5919,37 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                             dropped.append(p)
                         else:
                             kept.append(p)
-                    total_before = len(photos)
                     photos = kept
                     dropped_ids = {p["id"] for p in dropped}
+                    # The unreadable count exists to explain `no_subject_mask`
+                    # rejections in Process Review. A dropped photo that
+                    # already carries an active mask for the configured
+                    # variant won't be rejected for that, so counting it
+                    # overstates the damage from an outage that never harmed
+                    # it (Codex #1392 P2).
+                    # Photos that will be rejected as `no_subject_mask`
+                    # because of this outage — i.e. the dropped ones that
+                    # don't already have a mask. The already-masked ones need
+                    # no source read and are at no risk, so they drive neither
+                    # the count nor the failure latch below: latching on them
+                    # would fail the stage and demand a reconnect that would
+                    # change nothing (Codex #1392 P2).
+                    already_masked_ids, at_risk_dropped_ids = (
+                        _preflight_mask_outcomes(
+                            thread_db, dropped, sam2_variant, dinov2_variant,
+                            detector_confidence,
+                            contextual_weak_ids=contextual_weak_ids,
+                            weak_detection_confidence=(
+                                weak_detection_confidence
+                                if weak_rescue_enabled
+                                and weak_detection_confidence
+                                < detector_confidence
+                                else None
+                            ),
+                        )
+                    )
+                    em_preflight_unreadable = len(at_risk_dropped_ids)
+                    em_preflight_masked = len(already_masked_ids)
                     # Publish so eye_keypoints (later downstream) sees
                     # the same offline set without having to re-probe
                     # every folder from scratch.
@@ -5695,29 +5963,18 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                     already_flagged_classify = any(
                         e.startswith("[classify] Fatal:") for e in errors
                     )
-                    if not already_flagged_classify:
-                        # Classify didn't already own this outage
-                        # (e.g. fully-cached run where classify made no
-                        # image reads). Surface the source-offline
-                        # failure at this stage instead — a fatal-
-                        # prefixed error keeps the end-of-run rollup
-                        # from picking an unrelated warning as the
-                        # headline error, and marking the stage
-                        # ``failed`` prevents the pipeline from
-                        # finishing "successfully" with no masks made.
-                        errors.append(
-                            f"[extract_masks] Fatal: "
-                            f"{len(dropped_ids)} of {total_before} "
-                            f"photos unreachable (source offline). "
-                            f"Reconnect the missing folder(s) and run "
-                            f"Process again to extract the rest."
-                        )
+                    if at_risk_dropped_ids and not already_flagged_classify:
+                        # Latch the outage immediately so the finalizer
+                        # doesn't flip the stage back to ``completed``
+                        # (offline photos were removed above, so
+                        # ``em_failed`` is zero at the bottom of the loop
+                        # regardless — Codex #1388 P1 r3665130244).
+                        # The Fatal error string itself is built below
+                        # once ``total`` (the kept mask-candidate count) is
+                        # known, so its denominator matches the stage
+                        # result's ``total`` instead of the whole
+                        # collection worklist (Codex #1392 P2 r3687499184).
                         stages["extract_masks"]["status"] = "failed"
-                        # Survive the em_failed==0 finalizer at the bottom
-                        # of this stage — the offline photos were removed
-                        # from the worklist above, so the per-photo failure
-                        # counter would otherwise flip the stage back to
-                        # ``completed`` (Codex #1388 P1 r3665130244).
                         em_offline_latched = True
                     log.warning(
                         "Extract-masks: dropped %d photo(s) from %d "
@@ -5747,65 +6004,13 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                 # from "rows exist but every confidence is below
                 # detector_confidence" — the user's remediation differs
                 # (download weights vs lower the threshold).
-                detector_confidence = effective_cfg.get("detector_confidence", 0.2)
-                weak_rescue_enabled = pipeline_cfg.get(
-                    "weak_detection_rescue_enabled", True,
-                )
-                weak_detection_confidence = pipeline_cfg.get(
-                    "weak_detection_confidence", 0.12,
-                )
-
-                # Recompute the same contextual-weak set that classify_stage
-                # and load_photo_features use, so a bracketed weak frame that
-                # got classified above also gets SAM masks + quality features
-                # here. Without this, scoring.hard_reject_reasons drops the
-                # rescued frame with `no_subject_mask` on a first-time pipeline
-                # run (predictions land, but the mask worklist skipped it) —
-                # partially undoing the rescue.
-                contextual_weak_ids: set = set()
-                if (
-                    weak_rescue_enabled
-                    and weak_detection_confidence < detector_confidence
-                    and photos
-                ):
-                    from weak_detections import contextual_weak_runs
-                    raw_mdv6_dets = thread_db.get_detections_for_photos(
-                        [p["id"] for p in photos],
-                        min_conf=weak_detection_confidence,
-                        detector_model="megadetector-v6",
-                    )
-                    weak_runs = contextual_weak_runs(
-                        photos,
-                        raw_mdv6_dets,
-                        detector_confidence=detector_confidence,
-                        weak_confidence=weak_detection_confidence,
-                        max_gap=pipeline_cfg.get("burst_time_gap", 3.0),
-                    )
-                    weak_scope_ids = {
-                        photo_id
-                        for run in weak_runs
-                        for photo_id in (
-                            run["left_photo_id"],
-                            *run["photo_ids"],
-                            run["right_photo_id"],
-                        )
-                    }
-                    if weak_scope_ids:
-                        # Mask only frames that pass the same matching-species
-                        # anchor gate as encounter grouping. Candidate weak
-                        # runs with conflicting or unclassified anchors remain
-                        # ordinary sub-threshold detections throughout.
-                        from pipeline import load_photo_features
-                        weak_features = load_photo_features(
-                            thread_db,
-                            config=effective_cfg,
-                            photo_ids=weak_scope_ids,
-                        )
-                        contextual_weak_ids = {
-                            feature["id"]
-                            for feature in weak_features
-                            if feature.get("subject_uncertain")
-                        }
+                #
+                # ``detector_confidence`` / ``weak_rescue_enabled`` /
+                # ``weak_detection_confidence`` / ``contextual_weak_ids`` are
+                # captured above (before the pre-flight offline probe) so
+                # ``_preflight_mask_outcomes`` can apply the same weak-rescue
+                # eligibility the loop uses.  Reusing them here keeps that
+                # single-sourced.
 
                 photo_det_map = {}
                 photos_with_detections = 0
@@ -5892,9 +6097,56 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
 
                 folders = {f["id"]: f["path"] for f in thread_db.get_folder_tree()}
                 total = len(photos_to_process)
+                # Now that ``total`` is known, build the preflight outage
+                # message. The denominator has to be the mask-candidate
+                # total (loop total + preflight-dropped mask candidates),
+                # matching the stage result's ``total``. Using
+                # ``total_before`` — the whole collection worklist —
+                # produced messages like "1 of 100 photos unreachable"
+                # when only 1 was a mask candidate and the result showed
+                # ``total: 1``, so the reader couldn't reconcile the two
+                # (Codex #1392 P2 r3687499184).
+                if em_preflight_unreadable > 0:
+                    em_offline_preflight_error = (
+                        f"[extract_masks] Fatal: "
+                        f"{em_preflight_unreadable} of "
+                        f"{total + em_preflight_unreadable + em_preflight_masked} "
+                        f"photos unreachable (source offline). "
+                        f"Reconnect the missing folder(s) and run "
+                        f"Process again to extract the rest."
+                    )
+                    # Latch was set above only when this stage owns the
+                    # outage (classify didn't already emit a Fatal), so
+                    # this gate mirrors the previous append-in-preflight
+                    # condition and avoids a duplicate Fatal entry.
+                    if em_offline_latched:
+                        errors.append(em_offline_preflight_error)
                 masked = 0
                 skipped = 0
                 em_failed = 0
+                # Photos whose source file could not be read. Kept out of
+                # ``skipped`` because the two mean opposite things to the
+                # user: a skip is "SAM found no subject in this frame" (a
+                # real answer about the photo), while an unreadable source
+                # is "we never got to look at it". Both leave the photo
+                # unmasked, and scoring hard-rejects every unmasked photo
+                # with ``no_subject_mask`` — so folding them together let a
+                # dropped share present as a clean "N masked, M skipped"
+                # completion while two-thirds of the library silently became
+                # rejects in Process Review.
+                em_unreadable = 0
+                # Folders proven unreachable by a failed read during this
+                # loop. Every later photo under them is counted unreadable
+                # without reissuing a read: on a dead SMB/NFS share each
+                # attempt is an instant EIO, so re-probing hundreds of
+                # photos only slows the give-up down.
+                em_offline_folder_ids: set = set()
+                # Unreadable photos attributable to a latched source outage,
+                # tracked apart from the total so the reconnect message can't
+                # claim credit for a corrupt file in a healthy folder — or for
+                # photos behind a *different* dead source (Codex #1392 P2).
+                em_offline_unreadable = 0
+                em_offline_reasons: list = []
                 start_time = time.time()
 
                 # If the input collection has photos but none carry detections,
@@ -5952,22 +6204,25 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
 
                     log.warning("Pipeline extract-masks: %s", reason)
                     errors.append(f"[extract_masks] {reason}")
-                    stages["extract_masks"]["status"] = "skipped"
-                    runner.update_step(
-                        job["id"], "extract_masks", status="completed",
-                        summary=summary,
-                    )
                     if photos_subthreshold_only > 0:
                         em_reason = "all_subthreshold"
                     elif weights_present:
                         em_reason = "no_detections"
                     else:
                         em_reason = "weights_missing"
-                    result["stages"]["extract_masks"] = {
-                        "masked": 0, "skipped": 0, "failed": 0, "total": 0,
-                        "subthreshold": photos_subthreshold_only,
-                        "reason": em_reason,
-                    }
+                    exit_status, exit_step_status, exit_step_extra, exit_payload = (
+                        _extract_masks_early_exit(
+                            em_reason, photos_subthreshold_only,
+                            em_preflight_unreadable, em_preflight_masked,
+                            em_offline_latched, em_offline_preflight_error,
+                        )
+                    )
+                    stages["extract_masks"]["status"] = exit_status
+                    runner.update_step(
+                        job["id"], "extract_masks", status=exit_step_status,
+                        summary=summary, **exit_step_extra,
+                    )
+                    result["stages"]["extract_masks"] = exit_payload
                     _update_stages(runner, job["id"], stages)
                     return
 
@@ -5993,16 +6248,19 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                     )
                     log.warning("Pipeline extract-masks: %s", reason)
                     errors.append(f"[extract_masks] {reason}")
-                    stages["extract_masks"]["status"] = "skipped"
-                    runner.update_step(
-                        job["id"], "extract_masks", status="completed",
-                        summary=summary,
+                    exit_status, exit_step_status, exit_step_extra, exit_payload = (
+                        _extract_masks_early_exit(
+                            "all_subthreshold", photos_subthreshold_only,
+                            em_preflight_unreadable, em_preflight_masked,
+                            em_offline_latched, em_offline_preflight_error,
+                        )
                     )
-                    result["stages"]["extract_masks"] = {
-                        "masked": 0, "skipped": 0, "failed": 0, "total": 0,
-                        "subthreshold": photos_subthreshold_only,
-                        "reason": "all_subthreshold",
-                    }
+                    stages["extract_masks"]["status"] = exit_status
+                    runner.update_step(
+                        job["id"], "extract_masks", status=exit_step_status,
+                        summary=summary, **exit_step_extra,
+                    )
+                    result["stages"]["extract_masks"] = exit_payload
                     _update_stages(runner, job["id"], stages)
                     return
 
@@ -6133,6 +6391,31 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                                         processed = i + 1
                                         continue
 
+                            # Past the cache check, so this photo genuinely
+                            # needs a source read. If its folder was already
+                            # proven unreachable, account for it without
+                            # paying for a read we know will fail — but only
+                            # here, after the cache branch: a cached mask
+                            # only stats the local mask file, so it succeeds
+                            # even when the source volume is gone and must
+                            # still count as masked (Codex #1392 P2). Progress
+                            # is pushed too, otherwise the bar freezes on the
+                            # photo the outage started on while the stage
+                            # walks the rest of the worklist.
+                            if photo["folder_id"] in em_offline_folder_ids:
+                                em_unreadable += 1
+                                em_offline_unreadable += 1
+                                processed = i + 1
+                                stages["extract_masks"]["count"] = processed
+                                runner.update_step(
+                                    job["id"], "extract_masks",
+                                    progress={
+                                        "current": processed, "total": total,
+                                    },
+                                    error_count=em_failed + em_unreadable,
+                                )
+                                continue
+
                             # First true cache miss: ensure SAM2 + DINOv2 weights
                             # are present before render_proxy/generate_mask runs.
                             # No-op on subsequent iterations.
@@ -6140,7 +6423,36 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
 
                             proxy = render_proxy(image_path, longest_edge=proxy_longest_edge)
                             if proxy is None:
-                                skipped += 1
+                                # The source didn't load. Ask how far the
+                                # problem reaches before deciding whether to
+                                # keep going: one corrupt RAW is this photo's
+                                # failure, but a share that dropped mid-run
+                                # will fail every remaining read the same way.
+                                em_unreadable += 1
+                                offline = _source_offline_reason(
+                                    folder_path, image_path,
+                                )
+                                if offline is not None:
+                                    _scope, reason = offline
+                                    em_offline_unreadable += 1
+                                    if reason not in em_offline_reasons:
+                                        em_offline_reasons.append(reason)
+                                    # Latch the folder, not the run. A
+                                    # mount-scoped outage proves the photos
+                                    # on that volume are gone, but a
+                                    # collection can span several volumes and
+                                    # the local disk — writing off everything
+                                    # still unprocessed would skip masks we
+                                    # could have made and file those photos
+                                    # under an outage that never touched them
+                                    # (Codex #1392 P1). Other folders cost one
+                                    # failed read each to discover, which is
+                                    # nothing next to a wrongly abandoned run.
+                                    em_offline_folder_ids.add(
+                                        photo["folder_id"],
+                                    )
+                                    processed = i + 1
+                                    continue
                                 processed = i + 1
                                 continue
                             if _should_abort_without_pause(abort):
@@ -6245,7 +6557,7 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                     stages["extract_masks"]["total"] = total
                     runner.update_step(job["id"], "extract_masks",
                                        progress={"current": processed, "total": total},
-                                       error_count=em_failed)
+                                       error_count=em_failed + em_unreadable)
                     _emit_progress(
                         runner, job["id"], stages, "extract_masks",
                         "Extracting features (SAM2 + DINOv2)",
@@ -6266,26 +6578,107 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                         job["id"], "extract_masks", status="completed",
                         progress={"current": processed, "total": total},
                         summary=em_summary,
-                        error_count=em_failed,
+                        # Warnings on the Jobs page render off the step's
+                        # ``error_count`` — the mid-loop updates and the
+                        # normal finalizer both include unreadable counts,
+                        # so the cancel branch has to as well or a cancel
+                        # that arrives after a source dropped shows a
+                        # zero-warning row alongside a result that records
+                        # positive ``unreadable`` (Codex #1392 P2
+                        # r3687499188).
+                        error_count=(
+                            em_failed + em_unreadable
+                            + em_preflight_unreadable
+                        ),
                     )
                     result["stages"]["extract_masks"] = {
-                        "masked": masked, "skipped": skipped, "failed": em_failed,
-                        "total": total, "cancelled": True,
+                        "masked": masked + em_preflight_masked,
+                        "skipped": skipped, "failed": em_failed,
+                        "unreadable": em_unreadable + em_preflight_unreadable,
+                        # Preflight-inclusive, matching the normal finalizer:
+                        # the loop total alone can't cover photos that never
+                        # reached the loop (Codex #1392 P2).
+                        "total": (
+                            total + em_preflight_unreadable
+                            + em_preflight_masked
+                        ),
+                        "cancelled": True,
                     }
                 else:
+                    # Reported count spans both the photos this loop failed to
+                    # read and the ones the pre-flight dropped; the rollup
+                    # messages below stay keyed on the in-loop count because
+                    # the pre-flight branch already appended its own error.
+                    em_unreadable_all = em_unreadable + em_preflight_unreadable
+                    # ``total`` counts only what reached the loop, so it can't
+                    # be the denominator once pre-flight drops are folded into
+                    # the outcome counts — that publishes impossible tallies
+                    # like "3 unreadable of 0" and breaks any consumer deriving
+                    # coverage from them (Codex #1392 P2). Progress reporting
+                    # keeps using the loop-scoped ``total``.
+                    em_masked_all = masked + em_preflight_masked
+                    em_total_candidates = (
+                        total + em_preflight_unreadable + em_preflight_masked
+                    )
                     final_status = (
                         "failed"
-                        if em_failed > 0 or em_offline_latched
+                        if em_failed > 0 or em_unreadable_all > 0
+                        or em_offline_latched
                         else "completed"
                     )
                     stages["extract_masks"]["status"] = final_status
-                    em_rollup = (
-                        f"[extract_masks] {em_failed} of {total} photos failed mask extraction"
-                        if em_failed > 0 else None
+                    # Source outages own the headline: "reconnect this volume"
+                    # is the actionable message, and its Fatal prefix keeps
+                    # the end-of-run summary from picking a lesser warning.
+                    # Each cause reports only the photos it actually explains
+                    # — a corrupt file in a healthy folder is not recovered
+                    # by reconnecting a drive.
+                    em_other_unreadable = em_unreadable - em_offline_unreadable
+                    em_fatal_msg = None
+                    if em_offline_unreadable > 0:
+                        em_fatal_msg = (
+                            f"[extract_masks] Fatal: {em_offline_unreadable} "
+                            f"of {em_total_candidates} photos unreachable — "
+                            f"{'; '.join(em_offline_reasons)}. Reconnect the "
+                            f"source and run Process again; until then these "
+                            f"photos have no mask and Process Review rejects "
+                            f"them as `no_subject_mask`."
+                        )
+                    em_secondary_rollups = []
+                    if em_other_unreadable > 0:
+                        em_secondary_rollups.append(
+                            f"[extract_masks] {em_other_unreadable} of "
+                            f"{em_total_candidates} photos could not be read, "
+                            f"so they have no mask and Process Review rejects "
+                            f"them as `no_subject_mask`."
+                        )
+                    if em_failed > 0:
+                        em_secondary_rollups.append(
+                            f"[extract_masks] {em_failed} of {em_total_candidates} photos "
+                            f"failed mask extraction"
+                        )
+                    # Emit the actionable Fatal last so any collapse-by-stage
+                    # consumer that keeps whichever entry appeared last for
+                    # each stage still sees the reconnect instruction rather
+                    # than the generic "failed mask extraction" rollup
+                    # (Codex #1392 P2 r3687118058). The Extract card and
+                    # top-level banner already prefer Fatal explicitly; this
+                    # protects other listeners (job event streams, exports)
+                    # from the same silent-last-wins collapse.
+                    errors.extend(em_secondary_rollups)
+                    if em_fatal_msg:
+                        errors.append(em_fatal_msg)
+                    em_rollup = em_fatal_msg or (
+                        em_secondary_rollups[0]
+                        if em_secondary_rollups else None
                     )
-                    if em_rollup:
-                        errors.append(em_rollup)
-                    em_summary_parts = [f"{masked} masked", f"{skipped} skipped"]
+                    em_summary_parts = [
+                        f"{em_masked_all} masked", f"{skipped} skipped",
+                    ]
+                    if em_unreadable_all:
+                        em_summary_parts.append(
+                            f"{em_unreadable_all} unreadable",
+                        )
                     if em_failed:
                         em_summary_parts.append(f"{em_failed} failed")
                     if photos_subthreshold_only > 0:
@@ -6295,11 +6688,14 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                         )
                     runner.update_step(job["id"], "extract_masks", status=final_status,
                                        summary=", ".join(em_summary_parts),
-                                       error_count=em_failed,
+                                       error_count=em_failed + em_unreadable_all,
                                        error=em_rollup)
                     result["stages"]["extract_masks"] = {
-                        "masked": masked, "skipped": skipped, "failed": em_failed,
-                        "total": total, "subthreshold": photos_subthreshold_only,
+                        "masked": em_masked_all, "skipped": skipped,
+                        "failed": em_failed,
+                        "unreadable": em_unreadable_all,
+                        "total": em_total_candidates,
+                        "subthreshold": photos_subthreshold_only,
                     }
             except Exception as e:
                 errors.append(f"[extract_masks] Fatal: {e}")

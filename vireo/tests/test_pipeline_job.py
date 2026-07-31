@@ -8397,6 +8397,565 @@ def test_pipeline_extract_masks_cancel_marks_stage_cancelled(
 
 
 # ---------------------------------------------------------------------------
+# extract_masks unreadable-source accounting
+#
+# ``render_proxy`` returning None means the source file could not be read.
+# That was counted in the same ``skipped`` bucket as "SAM found no subject",
+# so a share that dropped mid-run finalized the stage as a clean "completed"
+# with "N masked, M skipped" — and every unmasked photo then got hard-rejected
+# downstream by scoring's ``no_subject_mask`` rule with nothing in the job tree
+# explaining why. Production hit this: an SMB mount died 10.5 hours into a run
+# and 311 of 706 photos were silently left unmasked.
+# ---------------------------------------------------------------------------
+
+
+def _add_photo_with_detection(db, folder_id, folder_path, filename):
+    """Add a photo + an animal detection so it enters the mask worklist."""
+    photo_id = db.add_photo(
+        folder_id, filename, ".jpg", 1000, 1_000_000.0 + hash(filename) % 1000,
+    )
+    _drop_jpeg(folder_path, filename)
+    db.save_detections(
+        photo_id,
+        [{"box": {"x": 0.1, "y": 0.1, "w": 0.5, "h": 0.5},
+          "confidence": 0.9, "category": "animal"}],
+        detector_model="MegaDetector",
+    )
+    return photo_id
+
+
+def _extract_masks_final_update(runner):
+    """The last extract_masks step update carrying a terminal status."""
+    finals = [
+        kw for (_, sid, kw) in runner.step_updates
+        if sid == "extract_masks"
+        and kw.get("status") in ("completed", "failed")
+        and "summary" in kw
+    ]
+    assert finals, (
+        f"Expected a final extract_masks update; got {runner.step_updates!r}"
+    )
+    return finals[-1]
+
+
+def _run_extract_masks_only(db_path, ws_id, collection_id):
+    """Run a mask-only pipeline and return ``(runner, result)``.
+
+    A failed stage makes ``run_pipeline_job`` raise at the end of the run
+    after stashing the structured result on the job, so the caller still
+    gets the per-stage counters either way.
+    """
+    runner = FakeRunner()
+    job = _make_job()
+    params = PipelineParams(
+        collection_id=collection_id,
+        skip_classify=True,
+        skip_extract_masks=False,
+        skip_regroup=True,
+    )
+    try:
+        result = run_pipeline_job(job, runner, db_path, ws_id, params)
+    except RuntimeError:
+        result = job["result"]
+    return runner, result
+
+
+def test_extract_masks_source_lost_midrun_fails_stage(tmp_path, monkeypatch):
+    """A source that goes away mid-loop must fail the stage, not complete.
+
+    Pre-fix shape: every remaining photo's ``render_proxy`` returned None,
+    each landing in ``skipped``, and the finalizer saw ``em_failed == 0`` and
+    reported "completed". The user's only signal that two-thirds of the
+    library was never masked was a skipped count indistinguishable from
+    "SAM found no subject here".
+    """
+    import config as cfg
+    from db import Database
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cfg.CONFIG_PATH = str(tmp_path / "config.json")
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws_id = db._active_workspace_id
+    folder_path = str(tmp_path / "photos")
+    os.makedirs(folder_path, exist_ok=True)
+    folder_id = db.add_folder(folder_path)
+
+    photo_ids = [
+        _add_photo_with_detection(db, folder_id, folder_path, f"bird{i}.jpg")
+        for i in range(3)
+    ]
+    collection_id = db.add_collection(
+        "Lost source",
+        json.dumps([{"field": "photo_ids", "value": photo_ids}]),
+    )
+
+    state = _stub_extract_masks_heavy_ops(monkeypatch)
+
+    import shutil
+
+    import masking
+
+    def render_then_lose_source(image_path, longest_edge=None):
+        state["proxy_calls"] += 1
+        # The share drops on the first read — as an unmounted volume does,
+        # every later read against this folder would fail the same way.
+        shutil.rmtree(folder_path, ignore_errors=True)
+        return None
+
+    state["proxy_calls"] = 0
+    monkeypatch.setattr(masking, "render_proxy", render_then_lose_source)
+
+    runner, result = _run_extract_masks_only(db_path, ws_id, collection_id)
+
+    em = result["stages"]["extract_masks"]
+    assert em["masked"] == 0
+    # All three photos must be accounted for as unreadable, not as benign
+    # skips — including the two the stage never re-probed.
+    assert em.get("unreadable") == 3, (
+        f"Expected 3 photos reported unreadable; got {em!r}"
+    )
+    assert em["skipped"] == 0, (
+        f"Unreadable photos must not land in the benign skip bucket; got {em!r}"
+    )
+    # Once the folder is known dead, stop reissuing reads against it.
+    assert state["proxy_calls"] == 1, (
+        f"Expected the stage to stop probing the dead source after the first "
+        f"failed read; got {state['proxy_calls']} render_proxy calls."
+    )
+
+    final = _extract_masks_final_update(runner)
+    assert final["status"] == "failed", (
+        f"A stage that masked nothing because the source vanished must not "
+        f"finalize as completed; got {final!r}"
+    )
+    assert "unreadable" in (final.get("summary") or "").lower(), (
+        f"Stage summary must name the unreadable photos; got "
+        f"{final.get('summary')!r}"
+    )
+    assert any(
+        "extract_masks" in err and "unreachable" in err.lower()
+        for err in result["errors"]
+    ), (
+        f"Expected an extract_masks source-unreachable error in the job "
+        f"rollup; got {result['errors']!r}"
+    )
+
+
+def test_extract_masks_offline_folder_does_not_stop_healthy_folder(
+    tmp_path, monkeypatch,
+):
+    """One dead folder must not strand photos in the collection's other,
+    still-reachable folders — the outage is folder-scoped, so the stage keeps
+    working through the rest and reports the unreadable ones."""
+    import config as cfg
+    from db import Database
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cfg.CONFIG_PATH = str(tmp_path / "config.json")
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws_id = db._active_workspace_id
+
+    dead_path = str(tmp_path / "dead")
+    live_path = str(tmp_path / "live")
+    os.makedirs(dead_path, exist_ok=True)
+    os.makedirs(live_path, exist_ok=True)
+    dead_folder = db.add_folder(dead_path)
+    live_folder = db.add_folder(live_path)
+
+    photo_ids = [
+        _add_photo_with_detection(db, dead_folder, dead_path, "gone0.jpg"),
+        _add_photo_with_detection(db, dead_folder, dead_path, "gone1.jpg"),
+        _add_photo_with_detection(db, live_folder, live_path, "here0.jpg"),
+    ]
+    collection_id = db.add_collection(
+        "Mixed reachability",
+        json.dumps([{"field": "photo_ids", "value": photo_ids}]),
+    )
+
+    state = _stub_extract_masks_heavy_ops(monkeypatch)
+
+    import shutil
+
+    import masking
+    import numpy as np
+
+    def render_scoped(image_path, longest_edge=None):
+        state["proxy_calls"] += 1
+        if image_path.startswith(dead_path):
+            shutil.rmtree(dead_path, ignore_errors=True)
+            return None
+        return np.zeros((16, 16, 3), dtype=np.uint8)
+
+    state["proxy_calls"] = 0
+    monkeypatch.setattr(masking, "render_proxy", render_scoped)
+
+    runner, result = _run_extract_masks_only(db_path, ws_id, collection_id)
+
+    em = result["stages"]["extract_masks"]
+    assert em["masked"] == 1, (
+        f"The reachable folder's photo must still be masked; got {em!r}"
+    )
+    assert em.get("unreadable") == 2, (
+        f"Both photos in the dead folder must be reported unreadable; got "
+        f"{em!r}"
+    )
+    final = _extract_masks_final_update(runner)
+    assert final["status"] == "failed", (
+        f"A partial outage still has to surface as a stage failure; got "
+        f"{final!r}"
+    )
+
+
+def test_extract_masks_mount_outage_still_processes_other_sources(
+    tmp_path, monkeypatch,
+):
+    """A dead volume must not strand photos that live somewhere else.
+
+    A mount-scoped outage proves the photos *on that volume* are gone, not
+    the rest of the worklist. A collection can span several volumes plus the
+    local disk, so writing off everything still unprocessed would both skip
+    masks that could have been made and file those photos under an outage
+    they were never affected by (Codex #1392 P1).
+    """
+    import config as cfg
+    import pipeline_job as pj
+    from db import Database
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cfg.CONFIG_PATH = str(tmp_path / "config.json")
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws_id = db._active_workspace_id
+
+    # Names chosen so the share sorts first: the worklist is ordered by
+    # path, and a stage that abandons the whole worklist after the outage
+    # must be observably unable to reach the local photo.
+    local_path = str(tmp_path / "zz_local")
+    share_path = str(tmp_path / "aa_share")
+    os.makedirs(local_path, exist_ok=True)
+    os.makedirs(share_path, exist_ok=True)
+    local_folder = db.add_folder(local_path)
+    share_folder = db.add_folder(share_path)
+
+    photo_ids = [
+        _add_photo_with_detection(db, local_folder, local_path, "zz0.jpg"),
+        _add_photo_with_detection(db, share_folder, share_path, "aa0.jpg"),
+        _add_photo_with_detection(db, share_folder, share_path, "aa1.jpg"),
+    ]
+    collection_id = db.add_collection(
+        "Volume plus local disk",
+        json.dumps([{"field": "photo_ids", "value": photo_ids}]),
+    )
+
+    state = _stub_extract_masks_heavy_ops(monkeypatch)
+
+    import masking
+    import numpy as np
+
+    read_order = []
+
+    def render_dead_share(image_path, longest_edge=None):
+        state["proxy_calls"] += 1
+        read_order.append(image_path)
+        if image_path.startswith(share_path):
+            return None
+        return np.zeros((16, 16, 3), dtype=np.uint8)
+
+    state["proxy_calls"] = 0
+    monkeypatch.setattr(masking, "render_proxy", render_dead_share)
+    # Only the share is gone; the local disk is fine.
+    monkeypatch.setattr(
+        pj, "_source_offline_reason",
+        lambda folder_path, image_path: (
+            ("mount", "volume /Volumes/Photography is not mounted")
+            if image_path.startswith(share_path) else None
+        ),
+    )
+
+    runner, result = _run_extract_masks_only(db_path, ws_id, collection_id)
+
+    # Guard the premise: if the worklist ever stops leading with the share,
+    # the masked-count assertion below silently stops discriminating.
+    assert read_order and read_order[0].startswith(share_path), (
+        f"This test needs the share to be read first; got {read_order!r}"
+    )
+
+    em = result["stages"]["extract_masks"]
+    assert em["masked"] == 1, (
+        f"The photo on the healthy local disk must still be masked; got {em!r}"
+    )
+    assert em.get("unreadable") == 2, (
+        f"Only the two photos on the dead volume are unreadable; got {em!r}"
+    )
+    # One failed read proves the share is gone; its second photo must not
+    # cost another round trip to a dead server.
+    assert state["proxy_calls"] == 2, (
+        f"Expected one failed read on the share plus one good local read; "
+        f"got {state['proxy_calls']} render_proxy calls."
+    )
+    final = _extract_masks_final_update(runner)
+    assert final["status"] == "failed"
+    assert any(
+        "/Volumes/Photography" in err for err in result["errors"]
+    ), (
+        f"The rollup must name the volume the user has to reconnect; got "
+        f"{result['errors']!r}"
+    )
+
+
+def test_extract_masks_offline_folder_still_counts_cached_masks(
+    tmp_path, monkeypatch,
+):
+    """A photo whose mask is already cached needs no source read, so a dead
+    folder must not relabel it unreadable.
+
+    The offline shortcut has to sit after the `photo_masks` cache check:
+    the cached branch only stats the local mask file, so it succeeds even
+    when the source volume is gone (Codex #1392 P2).
+    """
+    import config as cfg
+    from db import Database
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cfg.CONFIG_PATH = str(tmp_path / "config.json")
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws_id = db._active_workspace_id
+    folder_path = str(tmp_path / "photos")
+    os.makedirs(folder_path, exist_ok=True)
+    folder_id = db.add_folder(folder_path)
+
+    uncached = _add_photo_with_detection(db, folder_id, folder_path, "a.jpg")
+    cached = _add_photo_with_detection(db, folder_id, folder_path, "b.jpg")
+    collection_id = db.add_collection(
+        "Partly cached",
+        json.dumps([{"field": "photo_ids", "value": [uncached, cached]}]),
+    )
+
+    pipeline_cfg = db.get_effective_config(cfg.load()).get("pipeline", {})
+    sam2_variant = pipeline_cfg.get("sam2_variant")
+    dinov2_variant = pipeline_cfg.get("dinov2_variant")
+
+    # Seed a complete, matching cache entry for `cached`: mask row, mask
+    # file on local disk, and photos-row variants already consistent.
+    mask_dir = tmp_path / ".vireo" / "masks"
+    os.makedirs(mask_dir, exist_ok=True)
+    mask_file = str(mask_dir / f"{cached}.{sam2_variant}.png")
+    from PIL import Image
+    Image.new("L", (4, 4), 255).save(mask_file)
+    db.upsert_photo_mask(
+        cached, sam2_variant, mask_file, "MegaDetector",
+        0.1, 0.1, 0.5, 0.5,
+    )
+    db.set_active_mask_variant(cached, sam2_variant)
+    db.conn.execute(
+        "UPDATE photos SET dino_embedding_variant=? WHERE id=?",
+        (dinov2_variant, cached),
+    )
+    db.conn.commit()
+
+    state = _stub_extract_masks_heavy_ops(monkeypatch)
+
+    import shutil
+
+    import masking
+
+    def render_then_lose_source(image_path, longest_edge=None):
+        state["proxy_calls"] += 1
+        shutil.rmtree(folder_path, ignore_errors=True)
+        return None
+
+    state["proxy_calls"] = 0
+    monkeypatch.setattr(masking, "render_proxy", render_then_lose_source)
+
+    runner, result = _run_extract_masks_only(db_path, ws_id, collection_id)
+
+    em = result["stages"]["extract_masks"]
+    assert em["masked"] == 1, (
+        f"The cached photo needs no source read and must still count as "
+        f"masked; got {em!r}"
+    )
+    assert em.get("unreadable") == 1, (
+        f"Only the uncached photo is unreadable; got {em!r}"
+    )
+
+
+def test_extract_masks_preflight_offline_photos_are_counted_unreadable(
+    tmp_path, monkeypatch,
+):
+    """Photos dropped by the pre-flight offline probe still have to show up
+    in the stage's counters.
+
+    The pre-flight removes them from the worklist before the loop, so every
+    counter came back zero on a stage the user was simultaneously being told
+    had failed with unreachable photos — which the Extract card rendered as
+    "No photos needed masks" (Codex #1392 P2).
+    """
+    import config as cfg
+    from db import Database
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cfg.CONFIG_PATH = str(tmp_path / "config.json")
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws_id = db._active_workspace_id
+    folder_path = str(tmp_path / "photos")
+    os.makedirs(folder_path, exist_ok=True)
+    folder_id = db.add_folder(folder_path)
+
+    photo_ids = [
+        _add_photo_with_detection(db, folder_id, folder_path, f"bird{i}.jpg")
+        for i in range(3)
+    ]
+    collection_id = db.add_collection(
+        "Gone before we started",
+        json.dumps([{"field": "photo_ids", "value": photo_ids}]),
+    )
+
+    _stub_extract_masks_heavy_ops(monkeypatch)
+
+    # The source is already gone when the stage starts, so the pre-flight
+    # probe drops all three before the per-photo loop runs.
+    import shutil
+    shutil.rmtree(folder_path, ignore_errors=True)
+
+    runner, result = _run_extract_masks_only(db_path, ws_id, collection_id)
+
+    em = result["stages"]["extract_masks"]
+    assert em.get("unreadable") == 3, (
+        f"Pre-flight-dropped photos are unreadable, not absent; got {em!r}"
+    )
+    # The reported total has to cover the photos the pre-flight removed, or
+    # the stage publishes impossible counters like "3 unreadable of 0" and
+    # any consumer computing coverage from them is wrong (Codex #1392 P2).
+    assert em["total"] == 3, (
+        f"Total must count the pre-flight-dropped candidates; got {em!r}"
+    )
+    final = _extract_masks_final_update(runner)
+    assert final["status"] == "failed"
+    assert "3 unreadable" in (final.get("summary") or ""), (
+        f"The summary must not read as an empty worklist; got "
+        f"{final.get('summary')!r}"
+    )
+
+
+def test_extract_masks_single_unreadable_file_is_reported_not_skipped(
+    tmp_path, monkeypatch,
+):
+    """A corrupt file in an otherwise healthy folder is a per-photo failure:
+    the stage works through the rest, but the photo is reported as unreadable
+    rather than counted as a benign "no subject found" skip."""
+    import config as cfg
+    from db import Database
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cfg.CONFIG_PATH = str(tmp_path / "config.json")
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws_id = db._active_workspace_id
+    folder_path = str(tmp_path / "photos")
+    os.makedirs(folder_path, exist_ok=True)
+    folder_id = db.add_folder(folder_path)
+
+    photo_ids = [
+        _add_photo_with_detection(db, folder_id, folder_path, f"bird{i}.jpg")
+        for i in range(3)
+    ]
+    collection_id = db.add_collection(
+        "One corrupt file",
+        json.dumps([{"field": "photo_ids", "value": photo_ids}]),
+    )
+
+    state = _stub_extract_masks_heavy_ops(monkeypatch)
+
+    import masking
+    import numpy as np
+
+    def render_one_bad_file(image_path, longest_edge=None):
+        state["proxy_calls"] += 1
+        if image_path.endswith("bird1.jpg"):
+            return None
+        return np.zeros((16, 16, 3), dtype=np.uint8)
+
+    state["proxy_calls"] = 0
+    monkeypatch.setattr(masking, "render_proxy", render_one_bad_file)
+
+    runner, result = _run_extract_masks_only(db_path, ws_id, collection_id)
+
+    em = result["stages"]["extract_masks"]
+    assert em["masked"] == 2, (
+        f"A single bad file must not stop the healthy photos; got {em!r}"
+    )
+    assert em.get("unreadable") == 1, (
+        f"The unreadable photo must be reported as such; got {em!r}"
+    )
+    assert em["skipped"] == 0, (
+        f"An unreadable file is not a benign skip; got {em!r}"
+    )
+    assert state["proxy_calls"] == 3, (
+        f"Every photo should still have been attempted; got "
+        f"{state['proxy_calls']}"
+    )
+
+
+def test_extract_masks_no_subject_still_counts_as_benign_skip(
+    tmp_path, monkeypatch,
+):
+    """Guard against over-correction: SAM returning no mask for a readable
+    photo means "no subject found here", which is a legitimate outcome. It
+    stays in ``skipped`` and leaves the stage completed."""
+    import config as cfg
+    from db import Database
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cfg.CONFIG_PATH = str(tmp_path / "config.json")
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws_id = db._active_workspace_id
+    folder_path = str(tmp_path / "photos")
+    os.makedirs(folder_path, exist_ok=True)
+    folder_id = db.add_folder(folder_path)
+
+    photo_ids = [
+        _add_photo_with_detection(db, folder_id, folder_path, f"bird{i}.jpg")
+        for i in range(2)
+    ]
+    collection_id = db.add_collection(
+        "No subject",
+        json.dumps([{"field": "photo_ids", "value": photo_ids}]),
+    )
+
+    _stub_extract_masks_heavy_ops(monkeypatch)
+
+    import masking
+    monkeypatch.setattr(masking, "generate_mask", lambda *a, **k: None)
+
+    runner, result = _run_extract_masks_only(db_path, ws_id, collection_id)
+
+    em = result["stages"]["extract_masks"]
+    assert em["masked"] == 0
+    assert em["skipped"] == 2, (
+        f"A readable photo with no SAM mask stays a benign skip; got {em!r}"
+    )
+    assert em.get("unreadable", 0) == 0, (
+        f"Nothing was unreadable here; got {em!r}"
+    )
+    final = _extract_masks_final_update(runner)
+    assert final["status"] == "completed", (
+        f"No-subject skips must not fail the stage; got {final!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # extract_masks per-variant cache (photo_masks)
 #
 # Phase 2 of the SAM mask history plan stops the masking stage from re-running
@@ -16562,6 +17121,882 @@ def test_pipeline_extract_masks_offline_survives_finalizer_override(
     assert "source offline" in em_fatal[0].lower(), (
         f"The extract_masks Fatal error must name the outage as "
         f"source-offline; got {em_fatal[0]!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# extract_masks early-return exit state
+#
+# The stage bails out early when nothing in the worklist carries a qualifying
+# detection. That exit used to hard-code `skipped` + a zero total, which
+# erased a `failed` status the pre-flight source-offline branch had already
+# latched — letting the end-of-run rollup (it reads only stage statuses)
+# finish the job green while the dropped photos stayed unmasked and were
+# hard-rejected in Process Review (Codex #1392 P1).
+# ---------------------------------------------------------------------------
+
+
+def test_extract_masks_early_exit_preserves_latched_offline_failure():
+    from pipeline_job import _extract_masks_early_exit
+
+    status, step_status, _step_extra, payload = _extract_masks_early_exit(
+        "no_detections", subthreshold=0, preflight_unreadable=311,
+        preflight_masked=4, offline_latched=True,
+    )
+    assert step_status == "failed", (
+        f"An outage exit is a terminal failure on the job tree; got "
+        f"{step_status!r}"
+    )
+    assert status == "failed", (
+        "A pre-flight outage already latched a failure and appended a Fatal "
+        f"error; the early exit must not downgrade it. Got {status!r}"
+    )
+    # Reporting 311 unreadable against a hard-coded zero total publishes an
+    # impossible tally to anything computing coverage.
+    assert payload["unreadable"] == 311
+    # Cache hits the pre-flight dropped are still successful outcomes and
+    # still part of the stage's coverage.
+    assert payload["masked"] == 4
+    assert payload["total"] == 315
+    assert payload["reason"] == "no_detections"
+
+
+def test_extract_masks_early_exit_is_a_benign_skip_without_an_outage():
+    from pipeline_job import _extract_masks_early_exit
+
+    status, step_status, _step_extra, payload = _extract_masks_early_exit(
+        "weights_missing", subthreshold=4, preflight_unreadable=0,
+        preflight_masked=0, offline_latched=False,
+    )
+    assert status == "skipped", (
+        f"No outage means the early exit stays a benign skip; got {status!r}"
+    )
+    # JobRunner.update_step only finalizes completed/failed/cancelled, and
+    # the Jobs page only renders summaries for those. Sending "skipped" to
+    # the runner leaves a hollow pending-style row with no duration and no
+    # explanation of why the stage did nothing (Codex #1392 P2).
+    assert step_status == "completed", (
+        f"A benign skip still has to close out the runner step; got "
+        f"{step_status!r}"
+    )
+    assert payload["unreadable"] == 0
+    assert payload["total"] == 0
+    assert payload["subthreshold"] == 4
+
+
+def test_extract_masks_outage_rollup_counts_only_offline_photos(
+    tmp_path, monkeypatch,
+):
+    """The reconnect message must not claim unrelated bad files.
+
+    A corrupt file in a healthy folder and a photo behind a dead volume both
+    land in the unreadable bucket, but only one is fixed by reconnecting the
+    source. Attributing the combined count to the single latched outage tells
+    the user that plugging the drive back in recovers files it cannot touch
+    (Codex #1392 P2).
+    """
+    import config as cfg
+    import pipeline_job as pj
+    from db import Database
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cfg.CONFIG_PATH = str(tmp_path / "config.json")
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws_id = db._active_workspace_id
+
+    # Sorted so the corrupt file in the healthy folder is hit first, which is
+    # the ordering that produced the misattribution.
+    corrupt_path = str(tmp_path / "aa_healthy")
+    share_path = str(tmp_path / "zz_share")
+    os.makedirs(corrupt_path, exist_ok=True)
+    os.makedirs(share_path, exist_ok=True)
+    corrupt_folder = db.add_folder(corrupt_path)
+    share_folder = db.add_folder(share_path)
+
+    photo_ids = [
+        _add_photo_with_detection(
+            db, corrupt_folder, corrupt_path, "aa_bad.jpg",
+        ),
+        _add_photo_with_detection(db, share_folder, share_path, "zz0.jpg"),
+    ]
+    collection_id = db.add_collection(
+        "One corrupt file, one dead volume",
+        json.dumps([{"field": "photo_ids", "value": photo_ids}]),
+    )
+
+    state = _stub_extract_masks_heavy_ops(monkeypatch)
+
+    import masking
+
+    monkeypatch.setattr(
+        masking, "render_proxy", lambda p, longest_edge=None: None,
+    )
+    state["proxy_calls"] = 0
+    # The healthy folder is readable — that file is simply broken. Only the
+    # share is offline.
+    monkeypatch.setattr(
+        pj, "_source_offline_reason",
+        lambda folder_path, image_path: (
+            ("mount", "volume /Volumes/Photography is not mounted")
+            if image_path.startswith(share_path) else None
+        ),
+    )
+
+    _runner, result = _run_extract_masks_only(db_path, ws_id, collection_id)
+
+    em = result["stages"]["extract_masks"]
+    assert em.get("unreadable") == 2, f"Both photos are unreadable; got {em!r}"
+
+    outage_errors = [
+        e for e in result["errors"] if "/Volumes/Photography" in e
+    ]
+    assert outage_errors, f"Expected an outage rollup; got {result['errors']!r}"
+    assert "1 of 2 photos unreachable" in outage_errors[0], (
+        f"Only the photo on the dead volume is attributable to the outage; "
+        f"got {outage_errors[0]!r}"
+    )
+    # The corrupt file still has to be reported — just not as an outage.
+    assert any(
+        "could not be read" in e and "/Volumes/Photography" not in e
+        for e in result["errors"]
+    ), (
+        f"The corrupt file needs its own rollup; got {result['errors']!r}"
+    )
+
+
+def test_extract_masks_preflight_skips_photos_that_already_have_a_mask(
+    tmp_path, monkeypatch,
+):
+    """An offline photo that already carries a mask is not "unreadable".
+
+    The unreadable count exists to explain `no_subject_mask` rejections in
+    Process Review. A photo with an active mask for the configured variant
+    will not be rejected for that, so counting it makes the stage overstate
+    the damage from an outage it was never harmed by (Codex #1392 P2).
+    """
+    import config as cfg
+    from db import Database
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cfg.CONFIG_PATH = str(tmp_path / "config.json")
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws_id = db._active_workspace_id
+    folder_path = str(tmp_path / "photos")
+    os.makedirs(folder_path, exist_ok=True)
+    folder_id = db.add_folder(folder_path)
+
+    unmasked = _add_photo_with_detection(db, folder_id, folder_path, "a.jpg")
+    masked = _add_photo_with_detection(db, folder_id, folder_path, "b.jpg")
+    collection_id = db.add_collection(
+        "Half already masked",
+        json.dumps([{"field": "photo_ids", "value": [unmasked, masked]}]),
+    )
+
+    pipeline_cfg = db.get_effective_config(cfg.load()).get("pipeline", {})
+    sam2_variant = pipeline_cfg.get("sam2_variant")
+    dinov2_variant = pipeline_cfg.get("dinov2_variant")
+
+    mask_dir = tmp_path / ".vireo" / "masks"
+    os.makedirs(mask_dir, exist_ok=True)
+    mask_file = str(mask_dir / f"{masked}.{sam2_variant}.png")
+    from PIL import Image
+    Image.new("L", (4, 4), 255).save(mask_file)
+    db.upsert_photo_mask(
+        masked, sam2_variant, mask_file, "MegaDetector", 0.1, 0.1, 0.5, 0.5,
+    )
+    db.set_active_mask_variant(masked, sam2_variant)
+    db.conn.execute(
+        "UPDATE photos SET dino_embedding_variant=? WHERE id=?",
+        (dinov2_variant, masked),
+    )
+    db.conn.commit()
+
+    _stub_extract_masks_heavy_ops(monkeypatch)
+
+    # The source is gone before the stage starts, so the pre-flight probe
+    # drops both photos.
+    import shutil
+    shutil.rmtree(folder_path, ignore_errors=True)
+
+    _runner, result = _run_extract_masks_only(db_path, ws_id, collection_id)
+
+    em = result["stages"]["extract_masks"]
+    assert em.get("unreadable") == 1, (
+        f"Only the photo without a mask is at risk of a `no_subject_mask` "
+        f"rejection; got {em!r}"
+    )
+    # The cached photo is a successful outcome, exactly as it would be on the
+    # online cache-hit path — dropping it from every counter reports
+    # "1 unreadable of 1" for a two-photo collection (Codex #1392 P2).
+    assert em["masked"] == 1, (
+        f"An already-masked photo is a cache hit, not a non-event; got {em!r}"
+    )
+    assert em["total"] == 2, (
+        f"Total must cover both photos; got {em!r}"
+    )
+
+
+def test_extract_masks_preflight_fully_cached_folder_does_not_fail_stage(
+    tmp_path, monkeypatch,
+):
+    """An offline folder whose photos are all already masked is not a failure.
+
+    Nothing in it needed a source read, and nothing in it will be rejected as
+    `no_subject_mask`. Latching a Fatal error and failing the stage there
+    reports damage that did not happen — and blocks the run behind a
+    reconnect instruction that would change nothing (Codex #1392 P2).
+    """
+    import config as cfg
+    from db import Database
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cfg.CONFIG_PATH = str(tmp_path / "config.json")
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws_id = db._active_workspace_id
+    folder_path = str(tmp_path / "photos")
+    os.makedirs(folder_path, exist_ok=True)
+    folder_id = db.add_folder(folder_path)
+
+    photo_ids = [
+        _add_photo_with_detection(db, folder_id, folder_path, f"b{i}.jpg")
+        for i in range(2)
+    ]
+    collection_id = db.add_collection(
+        "All already masked",
+        json.dumps([{"field": "photo_ids", "value": photo_ids}]),
+    )
+
+    pipeline_cfg = db.get_effective_config(cfg.load()).get("pipeline", {})
+    sam2_variant = pipeline_cfg.get("sam2_variant")
+    dinov2_variant = pipeline_cfg.get("dinov2_variant")
+
+    mask_dir = tmp_path / ".vireo" / "masks"
+    os.makedirs(mask_dir, exist_ok=True)
+    from PIL import Image
+    for pid in photo_ids:
+        mask_file = str(mask_dir / f"{pid}.{sam2_variant}.png")
+        Image.new("L", (4, 4), 255).save(mask_file)
+        db.upsert_photo_mask(
+            pid, sam2_variant, mask_file, "MegaDetector", 0.1, 0.1, 0.5, 0.5,
+        )
+        db.set_active_mask_variant(pid, sam2_variant)
+        db.conn.execute(
+            "UPDATE photos SET dino_embedding_variant=? WHERE id=?",
+            (dinov2_variant, pid),
+        )
+    db.conn.commit()
+
+    _stub_extract_masks_heavy_ops(monkeypatch)
+
+    import shutil
+    shutil.rmtree(folder_path, ignore_errors=True)
+
+    runner, result = _run_extract_masks_only(db_path, ws_id, collection_id)
+
+    em = result["stages"]["extract_masks"]
+    assert em.get("unreadable") == 0, (
+        f"Nothing here is at risk of a `no_subject_mask` rejection; got {em!r}"
+    )
+    assert not any("unreachable" in e for e in result["errors"]), (
+        f"No outage error belongs on a fully-cached folder; got "
+        f"{result['errors']!r}"
+    )
+    final = _extract_masks_final_update(runner)
+    assert final["status"] != "failed", (
+        f"A fully-cached offline folder must not fail the stage; got {final!r}"
+    )
+
+
+def test_extract_masks_cancelled_total_covers_preflight_drops(
+    tmp_path, monkeypatch,
+):
+    """A cancelled run must not publish impossible counters either.
+
+    The cancel branch folds pre-flight drops into `unreadable` but reported
+    the post-filter loop total beside it, so a cancel after an outage could
+    persist "3 unreadable, total: 1" (Codex #1392 P2).
+    """
+    import config as cfg
+    import pipeline_job as pj
+    from db import Database
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cfg.CONFIG_PATH = str(tmp_path / "config.json")
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws_id = db._active_workspace_id
+
+    dead_path = str(tmp_path / "aa_dead")
+    live_path = str(tmp_path / "zz_live")
+    os.makedirs(dead_path, exist_ok=True)
+    os.makedirs(live_path, exist_ok=True)
+    dead_folder = db.add_folder(dead_path)
+    live_folder = db.add_folder(live_path)
+
+    photo_ids = [
+        _add_photo_with_detection(db, dead_folder, dead_path, "aa0.jpg"),
+        _add_photo_with_detection(db, dead_folder, dead_path, "aa1.jpg"),
+        _add_photo_with_detection(db, live_folder, live_path, "zz0.jpg"),
+    ]
+    collection_id = db.add_collection(
+        "Cancelled after an outage",
+        json.dumps([{"field": "photo_ids", "value": photo_ids}]),
+    )
+
+    _stub_extract_masks_heavy_ops(monkeypatch)
+
+    # The dead folder is gone before the run, so pre-flight drops its two.
+    import shutil
+    shutil.rmtree(dead_path, ignore_errors=True)
+
+    # Cancel as soon as the surviving healthy photo is reached.
+    import masking
+    import numpy as np
+
+    def render_then_cancel(image_path, longest_edge=None):
+        pj._should_abort_cancel_flag = True
+        return np.zeros((16, 16, 3), dtype=np.uint8)
+
+    monkeypatch.setattr(masking, "render_proxy", render_then_cancel)
+    original_should_abort = pj._should_abort
+    monkeypatch.setattr(
+        pj, "_should_abort",
+        lambda event: getattr(pj, "_should_abort_cancel_flag", False)
+        or original_should_abort(event),
+    )
+
+    _runner, result = _run_extract_masks_only(db_path, ws_id, collection_id)
+    if hasattr(pj, "_should_abort_cancel_flag"):
+        del pj._should_abort_cancel_flag
+
+    em = result["stages"]["extract_masks"]
+    assert em.get("cancelled") is True, f"Expected a cancelled result; got {em!r}"
+    assert em["total"] >= em.get("unreadable", 0), (
+        f"Cancelled totals must still cover the photos they report; got {em!r}"
+    )
+
+
+def test_extract_masks_cancelled_step_warning_covers_unreadable(
+    tmp_path, monkeypatch,
+):
+    """A cancel after a source dropped must still surface the unreadable
+    count as a step warning.
+
+    The mid-loop updates and the normal finalizer both feed
+    ``em_failed + em_unreadable`` (and preflight unreadables) into the
+    runner's ``error_count`` so the Jobs page badges the row for the
+    reader. The cancel branch passed only ``em_failed``, so a cancel
+    arriving after the pre-flight had dropped photos left a completed
+    Extract row with a zero warning count next to a result that recorded
+    positive ``unreadable`` (Codex #1392 P2 r3687499188).
+    """
+    import config as cfg
+    import pipeline_job as pj
+    from db import Database
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cfg.CONFIG_PATH = str(tmp_path / "config.json")
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws_id = db._active_workspace_id
+
+    dead_path = str(tmp_path / "aa_dead")
+    live_path = str(tmp_path / "zz_live")
+    os.makedirs(dead_path, exist_ok=True)
+    os.makedirs(live_path, exist_ok=True)
+    dead_folder = db.add_folder(dead_path)
+    live_folder = db.add_folder(live_path)
+
+    photo_ids = [
+        _add_photo_with_detection(db, dead_folder, dead_path, "aa0.jpg"),
+        _add_photo_with_detection(db, dead_folder, dead_path, "aa1.jpg"),
+        _add_photo_with_detection(db, live_folder, live_path, "zz0.jpg"),
+    ]
+    collection_id = db.add_collection(
+        "Cancel-after-outage warning count",
+        json.dumps([{"field": "photo_ids", "value": photo_ids}]),
+    )
+
+    _stub_extract_masks_heavy_ops(monkeypatch)
+
+    # Kill the shared source before the run so pre-flight drops both.
+    import shutil
+    shutil.rmtree(dead_path, ignore_errors=True)
+
+    import masking
+    import numpy as np
+
+    def render_then_cancel(image_path, longest_edge=None):
+        pj._should_abort_cancel_flag = True
+        return np.zeros((16, 16, 3), dtype=np.uint8)
+
+    monkeypatch.setattr(masking, "render_proxy", render_then_cancel)
+    original_should_abort = pj._should_abort
+    monkeypatch.setattr(
+        pj, "_should_abort",
+        lambda event: getattr(pj, "_should_abort_cancel_flag", False)
+        or original_should_abort(event),
+    )
+
+    runner, result = _run_extract_masks_only(db_path, ws_id, collection_id)
+    if hasattr(pj, "_should_abort_cancel_flag"):
+        del pj._should_abort_cancel_flag
+
+    em = result["stages"]["extract_masks"]
+    assert em.get("cancelled") is True, f"Expected cancelled; got {em!r}"
+    assert em["unreadable"] >= 2, (
+        f"Cancelled result must include the pre-flight drops in "
+        f"``unreadable``; got {em!r}"
+    )
+
+    final = _extract_masks_final_update(runner)
+    assert final["status"] == "completed", (
+        f"Cancel branch finalizes as completed; got {final!r}"
+    )
+    # Before the fix ``error_count`` was ``em_failed`` (zero here), so a
+    # cancel-after-outage Extract row rendered zero warnings alongside a
+    # result recording two unreadable photos. Aligning it with the mid-
+    # loop and finalizer paths (which include unreadable + preflight
+    # unreadable) is the fix (Codex #1392 P2 r3687499188).
+    assert final.get("error_count", 0) >= em["unreadable"], (
+        f"error_count must at least cover the unreadable photos so the "
+        f"Jobs row warns; got final={final!r}, em={em!r}"
+    )
+
+
+def test_extract_masks_preflight_error_denominator_matches_stage_total(
+    tmp_path, monkeypatch,
+):
+    """The preflight Fatal message and the stage result must describe
+    the same population.
+
+    ``at_risk_dropped_ids`` counts mask candidates only — photos with no
+    qualifying detection are dropped from it, because an outage doesn't
+    change their fate (the loop would never have read them for masking).
+    The denominator in the message, however, was ``total_before`` — the
+    whole collection worklist. A collection with 1 mask candidate on an
+    offline folder and additional no-detection photos published messages
+    like "1 of 4 photos unreachable" alongside a stage result reporting
+    ``total: 2``, and the reader had no way to reconcile them
+    (Codex #1392 P2 r3687499184).
+    """
+    import config as cfg
+    from db import Database
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cfg.CONFIG_PATH = str(tmp_path / "config.json")
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws_id = db._active_workspace_id
+
+    dead_path = str(tmp_path / "aa_dead")
+    live_path = str(tmp_path / "zz_live")
+    os.makedirs(dead_path, exist_ok=True)
+    os.makedirs(live_path, exist_ok=True)
+    dead_folder = db.add_folder(dead_path)
+    live_folder = db.add_folder(live_path)
+
+    # 1 mask candidate on the offline folder + 1 mask candidate on the
+    # healthy folder + 2 no-detection photos on the healthy folder.
+    # Mask-candidate total = 2; whole-collection total = 4.
+    photo_ids = [
+        _add_photo_with_detection(db, dead_folder, dead_path, "aa0.jpg"),
+        _add_photo_with_detection(db, live_folder, live_path, "zz0.jpg"),
+    ]
+    for filename in ("zz1.jpg", "zz2.jpg"):
+        pid = db.add_photo(
+            live_folder, filename, ".jpg", 1000,
+            1_000_000.0 + hash(filename) % 1000,
+        )
+        _drop_jpeg(live_path, filename)
+        photo_ids.append(pid)
+
+    collection_id = db.add_collection(
+        "Mixed detections plus outage",
+        json.dumps([{"field": "photo_ids", "value": photo_ids}]),
+    )
+
+    _stub_extract_masks_heavy_ops(monkeypatch)
+
+    import shutil
+    shutil.rmtree(dead_path, ignore_errors=True)
+
+    _runner, result = _run_extract_masks_only(db_path, ws_id, collection_id)
+
+    em = result["stages"]["extract_masks"]
+    assert em["total"] == 2, (
+        f"Stage total must count only mask candidates (1 kept + 1 "
+        f"dropped mask candidate); got {em!r}"
+    )
+    fatal = next(
+        (e for e in result["errors"]
+         if e.startswith("[extract_masks] Fatal:")),
+        None,
+    )
+    assert fatal is not None, (
+        f"Expected an extract_masks Fatal preflight error; got "
+        f"{result['errors']!r}"
+    )
+    # Before the fix the denominator was ``total_before`` — the whole
+    # collection worklist — so the message read "1 of 4 photos
+    # unreachable" while the stage result reported total: 2.
+    assert "1 of 2 photos unreachable" in fatal, (
+        f"Denominator must match the mask-candidate stage total; got "
+        f"{fatal!r}"
+    )
+
+
+def _seed_cached_mask(db, tmp_path, photo_id, sam2_variant, dinov2_variant,
+                      prompt=(0.1, 0.1, 0.5, 0.5), detector="MegaDetector"):
+    """Give `photo_id` a complete, active mask for the configured variant."""
+    from PIL import Image
+    mask_dir = tmp_path / ".vireo" / "masks"
+    os.makedirs(mask_dir, exist_ok=True)
+    mask_file = str(mask_dir / f"{photo_id}.{sam2_variant}.png")
+    Image.new("L", (4, 4), 255).save(mask_file)
+    db.upsert_photo_mask(photo_id, sam2_variant, mask_file, detector, *prompt)
+    db.set_active_mask_variant(photo_id, sam2_variant)
+    db.conn.execute(
+        "UPDATE photos SET dino_embedding_variant=? WHERE id=?",
+        (dinov2_variant, photo_id),
+    )
+    db.conn.commit()
+    return mask_file
+
+
+def test_extract_masks_preflight_stale_cached_mask_is_still_at_risk(
+    tmp_path, monkeypatch,
+):
+    """A mask built from an obsolete detection is not a usable cache hit.
+
+    If the detection box moved, the photo needs re-masking — which an offline
+    source makes impossible. Treating the stale mask as a success suppresses
+    the outage and lets scoring keep using a mask and embedding derived from
+    a detection that no longer applies (Codex #1392 P1).
+    """
+    import config as cfg
+    from db import Database
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cfg.CONFIG_PATH = str(tmp_path / "config.json")
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws_id = db._active_workspace_id
+    folder_path = str(tmp_path / "photos")
+    os.makedirs(folder_path, exist_ok=True)
+    folder_id = db.add_folder(folder_path)
+
+    pid = _add_photo_with_detection(db, folder_id, folder_path, "moved.jpg")
+    collection_id = db.add_collection(
+        "Stale prompt",
+        json.dumps([{"field": "photo_ids", "value": [pid]}]),
+    )
+
+    pipeline_cfg = db.get_effective_config(cfg.load()).get("pipeline", {})
+    # Mask cached against a box that no longer matches the live detection
+    # (_add_photo_with_detection stores 0.1/0.1/0.5/0.5).
+    _seed_cached_mask(
+        db, tmp_path, pid, pipeline_cfg.get("sam2_variant"),
+        pipeline_cfg.get("dinov2_variant"), prompt=(0.9, 0.9, 0.05, 0.05),
+    )
+
+    _stub_extract_masks_heavy_ops(monkeypatch)
+
+    import shutil
+    shutil.rmtree(folder_path, ignore_errors=True)
+
+    _runner, result = _run_extract_masks_only(db_path, ws_id, collection_id)
+
+    em = result["stages"]["extract_masks"]
+    assert em.get("unreadable") == 1, (
+        f"A stale mask needs a re-read the outage prevents; got {em!r}"
+    )
+    assert em["masked"] == 0, (
+        f"An obsolete mask is not a successful cache hit; got {em!r}"
+    )
+
+
+def test_extract_masks_preflight_ignores_photos_with_no_detection(
+    tmp_path, monkeypatch,
+):
+    """An offline photo the mask worklist would never have touched is not a
+    casualty of the outage.
+
+    Photos with no qualifying detection never enter mask extraction, so
+    counting them turns an unrelated source outage into a Fatal Extract
+    failure and tells the user to reconnect for photos that would still have
+    no mask candidate (Codex #1392 P2).
+    """
+    import config as cfg
+    from db import Database
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cfg.CONFIG_PATH = str(tmp_path / "config.json")
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws_id = db._active_workspace_id
+    folder_path = str(tmp_path / "photos")
+    os.makedirs(folder_path, exist_ok=True)
+    folder_id = db.add_folder(folder_path)
+
+    from PIL import Image
+    no_det = db.add_photo(folder_id, "nodet.jpg", ".jpg", 1000, 5_000_000.0)
+    Image.new("RGB", (16, 16), "black").save(
+        os.path.join(folder_path, "nodet.jpg")
+    )
+    collection_id = db.add_collection(
+        "No mask candidates",
+        json.dumps([{"field": "photo_ids", "value": [no_det]}]),
+    )
+
+    _stub_extract_masks_heavy_ops(monkeypatch)
+
+    import shutil
+    shutil.rmtree(folder_path, ignore_errors=True)
+
+    _runner, result = _run_extract_masks_only(db_path, ws_id, collection_id)
+
+    em = result["stages"]["extract_masks"]
+    assert em.get("unreadable", 0) == 0, (
+        f"A photo with no detection was never a mask candidate; got {em!r}"
+    )
+    assert not any("unreachable" in e for e in result["errors"]), (
+        f"No reconnect instruction belongs here; got {result['errors']!r}"
+    )
+
+
+def test_extract_masks_early_exit_carries_outage_detail_to_the_step():
+    """A failed early exit must tell the Jobs page why it failed.
+
+    The step showed only "Skipped — MegaDetector produced no detections"
+    with no error, so a row failed by a source outage hid the reconnect
+    instruction and blamed detections instead (Codex #1392 P2).
+    """
+    from pipeline_job import _extract_masks_early_exit
+
+    outage = "[extract_masks] Fatal: 311 of 315 photos unreachable."
+    _stage, step_status, step_extra, _payload = _extract_masks_early_exit(
+        "no_detections", subthreshold=0, preflight_unreadable=311,
+        preflight_masked=4, offline_latched=True, outage_error=outage,
+    )
+    assert step_status == "failed"
+    assert step_extra.get("error") == outage, (
+        f"The failed step needs the outage detail; got {step_extra!r}"
+    )
+    assert step_extra.get("error_count") == 311
+
+    _stage, step_status, step_extra, _payload = _extract_masks_early_exit(
+        "weights_missing", subthreshold=0, preflight_unreadable=0,
+        preflight_masked=0, offline_latched=False, outage_error=None,
+    )
+    assert step_status == "completed"
+    assert step_extra == {}, (
+        f"A benign skip carries no error fields; got {step_extra!r}"
+    )
+
+
+def test_extract_masks_early_exit_fails_when_preflight_unreadable_without_latch():
+    """A classify-owned outage still fails the extract early exit.
+
+    When classify has already emitted a source-offline Fatal, the pre-flight
+    intentionally does not re-latch (to avoid a duplicate error), so
+    ``offline_latched`` stays False even though ``preflight_unreadable > 0``.
+    Prior shape: the early exit reported ``skipped``/``completed``, leaving
+    a green Jobs row that hid the fact the extract stage had unreachable
+    photos of its own (Codex #1392 P2 r3687403367). It must fail on
+    ``preflight_unreadable > 0`` too, and carry the extract-owned outage
+    detail so the row shows the reconnect instruction.
+    """
+    from pipeline_job import _extract_masks_early_exit
+
+    outage = "[extract_masks] Fatal: 2 of 5 photos unreachable."
+    stage, step_status, step_extra, _payload = _extract_masks_early_exit(
+        "no_detections", subthreshold=0, preflight_unreadable=2,
+        preflight_masked=0, offline_latched=False, outage_error=outage,
+    )
+    assert stage == "failed", (
+        f"An early exit with unreadable photos is not a benign skip; "
+        f"got {stage!r}"
+    )
+    assert step_status == "failed", (
+        f"The runner step must show failed too; got {step_status!r}"
+    )
+    assert step_extra.get("error") == outage, (
+        f"The step needs the outage detail so the Jobs row shows the "
+        f"reconnect instruction; got {step_extra!r}"
+    )
+    assert step_extra.get("error_count") == 2
+
+
+def test_extract_masks_preflight_counts_rescued_weak_detections(
+    tmp_path, monkeypatch,
+):
+    """A weak burst frame the rescue path would have masked still counts.
+
+    With weak-detection rescue enabled the mask worklist reaches detections
+    below ``detector_confidence`` — but only for frames ``contextual_weak_
+    runs`` surfaces with matching-anchor-species classifications. A pre-flight
+    predicate that queries only at the main threshold silently drops those
+    frames from both outcome sets; if every at-risk photo on a dead source is
+    a rescued frame, the outage never latches at all — the silent completion
+    this PR exists to prevent (Codex #1392 P2 r3687355839).
+
+    The isolated-weak case is guarded separately below: an offline photo with
+    a weak-confidence detection but no rescuing anchor context would never be
+    read by the mask loop, so it must NOT inflate the outage report
+    (Codex #1392 P2 r3687403366).
+    """
+    import config as cfg
+    from db import Database
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cfg.CONFIG_PATH = str(tmp_path / "config.json")
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws_id = db._active_workspace_id
+    folder_path = str(tmp_path / "photos")
+    os.makedirs(folder_path, exist_ok=True)
+    folder_id = db.add_folder(folder_path)
+
+    # Bracketed burst: two high-confidence anchors classified with the same
+    # species, and a weak middle frame between them — the pattern
+    # ``contextual_weak_runs`` picks up. Both anchor detections carry the
+    # same prediction so ``load_photo_features`` marks the middle frame
+    # ``subject_uncertain`` (i.e. an eligible rescue).
+    photo_ids = []
+    detection_ids = []
+    for index, confidence in enumerate((0.9, 0.15, 0.9)):
+        filename = f"burst{index}.jpg"
+        pid = db.add_photo(
+            folder_id, filename, ".jpg", 1000, 1_000_000.0 + index,
+            timestamp=f"2026-07-18T08:36:3{index}",
+        )
+        _drop_jpeg(folder_path, filename)
+        det_id = db.write_detection_batch(
+            pid,
+            "megadetector-v6",
+            [{
+                "box": {"x": 0.1, "y": 0.1, "w": 0.5, "h": 0.5},
+                "confidence": confidence,
+                "category": "animal",
+            }],
+        )[0]
+        photo_ids.append(pid)
+        detection_ids.append(det_id)
+
+    db.add_prediction(
+        detection_ids[0], "Great-tailed Grackle", 0.9, "inat21",
+    )
+    db.add_prediction(
+        detection_ids[-1], "Great-tailed Grackle", 0.9, "inat21",
+    )
+
+    collection_id = db.add_collection(
+        "Rescued weak burst",
+        json.dumps([{"field": "photo_ids", "value": photo_ids}]),
+    )
+
+    _stub_extract_masks_heavy_ops(monkeypatch)
+
+    import shutil
+    shutil.rmtree(folder_path, ignore_errors=True)
+
+    _runner, result = _run_extract_masks_only(db_path, ws_id, collection_id)
+
+    em = result["stages"]["extract_masks"]
+    # All three photos are mask candidates: two via strict detection, one
+    # via contextual weak rescue. All three must show up as unreadable — a
+    # stage that reports 2 unreadable of 3 would silently drop the rescued
+    # frame, exactly the bug this test guards against.
+    assert em.get("unreadable") == 3, (
+        f"Rescued weak frame on a dead source must still count as "
+        f"unreadable; got {em!r}"
+    )
+    assert em["total"] == 3, (
+        f"Total must cover the rescued candidate too; got {em!r}"
+    )
+    assert any(
+        "3 of 3" in e and "unreachable" in e for e in result["errors"]
+    ), (
+        f"The reconnect message must claim every dropped candidate — "
+        f"rescued frame included; got {result['errors']!r}"
+    )
+
+
+def test_extract_masks_preflight_ignores_isolated_weak_detections(
+    tmp_path, monkeypatch,
+):
+    """An offline weak-conf photo without a rescuing burst must not inflate
+    the outage.
+
+    ``contextual_weak_runs`` needs matching-anchor-species neighbours to
+    surface a weak frame; a lone weak detection would never enter the mask
+    worklist online. A pre-flight that just checks ``weak_detection_
+    confidence`` counts it as at-risk anyway, turning an unrelated folder
+    outage into a Fatal Extract failure and demanding a reconnect for a
+    photo that still wouldn't get a mask (Codex #1392 P2 r3687403366).
+    """
+    import config as cfg
+    from db import Database
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cfg.CONFIG_PATH = str(tmp_path / "config.json")
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws_id = db._active_workspace_id
+    folder_path = str(tmp_path / "photos")
+    os.makedirs(folder_path, exist_ok=True)
+    folder_id = db.add_folder(folder_path)
+
+    from PIL import Image
+    pid = db.add_photo(folder_id, "weak.jpg", ".jpg", 1000, 7_000_000.0)
+    Image.new("RGB", (16, 16), "black").save(
+        os.path.join(folder_path, "weak.jpg")
+    )
+    # Between weak_detection_confidence (0.12) and detector_confidence (0.2)
+    # — but isolated, so contextual_weak_runs won't surface it and the mask
+    # loop would never read it online.
+    db.save_detections(
+        pid,
+        [{"box": {"x": 0.1, "y": 0.1, "w": 0.5, "h": 0.5},
+          "confidence": 0.15, "category": "animal"}],
+        detector_model="megadetector-v6",
+    )
+    collection_id = db.add_collection(
+        "Isolated weak frame",
+        json.dumps([{"field": "photo_ids", "value": [pid]}]),
+    )
+
+    _stub_extract_masks_heavy_ops(monkeypatch)
+
+    import shutil
+    shutil.rmtree(folder_path, ignore_errors=True)
+
+    _runner, result = _run_extract_masks_only(db_path, ws_id, collection_id)
+
+    em = result["stages"]["extract_masks"]
+    assert em.get("unreadable") == 0, (
+        f"An isolated weak detection isn't a mask candidate — an outage "
+        f"must not report it as unreachable; got {em!r}"
+    )
+    assert not any(
+        "unreachable" in e for e in result["errors"]
+    ), (
+        f"No reconnect instruction belongs to an unrelated outage; got "
+        f"{result['errors']!r}"
     )
 
 

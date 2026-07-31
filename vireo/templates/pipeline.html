@@ -2697,6 +2697,73 @@ function _showPipelineError(messages) {
   banner.scrollIntoView({behavior: 'smooth', block: 'nearest'});
 }
 
+// Per-photo outcomes for the Extract card, in the order the user cares
+// about. `masked`/`skipped`/`unreadable`/`failed`/`total` are what both the
+// pipeline stage and /api/jobs/extract-masks actually emit — this card used
+// to read `masks_created`/`scored_count`, names no backend has ever sent, so
+// its summary rendered empty on every run.
+function _extractMasksSummary(ext) {
+  if (!ext) return '';
+  var parts = [];
+  if (ext.masked) parts.push(ext.masked + ' masked');
+  if (ext.skipped) parts.push(ext.skipped + ' skipped');
+  // Distinct from "skipped": a skip means SAM looked and found no subject,
+  // unreadable means the source file never opened (dropped share, corrupt
+  // file). Both leave the photo unmasked, but only one is the user's to fix.
+  if (ext.unreadable) parts.push(ext.unreadable + ' unreadable');
+  if (ext.failed) parts.push(ext.failed + ' failed');
+  if (parts.length) return parts.join(', ');
+  // Every counter is zero. `reason` means the backend emptied the worklist
+  // because something went wrong (no detections, missing weights, everything
+  // below the detector threshold, source offline at preflight) — those photos
+  // did need masks and will be hard-rejected as `no_subject_mask` without
+  // them. Only a genuinely empty worklist gets the reassuring wording.
+  return ext.reason ? 'No masks created' : 'No photos needed masks';
+}
+
+// Whether a mask-extraction result deserves the green completed treatment.
+// Photos we couldn't read or that errored end the run with no mask, and
+// scoring hard-rejects every unmasked photo as `no_subject_mask`; a `reason`
+// means the backend emptied the worklist because something went wrong. None
+// of those are "Done!". Shared by the pipeline-run card and the standalone
+// Extract step so the two can't drift.
+function _extractMasksClean(ext) {
+  if (!ext) return true;
+  return !ext.unreadable && !ext.failed && !ext.reason;
+}
+
+// What the standalone Extract card should show for a finished job. The job
+// now reports `failed` when photos went unmasked, and the counts plus the
+// backend's reconnect instruction matter most in exactly that case — so the
+// rendering must not live inside a `completed`-only branch (Codex #1392 P2).
+//
+// `topErrors` is the completion event's own `errors` array. It's the only
+// source of a message when the worker raised (JobRunner leaves `result` null
+// and stashes the exception at the top level) or when the user cancelled
+// before the worker returned a structured result — otherwise those two paths
+// fall through to the generic "Some photos have no mask", hiding the real
+// cause (Codex #1392 P2).
+function _extractStepOutcome(jobStatus, result, topErrors) {
+  var clean = jobStatus === 'completed' && _extractMasksClean(result);
+  var nested = (result && result.errors) || [];
+  var errs = nested.length ? nested : (topErrors || []);
+  var statusText;
+  if (clean) {
+    statusText = 'Done!';
+  } else if (errs.length) {
+    statusText = 'Failed: ' + errs[0];
+  } else if (jobStatus === 'cancelled') {
+    statusText = 'Cancelled';
+  } else {
+    statusText = 'Some photos have no mask';
+  }
+  return {
+    clean: clean,
+    summary: _extractMasksSummary(result),
+    status: statusText,
+  };
+}
+
 function _onPipelineComplete(result) {
   if (result.status === 'cancelled') {
     var actionStatus = document.getElementById('pipelineActionStatus');
@@ -2788,16 +2855,31 @@ function _onPipelineComplete(result) {
 
   // Extract card
   if (stageResults.extract_masks) {
-    document.getElementById('numExtract').className = 'stage-num complete';
     var ext = stageResults.extract_masks;
-    var extSummary = [];
-    if (ext.masks_created) extSummary.push(ext.masks_created + ' masks');
-    if (ext.scored_count) extSummary.push(ext.scored_count + ' sharpness');
-    document.getElementById('txtMasks').textContent = extSummary.join(', ');
+    document.getElementById('txtMasks').textContent = _extractMasksSummary(ext);
+    // A photo the stage couldn't read or that errored ends the run with no
+    // mask, and scoring hard-rejects every unmasked photo as
+    // `no_subject_mask`. Marking the card complete/"Done!" in that state
+    // sends the user to Process Review with no idea why two-thirds of their
+    // encounters are rejects.
+    var extClean = _extractMasksClean(ext);
+    document.getElementById('numExtract').className =
+      extClean ? 'stage-num complete' : 'stage-num';
     var statusExt = document.getElementById('statusExtract');
     var fillExt = document.getElementById('fillExtract');
     if (fillExt) fillExt.style.width = '100%';
-    if (statusExt) { statusExt.textContent = 'Done!'; statusExt.className = 'status-msg ok'; }
+    if (statusExt) {
+      if (extClean) {
+        statusExt.textContent = 'Done!';
+        statusExt.className = 'status-msg ok';
+      } else {
+        // The errors loop below replaces this with the stage's actionable
+        // message ("Failed: [extract_masks] …"); this is the fallback for a
+        // stage that reported bad counts without an error entry.
+        statusExt.textContent = 'Some photos have no mask';
+        statusExt.className = 'status-msg error';
+      }
+    }
   }
 
   // Eye Keypoints card
@@ -2835,7 +2917,16 @@ function _onPipelineComplete(result) {
     r.errors.forEach(function(err) {
       var match = err.match(/^\[(\w+)\]/);
       var stage = match ? match[1] : 'unknown';
-      errorStages[stage] = err;
+      // One stage can report several errors. Keep the actionable one rather
+      // than whichever was appended last: a generic "1 of 2 photos failed"
+      // line would otherwise bury the "reconnect this volume" instruction
+      // that tells the user what to do (Codex #1392 P2). Mirrors the
+      // backend's own headline pick, which prefers "[stage] Fatal:".
+      var existing = errorStages[stage];
+      var isFatal = err.indexOf('] Fatal:') >= 0;
+      if (existing === undefined || (isFatal && existing.indexOf('] Fatal:') < 0)) {
+        errorStages[stage] = err;
+      }
     });
     var firstFailedCard = null;
     for (var stage in errorStages) {
@@ -3863,25 +3954,18 @@ async function runExtractStep(collectionId) {
         },
         onComplete: function(result) {
           window.dispatchEvent(new CustomEvent('vireo-job-done', {detail: {job_id: data.job_id}}));
-          if (result.status === 'completed') {
-            fill.style.width = '100%';
-            text.textContent = 'Complete';
-            status.textContent = 'Done!';
-            status.className = 'status-msg ok';
-            num.className = 'stage-num complete';
-            if (result.result) {
-              var r = result.result;
-              var summary = [];
-              if (r.masks_created) summary.push(r.masks_created + ' masks');
-              if (r.scored_count) summary.push(r.scored_count + ' sharpness');
-              document.getElementById('txtMasks').textContent = summary.join(', ');
-            }
-            resolve(true);
-          } else {
-            status.textContent = 'Failed';
-            num.className = 'stage-num';
-            resolve(false);
+          var outcome = _extractStepOutcome(
+            result.status, result.result, result.errors,
+          );
+          if (result.result) {
+            document.getElementById('txtMasks').textContent = outcome.summary;
           }
+          fill.style.width = '100%';
+          text.textContent = outcome.clean ? 'Complete' : 'Finished with problems';
+          status.textContent = outcome.status;
+          status.className = outcome.clean ? 'status-msg ok' : 'status-msg error';
+          num.className = outcome.clean ? 'stage-num complete' : 'stage-num';
+          resolve(outcome.clean);
         },
         onError: function() {
           status.textContent = 'Connection lost';

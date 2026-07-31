@@ -7234,3 +7234,99 @@ def test_local_import_invalidates_duplicate_skips_when_mount_detaches(
     )
     assert result["failed"] == 1, result
     assert result["safe_to_format"] is False, result
+
+
+def test_remote_import_invalidates_duplicate_skips_when_mount_detaches(
+        tmp_path, monkeypatch):
+    """The remote path needs the local path's duplicate-skip rollback.
+
+    A twin-verified skip increments ``skipped_duplicate``, never enters
+    ``landed`` or ``adopted_paths``, and can be satisfied by a shadow file
+    left on the persistent mount stub by an earlier failed import — so
+    rsync is skipped entirely and ``copied + skipped_duplicate ==
+    discovered`` holds against bytes that are not on the NAS. With
+    ``verify_by_hash`` on, the ``<remote>`` honesty gate stops masking it
+    and safe_to_format can go true over a card that is the only real
+    copy. See PR #1396 review (Codex P1 r3688498501 / r3688501706).
+    """
+    import shutil
+
+    import import_job as _ij
+    import pipeline_job as _pj
+    from import_job import ImportParams, run_import_job
+    from scanner import compute_file_hash
+
+    ra = _remote_archive_for(tmp_path)
+    calls = _remote_calls(ra)
+    _install_fake_remote_rsync(monkeypatch, calls, verify=None)
+    mount_base = ra["mount_base"]
+
+    # A shadow twin sitting on the mount stub, already cataloged — what an
+    # earlier failed import would have left behind.
+    twin_dir = os.path.join(mount_base, "2026", "2026-07-03")
+    os.makedirs(twin_dir, exist_ok=True)
+    twin_file = os.path.join(twin_dir, "IMG_0100.jpg")
+    Image.new("RGB", (16, 16), "red").save(twin_file)
+    ts = datetime(2026, 7, 3, 10, 0, 0).timestamp()
+    os.utime(twin_file, (ts, ts))
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws_id = db._active_workspace_id
+    fid = db.conn.execute(
+        "INSERT INTO folders (path, name, status) VALUES (?, ?, 'ok')",
+        (twin_dir, "2026-07-03"),
+    ).lastrowid
+    db.conn.execute(
+        "INSERT INTO photos (folder_id, filename, extension, file_size,"
+        " file_hash) VALUES (?, ?, '.jpg', ?, ?)",
+        (fid, "IMG_0100.jpg", os.path.getsize(twin_file),
+         compute_file_hash(twin_file)),
+    )
+    db.conn.commit()
+
+    card = tmp_path / "card"
+    card.mkdir()
+    shutil.copy2(twin_file, str(card / "IMG_0100.jpg"))
+
+    monkeypatch.setattr(
+        _pj, "_archive_mount_root_candidates",
+        lambda path: [mount_base] if str(path).startswith(mount_base) else [],
+    )
+    state = {"mounted": True}
+    real_ismount = os.path.ismount
+    monkeypatch.setattr(
+        os.path, "ismount",
+        lambda p: (
+            state["mounted"] if str(p) == mount_base else real_ismount(p)
+        ),
+    )
+
+    # Detach while the duplicate gate consults the twin — i.e. after the
+    # batch-boundary probe has already passed.
+    def _detach_after(fn):
+        def wrapper(*a, **kw):
+            rows = fn(*a, **kw)
+            state["mounted"] = False
+            return rows
+        return wrapper
+
+    monkeypatch.setattr(
+        _ij, "_key_twin_rows", _detach_after(_ij._key_twin_rows))
+    monkeypatch.setattr(
+        _ij, "_hash_twin_rows", _detach_after(_ij._hash_twin_rows))
+
+    result = run_import_job(
+        _make_job(), FakeRunner(), db_path, ws_id, ImportParams(
+            sources=[str(card)], destination=mount_base,
+            remote_target=ra, verify_by_hash=True,
+        ),
+    )
+
+    assert result["copied"] == 0, result
+    assert result["skipped_duplicate"] == 0, (
+        "a duplicate accepted against a detached archive still counted as "
+        f"safely already-present: {result}"
+    )
+    assert result["failed"] == 1, result
+    assert result["safe_to_format"] is False, result

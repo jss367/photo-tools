@@ -13,6 +13,12 @@ def _suppress_auto_preview(page):
     disables Start with "No files to import". Whether it lands at all is a
     race against how fast Playwright drives the form, so suppress it rather
     than let the machine's speed decide.
+
+    This hooks window.scheduleImportPreview, so it stops working silently if
+    a caller is ever changed to reach previewImport() directly. Assert
+    #btnStart is enabled immediately before clicking it in tests that rely on
+    this, so the failure surfaces as an assertion rather than as a 30s
+    actionability timeout with no explanation.
     """
     page.evaluate("() => { window.scheduleImportPreview = () => {}; }")
 
@@ -879,6 +885,10 @@ def test_import_copy_start_sends_restored_options(live_server, page):
     page.locator("#chkSkipDuplicates").uncheck()
     page.locator("#chkVerifyByHash").check()
 
+    # Guards _suppress_auto_preview(): if the debounce ever escapes it, a
+    # landed zero-file preview disables Start, and this reports that
+    # directly instead of as a bare actionability timeout.
+    expect(page.locator("#btnStart")).to_be_enabled()
     page.locator("#btnStart").click()
     expect(page.locator("#progressCard")).to_be_visible()
 
@@ -999,6 +1009,10 @@ def test_import_new_workspace_forwards_explicit_after_import(live_server, page):
     page.locator("#destInput").fill("/tmp/archive")
     page.locator("#afterImportSelect").select_option(str(identify_id))
 
+    # Guards _suppress_auto_preview(): if the debounce ever escapes it, a
+    # landed zero-file preview disables Start, and this reports that
+    # directly instead of as a bare actionability timeout.
+    expect(page.locator("#btnStart")).to_be_enabled()
     page.locator("#btnStart").click()
     expect(page.locator("#progressCard")).to_be_visible()
 
@@ -2273,9 +2287,11 @@ def test_changing_a_source_after_selecting_disables_start(live_server, page):
 
     page.evaluate("() => { window.scheduleImportPreview = () => {}; }")
     page.locator("#chkRecursive").click()   # invalidates the signature
-    expect(page.locator("#btnStart")).to_be_disabled()
+    # Label first, like every other gating assertion here: `disabled` alone
+    # matches several unrelated states this test doesn't mean.
     expect(page.locator("#btnStart")).to_have_text(
         "Preview again before importing")
+    expect(page.locator("#btnStart")).to_be_disabled()
 
 
 def test_start_is_disabled_while_a_preview_is_in_flight(live_server, page):
@@ -2288,7 +2304,7 @@ def test_start_is_disabled_while_a_preview_is_in_flight(live_server, page):
 
     page.evaluate(
         """() => {
-          const f = window.fetch;
+          const f = window.fetch.bind(window);
           window.__release = null;
           window.fetch = (input, init) => {
             const t = typeof input === 'string' ? input : input.url;
@@ -2597,4 +2613,162 @@ def test_start_is_blocked_when_the_captured_image_list_fails_to_load(
     page.goto(f"{live_server['url']}/import?new_images=not-a-snapshot-id")
     expect(page.locator("#newImagesImportSource")).to_contain_text(
         "could not be loaded")
+    # newImagesStartBlocked contributes no label, so the default caption is
+    # what proves the block came from that flag and not from a stray reason.
+    expect(page.locator("#btnStart")).to_have_text("Start import")
+    expect(page.locator("#btnStart")).to_be_disabled()
+
+
+def test_a_mode_round_trip_does_not_leave_start_live_over_an_empty_grid(
+        live_server, page):
+    """updateImportMode() throws the grid away, so it owes the gate a reset.
+
+    copy -> in place -> copy inside the 350ms re-preview debounce restores
+    the exact signature the completed preview captured, so the staleness
+    check reports "current" over a grid that no longer exists -- a live
+    Start, an invisible grid and a select-all still reading "3 of 3
+    selected", all at once. The debounce is stubbed out here so the
+    assertion pins the reset to updateImportMode() rather than to the
+    re-preview that happens to follow it.
+    """
+    page.goto(f"{live_server['url']}/import")
+    _stub_preview(page, _files(3))
+    _preview(page)
+    expect(page.locator("#btnStart")).to_have_text("Start import (3 files)")
+
+    _suppress_auto_preview(page)
+    page.locator("#modeInPlace").check()
+    page.locator("#modeCopy").check()
+
+    expect(page.locator("#importPreviewGrid")).not_to_be_visible()
+    # Back to "no preview run": Start is live, but it now means "import
+    # everything", which is what the empty screen beside it says.
+    expect(page.locator("#btnStart")).to_have_text("Start import")
+    expect(page.locator("#previewSelectedCount")).to_have_text(
+        "0 of 0 selected")
+
+
+def test_the_start_label_pluralises_a_single_file(live_server, page):
+    page.goto(f"{live_server['url']}/import")
+    _stub_preview(page, _files(2))
+    _preview(page)
+
+    page.locator(".import-preview-thumb .thumb-check").first.click()
+    expect(page.locator("#btnStart")).to_have_text("Start import (1 file)")
+
+
+# --- Task 10: the gate has to re-OPEN, not just close ---------------------
+
+
+def test_start_re_opens_after_a_failed_preview_is_retried(live_server, page):
+    """importPreviewFailed has exactly one reset, at the top of previewImport.
+
+    Lose it and a single failed preview disables Start for the life of the
+    page: the user previews again, gets a complete and current grid, and
+    stares at a dead button captioned "Preview again before importing".
+    """
+    page.goto(f"{live_server['url']}/import")
+    _stub_preview(page, _files(3))
+    page.evaluate(
+        """() => {
+          window.__failPreview = false;
+          const f = window.fetch.bind(window);
+          window.fetch = (input, init) => {
+            const t = typeof input === 'string' ? input : input.url;
+            if (window.__failPreview && t
+                && t.indexOf('/api/import/folder-preview') === 0) {
+              return Promise.resolve(new Response(
+                JSON.stringify({error: 'disk went away'}),
+                {status: 500, headers: {'Content-Type': 'application/json'}}));
+            }
+            return f(input, init);
+          };
+        }"""
+    )
+    _preview(page)
+
+    page.evaluate("() => { window.__failPreview = true; }")
+    page.locator("#btnPreview").click()
+    expect(page.locator("#btnStart")).to_have_text(
+        "Preview again before importing")
+
+    page.evaluate("() => { window.__failPreview = false; }")
+    page.locator("#btnPreview").click()
+    expect(page.locator("#importPreviewGrid")).to_be_visible()
+    expect(page.locator("#btnStart")).to_have_text("Start import (3 files)")
+    expect(page.locator("#btnStart")).to_be_enabled()
+
+
+def test_start_re_opens_when_the_import_fails_to_start(live_server, page):
+    """A rejected POST has to clear importStartPending.
+
+    Otherwise Start stays disabled reading "Importing…" next to an error
+    banner saying the import never started, and only a reload recovers.
+    """
+    page.goto(f"{live_server['url']}/import")
+    page.evaluate(
+        """() => {
+          const f = window.fetch.bind(window);
+          window.__rejectStart = null;
+          window.fetch = (input, init) => {
+            const t = typeof input === 'string' ? input : input.url;
+            if (t && t.indexOf('/api/jobs/import-in-place') === 0) {
+              return new Promise((res, rej) => { window.__rejectStart = rej; });
+            }
+            return f(input, init);
+          };
+          window.scheduleImportPreview = () => {};
+        }"""
+    )
+    page.locator("#sourceInput").fill("/tmp/card-a")
+    page.locator("#btnAddSource").click()
+    page.locator("#btnStart").click()
+    expect(page.locator("#btnStart")).to_have_text("Importing…")
+
+    page.evaluate(
+        "() => window.__rejectStart(new Error('archive is offline'))")
+    expect(page.locator("#btnStart")).to_have_text("Start import")
+    expect(page.locator("#btnStart")).to_be_enabled()
+
+
+def test_previewing_with_no_sources_does_not_latch_start_shut(
+        live_server, page):
+    """The validation early returns run AFTER in-flight is set.
+
+    previewImport() is awaited here so the assertion lands on the settled
+    state rather than on the moment before the early return.
+    """
+    page.goto(f"{live_server['url']}/import")
+    page.evaluate("async () => { await previewImport(); }")
+
+    assert page.evaluate("() => importPreviewInFlight") is False
+    expect(page.locator("#btnStart")).to_have_text("Start import")
+    expect(page.locator("#btnStart")).to_be_enabled()
+
+
+def test_previewing_with_no_file_types_does_not_latch_start_shut(
+        live_server, page):
+    """The second validation early return, same hazard.
+
+    Reachable in copy mode by unchecking the last extension of a custom
+    preset, which debounces straight into previewImport().
+    """
+    page.goto(f"{live_server['url']}/import")
+    _stub_preview(page, _files(3))
+    _preview(page)
+
+    # Set without dispatching change: no debounced re-preview to race with.
+    page.evaluate(
+        """() => {
+          document.getElementById('fileTypePreset').value = 'custom';
+          document.querySelectorAll('.file-ext').forEach(
+            (el) => { el.checked = false; });
+        }"""
+    )
+    page.evaluate("async () => { await previewImport(); }")
+
+    assert page.evaluate("() => importPreviewInFlight") is False
+    # Stale, not "Previewing…": the file types no longer match the grid.
+    expect(page.locator("#btnStart")).to_have_text(
+        "Preview again before importing")
     expect(page.locator("#btnStart")).to_be_disabled()

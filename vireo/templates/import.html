@@ -679,6 +679,20 @@ function updateImportMode() {
   document.getElementById('previewSummary').textContent = '';
   hideDestStructure();
   clearImportPreviewGrid();
+  // A mode switch throws the rendered preview away, so the lifecycle has to
+  // hear about it. Staleness alone can't: copy -> in place -> copy inside the
+  // 350ms re-preview debounce restores the EXACT signature the completed
+  // preview captured, so the check reports "current" over a grid that no
+  // longer exists — live Start, invisible grid, and a select-all still
+  // reading "3 of 3 selected", all at once.
+  //
+  // Here and not in clearImportPreviewGrid(): the zero-file branch of
+  // previewImport() calls that AFTER capturing the signature, so resetting
+  // there would push a completed empty preview back into "no preview run"
+  // and re-enable Start over it.
+  importPreviewCapturedSignature = null;
+  importPreviewedPaths = [];
+  updateImportSelectionUI();
   showError('');
   updateFileTypeControls();
   updateWorkspaceMode();
@@ -2362,9 +2376,11 @@ function updateStartGate() {
     reason = 'No files selected';
   }
   btn.disabled = reason !== null || newImagesStartBlocked;
+  const checked = importCheckedCount();
   btn.textContent = reason
     || (copyMode && importPreviewCapturedSignature !== null
-        ? 'Start import (' + importCheckedCount().toLocaleString() + ' files)'
+        ? 'Start import (' + checked.toLocaleString() + ' file'
+          + (checked === 1 ? '' : 's') + ')'
         : 'Start import');
 }
 

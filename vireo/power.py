@@ -20,7 +20,20 @@ log = logging.getLogger(__name__)
 
 
 class _ProcessInhibitor:
-    """An inhibitor backed by a child process (caffeinate, systemd-inhibit)."""
+    """An inhibitor backed by a child process (caffeinate, systemd-inhibit).
+
+    A brief health check after Popen catches the case where the supervisor
+    launches successfully but exits at once — systemd-inhibit does this
+    when the bus is unavailable or the lock is denied, and caffeinate does
+    it when ``-w`` points at a pid that has already gone. Without the
+    check, ``self.proc`` stays non-null, ``SleepBlocker.active`` reports
+    the machine as inhibited, ``/api/jobs`` says so, and the job runs
+    unprotected anyway. A real supervisor sleeps forever (systemd-inhibit
+    watching ``sleep infinity``) or waits on our pid (caffeinate -w), so
+    the wait is a no-op for healthy processes.
+    """
+
+    _STARTUP_HEALTH_WAIT_S = 0.2
 
     def __init__(self, argv):
         self.proc = subprocess.Popen(
@@ -28,6 +41,14 @@ class _ProcessInhibitor:
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+        )
+        try:
+            rc = self.proc.wait(timeout=self._STARTUP_HEALTH_WAIT_S)
+        except subprocess.TimeoutExpired:
+            return
+        raise RuntimeError(
+            f"inhibitor {argv[0]!r} exited immediately with rc={rc}; "
+            "running unprotected"
         )
 
     def stop(self):
@@ -42,27 +63,81 @@ class _ProcessInhibitor:
 
 
 class _WindowsInhibitor:
-    """ES_CONTINUOUS | ES_SYSTEM_REQUIRED for the calling thread.
+    """ES_CONTINUOUS | ES_SYSTEM_REQUIRED held on a dedicated thread.
 
     Deliberately omits ES_DISPLAY_REQUIRED: we keep the machine computing,
     we do not keep the screen lit.
+
+    Why a dedicated thread: SetThreadExecutionState applies to the
+    *calling* thread, and its ES_CONTINUOUS assertion is dropped by
+    Windows when that thread terminates. This inhibitor is shared across
+    JobRunner worker threads that come and go — if the first-acquiring
+    worker finishes and its thread exits while another job is still
+    holding the refcount, the OS assertion silently disappears and the
+    machine sleeps mid-job. Pinning both the ``set`` and the ``clear``
+    calls to a thread whose lifetime spans acquire → release is what
+    keeps the assertion in force.
     """
 
     ES_CONTINUOUS = 0x80000000
     ES_SYSTEM_REQUIRED = 0x00000001
 
+    _START_TIMEOUT_S = 5.0
+    _STOP_TIMEOUT_S = 5.0
+
     def __init__(self):
         import ctypes
 
         self._ctypes = ctypes
-        ctypes.windll.kernel32.SetThreadExecutionState(
-            self.ES_CONTINUOUS | self.ES_SYSTEM_REQUIRED
+        self._stop_event = threading.Event()
+        self._ready_event = threading.Event()
+        self._start_error = None
+        self._thread = threading.Thread(
+            target=self._run,
+            name="vireo-sleep-inhibitor",
+            daemon=True,
         )
+        self._thread.start()
+        if not self._ready_event.wait(timeout=self._START_TIMEOUT_S):
+            self._stop_event.set()
+            raise RuntimeError(
+                "Windows sleep-inhibitor thread did not start in "
+                f"{self._START_TIMEOUT_S}s"
+            )
+        if self._start_error is not None:
+            raise self._start_error
+
+    def _run(self):
+        try:
+            rv = self._ctypes.windll.kernel32.SetThreadExecutionState(
+                self.ES_CONTINUOUS | self.ES_SYSTEM_REQUIRED
+            )
+            if rv == 0:
+                # Docs: returns 0 on failure. Report so SleepBlocker can
+                # fall back to unprotected rather than lying about the
+                # machine being kept awake.
+                self._start_error = OSError(
+                    "SetThreadExecutionState returned 0"
+                )
+                return
+        except Exception as exc:  # noqa: BLE001 - reported to caller
+            self._start_error = exc
+            return
+        finally:
+            self._ready_event.set()
+        self._stop_event.wait()
+        try:
+            self._ctypes.windll.kernel32.SetThreadExecutionState(
+                self.ES_CONTINUOUS
+            )
+        except Exception:
+            log.warning(
+                "Clearing Windows sleep assertion failed", exc_info=True,
+            )
 
     def stop(self):
-        self._ctypes.windll.kernel32.SetThreadExecutionState(
-            self.ES_CONTINUOUS
-        )
+        self._stop_event.set()
+        self._thread.join(timeout=self._STOP_TIMEOUT_S)
 
 
 def start_platform_inhibitor(reason):

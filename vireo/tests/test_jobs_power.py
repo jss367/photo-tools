@@ -12,7 +12,6 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 sys.path.insert(0, os.path.dirname(__file__))
 
 import pytest
-
 from wait import wait_for_job_via_runner
 
 
@@ -50,8 +49,8 @@ class RecordingInhibitor:
 
 @pytest.fixture
 def runner_with_recorder(monkeypatch):
-    from jobs import JobRunner
     import power
+    from jobs import JobRunner
 
     recorder = RecordingInhibitor()
     monkeypatch.setattr(power, "start_platform_inhibitor", recorder.start)
@@ -161,9 +160,26 @@ def test_overlapping_long_jobs_share_one_assertion(runner_with_recorder):
     assert recorder.stopped == 1
 
 
-def test_jobs_api_reports_keeping_awake(app_and_db):
+def test_jobs_api_reports_keeping_awake(app_and_db, monkeypatch):
     """CORE_PHILOSOPHY: no black boxes. Vireo is overriding a system
-    power setting, so it has to say so rather than do it silently."""
+    power setting, so it has to say so rather than do it silently.
+
+    Substitute the platform inhibitor so the test asserts on the API's
+    reporting rather than on whether the current runner has a working
+    systemd (containers, CI's Windows leg, etc. don't) — a real
+    ``start_platform_inhibitor`` on those hosts now raises during startup,
+    which is the correct best-effort behavior but not what this test is
+    about."""
+    import power
+
+    class _FakeHandle:
+        def stop(self):
+            pass
+
+    monkeypatch.setattr(
+        power, "start_platform_inhibitor", lambda reason: _FakeHandle(),
+    )
+
     app, _ = app_and_db
     client = app.test_client()
 

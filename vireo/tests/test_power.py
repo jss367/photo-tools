@@ -6,10 +6,15 @@ sleep/DarkWake cycling.
 """
 
 import sys
+import threading
 
 import pytest
-
-from power import SleepBlocker, start_platform_inhibitor
+from power import (
+    SleepBlocker,
+    _ProcessInhibitor,
+    _WindowsInhibitor,
+    start_platform_inhibitor,
+)
 
 
 class FakeInhibitor:
@@ -152,6 +157,101 @@ def test_macos_inhibitor_runs_and_stops_caffeinate():
         handle.stop()
 
     assert handle.proc.poll() is not None, "caffeinate should be reaped"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX supervisor")
+def test_process_inhibitor_raises_when_child_exits_immediately():
+    """systemd-inhibit's Popen can succeed while the child dies at once —
+    the bus may be unavailable, the lock denied, or the supervised command
+    absent. Without the health check, ``proc`` stays non-null,
+    ``SleepBlocker.active`` reports the machine inhibited, and the job
+    runs unprotected. ``SleepBlocker`` treats the raise as the documented
+    best-effort failure path."""
+    with pytest.raises(RuntimeError, match="exited immediately"):
+        _ProcessInhibitor(["true"])
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX supervisor")
+def test_process_inhibitor_accepts_a_child_that_stays_alive():
+    """A well-behaved supervisor (systemd-inhibit watching ``sleep
+    infinity``, caffeinate watching a live pid) survives the health-check
+    window. The check must not false-positive on healthy processes."""
+    inh = _ProcessInhibitor(["sleep", "5"])
+    try:
+        assert inh.proc.poll() is None
+    finally:
+        inh.stop()
+
+
+def test_windows_inhibitor_runs_the_assertion_on_a_dedicated_thread():
+    """SetThreadExecutionState applies to the *calling* thread and its
+    ES_CONTINUOUS assertion dies with that thread. The blocker is shared
+    across job workers that come and go — the assertion must be pinned to
+    a thread whose lifetime spans acquire → release, not to whichever
+    worker happened to acquire first, or the OS silently drops it when
+    that worker exits mid-run."""
+    import types
+    from unittest.mock import MagicMock
+
+    call_records = []
+
+    def set_state(flags):
+        call_records.append(
+            (threading.current_thread().ident, flags)
+        )
+        return 1
+
+    fake_kernel32 = MagicMock()
+    fake_kernel32.SetThreadExecutionState = set_state
+    fake_ctypes = types.SimpleNamespace(
+        windll=types.SimpleNamespace(kernel32=fake_kernel32),
+    )
+
+    with pytest.MonkeyPatch().context() as m:
+        m.setitem(sys.modules, "ctypes", fake_ctypes)
+        inh = _WindowsInhibitor()
+        caller_tid = threading.current_thread().ident
+        try:
+            assert len(call_records) == 1, "set once on acquire"
+            set_tid, set_flags = call_records[0]
+            assert set_tid != caller_tid, (
+                "SetThreadExecutionState must run on the inhibitor's own "
+                "thread — not the acquiring worker, which will exit while "
+                "other jobs are still holding the refcount"
+            )
+            assert set_flags == (
+                _WindowsInhibitor.ES_CONTINUOUS
+                | _WindowsInhibitor.ES_SYSTEM_REQUIRED
+            )
+        finally:
+            inh.stop()
+
+    assert len(call_records) == 2, "set on acquire, cleared on stop"
+    clear_tid, clear_flags = call_records[1]
+    assert clear_tid == call_records[0][0], (
+        "clear must run on the same thread that placed the assertion"
+    )
+    assert clear_flags == _WindowsInhibitor.ES_CONTINUOUS
+
+
+def test_windows_inhibitor_reports_failure_from_the_worker_thread():
+    """SetThreadExecutionState returns 0 on failure. If we ignore it, the
+    blocker will report ``active=True`` while the machine is unprotected;
+    raising instead lets ``SleepBlocker`` fall through to its documented
+    best-effort path and log the warning."""
+    import types
+    from unittest.mock import MagicMock
+
+    fake_kernel32 = MagicMock()
+    fake_kernel32.SetThreadExecutionState = lambda flags: 0
+    fake_ctypes = types.SimpleNamespace(
+        windll=types.SimpleNamespace(kernel32=fake_kernel32),
+    )
+
+    with pytest.MonkeyPatch().context() as m:
+        m.setitem(sys.modules, "ctypes", fake_ctypes)
+        with pytest.raises(OSError, match="returned 0"):
+            _WindowsInhibitor()
 
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="macOS caffeinate")

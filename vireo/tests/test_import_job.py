@@ -5696,8 +5696,8 @@ def test_remote_adopted_only_scan_failure_counts_each_file_once(
     folder-level failure would inflate the terminal ledger to N+1 entries.
     """
     import shutil as _shutil
-    import scanner as scanner_module
 
+    import scanner as scanner_module
     from import_job import ImportParams, run_import_job
 
     ra = _remote_archive_for(tmp_path)

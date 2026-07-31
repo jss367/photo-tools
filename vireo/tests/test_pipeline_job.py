@@ -17998,3 +17998,144 @@ def test_extract_masks_preflight_ignores_isolated_weak_detections(
         f"No reconnect instruction belongs to an unrelated outage; got "
         f"{result['errors']!r}"
     )
+
+
+def test_archive_mount_baseline_records_only_real_mount_points(
+        tmp_path, monkeypatch):
+    """The baseline distinguishes a real mount from an ordinary directory.
+
+    An ordinary ``/mnt/photos`` that was never a mount must record False,
+    so the staleness check below can never fire for it. That is what keeps
+    the guard from refusing legitimate local destinations.
+    """
+    import os as _os
+
+    import pipeline_job as _pj
+
+    mounted = str(tmp_path / "mounted")
+    plain = str(tmp_path / "plain")
+    _os.makedirs(mounted)
+    _os.makedirs(plain)
+
+    monkeypatch.setattr(
+        _pj, "_archive_mount_root_candidates",
+        lambda path: [mounted, plain],
+    )
+    real_ismount = _os.path.ismount
+    monkeypatch.setattr(
+        _os.path, "ismount",
+        lambda p: True if str(p) == mounted else real_ismount(p),
+    )
+
+    baseline = _pj._archive_mount_baseline("/anything")
+
+    assert baseline == {mounted: True, plain: False}, baseline
+
+
+def test_unmounted_since_baseline_fires_only_for_a_lost_mount(
+        tmp_path, monkeypatch):
+    """Only a root that WAS mounted and no longer is counts as lost."""
+    import os as _os
+
+    import pipeline_job as _pj
+
+    lost = str(tmp_path / "lost")
+    never = str(tmp_path / "never")
+    still = str(tmp_path / "still")
+    for p in (lost, never, still):
+        _os.makedirs(p)
+
+    real_ismount = _os.path.ismount
+    monkeypatch.setattr(
+        _os.path, "ismount",
+        lambda p: True if str(p) == still else real_ismount(p),
+    )
+
+    # ``lost`` was mounted at baseline and now is not -> reported.
+    assert _pj._unmounted_since_baseline({lost: True}) == lost
+    # ``never`` was not a mount to begin with -> an ordinary directory,
+    # never reported no matter what.
+    assert _pj._unmounted_since_baseline({never: False}) is None
+    # ``still`` is mounted now as it was then -> nothing lost.
+    assert _pj._unmounted_since_baseline({still: True}) is None
+    # Empty baseline (destination not mount-shaped at all).
+    assert _pj._unmounted_since_baseline({}) is None
+
+
+def test_archive_mount_baseline_seeds_true_from_known_mounted_roots(
+        tmp_path, monkeypatch):
+    """A candidate ever seen live must baseline True even when detached now.
+
+    Otherwise a share that was already unmounted BEFORE the run started
+    escapes the guard: its baseline is False, no mounted → unmounted
+    transition can fire against a False baseline, and the persistent
+    ``/mnt/<name>`` stub still passes the per-batch check. Cross-run
+    history is what closes the hole. See PR #1396 review
+    (Codex P1 r3687401636).
+    """
+    import os as _os
+
+    import pipeline_job as _pj
+
+    detached = str(tmp_path / "detached")
+    virgin = str(tmp_path / "virgin")
+    _os.makedirs(detached)
+    _os.makedirs(virgin)
+
+    monkeypatch.setattr(
+        _pj, "_archive_mount_root_candidates",
+        lambda path: [detached, virgin],
+    )
+    real_ismount = _os.path.ismount
+    monkeypatch.setattr(
+        _os.path, "ismount",
+        # Neither candidate is currently a mount — but ``detached`` is in
+        # the known-set (a prior run saw it live), so the baseline must
+        # record it True so a still-detached state fires the transition.
+        lambda p: False if str(p) in (detached, virgin) else real_ismount(p),
+    )
+
+    baseline = _pj._archive_mount_baseline(
+        "/anything", known_mounted_roots={detached},
+    )
+    assert baseline == {detached: True, virgin: False}, baseline
+    # The staleness check then sees the True → False transition for
+    # ``detached``, exactly as it would for a share that dropped
+    # mid-run.
+    assert _pj._unmounted_since_baseline(baseline) == detached
+
+
+def test_known_mount_roots_round_trip_through_db_meta(tmp_path):
+    """Persisted mount roots survive across runs; only True is remembered.
+
+    Any candidate observed False in the baseline stays out of the record,
+    so a hand-made local ``/mnt/photos`` (never mounted) never joins the
+    known-set and never trips the staleness check. Merging with the
+    existing set is what keeps a mount root once-seen recorded across
+    subsequent runs, even when it's not live at capture time.
+    """
+    import pipeline_job as _pj
+    from db import Database
+
+    db = Database(str(tmp_path / "test.db"))
+
+    # Nothing recorded yet.
+    assert _pj._load_known_mount_roots(db) == set()
+
+    # A run observes /mnt/nas live but /mnt/photos not.
+    _pj._record_known_mount_roots(db, {"/mnt/nas": True, "/mnt/photos": False})
+    assert _pj._load_known_mount_roots(db) == {"/mnt/nas"}
+
+    # A second run observes /mnt/photos live; both roots are remembered.
+    _pj._record_known_mount_roots(db, {"/mnt/photos": True})
+    assert _pj._load_known_mount_roots(db) == {"/mnt/nas", "/mnt/photos"}
+
+    # A third run observes /mnt/nas detached now — the previous True
+    # stays recorded so the next baseline still seeds it True.
+    _pj._record_known_mount_roots(db, {"/mnt/nas": False})
+    assert _pj._load_known_mount_roots(db) == {"/mnt/nas", "/mnt/photos"}
+
+    # Recording an all-False baseline is a no-op (empty ``fresh`` set —
+    # a run that saw no live mounts must not blank the record).
+    _pj._record_known_mount_roots(db, {"/mnt/nas": False, "/mnt/photos": False})
+    assert _pj._load_known_mount_roots(db) == {"/mnt/nas", "/mnt/photos"}

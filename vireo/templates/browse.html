@@ -1962,6 +1962,11 @@ var currentPage = 1;
 var perPage = 50;
 var loading = false;
 var allLoaded = false;
+// True only after an authoritative response has initialized the grid, even
+// when that response contains zero photos. Health events can arrive while
+// bootstrap or a deep link is still pending; an "unaffected scope" is only
+// safe to preserve once there is an initialized dataset to preserve.
+var browseDatasetReady = false;
 var selectedPhotoId = null;
 var selectedIndex = -1;
 var anchorRestoreEpoch = 0;
@@ -2027,6 +2032,38 @@ var keywordAutocompletePromise = null;
 var keywordAutocompleteStates = {};
 var collectionCountRefreshTimer = null;
 var collectionCountLoadGen = 0;
+// Same superseded-response guard as loadCollectionCounts, extended to the
+// summary and calendar loaders so a slow /api/browse/summary or
+// /api/photos/calendar response cannot overwrite the panel or heatmap
+// after a newer scope selection triggered a fresh load
+// (CodeRabbit review r3684913398).
+var summaryLoadGen = 0;
+var summaryLoadStates = {};
+var summaryRenderDecisionGen = 0;
+var calendarDataLoadGen = 0;
+var calendarDataLoadStates = {};
+var calendarRenderDecisionGen = 0;
+// Internal generation counters shared across every caller of the sidebar
+// loaders. Without these, ``refreshBrowseSidebarCounts()`` and the various
+// mutation-triggered ``loadKeywords()``/``loadCollections()`` calls fire
+// without any freshness guard, so a slow pre-transition response can arrive
+// after a guarded ``refreshBrowseAfterFolderHealthChange`` render and
+// repaint the sidebar with data that no longer reflects the current health
+// state — reintroducing the offline-folder-in-tree symptom the health
+// refresh was meant to fix (Codex review r3686842772). Every loader checks
+// its captured generation after ``await`` and skips ``render*`` when a
+// newer call has since started, so last-started always wins regardless of
+// which call site issued it.
+var folderLoadGen = 0;
+var folderLoadStates = {};
+var folderRenderDecisionGen = 0;
+var keywordLoadGen = 0;
+var keywordLoadStates = {};
+var keywordRenderDecisionGen = 0;
+var collectionLoadGen = 0;
+var collectionLoadStates = {};
+var collectionRenderDecisionGen = 0;
+var browseFolderRows = [];
 var collectionsById = {};
 var browseCompareIds = [];
 var browseCompareOffset = 0;
@@ -2845,6 +2882,20 @@ function clearActiveSelectionAndDetail() {
 }
 
 /* ---------- Bootstrap ---------- */
+// ``folderHealthRefreshSeq`` must be *initialized* before ``bootstrapBrowse()``
+// is invoked, not merely declared. ``var`` hoists the declaration to the top
+// of the script but leaves the value ``undefined`` until this line executes;
+// the paired assignment lives further down at the health-refresh helpers.
+// Bootstrap synchronously reads ``folderHealthRefreshSeq`` into
+// ``bootstrapHealthSeq`` before its first await, so with the initialization
+// happening later, the snapshot was ``undefined``, the outer script then
+// ran the ``= 0`` assignment while bootstrap was awaiting ``/api/browse/init``,
+// and the post-await comparison ``0 !== undefined`` was always true. That
+// made ``healthChangedDuringInit`` fire on every normal load, skipping the
+// render block and leaving Browse empty until VireoFilter.init happened to
+// re-fetch. Initialize here so the pre-await snapshot reads the same ``0``
+// the rest of the script sees (Codex review r3686317674).
+var folderHealthRefreshSeq = 0;
 bootstrapBrowse();
 
 async function bootstrapBrowse() {
@@ -2853,16 +2904,45 @@ async function bootstrapBrowse() {
   // Prevent the IntersectionObserver from triggering loadPhotos() while bootstrap is in flight
   loading = true;
   var bootstrapSucceeded = false;
+  // Declared out here so the finally-region guard below can read it even
+  // if /api/browse/init throws before the assignment inside the try.
+  var healthChangedDuringInit = false;
+  // Snapshot the health-refresh generation before any await so we can
+  // detect a concurrent refresh from BOTH the try's success path and
+  // its catch. If a vireo:folder-health-changed event fires while
+  // /api/browse/init is in flight, refreshBrowseAfterFolderHealthChange()
+  // will have already reloaded folders/keywords/collections and the grid
+  // from the fresh post-flip state. Populating ``photos`` / rendering the
+  // sidebars from this pre-flip response afterwards would silently
+  // overwrite that fresher refresh with stale data — leaving the grid
+  // empty until another event or a manual reload (Codex review
+  // r3685515800). Snapshotting here (outside the try) also lets the
+  // catch below recompute the flag when the init request rejects: the
+  // in-try assignment used to be skipped by the throw, leaving the
+  // finally-region guard to release the load lock the concurrent health
+  // refresh's ``loadPhotos`` still owned (Codex review r3686191138).
+  var bootstrapHealthSeq = folderHealthRefreshSeq;
+  // Parse URL scope params BEFORE the first await. A folder-health event that
+  // fires while ``_cfgPromise`` is still pending runs
+  // refreshBrowseAfterFolderHealthChange(), which calls resetAndLoad() from
+  // the current ``activeFolderId`` / ``activeCollectionId``. If those were
+  // still null the refresh loads the unscoped workspace grid, and then this
+  // bootstrap's folder-scoped init response is thrown away by the
+  // healthChangedDuringInit guard below — for a plain collection deep link
+  // the browseFilterInitPromise.then replay reopens it, but a folder-only
+  // deep link has no such replay, so Browse would render unscoped despite
+  // ``?folder_id=N`` in the URL (Codex review r3686605296). Assigning here
+  // means any concurrent refresh sees the right scope.
+  var pageParams = new URLSearchParams(window.location.search);
+  var initialFolderId = parseInt(pageParams.get('folder_id'), 10);
+  if (!isNaN(initialFolderId)) activeFolderId = initialFolderId;
+  var initialCollectionId = parseInt(pageParams.get('collection_id'), 10);
+  if (!isNaN(initialCollectionId)) {
+    activeCollectionId = initialCollectionId;
+    dashboardCollectionScope = pageParams.get('dashboard_scope') === '1';
+  }
   try {
     applyBrowseConfig(await _cfgPromise);
-    var pageParams = new URLSearchParams(window.location.search);
-    var initialFolderId = parseInt(pageParams.get('folder_id'), 10);
-    if (!isNaN(initialFolderId)) activeFolderId = initialFolderId;
-    var initialCollectionId = parseInt(pageParams.get('collection_id'), 10);
-    if (!isNaN(initialCollectionId)) {
-      activeCollectionId = initialCollectionId;
-      dashboardCollectionScope = pageParams.get('dashboard_scope') === '1';
-    }
     // Legacy filter deep-link params (rating_min/flag/keyword/dates/…) are
     // compiled into an initial rule tree by VireoFilter.init below, which
     // reloads through /api/photos/query — the bootstrap endpoint is
@@ -2876,26 +2956,65 @@ async function bootstrapBrowse() {
     // in either case.
     if (activeCollectionId) initParams.set('collection_id', activeCollectionId);
     initParams.set('per_page', perPage);
+    var missingSnapshotVersionAtInitStart =
+      typeof _missingFoldersSnapshotVersion !== 'undefined'
+        ? _missingFoldersSnapshotVersion
+        : null;
     var data = await safeFetch('/api/browse/init?' + initParams.toString());
+    healthChangedDuringInit = folderHealthRefreshSeq !== bootstrapHealthSeq;
 
-    // Populate everything from a single response
-    photos = data.photos || [];
-    totalPhotos = data.total || 0;
-    currentPage = 2; // next page to load
-    if (photos.length >= totalPhotos) allLoaded = true;
+    // Seed the navbar's missing-folder snapshot from init's workspace-scoped
+    // view so the first /api/folders/missing observation has a baseline to
+    // compare against. Without this, a background _folder_health_loop flip
+    // that runs between /api/browse/init and the first navbar poll leaves
+    // the poll's null-baseline branch returning false — later polls then
+    // see the same IDs and never dispatch, so Browse stays showing the
+    // pre-flip state until another transition or a reload (Codex review
+    // r3686191141). The navbar helper compares its baseline version at init
+    // request start and completion: a poll/POST already applied before the
+    // request is older than init, while one applied during the request remains
+    // authoritative.
+    //
+    // When a differing poll snapshot lands while init is in flight, init may
+    // contain pre-flip photos/folders. Dispatch the init→now transition so
+    // refreshBrowseAfterFolderHealthChange takes over, and mark the
+    // health-changed flag so the guarded render path skips init's stale data
+    // (Codex review r3686452019). Conversely, a poll applied before this
+    // request is known older and the helper adopts init directly
+    // (Codex review r3687277899).
+    if (Array.isArray(data.missing_folder_ids) &&
+        typeof _reconcileMissingFoldersInitSnapshot === 'function') {
+      var initWasStale = _reconcileMissingFoldersInitSnapshot(
+        data.missing_folder_ids,
+        missingSnapshotVersionAtInitStart,
+        'bootstrap-reconcile',
+        data.folder_health_version);
+      if (initWasStale) healthChangedDuringInit = true;
+    }
 
-    renderFolderTree(data.folders || []);
-    renderKeywordTree(data.keywords || []);
-    renderCollectionList(data.collections || []);
-    loadCollectionCounts();
-    renderGrid();
-    updateFilterSummary();
-    loadSummary();
+    if (!healthChangedDuringInit) {
+      // Populate everything from a single response
+      photos = data.photos || [];
+      totalPhotos = data.total || 0;
+      currentPage = 2; // next page to load
+      if (photos.length >= totalPhotos) allLoaded = true;
+
+      renderFolderTree(data.folders || []);
+      renderKeywordTree(data.keywords || []);
+      renderCollectionList(data.collections || []);
+      renderGrid();
+      browseDatasetReady = true;
+      updateFilterSummary();
+      loadSummary();
+    }
     refreshPendingSyncBanner();
 
     document.getElementById('loadingState').style.display = 'none';
-    // Lazy-load collection photo counts to avoid N+1 on init
-    loadCollectionCounts();
+    // Lazy-load collection photo counts to avoid N+1 on init. Skip this
+    // when the health refresh already ran — it issued its own
+    // loadCollectionCounts() and repeating the call here would just fire
+    // another round-trip for the same data.
+    if (!healthChangedDuringInit) loadCollectionCounts();
     bootstrapSucceeded = true;
 
     // Universal filter bar: registry + persisted/deep-linked state load
@@ -3063,14 +3182,34 @@ async function bootstrapBrowse() {
       }
     }).catch(function() {});
   } catch(e) {
+    // /api/browse/init rejected — recompute healthChangedDuringInit so the
+    // finally-region guard below correctly defers to a concurrent health
+    // refresh that owns the load lock. The assignment inside the try was
+    // skipped by the throw, and without recomputing here we would clear
+    // ``loading`` even though the health refresh's ``loadPhotos`` still
+    // holds the mutex, letting the intersection observer fire a duplicate
+    // page-1 request against the same ``loadEpoch``
+    // (Codex review r3686191138).
+    healthChangedDuringInit = folderHealthRefreshSeq !== bootstrapHealthSeq;
     document.getElementById('loadingState').textContent = 'Error loading.';
   }
-  loading = false;
-  if (bootstrapSucceeded) {
-    rearmInfiniteScrollObserver();
-    // Make sure a tall viewport still gets its second page even when the
-    // sentinel callback does not fire after the initial layout.
-    requestAnimationFrame(ensureViewportHydrated);
+  // If a folder-health event fired while /api/browse/init was in flight,
+  // refreshBrowseAfterFolderHealthChange() has already taken over the load
+  // state: its resetAndLoad() → loadPhotos() chain owns ``loading`` and
+  // rearms the intersection observer itself when it settles. Clearing
+  // ``loading`` here would release the mutex that concurrent loadPhotos
+  // still holds, letting the newly-rearmed observer fire a second page-1
+  // request against the same ``loadEpoch``; both responses append and the
+  // grid ends up with duplicated cards and off-by-one pagination
+  // (Codex review r3685627307).
+  if (!healthChangedDuringInit) {
+    loading = false;
+    if (bootstrapSucceeded) {
+      rearmInfiniteScrollObserver();
+      // Make sure a tall viewport still gets its second page even when the
+      // sentinel callback does not fire after the initial layout.
+      requestAnimationFrame(ensureViewportHydrated);
+    }
   }
 }
 
@@ -3112,14 +3251,62 @@ function renderCollectionList(collections) {
 }
 
 /* ---------- Folder Tree ---------- */
-async function loadFolders() {
+function reconcileFolderLoadRenders() {
+  // Do not render an older successful response while any newer request is
+  // still pending. Once every newer request has failed, fall back to the
+  // newest success instead of leaving the pre-transition tree in the DOM.
+  // This handles both completion orders: success-before-failure and
+  // failure-before-success.
+  var gen = folderLoadGen;
+  while (gen > folderRenderDecisionGen) {
+    var state = folderLoadStates[gen];
+    if (!state || state.status === 'pending') return;
+    if (state.status === 'success') {
+      var shouldRender = !state.shouldRender || state.shouldRender();
+      folderRenderDecisionGen = gen;
+      if (shouldRender) renderFolderTree(state.data);
+      Object.keys(folderLoadStates).forEach(function(key) {
+        if (Number(key) <= folderLoadGen) delete folderLoadStates[key];
+      });
+      return;
+    }
+    gen--;
+  }
+}
+
+async function loadFolders(opts) {
+  var myGen = ++folderLoadGen;
+  folderLoadStates[myGen] = {
+    status: 'pending',
+    shouldRender: opts && opts.shouldRender
+  };
   try {
     var data = await safeFetch('/api/folders', {}, { toast: false });
-    renderFolderTree(data);
-  } catch(e) {}
+    var state = folderLoadStates[myGen];
+    if (!state) return data;
+    state.status = 'success';
+    state.data = data;
+    reconcileFolderLoadRenders();
+    return data;
+  } catch(e) {
+    var failedState = folderLoadStates[myGen];
+    if (failedState) {
+      failedState.status = 'failure';
+      reconcileFolderLoadRenders();
+    }
+    // Signal failure to callers that gate destructive decisions (e.g. the
+    // health refresh clearing ``activeFolderId``) on a successful fetch.
+    // A DOM/cache-based check after a swallowed failure sees the stale
+    // tree and preserves a folder that just went missing, then reloads
+    // its now-unavailable scope into an empty grid — the advanced navbar
+    // snapshot means later polls see no transition to repair it
+    // (Codex review r3687062925).
+    return null;
+  }
 }
 
 function renderFolderTree(folders) {
+  browseFolderRows = folders.slice();
   var byParent = {};
   folders.forEach(function(f) {
     var pid = f.parent_id || 'root';
@@ -3219,11 +3406,50 @@ function filterByFolder(folderId) {
 }
 
 /* ---------- Keyword Tree ---------- */
-async function loadKeywords() {
+function reconcileKeywordLoadRenders() {
+  // Do not discard the newest usable keyword response merely because a
+  // later request started. Pending newer generations still block it, while
+  // failed newer generations fall back to the newest success just like the
+  // folder and collection loaders.
+  var gen = keywordLoadGen;
+  while (gen > keywordRenderDecisionGen) {
+    var state = keywordLoadStates[gen];
+    if (!state || state.status === 'pending') return;
+    if (state.status === 'success') {
+      var shouldRender = !state.shouldRender || state.shouldRender();
+      keywordRenderDecisionGen = gen;
+      if (shouldRender) renderKeywordTree(state.data);
+      Object.keys(keywordLoadStates).forEach(function(key) {
+        if (Number(key) <= keywordLoadGen) delete keywordLoadStates[key];
+      });
+      return;
+    }
+    gen--;
+  }
+}
+
+async function loadKeywords(opts) {
+  var myGen = ++keywordLoadGen;
+  keywordLoadStates[myGen] = {
+    status: 'pending',
+    shouldRender: opts && opts.shouldRender
+  };
   try {
     var data = await safeFetch('/api/keywords', {}, { toast: false });
-    renderKeywordTree(data);
-  } catch(e) {}
+    var state = keywordLoadStates[myGen];
+    if (!state) return data;
+    state.status = 'success';
+    state.data = data;
+    reconcileKeywordLoadRenders();
+    return data;
+  } catch(e) {
+    var failedState = keywordLoadStates[myGen];
+    if (failedState) {
+      failedState.status = 'failure';
+      reconcileKeywordLoadRenders();
+    }
+    return null;
+  }
 }
 
 function renderKeywordTree(keywords) {
@@ -3312,11 +3538,54 @@ async function filterByKeyword(name) {
 }
 
 /* ---------- Collections ---------- */
-async function loadCollections() {
+function reconcileCollectionLoadRenders() {
+  // Mirror reconcileFolderLoadRenders: don't render an older successful
+  // response while a newer request is still pending, but if every newer
+  // request failed, fall back to the newest available success rather than
+  // leaving the collection list stale. Otherwise a health-owned request
+  // that observed a just-created collection could be silently dropped by
+  // a subsequent mutation-triggered reload that transiently fails, so the
+  // collection stays absent until the next explicit list refresh
+  // (Codex review r3687331931).
+  var gen = collectionLoadGen;
+  while (gen > collectionRenderDecisionGen) {
+    var state = collectionLoadStates[gen];
+    if (!state || state.status === 'pending') return;
+    if (state.status === 'success') {
+      var shouldRender = !state.shouldRender || state.shouldRender();
+      collectionRenderDecisionGen = gen;
+      if (shouldRender) renderCollectionList(state.data);
+      Object.keys(collectionLoadStates).forEach(function(key) {
+        if (Number(key) <= collectionLoadGen) delete collectionLoadStates[key];
+      });
+      return;
+    }
+    gen--;
+  }
+}
+
+async function loadCollections(opts) {
+  var myGen = ++collectionLoadGen;
+  collectionLoadStates[myGen] = {
+    status: 'pending',
+    shouldRender: opts && opts.shouldRender
+  };
   try {
     var data = await safeFetch('/api/collections', {}, { toast: false });
-    renderCollectionList(data);
-  } catch(e) {}
+    var state = collectionLoadStates[myGen];
+    if (!state) return data;
+    state.status = 'success';
+    state.data = data;
+    reconcileCollectionLoadRenders();
+    return data;
+  } catch(e) {
+    var failedState = collectionLoadStates[myGen];
+    if (failedState) {
+      failedState.status = 'failure';
+      reconcileCollectionLoadRenders();
+    }
+    return null;
+  }
 }
 
 async function loadCollectionCounts() {
@@ -3464,6 +3733,195 @@ function refreshBrowseSidebarCounts() {
   loadFolders();
   loadKeywords();
   loadCollectionCounts();
+}
+
+// ``folderHealthRefreshSeq`` is initialized above the bootstrapBrowse()
+// invocation so the pre-await snapshot inside bootstrap reads ``0`` instead
+// of ``undefined`` (Codex review r3686317674).
+function folderRowsContainScope(rows, folderId, scopeId) {
+  var byId = {};
+  (rows || []).forEach(function(row) { byId[row.id] = row; });
+  var currentId = folderId;
+  var seen = {};
+  while (currentId != null && !seen[currentId]) {
+    if (currentId === scopeId) return true;
+    seen[currentId] = true;
+    var row = byId[currentId];
+    currentId = row ? row.parent_id : null;
+  }
+  return false;
+}
+
+function folderHealthTouchesActiveScope(detail, beforeRows, afterRows) {
+  if (!activeFolderId) return true;
+  var restored = detail && Array.isArray(detail.restored) ? detail.restored : [];
+  var wentMissing = detail && Array.isArray(detail.wentMissing) ? detail.wentMissing : [];
+  var changedIds = restored.concat(wentMissing);
+  // The null-baseline fallback intentionally carries no ids. Conservatively
+  // reload because the server only knows that this workspace changed.
+  if (!changedIds.length) return true;
+  return changedIds.some(function(folderId) {
+    return folderRowsContainScope(beforeRows, folderId, activeFolderId) ||
+      folderRowsContainScope(afterRows, folderId, activeFolderId);
+  });
+}
+
+async function refreshBrowseAfterFolderHealthChange(detail) {
+  var seq = ++folderHealthRefreshSeq;
+  // A health-driven dataset refresh is not a user scope change: bumping
+  // browseScopeGen here would make any in-flight sidebar click
+  // (filterByFolder/filterByKeyword/filterByCollection) or the initial
+  // collection deep-link replay look stale, and its own guard would then
+  // silently discard the requested scope — leaving Browse on the workspace
+  // grid instead of the user's newer selection (Codex review r3684907518).
+  // folderHealthRefreshSeq below is the only counter this refresh needs.
+
+  // Apply the effective ``perPage`` (and other cfg values) before any
+  // loadPhotos call. Without this, a health event that fires while
+  // ``_cfgPromise`` is still pending calls resetAndLoad → loadPhotos with
+  // the hard-coded default (50), and bootstrap later applies the configured
+  // size — its own init response is discarded by the health-generation
+  // guard, but the perPage variable it wrote is not, so subsequent
+  // pagination computes offsets against the new size while the health
+  // refresh loaded page 1 with the old size: photos are silently skipped
+  // or duplicated across the boundary (Codex review r3686912883).
+  // applyBrowseConfig is idempotent — safe to call again after bootstrap.
+  try { applyBrowseConfig(await _cfgPromise); } catch (e) {}
+  if (seq !== folderHealthRefreshSeq) return;
+
+  // Refresh the scope controls first. If the selected folder just went
+  // offline it disappears from /api/folders; clear that stale scope before
+  // reloading the grid so Browse falls back to the available workspace.
+  //
+  // Pass ``shouldRender`` into each loader: without it, two overlapping
+  // health events (a folder flapping, or the modal check racing the
+  // ten-minute poll) can complete out of order — the older fetch's
+  // render*Tree call would clobber the newer render, and the post-await
+  // seq check would fire too late to undo the DOM mutation. Guarding
+  // *before* render means only the winning generation's data ever reaches
+  // the tree (Codex review r3685193225).
+  var isCurrent = function() { return seq === folderHealthRefreshSeq; };
+  var beforeFolderRows = browseFolderRows.slice();
+  var loaded = await Promise.all([
+    loadFolders({ shouldRender: isCurrent }),
+    loadKeywords({ shouldRender: isCurrent }),
+    loadCollections({ shouldRender: isCurrent }),
+  ]);
+  if (!isCurrent()) return;
+  // If ``/api/folders`` failed transiently during this health transition,
+  // the folder tree DOM (and the cached ``browseFolderRows``) are still
+  // the pre-transition state — a membership check against either would
+  // preserve a folder that just went missing, and ``resetAndLoad`` would
+  // then reload an empty folder-scoped grid. Because the navbar has
+  // already advanced ``_missingFoldersLastIds`` before dispatching this
+  // event, later polls see no transition and never repair the view, so
+  // schedule a retry via the same event listener rather than committing
+  // to a decision from stale data (Codex review r3687062925).
+  if (loaded[0] === null) {
+    var retryAttempt = detail && Number(detail.refreshRetryAttempt) || 0;
+    // Bound the short-term recovery loop. A prolonged/permanent endpoint
+    // outage must fall back to the normal ten-minute health poll instead of
+    // issuing folder/keyword/collection requests forever.
+    if (retryAttempt >= 3) {
+      // The navbar advanced ``_missingFoldersLastIds`` before dispatching
+      // this event, so its 10-minute poll will see unchanged IDs once
+      // ``/api/folders`` recovers and by default emits nothing — the page
+      // would then remain on pre-transition data indefinitely. Flag the
+      // navbar so the next successful poll fires a synthetic reconciliation
+      // event regardless of the ID diff, letting this handler re-attempt
+      // the refresh with a healthy endpoint (Codex review r3687331927).
+      if (typeof window.markMissingFoldersReconciliationPending === 'function') {
+        window.markMissingFoldersReconciliationPending();
+      }
+      return;
+    }
+    var retryDetail = Object.assign({}, detail || {}, {
+      source: 'refresh-retry',
+      refreshRetryAttempt: retryAttempt + 1
+    });
+    setTimeout(function() {
+      document.dispatchEvent(new CustomEvent('vireo:folder-health-changed', {
+        // Preserve restored/wentMissing ids so the successful retry can still
+        // distinguish an unrelated sibling transition from one that affects
+        // the active folder scope. Dropping them makes the conservative
+        // no-id fallback reset an unaffected grid and selection.
+        detail: retryDetail
+      }));
+    }, 2000 * Math.pow(2, retryAttempt));
+    return;
+  }
+  // Use the health-owned response rather than the DOM. A later unrelated
+  // loadFolders() call may supersede this render while still being in flight;
+  // in that window the DOM is intentionally old even though this response
+  // already proves whether the selected folder is available.
+  var currentFolderRows = loaded[0];
+  var activeScopeWasAffected = folderHealthTouchesActiveScope(
+    detail, beforeFolderRows, currentFolderRows);
+  if (activeFolderId &&
+      !currentFolderRows.some(function(folder) { return folder.id === activeFolderId; })) {
+    activeFolderId = null;
+    activeScopeWasAffected = true;
+  }
+
+  // A transition in an unrelated folder cannot change a leaf-folder result
+  // set. Keep its selection, detail panel, and scroll position intact while
+  // still refreshing workspace-wide sidebar and summary counts.
+  if (!activeScopeWasAffected && browseDatasetReady) {
+    loadCollectionCounts();
+    loadSummary();
+    if (timelineMode) loadCalendarData();
+    return;
+  }
+
+  // Preserve the active collection: resetAndLoad's default is to clear
+  // ``activeCollectionId`` for non-dashboard scopes, which would kick a user
+  // viewing a normal collection back to the unscoped workspace grid whenever
+  // folder health changes (CodeRabbit review r3684913393).
+  var gridReloadStatus = await resetAndLoad({
+    preserveCollection: true,
+    preserveAnchor: true
+  });
+  if (!isCurrent()) return;
+  if (gridReloadStatus === false) {
+    // resetAndLoad has already cleared the pre-transition grid. Keep the
+    // navbar reconciliation marker set so an unchanged normal poll retries
+    // after a transient first-page query/collection failure instead of
+    // leaving Browse empty indefinitely.
+    if (typeof window.markMissingFoldersReconciliationPending === 'function') {
+      window.markMissingFoldersReconciliationPending();
+    }
+    return;
+  }
+  loadCollectionCounts();
+  loadSummary();
+  if (timelineMode) loadCalendarData();
+}
+
+// Track the currently-running refresh so awaiters (the photo deep-link
+// loader in particular) can wait for it to settle before re-snapshotting
+// their generation counter and retrying. Without this, a health event
+// that fires while ``?photo_id=…`` is awaiting ``_cfgPromise`` /
+// ``/api/photos/<id>`` / ``/api/browse/init`` used to cancel the deep
+// link permanently — the refresh has no idea what folder the target
+// photo lives in, so Browse fell back to the unscoped workspace grid
+// without scrolling to the requested photo (and VireoFilter was left
+// uninitialized) (Codex review r3686778061).
+var _activeFolderHealthRefresh = Promise.resolve();
+document.addEventListener('vireo:folder-health-changed', function(event) {
+  _activeFolderHealthRefresh = refreshBrowseAfterFolderHealthChange(
+    event && event.detail);
+});
+
+async function waitForFolderHealthRefreshesToSettle() {
+  // A second event can replace the active promise while an awaiter is still
+  // waiting on the first. Keep observing until the promise that just settled
+  // is still the active one, so photo deep-link retries cannot resume in the
+  // gap between overlapping refreshes.
+  while (true) {
+    var observed = _activeFolderHealthRefresh;
+    try { await observed; } catch (e) { /* keep draining newer refreshes */ }
+    if (observed === _activeFolderHealthRefresh) return;
+  }
 }
 
 async function filterByCollection(id, options) {
@@ -4085,8 +4543,14 @@ async function saveCollection() {
 /* ---------- Photo Loading ---------- */
 async function resetAndLoad(options) {
   var preserveAnchor = !!(options && options.preserveAnchor);
+  // Callers that need the current collection scope to survive a reset
+  // (folder-health refresh) pass ``preserveCollection: true``. Without it
+  // the default clear below would drop a normal (non-dashboard) collection
+  // and send the user back to the unscoped workspace grid.
+  var preserveCollection = !!(options && options.preserveCollection);
   var anchor = preserveAnchor ? captureSelectedPhotoAnchor() : null;
   var restoreEpoch = anchor ? ++anchorRestoreEpoch : null;
+  browseDatasetReady = false;
   photos = [];
   currentPage = 1;
   allLoaded = false;
@@ -4105,15 +4569,21 @@ async function resetAndLoad(options) {
   // Dashboard-scoped collections are the exception: there the collection is an
   // explicit composable restriction that filters combine WITH, so it must
   // survive filter-driven reloads (dashboard drill-down deep links).
-  if (!dashboardCollectionScope) activeCollectionId = null;
+  if (!dashboardCollectionScope && !preserveCollection) activeCollectionId = null;
+  var preservedCollectionId = preserveCollection ? activeCollectionId : null;
   if (anchor) hideDetailPanel();
   else closeDetail();
   document.getElementById('grid').innerHTML = '';
   document.getElementById('gridContainer').scrollTop = 0;
 
   function resetRequestIsCurrent() {
-    return resetLoadEpoch === loadEpoch &&
-      (activeCollectionId == null || dashboardCollectionScope);
+    if (resetLoadEpoch !== loadEpoch) return false;
+    if (activeCollectionId == null) return true;
+    if (dashboardCollectionScope) return true;
+    // Explicitly preserved collection: the reset is still current as long as
+    // the caller-chosen scope hasn't been replaced by a newer sidebar click.
+    if (preserveCollection && activeCollectionId === preservedCollectionId) return true;
+    return false;
   }
   function anchorScanShouldContinue() {
     return resetRequestIsCurrent() && anchorRestoreEpoch === restoreEpoch;
@@ -4121,15 +4591,17 @@ async function resetAndLoad(options) {
 
   if (anchor) anchorScanDepth++;
   try {
-    await loadPhotos();
-    if (!resetRequestIsCurrent() || !anchor) return;
+    var initialLoadStatus = await loadPhotos();
+    if (initialLoadStatus !== true) return initialLoadStatus;
+    if (!resetRequestIsCurrent()) return null;
+    if (!anchor) return true;
 
     var card = await loadUntilPhotoRendered(anchor.photoId, anchorScanShouldContinue);
-    if (!resetRequestIsCurrent()) return;
-    if (!anchorRestoreIsPending(anchor, restoreEpoch)) return;
+    if (!resetRequestIsCurrent()) return null;
+    if (!anchorRestoreIsPending(anchor, restoreEpoch)) return true;
     if (!card) {
       clearActiveSelectionAndDetail();
-      return;
+      return true;
     }
 
     selectedPhotoId = anchor.photoId;
@@ -4143,6 +4615,7 @@ async function resetAndLoad(options) {
       restorePhotoAnchor(anchor);
       updateScrollPosition();
     });
+    return true;
   } finally {
     if (anchor) {
       anchorScanDepth = Math.max(0, anchorScanDepth - 1);
@@ -4174,7 +4647,8 @@ function buildCurrentBrowseParams() {
 }
 
 async function loadPhotos(options) {
-  if (loading || allLoaded) return;
+  if (loading) return null;
+  if (allLoaded) return true;
   loading = true;
   var epoch = loadEpoch;
   var loadSucceeded = false;
@@ -4230,7 +4704,7 @@ async function loadPhotos(options) {
 
   try {
     var data = await safeFetch(url, fetchOptions);
-    if (epoch !== loadEpoch) return;  // grid was reset mid-flight; drop stale response
+    if (epoch !== loadEpoch) return null;  // grid was reset mid-flight; drop stale response
     totalPhotos = data.total;
     if (window.VireoFilter && VireoFilter.setResultTotal) VireoFilter.setResultTotal(totalPhotos);
     if (window.VireoFilter && VireoFilter.setVisualInfo) {
@@ -4251,6 +4725,7 @@ async function loadPhotos(options) {
 
     if (firstNewIdx === 0) renderGrid();
     else appendGridPhotos(data.photos, firstNewIdx);
+    browseDatasetReady = true;
     updateGridTail();
     updateFilterSummary();
 
@@ -4268,7 +4743,7 @@ async function loadPhotos(options) {
     }
     loadSucceeded = true;
   } catch(e) {
-    if (epoch !== loadEpoch) return;
+    if (epoch !== loadEpoch) return null;
     if (showLoading && loadingState) {
       loadingState.textContent = 'Error loading photos.';
     }
@@ -4288,6 +4763,7 @@ async function loadPhotos(options) {
       }
     }
   }
+  return loadSucceeded;
 }
 
 /* ---------- Calendar Heatmap ---------- */
@@ -4307,7 +4783,7 @@ function toggleTimelineMode() {
   }
 }
 
-async function loadCalendarData() {
+function buildCalendarParams() {
   var params = new URLSearchParams();
   params.set('year', calendarYear);
   if (activeFolderId) params.set('folder_id', activeFolderId);
@@ -4327,9 +4803,54 @@ async function loadCalendarData() {
   var rules = getBrowseRulesWithoutTimestamp();
   if (rules) params.set('rules', JSON.stringify(rules));
   appendVisualScopeParams(params);
+  return params;
+}
 
-  calendarData = await safeFetch('/api/photos/calendar?' + params.toString());
-  renderCalendar();
+function reconcileCalendarLoadRenders() {
+  var gen = calendarDataLoadGen;
+  while (gen > calendarRenderDecisionGen) {
+    var state = calendarDataLoadStates[gen];
+    if (!state || state.status === 'pending') return;
+    if (state.status === 'success') {
+      var currentKey = buildCalendarParams().toString();
+      calendarRenderDecisionGen = gen;
+      if (state.key === currentKey) {
+        calendarData = state.data;
+        renderCalendar();
+      }
+      Object.keys(calendarDataLoadStates).forEach(function(key) {
+        if (Number(key) <= calendarDataLoadGen) delete calendarDataLoadStates[key];
+      });
+      return;
+    }
+    gen--;
+  }
+}
+
+async function loadCalendarData() {
+  var gen = ++calendarDataLoadGen;
+  var params = buildCalendarParams();
+  calendarDataLoadStates[gen] = {
+    status: 'pending',
+    key: params.toString()
+  };
+
+  try {
+    var data = await safeFetch('/api/photos/calendar?' + params.toString());
+    var state = calendarDataLoadStates[gen];
+    if (!state) return data;
+    state.status = 'success';
+    state.data = data;
+    reconcileCalendarLoadRenders();
+    return data;
+  } catch(e) {
+    var failedState = calendarDataLoadStates[gen];
+    if (failedState) {
+      failedState.status = 'failure';
+      reconcileCalendarLoadRenders();
+    }
+    return null;
+  }
 }
 
 function getBrowseRulesWithoutTimestamp() {
@@ -6645,18 +7166,58 @@ function closeDetail() {
   loadSummary();
 }
 
-async function loadSummary() {
+function buildSummaryParams() {
   var params = new URLSearchParams();
   if (activeFolderId) params.set('folder_id', activeFolderId);
   var rules = getBrowseRules();
   if (rules) params.set('rules', JSON.stringify(rules));
   appendVisualScopeParams(params);
   if (activeCollectionId) params.set('collection_id', activeCollectionId);
+  return params;
+}
+
+function reconcileSummaryLoadRenders() {
+  var gen = summaryLoadGen;
+  while (gen > summaryRenderDecisionGen) {
+    var state = summaryLoadStates[gen];
+    if (!state || state.status === 'pending') return;
+    if (state.status === 'success') {
+      var currentKey = buildSummaryParams().toString();
+      summaryRenderDecisionGen = gen;
+      if (state.key === currentKey) renderSummary(state.data);
+      Object.keys(summaryLoadStates).forEach(function(key) {
+        if (Number(key) <= summaryLoadGen) delete summaryLoadStates[key];
+      });
+      return;
+    }
+    gen--;
+  }
+}
+
+async function loadSummary() {
+  var gen = ++summaryLoadGen;
+  var params = buildSummaryParams();
+  summaryLoadStates[gen] = {
+    status: 'pending',
+    key: params.toString()
+  };
 
   try {
     var data = await safeFetch('/api/browse/summary?' + params.toString(), {}, { toast: false });
-    renderSummary(data);
-  } catch(e) {}
+    var state = summaryLoadStates[gen];
+    if (!state) return data;
+    state.status = 'success';
+    state.data = data;
+    reconcileSummaryLoadRenders();
+    return data;
+  } catch(e) {
+    var failedState = summaryLoadStates[gen];
+    if (failedState) {
+      failedState.status = 'failure';
+      reconcileSummaryLoadRenders();
+    }
+    return null;
+  }
 }
 
 function renderSummary(data) {
@@ -8358,25 +8919,54 @@ document.addEventListener('contextmenu', function(e) {
 });
 
 /* ---------- Deep-link: scroll to photo_id if present in URL ---------- */
-(async function() {
-  var params = new URLSearchParams(window.location.search);
-  var photoId = params.get('photo_id');
-  if (!photoId) return;
-  photoId = parseInt(photoId, 10);
-  if (isNaN(photoId)) return;
+// Cap retry loops so a folder that keeps flapping (health event on every
+// interval) can't spin this indefinitely — after this many stale
+// interruptions, fall through to whatever refreshBrowseAfterFolderHealthChange
+// last rendered rather than deep-link forever (Codex review r3686778061).
+var _DEEP_LINK_MAX_RETRIES = 5;
+async function _runPhotoDeepLink(photoId) {
+  // Snapshot the health-refresh generation BEFORE any await. If a
+  // vireo:folder-health-changed event fires while this loader is awaiting
+  // /api/photos/<id> or its folder-scoped /api/browse/init,
+  // refreshBrowseAfterFolderHealthChange() has already reloaded folders,
+  // keywords, collections, and the grid from the fresh post-flip state and
+  // owns the ``loading`` mutex. Rendering pre-flip data from initData or
+  // releasing ``loading`` here would either clobber that fresher refresh
+  // or let the intersection observer fire a duplicate page-1 request
+  // against the same loadEpoch (Codex review r3686696351).
+  var deepLinkHealthSeq = folderHealthRefreshSeq;
+  var isDeepLinkHealthCurrent = function() {
+    return folderHealthRefreshSeq === deepLinkHealthSeq;
+  };
+  // Signal to the outer retry loop whether we bailed out due to a
+  // concurrent health refresh (retryable) versus completed / errored
+  // (terminal). Returning a boolean keeps the existing return-early
+  // pattern intact — every ``return`` inside the try body is a stale
+  // detection.
+  var wasSuperseded = false;
 
   // Prevent the IntersectionObserver from triggering loadPhotos() while deep-link is loading
   loading = true;
   var deepLinkLoaded = false;
   try {
     applyBrowseConfig(await _cfgPromise);
+    if (!isDeepLinkHealthCurrent()) { wasSuperseded = true; return wasSuperseded; }
     var photo = await safeFetch('/api/photos/' + photoId, {}, { toast: false });
-    if (!photo || !photo.folder_id) { loading = false; return; }
+    if (!isDeepLinkHealthCurrent()) { wasSuperseded = true; return wasSuperseded; }
+    if (!photo || !photo.folder_id) {
+      // Don't release ``loading`` if a concurrent health refresh owns it
+      // (its loadPhotos would then race the intersection observer). The
+      // isDeepLinkHealthCurrent check above already returns early in that
+      // case, so reaching here means it's safe to release.
+      loading = false;
+      return wasSuperseded;
+    }
 
     // Navigate to the photo's folder
     activeFolderId = photo.folder_id;
     activeKeyword = null;
     activeCollectionId = null;
+    browseDatasetReady = false;
     photos = [];
     currentPage = 1;
     allLoaded = false;
@@ -8390,8 +8980,35 @@ document.addEventListener('contextmenu', function(e) {
 
     // Load pages until the target photo is found or all pages exhausted
     // (bootstrapBrowse was skipped, so we also need folder/keyword trees)
+    var missingSnapshotVersionAtInitStart =
+      typeof _missingFoldersSnapshotVersion !== 'undefined'
+        ? _missingFoldersSnapshotVersion
+        : null;
     var initData = await safeFetch('/api/browse/init?folder_id=' + photo.folder_id + '&per_page=' + perPage + '&sort=' + document.getElementById('sortSelect').value, {}, { toast: false });
+    if (!isDeepLinkHealthCurrent()) { wasSuperseded = true; return wasSuperseded; }
     if (initData) {
+      // Seed the navbar's missing-folder snapshot from init's workspace-scoped
+      // view so the first /api/folders/missing observation has a baseline to
+      // compare against. bootstrapBrowse() does the same seed but returns
+      // immediately for ?photo_id=..., so without this the deep-link path
+      // leaves _missingFoldersLastIds null: a background _folder_health_loop
+      // flip that runs between init and the first navbar poll then lands
+      // silently (null-baseline branch), later polls see the same IDs and
+      // never dispatch, and Browse stays stuck on the pre-flip state
+      // indefinitely. The shared snapshot-version helper adopts init when a
+      // baseline was already present before this request, but dispatches an
+      // init→current transition when a newer observation landed in flight;
+      // the subsequent isDeepLinkHealthCurrent check then skips stale render
+      // data (Codex reviews r3686696347 and r3687277899).
+      if (Array.isArray(initData.missing_folder_ids) &&
+          typeof _reconcileMissingFoldersInitSnapshot === 'function') {
+        _reconcileMissingFoldersInitSnapshot(
+          initData.missing_folder_ids,
+          missingSnapshotVersionAtInitStart,
+          'deep-link-reconcile',
+          initData.folder_health_version);
+        if (!isDeepLinkHealthCurrent()) { wasSuperseded = true; return wasSuperseded; }
+      }
       renderFolderTree(initData.folders || []);
       renderKeywordTree(initData.keywords || []);
       renderCollectionList(initData.collections || []);
@@ -8401,6 +9018,7 @@ document.addEventListener('contextmenu', function(e) {
       currentPage = 2;
       if (photos.length >= totalPhotos) allLoaded = true;
       renderGrid();
+      browseDatasetReady = true;
       document.getElementById('loadingState').style.display = 'none';
       deepLinkLoaded = true;
     }
@@ -8409,8 +9027,12 @@ document.addEventListener('contextmenu', function(e) {
     // above intentionally blocks IntersectionObserver-driven loads, but
     // loadPhotos() also honors it; clear it before this explicit paging pass
     // or a target beyond the first page spins in a resolved Promise loop.
+    // Same freshness guard as above — don't release ``loading`` if a health
+    // refresh took ownership while init was in flight.
+    if (!isDeepLinkHealthCurrent()) { wasSuperseded = true; return wasSuperseded; }
     loading = false;
     var el = await loadUntilPhotoRendered(photoId);
+    if (!isDeepLinkHealthCurrent()) { wasSuperseded = true; return wasSuperseded; }
 
     // Update folder tree active state
     document.querySelectorAll('#folderTree .tree-item').forEach(function(el) {
@@ -8460,10 +9082,41 @@ document.addEventListener('contextmenu', function(e) {
       }).catch(function() {});
     }
   } catch(e) { /* ignore deep-link errors silently */ }
-  loading = false;
-  if (deepLinkLoaded) {
-    rearmInfiniteScrollObserver();
-    requestAnimationFrame(ensureViewportHydrated);
+  // A concurrent refreshBrowseAfterFolderHealthChange() owns ``loading``
+  // and rearms the observer itself when its loadPhotos settles; releasing
+  // ``loading`` here would let a second page-1 request race against the
+  // same loadEpoch, producing duplicate cards and off-by-one pagination
+  // (Codex review r3686696351).
+  if (isDeepLinkHealthCurrent()) {
+    loading = false;
+    if (deepLinkLoaded) {
+      rearmInfiniteScrollObserver();
+      requestAnimationFrame(ensureViewportHydrated);
+    }
+  }
+  return wasSuperseded;
+}
+
+(async function() {
+  var params = new URLSearchParams(window.location.search);
+  var photoId = params.get('photo_id');
+  if (!photoId) return;
+  photoId = parseInt(photoId, 10);
+  if (isNaN(photoId)) return;
+
+  // If a folder-health refresh interrupts us, wait for it to finish and
+  // retry — otherwise the deep-link is silently abandoned and Browse is
+  // left on whatever the refresh happened to load (usually the unscoped
+  // workspace grid, with the target photo never scrolled into view and
+  // VireoFilter uninitialized) (Codex review r3686778061).
+  for (var attempt = 0; attempt < _DEEP_LINK_MAX_RETRIES; attempt++) {
+    var wasSuperseded = await _runPhotoDeepLink(photoId);
+    if (!wasSuperseded) return;
+    // Await the refresh that stole the load so the next attempt starts
+    // from a settled state and its pre-await snapshot is guaranteed to
+    // match the current generation (unless yet another refresh fires
+    // during the retry, which the loop handles).
+    await waitForFolderHealthRefreshesToSettle();
   }
 })();
 

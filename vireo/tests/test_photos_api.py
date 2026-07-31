@@ -197,6 +197,49 @@ def test_dashboard_and_browse_share_collection_date_scope(app_and_db):
     assert query_resp.get_json()["ids"] == [photos[2]["id"]]
 
 
+def test_browse_init_captures_missing_baseline_before_folder_tree(
+    app_and_db, monkeypatch,
+):
+    """/api/browse/init must establish its read snapshot from missing-folder
+    IDs before reading the folder tree.
+
+    The endpoint now wraps every first-paint read in one transaction, so the
+    ordering establishes the shared snapshot rather than merely narrowing
+    the direction of a possible inconsistency (Codex reviews r3686317681 and
+    r3687501744).
+    """
+    from db import Database
+
+    app, _ = app_and_db
+    client = app.test_client()
+
+    call_order = []
+    real_missing = Database.get_missing_folders
+    real_tree = Database.get_folder_tree
+
+    def spy_missing(self):
+        call_order.append("missing")
+        return real_missing(self)
+
+    def spy_tree(self):
+        call_order.append("tree")
+        return real_tree(self)
+
+    monkeypatch.setattr(Database, "get_missing_folders", spy_missing)
+    monkeypatch.setattr(Database, "get_folder_tree", spy_tree)
+
+    resp = client.get("/api/browse/init")
+    assert resp.status_code == 200
+
+    assert "missing" in call_order and "tree" in call_order, (
+        f"expected both reads to run, got {call_order}"
+    )
+    assert call_order.index("missing") < call_order.index("tree"), (
+        "get_missing_folders must establish the transaction snapshot before "
+        f"get_folder_tree; call order was {call_order}"
+    )
+
+
 def test_dashboard_options_flags_degraded_collections(app_and_db):
     """Collections whose rules can't compile are flagged so the scope
     picker can disable them instead of 400ing /api/stats and /api/coverage."""

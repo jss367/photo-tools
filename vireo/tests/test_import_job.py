@@ -7145,3 +7145,92 @@ def test_local_import_refuses_when_share_detached_before_run_starts(
         "no longer mounted" in u["reason"] or "detached" in u["reason"]
         for u in result["unsafe_files"]
     ), result["unsafe_files"]
+
+
+def test_local_import_invalidates_duplicate_skips_when_mount_detaches(
+        tmp_path, monkeypatch):
+    """A duplicate-only batch must not vouch for a detached archive.
+
+    An accepted duplicate never enters ``landed``, so reclassifying only
+    landed entries leaves the skip standing. A duplicate-only batch can
+    then satisfy ``copied + skipped_duplicate == discovered`` and report
+    safe_to_format=True while the real archive holds none of the bytes —
+    the card gets erased and the shadow disappears on remount.
+    See PR #1396 review (Codex P1 r3687506040).
+    """
+    import shutil
+
+    import import_job as _ij
+    import pipeline_job as _pj
+    from import_job import ImportParams, run_import_job
+    from scanner import compute_file_hash
+
+    dest = tmp_path / "mnt_NAS"
+    dest_dir = dest / "2026" / "2026-07-03"
+    dest_dir.mkdir(parents=True)
+    dest_file = dest_dir / "IMG_0100.jpg"
+    Image.new("RGB", (16, 16), "red").save(str(dest_file))
+    ts = datetime(2026, 7, 3, 10, 0, 0).timestamp()
+    os.utime(str(dest_file), (ts, ts))
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws_id = db._active_workspace_id
+    fid = db.conn.execute(
+        "INSERT INTO folders (path, name, status) VALUES (?, ?, 'ok')",
+        (str(dest_dir), dest_dir.name),
+    ).lastrowid
+    db.conn.execute(
+        "INSERT INTO photos (folder_id, filename, extension, file_size,"
+        " file_hash) VALUES (?, ?, '.jpg', ?, ?)",
+        (fid, "IMG_0100.jpg", os.path.getsize(str(dest_file)),
+         compute_file_hash(str(dest_file))),
+    )
+    db.conn.commit()
+
+    card = tmp_path / "card"
+    card.mkdir()
+    shutil.copy2(str(dest_file), str(card / "IMG_0100.jpg"))
+
+    monkeypatch.setattr(
+        _pj, "_archive_mount_root_candidates",
+        lambda path: [str(dest)] if str(path).startswith(str(dest)) else [],
+    )
+    state = {"mounted": True}
+    real_ismount = os.path.ismount
+    monkeypatch.setattr(
+        os.path, "ismount",
+        lambda p: (
+            state["mounted"] if str(p) == str(dest) else real_ismount(p)
+        ),
+    )
+
+    # The share drops while the duplicate gate is consulting the twin —
+    # after the per-file probe has already passed. Both lookup helpers are
+    # wrapped because which one runs depends on whether the checker
+    # produced a hash token or a metadata-key token.
+    def _detach_after(fn):
+        def wrapper(*a, **kw):
+            rows = fn(*a, **kw)
+            state["mounted"] = False
+            return rows
+        return wrapper
+
+    monkeypatch.setattr(
+        _ij, "_key_twin_rows", _detach_after(_ij._key_twin_rows))
+    monkeypatch.setattr(
+        _ij, "_hash_twin_rows", _detach_after(_ij._hash_twin_rows))
+
+    result = run_import_job(
+        _make_job(), FakeRunner(), db_path, ws_id, ImportParams(
+            sources=[str(card)], destination=str(dest),
+        ),
+    )
+
+    assert result["copied"] == 0, result
+    assert result["skipped_duplicate"] == 0, (
+        "a duplicate accepted against a detached archive still counted as "
+        f"safely already-present: {result}"
+    )
+    assert result["failed"] == 1, result
+    assert result["safe_to_format"] is False, result

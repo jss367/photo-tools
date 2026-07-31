@@ -2743,6 +2743,15 @@ def run_import_job(job, runner, db_path, workspace_id, params):
         # bytes, never the just-written archive copy.
         landed = []
         dup_dirs = set()
+        # Duplicate skips accepted in this batch that never enter
+        # ``landed`` — (source_file, counted_unverified). An accepted skip
+        # asserts "the archive already holds these bytes", which stops
+        # being true the moment the share detaches: the twin it matched
+        # may be in the local shadow. A duplicate-only batch would
+        # otherwise satisfy copied + skipped_duplicate == discovered and
+        # report safe_to_format True over an archive holding nothing.
+        # See PR #1396 review (Codex P1 r3687506040).
+        dup_skips = []
         # Sticky once tripped: a batch can hold hundreds of files (the
         # 2026-07-26 folder held 200), and when it is the only batch there
         # is no later batch boundary to catch a detach. Probing per file
@@ -2790,6 +2799,7 @@ def run_import_job(job, runner, db_path, workspace_id, params):
                             skipped_duplicate += 1
                             unverified_duplicate += 1
                             _counts(rel)["skipped_duplicate"] += 1
+                            dup_skips.append((source_file, True))
                             dup_dirs.update(_linkable_twin_dirs(
                                 likely_rows, _path_under_destination,
                             ))
@@ -2901,6 +2911,7 @@ def run_import_job(job, runner, db_path, workspace_id, params):
                     if accept:
                         skipped_duplicate += 1
                         _counts(rel)["skipped_duplicate"] += 1
+                        dup_skips.append((source_file, False))
                         # verified_twin_rows carries only twins whose
                         # bytes we re-hashed and matched this run — the
                         # only rows whose folders are safe to link. For
@@ -3021,6 +3032,7 @@ def run_import_job(job, runner, db_path, workspace_id, params):
                         # out of the duplicate-identity index (see ingest).
                         skipped_duplicate += 1
                         _counts(rel)["skipped_duplicate"] += 1
+                        dup_skips.append((source_file, False))
                         dup_dirs.add(dest_folder)
                         continue
                     if src_size == dest_size:
@@ -3124,6 +3136,30 @@ def run_import_job(job, runner, db_path, workspace_id, params):
         # a mount check on both sides of every copy in the batch.
         if not mount_lost:
             mount_lost = _unmounted_since_baseline(mount_baseline)
+
+        # Accepted duplicate skips rest on a twin that may live in the
+        # local shadow rather than on the share, so a detach invalidates
+        # the "already present" claim exactly as it invalidates a copy.
+        # These never enter ``landed``, so they need their own rollback:
+        # without it a duplicate-only batch reports every file safely
+        # accounted for and the card looks safe to erase over an archive
+        # holding none of the bytes. ``dup_dirs`` is dropped for the same
+        # reason — linking those folders would pull shadow paths into the
+        # workspace. See PR #1396 review (Codex P1 r3687506040).
+        if mount_lost and dup_skips:
+            for skipped_file, counted_unverified in dup_skips:
+                skipped_duplicate -= 1
+                _counts(rel)["skipped_duplicate"] -= 1
+                if counted_unverified:
+                    unverified_duplicate -= 1
+                _fail(
+                    rel, skipped_file,
+                    f"archive mount root {mount_lost} detached mid-batch; "
+                    "the duplicate this file matched cannot be confirmed "
+                    "to be on the archive rather than in a local shadow",
+                )
+            dup_skips = []
+            dup_dirs = set()
 
         # Anything that landed BEFORE the detach is sitting in the local
         # shadow, not on the archive. Roll those out of copied/

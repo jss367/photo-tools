@@ -6803,16 +6803,21 @@ def test_remote_import_stops_when_mount_point_persists_after_unmount(
         lambda path: [mount_base] if str(path).startswith(mount_base) else [],
     )
     real_ismount = os.path.ismount
-    first_landed = os.path.join(
-        mount_base, "2026", "2026-07-03", "DSC_0001.jpg")
+    second_batch_dir = os.path.join(mount_base, "2026", "2026-07-04")
 
     def fake_ismount(p):
         if str(p) != mount_base:
             return real_ismount(p)
-        # Detaches once the first batch has landed. Keyed on observable
+        # Detach BETWEEN batches: still mounted while batch one copies,
+        # scans and catalogs; gone by the time batch two starts writing
+        # (once batch two's folder is being created). Keyed on observable
         # state rather than a probe count so the test can't be retimed by
-        # a probe being added elsewhere.
-        return not os.path.exists(first_landed)
+        # a probe being added elsewhere, and deliberately AFTER "batch
+        # one's file landed" — an earlier trigger would exercise the
+        # mid-batch detach that the post-rsync probe now correctly rolls
+        # batch one back for too, which is covered by
+        # ``test_remote_import_rolls_back_landed_when_mount_detaches_post_rsync``.
+        return not os.path.exists(second_batch_dir)
 
     monkeypatch.setattr(os.path, "ismount", fake_ismount)
 
@@ -6829,8 +6834,13 @@ def test_remote_import_stops_when_mount_point_persists_after_unmount(
     assert result["copied"] == 1, result
     assert result["failed"] == 1, result
     assert result["safe_to_format"] is False, result
+    # "detached" is common to the batch-level, per-file, post-loop, and
+    # post-rsync guard messages — this test only cares that the detach
+    # was reported, not which probe fired first (which depends on exactly
+    # when the ismount flip lands relative to the second batch's
+    # preflight vs. its per-file loop). Mirrors the local counterpart.
     assert any(
-        "no longer mounted" in u["reason"] for u in result["unsafe_files"]
+        "detached" in u["reason"] for u in result["unsafe_files"]
     ), result["unsafe_files"]
 
 
@@ -7234,3 +7244,234 @@ def test_local_import_invalidates_duplicate_skips_when_mount_detaches(
     )
     assert result["failed"] == 1, result
     assert result["safe_to_format"] is False, result
+
+
+def test_remote_import_invalidates_duplicate_skips_when_mount_detaches(
+        tmp_path, monkeypatch):
+    """Same-shape defence on the remote path: a duplicate-only batch must
+    not vouch for a detached archive even when the twin re-hash succeeded
+    before the mount dropped.
+
+    The remote path only had a batch-level ``_missing_mount_root`` probe
+    plus a batch-boundary staleness check. Once the discovery loop
+    started, an SMB detach mid-loop meant the twin re-hash — and any
+    ``os.path.exists``/on-disk hash used to adopt a shadow file — could
+    read a local shadow rather than the NAS, letting the skip stand and
+    ``copied + skipped_duplicate == discovered`` flip ``safe_to_format``
+    green over an archive that holds none of the bytes. Mirrors the
+    local-path test with the twin-rows-then-detach seam.
+    See PR #1396 review (Codex P1 r3688498501).
+    """
+    import shutil
+
+    import import_job as _ij
+    import pipeline_job as _pj
+    from import_dedup import compute_file_hash as _hash
+    from import_job import ImportParams, run_import_job
+
+    ra = _remote_archive_for(tmp_path)
+    calls = _remote_calls(ra)
+    _install_fake_remote_rsync(monkeypatch, calls, verify=None)
+
+    # An off-card cataloged twin: byte-identical file whose folder is not
+    # under any import source so the source-root filter can't reject it as
+    # a stale card row (see _path_under_any_source in the remote path).
+    card = _make_card(tmp_path, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+    ])
+    card_file = str(card / "DSC_0001.jpg")
+    src_hash = _hash(card_file)
+    twin_dir = tmp_path / "archive_twin"
+    twin_dir.mkdir()
+    shutil.copy2(card_file, str(twin_dir / "DSC_0001.jpg"))
+
+    import scanner as _scanner
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws_id = db._active_workspace_id
+    _scanner.scan(str(twin_dir), db)
+    # Sanity: the twin row is present and correctly hashed so the
+    # duplicate gate can actually match.
+    twin_row = db.conn.execute(
+        "SELECT p.file_hash FROM photos p WHERE p.filename = 'DSC_0001.jpg'",
+    ).fetchone()
+    assert twin_row and twin_row["file_hash"] == src_hash, twin_row
+
+    mount_base = ra["mount_base"]
+    monkeypatch.setattr(
+        _pj, "_archive_mount_root_candidates",
+        lambda path: (
+            [mount_base] if str(path).startswith(mount_base) else []
+        ),
+    )
+    state = {"mounted": True}
+    real_ismount = os.path.ismount
+    monkeypatch.setattr(
+        os.path, "ismount",
+        lambda p: (
+            state["mounted"] if str(p) == mount_base else real_ismount(p)
+        ),
+    )
+
+    # Detach WHILE the duplicate gate is reading the twin — after the
+    # per-file probe passed, before the accept branch increments
+    # skipped_duplicate. Both lookup helpers are wrapped because which one
+    # fires depends on whether the checker produced a hash or key token.
+    def _detach_after(fn):
+        def wrapper(*a, **kw):
+            rows = fn(*a, **kw)
+            state["mounted"] = False
+            return rows
+        return wrapper
+
+    monkeypatch.setattr(
+        _ij, "_key_twin_rows", _detach_after(_ij._key_twin_rows))
+    monkeypatch.setattr(
+        _ij, "_hash_twin_rows", _detach_after(_ij._hash_twin_rows))
+
+    result = run_import_job(
+        _make_job(), FakeRunner(), db_path, ws_id,
+        ImportParams(
+            sources=[str(card)], destination=mount_base,
+            remote_target=ra, verify_by_hash=True,
+        ),
+    )
+
+    # No rsync happened (the file was accepted as a duplicate) and the
+    # accepted skip must be rolled back into failed.
+    assert calls["rsync"] == [], calls["rsync"]
+    assert result["copied"] == 0, result
+    assert result["skipped_duplicate"] == 0, (
+        "a remote duplicate accepted against a detached archive still "
+        f"counted as safely already-present: {result}"
+    )
+    assert result["failed"] == 1, result
+    assert result["safe_to_format"] is False, result
+    non_remote = [
+        u for u in result["unsafe_files"] if u["path"] != "<remote>"
+    ]
+    assert non_remote, result["unsafe_files"]
+    assert any(
+        "detached" in u["reason"] and "shadow" in u["reason"]
+        for u in non_remote
+    ), result["unsafe_files"]
+
+
+def test_remote_import_rolls_back_landed_when_mount_detaches_post_rsync(
+        tmp_path, monkeypatch):
+    """Post-rsync detach must not let the catalog scan point at a shadow.
+
+    rsync succeeds card → NAS regardless of the local mount, but the
+    per-batch ``scan()`` reads the mount to create photo rows. Without a
+    post-rsync/pre-scan probe on the remote path, a detach in that window
+    lets ``scan()`` walk the shadow: fresh landings either get rows
+    referencing shadow bytes (which the existing hash-mismatch guard
+    catches by accident) or, worse, get NO rows and the "not cataloged
+    after scan" failure fires. Either way the batch cannot honestly be
+    ``safe_to_format=True`` — but the failure has to arrive as an
+    explicit mount-detach rollback so the reason is diagnosable and no
+    room is left for a scan against the shadow to succeed silently.
+    See PR #1396 review (Codex P1 r3688498501).
+    """
+    import pipeline_job as _pj
+    from import_job import ImportParams, run_import_job
+
+    ra = _remote_archive_for(tmp_path)
+    calls = _remote_calls(ra)
+    mount_base = ra["mount_base"]
+    state = {"mounted": True}
+
+    # Detach WHEN the rsync completes but BEFORE the post-rsync probe: use
+    # the fake rsync's own callback as the seam so the detach lands after
+    # bytes have reached the NAS side and before the catalog scan starts.
+    # This is the window the local path's post-loop probe closes; the
+    # remote path needs the same guarantee. See PR #1396 review (Codex
+    # P1 r3688498501).
+    import shutil as _shutil
+
+    import move as _move
+
+    def rsync_then_detach(*args, **kwargs):
+        rc, stderr, timed_out = _install_fake_rsync_for_test(
+            calls, *args, **kwargs)
+        # Landed to the fake NAS (== local mount dir). Flip mount now, so
+        # by the time the post-rsync probe runs, the share is "gone".
+        state["mounted"] = False
+        return rc, stderr, timed_out
+
+    def _install_fake_rsync_for_test(_calls, src_path, dest_spec,
+                                     rsync_flags, total_files, progress_cb,
+                                     rsync_bin="rsync", extra_args=None,
+                                     src_specs=None,
+                                     src_specs_dest_is_dir=True, **kw):
+        ssh_path = dest_spec.split(":", 1)[1]
+        if src_specs_dest_is_dir:
+            rel = os.path.relpath(ssh_path, _calls["_ssh_base"])
+            mount_dir = os.path.join(_calls["_mount_base"], rel)
+            os.makedirs(mount_dir, exist_ok=True)
+            for s in src_specs:
+                _shutil.copy2(
+                    s, os.path.join(mount_dir, os.path.basename(s)))
+        else:
+            rel = os.path.relpath(ssh_path, _calls["_ssh_base"])
+            mount_file = os.path.join(_calls["_mount_base"], rel)
+            os.makedirs(os.path.dirname(mount_file), exist_ok=True)
+            _shutil.copy2(src_specs[0], mount_file)
+        _calls["rsync"].append({
+            "src_specs": list(src_specs), "dest_spec": dest_spec,
+            "rsync_bin": rsync_bin,
+            "extra_args": list(extra_args or []),
+            "flags": list(rsync_flags or []),
+            "dest_is_dir": src_specs_dest_is_dir,
+        })
+        return (0, "", False)
+
+    monkeypatch.setattr(_move, "_run_rsync_streamed", rsync_then_detach)
+    monkeypatch.setattr(_move, "_remote_mkdir_p", lambda r, p: (True, ""))
+    monkeypatch.setattr(
+        _move, "remote_verify_files", lambda *a, **kw: None)
+
+    card = _make_card(tmp_path, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+        ("DSC_0002.jpg", datetime(2026, 7, 3, 11, 0, 0), "green"),
+    ])
+
+    monkeypatch.setattr(
+        _pj, "_archive_mount_root_candidates",
+        lambda path: (
+            [mount_base] if str(path).startswith(mount_base) else []
+        ),
+    )
+    real_ismount = os.path.ismount
+    monkeypatch.setattr(
+        os.path, "ismount",
+        lambda p: (
+            state["mounted"] if str(p) == mount_base else real_ismount(p)
+        ),
+    )
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws_id = db._active_workspace_id
+    result = run_import_job(
+        _make_job(), FakeRunner(), db_path, ws_id,
+        ImportParams(
+            sources=[str(card)], destination=mount_base,
+            remote_target=ra, verify_by_hash=True,
+        ),
+    )
+
+    # rsync did run (bytes are on the NAS), but the post-rsync probe must
+    # have rolled every landed entry back into failed rather than trusting
+    # a shadow-side catalog scan.
+    assert calls["rsync"], "expected rsync to have run before the detach"
+    assert result["copied"] == 0, result
+    assert result["failed"] == 2, result
+    assert result["safe_to_format"] is False, result
+    non_remote = [
+        u for u in result["unsafe_files"] if u["path"] != "<remote>"
+    ]
+    assert non_remote, result["unsafe_files"]
+    assert all(
+        "detached" in u["reason"] for u in non_remote
+    ), result["unsafe_files"]

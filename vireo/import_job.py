@@ -1111,6 +1111,28 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
         # locally readable, so reuse the same on-disk re-hash contract.
         to_transfer = []           # (source_file, dest_basename, src_hash)
         dup_skipped = 0
+        # Every accepted skip (verified twin, intra-run/intra-batch dedup, or
+        # a byte-identical adopted mount file) recorded as (source_file,
+        # counted_unverified) so a mid-batch mount detach can roll each one
+        # back into ``failed``. Both categories hash bytes reachable through
+        # the local mount, so a detach in the middle of the discovery loop
+        # can leave a duplicate-only batch reporting every card file as
+        # accounted for (``copied + skipped_duplicate == discovered``) while
+        # the "already present" bytes actually lived in a local shadow of
+        # the archive rather than on the NAS. Without a rollback list a
+        # verified remote run could still report ``safe_to_format=True``
+        # over an archive that holds none of the bytes.
+        # See PR #1396 review (Codex P1 r3688498501).
+        dup_skips = []
+        # Sticky once tripped: the discovery loop below reads the mount
+        # (twin re-hash, on-disk adoption check, ``os.path.exists`` per
+        # candidate suffix), and any of those reads landing between a
+        # detach and the batch-end scan can back an accepted skip against
+        # a local shadow. Probing per file keeps the blast radius to the
+        # single file being decided at the instant the mount drops.
+        # Mirrors the local path's ``mount_lost`` bookkeeping. See PR
+        # #1396 review (Codex P1 r3688498501).
+        mount_lost = None
         # Twin folders (under destination) whose bytes we RE-HASHED this run
         # and confirmed against source hashes — safe to scan/link into the
         # active workspace after this batch's fresh-scan runs. Mirrors the
@@ -1153,6 +1175,26 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
             if runner.is_cancelled(job["id"]):
                 cancelled = True
                 break
+            # Per-file probe (see ``mount_lost`` above): the branches below
+            # read the mount to make skip/adopt/copy decisions, so a detach
+            # observed *before* this file's decisions must stop cataloging
+            # further files against a stale local shadow rather than the
+            # NAS. Sticky once tripped: cheaper than a redundant probe on
+            # every file, and matches the local path's per-file guard.
+            # See PR #1396 review (Codex P1 r3688498501).
+            if not mount_lost:
+                mount_lost = _unmounted_since_baseline(mount_baseline)
+            if mount_lost:
+                emitted += 1
+                _fail(
+                    rel, source_file,
+                    f"archive mount root {mount_lost} detached while this "
+                    "batch was preparing (the directory persists but the "
+                    "share is gone, so duplicate checks and cataloging "
+                    "would read a local shadow of the archive rather than "
+                    "the NAS)",
+                )
+                continue
             emitted += 1
             _emit(f"{rel}: importing", emitted, discovered, source_file.name)
             if checker is not None:
@@ -1174,6 +1216,7 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
                             unverified_duplicate += 1
                             dup_skipped += 1
                             _counts(rel)["skipped_duplicate"] += 1
+                            dup_skips.append((source_file, True))
                             dup_dirs.update(_linkable_twin_dirs(
                                 likely_rows, _path_under_destination,
                             ))
@@ -1258,6 +1301,7 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
                         skipped_duplicate += 1
                         dup_skipped += 1
                         _counts(rel)["skipped_duplicate"] += 1
+                        dup_skips.append((source_file, False))
                         # Preserve the verified twin folders so the follow-
                         # up dup-link scan can pull them into the active
                         # workspace. Without this a verified duplicate-only
@@ -1324,6 +1368,7 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
                 skipped_duplicate += 1
                 dup_skipped += 1
                 _counts(rel)["skipped_duplicate"] += 1
+                dup_skips.append((source_file, False))
                 _record_checker(source_file, dest_folder, src_hash)
                 continue
             stem, suffix = os.path.splitext(source_file.name)
@@ -1352,6 +1397,7 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
                         skipped_duplicate += 1
                         dup_skipped += 1
                         _counts(rel)["skipped_duplicate"] += 1
+                        dup_skips.append((source_file, False))
                         _record_checker(source_file, dest_folder, src_hash)
                         adopted = True
                         break
@@ -1368,6 +1414,7 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
                         skipped_duplicate += 1
                         dup_skipped += 1
                         _counts(rel)["skipped_duplicate"] += 1
+                        dup_skips.append((source_file, False))
                         claimed_basenames[candidate_key] = src_hash
                         # Track the adopted mount path + source-side hash
                         # so the restricted scan below picks it up (mixed
@@ -1395,6 +1442,56 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
             if checker is not None and src_hash is not None:
                 queued_src_hashes[src_hash] = dest_folder
             to_transfer.append((source_file, dest_basename, src_hash))
+
+        # Re-probe once after the discovery loop and before the rsync so a
+        # detach that lands *during* the last file's decisions is caught
+        # too. The per-file probe runs at the top of each iteration, so it
+        # cannot see a drop that happens while the final file is being
+        # hashed/adopted. Sticky like the local path's post-loop probe.
+        # See PR #1396 review (Codex P1 r3688498501).
+        if not mount_lost:
+            mount_lost = _unmounted_since_baseline(mount_baseline)
+
+        # A detach observed by any probe above invalidates every accepted
+        # skip in this batch: the twin re-hash and the on-disk adoption
+        # check both read the local mount, and once the share is gone
+        # those reads may have come from a local shadow rather than the
+        # NAS. Roll each skip back into ``failed`` (dropping the matching
+        # ``unverified_duplicate`` count for the trust-likely branch) and
+        # empty the follow-ups so nothing survives past the rsync/catalog:
+        #
+        # * ``to_transfer`` is cleared so rsync sends nothing this batch;
+        #   files stay on the card and will be re-decided next run with a
+        #   fresh baseline.
+        # * ``adopted_paths`` is cleared so the post-scan adoption
+        #   validation never fires against local-shadow paths.
+        # * ``dup_dirs`` is cleared so the follow-up ``scan(restrict_dirs=…)``
+        #   pass does not pull shadow twin folders into the workspace.
+        #
+        # Without this a duplicate-only batch — or even a mixed batch
+        # whose fresh copies rsync succeeded — could still satisfy
+        # ``copied + skipped_duplicate == discovered`` and let a verified
+        # remote run report ``safe_to_format=True`` over an archive that
+        # is missing the bytes. Mirrors the local path's ``dup_skips`` /
+        # ``landed`` rollback. See PR #1396 review (Codex P1 r3688498501).
+        if mount_lost and (dup_skips or adopted_paths):
+            for skipped_file, counted_unverified in dup_skips:
+                skipped_duplicate -= 1
+                dup_skipped -= 1
+                _counts(rel)["skipped_duplicate"] -= 1
+                if counted_unverified:
+                    unverified_duplicate -= 1
+                _fail(
+                    rel, skipped_file,
+                    f"archive mount root {mount_lost} detached mid-batch; "
+                    "the duplicate this file matched cannot be confirmed "
+                    "to be on the archive rather than in a local shadow",
+                )
+            dup_skips = []
+            adopted_paths = {}
+            dup_dirs = set()
+        if mount_lost:
+            to_transfer = []
 
         # --- Per-batch rsync -------------------------------------------
         # landed carries the card-side src_hash so the catalog-stamping loop
@@ -1567,6 +1664,54 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
                         verified += 1
                     landed.append((dest_path, str(sf), src_hash, sz, mt))
                     _record_checker(sf, dest_folder, src_hash)
+
+        # Post-rsync probe: cover the window between the last rsync/verify
+        # completing and the catalog scan starting. rsync itself pushes
+        # over SSH, so a mount drop during the transfer does not corrupt
+        # what reached the NAS — but the scan below reads the *mount* to
+        # write photo rows, and a scan against a local shadow would either
+        # populate rows from unrelated bytes (paths that happen to already
+        # exist there) or leave a "no photo row" failure for fresh
+        # landings that the workspace can never see. Roll landed entries
+        # back into ``failed`` and skip the catalog scan entirely; the
+        # bytes are on the NAS and a subsequent run will re-catalog them
+        # once the mount is back. Sticky, so a probe firing earlier in
+        # the batch also triggers this branch. Also rolls back any
+        # ``dup_skips`` that survived the discovery-loop rollback above
+        # (e.g. mount dropped between the post-loop probe and here). See
+        # PR #1396 review (Codex P1 r3688498501).
+        if not mount_lost:
+            mount_lost = _unmounted_since_baseline(mount_baseline)
+        if mount_lost and (landed or dup_skips or adopted_paths):
+            for dest_path, _sf, _sh, _sz, _mt in landed:
+                copied -= 1
+                _counts(rel)["copied"] -= 1
+                if params.verify_by_hash:
+                    verified -= 1
+                _fail(
+                    rel, dest_path,
+                    f"archive mount root {mount_lost} detached after the "
+                    "rsync completed but before the catalog scan; refusing "
+                    "to catalog against a local shadow of the archive "
+                    "(bytes reached the NAS and will be re-cataloged on "
+                    "the next run)",
+                )
+            for skipped_file, counted_unverified in dup_skips:
+                skipped_duplicate -= 1
+                dup_skipped -= 1
+                _counts(rel)["skipped_duplicate"] -= 1
+                if counted_unverified:
+                    unverified_duplicate -= 1
+                _fail(
+                    rel, skipped_file,
+                    f"archive mount root {mount_lost} detached mid-batch; "
+                    "the duplicate this file matched cannot be confirmed "
+                    "to be on the archive rather than in a local shadow",
+                )
+            landed = []
+            dup_skips = []
+            adopted_paths = {}
+            dup_dirs = set()
 
         # --- Catalog this batch ----------------------------------------
         # Fresh copies AND duplicate skips both need the mount folder

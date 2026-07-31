@@ -903,7 +903,7 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
     run_dest_folders = {}
     run_verified_hashes = {}
 
-    # Mount-root preflight (Task 2.7 late follow-up): when a saved remote
+    # Mount-root check (Task 2.7 late follow-up): when a saved remote
     # target's local mount root is not mounted (for example ``/Volumes/NAS``
     # or ``/mnt/NAS`` is absent because the share isn't attached), a naive
     # ``os.makedirs(dest_folder, exist_ok=True)`` in the batch loop below
@@ -912,13 +912,21 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
     # subsequent scan reads the fresh local shadow and leaves the import
     # uncataloged/failed; worse, on macOS/Linux that shadow root can also
     # prevent the real share from remounting at the configured path. Fail
-    # every batch's files up front with a clear reason instead. Reuses the
+    # the batch's files with a clear reason instead. Reuses the
     # pipeline path's ``_missing_archive_mount_root`` helper (only fires
     # for the ``/Volumes/X``, ``/mnt/X``, and ``/media/user/X`` shapes that
-    # denote removable/network mount roots), computed once here because
-    # every batch's ``dest_folder`` shares ``destination``'s mount root.
+    # denote removable/network mount roots).
+    #
+    # Re-probed per batch rather than once up front: a card import runs
+    # for hours against a network archive, and the share can drop *during*
+    # the run (a Tailscale/SMB archive unmounted two hours into an import
+    # on 2026-07-30, after which ``os.makedirs`` walked straight into the
+    # vacated mount point). A start-of-job preflight cannot see that. The
+    # probe is a couple of ``os.path.lexists`` calls on the mount root, so
+    # paying it once per destination folder is free next to the copy work.
     # See PR #1113 review.
-    _missing_mount_root = _missing_archive_mount_root(destination)
+    def _missing_mount_root():
+        return _missing_archive_mount_root(destination)
 
     def _record_checker(source_file, dest_folder=None, file_hash=None):
         """Register a landed/adopted file's identity with the intra-run checker.
@@ -989,20 +997,20 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
                 emitted, discovered,
             )
             continue
-        # Mount-root preflight (see the ``_missing_mount_root`` computation
-        # near the top of this function). Same shape as the dest-under-
-        # source guard: fail every file in the batch with a specific
-        # reason and skip the batch instead of letting ``os.makedirs``
-        # create a local shadow of the unmounted destination. Computed
-        # once outside the loop; the mount-root decision is a property
-        # of ``destination`` and doesn't vary per batch. See PR #1113
-        # review.
-        if _missing_mount_root:
+        # Mount-root check (see the ``_missing_mount_root`` helper near the
+        # top of this function). Same shape as the dest-under-source guard:
+        # fail every file in the batch with a specific reason and skip the
+        # batch instead of letting ``os.makedirs`` create a local shadow of
+        # the unmounted destination. Re-probed here, per batch, so a share
+        # that drops mid-run is caught at the next batch boundary rather
+        # than only at job start. See PR #1113 review.
+        missing_mount_root = _missing_mount_root()
+        if missing_mount_root:
             for source_file in batch:
                 emitted += 1
                 _fail(
                     rel, source_file,
-                    f"archive mount root {_missing_mount_root} is not "
+                    f"archive mount root {missing_mount_root} is not "
                     "available (destination drive is not mounted; refusing "
                     "to create a shadow directory tree under it, which "
                     "would prevent the real share from remounting)",
@@ -1013,7 +1021,24 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
                 emitted, discovered,
             )
             continue
-        os.makedirs(dest_folder, exist_ok=True)
+        # Mirrors the local path: the mount-root guard above only catches
+        # a mount point that vanished, so a stale-but-present mount, a
+        # read-only parent, or a permission change still reaches this
+        # call. An uncaught OSError here kills the background job; book
+        # it per file and let the run finish with an honest result.
+        try:
+            os.makedirs(dest_folder, exist_ok=True)
+        except OSError as e:
+            for source_file in batch:
+                emitted += 1
+                _fail(
+                    rel, source_file,
+                    f"could not create destination folder {dest_folder}: {e}",
+                )
+            _emit(
+                f"{rel}: destination unavailable", emitted, discovered,
+            )
+            continue
 
         # Promote any pre-existing folder row for this destination out of
         # ``'missing'``. Mirrors the local path (see
@@ -2190,6 +2215,7 @@ def run_import_job(job, runner, db_path, workspace_id, params):
     is committed per batch; cancellation and crashes leave every already-
     verified file cataloged and nothing else.
     """
+    from pipeline_job import _missing_archive_mount_root
     from scanner import scan
 
     db = Database(db_path)
@@ -2531,7 +2557,59 @@ def run_import_job(job, runner, db_path, workspace_id, params):
                     "copy",
                 )
             continue
-        os.makedirs(dest_folder, exist_ok=True)
+        # Same guard the remote path applies (see ``_missing_mount_root``
+        # in ``_run_remote_import_job``): if the archive's mount root has
+        # gone (share never attached, or unmounted mid-run), refuse the
+        # batch instead of letting ``os.makedirs`` recreate the vacated
+        # mount point as a plain local directory. That shadow tree would
+        # take the card's bytes onto the internal disk, look like a
+        # successful import, and then hide the moment the real share
+        # remounts over it. Probed per batch so a share that drops during
+        # a multi-hour card import is caught at the next batch boundary —
+        # a Tailscale/SMB archive did exactly that on 2026-07-30, and only
+        # a root-owned ``/Volumes`` turned the shadow write into a crash
+        # instead of silent data misplacement.
+        missing_mount_root = _missing_archive_mount_root(destination)
+        if missing_mount_root:
+            for source_file in batch:
+                # Count these as emitted: ``emitted`` otherwise only
+                # advances inside the per-file loop below, which this
+                # branch skips, and a progress bar frozen at the last
+                # copied file reads as "still working" while the rest of
+                # the card is quietly failing.
+                emitted += 1
+                _fail(
+                    rel, source_file,
+                    f"archive mount root {missing_mount_root} is not "
+                    "available (destination drive is not mounted; refusing "
+                    "to create a shadow directory tree under it, which "
+                    "would prevent the real share from remounting)",
+                )
+            _emit(
+                f"{rel}: archive unavailable", emitted, discovered,
+            )
+            continue
+        # The guard above only recognizes a mount point that *vanished*.
+        # A stale-but-present mount (Linux keeps ``/mnt/<name>`` after an
+        # unmount), a read-only or permission-changed parent, or a full
+        # disk all still surface here — and an uncaught OSError out of
+        # this call tears down the whole background job, which is exactly
+        # how the 2026-07-30 import died after two hours. Whatever the
+        # cause, book it as a per-file failure and keep the card marked
+        # unsafe to format instead of crashing the run.
+        try:
+            os.makedirs(dest_folder, exist_ok=True)
+        except OSError as e:
+            for source_file in batch:
+                emitted += 1
+                _fail(
+                    rel, source_file,
+                    f"could not create destination folder {dest_folder}: {e}",
+                )
+            _emit(
+                f"{rel}: destination unavailable", emitted, discovered,
+            )
+            continue
 
         # Promote any pre-existing folder row for this destination out of
         # ``'missing'``. Standalone scans run ``check_folder_health()`` as

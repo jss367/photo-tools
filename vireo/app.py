@@ -19892,6 +19892,13 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             # fails mid-scan doesn't inflate the baseline with phantom
             # files the next root would start above.
             scan_acc = {"prior": 0, "last_current": 0, "last_total": 0}
+            # Photos that actually reached the catalog, summed across roots
+            # from each scan()'s counts sink. Kept separate from the
+            # progress accumulator above: progress counts every file the
+            # scan disposes of (including ones skipped because they
+            # vanished under a dropped mount), which is what a progress bar
+            # needs but overstates the result line.
+            indexed_acc = {"n": 0}
 
             def progress_cb(current, total):
                 scan_acc["last_current"] = current
@@ -19987,6 +19994,12 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     "current_file": phase,
                     "rate": 0,
                 })
+                # Counts sink rather than the return value: scan() commits
+                # rows as it goes and can raise (or be cancelled) after
+                # thousands have landed. Reading the sink in `finally`
+                # credits that work on every exit path — a root that dies
+                # late would otherwise report zero photos indexed.
+                root_counts = {}
                 try:
                     do_scan(
                         root, thread_db,
@@ -19998,6 +20011,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                         thumb_cache_dir=app.config["THUMB_CACHE_DIR"],
                         cancel_check=cancel_check,
                         repair_missing_metadata=repair_missing_metadata,
+                        counts=root_counts,
                     )
                 except Exception as exc:
                     if isinstance(exc, ScanCancelled) and cancel_check():
@@ -20011,6 +20025,11 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     if msg not in job["errors"]:
                         job["errors"].append(msg)
                 finally:
+                    # Credit whatever this root indexed regardless of how
+                    # it exited — completed, raised, or cancelled. The
+                    # rows are committed either way, so the summary must
+                    # count them either way.
+                    indexed_acc["n"] += root_counts.get("indexed", 0)
                     # scanner.scan commits photo rows incrementally, so
                     # even a mid-scan failure can leave DB state that
                     # invalidates cached new-image counts. A failure
@@ -20054,7 +20073,12 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     advance_scan_acc()
 
             if cancelled or cancel_check():
-                photo_count = job["progress"].get("current", 0)
+                # Same indexed count as the completed path, not the
+                # progress counter. Otherwise "N photos" would mean two
+                # different things depending on which branch produced it,
+                # and a cancelled scan of a dropped share would report a
+                # full house of photos it never cataloged.
+                photo_count = indexed_acc["n"]
                 runner.update_step(
                     job["id"], "scan", status="cancelled",
                     summary=f"{photo_count} photos (cancelled)",
@@ -20065,11 +20089,13 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 )
                 return {"photos_indexed": photo_count, "cancelled": True}
 
-            # Use cumulative processed count, not planned total — on a
-            # clean run they're equal; on mixed-outcome runs "current"
-            # reflects the actual photos indexed while "total" includes
-            # planned-but-unprocessed files from the failed root(s).
-            photo_count = job["progress"].get("current", 0)
+            # Count what the scans reported as indexed, not the progress
+            # counter. On a clean run they agree; they diverge exactly when
+            # the run went wrong — progress advances for files that were
+            # discovered and then skipped (vanished under a mount that
+            # dropped mid-scan), so "N photos" would read as a success
+            # line for a scan that cataloged nothing.
+            photo_count = indexed_acc["n"]
             # Unique roots that hit any failure class. Counting unique
             # roots (not error entries) avoids inflating the "N of M"
             # summary when a single root raises in both scan and cache

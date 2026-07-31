@@ -160,15 +160,23 @@ def start_platform_inhibitor(reason):
     if sys.platform == "win32":
         return _WindowsInhibitor()
     # Linux and other POSIX. --what=idle leaves lid/power-button handling
-    # alone. systemd-inhibit needs a command to supervise; sleep infinity
-    # holds the lock until we terminate it.
+    # alone. systemd-inhibit needs a command to supervise; ``tail --pid``
+    # follows /dev/null until Vireo's pid exits and then returns, so the
+    # supervised command dies whenever Vireo dies (SIGTERM from
+    # ``/api/shutdown``, an OOM kill, a crash), systemd-inhibit releases
+    # the lock, and the inhibitor process reaps. ``sleep infinity`` would
+    # instead ignore Vireo's death entirely — the JobRunner worker
+    # threads are daemons so their ``finally`` blocks are not guaranteed
+    # to run on interpreter shutdown, and PR_SET_PDEATHSIG cannot help
+    # because it fires when the *thread* that forked exits (each job
+    # worker), not when the Vireo process exits.
     return _ProcessInhibitor([
         "systemd-inhibit",
         "--what=idle",
         "--who=Vireo",
         f"--why={reason}",
         "--mode=block",
-        "sleep", "infinity",
+        "tail", "--pid", str(os.getpid()), "-f", "/dev/null",
     ])
 
 

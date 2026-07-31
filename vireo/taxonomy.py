@@ -500,6 +500,46 @@ def clear_taxonomy_cache():
         _taxonomy_failed_stats.clear()
 
 
+def _write_taxonomy_json_atomically(path, data):
+    """Serialize ``data`` to ``path`` via a temp sibling and an atomic rename.
+
+    Both taxonomy writers use this. `open(path, "w")` truncates the target
+    for as long as it takes to serialize ~500MB, and anything reading it in
+    that window — including _load_taxonomy_cached from a concurrent request
+    — gets a partial document that will not parse; its retry loop is bounded
+    and cannot wait out an in-place write. Rename is atomic within a
+    filesystem, so a reader sees the whole old file or the whole new one,
+    and an interrupted write leaves the previous taxonomy intact.
+
+    Renames onto the *resolved* target: os.replace() would otherwise swap a
+    symlink for a regular file, detaching a taxonomy linked in from
+    elsewhere and leaving a duplicate ~500MB copy. Keeping the temp file
+    beside the resolved target also keeps the rename within one filesystem,
+    which is what makes it atomic.
+    """
+    target = os.path.realpath(path)
+    tmp_path = f"{target}.tmp"
+    try:
+        with open(tmp_path, "w") as f:
+            json.dump(data, f)
+            # Closing only hands the bytes to the page cache. Without fsync,
+            # a crash just after the rename can expose the target with
+            # unflushed content — the half-written taxonomy this whole dance
+            # exists to prevent.
+            f.flush()
+            os.fsync(f.fileno())
+        # A fresh temp file gets umask permissions; open(path, "w") kept the
+        # target's mode. Carry it over when there is a target to copy from,
+        # so writing cannot silently loosen or tighten access.
+        with contextlib.suppress(OSError):
+            os.chmod(tmp_path, stat_module.S_IMODE(os.stat(target).st_mode))
+        os.replace(tmp_path, target)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.remove(tmp_path)
+        raise
+
+
 def _taxonomy_stat_key(path):
     st = os.stat(path)
     return (st.st_mtime_ns, st.st_size)
@@ -848,40 +888,7 @@ class Taxonomy:
             data = json.load(f)
         data["taxa_by_common"] = self._by_common
         data["api_misses"] = sorted(self._api_misses)
-        # Write a sibling and rename over the target instead of truncating it
-        # in place. `open(path, "w")` empties the file for as long as it takes
-        # to serialize ~500MB, and anything reading it in that window — now
-        # including _load_taxonomy_cached — gets a truncated document. Rename
-        # is atomic within a filesystem, so a reader sees either the whole old
-        # file or the whole new one, and an interrupted save leaves the
-        # existing taxonomy intact rather than a half-written stub.
-        # Rename onto the resolved target, not the path we were handed:
-        # os.replace() would swap a symlink for a regular file, silently
-        # detaching a taxonomy that was linked in from elsewhere and leaving
-        # a duplicate ~500MB copy behind. open(path, "w") wrote through the
-        # link. Keeping the temp file beside the resolved target also keeps
-        # the rename within one filesystem, which is what makes it atomic.
-        target = os.path.realpath(self._path)
-        tmp_path = f"{target}.tmp"
-        try:
-            with open(tmp_path, "w") as f:
-                json.dump(data, f)
-                # Closing only hands the bytes to the page cache. Without
-                # fsync, a crash just after the rename can expose the target
-                # with unflushed content — the half-written taxonomy this
-                # whole dance exists to prevent.
-                f.flush()
-                os.fsync(f.fileno())
-            # A fresh temp file gets umask permissions; open(path, "w") kept
-            # the target's mode. Carry it over so saving cannot silently
-            # loosen or tighten access to the taxonomy.
-            with contextlib.suppress(OSError):
-                os.chmod(tmp_path, stat_module.S_IMODE(os.stat(target).st_mode))
-            os.replace(tmp_path, target)
-        except BaseException:
-            with contextlib.suppress(OSError):
-                os.remove(tmp_path)
-            raise
+        _write_taxonomy_json_atomically(self._path, data)
         self._dirty = False
         # This instance is the one the cache hands out, and it already holds
         # everything we just wrote. Re-stamp the cache key so the rewrite
@@ -1600,26 +1607,7 @@ def download_taxonomy(output_path, progress_callback=None):
         _status(
             f"Writing taxonomy ({len(taxa_by_common):,} common + {len(taxa_by_scientific):,} scientific names)..."
         )
-        # Write to a sibling and rename over the target rather than
-        # truncating in place. `open(output_path, "w")` empties the file
-        # for as long as it takes to serialize ~500MB, and anything
-        # reading it in that window — including _load_taxonomy_cached from
-        # a concurrent /api/predictions/compare request — sees a partial
-        # JSON document that fails to parse. The bounded retry loop over
-        # there can't wait out a multi-second in-place write. Rename onto
-        # the resolved target so we replace the file the symlink points
-        # to, matching Taxonomy.save() and keeping the rename within one
-        # filesystem (which is what makes it atomic).
-        target = os.path.realpath(output_path)
-        tmp_path = f"{target}.tmp"
-        try:
-            with open(tmp_path, "w") as f:
-                json.dump(result, f)
-            os.replace(tmp_path, target)
-        except BaseException:
-            with contextlib.suppress(OSError):
-                os.remove(tmp_path)
-            raise
+        _write_taxonomy_json_atomically(output_path, result)
         _status(
             f"Taxonomy complete: {len(taxa_by_common):,} common names, {len(taxa_by_scientific):,} scientific names"
         )

@@ -2969,3 +2969,56 @@ def test_download_taxonomy_writes_atomically(tmp_path, monkeypatch):
     written = json.loads(output_path.read_text())
     assert written["taxa_by_common"] == result["taxa_by_common"]
     assert not (tmp_path / "taxonomy.json.tmp").exists()
+
+
+def test_atomic_write_creates_a_new_target_without_a_mode_to_copy(tmp_path):
+    """A first-time write has no existing file to copy permissions from.
+
+    download_taxonomy() hits this on a fresh install; the mode copy must
+    degrade quietly rather than fail the write.
+    """
+    import taxonomy as tax_mod
+
+    target = tmp_path / "brand-new.json"
+    assert not target.exists()
+
+    tax_mod._write_taxonomy_json_atomically(str(target), {"taxa_by_common": {}})
+
+    assert json.loads(target.read_text()) == {"taxa_by_common": {}}
+    assert not (tmp_path / "brand-new.json.tmp").exists()
+
+
+def test_atomic_write_is_shared_by_both_taxonomy_writers(tmp_path, monkeypatch):
+    """save() and download_taxonomy() must not drift apart again.
+
+    They had two separate temp-file-and-rename implementations that differed
+    on fsync and permission handling; both now route through one helper.
+    """
+    import taxonomy as tax_mod
+
+    calls = []
+    real_writer = tax_mod._write_taxonomy_json_atomically
+
+    def recording_writer(path, data):
+        calls.append(path)
+        return real_writer(path, data)
+
+    monkeypatch.setattr(
+        tax_mod, "_write_taxonomy_json_atomically", recording_writer,
+    )
+
+    tax_mod.clear_taxonomy_cache()
+    persistent = tmp_path / "persistent.json"
+    _write_taxonomy_json(persistent, "test species")
+    monkeypatch.setattr(tax_mod, "TAXONOMY_JSON_PATH", str(persistent))
+
+    tax = tax_mod.load_local_taxonomy()
+    tax._api_misses.add("nothing here")
+    tax._dirty = True
+    tax.save()
+
+    assert calls == [str(persistent)]
+    import inspect
+    download_src = inspect.getsource(tax_mod.download_taxonomy)
+    assert "_write_taxonomy_json_atomically(output_path, result)" in download_src
+    assert 'open(output_path, "w")' not in download_src

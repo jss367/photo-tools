@@ -1023,6 +1023,53 @@ def test_load_folders_renders_older_success_after_newer_failure(
     expect(page.locator("#folderTree .tree-item")).to_have_count(1)
 
 
+def test_load_collections_renders_older_success_after_newer_failure(
+    live_server, page
+):
+    """A failed superseder must not suppress the newest successful list."""
+    db = live_server["db"]
+    page.goto(f"{live_server['url']}/browse")
+    page.wait_for_function("!loading", timeout=5000)
+
+    held = []
+    request_count = 0
+
+    def _hold_success_then_fail(route):
+        nonlocal request_count
+        request_count += 1
+        if request_count == 1:
+            held.append(route)
+        elif request_count == 2:
+            route.fulfill(status=500, body="fail")
+        else:
+            route.continue_()
+
+    page.route("**/api/collections", _hold_success_then_fail)
+    page.evaluate(
+        "() => { window._olderSuccessfulCollectionLoad = "
+        "loadCollections({ shouldRender: () => true }); }"
+    )
+    for _ in range(50):
+        if held:
+            break
+        page.wait_for_timeout(100)
+    assert held, "older collection-list request was never issued"
+
+    # The held request reaches the server only after release, so it observes
+    # this new collection. A later request starts first but fails; the older
+    # success is therefore the newest usable response and must be rendered.
+    collection_id = db.add_collection("Fallback collection", "[]")
+    page.evaluate("() => { window._failedCollectionLoad = loadCollections(); }")
+    page.wait_for_timeout(200)
+    held[0].continue_()
+
+    expect(
+        page.locator(
+            f'#collectionList .tree-item[data-collection-id="{collection_id}"]'
+        )
+    ).to_have_count(1, timeout=5000)
+
+
 def test_health_refresh_awaits_config_before_loading_photos(
     live_server, page, tmp_path
 ):
@@ -1392,16 +1439,20 @@ def test_health_refresh_retry_preserves_unrelated_transition_ids(
     expect(page.locator(".grid-card")).to_have_count(3)
 
 
-def test_health_refresh_stops_after_bounded_folder_retries(live_server, page):
-    """A persistent folder endpoint failure must not retry forever."""
+def test_bounded_folder_retries_reconcile_on_next_normal_poll(live_server, page):
+    """A capped retry burst stays dirty for the next normal health poll."""
     page.goto(f"{live_server['url']}/browse")
     expect(page.locator(".grid-card")).to_have_count(5)
 
     folder_requests = []
+    fail_folders = {"value": True}
 
     def _fail_folders(route):
         folder_requests.append(route.request.url)
-        route.fulfill(status=500, body="fail")
+        if fail_folders["value"]:
+            route.fulfill(status=500, body="fail")
+        else:
+            route.continue_()
 
     page.route("**/api/folders", _fail_folders)
     page.evaluate(
@@ -1415,6 +1466,16 @@ def test_health_refresh_stops_after_bounded_folder_retries(live_server, page):
     # later, and therefore no second folder-tree request should appear.
     page.wait_for_timeout(2300)
     assert len(folder_requests) == 1
+    assert page.evaluate("_missingFoldersReconciliationPending") is True
+
+    # The navbar snapshot already advanced before the original transition,
+    # so this poll sees unchanged missing-folder ids. It must still consume
+    # the persistent dirty marker and refresh the folder tree successfully.
+    fail_folders["value"] = False
+    page.evaluate("checkMissingFolders()")
+    page.evaluate("() => window._activeFolderHealthRefresh")
+    assert page.evaluate("_missingFoldersReconciliationPending") is False
+    assert len(folder_requests) == 2
 
 
 def test_missing_folders_recovery_skips_check_when_mutations_hang(

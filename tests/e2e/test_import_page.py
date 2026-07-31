@@ -2091,6 +2091,54 @@ def test_a_stale_duplicate_verdict_cannot_shrink_a_bulk_toggle(
         expect(_box(page, f["path"])).to_be_checked()
 
 
+def test_a_stale_duplicate_verdict_cannot_kill_the_master_checkbox(
+        live_server, page):
+    """The counters are the third way the stale set reaches the screen.
+
+    An all-duplicate previous run leaves importDuplicatePaths covering every
+    path. Counters reading that set report zero eligible over a grid of
+    ticked, enabled, badge-free boxes -- which prints "0 of 2 selected" and,
+    since fix 6 disables the master at zero eligible, hands the user a dead
+    control captioned "every discovered file is a duplicate" while two
+    perfectly selectable files sit under it.
+    """
+    page.goto(f"{live_server['url']}/import")
+    files = _files(2)
+    _stub_preview(page, files, duplicates=[f["path"] for f in files])
+    _preview(page)
+    expect(page.locator("#chkSelectAllImport")).to_be_disabled()
+
+    # The re-preview's first pass: same files, no verdicts yet.
+    page.evaluate("(f) => renderImportPreviewGrid(f, [], null)", files)
+    page.evaluate("() => updateImportSelectionUI()")
+    assert page.evaluate("() => importDuplicatePaths.size") == 2
+
+    master = page.locator("#chkSelectAllImport")
+    expect(master).to_be_enabled()
+    expect(master).to_be_checked()
+    expect(master).to_have_js_property("indeterminate", False)
+    expect(page.locator("#previewSelectedCount")).to_have_text(
+        "2 of 2 selected")
+    expect(page.locator(".import-preview-badge")).to_have_count(0)
+
+
+def test_folder_checkbox_tooltip_names_its_folder(live_server, page):
+    """Two headers, two tooltips -- "this folder" tells the user nothing."""
+    page.goto(f"{live_server['url']}/import")
+    files = (_files(1, prefix='/tmp/card/a/DSC_')
+             + _files(1, prefix='/tmp/card/b/DSC_'))
+    files[0]["subfolder"] = "a"
+    files[1]["subfolder"] = "b"
+    _stub_preview(page, files, duplicates=[files[1]["path"]])
+    _preview(page)
+
+    headers = page.locator(".import-preview-folder-header .folder-check")
+    expect(headers.nth(0)).to_have_attribute(
+        "title", "Select or deselect every file in a")
+    expect(headers.nth(1)).to_have_attribute(
+        "title", "Every file in b is a duplicate that will be skipped")
+
+
 def test_a_single_render_pass_produces_a_correct_folder_header(
         live_server, page):
     """One render must be enough.

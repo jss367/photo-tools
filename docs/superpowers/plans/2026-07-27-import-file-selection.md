@@ -1264,17 +1264,30 @@ function toggleImportSelection(path, checked, shiftKey) {
   updateImportSelectionUI();
 }
 
-function importEligibleCount() {
+// Count off the RENDERED CARDS, never off importDuplicatePaths. That set is
+// assigned only when the whole check-duplicates stream drains and is never
+// cleared, so on a re-preview it still holds the PREVIOUS run's verdicts
+// while the cards on screen carry none. Counters reading it under-report
+// over a grid of ticked, enabled, badge-free boxes — and the numbers drive
+// the select-all checkbox, so a stale count doesn't just print a wrong
+// figure, it disables a live control with nothing on screen explaining why.
+// Task 9 refactors this into importGridCards()/importSelectableCardPaths().
+function importSelectablePaths() {
+  const grid = document.getElementById('importPreviewGrid');
+  if (!grid) return [];
   const skipDupes = document.getElementById('chkSkipDuplicates').checked;
-  return importPreviewedPaths.filter(
-    p => !(importDuplicatePaths.has(p) && skipDupes)).length;
+  return Array.from(grid.querySelectorAll('.import-preview-thumb'))
+    .filter(el => !(el.classList.contains('duplicate') && skipDupes))
+    .map(el => el.dataset.path)
+    .filter(p => !!p);
+}
+
+function importEligibleCount() {
+  return importSelectablePaths().length;
 }
 
 function importCheckedCount() {
-  const skipDupes = document.getElementById('chkSkipDuplicates').checked;
-  return importPreviewedPaths.filter(
-    p => !importDeselected.has(p) && !(importDuplicatePaths.has(p) && skipDupes)
-  ).length;
+  return importSelectablePaths().filter(p => !importDeselected.has(p)).length;
 }
 
 function updateImportSelectionUI() {

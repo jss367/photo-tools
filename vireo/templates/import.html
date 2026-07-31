@@ -789,6 +789,14 @@ function wireImportSelectAll() {
     // Every rendered card, hidden or not — this is "select all", not
     // "select visible". Eligibility still comes off the cards, so a stale
     // importDuplicatePaths can't silently exclude files from a bulk action.
+    //
+    // SCOPE MISMATCH, for Task 11: this walks importGridCards() while
+    // importFolderPaths() walks importVisibleCards(). Equivalent today
+    // because the only cards anything hides are skipped duplicates, which
+    // both exclude. If Task 11's filter can hide a card while
+    // chkSkipDuplicates is OFF, that card would count toward the master's
+    // denominator but belong to no folder header — so ticking every header
+    // would leave the master dashed. Pick one scope then.
     importSelectableCardPaths(importGridCards())
       .forEach(p => {
         if (master.checked) importDeselected.delete(p);
@@ -2156,9 +2164,13 @@ function refreshImportFolderHeaders() {
     // Nothing to toggle — an enabled control that silently does nothing and
     // snaps back is worse than an honestly dead one.
     folderCheck.disabled = paths.length === 0;
+    // Name the folder. refreshImportFolderHeaders() has no `subfolder` in
+    // scope, so recover it from the label the renderer put beside the box.
+    const labelEl = folderCheck.parentNode.querySelector('span');
+    const name = (labelEl ? labelEl.textContent : '').replace(/ \(\d+\)$/, '');
     folderCheck.title = paths.length === 0
-      ? 'Every file in this folder is a duplicate that will be skipped'
-      : 'Select or deselect every file in this folder';
+      ? 'Every file in ' + name + ' is a duplicate that will be skipped'
+      : 'Select or deselect every file in ' + name;
   });
 }
 
@@ -2214,24 +2226,19 @@ function rerenderImportPreviewGridSafe() {
   refreshImportFolderHeaders();
 }
 
-// NOTE: these two counters read importDuplicatePaths, which is only assigned
-// once the check-duplicates stream finishes and is never cleared. On a
-// re-preview of the same folder they therefore under-report until the new
-// stream drains. Everything that touches the DOM derives duplicate-ness from
-// the cards instead (see importSelectableCardPaths); fixing the counters
-// belongs with the preview-lifecycle reset in Task 10, which is where
-// importDeselected gets cleared too.
+// Counted off the rendered cards, like every other readout on this page.
+// Reading importDuplicatePaths here instead would under-report during a
+// re-preview — it holds the previous run's verdicts until the new
+// check-duplicates stream drains — and the numbers drive the master
+// checkbox, so a stale count doesn't just print a wrong figure: it disables
+// a live control over cards that carry no badge to explain it.
 function importEligibleCount() {
-  const skipDupes = document.getElementById('chkSkipDuplicates').checked;
-  return importPreviewedPaths.filter(
-    p => !(importDuplicatePaths.has(p) && skipDupes)).length;
+  return importSelectableCardPaths(importGridCards()).length;
 }
 
 function importCheckedCount() {
-  const skipDupes = document.getElementById('chkSkipDuplicates').checked;
-  return importPreviewedPaths.filter(
-    p => !importDeselected.has(p) && !(importDuplicatePaths.has(p) && skipDupes)
-  ).length;
+  return importSelectableCardPaths(importGridCards())
+    .filter(p => !importDeselected.has(p)).length;
 }
 
 function updateImportSelectionUI() {

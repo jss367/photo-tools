@@ -5687,6 +5687,59 @@ def test_remote_import_scans_adopted_duplicate_in_mixed_batch(
     assert adopted_row["id"] in result["photo_ids"], result["photo_ids"]
 
 
+def test_remote_adopted_only_scan_failure_counts_each_file_once(
+        tmp_path, monkeypatch):
+    """A failed adopted-only scan reports the source file exactly once.
+
+    The validation pass below the scan already converts every adopted path
+    without a catalog row from ``skipped_duplicate`` to ``failed``. A second
+    folder-level failure would inflate the terminal ledger to N+1 entries.
+    """
+    import shutil as _shutil
+    import scanner as scanner_module
+
+    from import_job import ImportParams, run_import_job
+
+    ra = _remote_archive_for(tmp_path)
+    calls = _remote_calls(ra)
+    _install_fake_remote_rsync(monkeypatch, calls, verify=None)
+
+    card = _make_card(tmp_path, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+    ])
+    dest_folder = os.path.join(
+        ra["mount_base"], "2026", "2026-07-03",
+    )
+    os.makedirs(dest_folder, exist_ok=True)
+    _shutil.copy2(
+        str(card / "DSC_0001.jpg"),
+        os.path.join(dest_folder, "DSC_0001.jpg"),
+    )
+
+    def failing_scan(*args, **kwargs):
+        raise OSError("simulated adopted-only catalog scan failure")
+
+    monkeypatch.setattr(scanner_module, "scan", failing_scan)
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws_id = db._active_workspace_id
+    result = run_import_job(
+        _make_job(), FakeRunner(), db_path, ws_id,
+        ImportParams(
+            sources=[str(card)], destination=ra["mount_base"],
+            remote_target=ra, verify_by_hash=True,
+        ),
+    )
+
+    assert result["discovered"] == 1, result
+    assert result["copied"] == 0, result
+    assert result["skipped_duplicate"] == 0, result
+    assert result["failed"] == 1, result
+    assert len(result["unsafe_files"]) == 1, result
+    assert result["safe_to_format"] is False, result
+
+
 def test_remote_import_result_carries_imported_photo_ids(
         tmp_path, monkeypatch):
     """The after-import chaining hook builds its process-job collection

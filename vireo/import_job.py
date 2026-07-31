@@ -2057,13 +2057,6 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
                     if params.verify_by_hash:
                         verified -= 1
                     _fail(rel, dest_path, f"catalog scan failed: {e}")
-                # An adopted-only batch has no landed entries to roll back,
-                # but its pre-existing mount file still needs a catalog row.
-                if not landed and adopted_paths:
-                    _fail(
-                        rel, dest_folder,
-                        f"catalog scan failed for adopted mount files: {e}",
-                    )
                 landed = []
             else:
                 _invalidate_new_images(db, dest_folder)

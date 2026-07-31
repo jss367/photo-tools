@@ -7040,8 +7040,11 @@ def test_import_photos_passes_selection_to_the_job(app_and_db, tmp_path,
     monkeypatch.setattr(import_job, "run_import_job", spy)
 
     with app.test_client() as client:
+        # Asymmetric counts (previewed 2, checked 1) so a transposed pair of
+        # keyword arguments fails here rather than sailing through on 1 == 1.
         resp = client.post(
-            '/api/jobs/import-photos', json=_import_body(tmp_path),
+            '/api/jobs/import-photos',
+            json=_import_body(tmp_path, previewed_count=2),
         )
         assert resp.status_code == 200, resp.get_json()
         _drain(client, resp)
@@ -7051,8 +7054,7 @@ def test_import_photos_passes_selection_to_the_job(app_and_db, tmp_path,
     # math would raise TypeError on a list if the job's own defensive
     # coercion were ever removed.
     assert isinstance(params.include_paths, set)
-    assert params.include_paths is not None
-    assert params.previewed_count == 1
+    assert params.previewed_count == 2
     assert params.checked_count == 1
 
 
@@ -7099,6 +7101,53 @@ def test_import_photos_selection_is_honored_end_to_end(app_and_db, tmp_path):
 
     landed = [f for _, _, fs in os.walk(str(archive)) for f in fs]
     assert landed == ["a.jpg"], landed
+
+
+def test_import_job_config_records_counts_but_never_the_path_list(
+        app_and_db, tmp_path):
+    """Two ints for debugging; the path list stays out of the job row.
+
+    There is no re-run-from-config path, so persisting up to a few thousand
+    ``include_paths`` entries per import would be pure bloat. The counts
+    answer the question a stored job row is read for ("why did this copy 1
+    of 2?") for two ints.
+    """
+    app, _ = app_and_db
+    with app.test_client() as client:
+        # Asymmetric on purpose: transposed keys would pass on 1 == 1.
+        resp = client.post('/api/jobs/import-photos',
+                           json=_import_body(tmp_path, previewed_count=2))
+        assert resp.status_code == 200, resp.get_json()
+        job = wait_for_job_via_client(client, resp.get_json()["job_id"])
+
+    config = job["config"]
+    assert "include_paths" not in config, config
+    assert config["previewed_count"] == 2, config
+    assert config["checked_count"] == 1, config
+
+
+def test_import_job_config_omits_the_counts_when_nothing_was_selected(
+        app_and_db, tmp_path):
+    """An import sent without a selection keeps its historical config shape.
+
+    The counts are added conditionally so unselected imports — every import
+    predating this feature, and every one from a client that doesn't send
+    the fields — don't gain two null keys.
+    """
+    app, _ = app_and_db
+    body = _import_body(tmp_path)
+    for key in ("include_paths", "previewed_count", "checked_count"):
+        del body[key]
+
+    with app.test_client() as client:
+        resp = client.post('/api/jobs/import-photos', json=body)
+        assert resp.status_code == 200, resp.get_json()
+        job = wait_for_job_via_client(client, resp.get_json()["job_id"])
+
+    config = job["config"]
+    assert "previewed_count" not in config, config
+    assert "checked_count" not in config, config
+    assert "include_paths" not in config, config
 
 
 def test_import_photos_accepts_symlinked_file_inside_source(

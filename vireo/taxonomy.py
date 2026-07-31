@@ -739,8 +739,22 @@ class Taxonomy:
             data = json.load(f)
         data["taxa_by_common"] = self._by_common
         data["api_misses"] = sorted(self._api_misses)
-        with open(self._path, "w") as f:
-            json.dump(data, f)
+        # Write a sibling and rename over the target instead of truncating it
+        # in place. `open(path, "w")` empties the file for as long as it takes
+        # to serialize ~500MB, and anything reading it in that window — now
+        # including _load_taxonomy_cached — gets a truncated document. Rename
+        # is atomic within a filesystem, so a reader sees either the whole old
+        # file or the whole new one, and an interrupted save leaves the
+        # existing taxonomy intact rather than a half-written stub.
+        tmp_path = f"{self._path}.tmp"
+        try:
+            with open(tmp_path, "w") as f:
+                json.dump(data, f)
+            os.replace(tmp_path, self._path)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.remove(tmp_path)
+            raise
         self._dirty = False
         # This instance is the one the cache hands out, and it already holds
         # everything we just wrote. Re-stamp the cache key so the rewrite

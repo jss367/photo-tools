@@ -2286,3 +2286,66 @@ def test_taxonomy_save_keeps_cached_instance_current(tmp_path, monkeypatch):
     tax.save()
 
     assert tax_mod.load_local_taxonomy() is tax
+
+
+def test_taxonomy_save_leaves_original_intact_when_write_fails(tmp_path, monkeypatch):
+    """An interrupted save must not destroy the existing taxonomy.
+
+    save() used to truncate the target with open(path, "w") before
+    serializing ~500MB into it, so a crash — or any concurrent reader,
+    now including _load_taxonomy_cached — saw a half-written file.
+    """
+    import taxonomy as tax_mod
+
+    tax_mod.clear_taxonomy_cache()
+    persistent = tmp_path / "persistent.json"
+    _write_taxonomy_json(persistent, "test species")
+    monkeypatch.setattr(tax_mod, "TAXONOMY_JSON_PATH", str(persistent))
+    original = persistent.read_text()
+
+    tax = tax_mod.load_local_taxonomy()
+    tax._api_misses.add("nothing here")
+    tax._dirty = True
+
+    def exploding_dump(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(tax_mod.json, "dump", exploding_dump)
+
+    with pytest.raises(OSError):
+        tax.save()
+
+    assert persistent.read_text() == original
+    assert not (tmp_path / "persistent.json.tmp").exists()
+    tax_mod.clear_taxonomy_cache()
+    assert tax_mod.load_local_taxonomy().is_taxon("test species")
+
+
+def test_taxonomy_save_replaces_file_without_truncating_it(tmp_path, monkeypatch):
+    """The target is never observed empty: the new bytes land via rename."""
+    import taxonomy as tax_mod
+
+    tax_mod.clear_taxonomy_cache()
+    persistent = tmp_path / "persistent.json"
+    _write_taxonomy_json(persistent, "test species")
+    monkeypatch.setattr(tax_mod, "TAXONOMY_JSON_PATH", str(persistent))
+
+    tax = tax_mod.load_local_taxonomy()
+    tax._api_misses.add("nothing here")
+    tax._dirty = True
+
+    real_dump = tax_mod.json.dump
+    target_during_write = []
+
+    def observing_dump(data, fp, *args, **kwargs):
+        # Mid-serialize, the file callers read must still parse.
+        with open(persistent) as f:
+            target_during_write.append(json.load(f))
+        return real_dump(data, fp, *args, **kwargs)
+
+    monkeypatch.setattr(tax_mod.json, "dump", observing_dump)
+    tax.save()
+
+    assert len(target_during_write) == 1
+    assert "test species" in target_during_write[0]["taxa_by_common"]
+    assert json.loads(persistent.read_text())["api_misses"] == ["nothing here"]

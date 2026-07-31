@@ -61,6 +61,8 @@ jobs:
           gh pr edit "$PR" --repo "$REPO" --add-label "$AGENT_LABEL"
 
       - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
 
       - name: Fire routine
         uses: ./.github/actions/fire-routine
@@ -92,6 +94,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
 
       - name: Fire routine
         uses: ./.github/actions/fire-routine
@@ -118,6 +122,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
 
       - name: Check for open review threads
         id: threads
@@ -192,6 +198,8 @@ jobs:
 
       - uses: actions/checkout@v5
         if: steps.fork-check.outputs.is_fork == 'false'
+        with:
+          persist-credentials: false
 
       - name: Check for open review threads
         id: threads
@@ -266,6 +274,8 @@ jobs:
 
       - uses: actions/checkout@v5
         if: steps.pr.outputs.should_fix == 'true'
+        with:
+          persist-credentials: false
 
       - name: Fire routine
         if: steps.pr.outputs.should_fix == 'true'
@@ -336,6 +346,8 @@ jobs:
 
       - uses: actions/checkout@v5
         if: steps.conflicts.outputs.has_conflicts == 'true'
+        with:
+          persist-credentials: false
 
       - name: Fire routine
         if: steps.conflicts.outputs.has_conflicts == 'true'

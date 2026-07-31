@@ -2335,6 +2335,15 @@ def scan(root, db, progress_callback=None, incremental=False, extract_full_metad
                 width=width,
                 height=height,
             )
+            # Credit the photo the moment its row is durable — add_photo
+            # commits before returning. Several fallible steps run below
+            # (cache invalidation, XMP keyword import, duplicate
+            # auto-resolve, photo_callback), and one of them raising must
+            # not leave the sink reporting fewer photos than the catalog
+            # actually holds. ``processed_count`` stays at the end of the
+            # iteration: it drives the progress bar, which should only
+            # advance once the file is genuinely done with.
+            counts["indexed"] += 1
 
             # A brand-new row may have claimed a *recycled* rowid (see
             # ``purge_cached_files_for_recycled_id``). Cached derivatives
@@ -2512,7 +2521,6 @@ def scan(root, db, progress_callback=None, incremental=False, extract_full_metad
                 photo_callback(photo_id, str(image_path))
 
             processed_count += 1
-            counts["indexed"] += 1
             if progress_callback:
                 progress_callback(processed_count, total)
     except BaseException:

@@ -5649,3 +5649,40 @@ def test_scan_counts_sink_matches_the_returned_counts(tmp_path):
 
     assert result == counts, (result, counts)
     assert counts["indexed"] == 2, counts
+
+
+def test_scan_counts_photos_committed_before_a_post_insert_hook_raised(
+        tmp_path):
+    """The indexed count must match the catalog, not lag behind it.
+
+    ``db.add_photo()`` commits the row, but several fallible steps run
+    after it — cache invalidation, XMP keyword import, duplicate
+    auto-resolve, ``photo_callback``. A malformed sidecar or a failing
+    callback raising in that window leaves the photo durably in the
+    catalog while the counts sink is short, so the failure summary
+    under-reports rows that really did land.
+    """
+    from db import Database
+    from scanner import scan
+
+    root = str(tmp_path / "photos")
+    _create_test_images(root, {'': ['a.jpg', 'b.jpg', 'c.jpg', 'd.jpg']})
+
+    seen = {"n": 0}
+
+    def exploding_callback(photo_id, path_str):
+        seen["n"] += 1
+        if seen["n"] == 3:
+            raise RuntimeError("post-insert hook failed")
+
+    counts = {}
+    db = Database(str(tmp_path / "test.db"))
+    with pytest.raises(RuntimeError):
+        scan(root, db, counts=counts, photo_callback=exploding_callback)
+
+    committed = db.conn.execute("SELECT COUNT(*) FROM photos").fetchone()[0]
+    assert committed == 3, committed
+    assert counts["indexed"] == committed, (
+        f"sink says {counts['indexed']} indexed but {committed} rows are "
+        "committed in the catalog"
+    )

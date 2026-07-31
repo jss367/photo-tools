@@ -475,6 +475,19 @@
       carry.push(pid);
     });
     if (carry.length) body.carry_photo_ids = carry;
+    // Recover the parent's per-file selection so the retry stays scoped
+    // to the same files. See import.html retryBodyFromFinishedJob for the
+    // full rationale: without this the retry either fails the drift check
+    // or, once past it, silently re-imports the files the user
+    // deselected on the parent run. The three selection fields must
+    // travel together — the server 400s on a partial set.
+    if (Array.isArray(cfg.include_paths) && cfg.include_paths.length
+        && typeof cfg.previewed_count === 'number'
+        && typeof cfg.checked_count === 'number') {
+      body.include_paths = cfg.include_paths.slice();
+      body.previewed_count = cfg.previewed_count;
+      body.checked_count = cfg.checked_count;
+    }
     if (cfg.remote_target_id) {
       delete body.destination;
       body.remote_target_id = cfg.remote_target_id;

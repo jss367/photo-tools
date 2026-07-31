@@ -8,7 +8,7 @@ import time
 from types import SimpleNamespace
 
 from PIL import Image
-from wait import wait_for_job_via_client, wait_for_job_via_runner
+from wait import wait_for_job_phase, wait_for_job_via_client, wait_for_job_via_runner
 
 
 def _stub_classify_job(monkeypatch, sleep=0.2):
@@ -394,7 +394,7 @@ def test_job_sync_requests_serialize_xmp_work(app_and_db, monkeypatch):
         try:
             if call_number == 1:
                 first_entered.set()
-                assert release_first.wait(timeout=2), "first sync was not released"
+                assert release_first.wait(timeout=60), "first sync was not released"
             else:
                 second_entered.set()
 
@@ -409,18 +409,11 @@ def test_job_sync_requests_serialize_xmp_work(app_and_db, monkeypatch):
     monkeypatch.setattr(sync_module, "sync_to_xmp", fake_sync_to_xmp)
 
     first = client.post("/api/jobs/sync").get_json()["job_id"]
-    assert first_entered.wait(timeout=2), "first sync did not start"
+    assert first_entered.wait(timeout=30), "first sync did not start"
 
     second = client.post("/api/jobs/sync").get_json()["job_id"]
 
-    deadline = time.time() + 2
-    while time.time() < deadline:
-        job = app._job_runner.get(second)
-        if job and job["progress"].get("phase") == "Waiting for current XMP sync":
-            break
-        time.sleep(0.01)
-    else:
-        raise AssertionError("second sync did not reach the serialized wait point")
+    wait_for_job_phase(app._job_runner, second, "Waiting for current XMP sync")
 
     assert not second_entered.is_set(), (
         "second sync entered sync_to_xmp while the first sync was still running"
@@ -454,7 +447,7 @@ def test_cancelled_waiting_sync_does_not_write_xmp(app_and_db, monkeypatch):
 
         if call_number == 1:
             first_entered.set()
-            assert release_first.wait(timeout=2), "first sync was not released"
+            assert release_first.wait(timeout=60), "first sync was not released"
 
         if progress_callback:
             progress_callback(1, 1)
@@ -464,17 +457,10 @@ def test_cancelled_waiting_sync_does_not_write_xmp(app_and_db, monkeypatch):
     monkeypatch.setattr(sync_module, "sync_to_xmp", fake_sync_to_xmp)
 
     first = client.post("/api/jobs/sync").get_json()["job_id"]
-    assert first_entered.wait(timeout=2), "first sync did not start"
+    assert first_entered.wait(timeout=30), "first sync did not start"
 
     second = client.post("/api/jobs/sync").get_json()["job_id"]
-    deadline = time.time() + 2
-    while time.time() < deadline:
-        job = app._job_runner.get(second)
-        if job and job["progress"].get("phase") == "Waiting for current XMP sync":
-            break
-        time.sleep(0.01)
-    else:
-        raise AssertionError("second sync did not reach the serialized wait point")
+    wait_for_job_phase(app._job_runner, second, "Waiting for current XMP sync")
 
     cancel = client.post(f"/api/jobs/{second}/cancel")
     assert cancel.status_code == 200

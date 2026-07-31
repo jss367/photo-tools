@@ -81,6 +81,15 @@ def _photo_rows(db):
     ).fetchall()
 
 
+def _unsafe_paths(result):
+    return {u["path"] for u in result["unsafe_files"]}
+
+
+def _unsafe_reason(result, path):
+    return next(u["reason"] for u in result["unsafe_files"]
+                if u["path"] == path)
+
+
 def _ws_linked_folder_paths(db, ws_id):
     return {
         row["path"]
@@ -4130,6 +4139,52 @@ def _remote_calls(remote_archive):
     }
 
 
+def _run_remote_import(root, monkeypatch, params_kwargs, *, runner=None):
+    """Remote counterpart to ``_run_import``, for tests that only need the
+    happy-path transport seams (fake rsync, verification always OK).
+
+    Builds a fake NAS target under ``root`` (mount at ``root/mount``),
+    installs the transport seams, and runs the job against a fresh db at
+    ``root/test.db``. ``destination``, ``remote_target`` and
+    ``verify_by_hash`` are OWNED by this helper and must not be passed in
+    ``params_kwargs`` (each would collide); ``params_kwargs`` supplies
+    ``sources`` and everything else.
+
+    ``verify_by_hash`` is forced True because with it off
+    ``remote_unverified`` makes both card-safety verdicts False for free, and
+    every safety assertion built on this helper would pass vacuously.
+
+    RETURN SHAPE DIFFERS FROM ``_run_import``, deliberately and visibly:
+    this returns ``(result, calls)``; ``_run_import`` returns
+    ``(db, ws_id, result)``. Do not copy a destructuring from one to the
+    other. A test that needs the ``Database`` or the ``FakeRunner`` should
+    construct them itself — pass the runner in via ``runner=`` and keep its
+    own reference — or call ``run_import_job`` directly, as the tests that
+    need a hand-built remote-archive dict do.
+    """
+    from import_job import ImportParams, run_import_job
+
+    ra = _remote_archive_for(root)
+    calls = _remote_calls(ra)
+    _install_fake_remote_rsync(monkeypatch, calls, verify=None)
+    db_path = str(root / "test.db")
+    db = Database(db_path)
+    result = run_import_job(
+        _make_job(), runner or FakeRunner(), db_path,
+        db._active_workspace_id,
+        ImportParams(
+            destination=ra["mount_base"], remote_target=ra,
+            verify_by_hash=True, **params_kwargs,
+        ),
+    )
+    return result, calls
+
+
+def _summaries(runner):
+    """Every step summary the job pushed, in order."""
+    return [kw.get("summary", "") for _, _, kw in runner.step_updates]
+
+
 def test_remote_import_rsyncs_to_remote_and_catalogs_at_mount(
         tmp_path, monkeypatch):
     """A remote destination rsyncs the card into ``remote_path/subpath`` and
@@ -6608,6 +6663,1785 @@ def test_remote_import_cancel_mid_batch_does_not_start_rsync(
         f"no card files should have landed on the mount after "
         f"cancellation, but found: {landed}"
     )
+
+
+def test_include_paths_imports_only_selected_files(tmp_path):
+    """include_paths restricts the copy set; discovered still counts the card."""
+    from import_job import ImportParams
+
+    card = _make_card(tmp_path, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+        ("DSC_0002.jpg", datetime(2026, 7, 3, 11, 0, 0), "green"),
+        ("DSC_0003.jpg", datetime(2026, 7, 3, 12, 0, 0), "blue"),
+    ])
+    keep = {str(card / "DSC_0001.jpg"), str(card / "DSC_0003.jpg")}
+    archive = tmp_path / "archive"
+
+    db, _, result = _run_import(tmp_path, ImportParams(
+        sources=[str(card)], destination=str(archive),
+        include_paths=keep, previewed_count=3, checked_count=2,
+    ))
+
+    assert result["copied"] == 2
+    # No copy failed — otherwise "the deselected file is absent" below would
+    # also hold for a no-op filter whose third copy merely broke.
+    assert result["failed"] == 0
+    # discovered stays the full card — it backs the card-safety verdict.
+    assert result["discovered"] == 3
+
+    # The selected files landed in the archive and the deselected one did not.
+    expected = {
+        str(archive / "2026" / "2026-07-03" / "DSC_0001.jpg"),
+        str(archive / "2026" / "2026-07-03" / "DSC_0003.jpg"),
+    }
+    for path in expected:
+        assert os.path.isfile(path), f"missing archive file: {path}"
+    deselected = str(archive / "2026" / "2026-07-03" / "DSC_0002.jpg")
+    assert not os.path.exists(deselected), (
+        f"deselected file was copied to the archive: {deselected}"
+    )
+
+    rows = _photo_rows(db)
+    assert {
+        os.path.join(r["folder_path"], r["filename"]) for r in rows
+    } == expected
+
+
+def test_include_paths_absent_imports_everything(tmp_path):
+    """No selection means no opinion — current behavior is unchanged."""
+    from import_job import ImportParams
+
+    card = _make_card(tmp_path, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+        ("DSC_0002.jpg", datetime(2026, 7, 3, 11, 0, 0), "green"),
+    ])
+    _, _, result = _run_import(tmp_path, ImportParams(
+        sources=[str(card)], destination=str(tmp_path / "archive"),
+    ))
+    assert result["copied"] == 2
+    assert result["discovered"] == 2
+
+
+def test_include_paths_empty_set_imports_nothing(tmp_path):
+    """An empty selection is 'nothing chosen', not 'no opinion'.
+
+    Truthiness here instead of ``is not None`` would import the whole card.
+    """
+    from import_job import ImportParams
+
+    card = _make_card(tmp_path, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+        ("DSC_0002.jpg", datetime(2026, 7, 3, 11, 0, 0), "green"),
+    ])
+    _, _, result = _run_import(tmp_path, ImportParams(
+        sources=[str(card)], destination=str(tmp_path / "archive"),
+        include_paths=set(), previewed_count=2, checked_count=0,
+    ))
+    assert result["copied"] == 0
+    assert result["discovered"] == 2
+
+
+def test_deselection_makes_card_unsafe_to_format(tmp_path):
+    """End-to-end assertion, but NOT the guard for this commit's condition:
+    it also passes with the feature removed, because the ledger equality
+    already fails here (2 discovered, 1 copied). The real guard is
+    ``test_deselected_then_vanished_file_makes_card_unsafe``, where the
+    equality balances — delete that one and the protection is gone.
+    """
+    from import_job import ImportParams
+
+    card = _make_card(tmp_path, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+        ("DSC_0002.jpg", datetime(2026, 7, 3, 11, 0, 0), "green"),
+    ])
+    _, _, result = _run_import(tmp_path, ImportParams(
+        sources=[str(card)], destination=str(tmp_path / "archive"),
+        include_paths={str(card / "DSC_0001.jpg")},
+        previewed_count=2, checked_count=1,
+    ))
+    assert result["safe_to_format"] is False
+    assert result["unverified_duplicates_only"] is False
+
+
+def test_full_selection_of_card_with_duplicates_is_safe_to_format(tmp_path):
+    """THE duplicate-accounting regression guard.
+
+    Duplicates stay in include_paths, so the checker counts them as
+    skipped_duplicate and the ledger balances. If someone "fixes"
+    include_paths to mean the checked boxes, this goes false and Vireo
+    tells the user not to format a card that is fully archived.
+    """
+    from import_job import ImportParams
+
+    archive = tmp_path / "archive"
+    card = _make_card(tmp_path, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+        ("DSC_0002.jpg", datetime(2026, 7, 3, 11, 0, 0), "green"),
+    ])
+    # First import puts both in the archive.
+    _run_import(tmp_path, ImportParams(
+        sources=[str(card)], destination=str(archive),
+    ))
+    # Second import of the same card: everything is a duplicate.
+    all_paths = {str(card / "DSC_0001.jpg"), str(card / "DSC_0002.jpg")}
+    _, _, result = _run_import(
+        tmp_path, ImportParams(
+            sources=[str(card)], destination=str(archive),
+            include_paths=all_paths, previewed_count=2, checked_count=0,
+        ),
+    )
+    assert result["copied"] == 0
+    assert result["skipped_duplicate"] == 2
+    assert result["safe_to_format"] is True
+
+
+def test_vanished_in_scope_file_makes_card_unsafe(tmp_path):
+    """The ledger equality still balances here — 1 processed of 1 discovered —
+    so this needs its own condition."""
+    from import_job import ImportParams
+
+    card = _make_card(tmp_path, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+    ])
+    gone = str(card / "DSC_0002.jpg")  # previewed, then deleted
+    _, _, result = _run_import(tmp_path, ImportParams(
+        sources=[str(card)], destination=str(tmp_path / "archive"),
+        include_paths={str(card / "DSC_0001.jpg"), gone},
+        previewed_count=2, checked_count=2,
+    ))
+    assert result["copied"] == 1
+    assert result["discovered"] == 1
+    assert result["safe_to_format"] is False
+    assert result["unverified_duplicates_only"] is False
+
+
+def test_deselected_then_vanished_file_makes_card_unsafe(tmp_path):
+    """Deselect X, then X disappears before the job.
+
+    discovered=1, queued=1, copied=1 → the equality balances. vanished_paths
+    is empty because X was never in include_paths. Only the explicit
+    ``deselected == 0`` condition catches this.
+    """
+    from import_job import ImportParams
+
+    card = _make_card(tmp_path, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+    ])
+    _, _, result = _run_import(tmp_path, ImportParams(
+        sources=[str(card)], destination=str(tmp_path / "archive"),
+        include_paths={str(card / "DSC_0001.jpg")},
+        previewed_count=2, checked_count=1,   # DSC_0002 previewed, deselected, gone
+    ))
+    assert result["copied"] == 1
+    assert result["discovered"] == 1
+    assert result["safe_to_format"] is False
+    assert result["unverified_duplicates_only"] is False
+
+
+def _seed_likely_twin(tmp_path, db, name="IMG_0400.jpg", card_name="card"):
+    """Card file + a catalog row matching name/size/capture-time with
+    DIFFERENT bytes. With trust_likely_duplicates=True this drives
+    unverified_duplicate > 0 — the precondition that makes
+    unverified_duplicates_only reachable at all. Lifted from
+    test_trust_likely_duplicates_skips_metadata_match_without_byte_check.
+
+    ``card_name`` is parameterized (and the catalog folder derived from it)
+    so a caller can seed two independent cards under one ``tmp_path``
+    without silently merging them into ``_make_card``'s default ``card``.
+    """
+    from PIL.ExifTags import Base as ExifBase
+
+    dt = datetime(2026, 5, 1, 10, 15, 30)
+    card = tmp_path / card_name
+    card.mkdir(exist_ok=True)
+    card_file = card / name
+    img = Image.new("RGB", (16, 16), "red")
+    exif = img.getexif()
+    exif[ExifBase.DateTimeOriginal] = dt.strftime("%Y:%m:%d %H:%M:%S")
+    img.save(str(card_file), exif=exif)
+    card_bytes = card_file.read_bytes()
+
+    library = tmp_path / f"{card_name}_library"
+    library.mkdir(exist_ok=True)
+    (library / name).write_bytes(
+        card_bytes[:-1] + bytes([card_bytes[-1] ^ 0xFF]))
+
+    fid = db.conn.execute(
+        "INSERT INTO folders (path, name, status) VALUES (?, ?, 'ok')",
+        (str(library), library.name),
+    ).lastrowid
+    db.conn.execute(
+        "INSERT INTO photos (folder_id, filename, extension, file_size,"
+        " timestamp) VALUES (?, ?, '.jpg', ?, ?)",
+        (fid, name, len(card_bytes), "2026-05-01T10:15:30"),
+    )
+    db.conn.commit()
+    return card, card_file
+
+
+def test_deselected_then_vanished_also_blocks_the_amber_verdict(tmp_path):
+    """NON-VACUOUS guard for the second verdict block.
+
+    unverified_duplicates_only's FIRST condition is unverified_duplicate > 0,
+    so any test without a likely-duplicate asserts nothing — the verdict is
+    already False and a patch to safe_to_format alone would pass. This setup
+    makes it True on the baseline, and the ledger equality HOLDS (0 copied +
+    1 skipped == 1 discovered), so only the explicit deselected == 0
+    condition can flip it.
+    """
+    from import_job import ImportParams, run_import_job
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    card, card_file = _seed_likely_twin(tmp_path, db)
+
+    result = run_import_job(
+        _make_job(), FakeRunner(), db_path, db._active_workspace_id,
+        ImportParams(
+            sources=[str(card)], destination=str(tmp_path / "archive"),
+            trust_likely_duplicates=True,
+            include_paths={str(card_file)},
+            previewed_count=2, checked_count=1,  # a 2nd file was deselected, then vanished
+        ),
+    )
+    # Preconditions: without these the assertions below are vacuous.
+    assert result["unverified_duplicate"] == 1
+    assert result["copied"] + result["skipped_duplicate"] == result["discovered"]
+
+    assert result["safe_to_format"] is False
+    assert result["unverified_duplicates_only"] is False
+
+
+def test_vanished_file_also_blocks_the_amber_verdict(tmp_path):
+    """Same non-vacuous shape, for the vanished_paths condition."""
+    from import_job import ImportParams, run_import_job
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    card, card_file = _seed_likely_twin(tmp_path, db)
+
+    result = run_import_job(
+        _make_job(), FakeRunner(), db_path, db._active_workspace_id,
+        ImportParams(
+            sources=[str(card)], destination=str(tmp_path / "archive"),
+            trust_likely_duplicates=True,
+            include_paths={str(card_file), str(card / "GONE.jpg")},
+            previewed_count=2, checked_count=2,
+        ),
+    )
+    assert result["unverified_duplicate"] == 1
+    assert result["copied"] + result["skipped_duplicate"] == result["discovered"]
+
+    assert result["safe_to_format"] is False
+    assert result["unverified_duplicates_only"] is False
+
+
+def test_vanished_file_without_previewed_count_makes_card_unsafe(tmp_path):
+    """``vanished_paths`` must not be gated on ``previewed_count``.
+
+    Both fields are independently optional on ``ImportParams``, so a caller
+    can send a selection without a preview size. The ledger equality cannot
+    catch the vanished file (discovered=1, copied=1, balanced), so gating
+    the vanished-path check on ``previewed_count`` fails OPEN on exactly the
+    case this condition exists to close.
+    """
+    from import_job import ImportParams
+
+    card = _make_card(tmp_path, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+    ])
+    _, _, result = _run_import(tmp_path, ImportParams(
+        sources=[str(card)], destination=str(tmp_path / "archive"),
+        include_paths={str(card / "DSC_0001.jpg"), str(card / "GONE.jpg")},
+        previewed_count=None, checked_count=None,
+    ))
+    assert result["copied"] == 1
+    assert result["discovered"] == 1
+    assert result["safe_to_format"] is False
+    assert result["unverified_duplicates_only"] is False
+
+
+def test_include_paths_accepts_a_list(tmp_path):
+    """A JSON payload deserializes ``include_paths`` to a list.
+
+    The drift math does set arithmetic on it, so without coercing once above
+    the filter this raises TypeError before a single file is copied. That
+    crash is all this test guards: its ``safe_to_format`` assertion still
+    passes under a raw ``len(params.include_paths)``, because the ledger
+    equality already fails here (1 copied, 2 discovered). The guard for the
+    dedupe is ``test_repeated_include_path_does_not_mask_a_deselection``,
+    where the equality balances.
+    """
+    from import_job import ImportParams
+
+    card = _make_card(tmp_path, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+        ("DSC_0002.jpg", datetime(2026, 7, 3, 11, 0, 0), "green"),
+    ])
+    kept = str(card / "DSC_0001.jpg")
+    _, _, result = _run_import(tmp_path, ImportParams(
+        sources=[str(card)], destination=str(tmp_path / "archive"),
+        include_paths=[kept, kept],   # list, with a duplicate entry
+        previewed_count=2, checked_count=1,
+    ))
+    assert result["copied"] == 1
+    assert result["safe_to_format"] is False
+
+
+def test_negative_deselected_count_makes_card_unsafe(tmp_path):
+    """A payload previewing fewer files than it selected is self-inconsistent.
+
+    ``deselected`` goes negative, and ``> 0`` would read that as "nothing
+    deselected" and let the card go green. This module fails closed on
+    inconsistent input.
+    """
+    from import_job import ImportParams
+
+    card = _make_card(tmp_path, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+    ])
+    _, _, result = _run_import(tmp_path, ImportParams(
+        sources=[str(card)], destination=str(tmp_path / "archive"),
+        include_paths={str(card / "DSC_0001.jpg")},
+        previewed_count=0, checked_count=1,
+    ))
+    assert result["copied"] == 1
+    assert result["discovered"] == 1
+    assert result["safe_to_format"] is False
+    assert result["unverified_duplicates_only"] is False
+
+
+def test_repeated_include_path_does_not_mask_a_deselection(tmp_path):
+    """THE dedupe guard: a repeat must not inflate the selected count.
+
+    Three files previewed; the payload carries A twice and B once, so a raw
+    ``len(params.include_paths)`` reads 3 and computes ``deselected == 0``
+    even though only two distinct files were selected. The third previewed
+    file is not on the card any more, so ``vanished_paths`` is empty too,
+    and the ledger balances (2 copied of 2 discovered) — every other guard
+    is silent. Only counting the deduped set keeps the card unsafe.
+    """
+    from import_job import ImportParams
+
+    card = _make_card(tmp_path, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+        ("DSC_0002.jpg", datetime(2026, 7, 3, 11, 0, 0), "green"),
+    ])
+    a, b = str(card / "DSC_0001.jpg"), str(card / "DSC_0002.jpg")
+    _, _, result = _run_import(tmp_path, ImportParams(
+        sources=[str(card)], destination=str(tmp_path / "archive"),
+        include_paths=[a, a, b], previewed_count=3, checked_count=3,
+    ))
+    # Preconditions: without these the assertion below is vacuous.
+    assert result["copied"] + result["skipped_duplicate"] == result["discovered"]
+    assert result["copied"] == 2
+
+    assert result["safe_to_format"] is False
+    assert result["unverified_duplicates_only"] is False
+
+
+def test_deselection_explains_itself_on_the_result_card(tmp_path):
+    from import_job import ImportParams
+
+    card = _make_card(tmp_path, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+        ("DSC_0002.jpg", datetime(2026, 7, 3, 11, 0, 0), "green"),
+    ])
+    _, _, result = _run_import(tmp_path, ImportParams(
+        sources=[str(card)], destination=str(tmp_path / "archive"),
+        include_paths={str(card / "DSC_0001.jpg")},
+        previewed_count=2, checked_count=1,
+    ))
+    assert "Deselected files" in _unsafe_paths(result)
+    reason = _unsafe_reason(result, "Deselected files")
+    assert "1 file you deselected was not copied" in reason
+    # Must NOT claim the card holds the only copies — false when the
+    # deselected file is byte-identical to a selected one.
+    assert "only copies" not in reason
+
+
+def test_vanished_file_explains_itself_on_the_result_card(tmp_path):
+    from import_job import ImportParams
+
+    card = _make_card(tmp_path, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+    ])
+    _, _, result = _run_import(tmp_path, ImportParams(
+        sources=[str(card)], destination=str(tmp_path / "archive"),
+        include_paths={str(card / "DSC_0001.jpg"), str(card / "GONE.jpg")},
+        previewed_count=2, checked_count=2,
+    ))
+    assert "Files missing at import time" in _unsafe_paths(result)
+    # The count must be the number that VANISHED (1), not the size of the
+    # selection (2). Asserting only the path key lets a wrong denominator
+    # through: ``len(include_paths)`` here renders "2 files ... disappeared"
+    # while exactly one did, in user-facing card-safety copy.
+    assert _unsafe_reason(result, "Files missing at import time") == (
+        "1 file was in scope but had disappeared from the source "
+        "when the import ran"
+    )
+
+
+def test_files_appearing_after_preview_explain_themselves(tmp_path):
+    """A file that arrived after the preview is not in ``include_paths``.
+
+    It is therefore never copied, and the card still holds the only copy.
+    ``deselected`` is 0 here (two previewed, two selected) and nothing
+    vanished, so the appeared count is the only signal that can name it.
+    """
+    from import_job import ImportParams
+
+    card = _make_card(tmp_path, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+        ("DSC_0002.jpg", datetime(2026, 7, 3, 11, 0, 0), "green"),
+        ("DSC_0003.jpg", datetime(2026, 7, 3, 12, 0, 0), "blue"),
+    ])
+    _, _, result = _run_import(tmp_path, ImportParams(
+        sources=[str(card)], destination=str(tmp_path / "archive"),
+        include_paths={
+            str(card / "DSC_0001.jpg"), str(card / "DSC_0002.jpg"),
+        },
+        previewed_count=2, checked_count=2,
+    ))
+    assert "Files added after preview" in _unsafe_paths(result)
+    assert _unsafe_reason(result, "Files added after preview") == (
+        "at least 1 file arrived after your preview and was not imported "
+        "— re-preview to include it"
+    )
+
+
+def test_inconsistent_selection_count_explains_itself(tmp_path):
+    """A negative ``deselected`` blocks the card, so it must also speak.
+
+    ``_selection_blocks_format`` fails closed on ``deselected != 0``, so a
+    payload that previewed fewer files than it selected turns the pill red.
+    Appending only under ``deselected > 0`` would leave that red pill bare —
+    a warning with no stated reason. The count itself is untrustworthy here,
+    so the entry says the payload is inconsistent rather than quoting a
+    nonsense number.
+    """
+    from import_job import ImportParams
+
+    card = _make_card(tmp_path, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+    ])
+    _, _, result = _run_import(tmp_path, ImportParams(
+        sources=[str(card)], destination=str(tmp_path / "archive"),
+        include_paths={str(card / "DSC_0001.jpg")},
+        previewed_count=0, checked_count=1,
+    ))
+    # Selection is the ONLY blocker: the ledger balances and nothing failed.
+    assert result["copied"] == 1
+    assert result["copied"] + result["skipped_duplicate"] == result["discovered"]
+    assert result["failed"] == 0
+    assert result["safe_to_format"] is False
+
+    assert "Selection count mismatch" in _unsafe_paths(result)
+    # No nonsense number: the count is what is untrustworthy.
+    assert "-1" not in _unsafe_reason(result, "Selection count mismatch")
+
+
+def test_selection_entry_grammar_matches_the_count(tmp_path):
+    """Plural counterpart to the singular assertions above.
+
+    1 is the most likely real case (deselect one frame, one file vanishes),
+    so the singular forms are pinned per-branch; this pins the plural forms
+    so the pluralization can't be dropped in either direction.
+    """
+    from import_job import ImportParams
+
+    card = _make_card(tmp_path, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+        ("DSC_0002.jpg", datetime(2026, 7, 3, 11, 0, 0), "green"),
+        ("DSC_0003.jpg", datetime(2026, 7, 3, 12, 0, 0), "blue"),
+    ])
+    _, _, result = _run_import(tmp_path, ImportParams(
+        sources=[str(card)], destination=str(tmp_path / "archive"),
+        include_paths={
+            str(card / "DSC_0001.jpg"),
+            str(card / "GONE_A.jpg"), str(card / "GONE_B.jpg"),
+        },
+        previewed_count=5, checked_count=3,
+    ))
+    assert _unsafe_reason(result, "Deselected files") == (
+        "2 files you deselected were not copied"
+    )
+    assert _unsafe_reason(result, "Files missing at import time") == (
+        "2 files were in scope but had disappeared from the source "
+        "when the import ran"
+    )
+
+    # ``appeared`` has singular coverage above; pin its plural forms here so
+    # all three of its conditionals (``_plural``, the verb, the pronoun) are
+    # held from both sides. A fresh root is required: reusing ``tmp_path``
+    # would reuse this run's db/archive and turn the copy into a duplicate
+    # skip.
+    plural_root = tmp_path / "appeared_plural"
+    plural_root.mkdir()
+    card2 = _make_card(plural_root, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+        ("DSC_0002.jpg", datetime(2026, 7, 3, 11, 0, 0), "green"),
+        ("DSC_0003.jpg", datetime(2026, 7, 3, 12, 0, 0), "blue"),
+    ])
+    _, _, result2 = _run_import(plural_root, ImportParams(
+        sources=[str(card2)], destination=str(plural_root / "archive"),
+        include_paths={str(card2 / "DSC_0001.jpg")},
+        previewed_count=1, checked_count=1,
+    ))
+    assert _unsafe_reason(result2, "Files added after preview") == (
+        "at least 2 files arrived after your preview and were not "
+        "imported — re-preview to include them"
+    )
+    # Pin the KEY to a nonzero value, not just the sentence: every other
+    # ``files_appeared`` assertion in this file expects 0, so hard-coding the
+    # key to 0 would pass them all while the frontend readout that consumes
+    # it silently stopped reporting drift.
+    assert result2["files_appeared"] == 2
+
+
+def test_no_selection_blocked_result_leaves_the_pill_bare(tmp_path):
+    """The invariant: a selection-blocked card always states a reason.
+
+    ``renderResult`` hides the unsafe list entirely when it is empty, so any
+    path that flips the pill red without appending an entry produces a scary
+    warning with no stated reason. Each scenario asserts the SPECIFIC entry
+    it should produce — asserting only "non-empty" would pass on an
+    unrelated pre-existing entry (a failed copy, a likely duplicate).
+    """
+    from import_job import ImportParams
+
+    scenarios = [
+        # (name, card specs, include filenames, extra include, previewed,
+        #  expected entry path)
+        ("deselect",
+         ["DSC_0001.jpg", "DSC_0002.jpg"], ["DSC_0001.jpg"], None, 2,
+         "Deselected files"),
+        ("vanished",
+         ["DSC_0001.jpg"], ["DSC_0001.jpg"], "GONE.jpg", 2,
+         "Files missing at import time"),
+        ("appeared",
+         ["DSC_0001.jpg", "DSC_0002.jpg", "DSC_0003.jpg"],
+         ["DSC_0001.jpg", "DSC_0002.jpg"], None, 2,
+         "Files added after preview"),
+        # A negative ``deselected`` cannot occur alone: ``include_paths``
+        # larger than ``previewed_count`` means either a selected path is not
+        # on the card (vanished) or the card holds more than was previewed
+        # (appeared). The assertion is on the specific entry, so the
+        # co-occurring one cannot satisfy it.
+        ("negative",
+         ["DSC_0001.jpg"], ["DSC_0001.jpg"], None, 0,
+         "Selection count mismatch"),
+    ]
+    for name, specs, included, extra, previewed, expected in scenarios:
+        root = tmp_path / name
+        root.mkdir()
+        # Distinct colors: identical bytes would make the second file an
+        # in-batch duplicate (copied=1, skipped_duplicate=1), so a scenario
+        # that reads as two plain copies would quietly be exercising the
+        # duplicate path instead.
+        colors = ["red", "green", "blue", "white"]
+        card = _make_card(root, [
+            (fn, datetime(2026, 7, 3, 10 + i, 0, 0), colors[i])
+            for i, fn in enumerate(specs)
+        ])
+        include_paths = {str(card / fn) for fn in included}
+        if extra:
+            include_paths.add(str(card / extra))
+        _, _, result = _run_import(root, ImportParams(
+            sources=[str(card)], destination=str(root / "archive"),
+            include_paths=include_paths,
+            previewed_count=previewed, checked_count=len(include_paths),
+        ))
+        assert result["safe_to_format"] is False, name
+        assert result["unsafe_files"], name
+        assert expected in _unsafe_paths(result), name
+        # Entries are mirrored into ``errors``; both surfaces must speak.
+        assert any(e.startswith(expected + ": ") for e in result["errors"]), name
+
+
+def test_progress_total_is_the_queued_work_not_the_card(tmp_path):
+    """One of three files selected: the bar is sized 1, not 3.
+
+    Progress must run on the work actually enqueued. Against the full card a
+    half-deselected import runs to completion with the bar stalled part-way
+    — a finished job that looks hung.
+
+    The copy-loop emits are asserted separately from the discovery emit, and
+    with no truthiness filter on the way in. Three weaker shapes were tried
+    and each let a real mutation through: ``3 not in totals`` accepts any
+    other wrong number; ``if d.get("total")`` discards a zeroed total before
+    it can be seen; and set equality over ALL emits accepts a zeroed
+    copy-loop total by hiding it behind the discovery emit's legitimate 0.
+    """
+    from import_job import ImportParams
+
+    card = _make_card(tmp_path, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+        ("DSC_0002.jpg", datetime(2026, 7, 3, 11, 0, 0), "green"),
+        ("DSC_0003.jpg", datetime(2026, 7, 3, 12, 0, 0), "blue"),
+    ])
+    runner = FakeRunner()
+    _run_import(
+        tmp_path,
+        ImportParams(
+            sources=[str(card)], destination=str(tmp_path / "archive"),
+            include_paths={str(card / "DSC_0001.jpg")},
+            previewed_count=3, checked_count=1,
+        ),
+        runner=runner,
+    )
+    events = [d for _, kind, d in runner.events if kind == "progress"]
+    # The discovery emit is the only one entitled to a 0 total — the count
+    # isn't known yet when it fires.
+    assert [d["total"] for d in events
+            if d["phase"] == "Discovering files"] == [0]
+    # Every remaining emit is a copy-loop emit (one per file, one per batch)
+    # and every one of them must be sized by the queued work.
+    copy_totals = [d["total"] for d in events
+                   if d["phase"] != "Discovering files"]
+    assert copy_totals, "no copy-loop progress was emitted at all"
+    assert set(copy_totals) == {1}
+
+
+def test_ordinary_deselection_reports_no_files_appeared(tmp_path):
+    from import_job import ImportParams
+
+    card = _make_card(tmp_path, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+        ("DSC_0002.jpg", datetime(2026, 7, 3, 11, 0, 0), "green"),
+    ])
+    _, _, result = _run_import(tmp_path, ImportParams(
+        sources=[str(card)], destination=str(tmp_path / "archive"),
+        include_paths={str(card / "DSC_0001.jpg")},
+        previewed_count=2, checked_count=1,
+    ))
+    assert result["files_appeared"] == 0
+    assert result["files_vanished"] == 0
+
+
+def test_mixed_appear_and_vanish_never_reports_a_negative_count(tmp_path):
+    """files_appeared is a net delta clamped at zero. Without the clamp, more
+    vanishing than arriving renders "-3 files were added"."""
+    from import_job import ImportParams
+
+    card = _make_card(tmp_path, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+    ])
+    _, _, result = _run_import(tmp_path, ImportParams(
+        sources=[str(card)], destination=str(tmp_path / "archive"),
+        include_paths={str(card / "DSC_0001.jpg"),
+                       str(card / "GONE_A.jpg"), str(card / "GONE_B.jpg")},
+        previewed_count=3, checked_count=3,
+    ))
+    assert result["files_appeared"] == 0
+    assert result["files_vanished"] == 2
+
+
+def test_step_summary_selected_figure_comes_from_checked_count(tmp_path):
+    """Not len(include_paths) — that set retains unchecked duplicates and
+    would overstate what the user chose."""
+    from import_job import ImportParams
+
+    card = _make_card(tmp_path, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+        ("DSC_0002.jpg", datetime(2026, 7, 3, 11, 0, 0), "green"),
+    ])
+    runner = FakeRunner()
+    _run_import(
+        tmp_path,
+        ImportParams(
+            sources=[str(card)], destination=str(tmp_path / "archive"),
+            include_paths={str(card / "DSC_0001.jpg"),
+                           str(card / "DSC_0002.jpg")},
+            previewed_count=2, checked_count=1,
+        ),
+        runner=runner,
+    )
+    summaries = _summaries(runner)
+    # Full equality, not a substring: the discovered total has to survive in
+    # the selection form too. A ``"1 selected"`` substring check would pass
+    # with ``of 2 discovered`` quietly dropped, leaving the user a selected
+    # figure with nothing to read it against.
+    assert "1 selected of 2 discovered, 2 copied, 0 already present, 0 failed" \
+        in summaries
+
+
+def test_step_summary_without_selection_is_unchanged(tmp_path):
+    """The no-selection wording is the one every user sees today.
+
+    Pinned as full equality against the string ``main`` emits (verified by
+    running this assertion on ``main``), because the selection prefix was
+    added by composing around this tail — a substring assertion would pass
+    if the ``of N discovered`` tail were dropped to make room for it. The
+    discovered total appears exactly once in each of the two forms: in the
+    tail here, in the prefix when a selection is present.
+    """
+    from import_job import ImportParams
+
+    card = _make_card(tmp_path, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+        ("DSC_0002.jpg", datetime(2026, 7, 3, 11, 0, 0), "green"),
+    ])
+    runner = FakeRunner()
+    _run_import(
+        tmp_path,
+        ImportParams(
+            sources=[str(card)], destination=str(tmp_path / "archive"),
+        ),
+        runner=runner,
+    )
+    summaries = _summaries(runner)
+    assert "2 copied, 0 already present, 0 failed of 2 discovered" in summaries
+    # No selection means no selection prefix.
+    assert not any("selected" in s for s in summaries)
+
+
+def test_step_summary_claims_a_selection_only_when_one_was_applied(tmp_path):
+    """``include_paths`` and ``checked_count`` are independently optional.
+
+    It is ``include_paths`` alone that filters the copy set, so the summary's
+    selection form has to be gated on BOTH fields. Keyed on ``checked_count``
+    by itself, a payload carrying a count but no paths copies the whole card
+    while reporting "1 selected of 2 discovered" — a selection claimed for a
+    run where none was applied. Both divergent combinations are asserted:
+    each one alone kills a different half of the conjunction.
+    """
+    from import_job import ImportParams
+
+    # checked_count without include_paths: nothing was filtered, so nothing
+    # may be claimed. Both files are copied.
+    count_only = tmp_path / "count_only"
+    count_only.mkdir()
+    card = _make_card(count_only, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+        ("DSC_0002.jpg", datetime(2026, 7, 3, 11, 0, 0), "green"),
+    ])
+    runner = FakeRunner()
+    _, _, result = _run_import(
+        count_only,
+        ImportParams(
+            sources=[str(card)], destination=str(count_only / "archive"),
+            checked_count=1,
+        ),
+        runner=runner,
+    )
+    assert result["copied"] == 2, "no include_paths means no filtering"
+    summaries = _summaries(runner)
+    assert "2 copied, 0 already present, 0 failed of 2 discovered" in summaries
+    assert not any("selected" in s for s in summaries)
+
+    # include_paths without checked_count: the copy set IS filtered, but
+    # there is no trustworthy figure to quote, so it degrades to the plain
+    # form rather than printing "None selected".
+    paths_only = tmp_path / "paths_only"
+    paths_only.mkdir()
+    card2 = _make_card(paths_only, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+        ("DSC_0002.jpg", datetime(2026, 7, 3, 11, 0, 0), "green"),
+    ])
+    runner2 = FakeRunner()
+    _, _, result2 = _run_import(
+        paths_only,
+        ImportParams(
+            sources=[str(card2)], destination=str(paths_only / "archive"),
+            include_paths={str(card2 / "DSC_0001.jpg")},
+        ),
+        runner=runner2,
+    )
+    assert result2["copied"] == 1, "include_paths must still filter"
+    summaries2 = _summaries(runner2)
+    assert "1 copied, 0 already present, 0 failed of 2 discovered" in summaries2
+    assert not any("selected" in s for s in summaries2)
+
+
+# --- Selection on the REMOTE copy path --------------------------------------
+#
+# ``run_import_job`` delegates the whole run to ``_run_remote_import_job``
+# whenever ``params.remote_target`` is set (the user picked a saved NAS
+# target), so every selection behaviour asserted above for the local path has
+# to be asserted again here — the two functions share no code.
+#
+# EVERY test below passes ``verify_by_hash=True``. Without it
+# ``remote_unverified`` is True, both verdicts are already False, and the
+# card-safety assertions would pass on a remote path with no selection
+# handling at all.
+
+
+def test_remote_import_honors_include_paths_and_card_safety(
+        tmp_path, monkeypatch):
+    """Every assertion from Tasks 1-3, against the remote path."""
+    from import_job import ImportParams, run_import_job
+
+    ra = _remote_archive_for(tmp_path)
+    calls = _remote_calls(ra)
+    _install_fake_remote_rsync(monkeypatch, calls, verify=None)
+
+    card = _make_card(tmp_path, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+        ("DSC_0002.jpg", datetime(2026, 7, 3, 11, 0, 0), "green"),
+    ])
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    result = run_import_job(
+        _make_job(), FakeRunner(), db_path, db._active_workspace_id,
+        ImportParams(
+            sources=[str(card)], destination=ra["mount_base"],
+            remote_target=ra, verify_by_hash=True,
+            include_paths={str(card / "DSC_0001.jpg")},
+            previewed_count=2, checked_count=1,
+        ),
+    )
+
+    assert result["copied"] == 1
+    assert result["discovered"] == 2
+    assert "Deselected files" in {u["path"] for u in result["unsafe_files"]}
+    # verify_by_hash=True so remote_unverified is False and this assertion
+    # actually depends on the new condition rather than passing for free.
+    assert result["safe_to_format"] is False
+
+    # The deselected file never crossed the network, and never landed on the
+    # mount. Asserting only the counters would pass on a filter that dropped
+    # the file from the ledger while still rsyncing it.
+    transferred = {
+        os.path.basename(s) for c in calls["rsync"] for s in c["src_specs"]
+    }
+    assert transferred == {"DSC_0001.jpg"}
+    mount_dir = os.path.join(ra["mount_base"], "2026", "2026-07-03")
+    assert not os.path.exists(os.path.join(mount_dir, "DSC_0002.jpg"))
+    rows = _photo_rows(db)
+    assert {
+        os.path.join(r["folder_path"], r["filename"]) for r in rows
+    } == {os.path.join(mount_dir, "DSC_0001.jpg")}
+
+
+def test_remote_deselected_then_vanished_is_unsafe(tmp_path, monkeypatch):
+    """The equality balances (1 copied of 1 discovered); only the explicit
+    deselected condition catches it."""
+    from import_job import ImportParams, run_import_job
+
+    ra = _remote_archive_for(tmp_path)
+    # verify=None is the "verified OK" sentinel. Any non-None value is treated
+    # as a (name, detail) failure tuple and unpacked, so verify=True raises
+    # TypeError instead of failing an assertion.
+    _install_fake_remote_rsync(monkeypatch, _remote_calls(ra), verify=None)
+
+    card = _make_card(tmp_path, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+    ])
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    result = run_import_job(
+        _make_job(), FakeRunner(), db_path, db._active_workspace_id,
+        ImportParams(
+            sources=[str(card)], destination=ra["mount_base"],
+            remote_target=ra, verify_by_hash=True,
+            include_paths={str(card / "DSC_0001.jpg")},
+            previewed_count=2, checked_count=1,
+        ),
+    )
+    assert result["copied"] == 1
+    assert result["discovered"] == 1
+    assert result["safe_to_format"] is False
+
+
+def test_remote_include_paths_absent_imports_everything(tmp_path, monkeypatch):
+    """No selection means no opinion — remote behaviour is unchanged."""
+    card = _make_card(tmp_path, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+        ("DSC_0002.jpg", datetime(2026, 7, 3, 11, 0, 0), "green"),
+    ])
+    result, _ = _run_remote_import(
+        tmp_path, monkeypatch, {"sources": [str(card)]})
+    assert result["copied"] == 2
+    assert result["discovered"] == 2
+    assert result["safe_to_format"] is True
+
+
+def test_remote_include_paths_empty_set_imports_nothing(tmp_path, monkeypatch):
+    """An empty selection is 'nothing chosen', not 'no opinion'.
+
+    Truthiness instead of ``is not None`` would rsync the whole card.
+    """
+    card = _make_card(tmp_path, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+        ("DSC_0002.jpg", datetime(2026, 7, 3, 11, 0, 0), "green"),
+    ])
+    result, calls = _run_remote_import(tmp_path, monkeypatch, {
+        "sources": [str(card)],
+        "include_paths": set(), "previewed_count": 2, "checked_count": 0,
+    })
+    assert result["copied"] == 0
+    assert result["discovered"] == 2
+    assert calls["rsync"] == []
+
+
+def test_remote_full_selection_of_duplicates_is_safe_to_format(
+        tmp_path, monkeypatch):
+    """THE duplicate-accounting regression guard, remote edition.
+
+    Duplicates stay in ``include_paths``, so the checker counts them as
+    ``skipped_duplicate`` and the ledger balances. If someone "fixes"
+    ``include_paths`` to mean the checked boxes, this goes false and Vireo
+    tells the user not to format a card that is fully archived.
+    """
+    card = _make_card(tmp_path, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+        ("DSC_0002.jpg", datetime(2026, 7, 3, 11, 0, 0), "green"),
+    ])
+    # First import puts both on the NAS (and in the catalog).
+    first, _ = _run_remote_import(
+        tmp_path, monkeypatch, {"sources": [str(card)]})
+    assert first["copied"] == 2
+
+    # Second import of the same card: everything is a duplicate. Same db and
+    # same mount, so the twins are found.
+    result, _ = _run_remote_import(tmp_path, monkeypatch, {
+        "sources": [str(card)],
+        "include_paths": {str(card / "DSC_0001.jpg"),
+                          str(card / "DSC_0002.jpg")},
+        "previewed_count": 2, "checked_count": 0,
+    })
+    assert result["copied"] == 0
+    assert result["skipped_duplicate"] == 2
+    assert result["safe_to_format"] is True
+
+
+def test_remote_vanished_in_scope_file_makes_card_unsafe(
+        tmp_path, monkeypatch):
+    """The ledger equality balances here — 1 processed of 1 discovered — so
+    this needs its own condition."""
+    card = _make_card(tmp_path, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+    ])
+    result, _ = _run_remote_import(tmp_path, monkeypatch, {
+        "sources": [str(card)],
+        "include_paths": {str(card / "DSC_0001.jpg"),
+                          str(card / "DSC_0002.jpg")},   # previewed, deleted
+        "previewed_count": 2, "checked_count": 2,
+    })
+    assert result["copied"] == 1
+    assert result["discovered"] == 1
+    assert result["safe_to_format"] is False
+
+
+def test_remote_vanished_file_without_previewed_count_is_unsafe(
+        tmp_path, monkeypatch):
+    """``vanished_paths`` must not be gated on ``previewed_count``.
+
+    Both fields are independently optional, the ledger equality cannot see
+    the vanished file (1 copied of 1 discovered), and gating this on
+    ``previewed_count`` fails OPEN on exactly the case it exists to close.
+    """
+    card = _make_card(tmp_path, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+    ])
+    result, _ = _run_remote_import(tmp_path, monkeypatch, {
+        "sources": [str(card)],
+        "include_paths": {str(card / "DSC_0001.jpg"),
+                          str(card / "GONE.jpg")},
+        "previewed_count": None, "checked_count": None,
+    })
+    assert result["copied"] == 1
+    assert result["discovered"] == 1
+    assert result["safe_to_format"] is False
+    assert "Files missing at import time" in _unsafe_paths(result)
+
+
+def test_remote_negative_deselected_count_makes_card_unsafe(
+        tmp_path, monkeypatch):
+    """A payload previewing fewer files than it selected is self-inconsistent.
+
+    ``deselected`` goes negative, and ``> 0`` would read that as "nothing
+    deselected" and let the card go green.
+    """
+    card = _make_card(tmp_path, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+    ])
+    result, _ = _run_remote_import(tmp_path, monkeypatch, {
+        "sources": [str(card)],
+        "include_paths": {str(card / "DSC_0001.jpg")},
+        "previewed_count": 0, "checked_count": 1,
+    })
+    # Selection is the ONLY blocker: the ledger balances and nothing failed.
+    assert result["copied"] == 1
+    assert result["copied"] + result["skipped_duplicate"] == result["discovered"]
+    assert result["failed"] == 0
+    assert result["safe_to_format"] is False
+    assert "Selection count mismatch" in _unsafe_paths(result)
+    # No nonsense number: the count is what is untrustworthy.
+    assert "-1" not in _unsafe_reason(result, "Selection count mismatch")
+
+
+def test_remote_include_paths_accepts_a_list(tmp_path, monkeypatch):
+    """A JSON payload deserializes ``include_paths`` to a list.
+
+    The drift math does set arithmetic on it, so without coercing once above
+    the filter this raises TypeError before a single file is rsynced.
+    """
+    card = _make_card(tmp_path, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+        ("DSC_0002.jpg", datetime(2026, 7, 3, 11, 0, 0), "green"),
+    ])
+    kept = str(card / "DSC_0001.jpg")
+    result, _ = _run_remote_import(tmp_path, monkeypatch, {
+        "sources": [str(card)],
+        "include_paths": [kept, kept],   # list, with a duplicate entry
+        "previewed_count": 2, "checked_count": 1,
+    })
+    assert result["copied"] == 1
+    assert result["safe_to_format"] is False
+
+
+def test_remote_repeated_include_path_does_not_mask_a_deselection(
+        tmp_path, monkeypatch):
+    """THE dedupe guard: a repeat must not inflate the selected count.
+
+    Three files previewed; the payload carries A twice and B once, so a raw
+    ``len(params.include_paths)`` reads 3 and computes ``deselected == 0``.
+    The third previewed file is gone, so ``vanished_paths`` is empty too, and
+    the ledger balances — every other guard is silent.
+    """
+    card = _make_card(tmp_path, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+        ("DSC_0002.jpg", datetime(2026, 7, 3, 11, 0, 0), "green"),
+    ])
+    a, b = str(card / "DSC_0001.jpg"), str(card / "DSC_0002.jpg")
+    result, _ = _run_remote_import(tmp_path, monkeypatch, {
+        "sources": [str(card)],
+        "include_paths": [a, a, b],
+        "previewed_count": 3, "checked_count": 3,
+    })
+    # Preconditions: without these the assertion below is vacuous.
+    assert result["copied"] + result["skipped_duplicate"] == result["discovered"]
+    assert result["copied"] == 2
+    assert result["safe_to_format"] is False
+
+
+def test_remote_selection_entries_explain_themselves(tmp_path, monkeypatch):
+    """All four selection entries, with their exact user-facing wording.
+
+    ``renderResult`` HIDES the unsafe list when it is empty, so every
+    selection signal that flips the pill red must also append a line. Each
+    scenario asserts its SPECIFIC entry and full reason string — asserting
+    only "non-empty" would pass on an unrelated pre-existing entry, and
+    asserting only the path key would let a wrong count through in
+    user-facing card-safety copy.
+    """
+    scenarios = [
+        # (name, card filenames, included filenames, extra include,
+        #  previewed, expected path, expected reason)
+        ("deselect",
+         ["DSC_0001.jpg", "DSC_0002.jpg"], ["DSC_0001.jpg"], None, 2,
+         "Deselected files",
+         "1 file you deselected was not copied"),
+        ("deselect_plural",
+         ["DSC_0001.jpg", "DSC_0002.jpg", "DSC_0003.jpg"], ["DSC_0001.jpg"],
+         None, 3,
+         "Deselected files",
+         "2 files you deselected were not copied"),
+        ("vanished",
+         ["DSC_0001.jpg"], ["DSC_0001.jpg"], "GONE.jpg", 2,
+         "Files missing at import time",
+         "1 file was in scope but had disappeared from the source "
+         "when the import ran"),
+        ("appeared",
+         ["DSC_0001.jpg", "DSC_0002.jpg", "DSC_0003.jpg"],
+         ["DSC_0001.jpg", "DSC_0002.jpg"], None, 2,
+         "Files added after preview",
+         "at least 1 file arrived after your preview and was not imported "
+         "— re-preview to include it"),
+        ("appeared_plural",
+         ["DSC_0001.jpg", "DSC_0002.jpg", "DSC_0003.jpg"], ["DSC_0001.jpg"],
+         None, 1,
+         "Files added after preview",
+         "at least 2 files arrived after your preview and were not "
+         "imported — re-preview to include them"),
+    ]
+    for name, specs, included, extra, previewed, path, reason in scenarios:
+        root = tmp_path / name
+        root.mkdir()
+        # Distinct colors: identical bytes would make the second file an
+        # in-batch duplicate, so a scenario meant to read as two plain
+        # copies would quietly exercise the duplicate path instead.
+        colors = ["red", "green", "blue", "white"]
+        card = _make_card(root, [
+            (fn, datetime(2026, 7, 3, 10 + i, 0, 0), colors[i])
+            for i, fn in enumerate(specs)
+        ])
+        include_paths = {str(card / fn) for fn in included}
+        if extra:
+            include_paths.add(str(card / extra))
+        result, _ = _run_remote_import(root, monkeypatch, {
+            "sources": [str(card)], "include_paths": include_paths,
+            "previewed_count": previewed,
+            "checked_count": len(include_paths),
+        })
+        assert result["safe_to_format"] is False, name
+        assert path in _unsafe_paths(result), name
+        assert _unsafe_reason(result, path) == reason, name
+        # Entries are mirrored into ``errors``; both surfaces must speak.
+        assert any(e.startswith(path + ": ") for e in result["errors"]), name
+
+    # The plural vanished wording, alongside a plural deselection (previewed
+    # 5, selected 3, of which 2 are no longer on the card).
+    plural_root = tmp_path / "vanished_plural"
+    plural_root.mkdir()
+    card = _make_card(plural_root, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+        ("DSC_0002.jpg", datetime(2026, 7, 3, 11, 0, 0), "green"),
+        ("DSC_0003.jpg", datetime(2026, 7, 3, 12, 0, 0), "blue"),
+    ])
+    result, _ = _run_remote_import(plural_root, monkeypatch, {
+        "sources": [str(card)],
+        "include_paths": {str(card / "DSC_0001.jpg"),
+                          str(card / "GONE_A.jpg"),
+                          str(card / "GONE_B.jpg")},
+        "previewed_count": 5, "checked_count": 3,
+    })
+    assert _unsafe_reason(result, "Deselected files") == (
+        "2 files you deselected were not copied"
+    )
+    assert _unsafe_reason(result, "Files missing at import time") == (
+        "2 files were in scope but had disappeared from the source "
+        "when the import ran"
+    )
+
+
+def test_remote_selection_drift_counts_are_reported(tmp_path, monkeypatch):
+    """``files_appeared`` / ``files_vanished`` are pinned to NONZERO values.
+
+    Every other drift assertion in this file expects 0, so hard-coding either
+    key to 0 would pass them all while the frontend readout that consumes it
+    silently stopped reporting drift.
+    """
+    appeared_root = tmp_path / "appeared"
+    appeared_root.mkdir()
+    card = _make_card(appeared_root, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+        ("DSC_0002.jpg", datetime(2026, 7, 3, 11, 0, 0), "green"),
+        ("DSC_0003.jpg", datetime(2026, 7, 3, 12, 0, 0), "blue"),
+    ])
+    result, _ = _run_remote_import(appeared_root, monkeypatch, {
+        "sources": [str(card)],
+        "include_paths": {str(card / "DSC_0001.jpg")},
+        "previewed_count": 1, "checked_count": 1,
+    })
+    assert result["files_appeared"] == 2
+    assert result["files_vanished"] == 0
+
+    # ``files_appeared`` is a net delta clamped at zero: more vanishing than
+    # arriving must read 0, never a negative.
+    vanished_root = tmp_path / "vanished"
+    vanished_root.mkdir()
+    card2 = _make_card(vanished_root, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+    ])
+    result2, _ = _run_remote_import(vanished_root, monkeypatch, {
+        "sources": [str(card2)],
+        "include_paths": {str(card2 / "DSC_0001.jpg"),
+                          str(card2 / "GONE_A.jpg"),
+                          str(card2 / "GONE_B.jpg")},
+        "previewed_count": 3, "checked_count": 3,
+    })
+    assert result2["files_vanished"] == 2
+    assert result2["files_appeared"] == 0
+
+
+def test_remote_ordinary_deselection_reports_no_drift(tmp_path, monkeypatch):
+    """Both keys are unconditionally present, and read 0 on a plain
+    deselection."""
+    card = _make_card(tmp_path, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+        ("DSC_0002.jpg", datetime(2026, 7, 3, 11, 0, 0), "green"),
+    ])
+    result, _ = _run_remote_import(tmp_path, monkeypatch, {
+        "sources": [str(card)],
+        "include_paths": {str(card / "DSC_0001.jpg")},
+        "previewed_count": 2, "checked_count": 1,
+    })
+    assert result["files_appeared"] == 0
+    assert result["files_vanished"] == 0
+
+
+def test_remote_drift_keys_present_without_any_selection(
+        tmp_path, monkeypatch):
+    """The keys are unconditional — a caller reading them must not KeyError
+    on the overwhelmingly common no-selection run."""
+    card = _make_card(tmp_path, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+    ])
+    result, _ = _run_remote_import(
+        tmp_path, monkeypatch, {"sources": [str(card)]})
+    assert result["files_appeared"] == 0
+    assert result["files_vanished"] == 0
+
+
+def test_remote_progress_total_is_the_queued_work_not_the_card(
+        tmp_path, monkeypatch):
+    """One of three files selected: the bar is sized 1, not 3.
+
+    The copy-loop emits are asserted separately from the discovery emit, and
+    with no truthiness filter on the way in — a ``3 not in totals`` check
+    accepts any other wrong number, and set equality over ALL emits accepts a
+    zeroed copy-loop total by hiding it behind the discovery emit's
+    legitimate 0.
+    """
+    card = _make_card(tmp_path, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+        ("DSC_0002.jpg", datetime(2026, 7, 3, 11, 0, 0), "green"),
+        ("DSC_0003.jpg", datetime(2026, 7, 3, 12, 0, 0), "blue"),
+    ])
+    runner = FakeRunner()
+    _run_remote_import(tmp_path, monkeypatch, {
+        "sources": [str(card)],
+        "include_paths": {str(card / "DSC_0001.jpg")},
+        "previewed_count": 3, "checked_count": 1,
+    }, runner=runner)
+    events = [d for _, kind, d in runner.events if kind == "progress"]
+    # The discovery emit is the only one entitled to a 0 total — the count
+    # isn't known yet when it fires.
+    assert [d["total"] for d in events
+            if d["phase"] == "Discovering files"] == [0]
+    copy_totals = [d["total"] for d in events
+                   if d["phase"] != "Discovering files"]
+    assert copy_totals, "no copy-loop progress was emitted at all"
+    assert set(copy_totals) == {1}
+
+
+def test_remote_progress_total_covers_the_batch_guard_emits(
+        tmp_path, monkeypatch):
+    """The dest-under-source batch guard emits too, and it is also sized by
+    the queued work.
+
+    ``destination`` is the card itself here, so every batch fails the
+    dest-under-source guard and takes the early-``continue`` emit — the only
+    way to reach that site.
+    """
+    from import_job import ImportParams, run_import_job
+
+    card = _make_card(tmp_path, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+        ("DSC_0002.jpg", datetime(2026, 7, 3, 11, 0, 0), "green"),
+        ("DSC_0003.jpg", datetime(2026, 7, 3, 12, 0, 0), "blue"),
+    ])
+    ra = _remote_archive_for(tmp_path)
+    ra["mount_base"] = str(card)          # destination inside the source
+    calls = _remote_calls(ra)
+    _install_fake_remote_rsync(monkeypatch, calls, verify=None)
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    runner = FakeRunner()
+    result = run_import_job(
+        _make_job(), runner, db_path, db._active_workspace_id,
+        ImportParams(
+            sources=[str(card)], destination=str(card), remote_target=ra,
+            verify_by_hash=True,
+            include_paths={str(card / "DSC_0001.jpg"),
+                           str(card / "DSC_0002.jpg")},
+            previewed_count=3, checked_count=2,
+        ),
+    )
+    assert result["failed"] == 2, "the guard did not fire"
+    events = [d for _, kind, d in runner.events if kind == "progress"]
+    copy_totals = [d["total"] for d in events
+                   if d["phase"] != "Discovering files"]
+    assert copy_totals, "no copy-loop progress was emitted at all"
+    assert set(copy_totals) == {2}
+
+
+def test_remote_progress_total_covers_the_mount_root_guard_emit(
+        tmp_path, monkeypatch):
+    """The mount-root-absent batch guard has its own ``_emit``, and it is the
+    fourth and last copy-loop site.
+
+    Nothing else reaches it — the guard fires before makedirs and before any
+    transport call — so without this test that one denominator can stay sized
+    against the whole card while the other three are fixed. Setup lifted from
+    ``test_remote_import_refuses_when_mount_root_absent``.
+    """
+    import move as _move
+    import pipeline_job as _pj
+    from import_job import ImportParams, run_import_job
+    from move import build_remote_move_spec
+
+    card = _make_card(tmp_path, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+        ("DSC_0002.jpg", datetime(2026, 7, 3, 11, 0, 0), "green"),
+        ("DSC_0003.jpg", datetime(2026, 7, 3, 12, 0, 0), "blue"),
+    ])
+    fake_mount_base = str(tmp_path / "Volumes_NAS_Photos")
+    target = {
+        "id": "nas1", "name": "NAS", "host": "nas", "user": "me",
+        "port": 22, "ssh_key": "", "bwlimit_kbps": 0,
+        "remote_path": "/volume1/Photography",
+        "mount_path": fake_mount_base,
+    }
+    ra = {
+        "target": target, "rsync_bin": "/usr/bin/rsync",
+        "remote": build_remote_move_spec(target, "", "/usr/bin/rsync"),
+        "ssh_base": target["remote_path"], "mount_base": fake_mount_base,
+    }
+    monkeypatch.setattr(
+        _pj, "_missing_archive_mount_root",
+        lambda path: (
+            "/Volumes/NAS" if path.startswith(fake_mount_base) else None
+        ),
+    )
+    monkeypatch.setattr(_move, "_remote_mkdir_p", lambda r, p: (True, ""))
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    runner = FakeRunner()
+    result = run_import_job(
+        _make_job(), runner, db_path, db._active_workspace_id,
+        ImportParams(
+            sources=[str(card)], destination=fake_mount_base,
+            remote_target=ra, verify_by_hash=True,
+            include_paths={str(card / "DSC_0001.jpg"),
+                           str(card / "DSC_0002.jpg")},
+            previewed_count=3, checked_count=2,
+        ),
+    )
+    # Only the two SELECTED files reach the guard — the deselected one was
+    # never queued.
+    assert result["failed"] == 2, result
+    events = [d for _, kind, d in runner.events if kind == "progress"]
+    copy_totals = [d["total"] for d in events
+                   if d["phase"] != "Discovering files"]
+    assert copy_totals, "no copy-loop progress was emitted at all"
+    assert set(copy_totals) == {2}
+
+
+def test_remote_step_summary_selected_figure_comes_from_checked_count(
+        tmp_path, monkeypatch):
+    """Not ``len(include_paths)`` — that set retains unchecked duplicates and
+    would overstate what the user chose."""
+    card = _make_card(tmp_path, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+        ("DSC_0002.jpg", datetime(2026, 7, 3, 11, 0, 0), "green"),
+    ])
+    runner = FakeRunner()
+    _run_remote_import(tmp_path, monkeypatch, {
+        "sources": [str(card)],
+        "include_paths": {str(card / "DSC_0001.jpg"),
+                          str(card / "DSC_0002.jpg")},
+        "previewed_count": 2, "checked_count": 1,
+    }, runner=runner)
+    # Full equality, not a substring: the discovered total has to survive in
+    # the selection form too.
+    assert "1 selected of 2 discovered, 2 copied, 0 already present, 0 failed" \
+        in _summaries(runner)
+
+
+def test_remote_step_summary_without_selection_is_unchanged(
+        tmp_path, monkeypatch):
+    """The no-selection wording is the one every user sees today, and it is
+    byte-identical to what the remote path emitted before selection existed.
+    """
+    card = _make_card(tmp_path, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+        ("DSC_0002.jpg", datetime(2026, 7, 3, 11, 0, 0), "green"),
+    ])
+    runner = FakeRunner()
+    _run_remote_import(
+        tmp_path, monkeypatch, {"sources": [str(card)]}, runner=runner)
+    summaries = _summaries(runner)
+    assert "2 copied, 0 already present, 0 failed of 2 discovered" in summaries
+    assert not any("selected" in s for s in summaries)
+
+
+def test_remote_step_summary_claims_a_selection_only_when_applied(
+        tmp_path, monkeypatch):
+    """``include_paths`` and ``checked_count`` are independently optional.
+
+    It is ``include_paths`` alone that filters the copy set, so the selection
+    form has to be gated on BOTH. Keyed on ``checked_count`` alone, a payload
+    carrying a count but no paths copies the whole card while reporting
+    "1 selected of 2 discovered" — a selection claimed for a run where none
+    was applied. Both divergent combinations are asserted: each one alone
+    kills a different half of the conjunction.
+    """
+    # checked_count without include_paths: nothing was filtered, so nothing
+    # may be claimed.
+    count_only = tmp_path / "count_only"
+    count_only.mkdir()
+    card = _make_card(count_only, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+        ("DSC_0002.jpg", datetime(2026, 7, 3, 11, 0, 0), "green"),
+    ])
+    runner = FakeRunner()
+    result, _ = _run_remote_import(count_only, monkeypatch, {
+        "sources": [str(card)], "checked_count": 1,
+    }, runner=runner)
+    assert result["copied"] == 2, "no include_paths means no filtering"
+    summaries = _summaries(runner)
+    assert "2 copied, 0 already present, 0 failed of 2 discovered" in summaries
+    assert not any("selected" in s for s in summaries)
+
+    # include_paths without checked_count: the copy set IS filtered, but there
+    # is no trustworthy figure to quote, so it degrades to the plain form
+    # rather than printing "None selected".
+    paths_only = tmp_path / "paths_only"
+    paths_only.mkdir()
+    card2 = _make_card(paths_only, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+        ("DSC_0002.jpg", datetime(2026, 7, 3, 11, 0, 0), "green"),
+    ])
+    runner2 = FakeRunner()
+    result2, _ = _run_remote_import(paths_only, monkeypatch, {
+        "sources": [str(card2)],
+        "include_paths": {str(card2 / "DSC_0001.jpg")},
+    }, runner=runner2)
+    assert result2["copied"] == 1, "include_paths must still filter"
+    summaries2 = _summaries(runner2)
+    assert "1 copied, 0 already present, 0 failed of 2 discovered" in summaries2
+    assert not any("selected" in s for s in summaries2)
+
+
+# --- Local/remote selection parity -------------------------------------
+# The two copy paths (``run_import_job`` and ``_run_remote_import_job``)
+# carry the same selection logic. These tests are the safety net for that:
+# they drive IDENTICAL selection payloads through BOTH entry points and
+# assert the observable selection results agree, so a change applied to one
+# path and not the other fails here instead of shipping a wrong
+# format-the-card verdict on whichever path the author wasn't looking at.
+
+
+# The four ``unsafe_files`` entries the selection logic owns. Order within
+# this subset is user-visible — ``renderResult`` lists entries as it finds
+# them — so parity compares it. The filter matters: comparing the raw
+# ``unsafe_files`` order would drag in copy-failure and unverified-duplicate
+# entries, whose relative ordering legitimately differs between the two
+# paths, and the resulting noise would force the check to be dropped.
+_SELECTION_UNSAFE_PATHS = {
+    "Deselected files",
+    "Selection count mismatch",
+    "Files missing at import time",
+    "Files added after preview",
+}
+
+
+def _selection_observables(result, runner):
+    """The selection-visible surface of an import run, normalized so the
+    local and remote paths are directly comparable.
+
+    Deliberately excludes keys the two paths differ on for reasons that
+    have nothing to do with selection (``photo_ids``, ``verified``,
+    ``folders``, ``errors`` ordering).
+    """
+    import_summaries = [
+        kw.get("summary")
+        for _, step_id, kw in runner.step_updates
+        if step_id == "import" and kw.get("summary") is not None
+    ]
+    events = [d for _, kind, d in runner.events if kind == "progress"]
+    return {
+        "discovered": result["discovered"],
+        "copied": result["copied"],
+        "skipped_duplicate": result["skipped_duplicate"],
+        "failed": result["failed"],
+        "safe_to_format": result["safe_to_format"],
+        "unverified_duplicates_only": result["unverified_duplicates_only"],
+        "files_appeared": result["files_appeared"],
+        "files_vanished": result["files_vanished"],
+        "unsafe": {(u["path"], u["reason"]) for u in result["unsafe_files"]},
+        # A set erases render order, and render order is user-visible. Without
+        # this, emitting the drift lines in a different order on one path is a
+        # real one-sided divergence that passes every test in this file.
+        "unsafe_order": [u["path"] for u in result["unsafe_files"]
+                         if u["path"] in _SELECTION_UNSAFE_PATHS],
+        "summary": import_summaries[-1] if import_summaries else None,
+        # The discovery emit legitimately fires before the count is known,
+        # so it is excluded; every other emit is sized by the queued work.
+        "copy_totals": {d["total"] for d in events
+                        if d["phase"] != "Discovering files"},
+    }
+
+
+def _run_local_selection_case(root, monkeypatch, specs, selection):
+    """Run one selection scenario through the LOCAL copy path.
+
+    ``verify_by_hash=True`` matches what ``_run_remote_import`` forces: with
+    it off the remote path's ``remote_unverified`` makes both card-safety
+    verdicts False for free and every parity assertion passes vacuously.
+    """
+    from import_job import ImportParams, run_import_job
+
+    card = _make_card(root, specs)
+    runner = FakeRunner()
+    db_path = str(root / "test.db")
+    db = Database(db_path)
+    result = run_import_job(
+        _make_job(), runner, db_path, db._active_workspace_id,
+        ImportParams(
+            sources=[str(card)], destination=str(root / "archive"),
+            verify_by_hash=True, **selection(card),
+        ),
+    )
+    return _selection_observables(result, runner)
+
+
+def _run_remote_selection_case(root, monkeypatch, specs, selection):
+    """Run one selection scenario through the REMOTE copy path."""
+    card = _make_card(root, specs)
+    runner = FakeRunner()
+    result, _ = _run_remote_import(root, monkeypatch, {
+        "sources": [str(card)], **selection(card),
+    }, runner=runner)
+    return _selection_observables(result, runner)
+
+
+# Three distinct-colored frames: identical bytes would make the later files
+# in-batch duplicates, so a scenario meant to read as plain copies would
+# quietly exercise the duplicate path instead.
+_PARITY_CARD = [
+    ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+    ("DSC_0002.jpg", datetime(2026, 7, 3, 11, 0, 0), "green"),
+    ("DSC_0003.jpg", datetime(2026, 7, 3, 12, 0, 0), "blue"),
+]
+
+
+def _sel(names, previewed, checked, extra=()):
+    """Build the selection kwargs for a card, by basename."""
+    def build(card):
+        paths = {str(card / n) for n in names}
+        paths |= {str(card / n) for n in extra}
+        return {
+            "include_paths": paths,
+            "previewed_count": previewed,
+            "checked_count": checked,
+        }
+    return build
+
+
+# (id, card specs, selection builder). Each exercises one branch of the
+# shared selection logic; between them they cover both ``deselected``
+# branches, both drift counters, the two summary forms, and the
+# no-selection / empty-selection boundary.
+_SELECTION_PARITY_SCENARIOS = [
+    ("no_selection", _PARITY_CARD, lambda card: {}),
+    ("full_selection", _PARITY_CARD,
+     _sel(["DSC_0001.jpg", "DSC_0002.jpg", "DSC_0003.jpg"], 3, 3)),
+    ("empty_selection", _PARITY_CARD,
+     lambda card: {"include_paths": set(), "previewed_count": 3,
+                   "checked_count": 0}),
+    ("deselect_one", _PARITY_CARD,
+     _sel(["DSC_0001.jpg", "DSC_0002.jpg"], 3, 2)),
+    ("deselect_plural", _PARITY_CARD, _sel(["DSC_0001.jpg"], 3, 1)),
+    ("vanished", _PARITY_CARD,
+     _sel(["DSC_0001.jpg", "DSC_0002.jpg", "DSC_0003.jpg"], 4, 4,
+          extra=["GONE.jpg"])),
+    ("vanished_without_previewed_count", _PARITY_CARD,
+     lambda card: {
+         "include_paths": {str(card / "DSC_0001.jpg"), str(card / "GONE.jpg")},
+         "previewed_count": None, "checked_count": None,
+     }),
+    ("appeared", _PARITY_CARD, _sel(["DSC_0001.jpg"], 1, 1)),
+    ("negative_deselected", _PARITY_CARD,
+     _sel(["DSC_0001.jpg", "DSC_0002.jpg", "DSC_0003.jpg"], 2, 3)),
+    ("mixed_appear_and_vanish", _PARITY_CARD,
+     _sel(["DSC_0001.jpg"], 2, 2, extra=["GONE.jpg"])),
+    # Deselect AND vanish: the compound red pill, and the only scenario that
+    # emits two selection entries, so it is what pins their render order.
+    ("deselected_and_vanished", _PARITY_CARD,
+     _sel(["DSC_0001.jpg"], 3, 2, extra=["GONE.jpg"])),
+    ("include_paths_without_checked_count", _PARITY_CARD,
+     lambda card: {"include_paths": {str(card / "DSC_0001.jpg")},
+                   "previewed_count": 3, "checked_count": None}),
+    ("checked_count_without_include_paths", _PARITY_CARD,
+     lambda card: {"checked_count": 1}),
+]
+
+
+def test_selection_parity_scenarios_are_distinct():
+    """Guard for the parity test below: two scenarios that collapse onto the
+    same payload still both run, but the list covers one fewer branch than
+    its length suggests — a coverage gap that reads as coverage."""
+    seen = set()
+    for name, _specs, builder in _SELECTION_PARITY_SCENARIOS:
+        class _C:
+            def __truediv__(self, other):
+                return "/card/" + other
+        key = repr(sorted(
+            (k, sorted(v) if isinstance(v, set) else v)
+            for k, v in builder(_C()).items()
+        ))
+        assert key not in seen, f"{name} duplicates an earlier scenario"
+        seen.add(key)
+    assert len(seen) == len(_SELECTION_PARITY_SCENARIOS)
+
+
+def test_local_and_remote_selection_results_agree(tmp_path, monkeypatch):
+    """CHARACTERIZATION: the same selection payload must produce the same
+    selection outcome on both copy paths.
+
+    Runs every scenario through both entry points in its own tmp dir and
+    compares discovered/copied/verdict/drift counts, the (path, reason) set
+    of ``unsafe_files``, the import step summary, and the progress totals.
+
+    This is asserted as a whole-dict equality on purpose: a per-key check
+    added one at a time is how a divergence in the key nobody thought to
+    list survives.
+    """
+    mismatches = []
+    for name, specs, builder in _SELECTION_PARITY_SCENARIOS:
+        local_root = tmp_path / f"local_{name}"
+        local_root.mkdir()
+        remote_root = tmp_path / f"remote_{name}"
+        remote_root.mkdir()
+        local = _run_local_selection_case(
+            local_root, monkeypatch, specs, builder)
+        remote = _run_remote_selection_case(
+            remote_root, monkeypatch, specs, builder)
+        if local != remote:
+            mismatches.append((name, local, remote))
+    assert not mismatches, "\n".join(
+        f"{n}:\n  local ={l}\n  remote={r}" for n, l, r in mismatches
+    )
+
+
+def test_selection_parity_scenarios_actually_exercise_the_branches(
+        tmp_path, monkeypatch):
+    """Positive control for the parity test.
+
+    Equality between two paths is satisfiable by both being wrong in the
+    same way — or by every scenario producing an identical, boring result.
+    Pin the outcomes the scenarios are supposed to produce so a selection
+    branch that stops firing is caught here rather than passing parity.
+    """
+    seen = {}
+    for name, specs, builder in _SELECTION_PARITY_SCENARIOS:
+        root = tmp_path / name
+        root.mkdir()
+        seen[name] = _run_local_selection_case(
+            root, monkeypatch, specs, builder)
+
+    # A whole-card import with nothing selected is the green baseline.
+    assert seen["no_selection"]["safe_to_format"] is True
+    assert seen["no_selection"]["copied"] == 3
+    assert seen["no_selection"]["summary"] == (
+        "3 copied, 0 already present, 0 failed of 3 discovered")
+
+    # Selecting everything is still green, and switches summary form.
+    assert seen["full_selection"]["safe_to_format"] is True
+    assert seen["full_selection"]["copied"] == 3
+    assert seen["full_selection"]["summary"] == (
+        "3 selected of 3 discovered, 3 copied, 0 already present, 0 failed")
+
+    # Every drift scenario is red, and names its own reason.
+    reds = {
+        "empty_selection": "Deselected files",
+        "deselect_one": "Deselected files",
+        "deselect_plural": "Deselected files",
+        "vanished": "Files missing at import time",
+        "vanished_without_previewed_count": "Files missing at import time",
+        "appeared": "Files added after preview",
+        "negative_deselected": "Selection count mismatch",
+        "mixed_appear_and_vanish": "Files missing at import time",
+        "deselected_and_vanished": "Files missing at import time",
+    }
+    for name, path in reds.items():
+        assert seen[name]["safe_to_format"] is False, name
+        assert path in {p for p, _ in seen[name]["unsafe"]}, name
+
+    # The compound case emits BOTH lines, in the order the helper appends
+    # them — this is the render order parity now compares.
+    assert seen["deselected_and_vanished"]["unsafe_order"] == [
+        "Deselected files", "Files missing at import time",
+    ]
+
+    # Drift counters are nonzero where the scenario says they should be.
+    assert seen["appeared"]["files_appeared"] == 2
+    assert seen["appeared"]["files_vanished"] == 0
+    assert seen["vanished"]["files_vanished"] == 1
+    assert seen["mixed_appear_and_vanish"]["files_vanished"] == 1
+    assert seen["mixed_appear_and_vanish"]["files_appeared"] == 1
+
+    # Progress totals are the queued work, not the card.
+    assert seen["deselect_plural"]["copy_totals"] == {1}
+    assert seen["no_selection"]["copy_totals"] == {3}
+
+    # Both degraded summary forms fall back to the plain wording.
+    assert "selected" not in seen["include_paths_without_checked_count"][
+        "summary"]
+    assert "selected" not in seen["checked_count_without_include_paths"][
+        "summary"]
+    # ...and a bare ``checked_count`` must not filter the copy set.
+    assert seen["checked_count_without_include_paths"]["copied"] == 3
+
+
+def _symlinked_card(tmp_path, specs):
+    """A card reached through a symlinked directory.
+
+    ``pytest``'s ``tmp_path`` is already fully resolved, so an ordinary card
+    cannot tell ``str(f)`` apart from ``os.path.realpath(str(f))``. This one
+    can: the enumerated paths run through the symlink, their realpaths do
+    not, and the selection filter matches on the former.
+    """
+    import pytest
+
+    real = _make_card(tmp_path, specs, card_name="real_card")
+    link = tmp_path / "link_card"
+    try:
+        os.symlink(str(real), str(link), target_is_directory=True)
+    except (OSError, NotImplementedError, AttributeError):
+        pytest.skip("symlink creation not supported on this platform")
+    assert os.path.realpath(str(link)) != str(link), (
+        "the symlink resolved to itself; this test cannot distinguish "
+        "realpath from the literal path"
+    )
+    return link
+
+
+def test_selection_filter_matches_unresolved_paths_local(tmp_path):
+    """The selection filter must NOT resolve symlinks.
+
+    The caller's paths come from ``discover_source_files`` over the raw
+    source string, so they run through the symlink. Realpath-ing inside the
+    filter empties it and copies nothing — and every other test in this file
+    passes under that mutation, because ``tmp_path`` is already resolved.
+    """
+    from import_job import ImportParams, run_import_job
+
+    link = _symlinked_card(tmp_path, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+        ("DSC_0002.jpg", datetime(2026, 7, 3, 11, 0, 0), "green"),
+    ])
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    result = run_import_job(
+        _make_job(), FakeRunner(), db_path, db._active_workspace_id,
+        ImportParams(
+            sources=[str(link)], destination=str(tmp_path / "archive"),
+            verify_by_hash=True,
+            include_paths={str(link / "DSC_0001.jpg"),
+                           str(link / "DSC_0002.jpg")},
+            previewed_count=2, checked_count=2,
+        ),
+    )
+    assert result["copied"] == 2, "realpath in the filter would copy nothing"
+    assert result["files_vanished"] == 0
+    assert result["safe_to_format"] is True
+
+
+def test_selection_filter_matches_unresolved_paths_remote(
+        tmp_path, monkeypatch):
+    """Remote edition of the symlink guard — same mutation, same path."""
+    link = _symlinked_card(tmp_path, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+        ("DSC_0002.jpg", datetime(2026, 7, 3, 11, 0, 0), "green"),
+    ])
+    result, calls = _run_remote_import(tmp_path, monkeypatch, {
+        "sources": [str(link)],
+        "include_paths": {str(link / "DSC_0001.jpg"),
+                          str(link / "DSC_0002.jpg")},
+        "previewed_count": 2, "checked_count": 2,
+    })
+    assert result["copied"] == 2, "realpath in the filter would rsync nothing"
+    assert calls["rsync"], "nothing was rsynced at all"
+    assert result["files_vanished"] == 0
+    assert result["safe_to_format"] is True
+
 
 
 def test_local_import_refuses_when_mount_root_absent(tmp_path, monkeypatch):

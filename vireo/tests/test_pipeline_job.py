@@ -17122,3 +17122,130 @@ def test_pipeline_extract_masks_offline_survives_finalizer_override(
         f"The extract_masks Fatal error must name the outage as "
         f"source-offline; got {em_fatal[0]!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# extract_masks early-return exit state
+#
+# The stage bails out early when nothing in the worklist carries a qualifying
+# detection. That exit used to hard-code `skipped` + a zero total, which
+# erased a `failed` status the pre-flight source-offline branch had already
+# latched — letting the end-of-run rollup (it reads only stage statuses)
+# finish the job green while the dropped photos stayed unmasked and were
+# hard-rejected in Process Review (Codex #1392 P1).
+# ---------------------------------------------------------------------------
+
+
+def test_extract_masks_early_exit_preserves_latched_offline_failure():
+    from pipeline_job import _extract_masks_early_exit
+
+    status, payload = _extract_masks_early_exit(
+        "no_detections", subthreshold=0, preflight_unreadable=311,
+        offline_latched=True,
+    )
+    assert status == "failed", (
+        "A pre-flight outage already latched a failure and appended a Fatal "
+        f"error; the early exit must not downgrade it. Got {status!r}"
+    )
+    # Reporting 311 unreadable against a hard-coded zero total publishes an
+    # impossible tally to anything computing coverage.
+    assert payload["unreadable"] == 311
+    assert payload["total"] == 311
+    assert payload["reason"] == "no_detections"
+
+
+def test_extract_masks_early_exit_is_a_benign_skip_without_an_outage():
+    from pipeline_job import _extract_masks_early_exit
+
+    status, payload = _extract_masks_early_exit(
+        "weights_missing", subthreshold=4, preflight_unreadable=0,
+        offline_latched=False,
+    )
+    assert status == "skipped", (
+        f"No outage means the early exit stays a benign skip; got {status!r}"
+    )
+    assert payload["unreadable"] == 0
+    assert payload["total"] == 0
+    assert payload["subthreshold"] == 4
+
+
+def test_extract_masks_outage_rollup_counts_only_offline_photos(
+    tmp_path, monkeypatch,
+):
+    """The reconnect message must not claim unrelated bad files.
+
+    A corrupt file in a healthy folder and a photo behind a dead volume both
+    land in the unreadable bucket, but only one is fixed by reconnecting the
+    source. Attributing the combined count to the single latched outage tells
+    the user that plugging the drive back in recovers files it cannot touch
+    (Codex #1392 P2).
+    """
+    import config as cfg
+    import pipeline_job as pj
+    from db import Database
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cfg.CONFIG_PATH = str(tmp_path / "config.json")
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws_id = db._active_workspace_id
+
+    # Sorted so the corrupt file in the healthy folder is hit first, which is
+    # the ordering that produced the misattribution.
+    corrupt_path = str(tmp_path / "aa_healthy")
+    share_path = str(tmp_path / "zz_share")
+    os.makedirs(corrupt_path, exist_ok=True)
+    os.makedirs(share_path, exist_ok=True)
+    corrupt_folder = db.add_folder(corrupt_path)
+    share_folder = db.add_folder(share_path)
+
+    photo_ids = [
+        _add_photo_with_detection(
+            db, corrupt_folder, corrupt_path, "aa_bad.jpg",
+        ),
+        _add_photo_with_detection(db, share_folder, share_path, "zz0.jpg"),
+    ]
+    collection_id = db.add_collection(
+        "One corrupt file, one dead volume",
+        json.dumps([{"field": "photo_ids", "value": photo_ids}]),
+    )
+
+    state = _stub_extract_masks_heavy_ops(monkeypatch)
+
+    import masking
+
+    monkeypatch.setattr(
+        masking, "render_proxy", lambda p, longest_edge=None: None,
+    )
+    state["proxy_calls"] = 0
+    # The healthy folder is readable — that file is simply broken. Only the
+    # share is offline.
+    monkeypatch.setattr(
+        pj, "_source_offline_reason",
+        lambda folder_path, image_path: (
+            ("mount", "volume /Volumes/Photography is not mounted")
+            if image_path.startswith(share_path) else None
+        ),
+    )
+
+    _runner, result = _run_extract_masks_only(db_path, ws_id, collection_id)
+
+    em = result["stages"]["extract_masks"]
+    assert em.get("unreadable") == 2, f"Both photos are unreadable; got {em!r}"
+
+    outage_errors = [
+        e for e in result["errors"] if "/Volumes/Photography" in e
+    ]
+    assert outage_errors, f"Expected an outage rollup; got {result['errors']!r}"
+    assert "1 of 2 photos unreachable" in outage_errors[0], (
+        f"Only the photo on the dead volume is attributable to the outage; "
+        f"got {outage_errors[0]!r}"
+    )
+    # The corrupt file still has to be reported — just not as an outage.
+    assert any(
+        "could not be read" in e and "/Volumes/Photography" not in e
+        for e in result["errors"]
+    ), (
+        f"The corrupt file needs its own rollup; got {result['errors']!r}"
+    )

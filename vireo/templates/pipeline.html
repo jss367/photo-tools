@@ -2878,7 +2878,16 @@ function _onPipelineComplete(result) {
     r.errors.forEach(function(err) {
       var match = err.match(/^\[(\w+)\]/);
       var stage = match ? match[1] : 'unknown';
-      errorStages[stage] = err;
+      // One stage can report several errors. Keep the actionable one rather
+      // than whichever was appended last: a generic "1 of 2 photos failed"
+      // line would otherwise bury the "reconnect this volume" instruction
+      // that tells the user what to do (Codex #1392 P2). Mirrors the
+      // backend's own headline pick, which prefers "[stage] Fatal:".
+      var existing = errorStages[stage];
+      var isFatal = err.indexOf('] Fatal:') >= 0;
+      if (existing === undefined || (isFatal && existing.indexOf('] Fatal:') < 0)) {
+        errorStages[stage] = err;
+      }
     });
     var firstFailedCard = null;
     for (var stage in errorStages) {

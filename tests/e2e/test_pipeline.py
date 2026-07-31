@@ -706,3 +706,35 @@ def test_pipeline_extract_card_not_green_for_zero_mask_reasons(
     """)
     expect(page.locator("#numExtract")).not_to_have_class(re.compile("complete"))
     expect(page.locator("#statusExtract")).not_to_contain_text("Done!")
+
+
+def test_pipeline_card_shows_actionable_error_not_the_last_one(
+    live_server, page,
+):
+    """When a stage reports several errors, the card must keep the actionable
+    `Fatal:` one rather than whichever happened to be appended last.
+
+    The errors loop keyed by stage with last-value-wins, so a generic
+    "failed mask extraction" line appended after a source-outage Fatal buried
+    the reconnect instruction — the only message that tells the user what to
+    actually do (Codex #1392 P2).
+    """
+    url = live_server["url"]
+    page.goto(f"{url}/pipeline")
+    page.evaluate("""
+        _onPipelineComplete({
+          status: 'failed',
+          result: {
+            stages: {extract_masks: {
+              masked: 0, skipped: 0, failed: 1, unreadable: 1, total: 2,
+            }},
+            errors: [
+              '[extract_masks] Fatal: 1 of 2 photos unreachable — volume ' +
+              '/Volumes/Photography is not mounted. Reconnect the source ' +
+              'and run Process again.',
+              '[extract_masks] 1 of 2 photos failed mask extraction',
+            ],
+          },
+        });
+    """)
+    expect(page.locator("#statusExtract")).to_contain_text("Reconnect the source")

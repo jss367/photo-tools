@@ -280,6 +280,36 @@ def _source_offline_reason(
     return "folder", f"folder {folder_path} is unreadable"
 
 
+def _extract_masks_early_exit(
+    reason_key: str, subthreshold: int, preflight_unreadable: int,
+    offline_latched: bool,
+) -> tuple[str, dict]:
+    """Stage status + result payload for an ``extract_masks`` early return.
+
+    The stage bails out early when nothing in the worklist carries a
+    qualifying detection. That is normally a benign ``skipped``, but the
+    pre-flight source-offline branch may already have latched a ``failed``
+    status and appended a Fatal error. Overwriting it with ``skipped`` lets
+    the end-of-run rollup — which reads only stage statuses — finish the job
+    green while the dropped photos stay unmasked and get hard-rejected in
+    Process Review as ``no_subject_mask`` (Codex #1392 P1).
+
+    The total counts the pre-flight-dropped photos for the same reason the
+    finalizer does: reporting ``unreadable`` against a hard-coded zero total
+    publishes an impossible tally.
+    """
+    return (
+        "failed" if offline_latched else "skipped",
+        {
+            "masked": 0, "skipped": 0, "failed": 0,
+            "total": preflight_unreadable,
+            "unreadable": preflight_unreadable,
+            "subthreshold": subthreshold,
+            "reason": reason_key,
+        },
+    )
+
+
 def _still_offline_folder_ids_of(thread_db, folder_ids) -> set:
     """Return the folder IDs whose stored ``folders.path`` is unreachable.
 
@@ -5797,7 +5827,12 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                 # attempt is an instant EIO, so re-probing hundreds of
                 # photos only slows the give-up down.
                 em_offline_folder_ids: set = set()
-                em_offline_reason = None
+                # Unreadable photos attributable to a latched source outage,
+                # tracked apart from the total so the reconnect message can't
+                # claim credit for a corrupt file in a healthy folder — or for
+                # photos behind a *different* dead source (Codex #1392 P2).
+                em_offline_unreadable = 0
+                em_offline_reasons: list = []
                 start_time = time.time()
 
                 # If the input collection has photos but none carry detections,
@@ -5855,23 +5890,22 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
 
                     log.warning("Pipeline extract-masks: %s", reason)
                     errors.append(f"[extract_masks] {reason}")
-                    stages["extract_masks"]["status"] = "skipped"
-                    runner.update_step(
-                        job["id"], "extract_masks", status="completed",
-                        summary=summary,
-                    )
                     if photos_subthreshold_only > 0:
                         em_reason = "all_subthreshold"
                     elif weights_present:
                         em_reason = "no_detections"
                     else:
                         em_reason = "weights_missing"
-                    result["stages"]["extract_masks"] = {
-                        "masked": 0, "skipped": 0, "failed": 0, "total": 0,
-                        "unreadable": em_preflight_unreadable,
-                        "subthreshold": photos_subthreshold_only,
-                        "reason": em_reason,
-                    }
+                    exit_status, exit_payload = _extract_masks_early_exit(
+                        em_reason, photos_subthreshold_only,
+                        em_preflight_unreadable, em_offline_latched,
+                    )
+                    stages["extract_masks"]["status"] = exit_status
+                    runner.update_step(
+                        job["id"], "extract_masks", status=exit_status,
+                        summary=summary,
+                    )
+                    result["stages"]["extract_masks"] = exit_payload
                     _update_stages(runner, job["id"], stages)
                     return
 
@@ -5897,17 +5931,16 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                     )
                     log.warning("Pipeline extract-masks: %s", reason)
                     errors.append(f"[extract_masks] {reason}")
-                    stages["extract_masks"]["status"] = "skipped"
+                    exit_status, exit_payload = _extract_masks_early_exit(
+                        "all_subthreshold", photos_subthreshold_only,
+                        em_preflight_unreadable, em_offline_latched,
+                    )
+                    stages["extract_masks"]["status"] = exit_status
                     runner.update_step(
-                        job["id"], "extract_masks", status="completed",
+                        job["id"], "extract_masks", status=exit_status,
                         summary=summary,
                     )
-                    result["stages"]["extract_masks"] = {
-                        "masked": 0, "skipped": 0, "failed": 0, "total": 0,
-                        "unreadable": em_preflight_unreadable,
-                        "subthreshold": photos_subthreshold_only,
-                        "reason": "all_subthreshold",
-                    }
+                    result["stages"]["extract_masks"] = exit_payload
                     _update_stages(runner, job["id"], stages)
                     return
 
@@ -6051,6 +6084,7 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                             # walks the rest of the worklist.
                             if photo["folder_id"] in em_offline_folder_ids:
                                 em_unreadable += 1
+                                em_offline_unreadable += 1
                                 processed = i + 1
                                 stages["extract_masks"]["count"] = processed
                                 runner.update_step(
@@ -6080,8 +6114,9 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                                 )
                                 if offline is not None:
                                     _scope, reason = offline
-                                    if em_offline_reason is None:
-                                        em_offline_reason = reason
+                                    em_offline_unreadable += 1
+                                    if reason not in em_offline_reasons:
+                                        em_offline_reasons.append(reason)
                                     # Latch the folder, not the run. A
                                     # mount-scoped outage proves the photos
                                     # on that volume are gone, but a
@@ -6250,26 +6285,29 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                         else "completed"
                     )
                     stages["extract_masks"]["status"] = final_status
-                    # Unreadable sources lead the rollup when both kinds of
-                    # trouble happened: "we couldn't open your files" is the
-                    # actionable headline, and its Fatal prefix keeps the
-                    # end-of-run summary from picking a lesser warning.
+                    # Source outages lead the rollup: "reconnect this volume"
+                    # is the actionable headline, and its Fatal prefix keeps
+                    # the end-of-run summary from picking a lesser warning.
+                    # Each cause reports only the photos it actually explains
+                    # — a corrupt file in a healthy folder is not recovered by
+                    # reconnecting a drive.
+                    em_other_unreadable = em_unreadable - em_offline_unreadable
                     em_rollups = []
-                    if em_offline_reason:
+                    if em_offline_unreadable > 0:
                         em_rollups.append(
-                            f"[extract_masks] Fatal: {em_unreadable} of "
-                            f"{em_total_candidates} photos unreachable — "
-                            f"{em_offline_reason}. Reconnect the source and "
-                            f"run Process again; until then these photos "
-                            f"have no mask and Process Review rejects them "
-                            f"as `no_subject_mask`."
+                            f"[extract_masks] Fatal: {em_offline_unreadable} "
+                            f"of {em_total_candidates} photos unreachable — "
+                            f"{'; '.join(em_offline_reasons)}. Reconnect the "
+                            f"source and run Process again; until then these "
+                            f"photos have no mask and Process Review rejects "
+                            f"them as `no_subject_mask`."
                         )
-                    elif em_unreadable > 0:
+                    if em_other_unreadable > 0:
                         em_rollups.append(
-                            f"[extract_masks] {em_unreadable} of {em_total_candidates} "
-                            f"photos could not be read, so they have no mask "
-                            f"and Process Review rejects them as "
-                            f"`no_subject_mask`."
+                            f"[extract_masks] {em_other_unreadable} of "
+                            f"{em_total_candidates} photos could not be read, "
+                            f"so they have no mask and Process Review rejects "
+                            f"them as `no_subject_mask`."
                         )
                     if em_failed > 0:
                         em_rollups.append(

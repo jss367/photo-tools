@@ -3,6 +3,7 @@ import gc
 import gzip
 import json
 import os
+import stat
 import sys
 import tempfile
 import weakref
@@ -2734,3 +2735,47 @@ def test_clear_taxonomy_cache_also_clears_failure_records(tmp_path, monkeypatch)
     tax_mod.clear_taxonomy_cache()
     with tax_mod._taxonomy_cache_lock:
         assert tax_mod._taxonomy_failed_stats == {}
+
+
+def test_exhausted_retries_chain_the_last_parse_error(tmp_path, monkeypatch):
+    """"File kept changing" alone doesn't say which byte was malformed."""
+    import taxonomy as tax_mod
+
+    tax_mod.clear_taxonomy_cache()
+    persistent = tmp_path / "persistent.json"
+    _write_taxonomy_json(persistent, "test species")
+    monkeypatch.setattr(tax_mod, "TAXONOMY_JSON_PATH", str(persistent))
+
+    counter = {"n": 0}
+
+    def always_racing_and_raising(self, path):
+        counter["n"] += 1
+        os.utime(persistent, (counter["n"] + 6e9, counter["n"] + 6e9))
+        raise ValueError(f"malformed at byte {counter['n']}")
+
+    monkeypatch.setattr(tax_mod.Taxonomy, "__init__", always_racing_and_raising)
+
+    with pytest.raises(ValueError, match="kept changing") as excinfo:
+        tax_mod._load_taxonomy_cached(str(persistent))
+
+    assert isinstance(excinfo.value.__cause__, ValueError)
+    assert "malformed at byte" in str(excinfo.value.__cause__)
+
+
+def test_taxonomy_save_preserves_target_permissions(tmp_path, monkeypatch):
+    """Renaming a fresh temp file must not reset the taxonomy's mode."""
+    import taxonomy as tax_mod
+
+    tax_mod.clear_taxonomy_cache()
+    persistent = tmp_path / "persistent.json"
+    _write_taxonomy_json(persistent, "test species")
+    os.chmod(persistent, 0o640)
+    monkeypatch.setattr(tax_mod, "TAXONOMY_JSON_PATH", str(persistent))
+
+    tax = tax_mod.load_local_taxonomy()
+    tax._api_misses.add("nothing here")
+    tax._dirty = True
+    tax.save()
+
+    assert stat.S_IMODE(os.stat(persistent).st_mode) == 0o640
+    assert json.loads(persistent.read_text())["api_misses"] == ["nothing here"]

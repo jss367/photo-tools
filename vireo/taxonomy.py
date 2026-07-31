@@ -24,6 +24,7 @@ import os
 import re
 import socket
 import ssl
+import stat as stat_module
 import threading
 import time
 import unicodedata
@@ -548,6 +549,7 @@ def _load_taxonomy_cached(path):
         # to get a stable read; if the file keeps changing, return the
         # latest parse but skip the cache so the next call re-checks.
         taxonomy = None
+        last_error = None
         for _ in range(_TAXONOMY_PARSE_RETRY_LIMIT):
             # Same peak-RSS reason: release the previous retry's
             # instance before Taxonomy(path) builds the next one, so a
@@ -556,7 +558,8 @@ def _load_taxonomy_cached(path):
             pre_stat = _taxonomy_stat_key(path)
             try:
                 taxonomy = Taxonomy(path)
-            except (ValueError, OSError):
+            except (ValueError, OSError) as parse_error:
+                last_error = parse_error
                 # A rewrite caught mid-stream — from an atomic-save gap
                 # on another platform, an interrupted download, or an
                 # external tool — leaves a partial JSON document that
@@ -598,9 +601,12 @@ def _load_taxonomy_cached(path):
         # raised, surface a clean error rather than returning None and
         # letting the caller misread it as "file was fine but empty".
         if taxonomy is None:
+            # Chain the last parse failure: load_local_taxonomy() logs this,
+            # and "file kept changing" alone doesn't tell you which byte of
+            # which file was malformed.
             raise ValueError(
                 f"Unable to parse {path}: file kept changing during read"
-            )
+            ) from last_error
         return taxonomy
 
 
@@ -842,6 +848,17 @@ class Taxonomy:
         try:
             with open(tmp_path, "w") as f:
                 json.dump(data, f)
+                # Closing only hands the bytes to the page cache. Without
+                # fsync, a crash just after the rename can expose the target
+                # with unflushed content — the half-written taxonomy this
+                # whole dance exists to prevent.
+                f.flush()
+                os.fsync(f.fileno())
+            # A fresh temp file gets umask permissions; open(path, "w") kept
+            # the target's mode. Carry it over so saving cannot silently
+            # loosen or tighten access to the taxonomy.
+            with contextlib.suppress(OSError):
+                os.chmod(tmp_path, stat_module.S_IMODE(os.stat(target).st_mode))
             os.replace(tmp_path, target)
         except BaseException:
             with contextlib.suppress(OSError):

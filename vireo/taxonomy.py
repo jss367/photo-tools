@@ -707,6 +707,20 @@ def _load_taxonomy_cached(path):
         return taxonomy
 
 
+def _drop_cached_taxonomy_path(path):
+    """Release the cached parse for ``path`` (and its failure memo, if any).
+
+    Used when the file has gone away: the entry can never be served again,
+    and a full taxonomy is ~2.8GB of otherwise unreachable memory.
+    """
+    global _taxonomy_cache
+    with _taxonomy_cache_lock:
+        _taxonomy_failed_stats.pop(path, None)
+        cached = _taxonomy_cache
+        if cached is not None and cached[0] == path:
+            _taxonomy_cache = None
+
+
 def _restamp_taxonomy_cache(taxonomy):
     """Refresh the cache key after ``taxonomy`` rewrote its own file."""
     global _taxonomy_cache
@@ -744,6 +758,14 @@ def load_local_taxonomy(path=None):
     candidates = [path] if path else [TAXONOMY_JSON_PATH, LEGACY_TAXONOMY_JSON_PATH]
     for path in candidates:
         if not os.path.exists(path):
+            # The file backing a cached parse is gone, so that ~2.8GB object
+            # can never be served again. Release it here: _load_taxonomy_cached
+            # deliberately keeps cross-path entries (a live fallback is not
+            # stale), so a rollback to the legacy file would otherwise hold the
+            # deleted file's parse alive while allocating the legacy one — and
+            # with no fallback at all it would stay resident for the life of
+            # the process.
+            _drop_cached_taxonomy_path(path)
             continue
         try:
             return _load_taxonomy_cached(path)

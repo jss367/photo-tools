@@ -3307,3 +3307,65 @@ def test_download_taxonomy_evicts_cache_before_rebuilding(tmp_path, monkeypatch)
         "cache must be evicted BEFORE download_taxonomy() begins building "
         "its ~2.8GB replacement, otherwise both are live at once"
     )
+
+
+def test_deleted_preferred_file_releases_its_cached_parse(tmp_path, monkeypatch):
+    """A cached parse whose file is gone must not stay resident.
+
+    _load_taxonomy_cached keeps cross-path entries on purpose — a live
+    fallback is not stale — so nothing else would drop this one. A full
+    taxonomy is ~2.8GB, and rolling back to the legacy file would otherwise
+    hold the deleted file's parse alive while allocating the legacy one.
+    """
+    import taxonomy as tax_mod
+
+    tax_mod.clear_taxonomy_cache()
+    preferred = tmp_path / "persistent.json"
+    _write_taxonomy_json(preferred, "preferred species")
+    legacy = tmp_path / "taxonomy.json"
+    _write_taxonomy_json(legacy, "legacy species")
+    monkeypatch.setattr(tax_mod, "TAXONOMY_JSON_PATH", str(preferred))
+    monkeypatch.setattr(tax_mod, "LEGACY_TAXONOMY_JSON_PATH", str(legacy))
+
+    first = tax_mod.load_local_taxonomy()
+    assert first.is_taxon("preferred species")
+
+    cache_during_legacy_parse = []
+    real_init = tax_mod.Taxonomy.__init__
+
+    def observing_init(self, path):
+        if path == str(legacy):
+            cache_during_legacy_parse.append(tax_mod._taxonomy_cache)
+        real_init(self, path)
+
+    monkeypatch.setattr(tax_mod.Taxonomy, "__init__", observing_init)
+
+    preferred.unlink()
+    second = tax_mod.load_local_taxonomy()
+
+    assert second.is_taxon("legacy species")
+    assert cache_during_legacy_parse == [None], (
+        "the deleted file's parse must be released before the fallback loads"
+    )
+
+
+def test_deleted_taxonomy_with_no_fallback_releases_the_cache(tmp_path, monkeypatch):
+    """With nothing to fall back to, the dead entry still has to go."""
+    import taxonomy as tax_mod
+
+    tax_mod.clear_taxonomy_cache()
+    preferred = tmp_path / "persistent.json"
+    _write_taxonomy_json(preferred, "preferred species")
+    monkeypatch.setattr(tax_mod, "TAXONOMY_JSON_PATH", str(preferred))
+
+    assert tax_mod.load_local_taxonomy().is_taxon("preferred species")
+    with tax_mod._taxonomy_cache_lock:
+        assert tax_mod._taxonomy_cache is not None
+
+    preferred.unlink()
+
+    assert tax_mod.load_local_taxonomy() is None
+    with tax_mod._taxonomy_cache_lock:
+        assert tax_mod._taxonomy_cache is None, (
+            "an unservable taxonomy must not stay resident for the process"
+        )

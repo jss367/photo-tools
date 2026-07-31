@@ -27580,12 +27580,16 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     masked += 1
 
                 except Exception:
+                    # Log per-photo detail (with traceback) instead of appending
+                    # a per-photo entry to ``job["errors"]``. The aggregate we
+                    # return below is what _run_job then folds into
+                    # ``job["errors"]`` — a per-photo append on top of that
+                    # persists ``error_count`` = N+1 for N real failures
+                    # (Codex #1392 P2 r3688624550). Mirrors the pipeline
+                    # stage's own pattern in extract_masks_stage.
                     failed += 1
                     log.warning(
                         "Mask extraction failed for photo %s", photo_id, exc_info=True
-                    )
-                    job["errors"].append(
-                        f"Photo {photo_id}: mask extraction failed"
                     )
 
                 runner.push_event(

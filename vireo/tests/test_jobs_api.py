@@ -7983,3 +7983,77 @@ def test_extract_masks_route_reports_unreadable_sources(
     assert any("could not be read" in e for e in (result.get("errors") or [])), (
         f"The job needs an actionable error, not just a counter; got {result!r}"
     )
+
+
+def test_extract_masks_route_does_not_double_count_per_photo_failures(
+    app_and_db, tmp_path, monkeypatch,
+):
+    """A run with N failing photos must be reported with error_count == N,
+    not N+1.
+
+    ``/api/jobs/extract-masks`` used to append one ``Photo <id>: mask
+    extraction failed`` entry to ``job["errors"]`` for every raised photo
+    *and* return an aggregate ``N of Y photos failed mask extraction`` in
+    ``result["errors"]``. ``JobRunner._run_job`` then folds ``result.errors``
+    back into the same ``job["errors"]`` list, so the persisted / emitted
+    ``error_count`` came out one higher than the true failure count and any
+    dashboard reading it overstated the damage (Codex #1392 P2 r3688624550).
+    """
+    import config as cfg
+    cfg.save({
+        "pipeline": {
+            "sam2_variant": "sam2-small",
+            "dinov2_variant": "vit-b14",
+        },
+    })
+
+    app, db = app_and_db
+    pid = _seed_photo_with_detection(
+        db, tmp_path, "boom.jpg", (10, 20, 100, 200), "MegaDetector",
+    )
+
+    calls = []
+    _patch_extract_masks_deps(monkeypatch, calls)
+
+    # Force generate_mask to raise so the photo lands in the ``failed``
+    # bucket (distinct from ``unreadable`` / ``skipped``).
+    import masking
+
+    def boom(proxy, det_box, variant=None):
+        raise RuntimeError("simulated SAM crash")
+
+    monkeypatch.setattr(masking, "generate_mask", boom)
+
+    col_id = db.add_collection(
+        "double-count-test",
+        json.dumps([{"field": "photo_ids", "value": [pid]}]),
+    )
+
+    client = app.test_client()
+    resp = client.post(
+        "/api/jobs/extract-masks", json={"collection_id": col_id},
+    )
+    assert resp.status_code == 200
+    data = wait_for_job_via_client(client, resp.get_json()["job_id"])
+
+    result = data.get("result") or {}
+    assert result.get("failed") == 1, (
+        f"expected one failed photo in the result; got {result!r}"
+    )
+    assert data["status"] == "failed", (
+        f"a job that left photos unmasked must not report success; got "
+        f"{data['status']!r}"
+    )
+
+    # The card can still render an actionable headline off ``result.errors``…
+    assert any(
+        "failed mask extraction" in e for e in (result.get("errors") or [])
+    ), f"card needs an aggregate error; got {result!r}"
+
+    # …but the persisted / emitted job error list must count one failure per
+    # actually-failed photo, not that plus the aggregate.
+    job_errors = data.get("errors") or []
+    assert len(job_errors) == 1, (
+        f"error_count must equal the number of real failures (1), not N+1; "
+        f"got errors={job_errors!r}"
+    )

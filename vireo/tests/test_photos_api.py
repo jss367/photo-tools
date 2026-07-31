@@ -200,21 +200,13 @@ def test_dashboard_and_browse_share_collection_date_scope(app_and_db):
 def test_browse_init_captures_missing_baseline_before_folder_tree(
     app_and_db, monkeypatch,
 ):
-    """/api/browse/init must snapshot missing-folder IDs BEFORE reading the
-    folder tree.
+    """/api/browse/init must establish its read snapshot from missing-folder
+    IDs before reading the folder tree.
 
-    Each SELECT here reads its own committed snapshot (no explicit read
-    transaction), so a ``_folder_health_loop`` commit landing between the
-    two used to produce a split-snapshot response: folders reflected the
-    pre-flip state while ``missing_folder_ids`` reflected the post-flip
-    state. The client seeded ``_missingFoldersLastIds`` from that fresher
-    baseline, so subsequent /api/folders/missing polls saw no diff and
-    never dispatched ``vireo:folder-health-changed`` — Browse stayed
-    stuck on the pre-flip folders and grid until another transition or a
-    reload (Codex review r3686317681). Taking the baseline first guarantees
-    it is at least as OLD as the folder data: any lingering inconsistency
-    now points the "wrong" way, so the very next poll finds a diff and
-    drives a refresh.
+    The endpoint now wraps every first-paint read in one transaction, so the
+    ordering establishes the shared snapshot rather than merely narrowing
+    the direction of a possible inconsistency (Codex reviews r3686317681 and
+    r3687501744).
     """
     from db import Database
 
@@ -243,8 +235,8 @@ def test_browse_init_captures_missing_baseline_before_folder_tree(
         f"expected both reads to run, got {call_order}"
     )
     assert call_order.index("missing") < call_order.index("tree"), (
-        "get_missing_folders must run before get_folder_tree so the client's "
-        f"baseline is never fresher than the folder data; call order was {call_order}"
+        "get_missing_folders must establish the transaction snapshot before "
+        f"get_folder_tree; call order was {call_order}"
     )
 
 

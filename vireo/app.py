@@ -4760,6 +4760,14 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         folder_id = request.args.get("folder_id", None, type=int)
         collection_id = request.args.get("collection_id", None, type=int)
 
+        # Keep the combined first-paint payload on one SQLite read snapshot.
+        # Independent SELECT snapshots can straddle a background folder-health
+        # commit and combine pre-transition photos/missing IDs with a
+        # post-transition folder tree. Since the navbar poll may already have
+        # completed, there is no guaranteed immediate observation to repair
+        # that split response.
+        db.conn.execute("BEGIN")
+
         # ``db.get_photos(collection_id=...)`` / ``count_filtered_photos`` both
         # expand only ``collections.rules`` — the same rules-only path guarded
         # elsewhere by ``_reject_visual_collection``. A visual-only collection
@@ -4791,20 +4799,13 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         # never dispatch, leaving Browse stuck showing the pre-flip state
         # (Codex review r3686191141).
         #
-        # Take this snapshot BEFORE the photo / folder / keyword / collection
-        # reads. Each SELECT reads its own committed snapshot (no explicit
-        # transaction here), so ``_folder_health_loop`` committing between
-        # the folder read and the missing-folder read used to produce a
-        # split-snapshot response: folders reflected the pre-flip state
-        # while ``missing_folder_ids`` reflected the post-flip state. When
-        # the client seeded ``_missingFoldersLastIds`` from that fresher
-        # baseline, the subsequent /api/folders/missing polls saw no diff
-        # and never dispatched vireo:folder-health-changed, so Browse's
-        # sidebar/grid stayed stuck showing the pre-flip folders until
-        # another health transition or a reload (Codex review r3686317681).
-        # Taking the baseline first guarantees it is at least as OLD as the
-        # folder data — any inconsistency now points the "wrong" way, so
-        # the very next poll finds a diff and drives a refresh.
+        # This is the first read in the explicit transaction above, so every
+        # photo / folder / keyword / collection read below shares the same
+        # health snapshot. Ordering alone is insufficient: if the background
+        # health loop commits after this query but before get_folder_tree(),
+        # and the navbar's initial poll already finished, no immediate poll
+        # remains to repair the mixed response (Codex reviews r3686317681 and
+        # r3687501744).
         missing_folder_ids = [f["id"] for f in db.get_missing_folders()]
 
         # First paint is scope-only (folder / collection / sort); metadata
@@ -4824,6 +4825,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     sort=sort,
                 )
             except ValueError as exc:
+                db.conn.rollback()
                 return json_error(str(exc), 400)
             if not any([folder_id, collection_id]):
                 total = db.count_photos()
@@ -4834,6 +4836,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                         collection_id=collection_id,
                     )
                 except ValueError as exc:
+                    db.conn.rollback()
                     return json_error(str(exc), 400)
         folders = db.get_folder_tree()
         keywords = db.get_keyword_tree()
@@ -4883,7 +4886,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 )
             collection_dicts.append(d)
 
-        return jsonify(
+        response = jsonify(
             {
                 "photos": photo_dicts,
                 "total": total,
@@ -4895,6 +4898,11 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 "missing_folder_ids": missing_folder_ids,
             }
         )
+        # End the read transaction after every value in the response has been
+        # materialized. rollback() is intentional: this endpoint is read-only
+        # and it releases the snapshot without implying a write commit.
+        db.conn.rollback()
+        return response
 
     @app.route("/api/pipeline/slots")
     def api_pipeline_slots():

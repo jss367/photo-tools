@@ -11302,6 +11302,7 @@ function _scheduleMissingFoldersRecovery() {
 async function checkMissingFolders() {
   const myGen = ++_missingFoldersObservationGen;
   const mutationEpochAtStart = _missingFoldersMutationEpoch;
+  const snapshotVersionAtStart = _missingFoldersSnapshotVersion;
   try {
     const resp = await fetch('/api/folders/missing');
     if (!resp.ok) return;
@@ -11323,6 +11324,11 @@ async function checkMissingFolders() {
     // — see r3686095481 for why it can't safely delegate back here.
     if (_missingFoldersMutationInFlight > 0 ||
         mutationEpochAtStart !== _missingFoldersMutationEpoch) return;
+    // /api/browse/init can install a newer workspace snapshot while this
+    // GET is in flight even when no newer GET/POST exists. Do not let the
+    // pre-init poll overwrite that baseline, repaint the banner backwards,
+    // or dispatch a reverse health transition.
+    if (snapshotVersionAtStart !== _missingFoldersSnapshotVersion) return;
     const currentIds = folders.map(f => f.id).sort((a, b) => a - b);
     const dispatched = _dispatchFolderHealthChangeFromIds(
       _missingFoldersLastIds, currentIds, 'poll');

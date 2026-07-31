@@ -1,6 +1,56 @@
 import json
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from urllib.request import urlopen
 
 from playwright.sync_api import expect
+
+
+def test_browse_init_reads_folder_health_from_single_snapshot(
+    live_server, monkeypatch
+):
+    """Every health-sensitive init read must share one SQLite snapshot."""
+    from db import Database
+
+    reached_photo_query = threading.Event()
+    release_photo_query = threading.Event()
+    original_get_photos = Database.get_photos
+
+    def _hold_after_photos_read(self, *args, **kwargs):
+        rows = original_get_photos(self, *args, **kwargs)
+        reached_photo_query.set()
+        assert release_photo_query.wait(timeout=5)
+        return rows
+
+    monkeypatch.setattr(Database, "get_photos", _hold_after_photos_read)
+
+    def _request_init():
+        with urlopen(
+            f"{live_server['url']}/api/browse/init?per_page=50", timeout=10
+        ) as response:
+            return json.loads(response.read())
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(_request_init)
+        assert reached_photo_query.wait(timeout=5), "init never read its photo page"
+
+        # Commit a health transition after the missing-id/photo reads but
+        # before the endpoint continues to get_folder_tree(). Without the
+        # explicit read transaction the response mixes five old-snapshot
+        # photos and [] missing IDs with a post-transition one-folder tree.
+        missing_id = live_server["data"]["folders"][0]
+        live_server["db"].conn.execute(
+            "UPDATE folders SET status = 'missing' WHERE id = ?", (missing_id,)
+        )
+        live_server["db"].conn.commit()
+        release_photo_query.set()
+        payload = future.result(timeout=10)
+
+    assert payload["missing_folder_ids"] == []
+    assert len(payload["photos"]) == 5
+    assert {row["id"] for row in payload["folders"]} == set(
+        live_server["data"]["folders"]
+    )
 
 
 def test_folder_health_refresh_preserves_active_collection(live_server, page, tmp_path):
@@ -599,6 +649,76 @@ def test_bootstrap_adopts_init_when_poll_baseline_is_known_older(
         "(el) => getComputedStyle(el).display"
     ) == "none"
     expect(page.locator(".grid-card")).to_have_count(5)
+
+
+def test_bootstrap_snapshot_invalidates_older_inflight_poll(
+    live_server, page, tmp_path
+):
+    """A poll response read before init must not overwrite init's baseline."""
+    db = live_server["db"]
+    park = tmp_path / "park"
+    yard = tmp_path / "yard"
+    park.mkdir()
+    yard.mkdir()
+    folder_ids = live_server["data"]["folders"]
+    db.conn.executemany(
+        "UPDATE folders SET path = ?, status = 'ok' WHERE id = ?",
+        [(str(park), folder_ids[0]), (str(yard), folder_ids[1])],
+    )
+    db.conn.commit()
+
+    # Hold config so the navbar poll can read the old [] state before init
+    # starts. route.fetch() captures that response now; delaying fulfill
+    # simulates a slow delivery after the newer init snapshot is applied.
+    held_cfg = []
+    held_missing = []
+
+    def _hold_all_cfg(route):
+        held_cfg.append(route)
+
+    def _capture_then_hold_missing(route):
+        held_missing.append((route, route.fetch()))
+
+    page.route("**/api/config", _hold_all_cfg)
+    page.route("**/api/folders/missing", _capture_then_hold_missing)
+    page.goto(f"{live_server['url']}/browse")
+    for _ in range(50):
+        if held_cfg and held_missing:
+            break
+        page.wait_for_timeout(100)
+    assert held_cfg, "/api/config was never requested"
+    assert held_missing, "/api/folders/missing was never requested"
+
+    # Init begins after the transition and installs [park] as the newer
+    # baseline while the old poll response remains undelivered.
+    db.conn.execute(
+        "UPDATE folders SET status = 'missing' WHERE id = ?", (folder_ids[0],)
+    )
+    db.conn.commit()
+    for route in held_cfg:
+        route.continue_()
+    page.unroute("**/api/config", _hold_all_cfg)
+    page.wait_for_function(
+        f"browseDatasetReady && _missingFoldersLastIds.length === 1 && "
+        f"_missingFoldersLastIds[0] === {folder_ids[0]}",
+        timeout=10000,
+    )
+    expect(page.locator(".grid-card")).to_have_count(2)
+
+    page.evaluate(
+        "window._folderHealthEvents = [];"
+        "document.addEventListener('vireo:folder-health-changed', "
+        "function(e) { window._folderHealthEvents.push(e.detail.source); });"
+    )
+    held_missing[0][0].fulfill(response=held_missing[0][1])
+    page.wait_for_timeout(300)
+
+    assert page.evaluate("_missingFoldersLastIds") == [folder_ids[0]]
+    assert page.evaluate("window._folderHealthEvents") == []
+    assert page.locator("#missingFoldersBanner").evaluate(
+        "(el) => getComputedStyle(el).display"
+    ) == "flex"
+    expect(page.locator(".grid-card")).to_have_count(2)
 
 
 def test_bootstrap_defers_lock_release_when_init_rejects(

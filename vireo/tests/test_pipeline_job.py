@@ -17141,7 +17141,7 @@ def test_extract_masks_early_exit_preserves_latched_offline_failure():
 
     status, step_status, payload = _extract_masks_early_exit(
         "no_detections", subthreshold=0, preflight_unreadable=311,
-        offline_latched=True,
+        preflight_masked=4, offline_latched=True,
     )
     assert step_status == "failed", (
         f"An outage exit is a terminal failure on the job tree; got "
@@ -17154,7 +17154,10 @@ def test_extract_masks_early_exit_preserves_latched_offline_failure():
     # Reporting 311 unreadable against a hard-coded zero total publishes an
     # impossible tally to anything computing coverage.
     assert payload["unreadable"] == 311
-    assert payload["total"] == 311
+    # Cache hits the pre-flight dropped are still successful outcomes and
+    # still part of the stage's coverage.
+    assert payload["masked"] == 4
+    assert payload["total"] == 315
     assert payload["reason"] == "no_detections"
 
 
@@ -17163,7 +17166,7 @@ def test_extract_masks_early_exit_is_a_benign_skip_without_an_outage():
 
     status, step_status, payload = _extract_masks_early_exit(
         "weights_missing", subthreshold=4, preflight_unreadable=0,
-        offline_latched=False,
+        preflight_masked=0, offline_latched=False,
     )
     assert status == "skipped", (
         f"No outage means the early exit stays a benign skip; got {status!r}"
@@ -17325,6 +17328,15 @@ def test_extract_masks_preflight_skips_photos_that_already_have_a_mask(
     assert em.get("unreadable") == 1, (
         f"Only the photo without a mask is at risk of a `no_subject_mask` "
         f"rejection; got {em!r}"
+    )
+    # The cached photo is a successful outcome, exactly as it would be on the
+    # online cache-hit path — dropping it from every counter reports
+    # "1 unreadable of 1" for a two-photo collection (Codex #1392 P2).
+    assert em["masked"] == 1, (
+        f"An already-masked photo is a cache hit, not a non-event; got {em!r}"
+    )
+    assert em["total"] == 2, (
+        f"Total must cover both photos; got {em!r}"
     )
 
 

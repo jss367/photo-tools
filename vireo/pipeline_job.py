@@ -314,7 +314,7 @@ def _photos_with_active_mask(
 
 def _extract_masks_early_exit(
     reason_key: str, subthreshold: int, preflight_unreadable: int,
-    offline_latched: bool,
+    preflight_masked: int, offline_latched: bool,
 ) -> tuple[str, str, dict]:
     """Stage status, runner step status, and result payload for an
     ``extract_masks`` early return.
@@ -341,8 +341,8 @@ def _extract_masks_early_exit(
         "failed" if offline_latched else "skipped",
         "failed" if offline_latched else "completed",
         {
-            "masked": 0, "skipped": 0, "failed": 0,
-            "total": preflight_unreadable,
+            "masked": preflight_masked, "skipped": 0, "failed": 0,
+            "total": preflight_unreadable + preflight_masked,
             "unreadable": preflight_unreadable,
             "subthreshold": subthreshold,
             "reason": reason_key,
@@ -5545,6 +5545,12 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
             # unreachable photos — which the Extract card then rendered as
             # "No photos needed masks" (Codex #1392 P2).
             em_preflight_unreadable = 0
+            # Dropped photos that already carried a usable mask. They are a
+            # successful outcome — the online cache-hit path counts exactly
+            # this state as ``masked`` — so they belong in the counters
+            # instead of vanishing from the stage's coverage entirely
+            # (Codex #1392 P2).
+            em_preflight_masked = 0
 
             try:
                 import config as cfg
@@ -5649,10 +5655,12 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                     # the count nor the failure latch below: latching on them
                     # would fail the stage and demand a reconnect that would
                     # change nothing (Codex #1392 P2).
-                    at_risk_dropped_ids = dropped_ids - _photos_with_active_mask(
+                    already_masked_ids = _photos_with_active_mask(
                         thread_db, dropped_ids, sam2_variant, dinov2_variant,
                     )
+                    at_risk_dropped_ids = dropped_ids - already_masked_ids
                     em_preflight_unreadable = len(at_risk_dropped_ids)
+                    em_preflight_masked = len(already_masked_ids)
                     # Publish so eye_keypoints (later downstream) sees
                     # the same offline set without having to re-probe
                     # every folder from scratch.
@@ -5955,7 +5963,8 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                     exit_status, exit_step_status, exit_payload = (
                         _extract_masks_early_exit(
                             em_reason, photos_subthreshold_only,
-                            em_preflight_unreadable, em_offline_latched,
+                            em_preflight_unreadable, em_preflight_masked,
+                            em_offline_latched,
                         )
                     )
                     stages["extract_masks"]["status"] = exit_status
@@ -5992,7 +6001,8 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                     exit_status, exit_step_status, exit_payload = (
                         _extract_masks_early_exit(
                             "all_subthreshold", photos_subthreshold_only,
-                            em_preflight_unreadable, em_offline_latched,
+                            em_preflight_unreadable, em_preflight_masked,
+                            em_offline_latched,
                         )
                     )
                     stages["extract_masks"]["status"] = exit_status
@@ -6321,12 +6331,16 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                         error_count=em_failed,
                     )
                     result["stages"]["extract_masks"] = {
-                        "masked": masked, "skipped": skipped, "failed": em_failed,
+                        "masked": masked + em_preflight_masked,
+                        "skipped": skipped, "failed": em_failed,
                         "unreadable": em_unreadable + em_preflight_unreadable,
                         # Preflight-inclusive, matching the normal finalizer:
                         # the loop total alone can't cover photos that never
                         # reached the loop (Codex #1392 P2).
-                        "total": total + em_preflight_unreadable,
+                        "total": (
+                            total + em_preflight_unreadable
+                            + em_preflight_masked
+                        ),
                         "cancelled": True,
                     }
                 else:
@@ -6341,7 +6355,10 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                     # like "3 unreadable of 0" and breaks any consumer deriving
                     # coverage from them (Codex #1392 P2). Progress reporting
                     # keeps using the loop-scoped ``total``.
-                    em_total_candidates = total + em_preflight_unreadable
+                    em_masked_all = masked + em_preflight_masked
+                    em_total_candidates = (
+                        total + em_preflight_unreadable + em_preflight_masked
+                    )
                     final_status = (
                         "failed"
                         if em_failed > 0 or em_unreadable_all > 0
@@ -6380,7 +6397,9 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                         )
                     errors.extend(em_rollups)
                     em_rollup = em_rollups[0] if em_rollups else None
-                    em_summary_parts = [f"{masked} masked", f"{skipped} skipped"]
+                    em_summary_parts = [
+                        f"{em_masked_all} masked", f"{skipped} skipped",
+                    ]
                     if em_unreadable_all:
                         em_summary_parts.append(
                             f"{em_unreadable_all} unreadable",
@@ -6397,7 +6416,8 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                                        error_count=em_failed + em_unreadable_all,
                                        error=em_rollup)
                     result["stages"]["extract_masks"] = {
-                        "masked": masked, "skipped": skipped, "failed": em_failed,
+                        "masked": em_masked_all, "skipped": skipped,
+                        "failed": em_failed,
                         "unreadable": em_unreadable_all,
                         "total": em_total_candidates,
                         "subthreshold": photos_subthreshold_only,

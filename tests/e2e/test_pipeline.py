@@ -763,3 +763,49 @@ def test_extract_masks_clean_rejects_unreadable_and_failed_results(
                   "total": 4}) is False
     assert clean({"masked": 0, "skipped": 0, "unreadable": 0, "failed": 0,
                   "total": 0, "reason": "weights_missing"}) is False
+
+
+def test_extract_step_outcome_surfaces_backend_error_on_failed_job(
+    live_server, page,
+):
+    """A standalone Extract run that fails must still show why.
+
+    Making the endpoint return `ok: false` for unreadable photos flipped the
+    job status to `failed`, which sent the card down a generic "Failed"
+    branch that rendered neither the counts nor the reconnect instruction the
+    backend had just put in `result.errors` (Codex #1392 P2).
+    """
+    url = live_server["url"]
+    page.goto(f"{url}/pipeline")
+    outcome = page.evaluate(
+        "a => _extractStepOutcome(a[0], a[1])",
+        ["failed", {
+            "masked": 3, "skipped": 0, "unreadable": 2, "failed": 0,
+            "total": 5,
+            "errors": [
+                "2 of 5 photos could not be read, so they have no mask. "
+                "Reconnect the source and run Extract again."
+            ],
+        }],
+    )
+    assert outcome["clean"] is False
+    assert "3 masked" in outcome["summary"]
+    assert "2 unreadable" in outcome["summary"], (
+        f"The counts must survive a failed job; got {outcome!r}"
+    )
+    assert "Reconnect the source" in outcome["status"], (
+        f"The actionable backend error must reach the card; got {outcome!r}"
+    )
+
+
+def test_extract_step_outcome_clean_run_still_reads_done(live_server, page):
+    url = live_server["url"]
+    page.goto(f"{url}/pipeline")
+    outcome = page.evaluate(
+        "a => _extractStepOutcome(a[0], a[1])",
+        ["completed", {"masked": 5, "skipped": 0, "unreadable": 0,
+                       "failed": 0, "total": 5}],
+    )
+    assert outcome["clean"] is True
+    assert outcome["status"] == "Done!"
+    assert "5 masked" in outcome["summary"]

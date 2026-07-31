@@ -2732,6 +2732,22 @@ function _extractMasksClean(ext) {
   return !ext.unreadable && !ext.failed && !ext.reason;
 }
 
+// What the standalone Extract card should show for a finished job. The job
+// now reports `failed` when photos went unmasked, and the counts plus the
+// backend's reconnect instruction matter most in exactly that case — so the
+// rendering must not live inside a `completed`-only branch (Codex #1392 P2).
+function _extractStepOutcome(jobStatus, result) {
+  var clean = jobStatus === 'completed' && _extractMasksClean(result);
+  var errs = (result && result.errors) || [];
+  return {
+    clean: clean,
+    summary: _extractMasksSummary(result),
+    status: clean
+      ? 'Done!'
+      : (errs.length ? 'Failed: ' + errs[0] : 'Some photos have no mask'),
+  };
+}
+
 function _onPipelineComplete(result) {
   if (result.status === 'cancelled') {
     var actionStatus = document.getElementById('pipelineActionStatus');
@@ -3922,26 +3938,16 @@ async function runExtractStep(collectionId) {
         },
         onComplete: function(result) {
           window.dispatchEvent(new CustomEvent('vireo-job-done', {detail: {job_id: data.job_id}}));
-          if (result.status === 'completed') {
-            fill.style.width = '100%';
-            if (result.result) {
-              document.getElementById('txtMasks').textContent =
-                _extractMasksSummary(result.result);
-            }
-            // A job that finished without throwing still isn't a clean run
-            // if photos went unmasked — same rule the pipeline card uses.
-            var stepClean = _extractMasksClean(result.result);
-            text.textContent = stepClean ? 'Complete' : 'Finished with problems';
-            status.textContent = stepClean
-              ? 'Done!' : 'Some photos have no mask';
-            status.className = stepClean ? 'status-msg ok' : 'status-msg error';
-            num.className = stepClean ? 'stage-num complete' : 'stage-num';
-            resolve(stepClean);
-          } else {
-            status.textContent = 'Failed';
-            num.className = 'stage-num';
-            resolve(false);
+          var outcome = _extractStepOutcome(result.status, result.result);
+          if (result.result) {
+            document.getElementById('txtMasks').textContent = outcome.summary;
           }
+          fill.style.width = '100%';
+          text.textContent = outcome.clean ? 'Complete' : 'Finished with problems';
+          status.textContent = outcome.status;
+          status.className = outcome.clean ? 'status-msg ok' : 'status-msg error';
+          num.className = outcome.clean ? 'stage-num complete' : 'stage-num';
+          resolve(outcome.clean);
         },
         onError: function() {
           status.textContent = 'Connection lost';

@@ -159,10 +159,56 @@ def _missing_archive_mount_root(path: str) -> str | None:
     persists after unmount (Linux ``/mnt/<name>``) is NOT flagged by
     this helper — see ``_source_offline_reason`` for the mid-run outage
     check that also treats a directory-still-there-but-not-mounted case
-    as offline.
+    as offline, or ``_archive_mount_root_unavailable`` below for the
+    same signal shaped for the import-destination guard.
     """
     for mount_root in _archive_mount_root_candidates(path):
         if not os.path.lexists(mount_root):
+            return mount_root
+    return None
+
+
+def _archive_mount_root_unavailable(path: str) -> str | None:
+    """Return an archive mount root the caller should refuse to write into.
+
+    Superset of :func:`_missing_archive_mount_root` for the import
+    destination guard. Catches three shapes of "the intended archive
+    share isn't reachable" — one that a bare ``lexists`` check can see
+    and two that it can't:
+
+    * The mount-root directory is gone entirely (macOS ejects
+      ``/Volumes/<name>``) — same signal as ``_missing_archive_mount_root``.
+    * The mount-root directory exists but reads raise ``OSError`` (a
+      stale SMB/NFS mount whose server disconnected — ``ismount`` still
+      returns True, but every ``listdir`` / ``stat`` raises EIO).
+    * The mount-root directory exists, reads succeed, and the directory
+      is empty AND is not currently a mount point. That is the specific
+      Codex #1394 P1 (r3687190865) case: on Linux ``/mnt/<name>`` is a
+      persistent directory left behind after unmount, and
+      ``os.makedirs`` would happily create the destination on the
+      internal disk under that stub — files land locally, the run may
+      even report ``safe_to_format=True``, and the real share
+      remounting later either shadows the local copies out of sight or
+      blocks reattachment entirely.
+
+    A readable, populated root is left alone — that preserves the
+    legitimate (unusual) case of running an archive out of a plain
+    local directory that happens to sit under ``/mnt`` or similar, as
+    long as the user's own contents are already there. Refusing an
+    empty non-mount candidate is intentionally conservative: the false
+    positive is "user wants a brand-new empty local archive at a
+    mount-shaped path", which is easy to work around (mount it, or
+    seed it with a real folder); the false negative — silent shadow
+    writes onto the internal disk — is not.
+    """
+    for mount_root in _archive_mount_root_candidates(path):
+        if not os.path.lexists(mount_root):
+            return mount_root
+        try:
+            entries = os.listdir(mount_root)
+        except OSError:
+            return mount_root
+        if not entries and not os.path.ismount(mount_root):
             return mount_root
     return None
 

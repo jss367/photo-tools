@@ -715,7 +715,7 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
     reason ``"enable verify_by_hash for remote verification"`` — the card is
     off-loaded but its landing wasn't independently hash-confirmed.
     """
-    from pipeline_job import _missing_archive_mount_root
+    from pipeline_job import _archive_mount_root_unavailable
     from scanner import scan
 
     rt = params.remote_target
@@ -912,21 +912,24 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
     # subsequent scan reads the fresh local shadow and leaves the import
     # uncataloged/failed; worse, on macOS/Linux that shadow root can also
     # prevent the real share from remounting at the configured path. Fail
-    # the batch's files with a clear reason instead. Reuses the
-    # pipeline path's ``_missing_archive_mount_root`` helper (only fires
-    # for the ``/Volumes/X``, ``/mnt/X``, and ``/media/user/X`` shapes that
-    # denote removable/network mount roots).
+    # the batch's files with a clear reason instead. Uses the pipeline
+    # path's ``_archive_mount_root_unavailable`` helper (only fires for
+    # the ``/Volumes/X``, ``/mnt/X``, and ``/media/user/X`` shapes that
+    # denote removable/network mount roots); it recognises three shapes
+    # of "gone" — root vanished, root exists but reads raise, and Linux
+    # persistent-but-unmounted stub (Codex #1394 P1 r3687190865).
     #
     # Re-probed per batch rather than once up front: a card import runs
     # for hours against a network archive, and the share can drop *during*
     # the run (a Tailscale/SMB archive unmounted two hours into an import
     # on 2026-07-30, after which ``os.makedirs`` walked straight into the
     # vacated mount point). A start-of-job preflight cannot see that. The
-    # probe is a couple of ``os.path.lexists`` calls on the mount root, so
-    # paying it once per destination folder is free next to the copy work.
-    # See PR #1113 review.
+    # probe is a handful of ``os.path.lexists`` / ``os.listdir`` /
+    # ``os.path.ismount`` calls on the mount root, so paying it once per
+    # destination folder is free next to the copy work. See PR #1113
+    # review.
     def _missing_mount_root():
-        return _missing_archive_mount_root(destination)
+        return _archive_mount_root_unavailable(destination)
 
     def _record_checker(source_file, dest_folder=None, file_hash=None):
         """Register a landed/adopted file's identity with the intra-run checker.
@@ -2215,7 +2218,7 @@ def run_import_job(job, runner, db_path, workspace_id, params):
     is committed per batch; cancellation and crashes leave every already-
     verified file cataloged and nothing else.
     """
-    from pipeline_job import _missing_archive_mount_root
+    from pipeline_job import _archive_mount_root_unavailable
     from scanner import scan
 
     db = Database(db_path)
@@ -2569,7 +2572,13 @@ def run_import_job(job, runner, db_path, workspace_id, params):
         # a Tailscale/SMB archive did exactly that on 2026-07-30, and only
         # a root-owned ``/Volumes`` turned the shadow write into a crash
         # instead of silent data misplacement.
-        missing_mount_root = _missing_archive_mount_root(destination)
+        #
+        # ``_archive_mount_root_unavailable`` (superset of the older
+        # ``_missing_archive_mount_root``) additionally catches a Linux
+        # ``/mnt/<name>`` stub that persists after unmount — where
+        # ``lexists`` alone still returns True and would let the shadow
+        # write through (Codex #1394 P1 r3687190865).
+        missing_mount_root = _archive_mount_root_unavailable(destination)
         if missing_mount_root:
             for source_file in batch:
                 # Count these as emitted: ``emitted`` otherwise only

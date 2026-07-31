@@ -6219,7 +6219,7 @@ def test_remote_import_refuses_when_mount_root_absent(tmp_path, monkeypatch):
     }
 
     monkeypatch.setattr(
-        _pj, "_missing_archive_mount_root",
+        _pj, "_archive_mount_root_unavailable",
         lambda path: (
             "/Volumes/NAS"
             if path.startswith(fake_mount_base) else None
@@ -6490,7 +6490,7 @@ def test_local_import_refuses_when_mount_root_absent(tmp_path, monkeypatch):
     # shapes, so stub it to call our tmp destination's root missing —
     # same approach as test_remote_import_refuses_when_mount_root_absent.
     monkeypatch.setattr(
-        _pj, "_missing_archive_mount_root", lambda path: "/Volumes/NAS",
+        _pj, "_archive_mount_root_unavailable", lambda path: "/Volumes/NAS",
     )
 
     db, ws_id, result = _run_import(tmp_path, ImportParams(
@@ -6508,6 +6508,81 @@ def test_local_import_refuses_when_mount_root_absent(tmp_path, monkeypatch):
     assert not os.path.exists(dest), (
         f"shadow directory was created at {dest}: the guard failed to "
         "stop os.makedirs"
+    )
+
+
+def test_local_import_refuses_persistent_unmounted_stub(
+        tmp_path, monkeypatch):
+    """The Linux ``/mnt/<name>`` post-unmount stub case must be rejected.
+
+    Codex #1394 P1 (r3687190865): pre-fix the guard called
+    ``_missing_archive_mount_root``, which is only an ``os.path.lexists``
+    check. On Linux a mount-point directory (``/mnt/NAS``) persists
+    after unmount, so ``lexists`` returns True even though nothing is
+    mounted. ``os.makedirs`` then created the destination on the
+    internal disk and the card was copied to a local shadow tree that
+    would either be hidden the moment the real share remounted or
+    prevent the remount entirely — while the run cheerfully reported
+    ``safe_to_format=True`` on the still-holding-the-only-copy card.
+
+    Exercise the real ``_archive_mount_root_unavailable`` helper (no
+    monkeypatch of the check itself) against an actual empty stub
+    directory, only routing the candidate helper so a tmp path is seen
+    as mount-shaped.
+    """
+    import pipeline_job as _pj
+    from import_job import ImportParams
+
+    card = _make_card(tmp_path, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+        ("DSC_0002.jpg", datetime(2026, 7, 3, 11, 0, 0), "green"),
+    ])
+
+    # A real empty directory on disk plays the role of ``/mnt/NAS``
+    # post-unmount: it exists (lexists True), it's readable (listdir
+    # returns []), and it isn't a mount (ismount False on tmp_path).
+    stub_root = tmp_path / "mnt_NAS_stub"
+    stub_root.mkdir()
+    dest = str(stub_root / "photos")
+
+    # Route the mount-shaped candidate through the real helper so it
+    # sees the stub as a mount-root candidate — but do NOT patch the
+    # unavailable-check itself, so the actual empty+not-ismount logic
+    # is what's under test.
+    monkeypatch.setattr(
+        _pj, "_archive_mount_root_candidates",
+        lambda path: [str(stub_root)] if str(stub_root) in path else [],
+    )
+
+    db, ws_id, result = _run_import(tmp_path, ImportParams(
+        sources=[str(card)], destination=dest,
+    ))
+
+    assert result["copied"] == 0, result
+    assert result["failed"] == 2, result
+    assert result["safe_to_format"] is False, result
+    assert result["unsafe_files"], result
+    assert all(
+        str(stub_root) in u["reason"] and "not available" in u["reason"]
+        for u in result["unsafe_files"]
+    ), result["unsafe_files"]
+    # The stub root itself already exists (we created it) — the
+    # critical check is that NO photos landed inside it. os.makedirs
+    # must have been refused, so ``photos`` under the stub was never
+    # created and no *.jpg was ever written.
+    assert not os.path.exists(dest), (
+        f"destination {dest} was created despite the stub guard — "
+        "os.makedirs walked past the refusal and would have written "
+        "the card into a local shadow tree"
+    )
+    landed = [
+        p for p in stub_root.rglob("*")
+        if p.is_file() and p.suffix.lower() == ".jpg"
+    ]
+    assert not landed, (
+        f"card files landed under the stub root: {landed!r}. The refusal "
+        "must fire before any file write, otherwise the card looks safe "
+        "to format while its only copies sit on the internal disk."
     )
 
 
@@ -6538,7 +6613,7 @@ def test_local_import_stops_when_mount_disappears_mid_run(
         # Mounted for the first batch, gone for every batch after it.
         return None if calls["n"] == 1 else "/Volumes/NAS"
 
-    monkeypatch.setattr(_pj, "_missing_archive_mount_root", flaky_mount)
+    monkeypatch.setattr(_pj, "_archive_mount_root_unavailable", flaky_mount)
 
     db, ws_id, result = _run_import(tmp_path, ImportParams(
         sources=[str(card)], destination=dest,
@@ -6579,7 +6654,7 @@ def test_remote_import_stops_when_mount_disappears_mid_run(
         probes["n"] += 1
         return None if probes["n"] == 1 else "/Volumes/NAS"
 
-    monkeypatch.setattr(_pj, "_missing_archive_mount_root", flaky_mount)
+    monkeypatch.setattr(_pj, "_archive_mount_root_unavailable", flaky_mount)
 
     db_path = str(tmp_path / "test.db")
     db = Database(db_path)
@@ -6628,7 +6703,7 @@ def test_local_import_mount_loss_still_advances_progress(tmp_path, monkeypatch):
         calls["n"] += 1
         return None if calls["n"] == 1 else "/Volumes/NAS"
 
-    monkeypatch.setattr(_pj, "_missing_archive_mount_root", flaky_mount)
+    monkeypatch.setattr(_pj, "_archive_mount_root_unavailable", flaky_mount)
 
     runner = FakeRunner()
     db, ws_id, result = _run_import(

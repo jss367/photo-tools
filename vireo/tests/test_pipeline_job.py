@@ -12939,6 +12939,146 @@ def test_mount_root_offline_false_for_empty_ordinary_local_dir(tmp_path):
     )
 
 
+def test_archive_mount_root_unavailable_flags_persistent_unmounted_stub(
+        tmp_path, monkeypatch):
+    """A Linux ``/mnt/<name>`` stub left over after unmount must be refused.
+
+    Codex #1394 P1 (r3687190865): ``_missing_archive_mount_root``'s
+    ``os.path.lexists`` check returns True for a persistent post-unmount
+    ``/mnt/NAS`` directory, so the import guard let ``os.makedirs``
+    build the destination on the internal disk. The stronger
+    ``_archive_mount_root_unavailable`` helper additionally treats
+    "exists, readable, empty, not currently a mount point" as
+    unavailable — that is the specific signature of an unmounted stub
+    that the older helper missed. Pin that behaviour.
+    """
+    import pipeline_job as _pj
+
+    empty_stub = tmp_path / "mnt_NAS_stub"
+    empty_stub.mkdir()  # exists + readable + empty + ismount == False
+
+    # The real candidate helper only fires for the /Volumes/*,
+    # /mnt/*, and /media/user/* shapes. Stub it to route our tmp path
+    # into the check.
+    monkeypatch.setattr(
+        _pj, "_archive_mount_root_candidates",
+        lambda path: [str(empty_stub)],
+    )
+
+    flagged = _pj._archive_mount_root_unavailable(
+        str(empty_stub / "2026" / "01"),
+    )
+    assert flagged == str(empty_stub), (
+        "A mount-shaped path whose root exists but is empty AND is not a "
+        "mount point is the exact shape of a Linux post-unmount stub — "
+        "letting os.makedirs into it silently writes onto the internal "
+        f"disk. Got {flagged!r}; expected {str(empty_stub)!r}."
+    )
+
+
+def test_archive_mount_root_unavailable_allows_populated_local_dir(
+        tmp_path, monkeypatch):
+    """A readable, populated local directory at a mount-shaped path is
+    still available.
+
+    Guards against the natural over-fit of the P1 fix above:
+    ``os.path.ismount == False`` alone would flag a legitimate plain-
+    local ``/mnt/photos`` directory the user is using as an archive
+    without an actual mount. The helper must only refuse when the
+    directory is empty AND not a mount — a populated non-mount path
+    still passes.
+    """
+    import pipeline_job as _pj
+
+    populated_root = tmp_path / "mnt_photos_populated"
+    populated_root.mkdir()
+    (populated_root / "2026").mkdir()  # any real child is enough
+
+    monkeypatch.setattr(
+        _pj, "_archive_mount_root_candidates",
+        lambda path: [str(populated_root)],
+    )
+
+    flagged = _pj._archive_mount_root_unavailable(
+        str(populated_root / "2026" / "07"),
+    )
+    assert flagged is None, (
+        "A populated readable directory at a mount-shaped path must not be "
+        "reported as unavailable — that would break the legitimate case of "
+        "using /mnt/photos as a plain local archive with real contents. "
+        f"Got {flagged!r}."
+    )
+
+
+def test_archive_mount_root_unavailable_flags_stale_mount_that_raises(
+        tmp_path, monkeypatch):
+    """A stale SMB/NFS mount whose reads raise OSError must be refused.
+
+    ``os.path.ismount`` still returns True on a disconnected share
+    whose kernel-level mount hasn't torn down yet, and ``lexists`` on
+    the root directory succeeds too — but every read against it raises
+    EIO. Pre-fix the import guard walked straight past this shape into
+    ``os.makedirs``, which either succeeded (silent shadow tree) or
+    crashed the background job with an uncaught OSError (the
+    2026-07-30 outage). ``_archive_mount_root_unavailable`` catches it
+    via the same ``listdir`` probe ``_mount_root_offline`` uses.
+    """
+    import pipeline_job as _pj
+
+    dead_mount = tmp_path / "mnt_NAS_dead"
+    dead_mount.mkdir()
+
+    real_listdir = os.listdir
+
+    def flaky_listdir(path):
+        if str(path) == str(dead_mount):
+            raise OSError("EIO from stale mount")
+        return real_listdir(path)
+
+    monkeypatch.setattr(_pj.os, "listdir", flaky_listdir)
+    monkeypatch.setattr(
+        _pj, "_archive_mount_root_candidates",
+        lambda path: [str(dead_mount)],
+    )
+
+    flagged = _pj._archive_mount_root_unavailable(
+        str(dead_mount / "2026" / "01"),
+    )
+    assert flagged == str(dead_mount), (
+        "A mount root whose listdir raises OSError is a dead SMB/NFS "
+        "mount — os.makedirs into it would either crash the job or write "
+        f"a shadow tree. Got {flagged!r}; expected {str(dead_mount)!r}."
+    )
+
+
+def test_archive_mount_root_unavailable_flags_missing_root(
+        tmp_path, monkeypatch):
+    """The old ``lexists`` behaviour is preserved.
+
+    Sanity: swapping ``_missing_archive_mount_root`` for the new
+    stronger helper must not regress the original case (mount root
+    directory doesn't exist at all — the macOS-eject shape).
+    """
+    import pipeline_job as _pj
+
+    absent_root = tmp_path / "Volumes_NAS_ejected"
+    # Deliberately do NOT create the directory.
+
+    monkeypatch.setattr(
+        _pj, "_archive_mount_root_candidates",
+        lambda path: [str(absent_root)],
+    )
+
+    flagged = _pj._archive_mount_root_unavailable(
+        str(absent_root / "2026"),
+    )
+    assert flagged == str(absent_root), (
+        "A mount root that doesn't lexists at all must still be flagged — "
+        "this is the macOS eject / never-attached case the original "
+        f"_missing_archive_mount_root already handled. Got {flagged!r}."
+    )
+
+
 def test_still_offline_folder_ids_prunes_recovered_folders(tmp_path):
     """Folders that recovered must drop out of the still-offline set.
 

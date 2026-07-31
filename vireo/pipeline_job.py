@@ -149,6 +149,129 @@ def _archive_mount_root_candidates(path: str) -> list[str]:
     return seen
 
 
+def _archive_mount_baseline(
+    path: str,
+    known_mounted_roots: set[str] | None = None,
+) -> dict[str, bool]:
+    """Snapshot whether ``path``'s mount-root candidates are live mounts.
+
+    Pairs with ``_unmounted_since_baseline`` to catch the case
+    ``_missing_archive_mount_root`` structurally cannot see: a mount point
+    that *persists* as an empty directory after the share detaches. Linux
+    ``/mnt/<name>`` behaves that way (macOS removes ``/Volumes/<share>``,
+    which is why ``lexists`` is enough there), so on Linux an unmounted
+    archive looks exactly like a valid empty destination — ``os.makedirs``
+    succeeds and the import writes onto the system disk under the stale
+    mount point. See PR #1394 review (Codex P1 r3687190865).
+
+    ``os.path.ismount`` is the right primitive rather than a hand-rolled
+    ``st_dev`` comparison: on POSIX it already compares the directory's
+    device against its parent's, and ``_archive_mount_root_candidates``
+    deliberately returns Windows drive letters with a trailing separator
+    so ismount accepts them.
+
+    Recording the *baseline* is what makes this safe. An ordinary local
+    directory that merely looks mount-shaped (a plain ``/mnt/photos`` the
+    user created by hand) is False here and stays False, so it can never
+    trip the staleness check — a bare "is it mounted?" test would refuse
+    that destination outright and break working setups.
+
+    ``known_mounted_roots`` seeds the baseline as ``True`` for any
+    candidate the caller previously observed as a live mount (see
+    ``_load_known_mount_roots`` / ``_record_known_mount_roots``). Without
+    it, a share that was already detached BEFORE this run started
+    escapes the guard: its baseline is False and no mounted → unmounted
+    transition can fire against a False baseline, so the persistent
+    ``/mnt/<name>`` stub still passes the per-batch guard and copies
+    land on the local disk. Cross-run history closes that hole without
+    refusing hand-made local dirs — those never enter the known-set to
+    begin with (no run ever observed them as a live mount) and their
+    baseline stays False. See PR #1396 review (Codex P1 r3687401636).
+    """
+    known = known_mounted_roots or set()
+    baseline = {}
+    for root in _archive_mount_root_candidates(path):
+        baseline[root] = os.path.ismount(root) or root in known
+    return baseline
+
+
+_KNOWN_MOUNT_ROOTS_KEY = "known_archive_mount_roots"
+
+
+def _load_known_mount_roots(db) -> set[str]:
+    """Return the persistent set of mount roots ever observed as live.
+
+    Used by ``_archive_mount_baseline`` to seed True across runs: a share
+    that was live on a prior successful run and is detached now must be
+    treated as a mounted → unmounted transition, not as a plain local
+    dir that was never a mount. Read failures (missing key, malformed
+    JSON, DB gone) fall back to an empty set — a stale-history failure
+    is not a reason to refuse a fresh import.
+    """
+    try:
+        row = db.conn.execute(
+            "SELECT value FROM db_meta WHERE key = ?",
+            (_KNOWN_MOUNT_ROOTS_KEY,),
+        ).fetchone()
+    except Exception:
+        return set()
+    if row is None or row["value"] is None:
+        return set()
+    try:
+        entries = json.loads(row["value"])
+    except (TypeError, ValueError):
+        return set()
+    if not isinstance(entries, list):
+        return set()
+    return {str(e) for e in entries if isinstance(e, str)}
+
+
+def _record_known_mount_roots(db, baseline: dict[str, bool]) -> None:
+    """Merge any True baseline entries into the persistent known-mounted set.
+
+    Only additive — a root that was recorded once stays recorded, so a
+    share that is currently detached still gets its True → False
+    transition detected on the next run. If persistence itself fails
+    (DB locked, missing table on an ancient DB), silently give up: the
+    run has already captured its own within-run baseline and the cross-
+    run upgrade is best-effort. See PR #1396 review
+    (Codex P1 r3687401636).
+    """
+    fresh = {root for root, live in baseline.items() if live}
+    if not fresh:
+        return
+    try:
+        existing = _load_known_mount_roots(db)
+        merged = sorted(existing | fresh)
+        db.conn.execute(
+            "INSERT INTO db_meta(key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (_KNOWN_MOUNT_ROOTS_KEY, json.dumps(merged)),
+        )
+        db.conn.commit()
+    except Exception:
+        log.debug(
+            "Could not persist known archive mount roots (%r); "
+            "cross-run mount-baseline seeding will be skipped for the "
+            "next run.", sorted(fresh), exc_info=True,
+        )
+
+
+def _unmounted_since_baseline(baseline: dict[str, bool]) -> str | None:
+    """Return a root that was mounted at baseline and no longer is.
+
+    Deliberately one-directional: only a True → False transition counts.
+    A root that was never a mount is an ordinary directory and is ignored,
+    and a root still reporting mounted is left to the existing offline
+    probes (a stale-but-registered SMB mount keeps ``ismount`` True while
+    every read raises EIO — see ``_mount_root_offline``).
+    """
+    for root, was_mounted in baseline.items():
+        if was_mounted and not os.path.ismount(root):
+            return root
+    return None
+
+
 def _missing_archive_mount_root(path: str) -> str | None:
     """Return a likely missing mount root that must not be auto-created.
 

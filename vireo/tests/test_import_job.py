@@ -6712,15 +6712,19 @@ def test_local_import_stops_when_mount_point_persists_after_unmount(
         lambda path: [dest] if str(path).startswith(dest) else [],
     )
     real_ismount = os.path.ismount
-    first_landed = os.path.join(dest, "2026", "2026-07-03", "DSC_0001.jpg")
+    second_batch_dir = os.path.join(dest, "2026", "2026-07-04")
 
     def fake_ismount(p):
         if str(p) != dest:
             return real_ismount(p)
-        # Mounted until the first batch's file has landed, detached after.
-        # Keyed on observable state rather than a probe count, so adding
-        # or removing a probe elsewhere can't silently retime the test.
-        return not os.path.exists(first_landed)
+        # Detach cleanly BETWEEN batches: still mounted while batch one
+        # copies and catalogs, gone by the time batch two starts writing.
+        # Keyed on observable state (has batch two's folder been created)
+        # rather than a probe count, so adding or removing a probe cannot
+        # silently retime the test — and deliberately later than "batch
+        # one's file landed", which would instead exercise a mid-batch
+        # detach and correctly fail batch one too.
+        return not os.path.exists(second_batch_dir)
 
     monkeypatch.setattr(os.path, "ismount", fake_ismount)
 
@@ -6731,8 +6735,12 @@ def test_local_import_stops_when_mount_point_persists_after_unmount(
     assert result["copied"] == 1, result
     assert result["failed"] == 1, result
     assert result["safe_to_format"] is False, result
+    # "detached" is common to the batch-level and per-file guard messages.
+    # Which one fires depends on exactly when the share drops relative to
+    # the batch boundary, and this test cares that the detach is reported
+    # at all, not which probe noticed it first.
     assert any(
-        "no longer mounted" in u["reason"] for u in result["unsafe_files"]
+        "detached" in u["reason"] for u in result["unsafe_files"]
     ), result["unsafe_files"]
 
 
@@ -7009,3 +7017,50 @@ def test_local_import_detects_mount_loss_inside_a_single_batch(
     # Nothing from this run may be cataloged under the shadow directory.
     rows = _photo_rows(db)
     assert rows == [], rows
+
+
+def test_local_import_detects_mount_loss_during_the_final_file(
+        tmp_path, monkeypatch):
+    """A detach during the LAST file's copy must still be caught.
+
+    The pre-file probe runs before each copy, so with a single-file batch
+    (or on the last file of any batch) there is no next iteration to trip
+    it. Without a post-loop probe the copy, hash verification and catalog
+    scan all succeed against the local shadow and safe_to_format can go
+    true. See PR #1396 review (Codex P1 r3687456172).
+    """
+    import pipeline_job as _pj
+    from import_job import ImportParams
+
+    # A single file -> a single batch -> exactly one loop iteration.
+    card = _make_card(tmp_path, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+    ])
+    dest = str(tmp_path / "mnt_NAS")
+    os.makedirs(dest, exist_ok=True)
+
+    monkeypatch.setattr(
+        _pj, "_archive_mount_root_candidates",
+        lambda path: [dest] if str(path).startswith(dest) else [],
+    )
+    real_ismount = os.path.ismount
+    landed_path = os.path.join(dest, "2026", "2026-07-03", "DSC_0001.jpg")
+
+    def fake_ismount(p):
+        if str(p) != dest:
+            return real_ismount(p)
+        # Mounted right up until the file lands — i.e. the share drops
+        # while that final copy is in flight.
+        return not os.path.exists(landed_path)
+
+    monkeypatch.setattr(os.path, "ismount", fake_ismount)
+
+    db, ws_id, result = _run_import(tmp_path, ImportParams(
+        sources=[str(card)], destination=dest,
+    ))
+
+    assert result["copied"] == 0, result
+    assert result["failed"] == 1, result
+    assert result["safe_to_format"] is False, result
+    # The shadow copy must not be cataloged as an archive photo.
+    assert _photo_rows(db) == [], _photo_rows(db)

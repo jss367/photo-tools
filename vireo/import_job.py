@@ -3085,6 +3085,21 @@ def run_import_job(job, runner, db_path, workspace_id, params):
             )
             _record_checker(source_file, dest_folder, file_hash)
 
+        # The per-file probe runs BEFORE each copy, so it cannot see a
+        # detach that happens during the last (or only) file — there is no
+        # next iteration to catch it. Probe once more here, after the loop
+        # and before anything is cataloged, so the whole batch including
+        # its final file is covered. See PR #1396 review (Codex P1
+        # r3687456172).
+        #
+        # This is the last probe that can help: a detach after this point
+        # races the catalog scan itself, which is irreducible — no probe
+        # can make a network filesystem stay mounted across a write. What
+        # it does guarantee is that nothing is booked as archived without
+        # a mount check on both sides of every copy in the batch.
+        if not mount_lost:
+            mount_lost = _unmounted_since_baseline(mount_baseline)
+
         # Anything that landed BEFORE the detach is sitting in the local
         # shadow, not on the archive. Roll those out of copied/
         # skipped_duplicate into failed and drop them: cataloging them

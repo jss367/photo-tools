@@ -8610,15 +8610,16 @@ def test_extract_masks_offline_folder_does_not_stop_healthy_folder(
     )
 
 
-def test_extract_masks_lost_mount_stops_the_run(tmp_path, monkeypatch):
-    """A whole volume going away stops the stage instead of walking the rest
-    of the worklist.
+def test_extract_masks_mount_outage_still_processes_other_sources(
+    tmp_path, monkeypatch,
+):
+    """A dead volume must not strand photos that live somewhere else.
 
-    This is the shape production hit: an SMB share dropped and every one of
-    the 311 remaining reads returned an instant EIO. A mount-scoped outage
-    reaches every folder on the volume, not just the one the failure landed
-    in, so the folder latch alone would keep re-probing a dead server for
-    each surviving folder.
+    A mount-scoped outage proves the photos *on that volume* are gone, not
+    the rest of the worklist. A collection can span several volumes plus the
+    local disk, so writing off everything still unprocessed would both skip
+    masks that could have been made and file those photos under an outage
+    they were never affected by (Codex #1392 P1).
     """
     import config as cfg
     import pipeline_job as pj
@@ -8631,56 +8632,72 @@ def test_extract_masks_lost_mount_stops_the_run(tmp_path, monkeypatch):
     db = Database(db_path)
     ws_id = db._active_workspace_id
 
-    # Two folders standing in for two directories on one shared volume.
-    photo_ids = []
-    for name in ("folderA", "folderB"):
-        path = str(tmp_path / name)
-        os.makedirs(path, exist_ok=True)
-        folder_id = db.add_folder(path)
-        for i in range(2):
-            photo_ids.append(
-                _add_photo_with_detection(db, folder_id, path, f"{name}{i}.jpg")
-            )
+    # Names chosen so the share sorts first: the worklist is ordered by
+    # path, and a stage that abandons the whole worklist after the outage
+    # must be observably unable to reach the local photo.
+    local_path = str(tmp_path / "zz_local")
+    share_path = str(tmp_path / "aa_share")
+    os.makedirs(local_path, exist_ok=True)
+    os.makedirs(share_path, exist_ok=True)
+    local_folder = db.add_folder(local_path)
+    share_folder = db.add_folder(share_path)
+
+    photo_ids = [
+        _add_photo_with_detection(db, local_folder, local_path, "zz0.jpg"),
+        _add_photo_with_detection(db, share_folder, share_path, "aa0.jpg"),
+        _add_photo_with_detection(db, share_folder, share_path, "aa1.jpg"),
+    ]
     collection_id = db.add_collection(
-        "Shared volume",
+        "Volume plus local disk",
         json.dumps([{"field": "photo_ids", "value": photo_ids}]),
     )
 
     state = _stub_extract_masks_heavy_ops(monkeypatch)
 
     import masking
+    import numpy as np
+
+    read_order = []
 
     def render_dead_share(image_path, longest_edge=None):
         state["proxy_calls"] += 1
-        return None
+        read_order.append(image_path)
+        if image_path.startswith(share_path):
+            return None
+        return np.zeros((16, 16, 3), dtype=np.uint8)
 
     state["proxy_calls"] = 0
     monkeypatch.setattr(masking, "render_proxy", render_dead_share)
-    # The volume, not just one folder, is gone.
+    # Only the share is gone; the local disk is fine.
     monkeypatch.setattr(
         pj, "_source_offline_reason",
         lambda folder_path, image_path: (
-            "mount", "volume /Volumes/Photography is not mounted",
+            ("mount", "volume /Volumes/Photography is not mounted")
+            if image_path.startswith(share_path) else None
         ),
     )
 
     runner, result = _run_extract_masks_only(db_path, ws_id, collection_id)
 
-    em = result["stages"]["extract_masks"]
-    assert state["proxy_calls"] == 1, (
-        f"A mount-wide outage must stop the stage on the first failed read, "
-        f"not walk the remaining folders; got {state['proxy_calls']} "
-        f"render_proxy calls."
+    # Guard the premise: if the worklist ever stops leading with the share,
+    # the masked-count assertion below silently stops discriminating.
+    assert read_order and read_order[0].startswith(share_path), (
+        f"This test needs the share to be read first; got {read_order!r}"
     )
-    # Every photo still has to be accounted for, including the ones the
-    # stage never reached — they are just as unmasked as the one that failed.
-    assert em.get("unreadable") == 4, (
-        f"All four photos on the dead volume must be reported unreadable; "
-        f"got {em!r}"
-    )
-    assert em["masked"] == 0
-    assert em["skipped"] == 0
 
+    em = result["stages"]["extract_masks"]
+    assert em["masked"] == 1, (
+        f"The photo on the healthy local disk must still be masked; got {em!r}"
+    )
+    assert em.get("unreadable") == 2, (
+        f"Only the two photos on the dead volume are unreadable; got {em!r}"
+    )
+    # One failed read proves the share is gone; its second photo must not
+    # cost another round trip to a dead server.
+    assert state["proxy_calls"] == 2, (
+        f"Expected one failed read on the share plus one good local read; "
+        f"got {state['proxy_calls']} render_proxy calls."
+    )
     final = _extract_masks_final_update(runner)
     assert final["status"] == "failed"
     assert any(
@@ -8688,6 +8705,138 @@ def test_extract_masks_lost_mount_stops_the_run(tmp_path, monkeypatch):
     ), (
         f"The rollup must name the volume the user has to reconnect; got "
         f"{result['errors']!r}"
+    )
+
+
+def test_extract_masks_offline_folder_still_counts_cached_masks(
+    tmp_path, monkeypatch,
+):
+    """A photo whose mask is already cached needs no source read, so a dead
+    folder must not relabel it unreadable.
+
+    The offline shortcut has to sit after the `photo_masks` cache check:
+    the cached branch only stats the local mask file, so it succeeds even
+    when the source volume is gone (Codex #1392 P2).
+    """
+    import config as cfg
+    from db import Database
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cfg.CONFIG_PATH = str(tmp_path / "config.json")
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws_id = db._active_workspace_id
+    folder_path = str(tmp_path / "photos")
+    os.makedirs(folder_path, exist_ok=True)
+    folder_id = db.add_folder(folder_path)
+
+    uncached = _add_photo_with_detection(db, folder_id, folder_path, "a.jpg")
+    cached = _add_photo_with_detection(db, folder_id, folder_path, "b.jpg")
+    collection_id = db.add_collection(
+        "Partly cached",
+        json.dumps([{"field": "photo_ids", "value": [uncached, cached]}]),
+    )
+
+    pipeline_cfg = db.get_effective_config(cfg.load()).get("pipeline", {})
+    sam2_variant = pipeline_cfg.get("sam2_variant")
+    dinov2_variant = pipeline_cfg.get("dinov2_variant")
+
+    # Seed a complete, matching cache entry for `cached`: mask row, mask
+    # file on local disk, and photos-row variants already consistent.
+    mask_dir = tmp_path / ".vireo" / "masks"
+    os.makedirs(mask_dir, exist_ok=True)
+    mask_file = str(mask_dir / f"{cached}.{sam2_variant}.png")
+    from PIL import Image
+    Image.new("L", (4, 4), 255).save(mask_file)
+    db.upsert_photo_mask(
+        cached, sam2_variant, mask_file, "MegaDetector",
+        0.1, 0.1, 0.5, 0.5,
+    )
+    db.set_active_mask_variant(cached, sam2_variant)
+    db.conn.execute(
+        "UPDATE photos SET dino_embedding_variant=? WHERE id=?",
+        (dinov2_variant, cached),
+    )
+    db.conn.commit()
+
+    state = _stub_extract_masks_heavy_ops(monkeypatch)
+
+    import shutil
+
+    import masking
+
+    def render_then_lose_source(image_path, longest_edge=None):
+        state["proxy_calls"] += 1
+        shutil.rmtree(folder_path, ignore_errors=True)
+        return None
+
+    state["proxy_calls"] = 0
+    monkeypatch.setattr(masking, "render_proxy", render_then_lose_source)
+
+    runner, result = _run_extract_masks_only(db_path, ws_id, collection_id)
+
+    em = result["stages"]["extract_masks"]
+    assert em["masked"] == 1, (
+        f"The cached photo needs no source read and must still count as "
+        f"masked; got {em!r}"
+    )
+    assert em.get("unreadable") == 1, (
+        f"Only the uncached photo is unreadable; got {em!r}"
+    )
+
+
+def test_extract_masks_preflight_offline_photos_are_counted_unreadable(
+    tmp_path, monkeypatch,
+):
+    """Photos dropped by the pre-flight offline probe still have to show up
+    in the stage's counters.
+
+    The pre-flight removes them from the worklist before the loop, so every
+    counter came back zero on a stage the user was simultaneously being told
+    had failed with unreachable photos — which the Extract card rendered as
+    "No photos needed masks" (Codex #1392 P2).
+    """
+    import config as cfg
+    from db import Database
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cfg.CONFIG_PATH = str(tmp_path / "config.json")
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws_id = db._active_workspace_id
+    folder_path = str(tmp_path / "photos")
+    os.makedirs(folder_path, exist_ok=True)
+    folder_id = db.add_folder(folder_path)
+
+    photo_ids = [
+        _add_photo_with_detection(db, folder_id, folder_path, f"bird{i}.jpg")
+        for i in range(3)
+    ]
+    collection_id = db.add_collection(
+        "Gone before we started",
+        json.dumps([{"field": "photo_ids", "value": photo_ids}]),
+    )
+
+    _stub_extract_masks_heavy_ops(monkeypatch)
+
+    # The source is already gone when the stage starts, so the pre-flight
+    # probe drops all three before the per-photo loop runs.
+    import shutil
+    shutil.rmtree(folder_path, ignore_errors=True)
+
+    runner, result = _run_extract_masks_only(db_path, ws_id, collection_id)
+
+    em = result["stages"]["extract_masks"]
+    assert em.get("unreadable") == 3, (
+        f"Pre-flight-dropped photos are unreadable, not absent; got {em!r}"
+    )
+    final = _extract_masks_final_update(runner)
+    assert final["status"] == "failed"
+    assert "3 unreadable" in (final.get("summary") or ""), (
+        f"The summary must not read as an empty worklist; got "
+        f"{final.get('summary')!r}"
     )
 
 

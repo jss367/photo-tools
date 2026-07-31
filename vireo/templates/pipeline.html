@@ -2712,7 +2712,13 @@ function _extractMasksSummary(ext) {
   // file). Both leave the photo unmasked, but only one is the user's to fix.
   if (ext.unreadable) parts.push(ext.unreadable + ' unreadable');
   if (ext.failed) parts.push(ext.failed + ' failed');
-  return parts.join(', ') || 'No photos needed masks';
+  if (parts.length) return parts.join(', ');
+  // Every counter is zero. `reason` means the backend emptied the worklist
+  // because something went wrong (no detections, missing weights, everything
+  // below the detector threshold, source offline at preflight) — those photos
+  // did need masks and will be hard-rejected as `no_subject_mask` without
+  // them. Only a genuinely empty worklist gets the reassuring wording.
+  return ext.reason ? 'No masks created' : 'No photos needed masks';
 }
 
 function _onPipelineComplete(result) {

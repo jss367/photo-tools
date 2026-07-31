@@ -641,3 +641,37 @@ def test_pipeline_extract_card_reports_unreadable_photos(live_server, page):
     expect(summary).to_contain_text("311 unreadable")
     expect(page.locator("#pillExtract")).to_contain_text("Failed")
     expect(page.locator("#statusExtract")).to_contain_text("unreachable")
+
+
+def test_pipeline_extract_card_does_not_claim_no_masks_were_needed(
+    live_server, page,
+):
+    """An empty worklist the backend emptied because something went wrong is
+    not the same as "nothing needed doing".
+
+    When mask extraction reports a `reason` (no detections, missing weights,
+    everything below the detector threshold, source offline at preflight),
+    every counter comes back zero. Rendering that as "No photos needed masks"
+    contradicts the error the same card is showing and tells the user their
+    library is fine when it is about to be hard-rejected as `no_subject_mask`.
+    """
+    url = live_server["url"]
+    page.goto(f"{url}/pipeline")
+    page.evaluate("""
+        _onPipelineComplete({
+          status: 'failed',
+          result: {
+            stages: {extract_masks: {
+              masked: 0, skipped: 0, failed: 0, unreadable: 0, total: 0,
+              reason: 'weights_missing',
+            }},
+            errors: [
+              '[extract_masks] No detections available for 984 photo(s). ' +
+              'MegaDetector weights are not downloaded.',
+            ],
+          },
+        });
+    """)
+    expect(page.locator("#txtMasks")).not_to_contain_text(
+        "No photos needed masks"
+    )

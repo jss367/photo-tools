@@ -394,6 +394,63 @@ def test_bootstrap_defers_load_lock_release_during_health_refresh(
     )
 
 
+def test_unrelated_health_event_initializes_pending_folder_bootstrap(
+    live_server, page, tmp_path
+):
+    """An unrelated health transition must not preserve an unpainted grid."""
+    db = live_server["db"]
+    park = tmp_path / "park"
+    yard = tmp_path / "yard"
+    park.mkdir()
+    yard.mkdir()
+    folder_ids = live_server["data"]["folders"]
+    db.conn.executemany(
+        "UPDATE folders SET path = ?, status = 'ok' WHERE id = ?",
+        [(str(park), folder_ids[0]), (str(yard), folder_ids[1])],
+    )
+    db.conn.commit()
+
+    held_init = []
+
+    def _hold_first_init(route):
+        if not held_init:
+            held_init.append(route)
+        else:
+            route.continue_()
+
+    page.route("**/api/browse/init**", _hold_first_init)
+    page.goto(f"{live_server['url']}/browse?folder_id={folder_ids[0]}")
+    for _ in range(50):
+        if held_init:
+            break
+        page.wait_for_timeout(100)
+    assert held_init, "folder-scoped init request was never issued"
+    assert page.evaluate("browseDatasetReady") is False
+
+    # Yard changes while park's first paint is still held. The park scope is
+    # unaffected, but there is no initialized grid to preserve: the health
+    # refresh must take over the initial park-scoped load.
+    db.conn.execute(
+        "UPDATE folders SET status = 'missing' WHERE id = ?",
+        (folder_ids[1],),
+    )
+    db.conn.commit()
+    page.evaluate(
+        "document.dispatchEvent(new CustomEvent('vireo:folder-health-changed', "
+        f"{{detail: {{restored: [], wentMissing: [{folder_ids[1]}], "
+        "source: 'test'}}))"
+    )
+    page.evaluate("() => window._activeFolderHealthRefresh")
+
+    held_init[0].continue_()
+    page.wait_for_function(
+        "browseDatasetReady && !loading && photos.length === 3",
+        timeout=10000,
+    )
+    assert page.evaluate("activeFolderId") == folder_ids[0]
+    expect(page.locator(".grid-card")).to_have_count(3)
+
+
 def test_bootstrap_seeds_missing_snapshot_from_init_response(
     live_server, page, tmp_path
 ):

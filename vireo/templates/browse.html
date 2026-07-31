@@ -1962,6 +1962,11 @@ var currentPage = 1;
 var perPage = 50;
 var loading = false;
 var allLoaded = false;
+// True only after an authoritative response has initialized the grid, even
+// when that response contains zero photos. Health events can arrive while
+// bootstrap or a deep link is still pending; an "unaffected scope" is only
+// safe to preserve once there is an initialized dataset to preserve.
+var browseDatasetReady = false;
 var selectedPhotoId = null;
 var selectedIndex = -1;
 var anchorRestoreEpoch = 0;
@@ -2991,6 +2996,7 @@ async function bootstrapBrowse() {
       renderKeywordTree(data.keywords || []);
       renderCollectionList(data.collections || []);
       renderGrid();
+      browseDatasetReady = true;
       updateFilterSummary();
       loadSummary();
     }
@@ -3734,7 +3740,7 @@ async function refreshBrowseAfterFolderHealthChange(detail) {
   // A transition in an unrelated folder cannot change a leaf-folder result
   // set. Keep its selection, detail panel, and scroll position intact while
   // still refreshing workspace-wide sidebar and summary counts.
-  if (!activeScopeWasAffected) {
+  if (!activeScopeWasAffected && browseDatasetReady) {
     loadCollectionCounts();
     loadSummary();
     if (timelineMode) loadCalendarData();
@@ -4393,6 +4399,7 @@ async function resetAndLoad(options) {
   var preserveCollection = !!(options && options.preserveCollection);
   var anchor = preserveAnchor ? captureSelectedPhotoAnchor() : null;
   var restoreEpoch = anchor ? ++anchorRestoreEpoch : null;
+  browseDatasetReady = false;
   photos = [];
   currentPage = 1;
   allLoaded = false;
@@ -4563,6 +4570,7 @@ async function loadPhotos(options) {
 
     if (firstNewIdx === 0) renderGrid();
     else appendGridPhotos(data.photos, firstNewIdx);
+    browseDatasetReady = true;
     updateGridTail();
     updateFilterSummary();
 
@@ -8722,6 +8730,7 @@ async function _runPhotoDeepLink(photoId) {
     activeFolderId = photo.folder_id;
     activeKeyword = null;
     activeCollectionId = null;
+    browseDatasetReady = false;
     photos = [];
     currentPage = 1;
     allLoaded = false;
@@ -8774,6 +8783,7 @@ async function _runPhotoDeepLink(photoId) {
       currentPage = 2;
       if (photos.length >= totalPhotos) allLoaded = true;
       renderGrid();
+      browseDatasetReady = true;
       document.getElementById('loadingState').style.display = 'none';
       deepLinkLoaded = true;
     }

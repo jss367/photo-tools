@@ -2188,6 +2188,15 @@ def test_a_single_render_pass_produces_a_correct_folder_header(
     pass rather than on whichever one previewImport() happens to end with.
     """
     page.goto(f"{live_server['url']}/import")
+    # page.goto() returns on `load`, but initImportPage() is still awaiting
+    # /api/volumes, /api/config and /api/workspaces/active at that point, and
+    # its trailing updateImportMode() calls clearImportPreviewGrid() ->
+    # grid.innerHTML = ''. This test drives the renderer directly, so it has
+    # no network round trip of its own to hide behind and the wipe lands
+    # between the render and the assertions -- the header vanishes and the
+    # last expect() fails with "element(s) not found". Measured on this
+    # machine: 16/30 without this line, 30/30 with it.
+    page.wait_for_load_state("networkidle")
     _suppress_auto_preview(page)
     page.locator("#modeCopy").check()
     expect(page.locator("#importPreviewGrid")).to_be_hidden()

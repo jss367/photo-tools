@@ -3065,3 +3065,55 @@ def test_overlapping_atomic_writes_do_not_share_a_temp_file(tmp_path):
     # The outer write renamed last, so it wins — and the target is whole.
     assert json.loads(target.read_text())["taxa_by_common"] == {"outer species": {}}
     assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_load_local_taxonomy_with_explicit_path_does_not_fall_back(
+    tmp_path, monkeypatch,
+):
+    """path= pins the load to one artifact, with no legacy fallback.
+
+    The post-download retype must fail loudly when the file it just wrote
+    won't parse. Falling back would retype keywords from a stale legacy
+    copy while the taxa tables hold the new download's data — two taxonomy
+    versions mixed, reported as success.
+    """
+    import taxonomy as tax_mod
+
+    tax_mod.clear_taxonomy_cache()
+    preferred = tmp_path / "persistent.json"
+    preferred.write_text("{ not valid json")
+    legacy = tmp_path / "taxonomy.json"
+    _write_taxonomy_json(legacy, "legacy species")
+    monkeypatch.setattr(tax_mod, "TAXONOMY_JSON_PATH", str(preferred))
+    monkeypatch.setattr(tax_mod, "LEGACY_TAXONOMY_JSON_PATH", str(legacy))
+
+    # Default behaviour still falls back — other callers rely on it.
+    assert tax_mod.load_local_taxonomy().is_taxon("legacy species")
+
+    # Pinned to the broken artifact, it reports failure instead.
+    assert tax_mod.load_local_taxonomy(path=str(preferred)) is None
+
+
+def test_load_local_taxonomy_with_explicit_path_still_caches(tmp_path, monkeypatch):
+    """A pinned load shares the same cache as the default path."""
+    import taxonomy as tax_mod
+
+    tax_mod.clear_taxonomy_cache()
+    preferred = tmp_path / "persistent.json"
+    _write_taxonomy_json(preferred, "preferred species")
+    monkeypatch.setattr(tax_mod, "TAXONOMY_JSON_PATH", str(preferred))
+
+    parses = []
+    real_init = tax_mod.Taxonomy.__init__
+
+    def counting_init(self, path):
+        parses.append(path)
+        real_init(self, path)
+
+    monkeypatch.setattr(tax_mod.Taxonomy, "__init__", counting_init)
+
+    pinned = tax_mod.load_local_taxonomy(path=str(preferred))
+    default = tax_mod.load_local_taxonomy()
+
+    assert pinned is default
+    assert len(parses) == 1

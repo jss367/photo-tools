@@ -696,7 +696,7 @@ def _restamp_taxonomy_cache(taxonomy):
             _taxonomy_cache = None
 
 
-def load_local_taxonomy():
+def load_local_taxonomy(path=None):
     """Load a Taxonomy from disk, falling back across known paths.
 
     Tries ~/.vireo/taxonomy.json first, then the package-dir legacy path.
@@ -707,8 +707,15 @@ def load_local_taxonomy():
 
     The returned instance is shared across callers and cached until the
     file on disk changes — treat it as read-mostly.
+
+    Args:
+        path: load only this file, with no fallback. Use it when a
+            specific artifact has to be the one loaded: the post-download
+            retype must fail loudly if the file it just wrote won't parse,
+            rather than quietly retyping keywords from a stale legacy copy
+            while the taxa tables hold the new download's data.
     """
-    candidates = [TAXONOMY_JSON_PATH, LEGACY_TAXONOMY_JSON_PATH]
+    candidates = [path] if path else [TAXONOMY_JSON_PATH, LEGACY_TAXONOMY_JSON_PATH]
     for path in candidates:
         if not os.path.exists(path):
             continue

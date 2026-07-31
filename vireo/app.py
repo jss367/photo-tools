@@ -18506,7 +18506,13 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 # new one and could OOM. It also seeds the cache, so the
                 # next compare/accept request reuses this parse instead of
                 # paying for its own.
-                tax = load_local_taxonomy()
+                #
+                # Pin it to the file we just downloaded. Without path=, a
+                # transient failure parsing the new file would fall back to
+                # a legacy copy, and we would retype keywords from the old
+                # taxonomy while the taxa tables hold the new one — mixing
+                # versions and reporting success.
+                tax = load_local_taxonomy(path=TAXONOMY_JSON_PATH)
                 if tax is None:
                     raise RuntimeError(
                         f"taxonomy unreadable after download: {TAXONOMY_JSON_PATH}"

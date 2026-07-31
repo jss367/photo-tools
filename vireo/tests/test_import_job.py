@@ -7642,3 +7642,322 @@ def test_remote_step_summary_claims_a_selection_only_when_applied(
     summaries2 = _summaries(runner2)
     assert "1 copied, 0 already present, 0 failed of 2 discovered" in summaries2
     assert not any("selected" in s for s in summaries2)
+
+
+# --- Local/remote selection parity -------------------------------------
+# The two copy paths (``run_import_job`` and ``_run_remote_import_job``)
+# carry the same selection logic. These tests are the safety net for that:
+# they drive IDENTICAL selection payloads through BOTH entry points and
+# assert the observable selection results agree, so a change applied to one
+# path and not the other fails here instead of shipping a wrong
+# format-the-card verdict on whichever path the author wasn't looking at.
+
+
+def _selection_observables(result, runner):
+    """The selection-visible surface of an import run, normalized so the
+    local and remote paths are directly comparable.
+
+    Deliberately excludes keys the two paths differ on for reasons that
+    have nothing to do with selection (``photo_ids``, ``verified``,
+    ``folders``, ``errors`` ordering).
+    """
+    import_summaries = [
+        kw.get("summary")
+        for _, step_id, kw in runner.step_updates
+        if step_id == "import" and kw.get("summary") is not None
+    ]
+    events = [d for _, kind, d in runner.events if kind == "progress"]
+    return {
+        "discovered": result["discovered"],
+        "copied": result["copied"],
+        "skipped_duplicate": result["skipped_duplicate"],
+        "failed": result["failed"],
+        "safe_to_format": result["safe_to_format"],
+        "unverified_duplicates_only": result["unverified_duplicates_only"],
+        "files_appeared": result["files_appeared"],
+        "files_vanished": result["files_vanished"],
+        "unsafe": {(u["path"], u["reason"]) for u in result["unsafe_files"]},
+        "summary": import_summaries[-1] if import_summaries else None,
+        # The discovery emit legitimately fires before the count is known,
+        # so it is excluded; every other emit is sized by the queued work.
+        "copy_totals": {d["total"] for d in events
+                        if d["phase"] != "Discovering files"},
+    }
+
+
+def _run_local_selection_case(root, monkeypatch, specs, selection):
+    """Run one selection scenario through the LOCAL copy path.
+
+    ``verify_by_hash=True`` matches what ``_run_remote_import`` forces: with
+    it off the remote path's ``remote_unverified`` makes both card-safety
+    verdicts False for free and every parity assertion passes vacuously.
+    """
+    from import_job import ImportParams, run_import_job
+
+    card = _make_card(root, specs)
+    runner = FakeRunner()
+    db_path = str(root / "test.db")
+    db = Database(db_path)
+    result = run_import_job(
+        _make_job(), runner, db_path, db._active_workspace_id,
+        ImportParams(
+            sources=[str(card)], destination=str(root / "archive"),
+            verify_by_hash=True, **selection(card),
+        ),
+    )
+    return _selection_observables(result, runner)
+
+
+def _run_remote_selection_case(root, monkeypatch, specs, selection):
+    """Run one selection scenario through the REMOTE copy path."""
+    card = _make_card(root, specs)
+    runner = FakeRunner()
+    result, _ = _run_remote_import(root, monkeypatch, {
+        "sources": [str(card)], **selection(card),
+    }, runner=runner)
+    return _selection_observables(result, runner)
+
+
+# Three distinct-colored frames: identical bytes would make the later files
+# in-batch duplicates, so a scenario meant to read as plain copies would
+# quietly exercise the duplicate path instead.
+_PARITY_CARD = [
+    ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+    ("DSC_0002.jpg", datetime(2026, 7, 3, 11, 0, 0), "green"),
+    ("DSC_0003.jpg", datetime(2026, 7, 3, 12, 0, 0), "blue"),
+]
+
+
+def _sel(names, previewed, checked, extra=()):
+    """Build the selection kwargs for a card, by basename."""
+    def build(card):
+        paths = {str(card / n) for n in names}
+        paths |= {str(card / n) for n in extra}
+        return {
+            "include_paths": paths,
+            "previewed_count": previewed,
+            "checked_count": checked,
+        }
+    return build
+
+
+# (id, card specs, selection builder). Each exercises one branch of the
+# shared selection logic; between them they cover both ``deselected``
+# branches, both drift counters, the two summary forms, and the
+# no-selection / empty-selection boundary.
+_SELECTION_PARITY_SCENARIOS = [
+    ("no_selection", _PARITY_CARD, lambda card: {}),
+    ("full_selection", _PARITY_CARD,
+     _sel(["DSC_0001.jpg", "DSC_0002.jpg", "DSC_0003.jpg"], 3, 3)),
+    ("empty_selection", _PARITY_CARD,
+     lambda card: {"include_paths": set(), "previewed_count": 3,
+                   "checked_count": 0}),
+    ("deselect_one", _PARITY_CARD,
+     _sel(["DSC_0001.jpg", "DSC_0002.jpg"], 3, 2)),
+    ("deselect_plural", _PARITY_CARD, _sel(["DSC_0001.jpg"], 3, 1)),
+    ("vanished", _PARITY_CARD,
+     _sel(["DSC_0001.jpg", "DSC_0002.jpg", "DSC_0003.jpg"], 4, 4,
+          extra=["GONE.jpg"])),
+    ("vanished_without_previewed_count", _PARITY_CARD,
+     lambda card: {
+         "include_paths": {str(card / "DSC_0001.jpg"), str(card / "GONE.jpg")},
+         "previewed_count": None, "checked_count": None,
+     }),
+    ("appeared", _PARITY_CARD, _sel(["DSC_0001.jpg"], 1, 1)),
+    ("negative_deselected", _PARITY_CARD,
+     _sel(["DSC_0001.jpg", "DSC_0002.jpg", "DSC_0003.jpg"], 2, 3)),
+    ("mixed_appear_and_vanish", _PARITY_CARD,
+     _sel(["DSC_0001.jpg"], 2, 2, extra=["GONE.jpg"])),
+    ("include_paths_without_checked_count", _PARITY_CARD,
+     lambda card: {"include_paths": {str(card / "DSC_0001.jpg")},
+                   "previewed_count": 3, "checked_count": None}),
+    ("checked_count_without_include_paths", _PARITY_CARD,
+     lambda card: {"checked_count": 1}),
+]
+
+
+def test_selection_parity_scenarios_are_distinct():
+    """Guard for the parity test below: if two scenarios collapse onto the
+    same payload, the parametrization silently shrinks and a branch stops
+    being covered."""
+    seen = set()
+    for name, _specs, builder in _SELECTION_PARITY_SCENARIOS:
+        class _C:
+            def __truediv__(self, other):
+                return "/card/" + other
+        key = repr(sorted(
+            (k, sorted(v) if isinstance(v, set) else v)
+            for k, v in builder(_C()).items()
+        ))
+        assert key not in seen, f"{name} duplicates an earlier scenario"
+        seen.add(key)
+    assert len(seen) == len(_SELECTION_PARITY_SCENARIOS)
+
+
+def _selection_parity_ids():
+    return [s[0] for s in _SELECTION_PARITY_SCENARIOS]
+
+
+def test_local_and_remote_selection_results_agree(tmp_path, monkeypatch):
+    """CHARACTERIZATION: the same selection payload must produce the same
+    selection outcome on both copy paths.
+
+    Runs every scenario through both entry points in its own tmp dir and
+    compares discovered/copied/verdict/drift counts, the (path, reason) set
+    of ``unsafe_files``, the import step summary, and the progress totals.
+
+    This is asserted as a whole-dict equality on purpose: a per-key check
+    added one at a time is how a divergence in the key nobody thought to
+    list survives.
+    """
+    mismatches = []
+    for name, specs, builder in _SELECTION_PARITY_SCENARIOS:
+        local_root = tmp_path / f"local_{name}"
+        local_root.mkdir()
+        remote_root = tmp_path / f"remote_{name}"
+        remote_root.mkdir()
+        local = _run_local_selection_case(
+            local_root, monkeypatch, specs, builder)
+        remote = _run_remote_selection_case(
+            remote_root, monkeypatch, specs, builder)
+        if local != remote:
+            mismatches.append((name, local, remote))
+    assert not mismatches, "\n".join(
+        f"{n}:\n  local ={l}\n  remote={r}" for n, l, r in mismatches
+    )
+
+
+def test_selection_parity_scenarios_actually_exercise_the_branches(
+        tmp_path, monkeypatch):
+    """Positive control for the parity test.
+
+    Equality between two paths is satisfiable by both being wrong in the
+    same way — or by every scenario producing an identical, boring result.
+    Pin the outcomes the scenarios are supposed to produce so a selection
+    branch that stops firing is caught here rather than passing parity.
+    """
+    seen = {}
+    for name, specs, builder in _SELECTION_PARITY_SCENARIOS:
+        root = tmp_path / name
+        root.mkdir()
+        seen[name] = _run_local_selection_case(
+            root, monkeypatch, specs, builder)
+
+    # A whole-card import with nothing selected is the green baseline.
+    assert seen["no_selection"]["safe_to_format"] is True
+    assert seen["no_selection"]["copied"] == 3
+    assert seen["no_selection"]["summary"] == (
+        "3 copied, 0 already present, 0 failed of 3 discovered")
+
+    # Selecting everything is still green, and switches summary form.
+    assert seen["full_selection"]["safe_to_format"] is True
+    assert seen["full_selection"]["copied"] == 3
+    assert seen["full_selection"]["summary"] == (
+        "3 selected of 3 discovered, 3 copied, 0 already present, 0 failed")
+
+    # Every drift scenario is red, and names its own reason.
+    reds = {
+        "empty_selection": "Deselected files",
+        "deselect_one": "Deselected files",
+        "deselect_plural": "Deselected files",
+        "vanished": "Files missing at import time",
+        "vanished_without_previewed_count": "Files missing at import time",
+        "appeared": "Files added after preview",
+        "negative_deselected": "Selection count mismatch",
+        "mixed_appear_and_vanish": "Files missing at import time",
+    }
+    for name, path in reds.items():
+        assert seen[name]["safe_to_format"] is False, name
+        assert path in {p for p, _ in seen[name]["unsafe"]}, name
+
+    # Drift counters are nonzero where the scenario says they should be.
+    assert seen["appeared"]["files_appeared"] == 2
+    assert seen["appeared"]["files_vanished"] == 0
+    assert seen["vanished"]["files_vanished"] == 1
+    assert seen["mixed_appear_and_vanish"]["files_vanished"] == 1
+    assert seen["mixed_appear_and_vanish"]["files_appeared"] == 1
+
+    # Progress totals are the queued work, not the card.
+    assert seen["deselect_plural"]["copy_totals"] == {1}
+    assert seen["no_selection"]["copy_totals"] == {3}
+
+    # Both degraded summary forms fall back to the plain wording.
+    assert "selected" not in seen["include_paths_without_checked_count"][
+        "summary"]
+    assert "selected" not in seen["checked_count_without_include_paths"][
+        "summary"]
+    # ...and a bare ``checked_count`` must not filter the copy set.
+    assert seen["checked_count_without_include_paths"]["copied"] == 3
+
+
+def _symlinked_card(tmp_path, specs):
+    """A card reached through a symlinked directory.
+
+    ``pytest``'s ``tmp_path`` is already fully resolved, so an ordinary card
+    cannot tell ``str(f)`` apart from ``os.path.realpath(str(f))``. This one
+    can: the enumerated paths run through the symlink, their realpaths do
+    not, and the selection filter matches on the former.
+    """
+    import pytest
+
+    real = _make_card(tmp_path, specs, card_name="real_card")
+    link = tmp_path / "link_card"
+    try:
+        os.symlink(str(real), str(link), target_is_directory=True)
+    except (OSError, NotImplementedError, AttributeError):
+        pytest.skip("symlink creation not supported on this platform")
+    assert os.path.realpath(str(link)) != str(link), (
+        "the symlink resolved to itself; this test cannot distinguish "
+        "realpath from the literal path"
+    )
+    return link
+
+
+def test_selection_filter_matches_unresolved_paths_local(tmp_path):
+    """The selection filter must NOT resolve symlinks.
+
+    The caller's paths come from ``discover_source_files`` over the raw
+    source string, so they run through the symlink. Realpath-ing inside the
+    filter empties it and copies nothing — and every other test in this file
+    passes under that mutation, because ``tmp_path`` is already resolved.
+    """
+    from import_job import ImportParams, run_import_job
+
+    link = _symlinked_card(tmp_path, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+        ("DSC_0002.jpg", datetime(2026, 7, 3, 11, 0, 0), "green"),
+    ])
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    result = run_import_job(
+        _make_job(), FakeRunner(), db_path, db._active_workspace_id,
+        ImportParams(
+            sources=[str(link)], destination=str(tmp_path / "archive"),
+            verify_by_hash=True,
+            include_paths={str(link / "DSC_0001.jpg"),
+                           str(link / "DSC_0002.jpg")},
+            previewed_count=2, checked_count=2,
+        ),
+    )
+    assert result["copied"] == 2, "realpath in the filter would copy nothing"
+    assert result["files_vanished"] == 0
+    assert result["safe_to_format"] is True
+
+
+def test_selection_filter_matches_unresolved_paths_remote(
+        tmp_path, monkeypatch):
+    """Remote edition of the symlink guard — same mutation, same path."""
+    link = _symlinked_card(tmp_path, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+        ("DSC_0002.jpg", datetime(2026, 7, 3, 11, 0, 0), "green"),
+    ])
+    result, calls = _run_remote_import(tmp_path, monkeypatch, {
+        "sources": [str(link)],
+        "include_paths": {str(link / "DSC_0001.jpg"),
+                          str(link / "DSC_0002.jpg")},
+        "previewed_count": 2, "checked_count": 2,
+    })
+    assert result["copied"] == 2, "realpath in the filter would rsync nothing"
+    assert calls["rsync"], "nothing was rsynced at all"
+    assert result["files_vanished"] == 0
+    assert result["safe_to_format"] is True

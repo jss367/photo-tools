@@ -50,16 +50,25 @@ body { display: flex; flex-direction: column; height: 100vh; }
 .recent-destination-list .btn { font-size: 11px; padding: 2px 8px; max-width: 100%; overflow: hidden; text-overflow: ellipsis; }
 .input-fixed { max-width: 240px; flex: 0 1 240px; }
 .preview-summary { font-size: 12px; color: var(--text-secondary); margin-top: 6px; }
+.preview-selection-row {
+  display: flex; align-items: center; gap: 6px; margin-top: 6px;
+  font-size: 12px; color: var(--text-secondary); cursor: pointer;
+}
+.preview-selection-row input { accent-color: var(--accent); }
 .import-preview-grid { display: flex; flex-direction: column; gap: 12px; margin-top: 12px; max-height: 520px; overflow-y: auto; }
 .import-preview-folder { display: flex; flex-direction: column; gap: 6px; }
-.import-preview-folder-header { font-size: 12px; font-weight: 600; color: var(--text-secondary); overflow-wrap: anywhere; }
+.import-preview-folder-header {
+  font-size: 12px; font-weight: 600; color: var(--text-secondary);
+  overflow-wrap: anywhere; display: flex; align-items: center; gap: 6px;
+}
+.import-preview-folder-header .folder-check { flex: none; accent-color: var(--accent); }
 .import-preview-thumbs { display: grid; grid-template-columns: repeat(auto-fill, minmax(104px, 1fr)); gap: 8px; }
 .import-preview-thumb {
   position: relative; min-width: 0; overflow: hidden; border-radius: 6px;
   background: var(--bg-tertiary); border: 1px solid var(--border-primary);
 }
 .import-preview-thumb.duplicate { opacity: 0.55; }
-.import-preview-thumb .thumb-check { position: absolute; top: 4px; left: 4px; z-index: 2; }
+.import-preview-thumb .thumb-check { position: absolute; top: 4px; left: 4px; z-index: 2; accent-color: var(--accent); }
 .import-preview-thumb .thumb-check:disabled { opacity: 0.5; cursor: not-allowed; }
 .import-preview-thumb-img { aspect-ratio: 1; background: var(--bg-primary); overflow: hidden; }
 .import-preview-thumb-img img { width: 100%; height: 100%; object-fit: cover; display: block; }
@@ -72,8 +81,11 @@ body { display: flex; flex-direction: column; height: 100vh; }
   0% { background-position: 200% 0; }
   100% { background-position: -200% 0; }
 }
+/* Anchored right, not left: the checkbox owns the top-left corner and the
+   badge is the only thing that explains why that checkbox is disabled.
+   Stacking them hides the explanation. */
 .import-preview-badge {
-  position: absolute; top: 6px; left: 6px; border-radius: 3px; padding: 2px 5px;
+  position: absolute; top: 6px; right: 6px; border-radius: 3px; padding: 2px 5px;
   background: rgba(0,0,0,0.72); color: #fff; font-size: 9px; font-weight: 700;
   letter-spacing: 0; text-transform: uppercase;
 }
@@ -402,6 +414,10 @@ body { display: flex; flex-direction: column; height: 100vh; }
         <button class="btn btn-primary" id="btnStart" onclick="startImport()">Start import</button>
       </div>
       <div class="preview-summary" id="previewSummary"></div>
+      <label class="preview-selection-row" id="selectAllRow" style="display:none;">
+        <input type="checkbox" id="chkSelectAllImport" checked>
+        <span id="previewSelectedCount"></span>
+      </label>
       <div id="importPreviewGrid" class="import-preview-grid" style="display:none;"></div>
       <div id="importError"></div>
     </div>
@@ -759,6 +775,26 @@ function wireDestStructureInvalidation() {
       hideDestStructure();
       scheduleImportPreview();
     });
+  });
+}
+
+// Called from initImportPage() alongside wireDestStructureInvalidation():
+// #chkSelectAllImport is static template markup, so it already exists, and
+// wiring before the first await closes the window where a preview could
+// render with a dead master checkbox.
+function wireImportSelectAll() {
+  const master = document.getElementById('chkSelectAllImport');
+  if (!master) return;
+  master.addEventListener('change', () => {
+    const skipDupes = document.getElementById('chkSkipDuplicates').checked;
+    importPreviewedPaths
+      .filter(p => !(importDuplicatePaths.has(p) && skipDupes))
+      .forEach(p => {
+        if (master.checked) importDeselected.delete(p);
+        else importDeselected.add(p);
+      });
+    updateImportSelectionUI();
+    rerenderImportPreviewGridSafe();
   });
 }
 
@@ -1963,7 +1999,25 @@ function renderImportPreviewGrid(files, duplicatePaths, destinationFiles) {
     groupEl.className = 'import-preview-folder';
     const header = document.createElement('div');
     header.className = 'import-preview-folder-header';
-    header.textContent = subfolder + ' (' + groups[subfolder].length + ')';
+    const folderCheck = document.createElement('input');
+    folderCheck.type = 'checkbox';
+    folderCheck.className = 'folder-check';
+    folderCheck.title = 'Select or deselect every file in ' + subfolder;
+    // State is set by refreshImportFolderHeaders() once the cards exist —
+    // it derives the tally from the rendered cards, so the header and the
+    // boxes below it can never disagree.
+    folderCheck.addEventListener('change', () => {
+      importFolderPaths(header.parentNode).forEach((p) => {
+        if (folderCheck.checked) importDeselected.delete(p);
+        else importDeselected.add(p);
+      });
+      updateImportSelectionUI();
+      rerenderImportPreviewGridSafe();
+    });
+    header.appendChild(folderCheck);
+    const headerLabel = document.createElement('span');
+    headerLabel.textContent = subfolder + ' (' + groups[subfolder].length + ')';
+    header.appendChild(headerLabel);
     groupEl.appendChild(header);
 
     const thumbsEl = document.createElement('div');
@@ -2031,16 +2085,82 @@ function renderImportPreviewGrid(files, duplicatePaths, destinationFiles) {
     groupEl.appendChild(thumbsEl);
     grid.appendChild(groupEl);
   });
+  refreshImportFolderHeaders();
   grid.style.display = '';
   setupImportThumbnailScheduler();
 }
 
+// The selectable paths in one rendered folder group. Skipped duplicates are
+// excluded: they're already ineligible, so a bulk toggle must neither select
+// them (it can't) nor record a deselection for them (that would turn an
+// eligibility verdict into user intent, and it would outlive the verdict).
+function importFolderPaths(groupEl) {
+  if (!groupEl) return [];
+  const skipDupes = document.getElementById('chkSkipDuplicates').checked;
+  return Array.from(groupEl.querySelectorAll('.import-preview-thumb'))
+    .map(el => el.dataset.path)
+    .filter(p => p && !(importDuplicatePaths.has(p) && skipDupes));
+}
+
+// Folder headers are a tally of the cards under them, so they have to be
+// recomputed after ANY selection change — including a single per-file click,
+// which otherwise leaves the header claiming "all selected".
+function refreshImportFolderHeaders() {
+  document.querySelectorAll('.import-preview-folder').forEach((groupEl) => {
+    const folderCheck = groupEl.querySelector('.folder-check');
+    if (!folderCheck) return;
+    const paths = importFolderPaths(groupEl);
+    const onCount = paths.filter(p => !importDeselected.has(p)).length;
+    folderCheck.checked = onCount > 0;
+    // Tri-state: "some" must not read as "all". Only settable from JS.
+    folderCheck.indeterminate = onCount > 0 && onCount < paths.length;
+  });
+}
+
 function toggleImportSelection(path, checked, shiftKey) {
-  // Range handling arrives in Task 9.
-  if (checked) importDeselected.delete(path);
-  else importDeselected.add(path);
+  const skipDupes = document.getElementById('chkSkipDuplicates').checked;
+  // Range runs over VISIBLE render order, so a filter (e.g. Hide duplicates)
+  // can't make a shift-click toggle cards the user cannot see.
+  const visible = Array.from(
+    document.querySelectorAll('.import-preview-thumb')).map(el => el.dataset.path);
+  let targets = [path];
+  if (shiftKey && importSelectionAnchor !== null) {
+    const a = visible.indexOf(importSelectionAnchor);
+    const b = visible.indexOf(path);
+    if (a !== -1 && b !== -1) {
+      // min/max, not a..b: the anchor can sit after the click target.
+      targets = visible.slice(Math.min(a, b), Math.max(a, b) + 1);
+    }
+  }
+  targets
+    .filter(p => !(importDuplicatePaths.has(p) && skipDupes))
+    .forEach(p => {
+      if (checked) importDeselected.delete(p);
+      else importDeselected.add(p);
+    });
+  // Re-anchor on every click, shift-click included, so the next range starts
+  // from where this one ended.
   importSelectionAnchor = path;
   updateImportSelectionUI();
+  rerenderImportPreviewGridSafe();
+}
+
+// The hide-duplicates-checkbox branch adds rerenderImportPreviewGrid(). Until
+// it merges, fall back to a targeted DOM refresh.
+function rerenderImportPreviewGridSafe() {
+  if (typeof rerenderImportPreviewGrid === 'function') {
+    rerenderImportPreviewGrid();
+    return;
+  }
+  const skipDupes = document.getElementById('chkSkipDuplicates').checked;
+  document.querySelectorAll('.import-preview-thumb').forEach((el) => {
+    const cb = el.querySelector('.thumb-check');
+    if (!cb) return;
+    const isDup = importDuplicatePaths.has(el.dataset.path);
+    cb.checked = !importDeselected.has(el.dataset.path) && !(isDup && skipDupes);
+    cb.disabled = isDup && skipDupes;
+  });
+  refreshImportFolderHeaders();
 }
 
 function importEligibleCount() {
@@ -2063,6 +2183,16 @@ function updateImportSelectionUI() {
     // include_paths count, which is larger because it retains duplicates.
     el.textContent = importCheckedCount().toLocaleString() + ' of '
       + importPreviewedPaths.length.toLocaleString() + ' selected';
+  }
+  const master = document.getElementById('chkSelectAllImport');
+  if (master) {
+    // Derived like every other box on this page. A master that stays ticked
+    // while only some files are selected would be a lie the user reads as
+    // "everything goes".
+    const eligible = importEligibleCount();
+    const checked = importCheckedCount();
+    master.checked = checked > 0;
+    master.indeterminate = checked > 0 && checked < eligible;
   }
   const row = document.getElementById('selectAllRow');
   // The selectionEnabled check matters: without it a later call to this
@@ -2925,6 +3055,7 @@ async function initImportPage() {
   // template, or file-type controls without the rendered structure
   // being invalidated.
   wireDestStructureInvalidation();
+  wireImportSelectAll();
   await loadImportReadiness();
   // Native menu deep link: File > Import Folder... routes here as
   // /import?mode=copy&pick=source so it lands in Copy-to-archive with the

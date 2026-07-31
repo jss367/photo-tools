@@ -1665,3 +1665,280 @@ def test_import_preview_deselection_survives_a_later_render(live_server, page):
     expect(box(files[1]["path"])).not_to_be_checked()
     expect(box(files[1]["path"])).to_be_disabled()
     expect(box(files[2]["path"])).to_be_checked()
+
+    # Black-box proof of the same separation: drop the eligibility overlay
+    # and the duplicate comes back checked. If the verdict had been written
+    # into importDeselected, it would survive as intent and stay unchecked.
+    # (Set the control directly: .uncheck() fires change, which reruns the
+    # whole preview and would rebuild state from scratch.)
+    page.evaluate(
+        "() => { document.getElementById('chkSkipDuplicates').checked ="
+        " false; }")
+    page.evaluate(
+        "([files, dupes]) => renderImportPreviewGrid(files, dupes, null)",
+        [files, [files[1]["path"]]],
+    )
+    expect(box(files[1]["path"])).to_be_checked()
+    expect(box(files[1]["path"])).to_be_enabled()
+    # ...and the hand-picked deselection is still intent, so it survives.
+    expect(box(files[0]["path"])).not_to_be_checked()
+
+
+def _box(page, path):
+    return page.locator(
+        f".import-preview-thumb[data-path='{path}'] .thumb-check")
+
+
+def _drop_skip_duplicates_and_rerender(page, files, dupes):
+    """Turn the duplicate overlay off and re-render, without a re-preview.
+
+    Reveals whether a bulk operation wrote duplicate verdicts into
+    importDeselected: once the overlay is gone, anything still unchecked is
+    intent. Uses a direct property write rather than .uncheck() so no change
+    event fires and previewImport() doesn't rebuild the state under us.
+    """
+    page.evaluate(
+        "() => { document.getElementById('chkSkipDuplicates').checked ="
+        " false; }")
+    page.evaluate(
+        "([files, dupes]) => renderImportPreviewGrid(files, dupes, null)",
+        [files, dupes],
+    )
+
+
+def test_shift_click_selects_a_contiguous_range(live_server, page):
+    page.goto(f"{live_server['url']}/import")
+    files = _files(5)
+    _stub_preview(page, files)
+    _preview(page)
+
+    boxes = page.locator(".import-preview-thumb .thumb-check")
+    boxes.nth(1).click()                          # uncheck index 1
+    boxes.nth(3).click(modifiers=["Shift"])       # range 1..3 unchecked
+    for i, want in enumerate([True, False, False, False, True]):
+        if want:
+            expect(boxes.nth(i)).to_be_checked()
+        else:
+            expect(boxes.nth(i)).not_to_be_checked()
+
+
+def test_shift_click_range_runs_backwards_too(live_server, page):
+    """Anchor after target. The range is min..max, not anchor..target."""
+    page.goto(f"{live_server['url']}/import")
+    _stub_preview(page, _files(5))
+    _preview(page)
+
+    boxes = page.locator(".import-preview-thumb .thumb-check")
+    boxes.nth(3).click()                          # anchor at index 3
+    boxes.nth(1).click(modifiers=["Shift"])       # range 1..3 unchecked
+    for i, want in enumerate([True, False, False, False, True]):
+        if want:
+            expect(boxes.nth(i)).to_be_checked()
+        else:
+            expect(boxes.nth(i)).not_to_be_checked()
+
+
+def test_shift_click_moves_the_anchor(live_server, page):
+    """A shift-click re-anchors, so the next range starts where it ended."""
+    page.goto(f"{live_server['url']}/import")
+    _stub_preview(page, _files(5))
+    _preview(page)
+
+    boxes = page.locator(".import-preview-thumb .thumb-check")
+    boxes.nth(0).click()                          # anchor 0, uncheck 0
+    boxes.nth(4).click(modifiers=["Shift"])       # 0..4 unchecked, anchor 4
+    for i in range(5):
+        expect(boxes.nth(i)).not_to_be_checked()
+
+    boxes.nth(2).click(modifiers=["Shift"])       # re-check 2..4, not 0..2
+    for i, want in enumerate([False, False, True, True, True]):
+        if want:
+            expect(boxes.nth(i)).to_be_checked()
+        else:
+            expect(boxes.nth(i)).not_to_be_checked()
+
+
+def test_shift_range_does_not_deselect_ineligible_duplicates(
+        live_server, page):
+    """A range dragged across a skipped duplicate must not record intent.
+
+    While Skip duplicates is on the card is disabled either way, so the DOM
+    can't tell the two designs apart — turn the overlay off and look again.
+    """
+    page.goto(f"{live_server['url']}/import")
+    files = _files(4)
+    _stub_preview(page, files, duplicates=[files[1]["path"]])
+    _preview(page)
+
+    boxes = page.locator(".import-preview-thumb .thumb-check")
+    boxes.nth(0).click()
+    boxes.nth(2).click(modifiers=["Shift"])       # range spans the duplicate
+
+    _drop_skip_duplicates_and_rerender(page, files, [files[1]["path"]])
+    expect(_box(page, files[1]["path"])).to_be_checked()
+    expect(_box(page, files[0]["path"])).not_to_be_checked()
+    expect(_box(page, files[2]["path"])).not_to_be_checked()
+
+
+def test_folder_header_checkbox_toggles_its_subfolder(live_server, page):
+    page.goto(f"{live_server['url']}/import")
+    _stub_preview(page, _files(3))
+    _preview(page)
+
+    page.locator(".import-preview-folder-header .folder-check").first.click()
+    boxes = page.locator(".import-preview-thumb .thumb-check")
+    for i in range(3):
+        expect(boxes.nth(i)).not_to_be_checked()
+
+
+def test_folder_header_only_toggles_its_own_subfolder(live_server, page):
+    page.goto(f"{live_server['url']}/import")
+    files = (_files(2, prefix='/tmp/card/a/DSC_')
+             + _files(2, prefix='/tmp/card/b/DSC_'))
+    for f in files[:2]:
+        f["subfolder"] = "a"
+    for f in files[2:]:
+        f["subfolder"] = "b"
+    _stub_preview(page, files)
+    _preview(page)
+
+    headers = page.locator(".import-preview-folder-header .folder-check")
+    expect(headers).to_have_count(2)
+    headers.nth(0).click()
+    for f in files[:2]:
+        expect(_box(page, f["path"])).not_to_be_checked()
+    for f in files[2:]:
+        expect(_box(page, f["path"])).to_be_checked()
+
+
+def test_folder_header_is_indeterminate_on_a_partial_selection(
+        live_server, page):
+    """The tri-state is the honest readout: some != all, and != none."""
+    page.goto(f"{live_server['url']}/import")
+    _stub_preview(page, _files(3))
+    _preview(page)
+
+    header = page.locator(".import-preview-folder-header .folder-check").first
+    expect(header).to_be_checked()
+    expect(header).to_have_js_property("indeterminate", False)
+
+    boxes = page.locator(".import-preview-thumb .thumb-check")
+    boxes.nth(0).click()
+    expect(header).to_be_checked()
+    expect(header).to_have_js_property("indeterminate", True)
+
+    boxes.nth(1).click()
+    boxes.nth(2).click()
+    expect(header).not_to_be_checked()
+    expect(header).to_have_js_property("indeterminate", False)
+
+
+def test_folder_header_ignores_skipped_duplicates_in_its_tally(
+        live_server, page):
+    """An ineligible duplicate is not an unselected file.
+
+    Two eligible files both checked plus one skipped duplicate must read as
+    "all", not as a partial selection.
+    """
+    page.goto(f"{live_server['url']}/import")
+    files = _files(3)
+    _stub_preview(page, files, duplicates=[files[1]["path"]])
+    _preview(page)
+
+    header = page.locator(".import-preview-folder-header .folder-check").first
+    expect(header).to_be_checked()
+    expect(header).to_have_js_property("indeterminate", False)
+
+
+def test_folder_header_does_not_deselect_ineligible_duplicates(
+        live_server, page):
+    page.goto(f"{live_server['url']}/import")
+    files = _files(3)
+    _stub_preview(page, files, duplicates=[files[1]["path"]])
+    _preview(page)
+
+    page.locator(".import-preview-folder-header .folder-check").first.click()
+
+    _drop_skip_duplicates_and_rerender(page, files, [files[1]["path"]])
+    expect(_box(page, files[0]["path"])).not_to_be_checked()
+    expect(_box(page, files[1]["path"])).to_be_checked()
+    expect(_box(page, files[2]["path"])).not_to_be_checked()
+
+
+def test_select_all_toggles_every_file_and_reports_the_count(
+        live_server, page):
+    page.goto(f"{live_server['url']}/import")
+    _stub_preview(page, _files(3))
+    _preview(page)
+
+    expect(page.locator("#selectAllRow")).to_be_visible()
+    expect(page.locator("#previewSelectedCount")).to_have_text(
+        "3 of 3 selected")
+
+    page.locator("#chkSelectAllImport").uncheck()
+    boxes = page.locator(".import-preview-thumb .thumb-check")
+    for i in range(3):
+        expect(boxes.nth(i)).not_to_be_checked()
+    expect(page.locator("#previewSelectedCount")).to_have_text(
+        "0 of 3 selected")
+
+    page.locator("#chkSelectAllImport").check()
+    for i in range(3):
+        expect(boxes.nth(i)).to_be_checked()
+    expect(page.locator("#previewSelectedCount")).to_have_text(
+        "3 of 3 selected")
+
+
+def test_select_all_box_reflects_a_partial_selection(live_server, page):
+    page.goto(f"{live_server['url']}/import")
+    _stub_preview(page, _files(3))
+    _preview(page)
+
+    master = page.locator("#chkSelectAllImport")
+    expect(master).to_be_checked()
+    expect(master).to_have_js_property("indeterminate", False)
+
+    page.locator(".import-preview-thumb .thumb-check").nth(0).click()
+    expect(master).to_be_checked()
+    expect(master).to_have_js_property("indeterminate", True)
+
+
+def test_select_all_does_not_deselect_ineligible_duplicates(
+        live_server, page):
+    page.goto(f"{live_server['url']}/import")
+    files = _files(3)
+    _stub_preview(page, files, duplicates=[files[1]["path"]])
+    _preview(page)
+
+    page.locator("#chkSelectAllImport").uncheck()
+
+    _drop_skip_duplicates_and_rerender(page, files, [files[1]["path"]])
+    expect(_box(page, files[0]["path"])).not_to_be_checked()
+    expect(_box(page, files[1]["path"])).to_be_checked()
+    expect(_box(page, files[2]["path"])).not_to_be_checked()
+
+
+def test_duplicate_badge_and_checkbox_do_not_overlap(live_server, page):
+    """Both must stay legible: the box says it's off, the badge says why."""
+    page.goto(f"{live_server['url']}/import")
+    files = _files(3)
+    _stub_preview(page, files, duplicates=[files[1]["path"]])
+    _preview(page)
+
+    card = page.locator(
+        f".import-preview-thumb[data-path='{files[1]['path']}']")
+    check = card.locator(".thumb-check")
+    badge = card.locator(".import-preview-badge")
+    expect(check).to_be_visible()
+    expect(badge).to_be_visible()
+    expect(badge).to_have_text("Duplicate")
+
+    cb = check.bounding_box()
+    bb = badge.bounding_box()
+    assert cb["width"] > 0 and bb["width"] > 0
+    horizontal_gap = (cb["x"] + cb["width"] <= bb["x"]
+                      or bb["x"] + bb["width"] <= cb["x"])
+    vertical_gap = (cb["y"] + cb["height"] <= bb["y"]
+                    or bb["y"] + bb["height"] <= cb["y"])
+    assert horizontal_gap or vertical_gap, (
+        f"checkbox {cb} overlaps duplicate badge {bb}")

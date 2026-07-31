@@ -5796,7 +5796,6 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                             dropped.append(p)
                         else:
                             kept.append(p)
-                    total_before = len(photos)
                     photos = kept
                     dropped_ids = {p["id"] for p in dropped}
                     # The unreadable count exists to explain `no_subject_mask`

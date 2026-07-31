@@ -6495,16 +6495,16 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                         else "completed"
                     )
                     stages["extract_masks"]["status"] = final_status
-                    # Source outages lead the rollup: "reconnect this volume"
-                    # is the actionable headline, and its Fatal prefix keeps
+                    # Source outages own the headline: "reconnect this volume"
+                    # is the actionable message, and its Fatal prefix keeps
                     # the end-of-run summary from picking a lesser warning.
                     # Each cause reports only the photos it actually explains
-                    # — a corrupt file in a healthy folder is not recovered by
-                    # reconnecting a drive.
+                    # — a corrupt file in a healthy folder is not recovered
+                    # by reconnecting a drive.
                     em_other_unreadable = em_unreadable - em_offline_unreadable
-                    em_rollups = []
+                    em_fatal_msg = None
                     if em_offline_unreadable > 0:
-                        em_rollups.append(
+                        em_fatal_msg = (
                             f"[extract_masks] Fatal: {em_offline_unreadable} "
                             f"of {em_total_candidates} photos unreachable — "
                             f"{'; '.join(em_offline_reasons)}. Reconnect the "
@@ -6512,20 +6512,34 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                             f"photos have no mask and Process Review rejects "
                             f"them as `no_subject_mask`."
                         )
+                    em_secondary_rollups = []
                     if em_other_unreadable > 0:
-                        em_rollups.append(
+                        em_secondary_rollups.append(
                             f"[extract_masks] {em_other_unreadable} of "
                             f"{em_total_candidates} photos could not be read, "
                             f"so they have no mask and Process Review rejects "
                             f"them as `no_subject_mask`."
                         )
                     if em_failed > 0:
-                        em_rollups.append(
+                        em_secondary_rollups.append(
                             f"[extract_masks] {em_failed} of {em_total_candidates} photos "
                             f"failed mask extraction"
                         )
-                    errors.extend(em_rollups)
-                    em_rollup = em_rollups[0] if em_rollups else None
+                    # Emit the actionable Fatal last so any collapse-by-stage
+                    # consumer that keeps whichever entry appeared last for
+                    # each stage still sees the reconnect instruction rather
+                    # than the generic "failed mask extraction" rollup
+                    # (Codex #1392 P2 r3687118058). The Extract card and
+                    # top-level banner already prefer Fatal explicitly; this
+                    # protects other listeners (job event streams, exports)
+                    # from the same silent-last-wins collapse.
+                    errors.extend(em_secondary_rollups)
+                    if em_fatal_msg:
+                        errors.append(em_fatal_msg)
+                    em_rollup = em_fatal_msg or (
+                        em_secondary_rollups[0]
+                        if em_secondary_rollups else None
+                    )
                     em_summary_parts = [
                         f"{em_masked_all} masked", f"{skipped} skipped",
                     ]

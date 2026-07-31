@@ -2188,7 +2188,7 @@ def run_import_job(job, runner, db_path, workspace_id, params):
     # Selection drift. Computed against the pre-filter snapshot.
     deselected = 0
     vanished_paths = set()
-    appeared = 0  # noqa: F841 — consumed by the drift-reporting task.
+    appeared = 0
     if include_paths is not None:
         # Deliberately NOT gated on ``previewed_count``. A selected file the
         # card no longer holds is drift whether or not the caller told us how
@@ -2214,7 +2214,7 @@ def run_import_job(job, runner, db_path, workspace_id, params):
         # vanished gives ``deselected == 0``, and only ``vanished_paths``
         # blocks it. ``appeared`` is a report count, so a negative would be
         # meaningless.
-        appeared = max(0, len(discovered_paths) - params.previewed_count)  # noqa: F841
+        appeared = max(0, len(discovered_paths) - params.previewed_count)
 
     checker = None
     if params.skip_duplicates:
@@ -3408,6 +3408,46 @@ def run_import_job(job, runner, db_path, workspace_id, params):
                 f"{unverified_duplicate} matched by filename, byte size, "
                 "and capture time but were not compared byte-for-byte"
             ),
+        })
+    # Selection drift entries. ``renderResult`` HIDES the unsafe list when it
+    # is empty, so every signal that can flip the pill red must append a line
+    # here or the user gets "Do NOT format the card yet" with no stated
+    # reason. These lines *attribute* the gap between what was previewed and
+    # what was copied; they do not claim to enumerate it. Deselect one file,
+    # have another vanish, and have a third arrive after the preview, and the
+    # counts no longer map one-to-one onto the files still card-only — do not
+    # reword these into a claim that the list is exhaustive.
+    #
+    # Both branches of ``deselected`` are covered on purpose:
+    # ``_selection_blocks_format`` blocks on ``deselected != 0``, so a
+    # negative count (the payload previewed fewer files than it selected)
+    # turns the pill red too. A lone ``if deselected > 0`` would leave
+    # exactly that red pill bare. The negative branch does not quote the
+    # number: the payload is self-inconsistent, so the count is precisely the
+    # thing that cannot be trusted.
+    if deselected > 0:
+        unsafe_files.append({
+            "path": "Deselected files",
+            "reason": f"{deselected} files you deselected were not copied",
+        })
+    if deselected < 0:
+        unsafe_files.append({
+            "path": "Selection count mismatch",
+            "reason": ("your preview reported fewer files than were "
+                       "selected, so how many files went uncopied could not "
+                       "be determined — re-preview before formatting"),
+        })
+    if vanished_paths:
+        unsafe_files.append({
+            "path": "Files missing at import time",
+            "reason": f"{len(vanished_paths)} files were in scope but had "
+                      "disappeared from the source when the import ran",
+        })
+    if appeared > 0:
+        unsafe_files.append({
+            "path": "Files added after preview",
+            "reason": f"at least {appeared} files arrived after your preview "
+                      "and were not imported — re-preview to include them",
         })
     safe_to_format = (
         not cancelled

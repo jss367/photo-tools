@@ -6529,3 +6529,157 @@ def test_repeated_include_path_does_not_mask_a_deselection(tmp_path):
 
     assert result["safe_to_format"] is False
     assert result["unverified_duplicates_only"] is False
+
+
+def _unsafe_paths(result):
+    return {u["path"] for u in result["unsafe_files"]}
+
+
+def test_deselection_explains_itself_on_the_result_card(tmp_path):
+    from import_job import ImportParams
+
+    card = _make_card(tmp_path, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+        ("DSC_0002.jpg", datetime(2026, 7, 3, 11, 0, 0), "green"),
+    ])
+    _, _, result = _run_import(tmp_path, ImportParams(
+        sources=[str(card)], destination=str(tmp_path / "archive"),
+        include_paths={str(card / "DSC_0001.jpg")},
+        previewed_count=2, checked_count=1,
+    ))
+    assert "Deselected files" in _unsafe_paths(result)
+    entry = next(u for u in result["unsafe_files"]
+                 if u["path"] == "Deselected files")
+    assert "1 files you deselected were not copied" in entry["reason"]
+    # Must NOT claim the card holds the only copies — false when the
+    # deselected file is byte-identical to a selected one.
+    assert "only copies" not in entry["reason"]
+
+
+def test_vanished_file_explains_itself_on_the_result_card(tmp_path):
+    from import_job import ImportParams
+
+    card = _make_card(tmp_path, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+    ])
+    _, _, result = _run_import(tmp_path, ImportParams(
+        sources=[str(card)], destination=str(tmp_path / "archive"),
+        include_paths={str(card / "DSC_0001.jpg"), str(card / "GONE.jpg")},
+        previewed_count=2, checked_count=2,
+    ))
+    assert "Files missing at import time" in _unsafe_paths(result)
+
+
+def test_files_appearing_after_preview_explain_themselves(tmp_path):
+    """A file that arrived after the preview is not in ``include_paths``.
+
+    It is therefore never copied, and the card still holds the only copy.
+    ``deselected`` is 0 here (two previewed, two selected) and nothing
+    vanished, so the appeared count is the only signal that can name it.
+    """
+    from import_job import ImportParams
+
+    card = _make_card(tmp_path, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+        ("DSC_0002.jpg", datetime(2026, 7, 3, 11, 0, 0), "green"),
+        ("DSC_0003.jpg", datetime(2026, 7, 3, 12, 0, 0), "blue"),
+    ])
+    _, _, result = _run_import(tmp_path, ImportParams(
+        sources=[str(card)], destination=str(tmp_path / "archive"),
+        include_paths={
+            str(card / "DSC_0001.jpg"), str(card / "DSC_0002.jpg"),
+        },
+        previewed_count=2, checked_count=2,
+    ))
+    assert "Files added after preview" in _unsafe_paths(result)
+    entry = next(u for u in result["unsafe_files"]
+                 if u["path"] == "Files added after preview")
+    assert "at least 1 files arrived after your preview" in entry["reason"]
+
+
+def test_inconsistent_selection_count_explains_itself(tmp_path):
+    """A negative ``deselected`` blocks the card, so it must also speak.
+
+    ``_selection_blocks_format`` fails closed on ``deselected != 0``, so a
+    payload that previewed fewer files than it selected turns the pill red.
+    Appending only under ``deselected > 0`` would leave that red pill bare —
+    a warning with no stated reason. The count itself is untrustworthy here,
+    so the entry says the payload is inconsistent rather than quoting a
+    nonsense number.
+    """
+    from import_job import ImportParams
+
+    card = _make_card(tmp_path, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+    ])
+    _, _, result = _run_import(tmp_path, ImportParams(
+        sources=[str(card)], destination=str(tmp_path / "archive"),
+        include_paths={str(card / "DSC_0001.jpg")},
+        previewed_count=0, checked_count=1,
+    ))
+    # Selection is the ONLY blocker: the ledger balances and nothing failed.
+    assert result["copied"] == 1
+    assert result["copied"] + result["skipped_duplicate"] == result["discovered"]
+    assert result["failed"] == 0
+    assert result["safe_to_format"] is False
+
+    assert "Selection count mismatch" in _unsafe_paths(result)
+    entry = next(u for u in result["unsafe_files"]
+                 if u["path"] == "Selection count mismatch")
+    # No nonsense number: the count is what is untrustworthy.
+    assert "-1" not in entry["reason"]
+
+
+def test_no_selection_blocked_result_leaves_the_pill_bare(tmp_path):
+    """The invariant: a selection-blocked card always states a reason.
+
+    ``renderResult`` hides the unsafe list entirely when it is empty, so any
+    path that flips the pill red without appending an entry produces a scary
+    warning with no stated reason. Each scenario asserts the SPECIFIC entry
+    it should produce — asserting only "non-empty" would pass on an
+    unrelated pre-existing entry (a failed copy, a likely duplicate).
+    """
+    from import_job import ImportParams
+
+    scenarios = [
+        # (name, card specs, include filenames, extra include, previewed,
+        #  expected entry path)
+        ("deselect",
+         ["DSC_0001.jpg", "DSC_0002.jpg"], ["DSC_0001.jpg"], None, 2,
+         "Deselected files"),
+        ("vanished",
+         ["DSC_0001.jpg"], ["DSC_0001.jpg"], "GONE.jpg", 2,
+         "Files missing at import time"),
+        ("appeared",
+         ["DSC_0001.jpg", "DSC_0002.jpg", "DSC_0003.jpg"],
+         ["DSC_0001.jpg", "DSC_0002.jpg"], None, 2,
+         "Files added after preview"),
+        # A negative ``deselected`` cannot occur alone: ``include_paths``
+        # larger than ``previewed_count`` means either a selected path is not
+        # on the card (vanished) or the card holds more than was previewed
+        # (appeared). The assertion is on the specific entry, so the
+        # co-occurring one cannot satisfy it.
+        ("negative",
+         ["DSC_0001.jpg"], ["DSC_0001.jpg"], None, 0,
+         "Selection count mismatch"),
+    ]
+    for name, specs, included, extra, previewed, expected in scenarios:
+        root = tmp_path / name
+        root.mkdir()
+        card = _make_card(root, [
+            (fn, datetime(2026, 7, 3, 10 + i, 0, 0), "red")
+            for i, fn in enumerate(specs)
+        ])
+        include_paths = {str(card / fn) for fn in included}
+        if extra:
+            include_paths.add(str(card / extra))
+        _, _, result = _run_import(root, ImportParams(
+            sources=[str(card)], destination=str(root / "archive"),
+            include_paths=include_paths,
+            previewed_count=previewed, checked_count=len(include_paths),
+        ))
+        assert result["safe_to_format"] is False, name
+        assert result["unsafe_files"], name
+        assert expected in _unsafe_paths(result), name
+        # Entries are mirrored into ``errors``; both surfaces must speak.
+        assert any(e.startswith(expected + ": ") for e in result["errors"]), name

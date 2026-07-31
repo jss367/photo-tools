@@ -1541,3 +1541,127 @@ def test_import_folder_template_examples_retire_with_their_source(
     expect(preset.locator("option[value='%Y/%Y-%m-%d']")).to_have_text(
         "%Y/%Y-%m-%d")
     expect(preset.locator("option[value='%Y-%m-%d']")).to_have_text("%Y-%m-%d")
+
+
+def _stub_preview(page, files, duplicates=None):
+    """Stub folder-preview + check-duplicates, and put the page in COPY mode.
+
+    Two things here are load-bearing:
+      - #modeInPlace is `checked` by default (import.html:232). Without
+        selecting copy mode, previewImport() returns early at the
+        `if (!copyMode)` branch, no duplicate stream runs, and per Task 11
+        the checkboxes are hidden entirely — every selection test would
+        fail for the wrong reason.
+      - check-duplicates is SSE, not newline-JSON. The client parses
+        `buffer.split('\n\n')` + /^data: (.+)$/m. Frames must be
+        `data: {...}\n\n`. Copied from the existing stub above.
+    """
+    page.locator("#modeCopy").check()
+    page.evaluate(
+        """
+        ([files, dupes]) => {
+          const originalFetch = window.fetch.bind(window);
+          window.fetch = (input, init) => {
+            const t = typeof input === 'string' ? input : input.url;
+            if (t && t.indexOf('/api/import/folder-preview') === 0) {
+              return Promise.resolve(new Response(JSON.stringify({
+                total_count: files.length, total_size: 0,
+                type_breakdown: {'.jpg': files.length},
+                duplicate_count: 0, files: files,
+              }), {status: 200, headers: {'Content-Type': 'application/json'}}));
+            }
+            if (t && t.indexOf('/api/import/check-duplicates') === 0) {
+              const frame = 'data: ' + JSON.stringify({
+                duplicates: dupes, checked: files.length, total: files.length,
+              }) + '\\n\\n' + 'data: ' + JSON.stringify({
+                done: true, duplicate_count: dupes.length,
+                checked: files.length, total: files.length,
+              }) + '\\n\\n';
+              return Promise.resolve(new Response(frame, {
+                status: 200,
+                headers: {'Content-Type': 'text/event-stream'},
+              }));
+            }
+            return originalFetch(input, init);
+          };
+          window.pickDirectory = async () => ['/tmp/card'];
+        }
+        """,
+        [files, duplicates or []],
+    )
+
+
+def _preview(page):
+    """Add the stubbed source and wait for the grid to settle."""
+    page.locator("[data-testid='import-source-browse-btn']").click()
+    page.locator("#btnPreview").click()
+    expect(page.locator("#importPreviewGrid")).to_be_visible()
+
+
+def _files(n, prefix='/tmp/card/DSC_'):
+    return [{"path": f"{prefix}{i:04d}.jpg", "filename": f"DSC_{i:04d}.jpg",
+             "subfolder": "card", "size": 100, "extension": ".jpg",
+             "mtime": 0, "thumb_url": ""} for i in range(n)]
+
+
+def test_import_preview_files_are_checked_by_default(live_server, page):
+    page.goto(f"{live_server['url']}/import")
+    _stub_preview(page, _files(3))
+    _preview(page)
+
+    boxes = page.locator(".import-preview-thumb .thumb-check")
+    expect(boxes).to_have_count(3)
+    for i in range(3):
+        expect(boxes.nth(i)).to_be_checked()
+
+
+def test_import_preview_duplicates_are_unchecked_and_disabled(
+        live_server, page):
+    page.goto(f"{live_server['url']}/import")
+    files = _files(3)
+    _stub_preview(page, files, duplicates=[files[1]["path"]])
+    _preview(page)
+
+    dupe = page.locator(
+        f".import-preview-thumb[data-path='{files[1]['path']}'] .thumb-check")
+    expect(dupe).not_to_be_checked()
+    expect(dupe).to_be_disabled()
+
+
+def test_import_preview_deselection_survives_a_later_render(live_server, page):
+    """A hand-picked deselection must outlive the next render pass.
+
+    renderImportPreviewGrid runs up to three times per preview (files only,
+    then with duplicate verdicts, then with destination data). Checkbox state
+    is DERIVED from importDeselected on every pass rather than seeded, so a
+    late-arriving pass re-computes the same answer instead of stomping the
+    user's click. This drives the third pass the way import.html itself does.
+    """
+    page.goto(f"{live_server['url']}/import")
+    files = _files(3)
+    _stub_preview(page, files, duplicates=[files[1]["path"]])
+    _preview(page)
+
+    def box(path):
+        return page.locator(
+            f".import-preview-thumb[data-path='{path}'] .thumb-check")
+
+    box(files[0]["path"]).uncheck()
+    expect(box(files[0]["path"])).not_to_be_checked()
+
+    # The duplicate verdict is an eligibility overlay, not user intent: it
+    # must never be written into importDeselected.
+    assert page.evaluate("() => Array.from(importDeselected)") == [
+        files[0]["path"]]
+
+    # Re-render with the same inputs, as the destination-data pass does.
+    page.evaluate(
+        "([files, dupes]) => renderImportPreviewGrid(files, dupes, null)",
+        [files, [files[1]["path"]]],
+    )
+
+    expect(box(files[0]["path"])).not_to_be_checked()
+    expect(box(files[0]["path"])).to_be_enabled()
+    expect(box(files[1]["path"])).not_to_be_checked()
+    expect(box(files[1]["path"])).to_be_disabled()
+    expect(box(files[2]["path"])).to_be_checked()

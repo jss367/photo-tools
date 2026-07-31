@@ -59,6 +59,8 @@ body { display: flex; flex-direction: column; height: 100vh; }
   background: var(--bg-tertiary); border: 1px solid var(--border-primary);
 }
 .import-preview-thumb.duplicate { opacity: 0.55; }
+.import-preview-thumb .thumb-check { position: absolute; top: 4px; left: 4px; z-index: 2; }
+.import-preview-thumb .thumb-check:disabled { opacity: 0.5; cursor: not-allowed; }
 .import-preview-thumb-img { aspect-ratio: 1; background: var(--bg-primary); overflow: hidden; }
 .import-preview-thumb-img img { width: 100%; height: 100%; object-fit: cover; display: block; }
 .import-preview-thumb.skeleton .import-preview-thumb-img::after {
@@ -485,6 +487,14 @@ let importPreviewSeq = 0;
 let importPreviewTimer = null;
 let importThumbSchedulerCancel = null;
 let importTags = [];
+// User intent ONLY: paths the user explicitly unchecked. Duplicate verdicts
+// are a separate eligibility overlay and are never written in here — see the
+// import-file-selection spec §1. Keeping these separate is what makes the
+// checkbox state safe to re-derive on every render.
+let importDeselected = new Set();
+let importDuplicatePaths = new Set();
+let importPreviewedPaths = [];
+let importSelectionAnchor = null;
 let newImagesSnapshotId = null;
 let importExiftoolReady = null;
 let importExiftoolRequired = true;
@@ -1939,6 +1949,8 @@ function renderImportPreviewGrid(files, duplicatePaths, destinationFiles) {
     return;
   }
 
+  const skipDupes = document.getElementById('chkSkipDuplicates').checked;
+
   const groups = {};
   files.forEach((f) => {
     const key = f.subfolder || 'Source';
@@ -1966,6 +1978,21 @@ function renderImportPreviewGrid(files, duplicatePaths, destinationFiles) {
       card.dataset.path = f.path || '';
       if (f.thumb_url) card.dataset.thumbUrl = f.thumb_url;
       card.title = f.path || f.filename || '';
+
+      const check = document.createElement('input');
+      check.type = 'checkbox';
+      check.className = 'thumb-check';
+      // Derived, never seeded. The renderer runs up to three times per
+      // preview and duplicate verdicts arrive late; recomputing from state
+      // each pass means a late verdict just changes the answer.
+      check.checked = !importDeselected.has(f.path)
+        && !(isDuplicate && skipDupes);
+      check.disabled = isDuplicate && skipDupes;
+      check.addEventListener('click', (e) => {
+        e.stopPropagation();
+        toggleImportSelection(f.path, check.checked, e.shiftKey);
+      });
+      card.appendChild(check);
 
       const imgWrap = document.createElement('div');
       imgWrap.className = 'import-preview-thumb-img';
@@ -2006,6 +2033,48 @@ function renderImportPreviewGrid(files, duplicatePaths, destinationFiles) {
   });
   grid.style.display = '';
   setupImportThumbnailScheduler();
+}
+
+function toggleImportSelection(path, checked, shiftKey) {
+  // Range handling arrives in Task 9.
+  if (checked) importDeselected.delete(path);
+  else importDeselected.add(path);
+  importSelectionAnchor = path;
+  updateImportSelectionUI();
+}
+
+function importEligibleCount() {
+  const skipDupes = document.getElementById('chkSkipDuplicates').checked;
+  return importPreviewedPaths.filter(
+    p => !(importDuplicatePaths.has(p) && skipDupes)).length;
+}
+
+function importCheckedCount() {
+  const skipDupes = document.getElementById('chkSkipDuplicates').checked;
+  return importPreviewedPaths.filter(
+    p => !importDeselected.has(p) && !(importDuplicatePaths.has(p) && skipDupes)
+  ).length;
+}
+
+function updateImportSelectionUI() {
+  const el = document.getElementById('previewSelectedCount');
+  if (el) {
+    // The CHECKED count — what will actually be copied. Never the
+    // include_paths count, which is larger because it retains duplicates.
+    el.textContent = importCheckedCount().toLocaleString() + ' of '
+      + importPreviewedPaths.length.toLocaleString() + ' selected';
+  }
+  const row = document.getElementById('selectAllRow');
+  // The selectionEnabled check matters: without it a later call to this
+  // function can re-show the select-all row in in-place mode after Task 11
+  // hid it inside the renderer.
+  const selectionEnabled = newImagesSnapshotId === null
+    && selectedImportMode() === 'copy';
+  if (row) {
+    row.style.display =
+      (selectionEnabled && importPreviewedPaths.length) ? '' : 'none';
+  }
+  if (typeof updateStartGate === 'function') updateStartGate();  // Task 10
 }
 
 function setupImportThumbnailScheduler() {
@@ -2287,7 +2356,9 @@ async function previewImport(opts) {
       clearImportPreviewGrid();
       return;
     }
+    importPreviewedPaths = files.map(f => f.path);
     renderImportPreviewGrid(files, [], null);
+    updateImportSelectionUI();
     if (snapshotMode) {
       const unavailable = Number(data.unavailable_count || 0);
       summary.textContent = Number(data.total_count || files.length).toLocaleString() +
@@ -2354,7 +2425,9 @@ async function previewImport(opts) {
     summary.textContent = files.length + ' files found · ' + dupCount +
       ' already in your library (will be skipped) · ' +
       (files.length - dupCount) + ' to copy';
+    importDuplicatePaths = new Set(duplicatePaths);
     renderImportPreviewGrid(files, duplicatePaths, null);
+    updateImportSelectionUI();
     // Skipped duplicates aren't copied, so exclude them from the
     // folder-structure preview — the new/existing folder counts must
     // reflect the files that will actually land in the archive.

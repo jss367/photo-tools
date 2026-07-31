@@ -2153,6 +2153,84 @@ def test_load_local_taxonomy_cache_is_keyed_by_path(tmp_path, monkeypatch):
     assert tax_mod.load_local_taxonomy().is_taxon("second species")
 
 
+def test_load_local_taxonomy_detects_metadata_preserving_replacement(
+    tmp_path, monkeypatch,
+):
+    """A ``cp -p`` / ``rsync -t`` style swap with the old mtime and matching
+    size must still invalidate the cache.
+
+    An external updater can atomically install a taxonomy while preserving
+    the previous mtime and hitting the same byte length; without file
+    identity in the cache key the pair ``(mtime_ns, size)`` matches and
+    ``_load_taxonomy_cached()`` keeps handing back the old snapshot forever.
+    """
+    import taxonomy as tax_mod
+
+    tax_mod.clear_taxonomy_cache()
+    persistent = tmp_path / "persistent.json"
+    # Common names padded to the same length so the two taxonomy files
+    # serialize to the same byte count — that is the exact case where
+    # (mtime_ns, size) alone cannot tell them apart.
+    old_common = "a" * 30
+    new_common = "b" * 30
+    _write_taxonomy_json(persistent, old_common)
+    monkeypatch.setattr(tax_mod, "TAXONOMY_JSON_PATH", str(persistent))
+
+    first = tax_mod.load_local_taxonomy()
+    assert first.is_taxon(old_common)
+    old_stat = os.stat(persistent)
+
+    # Atomically replace via rename onto the target — new inode, but stamp
+    # the old mtime back so mtime and size match the pre-replacement values.
+    replacement = tmp_path / "replacement.json"
+    _write_taxonomy_json(replacement, new_common)
+    assert os.stat(replacement).st_size == old_stat.st_size, (
+        "test setup: the padded names must yield equal-size JSON files"
+    )
+    os.replace(str(replacement), str(persistent))
+    os.utime(persistent, ns=(old_stat.st_mtime_ns, old_stat.st_mtime_ns))
+    new_stat = os.stat(persistent)
+    assert new_stat.st_mtime_ns == old_stat.st_mtime_ns
+    assert new_stat.st_size == old_stat.st_size
+
+    second = tax_mod.load_local_taxonomy()
+    assert second is not first
+    assert second.is_taxon(new_common)
+    assert not second.is_taxon(old_common)
+
+
+def test_taxonomy_stat_key_includes_file_identity(tmp_path):
+    """The stat key must change when the file is atomically replaced,
+    even if mtime and size are preserved.
+
+    Direct guard on ``_taxonomy_stat_key`` for the metadata-preserving
+    replacement case — the integration test above depends on this
+    property, and asserting it in isolation makes a future regression
+    fail here first with an obvious diff.
+    """
+    import taxonomy as tax_mod
+
+    target = tmp_path / "taxonomy.json"
+    target.write_text("x" * 128)
+    before_stat = os.stat(target)
+    before_key = tax_mod._taxonomy_stat_key(str(target))
+
+    replacement = tmp_path / "replacement.json"
+    replacement.write_text("y" * 128)
+    os.replace(str(replacement), str(target))
+    os.utime(target, ns=(before_stat.st_mtime_ns, before_stat.st_mtime_ns))
+    after_stat = os.stat(target)
+    after_key = tax_mod._taxonomy_stat_key(str(target))
+
+    # Preconditions: mtime and size did not move, so a key made of just
+    # (mtime_ns, size) would compare equal.
+    assert after_stat.st_mtime_ns == before_stat.st_mtime_ns
+    assert after_stat.st_size == before_stat.st_size
+    # The key must still change — that is what makes the cache pick up
+    # the replacement.
+    assert after_key != before_key
+
+
 def test_load_local_taxonomy_retries_when_file_changes_during_parse(tmp_path, monkeypatch):
     """A rewrite mid-parse must not cache stale content under the new stat key.
 

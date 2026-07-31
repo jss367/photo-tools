@@ -23961,6 +23961,15 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             "workspace_id": active_ws,
             "created_workspace": created_workspace,
         }
+        if include_paths is not None:
+            # The two counts only — deliberately NOT ``include_paths``. There
+            # is no re-run-from-config path, so the path list would buy
+            # nothing while bloating the persisted job row by up to a few
+            # thousand entries. The counts are two ints and answer the
+            # question a stored job row is actually read for: "why did this
+            # run copy 40 files when the card held 300?"
+            job_config["previewed_count"] = previewed_count
+            job_config["checked_count"] = checked_count
         if move_target_snapshot is not None:
             job_config["after_process_move"] = {
                 "remote_target_id": move_target_snapshot["id"],
@@ -24116,6 +24125,9 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 remote_target=remote_target,
                 vireo_dir=vireo_dir,
                 thumb_cache_dir=thumb_cache_dir,
+                include_paths=include_paths,
+                previewed_count=previewed_count,
+                checked_count=checked_count,
             )
             try:
                 result = run_import_job(

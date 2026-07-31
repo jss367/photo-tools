@@ -7019,6 +7019,88 @@ def test_import_in_place_ignores_include_paths(app_and_db, tmp_path):
         _drain(client, resp)
 
 
+def test_import_photos_passes_selection_to_the_job(app_and_db, tmp_path,
+                                                   monkeypatch):
+    """The route must hand the validated selection to ``ImportParams``.
+
+    ``work()`` does ``from import_job import ... run_import_job`` at call
+    time, so patching the module attribute before the POST is what the job
+    thread actually resolves.
+    """
+    app, _ = app_and_db
+    captured = {}
+    import import_job
+
+    real = import_job.run_import_job
+
+    def spy(job, runner, db_path, ws, params):
+        captured["params"] = params
+        return real(job, runner, db_path, ws, params)
+
+    monkeypatch.setattr(import_job, "run_import_job", spy)
+
+    with app.test_client() as client:
+        resp = client.post(
+            '/api/jobs/import-photos', json=_import_body(tmp_path),
+        )
+        assert resp.status_code == 200, resp.get_json()
+        _drain(client, resp)
+
+    params = captured["params"]
+    # A set, not a list: the job's ``include_paths - discovered_paths`` drift
+    # math would raise TypeError on a list if the job's own defensive
+    # coercion were ever removed.
+    assert isinstance(params.include_paths, set)
+    assert params.include_paths is not None
+    assert params.previewed_count == 1
+    assert params.checked_count == 1
+
+
+def test_import_photos_selection_is_honored_end_to_end(app_and_db, tmp_path):
+    """The only test that exercises route -> job with a real deselection.
+
+    Every other backend test builds ``ImportParams`` directly, so a broken
+    wire between the route and the job would be invisible to them.
+    """
+    app, _ = app_and_db
+    src = tmp_path / "card"
+    src.mkdir()
+    Image.new('RGB', (16, 16)).save(str(src / "a.jpg"))
+    Image.new('RGB', (16, 16)).save(str(src / "b.jpg"))
+    archive = tmp_path / "archive"
+
+    with app.test_client() as client:
+        resp = client.post('/api/jobs/import-photos', json={
+            "sources": [str(src)],
+            "destination": str(archive),
+            "include_paths": [str(src / "a.jpg")],
+            "previewed_count": 2,
+            "checked_count": 1,
+        })
+        assert resp.status_code == 200, resp.get_json()
+        job = wait_for_job_via_client(client, resp.get_json()["job_id"])
+
+    assert job["status"] == "completed", job
+    result = job["result"]
+    assert result["copied"] == 1, result
+    # ``discovered`` is the whole card, not the filtered copy set — the
+    # card-safety ledger is judged against what is physically on the card.
+    assert result["discovered"] == 2, result
+    # One file was deliberately left behind, so the card is NOT safe to wipe.
+    assert result["safe_to_format"] is False, result
+    # ...and the pill says why, in the user's terms. This needs
+    # ``previewed_count`` to have survived the trip: without it the ledger
+    # check still turns the pill red, but bare.
+    assert any("deselect" in u["reason"] for u in result["unsafe_files"]), \
+        result["unsafe_files"]
+    # The step summary reads off ``checked_count``, the third field.
+    step = next(s for s in job["steps"] if s["id"] == "import")
+    assert step["summary"].startswith("1 selected of 2 discovered"), step
+
+    landed = [f for _, _, fs in os.walk(str(archive)) for f in fs]
+    assert landed == ["a.jpg"], landed
+
+
 def test_import_photos_accepts_symlinked_file_inside_source(
         app_and_db, tmp_path):
     """Lexical containment admits it, matching today's ingest() behavior.

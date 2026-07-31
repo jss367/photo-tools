@@ -2779,3 +2779,66 @@ def test_taxonomy_save_preserves_target_permissions(tmp_path, monkeypatch):
 
     assert stat.S_IMODE(os.stat(persistent).st_mode) == 0o640
     assert json.loads(persistent.read_text())["api_misses"] == ["nothing here"]
+
+
+def test_transient_open_failure_is_not_memoized_as_corruption(tmp_path, monkeypatch):
+    """A read that fails on OS grounds must get another chance.
+
+    The usual repairs for an unreadable file — restoring a permission bit,
+    fd pressure passing — change ctime at most, not mtime or size. Keying a
+    failure record to that stat would leave taxonomy features off until the
+    contents changed or the process restarted.
+    """
+    import taxonomy as tax_mod
+
+    tax_mod.clear_taxonomy_cache()
+    persistent = tmp_path / "persistent.json"
+    _write_taxonomy_json(persistent, "test species")
+    monkeypatch.setattr(tax_mod, "TAXONOMY_JSON_PATH", str(persistent))
+
+    real_init = tax_mod.Taxonomy.__init__
+    calls = {"n": 0}
+
+    def unreadable_once(self, path):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise PermissionError(13, "Permission denied", path)
+        real_init(self, path)
+
+    monkeypatch.setattr(tax_mod.Taxonomy, "__init__", unreadable_once)
+
+    # First call fails and must not be remembered as corruption.
+    assert tax_mod.load_local_taxonomy() is None
+    with tax_mod._taxonomy_cache_lock:
+        assert str(persistent) not in tax_mod._taxonomy_failed_stats
+
+    # Access restored, file untouched: the next call reopens it.
+    result = tax_mod.load_local_taxonomy()
+    assert result is not None
+    assert result.is_taxon("test species")
+    assert calls["n"] == 2
+
+
+def test_content_failure_is_still_memoized(tmp_path, monkeypatch):
+    """A malformed file is remembered, so it isn't re-read every request."""
+    import taxonomy as tax_mod
+
+    tax_mod.clear_taxonomy_cache()
+    persistent = tmp_path / "persistent.json"
+    persistent.write_text("{ not valid json")
+    monkeypatch.setattr(tax_mod, "TAXONOMY_JSON_PATH", str(persistent))
+
+    parses = []
+    real_init = tax_mod.Taxonomy.__init__
+
+    def counting_init(self, path):
+        parses.append(path)
+        real_init(self, path)
+
+    monkeypatch.setattr(tax_mod.Taxonomy, "__init__", counting_init)
+
+    assert tax_mod.load_local_taxonomy() is None
+    assert tax_mod.load_local_taxonomy() is None
+    assert len(parses) == 1
+    with tax_mod._taxonomy_cache_lock:
+        assert str(persistent) in tax_mod._taxonomy_failed_stats

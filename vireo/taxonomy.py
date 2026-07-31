@@ -588,7 +588,18 @@ def _load_taxonomy_cached(path):
                     # requests short-circuit before hitting the parse and,
                     # crucially, before the eviction above would drop a
                     # still-valid fallback in a corrupt-preferred scenario.
-                    _taxonomy_failed_stats[path] = pre_stat
+                    #
+                    # Only memoize a *content* failure, though. An OSError
+                    # can be transient — a read permission bit, a momentary
+                    # fd exhaustion — and the usual repair (chmod, or the
+                    # fd pressure passing) changes ctime at most, not mtime
+                    # or size. Memoizing it would key the record to a stat
+                    # that never changes, leaving taxonomy features off
+                    # until the contents happen to change or the process
+                    # restarts. A ValueError is the file's own content and
+                    # cannot fix itself without a rewrite.
+                    if isinstance(parse_error, ValueError):
+                        _taxonomy_failed_stats[path] = pre_stat
                     raise
                 continue
             post_stat = _taxonomy_stat_key(path)

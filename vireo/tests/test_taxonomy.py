@@ -2505,6 +2505,11 @@ def test_load_local_taxonomy_retries_parse_exception_from_mid_write(
     def flaky_init(self, path):
         attempts["n"] += 1
         if attempts["n"] == 1:
+            # A partial read means the writer was mid-rewrite, so the file
+            # has moved. That drift is what makes the retry worth doing —
+            # see the stably-corrupt test for the case that must not retry.
+            _write_taxonomy_json(persistent, "test species")
+            os.utime(persistent, (5e9, 5e9))
             raise ValueError("simulated mid-write JSONDecodeError")
         real_init(self, path)
 
@@ -2549,3 +2554,69 @@ def test_load_local_taxonomy_raises_when_every_parse_attempt_fails(
     # And the outer function still returns None cleanly, so callers that
     # tolerate no taxonomy at all keep working.
     assert tax_mod.load_local_taxonomy() is None
+
+
+def test_load_local_taxonomy_does_not_retry_a_stably_corrupt_file(
+    tmp_path, monkeypatch,
+):
+    """A file that is simply corrupt is read once, not once per retry.
+
+    Truncated JSON only raises at the *end* of the parse, so each retry
+    reads most of a ~500MB file. Retrying a read that cannot succeed puts
+    that cost back on every compare/accept request — the exact latency this
+    cache exists to remove. Only a file that demonstrably moved between
+    attempts is worth re-reading.
+    """
+    import taxonomy as tax_mod
+
+    tax_mod.clear_taxonomy_cache()
+    persistent = tmp_path / "persistent.json"
+    _write_taxonomy_json(persistent, "test species")
+    monkeypatch.setattr(tax_mod, "TAXONOMY_JSON_PATH", str(persistent))
+
+    attempts = {"n": 0}
+
+    def always_raising_init(self, path):
+        attempts["n"] += 1
+        raise ValueError("persistent corruption")
+
+    monkeypatch.setattr(tax_mod.Taxonomy, "__init__", always_raising_init)
+
+    with pytest.raises(ValueError, match="persistent corruption"):
+        tax_mod._load_taxonomy_cached(str(persistent))
+
+    assert attempts["n"] == 1, "an unchanged corrupt file must be read once"
+
+
+def test_corrupt_preferred_file_costs_one_parse_attempt_per_call(
+    tmp_path, monkeypatch,
+):
+    """The corrupt-preferred fallback stays cheap on every request.
+
+    The preferred candidate is attempted once (not once per retry) and the
+    legacy fallback is parsed once for the whole process.
+    """
+    import taxonomy as tax_mod
+
+    tax_mod.clear_taxonomy_cache()
+    corrupt = tmp_path / "persistent.json"
+    corrupt.write_text("{ not valid json")
+    legacy = tmp_path / "taxonomy.json"
+    _write_taxonomy_json(legacy, "legacy species")
+    monkeypatch.setattr(tax_mod, "TAXONOMY_JSON_PATH", str(corrupt))
+    monkeypatch.setattr(tax_mod, "LEGACY_TAXONOMY_JSON_PATH", str(legacy))
+
+    parses = []
+    real_init = tax_mod.Taxonomy.__init__
+
+    def counting_init(self, path):
+        parses.append(path)
+        real_init(self, path)
+
+    monkeypatch.setattr(tax_mod.Taxonomy, "__init__", counting_init)
+
+    for _ in range(3):
+        assert tax_mod.load_local_taxonomy().is_taxon("legacy species")
+
+    assert parses.count(str(corrupt)) == 3, "one attempt per call, not per retry"
+    assert parses.count(str(legacy)) == 1, "the fallback is parsed once"

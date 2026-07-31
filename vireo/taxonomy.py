@@ -537,6 +537,22 @@ def _load_taxonomy_cached(path):
                 # failure that the very next call could succeed at, and
                 # load_local_taxonomy() would silently fall through to
                 # a stale or nonexistent alternate candidate instead.
+                #
+                # Only retry when the file actually moved, though. A file
+                # that is simply corrupt fails identically every time, and
+                # retrying re-reads most of ~500MB two more times on every
+                # request — reinstating the latency and allocation pressure
+                # this cache exists to remove, for a read that cannot
+                # succeed. Truncated JSON only raises at the end of the
+                # parse, so this is the expensive case, not the cheap one.
+                try:
+                    file_moved = _taxonomy_stat_key(path) != pre_stat
+                except OSError:
+                    # Cannot even stat it now; a re-read will not fare
+                    # better, so report the parse failure we already have.
+                    file_moved = False
+                if not file_moved:
+                    raise
                 continue
             post_stat = _taxonomy_stat_key(path)
             if pre_stat == post_stat:

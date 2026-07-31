@@ -25,6 +25,7 @@ import re
 import socket
 import ssl
 import stat as stat_module
+import tempfile
 import threading
 import time
 import unicodedata
@@ -518,9 +519,19 @@ def _write_taxonomy_json_atomically(path, data):
     which is what makes it atomic.
     """
     target = os.path.realpath(path)
-    tmp_path = f"{target}.tmp"
+    # A unique temp name per write, not a fixed "<target>.tmp". Two writes
+    # can overlap — POSTing the download endpoint twice starts two workers,
+    # since it uses runner.start() rather than start_singleton() — and a
+    # shared name lets one writer rename its inode out from under the other,
+    # exposing a partial target and then failing the second writer when its
+    # pathname has vanished.
+    fd, tmp_path = tempfile.mkstemp(
+        dir=os.path.dirname(target) or ".",
+        prefix=f"{os.path.basename(target)}.",
+        suffix=".tmp",
+    )
     try:
-        with open(tmp_path, "w") as f:
+        with os.fdopen(fd, "w") as f:
             json.dump(data, f)
             # Closing only hands the bytes to the page cache. Without fsync,
             # a crash just after the rename can expose the target with
@@ -528,9 +539,11 @@ def _write_taxonomy_json_atomically(path, data):
             # exists to prevent.
             f.flush()
             os.fsync(f.fileno())
-        # A fresh temp file gets umask permissions; open(path, "w") kept the
-        # target's mode. Carry it over when there is a target to copy from,
-        # so writing cannot silently loosen or tighten access.
+        # mkstemp creates 0600; open(path, "w") kept the target's mode.
+        # Carry it over when there is a target to copy from, so writing
+        # cannot silently loosen or tighten access. With no existing target
+        # (a first download) the file stays 0600 — ~/.vireo is single-user
+        # data, so private is the right default there.
         with contextlib.suppress(OSError):
             os.chmod(tmp_path, stat_module.S_IMODE(os.stat(target).st_mode))
         os.replace(tmp_path, target)

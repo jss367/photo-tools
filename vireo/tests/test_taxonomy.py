@@ -2317,7 +2317,7 @@ def test_taxonomy_save_leaves_original_intact_when_write_fails(tmp_path, monkeyp
         tax.save()
 
     assert persistent.read_text() == original
-    assert not (tmp_path / "persistent.json.tmp").exists()
+    assert not list(tmp_path.glob("*.tmp")), "no temp file may survive"
     tax_mod.clear_taxonomy_cache()
     assert tax_mod.load_local_taxonomy().is_taxon("test species")
 
@@ -2477,7 +2477,7 @@ def test_taxonomy_save_writes_through_a_symlinked_path(tmp_path, monkeypatch):
     assert link.is_symlink(), "os.replace must not swap the link for a file"
     assert os.readlink(link) == str(real)
     assert json.loads(real.read_text())["api_misses"] == ["nothing here"]
-    assert not (tmp_path / "real-taxonomy.json.tmp").exists()
+    assert not list(tmp_path.glob("*.tmp")), "no temp file may survive"
 
 
 def test_load_local_taxonomy_retries_parse_exception_from_mid_write(
@@ -2957,7 +2957,7 @@ def test_download_taxonomy_writes_atomically(tmp_path, monkeypatch):
     assert output_path.read_text() == original_text, (
         "interrupted download must not clobber the existing taxonomy"
     )
-    assert not (tmp_path / "taxonomy.json.tmp").exists(), (
+    assert not list(tmp_path.glob("*.tmp")), (
         "failed atomic write must clean up its sibling temp file"
     )
 
@@ -2968,7 +2968,7 @@ def test_download_taxonomy_writes_atomically(tmp_path, monkeypatch):
     assert result["taxa_by_common"], "the successful write should produce content"
     written = json.loads(output_path.read_text())
     assert written["taxa_by_common"] == result["taxa_by_common"]
-    assert not (tmp_path / "taxonomy.json.tmp").exists()
+    assert not list(tmp_path.glob("*.tmp"))
 
 
 def test_atomic_write_creates_a_new_target_without_a_mode_to_copy(tmp_path):
@@ -2985,7 +2985,7 @@ def test_atomic_write_creates_a_new_target_without_a_mode_to_copy(tmp_path):
     tax_mod._write_taxonomy_json_atomically(str(target), {"taxa_by_common": {}})
 
     assert json.loads(target.read_text()) == {"taxa_by_common": {}}
-    assert not (tmp_path / "brand-new.json.tmp").exists()
+    assert not list(tmp_path.glob("*.tmp")), "no temp file may survive"
 
 
 def test_atomic_write_is_shared_by_both_taxonomy_writers(tmp_path, monkeypatch):
@@ -3022,3 +3022,46 @@ def test_atomic_write_is_shared_by_both_taxonomy_writers(tmp_path, monkeypatch):
     download_src = inspect.getsource(tax_mod.download_taxonomy)
     assert "_write_taxonomy_json_atomically(output_path, result)" in download_src
     assert 'open(output_path, "w")' not in download_src
+
+
+def test_overlapping_atomic_writes_do_not_share_a_temp_file(tmp_path):
+    """Concurrent writers must not collide on one temp path.
+
+    Two POSTs to the download endpoint start two workers — it uses
+    runner.start(), not start_singleton() — so both can be serializing at
+    once. With a fixed "<target>.tmp" one writer renames the inode out from
+    under the other, exposing a partial target and then failing the second
+    when its pathname has vanished.
+    """
+    import taxonomy as tax_mod
+
+    target = tmp_path / "taxonomy.json"
+    _write_taxonomy_json(target, "original species")
+
+    seen_temp_names = []
+    real_dump = tax_mod.json.dump
+    barrier = {"inner_done": False}
+
+    def dump_and_reenter(data, fp, *args, **kwargs):
+        seen_temp_names.append(fp.name)
+        if not barrier["inner_done"]:
+            # Start a second write while this one still holds its fd open.
+            barrier["inner_done"] = True
+            tax_mod._write_taxonomy_json_atomically(
+                str(target), {"taxa_by_common": {"inner species": {}}},
+            )
+        return real_dump(data, fp, *args, **kwargs)
+
+    import unittest.mock as mock
+    with mock.patch.object(tax_mod.json, "dump", dump_and_reenter):
+        tax_mod._write_taxonomy_json_atomically(
+            str(target), {"taxa_by_common": {"outer species": {}}},
+        )
+
+    assert len(seen_temp_names) == 2
+    assert seen_temp_names[0] != seen_temp_names[1], (
+        "each write needs its own temp file"
+    )
+    # The outer write renamed last, so it wins — and the target is whole.
+    assert json.loads(target.read_text())["taxa_by_common"] == {"outer species": {}}
+    assert not list(tmp_path.glob("*.tmp"))

@@ -6876,3 +6876,170 @@ def test_chained_process_snapshot_survives_mid_import_edit(
         assert pj["config"]["skip_regroup"] is False, pj["config"]
         # And the process_id link is still preserved for provenance.
         assert pj["config"]["process_id"] == full_id
+
+
+# --- POST /api/jobs/import-photos per-file selection validation ----------
+
+def _import_body(tmp_path, **over):
+    """Build a minimal valid import-photos body with a one-file selection.
+
+    Any ``<SRC>`` in an ``include_paths`` entry is replaced with the source
+    directory so parametrized cases can express paths relative to the card
+    without needing the fixture at collection time.
+    """
+    src = str(tmp_path / "card")
+    os.makedirs(src, exist_ok=True)
+    Image.new('RGB', (16, 16)).save(os.path.join(src, 'a.jpg'))
+    body = {
+        "sources": [src],
+        "destination": str(tmp_path / "archive"),
+        "include_paths": [os.path.join(src, "a.jpg")],
+        "previewed_count": 1,
+        "checked_count": 1,
+    }
+    body.update(over)
+    paths = body.get("include_paths")
+    if isinstance(paths, list):
+        body["include_paths"] = [
+            p.replace("<SRC>", src) if isinstance(p, str) else p
+            for p in paths
+        ]
+    return body
+
+
+def _drain(client, resp):
+    """Let an accepted import job finish before the test's DB is closed.
+
+    These tests only assert on the enqueue response, but an unwaited job
+    thread keeps writing to the tmp_path database after the fixture tears
+    down. Status is deliberately not asserted — validation, not import
+    outcome, is what's under test here.
+    """
+    wait_for_job_via_client(client, resp.get_json()["job_id"])
+
+
+@pytest.mark.parametrize("over", [
+    {"include_paths": []},                       # empty list
+    # Empty list with counts that agree with it — isolates the non-empty
+    # guard from the checked_count/previewed_count arithmetic.
+    {"include_paths": [], "previewed_count": 0, "checked_count": 0},
+    {"include_paths": "not-a-list"},
+    # Not iterable at all: without the isinstance guard this is a 500, not a
+    # 400 (the string case above still gets caught downstream by arithmetic).
+    {"include_paths": 123},
+    {"include_paths": [123]},
+    {"include_paths": [""]},
+    {"previewed_count": -1},
+    {"checked_count": -1},
+    {"previewed_count": True},                   # bool is an int in Python
+    {"checked_count": True},
+    {"previewed_count": None},                   # partial field set
+    {"include_paths": None},                     # counts without paths
+    {"checked_count": 5},                        # > len(include_paths)
+    # More selected files than the preview ever showed.
+    {"include_paths": ["<SRC>/a.jpg", "<SRC>/b.jpg"], "previewed_count": 1},
+    {"include_paths": ["/etc/passwd"]},          # outside sources
+    {"include_paths": ["relative/path.jpg"]},    # commonpath ValueError -> 400
+    {"include_paths": ["<SRC>/../outside/a.jpg"]},   # escapes to a sibling
+    {"include_paths": ["<SRC>-extra/a.jpg"]},        # sibling sharing a prefix
+])
+def test_import_photos_rejects_bad_selection(app_and_db, tmp_path, over):
+    app, _ = app_and_db
+    resp = app.test_client().post(
+        '/api/jobs/import-photos', json=_import_body(tmp_path, **over),
+    )
+    assert resp.status_code == 400, resp.get_json()
+
+
+def test_import_photos_accepts_a_valid_selection(app_and_db, tmp_path):
+    app, _ = app_and_db
+    with app.test_client() as client:
+        resp = client.post(
+            '/api/jobs/import-photos', json=_import_body(tmp_path),
+        )
+        assert resp.status_code == 200, resp.get_json()
+        _drain(client, resp)
+
+
+def test_import_photos_accepts_dot_dot_that_normalizes_back_inside(
+        app_and_db, tmp_path):
+    """Containment is judged on the normalized path, so a `..` that returns
+    to the source is contained — the check is not a naive string prefix."""
+    app, _ = app_and_db
+    with app.test_client() as client:
+        resp = client.post('/api/jobs/import-photos', json=_import_body(
+            tmp_path, include_paths=["<SRC>/../card/a.jpg"],
+        ))
+        assert resp.status_code == 200, resp.get_json()
+        _drain(client, resp)
+
+
+def test_import_photos_accepts_counts_at_the_boundary(app_and_db, tmp_path):
+    """previewed_count == checked_count == len(include_paths): everything the
+    preview showed is selected. The comparisons are <=, not <."""
+    app, _ = app_and_db
+    with app.test_client() as client:
+        resp = client.post('/api/jobs/import-photos', json=_import_body(
+            tmp_path,
+            include_paths=["<SRC>/a.jpg", "<SRC>/b.jpg"],
+            previewed_count=2,
+            checked_count=2,
+        ))
+        assert resp.status_code == 200, resp.get_json()
+        _drain(client, resp)
+
+
+def test_repeated_paths_do_not_inflate_the_deselected_count(app_and_db,
+                                                            tmp_path):
+    """include_paths is deduped at validation. Without it, a client repeating
+    a path shrinks previewed_count - len(include_paths) and could hide a
+    deselection from the card-safety verdict."""
+    app, _ = app_and_db
+    body = _import_body(tmp_path)
+    body["include_paths"] = body["include_paths"] * 3
+    with app.test_client() as client:
+        resp = client.post('/api/jobs/import-photos', json=body)
+        assert resp.status_code == 200, resp.get_json()
+        _drain(client, resp)
+
+
+def test_import_in_place_ignores_include_paths(app_and_db, tmp_path):
+    """That route is unchanged by this feature — it must not half-apply a
+    selection it has no machinery to honor."""
+    app, _ = app_and_db
+    src = str(tmp_path / "card")
+    os.makedirs(src, exist_ok=True)
+    Image.new('RGB', (16, 16)).save(os.path.join(src, 'a.jpg'))
+    with app.test_client() as client:
+        resp = client.post('/api/jobs/import-in-place', json={
+            "sources": [src],
+            "include_paths": [os.path.join(src, "nonexistent.jpg")],
+        })
+        assert resp.status_code == 200, resp.get_json()
+        _drain(client, resp)
+
+
+def test_import_photos_accepts_symlinked_file_inside_source(
+        app_and_db, tmp_path):
+    """Lexical containment admits it, matching today's ingest() behavior.
+
+    Regression guard against someone "hardening" this with realpath, which
+    would break imports that work today.
+    """
+    app, _ = app_and_db
+    src = tmp_path / "card"
+    src.mkdir()
+    outside = tmp_path / "outside.jpg"
+    Image.new('RGB', (16, 16)).save(str(outside))
+    os.symlink(str(outside), str(src / "link.jpg"))
+
+    with app.test_client() as client:
+        resp = client.post('/api/jobs/import-photos', json={
+            "sources": [str(src)],
+            "destination": str(tmp_path / "archive"),
+            "include_paths": [str(src / "link.jpg")],
+            "previewed_count": 1,
+            "checked_count": 1,
+        })
+        assert resp.status_code == 200, resp.get_json()
+        _drain(client, resp)

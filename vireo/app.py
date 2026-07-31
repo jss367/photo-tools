@@ -27341,6 +27341,14 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             masked = 0
             skipped = 0
             failed = 0
+            # A source file that never opened is not the same as "SAM found
+            # no subject here", even though both leave the photo unmasked.
+            # Only the second is an answer about the photo; the first means
+            # we never looked. Folding them together let a dropped share
+            # finish this job green while every unmasked photo went on to be
+            # hard-rejected in Process Review as `no_subject_mask`
+            # (Codex #1392 P1). Mirrors extract_masks_stage in pipeline_job.
+            unreadable = 0
             job["_start_time"] = time.time()
 
             for i, photo in enumerate(photos):
@@ -27392,7 +27400,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     # Load working-resolution proxy
                     proxy = render_proxy(image_path, longest_edge=proxy_longest_edge)
                     if proxy is None:
-                        skipped += 1
+                        unreadable += 1
                         continue
 
                     # Parse detection box
@@ -27512,7 +27520,8 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     },
                 )
 
-            return {"masked": masked, "skipped": skipped, "failed": failed, "total": total}
+            return {"masked": masked, "skipped": skipped, "failed": failed,
+                    "unreadable": unreadable, "total": total}
 
         job_id = runner.start(
             "extract-masks",

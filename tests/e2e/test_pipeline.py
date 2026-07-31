@@ -738,3 +738,28 @@ def test_pipeline_card_shows_actionable_error_not_the_last_one(
         });
     """)
     expect(page.locator("#statusExtract")).to_contain_text("Reconnect the source")
+
+
+def test_extract_masks_clean_rejects_unreadable_and_failed_results(
+    live_server, page,
+):
+    """The shared clean check both Extract completion paths use.
+
+    `runExtractStep` (the standalone card) marked itself green whenever the
+    job status was `completed`, ignoring the counters entirely — so a dropped
+    share rendered as "Done!" there even after the pipeline path learned not
+    to (Codex #1392 P1).
+    """
+    url = live_server["url"]
+    page.goto(f"{url}/pipeline")
+    clean = lambda ext: page.evaluate(  # noqa: E731
+        "ext => _extractMasksClean(ext)", ext
+    )
+    assert clean({"masked": 3, "skipped": 1, "unreadable": 0, "failed": 0,
+                  "total": 4}) is True
+    assert clean({"masked": 3, "skipped": 0, "unreadable": 1, "failed": 0,
+                  "total": 4}) is False
+    assert clean({"masked": 3, "skipped": 0, "unreadable": 0, "failed": 1,
+                  "total": 4}) is False
+    assert clean({"masked": 0, "skipped": 0, "unreadable": 0, "failed": 0,
+                  "total": 0, "reason": "weights_missing"}) is False

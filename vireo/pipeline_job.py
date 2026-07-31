@@ -5642,12 +5642,17 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                     # variant won't be rejected for that, so counting it
                     # overstates the damage from an outage that never harmed
                     # it (Codex #1392 P2).
-                    em_preflight_unreadable = len(dropped_ids) - len(
-                        _photos_with_active_mask(
-                            thread_db, dropped_ids,
-                            sam2_variant, dinov2_variant,
-                        )
+                    # Photos that will be rejected as `no_subject_mask`
+                    # because of this outage — i.e. the dropped ones that
+                    # don't already have a mask. The already-masked ones need
+                    # no source read and are at no risk, so they drive neither
+                    # the count nor the failure latch below: latching on them
+                    # would fail the stage and demand a reconnect that would
+                    # change nothing (Codex #1392 P2).
+                    at_risk_dropped_ids = dropped_ids - _photos_with_active_mask(
+                        thread_db, dropped_ids, sam2_variant, dinov2_variant,
                     )
+                    em_preflight_unreadable = len(at_risk_dropped_ids)
                     # Publish so eye_keypoints (later downstream) sees
                     # the same offline set without having to re-probe
                     # every folder from scratch.
@@ -5661,7 +5666,7 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                     already_flagged_classify = any(
                         e.startswith("[classify] Fatal:") for e in errors
                     )
-                    if not already_flagged_classify:
+                    if at_risk_dropped_ids and not already_flagged_classify:
                         # Classify didn't already own this outage
                         # (e.g. fully-cached run where classify made no
                         # image reads). Surface the source-offline
@@ -5673,7 +5678,7 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                         # finishing "successfully" with no masks made.
                         errors.append(
                             f"[extract_masks] Fatal: "
-                            f"{len(dropped_ids)} of {total_before} "
+                            f"{len(at_risk_dropped_ids)} of {total_before} "
                             f"photos unreachable (source offline). "
                             f"Reconnect the missing folder(s) and run "
                             f"Process again to extract the rest."

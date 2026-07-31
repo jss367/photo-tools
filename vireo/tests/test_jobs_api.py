@@ -7918,3 +7918,57 @@ def test_chained_process_snapshot_survives_mid_import_edit(
         assert pj["config"]["skip_regroup"] is False, pj["config"]
         # And the process_id link is still preserved for provenance.
         assert pj["config"]["process_id"] == full_id
+
+
+def test_extract_masks_route_reports_unreadable_sources(
+    app_and_db, tmp_path, monkeypatch,
+):
+    """The standalone Extract card must not report a dropped share as a
+    benign skip.
+
+    `/api/jobs/extract-masks` runs its own copy of the mask loop, and a
+    `render_proxy` returning None — the source file never opened — landed in
+    the same `skipped` bucket as "SAM found no subject". The job then
+    completed green while the photo stayed unmasked and got hard-rejected in
+    Process Review as `no_subject_mask` (Codex #1392 P1).
+    """
+    import config as cfg
+    cfg.save({
+        "pipeline": {
+            "sam2_variant": "sam2-small",
+            "dinov2_variant": "vit-b14",
+        },
+    })
+
+    app, db = app_and_db
+    pid = _seed_photo_with_detection(
+        db, tmp_path, "gone.jpg", (10, 20, 100, 200), "MegaDetector",
+    )
+
+    calls = []
+    _patch_extract_masks_deps(monkeypatch, calls)
+
+    import masking
+    monkeypatch.setattr(
+        masking, "render_proxy", lambda path, longest_edge=None: None,
+    )
+
+    col_id = db.add_collection(
+        "unreadable-source-test",
+        json.dumps([{"field": "photo_ids", "value": [pid]}]),
+    )
+
+    client = app.test_client()
+    resp = client.post(
+        "/api/jobs/extract-masks", json={"collection_id": col_id},
+    )
+    assert resp.status_code == 200
+    data = wait_for_job_via_client(client, resp.get_json()["job_id"])
+
+    result = data.get("result") or {}
+    assert result.get("unreadable") == 1, (
+        f"An unopenable source is not a benign skip; got {result!r}"
+    )
+    assert result.get("skipped") == 0, (
+        f"Unreadable photos must not inflate the skip count; got {result!r}"
+    )

@@ -2721,6 +2721,17 @@ function _extractMasksSummary(ext) {
   return ext.reason ? 'No masks created' : 'No photos needed masks';
 }
 
+// Whether a mask-extraction result deserves the green completed treatment.
+// Photos we couldn't read or that errored end the run with no mask, and
+// scoring hard-rejects every unmasked photo as `no_subject_mask`; a `reason`
+// means the backend emptied the worklist because something went wrong. None
+// of those are "Done!". Shared by the pipeline-run card and the standalone
+// Extract step so the two can't drift.
+function _extractMasksClean(ext) {
+  if (!ext) return true;
+  return !ext.unreadable && !ext.failed && !ext.reason;
+}
+
 function _onPipelineComplete(result) {
   if (result.status === 'cancelled') {
     var actionStatus = document.getElementById('pipelineActionStatus');
@@ -2819,11 +2830,7 @@ function _onPipelineComplete(result) {
     // `no_subject_mask`. Marking the card complete/"Done!" in that state
     // sends the user to Process Review with no idea why two-thirds of their
     // encounters are rejects.
-    // `reason` (weights_missing / no_detections / all_subthreshold /
-    // preflight outage) means zero masks were made with every per-photo
-    // counter still at zero — green completed styling there contradicts
-    // the card's own Failed pill (Codex #1392 P2).
-    var extClean = !ext.unreadable && !ext.failed && !ext.reason;
+    var extClean = _extractMasksClean(ext);
     document.getElementById('numExtract').className =
       extClean ? 'stage-num complete' : 'stage-num';
     var statusExt = document.getElementById('statusExtract');
@@ -3917,15 +3924,19 @@ async function runExtractStep(collectionId) {
           window.dispatchEvent(new CustomEvent('vireo-job-done', {detail: {job_id: data.job_id}}));
           if (result.status === 'completed') {
             fill.style.width = '100%';
-            text.textContent = 'Complete';
-            status.textContent = 'Done!';
-            status.className = 'status-msg ok';
-            num.className = 'stage-num complete';
             if (result.result) {
               document.getElementById('txtMasks').textContent =
                 _extractMasksSummary(result.result);
             }
-            resolve(true);
+            // A job that finished without throwing still isn't a clean run
+            // if photos went unmasked — same rule the pipeline card uses.
+            var stepClean = _extractMasksClean(result.result);
+            text.textContent = stepClean ? 'Complete' : 'Finished with problems';
+            status.textContent = stepClean
+              ? 'Done!' : 'Some photos have no mask';
+            status.className = stepClean ? 'status-msg ok' : 'status-msg error';
+            num.className = stepClean ? 'stage-num complete' : 'stage-num';
+            resolve(stepClean);
           } else {
             status.textContent = 'Failed';
             num.className = 'stage-num';

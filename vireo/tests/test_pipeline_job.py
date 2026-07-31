@@ -17326,3 +17326,76 @@ def test_extract_masks_preflight_skips_photos_that_already_have_a_mask(
         f"Only the photo without a mask is at risk of a `no_subject_mask` "
         f"rejection; got {em!r}"
     )
+
+
+def test_extract_masks_preflight_fully_cached_folder_does_not_fail_stage(
+    tmp_path, monkeypatch,
+):
+    """An offline folder whose photos are all already masked is not a failure.
+
+    Nothing in it needed a source read, and nothing in it will be rejected as
+    `no_subject_mask`. Latching a Fatal error and failing the stage there
+    reports damage that did not happen — and blocks the run behind a
+    reconnect instruction that would change nothing (Codex #1392 P2).
+    """
+    import config as cfg
+    from db import Database
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cfg.CONFIG_PATH = str(tmp_path / "config.json")
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws_id = db._active_workspace_id
+    folder_path = str(tmp_path / "photos")
+    os.makedirs(folder_path, exist_ok=True)
+    folder_id = db.add_folder(folder_path)
+
+    photo_ids = [
+        _add_photo_with_detection(db, folder_id, folder_path, f"b{i}.jpg")
+        for i in range(2)
+    ]
+    collection_id = db.add_collection(
+        "All already masked",
+        json.dumps([{"field": "photo_ids", "value": photo_ids}]),
+    )
+
+    pipeline_cfg = db.get_effective_config(cfg.load()).get("pipeline", {})
+    sam2_variant = pipeline_cfg.get("sam2_variant")
+    dinov2_variant = pipeline_cfg.get("dinov2_variant")
+
+    mask_dir = tmp_path / ".vireo" / "masks"
+    os.makedirs(mask_dir, exist_ok=True)
+    from PIL import Image
+    for pid in photo_ids:
+        mask_file = str(mask_dir / f"{pid}.{sam2_variant}.png")
+        Image.new("L", (4, 4), 255).save(mask_file)
+        db.upsert_photo_mask(
+            pid, sam2_variant, mask_file, "MegaDetector", 0.1, 0.1, 0.5, 0.5,
+        )
+        db.set_active_mask_variant(pid, sam2_variant)
+        db.conn.execute(
+            "UPDATE photos SET dino_embedding_variant=? WHERE id=?",
+            (dinov2_variant, pid),
+        )
+    db.conn.commit()
+
+    _stub_extract_masks_heavy_ops(monkeypatch)
+
+    import shutil
+    shutil.rmtree(folder_path, ignore_errors=True)
+
+    runner, result = _run_extract_masks_only(db_path, ws_id, collection_id)
+
+    em = result["stages"]["extract_masks"]
+    assert em.get("unreadable") == 0, (
+        f"Nothing here is at risk of a `no_subject_mask` rejection; got {em!r}"
+    )
+    assert not any("unreachable" in e for e in result["errors"]), (
+        f"No outage error belongs on a fully-cached folder; got "
+        f"{result['errors']!r}"
+    )
+    final = _extract_masks_final_update(runner)
+    assert final["status"] != "failed", (
+        f"A fully-cached offline folder must not fail the stage; got {final!r}"
+    )

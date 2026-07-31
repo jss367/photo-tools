@@ -3106,12 +3106,13 @@ def run_import_job(job, runner, db_path, workspace_id, params):
                     if src_size == 0 and dest_size == 0:
                         # Zero-byte twin: identical by definition, but kept
                         # out of the duplicate-identity index (see ingest).
-                        skipped_duplicate += 1
-                        _counts(rel)["skipped_duplicate"] += 1
-                        dup_skips.append((source_file, False))
-                        dup_dirs.add(dest_folder)
-                        continue
-                    if src_size == dest_size:
+                        # Treat it as an adopted landing, not a cataloged
+                        # twin: a crash may have left these bytes on disk
+                        # before any folder/photo row was committed. The
+                        # exact-file batch scan below catalogs that recovery
+                        # case without walking the rest of the directory.
+                        adopted_dest = (dest_file, EMPTY_FILE_SHA256)
+                    elif src_size == dest_size:
                         dest_hash = compute_file_hash(dest_file)
                         src_h = _src_hash_cached()
                         if src_h is not None and src_h == dest_hash:

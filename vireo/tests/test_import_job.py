@@ -3212,6 +3212,56 @@ def test_import_invalidates_new_images_cache(tmp_path):
     )
 
 
+def test_zero_byte_destination_collision_is_adopted_and_cataloged(tmp_path):
+    """A crash-recovery zero-byte destination has no hash-index identity.
+
+    It must enter the exact-file landed scan instead of the cataloged-twin
+    link path, because the previous run may have died before creating even
+    the destination folder row.
+    """
+    from import_job import ImportParams, run_import_job
+
+    card = tmp_path / "card"
+    card.mkdir()
+    source_file = card / "EMPTY.jpg"
+    source_file.touch()
+    timestamp = datetime(2026, 7, 3, 10, 0, 0).timestamp()
+    os.utime(str(source_file), (timestamp, timestamp))
+
+    archive = tmp_path / "archive"
+    dest_dir = archive / "2026" / "2026-07-03"
+    dest_dir.mkdir(parents=True)
+    dest_file = dest_dir / source_file.name
+    dest_file.touch()
+    os.utime(str(dest_file), (timestamp, timestamp))
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws_id = db._active_workspace_id
+    assert db.conn.execute(
+        "SELECT id FROM folders WHERE path = ?", (str(dest_dir),),
+    ).fetchone() is None
+
+    result = run_import_job(
+        _make_job(), FakeRunner(), db_path, ws_id,
+        ImportParams(sources=[str(card)], destination=str(archive)),
+    )
+
+    assert result["copied"] == 0, result
+    assert result["skipped_duplicate"] == 1, result
+    assert result["failed"] == 0, result
+    assert result["safe_to_format"] is True, result
+    row = db.conn.execute(
+        """SELECT p.id, p.hash_status FROM photos p
+           JOIN folders f ON f.id = p.folder_id
+           WHERE f.path = ? AND p.filename = ?""",
+        (str(dest_dir), source_file.name),
+    ).fetchone()
+    assert row is not None
+    assert row["hash_status"] == "ok"
+    assert str(dest_dir) in _ws_linked_folder_paths(db, ws_id)
+
+
 def test_import_promotes_missing_destination_folder_to_ok(tmp_path):
     """A pre-existing ``folders`` row marked ``'missing'`` for the import's
     destination path must transition back to ``'ok'`` before the batch

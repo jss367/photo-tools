@@ -3244,7 +3244,10 @@ async function loadFolders(opts) {
     var data = await safeFetch('/api/folders', {}, { toast: false });
     // Internal freshness guard: a later ``loadFolders()`` call — from any
     // site — has advanced the generation, so its response is the truth
-    // and ours would just overwrite it with stale data.
+    // and ours would just overwrite it with stale data. Still return the
+    // fetched data so callers that need it for membership checks (rather
+    // than the DOM) can use it without race-losing renders masking a
+    // successful fetch as a failure.
     if (myGen !== folderLoadGen) return data;
     // Callers that fire this alongside other refreshes can pass a
     // ``shouldRender`` guard so a slow response cannot overwrite a newer
@@ -3254,6 +3257,13 @@ async function loadFolders(opts) {
     renderFolderTree(data);
     return data;
   } catch(e) {
+    // Signal failure to callers that gate destructive decisions (e.g. the
+    // health refresh clearing ``activeFolderId``) on a successful fetch.
+    // A DOM/cache-based check after a swallowed failure sees the stale
+    // tree and preserves a folder that just went missing, then reloads
+    // its now-unavailable scope into an empty grid — the advanced navbar
+    // snapshot means later polls see no transition to repair it
+    // (Codex review r3687062925).
     return null;
   }
 }
@@ -3691,13 +3701,28 @@ async function refreshBrowseAfterFolderHealthChange(detail) {
     loadCollections({ shouldRender: isCurrent }),
   ]);
   if (!isCurrent()) return;
+  // If ``/api/folders`` failed transiently during this health transition,
+  // the folder tree DOM (and the cached ``browseFolderRows``) are still
+  // the pre-transition state — a membership check against either would
+  // preserve a folder that just went missing, and ``resetAndLoad`` would
+  // then reload an empty folder-scoped grid. Because the navbar has
+  // already advanced ``_missingFoldersLastIds`` before dispatching this
+  // event, later polls see no transition and never repair the view, so
+  // schedule a retry via the same event listener rather than committing
+  // to a decision from stale data (Codex review r3687062925).
+  if (loaded[0] === null) {
+    setTimeout(function() {
+      document.dispatchEvent(new CustomEvent('vireo:folder-health-changed', {
+        detail: { source: 'refresh-retry' }
+      }));
+    }, 2000);
+    return;
+  }
   // Use the health-owned response rather than the DOM. A later unrelated
   // loadFolders() call may supersede this render while still being in flight;
   // in that window the DOM is intentionally old even though this response
   // already proves whether the selected folder is available.
-  var currentFolderRows = Array.isArray(loaded[0])
-    ? loaded[0]
-    : browseFolderRows.slice();
+  var currentFolderRows = loaded[0];
   var activeScopeWasAffected = folderHealthTouchesActiveScope(
     detail, beforeFolderRows, currentFolderRows);
   if (activeFolderId &&

@@ -1046,6 +1046,104 @@ def test_unrelated_folder_health_change_preserves_leaf_selection(
     expect(page.locator(".grid-card")).to_have_count(3)
 
 
+def test_health_refresh_skips_stale_reset_when_load_folders_fails(
+    live_server, page, tmp_path
+):
+    """A transient ``/api/folders`` failure during a folder-health refresh
+    must NOT commit to a stale-DOM membership decision, and Browse must
+    recover automatically without waiting for the ten-minute background
+    poll.
+
+    Regression (Codex review r3687062925): ``loadFolders()`` swallowed its
+    exception and resolved, so the refresh's ``Promise.all`` looked
+    successful. The subsequent DOM check for ``activeFolderId`` then read
+    the pre-transition tree, retained the just-missing folder scope, and
+    reloaded that unavailable scope into an empty grid. Because the navbar
+    advances ``_missingFoldersLastIds`` before dispatching the event, no
+    later poll saw a transition to repair the view.
+    """
+    db = live_server["db"]
+    park = tmp_path / "park"
+    yard = tmp_path / "yard"
+    park.mkdir()
+    yard.mkdir()
+    folder_ids = live_server["data"]["folders"]
+    db.conn.execute(
+        "UPDATE folders SET path = ?, status = 'ok' WHERE id = ?",
+        (str(park), folder_ids[0]),
+    )
+    db.conn.execute(
+        "UPDATE folders SET path = ?, status = 'ok' WHERE id = ?",
+        (str(yard), folder_ids[1]),
+    )
+    db.conn.commit()
+
+    page.goto(f"{live_server['url']}/browse")
+    page.locator(".grid-card").first.wait_for(state="visible", timeout=5000)
+    expect(page.locator(".grid-card")).to_have_count(5)
+
+    # Select park so the health refresh has a folder scope to potentially
+    # mis-preserve. Once selected, only park's 3 photos are visible.
+    page.evaluate(f"filterByFolder({folder_ids[0]})")
+    expect(page.locator(".grid-card")).to_have_count(3)
+
+    # Ensure the initial /api/folders/missing poll seeded the baseline so
+    # the retry dispatched by the fix doesn't merely resurrect a null-diff.
+    page.wait_for_function(
+        "typeof _missingFoldersLastIds !== 'undefined' && "
+        "_missingFoldersLastIds !== null"
+    )
+
+    # Server-side: park just went missing. The navbar's next check-health
+    # POST will observe the transition and dispatch vireo:folder-health-
+    # changed. Route /api/folders to fail ONCE so the first refresh has to
+    # decide whether to reset the grid without fresh folder data.
+    db.conn.execute(
+        "UPDATE folders SET status = 'missing' WHERE id = ?", (folder_ids[0],)
+    )
+    db.conn.commit()
+
+    fail_state = {"fired": False}
+
+    def _fail_first_folders(route):
+        if route.request.method == "GET" and not fail_state["fired"]:
+            fail_state["fired"] = True
+            route.fulfill(status=500, body="fail")
+        else:
+            route.continue_()
+
+    page.route("**/api/folders", _fail_first_folders)
+
+    # Trigger the health refresh directly. Using the event bypasses the
+    # navbar poll timing so the test is deterministic; the fix under test
+    # lives entirely on the browse.html listener side.
+    page.evaluate(
+        "document.dispatchEvent(new CustomEvent('vireo:folder-health-changed', {"
+        " detail: { source: 'test' } }))"
+    )
+
+    # The first refresh must NOT run resetAndLoad against the stale park
+    # scope. Old behavior: the grid drops to 0 cards (park is missing).
+    # New behavior: skip the reset entirely, so the grid stays populated
+    # from the pre-event state until the retry fires.
+    page.wait_for_timeout(500)
+    interim_count = page.locator(".grid-card").count()
+    assert interim_count > 0, (
+        "health refresh reset the grid using stale folder data after "
+        "loadFolders() failed (activeFolderId was preserved from the "
+        "pre-transition DOM)"
+    )
+
+    # The scheduled retry (2s) re-dispatches the event; loadFolders now
+    # succeeds against a park-less tree, membership check clears
+    # activeFolderId, and the workspace-scoped reset lands on yard.
+    page.wait_for_function(
+        "activeFolderId === null",
+        timeout=5000,
+    )
+    expect(page.locator(".grid-card")).to_have_count(2)
+
+
 def test_missing_folders_recovery_skips_check_when_mutations_hang(
     live_server, page
 ):

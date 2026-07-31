@@ -2041,6 +2041,8 @@ var summaryLoadGen = 0;
 var summaryLoadStates = {};
 var summaryRenderDecisionGen = 0;
 var calendarDataLoadGen = 0;
+var calendarDataLoadStates = {};
+var calendarRenderDecisionGen = 0;
 // Internal generation counters shared across every caller of the sidebar
 // loaders. Without these, ``refreshBrowseSidebarCounts()`` and the various
 // mutation-triggered ``loadKeywords()``/``loadCollections()`` calls fire
@@ -4769,8 +4771,7 @@ function toggleTimelineMode() {
   }
 }
 
-async function loadCalendarData() {
-  var gen = ++calendarDataLoadGen;
+function buildCalendarParams() {
   var params = new URLSearchParams();
   params.set('year', calendarYear);
   if (activeFolderId) params.set('folder_id', activeFolderId);
@@ -4790,11 +4791,54 @@ async function loadCalendarData() {
   var rules = getBrowseRulesWithoutTimestamp();
   if (rules) params.set('rules', JSON.stringify(rules));
   appendVisualScopeParams(params);
+  return params;
+}
 
-  var data = await safeFetch('/api/photos/calendar?' + params.toString());
-  if (gen !== calendarDataLoadGen) return;
-  calendarData = data;
-  renderCalendar();
+function reconcileCalendarLoadRenders() {
+  var gen = calendarDataLoadGen;
+  while (gen > calendarRenderDecisionGen) {
+    var state = calendarDataLoadStates[gen];
+    if (!state || state.status === 'pending') return;
+    if (state.status === 'success') {
+      var currentKey = buildCalendarParams().toString();
+      calendarRenderDecisionGen = gen;
+      if (state.key === currentKey) {
+        calendarData = state.data;
+        renderCalendar();
+      }
+      Object.keys(calendarDataLoadStates).forEach(function(key) {
+        if (Number(key) <= calendarDataLoadGen) delete calendarDataLoadStates[key];
+      });
+      return;
+    }
+    gen--;
+  }
+}
+
+async function loadCalendarData() {
+  var gen = ++calendarDataLoadGen;
+  var params = buildCalendarParams();
+  calendarDataLoadStates[gen] = {
+    status: 'pending',
+    key: params.toString()
+  };
+
+  try {
+    var data = await safeFetch('/api/photos/calendar?' + params.toString());
+    var state = calendarDataLoadStates[gen];
+    if (!state) return data;
+    state.status = 'success';
+    state.data = data;
+    reconcileCalendarLoadRenders();
+    return data;
+  } catch(e) {
+    var failedState = calendarDataLoadStates[gen];
+    if (failedState) {
+      failedState.status = 'failure';
+      reconcileCalendarLoadRenders();
+    }
+    return null;
+  }
 }
 
 function getBrowseRulesWithoutTimestamp() {

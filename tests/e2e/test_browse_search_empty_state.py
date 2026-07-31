@@ -1378,6 +1378,47 @@ def test_load_summary_renders_older_success_after_newer_failure(
     expect(page.locator("#summaryPhotoCount")).to_have_text("5", timeout=5000)
 
 
+def test_load_calendar_renders_older_success_after_newer_failure(
+    live_server, page
+):
+    """An identical-scope failed superseder must retain a usable calendar."""
+    page.goto(f"{live_server['url']}/browse")
+    page.wait_for_function("browseDatasetReady", timeout=5000)
+    expected_year = str(page.evaluate("calendarYear"))
+
+    held = []
+    request_count = 0
+
+    def _hold_success_then_fail(route):
+        nonlocal request_count
+        request_count += 1
+        if request_count == 1:
+            held.append(route)
+        elif request_count == 2:
+            route.fulfill(status=500, body="fail")
+        else:
+            route.continue_()
+
+    page.route("**/api/photos/calendar**", _hold_success_then_fail)
+    page.evaluate(
+        "() => {"
+        "  document.getElementById('calYearLabel').textContent = 'stale';"
+        "  window._olderSuccessfulCalendarLoad = loadCalendarData();"
+        "}"
+    )
+    for _ in range(50):
+        if held:
+            break
+        page.wait_for_timeout(100)
+    assert held, "older calendar request was never issued"
+
+    page.evaluate("() => { window._failedCalendarLoad = loadCalendarData(); }")
+    page.wait_for_timeout(200)
+    held[0].continue_()
+
+    expect(page.locator("#calYearLabel")).to_have_text(expected_year, timeout=5000)
+
+
 def test_health_refresh_awaits_config_before_loading_photos(
     live_server, page, tmp_path
 ):

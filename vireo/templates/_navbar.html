@@ -11171,6 +11171,12 @@ let _missingFoldersObservationGen = 0;
 let _missingFoldersMutationGen = 0;
 let _missingFoldersMutationInFlight = 0;
 let _missingFoldersMutationEpoch = 0;
+// Incremented whenever a GET, POST, or Browse init snapshot becomes the
+// client-side baseline. Browse captures this immediately before requesting
+// /api/browse/init, which lets it distinguish a baseline that was already
+// applied (init is newer) from one that landed while init was in flight
+// (the later observation remains authoritative).
+let _missingFoldersSnapshotVersion = 0;
 
 function _missingFolderIdsDiffer(prev, curr) {
   if (prev.length !== curr.length) return true;
@@ -11221,6 +11227,28 @@ function _updateMissingFoldersBanner(folders) {
     banner.style.display = 'none';
     _missingBannerDismissedCount = 0;
   }
+}
+
+// Reconcile the missing-folder IDs bundled into /api/browse/init with the
+// navbar poll/POST baseline. If the baseline version has not changed since
+// the init request began, init is known to be the newer observation: adopt
+// it and update the banner without dispatching a backwards transition. If
+// the version changed in flight, keep that later observation and dispatch
+// init→current so Browse discards its stale init payload.
+function _reconcileMissingFoldersInitSnapshot(
+  initIds, snapshotVersionAtStart, source
+) {
+  const currentIds = initIds.slice().sort((a, b) => a - b);
+  const initIsNewer = _missingFoldersLastIds === null ||
+    snapshotVersionAtStart === _missingFoldersSnapshotVersion;
+  if (initIsNewer) {
+    _missingFoldersLastIds = currentIds;
+    _missingFoldersSnapshotVersion++;
+    _updateMissingFoldersBanner(currentIds.map(id => ({ id })));
+    return false;
+  }
+  return _dispatchFolderHealthChangeFromIds(
+    currentIds, _missingFoldersLastIds, source);
 }
 
 // Wait for every in-flight POST mutation to settle, then run one
@@ -11285,6 +11313,7 @@ async function checkMissingFolders() {
     const currentIds = folders.map(f => f.id).sort((a, b) => a - b);
     _dispatchFolderHealthChangeFromIds(_missingFoldersLastIds, currentIds, 'poll');
     _missingFoldersLastIds = currentIds;
+    _missingFoldersSnapshotVersion++;
     _updateMissingFoldersBanner(folders);
   } catch (e) { /* ignore */ }
 }
@@ -11761,6 +11790,7 @@ async function loadMissingFolders() {
     // the poll would see (last-poll ≠ post-POST) and fire a second
     // redundant vireo:folder-health-changed for the same transition.
     _missingFoldersLastIds = currentIds;
+    _missingFoldersSnapshotVersion++;
     const dispatched = _dispatchFolderHealthChangeFromIds(
       prevIds, currentIds, 'check-health');
     // Narrow initial-load race: the user opened this modal before the

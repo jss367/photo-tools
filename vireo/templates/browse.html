@@ -2051,6 +2051,8 @@ var calendarDataLoadGen = 0;
 // newer call has since started, so last-started always wins regardless of
 // which call site issued it.
 var folderLoadGen = 0;
+var folderLoadStates = {};
+var folderRenderDecisionGen = 0;
 var keywordLoadGen = 0;
 var collectionLoadGen = 0;
 var browseFolderRows = [];
@@ -2946,6 +2948,10 @@ async function bootstrapBrowse() {
     // in either case.
     if (activeCollectionId) initParams.set('collection_id', activeCollectionId);
     initParams.set('per_page', perPage);
+    var missingSnapshotVersionAtInitStart =
+      typeof _missingFoldersSnapshotVersion !== 'undefined'
+        ? _missingFoldersSnapshotVersion
+        : null;
     var data = await safeFetch('/api/browse/init?' + initParams.toString());
     healthChangedDuringInit = folderHealthRefreshSeq !== bootstrapHealthSeq;
 
@@ -2956,33 +2962,25 @@ async function bootstrapBrowse() {
     // the poll's null-baseline branch returning false — later polls then
     // see the same IDs and never dispatch, so Browse stays showing the
     // pre-flip state until another transition or a reload (Codex review
-    // r3686191141). Only seed if still null — a poll (or modal POST) that
-    // already landed is a fresher source of truth than this init snapshot.
+    // r3686191141). The navbar helper compares its baseline version at init
+    // request start and completion: a poll/POST already applied before the
+    // request is older than init, while one applied during the request remains
+    // authoritative.
     //
-    // When a poll DID land first with a non-null baseline that differs
-    // from init's, the flip committed between init's baseline read and
-    // the poll's observation. The poll wrote its post-flip snapshot to
-    // ``_missingFoldersLastIds`` without dispatching (null prev), and
-    // init returned with pre-flip photos/folders that we're about to
-    // render below. Left alone, later polls see the same post-flip IDs
-    // and never dispatch — Browse would stay stuck on the stale init
-    // paint forever. Dispatch the init→now transition here so
+    // When a differing poll snapshot lands while init is in flight, init may
+    // contain pre-flip photos/folders. Dispatch the init→now transition so
     // refreshBrowseAfterFolderHealthChange takes over, and mark the
-    // health-changed flag so the guarded render path skips init's data
-    // (Codex review r3686452019).
-    if (typeof _missingFoldersLastIds !== 'undefined' &&
-        Array.isArray(data.missing_folder_ids)) {
-      var initMissingIds = data.missing_folder_ids
-        .slice()
-        .sort(function(a, b) { return a - b; });
-      if (_missingFoldersLastIds === null) {
-        _missingFoldersLastIds = initMissingIds;
-      } else if (_missingFolderIdsDiffer(initMissingIds, _missingFoldersLastIds) &&
-                 typeof _dispatchFolderHealthChangeFromIds === 'function') {
-        var dispatched = _dispatchFolderHealthChangeFromIds(
-          initMissingIds, _missingFoldersLastIds, 'bootstrap-reconcile');
-        if (dispatched) healthChangedDuringInit = true;
-      }
+    // health-changed flag so the guarded render path skips init's stale data
+    // (Codex review r3686452019). Conversely, a poll applied before this
+    // request is known older and the helper adopts init directly
+    // (Codex review r3687277899).
+    if (Array.isArray(data.missing_folder_ids) &&
+        typeof _reconcileMissingFoldersInitSnapshot === 'function') {
+      var initWasStale = _reconcileMissingFoldersInitSnapshot(
+        data.missing_folder_ids,
+        missingSnapshotVersionAtInitStart,
+        'bootstrap-reconcile');
+      if (initWasStale) healthChangedDuringInit = true;
     }
 
     if (!healthChangedDuringInit) {
@@ -3244,25 +3242,49 @@ function renderCollectionList(collections) {
 }
 
 /* ---------- Folder Tree ---------- */
+function reconcileFolderLoadRenders() {
+  // Do not render an older successful response while any newer request is
+  // still pending. Once every newer request has failed, fall back to the
+  // newest success instead of leaving the pre-transition tree in the DOM.
+  // This handles both completion orders: success-before-failure and
+  // failure-before-success.
+  var gen = folderLoadGen;
+  while (gen > folderRenderDecisionGen) {
+    var state = folderLoadStates[gen];
+    if (!state || state.status === 'pending') return;
+    if (state.status === 'success') {
+      var shouldRender = !state.shouldRender || state.shouldRender();
+      folderRenderDecisionGen = gen;
+      if (shouldRender) renderFolderTree(state.data);
+      Object.keys(folderLoadStates).forEach(function(key) {
+        if (Number(key) <= folderLoadGen) delete folderLoadStates[key];
+      });
+      return;
+    }
+    gen--;
+  }
+}
+
 async function loadFolders(opts) {
   var myGen = ++folderLoadGen;
+  folderLoadStates[myGen] = {
+    status: 'pending',
+    shouldRender: opts && opts.shouldRender
+  };
   try {
     var data = await safeFetch('/api/folders', {}, { toast: false });
-    // Internal freshness guard: a later ``loadFolders()`` call — from any
-    // site — has advanced the generation, so its response is the truth
-    // and ours would just overwrite it with stale data. Still return the
-    // fetched data so callers that need it for membership checks (rather
-    // than the DOM) can use it without race-losing renders masking a
-    // successful fetch as a failure.
-    if (myGen !== folderLoadGen) return data;
-    // Callers that fire this alongside other refreshes can pass a
-    // ``shouldRender`` guard so a slow response cannot overwrite a newer
-    // render — see refreshBrowseAfterFolderHealthChange
-    // (Codex review r3685193225).
-    if (opts && opts.shouldRender && !opts.shouldRender()) return data;
-    renderFolderTree(data);
+    var state = folderLoadStates[myGen];
+    if (!state) return data;
+    state.status = 'success';
+    state.data = data;
+    reconcileFolderLoadRenders();
     return data;
   } catch(e) {
+    var failedState = folderLoadStates[myGen];
+    if (failedState) {
+      failedState.status = 'failure';
+      reconcileFolderLoadRenders();
+    }
     // Signal failure to callers that gate destructive decisions (e.g. the
     // health refresh clearing ``activeFolderId``) on a successful fetch.
     // A DOM/cache-based check after a swallowed failure sees the stale
@@ -3717,8 +3739,14 @@ async function refreshBrowseAfterFolderHealthChange(detail) {
   // schedule a retry via the same event listener rather than committing
   // to a decision from stale data (Codex review r3687062925).
   if (loaded[0] === null) {
+    var retryAttempt = detail && Number(detail.refreshRetryAttempt) || 0;
+    // Bound the short-term recovery loop. A prolonged/permanent endpoint
+    // outage must fall back to the normal ten-minute health poll instead of
+    // issuing folder/keyword/collection requests forever.
+    if (retryAttempt >= 3) return;
     var retryDetail = Object.assign({}, detail || {}, {
-      source: 'refresh-retry'
+      source: 'refresh-retry',
+      refreshRetryAttempt: retryAttempt + 1
     });
     setTimeout(function() {
       document.dispatchEvent(new CustomEvent('vireo:folder-health-changed', {
@@ -3728,7 +3756,7 @@ async function refreshBrowseAfterFolderHealthChange(detail) {
         // no-id fallback reset an unaffected grid and selection.
         detail: retryDetail
       }));
-    }, 2000);
+    }, 2000 * Math.pow(2, retryAttempt));
     return;
   }
   // Use the health-owned response rather than the DOM. A later unrelated
@@ -8751,6 +8779,10 @@ async function _runPhotoDeepLink(photoId) {
 
     // Load pages until the target photo is found or all pages exhausted
     // (bootstrapBrowse was skipped, so we also need folder/keyword trees)
+    var missingSnapshotVersionAtInitStart =
+      typeof _missingFoldersSnapshotVersion !== 'undefined'
+        ? _missingFoldersSnapshotVersion
+        : null;
     var initData = await safeFetch('/api/browse/init?folder_id=' + photo.folder_id + '&per_page=' + perPage + '&sort=' + document.getElementById('sortSelect').value, {}, { toast: false });
     if (!isDeepLinkHealthCurrent()) { wasSuperseded = true; return wasSuperseded; }
     if (initData) {
@@ -8762,24 +8794,18 @@ async function _runPhotoDeepLink(photoId) {
       // flip that runs between init and the first navbar poll then lands
       // silently (null-baseline branch), later polls see the same IDs and
       // never dispatch, and Browse stays stuck on the pre-flip state
-      // indefinitely. When a poll already landed with a differing baseline,
-      // dispatch the init→now transition so
-      // refreshBrowseAfterFolderHealthChange takes over — the subsequent
-      // isDeepLinkHealthCurrent check will then skip our stale render
-      // (Codex review r3686696347).
-      if (typeof _missingFoldersLastIds !== 'undefined' &&
-          Array.isArray(initData.missing_folder_ids)) {
-        var initMissingIds = initData.missing_folder_ids
-          .slice()
-          .sort(function(a, b) { return a - b; });
-        if (_missingFoldersLastIds === null) {
-          _missingFoldersLastIds = initMissingIds;
-        } else if (_missingFolderIdsDiffer(initMissingIds, _missingFoldersLastIds) &&
-                   typeof _dispatchFolderHealthChangeFromIds === 'function') {
-          _dispatchFolderHealthChangeFromIds(
-            initMissingIds, _missingFoldersLastIds, 'deep-link-reconcile');
-          if (!isDeepLinkHealthCurrent()) { wasSuperseded = true; return wasSuperseded; }
-        }
+      // indefinitely. The shared snapshot-version helper adopts init when a
+      // baseline was already present before this request, but dispatches an
+      // init→current transition when a newer observation landed in flight;
+      // the subsequent isDeepLinkHealthCurrent check then skips stale render
+      // data (Codex reviews r3686696347 and r3687277899).
+      if (Array.isArray(initData.missing_folder_ids) &&
+          typeof _reconcileMissingFoldersInitSnapshot === 'function') {
+        _reconcileMissingFoldersInitSnapshot(
+          initData.missing_folder_ids,
+          missingSnapshotVersionAtInitStart,
+          'deep-link-reconcile');
+        if (!isDeepLinkHealthCurrent()) { wasSuperseded = true; return wasSuperseded; }
       }
       renderFolderTree(initData.folders || []);
       renderKeywordTree(initData.keywords || []);

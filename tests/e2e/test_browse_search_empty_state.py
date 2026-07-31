@@ -526,6 +526,81 @@ def test_bootstrap_seeds_missing_snapshot_from_init_response(
     expect(page.locator(".grid-card")).to_have_count(5)
 
 
+def test_bootstrap_adopts_init_when_poll_baseline_is_known_older(
+    live_server, page, tmp_path
+):
+    """A poll completed before init starts must not override the newer init."""
+    db = live_server["db"]
+    park = tmp_path / "park"
+    yard = tmp_path / "yard"
+    park.mkdir()
+    yard.mkdir()
+    folder_ids = live_server["data"]["folders"]
+    db.conn.execute(
+        "UPDATE folders SET path = ?, status = 'missing' WHERE id = ?",
+        (str(tmp_path / "gone-park"), folder_ids[0]),
+    )
+    db.conn.execute(
+        "UPDATE folders SET path = ?, status = 'ok' WHERE id = ?",
+        (str(yard), folder_ids[1]),
+    )
+    db.conn.commit()
+
+    # Hold the config promise so the navbar's initial missing-folder poll can
+    # finish before bootstrap issues /api/browse/init.
+    held_cfg = []
+
+    def _hold_all_cfg(route):
+        if route.request.method == "GET":
+            held_cfg.append(route)
+        else:
+            route.continue_()
+
+    page.route("**/api/config", _hold_all_cfg)
+    page.goto(f"{live_server['url']}/browse")
+    for _ in range(50):
+        if held_cfg:
+            break
+        page.wait_for_timeout(100)
+    assert held_cfg, "/api/config was never requested"
+    page.wait_for_function(
+        f"_missingFoldersLastIds !== null && "
+        f"_missingFoldersLastIds.length === 1 && "
+        f"_missingFoldersLastIds[0] === {folder_ids[0]}"
+    )
+    poll_version = page.evaluate("_missingFoldersSnapshotVersion")
+    page.evaluate(
+        "window._folderHealthEvents = [];"
+        "document.addEventListener('vireo:folder-health-changed', "
+        "function(e) { window._folderHealthEvents.push(e.detail.source); });"
+    )
+
+    # Restore park after the poll observation but before init starts. Init is
+    # now the known-newer snapshot and should be adopted directly, not treated
+    # as stale and reconciled backwards to the old poll baseline.
+    db.conn.execute(
+        "UPDATE folders SET path = ?, status = 'ok' WHERE id = ?",
+        (str(park), folder_ids[0]),
+    )
+    db.conn.commit()
+    page.unroute("**/api/config", _hold_all_cfg)
+
+    page.wait_for_function("browseDatasetReady", timeout=10000)
+    state = page.evaluate(
+        "({photoCount: photos.length, missingIds: _missingFoldersLastIds, "
+        "events: window._folderHealthEvents, "
+        "snapshotVersion: _missingFoldersSnapshotVersion})"
+    )
+    assert state["photoCount"] == 5, state
+    assert state["missingIds"] == [], state
+    assert page.evaluate("_missingFoldersSnapshotVersion") > poll_version
+    assert state["events"] == []
+    assert page.locator("#missingFoldersBanner").evaluate(
+        "(el) => getComputedStyle(el).display"
+    ) == "none"
+    expect(page.locator(".grid-card")).to_have_count(5)
+
+
 def test_bootstrap_defers_lock_release_when_init_rejects(
     live_server, page, tmp_path
 ):
@@ -896,6 +971,58 @@ def test_load_folders_generation_guard_prevents_stale_render(
     )
 
 
+def test_load_folders_renders_older_success_after_newer_failure(
+    live_server, page
+):
+    """A failed superseder must not suppress the newest successful tree."""
+    db = live_server["db"]
+    folder_ids = live_server["data"]["folders"]
+    page.goto(f"{live_server['url']}/browse")
+    expect(page.locator("#folderTree .tree-item")).to_have_count(2)
+
+    held = []
+    request_count = 0
+
+    def _hold_success_then_fail(route):
+        nonlocal request_count
+        request_count += 1
+        if request_count == 1:
+            held.append(route)
+        elif request_count == 2:
+            route.fulfill(status=500, body="fail")
+        else:
+            route.continue_()
+
+    page.route("**/api/folders", _hold_success_then_fail)
+    page.evaluate(
+        "() => { window._olderSuccessfulFolderLoad = "
+        "loadFolders({ shouldRender: () => true }); }"
+    )
+    for _ in range(50):
+        if held:
+            break
+        page.wait_for_timeout(100)
+    assert held, "older folder-tree request was never issued"
+
+    # The held request will read the new tree when released. Start a newer
+    # request first and make that superseder fail.
+    db.conn.execute(
+        "UPDATE folders SET status = 'missing' WHERE id = ?",
+        (folder_ids[0],),
+    )
+    db.conn.commit()
+    page.evaluate("() => { window._failedFolderLoad = loadFolders(); }")
+    page.wait_for_timeout(200)
+    held[0].continue_()
+
+    page.wait_for_function(
+        f"!document.querySelector("
+        f"'#folderTree .tree-item[data-folder-id=\"{folder_ids[0]}\"]')",
+        timeout=5000,
+    )
+    expect(page.locator("#folderTree .tree-item")).to_have_count(1)
+
+
 def test_health_refresh_awaits_config_before_loading_photos(
     live_server, page, tmp_path
 ):
@@ -1263,6 +1390,31 @@ def test_health_refresh_retry_preserves_unrelated_transition_ids(
         "document.getElementById('detailContent').classList.contains('visible')"
     )
     expect(page.locator(".grid-card")).to_have_count(3)
+
+
+def test_health_refresh_stops_after_bounded_folder_retries(live_server, page):
+    """A persistent folder endpoint failure must not retry forever."""
+    page.goto(f"{live_server['url']}/browse")
+    expect(page.locator(".grid-card")).to_have_count(5)
+
+    folder_requests = []
+
+    def _fail_folders(route):
+        folder_requests.append(route.request.url)
+        route.fulfill(status=500, body="fail")
+
+    page.route("**/api/folders", _fail_folders)
+    page.evaluate(
+        "document.dispatchEvent(new CustomEvent('vireo:folder-health-changed', {"
+        "detail: {restored: [], wentMissing: [], source: 'test', "
+        "refreshRetryAttempt: 3}}))"
+    )
+    page.evaluate("() => window._activeFolderHealthRefresh")
+
+    # Attempt 3 is the cap: no fourth event should be scheduled two seconds
+    # later, and therefore no second folder-tree request should appear.
+    page.wait_for_timeout(2300)
+    assert len(folder_requests) == 1
 
 
 def test_missing_folders_recovery_skips_check_when_mutations_hang(

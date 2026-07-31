@@ -58,7 +58,10 @@ def fresh_server(tmp_path, monkeypatch):
 
     app = create_app(db_path=db_path, thumb_cache_dir=thumb_dir)
 
-    server = make_server("127.0.0.1", 0, app)
+    # threaded=True for the same reason as the shared ``live_server``
+    # fixture in conftest.py: a single-threaded server makes every page
+    # load queue behind whatever else the page requested.
+    server = make_server("127.0.0.1", 0, app, threaded=True)
     port = server.socket.getsockname()[1]
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()

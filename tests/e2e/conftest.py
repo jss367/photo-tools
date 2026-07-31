@@ -138,7 +138,17 @@ def live_server(tmp_path, monkeypatch):
 
     app = create_app(db_path=db_path, thumb_cache_dir=thumb_dir)
 
-    server = make_server("127.0.0.1", 0, app)
+    # threaded=True or the whole page load serializes behind one request.
+    # make_server defaults to a single-threaded BaseWSGIServer, while the
+    # shipped app runs waitress with 16 threads precisely so "page loads
+    # [don't] queue behind [a slow request] and the app appears frozen"
+    # (see main() in app.py). With a pool of one, a navbar poll that takes
+    # a moment (``/api/workspaces/active/new-images`` blocks up to 0.5s on
+    # a cold cache) holds the server while the page's thumbnails wait, so
+    # ``load`` — and therefore ``page.goto`` — can stall on a busy machine.
+    # Per-request connections come from ``_get_db()`` via Flask ``g``, the
+    # same isolation waitress relies on.
+    server = make_server("127.0.0.1", 0, app, threaded=True)
     port = server.socket.getsockname()[1]
     thread = threading.Thread(target=server.serve_forever)
     thread.daemon = True

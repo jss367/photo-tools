@@ -79,6 +79,11 @@ from ingest import (
     discover_source_files,
 )
 from job_contract import progress_event
+
+# Shared with the pipeline readiness copy so "1 file" / "2 files" reads the
+# same way everywhere the UI states a count. pipeline_plan imports only
+# stdlib at module level, so this does not cycle back through import_job.
+from pipeline_plan import _plural
 from scanner import EMPTY_FILE_SHA256
 
 log = logging.getLogger(__name__)
@@ -3410,11 +3415,18 @@ def run_import_job(job, runner, db_path, workspace_id, params):
             ),
         })
     # Selection drift entries. ``renderResult`` HIDES the unsafe list when it
-    # is empty, so every signal that can flip the pill red must append a line
-    # here or the user gets "Do NOT format the card yet" with no stated
-    # reason. These lines *attribute* the gap between what was previewed and
-    # what was copied; they do not claim to enumerate it. Deselect one file,
-    # have another vanish, and have a third arrive after the preview, and the
+    # is empty, so every SELECTION signal that can flip the pill red appends a
+    # line here — otherwise the user gets "Do NOT format the card yet" with no
+    # stated reason. That property holds for the selection signals only; it is
+    # NOT a general invariant of this function today. Known pre-existing gap:
+    # ``partial_scope`` (``recursive=False``, or a narrowed ``file_types``)
+    # flips ``safe_to_format`` False and appends nothing, so that path still
+    # renders a bare red pill. Out of scope here; don't read the block below
+    # as evidence it was fixed.
+    #
+    # These lines *attribute* the gap between what was previewed and what was
+    # copied; they do not claim to enumerate it. Deselect one file, have
+    # another vanish, and have a third arrive after the preview, and the
     # counts no longer map one-to-one onto the files still card-only — do not
     # reword these into a claim that the list is exhaustive.
     #
@@ -3424,11 +3436,25 @@ def run_import_job(job, runner, db_path, workspace_id, params):
     # turns the pill red too. A lone ``if deselected > 0`` would leave
     # exactly that red pill bare. The negative branch does not quote the
     # number: the payload is self-inconsistent, so the count is precisely the
-    # thing that cannot be trusted.
+    # thing that cannot be trusted. A negative ``deselected`` also cannot
+    # occur alone — ``len(include_paths) > previewed_count`` forces either a
+    # selected path the card no longer holds (``vanished_paths``) or a card
+    # holding more than was previewed (``appeared``) — so its line always
+    # ships alongside another.
+    #
+    # ``appeared`` likewise only ever renders under a red pill: a balanced
+    # ledger with ``appeared > 0`` forces ``deselected <= 0`` (negative
+    # blocks; zero would make ``appeared`` zero too).
+    #
+    # Counts are pluralized (``_plural`` + verb agreement) because 1 is the
+    # single most likely real case — one frame deselected, one file gone.
     if deselected > 0:
         unsafe_files.append({
             "path": "Deselected files",
-            "reason": f"{deselected} files you deselected were not copied",
+            "reason": (
+                f"{deselected} file{_plural(deselected)} you deselected "
+                f"{'was' if deselected == 1 else 'were'} not copied"
+            ),
         })
     if deselected < 0:
         unsafe_files.append({
@@ -3438,16 +3464,24 @@ def run_import_job(job, runner, db_path, workspace_id, params):
                        "be determined — re-preview before formatting"),
         })
     if vanished_paths:
+        vanished_count = len(vanished_paths)
         unsafe_files.append({
             "path": "Files missing at import time",
-            "reason": f"{len(vanished_paths)} files were in scope but had "
-                      "disappeared from the source when the import ran",
+            "reason": (
+                f"{vanished_count} file{_plural(vanished_count)} "
+                f"{'was' if vanished_count == 1 else 'were'} in scope but "
+                "had disappeared from the source when the import ran"
+            ),
         })
     if appeared > 0:
         unsafe_files.append({
             "path": "Files added after preview",
-            "reason": f"at least {appeared} files arrived after your preview "
-                      "and were not imported — re-preview to include them",
+            "reason": (
+                f"at least {appeared} file{_plural(appeared)} arrived after "
+                f"your preview and {'was' if appeared == 1 else 'were'} not "
+                f"imported — re-preview to include "
+                f"{'it' if appeared == 1 else 'them'}"
+            ),
         })
     safe_to_format = (
         not cancelled

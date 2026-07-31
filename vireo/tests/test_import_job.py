@@ -81,6 +81,15 @@ def _photo_rows(db):
     ).fetchall()
 
 
+def _unsafe_paths(result):
+    return {u["path"] for u in result["unsafe_files"]}
+
+
+def _unsafe_reason(result, path):
+    return next(u["reason"] for u in result["unsafe_files"]
+                if u["path"] == path)
+
+
 def _ws_linked_folder_paths(db, ws_id):
     return {
         row["path"]
@@ -6531,10 +6540,6 @@ def test_repeated_include_path_does_not_mask_a_deselection(tmp_path):
     assert result["unverified_duplicates_only"] is False
 
 
-def _unsafe_paths(result):
-    return {u["path"] for u in result["unsafe_files"]}
-
-
 def test_deselection_explains_itself_on_the_result_card(tmp_path):
     from import_job import ImportParams
 
@@ -6548,12 +6553,11 @@ def test_deselection_explains_itself_on_the_result_card(tmp_path):
         previewed_count=2, checked_count=1,
     ))
     assert "Deselected files" in _unsafe_paths(result)
-    entry = next(u for u in result["unsafe_files"]
-                 if u["path"] == "Deselected files")
-    assert "1 files you deselected were not copied" in entry["reason"]
+    reason = _unsafe_reason(result, "Deselected files")
+    assert "1 file you deselected was not copied" in reason
     # Must NOT claim the card holds the only copies — false when the
     # deselected file is byte-identical to a selected one.
-    assert "only copies" not in entry["reason"]
+    assert "only copies" not in reason
 
 
 def test_vanished_file_explains_itself_on_the_result_card(tmp_path):
@@ -6568,6 +6572,14 @@ def test_vanished_file_explains_itself_on_the_result_card(tmp_path):
         previewed_count=2, checked_count=2,
     ))
     assert "Files missing at import time" in _unsafe_paths(result)
+    # The count must be the number that VANISHED (1), not the size of the
+    # selection (2). Asserting only the path key lets a wrong denominator
+    # through: ``len(include_paths)`` here renders "2 files ... disappeared"
+    # while exactly one did, in user-facing card-safety copy.
+    assert _unsafe_reason(result, "Files missing at import time") == (
+        "1 file was in scope but had disappeared from the source "
+        "when the import ran"
+    )
 
 
 def test_files_appearing_after_preview_explain_themselves(tmp_path):
@@ -6592,9 +6604,10 @@ def test_files_appearing_after_preview_explain_themselves(tmp_path):
         previewed_count=2, checked_count=2,
     ))
     assert "Files added after preview" in _unsafe_paths(result)
-    entry = next(u for u in result["unsafe_files"]
-                 if u["path"] == "Files added after preview")
-    assert "at least 1 files arrived after your preview" in entry["reason"]
+    assert _unsafe_reason(result, "Files added after preview") == (
+        "at least 1 file arrived after your preview and was not imported "
+        "— re-preview to include it"
+    )
 
 
 def test_inconsistent_selection_count_explains_itself(tmp_path):
@@ -6624,10 +6637,39 @@ def test_inconsistent_selection_count_explains_itself(tmp_path):
     assert result["safe_to_format"] is False
 
     assert "Selection count mismatch" in _unsafe_paths(result)
-    entry = next(u for u in result["unsafe_files"]
-                 if u["path"] == "Selection count mismatch")
     # No nonsense number: the count is what is untrustworthy.
-    assert "-1" not in entry["reason"]
+    assert "-1" not in _unsafe_reason(result, "Selection count mismatch")
+
+
+def test_selection_entry_grammar_matches_the_count(tmp_path):
+    """Plural counterpart to the singular assertions above.
+
+    1 is the most likely real case (deselect one frame, one file vanishes),
+    so the singular forms are pinned per-branch; this pins the plural forms
+    so the pluralization can't be dropped in either direction.
+    """
+    from import_job import ImportParams
+
+    card = _make_card(tmp_path, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+        ("DSC_0002.jpg", datetime(2026, 7, 3, 11, 0, 0), "green"),
+        ("DSC_0003.jpg", datetime(2026, 7, 3, 12, 0, 0), "blue"),
+    ])
+    _, _, result = _run_import(tmp_path, ImportParams(
+        sources=[str(card)], destination=str(tmp_path / "archive"),
+        include_paths={
+            str(card / "DSC_0001.jpg"),
+            str(card / "GONE_A.jpg"), str(card / "GONE_B.jpg"),
+        },
+        previewed_count=5, checked_count=3,
+    ))
+    assert _unsafe_reason(result, "Deselected files") == (
+        "2 files you deselected were not copied"
+    )
+    assert _unsafe_reason(result, "Files missing at import time") == (
+        "2 files were in scope but had disappeared from the source "
+        "when the import ran"
+    )
 
 
 def test_no_selection_blocked_result_leaves_the_pill_bare(tmp_path):
@@ -6666,8 +6708,13 @@ def test_no_selection_blocked_result_leaves_the_pill_bare(tmp_path):
     for name, specs, included, extra, previewed, expected in scenarios:
         root = tmp_path / name
         root.mkdir()
+        # Distinct colors: identical bytes would make the second file an
+        # in-batch duplicate (copied=1, skipped_duplicate=1), so a scenario
+        # that reads as two plain copies would quietly be exercising the
+        # duplicate path instead.
+        colors = ["red", "green", "blue", "white"]
         card = _make_card(root, [
-            (fn, datetime(2026, 7, 3, 10 + i, 0, 0), "red")
+            (fn, datetime(2026, 7, 3, 10 + i, 0, 0), colors[i])
             for i, fn in enumerate(specs)
         ])
         include_paths = {str(card / fn) for fn in included}

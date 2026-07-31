@@ -2055,6 +2055,8 @@ var folderLoadStates = {};
 var folderRenderDecisionGen = 0;
 var keywordLoadGen = 0;
 var collectionLoadGen = 0;
+var collectionLoadStates = {};
+var collectionRenderDecisionGen = 0;
 var browseFolderRows = [];
 var collectionsById = {};
 var browseCompareIds = [];
@@ -3496,17 +3498,54 @@ async function filterByKeyword(name) {
 }
 
 /* ---------- Collections ---------- */
+function reconcileCollectionLoadRenders() {
+  // Mirror reconcileFolderLoadRenders: don't render an older successful
+  // response while a newer request is still pending, but if every newer
+  // request failed, fall back to the newest available success rather than
+  // leaving the collection list stale. Otherwise a health-owned request
+  // that observed a just-created collection could be silently dropped by
+  // a subsequent mutation-triggered reload that transiently fails, so the
+  // collection stays absent until the next explicit list refresh
+  // (Codex review r3687331931).
+  var gen = collectionLoadGen;
+  while (gen > collectionRenderDecisionGen) {
+    var state = collectionLoadStates[gen];
+    if (!state || state.status === 'pending') return;
+    if (state.status === 'success') {
+      var shouldRender = !state.shouldRender || state.shouldRender();
+      collectionRenderDecisionGen = gen;
+      if (shouldRender) renderCollectionList(state.data);
+      Object.keys(collectionLoadStates).forEach(function(key) {
+        if (Number(key) <= collectionLoadGen) delete collectionLoadStates[key];
+      });
+      return;
+    }
+    gen--;
+  }
+}
+
 async function loadCollections(opts) {
   var myGen = ++collectionLoadGen;
+  collectionLoadStates[myGen] = {
+    status: 'pending',
+    shouldRender: opts && opts.shouldRender
+  };
   try {
     var data = await safeFetch('/api/collections', {}, { toast: false });
-    // See loadFolders — same shared-generation freshness guard so an older
-    // response cannot overwrite the collection list that a newer caller
-    // has already repainted.
-    if (myGen !== collectionLoadGen) return;
-    if (opts && opts.shouldRender && !opts.shouldRender()) return;
-    renderCollectionList(data);
-  } catch(e) {}
+    var state = collectionLoadStates[myGen];
+    if (!state) return data;
+    state.status = 'success';
+    state.data = data;
+    reconcileCollectionLoadRenders();
+    return data;
+  } catch(e) {
+    var failedState = collectionLoadStates[myGen];
+    if (failedState) {
+      failedState.status = 'failure';
+      reconcileCollectionLoadRenders();
+    }
+    return null;
+  }
 }
 
 async function loadCollectionCounts() {
@@ -3743,7 +3782,19 @@ async function refreshBrowseAfterFolderHealthChange(detail) {
     // Bound the short-term recovery loop. A prolonged/permanent endpoint
     // outage must fall back to the normal ten-minute health poll instead of
     // issuing folder/keyword/collection requests forever.
-    if (retryAttempt >= 3) return;
+    if (retryAttempt >= 3) {
+      // The navbar advanced ``_missingFoldersLastIds`` before dispatching
+      // this event, so its 10-minute poll will see unchanged IDs once
+      // ``/api/folders`` recovers and by default emits nothing — the page
+      // would then remain on pre-transition data indefinitely. Flag the
+      // navbar so the next successful poll fires a synthetic reconciliation
+      // event regardless of the ID diff, letting this handler re-attempt
+      // the refresh with a healthy endpoint (Codex review r3687331927).
+      if (typeof window.markMissingFoldersReconciliationPending === 'function') {
+        window.markMissingFoldersReconciliationPending();
+      }
+      return;
+    }
     var retryDetail = Object.assign({}, detail || {}, {
       source: 'refresh-retry',
       refreshRetryAttempt: retryAttempt + 1

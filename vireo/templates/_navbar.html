@@ -11171,6 +11171,19 @@ let _missingFoldersObservationGen = 0;
 let _missingFoldersMutationGen = 0;
 let _missingFoldersMutationInFlight = 0;
 let _missingFoldersMutationEpoch = 0;
+// When Browse abandons its short-term retry loop after a folder-health event
+// (``/api/folders`` stayed down through every retry), the pre-transition
+// grid/tree is still on screen but ``_missingFoldersLastIds`` has already
+// advanced to the post-transition IDs. The normal 10-minute poll then sees
+// unchanged IDs and never re-emits, so the page stays stale until an
+// unrelated health flip or a reload (Codex review r3687331927). This flag
+// tells the next successful poll to dispatch a synthetic reconciliation
+// event regardless of the ID diff, so Browse can retry the refresh once the
+// endpoint recovers.
+let _missingFoldersReconciliationPending = false;
+window.markMissingFoldersReconciliationPending = function() {
+  _missingFoldersReconciliationPending = true;
+};
 // Incremented whenever a GET, POST, or Browse init snapshot becomes the
 // client-side baseline. Browse captures this immediately before requesting
 // /api/browse/init, which lets it distinguish a baseline that was already
@@ -11311,7 +11324,22 @@ async function checkMissingFolders() {
     if (_missingFoldersMutationInFlight > 0 ||
         mutationEpochAtStart !== _missingFoldersMutationEpoch) return;
     const currentIds = folders.map(f => f.id).sort((a, b) => a - b);
-    _dispatchFolderHealthChangeFromIds(_missingFoldersLastIds, currentIds, 'poll');
+    const dispatched = _dispatchFolderHealthChangeFromIds(
+      _missingFoldersLastIds, currentIds, 'poll');
+    // Browse abandoned an earlier refresh because ``/api/folders`` stayed
+    // down through every retry; ``_missingFoldersLastIds`` was already
+    // advanced then, so this poll's diff can be empty even though the page
+    // is still on pre-transition data. Force a synthetic reconciliation so
+    // Browse re-attempts the refresh now that the endpoint is answering
+    // again. Empty restored/wentMissing routes through the conservative
+    // reload path in ``folderHealthTouchesActiveScope`` (Codex review
+    // r3687331927).
+    if (!dispatched && _missingFoldersReconciliationPending) {
+      document.dispatchEvent(new CustomEvent('vireo:folder-health-changed', {
+        detail: { restored: [], wentMissing: [], source: 'poll-reconcile' },
+      }));
+    }
+    _missingFoldersReconciliationPending = false;
     _missingFoldersLastIds = currentIds;
     _missingFoldersSnapshotVersion++;
     _updateMissingFoldersBanner(folders);

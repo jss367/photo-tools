@@ -280,42 +280,81 @@ def _source_offline_reason(
     return "folder", f"folder {folder_path} is unreadable"
 
 
-def _photos_with_active_mask(
-    thread_db, photo_ids, sam2_variant, dinov2_variant,
-) -> set:
-    """Subset of ``photo_ids`` already carrying a usable mask on disk.
+def _preflight_mask_outcomes(
+    thread_db, dropped_photos, sam2_variant, dinov2_variant,
+    detector_confidence,
+):
+    """Split pre-flight-dropped photos into ``(already_masked, at_risk)``.
 
-    "Usable" means the photos row is active on the configured SAM variant
-    with matching DINO state and the mask file still exists — the state that
-    makes scoring treat the photo as masked rather than hard-rejecting it
-    with ``no_subject_mask``. Deliberately does NOT re-check the stored SAM
-    prompt against the current detection: a stale prompt means the mask is
-    out of date, not absent, so the photo is still not at risk of the
-    rejection this count is about.
+    The pre-flight removes photos on an unreachable source before the mask
+    loop runs, so their outcome has to be derived rather than observed. This
+    mirrors the loop's own two gates so the derivation can't drift from it:
 
-    Chunked to stay under SQLite's bound-parameter ceiling.
+    * **Worklist candidacy** — a photo with no qualifying detection would
+      never have been read for masking, so an outage doesn't change its
+      fate. It lands in neither set: counting it would turn an unrelated
+      outage into a Fatal Extract failure and tell the user to reconnect for
+      photos that would still have no mask candidate.
+    * **Cache validity** — the same test the loop's cache branch applies:
+      a ``photo_masks`` row for this variant whose stored prompt and detector
+      still match the current primary detection, whose file is on disk, and
+      whose photos row is active on the configured SAM *and* DINO variants.
+      A stale prompt means the mask must be regenerated, which an offline
+      source makes impossible — so it is at risk, not a cache hit. Treating
+      it as a hit would suppress the outage and leave scoring using a mask
+      and embedding derived from a detection that no longer applies.
+
+    Only the at-risk set is unmasked-and-unreachable, so only it should
+    drive the unreadable count, the reconnect message, and the failure latch.
     """
-    found: set = set()
-    ids = [pid for pid in photo_ids if pid is not None]
-    for start in range(0, len(ids), 500):
-        chunk = ids[start:start + 500]
-        placeholders = ",".join("?" * len(chunk))
-        rows = thread_db.conn.execute(
-            f"SELECT id, mask_path FROM photos WHERE id IN ({placeholders}) "
-            "AND active_mask_variant = ? AND dino_embedding_variant = ? "
-            "AND mask_path IS NOT NULL",
-            (*chunk, sam2_variant, dinov2_variant),
-        ).fetchall()
-        for row in rows:
-            if row["mask_path"] and os.path.isfile(row["mask_path"]):
-                found.add(row["id"])
-    return found
+    already_masked: set = set()
+    at_risk: set = set()
+    for photo in dropped_photos:
+        photo_id = photo["id"]
+        dets = [
+            d for d in thread_db.get_detections(
+                photo_id, min_conf=detector_confidence,
+            )
+            if d["detector_model"] != "full-image"
+        ]
+        if not dets:
+            continue
+        primary = dets[0]
+        existing = thread_db.get_photo_mask(photo_id, sam2_variant)
+        if existing is None or not existing["path"]:
+            at_risk.add(photo_id)
+            continue
+        cached_prompt = (
+            existing["prompt_x"], existing["prompt_y"],
+            existing["prompt_w"], existing["prompt_h"],
+        )
+        live_prompt = (
+            primary["box_x"], primary["box_y"],
+            primary["box_w"], primary["box_h"],
+        )
+        state = thread_db.conn.execute(
+            "SELECT active_mask_variant, dino_embedding_variant "
+            "FROM photos WHERE id = ?",
+            (photo_id,),
+        ).fetchone()
+        if (
+            existing["detector_model"] == primary["detector_model"]
+            and cached_prompt == live_prompt
+            and os.path.isfile(existing["path"])
+            and state is not None
+            and state["active_mask_variant"] == sam2_variant
+            and state["dino_embedding_variant"] == dinov2_variant
+        ):
+            already_masked.add(photo_id)
+        else:
+            at_risk.add(photo_id)
+    return already_masked, at_risk
 
 
 def _extract_masks_early_exit(
     reason_key: str, subthreshold: int, preflight_unreadable: int,
-    preflight_masked: int, offline_latched: bool,
-) -> tuple[str, str, dict]:
+    preflight_masked: int, offline_latched: bool, outage_error=None,
+) -> tuple[str, str, dict, dict]:
     """Stage status, runner step status, and result payload for an
     ``extract_masks`` early return.
 
@@ -336,10 +375,20 @@ def _extract_masks_early_exit(
     ``cancelled``, and the Jobs page only renders a summary for those, so
     sending ``skipped`` would leave a hollow pending-style row with no
     duration and no explanation of why the stage did nothing.
+
+    A latched exit also carries the outage detail onto the step. The Jobs
+    page renders error text from the step fields, so without it a row failed
+    by a dead source shows only the benign "no detections" summary — hiding
+    the reconnect instruction and blaming detections for the failure.
     """
+    step_extra = (
+        {"error": outage_error, "error_count": preflight_unreadable}
+        if offline_latched and outage_error else {}
+    )
     return (
         "failed" if offline_latched else "skipped",
         "failed" if offline_latched else "completed",
+        step_extra,
         {
             "masked": preflight_masked, "skipped": 0, "failed": 0,
             "total": preflight_unreadable + preflight_masked,
@@ -5551,6 +5600,9 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
             # instead of vanishing from the stage's coverage entirely
             # (Codex #1392 P2).
             em_preflight_masked = 0
+            # The pre-flight outage message, kept so an early exit can put it
+            # on the failed step instead of a benign "no detections" summary.
+            em_offline_preflight_error = None
 
             try:
                 import config as cfg
@@ -5655,10 +5707,12 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                     # the count nor the failure latch below: latching on them
                     # would fail the stage and demand a reconnect that would
                     # change nothing (Codex #1392 P2).
-                    already_masked_ids = _photos_with_active_mask(
-                        thread_db, dropped_ids, sam2_variant, dinov2_variant,
+                    already_masked_ids, at_risk_dropped_ids = (
+                        _preflight_mask_outcomes(
+                            thread_db, dropped, sam2_variant, dinov2_variant,
+                            effective_cfg.get("detector_confidence", 0.2),
+                        )
                     )
-                    at_risk_dropped_ids = dropped_ids - already_masked_ids
                     em_preflight_unreadable = len(at_risk_dropped_ids)
                     em_preflight_masked = len(already_masked_ids)
                     # Publish so eye_keypoints (later downstream) sees
@@ -5684,13 +5738,14 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                         # headline error, and marking the stage
                         # ``failed`` prevents the pipeline from
                         # finishing "successfully" with no masks made.
-                        errors.append(
+                        em_offline_preflight_error = (
                             f"[extract_masks] Fatal: "
                             f"{len(at_risk_dropped_ids)} of {total_before} "
                             f"photos unreachable (source offline). "
                             f"Reconnect the missing folder(s) and run "
                             f"Process again to extract the rest."
                         )
+                        errors.append(em_offline_preflight_error)
                         stages["extract_masks"]["status"] = "failed"
                         # Survive the em_failed==0 finalizer at the bottom
                         # of this stage — the offline photos were removed
@@ -5960,17 +6015,17 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                         em_reason = "no_detections"
                     else:
                         em_reason = "weights_missing"
-                    exit_status, exit_step_status, exit_payload = (
+                    exit_status, exit_step_status, exit_step_extra, exit_payload = (
                         _extract_masks_early_exit(
                             em_reason, photos_subthreshold_only,
                             em_preflight_unreadable, em_preflight_masked,
-                            em_offline_latched,
+                            em_offline_latched, em_offline_preflight_error,
                         )
                     )
                     stages["extract_masks"]["status"] = exit_status
                     runner.update_step(
                         job["id"], "extract_masks", status=exit_step_status,
-                        summary=summary,
+                        summary=summary, **exit_step_extra,
                     )
                     result["stages"]["extract_masks"] = exit_payload
                     _update_stages(runner, job["id"], stages)
@@ -5998,17 +6053,17 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                     )
                     log.warning("Pipeline extract-masks: %s", reason)
                     errors.append(f"[extract_masks] {reason}")
-                    exit_status, exit_step_status, exit_payload = (
+                    exit_status, exit_step_status, exit_step_extra, exit_payload = (
                         _extract_masks_early_exit(
                             "all_subthreshold", photos_subthreshold_only,
                             em_preflight_unreadable, em_preflight_masked,
-                            em_offline_latched,
+                            em_offline_latched, em_offline_preflight_error,
                         )
                     )
                     stages["extract_masks"]["status"] = exit_status
                     runner.update_step(
                         job["id"], "extract_masks", status=exit_step_status,
-                        summary=summary,
+                        summary=summary, **exit_step_extra,
                     )
                     result["stages"]["extract_masks"] = exit_payload
                     _update_stages(runner, job["id"], stages)

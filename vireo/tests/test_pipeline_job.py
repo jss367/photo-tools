@@ -17139,7 +17139,7 @@ def test_pipeline_extract_masks_offline_survives_finalizer_override(
 def test_extract_masks_early_exit_preserves_latched_offline_failure():
     from pipeline_job import _extract_masks_early_exit
 
-    status, step_status, payload = _extract_masks_early_exit(
+    status, step_status, _step_extra, payload = _extract_masks_early_exit(
         "no_detections", subthreshold=0, preflight_unreadable=311,
         preflight_masked=4, offline_latched=True,
     )
@@ -17164,7 +17164,7 @@ def test_extract_masks_early_exit_preserves_latched_offline_failure():
 def test_extract_masks_early_exit_is_a_benign_skip_without_an_outage():
     from pipeline_job import _extract_masks_early_exit
 
-    status, step_status, payload = _extract_masks_early_exit(
+    status, step_status, _step_extra, payload = _extract_masks_early_exit(
         "weights_missing", subthreshold=4, preflight_unreadable=0,
         preflight_masked=0, offline_latched=False,
     )
@@ -17480,4 +17480,155 @@ def test_extract_masks_cancelled_total_covers_preflight_drops(
     assert em.get("cancelled") is True, f"Expected a cancelled result; got {em!r}"
     assert em["total"] >= em.get("unreadable", 0), (
         f"Cancelled totals must still cover the photos they report; got {em!r}"
+    )
+
+
+def _seed_cached_mask(db, tmp_path, photo_id, sam2_variant, dinov2_variant,
+                      prompt=(0.1, 0.1, 0.5, 0.5), detector="MegaDetector"):
+    """Give `photo_id` a complete, active mask for the configured variant."""
+    from PIL import Image
+    mask_dir = tmp_path / ".vireo" / "masks"
+    os.makedirs(mask_dir, exist_ok=True)
+    mask_file = str(mask_dir / f"{photo_id}.{sam2_variant}.png")
+    Image.new("L", (4, 4), 255).save(mask_file)
+    db.upsert_photo_mask(photo_id, sam2_variant, mask_file, detector, *prompt)
+    db.set_active_mask_variant(photo_id, sam2_variant)
+    db.conn.execute(
+        "UPDATE photos SET dino_embedding_variant=? WHERE id=?",
+        (dinov2_variant, photo_id),
+    )
+    db.conn.commit()
+    return mask_file
+
+
+def test_extract_masks_preflight_stale_cached_mask_is_still_at_risk(
+    tmp_path, monkeypatch,
+):
+    """A mask built from an obsolete detection is not a usable cache hit.
+
+    If the detection box moved, the photo needs re-masking — which an offline
+    source makes impossible. Treating the stale mask as a success suppresses
+    the outage and lets scoring keep using a mask and embedding derived from
+    a detection that no longer applies (Codex #1392 P1).
+    """
+    import config as cfg
+    from db import Database
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cfg.CONFIG_PATH = str(tmp_path / "config.json")
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws_id = db._active_workspace_id
+    folder_path = str(tmp_path / "photos")
+    os.makedirs(folder_path, exist_ok=True)
+    folder_id = db.add_folder(folder_path)
+
+    pid = _add_photo_with_detection(db, folder_id, folder_path, "moved.jpg")
+    collection_id = db.add_collection(
+        "Stale prompt",
+        json.dumps([{"field": "photo_ids", "value": [pid]}]),
+    )
+
+    pipeline_cfg = db.get_effective_config(cfg.load()).get("pipeline", {})
+    # Mask cached against a box that no longer matches the live detection
+    # (_add_photo_with_detection stores 0.1/0.1/0.5/0.5).
+    _seed_cached_mask(
+        db, tmp_path, pid, pipeline_cfg.get("sam2_variant"),
+        pipeline_cfg.get("dinov2_variant"), prompt=(0.9, 0.9, 0.05, 0.05),
+    )
+
+    _stub_extract_masks_heavy_ops(monkeypatch)
+
+    import shutil
+    shutil.rmtree(folder_path, ignore_errors=True)
+
+    _runner, result = _run_extract_masks_only(db_path, ws_id, collection_id)
+
+    em = result["stages"]["extract_masks"]
+    assert em.get("unreadable") == 1, (
+        f"A stale mask needs a re-read the outage prevents; got {em!r}"
+    )
+    assert em["masked"] == 0, (
+        f"An obsolete mask is not a successful cache hit; got {em!r}"
+    )
+
+
+def test_extract_masks_preflight_ignores_photos_with_no_detection(
+    tmp_path, monkeypatch,
+):
+    """An offline photo the mask worklist would never have touched is not a
+    casualty of the outage.
+
+    Photos with no qualifying detection never enter mask extraction, so
+    counting them turns an unrelated source outage into a Fatal Extract
+    failure and tells the user to reconnect for photos that would still have
+    no mask candidate (Codex #1392 P2).
+    """
+    import config as cfg
+    from db import Database
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cfg.CONFIG_PATH = str(tmp_path / "config.json")
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws_id = db._active_workspace_id
+    folder_path = str(tmp_path / "photos")
+    os.makedirs(folder_path, exist_ok=True)
+    folder_id = db.add_folder(folder_path)
+
+    from PIL import Image
+    no_det = db.add_photo(folder_id, "nodet.jpg", ".jpg", 1000, 5_000_000.0)
+    Image.new("RGB", (16, 16), "black").save(
+        os.path.join(folder_path, "nodet.jpg")
+    )
+    collection_id = db.add_collection(
+        "No mask candidates",
+        json.dumps([{"field": "photo_ids", "value": [no_det]}]),
+    )
+
+    _stub_extract_masks_heavy_ops(monkeypatch)
+
+    import shutil
+    shutil.rmtree(folder_path, ignore_errors=True)
+
+    _runner, result = _run_extract_masks_only(db_path, ws_id, collection_id)
+
+    em = result["stages"]["extract_masks"]
+    assert em.get("unreadable", 0) == 0, (
+        f"A photo with no detection was never a mask candidate; got {em!r}"
+    )
+    assert not any("unreachable" in e for e in result["errors"]), (
+        f"No reconnect instruction belongs here; got {result['errors']!r}"
+    )
+
+
+def test_extract_masks_early_exit_carries_outage_detail_to_the_step():
+    """A failed early exit must tell the Jobs page why it failed.
+
+    The step showed only "Skipped — MegaDetector produced no detections"
+    with no error, so a row failed by a source outage hid the reconnect
+    instruction and blamed detections instead (Codex #1392 P2).
+    """
+    from pipeline_job import _extract_masks_early_exit
+
+    outage = "[extract_masks] Fatal: 311 of 315 photos unreachable."
+    _stage, step_status, step_extra, _payload = _extract_masks_early_exit(
+        "no_detections", subthreshold=0, preflight_unreadable=311,
+        preflight_masked=4, offline_latched=True, outage_error=outage,
+    )
+    assert step_status == "failed"
+    assert step_extra.get("error") == outage, (
+        f"The failed step needs the outage detail; got {step_extra!r}"
+    )
+    assert step_extra.get("error_count") == 311
+
+    _stage, step_status, step_extra, _payload = _extract_masks_early_exit(
+        "weights_missing", subthreshold=0, preflight_unreadable=0,
+        preflight_masked=0, offline_latched=False, outage_error=None,
+    )
+    assert step_status == "completed"
+    assert step_extra == {}, (
+        f"A benign skip carries no error fields; got {step_extra!r}"
     )

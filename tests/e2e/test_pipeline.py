@@ -809,3 +809,64 @@ def test_extract_step_outcome_clean_run_still_reads_done(live_server, page):
     assert outcome["clean"] is True
     assert outcome["status"] == "Done!"
     assert "5 masked" in outcome["summary"]
+
+
+def test_extract_step_outcome_surfaces_top_level_error_on_raised_worker(
+    live_server, page,
+):
+    """A worker that raises leaves `result: null` and stashes the exception
+    in the completion payload's top-level `errors`. Reading only nested
+    `result.errors` hid the real cause and rendered the generic
+    "Some photos have no mask" instead (Codex #1392 P2).
+    """
+    url = live_server["url"]
+    page.goto(f"{url}/pipeline")
+    outcome = page.evaluate(
+        "a => _extractStepOutcome(a[0], a[1], a[2])",
+        ["failed", None, ["SAM2 checkpoint corrupt: unexpected EOF"]],
+    )
+    assert outcome["clean"] is False
+    assert "SAM2 checkpoint corrupt" in outcome["status"], (
+        f"The top-level exception must reach the card when the worker "
+        f"raised; got {outcome!r}"
+    )
+
+
+def test_extract_step_outcome_labels_bare_cancellation(live_server, page):
+    """A cancel arriving before the worker returned a structured result must
+    read "Cancelled", not the generic "Some photos have no mask" fallback
+    (Codex #1392 P2).
+    """
+    url = live_server["url"]
+    page.goto(f"{url}/pipeline")
+    outcome = page.evaluate(
+        "a => _extractStepOutcome(a[0], a[1], a[2])",
+        ["cancelled", None, []],
+    )
+    assert outcome["clean"] is False
+    assert outcome["status"] == "Cancelled", (
+        f"A bare cancel must say so, not lie about missing masks; "
+        f"got {outcome!r}"
+    )
+
+
+def test_extract_step_outcome_prefers_nested_over_top_level_errors(
+    live_server, page,
+):
+    """When both nested and top-level errors exist, the nested (worker's own)
+    error is the actionable one — top-level is only the fallback for the
+    raised/cancelled paths.
+    """
+    url = live_server["url"]
+    page.goto(f"{url}/pipeline")
+    outcome = page.evaluate(
+        "a => _extractStepOutcome(a[0], a[1], a[2])",
+        ["failed", {
+            "masked": 1, "skipped": 0, "unreadable": 2, "failed": 0,
+            "total": 3,
+            "errors": ["Reconnect the source and run Extract again."],
+        }, ["duplicate of the nested error"]],
+    )
+    assert "Reconnect" in outcome["status"], (
+        f"Nested error wins over top-level; got {outcome!r}"
+    )

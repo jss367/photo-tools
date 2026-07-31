@@ -6236,6 +6236,13 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                     # messages below stay keyed on the in-loop count because
                     # the pre-flight branch already appended its own error.
                     em_unreadable_all = em_unreadable + em_preflight_unreadable
+                    # ``total`` counts only what reached the loop, so it can't
+                    # be the denominator once pre-flight drops are folded into
+                    # the outcome counts — that publishes impossible tallies
+                    # like "3 unreadable of 0" and breaks any consumer deriving
+                    # coverage from them (Codex #1392 P2). Progress reporting
+                    # keeps using the loop-scoped ``total``.
+                    em_total_candidates = total + em_preflight_unreadable
                     final_status = (
                         "failed"
                         if em_failed > 0 or em_unreadable_all > 0
@@ -6251,7 +6258,7 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                     if em_offline_reason:
                         em_rollups.append(
                             f"[extract_masks] Fatal: {em_unreadable} of "
-                            f"{total} photos unreachable — "
+                            f"{em_total_candidates} photos unreachable — "
                             f"{em_offline_reason}. Reconnect the source and "
                             f"run Process again; until then these photos "
                             f"have no mask and Process Review rejects them "
@@ -6259,14 +6266,14 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                         )
                     elif em_unreadable > 0:
                         em_rollups.append(
-                            f"[extract_masks] {em_unreadable} of {total} "
+                            f"[extract_masks] {em_unreadable} of {em_total_candidates} "
                             f"photos could not be read, so they have no mask "
                             f"and Process Review rejects them as "
                             f"`no_subject_mask`."
                         )
                     if em_failed > 0:
                         em_rollups.append(
-                            f"[extract_masks] {em_failed} of {total} photos "
+                            f"[extract_masks] {em_failed} of {em_total_candidates} photos "
                             f"failed mask extraction"
                         )
                     errors.extend(em_rollups)
@@ -6290,7 +6297,8 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                     result["stages"]["extract_masks"] = {
                         "masked": masked, "skipped": skipped, "failed": em_failed,
                         "unreadable": em_unreadable_all,
-                        "total": total, "subthreshold": photos_subthreshold_only,
+                        "total": em_total_candidates,
+                        "subthreshold": photos_subthreshold_only,
                     }
             except Exception as e:
                 errors.append(f"[extract_masks] Fatal: {e}")

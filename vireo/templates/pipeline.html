@@ -2819,7 +2819,11 @@ function _onPipelineComplete(result) {
     // `no_subject_mask`. Marking the card complete/"Done!" in that state
     // sends the user to Process Review with no idea why two-thirds of their
     // encounters are rejects.
-    var extClean = !ext.unreadable && !ext.failed;
+    // `reason` (weights_missing / no_detections / all_subthreshold /
+    // preflight outage) means zero masks were made with every per-photo
+    // counter still at zero — green completed styling there contradicts
+    // the card's own Failed pill (Codex #1392 P2).
+    var extClean = !ext.unreadable && !ext.failed && !ext.reason;
     document.getElementById('numExtract').className =
       extClean ? 'stage-num complete' : 'stage-num';
     var statusExt = document.getElementById('statusExtract');

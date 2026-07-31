@@ -8832,6 +8832,12 @@ def test_extract_masks_preflight_offline_photos_are_counted_unreadable(
     assert em.get("unreadable") == 3, (
         f"Pre-flight-dropped photos are unreadable, not absent; got {em!r}"
     )
+    # The reported total has to cover the photos the pre-flight removed, or
+    # the stage publishes impossible counters like "3 unreadable of 0" and
+    # any consumer computing coverage from them is wrong (Codex #1392 P2).
+    assert em["total"] == 3, (
+        f"Total must count the pre-flight-dropped candidates; got {em!r}"
+    )
     final = _extract_masks_final_update(runner)
     assert final["status"] == "failed"
     assert "3 unreadable" in (final.get("summary") or ""), (

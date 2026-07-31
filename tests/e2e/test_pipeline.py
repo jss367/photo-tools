@@ -675,3 +675,34 @@ def test_pipeline_extract_card_does_not_claim_no_masks_were_needed(
     expect(page.locator("#txtMasks")).not_to_contain_text(
         "No photos needed masks"
     )
+
+
+def test_pipeline_extract_card_not_green_for_zero_mask_reasons(
+    live_server, page,
+):
+    """A `reason` outcome makes no masks, so the card must not keep the
+    green completed styling while its own pill reads Failed.
+
+    `weights_missing` / `no_detections` / `all_subthreshold` all leave the
+    per-photo counters at zero, so a clean check that only looks at
+    `unreadable` and `failed` reads them as a flawless run.
+    """
+    url = live_server["url"]
+    page.goto(f"{url}/pipeline")
+    page.evaluate("""
+        _onPipelineComplete({
+          status: 'failed',
+          result: {
+            stages: {extract_masks: {
+              masked: 0, skipped: 0, failed: 0, unreadable: 0, total: 0,
+              reason: 'weights_missing',
+            }},
+            errors: [
+              '[extract_masks] No detections available for 984 photo(s). ' +
+              'MegaDetector weights are not downloaded.',
+            ],
+          },
+        });
+    """)
+    expect(page.locator("#numExtract")).not_to_have_class(re.compile("complete"))
+    expect(page.locator("#statusExtract")).not_to_contain_text("Done!")

@@ -690,6 +690,58 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
             onerror=_discovery_onerror,
         ))
     discovered = len(files)
+    # --- Selection ------------------------------------------------------
+    # Mirrors the local path (see the identical block in ``run_import_job``);
+    # the two functions share no code, so a change here needs the same change
+    # there. Coerce ONCE, above the filter, and use this set everywhere below:
+    # ``ImportParams.include_paths`` is typed ``set | None`` but a JSON payload
+    # deserializes to a list, and the drift math below does set arithmetic on
+    # it (``- discovered_paths``), which raises TypeError on a list before a
+    # single file is rsynced. Deduping here also keeps ``len(include_paths)``
+    # agreeing with the set the filter actually used, so a payload with
+    # repeats can't skew ``deselected``.
+    include_paths = (
+        set(params.include_paths) if params.include_paths is not None else None
+    )
+    # Snapshot BEFORE filtering — drift is measured against what the card
+    # actually holds, and computing it post-filter makes files-appeared zero.
+    discovered_paths = {str(f) for f in files}
+    if include_paths is not None:
+        # Exact string equality against ``str(f)`` as produced by
+        # ``discover_source_files``; the caller's paths come from that same
+        # enumeration and NEITHER side resolves symlinks. Realpath-ing here
+        # would silently empty this filter and rsync nothing.
+        files = [f for f in files if str(f) in include_paths]
+    # Progress denominator. Deliberately NOT ``discovered``: that counts the
+    # whole card, so a half-deselected import would run to completion with the
+    # bar stalled near 50% — a finished job that looks hung. ``queued`` is the
+    # work actually enqueued; ``discovered`` keeps backing the card-safety
+    # verdict below. Two denominators, on purpose.
+    queued = len(files)
+
+    # Selection drift. Computed against the pre-filter snapshot.
+    deselected = 0
+    vanished_paths = set()
+    appeared = 0
+    if include_paths is not None:
+        # Deliberately NOT gated on ``previewed_count``. A selected file the
+        # card no longer holds is drift whether or not the caller told us how
+        # big the preview was, the ledger equality cannot see it (discovered
+        # shrinks in step with copied), and ``include_paths`` without
+        # ``previewed_count`` is constructible today — both fields are
+        # independently optional on ``ImportParams``. Gating this would fail
+        # OPEN on exactly the case this code exists to close.
+        vanished_paths = include_paths - discovered_paths
+    if include_paths is not None and params.previewed_count is not None:
+        # Compared with ``!= 0``, not ``> 0``: a negative value means the
+        # caller previewed fewer files than it selected, which is
+        # self-inconsistent, and this module fails closed on inconsistency
+        # rather than reading it as "nothing deselected".
+        deselected = params.previewed_count - len(include_paths)
+        # ``appeared`` is a report count, so a negative would be meaningless;
+        # the "card holds fewer files than were previewed" case the clamp
+        # hides is caught by ``vanished_paths`` or a positive ``deselected``.
+        appeared = max(0, len(discovered_paths) - params.previewed_count)
 
     checker = None
     if params.skip_duplicates:
@@ -849,7 +901,7 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
             _emit(
                 f"{rel}: {_counts(rel)['copied']} copied · "
                 f"{_counts(rel)['skipped_duplicate']} already present",
-                emitted, discovered,
+                emitted, queued,
             )
             continue
         # Mount-root preflight (see the ``_missing_mount_root`` computation
@@ -873,7 +925,7 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
             _emit(
                 f"{rel}: {_counts(rel)['copied']} copied · "
                 f"{_counts(rel)['skipped_duplicate']} already present",
-                emitted, discovered,
+                emitted, queued,
             )
             continue
         os.makedirs(dest_folder, exist_ok=True)
@@ -947,7 +999,7 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
                 cancelled = True
                 break
             emitted += 1
-            _emit(f"{rel}: importing", emitted, discovered, source_file.name)
+            _emit(f"{rel}: importing", emitted, queued, source_file.name)
             if checker is not None:
                 try:
                     token = checker.match(source_file)
@@ -1890,7 +1942,7 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
         _emit(
             f"{rel}: {_counts(rel)['copied']} copied · "
             f"{_counts(rel)['skipped_duplicate']} already present",
-            emitted, discovered,
+            emitted, queued,
         )
         if cancelled:
             break
@@ -1917,13 +1969,34 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
     status = "cancelled" if cancelled else (
         "failed" if failed else "completed"
     )
+    # Two forms; the discovered total appears exactly once in each. Mirrors
+    # the local path.
+    #
+    #   no selection: "5 copied, 0 already present, 0 failed of
+    #                  5 discovered"   (byte-identical to before)
+    #   selection:    "1 selected of 3 discovered, 1 copied,
+    #                  0 already present, 0 failed"
+    #
+    # The gate is conjunctive, and must stay that way: ``include_paths`` and
+    # ``checked_count`` are independently optional on ``ImportParams``, and it
+    # is ``include_paths`` alone that decides whether the copy set was
+    # filtered above. Keying this on ``checked_count`` by itself would report
+    # "3 selected of 5 discovered" for a run that copied the whole card.
+    #
+    # The selected figure is ``checked_count``, NOT ``len(include_paths)``:
+    # that set also carries files the user left unchecked because they were
+    # flagged duplicates, so it would overstate what was chosen.
+    if include_paths is not None and params.checked_count is not None:
+        summary = (f"{params.checked_count} selected of {discovered} "
+                   f"discovered, {copied} copied, "
+                   f"{skipped_duplicate} already present, {failed} failed")
+    else:
+        summary = (f"{copied} copied, {skipped_duplicate} already present, "
+                   f"{failed} failed of {discovered} discovered")
     runner.update_step(
         job["id"], "import",
         status="failed" if status == "failed" else "completed",
-        summary=(
-            f"{copied} copied, {skipped_duplicate} already present, "
-            f"{failed} failed of {discovered} discovered"
-        ),
+        summary=summary,
     )
 
     for exc in discovery_errors:
@@ -1967,6 +2040,59 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
                 "and capture time but were not compared byte-for-byte"
             ),
         })
+    # Selection drift entries, mirroring the local path exactly. ``renderResult``
+    # HIDES the unsafe list when it is empty, so every SELECTION signal that can
+    # flip the pill red appends a line here — otherwise the user gets "Do NOT
+    # format the card yet" with no stated reason.
+    #
+    # These lines *attribute* the gap between what was previewed and what was
+    # copied; they do not claim to enumerate it.
+    #
+    # Both branches of ``deselected`` are covered on purpose:
+    # ``_selection_blocks_format`` blocks on ``deselected != 0``, so a negative
+    # count (the payload previewed fewer files than it selected) turns the pill
+    # red too, and a lone ``if deselected > 0`` would leave exactly that red
+    # pill bare. The negative branch does not quote the number: the payload is
+    # self-inconsistent, so the count is precisely the thing that cannot be
+    # trusted.
+    #
+    # Counts are pluralized (``_plural`` + verb agreement) because 1 is the
+    # single most likely real case — one frame deselected, one file gone.
+    if deselected > 0:
+        unsafe_files.append({
+            "path": "Deselected files",
+            "reason": (
+                f"{deselected} file{_plural(deselected)} you deselected "
+                f"{'was' if deselected == 1 else 'were'} not copied"
+            ),
+        })
+    if deselected < 0:
+        unsafe_files.append({
+            "path": "Selection count mismatch",
+            "reason": ("your preview reported fewer files than were "
+                       "selected, so how many files went uncopied could not "
+                       "be determined — re-preview before formatting"),
+        })
+    if vanished_paths:
+        vanished_count = len(vanished_paths)
+        unsafe_files.append({
+            "path": "Files missing at import time",
+            "reason": (
+                f"{vanished_count} file{_plural(vanished_count)} "
+                f"{'was' if vanished_count == 1 else 'were'} in scope but "
+                "had disappeared from the source when the import ran"
+            ),
+        })
+    if appeared > 0:
+        unsafe_files.append({
+            "path": "Files added after preview",
+            "reason": (
+                f"at least {appeared} file{_plural(appeared)} arrived after "
+                f"your preview and {'was' if appeared == 1 else 'were'} not "
+                f"imported — re-preview to include "
+                f"{'it' if appeared == 1 else 'them'}"
+            ),
+        })
     safe_to_format = (
         not cancelled
         and failed == 0
@@ -1976,7 +2102,14 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
         and not remote_unverified
         and unverified_duplicate == 0
         and (copied + skipped_duplicate) == discovered
+        and not _selection_blocks_format(
+            deselected=deselected, vanished_paths=vanished_paths)
     )
+    # ``unverified_duplicate`` requires ``not verify_by_hash``, which is
+    # exactly ``remote_unverified``, so this block is unreachable on the
+    # remote path today. The selection condition is wired anyway: the mutual
+    # exclusion is incidental, and a change to either flag would silently
+    # reopen the hole.
     unverified_duplicates_only = (
         unverified_duplicate > 0
         and not cancelled
@@ -1986,6 +2119,8 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
         and not partial_scope
         and not remote_unverified
         and (copied + skipped_duplicate) == discovered
+        and not _selection_blocks_format(
+            deselected=deselected, vanished_paths=vanished_paths)
     )
     result = {
         "discovered": discovered,
@@ -2007,6 +2142,11 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
         "folders": folder_counts,
         "cancelled": cancelled,
         "discovery_errors": len(discovery_errors),
+        # Selection drift, for the caller's readout. ``files_appeared`` is a
+        # clamped net delta (card size minus previewed count), so it reads 0
+        # — never negative — when more files vanished than arrived.
+        "files_appeared": appeared,
+        "files_vanished": len(vanished_paths),
         "ok": (failed == 0 and not discovery_errors and not dup_link_failed),
         "errors": [f"{u['path']}: {u['reason']}" for u in unsafe_files],
     }

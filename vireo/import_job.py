@@ -1586,10 +1586,32 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
             # files never become photo rows. See PR #1113 review.
             scan_files = landed_paths | set(adopted_paths.keys())
             try:
+                # Incremental ONLY for the duplicate-only case, where
+                # ``scan_files`` is empty so ``restrict_files`` is None and
+                # this call walks the whole ``dest_folder``. Re-importing a
+                # card into the same date folder it originally landed in
+                # means that folder already holds every twin, and walking
+                # it non-incrementally re-read and re-hashed all of them —
+                # an hours-long rescan on a network archive for a zero-copy
+                # import.
+                #
+                # It must stay OFF whenever ``scan_files`` is non-empty.
+                # A landed path is not necessarily uncataloged: a stale row
+                # can survive for a file deleted off the archive, and if
+                # the replacement bytes land at that path carrying an mtime
+                # equal to the stale row's, the incremental fast path skips
+                # it without comparing size or content. ``file_hash`` then
+                # keeps the stale value, the post-scan cross-check below
+                # compares the copy-time hash against it, and a file that
+                # transferred fine is reported failed — with retries unable
+                # to refresh the row. ``restrict_files`` already narrows
+                # those batches to a handful of paths, so incremental buys
+                # nothing there anyway. See PR #1398 review.
                 scan(
                     destination, db,
                     restrict_dirs=[dest_folder],
                     restrict_files=(scan_files or None),
+                    incremental=not scan_files,
                     vireo_dir=params.vireo_dir,
                     thumb_cache_dir=params.thumb_cache_dir,
                     skip_working_copies=True,

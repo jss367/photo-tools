@@ -5451,6 +5451,150 @@ def test_remote_import_dup_link_scan_does_not_reread_unchanged_twins(
     )
 
 
+def test_remote_import_dup_only_batch_does_not_reread_dest_folder_twins(
+        tmp_path, monkeypatch):
+    """A duplicate-only remote batch whose twins sit in the batch's OWN
+    destination folder must not re-read them.
+
+    ``test_remote_import_dup_link_scan_does_not_reread_unchanged_twins``
+    parks its twins in ``unsorted`` — a different folder from the batch
+    destination — so that test's batch scan walks an empty
+    ``dest_folder`` and reads nothing either way. The common real case is
+    re-importing a card into the same date folder it originally landed
+    in, where ``dest_folder`` already holds every twin. With no fresh
+    landings the batch scan passes ``restrict_files=None``, so it walks
+    the whole destination folder; without ``incremental=True`` it
+    re-reads and re-hashes every already-cataloged file there. On a
+    network archive that turns a zero-copy import into an hours-long
+    rescan.
+    """
+    import scanner
+    from import_job import ImportParams, run_import_job
+
+    ra = _remote_archive_for(tmp_path)
+    calls = _remote_calls(ra)
+    _install_fake_remote_rsync(monkeypatch, calls, verify=None)
+
+    card = _make_card(tmp_path, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+        ("DSC_0002.jpg", datetime(2026, 7, 3, 11, 0, 0), "green"),
+    ])
+
+    # The twins live in the very folder this card's files map to, which is
+    # what re-importing an already-imported card looks like.
+    dest_folder = os.path.join(ra["mount_base"], "2026", "2026-07-03")
+    os.makedirs(dest_folder, exist_ok=True)
+    import shutil as _shutil
+    for name in ("DSC_0001.jpg", "DSC_0002.jpg"):
+        _shutil.copy2(str(card / name), os.path.join(dest_folder, name))
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws_id = db._active_workspace_id
+    scanner.scan(ra["mount_base"], db)
+    _mark_exif_extracted(db)
+    assert len(_photo_rows(db)) == 2
+
+    read_paths = _count_feature_computations(monkeypatch)
+    result = run_import_job(
+        _make_job(), FakeRunner(), db_path, ws_id,
+        ImportParams(
+            sources=[str(card)], destination=ra["mount_base"],
+            remote_target=ra, verify_by_hash=True,
+        ),
+    )
+
+    assert calls["rsync"] == [], calls["rsync"]
+    assert result["skipped_duplicate"] == 2, result
+    assert result["copied"] == 0, result
+    assert result["failed"] == 0, result
+    assert dest_folder in _ws_linked_folder_paths(db, ws_id)
+    assert read_paths == [], (
+        "remote duplicate-only import re-read already-cataloged, unchanged "
+        f"twins in the destination folder: {read_paths}"
+    )
+
+
+def test_remote_import_landing_refreshes_stale_row_with_matching_mtime(
+        tmp_path, monkeypatch):
+    """A fresh landing at a destination path that carries a stale catalog
+    row must overwrite the row's ``file_hash`` even when the newly
+    transferred bytes inherit the same ``file_mtime`` the stale row
+    remembers.
+
+    ``scanner.scan()``'s incremental fast path treats a path as unchanged
+    when the on-disk ``file_mtime`` matches the catalog row's
+    ``file_mtime``. rsync ``-a`` (and ``shutil.copy2`` in the fake
+    harness) preserves the source's mtime on the destination, so a source
+    card whose file happens to share an mtime with a stale row — an
+    orphan left after the actual file was deleted, then re-landed by a
+    fresh import — would otherwise slip through incremental with its
+    stale ``file_hash`` intact. The subsequent
+    ``scan_h`` vs ``src_h_norm`` cross-check would then reject the
+    landing as a mount-hash mismatch and no retry could fix it (mtime has
+    not moved). The batch scan must therefore run non-incrementally
+    whenever it targets landed/adopted paths, matching the local path.
+    """
+    import scanner
+    from import_job import ImportParams, run_import_job
+
+    ra = _remote_archive_for(tmp_path)
+    calls = _remote_calls(ra)
+    _install_fake_remote_rsync(monkeypatch, calls, verify=None)
+
+    # Stale row: seed the destination path with red bytes and catalog
+    # them, then delete the file so the fresh landing goes through the
+    # "no collision" branch.
+    dest_folder = os.path.join(ra["mount_base"], "2026", "2026-07-03")
+    os.makedirs(dest_folder, exist_ok=True)
+    stale_target = os.path.join(dest_folder, "DSC_0001.jpg")
+    Image.new("RGB", (16, 16), "red").save(stale_target)
+    pinned_mtime = datetime(2026, 7, 3, 10, 0, 0).timestamp()
+    os.utime(stale_target, (pinned_mtime, pinned_mtime))
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws_id = db._active_workspace_id
+    scanner.scan(ra["mount_base"], db)
+    _mark_exif_extracted(db)
+    stale_row = db.conn.execute(
+        "SELECT id, file_hash FROM photos WHERE filename = ?",
+        ("DSC_0001.jpg",),
+    ).fetchone()
+    assert stale_row is not None
+    stale_hash = stale_row["file_hash"]
+
+    os.remove(stale_target)
+
+    # Card file with byte-different content but the SAME mtime the stale
+    # row remembers, so shutil.copy2 in the fake rsync lands bytes that
+    # match the incremental fast path's "unchanged" trigger.
+    card = _make_card(tmp_path, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "green"),
+    ])
+
+    result = run_import_job(
+        _make_job(), FakeRunner(), db_path, ws_id,
+        ImportParams(
+            sources=[str(card)], destination=ra["mount_base"],
+            remote_target=ra, verify_by_hash=True,
+        ),
+    )
+
+    assert result["failed"] == 0, result
+    assert result["copied"] == 1, result
+    assert result["safe_to_format"] is True, result
+    updated_row = db.conn.execute(
+        "SELECT file_hash FROM photos WHERE filename = ?",
+        ("DSC_0001.jpg",),
+    ).fetchone()
+    assert updated_row["file_hash"] != stale_hash, (
+        "stale catalog row was not refreshed after a fresh landing at the "
+        "same path with a matching mtime; the batch scan's incremental "
+        "fast path skipped the freshly transferred file"
+    )
+
+
 def test_remote_import_scans_adopted_duplicate_in_mixed_batch(
         tmp_path, monkeypatch):
     """A retry / crash-recovery batch that (a) copies one fresh file AND

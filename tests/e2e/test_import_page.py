@@ -1758,6 +1758,43 @@ def test_shift_click_moves_the_anchor(live_server, page):
             expect(boxes.nth(i)).not_to_be_checked()
 
 
+def test_shift_click_range_follows_render_order_not_api_order(
+        live_server, page):
+    """The range is over what the user dragged across, not over the payload.
+
+    renderImportPreviewGrid groups by subfolder and sorts the group keys, so
+    render order diverges from the API's file order whenever subfolders don't
+    arrive alphabetically. Here the API returns b/ first; the grid shows a/
+    first. A range computed from importPreviewedPaths would toggle b/0001 --
+    a card the user never dragged across -- and leave a/0001 alone.
+    """
+    page.goto(f"{live_server['url']}/import")
+    files = _files(2, prefix='/tmp/card/b/DSC_') + _files(
+        2, prefix='/tmp/card/a/DSC_')
+    for f in files[:2]:
+        f["subfolder"] = "b"
+    for f in files[2:]:
+        f["subfolder"] = "a"
+    _stub_preview(page, files)
+    _preview(page)
+
+    boxes = page.locator(".import-preview-thumb .thumb-check")
+    # Rendered: a/0000, a/0001, b/0000, b/0001.
+    assert page.evaluate(
+        "() => Array.from(document.querySelectorAll("
+        "'#importPreviewGrid .import-preview-thumb')).map(e => e.dataset.path)"
+    ) == [files[2]["path"], files[3]["path"],
+          files[0]["path"], files[1]["path"]]
+
+    boxes.nth(0).click()
+    boxes.nth(2).click(modifiers=["Shift"])   # a/0000 .. b/0000
+    for i, want in enumerate([False, False, False, True]):
+        if want:
+            expect(boxes.nth(i)).to_be_checked()
+        else:
+            expect(boxes.nth(i)).not_to_be_checked()
+
+
 def test_shift_range_does_not_deselect_ineligible_duplicates(
         live_server, page):
     """A range dragged across a skipped duplicate must not record intent.
@@ -1813,7 +1850,11 @@ def test_folder_header_only_toggles_its_own_subfolder(live_server, page):
 
 def test_folder_header_is_indeterminate_on_a_partial_selection(
         live_server, page):
-    """The tri-state is the honest readout: some != all, and != none."""
+    """The tri-state is the honest readout: some != all, and != none.
+
+    "All" semantics, matching chkSelectAll on pipeline.html: a partial
+    selection is dashed and NOT ticked.
+    """
     page.goto(f"{live_server['url']}/import")
     _stub_preview(page, _files(3))
     _preview(page)
@@ -1824,7 +1865,7 @@ def test_folder_header_is_indeterminate_on_a_partial_selection(
 
     boxes = page.locator(".import-preview-thumb .thumb-check")
     boxes.nth(0).click()
-    expect(header).to_be_checked()
+    expect(header).not_to_be_checked()
     expect(header).to_have_js_property("indeterminate", True)
 
     boxes.nth(1).click()
@@ -1838,7 +1879,7 @@ def test_folder_header_ignores_skipped_duplicates_in_its_tally(
     """An ineligible duplicate is not an unselected file.
 
     Two eligible files both checked plus one skipped duplicate must read as
-    "all", not as a partial selection.
+    "all", not as a partial selection...
     """
     page.goto(f"{live_server['url']}/import")
     files = _files(3)
@@ -1847,6 +1888,15 @@ def test_folder_header_ignores_skipped_duplicates_in_its_tally(
 
     header = page.locator(".import-preview-folder-header .folder-check").first
     expect(header).to_be_checked()
+    expect(header).to_have_js_property("indeterminate", False)
+
+    # ...and with both eligible files deselected it must read as "none". This
+    # is the case that actually pins the tally's duplicate filter: with the
+    # duplicate counted as a selected file the header would claim a partial
+    # selection the user cannot act on.
+    _box(page, files[0]["path"]).click()
+    _box(page, files[2]["path"]).click()
+    expect(header).not_to_be_checked()
     expect(header).to_have_js_property("indeterminate", False)
 
 
@@ -1899,8 +1949,69 @@ def test_select_all_box_reflects_a_partial_selection(live_server, page):
     expect(master).to_have_js_property("indeterminate", False)
 
     page.locator(".import-preview-thumb .thumb-check").nth(0).click()
-    expect(master).to_be_checked()
+    expect(master).not_to_be_checked()
     expect(master).to_have_js_property("indeterminate", True)
+
+
+def test_clicking_a_dashed_select_all_selects_the_rest(live_server, page):
+    """Tri-state direction, pinned deliberately.
+
+    "All" semantics (chkSelectAll on pipeline.html:1955 uses the same rule),
+    so a dashed master is unticked and clicking it completes the selection
+    rather than discarding the partial one.
+    """
+    page.goto(f"{live_server['url']}/import")
+    _stub_preview(page, _files(3))
+    _preview(page)
+
+    boxes = page.locator(".import-preview-thumb .thumb-check")
+    boxes.nth(0).click()
+    master = page.locator("#chkSelectAllImport")
+    expect(master).to_have_js_property("indeterminate", True)
+
+    master.click()
+    for i in range(3):
+        expect(boxes.nth(i)).to_be_checked()
+    expect(master).to_be_checked()
+    expect(master).to_have_js_property("indeterminate", False)
+
+
+def test_select_all_counts_against_the_eligible_files_not_the_total(
+        live_server, page):
+    """Skipped duplicates are not unselected files.
+
+    Every selectable file on: the master must read as full, not dashed. Its
+    denominator is the eligible count, while the readout beside it stays
+    "N of <discovered>" to match the summary line above.
+    """
+    page.goto(f"{live_server['url']}/import")
+    files = _files(3)
+    _stub_preview(page, files, duplicates=[files[1]["path"]])
+    _preview(page)
+
+    master = page.locator("#chkSelectAllImport")
+    expect(master).to_be_checked()
+    expect(master).to_have_js_property("indeterminate", False)
+    expect(page.locator("#previewSelectedCount")).to_have_text(
+        "2 of 3 selected")
+
+
+def test_bulk_checkboxes_are_disabled_when_nothing_is_selectable(
+        live_server, page):
+    """All duplicates: a live control that does nothing is a black box."""
+    page.goto(f"{live_server['url']}/import")
+    files = _files(2)
+    _stub_preview(page, files, duplicates=[f["path"] for f in files])
+    _preview(page)
+
+    master = page.locator("#chkSelectAllImport")
+    header = page.locator(".import-preview-folder-header .folder-check").first
+    expect(master).to_be_disabled()
+    expect(master).not_to_be_checked()
+    expect(header).to_be_disabled()
+    expect(header).not_to_be_checked()
+    expect(page.locator("#previewSelectedCount")).to_have_text(
+        "0 of 2 selected")
 
 
 def test_select_all_does_not_deselect_ineligible_duplicates(
@@ -1916,6 +2027,114 @@ def test_select_all_does_not_deselect_ineligible_duplicates(
     expect(_box(page, files[0]["path"])).not_to_be_checked()
     expect(_box(page, files[1]["path"])).to_be_checked()
     expect(_box(page, files[2]["path"])).not_to_be_checked()
+
+
+def test_a_stale_duplicate_verdict_cannot_disable_a_fresh_card(
+        live_server, page):
+    """importDuplicatePaths outlives the render it came from.
+
+    It is assigned only when the whole check-duplicates stream drains, and
+    never cleared, so a re-preview's FIRST render pass draws every card
+    enabled while the module set still holds the previous run's verdicts.
+    Anything that re-derives checkbox state from that set instead of from the
+    card turns an unrelated click into a disabled, unchecked box with no
+    badge explaining why -- and over SMB with verify_by_hash the window
+    between the first pass and the new verdicts is minutes.
+    """
+    page.goto(f"{live_server['url']}/import")
+    files = _files(3)
+    _stub_preview(page, files, duplicates=[files[1]["path"]])
+    _preview(page)
+    expect(_box(page, files[1]["path"])).to_be_disabled()
+
+    # The re-preview's first pass: same files, no verdicts yet.
+    page.evaluate("(f) => renderImportPreviewGrid(f, [], null)", files)
+    assert page.evaluate("() => importDuplicatePaths.size") == 1
+    for f in files:
+        expect(_box(page, f["path"])).to_be_enabled()
+        expect(_box(page, f["path"])).to_be_checked()
+
+    # A click anywhere refreshes every box. The stale verdict must not
+    # resurrect and disable a card that carries no badge.
+    _box(page, files[0]["path"]).click()
+    expect(_box(page, files[1]["path"])).to_be_enabled()
+    expect(_box(page, files[1]["path"])).to_be_checked()
+    expect(_box(page, files[2]["path"])).to_be_checked()
+    expect(page.locator(".import-preview-badge")).to_have_count(0)
+    header = page.locator(".import-preview-folder-header .folder-check").first
+    expect(header).to_be_enabled()
+    expect(header).to_have_js_property("indeterminate", True)
+
+
+def test_a_stale_duplicate_verdict_cannot_shrink_a_bulk_toggle(
+        live_server, page):
+    """Same stale window, the bulk paths.
+
+    A bulk toggle that reads importDuplicatePaths would quietly skip a card
+    the renderer drew as an ordinary selectable file: the user hits
+    "deselect all" and one box stays ticked with nothing to explain it.
+    """
+    page.goto(f"{live_server['url']}/import")
+    files = _files(3)
+    _stub_preview(page, files, duplicates=[files[1]["path"]])
+    _preview(page)
+
+    page.evaluate("(f) => renderImportPreviewGrid(f, [], null)", files)
+    assert page.evaluate("() => importDuplicatePaths.size") == 1
+
+    page.locator("#chkSelectAllImport").uncheck()
+    for f in files:
+        expect(_box(page, f["path"])).not_to_be_checked()
+
+    page.locator(".import-preview-folder-header .folder-check").first.check()
+    for f in files:
+        expect(_box(page, f["path"])).to_be_checked()
+
+
+def test_a_single_render_pass_produces_a_correct_folder_header(
+        live_server, page):
+    """One render must be enough.
+
+    #importPreviewGrid ships display:none, so anything that reads layout to
+    build the header tally has to run after the grid is shown. Copy mode
+    renders up to three times and hides the mistake; the in-place and
+    snapshot legs return after the first pass and would be left with a dead,
+    unticked header over a fully selected folder.
+    """
+    page.goto(f"{live_server['url']}/import")
+    expect(page.locator("#importPreviewGrid")).to_be_hidden()
+    page.evaluate("(f) => renderImportPreviewGrid(f, [], null)", _files(3))
+
+    header = page.locator(".import-preview-folder-header .folder-check").first
+    expect(header).to_be_enabled()
+    expect(header).to_be_checked()
+    expect(header).to_have_js_property("indeterminate", False)
+
+
+def test_shift_range_does_not_reach_through_a_hidden_card(live_server, page):
+    """Task 11 hides duplicate cards in place rather than re-rendering.
+
+    A range is what the user dragged across on screen, so a card that isn't
+    on screen must not be swept up by it. Hidden here the way a CSS filter
+    would hide it, since that branch hasn't merged yet.
+    """
+    page.goto(f"{live_server['url']}/import")
+    files = _files(4)
+    _stub_preview(page, files)
+    _preview(page)
+
+    hide = ("(p) => { document.querySelector("
+            "`.import-preview-thumb[data-path='${p}']`).style.display = 'X'; }")
+    page.evaluate(hide.replace("'X'", "'none'"), files[1]["path"])
+
+    _box(page, files[0]["path"]).click()
+    _box(page, files[2]["path"]).click(modifiers=["Shift"])
+
+    page.evaluate(hide.replace("'X'", "''"), files[1]["path"])
+    expect(_box(page, files[0]["path"])).not_to_be_checked()
+    expect(_box(page, files[1]["path"])).to_be_checked()
+    expect(_box(page, files[2]["path"])).not_to_be_checked()
+    expect(_box(page, files[3]["path"])).to_be_checked()
 
 
 def test_duplicate_badge_and_checkbox_do_not_overlap(live_server, page):

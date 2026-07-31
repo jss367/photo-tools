@@ -786,9 +786,10 @@ function wireImportSelectAll() {
   const master = document.getElementById('chkSelectAllImport');
   if (!master) return;
   master.addEventListener('change', () => {
-    const skipDupes = document.getElementById('chkSkipDuplicates').checked;
-    importPreviewedPaths
-      .filter(p => !(importDuplicatePaths.has(p) && skipDupes))
+    // Every rendered card, hidden or not — this is "select all", not
+    // "select visible". Eligibility still comes off the cards, so a stale
+    // importDuplicatePaths can't silently exclude files from a bulk action.
+    importSelectableCardPaths(importGridCards())
       .forEach(p => {
         if (master.checked) importDeselected.delete(p);
         else importDeselected.add(p);
@@ -2002,10 +2003,11 @@ function renderImportPreviewGrid(files, duplicatePaths, destinationFiles) {
     const folderCheck = document.createElement('input');
     folderCheck.type = 'checkbox';
     folderCheck.className = 'folder-check';
-    folderCheck.title = 'Select or deselect every file in ' + subfolder;
-    // State is set by refreshImportFolderHeaders() once the cards exist —
-    // it derives the tally from the rendered cards, so the header and the
-    // boxes below it can never disagree.
+    // Checked/indeterminate/disabled/title are all set by
+    // refreshImportFolderHeaders() once the cards exist and the grid is
+    // visible. It derives the tally from the rendered cards — including
+    // their duplicate class — so the header and the boxes below it read
+    // from exactly the same source and cannot disagree.
     folderCheck.addEventListener('change', () => {
       importFolderPaths(header.parentNode).forEach((p) => {
         if (folderCheck.checked) importDeselected.delete(p);
@@ -2085,9 +2087,43 @@ function renderImportPreviewGrid(files, duplicatePaths, destinationFiles) {
     groupEl.appendChild(thumbsEl);
     grid.appendChild(groupEl);
   });
-  refreshImportFolderHeaders();
   grid.style.display = '';
+  // After the grid is shown, not before: importVisibleCards() reads
+  // offsetParent, which is null for every card while the grid is still
+  // display:none — the state it inherits from the template on first render.
+  refreshImportFolderHeaders();
   setupImportThumbnailScheduler();
+}
+
+// Every card in the rendered grid, in render order.
+function importGridCards() {
+  const grid = document.getElementById('importPreviewGrid');
+  return grid ? Array.from(grid.querySelectorAll('.import-preview-thumb')) : [];
+}
+
+// Only the cards the user can actually see. Task 11 hides duplicate cards in
+// place; a shift-range must not reach through a hidden card and toggle it.
+function importVisibleCards(root) {
+  const scope = root || document.getElementById('importPreviewGrid');
+  if (!scope) return [];
+  return Array.from(scope.querySelectorAll('.import-preview-thumb'))
+    .filter(el => el.offsetParent !== null);
+}
+
+// Duplicate-ness is read off the CARD, never off importDuplicatePaths. The
+// module set is assigned only after the whole check-duplicates stream drains
+// and is never cleared, so during a re-preview it still holds the PREVIOUS
+// run's verdicts while the cards on screen carry none. Consulting it here
+// would disable a card the renderer drew enabled — and with no badge, since
+// the badge is drawn from the same argument the card was, leaving the user
+// with a dead control and no explanation. Over SMB with verify_by_hash that
+// window is minutes long.
+function importSelectableCardPaths(cards) {
+  const skipDupes = document.getElementById('chkSkipDuplicates').checked;
+  return cards
+    .filter(el => !(el.classList.contains('duplicate') && skipDupes))
+    .map(el => el.dataset.path)
+    .filter(p => !!p);
 }
 
 // The selectable paths in one rendered folder group. Skipped duplicates are
@@ -2096,33 +2132,44 @@ function renderImportPreviewGrid(files, duplicatePaths, destinationFiles) {
 // eligibility verdict into user intent, and it would outlive the verdict).
 function importFolderPaths(groupEl) {
   if (!groupEl) return [];
-  const skipDupes = document.getElementById('chkSkipDuplicates').checked;
-  return Array.from(groupEl.querySelectorAll('.import-preview-thumb'))
-    .map(el => el.dataset.path)
-    .filter(p => p && !(importDuplicatePaths.has(p) && skipDupes));
+  return importSelectableCardPaths(importVisibleCards(groupEl));
 }
 
 // Folder headers are a tally of the cards under them, so they have to be
 // recomputed after ANY selection change — including a single per-file click,
 // which otherwise leaves the header claiming "all selected".
 function refreshImportFolderHeaders() {
-  document.querySelectorAll('.import-preview-folder').forEach((groupEl) => {
+  const grid = document.getElementById('importPreviewGrid');
+  if (!grid) return;
+  grid.querySelectorAll('.import-preview-folder').forEach((groupEl) => {
     const folderCheck = groupEl.querySelector('.folder-check');
     if (!folderCheck) return;
     const paths = importFolderPaths(groupEl);
     const onCount = paths.filter(p => !importDeselected.has(p)).length;
-    folderCheck.checked = onCount > 0;
+    // "All", not "any" — matches chkSelectAll on pipeline.html so the same
+    // widget means the same thing on both pages. Consequence: clicking a
+    // dashed header SELECTS the rest of the folder rather than clearing it,
+    // which is also the conventional web behaviour for a tri-state parent.
+    folderCheck.checked = paths.length > 0 && onCount === paths.length;
     // Tri-state: "some" must not read as "all". Only settable from JS.
     folderCheck.indeterminate = onCount > 0 && onCount < paths.length;
+    // Nothing to toggle — an enabled control that silently does nothing and
+    // snaps back is worse than an honestly dead one.
+    folderCheck.disabled = paths.length === 0;
+    folderCheck.title = paths.length === 0
+      ? 'Every file in this folder is a duplicate that will be skipped'
+      : 'Select or deselect every file in this folder';
   });
 }
 
 function toggleImportSelection(path, checked, shiftKey) {
-  const skipDupes = document.getElementById('chkSkipDuplicates').checked;
-  // Range runs over VISIBLE render order, so a filter (e.g. Hide duplicates)
-  // can't make a shift-click toggle cards the user cannot see.
-  const visible = Array.from(
-    document.querySelectorAll('.import-preview-thumb')).map(el => el.dataset.path);
+  // Range runs over VISIBLE RENDER order — not importPreviewedPaths order,
+  // which is the API's. The renderer groups by subfolder and sorts the group
+  // keys, so the two diverge whenever subfolders don't arrive alphabetically,
+  // and a range computed from the wrong one toggles cards the user didn't
+  // drag across. Hidden cards are excluded for the same reason.
+  const cards = importVisibleCards();
+  const visible = cards.map(el => el.dataset.path);
   let targets = [path];
   if (shiftKey && importSelectionAnchor !== null) {
     const a = visible.indexOf(importSelectionAnchor);
@@ -2132,8 +2179,9 @@ function toggleImportSelection(path, checked, shiftKey) {
       targets = visible.slice(Math.min(a, b), Math.max(a, b) + 1);
     }
   }
+  const selectable = new Set(importSelectableCardPaths(cards));
   targets
-    .filter(p => !(importDuplicatePaths.has(p) && skipDupes))
+    .filter(p => selectable.has(p))
     .forEach(p => {
       if (checked) importDeselected.delete(p);
       else importDeselected.add(p);
@@ -2150,19 +2198,29 @@ function toggleImportSelection(path, checked, shiftKey) {
 function rerenderImportPreviewGridSafe() {
   if (typeof rerenderImportPreviewGrid === 'function') {
     rerenderImportPreviewGrid();
-    return;
+  } else {
+    const skipDupes = document.getElementById('chkSkipDuplicates').checked;
+    importGridCards().forEach((el) => {
+      const cb = el.querySelector('.thumb-check');
+      if (!cb) return;
+      const isDup = el.classList.contains('duplicate');
+      cb.checked = !importDeselected.has(el.dataset.path) && !(isDup && skipDupes);
+      cb.disabled = isDup && skipDupes;
+    });
   }
-  const skipDupes = document.getElementById('chkSkipDuplicates').checked;
-  document.querySelectorAll('.import-preview-thumb').forEach((el) => {
-    const cb = el.querySelector('.thumb-check');
-    if (!cb) return;
-    const isDup = importDuplicatePaths.has(el.dataset.path);
-    cb.checked = !importDeselected.has(el.dataset.path) && !(isDup && skipDupes);
-    cb.disabled = isDup && skipDupes;
-  });
+  // Unconditional: the sibling's rerenderImportPreviewGrid() is not known to
+  // refresh folder headers, and a header left claiming "all selected" after a
+  // per-file click is exactly the stale readout this function exists to stop.
   refreshImportFolderHeaders();
 }
 
+// NOTE: these two counters read importDuplicatePaths, which is only assigned
+// once the check-duplicates stream finishes and is never cleared. On a
+// re-preview of the same folder they therefore under-report until the new
+// stream drains. Everything that touches the DOM derives duplicate-ness from
+// the cards instead (see importSelectableCardPaths); fixing the counters
+// belongs with the preview-lifecycle reset in Task 10, which is where
+// importDeselected gets cleared too.
 function importEligibleCount() {
   const skipDupes = document.getElementById('chkSkipDuplicates').checked;
   return importPreviewedPaths.filter(
@@ -2186,13 +2244,23 @@ function updateImportSelectionUI() {
   }
   const master = document.getElementById('chkSelectAllImport');
   if (master) {
-    // Derived like every other box on this page. A master that stays ticked
-    // while only some files are selected would be a lie the user reads as
-    // "everything goes".
+    // Denominator is the ELIGIBLE count, not importPreviewedPaths.length:
+    // with "everything selected except two skipped duplicates" the master
+    // must read as full, not as a partial selection the user has to go
+    // hunting for.
+    // Tri-state rule is "all", matching chkSelectAll on pipeline.html
+    // (selected === total) so the same widget means the same thing on both
+    // pages; `indeterminate` is what carries "some".
     const eligible = importEligibleCount();
     const checked = importCheckedCount();
-    master.checked = checked > 0;
+    master.checked = eligible > 0 && checked === eligible;
     master.indeterminate = checked > 0 && checked < eligible;
+    // Nothing selectable (every discovered file is a skipped duplicate):
+    // a live control that does nothing on click is a black box.
+    master.disabled = eligible === 0;
+    master.title = eligible === 0
+      ? 'Every discovered file is a duplicate that will be skipped'
+      : 'Select or deselect every file in this preview';
   }
   const row = document.getElementById('selectAllRow');
   // The selectionEnabled check matters: without it a later call to this

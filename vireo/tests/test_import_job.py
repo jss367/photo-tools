@@ -7236,6 +7236,92 @@ def test_local_import_invalidates_duplicate_skips_when_mount_detaches(
     assert result["safe_to_format"] is False, result
 
 
+def test_local_import_mount_loss_is_sticky_across_batches(
+        tmp_path, monkeypatch):
+    """Same rationale as the remote-path sticky test: a batch's mount-
+    detach rollback undoes ``dup_skips`` / ``landed`` but not the
+    identities the same batch installed in the job-wide checker (and
+    ``run_dest_folders`` / ``run_verified_hashes``) via
+    ``_record_checker`` — ``DuplicateChecker`` exposes no removal API. If
+    the share remounts before a later batch, a byte-identical card file
+    would hit the intra-run fast path and be counted as a duplicate of a
+    rolled-back landing whose archive bytes never made it. See PR #1400
+    review (Codex P2 r3688614624).
+    """
+    import shutil
+
+    import pipeline_job as _pj
+    from import_job import ImportParams, run_import_job
+
+    dest = tmp_path / "mnt_NAS"
+    dest.mkdir()
+    day1_dir = dest / "2026" / "2026-07-03"
+    day1_dir.mkdir(parents=True)
+    # A twin file already at the batch 1 destination — the adopt branch
+    # matches it and calls ``_record_checker`` with dest_folder + hash,
+    # populating the job-wide checker's ``_seen_hashes`` and the intra-
+    # run cache. Those are what leak past the rollback.
+    twin_path = day1_dir / "IMG_0100.jpg"
+    Image.new("RGB", (16, 16), "red").save(str(twin_path))
+    ts1 = datetime(2026, 7, 3, 10, 0, 0).timestamp()
+    os.utime(str(twin_path), (ts1, ts1))
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws_id = db._active_workspace_id
+
+    card = tmp_path / "card"
+    card.mkdir()
+    # Batch 1 (2026-07-03): matches the adopted twin.
+    file_a = card / "IMG_0100.jpg"
+    shutil.copy2(str(twin_path), str(file_a))
+    os.utime(str(file_a), (ts1, ts1))
+    # Batch 2 (2026-07-04): byte-identical to A. Without the sticky
+    # fix, this hits the intra-run fast path against A's stale entry.
+    file_b = card / "IMG_0200.jpg"
+    shutil.copy2(str(twin_path), str(file_b))
+    ts2 = datetime(2026, 7, 4, 10, 0, 0).timestamp()
+    os.utime(str(file_b), (ts2, ts2))
+
+    monkeypatch.setattr(
+        _pj, "_archive_mount_root_candidates",
+        lambda path: [str(dest)] if str(path).startswith(str(dest)) else [],
+    )
+    real_ismount = os.path.ismount
+    monkeypatch.setattr(
+        os.path, "ismount",
+        lambda p: True if str(p) == str(dest) else real_ismount(p),
+    )
+
+    # Sequence the mount-probe returns so batch 1 detaches AFTER its
+    # per-file loop and batch 2 would see a REMOUNTED share at its
+    # batch-boundary probe. Local path call sites (per batch):
+    #   batch-boundary, per-file (1x), post-loop.
+    seq = iter([None, None, str(dest), None, None, None])
+
+    def fake_unmounted(baseline):
+        try:
+            return next(seq)
+        except StopIteration:
+            return None
+
+    monkeypatch.setattr(_pj, "_unmounted_since_baseline", fake_unmounted)
+
+    result = run_import_job(
+        _make_job(), FakeRunner(), db_path, ws_id, ImportParams(
+            sources=[str(card)], destination=str(dest),
+        ),
+    )
+
+    assert result["copied"] == 0, result
+    assert result["skipped_duplicate"] == 0, (
+        "file B in batch 2 was counted as a duplicate of A's rolled-back "
+        f"adopt via the stale intra-run cache: {result}"
+    )
+    assert result["failed"] == 2, result
+    assert result["safe_to_format"] is False, result
+
+
 def test_remote_import_invalidates_duplicate_skips_when_mount_detaches(
         tmp_path, monkeypatch):
     """The remote path needs the local path's duplicate-skip rollback.
@@ -7330,3 +7416,119 @@ def test_remote_import_invalidates_duplicate_skips_when_mount_detaches(
     )
     assert result["failed"] == 1, result
     assert result["safe_to_format"] is False, result
+
+
+def test_remote_import_mount_loss_is_sticky_across_batches(
+        tmp_path, monkeypatch):
+    """Mount loss must be sticky for the rest of the run.
+
+    A batch's mount-detach rollback undoes ``dup_skips`` / ``to_transfer``
+    / ``adopted_paths`` but not the identities the same batch already
+    installed in the job-wide checker (and in ``run_dest_folders`` /
+    ``run_verified_hashes``) via ``_record_checker`` — and
+    ``DuplicateChecker`` exposes no removal API, so those entries cannot
+    be surgically undone. If the share remounts before a later batch, a
+    byte-identical card file in that later batch would hit the intra-run
+    fast path at line 1237 and be counted as a duplicate of an adopted
+    or queued file whose archive claim was rolled back, with no backing
+    NAS copy. Refusing every remaining batch keeps the stale cache from
+    being consulted. See PR #1400 review (Codex P2 r3688614624).
+    """
+    import shutil
+
+    import pipeline_job as _pj
+    from import_job import ImportParams, run_import_job
+
+    ra = _remote_archive_for(tmp_path)
+    calls = _remote_calls(ra)
+    _install_fake_remote_rsync(monkeypatch, calls, verify=None)
+    mount_base = ra["mount_base"]
+
+    # Adopted twin already at the batch 1 destination (crash-recovery
+    # shape). The adopt branch matches its bytes and calls
+    # ``_record_checker`` with dest_folder + hash — populating both the
+    # job-wide checker's ``_seen_hashes`` and the intra-run
+    # ``run_dest_folders`` / ``run_verified_hashes``. Those are the
+    # entries the fix has to keep unreachable after the rollback.
+    day1_dir = os.path.join(mount_base, "2026", "2026-07-03")
+    os.makedirs(day1_dir)
+    twin_path = os.path.join(day1_dir, "IMG_0100.jpg")
+    Image.new("RGB", (16, 16), "red").save(twin_path)
+    ts1 = datetime(2026, 7, 3, 10, 0, 0).timestamp()
+    os.utime(twin_path, (ts1, ts1))
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws_id = db._active_workspace_id
+
+    card = tmp_path / "card"
+    card.mkdir()
+    # Batch 1 (2026-07-03): matches the adopted twin.
+    file_a = card / "IMG_0100.jpg"
+    shutil.copy2(twin_path, str(file_a))
+    os.utime(str(file_a), (ts1, ts1))
+    # Batch 2 (2026-07-04): BYTE-IDENTICAL to A. Without the sticky fix
+    # this hits the intra-run fast path against A's stale entry in
+    # ``run_dest_folders`` and is counted as ``skipped_duplicate`` even
+    # though A's landing was rolled back and the NAS holds nothing for
+    # it. With the fix, batch 2 is refused at the top of the loop.
+    file_b = card / "IMG_0200.jpg"
+    shutil.copy2(twin_path, str(file_b))
+    ts2 = datetime(2026, 7, 4, 10, 0, 0).timestamp()
+    os.utime(str(file_b), (ts2, ts2))
+
+    monkeypatch.setattr(
+        _pj, "_archive_mount_root_candidates",
+        lambda path: [mount_base] if str(path).startswith(mount_base) else [],
+    )
+
+    # Baseline captured at job start uses ismount — leave the mount root
+    # reporting live so the baseline is True. The per-batch detach/remount
+    # timing is driven through ``_unmounted_since_baseline`` below.
+    real_ismount = os.path.ismount
+    monkeypatch.setattr(
+        os.path, "ismount",
+        lambda p: True if str(p) == mount_base else real_ismount(p),
+    )
+
+    # Sequence the mount-probe returns so batch 1 detaches AFTER the
+    # per-file loop (post the adopt-branch _record_checker) and batch 2
+    # would see a REMOUNTED share at its batch-boundary probe. Without
+    # the sticky fix, batch 2 then reaches the dup gate and consults the
+    # stale intra-run cache; with it, ``mount_ever_lost`` already fired
+    # in batch 1 and batch 2's per-file fail loop runs before any probe.
+    #
+    # Call sites (remote path):
+    #   batch 1: batch-boundary, per-file (1x), post-loop
+    #   batch 2 without the fix: batch-boundary, per-file (1x), post-loop
+    seq = iter([None, None, mount_base, None, None, None])
+
+    def fake_unmounted(baseline):
+        try:
+            return next(seq)
+        except StopIteration:
+            return None
+
+    monkeypatch.setattr(_pj, "_unmounted_since_baseline", fake_unmounted)
+
+    result = run_import_job(
+        _make_job(), FakeRunner(), db_path, ws_id, ImportParams(
+            sources=[str(card)], destination=mount_base,
+            remote_target=ra, verify_by_hash=True,
+        ),
+    )
+
+    # File A was adopted in batch 1 then rolled back on detach; file B
+    # in batch 2 must NOT be counted as skipped_duplicate against A's
+    # stale intra-run cache entry. Both end up failed.
+    assert result["copied"] == 0, result
+    assert result["skipped_duplicate"] == 0, (
+        "file B in batch 2 was counted as a duplicate of A's rolled-back "
+        f"adopt via the stale intra-run cache: {result}"
+    )
+    assert result["failed"] == 2, result
+    assert result["safe_to_format"] is False, result
+
+    # No rsync happened either — both batches short-circuited before the
+    # transfer step.
+    assert calls["rsync"] == [], calls["rsync"]

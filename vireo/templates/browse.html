@@ -3912,6 +3912,18 @@ document.addEventListener('vireo:folder-health-changed', function(event) {
     event && event.detail);
 });
 
+async function waitForFolderHealthRefreshesToSettle() {
+  // A second event can replace the active promise while an awaiter is still
+  // waiting on the first. Keep observing until the promise that just settled
+  // is still the active one, so photo deep-link retries cannot resume in the
+  // gap between overlapping refreshes.
+  while (true) {
+    var observed = _activeFolderHealthRefresh;
+    try { await observed; } catch (e) { /* keep draining newer refreshes */ }
+    if (observed === _activeFolderHealthRefresh) return;
+  }
+}
+
 async function filterByCollection(id, options) {
   // The sidebar collection list is rendered from the initial /photos payload,
   // so a slow /api/filters/fields (or workspace) round-trip leaves clickable
@@ -9104,7 +9116,7 @@ async function _runPhotoDeepLink(photoId) {
     // from a settled state and its pre-await snapshot is guaranteed to
     // match the current generation (unless yet another refresh fires
     // during the retry, which the loop handles).
-    try { await _activeFolderHealthRefresh; } catch (e) { /* ignore */ }
+    await waitForFolderHealthRefreshesToSettle();
   }
 })();
 

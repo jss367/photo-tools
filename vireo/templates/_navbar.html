@@ -11280,8 +11280,21 @@ function _reconcileMissingFoldersInitSnapshot(
     _updateMissingFoldersBanner(currentIds.map(id => ({ id })));
     return false;
   }
-  return _dispatchFolderHealthChangeFromIds(
+  const dispatched = _dispatchFolderHealthChangeFromIds(
     currentIds, _missingFoldersLastIds, source);
+  if (dispatched) return true;
+  // A higher server version proves the init payload is stale even when the
+  // missing-ID set is unchanged (for example a healthy folder was linked,
+  // unlinked, inserted, or deleted). Force the conservative no-ID refresh so
+  // bootstrap does not render the obsolete folder tree/photo grid.
+  if (serverVersion !== null && _missingFoldersServerVersion !== null &&
+      serverVersion < _missingFoldersServerVersion) {
+    document.dispatchEvent(new CustomEvent('vireo:folder-health-changed', {
+      detail: { restored: [], wentMissing: [], source },
+    }));
+    return true;
+  }
+  return false;
 }
 
 // Wait for every in-flight POST mutation to settle, then run one

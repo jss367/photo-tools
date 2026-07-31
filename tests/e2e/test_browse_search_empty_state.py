@@ -824,6 +824,33 @@ def test_newer_init_server_snapshot_supersedes_delivered_old_poll(
     expect(page.locator(".grid-card")).to_have_count(2)
 
 
+def test_older_init_version_reconciles_when_missing_ids_match(live_server, page):
+    """A stale init version must refresh even when both missing sets are []."""
+    page.goto(f"{live_server['url']}/browse")
+    page.wait_for_function("browseDatasetReady", timeout=5000)
+
+    result = page.evaluate(
+        "() => {"
+        "  window._folderHealthEvents = [];"
+        "  document.addEventListener('vireo:folder-health-changed', "
+        "    function(e) { window._folderHealthEvents.push(e.detail.source); }, "
+        "    {once: true});"
+        "  _missingFoldersLastIds = [];"
+        "  _missingFoldersServerVersion = 12;"
+        "  const startVersion = _missingFoldersSnapshotVersion;"
+        "  const stale = _reconcileMissingFoldersInitSnapshot("
+        "    [], startVersion, 'same-ids-version-reconcile', 11);"
+        "  return {stale: stale, events: window._folderHealthEvents.slice()};"
+        "}"
+    )
+
+    assert result == {
+        "stale": True,
+        "events": ["same-ids-version-reconcile"],
+    }
+    page.evaluate("() => window._activeFolderHealthRefresh")
+
+
 def test_bootstrap_defers_lock_release_when_init_rejects(
     live_server, page, tmp_path
 ):
@@ -1868,6 +1895,33 @@ def test_failed_health_grid_reload_reconciles_on_next_normal_poll(
     expect(page.locator(".grid-card")).to_have_count(5)
     assert len(photo_requests) == 2
     assert page.evaluate("_missingFoldersReconciliationPending") is False
+
+
+def test_wait_for_folder_health_refreshes_drains_replacements(live_server, page):
+    """A deep-link waiter must not resume between refresh A and refresh B."""
+    page.goto(f"{live_server['url']}/browse")
+    page.wait_for_function("browseDatasetReady", timeout=5000)
+
+    page.evaluate(
+        "() => {"
+        "  window._refreshWaitDone = false;"
+        "  _activeFolderHealthRefresh = new Promise(resolve => {"
+        "    window._resolveRefreshA = resolve;"
+        "  });"
+        "  window._refreshWait = waitForFolderHealthRefreshesToSettle().then(() => {"
+        "    window._refreshWaitDone = true;"
+        "  });"
+        "  _activeFolderHealthRefresh = new Promise(resolve => {"
+        "    window._resolveRefreshB = resolve;"
+        "  });"
+        "  window._resolveRefreshA();"
+        "}"
+    )
+    page.wait_for_timeout(100)
+    assert page.evaluate("window._refreshWaitDone") is False
+
+    page.evaluate("window._resolveRefreshB()")
+    page.wait_for_function("window._refreshWaitDone === true", timeout=3000)
 
 
 def test_missing_folders_recovery_skips_check_when_mutations_hang(

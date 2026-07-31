@@ -2169,13 +2169,20 @@ def test_a_single_render_pass_produces_a_correct_folder_header(
         live_server, page):
     """One render must be enough.
 
-    #importPreviewGrid ships display:none, so anything that reads layout to
-    build the header tally has to run after the grid is shown. Copy mode
-    renders up to three times and hides the mistake; the in-place and
-    snapshot legs return after the first pass and would be left with a dead,
-    unticked header over a fully selected folder.
+    #importPreviewGrid ships display:none and previewImport() re-hides it
+    before every run, so anything that reads layout to build the header
+    tally has to run after the grid is shown again. The later passes would
+    paper over a mistake here, but they are not guaranteed: with
+    chkSkipDuplicates on and a destination that fails to resolve, the
+    files-only pass is the only one there is, and the user would be left
+    with a dead, unticked header over a fully selected folder.
+
+    Copy mode explicitly -- the header checkbox only exists there -- and the
+    renderer is driven directly so the assertion lands on a single pass.
     """
     page.goto(f"{live_server['url']}/import")
+    _suppress_auto_preview(page)
+    page.locator("#modeCopy").check()
     expect(page.locator("#importPreviewGrid")).to_be_hidden()
     page.evaluate("(f) => renderImportPreviewGrid(f, [], null)", _files(3))
 
@@ -2186,7 +2193,7 @@ def test_a_single_render_pass_produces_a_correct_folder_header(
 
 
 def test_shift_range_does_not_reach_through_a_hidden_card(live_server, page):
-    """Task 11 hides duplicate cards in place rather than re-rendering.
+    """The sibling hide-duplicates branch hides cards rather than re-render.
 
     A range is what the user dragged across on screen, so a card that isn't
     on screen must not be swept up by it. Hidden here the way a CSS filter
@@ -2772,3 +2779,208 @@ def test_previewing_with_no_file_types_does_not_latch_start_shut(
     expect(page.locator("#btnStart")).to_have_text(
         "Preview again before importing")
     expect(page.locator("#btnStart")).to_be_disabled()
+
+
+# --- Task 11: selection is copy-mode only, and the absence is explained ----
+
+
+def test_in_place_mode_hides_selection_and_explains_why(live_server, page):
+    """Hiding the controls is only half the requirement.
+
+    In-place import runs through do_scan(restrict_files=...), which
+    vireo/scanner.py only honours alongside restrict_dirs, so per-file
+    selection is out of scope for this mode. Omitting the checkboxes
+    silently would leave the user unable to tell whether selection is
+    missing, broken, or gated behind a setting they haven't found -- the
+    same unexplained-control failure the disabled-state work already had to
+    fix twice.
+    """
+    page.goto(f"{live_server['url']}/import")
+    _stub_preview(page, _files(3))
+    page.locator("#modeInPlace").click()
+    _preview(page)
+
+    expect(page.locator(".import-preview-thumb .thumb-check")).to_have_count(0)
+    expect(page.locator("#selectionUnavailableNote")).to_be_visible()
+    expect(page.locator("#selectionUnavailableNote")).to_contain_text(
+        "In-place import catalogs every file")
+    # The other two selection controls go with them: a folder header that
+    # bulk-toggles nothing, and a master checkbox over no boxes.
+    expect(page.locator(".import-preview-folder-header .folder-check")
+           ).to_have_count(0)
+    expect(page.locator("#selectAllRow")).not_to_be_visible()
+    # The cards themselves stay -- the preview is still the honest list of
+    # what will be catalogued.
+    expect(page.locator(".import-preview-thumb")).to_have_count(3)
+
+
+def test_the_folder_header_still_names_its_folder_without_a_checkbox(
+        live_server, page):
+    """Dropping the box must not leave an empty or half-empty header.
+
+    The header is a flex row with a 6px gap, so leaving a hidden or
+    zero-width checkbox in place would indent the folder name away from
+    the grid it labels. The name itself still has to be there: without it
+    the group separator would be a blank line.
+    """
+    page.goto(f"{live_server['url']}/import")
+    _stub_preview(page, _files(3))
+    page.locator("#modeInPlace").click()
+    _preview(page)
+
+    header = page.locator(".import-preview-folder-header")
+    expect(header).to_have_text("card (3)")
+    expect(page.locator(".import-preview-folder-header > *")).to_have_count(1)
+
+
+def test_switching_back_to_copy_restores_every_selection_control(
+        live_server, page):
+    """The re-open direction, which is where these flags usually rot.
+
+    in place -> copy has to bring back the per-file boxes, the folder
+    header, and the select-all row, AND retire the note -- a note still
+    reading "selection is available when copying files" beside a live set of
+    checkboxes is its own black box.
+    """
+    page.goto(f"{live_server['url']}/import")
+    _stub_preview(page, _files(3))
+    _preview(page)
+    expect(page.locator(".import-preview-thumb .thumb-check")).to_have_count(3)
+    expect(page.locator("#selectionUnavailableNote")).not_to_be_visible()
+
+    page.locator("#modeInPlace").click()
+    _preview(page)
+    expect(page.locator(".import-preview-thumb .thumb-check")).to_have_count(0)
+    expect(page.locator("#selectionUnavailableNote")).to_be_visible()
+
+    page.locator("#modeCopy").click()
+    _preview(page)
+    expect(page.locator(".import-preview-thumb .thumb-check")).to_have_count(3)
+    expect(page.locator(".import-preview-folder-header .folder-check")
+           ).to_have_count(1)
+    expect(page.locator("#selectAllRow")).to_be_visible()
+    expect(page.locator("#selectionUnavailableNote")).not_to_be_visible()
+
+
+def test_the_note_retires_on_a_mode_switch_before_any_preview(
+        live_server, page):
+    """The note is owned by the mode, not by the rendered grid.
+
+    updateImportMode() throws the preview away, so if the note only ever
+    updated inside the renderer it would survive a switch to copy mode with
+    no grid on screen and contradict the controls the user is about to see.
+    """
+    page.goto(f"{live_server['url']}/import")
+    _suppress_auto_preview(page)
+    expect(page.locator("#selectionUnavailableNote")).to_be_visible()
+
+    page.locator("#modeCopy").click()
+    expect(page.locator("#selectionUnavailableNote")).not_to_be_visible()
+
+    page.locator("#modeInPlace").click()
+    expect(page.locator("#selectionUnavailableNote")).to_be_visible()
+
+
+def test_in_place_start_label_carries_no_file_count(live_server, page):
+    """The label's count is guarded by copyMode and must stay that way.
+
+    In-place mode sends no include_paths, so "Start import (3 files)" would
+    be a promise the request doesn't make: the scan catalogues whatever is
+    on disk when it runs, not the three cards on screen.
+    """
+    page.goto(f"{live_server['url']}/import")
+    _stub_preview(page, _files(3))
+    page.locator("#modeInPlace").click()
+    _preview(page)
+
+    expect(page.locator("#btnStart")).to_have_text("Start import")
+    expect(page.locator("#btnStart")).to_be_enabled()
+
+
+def _stub_snapshot_import(page, files):
+    """Drive the new-images (snapshot) flow, the THIRD selection state.
+
+    Routed at the network layer rather than by patching window.fetch:
+    initNewImagesImport() runs from the page's own load handler, so a
+    fetch stub installed after goto() would arrive too late.
+    """
+    page.route(
+        "**/api/workspaces/active/new-images/snapshot/42",
+        lambda route: route.fulfill(
+            status=200, content_type="application/json",
+            body=json.dumps({
+                "snapshot_id": 42, "file_count": len(files),
+                "folder_paths": ["/tmp/card"],
+            })),
+    )
+    page.route(
+        "**/api/import/new-images-preview",
+        lambda route: route.fulfill(
+            status=200, content_type="application/json",
+            body=json.dumps({
+                "total_count": len(files), "unavailable_count": 0,
+                "files": files,
+            })),
+    )
+
+
+def test_snapshot_mode_hides_selection_and_says_what_it_will_import(
+        live_server, page):
+    """Snapshot mode is not in-place mode, and the note must not claim it is.
+
+    The mode radios are DISABLED here, so "selection is available when
+    copying files" would point at a control the user cannot reach, and
+    "catalogs every file in the folder" is wrong twice over: this import
+    adds exactly the frozen list that was captured, which is a subset of
+    the folder.
+    """
+    page.goto(f"{live_server['url']}/import")  # warm the app before routing
+    _stub_snapshot_import(page, _files(3))
+    page.goto(f"{live_server['url']}/import?new_images=42")
+    expect(page.locator("#importPreviewGrid")).to_be_visible()
+
+    expect(page.locator(".import-preview-thumb")).to_have_count(3)
+    expect(page.locator(".import-preview-thumb .thumb-check")).to_have_count(0)
+    expect(page.locator("#selectAllRow")).not_to_be_visible()
+    note = page.locator("#selectionUnavailableNote")
+    expect(note).to_be_visible()
+    expect(note).to_contain_text("captured list")
+    expect(note).not_to_contain_text("copying files")
+    expect(note).not_to_contain_text("every file in the folder")
+
+
+def test_snapshot_mode_withholds_selection_even_if_the_mode_radio_flips(
+        live_server, page):
+    """importSelectionEnabled()'s snapshot clause is not decoration.
+
+    Today it is belt-and-braces: activateNewImagesImport() ticks in-place
+    and DISABLES both radios, so "copy is checked" should be unreachable,
+    and updateImportMode() re-ticks in-place on every call besides. But the
+    snapshot import posts a snapshot_id against a frozen server-side list
+    and carries no include_paths at all, so if the radio ever comes back the
+    controls must not follow it -- checkboxes over a list the request cannot
+    narrow are a lie. Driven through the renderer directly because
+    updateImportMode() would undo the radio before the guard was reached.
+    """
+    page.goto(f"{live_server['url']}/import")
+    files = _files(3)
+    _stub_snapshot_import(page, files)
+    page.goto(f"{live_server['url']}/import?new_images=42")
+    expect(page.locator("#importPreviewGrid")).to_be_visible()
+
+    page.evaluate(
+        """(files) => {
+          document.getElementById('modeCopy').disabled = false;
+          document.getElementById('modeCopy').checked = true;
+          renderImportPreviewGrid(files, [], null);
+          updateImportSelectionUI();
+        }""",
+        files,
+    )
+
+    expect(page.locator(".import-preview-thumb")).to_have_count(3)
+    expect(page.locator(".import-preview-thumb .thumb-check")).to_have_count(0)
+    expect(page.locator(".import-preview-folder-header .folder-check")
+           ).to_have_count(0)
+    expect(page.locator("#selectAllRow")).not_to_be_visible()
+    expect(page.locator("#selectionUnavailableNote")).to_be_visible()

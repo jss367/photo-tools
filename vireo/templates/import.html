@@ -418,6 +418,10 @@ body { display: flex; flex-direction: column; height: 100vh; }
         <input type="checkbox" id="chkSelectAllImport" checked>
         <span id="previewSelectedCount"></span>
       </label>
+      <!-- Text is set by updateImportSelectionUI() from
+           selectionUnavailableText(): the wording differs between in-place
+           and snapshot mode, and one source for it beats two. -->
+      <div class="preview-summary" id="selectionUnavailableNote" style="display:none;"></div>
       <div id="importPreviewGrid" class="import-preview-grid" style="display:none;"></div>
       <div id="importError"></div>
     </div>
@@ -666,6 +670,39 @@ function selectedImportMode() {
   return checked ? checked.value : 'in_place';
 }
 
+// SINGLE DEFINITION of "per-file selection applies here". Read by the
+// renderer (which draws the boxes), updateImportSelectionUI() (which shows
+// the select-all row and the explanatory note) and updateStartGate() (which
+// counts the selection into the button label). Three copies of this
+// expression would be three chances for the boxes and the readouts about
+// them to disagree.
+//
+// Copy mode only. The in-place path runs through do_scan(restrict_files=…),
+// which vireo/scanner.py honours only alongside restrict_dirs, and filling
+// restrict_dirs would change which directories get registered as workspace
+// roots — a core scanner change, deliberately deferred. The snapshot
+// (new-images) flow is a third state: it imports exactly one frozen list.
+function importSelectionEnabled() {
+  return newImagesSnapshotId === null && selectedImportMode() === 'copy';
+}
+
+// Why the boxes aren't there. An unexplained absence is the same class of
+// failure as an unexplained disabled control: the user cannot tell whether
+// selection is missing, broken, or hidden behind a setting they haven't
+// found. The two strings must stay distinct — in snapshot mode both mode
+// radios are DISABLED, so pointing at copy mode would name a control the
+// user cannot reach, and the import adds the captured list rather than
+// everything in the folder.
+function selectionUnavailableText() {
+  if (newImagesSnapshotId !== null) {
+    return 'File selection is not available for this import. It adds exactly'
+      + ' the captured list of newly detected images, leaving the originals'
+      + ' where they are.';
+  }
+  return 'File selection is available when copying files. In-place import'
+    + ' catalogs every file in the folder.';
+}
+
 function updateImportMode() {
   if (newImagesSnapshotId !== null) {
     document.getElementById('modeInPlace').checked = true;
@@ -832,13 +869,16 @@ function wireImportSelectAll() {
     // "select visible". Eligibility still comes off the cards, so a stale
     // duplicate verdict can't silently exclude files from a bulk action.
     //
-    // SCOPE MISMATCH, for Task 11: this walks importGridCards() while
-    // importFolderPaths() walks importVisibleCards(). Equivalent today
-    // because the only cards anything hides are skipped duplicates, which
-    // both exclude. If Task 11's filter can hide a card while
-    // chkSkipDuplicates is OFF, that card would count toward the master's
-    // denominator but belong to no folder header — so ticking every header
-    // would leave the master dashed. Pick one scope then.
+    // SCOPE NOTE: this walks importGridCards() while importFolderPaths()
+    // walks importVisibleCards(). Still equivalent, and the in-place work
+    // did not change that: hiding selection withholds the CONTROLS
+    // (checkboxes, folder headers, this row) and leaves every card
+    // rendered and visible, so it adds no card that is hidden while
+    // chkSkipDuplicates is OFF — the case that would let a card count
+    // toward this master's denominator while belonging to no folder
+    // header, leaving the master dashed after ticking every header. The
+    // only cards anything hides are still skipped duplicates, which both
+    // scopes exclude. Re-check if a future change hides cards in place.
     importSelectableCardPaths(importGridCards())
       .forEach(p => {
         if (master.checked) importDeselected.delete(p);
@@ -2044,6 +2084,10 @@ function renderImportPreviewGrid(files, duplicatePaths, destinationFiles) {
   }
 
   const skipDupes = document.getElementById('chkSkipDuplicates').checked;
+  // The cards are still drawn in every mode — the preview is the honest list
+  // of what will be imported either way. Only the controls that would claim
+  // the user can change that list are withheld.
+  const selectionEnabled = importSelectionEnabled();
 
   const groups = {};
   files.forEach((f) => {
@@ -2057,23 +2101,27 @@ function renderImportPreviewGrid(files, duplicatePaths, destinationFiles) {
     groupEl.className = 'import-preview-folder';
     const header = document.createElement('div');
     header.className = 'import-preview-folder-header';
-    const folderCheck = document.createElement('input');
-    folderCheck.type = 'checkbox';
-    folderCheck.className = 'folder-check';
-    // Checked/indeterminate/disabled/title are all set by
-    // refreshImportFolderHeaders() once the cards exist and the grid is
-    // visible. It derives the tally from the rendered cards — including
-    // their duplicate class — so the header and the boxes below it read
-    // from exactly the same source and cannot disagree.
-    folderCheck.addEventListener('change', () => {
-      importFolderPaths(header.parentNode).forEach((p) => {
-        if (folderCheck.checked) importDeselected.delete(p);
-        else importDeselected.add(p);
+    if (selectionEnabled) {
+      const folderCheck = document.createElement('input');
+      folderCheck.type = 'checkbox';
+      folderCheck.className = 'folder-check';
+      // Checked/indeterminate/disabled/title are all set by
+      // refreshImportFolderHeaders() once the cards exist and the grid is
+      // visible. It derives the tally from the rendered cards — including
+      // their duplicate class — so the header and the boxes below it read
+      // from exactly the same source and cannot disagree.
+      folderCheck.addEventListener('change', () => {
+        importFolderPaths(header.parentNode).forEach((p) => {
+          if (folderCheck.checked) importDeselected.delete(p);
+          else importDeselected.add(p);
+        });
+        updateImportSelectionUI();
+        rerenderImportPreviewGridSafe();
       });
-      updateImportSelectionUI();
-      rerenderImportPreviewGridSafe();
-    });
-    header.appendChild(folderCheck);
+      // Omitted, not hidden: the header is a flex row with a gap, so a
+      // zero-width box would still indent the folder name off its grid.
+      header.appendChild(folderCheck);
+    }
     const headerLabel = document.createElement('span');
     headerLabel.textContent = subfolder + ' (' + groups[subfolder].length + ')';
     header.appendChild(headerLabel);
@@ -2092,20 +2140,22 @@ function renderImportPreviewGrid(files, duplicatePaths, destinationFiles) {
       if (f.thumb_url) card.dataset.thumbUrl = f.thumb_url;
       card.title = f.path || f.filename || '';
 
-      const check = document.createElement('input');
-      check.type = 'checkbox';
-      check.className = 'thumb-check';
-      // Derived, never seeded. The renderer runs up to three times per
-      // preview and duplicate verdicts arrive late; recomputing from state
-      // each pass means a late verdict just changes the answer.
-      check.checked = !importDeselected.has(f.path)
-        && !(isDuplicate && skipDupes);
-      check.disabled = isDuplicate && skipDupes;
-      check.addEventListener('click', (e) => {
-        e.stopPropagation();
-        toggleImportSelection(f.path, check.checked, e.shiftKey);
-      });
-      card.appendChild(check);
+      if (selectionEnabled) {
+        const check = document.createElement('input');
+        check.type = 'checkbox';
+        check.className = 'thumb-check';
+        // Derived, never seeded. The renderer runs up to three times per
+        // preview and duplicate verdicts arrive late; recomputing from state
+        // each pass means a late verdict just changes the answer.
+        check.checked = !importDeselected.has(f.path)
+          && !(isDuplicate && skipDupes);
+        check.disabled = isDuplicate && skipDupes;
+        check.addEventListener('click', (e) => {
+          e.stopPropagation();
+          toggleImportSelection(f.path, check.checked, e.shiftKey);
+        });
+        card.appendChild(check);
+      }
 
       const imgWrap = document.createElement('div');
       imgWrap.className = 'import-preview-thumb-img';
@@ -2158,8 +2208,9 @@ function importGridCards() {
   return grid ? Array.from(grid.querySelectorAll('.import-preview-thumb')) : [];
 }
 
-// Only the cards the user can actually see. Task 11 hides duplicate cards in
-// place; a shift-range must not reach through a hidden card and toggle it.
+// Only the cards the user can actually see. The sibling
+// hide-duplicates-checkbox branch hides duplicate cards in place; a
+// shift-range must not reach through a hidden card and toggle it.
 function importVisibleCards(root) {
   const scope = root || document.getElementById('importPreviewGrid');
   if (!scope) return [];
@@ -2320,13 +2371,22 @@ function updateImportSelectionUI() {
   }
   const row = document.getElementById('selectAllRow');
   // The selectionEnabled check matters: without it a later call to this
-  // function can re-show the select-all row in in-place mode after Task 11
-  // hid it inside the renderer.
-  const selectionEnabled = newImagesSnapshotId === null
-    && selectedImportMode() === 'copy';
+  // function can re-show the select-all row in in-place mode after the
+  // renderer has already left the per-file boxes out.
+  const selectionEnabled = importSelectionEnabled();
   if (row) {
     row.style.display =
       (selectionEnabled && importPreviewedPaths.length) ? '' : 'none';
+  }
+  // Owned here rather than by the renderer, and NOT gated on a rendered
+  // grid: updateImportMode() throws the preview away, so a note that only
+  // ever moved inside renderImportPreviewGrid() would survive a switch to
+  // copy mode and sit there contradicting the controls the user is about to
+  // get. This function is on every path that changes the mode.
+  const note = document.getElementById('selectionUnavailableNote');
+  if (note) {
+    note.textContent = selectionUnavailableText();
+    note.style.display = selectionEnabled ? 'none' : '';
   }
   updateStartGate();
 }
@@ -2348,8 +2408,12 @@ function updateImportSelectionUI() {
 function updateStartGate() {
   const btn = document.getElementById('btnStart');
   if (!btn) return;
-  const copyMode = newImagesSnapshotId === null
-    && selectedImportMode() === 'copy';
+  // Same predicate as the boxes themselves — see importSelectionEnabled().
+  // The label counts the selection, so it must not outlive the controls
+  // that produce one: "Start import (3 files)" in in-place mode would be a
+  // promise the request never makes, since the scan catalogues whatever is
+  // on disk when it runs rather than the three cards on screen.
+  const copyMode = importSelectionEnabled();
   let reason = null;
   if (activeJobId !== null || importStartPending) reason = 'Importing…';
   else if (copyMode && importPreviewInFlight) reason = 'Previewing…';

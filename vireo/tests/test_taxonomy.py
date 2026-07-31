@@ -1,9 +1,11 @@
 # vireo/tests/test_taxonomy.py
+import gc
 import gzip
 import json
 import os
 import sys
 import tempfile
+import weakref
 
 import pytest
 
@@ -2230,8 +2232,6 @@ def test_load_local_taxonomy_releases_between_retries(tmp_path, monkeypatch):
     weakref; only the caller's returned instance should still be
     alive after the final retry.
     """
-    import gc
-    import weakref
     import taxonomy as tax_mod
 
     tax_mod.clear_taxonomy_cache()

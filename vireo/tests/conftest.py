@@ -84,18 +84,23 @@ def _shutdown_created_job_runners(monkeypatch):
     yield
 
     leaked = []
+    shutdown_failures = 0
     for runner in reversed(created):
-        if not runner.shutdown(timeout=5.0):
-            leaked.extend(
-                thread.name
-                for thread in runner._worker_threads
-                if thread.is_alive()
-            )
-    if leaked:
-        pytest.fail(
-            "background JobRunner workers outlived their test: "
-            + ", ".join(sorted(leaked))
+        if runner.shutdown(timeout=5.0):
+            continue
+        shutdown_failures += 1
+        leaked.extend(
+            thread.name
+            for thread in runner._worker_threads
+            if thread.is_alive()
         )
+    if shutdown_failures:
+        parts = [f"{shutdown_failures} JobRunner(s) reported unsuccessful shutdown"]
+        if leaked:
+            parts.append(
+                "workers still alive: " + ", ".join(sorted(leaked))
+            )
+        pytest.fail("background JobRunner shutdown failed: " + "; ".join(parts))
 
 
 @pytest.fixture(autouse=True)

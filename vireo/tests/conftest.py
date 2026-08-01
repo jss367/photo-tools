@@ -62,6 +62,43 @@ def _disable_startup_backfill_timers(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _shutdown_created_job_runners(monkeypatch):
+    """Keep background jobs inside the test that created them.
+
+    Tests build apps through many local helpers, so relying on every caller to
+    remember a teardown call has repeatedly let a worker survive into the next
+    test's tmp_path and process-wide monkeypatches. Track JobRunner construction
+    centrally and make leaked work fail its owner instead of poisoning a later
+    assertion.
+    """
+    from jobs import JobRunner
+
+    created = []
+    original_init = JobRunner.__init__
+
+    def tracked_init(runner, *args, **kwargs):
+        original_init(runner, *args, **kwargs)
+        created.append(runner)
+
+    monkeypatch.setattr(JobRunner, "__init__", tracked_init)
+    yield
+
+    leaked = []
+    for runner in reversed(created):
+        if not runner.shutdown(timeout=5.0):
+            leaked.extend(
+                thread.name
+                for thread in runner._worker_threads
+                if thread.is_alive()
+            )
+    if leaked:
+        pytest.fail(
+            "background JobRunner workers outlived their test: "
+            + ", ".join(sorted(leaked))
+        )
+
+
+@pytest.fixture(autouse=True)
 def _reset_model_cache():
     """Drop the process-wide ModelCache between tests.
 
@@ -168,7 +205,10 @@ def app_and_db(tmp_path, monkeypatch):
 
     app = create_app(db_path=db_path, thumb_cache_dir=thumb_dir, api_token="test-token-123")
     yield app, db
+    jobs_stopped = app._cleanup_app_resources(job_timeout=5.0)
     db.close()
+    if not jobs_stopped:
+        pytest.fail("app background jobs did not stop during fixture teardown")
 
 
 @pytest.fixture
@@ -216,4 +256,7 @@ def client_with_photo(tmp_path, monkeypatch):
 
     app = create_app(db_path=db_path, thumb_cache_dir=str(thumb_dir), api_token="test-token-123")
     yield app, db, pid
+    jobs_stopped = app._cleanup_app_resources(job_timeout=5.0)
     db.close()
+    if not jobs_stopped:
+        pytest.fail("app background jobs did not stop during fixture teardown")

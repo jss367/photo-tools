@@ -5,6 +5,8 @@ import sys
 import threading
 import time
 
+import pytest
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 sys.path.insert(0, os.path.dirname(__file__))
 
@@ -31,6 +33,33 @@ def test_job_runner_starts_and_completes(tmp_path):
     assert job['status'] == 'completed'
     assert job['result'] == {'items': 3}
     assert job['progress']['current'] == 3
+
+
+def test_job_runner_shutdown_cancels_and_joins_workers():
+    """Teardown owns worker lifetime and refuses work after it begins."""
+    from jobs import JobRunner
+
+    runner = JobRunner()
+    started = threading.Event()
+    stopped = threading.Event()
+
+    def work(job):
+        started.set()
+        while not runner.cancellation_requested(job["id"]):
+            time.sleep(0.01)
+        stopped.set()
+        return {}
+
+    job_id = runner.start("test", work)
+    assert started.wait(timeout=2)
+
+    assert runner.shutdown(timeout=2) is True
+    assert stopped.is_set()
+    assert runner.get(job_id)["status"] == "cancelled"
+    assert not runner._worker_threads
+
+    with pytest.raises(RuntimeError, match="shut down"):
+        runner.start("late", lambda _job: {})
 
 
 def _wait_for_status(runner, job_id, status, timeout=3.0):

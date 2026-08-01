@@ -34,6 +34,20 @@ _JOB_RETENTION_SECS = 3600  # 1 hour
 _PROMOTION_RETRY_DELAY_SECS = 0.1
 
 
+class _TrackedJobThread(threading.Thread):
+    """A normal job thread that reports when its target has fully returned."""
+
+    def __init__(self, *args, on_finish, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._on_finish = on_finish
+
+    def run(self):
+        try:
+            super().run()
+        finally:
+            self._on_finish(self)
+
+
 # Maximum number of pipeline jobs allowed to run concurrently. Bumped
 # to 2 in Step 6 of the concurrency rollout (Steps 1-3 added the
 # ModelCache + GPU/regroup locks that make this safe; Steps 4-5 added
@@ -92,10 +106,101 @@ class JobRunner:
         # millisecond don't collide on the PRIMARY KEY.
         self._enqueue_counter = 0
         self._promotion_retry_scheduled = False
+        # Worker ownership is explicit.  Daemon threads alone are not a
+        # lifecycle: short-lived create_app() callers (especially tests) must
+        # be able to cancel and join their work before tearing down databases
+        # and process-wide monkeypatches.
+        self._worker_threads = set()
+        self._shutting_down = False
         if db:
             self._db_path = db.conn.execute("PRAGMA database_list").fetchone()[2]
             self._ensure_history_table(db)
             self._startup_sweep(db)
+
+    def _start_worker_thread(self, job, work_fn):
+        """Start and retain a worker until its complete cleanup finishes.
+
+        Returns False when shutdown won the race with a caller that had
+        already registered a job but had not started its thread yet.
+        """
+        def forget_thread(thread):
+            with self._lock:
+                self._worker_threads.discard(thread)
+
+        thread = _TrackedJobThread(
+            target=self._run_job,
+            args=(job, work_fn),
+            on_finish=forget_thread,
+            daemon=True,
+            name=f"vireo-job-{job['id']}",
+        )
+        with self._lock:
+            if self._shutting_down:
+                return False
+            self._worker_threads.add(thread)
+            # Start while still holding the ownership lock. shutdown() can
+            # therefore never take a snapshot between registration and start.
+            thread.start()
+        return True
+
+    def _discard_unstarted_job(self, job_id):
+        """Remove a job whose worker lost the race with shutdown()."""
+        with self._lock:
+            self._jobs.pop(job_id, None)
+            self._events.pop(job_id, None)
+            self._subscribers.pop(job_id, None)
+            self._cancelled.discard(job_id)
+            self._pause_requested.discard(job_id)
+            self._uncancellable.discard(job_id)
+
+    def shutdown(self, timeout=10.0):
+        """Stop accepting work, request cancellation, and join workers.
+
+        Cancellation is cooperative: work functions must reach an
+        ``is_cancelled``/``cancellation_requested`` checkpoint before their
+        thread can exit. Returns False when one or more workers remain alive
+        after *timeout*, allowing callers such as pytest fixtures to fail at
+        the test that leaked the work instead of contaminating the next one.
+        """
+        if timeout < 0:
+            raise ValueError("timeout must be non-negative")
+
+        with self._pause_condition:
+            self._shutting_down = True
+            queued_ids = list(self._queued_pipelines)
+            for job_id, job in self._jobs.items():
+                if (
+                    job.get("status") in ("running", "pausing", "paused")
+                    and job_id not in self._uncancellable
+                ):
+                    self._cancelled.add(job_id)
+                    self._pause_requested.discard(job_id)
+            # A paused worker must wake before it can observe cancellation.
+            self._pause_condition.notify_all()
+
+        # Queued jobs have persisted state to transition as well as in-memory
+        # contexts to remove. Do that outside the runner lock.
+        for job_id in queued_ids:
+            self.cancel_job(job_id, promote_after_cancel=False)
+
+        deadline = time.monotonic() + timeout
+        current = threading.current_thread()
+        while True:
+            with self._lock:
+                threads = [
+                    thread for thread in self._worker_threads
+                    if thread is not current and thread.is_alive()
+                ]
+            if not threads:
+                return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                log.warning(
+                    "JobRunner shutdown timed out with %d worker(s) alive: %s",
+                    len(threads), ", ".join(thread.name for thread in threads),
+                )
+                return False
+            threads[0].join(timeout=remaining)
 
     def _ensure_history_table(self, db):
         db.conn.execute(
@@ -182,6 +287,8 @@ class JobRunner:
         Returns the job id.
         """
         with self._lock:
+            if self._shutting_down:
+                raise RuntimeError("JobRunner is shut down")
             self._enqueue_counter += 1
             seq = self._enqueue_counter
         job_id = f"pipeline-{int(time.time() * 1000)}-{seq}"
@@ -213,6 +320,15 @@ class JobRunner:
                 "runtime_warning": runtime_warning,
                 "started_at": now_iso,
             }
+            shutdown_raced = self._shutting_down
+
+        # The database insert happens outside the runner lock. shutdown() may
+        # begin in that window after the initial admission check; publish a
+        # terminal cancellation instead of leaving a queued row behind after
+        # the runner has already reported itself drained.
+        if shutdown_raced:
+            self.cancel_job(job_id, promote_after_cancel=False)
+            raise RuntimeError("JobRunner is shut down")
 
         # Promote eagerly so a free slot is filled before we return.
         self._try_promote_queued()
@@ -227,6 +343,8 @@ class JobRunner:
         lands first, rowcount==0 and promotion quietly gives up.
         """
         with self._lock:
+            if self._shutting_down:
+                return
             active = sum(
                 1 for j in self._jobs.values()
                 if (
@@ -345,18 +463,36 @@ class JobRunner:
             self._try_promote_queued()
             return
 
-        thread = threading.Thread(
-            target=self._run_job, args=(job, work_fn), daemon=True,
-        )
         log.info("Job %s started type=pipeline", job["id"])
-        thread.start()
+        if not self._start_worker_thread(job, work_fn):
+            # shutdown() marked the installed job for cancellation while it
+            # sat between promotion and thread start. Record the terminal row
+            # here because this promoted pipeline was already persisted as
+            # running before its in-memory worker registration existed.
+            now = datetime.now().isoformat()
+            with self._lock:
+                job["status"] = "cancelled"
+                job["finished_at"] = now
+                job["_ended_at"] = time.time()
+                self._cancelled.discard(job["id"])
+            self.push_event(job["id"], "complete", {
+                "job_id": job["id"],
+                "job_type": job["type"],
+                "status": "cancelled",
+                "result": None,
+                "duration": 0.0,
+                "errors": [],
+            })
+            if self._db_path:
+                self._persist_job(job, 0.0)
+            job["_persisted"] = True
 
     def _schedule_promotion_retry_locked(self):
         """Retry queue promotion after a transient DB failure.
 
         Must be called with self._lock held.
         """
-        if self._promotion_retry_scheduled:
+        if self._promotion_retry_scheduled or self._shutting_down:
             return
         self._promotion_retry_scheduled = True
 
@@ -364,6 +500,8 @@ class JobRunner:
             time.sleep(_PROMOTION_RETRY_DELAY_SECS)
             with self._lock:
                 self._promotion_retry_scheduled = False
+                if self._shutting_down:
+                    return
             self._try_promote_queued()
 
         thread = threading.Thread(target=retry, daemon=True)
@@ -436,11 +574,10 @@ class JobRunner:
             counts_for_badge=counts_for_badge, pausable=pausable,
             blocks_local_transitions=blocks_local_transitions,
         )
-        thread = threading.Thread(
-            target=self._run_job, args=(job, work_fn), daemon=True
-        )
         log.info("Job %s started type=%s", job["id"], job_type)
-        thread.start()
+        if not self._start_worker_thread(job, work_fn):
+            self._discard_unstarted_job(job["id"])
+            raise RuntimeError("JobRunner is shut down")
         return job["id"]
 
     def _make_job_dict(self, job_id, job_type, *, config, workspace_id,
@@ -491,6 +628,8 @@ class JobRunner:
         # the second registration overwrite the first in _jobs/_events and
         # clobber its history row.
         with self._lock:
+            if self._shutting_down:
+                raise RuntimeError("JobRunner is shut down")
             self._enqueue_counter += 1
             seq = self._enqueue_counter
             job_id = f"{job_type}-{int(time.time() * 1000)}-{seq}"
@@ -555,6 +694,8 @@ class JobRunner:
         # Compute the joined snapshot / register a new job under one lock
         # acquisition so the check-and-start is genuinely atomic.
         with self._lock:
+            if self._shutting_down:
+                raise RuntimeError("JobRunner is shut down")
             existing_id, existing = self._find_singleton_locked(
                 job_type, singleton_key,
             )
@@ -580,14 +721,13 @@ class JobRunner:
             self._events[job_id] = deque(maxlen=1000)
             self._subscribers[job_id] = []
 
-        thread = threading.Thread(
-            target=self._run_job, args=(job, work_fn), daemon=True,
-        )
         log.info(
             "Job %s started type=%s singleton_key=%s",
             job_id, job_type, singleton_key,
         )
-        thread.start()
+        if not self._start_worker_thread(job, work_fn):
+            self._discard_unstarted_job(job_id)
+            raise RuntimeError("JobRunner is shut down")
         return job_id, False, None
 
     def _prune_finished_jobs(self):

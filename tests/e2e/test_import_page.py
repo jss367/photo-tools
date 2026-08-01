@@ -3137,6 +3137,11 @@ def test_hide_duplicates_does_not_re_request_the_thumbnails_per_click(
     _stub_preview(page, files)
     _preview(page)
 
+    # _preview() returns as soon as the grid is visible, while the thumbnail
+    # scheduler may still be draining its initial queue.  Start measuring only
+    # after those requests have settled so they cannot be mistaken for work
+    # caused by the selection clicks below.
+    expect(page.locator(".import-preview-thumb.skeleton")).to_have_count(0)
     hits = []
     page.on("request", lambda r: hits.append(r.url)
             if "folder-preview/thumbnail" in r.url else None)

@@ -3866,6 +3866,16 @@ def _stub_snapshot_import(page, files):
     initNewImagesImport() runs from the page's own load handler, so a
     fetch stub installed after goto() would arrive too late.
     """
+    # initImportPage() waits for volume suggestions before it follows the
+    # new_images deep link.  The real endpoint probes the host and can take
+    # longer than Playwright's five-second assertion timeout, even though
+    # volumes have nothing to do with snapshot imports.  Keep this helper
+    # isolated from that machine-dependent prerequisite.
+    page.route(
+        "**/api/volumes",
+        lambda route: route.fulfill(
+            status=200, content_type="application/json", body="[]"),
+    )
     page.route(
         "**/api/workspaces/active/new-images/snapshot/42",
         lambda route: route.fulfill(

@@ -4126,11 +4126,21 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
     app._log_broadcaster = LogBroadcaster(buffer_size=500)
     app._log_broadcaster.install()
 
-    def _cleanup_app_resources():
-        with contextlib.suppress(Exception):
+    def _cleanup_app_resources(job_timeout=10.0):
+        try:
+            jobs_stopped = app._job_runner.shutdown(timeout=job_timeout)
+        except Exception:
+            jobs_stopped = False
+            log.exception("Failed to shut down background jobs cleanly")
+        try:
             app._log_broadcaster.uninstall()
-        with contextlib.suppress(Exception):
+        except Exception:
+            log.exception("Failed to uninstall log broadcaster during cleanup")
+        try:
             init_db.close()
+        except Exception:
+            log.exception("Failed to close database during cleanup")
+        return jobs_stopped
 
     app._cleanup_app_resources = _cleanup_app_resources
 

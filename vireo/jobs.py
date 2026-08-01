@@ -165,6 +165,12 @@ class JobRunner:
         if timeout < 0:
             raise ValueError("timeout must be non-negative")
 
+        # Start the deadline clock BEFORE queued cancellation. cancel_job's
+        # SQLite write uses a 30s connection timeout, so a locked db would
+        # otherwise let one queued cancellation burn the whole shutdown
+        # budget with the join phase never running.
+        deadline = time.monotonic() + timeout
+
         with self._pause_condition:
             self._shutting_down = True
             queued_ids = list(self._queued_pipelines)
@@ -179,11 +185,25 @@ class JobRunner:
             self._pause_condition.notify_all()
 
         # Queued jobs have persisted state to transition as well as in-memory
-        # contexts to remove. Do that outside the runner lock.
-        for job_id in queued_ids:
-            self.cancel_job(job_id, promote_after_cancel=False)
+        # contexts to remove. Do that outside the runner lock. Contain any
+        # cancel_job failure (e.g. OperationalError from a locked SQLite db)
+        # and stop iterating once the deadline is exhausted so we always
+        # reach the worker join phase below.
+        for index, job_id in enumerate(queued_ids):
+            if time.monotonic() >= deadline:
+                log.warning(
+                    "JobRunner shutdown timed out cancelling queued jobs; "
+                    "%d queued job(s) left uncancelled",
+                    len(queued_ids) - index,
+                )
+                break
+            try:
+                self.cancel_job(job_id, promote_after_cancel=False)
+            except Exception:
+                log.exception(
+                    "Failed to cancel queued job %s during shutdown", job_id,
+                )
 
-        deadline = time.monotonic() + timeout
         current = threading.current_thread()
         while True:
             with self._lock:

@@ -62,6 +62,62 @@ def test_job_runner_shutdown_cancels_and_joins_workers():
         runner.start("late", lambda _job: {})
 
 
+def test_shutdown_bounded_by_timeout_when_queued_cancel_stalls():
+    """A slow/raising cancel_job must not consume the join budget."""
+    from jobs import JobRunner
+
+    runner = JobRunner()
+
+    started = threading.Event()
+    stopped = threading.Event()
+
+    def work(job):
+        started.set()
+        while not runner.cancellation_requested(job["id"]):
+            time.sleep(0.01)
+        stopped.set()
+        return {}
+
+    running_id = runner.start("test", work)
+    assert started.wait(timeout=2)
+
+    # Simulate queued pipelines whose cancellation blocks or raises the way
+    # a locked SQLite database would. cancel_job's real db path uses a 30s
+    # connect timeout; without deadline containment shutdown would inherit
+    # that delay per queued job and skip the join phase on exceptions.
+    with runner._lock:
+        for i in range(3):
+            runner._queued_pipelines[f"queued-{i}"] = {
+                "work_fn": lambda _job: {},
+                "config": {},
+                "workspace_id": None,
+                "runtime_warning": None,
+                "started_at": "now",
+            }
+
+    cancel_calls = []
+
+    def slow_and_raising_cancel(job_id, expected_status=None,
+                                promote_after_cancel=True):
+        cancel_calls.append(job_id)
+        time.sleep(1.0)
+        raise RuntimeError("simulated locked-db failure")
+
+    runner.cancel_job = slow_and_raising_cancel
+
+    start = time.monotonic()
+    stopped_cleanly = runner.shutdown(timeout=1.5)
+    elapsed = time.monotonic() - start
+
+    assert stopped_cleanly is True
+    assert stopped.is_set()
+    assert runner.get(running_id)["status"] == "cancelled"
+    # At least one queued cancel was attempted; the deadline stopped the
+    # rest and the raised exception did not skip the worker join.
+    assert cancel_calls, "expected at least one queued cancellation attempt"
+    assert elapsed < 3.0, f"shutdown exceeded bounded budget: {elapsed:.2f}s"
+
+
 def _wait_for_status(runner, job_id, status, timeout=3.0):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:

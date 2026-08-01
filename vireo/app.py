@@ -4132,10 +4132,14 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         except Exception:
             jobs_stopped = False
             log.exception("Failed to shut down background jobs cleanly")
-        with contextlib.suppress(Exception):
+        try:
             app._log_broadcaster.uninstall()
-        with contextlib.suppress(Exception):
+        except Exception:
+            log.exception("Failed to uninstall log broadcaster during cleanup")
+        try:
             init_db.close()
+        except Exception:
+            log.exception("Failed to close database during cleanup")
         return jobs_stopped
 
     app._cleanup_app_resources = _cleanup_app_resources

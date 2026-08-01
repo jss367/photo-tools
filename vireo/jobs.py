@@ -165,12 +165,9 @@ class JobRunner:
         if timeout < 0:
             raise ValueError("timeout must be non-negative")
 
-        # Start the deadline clock BEFORE queued cancellation. cancel_job's
-        # SQLite write uses a 30s connection timeout, so a locked db would
-        # otherwise let one queued cancellation burn the whole shutdown
-        # budget with the join phase never running.
+        # Start the deadline clock before queued cancellation so database-lock
+        # waits and worker joins share the caller's shutdown budget.
         deadline = time.monotonic() + timeout
-
         with self._pause_condition:
             self._shutting_down = True
             queued_ids = list(self._queued_pipelines)
@@ -185,12 +182,13 @@ class JobRunner:
             self._pause_condition.notify_all()
 
         # Queued jobs have persisted state to transition as well as in-memory
-        # contexts to remove. Do that outside the runner lock. Contain any
-        # cancel_job failure (e.g. OperationalError from a locked SQLite db)
-        # and stop iterating once the deadline is exhausted so we always
-        # reach the worker join phase below.
+        # contexts to remove. Do that outside the runner lock, bounding each
+        # SQLite lock wait by the time left for the whole shutdown.
+        queued_cancelled = True
         for index, job_id in enumerate(queued_ids):
-            if time.monotonic() >= deadline:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                queued_cancelled = False
                 log.warning(
                     "JobRunner shutdown timed out cancelling queued jobs; "
                     "%d queued job(s) left uncancelled",
@@ -198,8 +196,13 @@ class JobRunner:
                 )
                 break
             try:
-                self.cancel_job(job_id, promote_after_cancel=False)
+                self.cancel_job(
+                    job_id,
+                    promote_after_cancel=False,
+                    db_timeout=remaining,
+                )
             except Exception:
+                queued_cancelled = False
                 log.exception(
                     "Failed to cancel queued job %s during shutdown", job_id,
                 )
@@ -212,7 +215,7 @@ class JobRunner:
                     if thread is not current and thread.is_alive()
                 ]
             if not threads:
-                return True
+                return queued_cancelled
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 log.warning(
@@ -524,7 +527,17 @@ class JobRunner:
                     return
             self._try_promote_queued()
 
-        thread = threading.Thread(target=retry, daemon=True)
+        def forget_thread(thread):
+            with self._lock:
+                self._worker_threads.discard(thread)
+
+        thread = _TrackedJobThread(
+            target=retry,
+            on_finish=forget_thread,
+            daemon=True,
+            name="vireo-promotion-retry",
+        )
+        self._worker_threads.add(thread)
         thread.start()
 
     def _record_terminal_queued_pipeline(self, job_id, ctx, status="cancelled"):
@@ -1306,7 +1319,13 @@ class JobRunner:
                             step[key] = kwargs[key]
                     break
 
-    def cancel_job(self, job_id, expected_status=None, promote_after_cancel=True):
+    def cancel_job(
+        self,
+        job_id,
+        expected_status=None,
+        promote_after_cancel=True,
+        db_timeout=30.0,
+    ):
         """Request cancellation of a running OR queued job.
 
         For running jobs: the work function should periodically check
@@ -1327,6 +1346,7 @@ class JobRunner:
                 removing a queued job. Bulk queued cancellation sets this False
                 so the whole snapshot can be cancelled before another queued job
                 is promoted.
+            db_timeout: maximum time to wait for a locked history database.
 
         Returns True if the job was found and either marked for
         cancellation (running) or transitioned to cancelled (queued).
@@ -1370,7 +1390,7 @@ class JobRunner:
         cancelled = True
         if self._db_path:
             import sqlite3
-            conn = sqlite3.connect(self._db_path, timeout=30)
+            conn = sqlite3.connect(self._db_path, timeout=max(0.0, db_timeout))
             try:
                 cur = conn.execute(
                     "UPDATE job_history "

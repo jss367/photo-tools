@@ -52,6 +52,8 @@ def test_job_runner_shutdown_cancels_and_joins_workers():
 
     job_id = runner.start("test", work)
     assert started.wait(timeout=2)
+    with runner._lock:
+        runner._schedule_promotion_retry_locked()
 
     assert runner.shutdown(timeout=2) is True
     assert stopped.is_set()
@@ -62,60 +64,34 @@ def test_job_runner_shutdown_cancels_and_joins_workers():
         runner.start("late", lambda _job: {})
 
 
-def test_shutdown_bounded_by_timeout_when_queued_cancel_stalls():
-    """A slow/raising cancel_job must not consume the join budget."""
+def test_job_runner_shutdown_joins_after_queued_cancel_failure(monkeypatch):
+    """A locked queued row cannot bypass the bounded worker join."""
     from jobs import JobRunner
 
     runner = JobRunner()
-
-    started = threading.Event()
     stopped = threading.Event()
 
     def work(job):
-        started.set()
         while not runner.cancellation_requested(job["id"]):
             time.sleep(0.01)
         stopped.set()
-        return {}
 
-    running_id = runner.start("test", work)
-    assert started.wait(timeout=2)
+    runner.start("test", work)
+    runner._queued_pipelines["queued"] = {}
+    observed_timeouts = []
 
-    # Simulate queued pipelines whose cancellation blocks or raises the way
-    # a locked SQLite database would. cancel_job's real db path uses a 30s
-    # connect timeout; without deadline containment shutdown would inherit
-    # that delay per queued job and skip the join phase on exceptions.
-    with runner._lock:
-        for i in range(3):
-            runner._queued_pipelines[f"queued-{i}"] = {
-                "work_fn": lambda _job: {},
-                "config": {},
-                "workspace_id": None,
-                "runtime_warning": None,
-                "started_at": "now",
-            }
+    def fail_cancel(_job_id, *, promote_after_cancel, db_timeout):
+        observed_timeouts.append(db_timeout)
+        raise RuntimeError("database is locked")
 
-    cancel_calls = []
+    monkeypatch.setattr(runner, "cancel_job", fail_cancel)
 
-    def slow_and_raising_cancel(job_id, expected_status=None,
-                                promote_after_cancel=True):
-        cancel_calls.append(job_id)
-        time.sleep(1.0)
-        raise RuntimeError("simulated locked-db failure")
-
-    runner.cancel_job = slow_and_raising_cancel
-
-    start = time.monotonic()
-    stopped_cleanly = runner.shutdown(timeout=1.5)
-    elapsed = time.monotonic() - start
-
-    assert stopped_cleanly is True
+    assert runner.shutdown(timeout=2) is False
     assert stopped.is_set()
-    assert runner.get(running_id)["status"] == "cancelled"
-    # At least one queued cancel was attempted; the deadline stopped the
-    # rest and the raised exception did not skip the worker join.
-    assert cancel_calls, "expected at least one queued cancellation attempt"
-    assert elapsed < 3.0, f"shutdown exceeded bounded budget: {elapsed:.2f}s"
+    assert observed_timeouts and 0 < observed_timeouts[0] <= 2
+    assert not runner._worker_threads
+    with runner._lock:
+        runner._queued_pipelines.clear()
 
 
 def _wait_for_status(runner, job_id, status, timeout=3.0):

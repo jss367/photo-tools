@@ -1583,18 +1583,16 @@ body.sidebar-resizing {
       <button onclick="batchSetRating(5)" style="background:var(--bg-tertiary);color:var(--warning);border:none;border-radius:3px;padding:4px 8px;font-size:12px;cursor:pointer;">&#9733;5</button>
       <button onclick="batchSetFlag('flagged')" style="background:var(--bg-tertiary);color:var(--accent);border:none;border-radius:3px;padding:4px 8px;font-size:12px;cursor:pointer;">Flag</button>
       <button onclick="batchSetFlag('rejected')" style="background:var(--bg-tertiary);color:var(--danger);border:none;border-radius:3px;padding:4px 8px;font-size:12px;cursor:pointer;">Reject</button>
+      <span style="width:1px;height:20px;background:var(--border-primary);"></span>
       <button onclick="batchAddKeyword()" style="background:var(--bg-tertiary);color:var(--text-secondary);border:none;border-radius:3px;padding:4px 8px;font-size:12px;cursor:pointer;">+ Keyword</button>
-      <button id="resolveGpsSelectedBtn" onclick="reviewLocationsForSelection()" title="Review selected photo coordinates on a map and assign friendly place names" style="background:var(--bg-tertiary);color:var(--accent);border:1px solid var(--accent);border-radius:3px;padding:4px 8px;font-size:12px;cursor:pointer;">Review on Map</button>
       <button onclick="addToCollection()" style="background:var(--bg-tertiary);color:var(--info);border:none;border-radius:3px;padding:4px 8px;font-size:12px;cursor:pointer;">+ Collection</button>
+      <span style="width:1px;height:20px;background:var(--border-primary);"></span>
       <button id="compareBtn" onclick="openBrowseCompare()" title="Compare two selected photos side by side" style="display:none;background:var(--bg-tertiary);color:var(--accent);border:1px solid var(--accent);border-radius:3px;padding:4px 8px;font-size:12px;cursor:pointer;">Compare</button>
-      <button id="bestBatchBtn" onclick="openBestBatch()" title="Find and rank neighboring frames around the selected photo" style="display:none;background:var(--bg-tertiary);color:var(--accent);border:1px solid var(--accent);border-radius:3px;padding:4px 8px;font-size:12px;cursor:pointer;">Best Batch</button>
       <button id="burstReviewBtn" onclick="openSelectedInBurstReview()" title="Open selected photos in burst review" style="display:none;background:var(--bg-tertiary);color:var(--accent);border:1px solid var(--accent);border-radius:3px;padding:4px 8px;font-size:12px;cursor:pointer;">Review Burst</button>
-      <button id="prepareFullResolutionBtn" onclick="prepareFullResolutionSelection()" title="Cache originals and full-resolution renders before inspecting detail" style="background:var(--bg-tertiary);color:var(--accent);border:1px solid var(--accent);border-radius:3px;padding:4px 8px;font-size:12px;cursor:pointer;">Prepare Full Resolution</button>
-      <button id="developBtn" onclick="developSelected()" title="Develop selected RAW photos with darktable" style="background:var(--bg-tertiary);color:var(--text-secondary);border:none;border-radius:3px;padding:4px 8px;font-size:12px;cursor:pointer;">Develop</button>
-      <button onclick="batchSubmitInat()" style="background:var(--bg-tertiary);color:#74ac00;border:none;border-radius:3px;padding:4px 8px;font-size:12px;cursor:pointer;">iNaturalist</button>
-      <button onclick="makeAvailableOffline()" style="background:var(--bg-tertiary);color:var(--text-secondary);border:none;border-radius:3px;padding:4px 8px;font-size:12px;cursor:pointer;">Make Offline</button>
+      <span style="width:1px;height:20px;background:var(--border-primary);"></span>
       <button onclick="openExportModal()" style="background:var(--bg-tertiary);color:var(--text-secondary);border:none;border-radius:3px;padding:4px 8px;font-size:12px;cursor:pointer;">Export</button>
       <button onclick="batchDelete()" style="background:var(--danger);color:white;border:none;border-radius:3px;padding:4px 8px;font-size:12px;cursor:pointer;" title="Delete selected photos">Delete</button>
+      <button id="batchMoreBtn" onclick="openBatchMoreMenu(this)" title="All actions for the selected photos — same menu as right-click" style="background:var(--bg-tertiary);color:var(--text-secondary);border:1px solid var(--border-secondary);border-radius:3px;padding:4px 8px;font-size:12px;cursor:pointer;font-weight:600;">More &#9662;</button>
       <button onclick="clearSelection()" style="background:none;color:var(--text-faint);border:none;padding:4px 8px;font-size:12px;cursor:pointer;margin-left:auto;">Clear</button>
     </div>
 
@@ -8669,6 +8667,7 @@ function buildPhotoContextMenu(photoIds) {
       colorChip('yellow', '\u25CF', 'Yellow'),
       colorChip('green', '\u25CF', 'Green'),
       colorChip('blue', '\u25CF', 'Blue'),
+      colorChip('purple', '\u25CF', 'Purple'),
     ] },
     { chips: [
       flagChip('flagged', '\u2691', 'Flag as pick'),
@@ -8680,17 +8679,19 @@ function buildPhotoContextMenu(photoIds) {
       onClick: function() { if (typeof findSimilar === 'function') findSimilar(photoIds[0]); } },
     { label: 'View on Map', disabled: !one, disabledHint: hint,
       onClick: function() { viewPhotoOnMap(photoIds[0]); } },
+    { label: 'Review on Map',
+      onClick: function() { reviewLocationsForSelection(); } },
     { label: 'Compare', disabled: photoIds.length < 2, disabledHint: 'Select at least two photos',
       onClick: function() { openBrowseCompare(); } },
     { label: 'Best Batch',
       onClick: function() { openBestBatchForIds(photoIds, photoIds[0]); } },
     { label: 'Review Burst', disabled: photoIds.length < 2, disabledHint: 'Select at least two photos',
       onClick: function() { openSelectedInBurstReview(); } },
-    { label: 'Prepare Full Resolution',
-      onClick: function() { prepareFullResolutionSelection(photoIds); } },
     { separator: true },
     { label: 'Edit Photo', disabled: !one, disabledHint: hint,
       onClick: function() { openPhotoEditor(photoIds[0]); } },
+    { label: 'Develop',
+      onClick: function() { developSelected(); } },
   ].concat(buildOpenInEditorMenuItems(photoIds)).concat([
     { label: window.VIREO_REVEAL_LABEL, disabled: !one, disabledHint: hint,
       onClick: function() { revealPhoto(photoIds[0]); } },
@@ -8708,8 +8709,25 @@ function buildPhotoContextMenu(photoIds) {
   })).concat([
     { label: 'Adjust Capture Time\u2026', onClick: function() { openCaptureTimeModal(); } },
     { separator: true },
+    { label: 'Send to iNaturalist', onClick: function() { batchSubmitInat(); } },
+    { label: 'Make Offline', onClick: function() { makeAvailableOffline(); } },
+    { label: 'Prepare Full Resolution',
+      onClick: function() { prepareFullResolutionSelection(photoIds); } },
+    { label: 'Export\u2026', onClick: function() { openExportModal(); } },
+    { separator: true },
     { label: 'Delete', onClick: function() { batchDelete(); } },
   ]);
+}
+
+// The More button on the batch bar opens the same menu as right-click on a
+// card, anchored under the button. openContextMenu only reads clientX/Y and
+// clamps to the viewport, so a synthetic event object is enough.
+function openBatchMoreMenu(btn) {
+  var ids = getActiveSelection();
+  if (!ids.length) return;
+  var r = btn.getBoundingClientRect();
+  openContextMenu({ clientX: r.left, clientY: r.bottom + 4 },
+                  buildPhotoContextMenu(ids));
 }
 
 // Document-level delegation: grids re-render on sort/filter/scroll, so

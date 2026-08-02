@@ -60,6 +60,32 @@ def test_browse_page(app_and_db):
     ) == 5
 
 
+def test_browse_slim_batch_bar_and_unified_menu(app_and_db):
+    """The batch bar keeps only high-frequency verbs plus More; the photo
+    context menu is the complete action surface (spec
+    docs/superpowers/specs/2026-08-02-browse-batch-bar-unified-menu-design.md)."""
+    app, _ = app_and_db
+    html = app.test_client().get('/browse').get_data(as_text=True)
+    # More button opens the unified menu
+    assert 'id="batchMoreBtn"' in html
+    assert 'function openBatchMoreMenu(' in html
+    # Bar-only buttons that moved into the menu are gone from the bar
+    for removed in ('id="resolveGpsSelectedBtn"', 'id="bestBatchBtn"',
+                    'id="prepareFullResolutionBtn"', 'id="developBtn"'):
+        assert removed not in html
+    # The five former bar-only actions now exist as menu items
+    for label in ("label: 'Review on Map'", "label: 'Develop'",
+                  "label: 'Send to iNaturalist'", "label: 'Make Offline'",
+                  "label: 'Export\\u2026'"):
+        assert label in html
+    # Purple joins the menu's color chip row
+    assert "colorChip('purple'" in html
+    # Kept on the bar: Compare, Review Burst, Export, Delete
+    for kept in ('id="compareBtn"', 'id="burstReviewBtn"',
+                 'onclick="openExportModal()"', 'onclick="batchDelete()"'):
+        assert kept in html
+
+
 def test_browse_discloses_raw_jpeg_pairs_and_offers_source_switch(app_and_db):
     """The paired-file behavior must be discoverable in Browse rather than
     existing only as an internal ``companion_path`` or delete-dialog detail."""

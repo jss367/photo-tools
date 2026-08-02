@@ -3789,7 +3789,7 @@ def test_move_to_volume_trash_renames_without_finder(monkeypatch, tmp_path):
     monkeypatch.setattr(
         app_module, "_volume_root_for_path", lambda _path: str(volume),
     )
-    monkeypatch.setattr(app_module.os, "getuid", lambda: 501)
+    monkeypatch.setattr(app_module.os, "getuid", lambda: 501, raising=False)
 
     assert app_module._move_to_volume_trash(str(source)) is True
     assert not source.exists()

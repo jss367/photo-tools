@@ -4076,6 +4076,101 @@ def test_trash_paths_marks_success_when_send2trash_reports_after_move(
     assert failures == []
 
 
+def test_path_confirmed_gone_rejects_stale_mount_point_directory(
+    monkeypatch, tmp_path,
+):
+    """When a managed folder is itself a mount point (e.g. /mnt/photos) and
+    the network volume disconnects, the local mount-point directory can
+    remain on the underlying local filesystem. ``os.path.isdir`` then
+    still returns True even though the actual volume is gone. Compare the
+    pre-op ``st_dev`` snapshot against the post-op device so the file is
+    not falsely accepted as ``gone``.
+    """
+    import app as app_module
+
+    mount_root = tmp_path / "mnt_photos"
+    mount_root.mkdir()
+    photo = mount_root / "bird.NEF"
+    photo.write_bytes(b"raw")
+
+    baseline_dev = app_module._snapshot_parent_device(str(photo))
+    assert baseline_dev is not None
+
+    # The file appears gone (the "disconnect" symptom) but the parent
+    # directory is still stat'able on a different device (the mount point
+    # replaced by the underlying local FS).
+    photo.unlink()
+    real_stat = os.stat
+
+    def stat_with_shifted_dev(path, *args, **kwargs):
+        result = real_stat(path, *args, **kwargs)
+        if os.path.normpath(path) == os.path.normpath(str(mount_root)):
+            class _Shifted:
+                st_dev = baseline_dev + 1
+                st_mode = result.st_mode
+            return _Shifted()
+        return result
+
+    monkeypatch.setattr(app_module.os, "stat", stat_with_shifted_dev)
+
+    # Without the snapshot the legacy check accepts the file as gone.
+    assert app_module._path_confirmed_gone(str(photo)) is True
+    # With the snapshot it correctly refuses to accept the change.
+    assert app_module._path_confirmed_gone(
+        str(photo), expected_parent_dev=baseline_dev,
+    ) is False
+
+
+def test_trash_paths_rejects_success_when_mount_replaced_by_local_fs(
+    monkeypatch, tmp_path,
+):
+    """A send2trash that raises after the mount vanished but left the
+    mount-point directory behind must be reported as a failure, not as a
+    successful trash.
+    """
+    import app as app_module
+    import send2trash
+
+    mount_root = tmp_path / "SMB_Share"
+    mount_root.mkdir()
+    photo = mount_root / "bird.NEF"
+    photo.write_bytes(b"raw")
+
+    baseline_dev = os.stat(str(mount_root)).st_dev
+    monkeypatch.setattr(app_module.sys, "platform", "linux")
+    monkeypatch.setattr(app_module, "_move_to_volume_trash", lambda _p: False)
+
+    real_stat = os.stat
+
+    def mount_disconnect_after_send2trash(path):
+        # Simulate the mount vanishing during send2trash: the file is gone
+        # but the mount-point directory remains, backed by a different
+        # underlying device.
+        os.unlink(path)
+
+        def stat_with_shifted_dev(target, *args, **kwargs):
+            result = real_stat(target, *args, **kwargs)
+            if os.path.normpath(target) == os.path.normpath(str(mount_root)):
+                class _Shifted:
+                    st_dev = baseline_dev + 1
+                    st_mode = result.st_mode
+                return _Shifted()
+            return result
+
+        monkeypatch.setattr(app_module.os, "stat", stat_with_shifted_dev)
+        raise OSError("Network volume unavailable")
+
+    monkeypatch.setattr(
+        send2trash, "send2trash", mount_disconnect_after_send2trash,
+    )
+
+    moved, successful, failures = app_module._trash_paths([str(photo)])
+
+    assert moved == 0
+    assert successful == set()
+    assert [failure["path"] for failure in failures] == [str(photo)]
+
+
 def test_navbar_js_fallbacks_match_python_constants():
     """The hardcoded fallback lists in _navbar.html must mirror the
     canonical Python lists. The navbar's JS uses these fallbacks when

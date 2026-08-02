@@ -19,6 +19,7 @@ import queue
 import re
 import secrets
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -1845,7 +1846,25 @@ def _trash_via_finder(filepaths, timeout=_FINDER_TRASH_TIMEOUT_SECS):
         raise OSError(result.stderr.strip() or f"Finder trash failed ({result.returncode})")
 
 
-def _path_confirmed_gone(filepath):
+def _snapshot_parent_device(filepath):
+    """Return the parent directory's ``st_dev`` for later mount verification.
+
+    Callers snapshot this before any deletion attempt and pass it to
+    :func:`_path_confirmed_gone` afterwards. A network mount that
+    disconnects mid-op leaves the mount-point directory visible on the
+    underlying local filesystem, so ``os.path.isdir`` alone reports the
+    parent as live even though the actual volume is gone. Comparing the
+    pre-op and post-op ``st_dev`` catches that drop. ``None`` means no
+    baseline could be captured, so the device check is skipped.
+    """
+    parent = os.path.dirname(filepath) or os.sep
+    try:
+        return os.stat(parent).st_dev
+    except OSError:
+        return None
+
+
+def _path_confirmed_gone(filepath, expected_parent_dev=None):
     """Return True only when the file is verifiably absent from a live volume.
 
     ``os.path.exists`` returning False is ambiguous on network volumes: it
@@ -1855,14 +1874,27 @@ def _path_confirmed_gone(filepath):
     mount comes back. Confirm both that the file is missing *and* that the
     parent directory is still reachable so a genuine live-volume delete is
     accepted while a mid-flight disconnect is preserved as a failure.
+
+    When ``expected_parent_dev`` is provided (from
+    :func:`_snapshot_parent_device`), also require the parent's current
+    ``st_dev`` to match — a network mount that vanishes can leave its
+    mount-point directory in place on the underlying local filesystem, so
+    the ``os.path.isdir`` check alone would incorrectly accept the file
+    as gone.
     """
     if os.path.exists(filepath):
         return False
     parent = os.path.dirname(filepath) or os.sep
     try:
-        return os.path.isdir(parent)
+        parent_stat = os.stat(parent)
     except OSError:
         return False
+    if not stat.S_ISDIR(parent_stat.st_mode):
+        return False
+    return not (
+        expected_parent_dev is not None
+        and parent_stat.st_dev != expected_parent_dev
+    )
 
 
 def _trash_paths(filepaths):
@@ -1878,6 +1910,12 @@ def _trash_paths(filepaths):
     moved = 0
     fallback = []
     preflight_errors = {}
+    # Snapshot each parent's st_dev before we touch anything. A network
+    # mount that vanishes mid-batch can leave the mount-point directory
+    # visible on the underlying local FS, so ``os.path.isdir`` alone would
+    # accept the file as gone. Comparing pre-op vs post-op st_dev catches
+    # the mount drop even when the directory still stats cleanly.
+    parent_devs = {path: _snapshot_parent_device(path) for path in ordered}
 
     for filepath in ordered:
         if not os.path.isfile(filepath):
@@ -1885,10 +1923,11 @@ def _trash_paths(filepaths):
             # volumes — it also happens when the underlying stat fails
             # because the mount is already disconnected. Only treat the
             # path as "already gone" when the parent directory is still
-            # reachable; otherwise preserve as a failure so the caller
-            # doesn't prune the catalog row for a photo that reappears
-            # when the mount comes back.
-            if _path_confirmed_gone(filepath):
+            # reachable AND its device matches the pre-op snapshot;
+            # otherwise preserve as a failure so the caller doesn't prune
+            # the catalog row for a photo that reappears when the mount
+            # comes back.
+            if _path_confirmed_gone(filepath, parent_devs.get(filepath)):
                 log.warning("File already missing: %s", filepath)
                 successful.add(filepath)
             else:
@@ -1924,7 +1963,7 @@ def _trash_paths(filepaths):
                 # (the underlying stat fails), which would otherwise mask a
                 # real failure and prune the catalog row for a photo that
                 # reappears when the mount comes back.
-                if _path_confirmed_gone(filepath):
+                if _path_confirmed_gone(filepath, parent_devs.get(filepath)):
                     successful.add(filepath)
                     moved += 1
                     continue
@@ -1945,10 +1984,10 @@ def _trash_paths(filepaths):
         except Exception:
             log.warning("Finder Trash failed for a file batch", exc_info=True)
         for filepath in finder_batch:
-            # Only accept "gone" when the parent directory is still reachable;
-            # otherwise a stat failure from a disconnected mount would read
-            # as success.
-            if _path_confirmed_gone(filepath):
+            # Only accept "gone" when the parent directory is still reachable
+            # AND its device matches the pre-op snapshot; otherwise a stat
+            # against a stale/replaced mount point would read as success.
+            if _path_confirmed_gone(filepath, parent_devs.get(filepath)):
                 successful.add(filepath)
                 moved += 1
 
@@ -10442,6 +10481,14 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             successful = set()
             failures = []
             removed = 0
+            # Snapshot each parent's st_dev before deletion so a mount that
+            # vanishes mid-batch can be detected even when the mount point
+            # remains visible on the underlying local FS (see
+            # ``_snapshot_parent_device``).
+            parent_devs = {
+                path: _snapshot_parent_device(path)
+                for path in paths_to_change
+            }
             for filepath in paths_to_change:
                 if not os.path.isfile(filepath):
                     # Same live-parent gate as ``_trash_paths`` — a
@@ -10449,7 +10496,9 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     # return False, and treating that as "already gone"
                     # would prune the catalog row for a photo that
                     # reappears when the volume comes back.
-                    if _path_confirmed_gone(filepath):
+                    if _path_confirmed_gone(
+                        filepath, parent_devs.get(filepath),
+                    ):
                         log.warning("File already missing: %s", filepath)
                         successful.add(filepath)
                     else:

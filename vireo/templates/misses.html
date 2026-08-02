@@ -1751,8 +1751,17 @@ async function deleteSelectedMisses() {
     // dropping them from ``missesData`` would hide files still on disk until
     // reload. Callback receives the same ``data`` shape as other delete
     // callbacks: ``failed_photo_ids`` lists IDs kept intentionally.
+    //
+    // ``deleted_photo_ids`` (from the server) is the authoritative set of
+    // catalog rows that were actually removed and includes auto-expanded
+    // companion IDs the user never selected — reconcile against it so
+    // companion misses whose files were trashed successfully leave the
+    // list along with the primary. Older servers omit the key; fall back
+    // to the previous "selection minus retained" derivation.
     var retained = new Set((data && data.failed_photo_ids) || []);
-    var actuallyDeleted = ids.filter(function(id) { return !retained.has(id); });
+    var actuallyDeleted = data && Array.isArray(data.deleted_photo_ids)
+      ? data.deleted_photo_ids.slice()
+      : ids.filter(function(id) { return !retained.has(id); });
     // Match browse.html: retained IDs stay selected so the user can retry
     // immediately. clearSelection() would drop everything, including the
     // rows they still need to act on.

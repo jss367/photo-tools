@@ -10263,6 +10263,8 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             return {
                 "ok": True, "deleted": 0, "trashed": trashed,
                 "trash_failed": trash_failed,
+                "failed_photo_ids": [],
+                "deleted_photo_ids": [],
             }
 
         if not photo_ids:
@@ -10404,6 +10406,12 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 "trashed": 0,
                 "trash_failed": [],
                 "failed_photo_ids": [],
+                # Vireo-only mode can't partially fail: ``ids`` reflects
+                # every row (including auto-expanded companions) removed
+                # from the catalog. Clients reconcile against this list so
+                # companions that weren't part of the original selection
+                # still leave client state.
+                "deleted_photo_ids": list(result["ids"]),
             }
 
         # Disk modes resolve paths without changing SQLite. A photo's catalog
@@ -10610,6 +10618,12 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             "trashed": trashed,
             "trash_failed": trash_failed,
             "failed_photo_ids": failed_ids,
+            # Every id whose catalog row was actually removed, including
+            # auto-expanded companions the caller never explicitly selected.
+            # Clients reconcile grid/selection state against this so a
+            # companion row whose file was trashed successfully isn't left
+            # visible after its primary was retained (or vice versa).
+            "deleted_photo_ids": list(result["ids"]),
         }
 
     @app.route("/api/batch/delete", methods=["POST"])

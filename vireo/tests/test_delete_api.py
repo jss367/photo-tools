@@ -789,6 +789,105 @@ def test_api_batch_delete_companion_failure_does_not_move_primary(
     assert db.get_photo(photo["id"]) is not None
 
 
+def test_api_batch_delete_disk_returns_deleted_photo_ids_for_expanded_companions(
+    app_and_db, tmp_path, monkeypatch,
+):
+    """The response must name every catalog row removed, including auto-expanded companions.
+
+    When ``include_companions=True`` matches a companion that already owns its
+    own photo row, the resolver silently pulls that companion id into the
+    delete set. If only the caller's selection is echoed back, clients like
+    ``browse.html`` have no way to reconcile the successfully-trashed
+    companion out of their grid and it lingers until reload even though its
+    catalog row and file are gone.
+    """
+    import app as appmod
+
+    app, db = app_and_db
+    client = app.test_client()
+    folder_path = str(tmp_path / "companion_pair")
+    fid = db.add_folder(folder_path, name="companion_pair")
+    primary_id = db.add_photo(
+        folder_id=fid, filename="bird.nef", extension=".nef",
+        file_size=10, file_mtime=1.0,
+    )
+    companion_id = db.add_photo(
+        folder_id=fid, filename="bird.jpg", extension=".jpg",
+        file_size=10, file_mtime=2.0,
+    )
+    db.conn.execute(
+        "UPDATE photos SET companion_path = 'bird.jpg' WHERE id = ?",
+        (primary_id,),
+    )
+    db.conn.commit()
+    os.makedirs(folder_path, exist_ok=True)
+    primary_path = os.path.join(folder_path, "bird.nef")
+    companion_path = os.path.join(folder_path, "bird.jpg")
+    with open(primary_path, "wb") as f:
+        f.write(b"raw bytes")
+    Image.new("RGB", (10, 10)).save(companion_path)
+
+    def real_trash(paths):
+        removed = set()
+        for p in paths:
+            if os.path.exists(p):
+                os.remove(p)
+                removed.add(p)
+        return len(removed), removed, []
+
+    monkeypatch.setattr(appmod, "_trash_paths", real_trash)
+    resp = client.post("/api/batch/delete", json={
+        "photo_ids": [primary_id],
+        "mode": "disk",
+        "include_companions": True,
+    })
+
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert data["deleted"] == 2
+    assert data["failed_photo_ids"] == []
+    assert set(data["deleted_photo_ids"]) == {primary_id, companion_id}, (
+        "response must name the auto-expanded companion so clients can "
+        "reconcile it out of their state"
+    )
+    assert db.get_photo(primary_id) is None
+    assert db.get_photo(companion_id) is None
+
+
+def test_api_batch_delete_vireo_returns_deleted_photo_ids_for_expanded_companions(
+    app_and_db, tmp_path,
+):
+    """The vireo-mode response must also name auto-expanded companion ids."""
+    app, db = app_and_db
+    client = app.test_client()
+    folder_path = str(tmp_path / "vireo_pair")
+    fid = db.add_folder(folder_path, name="vireo_pair")
+    primary_id = db.add_photo(
+        folder_id=fid, filename="bird.nef", extension=".nef",
+        file_size=10, file_mtime=1.0,
+    )
+    companion_id = db.add_photo(
+        folder_id=fid, filename="bird.jpg", extension=".jpg",
+        file_size=10, file_mtime=2.0,
+    )
+    db.conn.execute(
+        "UPDATE photos SET companion_path = 'bird.jpg' WHERE id = ?",
+        (primary_id,),
+    )
+    db.conn.commit()
+
+    resp = client.post("/api/batch/delete", json={
+        "photo_ids": [primary_id],
+        "mode": "vireo",
+        "include_companions": True,
+    })
+
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert data["deleted"] == 2
+    assert set(data["deleted_photo_ids"]) == {primary_id, companion_id}
+
+
 def test_api_batch_delete_removes_thumbnails(app_and_db):
     """Deleting a photo removes its thumbnail file."""
     app, db = app_and_db

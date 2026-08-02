@@ -8149,9 +8149,21 @@ function lightboxDelete() {
       return;
     }
 
+    // ``deleted_photo_ids`` includes auto-expanded companions the caller
+    // never selected. Purge those from the lightbox list and browse grid
+    // too — a companion whose file was trashed but whose row is still
+    // client-side would otherwise linger until reload.
+    var deletedIds = data && Array.isArray(data.deleted_photo_ids)
+      ? data.deleted_photo_ids.slice()
+      : [currentId];
+    if (deletedIds.indexOf(currentId) === -1) deletedIds.push(currentId);
+    var deletedSet = new Set(deletedIds);
+
     // Remove from lightbox photo list
     var idx = _lightboxPhotoList.findIndex(function(x) { return x.id === currentId; });
-    _lightboxPhotoList.splice(idx, 1);
+    _lightboxPhotoList = _lightboxPhotoList.filter(function(x) {
+      return !deletedSet.has(x.id);
+    });
 
     if (_lightboxPhotoList.length === 0) {
       closeLightbox(null);
@@ -8163,9 +8175,9 @@ function lightboxDelete() {
 
     // Also update browse grid if we're on the browse page
     if (typeof photos !== 'undefined' && typeof renderGrid === 'function') {
-      photos = photos.filter(function(x) { return x.id !== currentId; });
-      selectedPhotos.delete(currentId);
-      if (selectedPhotoId === currentId) selectedPhotoId = null;
+      photos = photos.filter(function(x) { return !deletedSet.has(x.id); });
+      deletedSet.forEach(function(id) { selectedPhotos.delete(id); });
+      if (deletedSet.has(selectedPhotoId)) selectedPhotoId = null;
       renderGrid();
       if (typeof refreshBrowseSidebarCounts === 'function') {
         refreshBrowseSidebarCounts();

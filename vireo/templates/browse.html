@@ -6398,8 +6398,18 @@ function batchDelete() {
     // user declined the permanent-delete fallback). Keep those rows visible
     // — dropping them from ``photos`` would hide files still on disk until
     // the next reload.
+    //
+    // ``deleted_photo_ids`` is the authoritative set of catalog rows the
+    // server removed, and it includes auto-expanded companion IDs that
+    // aren't in the original ``ids`` selection. Without reconciling
+    // against it, a companion row whose file was trashed successfully
+    // would linger in the grid until reload even though its catalog row
+    // and file are gone. Older servers omit the key — fall back to the
+    // pre-existing "selection minus retained" derivation in that case.
     var retained = new Set((data && data.failed_photo_ids) || []);
-    var deletedSet = new Set(ids.filter(function(id) { return !retained.has(id); }));
+    var deletedSet = data && Array.isArray(data.deleted_photo_ids)
+      ? new Set(data.deleted_photo_ids)
+      : new Set(ids.filter(function(id) { return !retained.has(id); }));
     photos = photos.filter(function(p) { return !deletedSet.has(p.id); });
     totalPhotos = Math.max(0, totalPhotos - (data.deleted || 0));
     selectedPhotos = new Set(Array.from(selectedPhotos).filter(function(id) {

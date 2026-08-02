@@ -1769,7 +1769,10 @@ def _move_to_volume_trash(filepath):
                 f"could not reserve a unique Trash destination in {trash_dir}",
             )
         try:
-            os.rename(filepath, reserved)
+            # ``os.replace`` (not ``os.rename``) so the O_EXCL placeholder we
+            # just reserved is overwritten. POSIX rename replaces silently,
+            # but Windows rename raises when the destination exists.
+            os.replace(filepath, reserved)
         except OSError:
             # A network filesystem can commit a rename but lose the success
             # response. Never unlink ``reserved`` unless it is still the exact

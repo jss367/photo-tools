@@ -3840,7 +3840,7 @@ def test_move_to_volume_trash_preserves_both_files_on_name_collision(
 def test_move_to_volume_trash_removes_placeholder_when_rename_fails(
     monkeypatch, tmp_path,
 ):
-    """A failed ``os.rename`` must not leak the reserved placeholder file."""
+    """A failed rename must not leak the reserved placeholder file."""
     import app as app_module
 
     volume = tmp_path / "Photography"
@@ -3858,7 +3858,7 @@ def test_move_to_volume_trash_removes_placeholder_when_rename_fails(
     def boom(_src, _dst):
         raise OSError("rename refused")
 
-    monkeypatch.setattr(app_module.os, "rename", boom)
+    monkeypatch.setattr(app_module.os, "replace", boom)
 
     assert app_module._move_to_volume_trash(str(source)) is False
     assert source.exists()
@@ -3883,13 +3883,13 @@ def test_move_to_volume_trash_preserves_committed_rename_after_reported_error(
         app_module, "_volume_root_for_path", lambda _path: str(volume),
     )
     monkeypatch.setattr(app_module.os, "getuid", lambda: 501, raising=False)
-    real_rename = app_module.os.rename
+    real_replace = app_module.os.replace
 
-    def rename_then_report_error(src, dst):
-        real_rename(src, dst)
+    def replace_then_report_error(src, dst):
+        real_replace(src, dst)
         raise OSError("network response lost")
 
-    monkeypatch.setattr(app_module.os, "rename", rename_then_report_error)
+    monkeypatch.setattr(app_module.os, "replace", replace_then_report_error)
 
     assert app_module._move_to_volume_trash(str(source)) is True
     assert not source.exists()

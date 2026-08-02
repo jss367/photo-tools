@@ -434,6 +434,67 @@ def test_api_batch_delete_disk_partial_failure_deletes_only_successes(
     assert os.path.exists(failed_path)
 
 
+def test_api_batch_delete_skips_row_whose_identity_changed_mid_delete(
+    app_and_db, tmp_path, monkeypatch,
+):
+    """A concurrent move-photos must not turn a disk delete into an orphan.
+
+    The disk-mode trash step reports success when it finds the resolved path
+    already missing — but that "missing" file could have been removed by a
+    concurrent ``/api/jobs/move-photos`` job that ALSO committed a new
+    ``folder_id`` for the same row. Deleting the row by id after the fact
+    would strand the moved file in the destination folder with no catalog
+    entry. Simulate that race by relocating the row inside the trash stub
+    and confirm the catalog row is preserved and reported retained.
+    """
+    import app as appmod
+
+    app, db = app_and_db
+    client = app.test_client()
+    source_folder = str(tmp_path / "source")
+    dest_folder = str(tmp_path / "dest")
+    src_fid = db.add_folder(source_folder, name="source")
+    dst_fid = db.add_folder(dest_folder, name="dest")
+    pid = db.add_photo(
+        folder_id=src_fid, filename="bird.jpg", extension=".jpg",
+        file_size=10, file_mtime=1.0,
+    )
+    os.makedirs(source_folder, exist_ok=True)
+    os.makedirs(dest_folder, exist_ok=True)
+    dest_file = os.path.join(dest_folder, "bird.jpg")
+    Image.new("RGB", (10, 10)).save(dest_file)
+
+    def concurrent_move_then_trash(paths):
+        # Emulate move-photos committing a new folder_id while the trash
+        # stub runs. The source file was already removed by the "move" so
+        # the real trash step (had it run) would treat the path as
+        # successfully absent.
+        db.conn.execute(
+            "UPDATE photos SET folder_id = ? WHERE id = ?",
+            (dst_fid, pid),
+        )
+        db.conn.commit()
+        return 0, set(paths), []
+
+    monkeypatch.setattr(appmod, "_trash_paths", concurrent_move_then_trash)
+    resp = client.post("/api/batch/delete", json={
+        "photo_ids": [pid],
+        "mode": "disk",
+    })
+
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert data["deleted"] == 0
+    assert data["failed_photo_ids"] == [pid]
+    assert any(
+        entry.get("photo_id") == pid for entry in data["trash_failed"]
+    )
+    row = db.get_photo(pid)
+    assert row is not None, "moved row must survive a racing disk delete"
+    assert row["folder_id"] == dst_fid
+    assert os.path.exists(dest_file), "moved file must not be orphaned"
+
+
 def test_api_batch_delete_companion_failure_does_not_move_primary(
     app_and_db, tmp_path, monkeypatch,
 ):

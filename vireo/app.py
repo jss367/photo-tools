@@ -10182,17 +10182,63 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         if mode not in ("vireo", "disk", "disk_permanent"):
             raise ValueError("mode must be 'vireo', 'disk', or 'disk_permanent'")
 
-        def remove_catalog_rows(ids, *, expand_companions):
-            """Atomically remove resolved catalog rows, then clean caches."""
-            result = {"deleted": 0, "ids": [], "files": []}
+        def remove_catalog_rows(ids, *, expand_companions, revalidate_identity=None):
+            """Atomically remove resolved catalog rows, then clean caches.
+
+            ``revalidate_identity`` is an optional ``{photo_id: (folder_id,
+            filename)}`` map captured at the start of the disk operation. When
+            provided, each row is re-checked inside the delete transaction and
+            skipped if its ``(folder_id, filename)`` has changed since — a
+            concurrent ``/api/jobs/move-photos`` can commit a new folder_id
+            while the disk-delete's stale-path ``os.path.isfile`` check is
+            already reporting "gone", and deleting by id alone would then
+            discard the row for a photo that now lives at a completely
+            different path. Skipped ids are returned as ``skipped_ids`` so
+            the caller can surface them alongside filesystem failures.
+            """
+            result = {
+                "deleted": 0, "ids": [], "files": [], "skipped_ids": [],
+            }
+            skipped_ids = []
             total = len(ids)
             prepared = 0
             emit(
                 "Removing from Vireo", 0, total,
                 detail="Preparing database changes; nothing is committed yet.",
             )
+            revalidating = bool(revalidate_identity)
+            # BEGIN IMMEDIATE takes the write lock up front so no other writer
+            # (notably move-photos) can commit an identity change between the
+            # revalidation SELECT and the DELETE that follows. Without it, a
+            # move committed after the SELECT but before the DELETE would let
+            # us delete a row that no longer matches the identity we verified.
+            if revalidating:
+                db.conn.execute("BEGIN IMMEDIATE")
             try:
-                for chunk in _chunked(ids):
+                if revalidating:
+                    verified_ids = []
+                    for chunk in _chunked(ids):
+                        placeholders = ",".join("?" for _ in chunk)
+                        current = {
+                            row["id"]: (row["folder_id"], row["filename"])
+                            for row in db.conn.execute(
+                                f"SELECT id, folder_id, filename FROM photos "
+                                f"WHERE id IN ({placeholders})",
+                                list(chunk),
+                            )
+                        }
+                        for photo_id in chunk:
+                            expected = revalidate_identity.get(photo_id)
+                            actual = current.get(photo_id)
+                            if expected is not None and actual == expected:
+                                verified_ids.append(photo_id)
+                            else:
+                                skipped_ids.append(photo_id)
+                    ids_to_delete = verified_ids
+                else:
+                    ids_to_delete = list(ids)
+
+                for chunk in _chunked(ids_to_delete):
                     chunk_result = db.delete_photos(
                         chunk,
                         include_companions=expand_companions,
@@ -10212,6 +10258,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             except Exception:
                 db.conn.rollback()
                 raise
+            result["skipped_ids"] = skipped_ids
 
             emit(
                 "Removed from Vireo", result["deleted"], result["deleted"],
@@ -10261,6 +10308,15 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         primary_paths = {
             f["photo_id"]: os.path.join(f["folder_path"], f["filename"])
             for f in files
+        }
+        # Snapshot each row's identity so the catalog-removal step can verify
+        # the row still points at the same file it did when we resolved paths.
+        # Without this, a concurrent /api/jobs/move-photos can commit a new
+        # folder_id and remove the source file mid-run; our stale-path
+        # os.path.isfile would then read "already gone" and we would delete
+        # a row that now represents the moved file at a different location.
+        resolved_identity = {
+            f["photo_id"]: (f["folder_id"], f["filename"]) for f in files
         }
         catalog_primary_paths = set(primary_paths.values())
         extra_companions = {}
@@ -10364,8 +10420,29 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             ),
         )
         result = remove_catalog_rows(
-            successful_ids, expand_companions=False,
+            successful_ids,
+            expand_companions=False,
+            revalidate_identity=resolved_identity,
         )
+        # Rows whose identity changed between resolve and catalog-removal
+        # weren't deleted — surface them alongside filesystem failures so
+        # the client keeps them visible and doesn't report them as trashed.
+        skipped_ids = result.get("skipped_ids", []) or []
+        if skipped_ids:
+            already_failed = set(failed_ids)
+            for photo_id in skipped_ids:
+                trash_failed.append({
+                    "photo_id": photo_id,
+                    "path": primary_paths.get(photo_id, ""),
+                    "error": (
+                        "Photo was moved to a new folder during this delete; "
+                        "the catalog row was preserved"
+                    ),
+                })
+            failed_ids = failed_ids + [
+                photo_id for photo_id in skipped_ids
+                if photo_id not in already_failed
+            ]
         emit("Finishing", 1, 1)
         return {
             "ok": True,

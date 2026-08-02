@@ -6408,9 +6408,11 @@ function batchDelete() {
     if (selectedPhotoId != null && deletedSet.has(selectedPhotoId)) {
       selectedPhotoId = null;
     }
-    if (selectedPhotos.size === 0) {
-      document.getElementById('batchBar').style.display = 'none';
-    }
+    // Re-sync the batch bar (count, compare/best/burst buttons, selection
+    // inspector) against the shrunk selection. Just hiding the bar when the
+    // set empties leaves stale state — the count and buttons stayed sized for
+    // the pre-delete IDs on a partial deletion.
+    updateBatchBar();
     renderGrid();
     updateFilterSummary();
     loadSummary();

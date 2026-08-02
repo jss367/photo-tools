@@ -91,6 +91,78 @@ def _unsafe_reason(result, path):
                 if u["path"] == path)
 
 
+def test_import_eta_waits_for_a_completed_transfer_batch():
+    """Fast duplicate-only work must not seed the transfer ETA."""
+    from import_job import _ImportEtaEstimator
+
+    now = [0.0]
+    eta = _ImportEtaEstimator(clock=lambda: now[0])
+
+    # A quick duplicate-only batch settles 200 files, but says nothing
+    # about how long the remaining card-to-archive transfers will take.
+    eta.note_importing(copied=0)
+    now[0] = 2.0
+    eta.note_batch_complete(current=200, copied=0)
+    assert eta.fields(1000) == {
+        "eta_state": "estimating",
+        "eta_settled": 200,
+    }
+
+    # The first real transfer+catalog batch supplies the first honest rate.
+    eta.note_importing(copied=0)
+    now[0] = 22.0
+    eta.note_batch_complete(current=400, copied=200)
+    assert eta.fields(1000) == {
+        "eta_state": "ready",
+        "eta_settled": 400,
+        "eta_seconds": 60.0,
+        "eta_rate_per_min": 600.0,
+    }
+
+
+def test_import_eta_does_not_count_an_active_prepared_batch_as_settled():
+    """Queuing the next batch must not make its ETA disappear early."""
+    from import_job import _ImportEtaEstimator
+
+    now = [0.0]
+    eta = _ImportEtaEstimator(clock=lambda: now[0])
+    eta.note_importing(copied=0)
+    now[0] = 20.0
+    eta.note_batch_complete(current=200, copied=200)
+
+    # The UI counter may already say 400 while rsync is still transferring
+    # that second batch. The estimator intentionally remains at 200 settled.
+    eta.note_importing(copied=200)
+    assert eta.fields(1000)["eta_settled"] == 200
+    assert eta.fields(1000)["eta_seconds"] == 80.0
+
+
+def test_import_eta_uses_preview_new_count_for_a_mixed_boundary_batch():
+    """A mostly-duplicate batch must not look like 200 fast transfers."""
+    from import_job import _ImportEtaEstimator
+
+    now = [0.0]
+    eta = _ImportEtaEstimator(clock=lambda: now[0], expected_new=100)
+
+    # Learn the duplicate-check cost separately.
+    eta.note_importing(copied=0)
+    now[0] = 2.0
+    eta.note_batch_complete(current=200, copied=0)
+
+    # The next 200-file batch crosses the old/new boundary: 180 duplicates,
+    # only 20 actual copies. Its 22 seconds therefore imply about 1.01s per
+    # new file after subtracting the learned duplicate-check time.
+    eta.note_importing(copied=0)
+    now[0] = 24.0
+    eta.note_batch_complete(current=400, copied=20)
+    fields = eta.fields(1000)
+
+    # 80 new * 1.01s + 520 duplicates * 0.01s = 86 seconds.
+    assert fields["eta_state"] == "ready"
+    assert fields["eta_settled"] == 400
+    assert fields["eta_seconds"] == 86.0
+
+
 def _ws_linked_folder_paths(db, ws_id):
     return {
         row["path"]
@@ -6062,9 +6134,12 @@ def test_progress_events_carry_live_per_folder_counts(tmp_path):
     ), runner=runner)
 
     progress_folder_totals = []
+    eta_events = []
     for (_, evt, data) in runner.events:
         if evt != "progress" or "folders" not in data:
             continue
+        if "eta_state" in data:
+            eta_events.append(data)
         total_copied = sum(
             c.get("copied", 0) for c in data["folders"].values()
         )
@@ -6076,6 +6151,10 @@ def test_progress_events_carry_live_per_folder_counts(tmp_path):
     assert any(0 < t < 4 for t in progress_folder_totals), (
         progress_folder_totals
     )
+    assert any(e["eta_state"] == "estimating" for e in eta_events)
+    assert eta_events[-1]["eta_state"] == "ready"
+    assert eta_events[-1]["eta_settled"] == 4
+    assert eta_events[-1]["eta_seconds"] == 0.0
 
 
 def test_remote_import_links_alias_spelled_twin_folder(tmp_path, monkeypatch):

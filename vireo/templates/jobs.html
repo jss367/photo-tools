@@ -700,25 +700,52 @@
     if (isExpanded) {
       // 8: Throughput + ETA for running steps
       if (isRunning && step.progress && step.progress.current > 0 && step.started_at) {
-        var stepSecs = (Date.now() - new Date(step.started_at).getTime()) / 1000;
-        if (stepSecs > 0) {
-          var perSec = step.progress.current / stepSecs;
-          var perMin = perSec * 60;
-          var throughput;
-          if (perMin >= 1) {
-            throughput = '~' + Math.round(perMin) + '/min';
-          } else {
-            throughput = '~' + (1 / perSec).toFixed(1) + 's each';
-          }
-          var statusLine = throughput;
-          // ETA only when we know the total and have a non-zero rate
-          if (step.progress.total > 0 && perSec > 0) {
-            var remaining = step.progress.total - step.progress.current;
-            if (remaining > 0) {
-              statusLine += ' &middot; ETA ' + formatElapsed(remaining / perSec);
+        if (job.type === 'import') {
+          // Import's visible counter advances while a batch is prepared,
+          // before its transfer and restricted catalog scan finish. Use the
+          // backend's completed-batch estimate instead of current / elapsed,
+          // which is badly skewed by fast duplicate checks and queued files.
+          var etaState = step.progress.eta_state;
+          var etaSeconds = Number(step.progress.eta_seconds);
+          var etaRate = Number(step.progress.eta_rate_per_min);
+          var importStatusLine;
+          if (etaState === 'ready' && isFinite(etaSeconds)) {
+            if (etaSeconds > 0) {
+              if (isFinite(etaRate) && etaRate > 0) {
+                importStatusLine = '~' + Math.round(etaRate) +
+                  '/min from completed batches';
+              } else {
+                importStatusLine = 'Based on completed batches';
+              }
+              importStatusLine += ' &middot; ETA ' + formatElapsed(etaSeconds);
+            } else {
+              importStatusLine = 'Copy batches complete &middot; finishing import…';
             }
+          } else {
+            importStatusLine = 'Estimating after the first transfer batch…';
           }
-          html += '<div class="tree-step-throughput">' + statusLine + '</div>';
+          html += '<div class="tree-step-throughput">' + importStatusLine + '</div>';
+        } else {
+          var stepSecs = (Date.now() - new Date(step.started_at).getTime()) / 1000;
+          if (stepSecs > 0) {
+            var perSec = step.progress.current / stepSecs;
+            var perMin = perSec * 60;
+            var throughput;
+            if (perMin >= 1) {
+              throughput = '~' + Math.round(perMin) + '/min';
+            } else {
+              throughput = '~' + (1 / perSec).toFixed(1) + 's each';
+            }
+            var statusLine = throughput;
+            // ETA only when we know the total and have a non-zero rate
+            if (step.progress.total > 0 && perSec > 0) {
+              var remaining = step.progress.total - step.progress.current;
+              if (remaining > 0) {
+                statusLine += ' &middot; ETA ' + formatElapsed(remaining / perSec);
+              }
+            }
+            html += '<div class="tree-step-throughput">' + statusLine + '</div>';
+          }
         }
       }
 

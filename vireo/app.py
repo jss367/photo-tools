@@ -10277,10 +10277,11 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                                 row["folder_id"],
                                 row["filename"],
                                 row["folder_path"],
+                                row["companion_path"],
                             )
                             for row in db.conn.execute(
                                 f"SELECT p.id, p.folder_id, p.filename, "
-                                f"f.path AS folder_path "
+                                f"p.companion_path, f.path AS folder_path "
                                 f"FROM photos p "
                                 f"JOIN folders f ON f.id = p.folder_id "
                                 f"WHERE p.id IN ({placeholders})",
@@ -10389,9 +10390,17 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         # which keeps folder_id and filename unchanged while renaming
         # ``folders.path``, is also caught — otherwise the row would still be
         # deleted even though the copied file remains at the new path.
+        # ``companion_path`` is included so a concurrent scan that pairs a
+        # RAW with a JPEG mid-delete (scanner.py: ``UPDATE photos SET
+        # companion_path`` on the primary, ``DELETE FROM photos`` on the
+        # merged companion) is also caught — otherwise the primary's tuple
+        # would still match, and we'd trash only the pre-pair paths and
+        # remove the primary row, orphaning the newly-paired companion file
+        # on disk with no catalog entry.
         resolved_identity = {
             f["photo_id"]: (
                 f["folder_id"], f["filename"], f["folder_path"],
+                f["companion_path"],
             )
             for f in files
         }

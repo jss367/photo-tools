@@ -673,6 +673,73 @@ def test_api_batch_delete_skips_row_whose_folder_path_changed_mid_delete(
     assert os.path.exists(moved_file), "moved file must not be orphaned"
 
 
+def test_api_batch_delete_disk_revalidates_companion_pairing_before_delete(
+    app_and_db, tmp_path, monkeypatch,
+):
+    """A concurrent scan that pairs RAW+JPEG must not orphan the JPEG on disk.
+
+    A scan pairing step commits ``UPDATE photos SET companion_path`` on the
+    surviving RAW and ``DELETE FROM photos`` on the merged JPEG row while
+    keeping the RAW's ``(folder_id, filename, folder_path)`` untouched.
+    Comparing only that tuple would still match, and the delete would trash
+    the RAW file + remove the RAW row while never touching the JPEG file —
+    leaving the JPEG on disk with no catalog entry. The revalidation must
+    also include ``companion_path`` so the newly-paired row is skipped and
+    reported retained.
+    """
+    import app as appmod
+
+    app, db = app_and_db
+    client = app.test_client()
+    folder_path = str(tmp_path / "raw_pair")
+    fid = db.add_folder(folder_path, name="raw_pair")
+    raw_id = db.add_photo(
+        folder_id=fid, filename="bird.nef", extension=".nef",
+        file_size=10, file_mtime=1.0,
+    )
+    os.makedirs(folder_path, exist_ok=True)
+    raw_file = os.path.join(folder_path, "bird.nef")
+    jpeg_file = os.path.join(folder_path, "bird.jpg")
+    with open(raw_file, "wb") as f:
+        f.write(b"raw bytes")
+    Image.new("RGB", (10, 10)).save(jpeg_file)
+
+    def concurrent_pair_then_trash(paths):
+        # Emulate scanner pairing committing a new companion_path on the RAW
+        # mid-delete. The (folder_id, filename, folder_path) tuple is
+        # unchanged, but the row now claims the JPEG as its companion and
+        # any real trash step would need to include that file too.
+        db.conn.execute(
+            "UPDATE photos SET companion_path = 'bird.jpg' WHERE id = ?",
+            (raw_id,),
+        )
+        db.conn.commit()
+        return 0, set(paths), []
+
+    monkeypatch.setattr(appmod, "_trash_paths", concurrent_pair_then_trash)
+    resp = client.post("/api/batch/delete", json={
+        "photo_ids": [raw_id],
+        "mode": "disk",
+        "include_companions": True,
+    })
+
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert data["deleted"] == 0
+    assert data["failed_photo_ids"] == [raw_id]
+    assert any(
+        entry.get("photo_id") == raw_id for entry in data["trash_failed"]
+    )
+    row = db.get_photo(raw_id)
+    assert row is not None, (
+        "newly-paired row must survive a racing disk delete"
+    )
+    assert row["companion_path"] == "bird.jpg"
+    assert os.path.exists(jpeg_file), (
+        "companion file must not be orphaned by a stale-tuple delete"
+    )
+
+
 def test_api_batch_delete_companion_failure_does_not_move_primary(
     app_and_db, tmp_path, monkeypatch,
 ):

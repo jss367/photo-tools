@@ -610,6 +610,63 @@ def test_api_batch_delete_disk_targets_absolute_companion_path(
     assert db.get_photo(photo["id"]) is None
 
 
+def test_api_batch_delete_skips_row_whose_folder_path_changed_mid_delete(
+    app_and_db, tmp_path, monkeypatch,
+):
+    """A concurrent /api/jobs/move-folder must not turn a disk delete into an orphan.
+
+    A folder move keeps each photo's ``folder_id`` and ``filename`` unchanged
+    while renaming ``folders.path``. Comparing only ``(folder_id, filename)``
+    would pass, and the delete would strip the catalog row even though the
+    copied file now lives at the new folder path. The revalidation must also
+    include the resolved folder path.
+    """
+    import app as appmod
+
+    app, db = app_and_db
+    client = app.test_client()
+    original_folder = str(tmp_path / "original")
+    renamed_folder = str(tmp_path / "renamed")
+    fid = db.add_folder(original_folder, name="original")
+    pid = db.add_photo(
+        folder_id=fid, filename="bird.jpg", extension=".jpg",
+        file_size=10, file_mtime=1.0,
+    )
+    os.makedirs(renamed_folder, exist_ok=True)
+    moved_file = os.path.join(renamed_folder, "bird.jpg")
+    Image.new("RGB", (10, 10)).save(moved_file)
+
+    def concurrent_folder_rename_then_trash(paths):
+        # Simulate move-folder committing a new folders.path mid-delete while
+        # keeping folder_id and filename intact — the same photo row now
+        # points at moved_file instead of the resolved original_folder path.
+        db.conn.execute(
+            "UPDATE folders SET path = ? WHERE id = ?",
+            (renamed_folder, fid),
+        )
+        db.conn.commit()
+        return 0, set(paths), []
+
+    monkeypatch.setattr(
+        appmod, "_trash_paths", concurrent_folder_rename_then_trash,
+    )
+    resp = client.post("/api/batch/delete", json={
+        "photo_ids": [pid],
+        "mode": "disk",
+    })
+
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert data["deleted"] == 0
+    assert data["failed_photo_ids"] == [pid]
+    assert any(
+        entry.get("photo_id") == pid for entry in data["trash_failed"]
+    )
+    row = db.get_photo(pid)
+    assert row is not None, "renamed-folder row must survive a racing disk delete"
+    assert os.path.exists(moved_file), "moved file must not be orphaned"
+
+
 def test_api_batch_delete_companion_failure_does_not_move_primary(
     app_and_db, tmp_path, monkeypatch,
 ):

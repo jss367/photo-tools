@@ -10215,12 +10215,15 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             """Atomically remove resolved catalog rows, then clean caches.
 
             ``revalidate_identity`` is an optional ``{photo_id: (folder_id,
-            filename)}`` map captured at the start of the disk operation. When
-            provided, each row is re-checked inside the delete transaction and
-            skipped if its ``(folder_id, filename)`` has changed since — a
-            concurrent ``/api/jobs/move-photos`` can commit a new folder_id
-            while the disk-delete's stale-path ``os.path.isfile`` check is
-            already reporting "gone", and deleting by id alone would then
+            filename, folder_path)}`` map captured at the start of the disk
+            operation. When provided, each row is re-checked inside the delete
+            transaction and skipped if any of those three fields has changed
+            since — a concurrent ``/api/jobs/move-photos`` can commit a new
+            ``folder_id`` while the disk-delete's stale-path
+            ``os.path.isfile`` check is already reporting "gone", and a
+            concurrent ``/api/jobs/move-folder`` can leave ``folder_id`` and
+            ``filename`` unchanged while renaming the underlying
+            ``folders.path``. Deleting by id alone in either case would
             discard the row for a photo that now lives at a completely
             different path. Skipped ids are returned as ``skipped_ids`` so
             the caller can surface them alongside filesystem failures.
@@ -10237,10 +10240,11 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             )
             revalidating = bool(revalidate_identity)
             # BEGIN IMMEDIATE takes the write lock up front so no other writer
-            # (notably move-photos) can commit an identity change between the
-            # revalidation SELECT and the DELETE that follows. Without it, a
-            # move committed after the SELECT but before the DELETE would let
-            # us delete a row that no longer matches the identity we verified.
+            # (notably move-photos or move-folder) can commit an identity
+            # change between the revalidation SELECT and the DELETE that
+            # follows. Without it, a move committed after the SELECT but
+            # before the DELETE would let us delete a row that no longer
+            # matches the identity we verified.
             if revalidating:
                 db.conn.execute("BEGIN IMMEDIATE")
             try:
@@ -10249,10 +10253,17 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     for chunk in _chunked(ids):
                         placeholders = ",".join("?" for _ in chunk)
                         current = {
-                            row["id"]: (row["folder_id"], row["filename"])
+                            row["id"]: (
+                                row["folder_id"],
+                                row["filename"],
+                                row["folder_path"],
+                            )
                             for row in db.conn.execute(
-                                f"SELECT id, folder_id, filename FROM photos "
-                                f"WHERE id IN ({placeholders})",
+                                f"SELECT p.id, p.folder_id, p.filename, "
+                                f"f.path AS folder_path "
+                                f"FROM photos p "
+                                f"JOIN folders f ON f.id = p.folder_id "
+                                f"WHERE p.id IN ({placeholders})",
                                 list(chunk),
                             )
                         }
@@ -10354,8 +10365,15 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         # folder_id and remove the source file mid-run; our stale-path
         # os.path.isfile would then read "already gone" and we would delete
         # a row that now represents the moved file at a different location.
+        # The folder_path is included so a concurrent /api/jobs/move-folder,
+        # which keeps folder_id and filename unchanged while renaming
+        # ``folders.path``, is also caught — otherwise the row would still be
+        # deleted even though the copied file remains at the new path.
         resolved_identity = {
-            f["photo_id"]: (f["folder_id"], f["filename"]) for f in files
+            f["photo_id"]: (
+                f["folder_id"], f["filename"], f["folder_path"],
+            )
+            for f in files
         }
         catalog_primary_paths = set(primary_paths.values())
         extra_companions = {}

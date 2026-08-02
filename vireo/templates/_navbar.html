@@ -8146,11 +8146,6 @@ function lightboxDelete() {
     // until the next reload — the toast already told the user it was kept.
     var retained = (data && data.failed_photo_ids) || [];
     if (retained.indexOf(currentId) !== -1) {
-      try {
-        document.dispatchEvent(new CustomEvent('lightbox:photodeleted', {
-          detail: { photoId: currentId, result: data || null, retained: true }
-        }));
-      } catch (_) {}
       return;
     }
 

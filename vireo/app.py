@@ -1748,12 +1748,16 @@ def _move_to_volume_trash(filepath):
         # the user meant to send to Trash.
         candidate = os.path.join(trash_dir, basename)
         reserved = None
+        reserved_stat = None
         for _ in range(32):
             try:
                 fd = os.open(
                     candidate, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600,
                 )
-                os.close(fd)
+                try:
+                    reserved_stat = os.fstat(fd)
+                finally:
+                    os.close(fd)
                 reserved = candidate
                 break
             except FileExistsError:
@@ -1767,9 +1771,26 @@ def _move_to_volume_trash(filepath):
         try:
             os.rename(filepath, reserved)
         except OSError:
-            # Roll back the placeholder so the reserved name stays free.
+            # A network filesystem can commit a rename but lose the success
+            # response. Never unlink ``reserved`` unless it is still the exact
+            # placeholder we created; otherwise that path may now be the photo.
             try:
-                os.unlink(reserved)
+                current_stat = os.lstat(reserved)
+                try:
+                    os.lstat(filepath)
+                    source_still_exists = True
+                except FileNotFoundError:
+                    source_still_exists = False
+                if not source_still_exists:
+                    return True
+                placeholder_unchanged = (
+                    reserved_stat.st_ino
+                    and current_stat.st_dev == reserved_stat.st_dev
+                    and current_stat.st_ino == reserved_stat.st_ino
+                    and current_stat.st_size == reserved_stat.st_size
+                )
+                if placeholder_unchanged:
+                    os.unlink(reserved)
             except OSError:
                 pass
             raise

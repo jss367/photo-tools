@@ -3866,6 +3866,37 @@ def test_move_to_volume_trash_removes_placeholder_when_rename_fails(
     assert list(trash_dir.iterdir()) == []
 
 
+def test_move_to_volume_trash_preserves_committed_rename_after_reported_error(
+    monkeypatch, tmp_path,
+):
+    """A lost network success response must not unlink the moved photo."""
+    import app as app_module
+
+    volume = tmp_path / "Photography"
+    source_dir = volume / "Raw"
+    source_dir.mkdir(parents=True)
+    source = source_dir / "bird.NEF"
+    source.write_bytes(b"raw")
+
+    monkeypatch.setattr(app_module.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        app_module, "_volume_root_for_path", lambda _path: str(volume),
+    )
+    monkeypatch.setattr(app_module.os, "getuid", lambda: 501, raising=False)
+    real_rename = app_module.os.rename
+
+    def rename_then_report_error(src, dst):
+        real_rename(src, dst)
+        raise OSError("network response lost")
+
+    monkeypatch.setattr(app_module.os, "rename", rename_then_report_error)
+
+    assert app_module._move_to_volume_trash(str(source)) is True
+    assert not source.exists()
+    trashed = volume / ".Trashes" / "501" / "bird.NEF"
+    assert trashed.read_bytes() == b"raw"
+
+
 def test_trash_paths_batches_finder_fallback_and_retains_timeout_failures(
     monkeypatch, tmp_path,
 ):

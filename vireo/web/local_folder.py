@@ -12,6 +12,7 @@ from services.local_folder import (
     affected_workspace_ids,
     discard_folder,
     folder_status,
+    local_copy_preflight,
     local_path_for_base,
     local_root_for_folder,
     local_root_under_folder,
@@ -144,6 +145,48 @@ def create_local_folder_blueprint(
             names[root_id] = os.path.basename(path.rstrip("/\\")) or "Folder"
         return names, paths
 
+    def _stage_destinations(body, root_ids, root_names, source_paths):
+        raw_destinations = body.get("destination_bases") or {}
+        if not isinstance(raw_destinations, dict):
+            return None, json_error("destination_bases must be an object", 400)
+        destination_bases = {}
+        final_destinations = []
+        for root_id in root_ids:
+            raw = raw_destinations.get(str(root_id), raw_destinations.get(root_id))
+            if raw is None:
+                continue
+            if not isinstance(raw, str) or not raw.strip():
+                return None, json_error("Each local destination must be a non-empty path", 400)
+            destination = os.path.normpath(os.path.expanduser(raw.strip()))
+            if not os.path.isabs(destination):
+                return None, json_error("Each local destination must be an absolute path", 400)
+            destination_bases[root_id] = destination
+            final_destinations.append(
+                (
+                    root_id,
+                    os.path.normcase(
+                        os.path.abspath(
+                            local_path_for_base(
+                                destination, root_id, source_paths[root_id]
+                            )
+                        )
+                    ),
+                )
+            )
+        for index, (root_id, path) in enumerate(final_destinations):
+            for other_id, other_path in final_destinations[index + 1 :]:
+                try:
+                    overlaps = os.path.commonpath([path, other_path]) in {path, other_path}
+                except ValueError:
+                    overlaps = False
+                if overlaps:
+                    return None, json_error(
+                        f"The selected destinations for {root_names[root_id]} and "
+                        f"{root_names[other_id]} overlap. Choose separate locations.",
+                        400,
+                    )
+        return destination_bases, None
+
     @blueprint.get("/api/workspaces/active/local-folders")
     def local_folder_status():
         db, workspace_id, error = _active_context()
@@ -180,6 +223,46 @@ def create_local_folder_blueprint(
         payload["jobs"] = jobs
         return jsonify(payload)
 
+    @blueprint.post("/api/workspaces/active/local-folders/preflight")
+    def preflight_local_folders():
+        db, workspace_id, error = _active_context()
+        if error:
+            return error
+        legacy_error = _legacy_error(db, workspace_id)
+        if legacy_error is not None:
+            return legacy_error
+        body = request.get_json(silent=True) or {}
+        root_ids, request_error = _requested_roots(db, workspace_id, body)
+        if request_error is not None:
+            return request_error
+        root_ids = [
+            root_id
+            for root_id in root_ids
+            if local_root_for_folder(db, root_id) is None
+            and local_root_under_folder(db, root_id) is None
+        ]
+        if not root_ids:
+            return json_error(
+                "The selected folders are already local or contain a folder working locally",
+                409,
+            )
+        root_names, source_paths = _folder_names(db, root_ids)
+        destination_bases, destination_error = _stage_destinations(
+            body, root_ids, root_names, source_paths
+        )
+        if destination_error is not None:
+            return destination_error
+        try:
+            result = local_copy_preflight(
+                db,
+                root_ids,
+                vireo_dir,
+                destination_bases=destination_bases,
+            )
+        except LocalWorkspaceError as exc:
+            return json_error(str(exc), 409)
+        return jsonify(result)
+
     @blueprint.post("/api/workspaces/active/local-folders/stage")
     def stage_local_folders():
         db, workspace_id, error = _active_context()
@@ -211,39 +294,12 @@ def create_local_folder_blueprint(
                 "The selected folders are already local or contain a folder working locally",
                 409,
             )
-        raw_destinations = body.get("destination_bases") or {}
-        if not isinstance(raw_destinations, dict):
-            return json_error("destination_bases must be an object", 400)
         root_names, source_paths = _folder_names(db, root_ids)
-        destination_bases = {}
-        final_destinations = []
-        for root_id in root_ids:
-            raw = raw_destinations.get(str(root_id), raw_destinations.get(root_id))
-            if raw is None:
-                continue
-            if not isinstance(raw, str) or not raw.strip():
-                return json_error("Each local destination must be a non-empty path", 400)
-            destination = os.path.normpath(os.path.expanduser(raw.strip()))
-            if not os.path.isabs(destination):
-                return json_error("Each local destination must be an absolute path", 400)
-            destination_bases[root_id] = destination
-            final_destinations.append(
-                (root_id, os.path.normcase(os.path.abspath(local_path_for_base(
-                    destination, root_id, source_paths[root_id]
-                ))))
-            )
-        for index, (root_id, path) in enumerate(final_destinations):
-            for other_id, other_path in final_destinations[index + 1:]:
-                try:
-                    overlaps = os.path.commonpath([path, other_path]) in {path, other_path}
-                except ValueError:
-                    overlaps = False
-                if overlaps:
-                    return json_error(
-                        f"The selected destinations for {root_names[root_id]} and "
-                        f"{root_names[other_id]} overlap. Choose separate locations.",
-                        400,
-                    )
+        destination_bases, destination_error = _stage_destinations(
+            body, root_ids, root_names, source_paths
+        )
+        if destination_error is not None:
+            return destination_error
         runner = get_runner()
 
         def work(job):

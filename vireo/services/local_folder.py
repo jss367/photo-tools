@@ -42,6 +42,8 @@ from services.local_workspace import (
     _source_state,
     _walk_entries,
     _write_manifest,
+    destination_disk_space,
+    source_tree_size,
     stage_boundary_lock,
 )
 
@@ -76,6 +78,88 @@ def default_local_path(vireo_dir: str, root_folder_id: int, source_path: str) ->
 
 def local_path_for_base(local_base: str | Path, root_folder_id: int, source_path: str) -> Path:
     return Path(local_base) / _safe_folder_name(source_path, root_folder_id)
+
+
+def local_copy_preflight(
+    db,
+    root_folder_ids: list[int],
+    vireo_dir: str,
+    *,
+    destination_bases: dict[int, str] | None = None,
+) -> dict:
+    """Measure selected sources and capacity on their destination volumes."""
+    destination_bases = destination_bases or {}
+    folders = []
+    volumes_by_device: dict[int, dict] = {}
+
+    for raw_root_id in root_folder_ids:
+        root_folder_id = int(raw_root_id)
+        row = db.conn.execute(
+            "SELECT path FROM folders WHERE id=?", (root_folder_id,)
+        ).fetchone()
+        if row is None:
+            raise LocalWorkspaceError(f"Folder {root_folder_id} was not found")
+        source_path = row["path"]
+        local_base = destination_bases.get(root_folder_id)
+        if local_base is None:
+            local_base = str(default_local_base(vireo_dir, root_folder_id))
+        local_path = local_path_for_base(local_base, root_folder_id, source_path)
+        total_files, total_bytes = source_tree_size(source_path)
+        space = destination_disk_space(local_path)
+        device = int(space["device"])
+        volume = volumes_by_device.setdefault(
+            device,
+            {
+                "device": device,
+                "free_bytes": int(space["free_bytes"]),
+                "total_bytes": int(space["total_bytes"]),
+                "reserve_bytes": int(space["reserve_bytes"]),
+                "copy_bytes": 0,
+                "destination_paths": [],
+                "folder_ids": [],
+            },
+        )
+        # If free space changes during a multi-folder scan, use the most
+        # conservative reading for the shared-volume aggregate.
+        volume["free_bytes"] = min(volume["free_bytes"], int(space["free_bytes"]))
+        volume["copy_bytes"] += total_bytes
+        volume["destination_paths"].append(str(local_path))
+        volume["folder_ids"].append(root_folder_id)
+        folders.append(
+            {
+                "folder_id": root_folder_id,
+                "source_path": source_path,
+                "destination_path": str(local_path),
+                "total_files": total_files,
+                "total_bytes": total_bytes,
+                "device": device,
+            }
+        )
+
+    volumes = []
+    for index, volume in enumerate(volumes_by_device.values(), start=1):
+        volume["id"] = index
+        volume["required_bytes"] = volume["copy_bytes"] + volume["reserve_bytes"]
+        volume["after_copy_bytes"] = volume["free_bytes"] - volume["copy_bytes"]
+        volume["can_copy"] = volume["free_bytes"] >= volume["required_bytes"]
+        volumes.append(volume)
+        for folder in folders:
+            if folder.get("device") == volume["device"]:
+                folder["volume_id"] = volume["id"]
+                folder["free_bytes"] = volume["free_bytes"]
+                folder["reserve_bytes"] = volume["reserve_bytes"]
+    for folder in folders:
+        folder.pop("device", None)
+    for volume in volumes:
+        volume.pop("device", None)
+
+    return {
+        "folder_count": len(folders),
+        "total_bytes": sum(folder["total_bytes"] for folder in folders),
+        "can_copy": all(volume["can_copy"] for volume in volumes),
+        "folders": folders,
+        "volumes": volumes,
+    }
 
 
 def manifest_path(vireo_dir: str, root_folder_id: int) -> Path:

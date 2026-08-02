@@ -35,7 +35,13 @@ from pathlib import Path
 from config import _replace_with_windows_retry
 
 MANIFEST_VERSION = 2
+# Keep at least 5% of a destination volume free after a local copy, with
+# sensible bounds for very small and very large disks.  The lower bound
+# preserves the historical 1 GiB safety margin; the upper bound avoids making
+# large external SSDs unnecessarily unusable for Work Locally.
 LOCAL_RESERVE_BYTES = 1024**3
+LOCAL_MAX_RESERVE_BYTES = 20 * 1024**3
+LOCAL_RESERVE_FRACTION = 0.05
 
 # Serializes stage/sync/discard per workspace. A short global guard covers
 # stage's cross-workspace overlap validation so two concurrent stages cannot
@@ -82,6 +88,73 @@ class LocalWorkspaceConflict(LocalWorkspaceError):
 
 class LocalWorkspaceCancelled(LocalWorkspaceError):
     """The caller cancelled a still-interruptible transfer."""
+
+
+def local_space_reserve(total_bytes: int) -> int:
+    """Return the free-space reserve Work Locally keeps on a volume."""
+    proportional = int(max(0, total_bytes) * LOCAL_RESERVE_FRACTION)
+    return min(LOCAL_MAX_RESERVE_BYTES, max(LOCAL_RESERVE_BYTES, proportional))
+
+
+def destination_disk_space(path: str | Path) -> dict:
+    """Return capacity details for the volume containing ``path``.
+
+    Destination folders commonly do not exist yet. Walk up to the closest
+    existing ancestor so the preview can report capacity before staging has
+    created anything.
+    """
+    requested = Path(path).expanduser()
+    probe = requested
+    while not os.path.lexists(probe):
+        parent = probe.parent
+        if parent == probe:
+            break
+        probe = parent
+    try:
+        usage = shutil.disk_usage(probe)
+        device = os.stat(probe).st_dev
+    except OSError as exc:
+        raise LocalWorkspaceError(
+            f"Could not check free space at {requested}: {exc}"
+        ) from exc
+    return {
+        "total_bytes": usage.total,
+        "free_bytes": usage.free,
+        "reserve_bytes": local_space_reserve(usage.total),
+        "device": device,
+        "probe_path": str(probe),
+    }
+
+
+def source_tree_size(source: str) -> tuple[int, int]:
+    """Return the exact entry count and logical bytes copied from ``source``."""
+    try:
+        root_st = os.lstat(source)
+    except OSError as exc:
+        raise LocalWorkspaceError(f"Workspace folder is unavailable: {source}") from exc
+    if stat.S_ISLNK(root_st.st_mode):
+        raise LocalWorkspaceError(
+            f"Workspace root is a symlink and cannot be staged: {source}"
+        )
+    if not stat.S_ISDIR(root_st.st_mode):
+        raise LocalWorkspaceError(f"Workspace folder is unavailable: {source}")
+
+    total_files = 0
+    total_bytes = 0
+    for _rel, full, st in _walk_entries(source):
+        mode = st.st_mode
+        if stat.S_ISREG(mode):
+            total_bytes += st.st_size
+            total_files += 1
+        elif stat.S_ISLNK(mode):
+            if not _symlink_stays_within(full, source):
+                raise LocalWorkspaceError(
+                    f"Symlink escapes or uses an absolute target and cannot be staged: {full}"
+                )
+            total_files += 1
+        elif not stat.S_ISDIR(mode):
+            raise LocalWorkspaceError(f"Unsupported special file in workspace: {full}")
+    return total_files, total_bytes
 
 
 def workspace_dir(vireo_dir: str, workspace_id: int) -> Path:
@@ -421,12 +494,13 @@ def _collect_source_entries(roots: list[dict], local_base: Path) -> tuple[dict[i
             entries.append((rel, full, st))
         per_root[index] = entries
 
-    free = shutil.disk_usage(local_base.parent).free
-    required = total_bytes + LOCAL_RESERVE_BYTES
-    if free < required:
+    usage = shutil.disk_usage(local_base.parent)
+    reserve = local_space_reserve(usage.total)
+    required = total_bytes + reserve
+    if usage.free < required:
         raise LocalWorkspaceError(
             f"Not enough local space: need {required:,} bytes including safety reserve, "
-            f"but only {free:,} bytes are free"
+            f"but only {usage.free:,} bytes are free"
         )
     return per_root, total_files, total_bytes
 

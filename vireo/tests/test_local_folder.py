@@ -9,6 +9,7 @@ from services.local_folder import (
     LocalWorkspaceError,
     discard_folder,
     folder_status,
+    local_copy_preflight,
     local_root_under_folder,
     local_roots_under_folder,
     stage_folder,
@@ -101,6 +102,75 @@ def test_custom_local_destination_refuses_existing_folder(tmp_path):
             )
         assert (existing / "keep.txt").read_text() == "do not overwrite"
         assert Path(db.get_folder(folder_id)["path"]) == _source
+    finally:
+        db.close()
+
+
+def test_local_copy_preflight_aggregates_folders_on_the_same_disk(
+    tmp_path, monkeypatch
+):
+    from services import local_folder as service
+
+    db = Database(str(tmp_path / "vireo.db"))
+    workspace_id = db.create_workspace("Trip")
+    first = tmp_path / "nas" / "first"
+    second = tmp_path / "nas" / "second"
+    first.mkdir(parents=True)
+    second.mkdir(parents=True)
+    (first / "one.raw").write_bytes(b"a" * 30)
+    (second / "two.raw").write_bytes(b"b" * 60)
+    first_id = db.add_folder(str(first), name="first", link_to_workspace=False)
+    second_id = db.add_folder(str(second), name="second", link_to_workspace=False)
+    db.add_workspace_folder(workspace_id, first_id)
+    db.add_workspace_folder(workspace_id, second_id)
+    monkeypatch.setattr(
+        service,
+        "destination_disk_space",
+        lambda _path: {
+            "total_bytes": 1_000,
+            "free_bytes": 100,
+            "reserve_bytes": 20,
+            "device": 7,
+            "probe_path": str(tmp_path),
+        },
+    )
+    try:
+        result = local_copy_preflight(
+            db, [first_id, second_id], str(tmp_path / "vireo")
+        )
+
+        assert result["total_bytes"] == 90
+        assert [folder["total_bytes"] for folder in result["folders"]] == [30, 60]
+        assert len(result["volumes"]) == 1
+        assert result["volumes"][0]["copy_bytes"] == 90
+        assert result["volumes"][0]["after_copy_bytes"] == 10
+        assert result["volumes"][0]["can_copy"] is False
+        assert result["can_copy"] is False
+    finally:
+        db.close()
+
+
+def test_stage_refuses_copy_that_would_use_scaled_safety_reserve(
+    tmp_path, monkeypatch
+):
+    from services import local_workspace as workspace_service
+
+    db, vireo_dir, source, _first, _second, folder_id = _shared_environment(tmp_path)
+    large = source / "large.raw"
+    with large.open("wb") as handle:
+        handle.truncate(2 * 1024**3)
+    usage_type = workspace_service.shutil._ntuple_diskusage
+    monkeypatch.setattr(
+        workspace_service.shutil,
+        "disk_usage",
+        lambda _path: usage_type(100 * 1024**3, 94 * 1024**3, 6 * 1024**3),
+    )
+    try:
+        # A 100 GiB destination keeps 5 GiB free. The old fixed 1 GiB
+        # reserve would have allowed this 2 GiB copy with only 6 GiB free.
+        with pytest.raises(LocalWorkspaceError, match="safety reserve"):
+            stage_folder(db, folder_id, str(vireo_dir))
+        assert db.get_folder(folder_id)["path"] == str(source)
     finally:
         db.close()
 
@@ -433,6 +503,24 @@ def test_folder_stage_endpoint_accepts_destination_and_uses_folder_name_in_job(t
         )
         assert item["local_folder_name"] == "104NCZ_8"
         assert Path(item["default_local_path"]).name == "104NCZ_8"
+
+        preflight = client.post(
+            "/api/workspaces/active/local-folders/preflight",
+            json={
+                "folder_ids": [folder_id],
+                "destination_bases": {str(folder_id): str(destination)},
+            },
+        )
+        assert preflight.status_code == 200, preflight.get_json()
+        capacity = preflight.get_json()
+        assert capacity["can_copy"] is True
+        assert capacity["total_bytes"] == len(b"original")
+        assert capacity["folders"][0]["total_files"] == 1
+        assert capacity["folders"][0]["destination_path"] == str(
+            destination / "104NCZ_8"
+        )
+        assert capacity["volumes"][0]["free_bytes"] > capacity["total_bytes"]
+        assert capacity["volumes"][0]["reserve_bytes"] >= 1024**3
 
         response = client.post(
             "/api/workspaces/active/local-folders/stage",

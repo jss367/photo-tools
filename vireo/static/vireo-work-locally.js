@@ -5,6 +5,9 @@
   var activeJob = null;
   var actionInFlight = false;
   var pendingStageItems = [];
+  var stagePreflightGeneration = 0;
+  var stagePreflightTimer = null;
+  var stagePreflightSignature = null;
 
   function selectedItems(folderIds, localOnly) {
     var wanted = folderIds && folderIds.length
@@ -41,10 +44,123 @@
     preview.textContent = joinPath(input.value.trim(), input.dataset.localFolderName);
   }
 
+  function stageRequestBody() {
+    var destinationBases = {};
+    var complete = pendingStageItems.length > 0;
+    pendingStageItems.forEach(function(item) {
+      var id = Number(item.requested_folder_id);
+      var input = document.querySelector('[data-local-destination-base="' + id + '"]');
+      var destination = input ? input.value.trim() : '';
+      if (!destination) complete = false;
+      destinationBases[String(id)] = destination;
+    });
+    return {
+      complete: complete,
+      body: {
+        folder_ids: pendingStageItems.map(function(item) { return item.requested_folder_id; }),
+        destination_bases: destinationBases
+      }
+    };
+  }
+
+  function renderStagePreflight(preflight) {
+    var capacity = document.getElementById('stageLocalFoldersCapacity');
+    var button = document.getElementById('confirmStageLocalFolders');
+    var error = document.getElementById('stageLocalFoldersError');
+    if (error) error.textContent = '';
+    var byFolder = {};
+    (preflight.folders || []).forEach(function(folder) {
+      byFolder[String(folder.folder_id)] = folder;
+    });
+    pendingStageItems.forEach(function(item) {
+      var id = String(item.requested_folder_id);
+      var line = document.querySelector('[data-local-capacity-folder="' + id + '"]');
+      var folder = byFolder[id];
+      if (!line || !folder) return;
+      line.style.color = 'var(--text-secondary)';
+      line.textContent = formatBytesNav(folder.total_bytes || 0) + ' to copy · ' +
+        Number(folder.total_files || 0).toLocaleString() + ' file' +
+        (Number(folder.total_files || 0) === 1 ? '' : 's') + ' · ' +
+        formatBytesNav(folder.free_bytes || 0) + ' free on destination';
+    });
+
+    var blocked = (preflight.volumes || []).filter(function(volume) {
+      return !volume.can_copy;
+    });
+    if (capacity) {
+      capacity.style.color = blocked.length ? 'var(--danger)' : 'var(--text-secondary)';
+      if (blocked.length) {
+        capacity.innerHTML = blocked.map(function(volume) {
+          return '<div><strong>Not enough space.</strong> ' +
+            escapeHtml(formatBytesNav(volume.copy_bytes || 0)) + ' would be copied to this disk, ' +
+            escapeHtml(formatBytesNav(volume.free_bytes || 0)) + ' is free, and Vireo keeps ' +
+            escapeHtml(formatBytesNav(volume.reserve_bytes || 0)) + ' free for safety.</div>';
+        }).join('');
+      } else {
+        var volumeCount = (preflight.volumes || []).length;
+        capacity.textContent = formatBytesNav(preflight.total_bytes || 0) + ' total to copy' +
+          (volumeCount === 1
+            ? ' · ' + formatBytesNav(preflight.volumes[0].after_copy_bytes || 0) + ' will remain free'
+            : ' across ' + volumeCount + ' destination disks') +
+          '. Vireo will stop before using the safety reserve.';
+      }
+    }
+    if (button) button.disabled = !preflight.can_copy;
+  }
+
+  async function runStagePreflight() {
+    var request = stageRequestBody();
+    var capacity = document.getElementById('stageLocalFoldersCapacity');
+    var button = document.getElementById('confirmStageLocalFolders');
+    var generation = ++stagePreflightGeneration;
+    stagePreflightSignature = null;
+    if (button) button.disabled = true;
+    if (!request.complete) {
+      if (capacity) {
+        capacity.style.color = 'var(--danger)';
+        capacity.textContent = 'Choose a destination for every local copy.';
+      }
+      return;
+    }
+    if (capacity) {
+      capacity.style.color = 'var(--text-dim)';
+      capacity.innerHTML = '<span class="btn-spinner" style="display:inline-block;margin-right:6px;"></span>Calculating folder sizes and available space...';
+    }
+    try {
+      var result = await Vireo.api.json('/api/workspaces/active/local-folders/preflight', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(request.body)
+      }, {toast: false});
+      if (generation !== stagePreflightGeneration || !pendingStageItems.length) return;
+      stagePreflightSignature = JSON.stringify(request.body);
+      renderStagePreflight(result);
+    } catch (requestError) {
+      if (generation !== stagePreflightGeneration || !pendingStageItems.length) return;
+      if (capacity) {
+        capacity.style.color = 'var(--danger)';
+        capacity.textContent = requestError.message || 'Could not check folder sizes and free space.';
+      }
+    }
+  }
+
+  function scheduleStagePreflight(delay) {
+    if (stagePreflightTimer) clearTimeout(stagePreflightTimer);
+    stagePreflightGeneration += 1;
+    stagePreflightSignature = null;
+    var button = document.getElementById('confirmStageLocalFolders');
+    if (button) button.disabled = true;
+    stagePreflightTimer = setTimeout(runStagePreflight, delay == null ? 500 : delay);
+  }
+
   function closeStageDialog() {
     if (actionInFlight) return;
     var modal = document.getElementById('stageLocalFoldersModal');
     if (modal) modal.classList.remove('open');
+    stagePreflightGeneration += 1;
+    stagePreflightSignature = null;
+    if (stagePreflightTimer) clearTimeout(stagePreflightTimer);
+    stagePreflightTimer = null;
     pendingStageItems = [];
   }
 
@@ -77,10 +193,12 @@
           '<button class="modal-btn" data-browse-local-destination="' + id + '" style="white-space:nowrap;">Browse...</button>' +
         '</div>' +
         '<div style="font-size:10px;color:var(--text-dim);margin-top:5px;">Local folder: <span data-local-destination-preview="' + id + '" style="font-family:monospace;">' + escapeHtml(finalPath) + '</span></div>' +
+        '<div data-local-capacity-folder="' + id + '" style="font-size:11px;color:var(--text-dim);margin-top:6px;">Calculating size and free space...</div>' +
         (shared > 1 ? '<div style="font-size:10px;color:var(--accent);margin-top:4px;">This copy will be shared by ' + shared + ' linked workspaces.</div>' : '') +
       '</div>';
     }).join('');
     modal.classList.add('open');
+    scheduleStagePreflight(0);
   }
 
   function progressMarkup() {
@@ -258,17 +376,11 @@
     if (actionInFlight || activeJob || !pendingStageItems.length) return;
     var error = document.getElementById('stageLocalFoldersError');
     var button = document.getElementById('confirmStageLocalFolders');
-    var destinationBases = {};
-    for (var i = 0; i < pendingStageItems.length; i += 1) {
-      var id = Number(pendingStageItems[i].requested_folder_id);
-      var input = document.querySelector('[data-local-destination-base="' + id + '"]');
-      var destination = input ? input.value.trim() : '';
-      if (!destination) {
-        if (error) error.textContent = 'Choose a destination for every local copy.';
-        if (input) input.focus();
-        return;
-      }
-      destinationBases[String(id)] = destination;
+    var request = stageRequestBody();
+    if (!request.complete || stagePreflightSignature !== JSON.stringify(request.body)) {
+      if (error) error.textContent = 'Wait for the size and free-space check to finish.';
+      scheduleStagePreflight(0);
+      return;
     }
     actionInFlight = true;
     if (button) button.disabled = true;
@@ -277,10 +389,7 @@
       var result = await Vireo.api.json('/api/workspaces/active/local-folders/stage', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({
-          folder_ids: pendingStageItems.map(function(item) { return item.requested_folder_id; }),
-          destination_bases: destinationBases
-        })
+        body: JSON.stringify(request.body)
       }, {toast: false});
       var modal = document.getElementById('stageLocalFoldersModal');
       if (modal) modal.classList.remove('open');
@@ -290,7 +399,7 @@
       if (error) error.textContent = requestError.message || 'Could not start the local copy.';
     } finally {
       actionInFlight = false;
-      if (button) button.disabled = false;
+      if (pendingStageItems.length) scheduleStagePreflight(0);
     }
   }
 
@@ -454,6 +563,7 @@
   document.getElementById('stageLocalFoldersModalItems').addEventListener('input', function(event) {
     if (event.target.matches('[data-local-destination-base]')) {
       updateStageDestinationPreview(event.target);
+      scheduleStagePreflight();
     }
   });
   document.getElementById('stageLocalFoldersModalItems').addEventListener('click', async function(event) {
@@ -468,6 +578,7 @@
     if (!chosen || Array.isArray(chosen)) return;
     input.value = chosen;
     updateStageDestinationPreview(input);
+    scheduleStagePreflight(0);
   });
   document.getElementById('syncSelectedLocalFolders').addEventListener('click', function() {
     var selected = managerSelection();

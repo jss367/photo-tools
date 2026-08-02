@@ -345,6 +345,144 @@ def test_api_batch_delete_disk_mode(app_and_db, tmp_path):
     assert db.get_photo(pid) is None
 
 
+def test_api_batch_delete_disk_failure_retains_catalog_row(
+    app_and_db, tmp_path, monkeypatch,
+):
+    """A Trash failure leaves both the original and its Vireo row retryable."""
+    import app as appmod
+
+    app, db = app_and_db
+    client = app.test_client()
+    photo = db.get_photos()[0]
+    folder_path = str(tmp_path / "disk_photos")
+    db.conn.execute(
+        "UPDATE folders SET path = ? WHERE id = ?",
+        (folder_path, photo["folder_id"]),
+    )
+    db.conn.commit()
+    os.makedirs(folder_path, exist_ok=True)
+    real_file = os.path.join(folder_path, photo["filename"])
+    Image.new("RGB", (10, 10)).save(real_file)
+
+    def fail_trash(paths):
+        paths = list(paths)
+        return 0, set(), [
+            {"path": path, "error": "SMB Trash unavailable"} for path in paths
+        ]
+
+    monkeypatch.setattr(appmod, "_trash_paths", fail_trash)
+    resp = client.post("/api/batch/delete", json={
+        "photo_ids": [photo["id"]],
+        "mode": "disk",
+    })
+
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert data["deleted"] == 0
+    assert data["trashed"] == 0
+    assert data["failed_photo_ids"] == [photo["id"]]
+    assert data["trash_failed"][0]["photo_id"] == photo["id"]
+    assert os.path.exists(real_file)
+    assert db.get_photo(photo["id"]) is not None
+
+
+def test_api_batch_delete_disk_partial_failure_deletes_only_successes(
+    app_and_db, tmp_path, monkeypatch,
+):
+    """A mixed filesystem result deletes only successfully trashed rows."""
+    import app as appmod
+
+    app, db = app_and_db
+    client = app.test_client()
+    folder_path = str(tmp_path / "partial")
+    fid = db.add_folder(folder_path, name="partial")
+    success_id = db.add_photo(
+        folder_id=fid, filename="success.jpg", extension=".jpg",
+        file_size=10, file_mtime=1.0,
+    )
+    failed_id = db.add_photo(
+        folder_id=fid, filename="failed.jpg", extension=".jpg",
+        file_size=10, file_mtime=2.0,
+    )
+    os.makedirs(folder_path, exist_ok=True)
+    success_path = os.path.join(folder_path, "success.jpg")
+    failed_path = os.path.join(folder_path, "failed.jpg")
+    Image.new("RGB", (10, 10)).save(success_path)
+    Image.new("RGB", (10, 10)).save(failed_path)
+
+    def partial_trash(paths):
+        paths = list(paths)
+        os.remove(success_path)
+        return 1, {success_path}, [{
+            "path": failed_path, "error": "simulated failure",
+        }]
+
+    monkeypatch.setattr(appmod, "_trash_paths", partial_trash)
+    resp = client.post("/api/batch/delete", json={
+        "photo_ids": [success_id, failed_id],
+        "mode": "disk",
+    })
+
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert data["deleted"] == 1
+    assert data["trashed"] == 1
+    assert data["failed_photo_ids"] == [failed_id]
+    assert db.get_photo(success_id) is None
+    assert db.get_photo(failed_id) is not None
+    assert not os.path.exists(success_path)
+    assert os.path.exists(failed_path)
+
+
+def test_api_batch_delete_companion_failure_does_not_move_primary(
+    app_and_db, tmp_path, monkeypatch,
+):
+    """An untracked companion must succeed before its primary is touched."""
+    import app as appmod
+
+    app, db = app_and_db
+    client = app.test_client()
+    photo = db.get_photos()[0]
+    folder_path = str(tmp_path / "companions")
+    db.conn.execute(
+        "UPDATE folders SET path = ? WHERE id = ?",
+        (folder_path, photo["folder_id"]),
+    )
+    db.conn.execute(
+        "UPDATE photos SET companion_path = 'bird.xmp' WHERE id = ?",
+        (photo["id"],),
+    )
+    db.conn.commit()
+    os.makedirs(folder_path, exist_ok=True)
+    primary = os.path.join(folder_path, photo["filename"])
+    companion = os.path.join(folder_path, "bird.xmp")
+    Image.new("RGB", (10, 10)).save(primary)
+    with open(companion, "w") as f:
+        f.write("sidecar")
+
+    calls = []
+
+    def fail_companion(paths):
+        paths = list(paths)
+        calls.append(paths)
+        return 0, set(), [
+            {"path": path, "error": "sidecar locked"} for path in paths
+        ]
+
+    monkeypatch.setattr(appmod, "_trash_paths", fail_companion)
+    resp = client.post("/api/batch/delete", json={
+        "photo_ids": [photo["id"]],
+        "mode": "disk",
+        "include_companions": True,
+    })
+
+    assert resp.status_code == 200
+    assert calls == [[companion]], "primary must not be attempted after dependency failure"
+    assert os.path.exists(primary)
+    assert os.path.exists(companion)
+    assert db.get_photo(photo["id"]) is not None
+
+
 def test_api_batch_delete_removes_thumbnails(app_and_db):
     """Deleting a photo removes its thumbnail file."""
     app, db = app_and_db

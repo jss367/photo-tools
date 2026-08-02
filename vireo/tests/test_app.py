@@ -3751,6 +3751,89 @@ def test_trash_via_finder_guarded_off_mac(monkeypatch):
     assert called == [], "osascript must not be spawned off macOS"
 
 
+def test_trash_via_finder_batches_paths_and_sets_timeout(monkeypatch):
+    """Finder fallback uses one bounded AppleScript process for a batch."""
+    import types
+
+    import app as app_module
+
+    monkeypatch.setattr(app_module.sys, "platform", "darwin")
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append((argv, kwargs))
+        return types.SimpleNamespace(returncode=0, stderr="")
+
+    monkeypatch.setattr(app_module.subprocess, "run", fake_run)
+    app_module._trash_via_finder(["/Volumes/X/a.NEF", "/Volumes/X/b.NEF"])
+
+    assert len(calls) == 1
+    argv, kwargs = calls[0]
+    assert "/Volumes/X/a.NEF" in argv
+    assert "/Volumes/X/b.NEF" in argv
+    assert "repeat with posixPath in argv" in argv
+    assert kwargs["timeout"] == app_module._FINDER_TRASH_TIMEOUT_SECS
+
+
+def test_move_to_volume_trash_renames_without_finder(monkeypatch, tmp_path):
+    """Mounted-volume fast path performs a same-volume move into .Trashes."""
+    import app as app_module
+
+    volume = tmp_path / "Photography"
+    source_dir = volume / "Raw Files"
+    source_dir.mkdir(parents=True)
+    source = source_dir / "bird.NEF"
+    source.write_bytes(b"raw")
+
+    monkeypatch.setattr(app_module.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        app_module, "_volume_root_for_path", lambda _path: str(volume),
+    )
+    monkeypatch.setattr(app_module.os, "getuid", lambda: 501)
+
+    assert app_module._move_to_volume_trash(str(source)) is True
+    assert not source.exists()
+    assert (volume / ".Trashes" / "501" / "bird.NEF").read_bytes() == b"raw"
+
+
+def test_trash_paths_batches_finder_fallback_and_retains_timeout_failures(
+    monkeypatch, tmp_path,
+):
+    """Failed send2trash paths share one Finder call and remain retryable."""
+    import subprocess
+
+    import app as app_module
+    import send2trash
+
+    first = tmp_path / "first.NEF"
+    second = tmp_path / "second.NEF"
+    first.write_bytes(b"one")
+    second.write_bytes(b"two")
+
+    monkeypatch.setattr(app_module.sys, "platform", "darwin")
+    monkeypatch.setattr(app_module, "_move_to_volume_trash", lambda _path: False)
+    monkeypatch.setattr(
+        send2trash, "send2trash",
+        lambda _path: (_ for _ in ()).throw(OSError("legacy Trash failed")),
+    )
+    finder_calls = []
+
+    def timeout(paths):
+        finder_calls.append(list(paths))
+        raise subprocess.TimeoutExpired("osascript", 30)
+
+    monkeypatch.setattr(app_module, "_trash_via_finder", timeout)
+    moved, successful, failures = app_module._trash_paths([
+        str(first), str(second),
+    ])
+
+    assert finder_calls == [[str(first), str(second)]]
+    assert moved == 0
+    assert successful == set()
+    assert {failure["path"] for failure in failures} == {str(first), str(second)}
+    assert first.exists() and second.exists()
+
+
 def test_navbar_js_fallbacks_match_python_constants():
     """The hardcoded fallback lists in _navbar.html must mirror the
     canonical Python lists. The navbar's JS uses these fallbacks when

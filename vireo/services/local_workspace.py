@@ -131,6 +131,29 @@ def destination_disk_space(path: str | Path) -> dict:
     }
 
 
+def destination_case_insensitive(path: str | Path) -> bool:
+    """Probe whether the existing volume containing ``path`` folds case."""
+    base = Path(path).expanduser()
+    while not base.is_dir():
+        parent = base.parent
+        if parent == base:
+            break
+        base = parent
+    try:
+        fd, probe = tempfile.mkstemp(prefix="VireoCaseProbe-", dir=str(base))
+    except OSError as exc:
+        raise LocalWorkspaceError(
+            f"Could not inspect the destination filesystem at {path}: {exc}"
+        ) from exc
+    os.close(fd)
+    try:
+        lower = os.path.join(os.path.dirname(probe), os.path.basename(probe).lower())
+        return lower != probe and os.path.exists(lower)
+    finally:
+        with suppress(FileNotFoundError):
+            os.unlink(probe)
+
+
 def _estimated_destination_bytes(st) -> int:
     """Conservatively estimate allocation consumed by one copied entry."""
     if stat.S_ISREG(st.st_mode):
@@ -143,8 +166,8 @@ def _estimated_destination_bytes(st) -> int:
     return LOCAL_ALLOCATION_UNIT_BYTES
 
 
-def source_tree_size(source: str) -> tuple[int, int, int]:
-    """Return copied-file count, logical bytes, and estimated allocated bytes."""
+def _validated_tree_entries(source: str):
+    """Yield safe, supported entries from a validated source directory."""
     try:
         root_st = os.lstat(source)
     except OSError as exc:
@@ -156,27 +179,36 @@ def source_tree_size(source: str) -> tuple[int, int, int]:
     if not stat.S_ISDIR(root_st.st_mode):
         raise LocalWorkspaceError(f"Workspace folder is unavailable: {source}")
 
+    for rel, full, st in _walk_entries(source):
+        mode = st.st_mode
+        if stat.S_ISLNK(mode):
+            if not _symlink_stays_within(full, source):
+                raise LocalWorkspaceError(
+                    f"Symlink escapes or uses an absolute target and cannot be staged: {full}"
+                )
+        elif not stat.S_ISREG(mode) and not stat.S_ISDIR(mode):
+            raise LocalWorkspaceError(f"Unsupported special file in workspace: {full}")
+        yield rel, full, st
+
+
+def source_tree_size(source: str) -> tuple[int, int, int]:
+    """Return copied-file count, logical bytes, and estimated allocated bytes."""
+
     total_files = 0
     total_bytes = 0
     # The destination root directory itself is created for every source.
     estimated_bytes = LOCAL_ALLOCATION_UNIT_BYTES
-    for _rel, full, st in _walk_entries(source):
+    for _rel, _full, st in _validated_tree_entries(source):
         mode = st.st_mode
         if stat.S_ISREG(mode):
             total_bytes += st.st_size
             total_files += 1
             estimated_bytes += _estimated_destination_bytes(st)
         elif stat.S_ISLNK(mode):
-            if not _symlink_stays_within(full, source):
-                raise LocalWorkspaceError(
-                    f"Symlink escapes or uses an absolute target and cannot be staged: {full}"
-                )
             total_files += 1
             estimated_bytes += _estimated_destination_bytes(st)
         elif stat.S_ISDIR(mode):
             estimated_bytes += _estimated_destination_bytes(st)
-        else:
-            raise LocalWorkspaceError(f"Unsupported special file in workspace: {full}")
     return total_files, total_bytes, estimated_bytes
 
 
@@ -415,14 +447,7 @@ def _dest_case_insensitive(local_base: Path) -> bool:
     """
     base = local_base.parent
     base.mkdir(parents=True, exist_ok=True)
-    fd, probe = tempfile.mkstemp(prefix="VireoCaseProbe-", dir=str(base))
-    os.close(fd)
-    try:
-        lower = os.path.join(os.path.dirname(probe), os.path.basename(probe).lower())
-        return lower != probe and os.path.exists(lower)
-    finally:
-        with suppress(FileNotFoundError):
-            os.unlink(probe)
+    return destination_case_insensitive(base)
 
 
 def _walk_entries(root: str):
@@ -467,39 +492,19 @@ def _collect_source_entries(roots: list[dict], local_base: Path) -> tuple[dict[i
     for index, root in enumerate(roots):
         source = root["source_path"]
         estimated_bytes += LOCAL_ALLOCATION_UNIT_BYTES
-        # os.path.isdir follows symlinks; a source root that is itself a
-        # symlink would activate successfully here but sync_back later lstats
-        # and rejects it, leaving every local edit unsyncable. Reject
-        # symlinked (or non-directory) roots up front instead.
-        try:
-            root_st = os.lstat(source)
-        except OSError as exc:
-            raise LocalWorkspaceError(f"Workspace folder is unavailable: {source}") from exc
-        if stat.S_ISLNK(root_st.st_mode):
-            raise LocalWorkspaceError(
-                f"Workspace root is a symlink and cannot be staged: {source}"
-            )
-        if not stat.S_ISDIR(root_st.st_mode):
-            raise LocalWorkspaceError(f"Workspace folder is unavailable: {source}")
         entries = []
         folded_seen: dict[str, str] = {}
-        for rel, full, st in _walk_entries(source):
+        for rel, full, st in _validated_tree_entries(source):
             mode = st.st_mode
             if stat.S_ISREG(mode):
                 total_bytes += st.st_size
                 total_files += 1
                 estimated_bytes += _estimated_destination_bytes(st)
             elif stat.S_ISLNK(mode):
-                if not _symlink_stays_within(full, source):
-                    raise LocalWorkspaceError(
-                        f"Symlink escapes or uses an absolute target and cannot be staged: {full}"
-                    )
                 total_files += 1
                 estimated_bytes += _estimated_destination_bytes(st)
             elif stat.S_ISDIR(mode):
                 estimated_bytes += _estimated_destination_bytes(st)
-            else:
-                raise LocalWorkspaceError(f"Unsupported special file in workspace: {full}")
             if case_insensitive_target and rel:
                 # Normalize Unicode form before folding case: macOS
                 # (HFS+/APFS) and Windows also collapse canonically

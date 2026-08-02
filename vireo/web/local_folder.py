@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import threading
+import unicodedata
 
 from db import Database
 from flask import Blueprint, jsonify, request
@@ -22,6 +23,7 @@ from services.local_folder import (
     workspace_local_root_ids,
     workspace_status,
 )
+from services.local_workspace import destination_case_insensitive
 from services.local_workspace import local_state as legacy_local_state
 
 LOCAL_FOLDER_JOB_TYPES = frozenset(
@@ -161,22 +163,27 @@ def create_local_folder_blueprint(
             if not os.path.isabs(destination):
                 return None, json_error("Each local destination must be an absolute path", 400)
             destination_bases[root_id] = destination
+            final_path = os.path.abspath(
+                local_path_for_base(destination, root_id, source_paths[root_id])
+            )
             final_destinations.append(
                 (
                     root_id,
-                    os.path.normcase(
-                        os.path.abspath(
-                            local_path_for_base(
-                                destination, root_id, source_paths[root_id]
-                            )
-                        )
-                    ),
+                    os.path.normcase(final_path),
+                    destination_case_insensitive(final_path),
                 )
             )
-        for index, (root_id, path) in enumerate(final_destinations):
-            for other_id, other_path in final_destinations[index + 1 :]:
+        for index, (root_id, path, case_insensitive) in enumerate(final_destinations):
+            for other_id, other_path, other_case_insensitive in final_destinations[index + 1 :]:
+                compared_path = path
+                compared_other_path = other_path
+                if case_insensitive or other_case_insensitive:
+                    compared_path = unicodedata.normalize("NFC", path).casefold()
+                    compared_other_path = unicodedata.normalize("NFC", other_path).casefold()
                 try:
-                    overlaps = os.path.commonpath([path, other_path]) in {path, other_path}
+                    overlaps = os.path.commonpath(
+                        [compared_path, compared_other_path]
+                    ) in {compared_path, compared_other_path}
                 except ValueError:
                     overlaps = False
                 if overlaps:

@@ -543,6 +543,57 @@ def test_folder_stage_endpoint_accepts_destination_and_uses_folder_name_in_job(t
         check_db.close()
 
 
+def test_stage_endpoint_rejects_case_folded_destination_collisions(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    from app import create_app
+    from web import local_folder as local_folder_web
+
+    first = tmp_path / "nas" / "Photos"
+    second = tmp_path / "other-nas" / "PHOTOS"
+    first.mkdir(parents=True)
+    second.mkdir(parents=True)
+    (first / "one.jpg").write_bytes(b"one")
+    (second / "two.jpg").write_bytes(b"two")
+    vireo_dir = tmp_path / "vireo"
+    thumbs = vireo_dir / "thumbnails"
+    thumbs.mkdir(parents=True)
+    db_path = str(vireo_dir / "vireo.db")
+    db = Database(db_path)
+    workspace_id = db.create_workspace("Case collision")
+    first_id = db.add_folder(str(first), name="Photos", link_to_workspace=False)
+    second_id = db.add_folder(str(second), name="PHOTOS", link_to_workspace=False)
+    db.add_workspace_folder(workspace_id, first_id)
+    db.add_workspace_folder(workspace_id, second_id)
+    db.set_active_workspace(workspace_id)
+    db.close()
+
+    monkeypatch.setattr(
+        local_folder_web, "destination_case_insensitive", lambda _path: True
+    )
+    app = create_app(db_path, thumb_cache_dir=str(thumbs))
+    app.config["TESTING"] = True
+    destination = tmp_path / "local"
+    with app.test_client() as client:
+        assert client.post(
+            f"/api/workspaces/{workspace_id}/activate", json={}
+        ).status_code == 200
+        response = client.post(
+            "/api/workspaces/active/local-folders/preflight",
+            json={
+                "folder_ids": [first_id, second_id],
+                "destination_bases": {
+                    str(first_id): str(destination),
+                    str(second_id): str(destination),
+                },
+            },
+        )
+
+    assert response.status_code == 400
+    assert "overlap" in response.get_json()["error"]
+
+
 def test_local_root_under_folder_finds_descendant_session(tmp_path):
     db = Database(str(tmp_path / "vireo.db"))
     workspace_id = db.create_workspace("Ancestor")

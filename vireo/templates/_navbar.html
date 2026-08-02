@@ -1617,6 +1617,10 @@ input[type=text], input[type=date], select, .path-input, .text-input, .model-sel
   border: 1px solid var(--border-secondary);
   border-radius: 6px; padding: 4px 0;
   min-width: 180px;
+  /* On short viewports (Tauri's 600px minimum) a long menu can exceed the
+     window; openContextMenu only repositions, so scroll instead of clip. */
+  max-height: calc(100vh - 8px);
+  overflow-y: auto;
   box-shadow: 0 4px 16px rgba(0,0,0,0.4);
   font-size: 13px; color: var(--text-primary);
   user-select: none;

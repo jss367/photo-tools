@@ -3,6 +3,19 @@ import json
 from playwright.sync_api import expect
 
 
+def click_more_menu_item(page, label):
+    """Open the batch bar's More menu and click the named action.
+
+    The slimmed batch bar keeps only high-frequency verbs; everything else
+    lives in the unified context menu that More opens (same builder as
+    right-click on a card).
+    """
+    page.locator("#batchMoreBtn").click()
+    item = page.locator(".vireo-ctx-menu .vireo-ctx-item", has_text=label)
+    expect(item).to_be_visible()
+    item.click()
+
+
 def disable_infinite_scroll(page):
     page.add_init_script("""
       class NoopIntersectionObserver {
@@ -95,8 +108,8 @@ def test_large_library_uses_bounded_placeholder_runway(live_server, page):
 
 
 def test_single_click_reveals_batch_bar(live_server, page):
-    """Normal-click on one photo reveals the batch bar so Develop/Export/Delete
-    are reachable with a single photo selected.
+    """Normal-click on one photo reveals the batch bar so Export/Delete and
+    the More menu (Develop, etc.) are reachable with a single photo selected.
 
     Regression: updateBatchBar() previously only showed the bar when
     selectedPhotos.size > 1, leaving single-click users with no UI path to
@@ -114,7 +127,60 @@ def test_single_click_reveals_batch_bar(live_server, page):
 
     expect(bar).to_be_visible()
     expect(page.locator("#batchCount")).to_have_text("1 selected")
-    expect(page.locator("#developBtn")).to_be_visible()
+    expect(page.locator("#batchMoreBtn")).to_be_visible()
+    # Develop moved off the bar into the unified More menu; it must still be
+    # reachable for a single-photo selection.
+    page.locator("#batchMoreBtn").click()
+    expect(
+        page.locator(".vireo-ctx-menu .vireo-ctx-item", has_text="Develop")
+    ).to_be_visible()
+    page.keyboard.press("Escape")
+
+
+def test_more_menu_scrolls_within_short_viewport(live_server, page):
+    """The unified action menu is tall; at Tauri's 600px minimum window
+    height it must scroll within the viewport instead of rendering lower
+    actions (Prepare Full Resolution, Export, Delete) off-screen where they
+    cannot be clicked.
+    """
+    page.set_viewport_size({"width": 1100, "height": 600})
+    page.goto(f"{live_server['url']}/browse")
+    first = page.locator(".grid-card").first
+    first.wait_for(state="visible")
+    first.click()
+
+    page.locator("#batchMoreBtn").click()
+    menu = page.locator(".vireo-ctx-menu")
+    expect(menu).to_be_visible()
+    box = menu.bounding_box()
+    assert box["y"] >= 0
+    assert box["y"] + box["height"] <= 600
+
+    delete_item = page.locator(".vireo-ctx-menu .vireo-ctx-item", has_text="Delete")
+    delete_item.scroll_into_view_if_needed()
+    expect(delete_item).to_be_visible()
+
+
+def test_batch_bar_wraps_at_minimum_window_width(live_server, page):
+    """At Tauri's 800px minimum window width the fixed sidebar leaves ~533px
+    of content width. The batch bar must wrap rather than clip, so More —
+    the entry point for every action removed from the bar — stays reachable.
+    """
+    page.set_viewport_size({"width": 800, "height": 600})
+    page.goto(f"{live_server['url']}/browse")
+    first = page.locator(".grid-card").first
+    first.wait_for(state="visible")
+    first.click()
+
+    more = page.locator("#batchMoreBtn")
+    expect(more).to_be_visible()
+    box = more.bounding_box()
+    assert box["x"] >= 0
+    assert box["x"] + box["width"] <= 800
+
+    more.click()
+    expect(page.locator(".vireo-ctx-menu")).to_be_visible()
+    page.keyboard.press("Escape")
 
 
 def test_prepare_full_resolution_uses_active_browse_selection(live_server, page):
@@ -149,16 +215,12 @@ def test_prepare_full_resolution_uses_active_browse_selection(live_server, page)
     selected_id = int(first.get_attribute("data-id"))
     first.click()
 
-    button = page.locator("#prepareFullResolutionBtn")
-    expect(button).to_be_visible()
-    button.click()
+    click_more_menu_item(page, "Prepare Full Resolution")
 
     page.wait_for_function(
         "() => window._prepareFullResolutionJobId === null"
     )
     assert submitted == [{"photo_ids": [selected_id]}]
-    expect(button).to_be_enabled()
-    expect(button).to_have_text("Prepare Full Resolution")
 
 
 def test_prepare_full_resolution_surfaces_fatal_job_failure(live_server, page):
@@ -186,7 +248,7 @@ def test_prepare_full_resolution_surfaces_fatal_job_failure(live_server, page):
     page.goto(f"{live_server['url']}/browse")
     page.locator(".grid-card").first.wait_for(state="visible")
     page.locator(".grid-card").first.click()
-    page.locator("#prepareFullResolutionBtn").click()
+    click_more_menu_item(page, "Prepare Full Resolution")
 
     page.wait_for_function(
         "() => window._prepareFullResolutionJobId === null"
@@ -222,7 +284,7 @@ def test_prepare_full_resolution_summarizes_partial_failure(live_server, page):
     page.goto(f"{live_server['url']}/browse")
     page.locator(".grid-card").first.wait_for(state="visible")
     page.locator(".grid-card").first.click()
-    page.locator("#prepareFullResolutionBtn").click()
+    click_more_menu_item(page, "Prepare Full Resolution")
 
     page.wait_for_function(
         "() => window._prepareFullResolutionJobId === null"

@@ -18,8 +18,10 @@ The browse page has two hand-maintained bulk-action surfaces that have drifted a
 
 ### 1. `buildPhotoContextMenu()` becomes the single complete action surface
 
-Add the five batch-bar-only actions to the menu, reusing the existing handlers
-verbatim (all already operate on the current selection):
+Add the five batch-bar-only actions to the menu (the sixth bar-only control,
+Clear, stays on the bar — it manages selection rather than acting on photos),
+reusing the existing handlers verbatim (all already operate on the current
+selection):
 
 | New menu item | Handler | Placement |
 |---|---|---|
@@ -63,7 +65,9 @@ the bottom jobs panel.
 
 ### 3. More ▾ opens the same menu
 
-The `More ▾` button calls `openContextMenu(syntheticEvent,
+`More ▾` is always visible whenever the bar is (the bar itself only renders
+for selections of ≥1, so no separate gating is needed). It calls
+`openContextMenu(syntheticEvent,
 buildPhotoContextMenu(getActiveSelection()))`, where `syntheticEvent` is
 `{clientX, clientY}` derived from the button's `getBoundingClientRect()`
 (bottom-left corner) — `openContextMenu` only reads those two fields and

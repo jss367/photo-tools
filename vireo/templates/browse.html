@@ -1816,6 +1816,8 @@ body.sidebar-resizing {
   </div>
 </div>
 
+{% include '_work_locally_stage_modal.html' %}
+
 <!-- Collection Modal -->
 <div class="modal-overlay" id="collectionModal">
   <div class="modal">
@@ -1949,6 +1951,7 @@ body.sidebar-resizing {
 </div>
 
 
+<script src="/static/vireo-work-locally.js"></script>
 <script>
 /* Google Maps API key — populated from /api/config below (window._cfgPromise).
    Empty string when no key is configured; the Location section then
@@ -8774,6 +8777,14 @@ function moveFolder(fid) {
   window.location.href = '/move?folder_id=' + encodeURIComponent(fid);
 }
 
+function workLocallyFolder(fid) {
+  if (window.vireoLocalFolders) {
+    window.vireoLocalFolders.stage(fid);
+    return;
+  }
+  window.location.href = '/workspace#work-locally';
+}
+
 async function rescanFolder(fid) {
   showToast('Starting folder rescan...', 'info');
   try {
@@ -8804,6 +8815,7 @@ document.addEventListener('contextmenu', function(e) {
     { label: window.VIREO_REVEAL_LABEL, onClick: function() { revealFolder(fid); } },
     { label: 'Copy Path', onClick: function() { copyFolderPath(fid); } },
     { separator: true },
+    { label: 'Work Locally\u2026', onClick: function() { workLocallyFolder(fid); } },
     { label: 'Move\u2026', onClick: function() { moveFolder(fid); } },
     { label: 'Rescan this Folder', onClick: function() { rescanFolder(fid); } },
   ]);

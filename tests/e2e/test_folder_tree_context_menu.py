@@ -6,6 +6,7 @@ Menu items:
 - Reveal in Finder/Folder
 - Copy Path
 - separator
+- Work Locally…
 - Move…
 - Rescan this Folder
 
@@ -31,6 +32,7 @@ def test_folder_tree_right_click_opens_menu(live_server, page):
         "Filter by this folder",
         "Reveal in",
         "Copy Path",
+        "Work Locally…",
         "Move…",
         "Rescan this Folder",
     ]:
@@ -55,6 +57,47 @@ def test_folder_tree_move_opens_move_page_with_source_selected(live_server, page
     page.wait_for_url(f"**/move?folder_id={fid}")
     expect(page.locator("#quickFolderSelect")).to_have_value(fid)
     expect(page.locator("#quickFolderInfo")).not_to_be_empty()
+
+
+def test_folder_tree_work_locally_copies_selected_root(live_server, page, tmp_path):
+    """Work Locally… opens the chooser and copies the selected root."""
+    db = live_server["db"]
+    source = tmp_path / "nas-source"
+    source.mkdir()
+    (source / "bird.jpg").write_bytes(b"original")
+    workspace_id = db.create_workspace("Browse Local Copy")
+    db.set_active_workspace(workspace_id)
+    folder_id = db.add_folder(str(source), name="nas-source")
+    assert page.request.post(
+        f"{live_server['url']}/api/workspaces/{workspace_id}/activate"
+    ).ok
+
+    page.goto(f"{live_server['url']}/browse")
+    item = page.locator(f'.tree-item[data-folder-id="{folder_id}"]')
+    item.wait_for(state="visible")
+    item.click(button="right")
+    page.locator(
+        ".vireo-ctx-menu .vireo-ctx-item", has_text="Work Locally…"
+    ).click()
+
+    modal = page.locator("#stageLocalFoldersModal")
+    expect(modal).to_have_class("modal-overlay open")
+    destination = tmp_path / "fast-storage"
+    modal.locator("[data-local-destination-base]").fill(str(destination))
+    expect(modal.locator("[data-local-destination-preview]")).to_contain_text(
+        str(destination / "nas-source")
+    )
+    modal.get_by_role("button", name="Copy Locally", exact=True).click()
+
+    expect(page.locator("#toastContainer")).to_contain_text(
+        "Local folder update complete", timeout=15000
+    )
+    local_root = destination / "nas-source"
+    assert (local_root / "bird.jpg").read_bytes() == b"original"
+    catalog_path = db.conn.execute(
+        "SELECT path FROM folders WHERE id=?", (folder_id,)
+    ).fetchone()["path"]
+    assert catalog_path == str(local_root)
 
 
 def test_folder_tree_filter_by_folder_fires_filter(live_server, page):

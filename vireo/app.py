@@ -1877,11 +1877,27 @@ def _trash_paths(filepaths):
     successful = set()
     moved = 0
     fallback = []
+    preflight_errors = {}
 
     for filepath in ordered:
         if not os.path.isfile(filepath):
-            log.warning("File already missing: %s", filepath)
-            successful.add(filepath)
+            # ``os.path.isfile`` returning False is ambiguous on network
+            # volumes — it also happens when the underlying stat fails
+            # because the mount is already disconnected. Only treat the
+            # path as "already gone" when the parent directory is still
+            # reachable; otherwise preserve as a failure so the caller
+            # doesn't prune the catalog row for a photo that reappears
+            # when the mount comes back.
+            if _path_confirmed_gone(filepath):
+                log.warning("File already missing: %s", filepath)
+                successful.add(filepath)
+            else:
+                preflight_errors[filepath] = (
+                    "Source path is unreachable"
+                )
+                log.warning(
+                    "Trash preflight: source unreachable for %s", filepath,
+                )
             continue
         if _move_to_volume_trash(filepath):
             successful.add(filepath)
@@ -1940,7 +1956,11 @@ def _trash_paths(filepaths):
     for filepath in ordered:
         if filepath in successful:
             continue
-        error = send_errors.get(filepath) or "Trash operation failed"
+        error = (
+            preflight_errors.get(filepath)
+            or send_errors.get(filepath)
+            or "Trash operation failed"
+        )
         failures.append({"path": filepath, "error": error})
         log.warning("Trash failed for %s: %s", filepath, error)
     return moved, successful, failures
@@ -10415,8 +10435,23 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             removed = 0
             for filepath in paths_to_change:
                 if not os.path.isfile(filepath):
-                    log.warning("File already missing: %s", filepath)
-                    successful.add(filepath)
+                    # Same live-parent gate as ``_trash_paths`` — a
+                    # disconnected mount also makes ``os.path.isfile``
+                    # return False, and treating that as "already gone"
+                    # would prune the catalog row for a photo that
+                    # reappears when the volume comes back.
+                    if _path_confirmed_gone(filepath):
+                        log.warning("File already missing: %s", filepath)
+                        successful.add(filepath)
+                    else:
+                        log.warning(
+                            "Permanent delete preflight: source "
+                            "unreachable for %s", filepath,
+                        )
+                        failures.append({
+                            "path": filepath,
+                            "error": "Source path is unreachable",
+                        })
                     continue
                 try:
                     os.remove(filepath)

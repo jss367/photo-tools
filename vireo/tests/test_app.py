@@ -3973,6 +3973,74 @@ def test_trash_paths_preserves_failure_when_volume_becomes_unreachable(
     assert [failure["path"] for failure in failures] == [str(photo)]
 
 
+def test_trash_paths_preflight_preserves_failure_on_disconnected_mount(
+    monkeypatch, tmp_path,
+):
+    """A mount disconnected BEFORE the preflight must not be reported as
+    already-gone. ``os.path.isfile`` returns False in that case because the
+    underlying stat fails, and previously the preflight would silently mark
+    the path successful and let the caller prune the catalog row for a
+    photo that reappears when the mount comes back.
+    """
+    import app as app_module
+
+    volume = tmp_path / "SMB_Share"
+    volume.mkdir()
+    photo = volume / "bird.NEF"
+    photo.write_bytes(b"raw")
+    photo_path = str(photo)
+
+    monkeypatch.setattr(app_module.sys, "platform", "linux")
+    monkeypatch.setattr(app_module, "_move_to_volume_trash", lambda _p: False)
+
+    import shutil
+    shutil.rmtree(str(volume))
+
+    called = {"send2trash": False, "finder": False}
+
+    import send2trash
+
+    def unexpected_send2trash(_path):
+        called["send2trash"] = True
+        raise AssertionError("send2trash must not be called for a preflight-detected unreachable mount")
+
+    def unexpected_finder(_paths):
+        called["finder"] = True
+        raise AssertionError("Finder must not be called for a preflight-detected unreachable mount")
+
+    monkeypatch.setattr(send2trash, "send2trash", unexpected_send2trash)
+    monkeypatch.setattr(app_module, "_trash_via_finder", unexpected_finder)
+
+    moved, successful, failures = app_module._trash_paths([photo_path])
+
+    assert moved == 0
+    assert successful == set()
+    assert [failure["path"] for failure in failures] == [photo_path]
+    assert failures[0]["error"] == "Source path is unreachable"
+    assert called["send2trash"] is False
+    assert called["finder"] is False
+
+
+def test_trash_paths_preflight_accepts_already_missing_on_live_volume(
+    monkeypatch, tmp_path,
+):
+    """A file legitimately missing on a still-mounted volume is accepted."""
+    import app as app_module
+
+    folder = tmp_path / "local"
+    folder.mkdir()
+    ghost = folder / "already_gone.NEF"
+
+    monkeypatch.setattr(app_module.sys, "platform", "linux")
+    monkeypatch.setattr(app_module, "_move_to_volume_trash", lambda _p: False)
+
+    moved, successful, failures = app_module._trash_paths([str(ghost)])
+
+    assert moved == 0
+    assert successful == {str(ghost)}
+    assert failures == []
+
+
 def test_trash_paths_marks_success_when_send2trash_reports_after_move(
     monkeypatch, tmp_path,
 ):

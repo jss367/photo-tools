@@ -536,9 +536,12 @@ def test_browse_review_on_map_opens_the_selected_photos(live_server, page):
         photo_id,
     )
 
-    button = page.locator("#resolveGpsSelectedBtn")
-    expect(button).to_have_text("Review on Map")
-    button.click()
+    # Review on Map moved off the slimmed batch bar into the unified More
+    # menu (same builder as right-click on a card).
+    page.locator("#batchMoreBtn").click()
+    item = page.locator(".vireo-ctx-menu .vireo-ctx-item", has_text="Review on Map")
+    expect(item).to_be_visible()
+    item.click()
 
     page.wait_for_url("**/locations/review?source=selection")
     expect(page.locator("#locationReviewGroupTitle")).to_have_text("1 photo")

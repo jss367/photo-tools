@@ -161,6 +161,28 @@ def test_more_menu_scrolls_within_short_viewport(live_server, page):
     expect(delete_item).to_be_visible()
 
 
+def test_batch_bar_wraps_at_minimum_window_width(live_server, page):
+    """At Tauri's 800px minimum window width the fixed sidebar leaves ~533px
+    of content width. The batch bar must wrap rather than clip, so More —
+    the entry point for every action removed from the bar — stays reachable.
+    """
+    page.set_viewport_size({"width": 800, "height": 600})
+    page.goto(f"{live_server['url']}/browse")
+    first = page.locator(".grid-card").first
+    first.wait_for(state="visible")
+    first.click()
+
+    more = page.locator("#batchMoreBtn")
+    expect(more).to_be_visible()
+    box = more.bounding_box()
+    assert box["x"] >= 0
+    assert box["x"] + box["width"] <= 800
+
+    more.click()
+    expect(page.locator(".vireo-ctx-menu")).to_be_visible()
+    page.keyboard.press("Escape")
+
+
 def test_prepare_full_resolution_uses_active_browse_selection(live_server, page):
     submitted = []
 

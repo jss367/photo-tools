@@ -6421,7 +6421,7 @@ function batchDelete() {
     var countEl = document.getElementById('photoCount');
     if (countEl) {
       var current = parseInt(countEl.textContent) || 0;
-      countEl.textContent = (current - (data.deleted || 0));
+      countEl.textContent = Math.max(0, current - (data.deleted || 0));
     }
   });
 }

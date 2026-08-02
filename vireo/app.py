@@ -1845,6 +1845,26 @@ def _trash_via_finder(filepaths, timeout=_FINDER_TRASH_TIMEOUT_SECS):
         raise OSError(result.stderr.strip() or f"Finder trash failed ({result.returncode})")
 
 
+def _path_confirmed_gone(filepath):
+    """Return True only when the file is verifiably absent from a live volume.
+
+    ``os.path.exists`` returning False is ambiguous on network volumes: it
+    also returns False when the underlying stat call errors out because the
+    mount went away mid-operation. Treating that as "successfully moved to
+    Trash" would prune the catalog row for a photo that reappears when the
+    mount comes back. Confirm both that the file is missing *and* that the
+    parent directory is still reachable so a genuine live-volume delete is
+    accepted while a mid-flight disconnect is preserved as a failure.
+    """
+    if os.path.exists(filepath):
+        return False
+    parent = os.path.dirname(filepath) or os.sep
+    try:
+        return os.path.isdir(parent)
+    except OSError:
+        return False
+
+
 def _trash_paths(filepaths):
     """Move paths to Trash and return ``(moved, successful, failures)``.
 
@@ -1882,10 +1902,13 @@ def _trash_paths(filepaths):
                 if isinstance(exc, (KeyboardInterrupt, GeneratorExit)):
                     raise
                 # Some platform Trash APIs can complete the move and still
-                # report a post-operation error. Trust the requested end state
-                # so we do not retain a ghost catalog row for a file that is
-                # already gone.
-                if not os.path.exists(filepath):
+                # report a post-operation error. Only trust the "not there"
+                # signal when we can positively verify it — a disconnected
+                # network volume also makes ``os.path.exists`` return False
+                # (the underlying stat fails), which would otherwise mask a
+                # real failure and prune the catalog row for a photo that
+                # reappears when the mount comes back.
+                if _path_confirmed_gone(filepath):
                     successful.add(filepath)
                     moved += 1
                     continue
@@ -1906,7 +1929,10 @@ def _trash_paths(filepaths):
         except Exception:
             log.warning("Finder Trash failed for a file batch", exc_info=True)
         for filepath in finder_batch:
-            if not os.path.exists(filepath):
+            # Only accept "gone" when the parent directory is still reachable;
+            # otherwise a stat failure from a disconnected mount would read
+            # as success.
+            if _path_confirmed_gone(filepath):
                 successful.add(filepath)
                 moved += 1
 
@@ -10233,6 +10259,16 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                         for photo_id in chunk:
                             expected = revalidate_identity.get(photo_id)
                             actual = current.get(photo_id)
+                            if actual is None:
+                                # Row already gone — a concurrent delete beat
+                                # us to it. The requested end state already
+                                # holds, so treat it as successfully deleted
+                                # rather than a stale identity we couldn't
+                                # verify. Reporting it in ``failed_photo_ids``
+                                # here would leave the client showing a photo
+                                # that is absent from both catalog and disk
+                                # until reload.
+                                continue
                             if expected is not None and actual == expected:
                                 verified_ids.append(photo_id)
                             else:
@@ -10325,9 +10361,19 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         extra_companions = {}
         if include_companions:
             for f in files:
-                if not f.get("companion_path"):
+                companion_path = f.get("companion_path")
+                if not companion_path:
                     continue
-                companion = os.path.join(f["folder_path"], f["companion_path"])
+                # ``companion_path`` is stored as either a relative filename
+                # inside the same folder or an absolute path (see the same
+                # resolution in new_images.py:35-40). Joining an absolute
+                # path with the folder path would silently target the wrong
+                # file — the disk op would either fail or, worse, trash the
+                # wrong photo without ever pruning the correct catalog row.
+                companion = (
+                    companion_path if os.path.isabs(companion_path)
+                    else os.path.join(f["folder_path"], companion_path)
+                )
                 if companion not in catalog_primary_paths:
                     extra_companions.setdefault(f["photo_id"], set()).add(companion)
 

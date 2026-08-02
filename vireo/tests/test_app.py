@@ -3935,6 +3935,79 @@ def test_trash_paths_batches_finder_fallback_and_retains_timeout_failures(
     assert first.exists() and second.exists()
 
 
+def test_trash_paths_preserves_failure_when_volume_becomes_unreachable(
+    monkeypatch, tmp_path,
+):
+    """A disconnected-mid-flight mount must not be reported as success.
+
+    ``os.path.exists`` returning False is ambiguous: it also happens when the
+    underlying stat fails because the mount vanished. Trusting that as
+    "successfully in Trash" would prune the catalog row for a photo that
+    reappears when the mount comes back. When both the file AND its parent
+    directory look absent, treat it as a failure and let the caller retry.
+    """
+    import app as app_module
+    import send2trash
+
+    volume = tmp_path / "SMB_Share"
+    volume.mkdir()
+    photo = volume / "bird.NEF"
+    photo.write_bytes(b"raw")
+
+    monkeypatch.setattr(app_module.sys, "platform", "linux")
+    monkeypatch.setattr(app_module, "_move_to_volume_trash", lambda _path: False)
+
+    def send2trash_after_disconnect(_path):
+        # Simulate the mount vanishing during send2trash: the call raises and
+        # the entire directory tree is gone.
+        import shutil
+        shutil.rmtree(str(volume))
+        raise OSError("Network volume unavailable")
+
+    monkeypatch.setattr(send2trash, "send2trash", send2trash_after_disconnect)
+
+    moved, successful, failures = app_module._trash_paths([str(photo)])
+
+    assert moved == 0
+    assert successful == set()
+    assert [failure["path"] for failure in failures] == [str(photo)]
+
+
+def test_trash_paths_marks_success_when_send2trash_reports_after_move(
+    monkeypatch, tmp_path,
+):
+    """A live-volume send2trash that raises after the move still succeeds.
+
+    Some Trash APIs commit the move and then raise a post-op error. As long
+    as the file is verifiably absent AND the parent directory is still
+    reachable, honor the requested end state so we don't leave a ghost row.
+    """
+    import app as app_module
+    import send2trash
+
+    folder = tmp_path / "local"
+    folder.mkdir()
+    photo = folder / "bird.NEF"
+    photo.write_bytes(b"raw")
+
+    monkeypatch.setattr(app_module.sys, "platform", "linux")
+    monkeypatch.setattr(app_module, "_move_to_volume_trash", lambda _path: False)
+
+    def send2trash_committed_then_raises(path):
+        os.remove(path)
+        raise OSError("post-move Trash API glitch")
+
+    monkeypatch.setattr(
+        send2trash, "send2trash", send2trash_committed_then_raises,
+    )
+
+    moved, successful, failures = app_module._trash_paths([str(photo)])
+
+    assert moved == 1
+    assert successful == {str(photo)}
+    assert failures == []
+
+
 def test_navbar_js_fallbacks_match_python_constants():
     """The hardcoded fallback lists in _navbar.html must mirror the
     canonical Python lists. The navbar's JS uses these fallbacks when

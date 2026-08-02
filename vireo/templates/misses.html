@@ -1753,9 +1753,13 @@ async function deleteSelectedMisses() {
     // callbacks: ``failed_photo_ids`` lists IDs kept intentionally.
     var retained = new Set((data && data.failed_photo_ids) || []);
     var actuallyDeleted = ids.filter(function(id) { return !retained.has(id); });
-    clearSelection();
+    // Match browse.html: retained IDs stay selected so the user can retry
+    // immediately. clearSelection() would drop everything, including the
+    // rows they still need to act on.
+    actuallyDeleted.forEach(function(id) { selection.delete(id); });
     removePhotosFromMissesData(actuallyDeleted);
     render();
+    updateSelectionBar();
     loadMisses();
   };
 

@@ -412,10 +412,14 @@ def test_api_batch_delete_disk_partial_failure_deletes_only_successes(
 
     def partial_trash(paths):
         paths = list(paths)
-        os.remove(success_path)
-        return 1, {success_path}, [{
-            "path": failed_path, "error": "simulated failure",
-        }]
+        successes = {p for p in paths if p == success_path}
+        for p in successes:
+            os.remove(p)
+        failures = [
+            {"path": p, "error": "simulated failure"}
+            for p in paths if p not in successes
+        ]
+        return len(successes), successes, failures
 
     monkeypatch.setattr(appmod, "_trash_paths", partial_trash)
     resp = client.post("/api/batch/delete", json={
@@ -493,6 +497,117 @@ def test_api_batch_delete_skips_row_whose_identity_changed_mid_delete(
     assert row is not None, "moved row must survive a racing disk delete"
     assert row["folder_id"] == dst_fid
     assert os.path.exists(dest_file), "moved file must not be orphaned"
+
+
+def test_api_batch_delete_treats_concurrently_deleted_row_as_completed(
+    app_and_db, tmp_path, monkeypatch,
+):
+    """A row already removed by a racing delete must not resurface as failed.
+
+    Two overlapping delete requests can race — the first commits the row's
+    removal before the second reaches identity revalidation. When the
+    second's SELECT returns nothing for that id, the requested end state
+    already holds; reporting it as ``failed_photo_ids`` would leave the
+    client showing a photo that is absent from both catalog and disk until
+    reload.
+    """
+    import app as appmod
+
+    app, db = app_and_db
+    client = app.test_client()
+    folder_path = str(tmp_path / "raced")
+    fid = db.add_folder(folder_path, name="raced")
+    pid = db.add_photo(
+        folder_id=fid, filename="bird.jpg", extension=".jpg",
+        file_size=10, file_mtime=1.0,
+    )
+    os.makedirs(folder_path, exist_ok=True)
+
+    def concurrent_delete_then_trash(paths):
+        # A racing delete finished the same row before revalidation runs.
+        db.conn.execute("DELETE FROM photos WHERE id = ?", (pid,))
+        db.conn.commit()
+        return 0, set(paths), []
+
+    monkeypatch.setattr(appmod, "_trash_paths", concurrent_delete_then_trash)
+    resp = client.post("/api/batch/delete", json={
+        "photo_ids": [pid],
+        "mode": "disk",
+    })
+
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert data["failed_photo_ids"] == [], (
+        "row that was already deleted must not be reported as failed"
+    )
+    assert data["trash_failed"] == []
+    assert db.get_photo(pid) is None
+
+
+def test_api_batch_delete_disk_targets_absolute_companion_path(
+    app_and_db, tmp_path, monkeypatch,
+):
+    """An absolute ``companion_path`` must not be joined with folder_path.
+
+    ``companion_path`` is stored as either a bare filename (same folder) or
+    an absolute path; joining an absolute path with the folder would silently
+    target the wrong file, either failing the operation or trashing an
+    unrelated photo without ever pruning the correct catalog row.
+    """
+    import app as appmod
+
+    app, db = app_and_db
+    client = app.test_client()
+    photo = db.get_photos()[0]
+    folder_path = str(tmp_path / "abs")
+    sidecar_folder = str(tmp_path / "sidecars")
+    db.conn.execute(
+        "UPDATE folders SET path = ? WHERE id = ?",
+        (folder_path, photo["folder_id"]),
+    )
+    absolute_companion = os.path.join(sidecar_folder, "bird.xmp")
+    db.conn.execute(
+        "UPDATE photos SET companion_path = ? WHERE id = ?",
+        (absolute_companion, photo["id"]),
+    )
+    db.conn.commit()
+    os.makedirs(folder_path, exist_ok=True)
+    os.makedirs(sidecar_folder, exist_ok=True)
+    primary = os.path.join(folder_path, photo["filename"])
+    Image.new("RGB", (10, 10)).save(primary)
+    with open(absolute_companion, "w") as f:
+        f.write("sidecar")
+
+    seen_paths = []
+
+    def record_trash(paths):
+        paths = list(paths)
+        seen_paths.append(paths)
+        removed = set()
+        for p in paths:
+            if os.path.isfile(p):
+                os.remove(p)
+                removed.add(p)
+        return len(removed), removed, []
+
+    monkeypatch.setattr(appmod, "_trash_paths", record_trash)
+    resp = client.post("/api/batch/delete", json={
+        "photo_ids": [photo["id"]],
+        "mode": "disk",
+        "include_companions": True,
+    })
+
+    assert resp.status_code == 200
+    all_paths = [p for call in seen_paths for p in call]
+    assert absolute_companion in all_paths, (
+        "absolute companion path must be trashed as-is, not joined "
+        "with folder_path"
+    )
+    joined = os.path.join(folder_path, absolute_companion.lstrip(os.sep))
+    assert joined not in all_paths
+    assert not os.path.exists(absolute_companion)
+    assert not os.path.exists(primary)
+    assert db.get_photo(photo["id"]) is None
 
 
 def test_api_batch_delete_companion_failure_does_not_move_primary(

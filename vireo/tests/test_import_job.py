@@ -163,6 +163,30 @@ def test_import_eta_uses_preview_new_count_for_a_mixed_boundary_batch():
     assert fields["eta_seconds"] == 86.0
 
 
+def test_import_eta_no_preview_measures_only_copied_files_in_mixed_batch():
+    """A no-preview mixed batch must not dilute one transfer over 200 files."""
+    from import_job import _ImportEtaEstimator
+
+    now = [0.0]
+    eta = _ImportEtaEstimator(clock=lambda: now[0])
+
+    # Learn a 0.01-second duplicate check from a pure duplicate batch.
+    eta.note_importing(copied=0)
+    now[0] = 2.0
+    eta.note_batch_complete(current=200, copied=0)
+
+    # The next batch takes 12 seconds but contains only one real copy. After
+    # subtracting 1.99 seconds for its 199 duplicates, the expensive rate is
+    # 10.01 seconds per copied file, not 0.06 seconds per settled source.
+    eta.note_importing(copied=0)
+    now[0] = 14.0
+    eta.note_batch_complete(current=400, copied=1)
+    fields = eta.fields(600)
+
+    assert fields["eta_state"] == "ready"
+    assert fields["eta_seconds"] == 2002.0
+
+
 def _ws_linked_folder_paths(db, ws_id):
     return {
         row["path"]

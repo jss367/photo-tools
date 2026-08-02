@@ -177,10 +177,14 @@ class _ImportEtaEstimator:
                     self._duplicate_seconds_per_file = self._smooth(
                         self._duplicate_seconds_per_file, measured,
                     )
-                elif self._expected_new is not None:
-                    # checked_count tells us how many selected preview files
-                    # were not duplicates. Separate that expensive work from
-                    # duplicate checks when a boundary batch contains both.
+                else:
+                    # Measure expensive work against files actually copied,
+                    # even when no preview supplied an expected-new count. A
+                    # boundary batch with 199 quick duplicates and one slow
+                    # transfer must not look like 200 fast transfers. Remove
+                    # the duplicate time learned from earlier pure batches
+                    # when available; otherwise retaining it here makes the
+                    # first estimate conservative instead of optimistic.
                     duplicate_time = (
                         duplicates_in_batch
                         * (self._duplicate_seconds_per_file or 0.0)
@@ -189,15 +193,6 @@ class _ImportEtaEstimator:
                         elapsed - duplicate_time,
                         0.001 * copied_in_batch,
                     ) / copied_in_batch
-                    self._seconds_per_file = self._smooth(
-                        self._seconds_per_file, measured,
-                    )
-                else:
-                    # Without a preview count, completed source files are the
-                    # only honest denominator available. Still require some
-                    # landed work so a fast duplicate-only batch cannot seed
-                    # the transfer estimate.
-                    measured = elapsed / completed
                     self._seconds_per_file = self._smooth(
                         self._seconds_per_file, measured,
                     )

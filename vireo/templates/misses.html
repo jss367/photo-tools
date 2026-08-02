@@ -1747,8 +1747,14 @@ async function deleteSelectedMisses() {
   var companionCount = rows.filter(function(p) { return !!p.companion_path; }).length;
 
   var afterDelete = function(data) {
+    // Rows the server retained after Trash failures must remain visible —
+    // dropping them from ``missesData`` would hide files still on disk until
+    // reload. Callback receives the same ``data`` shape as other delete
+    // callbacks: ``failed_photo_ids`` lists IDs kept intentionally.
+    var retained = new Set((data && data.failed_photo_ids) || []);
+    var actuallyDeleted = ids.filter(function(id) { return !retained.has(id); });
     clearSelection();
-    removePhotosFromMissesData(ids);
+    removePhotosFromMissesData(actuallyDeleted);
     render();
     loadMisses();
   };

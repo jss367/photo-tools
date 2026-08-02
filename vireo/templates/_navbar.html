@@ -8140,6 +8140,20 @@ function lightboxDelete() {
   var companionCount = (p && p.companion_path) ? 1 : 0;
 
   showDeleteDialog([currentId], companionCount, function(data) {
+    // If the server retained this photo because its Trash step failed (and
+    // the user declined the permanent-delete fallback), leave it in the
+    // lightbox and grid. Dropping it here would hide a file still on disk
+    // until the next reload — the toast already told the user it was kept.
+    var retained = (data && data.failed_photo_ids) || [];
+    if (retained.indexOf(currentId) !== -1) {
+      try {
+        document.dispatchEvent(new CustomEvent('lightbox:photodeleted', {
+          detail: { photoId: currentId, result: data || null, retained: true }
+        }));
+      } catch (_) {}
+      return;
+    }
+
     // Remove from lightbox photo list
     var idx = _lightboxPhotoList.findIndex(function(x) { return x.id === currentId; });
     _lightboxPhotoList.splice(idx, 1);

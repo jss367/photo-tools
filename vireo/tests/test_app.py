@@ -3796,6 +3796,76 @@ def test_move_to_volume_trash_renames_without_finder(monkeypatch, tmp_path):
     assert (volume / ".Trashes" / "501" / "bird.NEF").read_bytes() == b"raw"
 
 
+def test_move_to_volume_trash_preserves_both_files_on_name_collision(
+    monkeypatch, tmp_path,
+):
+    """Same-named files from different folders must both survive in Trash.
+
+    Regression: the earlier ``lexists`` check followed by ``os.rename`` was a
+    TOCTOU race — two concurrent moves could observe an empty destination and
+    then both rename to the same path, permanently losing one photo. The
+    atomic reservation must assign a unique suffix to the second caller.
+    """
+    import app as app_module
+
+    volume = tmp_path / "Photography"
+    first_dir = volume / "A"
+    second_dir = volume / "B"
+    first_dir.mkdir(parents=True)
+    second_dir.mkdir(parents=True)
+    first = first_dir / "bird.NEF"
+    second = second_dir / "bird.NEF"
+    first.write_bytes(b"first")
+    second.write_bytes(b"second")
+
+    monkeypatch.setattr(app_module.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        app_module, "_volume_root_for_path", lambda _path: str(volume),
+    )
+    monkeypatch.setattr(app_module.os, "getuid", lambda: 501, raising=False)
+
+    assert app_module._move_to_volume_trash(str(first)) is True
+    assert app_module._move_to_volume_trash(str(second)) is True
+
+    trash_dir = volume / ".Trashes" / "501"
+    assert not first.exists()
+    assert not second.exists()
+
+    trashed = sorted(p for p in trash_dir.iterdir() if p.suffix == ".NEF")
+    assert len(trashed) == 2, [p.name for p in trashed]
+    contents = sorted(p.read_bytes() for p in trashed)
+    assert contents == [b"first", b"second"]
+
+
+def test_move_to_volume_trash_removes_placeholder_when_rename_fails(
+    monkeypatch, tmp_path,
+):
+    """A failed ``os.rename`` must not leak the reserved placeholder file."""
+    import app as app_module
+
+    volume = tmp_path / "Photography"
+    source_dir = volume / "Raw"
+    source_dir.mkdir(parents=True)
+    source = source_dir / "bird.NEF"
+    source.write_bytes(b"raw")
+
+    monkeypatch.setattr(app_module.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        app_module, "_volume_root_for_path", lambda _path: str(volume),
+    )
+    monkeypatch.setattr(app_module.os, "getuid", lambda: 501, raising=False)
+
+    def boom(_src, _dst):
+        raise OSError("rename refused")
+
+    monkeypatch.setattr(app_module.os, "rename", boom)
+
+    assert app_module._move_to_volume_trash(str(source)) is False
+    assert source.exists()
+    trash_dir = volume / ".Trashes" / "501"
+    assert list(trash_dir.iterdir()) == []
+
+
 def test_trash_paths_batches_finder_fallback_and_retains_timeout_failures(
     monkeypatch, tmp_path,
 ):

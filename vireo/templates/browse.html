@@ -6394,13 +6394,23 @@ function batchDelete() {
     if (p && p.companion_path) companionCount++;
   });
   showDeleteDialog(ids, companionCount, function(data) {
-    // Remove deleted photos from local array
-    var deletedSet = new Set(ids);
+    // The server may have retained rows whose Trash step failed (and the
+    // user declined the permanent-delete fallback). Keep those rows visible
+    // — dropping them from ``photos`` would hide files still on disk until
+    // the next reload.
+    var retained = new Set((data && data.failed_photo_ids) || []);
+    var deletedSet = new Set(ids.filter(function(id) { return !retained.has(id); }));
     photos = photos.filter(function(p) { return !deletedSet.has(p.id); });
     totalPhotos = Math.max(0, totalPhotos - (data.deleted || 0));
-    selectedPhotos.clear();
-    selectedPhotoId = null;
-    document.getElementById('batchBar').style.display = 'none';
+    selectedPhotos = new Set(Array.from(selectedPhotos).filter(function(id) {
+      return !deletedSet.has(id);
+    }));
+    if (selectedPhotoId != null && deletedSet.has(selectedPhotoId)) {
+      selectedPhotoId = null;
+    }
+    if (selectedPhotos.size === 0) {
+      document.getElementById('batchBar').style.display = 'none';
+    }
     renderGrid();
     updateFilterSummary();
     loadSummary();
@@ -6409,7 +6419,7 @@ function batchDelete() {
     var countEl = document.getElementById('photoCount');
     if (countEl) {
       var current = parseInt(countEl.textContent) || 0;
-      countEl.textContent = (current - data.deleted);
+      countEl.textContent = (current - (data.deleted || 0));
     }
   });
 }

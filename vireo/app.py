@@ -1740,13 +1740,39 @@ def _move_to_volume_trash(filepath):
             raise OSError("volume Trash directory resolves outside its volume")
 
         basename = os.path.basename(filepath)
-        destination = os.path.join(trash_dir, basename)
-        if os.path.lexists(destination):
-            stem, ext = os.path.splitext(basename)
-            destination = os.path.join(
-                trash_dir, f"{stem} {uuid.uuid4().hex[:8]}{ext}",
+        stem, ext = os.path.splitext(basename)
+        # Atomically reserve the destination name with O_CREAT|O_EXCL so two
+        # concurrent moves for same-named files from different folders can't
+        # both observe an empty slot and then rename to the same path — POSIX
+        # rename would silently replace one file, permanently losing a photo
+        # the user meant to send to Trash.
+        candidate = os.path.join(trash_dir, basename)
+        reserved = None
+        for _ in range(32):
+            try:
+                fd = os.open(
+                    candidate, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600,
+                )
+                os.close(fd)
+                reserved = candidate
+                break
+            except FileExistsError:
+                candidate = os.path.join(
+                    trash_dir, f"{stem} {uuid.uuid4().hex[:8]}{ext}",
+                )
+        if reserved is None:
+            raise OSError(
+                f"could not reserve a unique Trash destination in {trash_dir}",
             )
-        os.rename(filepath, destination)
+        try:
+            os.rename(filepath, reserved)
+        except OSError:
+            # Roll back the placeholder so the reserved name stays free.
+            try:
+                os.unlink(reserved)
+            except OSError:
+                pass
+            raise
         return True
     except OSError as exc:
         log.debug("Direct volume Trash move failed for %s: %s", filepath, exc)

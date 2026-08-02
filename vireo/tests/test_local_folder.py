@@ -127,9 +127,9 @@ def test_local_copy_preflight_aggregates_folders_on_the_same_disk(
         service,
         "destination_disk_space",
         lambda _path: {
-            "total_bytes": 1_000,
-            "free_bytes": 100,
-            "reserve_bytes": 20,
+            "total_bytes": 100_000,
+            "free_bytes": 18_000,
+            "reserve_bytes": 2_000,
             "device": 7,
             "probe_path": str(tmp_path),
         },
@@ -141,9 +141,10 @@ def test_local_copy_preflight_aggregates_folders_on_the_same_disk(
 
         assert result["total_bytes"] == 90
         assert [folder["total_bytes"] for folder in result["folders"]] == [30, 60]
+        assert [folder["estimated_bytes"] for folder in result["folders"]] == [8192, 8192]
         assert len(result["volumes"]) == 1
-        assert result["volumes"][0]["copy_bytes"] == 90
-        assert result["volumes"][0]["after_copy_bytes"] == 10
+        assert result["volumes"][0]["copy_bytes"] == 16384
+        assert result["volumes"][0]["after_copy_bytes"] == 1616
         assert result["volumes"][0]["can_copy"] is False
         assert result["can_copy"] is False
     finally:

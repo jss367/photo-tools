@@ -104,7 +104,7 @@ def local_copy_preflight(
         if local_base is None:
             local_base = str(default_local_base(vireo_dir, root_folder_id))
         local_path = local_path_for_base(local_base, root_folder_id, source_path)
-        total_files, total_bytes = source_tree_size(source_path)
+        total_files, total_bytes, estimated_bytes = source_tree_size(source_path)
         space = destination_disk_space(local_path)
         device = int(space["device"])
         volume = volumes_by_device.setdefault(
@@ -122,7 +122,7 @@ def local_copy_preflight(
         # If free space changes during a multi-folder scan, use the most
         # conservative reading for the shared-volume aggregate.
         volume["free_bytes"] = min(volume["free_bytes"], int(space["free_bytes"]))
-        volume["copy_bytes"] += total_bytes
+        volume["copy_bytes"] += estimated_bytes
         volume["destination_paths"].append(str(local_path))
         volume["folder_ids"].append(root_folder_id)
         folders.append(
@@ -132,6 +132,7 @@ def local_copy_preflight(
                 "destination_path": str(local_path),
                 "total_files": total_files,
                 "total_bytes": total_bytes,
+                "estimated_bytes": estimated_bytes,
                 "device": device,
             }
         )

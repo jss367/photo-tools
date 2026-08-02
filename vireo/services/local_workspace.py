@@ -42,6 +42,11 @@ MANIFEST_VERSION = 2
 LOCAL_RESERVE_BYTES = 1024**3
 LOCAL_MAX_RESERVE_BYTES = 20 * 1024**3
 LOCAL_RESERVE_FRACTION = 0.05
+# A copied entry consumes at least one destination allocation unit even when
+# its logical size is zero. Four KiB is the common minimum on APFS, NTFS, and
+# ext filesystems; the separate volume reserve covers larger cluster sizes and
+# filesystem metadata without making ordinary photo folders look enormous.
+LOCAL_ALLOCATION_UNIT_BYTES = 4096
 
 # Serializes stage/sync/discard per workspace. A short global guard covers
 # stage's cross-workspace overlap validation so two concurrent stages cannot
@@ -126,8 +131,20 @@ def destination_disk_space(path: str | Path) -> dict:
     }
 
 
-def source_tree_size(source: str) -> tuple[int, int]:
-    """Return the exact entry count and logical bytes copied from ``source``."""
+def _estimated_destination_bytes(st) -> int:
+    """Conservatively estimate allocation consumed by one copied entry."""
+    if stat.S_ISREG(st.st_mode):
+        units = max(
+            1,
+            (st.st_size + LOCAL_ALLOCATION_UNIT_BYTES - 1)
+            // LOCAL_ALLOCATION_UNIT_BYTES,
+        )
+        return units * LOCAL_ALLOCATION_UNIT_BYTES
+    return LOCAL_ALLOCATION_UNIT_BYTES
+
+
+def source_tree_size(source: str) -> tuple[int, int, int]:
+    """Return copied-file count, logical bytes, and estimated allocated bytes."""
     try:
         root_st = os.lstat(source)
     except OSError as exc:
@@ -141,20 +158,26 @@ def source_tree_size(source: str) -> tuple[int, int]:
 
     total_files = 0
     total_bytes = 0
+    # The destination root directory itself is created for every source.
+    estimated_bytes = LOCAL_ALLOCATION_UNIT_BYTES
     for _rel, full, st in _walk_entries(source):
         mode = st.st_mode
         if stat.S_ISREG(mode):
             total_bytes += st.st_size
             total_files += 1
+            estimated_bytes += _estimated_destination_bytes(st)
         elif stat.S_ISLNK(mode):
             if not _symlink_stays_within(full, source):
                 raise LocalWorkspaceError(
                     f"Symlink escapes or uses an absolute target and cannot be staged: {full}"
                 )
             total_files += 1
-        elif not stat.S_ISDIR(mode):
+            estimated_bytes += _estimated_destination_bytes(st)
+        elif stat.S_ISDIR(mode):
+            estimated_bytes += _estimated_destination_bytes(st)
+        else:
             raise LocalWorkspaceError(f"Unsupported special file in workspace: {full}")
-    return total_files, total_bytes
+    return total_files, total_bytes, estimated_bytes
 
 
 def workspace_dir(vireo_dir: str, workspace_id: int) -> Path:
@@ -437,11 +460,13 @@ def _collect_source_entries(roots: list[dict], local_base: Path) -> tuple[dict[i
     """
     per_root: dict[int, list] = {}
     total_bytes = 0
+    estimated_bytes = 0
     total_files = 0
     local_base.parent.mkdir(parents=True, exist_ok=True)
     case_insensitive_target = _dest_case_insensitive(local_base)
     for index, root in enumerate(roots):
         source = root["source_path"]
+        estimated_bytes += LOCAL_ALLOCATION_UNIT_BYTES
         # os.path.isdir follows symlinks; a source root that is itself a
         # symlink would activate successfully here but sync_back later lstats
         # and rejects it, leaving every local edit unsyncable. Reject
@@ -463,14 +488,16 @@ def _collect_source_entries(roots: list[dict], local_base: Path) -> tuple[dict[i
             if stat.S_ISREG(mode):
                 total_bytes += st.st_size
                 total_files += 1
+                estimated_bytes += _estimated_destination_bytes(st)
             elif stat.S_ISLNK(mode):
                 if not _symlink_stays_within(full, source):
                     raise LocalWorkspaceError(
                         f"Symlink escapes or uses an absolute target and cannot be staged: {full}"
                     )
                 total_files += 1
+                estimated_bytes += _estimated_destination_bytes(st)
             elif stat.S_ISDIR(mode):
-                pass
+                estimated_bytes += _estimated_destination_bytes(st)
             else:
                 raise LocalWorkspaceError(f"Unsupported special file in workspace: {full}")
             if case_insensitive_target and rel:
@@ -496,7 +523,7 @@ def _collect_source_entries(roots: list[dict], local_base: Path) -> tuple[dict[i
 
     usage = shutil.disk_usage(local_base.parent)
     reserve = local_space_reserve(usage.total)
-    required = total_bytes + reserve
+    required = estimated_bytes + reserve
     if usage.free < required:
         raise LocalWorkspaceError(
             f"Not enough local space: need {required:,} bytes including safety reserve, "

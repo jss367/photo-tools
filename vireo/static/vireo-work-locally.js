@@ -66,8 +66,6 @@
   function renderStagePreflight(preflight) {
     var capacity = document.getElementById('stageLocalFoldersCapacity');
     var button = document.getElementById('confirmStageLocalFolders');
-    var error = document.getElementById('stageLocalFoldersError');
-    if (error) error.textContent = '';
     var byFolder = {};
     (preflight.folders || []).forEach(function(folder) {
       byFolder[String(folder.folder_id)] = folder;

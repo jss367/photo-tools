@@ -3790,6 +3790,426 @@ def test_trash_via_finder_guarded_off_mac(monkeypatch):
     assert called == [], "osascript must not be spawned off macOS"
 
 
+def test_trash_via_finder_batches_paths_and_sets_timeout(monkeypatch):
+    """Finder fallback uses one bounded AppleScript process for a batch."""
+    import types
+
+    import app as app_module
+
+    monkeypatch.setattr(app_module.sys, "platform", "darwin")
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append((argv, kwargs))
+        return types.SimpleNamespace(returncode=0, stderr="")
+
+    monkeypatch.setattr(app_module.subprocess, "run", fake_run)
+    app_module._trash_via_finder(["/Volumes/X/a.NEF", "/Volumes/X/b.NEF"])
+
+    assert len(calls) == 1
+    argv, kwargs = calls[0]
+    assert "/Volumes/X/a.NEF" in argv
+    assert "/Volumes/X/b.NEF" in argv
+    assert "repeat with posixPath in argv" in argv
+    assert kwargs["timeout"] == app_module._FINDER_TRASH_TIMEOUT_SECS
+
+
+def test_move_to_volume_trash_renames_without_finder(monkeypatch, tmp_path):
+    """Mounted-volume fast path performs a same-volume move into .Trashes."""
+    import app as app_module
+
+    volume = tmp_path / "Photography"
+    source_dir = volume / "Raw Files"
+    source_dir.mkdir(parents=True)
+    source = source_dir / "bird.NEF"
+    source.write_bytes(b"raw")
+
+    monkeypatch.setattr(app_module.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        app_module, "_volume_root_for_path", lambda _path: str(volume),
+    )
+    monkeypatch.setattr(app_module.os, "getuid", lambda: 501, raising=False)
+
+    assert app_module._move_to_volume_trash(str(source)) is True
+    assert not source.exists()
+    assert (volume / ".Trashes" / "501" / "bird.NEF").read_bytes() == b"raw"
+
+
+def test_move_to_volume_trash_preserves_both_files_on_name_collision(
+    monkeypatch, tmp_path,
+):
+    """Same-named files from different folders must both survive in Trash.
+
+    Regression: the earlier ``lexists`` check followed by ``os.rename`` was a
+    TOCTOU race — two concurrent moves could observe an empty destination and
+    then both rename to the same path, permanently losing one photo. The
+    atomic reservation must assign a unique suffix to the second caller.
+    """
+    import app as app_module
+
+    volume = tmp_path / "Photography"
+    first_dir = volume / "A"
+    second_dir = volume / "B"
+    first_dir.mkdir(parents=True)
+    second_dir.mkdir(parents=True)
+    first = first_dir / "bird.NEF"
+    second = second_dir / "bird.NEF"
+    first.write_bytes(b"first")
+    second.write_bytes(b"second")
+
+    monkeypatch.setattr(app_module.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        app_module, "_volume_root_for_path", lambda _path: str(volume),
+    )
+    monkeypatch.setattr(app_module.os, "getuid", lambda: 501, raising=False)
+
+    assert app_module._move_to_volume_trash(str(first)) is True
+    assert app_module._move_to_volume_trash(str(second)) is True
+
+    trash_dir = volume / ".Trashes" / "501"
+    assert not first.exists()
+    assert not second.exists()
+
+    trashed = sorted(p for p in trash_dir.iterdir() if p.suffix == ".NEF")
+    assert len(trashed) == 2, [p.name for p in trashed]
+    contents = sorted(p.read_bytes() for p in trashed)
+    assert contents == [b"first", b"second"]
+
+
+def test_move_to_volume_trash_removes_placeholder_when_rename_fails(
+    monkeypatch, tmp_path,
+):
+    """A failed rename must not leak the reserved placeholder file."""
+    import app as app_module
+
+    volume = tmp_path / "Photography"
+    source_dir = volume / "Raw"
+    source_dir.mkdir(parents=True)
+    source = source_dir / "bird.NEF"
+    source.write_bytes(b"raw")
+
+    monkeypatch.setattr(app_module.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        app_module, "_volume_root_for_path", lambda _path: str(volume),
+    )
+    monkeypatch.setattr(app_module.os, "getuid", lambda: 501, raising=False)
+
+    def boom(_src, _dst):
+        raise OSError("rename refused")
+
+    monkeypatch.setattr(app_module.os, "replace", boom)
+
+    assert app_module._move_to_volume_trash(str(source)) is False
+    assert source.exists()
+    trash_dir = volume / ".Trashes" / "501"
+    assert list(trash_dir.iterdir()) == []
+
+
+def test_move_to_volume_trash_preserves_committed_rename_after_reported_error(
+    monkeypatch, tmp_path,
+):
+    """A lost network success response must not unlink the moved photo."""
+    import app as app_module
+
+    volume = tmp_path / "Photography"
+    source_dir = volume / "Raw"
+    source_dir.mkdir(parents=True)
+    source = source_dir / "bird.NEF"
+    source.write_bytes(b"raw")
+
+    monkeypatch.setattr(app_module.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        app_module, "_volume_root_for_path", lambda _path: str(volume),
+    )
+    monkeypatch.setattr(app_module.os, "getuid", lambda: 501, raising=False)
+    real_replace = app_module.os.replace
+
+    def replace_then_report_error(src, dst):
+        real_replace(src, dst)
+        raise OSError("network response lost")
+
+    monkeypatch.setattr(app_module.os, "replace", replace_then_report_error)
+
+    assert app_module._move_to_volume_trash(str(source)) is True
+    assert not source.exists()
+    trashed = volume / ".Trashes" / "501" / "bird.NEF"
+    assert trashed.read_bytes() == b"raw"
+
+
+def test_trash_paths_batches_finder_fallback_and_retains_timeout_failures(
+    monkeypatch, tmp_path,
+):
+    """Failed send2trash paths share one Finder call and remain retryable."""
+    import subprocess
+
+    import app as app_module
+    import send2trash
+
+    first = tmp_path / "first.NEF"
+    second = tmp_path / "second.NEF"
+    first.write_bytes(b"one")
+    second.write_bytes(b"two")
+
+    monkeypatch.setattr(app_module.sys, "platform", "darwin")
+    monkeypatch.setattr(app_module, "_move_to_volume_trash", lambda _path: False)
+    monkeypatch.setattr(
+        send2trash, "send2trash",
+        lambda _path: (_ for _ in ()).throw(OSError("legacy Trash failed")),
+    )
+    finder_calls = []
+
+    def timeout(paths):
+        finder_calls.append(list(paths))
+        raise subprocess.TimeoutExpired("osascript", 30)
+
+    monkeypatch.setattr(app_module, "_trash_via_finder", timeout)
+    moved, successful, failures = app_module._trash_paths([
+        str(first), str(second),
+    ])
+
+    assert finder_calls == [[str(first), str(second)]]
+    assert moved == 0
+    assert successful == set()
+    assert {failure["path"] for failure in failures} == {str(first), str(second)}
+    assert first.exists() and second.exists()
+
+
+def test_trash_paths_preserves_failure_when_volume_becomes_unreachable(
+    monkeypatch, tmp_path,
+):
+    """A disconnected-mid-flight mount must not be reported as success.
+
+    ``os.path.exists`` returning False is ambiguous: it also happens when the
+    underlying stat fails because the mount vanished. Trusting that as
+    "successfully in Trash" would prune the catalog row for a photo that
+    reappears when the mount comes back. When both the file AND its parent
+    directory look absent, treat it as a failure and let the caller retry.
+    """
+    import app as app_module
+    import send2trash
+
+    volume = tmp_path / "SMB_Share"
+    volume.mkdir()
+    photo = volume / "bird.NEF"
+    photo.write_bytes(b"raw")
+
+    monkeypatch.setattr(app_module.sys, "platform", "linux")
+    monkeypatch.setattr(app_module, "_move_to_volume_trash", lambda _path: False)
+
+    def send2trash_after_disconnect(_path):
+        # Simulate the mount vanishing during send2trash: the call raises and
+        # the entire directory tree is gone.
+        import shutil
+        shutil.rmtree(str(volume))
+        raise OSError("Network volume unavailable")
+
+    monkeypatch.setattr(send2trash, "send2trash", send2trash_after_disconnect)
+
+    moved, successful, failures = app_module._trash_paths([str(photo)])
+
+    assert moved == 0
+    assert successful == set()
+    assert [failure["path"] for failure in failures] == [str(photo)]
+
+
+def test_trash_paths_preflight_preserves_failure_on_disconnected_mount(
+    monkeypatch, tmp_path,
+):
+    """A mount disconnected BEFORE the preflight must not be reported as
+    already-gone. ``os.path.isfile`` returns False in that case because the
+    underlying stat fails, and previously the preflight would silently mark
+    the path successful and let the caller prune the catalog row for a
+    photo that reappears when the mount comes back.
+    """
+    import app as app_module
+
+    volume = tmp_path / "SMB_Share"
+    volume.mkdir()
+    photo = volume / "bird.NEF"
+    photo.write_bytes(b"raw")
+    photo_path = str(photo)
+
+    monkeypatch.setattr(app_module.sys, "platform", "linux")
+    monkeypatch.setattr(app_module, "_move_to_volume_trash", lambda _p: False)
+
+    import shutil
+    shutil.rmtree(str(volume))
+
+    called = {"send2trash": False, "finder": False}
+
+    import send2trash
+
+    def unexpected_send2trash(_path):
+        called["send2trash"] = True
+        raise AssertionError("send2trash must not be called for a preflight-detected unreachable mount")
+
+    def unexpected_finder(_paths):
+        called["finder"] = True
+        raise AssertionError("Finder must not be called for a preflight-detected unreachable mount")
+
+    monkeypatch.setattr(send2trash, "send2trash", unexpected_send2trash)
+    monkeypatch.setattr(app_module, "_trash_via_finder", unexpected_finder)
+
+    moved, successful, failures = app_module._trash_paths([photo_path])
+
+    assert moved == 0
+    assert successful == set()
+    assert [failure["path"] for failure in failures] == [photo_path]
+    assert failures[0]["error"] == "Source path is unreachable"
+    assert called["send2trash"] is False
+    assert called["finder"] is False
+
+
+def test_trash_paths_preflight_accepts_already_missing_on_live_volume(
+    monkeypatch, tmp_path,
+):
+    """A file legitimately missing on a still-mounted volume is accepted."""
+    import app as app_module
+
+    folder = tmp_path / "local"
+    folder.mkdir()
+    ghost = folder / "already_gone.NEF"
+
+    monkeypatch.setattr(app_module.sys, "platform", "linux")
+    monkeypatch.setattr(app_module, "_move_to_volume_trash", lambda _p: False)
+
+    moved, successful, failures = app_module._trash_paths([str(ghost)])
+
+    assert moved == 0
+    assert successful == {str(ghost)}
+    assert failures == []
+
+
+def test_trash_paths_marks_success_when_send2trash_reports_after_move(
+    monkeypatch, tmp_path,
+):
+    """A live-volume send2trash that raises after the move still succeeds.
+
+    Some Trash APIs commit the move and then raise a post-op error. As long
+    as the file is verifiably absent AND the parent directory is still
+    reachable, honor the requested end state so we don't leave a ghost row.
+    """
+    import app as app_module
+    import send2trash
+
+    folder = tmp_path / "local"
+    folder.mkdir()
+    photo = folder / "bird.NEF"
+    photo.write_bytes(b"raw")
+
+    monkeypatch.setattr(app_module.sys, "platform", "linux")
+    monkeypatch.setattr(app_module, "_move_to_volume_trash", lambda _path: False)
+
+    def send2trash_committed_then_raises(path):
+        os.remove(path)
+        raise OSError("post-move Trash API glitch")
+
+    monkeypatch.setattr(
+        send2trash, "send2trash", send2trash_committed_then_raises,
+    )
+
+    moved, successful, failures = app_module._trash_paths([str(photo)])
+
+    assert moved == 1
+    assert successful == {str(photo)}
+    assert failures == []
+
+
+def test_path_confirmed_gone_rejects_stale_mount_point_directory(
+    monkeypatch, tmp_path,
+):
+    """When a managed folder is itself a mount point (e.g. /mnt/photos) and
+    the network volume disconnects, the local mount-point directory can
+    remain on the underlying local filesystem. ``os.path.isdir`` then
+    still returns True even though the actual volume is gone. Compare the
+    pre-op ``st_dev`` snapshot against the post-op device so the file is
+    not falsely accepted as ``gone``.
+    """
+    import app as app_module
+
+    mount_root = tmp_path / "mnt_photos"
+    mount_root.mkdir()
+    photo = mount_root / "bird.NEF"
+    photo.write_bytes(b"raw")
+
+    baseline_dev = app_module._snapshot_parent_device(str(photo))
+    assert baseline_dev is not None
+
+    # The file appears gone (the "disconnect" symptom) but the parent
+    # directory is still stat'able on a different device (the mount point
+    # replaced by the underlying local FS).
+    photo.unlink()
+    real_stat = os.stat
+
+    def stat_with_shifted_dev(path, *args, **kwargs):
+        result = real_stat(path, *args, **kwargs)
+        if os.path.normpath(path) == os.path.normpath(str(mount_root)):
+            class _Shifted:
+                st_dev = baseline_dev + 1
+                st_mode = result.st_mode
+            return _Shifted()
+        return result
+
+    monkeypatch.setattr(app_module.os, "stat", stat_with_shifted_dev)
+
+    # Without the snapshot the legacy check accepts the file as gone.
+    assert app_module._path_confirmed_gone(str(photo)) is True
+    # With the snapshot it correctly refuses to accept the change.
+    assert app_module._path_confirmed_gone(
+        str(photo), expected_parent_dev=baseline_dev,
+    ) is False
+
+
+def test_trash_paths_rejects_success_when_mount_replaced_by_local_fs(
+    monkeypatch, tmp_path,
+):
+    """A send2trash that raises after the mount vanished but left the
+    mount-point directory behind must be reported as a failure, not as a
+    successful trash.
+    """
+    import app as app_module
+    import send2trash
+
+    mount_root = tmp_path / "SMB_Share"
+    mount_root.mkdir()
+    photo = mount_root / "bird.NEF"
+    photo.write_bytes(b"raw")
+
+    baseline_dev = os.stat(str(mount_root)).st_dev
+    monkeypatch.setattr(app_module.sys, "platform", "linux")
+    monkeypatch.setattr(app_module, "_move_to_volume_trash", lambda _p: False)
+
+    real_stat = os.stat
+
+    def mount_disconnect_after_send2trash(path):
+        # Simulate the mount vanishing during send2trash: the file is gone
+        # but the mount-point directory remains, backed by a different
+        # underlying device.
+        os.unlink(path)
+
+        def stat_with_shifted_dev(target, *args, **kwargs):
+            result = real_stat(target, *args, **kwargs)
+            if os.path.normpath(target) == os.path.normpath(str(mount_root)):
+                class _Shifted:
+                    st_dev = baseline_dev + 1
+                    st_mode = result.st_mode
+                return _Shifted()
+            return result
+
+        monkeypatch.setattr(app_module.os, "stat", stat_with_shifted_dev)
+        raise OSError("Network volume unavailable")
+
+    monkeypatch.setattr(
+        send2trash, "send2trash", mount_disconnect_after_send2trash,
+    )
+
+    moved, successful, failures = app_module._trash_paths([str(photo)])
+
+    assert moved == 0
+    assert successful == set()
+    assert [failure["path"] for failure in failures] == [str(photo)]
+
+
 def test_navbar_js_fallbacks_match_python_constants():
     """The hardcoded fallback lists in _navbar.html must mirror the
     canonical Python lists. The navbar's JS uses these fallbacks when

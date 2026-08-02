@@ -7971,7 +7971,7 @@ function updateDeleteProgress(data) {
   if (detail) detail.textContent = parts.join(' · ');
 }
 
-function handleDeleteJobComplete(evt, savedCallback, mode) {
+async function handleDeleteJobComplete(evt, savedCallback, mode, includeCompanions) {
   var data = evt && evt.result;
   if (!evt || evt.status !== 'completed' || !data) {
     hideDeleteModal();
@@ -7984,22 +7984,48 @@ function handleDeleteJobComplete(evt, savedCallback, mode) {
 
   if (data.trash_failed && data.trash_failed.length > 0) {
     var paths = data.trash_failed.map(function(f) { return f.path; });
+    var failedIds = (data.failed_photo_ids || []).filter(function(id, idx, all) {
+      return all.indexOf(id) === idx;
+    });
     if (confirm('Trash not available for ' + paths.length + ' file(s):\n' +
         paths.slice(0, 5).join('\n') +
         (paths.length > 5 ? '\n... and ' + (paths.length - 5) + ' more' : '') +
         '\n\nPermanently delete instead?')) {
-      safeFetch('/api/batch/delete', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({paths: paths, mode: 'disk_permanent'}),
-      }).catch(function() { /* already removed from DB */ });
+      try {
+        // Newer servers retain catalog rows whose Trash operation failed, so
+        // retry by photo id and let the server remove each row only after its
+        // permanent file deletion succeeds. ``paths`` remains the compatibility
+        // path for an in-flight job started by an older build that already
+        // removed its rows.
+        var retryBody = failedIds.length
+          ? {
+              photo_ids: failedIds,
+              mode: 'disk_permanent',
+              include_companions: !!includeCompanions,
+            }
+          : {paths: paths, mode: 'disk_permanent'};
+        var retry = await safeFetch('/api/batch/delete', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify(retryBody),
+        });
+        data.deleted += Number(retry.deleted || 0);
+        data.trashed += Number(retry.trashed || 0);
+        data.trash_failed = retry.trash_failed || [];
+        data.failed_photo_ids = retry.failed_photo_ids || [];
+      } catch (e) {
+        // safeFetch already surfaced the actionable error.
+      }
     }
   }
 
   var msg = mode === 'vireo'
     ? data.deleted + ' photo' + (data.deleted === 1 ? '' : 's') + ' removed'
     : data.deleted + ' photo' + (data.deleted === 1 ? '' : 's') + ' moved to Trash';
-  showToast(msg, 'success');
+  if (data.failed_photo_ids && data.failed_photo_ids.length) {
+    msg += '; ' + data.failed_photo_ids.length + ' retained after file errors';
+  }
+  showToast(msg, data.failed_photo_ids && data.failed_photo_ids.length ? 'error' : 'success');
 
   if (savedCallback) savedCallback(data);
 }
@@ -8069,7 +8095,7 @@ async function confirmDelete() {
     onProgress: updateDeleteProgress,
     onComplete: function(evt) {
       _deleteJobSource = null;
-      handleDeleteJobComplete(evt, savedCallback, mode);
+      handleDeleteJobComplete(evt, savedCallback, mode, includeCompanions);
     },
     onError: function() {
       _deleteJobSource = null;
@@ -8118,6 +8144,15 @@ function lightboxDelete() {
   var companionCount = (p && p.companion_path) ? 1 : 0;
 
   showDeleteDialog([currentId], companionCount, function(data) {
+    // If the server retained this photo because its Trash step failed (and
+    // the user declined the permanent-delete fallback), leave it in the
+    // lightbox and grid. Dropping it here would hide a file still on disk
+    // until the next reload — the toast already told the user it was kept.
+    var retained = (data && data.failed_photo_ids) || [];
+    if (retained.indexOf(currentId) !== -1) {
+      return;
+    }
+
     // Remove from lightbox photo list
     var idx = _lightboxPhotoList.findIndex(function(x) { return x.id === currentId; });
     _lightboxPhotoList.splice(idx, 1);

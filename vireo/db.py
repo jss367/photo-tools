@@ -8602,23 +8602,20 @@ class Database:
                 raise
             log.exception("Failed to prune pipeline cache after delete")
 
-    def delete_photos(self, photo_ids, include_companions=False, commit=True):
-        """Delete photos and all associated data.
+    def resolve_photos_for_delete(self, photo_ids, include_companions=False):
+        """Resolve photo ids to the rows and paths a delete would remove.
 
-        Returns dict with 'deleted' count, 'ids' list of deleted photo IDs
-        (post-companion-resolution), and 'files' list of
-        {photo_id, folder_path, filename, companion_path} for file cleanup.
+        This is intentionally read-only. Disk-delete callers use it to move
+        originals to Trash *before* deleting their catalog rows, so a failed
+        filesystem operation leaves the photo visible and retryable in Vireo.
 
-        When ``commit`` is ``False``, this call participates in an outer
-        transaction managed by the caller: no ``commit()``/``rollback()`` is
-        issued here, **and** the non-DB pipeline-cache prune is skipped so
-        a later failed chunk can roll the DB back without leaving a
-        permanently-mutated cache file on disk. The caller is responsible
-        for invoking ``prune_pipeline_cache_for_ids`` with the union of
-        returned ``ids`` after the outer commit succeeds.
+        Returns a dict with ``ids``, ``files``, and the private ``_rows`` used
+        by :meth:`delete_photos`. ``files`` retains the long-standing cleanup
+        shape and additionally includes ``folder_id`` for callers that need to
+        group related paths.
         """
         if not photo_ids:
-            return {"deleted": 0, "ids": [], "files": []}
+            return {"ids": [], "files": [], "_rows": []}
 
         # Resolve to actual existing photos. Chunked — callers like
         # /api/audit/remove-missing pass arbitrarily large id lists straight
@@ -8634,7 +8631,7 @@ class Database:
             ).fetchall())
 
         if not rows:
-            return {"deleted": 0, "ids": [], "files": []}
+            return {"ids": [], "files": [], "_rows": []}
 
         # Resolve companions
         if include_companions:
@@ -8664,12 +8661,39 @@ class Database:
         files = [
             {
                 "photo_id": row["id"],
+                "folder_id": row["folder_id"],
                 "folder_path": row["folder_path"],
                 "filename": row["filename"],
                 "companion_path": row["companion_path"],
             }
             for row in rows
         ]
+
+        return {"ids": all_ids, "files": files, "_rows": rows}
+
+    def delete_photos(self, photo_ids, include_companions=False, commit=True):
+        """Delete photos and all associated data.
+
+        Returns dict with 'deleted' count, 'ids' list of deleted photo IDs
+        (post-companion-resolution), and 'files' list of
+        {photo_id, folder_path, filename, companion_path} for file cleanup.
+
+        When ``commit`` is ``False``, this call participates in an outer
+        transaction managed by the caller: no ``commit()``/``rollback()`` is
+        issued here, **and** the non-DB pipeline-cache prune is skipped so
+        a later failed chunk can roll the DB back without leaving a
+        permanently-mutated cache file on disk. The caller is responsible
+        for invoking ``prune_pipeline_cache_for_ids`` with the union of
+        returned ``ids`` after the outer commit succeeds.
+        """
+        resolved = self.resolve_photos_for_delete(
+            photo_ids, include_companions=include_companions,
+        )
+        rows = resolved.pop("_rows")
+        if not rows:
+            return {"deleted": 0, "ids": [], "files": []}
+        all_ids = resolved["ids"]
+        files = resolved["files"]
 
         # Count photos per folder for decrementing
         folder_counts = {}

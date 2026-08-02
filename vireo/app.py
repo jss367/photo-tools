@@ -19,6 +19,7 @@ import queue
 import re
 import secrets
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -1673,6 +1674,22 @@ def _file_manager_labels():
     }
 
 
+_FINDER_TRASH_TIMEOUT_SECS = 30
+_FINDER_TRASH_BATCH_SIZE = 20
+
+
+def _volume_root_for_path(filepath):
+    """Return ``/Volumes/<name>`` for a path on a macOS mounted volume."""
+    try:
+        normalized = os.path.normpath(os.path.abspath(filepath))
+    except (OSError, TypeError, ValueError):
+        return None
+    parts = normalized.split(os.sep)
+    if len(parts) < 4 or parts[0] != "" or parts[1] != "Volumes" or not parts[2]:
+        return None
+    return os.sep.join(parts[:3])
+
+
 def _ensure_volume_trashes_dir(filepath, ensured_volumes):
     """Make sure ``/Volumes/<X>/.Trashes/<uid>/`` exists when ``filepath`` is on
     an external/network mount. macOS ``send2trash`` legacy mode raises
@@ -1686,10 +1703,9 @@ def _ensure_volume_trashes_dir(filepath, ensured_volumes):
     ``makedirs`` (read-only mount, ACL block) is swallowed so the actual
     trash call surfaces a more specific error than "could not mkdir".
     """
-    parts = filepath.split(os.sep)
-    if len(parts) < 4 or parts[0] != "" or parts[1] != "Volumes":
+    volume_root = _volume_root_for_path(filepath)
+    if volume_root is None:
         return
-    volume_root = os.sep.join(parts[:3])
     if volume_root in ensured_volumes:
         return
     ensured_volumes.add(volume_root)
@@ -1700,34 +1716,293 @@ def _ensure_volume_trashes_dir(filepath, ensured_volumes):
         log.debug("could not ensure %s: %s", trashes_dir, exc)
 
 
-def _trash_via_finder(filepath):
-    """Trash a file via Finder using AppleScript.
+def _move_to_volume_trash(filepath):
+    """Move one file directly into its mounted volume's Trash directory.
+
+    Finder ultimately performs a same-volume move into
+    ``/Volumes/<name>/.Trashes/<uid>``. Doing that move directly avoids the
+    legacy Carbon ``send2trash`` failure and the multi-second AppleScript
+    round trip seen on SMB/NAS mounts. Returns ``True`` only when the move
+    completed; callers retain their normal trash fallbacks on ``False``.
+    """
+    if sys.platform != "darwin":
+        return False
+    volume_root = _volume_root_for_path(filepath)
+    if volume_root is None:
+        return False
+
+    trash_dir = os.path.join(volume_root, ".Trashes", str(os.getuid()))
+    try:
+        os.makedirs(trash_dir, mode=0o700, exist_ok=True)
+        # Refuse a redirected Trash directory. The destination must remain on
+        # the same mounted volume as the source.
+        real_trash = os.path.realpath(trash_dir)
+        if os.path.commonpath((volume_root, real_trash)) != volume_root:
+            raise OSError("volume Trash directory resolves outside its volume")
+
+        basename = os.path.basename(filepath)
+        stem, ext = os.path.splitext(basename)
+        # Atomically reserve the destination name with O_CREAT|O_EXCL so two
+        # concurrent moves for same-named files from different folders can't
+        # both observe an empty slot and then rename to the same path — POSIX
+        # rename would silently replace one file, permanently losing a photo
+        # the user meant to send to Trash.
+        candidate = os.path.join(trash_dir, basename)
+        reserved = None
+        reserved_stat = None
+        for _ in range(32):
+            try:
+                fd = os.open(
+                    candidate, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600,
+                )
+                try:
+                    reserved_stat = os.fstat(fd)
+                finally:
+                    os.close(fd)
+                reserved = candidate
+                break
+            except FileExistsError:
+                candidate = os.path.join(
+                    trash_dir, f"{stem} {uuid.uuid4().hex[:8]}{ext}",
+                )
+        if reserved is None:
+            raise OSError(
+                f"could not reserve a unique Trash destination in {trash_dir}",
+            )
+        try:
+            # ``os.replace`` (not ``os.rename``) so the O_EXCL placeholder we
+            # just reserved is overwritten. POSIX rename replaces silently,
+            # but Windows rename raises when the destination exists.
+            os.replace(filepath, reserved)
+        except OSError:
+            # A network filesystem can commit a rename but lose the success
+            # response. Never unlink ``reserved`` unless it is still the exact
+            # placeholder we created; otherwise that path may now be the photo.
+            try:
+                current_stat = os.lstat(reserved)
+                try:
+                    os.lstat(filepath)
+                    source_still_exists = True
+                except FileNotFoundError:
+                    source_still_exists = False
+                if not source_still_exists:
+                    return True
+                placeholder_unchanged = (
+                    reserved_stat.st_ino
+                    and current_stat.st_dev == reserved_stat.st_dev
+                    and current_stat.st_ino == reserved_stat.st_ino
+                    and current_stat.st_size == reserved_stat.st_size
+                )
+                if placeholder_unchanged:
+                    os.unlink(reserved)
+            except OSError:
+                pass
+            raise
+        return True
+    except OSError as exc:
+        log.debug("Direct volume Trash move failed for %s: %s", filepath, exc)
+        return False
+
+
+def _trash_via_finder(filepaths, timeout=_FINDER_TRASH_TIMEOUT_SECS):
+    """Trash one or more files via one bounded Finder AppleScript call.
 
     Fallback for when send2trash fails (e.g. external volumes where the
     legacy Carbon API can't locate .Trashes). macOS-only: on Linux/Windows
     ``send2trash`` already implements the platform trash spec, so there is no
     equivalent fallback. Raising here (instead of spawning a doomed
     ``osascript``) lets the caller surface the original send2trash failure.
+
+    A timeout is mandatory because Finder can otherwise wait indefinitely on
+    an unavailable SMB share. Callers verify path existence after any error,
+    since Finder may have completed only part of a batch before failing.
     """
     if sys.platform != "darwin":
         raise OSError("Finder trash fallback is only available on macOS")
+    if isinstance(filepaths, (str, bytes, os.PathLike)):
+        filepaths = [os.fspath(filepaths)]
+    else:
+        filepaths = [os.fspath(path) for path in filepaths]
+    if not filepaths:
+        return
     result = subprocess.run(
         [
             "osascript",
             "-e", "on run argv",
-            "-e", "set posixPath to item 1 of argv",
-            "-e", "set fileRef to POSIX file posixPath",
+            "-e", "repeat with posixPath in argv",
+            "-e", "set fileRef to POSIX file (contents of posixPath)",
             "-e", "tell application \"Finder\" to delete fileRef",
+            "-e", "end repeat",
             "-e", "end run",
             "--",
-            filepath,
+            *filepaths,
         ],
         capture_output=True,
         text=True,
+        timeout=timeout,
         **no_window_kwargs(),
     )
     if result.returncode != 0:
         raise OSError(result.stderr.strip() or f"Finder trash failed ({result.returncode})")
+
+
+def _snapshot_parent_device(filepath):
+    """Return the parent directory's ``st_dev`` for later mount verification.
+
+    Callers snapshot this before any deletion attempt and pass it to
+    :func:`_path_confirmed_gone` afterwards. A network mount that
+    disconnects mid-op leaves the mount-point directory visible on the
+    underlying local filesystem, so ``os.path.isdir`` alone reports the
+    parent as live even though the actual volume is gone. Comparing the
+    pre-op and post-op ``st_dev`` catches that drop. ``None`` means no
+    baseline could be captured, so the device check is skipped.
+    """
+    parent = os.path.dirname(filepath) or os.sep
+    try:
+        return os.stat(parent).st_dev
+    except OSError:
+        return None
+
+
+def _path_confirmed_gone(filepath, expected_parent_dev=None):
+    """Return True only when the file is verifiably absent from a live volume.
+
+    ``os.path.exists`` returning False is ambiguous on network volumes: it
+    also returns False when the underlying stat call errors out because the
+    mount went away mid-operation. Treating that as "successfully moved to
+    Trash" would prune the catalog row for a photo that reappears when the
+    mount comes back. Confirm both that the file is missing *and* that the
+    parent directory is still reachable so a genuine live-volume delete is
+    accepted while a mid-flight disconnect is preserved as a failure.
+
+    When ``expected_parent_dev`` is provided (from
+    :func:`_snapshot_parent_device`), also require the parent's current
+    ``st_dev`` to match — a network mount that vanishes can leave its
+    mount-point directory in place on the underlying local filesystem, so
+    the ``os.path.isdir`` check alone would incorrectly accept the file
+    as gone.
+    """
+    if os.path.exists(filepath):
+        return False
+    parent = os.path.dirname(filepath) or os.sep
+    try:
+        parent_stat = os.stat(parent)
+    except OSError:
+        return False
+    if not stat.S_ISDIR(parent_stat.st_mode):
+        return False
+    return not (
+        expected_parent_dev is not None
+        and parent_stat.st_dev != expected_parent_dev
+    )
+
+
+def _trash_paths(filepaths):
+    """Move paths to Trash and return ``(moved, successful, failures)``.
+
+    Missing paths are successful (the requested end state already holds) but
+    are not counted as moved. On macOS mounted volumes we try a direct,
+    same-volume rename first. Remaining paths use send2trash individually so
+    failures can be attributed, then one Finder process per bounded batch.
+    """
+    ordered = list(dict.fromkeys(filepaths))
+    successful = set()
+    moved = 0
+    fallback = []
+    preflight_errors = {}
+    # Snapshot each parent's st_dev before we touch anything. A network
+    # mount that vanishes mid-batch can leave the mount-point directory
+    # visible on the underlying local FS, so ``os.path.isdir`` alone would
+    # accept the file as gone. Comparing pre-op vs post-op st_dev catches
+    # the mount drop even when the directory still stats cleanly.
+    parent_devs = {path: _snapshot_parent_device(path) for path in ordered}
+
+    for filepath in ordered:
+        if not os.path.isfile(filepath):
+            # ``os.path.isfile`` returning False is ambiguous on network
+            # volumes — it also happens when the underlying stat fails
+            # because the mount is already disconnected. Only treat the
+            # path as "already gone" when the parent directory is still
+            # reachable AND its device matches the pre-op snapshot;
+            # otherwise preserve as a failure so the caller doesn't prune
+            # the catalog row for a photo that reappears when the mount
+            # comes back.
+            if _path_confirmed_gone(filepath, parent_devs.get(filepath)):
+                log.warning("File already missing: %s", filepath)
+                successful.add(filepath)
+            else:
+                preflight_errors[filepath] = (
+                    "Source path is unreachable"
+                )
+                log.warning(
+                    "Trash preflight: source unreachable for %s", filepath,
+                )
+            continue
+        if _move_to_volume_trash(filepath):
+            successful.add(filepath)
+            moved += 1
+        else:
+            fallback.append(filepath)
+
+    finder_candidates = []
+    send_errors = {}
+    if fallback:
+        from send2trash import send2trash as _trash
+        for filepath in fallback:
+            try:
+                _trash(filepath)
+                successful.add(filepath)
+                moved += 1
+            except BaseException as exc:
+                if isinstance(exc, (KeyboardInterrupt, GeneratorExit)):
+                    raise
+                # Some platform Trash APIs can complete the move and still
+                # report a post-operation error. Only trust the "not there"
+                # signal when we can positively verify it — a disconnected
+                # network volume also makes ``os.path.exists`` return False
+                # (the underlying stat fails), which would otherwise mask a
+                # real failure and prune the catalog row for a photo that
+                # reappears when the mount comes back.
+                if _path_confirmed_gone(filepath, parent_devs.get(filepath)):
+                    successful.add(filepath)
+                    moved += 1
+                    continue
+                send_errors[filepath] = str(exc)
+                if sys.platform == "darwin":
+                    finder_candidates.append(filepath)
+
+    for finder_batch in _chunked(
+        finder_candidates, size=_FINDER_TRASH_BATCH_SIZE,
+    ):
+        try:
+            _trash_via_finder(finder_batch)
+        except subprocess.TimeoutExpired:
+            log.warning(
+                "Finder Trash timed out after %ss for %d file(s)",
+                _FINDER_TRASH_TIMEOUT_SECS, len(finder_batch),
+            )
+        except Exception:
+            log.warning("Finder Trash failed for a file batch", exc_info=True)
+        for filepath in finder_batch:
+            # Only accept "gone" when the parent directory is still reachable
+            # AND its device matches the pre-op snapshot; otherwise a stat
+            # against a stale/replaced mount point would read as success.
+            if _path_confirmed_gone(filepath, parent_devs.get(filepath)):
+                successful.add(filepath)
+                moved += 1
+
+    failures = []
+    for filepath in ordered:
+        if filepath in successful:
+            continue
+        error = (
+            preflight_errors.get(filepath)
+            or send_errors.get(filepath)
+            or "Trash operation failed"
+        )
+        failures.append({"path": filepath, "error": error})
+        log.warning("Trash failed for %s: %s", filepath, error)
+    return moved, successful, failures
 
 
 def _compute_time_range(photos_by_id, photo_ids):
@@ -9995,133 +10270,346 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         if mode not in ("vireo", "disk", "disk_permanent"):
             raise ValueError("mode must be 'vireo', 'disk', or 'disk_permanent'")
 
-        # Chunked because delete_photos issues several IN-clause queries; a
-        # 1000+ id request would hit SQLite's bound-parameter cap on legacy
-        # builds. We pass ``commit=False`` so all chunks share one outer
-        # transaction — without that, an error on a later chunk would 500
-        # the request after earlier chunks already committed, leaving DB
-        # rows gone and cached files / disk trashing not yet cleaned up
-        # for them. ``commit=False`` also defers the pipeline-cache prune
-        # (a non-transactional file write) to the caller so a rolled-back
-        # later chunk doesn't leave the cache permanently stripped of rows
-        # the DB just restored.
-        result = {"deleted": 0, "ids": [], "files": []}
-        total_requested = len(photo_ids)
-        prepared = 0
-        emit(
-            "Removing from Vireo",
-            0,
-            total_requested,
-            detail="Preparing database changes; nothing is committed yet.",
-        )
-        try:
-            for chunk in _chunked(photo_ids):
-                chunk_result = db.delete_photos(
-                    chunk,
-                    include_companions=include_companions,
-                    commit=False,
-                )
-                result["deleted"] += chunk_result["deleted"]
-                result["ids"].extend(chunk_result["ids"])
-                result["files"].extend(chunk_result["files"])
-                prepared += len(chunk)
-                emit(
-                    "Removing from Vireo",
-                    min(prepared, total_requested),
-                    total_requested,
-                    detail="Preparing database changes; nothing is committed yet.",
-                )
-            db.conn.commit()
-        except Exception:
-            db.conn.rollback()
-            raise
-        emit(
-            "Removed from Vireo",
-            result["deleted"],
-            result["deleted"],
-            detail="Database changes committed.",
-        )
+        def remove_catalog_rows(ids, *, expand_companions, revalidate_identity=None):
+            """Atomically remove resolved catalog rows, then clean caches.
 
-        # Run the deferred non-DB side effects only after the outer
-        # transaction committed successfully.
-        emit("Pruning pipeline cache", 0, 1)
-        try:
-            db.prune_pipeline_cache_for_ids(result["ids"])
-        except BaseException as exc:
-            _reraise_fatal_cleanup_error(exc)
-            log.exception("Failed to prune pipeline cache after delete")
-        emit("Pruning pipeline cache", 1, 1)
-
-        def cache_progress(current, total, filename):
-            emit("Cleaning cached files", current, total, filename)
-
-        emit("Cleaning cached files", 0, len(result["files"]))
-        _cleanup_cached_files_for_deleted_photos(
-            result["files"], progress_callback=cache_progress,
-        )
-
-        trashed = 0
-        trash_failed = []
-        if mode in ("disk", "disk_permanent"):
-            disk_targets = []
-            for f in result["files"]:
-                # Collect all files to delete: primary + companion
-                primary = os.path.join(f["folder_path"], f["filename"])
-                disk_targets.append(primary)
-                if include_companions and f.get("companion_path"):
-                    companion = os.path.join(f["folder_path"], f["companion_path"])
-                    disk_targets.append(companion)
-
-            disk_phase = (
-                "Moving files to Trash"
-                if mode == "disk" else "Deleting files permanently"
+            ``revalidate_identity`` is an optional ``{photo_id: (folder_id,
+            filename, folder_path)}`` map captured at the start of the disk
+            operation. When provided, each row is re-checked inside the delete
+            transaction and skipped if any of those three fields has changed
+            since — a concurrent ``/api/jobs/move-photos`` can commit a new
+            ``folder_id`` while the disk-delete's stale-path
+            ``os.path.isfile`` check is already reporting "gone", and a
+            concurrent ``/api/jobs/move-folder`` can leave ``folder_id`` and
+            ``filename`` unchanged while renaming the underlying
+            ``folders.path``. Deleting by id alone in either case would
+            discard the row for a photo that now lives at a completely
+            different path. Skipped ids are returned as ``skipped_ids`` so
+            the caller can surface them alongside filesystem failures.
+            """
+            result = {
+                "deleted": 0, "ids": [], "files": [], "skipped_ids": [],
+            }
+            skipped_ids = []
+            total = len(ids)
+            prepared = 0
+            emit(
+                "Removing from Vireo", 0, total,
+                detail="Preparing database changes; nothing is committed yet.",
             )
-            ensured_volumes = set()
-            emit(disk_phase, 0, len(disk_targets))
-            for idx, filepath in enumerate(disk_targets, start=1):
-                basename = os.path.basename(filepath)
-                if not os.path.isfile(filepath):
-                    log.warning("File already missing: %s", filepath)
-                    emit(disk_phase, idx, len(disk_targets), basename)
-                    continue
-                if mode == "disk":
-                    _ensure_volume_trashes_dir(filepath, ensured_volumes)
-                    try:
-                        from send2trash import send2trash as _trash
-                        _trash(filepath)
-                        trashed += 1
-                    except BaseException as send_err:
-                        _reraise_fatal_cleanup_error(send_err)
-                        # send2trash implements the platform trash spec on
-                        # Linux/Windows; the AppleScript Finder fallback only
-                        # helps on macOS. Off-mac, report the real send2trash
-                        # error instead of masking it with the Finder guard.
-                        if sys.platform == "darwin":
-                            log.debug("send2trash failed for %s, trying Finder", filepath)
-                            try:
-                                _trash_via_finder(filepath)
-                                trashed += 1
-                            except Exception:
-                                log.warning("Trash failed for %s", filepath, exc_info=True)
-                                trash_failed.append({"path": filepath})
-                        else:
-                            log.warning("Trash failed for %s: %s", filepath, send_err)
-                            trash_failed.append({"path": filepath})
-                else:  # disk_permanent
-                    try:
-                        os.remove(filepath)
-                        trashed += 1
-                    except OSError:
-                        log.warning("Permanent delete failed for %s", filepath, exc_info=True)
-                        trash_failed.append({"path": filepath})
-                emit(disk_phase, idx, len(disk_targets), basename)
+            revalidating = bool(revalidate_identity)
+            # BEGIN IMMEDIATE takes the write lock up front so no other writer
+            # (notably move-photos or move-folder) can commit an identity
+            # change between the revalidation SELECT and the DELETE that
+            # follows. Without it, a move committed after the SELECT but
+            # before the DELETE would let us delete a row that no longer
+            # matches the identity we verified.
+            if revalidating:
+                db.conn.execute("BEGIN IMMEDIATE")
+            try:
+                if revalidating:
+                    verified_ids = []
+                    for chunk in _chunked(ids):
+                        placeholders = ",".join("?" for _ in chunk)
+                        current = {
+                            row["id"]: (
+                                row["folder_id"],
+                                row["filename"],
+                                row["folder_path"],
+                                row["companion_path"],
+                            )
+                            for row in db.conn.execute(
+                                f"SELECT p.id, p.folder_id, p.filename, "
+                                f"p.companion_path, f.path AS folder_path "
+                                f"FROM photos p "
+                                f"JOIN folders f ON f.id = p.folder_id "
+                                f"WHERE p.id IN ({placeholders})",
+                                list(chunk),
+                            )
+                        }
+                        for photo_id in chunk:
+                            expected = revalidate_identity.get(photo_id)
+                            actual = current.get(photo_id)
+                            if actual is None:
+                                # Row already gone — a concurrent delete beat
+                                # us to it. The requested end state already
+                                # holds, so treat it as successfully deleted
+                                # rather than a stale identity we couldn't
+                                # verify. Reporting it in ``failed_photo_ids``
+                                # here would leave the client showing a photo
+                                # that is absent from both catalog and disk
+                                # until reload.
+                                continue
+                            if expected is not None and actual == expected:
+                                verified_ids.append(photo_id)
+                            else:
+                                skipped_ids.append(photo_id)
+                    ids_to_delete = verified_ids
+                else:
+                    ids_to_delete = list(ids)
 
+                for chunk in _chunked(ids_to_delete):
+                    chunk_result = db.delete_photos(
+                        chunk,
+                        include_companions=expand_companions,
+                        commit=False,
+                    )
+                    result["deleted"] += chunk_result["deleted"]
+                    result["ids"].extend(chunk_result["ids"])
+                    result["files"].extend(chunk_result["files"])
+                    prepared += len(chunk)
+                    emit(
+                        "Removing from Vireo", min(prepared, total), total,
+                        detail=(
+                            "Preparing database changes; nothing is committed yet."
+                        ),
+                    )
+                db.conn.commit()
+            except Exception:
+                db.conn.rollback()
+                raise
+            result["skipped_ids"] = skipped_ids
+
+            emit(
+                "Removed from Vireo", result["deleted"], result["deleted"],
+                detail="Database changes committed.",
+            )
+            emit("Pruning pipeline cache", 0, 1)
+            try:
+                db.prune_pipeline_cache_for_ids(result["ids"])
+            except BaseException as exc:
+                _reraise_fatal_cleanup_error(exc)
+                log.exception("Failed to prune pipeline cache after delete")
+            emit("Pruning pipeline cache", 1, 1)
+
+            def cache_progress(current, total_files, filename):
+                emit("Cleaning cached files", current, total_files, filename)
+
+            emit("Cleaning cached files", 0, len(result["files"]))
+            _cleanup_cached_files_for_deleted_photos(
+                result["files"], progress_callback=cache_progress,
+            )
+            return result
+
+        # Database-only mode has no filesystem prerequisite and retains the
+        # original all-or-nothing catalog transaction.
+        if mode == "vireo":
+            result = remove_catalog_rows(
+                photo_ids, expand_companions=include_companions,
+            )
+            emit("Finishing", 1, 1)
+            return {
+                "ok": True,
+                "deleted": result["deleted"],
+                "trashed": 0,
+                "trash_failed": [],
+                "failed_photo_ids": [],
+            }
+
+        # Disk modes resolve paths without changing SQLite. A photo's catalog
+        # row is removed only after its primary file reached the requested end
+        # state. A companion without its own photo row is processed first; if
+        # that fails, its primary is left untouched and its row remains
+        # retryable.
+        resolved = db.resolve_photos_for_delete(
+            photo_ids, include_companions=include_companions,
+        )
+        files = resolved["files"]
+        primary_paths = {
+            f["photo_id"]: os.path.join(f["folder_path"], f["filename"])
+            for f in files
+        }
+        # Snapshot each row's identity so the catalog-removal step can verify
+        # the row still points at the same file it did when we resolved paths.
+        # Without this, a concurrent /api/jobs/move-photos can commit a new
+        # folder_id and remove the source file mid-run; our stale-path
+        # os.path.isfile would then read "already gone" and we would delete
+        # a row that now represents the moved file at a different location.
+        # The folder_path is included so a concurrent /api/jobs/move-folder,
+        # which keeps folder_id and filename unchanged while renaming
+        # ``folders.path``, is also caught — otherwise the row would still be
+        # deleted even though the copied file remains at the new path.
+        # ``companion_path`` is included so a concurrent scan that pairs a
+        # RAW with a JPEG mid-delete (scanner.py: ``UPDATE photos SET
+        # companion_path`` on the primary, ``DELETE FROM photos`` on the
+        # merged companion) is also caught — otherwise the primary's tuple
+        # would still match, and we'd trash only the pre-pair paths and
+        # remove the primary row, orphaning the newly-paired companion file
+        # on disk with no catalog entry.
+        resolved_identity = {
+            f["photo_id"]: (
+                f["folder_id"], f["filename"], f["folder_path"],
+                f["companion_path"],
+            )
+            for f in files
+        }
+        catalog_primary_paths = set(primary_paths.values())
+        extra_companions = {}
+        if include_companions:
+            for f in files:
+                companion_path = f.get("companion_path")
+                if not companion_path:
+                    continue
+                # ``companion_path`` is stored as either a relative filename
+                # inside the same folder or an absolute path (see the same
+                # resolution in new_images.py:35-40). Joining an absolute
+                # path with the folder path would silently target the wrong
+                # file — the disk op would either fail or, worse, trash the
+                # wrong photo without ever pruning the correct catalog row.
+                companion = (
+                    companion_path if os.path.isabs(companion_path)
+                    else os.path.join(f["folder_path"], companion_path)
+                )
+                if companion not in catalog_primary_paths:
+                    extra_companions.setdefault(f["photo_id"], set()).add(companion)
+
+        disk_phase = (
+            "Moving files to Trash"
+            if mode == "disk" else "Deleting files permanently"
+        )
+        all_disk_paths = list(dict.fromkeys(
+            [path for paths_for_id in extra_companions.values() for path in paths_for_id]
+            + list(primary_paths.values())
+        ))
+        emit(disk_phase, 0, len(all_disk_paths))
+
+        def operate(paths_to_change):
+            if not paths_to_change:
+                return 0, set(), []
+            if mode == "disk":
+                return _trash_paths(paths_to_change)
+            successful = set()
+            failures = []
+            removed = 0
+            # Snapshot each parent's st_dev before deletion so a mount that
+            # vanishes mid-batch can be detected even when the mount point
+            # remains visible on the underlying local FS (see
+            # ``_snapshot_parent_device``).
+            parent_devs = {
+                path: _snapshot_parent_device(path)
+                for path in paths_to_change
+            }
+            for filepath in paths_to_change:
+                if not os.path.isfile(filepath):
+                    # Same live-parent gate as ``_trash_paths`` — a
+                    # disconnected mount also makes ``os.path.isfile``
+                    # return False, and treating that as "already gone"
+                    # would prune the catalog row for a photo that
+                    # reappears when the volume comes back.
+                    if _path_confirmed_gone(
+                        filepath, parent_devs.get(filepath),
+                    ):
+                        log.warning("File already missing: %s", filepath)
+                        successful.add(filepath)
+                    else:
+                        log.warning(
+                            "Permanent delete preflight: source "
+                            "unreachable for %s", filepath,
+                        )
+                        failures.append({
+                            "path": filepath,
+                            "error": "Source path is unreachable",
+                        })
+                    continue
+                try:
+                    os.remove(filepath)
+                    successful.add(filepath)
+                    removed += 1
+                except OSError as exc:
+                    log.warning(
+                        "Permanent delete failed for %s", filepath,
+                        exc_info=True,
+                    )
+                    failures.append({"path": filepath, "error": str(exc)})
+            return removed, successful, failures
+
+        companion_paths = list(dict.fromkeys(
+            path for paths_for_id in extra_companions.values()
+            for path in paths_for_id
+        ))
+        trashed, companion_success, companion_failures = operate(companion_paths)
+        eligible_ids = {
+            photo_id for photo_id in resolved["ids"]
+            if extra_companions.get(photo_id, set()) <= companion_success
+        }
+        eligible_primary_paths = [
+            primary_paths[photo_id] for photo_id in resolved["ids"]
+            if photo_id in eligible_ids and photo_id in primary_paths
+        ]
+        primary_moved, primary_success, primary_failures = operate(
+            eligible_primary_paths,
+        )
+        trashed += primary_moved
+        successful_ids = [
+            photo_id for photo_id in resolved["ids"]
+            if photo_id in eligible_ids
+            and primary_paths.get(photo_id) in primary_success
+        ]
+        successful_id_set = set(successful_ids)
+        failed_ids = [
+            photo_id for photo_id in resolved["ids"]
+            if photo_id not in successful_id_set
+        ]
+
+        failure_by_path = {
+            failure["path"]: failure
+            for failure in companion_failures + primary_failures
+        }
+        trash_failed = []
+        for photo_id in failed_ids:
+            failed_paths = [
+                path for path in extra_companions.get(photo_id, set())
+                if path not in companion_success
+            ]
+            primary = primary_paths.get(photo_id)
+            if not failed_paths and primary not in primary_success:
+                failed_paths.append(primary)
+            for filepath in failed_paths:
+                detail = dict(failure_by_path.get(filepath) or {
+                    "path": filepath,
+                    "error": "A companion file could not be removed",
+                })
+                detail["photo_id"] = photo_id
+                trash_failed.append(detail)
+
+        emit(
+            disk_phase, len(all_disk_paths), len(all_disk_paths),
+            detail=(
+                f"{len(successful_ids)} photo(s) ready for catalog removal; "
+                f"{len(failed_ids)} retained after filesystem errors."
+            ),
+        )
+        result = remove_catalog_rows(
+            successful_ids,
+            expand_companions=False,
+            revalidate_identity=resolved_identity,
+        )
+        # Rows whose identity changed between resolve and catalog-removal
+        # weren't deleted — surface them alongside filesystem failures so
+        # the client keeps them visible and doesn't report them as trashed.
+        skipped_ids = result.get("skipped_ids", []) or []
+        if skipped_ids:
+            already_failed = set(failed_ids)
+            for photo_id in skipped_ids:
+                trash_failed.append({
+                    "photo_id": photo_id,
+                    "path": primary_paths.get(photo_id, ""),
+                    "error": (
+                        "Photo was moved to a new folder during this delete; "
+                        "the catalog row was preserved"
+                    ),
+                })
+            failed_ids = failed_ids + [
+                photo_id for photo_id in skipped_ids
+                if photo_id not in already_failed
+            ]
         emit("Finishing", 1, 1)
         return {
             "ok": True,
             "deleted": result["deleted"],
             "trashed": trashed,
             "trash_failed": trash_failed,
+            "failed_photo_ids": failed_ids,
         }
 
     @app.route("/api/batch/delete", methods=["POST"])
@@ -21000,11 +21488,10 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             if anchor is not None:
                 anchored_hashes.add(h)
 
-        trashed = 0
+        trash_candidates = []
         trashed_pids = []
         skipped = []
         failed = []
-        ensured_volumes = set()
         for pid in photo_ids:
             row = rows_by_id.get(pid)
             if row is None:
@@ -21030,29 +21517,24 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 skipped.append({"id": pid, "reason": "file already missing"})
                 trashed_pids.append(pid)
                 continue
-            _ensure_volume_trashes_dir(filepath, ensured_volumes)
-            try:
-                from send2trash import send2trash as _trash
-                _trash(filepath)
-                trashed += 1
+            trash_candidates.append((pid, filepath))
+
+        trashed, successful_paths, trash_failures = _trash_paths(
+            [filepath for _pid, filepath in trash_candidates],
+        )
+        failure_by_path = {
+            failure["path"]: failure for failure in trash_failures
+        }
+        for pid, filepath in trash_candidates:
+            if filepath in successful_paths:
                 trashed_pids.append(pid)
-            except Exception as send_err:
-                # send2trash implements the platform trash spec on Linux/Windows;
-                # the AppleScript Finder fallback only helps on macOS. Off-mac,
-                # surface the real send2trash error rather than masking it with
-                # the Finder guard's "only available on macOS" message.
-                if sys.platform != "darwin":
-                    log.warning("Trash failed for %s", filepath, exc_info=True)
-                    failed.append({"id": pid, "path": filepath, "error": str(send_err)})
-                    continue
-                log.debug("send2trash failed for %s, trying Finder", filepath)
-                try:
-                    _trash_via_finder(filepath)
-                    trashed += 1
-                    trashed_pids.append(pid)
-                except Exception as e:
-                    log.warning("Trash failed for %s", filepath, exc_info=True)
-                    failed.append({"id": pid, "path": filepath, "error": str(e)})
+                continue
+            failure = failure_by_path.get(filepath) or {}
+            failed.append({
+                "id": pid,
+                "path": filepath,
+                "error": failure.get("error", "Trash operation failed"),
+            })
 
         # Drop DB rows + cached derivatives for every photo whose file is now
         # gone. Chunked so ``delete_photos``' five internal IN-clause queries

@@ -439,53 +439,83 @@
     }
   }
 
-  document.getElementById('localWorkspaceContent').addEventListener('click', function(event) {
-    var button = event.target.closest('[data-local-folders-action], [data-legacy-action]');
-    if (!button || button.disabled) return;
-    var action = button.dataset.localFoldersAction;
-    if (action === 'stage-all') openStageDialog(null);
-    else if (action === 'manage') openManager();
-    else if (button.dataset.legacyAction) legacyAction(button.dataset.legacyAction);
-  });
-
-  document.getElementById('closeLocalFoldersModal').addEventListener('click', closeManager);
-  document.getElementById('cancelStageLocalFolders').addEventListener('click', closeStageDialog);
-  document.getElementById('confirmStageLocalFolders').addEventListener('click', submitStageDialog);
-  document.getElementById('stageLocalFoldersModalItems').addEventListener('input', function(event) {
-    if (event.target.matches('[data-local-destination-base]')) {
-      updateStageDestinationPreview(event.target);
-    }
-  });
-  document.getElementById('stageLocalFoldersModalItems').addEventListener('click', async function(event) {
-    var button = event.target.closest('[data-browse-local-destination]');
-    if (!button) return;
-    var id = button.dataset.browseLocalDestination;
-    var input = document.querySelector('[data-local-destination-base="' + id + '"]');
-    if (!input || typeof pickDirectory !== 'function') return;
-    var chosen = await pickDirectory('Choose a location for ' + input.dataset.folderName, {
-      defaultPath: input.value.trim()
+  var panel = document.getElementById('localWorkspaceContent');
+  if (panel) {
+    panel.addEventListener('click', function(event) {
+      var button = event.target.closest('[data-local-folders-action], [data-legacy-action]');
+      if (!button || button.disabled) return;
+      var action = button.dataset.localFoldersAction;
+      if (action === 'stage-all') openStageDialog(null);
+      else if (action === 'manage') openManager();
+      else if (button.dataset.legacyAction) legacyAction(button.dataset.legacyAction);
     });
-    if (!chosen || Array.isArray(chosen)) return;
-    input.value = chosen;
-    updateStageDestinationPreview(input);
-  });
-  document.getElementById('syncSelectedLocalFolders').addEventListener('click', function() {
-    var selected = managerSelection();
-    if (!selected.length) return;
-    closeManager();
-    sync(selected);
-  });
-  document.getElementById('discardSelectedLocalFolders').addEventListener('click', function() {
-    var selected = managerSelection();
-    if (!selected.length) return;
-    closeManager();
-    discard(selected);
-  });
+  }
+
+  var closeManagerButton = document.getElementById('closeLocalFoldersModal');
+  if (closeManagerButton) closeManagerButton.addEventListener('click', closeManager);
+  var cancelStageButton = document.getElementById('cancelStageLocalFolders');
+  if (cancelStageButton) cancelStageButton.addEventListener('click', closeStageDialog);
+  var confirmStageButton = document.getElementById('confirmStageLocalFolders');
+  if (confirmStageButton) confirmStageButton.addEventListener('click', submitStageDialog);
+  var stageItems = document.getElementById('stageLocalFoldersModalItems');
+  if (stageItems) {
+    stageItems.addEventListener('input', function(event) {
+      if (event.target.matches('[data-local-destination-base]')) {
+        updateStageDestinationPreview(event.target);
+      }
+    });
+    stageItems.addEventListener('click', async function(event) {
+      var button = event.target.closest('[data-browse-local-destination]');
+      if (!button) return;
+      var id = button.dataset.browseLocalDestination;
+      var input = document.querySelector('[data-local-destination-base="' + id + '"]');
+      if (!input || typeof pickDirectory !== 'function') return;
+      var chosen = await pickDirectory('Choose a location for ' + input.dataset.folderName, {
+        defaultPath: input.value.trim()
+      });
+      if (!chosen || Array.isArray(chosen)) return;
+      input.value = chosen;
+      updateStageDestinationPreview(input);
+    });
+  }
+  var syncSelectedButton = document.getElementById('syncSelectedLocalFolders');
+  if (syncSelectedButton) {
+    syncSelectedButton.addEventListener('click', function() {
+      var selected = managerSelection();
+      if (!selected.length) return;
+      closeManager();
+      sync(selected);
+    });
+  }
+  var discardSelectedButton = document.getElementById('discardSelectedLocalFolders');
+  if (discardSelectedButton) {
+    discardSelectedButton.addEventListener('click', function() {
+      var selected = managerSelection();
+      if (!selected.length) return;
+      closeManager();
+      discard(selected);
+    });
+  }
+
+  async function stageFromAnywhere(folderId) {
+    if (!data) await load();
+    if (activeJob || (data && data.legacy_workspace_session)) {
+      window.location.href = '/workspace#work-locally';
+      return false;
+    }
+    var item = statusFor(Number(folderId));
+    if (!item || item.state !== 'remote') {
+      window.location.href = '/workspace#work-locally';
+      return false;
+    }
+    openStageDialog([Number(folderId)]);
+    return true;
+  }
 
   window.vireoLocalFolders = {
     load: load,
     statusFor: statusFor,
-    stage: function(folderId) { return openStageDialog([Number(folderId)]); },
+    stage: stageFromAnywhere,
     sync: function(folderId) { return sync([Number(folderId)]); },
     discard: function(folderId) { return discard([Number(folderId)]); }
   };

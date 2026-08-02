@@ -179,16 +179,21 @@ def _validated_tree_entries(source: str):
     if not stat.S_ISDIR(root_st.st_mode):
         raise LocalWorkspaceError(f"Workspace folder is unavailable: {source}")
 
-    for rel, full, st in _walk_entries(source):
-        mode = st.st_mode
-        if stat.S_ISLNK(mode):
-            if not _symlink_stays_within(full, source):
-                raise LocalWorkspaceError(
-                    f"Symlink escapes or uses an absolute target and cannot be staged: {full}"
-                )
-        elif not stat.S_ISREG(mode) and not stat.S_ISDIR(mode):
-            raise LocalWorkspaceError(f"Unsupported special file in workspace: {full}")
-        yield rel, full, st
+    try:
+        for rel, full, st in _walk_entries(source):
+            mode = st.st_mode
+            if stat.S_ISLNK(mode):
+                if not _symlink_stays_within(full, source):
+                    raise LocalWorkspaceError(
+                        f"Symlink escapes or uses an absolute target and cannot be staged: {full}"
+                    )
+            elif not stat.S_ISREG(mode) and not stat.S_ISDIR(mode):
+                raise LocalWorkspaceError(f"Unsupported special file in workspace: {full}")
+            yield rel, full, st
+    except OSError as exc:
+        raise LocalWorkspaceError(
+            f"Could not read workspace directory: {exc}"
+        ) from exc
 
 
 def source_tree_size(source: str) -> tuple[int, int, int]:

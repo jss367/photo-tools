@@ -594,6 +594,48 @@ def test_stage_endpoint_rejects_case_folded_destination_collisions(
     assert "overlap" in response.get_json()["error"]
 
 
+def test_preflight_endpoint_returns_destination_probe_error(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    from app import create_app
+    from web import local_folder as local_folder_web
+
+    source = tmp_path / "nas" / "Photos"
+    source.mkdir(parents=True)
+    vireo_dir = tmp_path / "vireo"
+    thumbs = vireo_dir / "thumbnails"
+    thumbs.mkdir(parents=True)
+    db_path = str(vireo_dir / "vireo.db")
+    db = Database(db_path)
+    workspace_id = db.create_workspace("Probe failure")
+    folder_id = db.add_folder(str(source), name="Photos", link_to_workspace=False)
+    db.add_workspace_folder(workspace_id, folder_id)
+    db.set_active_workspace(workspace_id)
+    db.close()
+
+    def fail_probe(_path):
+        raise LocalWorkspaceError("Could not inspect destination filesystem")
+
+    monkeypatch.setattr(
+        local_folder_web, "destination_case_insensitive", fail_probe
+    )
+    app = create_app(db_path, thumb_cache_dir=str(thumbs))
+    app.config["TESTING"] = True
+    with app.test_client() as client:
+        assert client.post(
+            f"/api/workspaces/{workspace_id}/activate", json={}
+        ).status_code == 200
+        response = client.post(
+            "/api/workspaces/active/local-folders/preflight",
+            json={
+                "folder_ids": [folder_id],
+                "destination_bases": {str(folder_id): str(tmp_path / "local")},
+            },
+        )
+
+    assert response.status_code == 409
+    assert response.get_json()["error"] == "Could not inspect destination filesystem"
+
+
 def test_local_root_under_folder_finds_descendant_session(tmp_path):
     db = Database(str(tmp_path / "vireo.db"))
     workspace_id = db.create_workspace("Ancestor")

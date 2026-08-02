@@ -71,6 +71,22 @@ def _source_fs_preserves_case(directory: Path) -> bool:
         probe.unlink()
 
 
+def test_source_tree_size_converts_traversal_race_to_workspace_error(
+    tmp_path, monkeypatch
+):
+    source = tmp_path / "source"
+    source.mkdir()
+
+    def raced_walk(_root):
+        raise FileNotFoundError("entry disappeared during traversal")
+        yield
+
+    monkeypatch.setattr(local_workspace, "_walk_entries", raced_walk)
+
+    with pytest.raises(LocalWorkspaceError, match="Could not read workspace directory"):
+        local_workspace.source_tree_size(str(source))
+
+
 def test_stage_modify_and_sync_back(local_workspace_env):
     env = local_workspace_env
     result = stage_workspace(env["db"], env["workspace_id"], str(env["vireo_dir"]))

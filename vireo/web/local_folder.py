@@ -166,11 +166,15 @@ def create_local_folder_blueprint(
             final_path = os.path.abspath(
                 local_path_for_base(destination, root_id, source_paths[root_id])
             )
+            try:
+                case_insensitive = destination_case_insensitive(final_path)
+            except LocalWorkspaceError as exc:
+                return None, json_error(str(exc), 409)
             final_destinations.append(
                 (
                     root_id,
                     os.path.normcase(final_path),
-                    destination_case_insensitive(final_path),
+                    case_insensitive,
                 )
             )
         for index, (root_id, path, case_insensitive) in enumerate(final_destinations):

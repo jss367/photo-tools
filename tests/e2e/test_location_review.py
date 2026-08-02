@@ -229,6 +229,40 @@ def test_location_review_assigns_a_custom_name_to_coordinate_group(
     ]
 
 
+def test_location_review_missing_google_key_links_to_settings(live_server, page):
+    """The empty suggestion state explains how to enable nearby places."""
+    photo_id = live_server["data"]["photos"][0]
+    with live_server["db"].conn:
+        live_server["db"].conn.execute(
+            "UPDATE photos SET latitude = ?, longitude = ? WHERE id = ?",
+            (33.2550, -116.4050, photo_id),
+        )
+
+    page.route("https://unpkg.com/**", _stub_leaflet)
+    page.goto(f"{live_server['url']}/browse")
+    page.evaluate(
+        "photoId => sessionStorage.setItem('vireoLocationReviewSource', "
+        "JSON.stringify({photo_ids: [photoId]}))",
+        photo_id,
+    )
+    page.goto(f"{live_server['url']}/locations/review?source=selection")
+
+    prompt = page.locator(".location-review-setup-prompt")
+    expect(prompt).to_contain_text("Enable nearby place suggestions")
+    expect(prompt).to_contain_text("Add a Google Maps API key")
+    expect(prompt.get_by_role("link", name="Open Settings")).to_have_attribute(
+        "href", "/settings#google-maps"
+    )
+    expect(page.locator("#locationReviewSuggestionStatus")).to_have_text(
+        "Setup needed"
+    )
+    expect(
+        page.locator("#locationReviewMapMessage").get_by_role(
+            "link", name="Open Settings"
+        )
+    ).to_have_attribute("href", "/settings#google-maps")
+
+
 def test_location_review_ranks_saved_and_google_places_by_distance(
     live_server, page,
 ):

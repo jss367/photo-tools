@@ -603,8 +603,14 @@ def test_api_batch_delete_disk_targets_absolute_companion_path(
         "absolute companion path must be trashed as-is, not joined "
         "with folder_path"
     )
-    joined = os.path.join(folder_path, absolute_companion.lstrip(os.sep))
-    assert joined not in all_paths
+    # Only the primary and the absolute companion should be trashed. Any
+    # additional path (e.g. a naively ``os.path.join``-ed variant of the
+    # absolute companion) indicates the code failed to detect that
+    # ``companion_path`` was already absolute.
+    unexpected = set(all_paths) - {primary, absolute_companion}
+    assert not unexpected, (
+        f"unexpected paths trashed alongside primary/companion: {unexpected}"
+    )
     assert not os.path.exists(absolute_companion)
     assert not os.path.exists(primary)
     assert db.get_photo(photo["id"]) is None

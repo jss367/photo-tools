@@ -6153,9 +6153,12 @@ def test_progress_events_carry_live_per_folder_counts(tmp_path):
         ("DSC_0004.jpg", datetime(2026, 7, 4, 9, 5, 0), "white"),
     ])
     runner = FakeRunner()
+    job = _make_job()
+    include_paths = {str(path) for path in card.iterdir()}
     _run_import(tmp_path, ImportParams(
         sources=[str(card)], destination=str(tmp_path / "archive"),
-    ), runner=runner)
+        include_paths=include_paths, previewed_count=4, checked_count=4,
+    ), runner=runner, job=job)
 
     progress_folder_totals = []
     eta_events = []
@@ -6179,6 +6182,7 @@ def test_progress_events_carry_live_per_folder_counts(tmp_path):
     assert eta_events[-1]["eta_state"] == "ready"
     assert eta_events[-1]["eta_settled"] == 4
     assert eta_events[-1]["eta_seconds"] == 0.0
+    assert "eta_rate_per_min" not in job["progress"]
 
 
 def test_remote_import_links_alias_spelled_twin_folder(tmp_path, monkeypatch):

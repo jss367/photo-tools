@@ -116,6 +116,9 @@ def _invalidate_new_images(db, root):
 # scan, and hash stamping all commit at batch boundaries, so every stopping
 # point (cancel, crash, yanked card) leaves a valid catalog.
 IMPORT_BATCH_SIZE = 200
+_IMPORT_ETA_PROGRESS_KEYS = (
+    "eta_state", "eta_settled", "eta_seconds", "eta_rate_per_min",
+)
 
 
 class _ImportEtaEstimator:
@@ -1251,10 +1254,10 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
         expected_new=(params.checked_count if params.skip_duplicates else None),
     )
 
-    def _emit(phase, current, total, current_file=""):
+    def _emit(phase, current, total, current_file="", *, is_importing=False):
         eta_fields = {}
         if total > 0:
-            if phase.endswith(": importing"):
+            if is_importing:
                 eta.note_importing(copied)
             else:
                 eta.note_batch_complete(current, copied)
@@ -1262,6 +1265,8 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
         job["progress"]["current"] = current
         job["progress"]["total"] = total
         job["progress"]["current_file"] = current_file
+        for key in _IMPORT_ETA_PROGRESS_KEYS:
+            job["progress"].pop(key, None)
         job["progress"].update(eta_fields)
         runner.update_step(
             job["id"], "import",
@@ -1697,7 +1702,10 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
                 )
                 continue
             emitted += 1
-            _emit(f"{rel}: importing", emitted, queued, source_file.name)
+            _emit(
+                f"{rel}: importing", emitted, queued, source_file.name,
+                is_importing=True,
+            )
             if checker is not None:
                 try:
                     token = checker.match(source_file)
@@ -2894,10 +2902,10 @@ def run_import_job(job, runner, db_path, workspace_id, params):
     # an empty-but-present dict.
     folder_counts = {}
 
-    def _emit(phase, current, total, current_file=""):
+    def _emit(phase, current, total, current_file="", *, is_importing=False):
         eta_fields = {}
         if total > 0:
-            if phase.endswith(": importing"):
+            if is_importing:
                 eta.note_importing(copied)
             else:
                 eta.note_batch_complete(current, copied)
@@ -2905,6 +2913,8 @@ def run_import_job(job, runner, db_path, workspace_id, params):
         job["progress"]["current"] = current
         job["progress"]["total"] = total
         job["progress"]["current_file"] = current_file
+        for key in _IMPORT_ETA_PROGRESS_KEYS:
+            job["progress"].pop(key, None)
         job["progress"].update(eta_fields)
         runner.update_step(
             job["id"], "import",
@@ -3345,6 +3355,7 @@ def run_import_job(job, runner, db_path, workspace_id, params):
             emitted += 1
             _emit(
                 f"{rel}: importing", emitted, queued, source_file.name,
+                is_importing=True,
             )
 
             # Duplicate gate.

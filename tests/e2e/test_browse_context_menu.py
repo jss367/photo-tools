@@ -1,4 +1,10 @@
+import re
+
 from playwright.sync_api import expect
+
+# Exact match — the unified menu also holds "Review on Map" (added in the
+# batch-bar consolidation), which a plain has_text substring would also match.
+VIEW_ON_MAP_EXACT = re.compile(r"^View on Map$")
 
 
 def test_right_click_photo_opens_menu(live_server, page):
@@ -19,7 +25,7 @@ def test_right_click_photo_opens_menu(live_server, page):
     expect(menu.locator(".vireo-ctx-item", has_text="Reveal in")).to_be_visible()
     expect(menu.locator(".vireo-ctx-item", has_text="Copy Path")).to_be_visible()
     expect(menu.locator(".vireo-ctx-item", has_text="Delete")).to_be_visible()
-    expect(menu.locator(".vireo-ctx-item", has_text="View on Map")).to_be_visible()
+    expect(menu.locator(".vireo-ctx-item", has_text=VIEW_ON_MAP_EXACT)).to_be_visible()
 
 
 def test_view_on_map_context_action_targets_right_clicked_photo(live_server, page):
@@ -36,7 +42,7 @@ def test_view_on_map_context_action_targets_right_clicked_photo(live_server, pag
     menu = page.locator(".vireo-ctx-menu")
     expect(menu).to_be_visible()
 
-    menu.locator(".vireo-ctx-item", has_text="View on Map").click()
+    menu.locator(".vireo-ctx-item", has_text=VIEW_ON_MAP_EXACT).click()
     assert page.evaluate("window.__mapTarget") == pid
 
 

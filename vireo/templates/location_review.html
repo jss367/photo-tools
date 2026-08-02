@@ -125,6 +125,7 @@ body {
   font-size: 11px;
   box-shadow: 0 3px 12px rgba(0,0,0,.24);
 }
+.location-review-map-message a { color: var(--accent); }
 .location-review-thumbnails {
   display: flex;
   gap: 8px;
@@ -251,6 +252,25 @@ body {
   color: var(--accent);
 }
 .location-review-candidates { display: flex; flex-direction: column; gap: 7px; }
+.location-review-setup-prompt {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+  padding: 10px;
+  border: 1px solid color-mix(in srgb, var(--accent) 35%, var(--border-primary));
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--accent) 6%, var(--bg-primary));
+  color: var(--text-secondary);
+  font-size: 11px;
+  line-height: 1.4;
+}
+.location-review-setup-prompt strong { color: var(--text-primary); font-size: 12px; }
+.location-review-setup-prompt .location-review-button {
+  display: inline-block;
+  margin-top: 2px;
+  text-decoration: none;
+}
 .location-review-candidate {
   display: grid;
   grid-template-columns: 18px minmax(0, 1fr);
@@ -519,6 +539,7 @@ body {
     candidateMarkers: [],
     placesService: null,
     autocomplete: null,
+    googleMapsUnavailableReason: null,
     renderToken: 0,
   };
 
@@ -876,11 +897,23 @@ body {
   function renderCandidates() {
     var container = document.getElementById('locationReviewCandidates');
     var candidates = allCandidates();
+    var setupPrompt = '';
+    if (state.googleMapsUnavailableReason === 'missing_key') {
+      setupPrompt = '<div class="location-review-setup-prompt">' +
+        '<strong>Enable nearby place suggestions</strong>' +
+        '<span>Add a Google Maps API key to find named places near these photos. Previously used locations and custom names still work without one.</span>' +
+        '<a class="location-review-button" href="/settings#google-maps">Open Settings</a></div>';
+    } else if (state.googleMapsUnavailableReason === 'load_failed') {
+      setupPrompt = '<div class="location-review-setup-prompt">' +
+        '<strong>Google Maps could not be loaded</strong>' +
+        '<span>Check the API key and enabled Google Maps APIs in Settings. Previously used locations and custom names are still available.</span>' +
+        '<a class="location-review-button" href="/settings#google-maps">Check Settings</a></div>';
+    }
     if (!candidates.length) {
-      container.innerHTML = '<div class="location-review-loading">No nearby named places found. Search the map or enter a custom friendly name.</div>';
+      container.innerHTML = setupPrompt || '<div class="location-review-loading">No nearby named places found. Search the map or enter a custom friendly name.</div>';
       return;
     }
-    container.innerHTML = candidates.map(function(choice, index) {
+    container.innerHTML = setupPrompt + candidates.map(function(choice, index) {
       var selected = candidateKey(choice) === candidateKey(state.selectedChoice) ? ' selected' : '';
       var badge = choice.kind === 'keyword'
         ? '<span class="location-review-candidate-badge">Previously used</span>' : '';
@@ -1090,7 +1123,13 @@ body {
     renderCandidates();
     renderCandidateMarkers();
     var count = allCandidates().length;
-    document.getElementById('locationReviewSuggestionStatus').textContent = count ? count + ' options' : 'No matches';
+    var status = count ? count + (count === 1 ? ' option' : ' options') : 'No matches';
+    if (state.googleMapsUnavailableReason === 'missing_key') {
+      status = count ? count + (count === 1 ? ' saved option' : ' saved options') : 'Setup needed';
+    } else if (state.googleMapsUnavailableReason === 'load_failed') {
+      status = count ? count + (count === 1 ? ' saved option' : ' saved options') : 'Google Maps unavailable';
+    }
+    document.getElementById('locationReviewSuggestionStatus').textContent = status;
   }
 
   async function loadSuggestions(group, token) {
@@ -1203,8 +1242,11 @@ body {
         message.classList.add('location-review-hidden');
         return;
       } catch (e) {
+        state.googleMapsUnavailableReason = 'load_failed';
         console.warn('Google Maps unavailable; using basic map', e);
       }
+    } else {
+      state.googleMapsUnavailableReason = 'missing_key';
     }
 
     state.mapMode = 'leaflet';
@@ -1224,7 +1266,11 @@ body {
     var terrain = L.tileLayer('https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png', {attribution: '&copy; OpenTopoMap', maxZoom: 17});
     state.map = L.map('locationReviewMap', {layers: [street]}).setView([20,0], 2);
     L.control.layers({'Street': street, 'Satellite': satellite, 'Terrain': terrain}).addTo(state.map);
-    message.textContent = 'Add a Google Maps key in Settings for nearby park and place suggestions. Saved locations and custom names remain available.';
+    if (state.googleMapsUnavailableReason === 'load_failed') {
+      message.innerHTML = 'Google Maps could not be loaded. <a href="/settings#google-maps">Check Settings</a> to restore nearby suggestions.';
+    } else {
+      message.innerHTML = 'Add a Google Maps key for nearby park and place suggestions. <a href="/settings#google-maps">Open Settings</a>.';
+    }
   }
 
   function bindGoogleSearch() {

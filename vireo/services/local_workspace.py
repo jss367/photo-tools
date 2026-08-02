@@ -35,7 +35,18 @@ from pathlib import Path
 from config import _replace_with_windows_retry
 
 MANIFEST_VERSION = 2
+# Keep at least 5% of a destination volume free after a local copy, with
+# sensible bounds for very small and very large disks.  The lower bound
+# preserves the historical 1 GiB safety margin; the upper bound avoids making
+# large external SSDs unnecessarily unusable for Work Locally.
 LOCAL_RESERVE_BYTES = 1024**3
+LOCAL_MAX_RESERVE_BYTES = 20 * 1024**3
+LOCAL_RESERVE_FRACTION = 0.05
+# A copied entry consumes at least one destination allocation unit even when
+# its logical size is zero. Four KiB is the common minimum on APFS, NTFS, and
+# ext filesystems; the separate volume reserve covers larger cluster sizes and
+# filesystem metadata without making ordinary photo folders look enormous.
+LOCAL_ALLOCATION_UNIT_BYTES = 4096
 
 # Serializes stage/sync/discard per workspace. A short global guard covers
 # stage's cross-workspace overlap validation so two concurrent stages cannot
@@ -82,6 +93,128 @@ class LocalWorkspaceConflict(LocalWorkspaceError):
 
 class LocalWorkspaceCancelled(LocalWorkspaceError):
     """The caller cancelled a still-interruptible transfer."""
+
+
+def local_space_reserve(total_bytes: int) -> int:
+    """Return the free-space reserve Work Locally keeps on a volume."""
+    proportional = int(max(0, total_bytes) * LOCAL_RESERVE_FRACTION)
+    return min(LOCAL_MAX_RESERVE_BYTES, max(LOCAL_RESERVE_BYTES, proportional))
+
+
+def destination_disk_space(path: str | Path) -> dict:
+    """Return capacity details for the volume containing ``path``.
+
+    Destination folders commonly do not exist yet. Walk up to the closest
+    existing ancestor so the preview can report capacity before staging has
+    created anything.
+    """
+    requested = Path(path).expanduser()
+    probe = requested
+    while not os.path.lexists(probe):
+        parent = probe.parent
+        if parent == probe:
+            break
+        probe = parent
+    try:
+        usage = shutil.disk_usage(probe)
+        device = os.stat(probe).st_dev
+    except OSError as exc:
+        raise LocalWorkspaceError(
+            f"Could not check free space at {requested}: {exc}"
+        ) from exc
+    return {
+        "total_bytes": usage.total,
+        "free_bytes": usage.free,
+        "reserve_bytes": local_space_reserve(usage.total),
+        "device": device,
+        "probe_path": str(probe),
+    }
+
+
+def destination_case_insensitive(path: str | Path) -> bool:
+    """Probe whether the existing volume containing ``path`` folds case."""
+    base = Path(path).expanduser()
+    while not base.is_dir():
+        parent = base.parent
+        if parent == base:
+            break
+        base = parent
+    try:
+        fd, probe = tempfile.mkstemp(prefix="VireoCaseProbe-", dir=str(base))
+    except OSError as exc:
+        raise LocalWorkspaceError(
+            f"Could not inspect the destination filesystem at {path}: {exc}"
+        ) from exc
+    os.close(fd)
+    try:
+        lower = os.path.join(os.path.dirname(probe), os.path.basename(probe).lower())
+        return lower != probe and os.path.exists(lower)
+    finally:
+        with suppress(FileNotFoundError):
+            os.unlink(probe)
+
+
+def _estimated_destination_bytes(st) -> int:
+    """Conservatively estimate allocation consumed by one copied entry."""
+    if stat.S_ISREG(st.st_mode):
+        units = max(
+            1,
+            (st.st_size + LOCAL_ALLOCATION_UNIT_BYTES - 1)
+            // LOCAL_ALLOCATION_UNIT_BYTES,
+        )
+        return units * LOCAL_ALLOCATION_UNIT_BYTES
+    return LOCAL_ALLOCATION_UNIT_BYTES
+
+
+def _validated_tree_entries(source: str):
+    """Yield safe, supported entries from a validated source directory."""
+    try:
+        root_st = os.lstat(source)
+    except OSError as exc:
+        raise LocalWorkspaceError(f"Workspace folder is unavailable: {source}") from exc
+    if stat.S_ISLNK(root_st.st_mode):
+        raise LocalWorkspaceError(
+            f"Workspace root is a symlink and cannot be staged: {source}"
+        )
+    if not stat.S_ISDIR(root_st.st_mode):
+        raise LocalWorkspaceError(f"Workspace folder is unavailable: {source}")
+
+    try:
+        for rel, full, st in _walk_entries(source):
+            mode = st.st_mode
+            if stat.S_ISLNK(mode):
+                if not _symlink_stays_within(full, source):
+                    raise LocalWorkspaceError(
+                        f"Symlink escapes or uses an absolute target and cannot be staged: {full}"
+                    )
+            elif not stat.S_ISREG(mode) and not stat.S_ISDIR(mode):
+                raise LocalWorkspaceError(f"Unsupported special file in workspace: {full}")
+            yield rel, full, st
+    except OSError as exc:
+        raise LocalWorkspaceError(
+            f"Could not read workspace directory: {exc}"
+        ) from exc
+
+
+def source_tree_size(source: str) -> tuple[int, int, int]:
+    """Return copied-file count, logical bytes, and estimated allocated bytes."""
+
+    total_files = 0
+    total_bytes = 0
+    # The destination root directory itself is created for every source.
+    estimated_bytes = LOCAL_ALLOCATION_UNIT_BYTES
+    for _rel, _full, st in _validated_tree_entries(source):
+        mode = st.st_mode
+        if stat.S_ISREG(mode):
+            total_bytes += st.st_size
+            total_files += 1
+            estimated_bytes += _estimated_destination_bytes(st)
+        elif stat.S_ISLNK(mode):
+            total_files += 1
+            estimated_bytes += _estimated_destination_bytes(st)
+        elif stat.S_ISDIR(mode):
+            estimated_bytes += _estimated_destination_bytes(st)
+    return total_files, total_bytes, estimated_bytes
 
 
 def workspace_dir(vireo_dir: str, workspace_id: int) -> Path:
@@ -319,14 +452,7 @@ def _dest_case_insensitive(local_base: Path) -> bool:
     """
     base = local_base.parent
     base.mkdir(parents=True, exist_ok=True)
-    fd, probe = tempfile.mkstemp(prefix="VireoCaseProbe-", dir=str(base))
-    os.close(fd)
-    try:
-        lower = os.path.join(os.path.dirname(probe), os.path.basename(probe).lower())
-        return lower != probe and os.path.exists(lower)
-    finally:
-        with suppress(FileNotFoundError):
-            os.unlink(probe)
+    return destination_case_insensitive(base)
 
 
 def _walk_entries(root: str):
@@ -364,42 +490,26 @@ def _collect_source_entries(roots: list[dict], local_base: Path) -> tuple[dict[i
     """
     per_root: dict[int, list] = {}
     total_bytes = 0
+    estimated_bytes = 0
     total_files = 0
     local_base.parent.mkdir(parents=True, exist_ok=True)
     case_insensitive_target = _dest_case_insensitive(local_base)
     for index, root in enumerate(roots):
         source = root["source_path"]
-        # os.path.isdir follows symlinks; a source root that is itself a
-        # symlink would activate successfully here but sync_back later lstats
-        # and rejects it, leaving every local edit unsyncable. Reject
-        # symlinked (or non-directory) roots up front instead.
-        try:
-            root_st = os.lstat(source)
-        except OSError as exc:
-            raise LocalWorkspaceError(f"Workspace folder is unavailable: {source}") from exc
-        if stat.S_ISLNK(root_st.st_mode):
-            raise LocalWorkspaceError(
-                f"Workspace root is a symlink and cannot be staged: {source}"
-            )
-        if not stat.S_ISDIR(root_st.st_mode):
-            raise LocalWorkspaceError(f"Workspace folder is unavailable: {source}")
+        estimated_bytes += LOCAL_ALLOCATION_UNIT_BYTES
         entries = []
         folded_seen: dict[str, str] = {}
-        for rel, full, st in _walk_entries(source):
+        for rel, full, st in _validated_tree_entries(source):
             mode = st.st_mode
             if stat.S_ISREG(mode):
                 total_bytes += st.st_size
                 total_files += 1
+                estimated_bytes += _estimated_destination_bytes(st)
             elif stat.S_ISLNK(mode):
-                if not _symlink_stays_within(full, source):
-                    raise LocalWorkspaceError(
-                        f"Symlink escapes or uses an absolute target and cannot be staged: {full}"
-                    )
                 total_files += 1
+                estimated_bytes += _estimated_destination_bytes(st)
             elif stat.S_ISDIR(mode):
-                pass
-            else:
-                raise LocalWorkspaceError(f"Unsupported special file in workspace: {full}")
+                estimated_bytes += _estimated_destination_bytes(st)
             if case_insensitive_target and rel:
                 # Normalize Unicode form before folding case: macOS
                 # (HFS+/APFS) and Windows also collapse canonically
@@ -421,12 +531,13 @@ def _collect_source_entries(roots: list[dict], local_base: Path) -> tuple[dict[i
             entries.append((rel, full, st))
         per_root[index] = entries
 
-    free = shutil.disk_usage(local_base.parent).free
-    required = total_bytes + LOCAL_RESERVE_BYTES
-    if free < required:
+    usage = shutil.disk_usage(local_base.parent)
+    reserve = local_space_reserve(usage.total)
+    required = estimated_bytes + reserve
+    if usage.free < required:
         raise LocalWorkspaceError(
             f"Not enough local space: need {required:,} bytes including safety reserve, "
-            f"but only {free:,} bytes are free"
+            f"but only {usage.free:,} bytes are free"
         )
     return per_root, total_files, total_bytes
 

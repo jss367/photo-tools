@@ -381,6 +381,7 @@ POST         /api/workspaces/<int:ws_id>/pin
 POST         /api/workspaces/active/config
 POST         /api/workspaces/active/local-folders/discard
 POST         /api/workspaces/active/local-folders/preflight
+POST         /api/workspaces/active/local-folders/preflight/cancel
 POST         /api/workspaces/active/local-folders/stage
 POST         /api/workspaces/active/local-folders/sync
 POST         /api/workspaces/active/local-workspace/discard

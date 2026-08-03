@@ -20,6 +20,7 @@ began publishing to the source and did not finish).
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
@@ -101,7 +102,7 @@ def local_space_reserve(total_bytes: int) -> int:
     return min(LOCAL_MAX_RESERVE_BYTES, max(LOCAL_RESERVE_BYTES, proportional))
 
 
-def destination_disk_space(path: str | Path) -> dict:
+def destination_disk_space(path: str | Path, *, cancel_check=None) -> dict:
     """Return capacity details for the volume containing ``path``.
 
     Destination folders commonly do not exist yet. Walk up to the closest
@@ -110,13 +111,21 @@ def destination_disk_space(path: str | Path) -> dict:
     """
     requested = Path(path).expanduser()
     probe = requested
-    while not os.path.lexists(probe):
+    while True:
+        if cancel_check and cancel_check():
+            raise LocalWorkspaceCancelled("Folder scan cancelled")
+        if os.path.lexists(probe):
+            break
         parent = probe.parent
         if parent == probe:
             break
         probe = parent
+    if cancel_check and cancel_check():
+        raise LocalWorkspaceCancelled("Folder scan cancelled")
     try:
         usage = shutil.disk_usage(probe)
+        if cancel_check and cancel_check():
+            raise LocalWorkspaceCancelled("Folder scan cancelled")
         device = os.stat(probe).st_dev
     except OSError as exc:
         raise LocalWorkspaceError(
@@ -131,14 +140,20 @@ def destination_disk_space(path: str | Path) -> dict:
     }
 
 
-def destination_case_insensitive(path: str | Path) -> bool:
+def destination_case_insensitive(path: str | Path, *, cancel_check=None) -> bool:
     """Probe whether the existing volume containing ``path`` folds case."""
     base = Path(path).expanduser()
-    while not base.is_dir():
+    while True:
+        if cancel_check and cancel_check():
+            raise LocalWorkspaceCancelled("Folder scan cancelled")
+        if base.is_dir():
+            break
         parent = base.parent
         if parent == base:
             break
         base = parent
+    if cancel_check and cancel_check():
+        raise LocalWorkspaceCancelled("Folder scan cancelled")
     try:
         fd, probe = tempfile.mkstemp(prefix="VireoCaseProbe-", dir=str(base))
     except OSError as exc:
@@ -147,8 +162,13 @@ def destination_case_insensitive(path: str | Path) -> bool:
         ) from exc
     os.close(fd)
     try:
+        if cancel_check and cancel_check():
+            raise LocalWorkspaceCancelled("Folder scan cancelled")
         lower = os.path.join(os.path.dirname(probe), os.path.basename(probe).lower())
-        return lower != probe and os.path.exists(lower)
+        result = lower != probe and os.path.exists(lower)
+        if cancel_check and cancel_check():
+            raise LocalWorkspaceCancelled("Folder scan cancelled")
+        return result
     finally:
         with suppress(FileNotFoundError):
             os.unlink(probe)
@@ -166,12 +186,16 @@ def _estimated_destination_bytes(st) -> int:
     return LOCAL_ALLOCATION_UNIT_BYTES
 
 
-def _validated_tree_entries(source: str):
+def _validated_tree_entries(source: str, *, cancel_check=None):
     """Yield safe, supported entries from a validated source directory."""
+    if cancel_check and cancel_check():
+        raise LocalWorkspaceCancelled("Folder scan cancelled")
     try:
         root_st = os.lstat(source)
     except OSError as exc:
         raise LocalWorkspaceError(f"Workspace folder is unavailable: {source}") from exc
+    if cancel_check and cancel_check():
+        raise LocalWorkspaceCancelled("Folder scan cancelled")
     if stat.S_ISLNK(root_st.st_mode):
         raise LocalWorkspaceError(
             f"Workspace root is a symlink and cannot be staged: {source}"
@@ -180,7 +204,13 @@ def _validated_tree_entries(source: str):
         raise LocalWorkspaceError(f"Workspace folder is unavailable: {source}")
 
     try:
-        for rel, full, st in _walk_entries(source):
+        for rel, full, st in _walk_entries(source, cancel_check=cancel_check):
+            # Filesystem calls on network volumes may take a long time and
+            # cannot be interrupted while the kernel is servicing them. Check
+            # immediately after each one returns so an obsolete preflight does
+            # not continue walking the rest of the tree.
+            if cancel_check and cancel_check():
+                raise LocalWorkspaceCancelled("Folder scan cancelled")
             mode = st.st_mode
             if stat.S_ISLNK(mode):
                 if not _symlink_stays_within(full, source):
@@ -196,14 +226,16 @@ def _validated_tree_entries(source: str):
         ) from exc
 
 
-def source_tree_size(source: str) -> tuple[int, int, int]:
+def source_tree_size(source: str, *, cancel_check=None) -> tuple[int, int, int]:
     """Return copied-file count, logical bytes, and estimated allocated bytes."""
 
     total_files = 0
     total_bytes = 0
     # The destination root directory itself is created for every source.
     estimated_bytes = LOCAL_ALLOCATION_UNIT_BYTES
-    for _rel, _full, st in _validated_tree_entries(source):
+    for _rel, _full, st in _validated_tree_entries(
+        source, cancel_check=cancel_check
+    ):
         mode = st.st_mode
         if stat.S_ISREG(mode):
             total_bytes += st.st_size
@@ -455,30 +487,132 @@ def _dest_case_insensitive(local_base: Path) -> bool:
     return destination_case_insensitive(base)
 
 
-def _walk_entries(root: str):
+def _walk_entries(root: str, *, cancel_check=None):
     """Yield ``(rel, full, lstat)`` for every entry under root.
 
     Directories are included (so callers can recreate structure, including
     empty directories); directory symlinks are yielded as link entries and
-    not descended into. Each entry is stat'ed exactly once here — callers
-    classify via the yielded stat instead of re-statting.
+    not descended into. Child directories are re-stat'ed immediately before
+    descent so a symlink replacement cannot redirect traversal outside root.
+    On Unix the directory is then reopened with ``O_NOFOLLOW`` before its
+    contents are enumerated, which closes the narrow window between the
+    fresh ``lstat`` and the ``scandir`` opendir; a swap in that window
+    fails the open with ``ELOOP`` instead of letting ``scandir`` follow a
+    replacement symlink into an unrelated tree. Per-entry ``stat`` is done
+    via the parent's directory descriptor so intermediate ancestor swaps
+    cannot redirect the child's stat either.
+
+    ``cancel_check`` is checked between ``scandir`` entries, before every
+    ``os.lstat``, and between the ``lstat`` and the potentially blocking
+    directory open. On a slow network volume, any of these operations may
+    block, but the scan stops as soon as the current filesystem call returns
+    instead of letting a directory-wide batch finish first.
     """
-    for dirpath, dirnames, filenames in os.walk(root, followlinks=False, onerror=_raise_walk_error):
-        rel_dir = _relative(dirpath, root)
-        if rel_dir:
-            yield rel_dir, dirpath, os.lstat(dirpath)
-        kept = []
-        for dirname in dirnames:
-            full = os.path.join(dirpath, dirname)
-            st = os.lstat(full)
-            if stat.S_ISLNK(st.st_mode):
-                yield _relative(full, root), full, st
-            else:
-                kept.append(dirname)
-        dirnames[:] = kept
-        for filename in filenames:
-            full = os.path.join(dirpath, filename)
-            yield rel_dir and os.path.join(rel_dir, filename) or filename, full, os.lstat(full)
+    pending = [(root, None)]
+    while pending:
+        dirpath, directory_st = pending.pop()
+        if cancel_check and cancel_check():
+            raise LocalWorkspaceCancelled("Folder scan cancelled")
+        try:
+            current_st = os.lstat(dirpath)
+        except OSError as error:
+            _raise_walk_error(error)
+        # Slow SMB shares can block for many seconds inside the enumeration
+        # below. Recheck cancellation between the potentially blocking lstat
+        # above and the open/scandir so an obsolete preflight does not have
+        # to wait for another whole filesystem call before it can back out.
+        # Codex flagged this for the root specifically, whose lstat is not
+        # followed by a yield, but it applies to popped children too.
+        if cancel_check and cancel_check():
+            raise LocalWorkspaceCancelled("Folder scan cancelled")
+        # A queued child that is no longer a directory (replaced by a symlink
+        # or a plain file since the parent's scandir listed it) is yielded
+        # with the fresh stat and skipped for descent. The caller's symlink
+        # guard then refuses escaping targets; a type flip to a regular file
+        # is reported through the normal unsupported-type check.
+        if directory_st is not None and not stat.S_ISDIR(current_st.st_mode):
+            yield _relative(dirpath, root), dirpath, current_st
+            continue
+        if directory_st is None and not stat.S_ISDIR(current_st.st_mode):
+            raise LocalWorkspaceError(
+                f"Workspace root changed during directory scan: {root}"
+            )
+        # Open the directory with O_NOFOLLOW so a symlink swap in the tiny
+        # window between the lstat above and scandir cannot silently redirect
+        # enumeration into an unrelated tree. Enumerating through the fd also
+        # keeps per-entry stat calls anchored to the parent's descriptor, so
+        # an intermediate ancestor swap cannot escape either. On Windows
+        # (no O_NOFOLLOW) NTFS symlink creation requires elevation, so fall
+        # back to the direct path.
+        dir_fd = None
+        if hasattr(os, "O_NOFOLLOW"):
+            open_flags = os.O_RDONLY | os.O_NOFOLLOW
+            if hasattr(os, "O_DIRECTORY"):
+                open_flags |= os.O_DIRECTORY
+            try:
+                dir_fd = os.open(dirpath, open_flags)
+            except OSError as error:
+                if error.errno in {errno.ELOOP, errno.ENOTDIR, errno.ENOENT}:
+                    # dirpath became a symlink, changed type, or was removed
+                    # between our lstat and this open. Re-lstat so the caller
+                    # sees the fresh type; a queued child is yielded with its
+                    # new stat while a root topology change is fatal.
+                    try:
+                        swapped_st = os.lstat(dirpath)
+                    except OSError as swapped_err:
+                        _raise_walk_error(swapped_err)
+                    if directory_st is None:
+                        raise LocalWorkspaceError(
+                            f"Workspace root changed during directory scan: {root}"
+                        ) from error
+                    if stat.S_ISDIR(swapped_st.st_mode):
+                        # A transient open failure followed by a directory
+                        # lstat is ambiguous: skipping it would silently omit
+                        # the entire subtree from size checks and staging.
+                        raise LocalWorkspaceError(
+                            f"Workspace directory changed during directory scan: {dirpath}"
+                        ) from error
+                    yield _relative(dirpath, root), dirpath, swapped_st
+                    continue
+                _raise_walk_error(error)
+        if directory_st is not None:
+            yield _relative(dirpath, root), dirpath, current_st
+        scan_target = dir_fd if dir_fd is not None else dirpath
+        child_directories = []
+        try:
+            entries = os.scandir(scan_target)
+            with entries:
+                iterator = iter(entries)
+                while True:
+                    if cancel_check and cancel_check():
+                        raise LocalWorkspaceCancelled("Folder scan cancelled")
+                    try:
+                        entry = next(iterator)
+                    except StopIteration:
+                        break
+                    if cancel_check and cancel_check():
+                        raise LocalWorkspaceCancelled("Folder scan cancelled")
+                    full = os.path.join(dirpath, entry.name)
+                    # entry.stat with the fd-based scandir routes through
+                    # fstatat on the parent descriptor, so an intermediate
+                    # swap cannot redirect the stat of the final component.
+                    st = entry.stat(follow_symlinks=False)
+                    if stat.S_ISDIR(st.st_mode):
+                        child_directories.append((full, st))
+                    else:
+                        yield _relative(full, root), full, st
+        except OSError as error:
+            _raise_walk_error(error)
+        finally:
+            if dir_fd is not None:
+                with suppress(OSError):
+                    os.close(dir_fd)
+
+        # Stack order preserves scandir's depth-first ordering.
+        for child in reversed(child_directories):
+            if cancel_check and cancel_check():
+                raise LocalWorkspaceCancelled("Folder scan cancelled")
+            pending.append(child)
 
 
 def _collect_source_entries(roots: list[dict], local_base: Path) -> tuple[dict[int, list], int, int]:

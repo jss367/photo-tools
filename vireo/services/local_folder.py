@@ -86,6 +86,7 @@ def local_copy_preflight(
     vireo_dir: str,
     *,
     destination_bases: dict[int, str] | None = None,
+    cancel_check=None,
 ) -> dict:
     """Measure selected sources and capacity on their destination volumes."""
     destination_bases = destination_bases or {}
@@ -93,6 +94,8 @@ def local_copy_preflight(
     volumes_by_device: dict[int, dict] = {}
 
     for raw_root_id in root_folder_ids:
+        if cancel_check and cancel_check():
+            raise LocalWorkspaceCancelled("Folder scan cancelled")
         root_folder_id = int(raw_root_id)
         row = db.conn.execute(
             "SELECT path FROM folders WHERE id=?", (root_folder_id,)
@@ -104,8 +107,12 @@ def local_copy_preflight(
         if local_base is None:
             local_base = str(default_local_base(vireo_dir, root_folder_id))
         local_path = local_path_for_base(local_base, root_folder_id, source_path)
-        total_files, total_bytes, estimated_bytes = source_tree_size(source_path)
-        space = destination_disk_space(local_path)
+        total_files, total_bytes, estimated_bytes = source_tree_size(
+            source_path, cancel_check=cancel_check
+        )
+        if cancel_check and cancel_check():
+            raise LocalWorkspaceCancelled("Folder scan cancelled")
+        space = destination_disk_space(local_path, cancel_check=cancel_check)
         device = int(space["device"])
         volume = volumes_by_device.setdefault(
             device,

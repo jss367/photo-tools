@@ -1,3 +1,4 @@
+import errno
 import os
 import shutil
 import threading
@@ -7,6 +8,7 @@ import pytest
 import services.local_workspace as local_workspace
 from db import Database
 from services.local_workspace import (
+    LocalWorkspaceCancelled,
     LocalWorkspaceConflict,
     LocalWorkspaceError,
     discard_local,
@@ -71,13 +73,38 @@ def _source_fs_preserves_case(directory: Path) -> bool:
         probe.unlink()
 
 
+def _scandir_target_is(directory, scandir_arg) -> bool:
+    """Whether ``scandir_arg`` (path or fd) refers to ``directory``.
+
+    The walker now opens each directory with ``O_NOFOLLOW`` and passes the
+    resulting file descriptor to ``os.scandir``, so mocks that used to key on
+    the path argument must also recognise fd calls. Matching by (inode,
+    device) works for both a path and a directory descriptor.
+    """
+    try:
+        expected = os.stat(directory)
+    except OSError:
+        return False
+    if isinstance(scandir_arg, int):
+        try:
+            actual = os.fstat(scandir_arg)
+        except OSError:
+            return False
+    else:
+        try:
+            actual = os.stat(scandir_arg)
+        except OSError:
+            return False
+    return (actual.st_ino, actual.st_dev) == (expected.st_ino, expected.st_dev)
+
+
 def test_source_tree_size_converts_traversal_race_to_workspace_error(
     tmp_path, monkeypatch
 ):
     source = tmp_path / "source"
     source.mkdir()
 
-    def raced_walk(_root):
+    def raced_walk(_root, *, cancel_check=None):
         raise FileNotFoundError("entry disappeared during traversal")
         yield
 
@@ -85,6 +112,261 @@ def test_source_tree_size_converts_traversal_race_to_workspace_error(
 
     with pytest.raises(LocalWorkspaceError, match="Could not read workspace directory"):
         local_workspace.source_tree_size(str(source))
+
+
+def test_source_tree_size_cancels_between_scandir_entries(tmp_path, monkeypatch):
+    source = tmp_path / "source"
+    source.mkdir()
+    for index in range(4):
+        (source / f"photo-{index}.raw").write_bytes(b"raw")
+
+    cancelled = threading.Event()
+    enumerated = 0
+    real_scandir = local_workspace.os.scandir
+
+    class CancellingIterator:
+        def __init__(self, entries):
+            self.entries = entries
+
+        def __enter__(self):
+            self.entries.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self.entries.__exit__(*args)
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            nonlocal enumerated
+            entry = next(self.entries)
+            enumerated += 1
+            if enumerated == 2:
+                cancelled.set()
+            return entry
+
+    def cancelling_scandir(path):
+        entries = real_scandir(path)
+        if _scandir_target_is(source, path):
+            return CancellingIterator(entries)
+        return entries
+
+    monkeypatch.setattr(local_workspace.os, "scandir", cancelling_scandir)
+
+    with pytest.raises(LocalWorkspaceCancelled, match="Folder scan cancelled"):
+        local_workspace.source_tree_size(
+            str(source), cancel_check=cancelled.is_set
+        )
+
+    assert enumerated == 2
+
+
+def test_walk_entries_cancels_after_root_stat_before_scandir(tmp_path, monkeypatch):
+    source = tmp_path / "source"
+    source.mkdir()
+    cancelled = threading.Event()
+    real_lstat = local_workspace.os.lstat
+
+    def cancelling_lstat(path):
+        result = real_lstat(path)
+        if os.path.normpath(path) == os.path.normpath(source):
+            cancelled.set()
+        return result
+
+    def unexpected_scandir(_path):
+        raise AssertionError("cancelled traversal must not start scandir")
+
+    monkeypatch.setattr(local_workspace.os, "lstat", cancelling_lstat)
+    monkeypatch.setattr(local_workspace.os, "scandir", unexpected_scandir)
+
+    with pytest.raises(LocalWorkspaceCancelled, match="Folder scan cancelled"):
+        list(
+            local_workspace._walk_entries(
+                str(source), cancel_check=cancelled.is_set
+            )
+        )
+
+
+def test_walk_entries_converts_queued_directory_stat_race(tmp_path, monkeypatch):
+    source = tmp_path / "source"
+    child = source / "child"
+    child.mkdir(parents=True)
+    real_lstat = local_workspace.os.lstat
+    child_stats = 0
+
+    def disappearing_lstat(path):
+        nonlocal child_stats
+        if os.path.normpath(path) == os.path.normpath(child):
+            child_stats += 1
+            raise FileNotFoundError("queued directory disappeared")
+        return real_lstat(path)
+
+    monkeypatch.setattr(local_workspace.os, "lstat", disappearing_lstat)
+
+    with pytest.raises(LocalWorkspaceError, match="Could not read workspace directory"):
+        list(local_workspace._walk_entries(str(source)))
+
+    # The walker no longer calls ``os.lstat`` inside the parent's scandir
+    # loop (per-entry stat now routes through ``DirEntry.stat`` on the
+    # parent fd), so the queued child is lstat'd exactly once — at the
+    # pop-and-revalidate boundary — and that is where the OSError must
+    # convert to a LocalWorkspaceError.
+    assert child_stats == 1
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows test runners may not permit symlinks")
+def test_source_tree_size_does_not_follow_queued_directory_replaced_by_symlink(
+    tmp_path, monkeypatch
+):
+    source = tmp_path / "source"
+    child = source / "child"
+    child.mkdir(parents=True)
+    (child / "inside.raw").write_bytes(b"inside")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "outside.raw").write_bytes(b"outside")
+
+    real_scandir = local_workspace.os.scandir
+    swapped = False
+
+    class SwapOnExhaustion:
+        def __init__(self, entries):
+            self.entries = entries
+
+        def __enter__(self):
+            self.entries.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self.entries.__exit__(*args)
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            nonlocal swapped
+            try:
+                return next(self.entries)
+            except StopIteration:
+                if not swapped:
+                    shutil.rmtree(child)
+                    os.symlink(outside, child)
+                    swapped = True
+                raise
+
+    def swapping_scandir(path):
+        entries = real_scandir(path)
+        if _scandir_target_is(source, path):
+            return SwapOnExhaustion(entries)
+        return entries
+
+    monkeypatch.setattr(local_workspace.os, "scandir", swapping_scandir)
+
+    with pytest.raises(LocalWorkspaceError, match="Symlink escapes"):
+        local_workspace.source_tree_size(str(source))
+
+    assert swapped
+
+
+@pytest.mark.skipif(
+    not hasattr(os, "O_NOFOLLOW"),
+    reason="O_NOFOLLOW swap protection is only wired on platforms that expose it",
+)
+def test_source_tree_size_detects_child_swapped_to_symlink_before_open(
+    tmp_path, monkeypatch
+):
+    """A child dir that becomes a symlink between the walker's fresh lstat
+    and its O_NOFOLLOW open must be re-lstat'd and yielded as a symlink
+    instead of letting the enumeration follow into an unrelated tree."""
+    source = tmp_path / "source"
+    child = source / "child"
+    child.mkdir(parents=True)
+    (child / "inside.raw").write_bytes(b"inside")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "outside.raw").write_bytes(b"outside")
+
+    real_open = local_workspace.os.open
+    swap_done = False
+
+    def swapping_open(path, flags, *args, **kwargs):
+        nonlocal swap_done
+        if (
+            not swap_done
+            and isinstance(path, (str, bytes, os.PathLike))
+            and os.path.normpath(os.fspath(path)) == os.path.normpath(child)
+            and flags & os.O_NOFOLLOW
+        ):
+            shutil.rmtree(child)
+            os.symlink(outside, child)
+            swap_done = True
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(local_workspace.os, "open", swapping_open)
+
+    with pytest.raises(LocalWorkspaceError, match="Symlink escapes"):
+        local_workspace.source_tree_size(str(source))
+
+    assert swap_done
+
+
+@pytest.mark.skipif(
+    not hasattr(os, "O_NOFOLLOW"),
+    reason="O_NOFOLLOW directory opens are only used on supported platforms",
+)
+def test_walk_entries_rejects_directory_after_transient_open_failure(
+    tmp_path, monkeypatch
+):
+    """A failed open followed by a directory lstat must not skip its subtree."""
+    source = tmp_path / "source"
+    child = source / "child"
+    child.mkdir(parents=True)
+    (child / "inside.raw").write_bytes(b"inside")
+
+    real_open = local_workspace.os.open
+    failed = False
+
+    def transient_open(path, flags, *args, **kwargs):
+        nonlocal failed
+        if (
+            not failed
+            and isinstance(path, (str, bytes, os.PathLike))
+            and os.path.normpath(os.fspath(path)) == os.path.normpath(child)
+            and flags & os.O_NOFOLLOW
+        ):
+            failed = True
+            raise FileNotFoundError(errno.ENOENT, "transient directory open", path)
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(local_workspace.os, "open", transient_open)
+
+    with pytest.raises(LocalWorkspaceError, match="Workspace directory changed"):
+        list(local_workspace._walk_entries(str(source)))
+
+    assert failed
+
+
+@pytest.mark.parametrize(
+    "probe",
+    [
+        local_workspace.destination_disk_space,
+        local_workspace.destination_case_insensitive,
+    ],
+)
+def test_destination_probe_cancels_between_missing_ancestors(tmp_path, probe):
+    checks = 0
+
+    def cancel_check():
+        nonlocal checks
+        checks += 1
+        return checks == 2
+
+    destination = tmp_path / "missing" / "deep" / "photos"
+    with pytest.raises(LocalWorkspaceCancelled, match="Folder scan cancelled"):
+        probe(destination, cancel_check=cancel_check)
+
+    assert checks == 2
 
 
 def test_stage_modify_and_sync_back(local_workspace_env):
@@ -130,14 +412,14 @@ def test_stage_modify_and_sync_back(local_workspace_env):
 
 def test_stage_aborts_when_source_directory_cannot_be_read(local_workspace_env, monkeypatch):
     env = local_workspace_env
-    real_walk = local_workspace.os.walk
+    real_scandir = local_workspace.os.scandir
 
-    def failing_walk(path, *args, **kwargs):
-        if os.path.normpath(path) == os.path.normpath(env["source"]):
-            kwargs["onerror"](PermissionError("NAS directory denied"))
-        return real_walk(path, *args, **kwargs)
+    def failing_scandir(path):
+        if _scandir_target_is(env["source"], path):
+            raise PermissionError("NAS directory denied")
+        return real_scandir(path)
 
-    monkeypatch.setattr(local_workspace.os, "walk", failing_walk)
+    monkeypatch.setattr(local_workspace.os, "scandir", failing_scandir)
 
     with pytest.raises(LocalWorkspaceError, match="NAS directory denied"):
         stage_workspace(env["db"], env["workspace_id"], str(env["vireo_dir"]))
@@ -154,8 +436,8 @@ def test_staging_temp_file_cannot_overwrite_real_sibling(local_workspace_env, mo
     base.write_bytes(b"base contents")
     real_walk_entries = local_workspace._walk_entries
 
-    def sibling_first(root):
-        yield from sorted(real_walk_entries(root), reverse=True)
+    def sibling_first(root, *, cancel_check=None):
+        yield from sorted(real_walk_entries(root, cancel_check=cancel_check), reverse=True)
 
     monkeypatch.setattr(local_workspace, "_walk_entries", sibling_first)
     stage_workspace(env["db"], env["workspace_id"], str(env["vireo_dir"]))
@@ -225,8 +507,8 @@ def test_stage_rejects_source_swapped_to_symlink_before_copy(local_workspace_env
     real_walk_entries = local_workspace._walk_entries
     swapped = {"done": False}
 
-    def swap_after_walk(root):
-        for entry in real_walk_entries(root):
+    def swap_after_walk(root, *, cancel_check=None):
+        for entry in real_walk_entries(root, cancel_check=cancel_check):
             rel, full, _st = entry
             yield entry
             if not swapped["done"] and rel == os.path.join("2026", "bird.jpg"):
@@ -337,8 +619,8 @@ def test_stage_rejects_symlink_target_swapped_after_walk(local_workspace_env, tm
     real_walk_entries = local_workspace._walk_entries
     swapped = {"done": False}
 
-    def swap_after_walk(root):
-        for entry in real_walk_entries(root):
+    def swap_after_walk(root, *, cancel_check=None):
+        for entry in real_walk_entries(root, cancel_check=cancel_check):
             rel, full, _st = entry
             yield entry
             if not swapped["done"] and rel == "safe-link.jpg":

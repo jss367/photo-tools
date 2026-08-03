@@ -8,6 +8,122 @@
   var stagePreflightGeneration = 0;
   var stagePreflightTimer = null;
   var stagePreflightSignature = null;
+  var stagePreflightAbort = null;
+  var stagePreflightId = null;
+  var stagePreflightWorkspaceId = null;
+  var stagePreflightStorageKey = preflightClientStorageKey();
+  var stagePreflightClientState = loadPreflightClientState();
+  var stagePreflightClientId = stagePreflightClientState.id;
+  // The per-history-entry token and counter survive reloads and Back/Forward.
+  // If a pagehide keepalive is dropped, a restored page can still supersede
+  // its old scan without sharing cancellation state with an unrelated tab.
+  var stagePreflightSeq = stagePreflightClientState.seq;
+
+  function newPreflightId() {
+    if (window.crypto && typeof window.crypto.randomUUID === 'function') {
+      return window.crypto.randomUUID();
+    }
+    return Date.now().toString(36) + '-' + Math.random().toString(36).slice(2);
+  }
+
+  function loadPreflightClientState() {
+    try {
+      var stored = JSON.parse(window.sessionStorage.getItem(stagePreflightStorageKey));
+      if (
+        stored && typeof stored.id === 'string' && stored.id &&
+        Number.isSafeInteger(stored.seq) && stored.seq >= 0
+      ) {
+        return stored;
+      }
+    } catch (_error) {
+      // Storage can be disabled by browser privacy settings. The in-memory
+      // state below still preserves normal same-page supersession.
+    }
+    var state = {id: newPreflightId(), seq: 0};
+    persistPreflightClientState(state);
+    return state;
+  }
+
+  function preflightClientStorageKey() {
+    var stateKey = 'vireoWorkLocallyPreflightEntryId';
+    var keyPrefix = 'vireoWorkLocallyPreflightClient:';
+    try {
+      var historyState = window.history.state;
+      var entryId = isRestoredNavigation() && historyState &&
+        typeof historyState[stateKey] === 'string'
+        ? historyState[stateKey]
+        : null;
+      if (!entryId) {
+        entryId = newPreflightId();
+        var nextState = historyState && typeof historyState === 'object'
+          ? Object.assign({}, historyState)
+          : {};
+        nextState[stateKey] = entryId;
+        window.history.replaceState(nextState, document.title);
+      }
+      return keyPrefix + entryId;
+    } catch (_error) {
+      // History state can be unavailable in hardened browsing contexts.
+      return keyPrefix + newPreflightId();
+    }
+  }
+
+  function isRestoredNavigation() {
+    try {
+      if (window.performance && typeof window.performance.getEntriesByType === 'function') {
+        var navigations = window.performance.getEntriesByType('navigation');
+        if (navigations.length) {
+          return ['reload', 'back_forward'].indexOf(navigations[0].type) >= 0;
+        }
+      }
+      // Navigation Timing Level 1 fallback for older WebKit versions.
+      return Boolean(
+        window.performance && window.performance.navigation &&
+        [1, 2].indexOf(window.performance.navigation.type) >= 0
+      );
+    } catch (_error) {
+      return false;
+    }
+  }
+
+  function persistPreflightClientState(state) {
+    try {
+      window.sessionStorage.setItem(stagePreflightStorageKey, JSON.stringify(state));
+    } catch (_error) {
+      // Best effort: blocked or full storage should not prevent preflighting.
+    }
+  }
+
+  function newPreflightSeq() {
+    stagePreflightSeq += 1;
+    stagePreflightClientState.seq = stagePreflightSeq;
+    persistPreflightClientState(stagePreflightClientState);
+    return stagePreflightSeq;
+  }
+
+  function cancelStagePreflight(notifyServer) {
+    var preflightId = stagePreflightId;
+    var workspaceId = stagePreflightWorkspaceId;
+    if (stagePreflightAbort) stagePreflightAbort.abort();
+    stagePreflightAbort = null;
+    stagePreflightId = null;
+    stagePreflightWorkspaceId = null;
+    if (!notifyServer || !preflightId) return;
+    // Aborting fetch stops the browser from waiting, but a WSGI handler may
+    // already be blocked in SMB I/O. Notify the server so it stops walking as
+    // soon as that filesystem call returns. A later preflight also supersedes
+    // the earlier one server-side if this best-effort request cannot arrive.
+    Vireo.api.fetch('/api/workspaces/active/local-folders/preflight/cancel', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        preflight_id: preflightId,
+        workspace_id: workspaceId
+      }),
+      keepalive: true
+    }).catch(function() {});
+  }
+
   var blockingJobTimer = null;
   var stageBlockedByJob = false;
 
@@ -132,6 +248,7 @@
     return {
       complete: complete,
       body: {
+        workspace_id: data && data.workspace_id,
         folder_ids: pendingStageItems.map(function(item) { return item.requested_folder_id; }),
         destination_bases: destinationBases
       }
@@ -151,6 +268,7 @@
       stageBlockedByJob = true;
       stagePreflightGeneration += 1;
       stagePreflightSignature = null;
+      cancelStagePreflight(true);
       if (stagePreflightTimer) clearTimeout(stagePreflightTimer);
       stagePreflightTimer = null;
       if (button) button.disabled = true;
@@ -220,6 +338,14 @@
       }
       return;
     }
+    var controller = new AbortController();
+    var preflightId = newPreflightId();
+    var preflightSeq = newPreflightSeq();
+    stagePreflightAbort = controller;
+    stagePreflightId = preflightId;
+    stagePreflightWorkspaceId = data && data.workspace_id != null
+      ? Number(data.workspace_id)
+      : null;
     if (capacity) {
       capacity.style.color = 'var(--text-dim)';
       capacity.innerHTML = '<span class="btn-spinner" style="display:inline-block;margin-right:6px;"></span>Calculating folder sizes and available space...';
@@ -228,22 +354,34 @@
       var result = await Vireo.api.json('/api/workspaces/active/local-folders/preflight', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify(request.body)
+        body: JSON.stringify(Object.assign({}, request.body, {
+          preflight_id: preflightId,
+          preflight_client_id: stagePreflightClientId,
+          preflight_seq: preflightSeq
+        })),
+        signal: controller.signal
       }, {toast: false});
       if (generation !== stagePreflightGeneration || !pendingStageItems.length) return;
       stagePreflightSignature = JSON.stringify(request.body);
       renderStagePreflight(result);
     } catch (requestError) {
-      if (generation !== stagePreflightGeneration || !pendingStageItems.length) return;
+      if (controller.signal.aborted || generation !== stagePreflightGeneration || !pendingStageItems.length) return;
       if (capacity) {
         capacity.style.color = 'var(--danger)';
         capacity.textContent = requestError.message || 'Could not check folder sizes and free space.';
+      }
+    } finally {
+      if (stagePreflightAbort === controller) stagePreflightAbort = null;
+      if (stagePreflightId === preflightId) {
+        stagePreflightId = null;
+        stagePreflightWorkspaceId = null;
       }
     }
   }
 
   function scheduleStagePreflight(delay) {
     if (stagePreflightTimer) clearTimeout(stagePreflightTimer);
+    cancelStagePreflight(true);
     stagePreflightGeneration += 1;
     stagePreflightSignature = null;
     var button = document.getElementById('confirmStageLocalFolders');
@@ -257,6 +395,7 @@
     if (modal) modal.classList.remove('open');
     stagePreflightGeneration += 1;
     stagePreflightSignature = null;
+    cancelStagePreflight(true);
     stageBlockedByJob = false;
     if (stagePreflightTimer) clearTimeout(stagePreflightTimer);
     stagePreflightTimer = null;
@@ -755,6 +894,22 @@
       discard(selected);
     });
   }
+
+  window.addEventListener('pagehide', function() {
+    cancelStagePreflight(true);
+  });
+  window.addEventListener('pageshow', function(event) {
+    var modal = document.getElementById('stageLocalFoldersModal');
+    if (
+      event.persisted &&
+      modal && modal.classList.contains('open') &&
+      pendingStageItems.length &&
+      !stageBlockedByJob &&
+      stagePreflightSignature === null
+    ) {
+      scheduleStagePreflight(0);
+    }
+  });
 
   async function stageFromAnywhere(folderId) {
     if (!data) await load();

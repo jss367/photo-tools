@@ -46,6 +46,82 @@
     }).catch(function() {});
   }
 
+  var blockingJobTimer = null;
+  var stageBlockedByJob = false;
+
+  function blockingJobMessage(job) {
+    job = job || (data && data.blocking_job);
+    if (!job) return '';
+    var label = typeof window.formatJobType === 'function'
+      ? window.formatJobType(job.type)
+      : String(job.type || 'Processing').replace(/[-_]+/g, ' ');
+    var status = ['queued', 'running', 'pausing', 'paused'].indexOf(job.status) >= 0
+      ? job.status
+      : 'running';
+    return label + ' is ' + status + '. Work Locally will be available when it finishes or is cancelled.';
+  }
+
+  function blockingJobForFolder(folderId) {
+    var jobs = (data && data.folder_blocking_jobs) || {};
+    return jobs[String(Number(folderId))] || null;
+  }
+
+  function blockingJobForSelection(folderIds) {
+    if (!data) return null;
+    if (!folderIds || !folderIds.length) return data.blocking_job || null;
+    for (var index = 0; index < folderIds.length; index += 1) {
+      var job = blockingJobForFolder(folderIds[index]);
+      if (job) return job;
+    }
+    return null;
+  }
+
+  function blockerSignature(payload) {
+    if (!payload) return '';
+    return JSON.stringify({
+      blocking_job: payload.blocking_job || null,
+      folder_blocking_jobs: payload.folder_blocking_jobs || {}
+    });
+  }
+
+  async function refreshBlockingJob() {
+    // Poll only the lightweight blocker endpoint. The full /local-folders
+    // payload walks every managed local tree, so hitting it on a keep-alive
+    // timer while nothing is happening would keep the disk busy for large
+    // libraries. Trigger a full load() only when the blocker state actually
+    // changes so the panel re-renders enabled/disabled controls.
+    if (!data) return;
+    try {
+      var payload = await Vireo.api.json(
+        '/api/workspaces/active/local-folders/blocker', {}, {toast: false}
+      );
+      var previous = blockerSignature(data);
+      var next = blockerSignature(payload);
+      if (previous !== next) {
+        await load();
+      }
+    } catch (_error) {
+      // Swallow — the next tick will retry, and any hard error already
+      // surfaces through the full-load code path.
+    } finally {
+      scheduleBlockingJobRefresh();
+    }
+  }
+
+  function scheduleBlockingJobRefresh() {
+    if (blockingJobTimer) clearTimeout(blockingJobTimer);
+    blockingJobTimer = null;
+    if (!data) return;
+    // Fast refresh while a block is active so the UI re-enables promptly,
+    // slow keep-alive otherwise so a scan/pipeline started in another tab
+    // becomes visible without a page reload.
+    var delay = data.blocking_job ? 3000 : 15000;
+    blockingJobTimer = setTimeout(function() {
+      blockingJobTimer = null;
+      refreshBlockingJob();
+    }, delay);
+  }
+
   function selectedItems(folderIds, localOnly) {
     var wanted = folderIds && folderIds.length
       ? new Set(folderIds.map(Number))
@@ -98,6 +174,32 @@
         destination_bases: destinationBases
       }
     };
+  }
+
+  function updateStageDialogBlocker() {
+    var modal = document.getElementById('stageLocalFoldersModal');
+    if (!modal || !modal.classList.contains('open') || !pendingStageItems.length) return;
+    var folderIds = pendingStageItems.map(function(item) {
+      return item.requested_folder_id;
+    });
+    var blocker = blockingJobForSelection(folderIds);
+    var button = document.getElementById('confirmStageLocalFolders');
+    var error = document.getElementById('stageLocalFoldersError');
+    if (blocker) {
+      stageBlockedByJob = true;
+      stagePreflightGeneration += 1;
+      stagePreflightSignature = null;
+      cancelStagePreflight(true);
+      if (stagePreflightTimer) clearTimeout(stagePreflightTimer);
+      stagePreflightTimer = null;
+      if (button) button.disabled = true;
+      if (error) error.textContent = blockingJobMessage(blocker);
+      return;
+    }
+    if (!stageBlockedByJob) return;
+    stageBlockedByJob = false;
+    if (error) error.textContent = '';
+    scheduleStagePreflight(0);
   }
 
   function renderStagePreflight(preflight) {
@@ -209,13 +311,21 @@
     stagePreflightGeneration += 1;
     stagePreflightSignature = null;
     cancelStagePreflight(true);
+    stageBlockedByJob = false;
     if (stagePreflightTimer) clearTimeout(stagePreflightTimer);
     stagePreflightTimer = null;
     pendingStageItems = [];
   }
 
-  function openStageDialog(folderIds) {
+  async function openStageDialog(folderIds) {
     if (actionInFlight || activeJob) return;
+    await load();
+    if (actionInFlight || activeJob) return;
+    var blocker = blockingJobForSelection(folderIds);
+    if (blocker) {
+      showToast(blockingJobMessage(blocker), 'warning');
+      return;
+    }
     var items = selectedItems(folderIds, false).filter(function(item) {
       return item.state === 'remote';
     });
@@ -225,6 +335,7 @@
     var error = document.getElementById('stageLocalFoldersError');
     var modal = document.getElementById('stageLocalFoldersModal');
     if (!container || !modal) return;
+    stageBlockedByJob = false;
     if (error) error.textContent = '';
     container.innerHTML = items.map(function(item) {
       var id = Number(item.requested_folder_id);
@@ -281,10 +392,17 @@
       container.innerHTML = '<span style="color:var(--text-ghost);font-size:13px;">Migrating the previous local session...</span>';
       return;
     }
+    var blocked = !!(data && data.blocking_job);
+    var blockerHtml = blocked
+      ? '<div role="status" style="font-size:12px;color:var(--warning);line-height:1.5;margin-bottom:12px;">' +
+          escapeHtml(blockingJobMessage()) + ' <a href="/jobs" style="color:inherit;text-decoration:underline;">View Jobs</a></div>'
+      : '';
+    var disabledAttrs = blocked ? ' disabled style="opacity:.5;"' : '';
     if (legacy.state === 'staging') {
       container.innerHTML =
         '<div style="font-size:13px;color:var(--warning);margin-bottom:10px;">An older workspace copy was interrupted before activation.</div>' +
-        '<button class="btn btn-secondary" data-legacy-action="discard">Clean Up Incomplete Copy</button>';
+        blockerHtml +
+        '<button class="btn btn-secondary" data-legacy-action="discard"' + disabledAttrs + '>Clean Up Incomplete Copy</button>';
       return;
     }
     var changes = legacy.changes || {created: 0, modified: 0, deleted: 0};
@@ -295,9 +413,10 @@
       '</div>' +
       '<div style="font-size:11px;color:var(--text-dim);margin-bottom:12px;">' +
         changes.created + ' new · ' + changes.modified + ' modified · ' + changes.deleted + ' deleted</div>' +
+      blockerHtml +
       '<div style="display:flex;gap:8px;flex-wrap:wrap;">' +
-        '<button class="btn btn-secondary" data-legacy-action="sync">' + (recovery ? 'Finish Sync-back' : 'Finish and Sync Back') + '</button>' +
-        '<button class="btn btn-secondary" style="color:var(--danger);" data-legacy-action="discard">Discard Local Changes</button>' +
+        '<button class="btn btn-secondary" data-legacy-action="sync"' + disabledAttrs + '>' + (recovery ? 'Finish Sync-back' : 'Finish and Sync Back') + '</button>' +
+        '<button class="btn btn-secondary" style="color:var(--danger);" data-legacy-action="discard"' + disabledAttrs + '>Discard Local Changes</button>' +
       '</div>';
   }
 
@@ -334,6 +453,7 @@
     var shared = localItems.filter(function(item) {
       return (item.workspace_ids || []).length > 1;
     }).length;
+    var blocked = !!data.blocking_job;
 
     var summary = local === 0
       ? 'All ' + total + ' folder' + (total === 1 ? ' is' : 's are') + ' using source storage.'
@@ -346,13 +466,20 @@
         (local ? changes.created + ' new · ' + changes.modified + ' modified · ' + changes.deleted + ' deleted' :
           'Local copies speed up work on network or slower storage.') +
         (shared ? ' · ' + shared + ' shared local folder' + (shared === 1 ? '' : 's') : '') +
-      '</div><div style="display:flex;gap:8px;flex-wrap:wrap;">';
+      '</div>';
+    if (blocked) {
+      html += '<div role="status" style="font-size:12px;color:var(--warning);line-height:1.5;margin-bottom:12px;">' +
+        escapeHtml(blockingJobMessage()) + ' <a href="/jobs" style="color:inherit;text-decoration:underline;">View Jobs</a></div>';
+    }
+    html += '<div style="display:flex;gap:8px;flex-wrap:wrap;">';
     if (local < total) {
-      html += '<button class="btn btn-secondary" data-local-folders-action="stage-all">' +
+      html += '<button class="btn btn-secondary" data-local-folders-action="stage-all"' +
+        (blocked ? ' disabled style="opacity:.5;"' : '') + '>' +
         (local ? 'Make All Folders Local' : 'Work Entire Workspace Locally') + '</button>';
     }
     if (local) {
-      html += '<button class="btn btn-secondary" data-local-folders-action="manage">Finish Local Work...</button>';
+      html += '<button class="btn btn-secondary" data-local-folders-action="manage"' +
+        (blocked ? ' disabled style="opacity:.5;"' : '') + '>Finish Local Work...</button>';
     }
     html += '</div>';
     container.innerHTML = html;
@@ -414,6 +541,8 @@
       window.vireoLocalFolderData = data;
       render();
       if (typeof loadWsFolders === 'function') loadWsFolders();
+      updateStageDialogBlocker();
+      scheduleBlockingJobRefresh();
       return data;
     } catch (error) {
       var container = document.getElementById('localWorkspaceContent');
@@ -427,6 +556,13 @@
     var error = document.getElementById('stageLocalFoldersError');
     var button = document.getElementById('confirmStageLocalFolders');
     var request = stageRequestBody();
+    var blocker = blockingJobForSelection(request.body.folder_ids);
+    if (blocker) {
+      stageBlockedByJob = true;
+      if (button) button.disabled = true;
+      if (error) error.textContent = blockingJobMessage(blocker);
+      return;
+    }
     if (!request.complete || stagePreflightSignature !== JSON.stringify(request.body)) {
       if (error) error.textContent = 'Wait for the size and free-space check to finish.';
       scheduleStagePreflight(0);
@@ -457,6 +593,11 @@
     if (actionInFlight || activeJob) return;
     await load();
     if (activeJob) return;
+    var blocker = blockingJobForSelection(folderIds);
+    if (blocker) {
+      showToast(blockingJobMessage(blocker), 'warning');
+      return;
+    }
     var items = selectedItems(folderIds, true);
     if (!items.length) return;
     if (items.some(function(item) {
@@ -504,6 +645,11 @@
     if (actionInFlight || activeJob) return;
     await load();
     if (activeJob) return;
+    var blocker = blockingJobForSelection(folderIds);
+    if (blocker) {
+      showToast(blockingJobMessage(blocker), 'warning');
+      return;
+    }
     var items = selectedItems(folderIds, true);
     if (!items.length) return;
     var affected = new Set();
@@ -570,6 +716,12 @@
 
   async function legacyAction(action) {
     if (!data || !data.legacy || actionInFlight || activeJob) return;
+    await load();
+    if (!data || !data.legacy || actionInFlight || activeJob) return;
+    if (data.blocking_job) {
+      showToast(blockingJobMessage(), 'warning');
+      return;
+    }
     var legacy = data.legacy;
     var endpoint = action === 'sync' ? 'sync' : 'discard';
     var body;
@@ -676,6 +828,9 @@
   window.vireoLocalFolders = {
     load: load,
     statusFor: statusFor,
+    blockingJob: function() { return data && data.blocking_job; },
+    blockingJobFor: blockingJobForFolder,
+    blockingMessage: blockingJobMessage,
     stage: stageFromAnywhere,
     sync: function(folderId) { return sync([Number(folderId)]); },
     discard: function(folderId) { return discard([Number(folderId)]); }

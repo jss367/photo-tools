@@ -1981,6 +1981,321 @@ def test_folder_stage_endpoint_refuses_while_scan_is_paused(tmp_path, monkeypatc
         wait_for_job_via_client(client, job_id)
 
 
+def test_local_folder_status_exposes_blocking_job_and_preflight_stops_early(
+    tmp_path, monkeypatch
+):
+    """The UI should know a transition is unavailable before scanning storage.
+
+    The capacity preflight can take a long time on a network volume.  If a
+    pipeline already makes Work Locally unsafe, report that job in status and
+    reject preflight without walking the source tree.
+    """
+    import threading
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    import web.local_folder as local_folder_web
+    from app import create_app
+
+    source = tmp_path / "nas" / "photos"
+    source.mkdir(parents=True)
+    (source / "bird.jpg").write_bytes(b"original")
+    vireo_dir = tmp_path / "vireo"
+    thumbs = vireo_dir / "thumbnails"
+    thumbs.mkdir(parents=True)
+    db_path = str(vireo_dir / "vireo.db")
+
+    db = Database(db_path)
+    workspace_id = db.create_workspace("Owner")
+    folder_id = db.add_folder(str(source), name="photos", link_to_workspace=False)
+    db.add_workspace_folder(workspace_id, folder_id)
+    db.set_active_workspace(workspace_id)
+    db.close()
+
+    app = create_app(db_path, thumb_cache_dir=str(thumbs))
+    app.config["TESTING"] = True
+    started = threading.Event()
+    release = threading.Event()
+
+    def processing(_job):
+        started.set()
+        assert release.wait(timeout=10)
+        return {"ok": True}
+
+    def unexpected_preflight(*_args, **_kwargs):
+        raise AssertionError("blocked preflight must not scan source storage")
+
+    monkeypatch.setattr(local_folder_web, "local_copy_preflight", unexpected_preflight)
+
+    with app.test_client() as client:
+        assert client.post(
+            f"/api/workspaces/{workspace_id}/activate", json={}
+        ).status_code == 200
+        job_id = app._job_runner.start(
+            "pipeline", processing, workspace_id=workspace_id
+        )
+        try:
+            assert started.wait(timeout=2)
+            status = client.get(
+                "/api/workspaces/active/local-folders"
+            ).get_json()
+            assert status["blocking_job"] == {
+                "id": job_id,
+                "type": "pipeline",
+                "status": "running",
+            }
+
+            preflight = client.post(
+                "/api/workspaces/active/local-folders/preflight",
+                json={"folder_ids": [folder_id]},
+            )
+            assert preflight.status_code == 409
+            assert "pipeline" in preflight.get_json()["error"]
+        finally:
+            release.set()
+        assert wait_for_job_via_client(client, job_id)["status"] == "completed"
+
+
+def test_local_folder_blocker_endpoint_avoids_source_walk(tmp_path, monkeypatch):
+    """The lightweight blocker endpoint must not walk managed local trees.
+
+    The Work Locally panel polls this endpoint on a keep-alive timer to notice
+    scans/pipelines started from other tabs. The full ``/local-folders``
+    payload recursively walks every managed local tree via ``folder_status``
+    to compute a change summary, so hitting it every few seconds on a large
+    library would keep the disk continuously busy.
+    """
+    monkeypatch.setenv("HOME", str(tmp_path))
+    import web.local_folder as local_folder_web
+    from app import create_app
+
+    source = tmp_path / "nas" / "photos"
+    source.mkdir(parents=True)
+    (source / "bird.jpg").write_bytes(b"original")
+    vireo_dir = tmp_path / "vireo"
+    thumbs = vireo_dir / "thumbnails"
+    thumbs.mkdir(parents=True)
+    db_path = str(vireo_dir / "vireo.db")
+
+    db = Database(db_path)
+    workspace_id = db.create_workspace("Owner")
+    folder_id = db.add_folder(str(source), name="photos", link_to_workspace=False)
+    db.add_workspace_folder(workspace_id, folder_id)
+    db.set_active_workspace(workspace_id)
+    db.close()
+
+    app = create_app(db_path, thumb_cache_dir=str(thumbs))
+    app.config["TESTING"] = True
+
+    def unexpected_status(*_args, **_kwargs):
+        raise AssertionError("blocker endpoint must not walk local trees")
+
+    # web.local_folder rebinds workspace_status via `from services.local_folder
+    # import workspace_status`, so patch that name on the consuming module.
+    monkeypatch.setattr(local_folder_web, "workspace_status", unexpected_status)
+
+    with app.test_client() as client:
+        assert client.post(
+            f"/api/workspaces/{workspace_id}/activate", json={}
+        ).status_code == 200
+        # No blocker → empty payload, without walking storage.
+        response = client.get("/api/workspaces/active/local-folders/blocker")
+        assert response.status_code == 200
+        assert response.get_json() == {
+            "blocking_job": None,
+            "folder_blocking_jobs": {},
+        }
+
+    import threading
+
+    started = threading.Event()
+    release = threading.Event()
+
+    def processing(_job):
+        started.set()
+        assert release.wait(timeout=10)
+        return {"ok": True}
+
+    with app.test_client() as client:
+        assert client.post(
+            f"/api/workspaces/{workspace_id}/activate", json={}
+        ).status_code == 200
+        job_id = app._job_runner.start(
+            "pipeline", processing, workspace_id=workspace_id
+        )
+        try:
+            assert started.wait(timeout=2)
+            response = client.get("/api/workspaces/active/local-folders/blocker")
+            assert response.status_code == 200
+            assert response.get_json() == {
+                "blocking_job": {
+                    "id": job_id,
+                    "type": "pipeline",
+                    "status": "running",
+                },
+                "folder_blocking_jobs": {
+                    str(folder_id): {
+                        "id": job_id,
+                        "type": "pipeline",
+                        "status": "running",
+                    }
+                },
+            }
+        finally:
+            release.set()
+        assert wait_for_job_via_client(client, job_id)["status"] == "completed"
+
+    # Once the pipeline finishes the endpoint should report an empty blocker
+    # again, still without hitting workspace_status.
+    with app.test_client() as client:
+        assert client.post(
+            f"/api/workspaces/{workspace_id}/activate", json={}
+        ).status_code == 200
+        response = client.get("/api/workspaces/active/local-folders/blocker")
+        assert response.status_code == 200
+        assert response.get_json() == {
+            "blocking_job": None,
+            "folder_blocking_jobs": {},
+        }
+    # Silence unused-variable warning when folder_id isn't referenced.
+    assert folder_id
+
+
+def test_local_folder_blockers_are_scoped_to_affected_roots(tmp_path, monkeypatch):
+    """A shared-root job must not disable an unrelated root in the workspace."""
+    import threading
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    from app import create_app
+
+    shared_source = tmp_path / "nas" / "shared"
+    unrelated_source = tmp_path / "nas" / "unrelated"
+    shared_source.mkdir(parents=True)
+    unrelated_source.mkdir(parents=True)
+    (shared_source / "bird.jpg").write_bytes(b"shared")
+    (unrelated_source / "fox.jpg").write_bytes(b"unrelated")
+    vireo_dir = tmp_path / "vireo"
+    thumbs = vireo_dir / "thumbnails"
+    thumbs.mkdir(parents=True)
+    db_path = str(vireo_dir / "vireo.db")
+
+    db = Database(db_path)
+    first_workspace = db.create_workspace("First")
+    second_workspace = db.create_workspace("Second")
+    shared_id = db.add_folder(
+        str(shared_source), name="shared", link_to_workspace=False
+    )
+    unrelated_id = db.add_folder(
+        str(unrelated_source), name="unrelated", link_to_workspace=False
+    )
+    db.add_workspace_folder(first_workspace, shared_id)
+    db.add_workspace_folder(first_workspace, unrelated_id)
+    db.add_workspace_folder(second_workspace, shared_id)
+    db.close()
+
+    app = create_app(db_path, thumb_cache_dir=str(thumbs))
+    app.config["TESTING"] = True
+    started = threading.Event()
+    release = threading.Event()
+
+    def processing(_job):
+        started.set()
+        assert release.wait(timeout=10)
+        return {"ok": True}
+
+    with app.test_client() as client:
+        assert client.post(
+            f"/api/workspaces/{first_workspace}/activate", json={}
+        ).status_code == 200
+        job_id = app._job_runner.start(
+            "pipeline", processing, workspace_id=second_workspace
+        )
+        try:
+            assert started.wait(timeout=2)
+            blocker = client.get(
+                "/api/workspaces/active/local-folders/blocker"
+            ).get_json()
+            assert blocker["blocking_job"]["id"] == job_id
+            assert blocker["folder_blocking_jobs"] == {
+                str(shared_id): blocker["blocking_job"]
+            }
+
+            stage = client.post(
+                "/api/workspaces/active/local-folders/stage",
+                json={"folder_ids": [unrelated_id]},
+            )
+            assert stage.status_code == 202, stage.get_json()
+            assert wait_for_job_via_client(
+                client, stage.get_json()["job_id"]
+            )["status"] == "completed"
+        finally:
+            release.set()
+        assert wait_for_job_via_client(client, job_id)["status"] == "completed"
+
+
+def test_local_folder_blockers_include_descendant_sessions(tmp_path, monkeypatch):
+    """Every local-session row surfaced by workspace status gets a blocker."""
+    import threading
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    from app import create_app
+
+    parent_source = tmp_path / "nas" / "parent"
+    child_source = parent_source / "child"
+    child_source.mkdir(parents=True)
+    (child_source / "bird.jpg").write_bytes(b"original")
+    vireo_dir = tmp_path / "vireo"
+    thumbs = vireo_dir / "thumbnails"
+    thumbs.mkdir(parents=True)
+    db_path = str(vireo_dir / "vireo.db")
+
+    db = Database(db_path)
+    parent_workspace = db.create_workspace("Parent")
+    child_workspace = db.create_workspace("Child")
+    parent_id = db.add_folder(
+        str(parent_source), name="parent", link_to_workspace=False
+    )
+    child_id = db.add_folder(
+        str(child_source),
+        name="child",
+        parent_id=parent_id,
+        link_to_workspace=False,
+    )
+    db.add_workspace_folder(parent_workspace, parent_id)
+    db.add_workspace_folder(child_workspace, child_id)
+    stage_folder(db, child_id, str(vireo_dir))
+    db.close()
+
+    app = create_app(db_path, thumb_cache_dir=str(thumbs))
+    app.config["TESTING"] = True
+    started = threading.Event()
+    release = threading.Event()
+
+    def processing(_job):
+        started.set()
+        assert release.wait(timeout=10)
+        return {"ok": True}
+
+    with app.test_client() as client:
+        assert client.post(
+            f"/api/workspaces/{parent_workspace}/activate", json={}
+        ).status_code == 200
+        job_id = app._job_runner.start(
+            "pipeline", processing, workspace_id=child_workspace
+        )
+        try:
+            assert started.wait(timeout=2)
+            blocker = client.get(
+                "/api/workspaces/active/local-folders/blocker"
+            ).get_json()
+            assert blocker["blocking_job"]["id"] == job_id
+            assert blocker["folder_blocking_jobs"] == {
+                str(child_id): blocker["blocking_job"],
+            }
+        finally:
+            release.set()
+        assert wait_for_job_via_client(client, job_id)["status"] == "completed"
+
+
 def test_folder_sync_proceeds_while_observational_job_runs(tmp_path, monkeypatch):
     """An automatic read-only probe must not hold local work hostage.
 

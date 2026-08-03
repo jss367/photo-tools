@@ -149,6 +149,7 @@ GET          /api/workspaces/<int:ws_id>/folders
 GET          /api/workspaces/active
 GET          /api/workspaces/active/config
 GET          /api/workspaces/active/local-folders
+GET          /api/workspaces/active/local-folders/blocker
 GET          /api/workspaces/active/local-workspace
 GET          /api/workspaces/active/new-images
 GET          /api/workspaces/active/new-images/snapshot/<int:snapshot_id>

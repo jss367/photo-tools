@@ -203,6 +203,8 @@ async function loadWsFolders() {
       ws.folders.forEach(function(f) {
         _wsFoldersById[f.id] = f;
         var local = window.vireoLocalFolders ? window.vireoLocalFolders.statusFor(f.id) : null;
+        var localBlocked = window.vireoLocalFolders && window.vireoLocalFolders.blockingJobFor(f.id);
+        var localBlockedMessage = localBlocked ? window.vireoLocalFolders.blockingMessage(localBlocked) : '';
         var displayPath = local && local.display_path ? local.display_path : f.path;
         var hasLocalActions = local && local.state !== 'remote' && local.state !== 'staging' &&
           !(local.state === 'recovery' && local.recovery_kind !== 'sync');
@@ -216,12 +218,16 @@ async function loadWsFolders() {
         html += '</label>';
         if (local) {
           if (local.state === 'remote') {
-            html += '<button onclick="vireoLocalFolders.stage(' + f.id + ')" class="btn btn-secondary" style="padding:4px 9px;font-size:11px;">Work Locally</button>';
+            html += '<button onclick="vireoLocalFolders.stage(' + f.id + ')" class="btn btn-secondary"' +
+              (localBlocked ? ' disabled title="' + escapeAttr(localBlockedMessage) + '"' : '') +
+              ' style="padding:4px 9px;font-size:11px;' + (localBlocked ? 'opacity:.5;' : '') + '">Work Locally</button>';
           } else if (local.state === 'staging') {
             html += '<span style="font-size:11px;color:var(--warning);">Copying...</span>';
           } else if (local.state === 'recovery' && local.recovery_kind !== 'sync') {
             html += '<span style="font-size:11px;color:var(--warning);">Local copy needs cleanup</span>';
-            html += '<button onclick="vireoLocalFolders.discard(' + f.id + ')" class="btn btn-secondary" style="padding:4px 9px;font-size:11px;color:var(--danger);">Clean Up</button>';
+            html += '<button onclick="vireoLocalFolders.discard(' + f.id + ')" class="btn btn-secondary"' +
+              (localBlocked ? ' disabled title="' + escapeAttr(localBlockedMessage) + '"' : '') +
+              ' style="padding:4px 9px;font-size:11px;color:var(--danger);' + (localBlocked ? 'opacity:.5;' : '') + '">Clean Up</button>';
           }
         }
         html += '<button onclick="removeFolderFromWs(' + ws.id + ', ' + f.id + ')" style="background:none;border:none;color:var(--danger);cursor:pointer;font-size:16px;" title="Remove from workspace">&times;</button>';
@@ -232,8 +238,12 @@ async function loadWsFolders() {
           html += '<span style="font-size:10px;color:var(--accent);background:rgba(36,229,202,0.1);padding:2px 7px;border-radius:3px;" title="' +
             (sharedCount > 1 ? 'Shared by ' + sharedCount + ' workspaces' : 'Using managed local storage') + '">Local' +
             (sharedCount > 1 ? ' · ' + sharedCount + ' workspaces' : '') + '</span>';
-          html += '<button onclick="vireoLocalFolders.sync(' + f.id + ')" class="btn btn-secondary" style="padding:4px 9px;font-size:11px;">Sync Back</button>';
-          html += '<button onclick="vireoLocalFolders.discard(' + f.id + ')" class="btn btn-secondary" style="padding:4px 9px;font-size:11px;color:var(--danger);">Discard</button>';
+          html += '<button onclick="vireoLocalFolders.sync(' + f.id + ')" class="btn btn-secondary"' +
+            (localBlocked ? ' disabled title="' + escapeAttr(localBlockedMessage) + '"' : '') +
+            ' style="padding:4px 9px;font-size:11px;' + (localBlocked ? 'opacity:.5;' : '') + '">Sync Back</button>';
+          html += '<button onclick="vireoLocalFolders.discard(' + f.id + ')" class="btn btn-secondary"' +
+            (localBlocked ? ' disabled title="' + escapeAttr(localBlockedMessage) + '"' : '') +
+            ' style="padding:4px 9px;font-size:11px;color:var(--danger);' + (localBlocked ? 'opacity:.5;' : '') + '">Discard</button>';
           html += '</div>';
         }
         html += '</div>';

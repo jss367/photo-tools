@@ -775,6 +775,57 @@ def test_preflight_cancel_can_arrive_before_scan_starts(tmp_path, monkeypatch):
     assert older.get_json()["error"] == "Folder size calculation was cancelled"
 
 
+def test_queued_preflight_stays_bound_to_origin_workspace(tmp_path, monkeypatch):
+    """A delayed POST must consume the origin workspace's cancel tombstone."""
+    from services.local_folder import LocalWorkspaceCancelled
+
+    def fake_preflight(
+        _db, _root_ids, _vireo_dir, *, destination_bases=None, cancel_check=None
+    ):
+        if cancel_check and cancel_check():
+            raise LocalWorkspaceCancelled("cancelled before queued request ran")
+        return {"folder_count": 1, "total_bytes": 0, "can_copy": True,
+                "folders": [], "volumes": []}
+
+    app, folder_id = _cancellable_preflight_app(
+        tmp_path, monkeypatch, fake_preflight
+    )
+    with app.test_client() as client:
+        origin_workspace_id = client.get(
+            "/api/workspaces/active/local-folders"
+        ).get_json()["workspace_id"]
+        other_workspace_id = client.post(
+            "/api/workspaces",
+            json={"name": "Shared workspace", "folder_ids": [folder_id]},
+        ).get_json()["id"]
+        assert client.post(
+            f"/api/workspaces/{other_workspace_id}/activate", json={}
+        ).status_code == 200
+
+        cancel = client.post(
+            "/api/workspaces/active/local-folders/preflight/cancel",
+            json={
+                "preflight_id": "queued-origin-request",
+                "workspace_id": origin_workspace_id,
+            },
+        )
+        preflight = client.post(
+            "/api/workspaces/active/local-folders/preflight",
+            json={
+                "folder_ids": [folder_id],
+                "preflight_id": "queued-origin-request",
+                "preflight_client_id": "origin-tab",
+                "preflight_seq": 1,
+                "workspace_id": origin_workspace_id,
+            },
+        )
+
+    assert cancel.status_code == 200
+    assert cancel.get_json() == {"cancelled": False}
+    assert preflight.status_code == 409
+    assert preflight.get_json()["error"] == "Folder size calculation was cancelled"
+
+
 def test_preflight_precancelled_newer_request_stops_intervening_older_scan(
     tmp_path, monkeypatch
 ):

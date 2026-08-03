@@ -228,6 +228,7 @@
     return {
       complete: complete,
       body: {
+        workspace_id: data && data.workspace_id,
         folder_ids: pendingStageItems.map(function(item) { return item.requested_folder_id; }),
         destination_bases: destinationBases
       }

@@ -131,6 +131,24 @@ def create_local_folder_blueprint(
             return None, None, json_error("No active workspace", 400)
         return db, int(workspace_id), None
 
+    def _preflight_context(body):
+        """Bind a queued preflight to the workspace that submitted it."""
+        raw_workspace_id = body.get("workspace_id")
+        if raw_workspace_id is None:
+            # Backward compatibility for clients loaded before workspace-bound
+            # preflights were introduced.
+            return _active_context()
+        if isinstance(raw_workspace_id, bool):
+            return None, None, json_error("workspace_id must be an integer", 400)
+        try:
+            workspace_id = int(raw_workspace_id)
+        except (TypeError, ValueError):
+            return None, None, json_error("workspace_id must be an integer", 400)
+        db = get_db()
+        if db.get_workspace(workspace_id) is None:
+            return None, None, json_error("Workspace not found", 404)
+        return db, workspace_id, None
+
     def _active_root_ids(db, workspace_id):
         return [int(row["id"]) for row in db.get_workspace_folder_roots(workspace_id)]
 
@@ -384,13 +402,13 @@ def create_local_folder_blueprint(
 
     @blueprint.post("/api/workspaces/active/local-folders/preflight")
     def preflight_local_folders():
-        db, workspace_id, error = _active_context()
+        body = request.get_json(silent=True) or {}
+        db, workspace_id, error = _preflight_context(body)
         if error:
             return error
         legacy_error = _legacy_error(db, workspace_id)
         if legacy_error is not None:
             return legacy_error
-        body = request.get_json(silent=True) or {}
         root_ids, request_error = _requested_roots(db, workspace_id, body)
         if request_error is not None:
             return request_error

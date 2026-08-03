@@ -876,11 +876,22 @@ def test_preflight_cancel_stops_destination_probing(tmp_path, monkeypatch):
     release_probe = threading.Event()
     probe_paths = []
 
-    def slow_case_insensitive(final_path, **_kwargs):
+    def slow_case_insensitive(final_path, *, cancel_check=None, **_kwargs):
         probe_paths.append(final_path)
         if len(probe_paths) == 1:
             first_probe_started.set()
             assert release_probe.wait(5), "test did not release the destination probe"
+        # Emulate the real probe honouring the cancellation callback so we
+        # exercise ``LocalWorkspaceCancelled`` propagating out of the probe
+        # (as opposed to only checking the loop's between-iteration check).
+        # ``LocalWorkspaceCancelled`` subclasses ``LocalWorkspaceError``, so a
+        # naive ``except LocalWorkspaceError`` around the probe would swallow
+        # this into the generic destination-error 409 instead of the
+        # cancellation error text.
+        if cancel_check and cancel_check():
+            from services.local_folder import LocalWorkspaceCancelled
+
+            raise LocalWorkspaceCancelled("Folder scan cancelled")
         return False
 
     def fake_preflight(

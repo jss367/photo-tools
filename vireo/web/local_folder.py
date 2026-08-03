@@ -269,6 +269,13 @@ def create_local_folder_blueprint(
                 case_insensitive = destination_case_insensitive(
                     final_path, cancel_check=cancel_check
                 )
+            except LocalWorkspaceCancelled:
+                # ``LocalWorkspaceCancelled`` subclasses ``LocalWorkspaceError``.
+                # Let it propagate so the route-level handler returns the
+                # cancellation-specific error message instead of the generic
+                # 409 the destination probe returns for real filesystem
+                # failures.
+                raise
             except LocalWorkspaceError as exc:
                 return None, json_error(str(exc), 409)
             final_destinations.append(

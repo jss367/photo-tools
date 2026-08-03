@@ -25,11 +25,15 @@
   function scheduleBlockingJobRefresh() {
     if (blockingJobTimer) clearTimeout(blockingJobTimer);
     blockingJobTimer = null;
-    if (!data || !data.blocking_job) return;
+    if (!data) return;
+    // Fast refresh while a block is active so the UI re-enables promptly,
+    // slow keep-alive otherwise so a scan/pipeline started in another tab
+    // becomes visible without a page reload.
+    var delay = data.blocking_job ? 3000 : 15000;
     blockingJobTimer = setTimeout(function() {
       blockingJobTimer = null;
       load();
-    }, 3000);
+    }, delay);
   }
 
   function selectedItems(folderIds, localOnly) {
@@ -256,10 +260,17 @@
       container.innerHTML = '<span style="color:var(--text-ghost);font-size:13px;">Migrating the previous local session...</span>';
       return;
     }
+    var blocked = !!(data && data.blocking_job);
+    var blockerHtml = blocked
+      ? '<div role="status" style="font-size:12px;color:var(--warning);line-height:1.5;margin-bottom:12px;">' +
+          escapeHtml(blockingJobMessage()) + ' <a href="/jobs" style="color:inherit;text-decoration:underline;">View Jobs</a></div>'
+      : '';
+    var disabledAttrs = blocked ? ' disabled style="opacity:.5;"' : '';
     if (legacy.state === 'staging') {
       container.innerHTML =
         '<div style="font-size:13px;color:var(--warning);margin-bottom:10px;">An older workspace copy was interrupted before activation.</div>' +
-        '<button class="btn btn-secondary" data-legacy-action="discard">Clean Up Incomplete Copy</button>';
+        blockerHtml +
+        '<button class="btn btn-secondary" data-legacy-action="discard"' + disabledAttrs + '>Clean Up Incomplete Copy</button>';
       return;
     }
     var changes = legacy.changes || {created: 0, modified: 0, deleted: 0};
@@ -270,9 +281,10 @@
       '</div>' +
       '<div style="font-size:11px;color:var(--text-dim);margin-bottom:12px;">' +
         changes.created + ' new · ' + changes.modified + ' modified · ' + changes.deleted + ' deleted</div>' +
+      blockerHtml +
       '<div style="display:flex;gap:8px;flex-wrap:wrap;">' +
-        '<button class="btn btn-secondary" data-legacy-action="sync">' + (recovery ? 'Finish Sync-back' : 'Finish and Sync Back') + '</button>' +
-        '<button class="btn btn-secondary" style="color:var(--danger);" data-legacy-action="discard">Discard Local Changes</button>' +
+        '<button class="btn btn-secondary" data-legacy-action="sync"' + disabledAttrs + '>' + (recovery ? 'Finish Sync-back' : 'Finish and Sync Back') + '</button>' +
+        '<button class="btn btn-secondary" style="color:var(--danger);" data-legacy-action="discard"' + disabledAttrs + '>Discard Local Changes</button>' +
       '</div>';
   }
 
@@ -554,6 +566,10 @@
 
   async function legacyAction(action) {
     if (!data || !data.legacy || actionInFlight || activeJob) return;
+    if (data.blocking_job) {
+      showToast(blockingJobMessage(), 'warning');
+      return;
+    }
     var legacy = data.legacy;
     var endpoint = action === 'sync' ? 'sync' : 'discard';
     var body;

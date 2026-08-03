@@ -11,12 +11,12 @@
   var stagePreflightAbort = null;
   var stagePreflightId = null;
   var stagePreflightWorkspaceId = null;
-  var stagePreflightStorageKey = 'vireoWorkLocallyPreflightClient';
+  var stagePreflightStorageKey = preflightClientStorageKey();
   var stagePreflightClientState = loadPreflightClientState();
   var stagePreflightClientId = stagePreflightClientState.id;
-  // The per-tab token and counter survive reloads. If a pagehide keepalive is
-  // dropped, the first request from the reloaded page can still supersede the
-  // old scan without sharing cancellation state with an unrelated tab.
+  // The per-history-entry token and counter survive reloads and Back/Forward.
+  // If a pagehide keepalive is dropped, a restored page can still supersede
+  // its old scan without sharing cancellation state with an unrelated tab.
   var stagePreflightSeq = stagePreflightClientState.seq;
 
   function newPreflightId() {
@@ -27,27 +27,45 @@
   }
 
   function loadPreflightClientState() {
-    // sessionStorage survives reloads, but browsers may copy it when a tab is
-    // duplicated or opened from another tab. Only reuse the stored identity
-    // for a reload or same-tab history restoration; a copied browsing context
-    // reports a normal navigation and must get its own cancellation slot.
-    if (isRestoredNavigation()) {
-      try {
-        var stored = JSON.parse(window.sessionStorage.getItem(stagePreflightStorageKey));
-        if (
-          stored && typeof stored.id === 'string' && stored.id &&
-          Number.isSafeInteger(stored.seq) && stored.seq >= 0
-        ) {
-          return stored;
-        }
-      } catch (_error) {
-        // Storage can be disabled by browser privacy settings. The in-memory
-        // state below still preserves normal same-page supersession.
+    try {
+      var stored = JSON.parse(window.sessionStorage.getItem(stagePreflightStorageKey));
+      if (
+        stored && typeof stored.id === 'string' && stored.id &&
+        Number.isSafeInteger(stored.seq) && stored.seq >= 0
+      ) {
+        return stored;
       }
+    } catch (_error) {
+      // Storage can be disabled by browser privacy settings. The in-memory
+      // state below still preserves normal same-page supersession.
     }
     var state = {id: newPreflightId(), seq: 0};
     persistPreflightClientState(state);
     return state;
+  }
+
+  function preflightClientStorageKey() {
+    var stateKey = 'vireoWorkLocallyPreflightEntryId';
+    var keyPrefix = 'vireoWorkLocallyPreflightClient:';
+    try {
+      var historyState = window.history.state;
+      var entryId = isRestoredNavigation() && historyState &&
+        typeof historyState[stateKey] === 'string'
+        ? historyState[stateKey]
+        : null;
+      if (!entryId) {
+        entryId = newPreflightId();
+        var nextState = historyState && typeof historyState === 'object'
+          ? Object.assign({}, historyState)
+          : {};
+        nextState[stateKey] = entryId;
+        window.history.replaceState(nextState, document.title);
+      }
+      return keyPrefix + entryId;
+    } catch (_error) {
+      // History state can be unavailable in hardened browsing contexts.
+      return keyPrefix + newPreflightId();
+    }
   }
 
   function isRestoredNavigation() {

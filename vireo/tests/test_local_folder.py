@@ -762,6 +762,74 @@ def test_preflight_cancel_can_arrive_before_scan_starts(tmp_path, monkeypatch):
     assert older.get_json()["error"] == "Folder size calculation was cancelled"
 
 
+def test_preflight_precancelled_newer_request_stops_intervening_older_scan(
+    tmp_path, monkeypatch
+):
+    from services.local_folder import LocalWorkspaceCancelled
+
+    older_started = threading.Event()
+    release_older = threading.Event()
+    calls_lock = threading.Lock()
+    calls = 0
+
+    def fake_preflight(
+        _db, _root_ids, _vireo_dir, *, destination_bases=None, cancel_check=None
+    ):
+        nonlocal calls
+        with calls_lock:
+            calls += 1
+            call_number = calls
+        if call_number == 1:
+            older_started.set()
+            assert release_older.wait(5), "test did not release the older scan"
+        if cancel_check and cancel_check():
+            raise LocalWorkspaceCancelled("cancelled")
+        return {"folder_count": 1, "total_bytes": 1, "can_copy": True,
+                "folders": [], "volumes": []}
+
+    app, folder_id = _cancellable_preflight_app(
+        tmp_path, monkeypatch, fake_preflight
+    )
+    older_result = {}
+
+    def request_older():
+        with app.test_client() as client:
+            older_result["response"] = client.post(
+                "/api/workspaces/active/local-folders/preflight",
+                json={
+                    "folder_ids": [folder_id],
+                    "preflight_id": "older",
+                    "preflight_client_id": "browser-one",
+                    "preflight_seq": 3,
+                },
+            )
+
+    thread = threading.Thread(target=request_older)
+    thread.start()
+    assert older_started.wait(5), "older preflight did not start"
+    with app.test_client() as client:
+        cancel = client.post(
+            "/api/workspaces/active/local-folders/preflight/cancel",
+            json={"preflight_id": "newer"},
+        )
+        newer = client.post(
+            "/api/workspaces/active/local-folders/preflight",
+            json={
+                "folder_ids": [folder_id],
+                "preflight_id": "newer",
+                "preflight_client_id": "browser-one",
+                "preflight_seq": 5,
+            },
+        )
+    release_older.set()
+    thread.join(5)
+
+    assert not thread.is_alive()
+    assert cancel.get_json() == {"cancelled": False}
+    assert newer.status_code == 409
+    assert older_result["response"].status_code == 409
+
+
 def test_preflight_cancel_stops_destination_probing(tmp_path, monkeypatch):
     """A cancel request must break the destination-validation loop so a
     dismissed dialog does not continue probing every remaining destination

@@ -77,19 +77,32 @@ def create_local_folder_blueprint(
                 # The cancel request can beat the original request to a free
                 # Waitress worker. Advance ordering above before consuming its
                 # tombstone so an even older delayed request is still rejected.
+                # If that predecessor registered between the cancel and this
+                # request, stop it too; the dismissed page no longer needs
+                # either scan. Do not disrupt a scan from another browser page.
                 cancelled_preflight_ids.pop(cancellation_key, None)
+                previous = active_preflights.get(int(workspace_id))
+                if previous is not None and (
+                    preflight_client_id is None
+                    or previous[2] == preflight_client_id
+                ):
+                    previous[1].set()
                 cancelled.set()
                 return cancelled
             previous = active_preflights.get(int(workspace_id))
             if previous is not None:
                 previous[1].set()
-            active_preflights[int(workspace_id)] = (preflight_id, cancelled)
+            active_preflights[int(workspace_id)] = (
+                preflight_id,
+                cancelled,
+                preflight_client_id,
+            )
         return cancelled
 
     def _finish_preflight(workspace_id, preflight_id, cancelled):
         with preflight_lock:
             current = active_preflights.get(int(workspace_id))
-            if current == (preflight_id, cancelled):
+            if current is not None and current[:2] == (preflight_id, cancelled):
                 active_preflights.pop(int(workspace_id), None)
 
     def _cancel_preflight(workspace_id, preflight_id):

@@ -10,6 +10,7 @@
   var stagePreflightSignature = null;
   var stagePreflightAbort = null;
   var stagePreflightId = null;
+  var stagePreflightWorkspaceId = null;
   var stagePreflightClientId = newPreflightId();
   // Client-side monotonic counter scoped by ``stagePreflightClientId``. A new
   // page gets a new id, so its first request is not rejected by the server's
@@ -30,9 +31,11 @@
 
   function cancelStagePreflight(notifyServer) {
     var preflightId = stagePreflightId;
+    var workspaceId = stagePreflightWorkspaceId;
     if (stagePreflightAbort) stagePreflightAbort.abort();
     stagePreflightAbort = null;
     stagePreflightId = null;
+    stagePreflightWorkspaceId = null;
     if (!notifyServer || !preflightId) return;
     // Aborting fetch stops the browser from waiting, but a WSGI handler may
     // already be blocked in SMB I/O. Notify the server so it stops walking as
@@ -41,7 +44,10 @@
     Vireo.api.fetch('/api/workspaces/active/local-folders/preflight/cancel', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({preflight_id: preflightId}),
+      body: JSON.stringify({
+        preflight_id: preflightId,
+        workspace_id: workspaceId
+      }),
       keepalive: true
     }).catch(function() {});
   }
@@ -264,6 +270,9 @@
     var preflightSeq = newPreflightSeq();
     stagePreflightAbort = controller;
     stagePreflightId = preflightId;
+    stagePreflightWorkspaceId = data && data.workspace_id != null
+      ? Number(data.workspace_id)
+      : null;
     if (capacity) {
       capacity.style.color = 'var(--text-dim)';
       capacity.innerHTML = '<span class="btn-spinner" style="display:inline-block;margin-right:6px;"></span>Calculating folder sizes and available space...';
@@ -290,7 +299,10 @@
       }
     } finally {
       if (stagePreflightAbort === controller) stagePreflightAbort = null;
-      if (stagePreflightId === preflightId) stagePreflightId = null;
+      if (stagePreflightId === preflightId) {
+        stagePreflightId = null;
+        stagePreflightWorkspaceId = null;
+      }
     }
   }
 

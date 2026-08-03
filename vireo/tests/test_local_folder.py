@@ -688,6 +688,13 @@ def test_preflight_cancel_endpoint_stops_matching_scan(tmp_path, monkeypatch):
         tmp_path, monkeypatch, fake_preflight
     )
     result = {}
+    with app.test_client() as client:
+        origin_workspace_id = client.get(
+            "/api/workspaces/active/local-folders"
+        ).get_json()["workspace_id"]
+        other_workspace_id = client.post(
+            "/api/workspaces", json={"name": "Other workspace"}
+        ).get_json()["id"]
 
     def request_preflight():
         with app.test_client() as client:
@@ -700,9 +707,15 @@ def test_preflight_cancel_endpoint_stops_matching_scan(tmp_path, monkeypatch):
     thread.start()
     assert started.wait(5), "preflight did not start"
     with app.test_client() as client:
+        assert client.post(
+            f"/api/workspaces/{other_workspace_id}/activate", json={}
+        ).status_code == 200
         cancelled = client.post(
             "/api/workspaces/active/local-folders/preflight/cancel",
-            json={"preflight_id": "dialog-one"},
+            json={
+                "preflight_id": "dialog-one",
+                "workspace_id": origin_workspace_id,
+            },
         )
     release.set()
     thread.join(5)

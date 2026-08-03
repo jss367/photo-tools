@@ -115,6 +115,13 @@ def create_local_folder_blueprint(
                 if active_key[0] == int(workspace_id) and current[0] == preflight_id:
                     current[1].set()
                     return True
+            # Preflight IDs are generated uniquely per browser request. This
+            # fallback handles workspace activation racing ahead of pagehide
+            # in older clients that did not include their originating id.
+            for current in active_preflights.values():
+                if current[0] == preflight_id:
+                    current[1].set()
+                    return True
             return False
 
     def _active_context():
@@ -469,8 +476,16 @@ def create_local_folder_blueprint(
         preflight_id = body.get("preflight_id")
         if not isinstance(preflight_id, str) or not preflight_id.strip():
             return json_error("preflight_id must be a non-empty string", 400)
+        cancel_workspace_id = body.get("workspace_id")
+        if isinstance(cancel_workspace_id, bool):
+            cancel_workspace_id = workspace_id
+        else:
+            try:
+                cancel_workspace_id = int(cancel_workspace_id)
+            except (TypeError, ValueError):
+                cancel_workspace_id = workspace_id
         return jsonify(
-            {"cancelled": _cancel_preflight(workspace_id, preflight_id)}
+            {"cancelled": _cancel_preflight(cancel_workspace_id, preflight_id)}
         )
 
     @blueprint.post("/api/workspaces/active/local-folders/stage")

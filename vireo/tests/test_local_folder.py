@@ -952,8 +952,8 @@ def test_preflight_cancel_after_workspace_switch_stops_scan(tmp_path, monkeypatc
     the active one. Scoping cancellation by that active workspace would leave
     the old workspace's SMB scan running; the ``preflight_id`` UUID is
     globally unique, so cancellation resolves by that instead."""
-    from services.local_folder import LocalWorkspaceCancelled
     from app import create_app
+    from services.local_folder import LocalWorkspaceCancelled
     from web import local_folder as local_folder_web
 
     monkeypatch.setenv("HOME", str(tmp_path))

@@ -943,6 +943,88 @@ def test_preflight_cancel_stops_destination_probing(tmp_path, monkeypatch):
     assert len(probe_paths) == 1
 
 
+def test_preflight_cancel_after_workspace_switch_stops_scan(tmp_path, monkeypatch):
+    """A cancel POSTed after switching to another workspace must still stop
+    the scan started under the previous workspace.
+
+    ``switchWorkspace`` activates the new workspace before ``pagehide`` fires
+    the best-effort cancel, so the cancel handler sees the new workspace as
+    the active one. Scoping cancellation by that active workspace would leave
+    the old workspace's SMB scan running; the ``preflight_id`` UUID is
+    globally unique, so cancellation resolves by that instead."""
+    from services.local_folder import LocalWorkspaceCancelled
+    from app import create_app
+    from web import local_folder as local_folder_web
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    source = tmp_path / "nas" / "Photos"
+    source.mkdir(parents=True)
+    (source / "bird.raw").write_bytes(b"raw")
+    vireo_dir = tmp_path / "vireo"
+    thumbs = vireo_dir / "thumbnails"
+    thumbs.mkdir(parents=True)
+    db_path = str(vireo_dir / "vireo.db")
+    db = Database(db_path)
+    first_workspace = db.create_workspace("First")
+    second_workspace = db.create_workspace("Second")
+    folder_id = db.add_folder(str(source), name="Photos", link_to_workspace=False)
+    db.add_workspace_folder(first_workspace, folder_id)
+    db.close()
+
+    started = threading.Event()
+    release = threading.Event()
+
+    def fake_preflight(
+        _db, _root_ids, _vireo_dir, *, destination_bases=None, cancel_check=None
+    ):
+        started.set()
+        assert release.wait(5), "test did not release the fake preflight"
+        if cancel_check and cancel_check():
+            raise LocalWorkspaceCancelled("cancelled after workspace switch")
+        return {"folder_count": 1, "total_bytes": 0, "can_copy": True,
+                "folders": [], "volumes": []}
+
+    monkeypatch.setattr(local_folder_web, "local_copy_preflight", fake_preflight)
+    app = create_app(db_path, thumb_cache_dir=str(thumbs))
+    app.config["TESTING"] = True
+    with app.test_client() as client:
+        assert client.post(
+            f"/api/workspaces/{first_workspace}/activate", json={}
+        ).status_code == 200
+
+    result = {}
+
+    def request_preflight():
+        with app.test_client() as client:
+            result["response"] = client.post(
+                "/api/workspaces/active/local-folders/preflight",
+                json={"folder_ids": [folder_id], "preflight_id": "scan-in-first"},
+            )
+
+    thread = threading.Thread(target=request_preflight)
+    thread.start()
+    assert started.wait(5), "preflight did not start under first workspace"
+
+    with app.test_client() as client:
+        assert client.post(
+            f"/api/workspaces/{second_workspace}/activate", json={}
+        ).status_code == 200
+        cancelled = client.post(
+            "/api/workspaces/active/local-folders/preflight/cancel",
+            json={"preflight_id": "scan-in-first"},
+        )
+    release.set()
+    thread.join(5)
+
+    assert not thread.is_alive()
+    assert cancelled.status_code == 200
+    assert cancelled.get_json() == {"cancelled": True}
+    assert result["response"].status_code == 409
+    assert result["response"].get_json()["error"] == (
+        "Folder size calculation was cancelled"
+    )
+
+
 def test_older_seq_arrival_cannot_supersede_newer_registered_scan(tmp_path, monkeypatch):
     """A delayed request with an older ``preflight_seq`` must not cancel a
     newer scan that already registered.

@@ -1,3 +1,4 @@
+import errno
 import os
 import shutil
 import threading
@@ -308,6 +309,42 @@ def test_source_tree_size_detects_child_swapped_to_symlink_before_open(
         local_workspace.source_tree_size(str(source))
 
     assert swap_done
+
+
+@pytest.mark.skipif(
+    not hasattr(os, "O_NOFOLLOW"),
+    reason="O_NOFOLLOW directory opens are only used on supported platforms",
+)
+def test_walk_entries_rejects_directory_after_transient_open_failure(
+    tmp_path, monkeypatch
+):
+    """A failed open followed by a directory lstat must not skip its subtree."""
+    source = tmp_path / "source"
+    child = source / "child"
+    child.mkdir(parents=True)
+    (child / "inside.raw").write_bytes(b"inside")
+
+    real_open = local_workspace.os.open
+    failed = False
+
+    def transient_open(path, flags, *args, **kwargs):
+        nonlocal failed
+        if (
+            not failed
+            and isinstance(path, (str, bytes, os.PathLike))
+            and os.path.normpath(os.fspath(path)) == os.path.normpath(child)
+            and flags & os.O_NOFOLLOW
+        ):
+            failed = True
+            raise FileNotFoundError(errno.ENOENT, "transient directory open", path)
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(local_workspace.os, "open", transient_open)
+
+    with pytest.raises(LocalWorkspaceError, match="Workspace directory changed"):
+        list(local_workspace._walk_entries(str(source)))
+
+    assert failed
 
 
 @pytest.mark.parametrize(

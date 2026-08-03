@@ -565,6 +565,13 @@ def _walk_entries(root: str, *, cancel_check=None):
                         raise LocalWorkspaceError(
                             f"Workspace root changed during directory scan: {root}"
                         ) from error
+                    if stat.S_ISDIR(swapped_st.st_mode):
+                        # A transient open failure followed by a directory
+                        # lstat is ambiguous: skipping it would silently omit
+                        # the entire subtree from size checks and staging.
+                        raise LocalWorkspaceError(
+                            f"Workspace directory changed during directory scan: {dirpath}"
+                        ) from error
                     yield _relative(dirpath, root), dirpath, swapped_st
                     continue
                 _raise_walk_error(error)

@@ -8,6 +8,33 @@
   var stagePreflightGeneration = 0;
   var stagePreflightTimer = null;
   var stagePreflightSignature = null;
+  var stagePreflightAbort = null;
+  var stagePreflightId = null;
+
+  function newPreflightId() {
+    if (window.crypto && typeof window.crypto.randomUUID === 'function') {
+      return window.crypto.randomUUID();
+    }
+    return Date.now().toString(36) + '-' + Math.random().toString(36).slice(2);
+  }
+
+  function cancelStagePreflight(notifyServer) {
+    var preflightId = stagePreflightId;
+    if (stagePreflightAbort) stagePreflightAbort.abort();
+    stagePreflightAbort = null;
+    stagePreflightId = null;
+    if (!notifyServer || !preflightId) return;
+    // Aborting fetch stops the browser from waiting, but a WSGI handler may
+    // already be blocked in SMB I/O. Notify the server so it stops walking as
+    // soon as that filesystem call returns. A later preflight also supersedes
+    // the earlier one server-side if this best-effort request cannot arrive.
+    Vireo.api.fetch('/api/workspaces/active/local-folders/preflight/cancel', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({preflight_id: preflightId}),
+      keepalive: true
+    }).catch(function() {});
+  }
 
   function selectedItems(folderIds, localOnly) {
     var wanted = folderIds && folderIds.length
@@ -120,6 +147,10 @@
       }
       return;
     }
+    var controller = new AbortController();
+    var preflightId = newPreflightId();
+    stagePreflightAbort = controller;
+    stagePreflightId = preflightId;
     if (capacity) {
       capacity.style.color = 'var(--text-dim)';
       capacity.innerHTML = '<span class="btn-spinner" style="display:inline-block;margin-right:6px;"></span>Calculating folder sizes and available space...';
@@ -128,22 +159,27 @@
       var result = await Vireo.api.json('/api/workspaces/active/local-folders/preflight', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify(request.body)
+        body: JSON.stringify(Object.assign({}, request.body, {preflight_id: preflightId})),
+        signal: controller.signal
       }, {toast: false});
       if (generation !== stagePreflightGeneration || !pendingStageItems.length) return;
       stagePreflightSignature = JSON.stringify(request.body);
       renderStagePreflight(result);
     } catch (requestError) {
-      if (generation !== stagePreflightGeneration || !pendingStageItems.length) return;
+      if (controller.signal.aborted || generation !== stagePreflightGeneration || !pendingStageItems.length) return;
       if (capacity) {
         capacity.style.color = 'var(--danger)';
         capacity.textContent = requestError.message || 'Could not check folder sizes and free space.';
       }
+    } finally {
+      if (stagePreflightAbort === controller) stagePreflightAbort = null;
+      if (stagePreflightId === preflightId) stagePreflightId = null;
     }
   }
 
   function scheduleStagePreflight(delay) {
     if (stagePreflightTimer) clearTimeout(stagePreflightTimer);
+    cancelStagePreflight(true);
     stagePreflightGeneration += 1;
     stagePreflightSignature = null;
     var button = document.getElementById('confirmStageLocalFolders');
@@ -157,6 +193,7 @@
     if (modal) modal.classList.remove('open');
     stagePreflightGeneration += 1;
     stagePreflightSignature = null;
+    cancelStagePreflight(true);
     if (stagePreflightTimer) clearTimeout(stagePreflightTimer);
     stagePreflightTimer = null;
     pendingStageItems = [];

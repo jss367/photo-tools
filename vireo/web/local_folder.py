@@ -9,6 +9,7 @@ import unicodedata
 from db import Database
 from flask import Blueprint, jsonify, request
 from services.local_folder import (
+    LocalWorkspaceCancelled,
     LocalWorkspaceError,
     affected_workspace_ids,
     discard_folder,
@@ -36,6 +37,45 @@ def create_local_folder_blueprint(
 ):
     blueprint = Blueprint("local_folder", __name__)
     transition_lock = threading.RLock()
+    preflight_lock = threading.Lock()
+    active_preflights = {}
+    cancelled_preflight_ids = {}
+    max_cancelled_preflight_ids = 256
+
+    def _begin_preflight(workspace_id, preflight_id):
+        cancelled = threading.Event()
+        with preflight_lock:
+            cancellation_key = (int(workspace_id), preflight_id)
+            if preflight_id is not None and cancellation_key in cancelled_preflight_ids:
+                # The cancel request can beat the original request to a free
+                # Waitress worker. Preserve it as a short-lived tombstone so a
+                # late obsolete scan cannot replace and cancel a newer one.
+                cancelled_preflight_ids.pop(cancellation_key, None)
+                cancelled.set()
+                return cancelled
+            previous = active_preflights.get(int(workspace_id))
+            if previous is not None:
+                previous[1].set()
+            active_preflights[int(workspace_id)] = (preflight_id, cancelled)
+        return cancelled
+
+    def _finish_preflight(workspace_id, preflight_id, cancelled):
+        with preflight_lock:
+            current = active_preflights.get(int(workspace_id))
+            if current == (preflight_id, cancelled):
+                active_preflights.pop(int(workspace_id), None)
+
+    def _cancel_preflight(workspace_id, preflight_id):
+        with preflight_lock:
+            cancellation_key = (int(workspace_id), preflight_id)
+            cancelled_preflight_ids[cancellation_key] = None
+            while len(cancelled_preflight_ids) > max_cancelled_preflight_ids:
+                cancelled_preflight_ids.pop(next(iter(cancelled_preflight_ids)))
+            current = active_preflights.get(int(workspace_id))
+            if current is None or current[0] != preflight_id:
+                return False
+            current[1].set()
+            return True
 
     def _active_context():
         db = get_db()
@@ -263,16 +303,38 @@ def create_local_folder_blueprint(
         )
         if destination_error is not None:
             return destination_error
+        preflight_id = body.get("preflight_id")
+        if not isinstance(preflight_id, str) or not preflight_id.strip():
+            preflight_id = None
+        cancelled = _begin_preflight(workspace_id, preflight_id)
         try:
             result = local_copy_preflight(
                 db,
                 root_ids,
                 vireo_dir,
                 destination_bases=destination_bases,
+                cancel_check=cancelled.is_set,
             )
+        except LocalWorkspaceCancelled:
+            return json_error("Folder size calculation was cancelled", 409)
         except LocalWorkspaceError as exc:
             return json_error(str(exc), 409)
+        finally:
+            _finish_preflight(workspace_id, preflight_id, cancelled)
         return jsonify(result)
+
+    @blueprint.post("/api/workspaces/active/local-folders/preflight/cancel")
+    def cancel_preflight_local_folders():
+        _db, workspace_id, error = _active_context()
+        if error:
+            return error
+        body = request.get_json(silent=True) or {}
+        preflight_id = body.get("preflight_id")
+        if not isinstance(preflight_id, str) or not preflight_id.strip():
+            return json_error("preflight_id must be a non-empty string", 400)
+        return jsonify(
+            {"cancelled": _cancel_preflight(workspace_id, preflight_id)}
+        )
 
     @blueprint.post("/api/workspaces/active/local-folders/stage")
     def stage_local_folders():

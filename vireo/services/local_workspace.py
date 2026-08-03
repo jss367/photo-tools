@@ -166,12 +166,16 @@ def _estimated_destination_bytes(st) -> int:
     return LOCAL_ALLOCATION_UNIT_BYTES
 
 
-def _validated_tree_entries(source: str):
+def _validated_tree_entries(source: str, *, cancel_check=None):
     """Yield safe, supported entries from a validated source directory."""
+    if cancel_check and cancel_check():
+        raise LocalWorkspaceCancelled("Folder scan cancelled")
     try:
         root_st = os.lstat(source)
     except OSError as exc:
         raise LocalWorkspaceError(f"Workspace folder is unavailable: {source}") from exc
+    if cancel_check and cancel_check():
+        raise LocalWorkspaceCancelled("Folder scan cancelled")
     if stat.S_ISLNK(root_st.st_mode):
         raise LocalWorkspaceError(
             f"Workspace root is a symlink and cannot be staged: {source}"
@@ -181,6 +185,12 @@ def _validated_tree_entries(source: str):
 
     try:
         for rel, full, st in _walk_entries(source):
+            # Filesystem calls on network volumes may take a long time and
+            # cannot be interrupted while the kernel is servicing them. Check
+            # immediately after each one returns so an obsolete preflight does
+            # not continue walking the rest of the tree.
+            if cancel_check and cancel_check():
+                raise LocalWorkspaceCancelled("Folder scan cancelled")
             mode = st.st_mode
             if stat.S_ISLNK(mode):
                 if not _symlink_stays_within(full, source):
@@ -196,14 +206,16 @@ def _validated_tree_entries(source: str):
         ) from exc
 
 
-def source_tree_size(source: str) -> tuple[int, int, int]:
+def source_tree_size(source: str, *, cancel_check=None) -> tuple[int, int, int]:
     """Return copied-file count, logical bytes, and estimated allocated bytes."""
 
     total_files = 0
     total_bytes = 0
     # The destination root directory itself is created for every source.
     estimated_bytes = LOCAL_ALLOCATION_UNIT_BYTES
-    for _rel, _full, st in _validated_tree_entries(source):
+    for _rel, _full, st in _validated_tree_entries(
+        source, cancel_check=cancel_check
+    ):
         mode = st.st_mode
         if stat.S_ISREG(mode):
             total_bytes += st.st_size

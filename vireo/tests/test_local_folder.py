@@ -1,5 +1,6 @@
 """Folder-scoped Work Locally behavior and shared-workspace integration."""
 
+import threading
 from pathlib import Path
 
 import pytest
@@ -634,6 +635,168 @@ def test_preflight_endpoint_returns_destination_probe_error(tmp_path, monkeypatc
 
     assert response.status_code == 409
     assert response.get_json()["error"] == "Could not inspect destination filesystem"
+
+
+def _cancellable_preflight_app(tmp_path, monkeypatch, fake_preflight):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    from app import create_app
+    from web import local_folder as local_folder_web
+
+    source = tmp_path / "nas" / "Photos"
+    source.mkdir(parents=True)
+    (source / "bird.raw").write_bytes(b"raw")
+    vireo_dir = tmp_path / "vireo"
+    thumbs = vireo_dir / "thumbnails"
+    thumbs.mkdir(parents=True)
+    db_path = str(vireo_dir / "vireo.db")
+    db = Database(db_path)
+    workspace_id = db.create_workspace("Cancellable preflight")
+    folder_id = db.add_folder(str(source), name="Photos", link_to_workspace=False)
+    db.add_workspace_folder(workspace_id, folder_id)
+    db.set_active_workspace(workspace_id)
+    db.close()
+
+    monkeypatch.setattr(local_folder_web, "local_copy_preflight", fake_preflight)
+    app = create_app(db_path, thumb_cache_dir=str(thumbs))
+    app.config["TESTING"] = True
+    with app.test_client() as client:
+        assert client.post(
+            f"/api/workspaces/{workspace_id}/activate", json={}
+        ).status_code == 200
+    return app, folder_id
+
+
+def test_preflight_cancel_endpoint_stops_matching_scan(tmp_path, monkeypatch):
+    from services.local_folder import LocalWorkspaceCancelled
+
+    started = threading.Event()
+    release = threading.Event()
+
+    def fake_preflight(
+        _db, _root_ids, _vireo_dir, *, destination_bases=None, cancel_check=None
+    ):
+        started.set()
+        assert release.wait(5), "test did not release the fake preflight"
+        if cancel_check and cancel_check():
+            raise LocalWorkspaceCancelled("cancelled")
+        return {"folder_count": 1, "total_bytes": 0, "can_copy": True,
+                "folders": [], "volumes": []}
+
+    app, folder_id = _cancellable_preflight_app(
+        tmp_path, monkeypatch, fake_preflight
+    )
+    result = {}
+
+    def request_preflight():
+        with app.test_client() as client:
+            result["response"] = client.post(
+                "/api/workspaces/active/local-folders/preflight",
+                json={"folder_ids": [folder_id], "preflight_id": "dialog-one"},
+            )
+
+    thread = threading.Thread(target=request_preflight)
+    thread.start()
+    assert started.wait(5), "preflight did not start"
+    with app.test_client() as client:
+        cancelled = client.post(
+            "/api/workspaces/active/local-folders/preflight/cancel",
+            json={"preflight_id": "dialog-one"},
+        )
+    release.set()
+    thread.join(5)
+
+    assert not thread.is_alive()
+    assert cancelled.status_code == 200
+    assert cancelled.get_json() == {"cancelled": True}
+    assert result["response"].status_code == 409
+    assert result["response"].get_json()["error"] == (
+        "Folder size calculation was cancelled"
+    )
+
+
+def test_preflight_cancel_can_arrive_before_scan_starts(tmp_path, monkeypatch):
+    from services.local_folder import LocalWorkspaceCancelled
+
+    def fake_preflight(
+        _db, _root_ids, _vireo_dir, *, destination_bases=None, cancel_check=None
+    ):
+        if cancel_check and cancel_check():
+            raise LocalWorkspaceCancelled("cancelled before start")
+        return {"folder_count": 1, "total_bytes": 0, "can_copy": True,
+                "folders": [], "volumes": []}
+
+    app, folder_id = _cancellable_preflight_app(
+        tmp_path, monkeypatch, fake_preflight
+    )
+    with app.test_client() as client:
+        cancel = client.post(
+            "/api/workspaces/active/local-folders/preflight/cancel",
+            json={"preflight_id": "late-request"},
+        )
+        preflight = client.post(
+            "/api/workspaces/active/local-folders/preflight",
+            json={"folder_ids": [folder_id], "preflight_id": "late-request"},
+        )
+
+    assert cancel.status_code == 200
+    assert cancel.get_json() == {"cancelled": False}
+    assert preflight.status_code == 409
+    assert preflight.get_json()["error"] == "Folder size calculation was cancelled"
+
+
+def test_new_preflight_supersedes_old_scan(tmp_path, monkeypatch):
+    from services.local_folder import LocalWorkspaceCancelled
+
+    first_started = threading.Event()
+    release_first = threading.Event()
+    calls_lock = threading.Lock()
+    calls = 0
+
+    def fake_preflight(
+        _db, _root_ids, _vireo_dir, *, destination_bases=None, cancel_check=None
+    ):
+        nonlocal calls
+        with calls_lock:
+            calls += 1
+            call_number = calls
+        if call_number == 1:
+            first_started.set()
+            assert release_first.wait(5), "test did not release the first preflight"
+            if cancel_check and cancel_check():
+                raise LocalWorkspaceCancelled("superseded")
+        return {"folder_count": 1, "total_bytes": call_number, "can_copy": True,
+                "folders": [], "volumes": []}
+
+    app, folder_id = _cancellable_preflight_app(
+        tmp_path, monkeypatch, fake_preflight
+    )
+    first_result = {}
+
+    def request_first():
+        with app.test_client() as client:
+            first_result["response"] = client.post(
+                "/api/workspaces/active/local-folders/preflight",
+                json={"folder_ids": [folder_id], "preflight_id": "first"},
+            )
+
+    thread = threading.Thread(target=request_first)
+    thread.start()
+    assert first_started.wait(5), "first preflight did not start"
+    with app.test_client() as client:
+        second = client.post(
+            "/api/workspaces/active/local-folders/preflight",
+            json={"folder_ids": [folder_id], "preflight_id": "second"},
+        )
+    release_first.set()
+    thread.join(5)
+
+    assert not thread.is_alive()
+    assert second.status_code == 200
+    assert second.get_json()["total_bytes"] == 2
+    assert first_result["response"].status_code == 409
+    assert first_result["response"].get_json()["error"] == (
+        "Folder size calculation was cancelled"
+    )
 
 
 def test_local_root_under_folder_finds_descendant_session(tmp_path):

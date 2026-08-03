@@ -744,6 +744,106 @@ def test_preflight_cancel_can_arrive_before_scan_starts(tmp_path, monkeypatch):
     assert preflight.get_json()["error"] == "Folder size calculation was cancelled"
 
 
+def test_preflight_cancel_stops_destination_probing(tmp_path, monkeypatch):
+    """A cancel request must break the destination-validation loop so a
+    dismissed dialog does not continue probing every remaining destination
+    volume — each ``destination_case_insensitive`` call can hang for seconds
+    on an unavailable network mount."""
+    from web import local_folder as local_folder_web
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    from app import create_app
+
+    source_a = tmp_path / "nas" / "PhotosA"
+    source_b = tmp_path / "nas" / "PhotosB"
+    source_a.mkdir(parents=True)
+    source_b.mkdir(parents=True)
+    (source_a / "bird.raw").write_bytes(b"raw")
+    (source_b / "bird.raw").write_bytes(b"raw")
+    vireo_dir = tmp_path / "vireo"
+    thumbs = vireo_dir / "thumbnails"
+    thumbs.mkdir(parents=True)
+    db_path = str(vireo_dir / "vireo.db")
+    db = Database(db_path)
+    workspace_id = db.create_workspace("Cancellable destination probe")
+    folder_a = db.add_folder(str(source_a), name="PhotosA", link_to_workspace=False)
+    folder_b = db.add_folder(str(source_b), name="PhotosB", link_to_workspace=False)
+    db.add_workspace_folder(workspace_id, folder_a)
+    db.add_workspace_folder(workspace_id, folder_b)
+    db.set_active_workspace(workspace_id)
+    db.close()
+
+    first_probe_started = threading.Event()
+    release_probe = threading.Event()
+    probe_paths = []
+
+    def slow_case_insensitive(final_path):
+        probe_paths.append(final_path)
+        if len(probe_paths) == 1:
+            first_probe_started.set()
+            assert release_probe.wait(5), "test did not release the destination probe"
+        return False
+
+    def fake_preflight(
+        _db, _root_ids, _vireo_dir, *, destination_bases=None, cancel_check=None
+    ):
+        raise AssertionError(
+            "preflight should not run after cancellation during destination validation"
+        )
+
+    monkeypatch.setattr(
+        local_folder_web, "destination_case_insensitive", slow_case_insensitive
+    )
+    monkeypatch.setattr(local_folder_web, "local_copy_preflight", fake_preflight)
+    app = create_app(db_path, thumb_cache_dir=str(thumbs))
+    app.config["TESTING"] = True
+    with app.test_client() as client:
+        assert client.post(
+            f"/api/workspaces/{workspace_id}/activate", json={}
+        ).status_code == 200
+
+    destination_a = str(tmp_path / "local" / "a")
+    destination_b = str(tmp_path / "local" / "b")
+    result = {}
+
+    def request_preflight():
+        with app.test_client() as client:
+            result["response"] = client.post(
+                "/api/workspaces/active/local-folders/preflight",
+                json={
+                    "folder_ids": [folder_a, folder_b],
+                    "preflight_id": "probe-cancel",
+                    "destination_bases": {
+                        str(folder_a): destination_a,
+                        str(folder_b): destination_b,
+                    },
+                },
+            )
+
+    thread = threading.Thread(target=request_preflight)
+    thread.start()
+    assert first_probe_started.wait(5), "first destination probe did not start"
+    with app.test_client() as client:
+        cancelled = client.post(
+            "/api/workspaces/active/local-folders/preflight/cancel",
+            json={"preflight_id": "probe-cancel"},
+        )
+    release_probe.set()
+    thread.join(5)
+
+    assert not thread.is_alive()
+    assert cancelled.status_code == 200
+    assert cancelled.get_json() == {"cancelled": True}
+    assert result["response"].status_code == 409
+    assert result["response"].get_json()["error"] == (
+        "Folder size calculation was cancelled"
+    )
+    # The second destination is never probed — cancellation propagates
+    # through the loop between filesystem calls instead of forcing the
+    # obsolete handler to walk every remaining volume.
+    assert len(probe_paths) == 1
+
+
 def test_new_preflight_supersedes_old_scan(tmp_path, monkeypatch):
     from services.local_folder import LocalWorkspaceCancelled
 

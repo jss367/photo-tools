@@ -187,7 +187,7 @@ def create_local_folder_blueprint(
             names[root_id] = os.path.basename(path.rstrip("/\\")) or "Folder"
         return names, paths
 
-    def _stage_destinations(body, root_ids, root_names, source_paths):
+    def _stage_destinations(body, root_ids, root_names, source_paths, *, cancel_check=None):
         raw_destinations = body.get("destination_bases") or {}
         if not isinstance(raw_destinations, dict):
             return None, json_error("destination_bases must be an object", 400)
@@ -206,6 +206,15 @@ def create_local_folder_blueprint(
             final_path = os.path.abspath(
                 local_path_for_base(destination, root_id, source_paths[root_id])
             )
+            # ``destination_case_insensitive`` probes the destination volume,
+            # which can block for seconds on a slow or unreachable network
+            # mount. Cooperate with cancellation between folders so a cancel
+            # request only has to wait for the current probe, not every
+            # remaining destination, before the request returns.
+            if cancel_check and cancel_check():
+                raise LocalWorkspaceCancelled(
+                    "Preflight cancelled during destination validation"
+                )
             try:
                 case_insensitive = destination_case_insensitive(final_path)
             except LocalWorkspaceError as exc:
@@ -298,27 +307,41 @@ def create_local_folder_blueprint(
                 409,
             )
         root_names, source_paths = _folder_names(db, root_ids)
-        destination_bases, destination_error = _stage_destinations(
-            body, root_ids, root_names, source_paths
-        )
-        if destination_error is not None:
-            return destination_error
         preflight_id = body.get("preflight_id")
         if not isinstance(preflight_id, str) or not preflight_id.strip():
             preflight_id = None
+        # Register cancellation state before probing destinations so a concurrent
+        # cancel request can flip the shared Event between filesystem calls,
+        # rather than being reduced to a tombstone that only takes effect once
+        # every destination volume has finished responding to
+        # ``destination_case_insensitive`` — which can hang for seconds each on
+        # an unavailable network mount.
         cancelled = _begin_preflight(workspace_id, preflight_id)
         try:
-            result = local_copy_preflight(
-                db,
-                root_ids,
-                vireo_dir,
-                destination_bases=destination_bases,
-                cancel_check=cancelled.is_set,
-            )
-        except LocalWorkspaceCancelled:
-            return json_error("Folder size calculation was cancelled", 409)
-        except LocalWorkspaceError as exc:
-            return json_error(str(exc), 409)
+            try:
+                destination_bases, destination_error = _stage_destinations(
+                    body,
+                    root_ids,
+                    root_names,
+                    source_paths,
+                    cancel_check=cancelled.is_set,
+                )
+            except LocalWorkspaceCancelled:
+                return json_error("Folder size calculation was cancelled", 409)
+            if destination_error is not None:
+                return destination_error
+            try:
+                result = local_copy_preflight(
+                    db,
+                    root_ids,
+                    vireo_dir,
+                    destination_bases=destination_bases,
+                    cancel_check=cancelled.is_set,
+                )
+            except LocalWorkspaceCancelled:
+                return json_error("Folder size calculation was cancelled", 409)
+            except LocalWorkspaceError as exc:
+                return json_error(str(exc), 409)
         finally:
             _finish_preflight(workspace_id, preflight_id, cancelled)
         return jsonify(result)

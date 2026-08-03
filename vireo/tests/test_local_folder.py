@@ -1539,7 +1539,10 @@ def test_local_folder_blocker_endpoint_avoids_source_walk(tmp_path, monkeypatch)
         # No blocker → empty payload, without walking storage.
         response = client.get("/api/workspaces/active/local-folders/blocker")
         assert response.status_code == 200
-        assert response.get_json() == {"blocking_job": None}
+        assert response.get_json() == {
+            "blocking_job": None,
+            "folder_blocking_jobs": {},
+        }
 
     import threading
 
@@ -1567,7 +1570,14 @@ def test_local_folder_blocker_endpoint_avoids_source_walk(tmp_path, monkeypatch)
                     "id": job_id,
                     "type": "pipeline",
                     "status": "running",
-                }
+                },
+                "folder_blocking_jobs": {
+                    str(folder_id): {
+                        "id": job_id,
+                        "type": "pipeline",
+                        "status": "running",
+                    }
+                },
             }
         finally:
             release.set()
@@ -1581,9 +1591,84 @@ def test_local_folder_blocker_endpoint_avoids_source_walk(tmp_path, monkeypatch)
         ).status_code == 200
         response = client.get("/api/workspaces/active/local-folders/blocker")
         assert response.status_code == 200
-        assert response.get_json() == {"blocking_job": None}
+        assert response.get_json() == {
+            "blocking_job": None,
+            "folder_blocking_jobs": {},
+        }
     # Silence unused-variable warning when folder_id isn't referenced.
     assert folder_id
+
+
+def test_local_folder_blockers_are_scoped_to_affected_roots(tmp_path, monkeypatch):
+    """A shared-root job must not disable an unrelated root in the workspace."""
+    import threading
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    from app import create_app
+
+    shared_source = tmp_path / "nas" / "shared"
+    unrelated_source = tmp_path / "nas" / "unrelated"
+    shared_source.mkdir(parents=True)
+    unrelated_source.mkdir(parents=True)
+    (shared_source / "bird.jpg").write_bytes(b"shared")
+    (unrelated_source / "fox.jpg").write_bytes(b"unrelated")
+    vireo_dir = tmp_path / "vireo"
+    thumbs = vireo_dir / "thumbnails"
+    thumbs.mkdir(parents=True)
+    db_path = str(vireo_dir / "vireo.db")
+
+    db = Database(db_path)
+    first_workspace = db.create_workspace("First")
+    second_workspace = db.create_workspace("Second")
+    shared_id = db.add_folder(
+        str(shared_source), name="shared", link_to_workspace=False
+    )
+    unrelated_id = db.add_folder(
+        str(unrelated_source), name="unrelated", link_to_workspace=False
+    )
+    db.add_workspace_folder(first_workspace, shared_id)
+    db.add_workspace_folder(first_workspace, unrelated_id)
+    db.add_workspace_folder(second_workspace, shared_id)
+    db.close()
+
+    app = create_app(db_path, thumb_cache_dir=str(thumbs))
+    app.config["TESTING"] = True
+    started = threading.Event()
+    release = threading.Event()
+
+    def processing(_job):
+        started.set()
+        assert release.wait(timeout=10)
+        return {"ok": True}
+
+    with app.test_client() as client:
+        assert client.post(
+            f"/api/workspaces/{first_workspace}/activate", json={}
+        ).status_code == 200
+        job_id = app._job_runner.start(
+            "pipeline", processing, workspace_id=second_workspace
+        )
+        try:
+            assert started.wait(timeout=2)
+            blocker = client.get(
+                "/api/workspaces/active/local-folders/blocker"
+            ).get_json()
+            assert blocker["blocking_job"]["id"] == job_id
+            assert blocker["folder_blocking_jobs"] == {
+                str(shared_id): blocker["blocking_job"]
+            }
+
+            stage = client.post(
+                "/api/workspaces/active/local-folders/stage",
+                json={"folder_ids": [unrelated_id]},
+            )
+            assert stage.status_code == 202, stage.get_json()
+            assert wait_for_job_via_client(
+                client, stage.get_json()["job_id"]
+            )["status"] == "completed"
+        finally:
+            release.set()
+        assert wait_for_job_via_client(client, job_id)["status"] == "completed"
 
 
 def test_folder_sync_proceeds_while_observational_job_runs(tmp_path, monkeypatch):

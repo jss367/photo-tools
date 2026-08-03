@@ -9,9 +9,10 @@
   var stagePreflightTimer = null;
   var stagePreflightSignature = null;
   var blockingJobTimer = null;
+  var stageBlockedByJob = false;
 
-  function blockingJobMessage() {
-    var job = data && data.blocking_job;
+  function blockingJobMessage(job) {
+    job = job || (data && data.blocking_job);
     if (!job) return '';
     var label = typeof window.formatJobType === 'function'
       ? window.formatJobType(job.type)
@@ -22,9 +23,27 @@
     return label + ' is ' + status + '. Work Locally will be available when it finishes or is cancelled.';
   }
 
-  function blockerSignature(job) {
-    if (!job) return '';
-    return String(job.id) + ':' + String(job.status || '');
+  function blockingJobForFolder(folderId) {
+    var jobs = (data && data.folder_blocking_jobs) || {};
+    return jobs[String(Number(folderId))] || null;
+  }
+
+  function blockingJobForSelection(folderIds) {
+    if (!data) return null;
+    if (!folderIds || !folderIds.length) return data.blocking_job || null;
+    for (var index = 0; index < folderIds.length; index += 1) {
+      var job = blockingJobForFolder(folderIds[index]);
+      if (job) return job;
+    }
+    return null;
+  }
+
+  function blockerSignature(payload) {
+    if (!payload) return '';
+    return JSON.stringify({
+      blocking_job: payload.blocking_job || null,
+      folder_blocking_jobs: payload.folder_blocking_jobs || {}
+    });
   }
 
   async function refreshBlockingJob() {
@@ -38,8 +57,8 @@
       var payload = await Vireo.api.json(
         '/api/workspaces/active/local-folders/blocker', {}, {toast: false}
       );
-      var previous = blockerSignature(data.blocking_job);
-      var next = blockerSignature(payload.blocking_job);
+      var previous = blockerSignature(data);
+      var next = blockerSignature(payload);
       if (previous !== next) {
         await load();
       }
@@ -117,6 +136,31 @@
         destination_bases: destinationBases
       }
     };
+  }
+
+  function updateStageDialogBlocker() {
+    var modal = document.getElementById('stageLocalFoldersModal');
+    if (!modal || !modal.classList.contains('open') || !pendingStageItems.length) return;
+    var folderIds = pendingStageItems.map(function(item) {
+      return item.requested_folder_id;
+    });
+    var blocker = blockingJobForSelection(folderIds);
+    var button = document.getElementById('confirmStageLocalFolders');
+    var error = document.getElementById('stageLocalFoldersError');
+    if (blocker) {
+      stageBlockedByJob = true;
+      stagePreflightGeneration += 1;
+      stagePreflightSignature = null;
+      if (stagePreflightTimer) clearTimeout(stagePreflightTimer);
+      stagePreflightTimer = null;
+      if (button) button.disabled = true;
+      if (error) error.textContent = blockingJobMessage(blocker);
+      return;
+    }
+    if (!stageBlockedByJob) return;
+    stageBlockedByJob = false;
+    if (error) error.textContent = '';
+    scheduleStagePreflight(0);
   }
 
   function renderStagePreflight(preflight) {
@@ -213,6 +257,7 @@
     if (modal) modal.classList.remove('open');
     stagePreflightGeneration += 1;
     stagePreflightSignature = null;
+    stageBlockedByJob = false;
     if (stagePreflightTimer) clearTimeout(stagePreflightTimer);
     stagePreflightTimer = null;
     pendingStageItems = [];
@@ -220,8 +265,9 @@
 
   function openStageDialog(folderIds) {
     if (actionInFlight || activeJob) return;
-    if (data && data.blocking_job) {
-      showToast(blockingJobMessage(), 'warning');
+    var blocker = blockingJobForSelection(folderIds);
+    if (blocker) {
+      showToast(blockingJobMessage(blocker), 'warning');
       return;
     }
     var items = selectedItems(folderIds, false).filter(function(item) {
@@ -233,6 +279,7 @@
     var error = document.getElementById('stageLocalFoldersError');
     var modal = document.getElementById('stageLocalFoldersModal');
     if (!container || !modal) return;
+    stageBlockedByJob = false;
     if (error) error.textContent = '';
     container.innerHTML = items.map(function(item) {
       var id = Number(item.requested_folder_id);
@@ -438,6 +485,7 @@
       window.vireoLocalFolderData = data;
       render();
       if (typeof loadWsFolders === 'function') loadWsFolders();
+      updateStageDialogBlocker();
       scheduleBlockingJobRefresh();
       return data;
     } catch (error) {
@@ -452,6 +500,13 @@
     var error = document.getElementById('stageLocalFoldersError');
     var button = document.getElementById('confirmStageLocalFolders');
     var request = stageRequestBody();
+    var blocker = blockingJobForSelection(request.body.folder_ids);
+    if (blocker) {
+      stageBlockedByJob = true;
+      if (button) button.disabled = true;
+      if (error) error.textContent = blockingJobMessage(blocker);
+      return;
+    }
     if (!request.complete || stagePreflightSignature !== JSON.stringify(request.body)) {
       if (error) error.textContent = 'Wait for the size and free-space check to finish.';
       scheduleStagePreflight(0);
@@ -482,8 +537,9 @@
     if (actionInFlight || activeJob) return;
     await load();
     if (activeJob) return;
-    if (data && data.blocking_job) {
-      showToast(blockingJobMessage(), 'warning');
+    var blocker = blockingJobForSelection(folderIds);
+    if (blocker) {
+      showToast(blockingJobMessage(blocker), 'warning');
       return;
     }
     var items = selectedItems(folderIds, true);
@@ -533,8 +589,9 @@
     if (actionInFlight || activeJob) return;
     await load();
     if (activeJob) return;
-    if (data && data.blocking_job) {
-      showToast(blockingJobMessage(), 'warning');
+    var blocker = blockingJobForSelection(folderIds);
+    if (blocker) {
+      showToast(blockingJobMessage(blocker), 'warning');
       return;
     }
     var items = selectedItems(folderIds, true);
@@ -714,6 +771,7 @@
     load: load,
     statusFor: statusFor,
     blockingJob: function() { return data && data.blocking_job; },
+    blockingJobFor: blockingJobForFolder,
     blockingMessage: blockingJobMessage,
     stage: stageFromAnywhere,
     sync: function(folderId) { return sync([Number(folderId)]); },

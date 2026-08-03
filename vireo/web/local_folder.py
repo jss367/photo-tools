@@ -201,14 +201,27 @@ def create_local_folder_blueprint(
                     )
         return destination_bases, None
 
-    def _blocking_job_payload(db, workspace_id):
-        blocking_job = _busy_job(db, _active_root_ids(db, workspace_id), workspace_id)
-        if blocking_job is None:
+    def _job_payload(job):
+        if job is None:
             return None
         return {
-            "id": blocking_job["id"],
-            "type": blocking_job["type"],
-            "status": blocking_job["status"],
+            "id": job["id"],
+            "type": job["type"],
+            "status": job["status"],
+        }
+
+    def _blocking_status_payload(db, workspace_id):
+        root_ids = _active_root_ids(db, workspace_id)
+        folder_blocking_jobs = {}
+        for root_id in root_ids:
+            blocking_job = _busy_job(db, [root_id], workspace_id)
+            if blocking_job is not None:
+                folder_blocking_jobs[str(root_id)] = _job_payload(blocking_job)
+        return {
+            "blocking_job": _job_payload(
+                _busy_job(db, root_ids, workspace_id)
+            ),
+            "folder_blocking_jobs": folder_blocking_jobs,
         }
 
     @blueprint.get("/api/workspaces/active/local-folders/blocker")
@@ -221,7 +234,7 @@ def create_local_folder_blueprint(
         db, workspace_id, error = _active_context()
         if error:
             return error
-        return jsonify({"blocking_job": _blocking_job_payload(db, workspace_id)})
+        return jsonify(_blocking_status_payload(db, workspace_id))
 
     @blueprint.get("/api/workspaces/active/local-folders")
     def local_folder_status():
@@ -234,7 +247,7 @@ def create_local_folder_blueprint(
             return json_error(str(exc), 409)
         payload["legacy_workspace_session"] = bool(legacy_local_state(db, workspace_id))
 
-        payload["blocking_job"] = _blocking_job_payload(db, workspace_id)
+        payload.update(_blocking_status_payload(db, workspace_id))
 
         jobs = []
         active_roots = set(_active_root_ids(db, workspace_id))

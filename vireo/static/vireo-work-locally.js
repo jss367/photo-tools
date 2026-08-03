@@ -27,21 +27,43 @@
   }
 
   function loadPreflightClientState() {
-    try {
-      var stored = JSON.parse(window.sessionStorage.getItem(stagePreflightStorageKey));
-      if (
-        stored && typeof stored.id === 'string' && stored.id &&
-        Number.isSafeInteger(stored.seq) && stored.seq >= 0
-      ) {
-        return stored;
+    // sessionStorage survives reloads, but browsers may copy it when a tab is
+    // duplicated or opened from another tab. Only reuse the stored identity
+    // for an actual reload; a copied browsing context reports a normal
+    // navigation and must get its own server-side cancellation slot.
+    if (isReloadNavigation()) {
+      try {
+        var stored = JSON.parse(window.sessionStorage.getItem(stagePreflightStorageKey));
+        if (
+          stored && typeof stored.id === 'string' && stored.id &&
+          Number.isSafeInteger(stored.seq) && stored.seq >= 0
+        ) {
+          return stored;
+        }
+      } catch (_error) {
+        // Storage can be disabled by browser privacy settings. The in-memory
+        // state below still preserves normal same-page supersession.
       }
-    } catch (_error) {
-      // Storage can be disabled by browser privacy settings. The in-memory
-      // state below still preserves normal same-page supersession.
     }
     var state = {id: newPreflightId(), seq: 0};
     persistPreflightClientState(state);
     return state;
+  }
+
+  function isReloadNavigation() {
+    try {
+      if (window.performance && typeof window.performance.getEntriesByType === 'function') {
+        var navigations = window.performance.getEntriesByType('navigation');
+        if (navigations.length) return navigations[0].type === 'reload';
+      }
+      // Navigation Timing Level 1 fallback for older WebKit versions.
+      return Boolean(
+        window.performance && window.performance.navigation &&
+        window.performance.navigation.type === 1
+      );
+    } catch (_error) {
+      return false;
+    }
   }
 
   function persistPreflightClientState(state) {

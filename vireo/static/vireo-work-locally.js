@@ -8,6 +8,29 @@
   var stagePreflightGeneration = 0;
   var stagePreflightTimer = null;
   var stagePreflightSignature = null;
+  var blockingJobTimer = null;
+
+  function blockingJobMessage() {
+    var job = data && data.blocking_job;
+    if (!job) return '';
+    var label = typeof window.formatJobType === 'function'
+      ? window.formatJobType(job.type)
+      : String(job.type || 'Processing').replace(/[-_]+/g, ' ');
+    var status = ['queued', 'running', 'pausing', 'paused'].indexOf(job.status) >= 0
+      ? job.status
+      : 'running';
+    return label + ' is ' + status + '. Work Locally will be available when it finishes or is cancelled.';
+  }
+
+  function scheduleBlockingJobRefresh() {
+    if (blockingJobTimer) clearTimeout(blockingJobTimer);
+    blockingJobTimer = null;
+    if (!data || !data.blocking_job) return;
+    blockingJobTimer = setTimeout(function() {
+      blockingJobTimer = null;
+      load();
+    }, 3000);
+  }
 
   function selectedItems(folderIds, localOnly) {
     var wanted = folderIds && folderIds.length
@@ -164,6 +187,10 @@
 
   function openStageDialog(folderIds) {
     if (actionInFlight || activeJob) return;
+    if (data && data.blocking_job) {
+      showToast(blockingJobMessage(), 'warning');
+      return;
+    }
     var items = selectedItems(folderIds, false).filter(function(item) {
       return item.state === 'remote';
     });
@@ -282,6 +309,7 @@
     var shared = localItems.filter(function(item) {
       return (item.workspace_ids || []).length > 1;
     }).length;
+    var blocked = !!data.blocking_job;
 
     var summary = local === 0
       ? 'All ' + total + ' folder' + (total === 1 ? ' is' : 's are') + ' using source storage.'
@@ -294,13 +322,20 @@
         (local ? changes.created + ' new · ' + changes.modified + ' modified · ' + changes.deleted + ' deleted' :
           'Local copies speed up work on network or slower storage.') +
         (shared ? ' · ' + shared + ' shared local folder' + (shared === 1 ? '' : 's') : '') +
-      '</div><div style="display:flex;gap:8px;flex-wrap:wrap;">';
+      '</div>';
+    if (blocked) {
+      html += '<div role="status" style="font-size:12px;color:var(--warning);line-height:1.5;margin-bottom:12px;">' +
+        escapeHtml(blockingJobMessage()) + ' <a href="/jobs" style="color:inherit;text-decoration:underline;">View Jobs</a></div>';
+    }
+    html += '<div style="display:flex;gap:8px;flex-wrap:wrap;">';
     if (local < total) {
-      html += '<button class="btn btn-secondary" data-local-folders-action="stage-all">' +
+      html += '<button class="btn btn-secondary" data-local-folders-action="stage-all"' +
+        (blocked ? ' disabled style="opacity:.5;"' : '') + '>' +
         (local ? 'Make All Folders Local' : 'Work Entire Workspace Locally') + '</button>';
     }
     if (local) {
-      html += '<button class="btn btn-secondary" data-local-folders-action="manage">Finish Local Work...</button>';
+      html += '<button class="btn btn-secondary" data-local-folders-action="manage"' +
+        (blocked ? ' disabled style="opacity:.5;"' : '') + '>Finish Local Work...</button>';
     }
     html += '</div>';
     container.innerHTML = html;
@@ -362,6 +397,7 @@
       window.vireoLocalFolderData = data;
       render();
       if (typeof loadWsFolders === 'function') loadWsFolders();
+      scheduleBlockingJobRefresh();
       return data;
     } catch (error) {
       var container = document.getElementById('localWorkspaceContent');
@@ -624,6 +660,8 @@
   window.vireoLocalFolders = {
     load: load,
     statusFor: statusFor,
+    blockingJob: function() { return data && data.blocking_job; },
+    blockingMessage: blockingJobMessage,
     stage: stageFromAnywhere,
     sync: function(folderId) { return sync([Number(folderId)]); },
     discard: function(folderId) { return discard([Number(folderId)]); }

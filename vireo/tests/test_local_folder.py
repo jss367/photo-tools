@@ -1420,6 +1420,80 @@ def test_folder_stage_endpoint_refuses_while_scan_is_paused(tmp_path, monkeypatc
         wait_for_job_via_client(client, job_id)
 
 
+def test_local_folder_status_exposes_blocking_job_and_preflight_stops_early(
+    tmp_path, monkeypatch
+):
+    """The UI should know a transition is unavailable before scanning storage.
+
+    The capacity preflight can take a long time on a network volume.  If a
+    pipeline already makes Work Locally unsafe, report that job in status and
+    reject preflight without walking the source tree.
+    """
+    import threading
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    import web.local_folder as local_folder_web
+    from app import create_app
+
+    source = tmp_path / "nas" / "photos"
+    source.mkdir(parents=True)
+    (source / "bird.jpg").write_bytes(b"original")
+    vireo_dir = tmp_path / "vireo"
+    thumbs = vireo_dir / "thumbnails"
+    thumbs.mkdir(parents=True)
+    db_path = str(vireo_dir / "vireo.db")
+
+    db = Database(db_path)
+    workspace_id = db.create_workspace("Owner")
+    folder_id = db.add_folder(str(source), name="photos", link_to_workspace=False)
+    db.add_workspace_folder(workspace_id, folder_id)
+    db.set_active_workspace(workspace_id)
+    db.close()
+
+    app = create_app(db_path, thumb_cache_dir=str(thumbs))
+    app.config["TESTING"] = True
+    started = threading.Event()
+    release = threading.Event()
+
+    def processing(_job):
+        started.set()
+        assert release.wait(timeout=10)
+        return {"ok": True}
+
+    def unexpected_preflight(*_args, **_kwargs):
+        raise AssertionError("blocked preflight must not scan source storage")
+
+    monkeypatch.setattr(local_folder_web, "local_copy_preflight", unexpected_preflight)
+
+    with app.test_client() as client:
+        assert client.post(
+            f"/api/workspaces/{workspace_id}/activate", json={}
+        ).status_code == 200
+        job_id = app._job_runner.start(
+            "pipeline", processing, workspace_id=workspace_id
+        )
+        try:
+            assert started.wait(timeout=2)
+            status = client.get(
+                "/api/workspaces/active/local-folders"
+            ).get_json()
+            assert status["blocking_job"] == {
+                "id": job_id,
+                "type": "pipeline",
+                "status": "running",
+            }
+
+            preflight = client.post(
+                "/api/workspaces/active/local-folders/preflight",
+                json={"folder_ids": [folder_id]},
+            )
+            assert preflight.status_code == 409
+            assert "pipeline" in preflight.get_json()["error"]
+        finally:
+            release.set()
+        assert wait_for_job_via_client(client, job_id)["status"] == "completed"
+
+
 def test_folder_sync_proceeds_while_observational_job_runs(tmp_path, monkeypatch):
     """An automatic read-only probe must not hold local work hostage.
 

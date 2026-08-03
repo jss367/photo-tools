@@ -121,6 +121,9 @@ def create_local_folder_blueprint(
                 return job
         return None
 
+    def _busy_job_error(job):
+        return f"Wait for the {job['type']} job to finish before working locally"
+
     def _legacy_error(db, workspace_id):
         if legacy_local_state(db, workspace_id):
             return json_error(
@@ -209,6 +212,17 @@ def create_local_folder_blueprint(
             return json_error(str(exc), 409)
         payload["legacy_workspace_session"] = bool(legacy_local_state(db, workspace_id))
 
+        blocking_job = _busy_job(db, _active_root_ids(db, workspace_id), workspace_id)
+        payload["blocking_job"] = (
+            {
+                "id": blocking_job["id"],
+                "type": blocking_job["type"],
+                "status": blocking_job["status"],
+            }
+            if blocking_job is not None
+            else None
+        )
+
         jobs = []
         active_roots = set(_active_root_ids(db, workspace_id))
         # Include descendant local sessions (workspace A links /parent while
@@ -257,6 +271,9 @@ def create_local_folder_blueprint(
                 "The selected folders are already local or contain a folder working locally",
                 409,
             )
+        busy = _busy_job(db, root_ids, workspace_id)
+        if busy:
+            return json_error(_busy_job_error(busy), 409)
         root_names, source_paths = _folder_names(db, root_ids)
         destination_bases, destination_error = _stage_destinations(
             body, root_ids, root_names, source_paths
@@ -374,9 +391,7 @@ def create_local_folder_blueprint(
         with transition_lock:
             busy = _busy_job(db, root_ids, workspace_id)
             if busy:
-                return json_error(
-                    f"Wait for the {busy['type']} job to finish before working locally", 409
-                )
+                return json_error(_busy_job_error(busy), 409)
             # Recheck residency inside the same registration boundary so two
             # simultaneous requests cannot both report 202 for one folder.
             if any(local_root_for_folder(db, root_id) is not None for root_id in root_ids):

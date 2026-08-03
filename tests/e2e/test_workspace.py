@@ -48,6 +48,54 @@ def test_work_locally_full_cycle(live_server, page, tmp_path):
     assert restored == str(source)
 
 
+def test_work_locally_explains_processing_blocker(live_server, page, tmp_path):
+    """A running pipeline disables local-copy controls with a visible reason."""
+    import threading
+
+    db = live_server["db"]
+    source = tmp_path / "nas-blocked"
+    source.mkdir()
+    (source / "bird.jpg").write_bytes(b"original-bytes")
+    workspace_id = db.create_workspace("Processing")
+    db.set_active_workspace(workspace_id)
+    db.add_folder(str(source), name="nas-blocked")
+
+    assert page.request.post(
+        f"{live_server['url']}/api/workspaces/{workspace_id}/activate"
+    ).ok
+
+    started = threading.Event()
+    release = threading.Event()
+
+    def processing(_job):
+        started.set()
+        assert release.wait(timeout=10)
+        return {"ok": True}
+
+    job_id = live_server["app"]._job_runner.start(
+        "pipeline", processing, workspace_id=workspace_id
+    )
+    try:
+        assert started.wait(timeout=2)
+        page.goto(f"{live_server['url']}/workspace", timeout=5000)
+
+        panel = page.locator("#localWorkspaceContent")
+        expect(panel).to_contain_text(
+            "Pipeline is running. Work Locally will be available when it finishes or is cancelled.",
+            timeout=5000,
+        )
+        expect(panel.get_by_role("link", name="View Jobs")).to_be_visible()
+        folder_action = page.get_by_role("button", name="Work Locally", exact=True)
+        expect(folder_action).to_be_disabled()
+
+        release.set()
+        expect(folder_action).to_be_enabled(timeout=10000)
+        expect(panel).not_to_contain_text("Pipeline is running", timeout=10000)
+    finally:
+        release.set()
+        live_server["app"]._job_runner.cancel_job(job_id)
+
+
 def test_workspace_page_lists_all_workspaces(live_server, page):
     """Workspace page shows both Default and Field Work workspaces."""
     url = live_server["url"]

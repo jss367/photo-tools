@@ -263,7 +263,9 @@
     pendingStageItems = [];
   }
 
-  function openStageDialog(folderIds) {
+  async function openStageDialog(folderIds) {
+    if (actionInFlight || activeJob) return;
+    await load();
     if (actionInFlight || activeJob) return;
     var blocker = blockingJobForSelection(folderIds);
     if (blocker) {
@@ -659,6 +661,8 @@
   }
 
   async function legacyAction(action) {
+    if (!data || !data.legacy || actionInFlight || activeJob) return;
+    await load();
     if (!data || !data.legacy || actionInFlight || activeJob) return;
     if (data.blocking_job) {
       showToast(blockingJobMessage(), 'warning');

@@ -41,12 +41,14 @@ def create_local_folder_blueprint(
     active_preflights = {}
     cancelled_preflight_ids = {}
     max_cancelled_preflight_ids = 256
-    # Highest client-supplied ordering token seen per workspace. Registered
-    # under ``preflight_lock``; any request that arrives with a token less than
-    # or equal to this is rejected before it can supersede a newer scan.
-    last_preflight_seq: dict[int, int] = {}
+    # Highest ordering token seen per workspace and browser page. Scoping the
+    # high-water mark by client lets a refreshed page start its sequence at one
+    # without being rejected by the previous page's larger counter.
+    last_preflight_seq: dict[tuple[int, str | None], int] = {}
 
-    def _begin_preflight(workspace_id, preflight_id, preflight_seq=None):
+    def _begin_preflight(
+        workspace_id, preflight_id, preflight_client_id=None, preflight_seq=None
+    ):
         cancelled = threading.Event()
         with preflight_lock:
             cancellation_key = (int(workspace_id), preflight_id)
@@ -66,12 +68,12 @@ def create_local_folder_blueprint(
             # the client is stuck at 409 while the user's latest inputs never
             # get a size back. Reject the stale arrival instead.
             if preflight_seq is not None:
-                ws_key = int(workspace_id)
-                last_seen = last_preflight_seq.get(ws_key)
+                ordering_key = (int(workspace_id), preflight_client_id)
+                last_seen = last_preflight_seq.get(ordering_key)
                 if last_seen is not None and preflight_seq <= last_seen:
                     cancelled.set()
                     return cancelled
-                last_preflight_seq[ws_key] = preflight_seq
+                last_preflight_seq[ordering_key] = preflight_seq
             previous = active_preflights.get(int(workspace_id))
             if previous is not None:
                 previous[1].set()
@@ -329,6 +331,12 @@ def create_local_folder_blueprint(
         preflight_id = body.get("preflight_id")
         if not isinstance(preflight_id, str) or not preflight_id.strip():
             preflight_id = None
+        preflight_client_id = body.get("preflight_client_id")
+        if (
+            not isinstance(preflight_client_id, str)
+            or not preflight_client_id.strip()
+        ):
+            preflight_client_id = None
         raw_seq = body.get("preflight_seq")
         preflight_seq: int | None
         if isinstance(raw_seq, bool):
@@ -344,7 +352,12 @@ def create_local_folder_blueprint(
         # every destination volume has finished responding to
         # ``destination_case_insensitive`` — which can hang for seconds each on
         # an unavailable network mount.
-        cancelled = _begin_preflight(workspace_id, preflight_id, preflight_seq)
+        cancelled = _begin_preflight(
+            workspace_id,
+            preflight_id,
+            preflight_client_id,
+            preflight_seq,
+        )
         try:
             try:
                 destination_bases, destination_error = _stage_destinations(

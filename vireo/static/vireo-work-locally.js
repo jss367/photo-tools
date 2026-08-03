@@ -10,10 +10,10 @@
   var stagePreflightSignature = null;
   var stagePreflightAbort = null;
   var stagePreflightId = null;
-  // Client-side monotonic counter shared with the server as ``preflight_seq``.
-  // The server tracks the highest seq it has ever registered per workspace so
-  // that a delayed obsolete request (older seq) cannot supersede a newer scan
-  // that already registered — even when its cancel signal was never delivered.
+  var stagePreflightClientId = newPreflightId();
+  // Client-side monotonic counter scoped by ``stagePreflightClientId``. A new
+  // page gets a new id, so its first request is not rejected by the server's
+  // high-water mark from an earlier page load.
   var stagePreflightSeq = 0;
 
   function newPreflightId() {
@@ -172,6 +172,7 @@
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify(Object.assign({}, request.body, {
           preflight_id: preflightId,
+          preflight_client_id: stagePreflightClientId,
           preflight_seq: preflightSeq
         })),
         signal: controller.signal

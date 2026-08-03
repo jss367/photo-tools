@@ -893,6 +893,7 @@ def test_older_seq_arrival_cannot_supersede_newer_registered_scan(tmp_path, monk
                 json={
                     "folder_ids": [folder_id],
                     "preflight_id": "newer",
+                    "preflight_client_id": "browser-one",
                     "preflight_seq": 5,
                 },
             )
@@ -906,6 +907,7 @@ def test_older_seq_arrival_cannot_supersede_newer_registered_scan(tmp_path, monk
             json={
                 "folder_ids": [folder_id],
                 "preflight_id": "older",
+                "preflight_client_id": "browser-one",
                 "preflight_seq": 3,
             },
         )
@@ -920,6 +922,40 @@ def test_older_seq_arrival_cannot_supersede_newer_registered_scan(tmp_path, monk
     # Newer scan ran to completion — was not cancelled by the stale arrival.
     assert newer_result["response"].status_code == 200
     assert newer_result["response"].get_json()["total_bytes"] == 999
+
+
+def test_new_browser_client_can_restart_preflight_sequence(tmp_path, monkeypatch):
+    def fake_preflight(
+        _db, _root_ids, _vireo_dir, *, destination_bases=None, cancel_check=None
+    ):
+        return {"folder_count": 1, "total_bytes": 1, "can_copy": True,
+                "folders": [], "volumes": []}
+
+    app, folder_id = _cancellable_preflight_app(
+        tmp_path, monkeypatch, fake_preflight
+    )
+    with app.test_client() as client:
+        old_page = client.post(
+            "/api/workspaces/active/local-folders/preflight",
+            json={
+                "folder_ids": [folder_id],
+                "preflight_id": "old-page",
+                "preflight_client_id": "browser-one",
+                "preflight_seq": 5,
+            },
+        )
+        refreshed_page = client.post(
+            "/api/workspaces/active/local-folders/preflight",
+            json={
+                "folder_ids": [folder_id],
+                "preflight_id": "refreshed-page",
+                "preflight_client_id": "browser-two",
+                "preflight_seq": 1,
+            },
+        )
+
+    assert old_page.status_code == 200
+    assert refreshed_page.status_code == 200
 
 
 def test_new_preflight_supersedes_old_scan(tmp_path, monkeypatch):

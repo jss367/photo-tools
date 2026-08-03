@@ -475,33 +475,44 @@ def _walk_entries(root: str, *, cancel_check=None):
     not descended into. Each entry is stat'ed exactly once here — callers
     classify via the yielded stat instead of re-statting.
 
-    ``cancel_check`` is checked before every ``os.lstat`` on a child entry.
-    ``os.walk`` batches the per-child ``os.lstat`` calls (via the inner
-    ``for dirname in dirnames`` classification), and on a slow network volume
-    those blocking calls are what a cancellation actually needs to interrupt
-    — waiting for the whole batch before a caller-level check would let a
-    cancelled scan continue through every child of a large directory.
+    ``cancel_check`` is checked between ``scandir`` entries and before every
+    ``os.lstat``. On a slow network volume, either operation may block, but the
+    scan stops as soon as the current filesystem call returns instead of
+    letting a directory-wide batch finish first.
     """
-    for dirpath, dirnames, filenames in os.walk(root, followlinks=False, onerror=_raise_walk_error):
-        rel_dir = _relative(dirpath, root)
-        if rel_dir:
-            yield rel_dir, dirpath, os.lstat(dirpath)
-        kept = []
-        for dirname in dirnames:
+    pending = [(root, None)]
+    while pending:
+        dirpath, directory_st = pending.pop()
+        if directory_st is not None:
+            yield _relative(dirpath, root), dirpath, directory_st
+        child_directories = []
+        try:
+            entries = os.scandir(dirpath)
+            with entries:
+                iterator = iter(entries)
+                while True:
+                    if cancel_check and cancel_check():
+                        raise LocalWorkspaceCancelled("Folder scan cancelled")
+                    try:
+                        entry = next(iterator)
+                    except StopIteration:
+                        break
+                    if cancel_check and cancel_check():
+                        raise LocalWorkspaceCancelled("Folder scan cancelled")
+                    full = entry.path
+                    st = os.lstat(full)
+                    if stat.S_ISDIR(st.st_mode):
+                        child_directories.append((full, st))
+                    else:
+                        yield _relative(full, root), full, st
+        except OSError as error:
+            _raise_walk_error(error)
+
+        # Stack order preserves scandir's depth-first ordering.
+        for child in reversed(child_directories):
             if cancel_check and cancel_check():
                 raise LocalWorkspaceCancelled("Folder scan cancelled")
-            full = os.path.join(dirpath, dirname)
-            st = os.lstat(full)
-            if stat.S_ISLNK(st.st_mode):
-                yield _relative(full, root), full, st
-            else:
-                kept.append(dirname)
-        dirnames[:] = kept
-        for filename in filenames:
-            if cancel_check and cancel_check():
-                raise LocalWorkspaceCancelled("Folder scan cancelled")
-            full = os.path.join(dirpath, filename)
-            yield rel_dir and os.path.join(rel_dir, filename) or filename, full, os.lstat(full)
+            pending.append(child)
 
 
 def _collect_source_entries(roots: list[dict], local_base: Path) -> tuple[dict[int, list], int, int]:

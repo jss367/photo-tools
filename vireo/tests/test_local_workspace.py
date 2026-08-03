@@ -7,6 +7,7 @@ import pytest
 import services.local_workspace as local_workspace
 from db import Database
 from services.local_workspace import (
+    LocalWorkspaceCancelled,
     LocalWorkspaceConflict,
     LocalWorkspaceError,
     discard_local,
@@ -87,6 +88,54 @@ def test_source_tree_size_converts_traversal_race_to_workspace_error(
         local_workspace.source_tree_size(str(source))
 
 
+def test_source_tree_size_cancels_between_scandir_entries(tmp_path, monkeypatch):
+    source = tmp_path / "source"
+    source.mkdir()
+    for index in range(4):
+        (source / f"photo-{index}.raw").write_bytes(b"raw")
+
+    cancelled = threading.Event()
+    enumerated = 0
+    real_scandir = local_workspace.os.scandir
+
+    class CancellingIterator:
+        def __init__(self, entries):
+            self.entries = entries
+
+        def __enter__(self):
+            self.entries.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self.entries.__exit__(*args)
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            nonlocal enumerated
+            entry = next(self.entries)
+            enumerated += 1
+            if enumerated == 2:
+                cancelled.set()
+            return entry
+
+    def cancelling_scandir(path):
+        entries = real_scandir(path)
+        if os.path.normpath(path) == os.path.normpath(source):
+            return CancellingIterator(entries)
+        return entries
+
+    monkeypatch.setattr(local_workspace.os, "scandir", cancelling_scandir)
+
+    with pytest.raises(LocalWorkspaceCancelled, match="Folder scan cancelled"):
+        local_workspace.source_tree_size(
+            str(source), cancel_check=cancelled.is_set
+        )
+
+    assert enumerated == 2
+
+
 def test_stage_modify_and_sync_back(local_workspace_env):
     env = local_workspace_env
     result = stage_workspace(env["db"], env["workspace_id"], str(env["vireo_dir"]))
@@ -130,14 +179,14 @@ def test_stage_modify_and_sync_back(local_workspace_env):
 
 def test_stage_aborts_when_source_directory_cannot_be_read(local_workspace_env, monkeypatch):
     env = local_workspace_env
-    real_walk = local_workspace.os.walk
+    real_scandir = local_workspace.os.scandir
 
-    def failing_walk(path, *args, **kwargs):
+    def failing_scandir(path):
         if os.path.normpath(path) == os.path.normpath(env["source"]):
-            kwargs["onerror"](PermissionError("NAS directory denied"))
-        return real_walk(path, *args, **kwargs)
+            raise PermissionError("NAS directory denied")
+        return real_scandir(path)
 
-    monkeypatch.setattr(local_workspace.os, "walk", failing_walk)
+    monkeypatch.setattr(local_workspace.os, "scandir", failing_scandir)
 
     with pytest.raises(LocalWorkspaceError, match="NAS directory denied"):
         stage_workspace(env["db"], env["workspace_id"], str(env["vireo_dir"]))

@@ -1671,6 +1671,70 @@ def test_local_folder_blockers_are_scoped_to_affected_roots(tmp_path, monkeypatc
         assert wait_for_job_via_client(client, job_id)["status"] == "completed"
 
 
+def test_local_folder_blockers_include_descendant_sessions(tmp_path, monkeypatch):
+    """Every local-session row surfaced by workspace status gets a blocker."""
+    import threading
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    from app import create_app
+
+    parent_source = tmp_path / "nas" / "parent"
+    child_source = parent_source / "child"
+    child_source.mkdir(parents=True)
+    (child_source / "bird.jpg").write_bytes(b"original")
+    vireo_dir = tmp_path / "vireo"
+    thumbs = vireo_dir / "thumbnails"
+    thumbs.mkdir(parents=True)
+    db_path = str(vireo_dir / "vireo.db")
+
+    db = Database(db_path)
+    parent_workspace = db.create_workspace("Parent")
+    child_workspace = db.create_workspace("Child")
+    parent_id = db.add_folder(
+        str(parent_source), name="parent", link_to_workspace=False
+    )
+    child_id = db.add_folder(
+        str(child_source),
+        name="child",
+        parent_id=parent_id,
+        link_to_workspace=False,
+    )
+    db.add_workspace_folder(parent_workspace, parent_id)
+    db.add_workspace_folder(child_workspace, child_id)
+    stage_folder(db, child_id, str(vireo_dir))
+    db.close()
+
+    app = create_app(db_path, thumb_cache_dir=str(thumbs))
+    app.config["TESTING"] = True
+    started = threading.Event()
+    release = threading.Event()
+
+    def processing(_job):
+        started.set()
+        assert release.wait(timeout=10)
+        return {"ok": True}
+
+    with app.test_client() as client:
+        assert client.post(
+            f"/api/workspaces/{parent_workspace}/activate", json={}
+        ).status_code == 200
+        job_id = app._job_runner.start(
+            "pipeline", processing, workspace_id=child_workspace
+        )
+        try:
+            assert started.wait(timeout=2)
+            blocker = client.get(
+                "/api/workspaces/active/local-folders/blocker"
+            ).get_json()
+            assert blocker["blocking_job"]["id"] == job_id
+            assert blocker["folder_blocking_jobs"] == {
+                str(child_id): blocker["blocking_job"],
+            }
+        finally:
+            release.set()
+        assert wait_for_job_via_client(client, job_id)["status"] == "completed"
+
+
 def test_folder_sync_proceeds_while_observational_job_runs(tmp_path, monkeypatch):
     """An automatic read-only probe must not hold local work hostage.
 

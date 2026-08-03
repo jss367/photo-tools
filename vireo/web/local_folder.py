@@ -212,14 +212,17 @@ def create_local_folder_blueprint(
 
     def _blocking_status_payload(db, workspace_id):
         root_ids = _active_root_ids(db, workspace_id)
+        selectable_root_ids = set(root_ids) | set(
+            workspace_local_root_ids(db, workspace_id)
+        )
         folder_blocking_jobs = {}
-        for root_id in root_ids:
+        for root_id in selectable_root_ids:
             blocking_job = _busy_job(db, [root_id], workspace_id)
             if blocking_job is not None:
                 folder_blocking_jobs[str(root_id)] = _job_payload(blocking_job)
         return {
             "blocking_job": _job_payload(
-                _busy_job(db, root_ids, workspace_id)
+                _busy_job(db, selectable_root_ids, workspace_id)
             ),
             "folder_blocking_jobs": folder_blocking_jobs,
         }

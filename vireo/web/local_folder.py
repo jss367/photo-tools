@@ -47,6 +47,23 @@ def create_local_folder_blueprint(
     last_preflight_seq: dict[tuple[int, str | None], int] = {}
     max_preflight_sequences = 64
 
+    def _trim_preflight_sequences(protected_key=None):
+        while len(last_preflight_seq) > max_preflight_sequences:
+            inactive_key = next(
+                (
+                    key
+                    for key in last_preflight_seq
+                    if key not in active_preflights and key != protected_key
+                ),
+                None,
+            )
+            if inactive_key is None:
+                # The number of active scans is already constrained by server
+                # workers. Keep their ordering records until they finish, then
+                # trim from ``_finish_preflight`` below.
+                break
+            last_preflight_seq.pop(inactive_key, None)
+
     def _begin_preflight(
         workspace_id, preflight_id, preflight_client_id=None, preflight_seq=None
     ):
@@ -72,8 +89,7 @@ def create_local_folder_blueprint(
                 # browser pages rather than whichever key was first seen.
                 last_preflight_seq.pop(ordering_key, None)
                 last_preflight_seq[ordering_key] = preflight_seq
-                while len(last_preflight_seq) > max_preflight_sequences:
-                    last_preflight_seq.pop(next(iter(last_preflight_seq)))
+                _trim_preflight_sequences(ordering_key)
             if preflight_id is not None and cancellation_key in cancelled_preflight_ids:
                 # The cancel request can beat the original request to a free
                 # Waitress worker. Advance ordering above before consuming its
@@ -104,6 +120,7 @@ def create_local_folder_blueprint(
             current = active_preflights.get(active_key)
             if current == (preflight_id, cancelled):
                 active_preflights.pop(active_key, None)
+            _trim_preflight_sequences()
 
     def _cancel_preflight(workspace_id, preflight_id):
         with preflight_lock:

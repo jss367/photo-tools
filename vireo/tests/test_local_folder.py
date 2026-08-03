@@ -1167,6 +1167,82 @@ def test_older_seq_arrival_cannot_supersede_newer_registered_scan(tmp_path, monk
     assert newer_result["response"].get_json()["total_bytes"] == 999
 
 
+def test_sequence_cache_does_not_evict_active_client(tmp_path, monkeypatch):
+    """Cache pressure must not let an older request replace an active scan."""
+    from services.local_folder import LocalWorkspaceCancelled
+
+    active_started = threading.Event()
+    release_active = threading.Event()
+    calls_lock = threading.Lock()
+    calls = 0
+
+    def fake_preflight(
+        _db, _root_ids, _vireo_dir, *, destination_bases=None, cancel_check=None
+    ):
+        if cancel_check and cancel_check():
+            raise LocalWorkspaceCancelled("stale sequence")
+        nonlocal calls
+        with calls_lock:
+            calls += 1
+            call_number = calls
+        if call_number == 1:
+            active_started.set()
+            assert release_active.wait(5), "test did not release the active scan"
+            if cancel_check and cancel_check():
+                raise LocalWorkspaceCancelled("active scan was superseded")
+        return {"folder_count": 1, "total_bytes": call_number, "can_copy": True,
+                "folders": [], "volumes": []}
+
+    app, folder_id = _cancellable_preflight_app(
+        tmp_path, monkeypatch, fake_preflight
+    )
+    active_result = {}
+
+    def request_active():
+        with app.test_client() as client:
+            active_result["response"] = client.post(
+                "/api/workspaces/active/local-folders/preflight",
+                json={
+                    "folder_ids": [folder_id],
+                    "preflight_id": "active-newer",
+                    "preflight_client_id": "active-client",
+                    "preflight_seq": 5,
+                },
+            )
+
+    thread = threading.Thread(target=request_active)
+    thread.start()
+    assert active_started.wait(5), "active preflight did not start"
+    with app.test_client() as client:
+        for index in range(64):
+            response = client.post(
+                "/api/workspaces/active/local-folders/preflight",
+                json={
+                    "folder_ids": [folder_id],
+                    "preflight_id": f"cache-pressure-{index}",
+                    "preflight_client_id": f"other-client-{index}",
+                    "preflight_seq": 1,
+                },
+            )
+            assert response.status_code == 200
+        older = client.post(
+            "/api/workspaces/active/local-folders/preflight",
+            json={
+                "folder_ids": [folder_id],
+                "preflight_id": "active-older",
+                "preflight_client_id": "active-client",
+                "preflight_seq": 3,
+            },
+        )
+    release_active.set()
+    thread.join(5)
+
+    assert not thread.is_alive()
+    assert older.status_code == 409
+    assert older.get_json()["error"] == "Folder size calculation was cancelled"
+    assert active_result["response"].status_code == 200
+
+
 def test_new_browser_client_can_restart_preflight_sequence(tmp_path, monkeypatch):
     def fake_preflight(
         _db, _root_ids, _vireo_dir, *, destination_bases=None, cancel_check=None

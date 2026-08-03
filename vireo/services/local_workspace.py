@@ -20,6 +20,7 @@ began publishing to the source and did not finish).
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
@@ -493,11 +494,19 @@ def _walk_entries(root: str, *, cancel_check=None):
     empty directories); directory symlinks are yielded as link entries and
     not descended into. Child directories are re-stat'ed immediately before
     descent so a symlink replacement cannot redirect traversal outside root.
+    On Unix the directory is then reopened with ``O_NOFOLLOW`` before its
+    contents are enumerated, which closes the narrow window between the
+    fresh ``lstat`` and the ``scandir`` opendir; a swap in that window
+    fails the open with ``ELOOP`` instead of letting ``scandir`` follow a
+    replacement symlink into an unrelated tree. Per-entry ``stat`` is done
+    via the parent's directory descriptor so intermediate ancestor swaps
+    cannot redirect the child's stat either.
 
-    ``cancel_check`` is checked between ``scandir`` entries and before every
-    ``os.lstat``. On a slow network volume, either operation may block, but the
-    scan stops as soon as the current filesystem call returns instead of
-    letting a directory-wide batch finish first.
+    ``cancel_check`` is checked between ``scandir`` entries, before every
+    ``os.lstat``, and between the ``lstat`` and the potentially blocking
+    directory open. On a slow network volume, any of these operations may
+    block, but the scan stops as soon as the current filesystem call returns
+    instead of letting a directory-wide batch finish first.
     """
     pending = [(root, None)]
     while pending:
@@ -508,19 +517,63 @@ def _walk_entries(root: str, *, cancel_check=None):
             current_st = os.lstat(dirpath)
         except OSError as error:
             _raise_walk_error(error)
+        # Slow SMB shares can block for many seconds inside the enumeration
+        # below. Recheck cancellation between the potentially blocking lstat
+        # above and the open/scandir so an obsolete preflight does not have
+        # to wait for another whole filesystem call before it can back out.
+        # Codex flagged this for the root specifically, whose lstat is not
+        # followed by a yield, but it applies to popped children too.
         if cancel_check and cancel_check():
             raise LocalWorkspaceCancelled("Folder scan cancelled")
-        if directory_st is not None:
+        # A queued child that is no longer a directory (replaced by a symlink
+        # or a plain file since the parent's scandir listed it) is yielded
+        # with the fresh stat and skipped for descent. The caller's symlink
+        # guard then refuses escaping targets; a type flip to a regular file
+        # is reported through the normal unsupported-type check.
+        if directory_st is not None and not stat.S_ISDIR(current_st.st_mode):
             yield _relative(dirpath, root), dirpath, current_st
-        elif not stat.S_ISDIR(current_st.st_mode):
+            continue
+        if directory_st is None and not stat.S_ISDIR(current_st.st_mode):
             raise LocalWorkspaceError(
                 f"Workspace root changed during directory scan: {root}"
             )
-        if not stat.S_ISDIR(current_st.st_mode):
-            continue
+        # Open the directory with O_NOFOLLOW so a symlink swap in the tiny
+        # window between the lstat above and scandir cannot silently redirect
+        # enumeration into an unrelated tree. Enumerating through the fd also
+        # keeps per-entry stat calls anchored to the parent's descriptor, so
+        # an intermediate ancestor swap cannot escape either. On Windows
+        # (no O_NOFOLLOW) NTFS symlink creation requires elevation, so fall
+        # back to the direct path.
+        dir_fd = None
+        if hasattr(os, "O_NOFOLLOW"):
+            open_flags = os.O_RDONLY | os.O_NOFOLLOW
+            if hasattr(os, "O_DIRECTORY"):
+                open_flags |= os.O_DIRECTORY
+            try:
+                dir_fd = os.open(dirpath, open_flags)
+            except OSError as error:
+                if error.errno in {errno.ELOOP, errno.ENOTDIR, errno.ENOENT}:
+                    # dirpath became a symlink, changed type, or was removed
+                    # between our lstat and this open. Re-lstat so the caller
+                    # sees the fresh type; a queued child is yielded with its
+                    # new stat while a root topology change is fatal.
+                    try:
+                        swapped_st = os.lstat(dirpath)
+                    except OSError as swapped_err:
+                        _raise_walk_error(swapped_err)
+                    if directory_st is None:
+                        raise LocalWorkspaceError(
+                            f"Workspace root changed during directory scan: {root}"
+                        ) from error
+                    yield _relative(dirpath, root), dirpath, swapped_st
+                    continue
+                _raise_walk_error(error)
+        if directory_st is not None:
+            yield _relative(dirpath, root), dirpath, current_st
+        scan_target = dir_fd if dir_fd is not None else dirpath
         child_directories = []
         try:
-            entries = os.scandir(dirpath)
+            entries = os.scandir(scan_target)
             with entries:
                 iterator = iter(entries)
                 while True:
@@ -532,14 +585,21 @@ def _walk_entries(root: str, *, cancel_check=None):
                         break
                     if cancel_check and cancel_check():
                         raise LocalWorkspaceCancelled("Folder scan cancelled")
-                    full = entry.path
-                    st = os.lstat(full)
+                    full = os.path.join(dirpath, entry.name)
+                    # entry.stat with the fd-based scandir routes through
+                    # fstatat on the parent descriptor, so an intermediate
+                    # swap cannot redirect the stat of the final component.
+                    st = entry.stat(follow_symlinks=False)
                     if stat.S_ISDIR(st.st_mode):
                         child_directories.append((full, st))
                     else:
                         yield _relative(full, root), full, st
         except OSError as error:
             _raise_walk_error(error)
+        finally:
+            if dir_fd is not None:
+                with suppress(OSError):
+                    os.close(dir_fd)
 
         # Stack order preserves scandir's depth-first ordering.
         for child in reversed(child_directories):

@@ -813,6 +813,18 @@
   window.addEventListener('pagehide', function() {
     cancelStagePreflight(true);
   });
+  window.addEventListener('pageshow', function(event) {
+    var modal = document.getElementById('stageLocalFoldersModal');
+    if (
+      event.persisted &&
+      modal && modal.classList.contains('open') &&
+      pendingStageItems.length &&
+      !stageBlockedByJob &&
+      stagePreflightSignature === null
+    ) {
+      scheduleStagePreflight(0);
+    }
+  });
 
   async function stageFromAnywhere(folderId) {
     if (!data) await load();

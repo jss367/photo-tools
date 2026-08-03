@@ -505,6 +505,8 @@ def _walk_entries(root: str, *, cancel_check=None):
         if cancel_check and cancel_check():
             raise LocalWorkspaceCancelled("Folder scan cancelled")
         current_st = os.lstat(dirpath)
+        if cancel_check and cancel_check():
+            raise LocalWorkspaceCancelled("Folder scan cancelled")
         if directory_st is not None:
             yield _relative(dirpath, root), dirpath, current_st
         elif not stat.S_ISDIR(current_st.st_mode):

@@ -136,6 +136,32 @@ def test_source_tree_size_cancels_between_scandir_entries(tmp_path, monkeypatch)
     assert enumerated == 2
 
 
+def test_walk_entries_cancels_after_root_stat_before_scandir(tmp_path, monkeypatch):
+    source = tmp_path / "source"
+    source.mkdir()
+    cancelled = threading.Event()
+    real_lstat = local_workspace.os.lstat
+
+    def cancelling_lstat(path):
+        result = real_lstat(path)
+        if os.path.normpath(path) == os.path.normpath(source):
+            cancelled.set()
+        return result
+
+    def unexpected_scandir(_path):
+        raise AssertionError("cancelled traversal must not start scandir")
+
+    monkeypatch.setattr(local_workspace.os, "lstat", cancelling_lstat)
+    monkeypatch.setattr(local_workspace.os, "scandir", unexpected_scandir)
+
+    with pytest.raises(LocalWorkspaceCancelled, match="Folder scan cancelled"):
+        list(
+            local_workspace._walk_entries(
+                str(source), cancel_check=cancelled.is_set
+            )
+        )
+
+
 @pytest.mark.skipif(os.name == "nt", reason="Windows test runners may not permit symlinks")
 def test_source_tree_size_does_not_follow_queued_directory_replaced_by_symlink(
     tmp_path, monkeypatch

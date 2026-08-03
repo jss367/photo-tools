@@ -737,13 +737,29 @@ def test_preflight_cancel_can_arrive_before_scan_starts(tmp_path, monkeypatch):
         )
         preflight = client.post(
             "/api/workspaces/active/local-folders/preflight",
-            json={"folder_ids": [folder_id], "preflight_id": "late-request"},
+            json={
+                "folder_ids": [folder_id],
+                "preflight_id": "late-request",
+                "preflight_client_id": "browser-one",
+                "preflight_seq": 5,
+            },
+        )
+        older = client.post(
+            "/api/workspaces/active/local-folders/preflight",
+            json={
+                "folder_ids": [folder_id],
+                "preflight_id": "older-request",
+                "preflight_client_id": "browser-one",
+                "preflight_seq": 3,
+            },
         )
 
     assert cancel.status_code == 200
     assert cancel.get_json() == {"cancelled": False}
     assert preflight.status_code == 409
     assert preflight.get_json()["error"] == "Folder size calculation was cancelled"
+    assert older.status_code == 409
+    assert older.get_json()["error"] == "Folder size calculation was cancelled"
 
 
 def test_preflight_cancel_stops_destination_probing(tmp_path, monkeypatch):
@@ -958,6 +974,44 @@ def test_new_browser_client_can_restart_preflight_sequence(tmp_path, monkeypatch
 
     assert old_page.status_code == 200
     assert refreshed_page.status_code == 200
+
+
+def test_preflight_sequence_cache_is_bounded(tmp_path, monkeypatch):
+    def fake_preflight(
+        _db, _root_ids, _vireo_dir, *, destination_bases=None, cancel_check=None
+    ):
+        return {"folder_count": 1, "total_bytes": 1, "can_copy": True,
+                "folders": [], "volumes": []}
+
+    app, folder_id = _cancellable_preflight_app(
+        tmp_path, monkeypatch, fake_preflight
+    )
+    with app.test_client() as client:
+        for index in range(65):
+            response = client.post(
+                "/api/workspaces/active/local-folders/preflight",
+                json={
+                    "folder_ids": [folder_id],
+                    "preflight_id": f"request-{index}",
+                    "preflight_client_id": f"browser-{index}",
+                    "preflight_seq": 5,
+                },
+            )
+            assert response.status_code == 200
+
+        # The oldest of 65 page entries was evicted from the 64-entry cache,
+        # so its restarted sequence is accepted rather than rejected as stale.
+        evicted_client = client.post(
+            "/api/workspaces/active/local-folders/preflight",
+            json={
+                "folder_ids": [folder_id],
+                "preflight_id": "evicted-client",
+                "preflight_client_id": "browser-0",
+                "preflight_seq": 1,
+            },
+        )
+
+    assert evicted_client.status_code == 200
 
 
 def test_new_preflight_supersedes_old_scan(tmp_path, monkeypatch):

@@ -45,6 +45,7 @@ def create_local_folder_blueprint(
     # high-water mark by client lets a refreshed page start its sequence at one
     # without being rejected by the previous page's larger counter.
     last_preflight_seq: dict[tuple[int, str | None], int] = {}
+    max_preflight_sequences = 64
 
     def _begin_preflight(
         workspace_id, preflight_id, preflight_client_id=None, preflight_seq=None
@@ -52,13 +53,6 @@ def create_local_folder_blueprint(
         cancelled = threading.Event()
         with preflight_lock:
             cancellation_key = (int(workspace_id), preflight_id)
-            if preflight_id is not None and cancellation_key in cancelled_preflight_ids:
-                # The cancel request can beat the original request to a free
-                # Waitress worker. Preserve it as a short-lived tombstone so a
-                # late obsolete scan cannot replace and cancel a newer one.
-                cancelled_preflight_ids.pop(cancellation_key, None)
-                cancelled.set()
-                return cancelled
             # Client-provided monotonic ordering token. Waitress can deliver
             # an older request after a newer one has already registered (the
             # older one waited longer for a free worker, or its cancel signal
@@ -73,7 +67,19 @@ def create_local_folder_blueprint(
                 if last_seen is not None and preflight_seq <= last_seen:
                     cancelled.set()
                     return cancelled
+                # Refresh insertion order so the bounded cache retains active
+                # browser pages rather than whichever key was first seen.
+                last_preflight_seq.pop(ordering_key, None)
                 last_preflight_seq[ordering_key] = preflight_seq
+                while len(last_preflight_seq) > max_preflight_sequences:
+                    last_preflight_seq.pop(next(iter(last_preflight_seq)))
+            if preflight_id is not None and cancellation_key in cancelled_preflight_ids:
+                # The cancel request can beat the original request to a free
+                # Waitress worker. Advance ordering above before consuming its
+                # tombstone so an even older delayed request is still rejected.
+                cancelled_preflight_ids.pop(cancellation_key, None)
+                cancelled.set()
+                return cancelled
             previous = active_preflights.get(int(workspace_id))
             if previous is not None:
                 previous[1].set()
@@ -337,6 +343,7 @@ def create_local_folder_blueprint(
         if (
             not isinstance(preflight_client_id, str)
             or not preflight_client_id.strip()
+            or len(preflight_client_id) > 128
         ):
             preflight_client_id = None
         raw_seq = body.get("preflight_seq")

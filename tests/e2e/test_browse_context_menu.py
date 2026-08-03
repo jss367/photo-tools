@@ -19,7 +19,7 @@ def test_right_click_photo_opens_menu(live_server, page):
     expect(menu.locator(".vireo-ctx-item", has_text="Reveal in")).to_be_visible()
     expect(menu.locator(".vireo-ctx-item", has_text="Copy Path")).to_be_visible()
     expect(menu.locator(".vireo-ctx-item", has_text="Delete")).to_be_visible()
-    expect(menu.locator(".vireo-ctx-item", has_text="View on Map")).to_be_visible()
+    expect(menu.get_by_text("View on Map", exact=True)).to_be_visible()
 
 
 def test_view_on_map_context_action_targets_right_clicked_photo(live_server, page):
@@ -36,7 +36,7 @@ def test_view_on_map_context_action_targets_right_clicked_photo(live_server, pag
     menu = page.locator(".vireo-ctx-menu")
     expect(menu).to_be_visible()
 
-    menu.locator(".vireo-ctx-item", has_text="View on Map").click()
+    menu.get_by_text("View on Map", exact=True).click()
     assert page.evaluate("window.__mapTarget") == pid
 
 

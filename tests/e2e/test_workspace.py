@@ -52,13 +52,27 @@ def test_work_locally_explains_processing_blocker(live_server, page, tmp_path):
     """A running pipeline disables local-copy controls with a visible reason."""
     import threading
 
+    from services.local_folder import stage_folder
+
     db = live_server["db"]
     source = tmp_path / "nas-blocked"
     source.mkdir()
     (source / "bird.jpg").write_bytes(b"original-bytes")
+    recovery_source = tmp_path / "nas-recovery"
+    recovery_source.mkdir()
+    (recovery_source / "fox.jpg").write_bytes(b"original-bytes")
     workspace_id = db.create_workspace("Processing")
     db.set_active_workspace(workspace_id)
     db.add_folder(str(source), name="nas-blocked")
+    recovery_folder_id = db.add_folder(
+        str(recovery_source), name="nas-recovery"
+    )
+    stage_folder(db, recovery_folder_id, str(tmp_path))
+    db.conn.execute(
+        "UPDATE local_folders SET state='staging' WHERE root_folder_id=?",
+        (recovery_folder_id,),
+    )
+    db.conn.commit()
 
     assert page.request.post(
         f"{live_server['url']}/api/workspaces/{workspace_id}/activate"
@@ -86,10 +100,13 @@ def test_work_locally_explains_processing_blocker(live_server, page, tmp_path):
         )
         expect(panel.get_by_role("link", name="View Jobs")).to_be_visible()
         folder_action = page.get_by_role("button", name="Work Locally", exact=True)
+        cleanup_action = page.get_by_role("button", name="Clean Up", exact=True)
         expect(folder_action).to_be_disabled()
+        expect(cleanup_action).to_be_disabled()
 
         release.set()
         expect(folder_action).to_be_enabled(timeout=10000)
+        expect(cleanup_action).to_be_enabled(timeout=10000)
         expect(panel).not_to_contain_text("Pipeline is running", timeout=10000)
     finally:
         release.set()

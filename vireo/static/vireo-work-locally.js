@@ -11,11 +11,13 @@
   var stagePreflightAbort = null;
   var stagePreflightId = null;
   var stagePreflightWorkspaceId = null;
-  var stagePreflightClientId = newPreflightId();
-  // Client-side monotonic counter scoped by ``stagePreflightClientId``. A new
-  // page gets a new id, so its first request is not rejected by the server's
-  // high-water mark from an earlier page load.
-  var stagePreflightSeq = 0;
+  var stagePreflightStorageKey = 'vireoWorkLocallyPreflightClient';
+  var stagePreflightClientState = loadPreflightClientState();
+  var stagePreflightClientId = stagePreflightClientState.id;
+  // The per-tab token and counter survive reloads. If a pagehide keepalive is
+  // dropped, the first request from the reloaded page can still supersede the
+  // old scan without sharing cancellation state with an unrelated tab.
+  var stagePreflightSeq = stagePreflightClientState.seq;
 
   function newPreflightId() {
     if (window.crypto && typeof window.crypto.randomUUID === 'function') {
@@ -24,8 +26,36 @@
     return Date.now().toString(36) + '-' + Math.random().toString(36).slice(2);
   }
 
+  function loadPreflightClientState() {
+    try {
+      var stored = JSON.parse(window.sessionStorage.getItem(stagePreflightStorageKey));
+      if (
+        stored && typeof stored.id === 'string' && stored.id &&
+        Number.isSafeInteger(stored.seq) && stored.seq >= 0
+      ) {
+        return stored;
+      }
+    } catch (_error) {
+      // Storage can be disabled by browser privacy settings. The in-memory
+      // state below still preserves normal same-page supersession.
+    }
+    var state = {id: newPreflightId(), seq: 0};
+    persistPreflightClientState(state);
+    return state;
+  }
+
+  function persistPreflightClientState(state) {
+    try {
+      window.sessionStorage.setItem(stagePreflightStorageKey, JSON.stringify(state));
+    } catch (_error) {
+      // Best effort: blocked or full storage should not prevent preflighting.
+    }
+  }
+
   function newPreflightSeq() {
     stagePreflightSeq += 1;
+    stagePreflightClientState.seq = stagePreflightSeq;
+    persistPreflightClientState(stagePreflightClientState);
     return stagePreflightSeq;
   }
 

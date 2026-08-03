@@ -162,6 +162,29 @@ def test_walk_entries_cancels_after_root_stat_before_scandir(tmp_path, monkeypat
         )
 
 
+def test_walk_entries_converts_queued_directory_stat_race(tmp_path, monkeypatch):
+    source = tmp_path / "source"
+    child = source / "child"
+    child.mkdir(parents=True)
+    real_lstat = local_workspace.os.lstat
+    child_stats = 0
+
+    def disappearing_lstat(path):
+        nonlocal child_stats
+        if os.path.normpath(path) == os.path.normpath(child):
+            child_stats += 1
+            if child_stats == 2:
+                raise FileNotFoundError("queued directory disappeared")
+        return real_lstat(path)
+
+    monkeypatch.setattr(local_workspace.os, "lstat", disappearing_lstat)
+
+    with pytest.raises(LocalWorkspaceError, match="Could not read workspace directory"):
+        list(local_workspace._walk_entries(str(source)))
+
+    assert child_stats == 2
+
+
 @pytest.mark.skipif(os.name == "nt", reason="Windows test runners may not permit symlinks")
 def test_source_tree_size_does_not_follow_queued_directory_replaced_by_symlink(
     tmp_path, monkeypatch

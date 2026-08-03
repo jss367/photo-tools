@@ -504,7 +504,10 @@ def _walk_entries(root: str, *, cancel_check=None):
         dirpath, directory_st = pending.pop()
         if cancel_check and cancel_check():
             raise LocalWorkspaceCancelled("Folder scan cancelled")
-        current_st = os.lstat(dirpath)
+        try:
+            current_st = os.lstat(dirpath)
+        except OSError as error:
+            _raise_walk_error(error)
         if cancel_check and cancel_check():
             raise LocalWorkspaceCancelled("Folder scan cancelled")
         if directory_st is not None:

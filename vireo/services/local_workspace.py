@@ -184,7 +184,7 @@ def _validated_tree_entries(source: str, *, cancel_check=None):
         raise LocalWorkspaceError(f"Workspace folder is unavailable: {source}")
 
     try:
-        for rel, full, st in _walk_entries(source):
+        for rel, full, st in _walk_entries(source, cancel_check=cancel_check):
             # Filesystem calls on network volumes may take a long time and
             # cannot be interrupted while the kernel is servicing them. Check
             # immediately after each one returns so an obsolete preflight does
@@ -467,13 +467,20 @@ def _dest_case_insensitive(local_base: Path) -> bool:
     return destination_case_insensitive(base)
 
 
-def _walk_entries(root: str):
+def _walk_entries(root: str, *, cancel_check=None):
     """Yield ``(rel, full, lstat)`` for every entry under root.
 
     Directories are included (so callers can recreate structure, including
     empty directories); directory symlinks are yielded as link entries and
     not descended into. Each entry is stat'ed exactly once here — callers
     classify via the yielded stat instead of re-statting.
+
+    ``cancel_check`` is checked before every ``os.lstat`` on a child entry.
+    ``os.walk`` batches the per-child ``os.lstat`` calls (via the inner
+    ``for dirname in dirnames`` classification), and on a slow network volume
+    those blocking calls are what a cancellation actually needs to interrupt
+    — waiting for the whole batch before a caller-level check would let a
+    cancelled scan continue through every child of a large directory.
     """
     for dirpath, dirnames, filenames in os.walk(root, followlinks=False, onerror=_raise_walk_error):
         rel_dir = _relative(dirpath, root)
@@ -481,6 +488,8 @@ def _walk_entries(root: str):
             yield rel_dir, dirpath, os.lstat(dirpath)
         kept = []
         for dirname in dirnames:
+            if cancel_check and cancel_check():
+                raise LocalWorkspaceCancelled("Folder scan cancelled")
             full = os.path.join(dirpath, dirname)
             st = os.lstat(full)
             if stat.S_ISLNK(st.st_mode):
@@ -489,6 +498,8 @@ def _walk_entries(root: str):
                 kept.append(dirname)
         dirnames[:] = kept
         for filename in filenames:
+            if cancel_check and cancel_check():
+                raise LocalWorkspaceCancelled("Folder scan cancelled")
             full = os.path.join(dirpath, filename)
             yield rel_dir and os.path.join(rel_dir, filename) or filename, full, os.lstat(full)
 

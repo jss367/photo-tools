@@ -844,6 +844,84 @@ def test_preflight_cancel_stops_destination_probing(tmp_path, monkeypatch):
     assert len(probe_paths) == 1
 
 
+def test_older_seq_arrival_cannot_supersede_newer_registered_scan(tmp_path, monkeypatch):
+    """A delayed request with an older ``preflight_seq`` must not cancel a
+    newer scan that already registered.
+
+    Waitress can deliver requests out of order (an older one waited longer for
+    a free worker, or its cancel signal was dropped). Without the ordering
+    token the older arrival unconditionally cancels the newer scan and takes
+    over as active — a subsequent cancel for the older id then cancels it
+    too, and the client is stuck at 409 while its latest inputs never get a
+    size back."""
+    from services.local_folder import LocalWorkspaceCancelled
+
+    newer_started = threading.Event()
+    release_newer = threading.Event()
+    calls_lock = threading.Lock()
+    calls = 0
+
+    def fake_preflight(
+        _db, _root_ids, _vireo_dir, *, destination_bases=None, cancel_check=None
+    ):
+        # A stale arrival rejected by the ordering token gets a pre-set
+        # ``cancel_check``; short-circuit here rather than doing any scan
+        # work so the test can distinguish rejection from a full scan.
+        if cancel_check and cancel_check():
+            raise LocalWorkspaceCancelled("stale seq arrival was rejected")
+        nonlocal calls
+        with calls_lock:
+            calls += 1
+            call_number = calls
+        assert call_number == 1, "older seq arrival should not run a scan"
+        newer_started.set()
+        assert release_newer.wait(5), "test did not release the newer preflight"
+        if cancel_check and cancel_check():
+            raise LocalWorkspaceCancelled("newer was superseded")
+        return {"folder_count": 1, "total_bytes": 999, "can_copy": True,
+                "folders": [], "volumes": []}
+
+    app, folder_id = _cancellable_preflight_app(
+        tmp_path, monkeypatch, fake_preflight
+    )
+    newer_result = {}
+
+    def request_newer():
+        with app.test_client() as client:
+            newer_result["response"] = client.post(
+                "/api/workspaces/active/local-folders/preflight",
+                json={
+                    "folder_ids": [folder_id],
+                    "preflight_id": "newer",
+                    "preflight_seq": 5,
+                },
+            )
+
+    thread = threading.Thread(target=request_newer)
+    thread.start()
+    assert newer_started.wait(5), "newer preflight did not start"
+    with app.test_client() as client:
+        older = client.post(
+            "/api/workspaces/active/local-folders/preflight",
+            json={
+                "folder_ids": [folder_id],
+                "preflight_id": "older",
+                "preflight_seq": 3,
+            },
+        )
+    release_newer.set()
+    thread.join(5)
+
+    assert not thread.is_alive()
+    # Older arrival is rejected with the same 409 the client already knows
+    # about; it never touched active_preflights.
+    assert older.status_code == 409
+    assert older.get_json()["error"] == "Folder size calculation was cancelled"
+    # Newer scan ran to completion — was not cancelled by the stale arrival.
+    assert newer_result["response"].status_code == 200
+    assert newer_result["response"].get_json()["total_bytes"] == 999
+
+
 def test_new_preflight_supersedes_old_scan(tmp_path, monkeypatch):
     from services.local_folder import LocalWorkspaceCancelled
 

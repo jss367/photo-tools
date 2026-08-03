@@ -41,8 +41,12 @@ def create_local_folder_blueprint(
     active_preflights = {}
     cancelled_preflight_ids = {}
     max_cancelled_preflight_ids = 256
+    # Highest client-supplied ordering token seen per workspace. Registered
+    # under ``preflight_lock``; any request that arrives with a token less than
+    # or equal to this is rejected before it can supersede a newer scan.
+    last_preflight_seq: dict[int, int] = {}
 
-    def _begin_preflight(workspace_id, preflight_id):
+    def _begin_preflight(workspace_id, preflight_id, preflight_seq=None):
         cancelled = threading.Event()
         with preflight_lock:
             cancellation_key = (int(workspace_id), preflight_id)
@@ -53,6 +57,21 @@ def create_local_folder_blueprint(
                 cancelled_preflight_ids.pop(cancellation_key, None)
                 cancelled.set()
                 return cancelled
+            # Client-provided monotonic ordering token. Waitress can deliver
+            # an older request after a newer one has already registered (the
+            # older one waited longer for a free worker, or its cancel signal
+            # never arrived). Without this check the older request would
+            # unconditionally cancel the newer scan and take over as active;
+            # a subsequent cancel for the older id then cancels it too, and
+            # the client is stuck at 409 while the user's latest inputs never
+            # get a size back. Reject the stale arrival instead.
+            if preflight_seq is not None:
+                ws_key = int(workspace_id)
+                last_seen = last_preflight_seq.get(ws_key)
+                if last_seen is not None and preflight_seq <= last_seen:
+                    cancelled.set()
+                    return cancelled
+                last_preflight_seq[ws_key] = preflight_seq
             previous = active_preflights.get(int(workspace_id))
             if previous is not None:
                 previous[1].set()
@@ -310,13 +329,22 @@ def create_local_folder_blueprint(
         preflight_id = body.get("preflight_id")
         if not isinstance(preflight_id, str) or not preflight_id.strip():
             preflight_id = None
+        raw_seq = body.get("preflight_seq")
+        preflight_seq: int | None
+        if isinstance(raw_seq, bool):
+            preflight_seq = None
+        else:
+            try:
+                preflight_seq = int(raw_seq) if raw_seq is not None else None
+            except (TypeError, ValueError):
+                preflight_seq = None
         # Register cancellation state before probing destinations so a concurrent
         # cancel request can flip the shared Event between filesystem calls,
         # rather than being reduced to a tombstone that only takes effect once
         # every destination volume has finished responding to
         # ``destination_case_insensitive`` — which can hang for seconds each on
         # an unavailable network mount.
-        cancelled = _begin_preflight(workspace_id, preflight_id)
+        cancelled = _begin_preflight(workspace_id, preflight_id, preflight_seq)
         try:
             try:
                 destination_bases, destination_error = _stage_destinations(

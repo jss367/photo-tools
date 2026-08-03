@@ -10,12 +10,22 @@
   var stagePreflightSignature = null;
   var stagePreflightAbort = null;
   var stagePreflightId = null;
+  // Client-side monotonic counter shared with the server as ``preflight_seq``.
+  // The server tracks the highest seq it has ever registered per workspace so
+  // that a delayed obsolete request (older seq) cannot supersede a newer scan
+  // that already registered — even when its cancel signal was never delivered.
+  var stagePreflightSeq = 0;
 
   function newPreflightId() {
     if (window.crypto && typeof window.crypto.randomUUID === 'function') {
       return window.crypto.randomUUID();
     }
     return Date.now().toString(36) + '-' + Math.random().toString(36).slice(2);
+  }
+
+  function newPreflightSeq() {
+    stagePreflightSeq += 1;
+    return stagePreflightSeq;
   }
 
   function cancelStagePreflight(notifyServer) {
@@ -149,6 +159,7 @@
     }
     var controller = new AbortController();
     var preflightId = newPreflightId();
+    var preflightSeq = newPreflightSeq();
     stagePreflightAbort = controller;
     stagePreflightId = preflightId;
     if (capacity) {
@@ -159,7 +170,10 @@
       var result = await Vireo.api.json('/api/workspaces/active/local-folders/preflight', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify(Object.assign({}, request.body, {preflight_id: preflightId})),
+        body: JSON.stringify(Object.assign({}, request.body, {
+          preflight_id: preflightId,
+          preflight_seq: preflightSeq
+        })),
         signal: controller.signal
       }, {toast: false});
       if (generation !== stagePreflightGeneration || !pendingStageItems.length) return;

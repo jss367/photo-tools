@@ -77,7 +77,7 @@ def test_source_tree_size_converts_traversal_race_to_workspace_error(
     source = tmp_path / "source"
     source.mkdir()
 
-    def raced_walk(_root):
+    def raced_walk(_root, *, cancel_check=None):
         raise FileNotFoundError("entry disappeared during traversal")
         yield
 
@@ -154,8 +154,8 @@ def test_staging_temp_file_cannot_overwrite_real_sibling(local_workspace_env, mo
     base.write_bytes(b"base contents")
     real_walk_entries = local_workspace._walk_entries
 
-    def sibling_first(root):
-        yield from sorted(real_walk_entries(root), reverse=True)
+    def sibling_first(root, *, cancel_check=None):
+        yield from sorted(real_walk_entries(root, cancel_check=cancel_check), reverse=True)
 
     monkeypatch.setattr(local_workspace, "_walk_entries", sibling_first)
     stage_workspace(env["db"], env["workspace_id"], str(env["vireo_dir"]))
@@ -225,8 +225,8 @@ def test_stage_rejects_source_swapped_to_symlink_before_copy(local_workspace_env
     real_walk_entries = local_workspace._walk_entries
     swapped = {"done": False}
 
-    def swap_after_walk(root):
-        for entry in real_walk_entries(root):
+    def swap_after_walk(root, *, cancel_check=None):
+        for entry in real_walk_entries(root, cancel_check=cancel_check):
             rel, full, _st = entry
             yield entry
             if not swapped["done"] and rel == os.path.join("2026", "bird.jpg"):
@@ -337,8 +337,8 @@ def test_stage_rejects_symlink_target_swapped_after_walk(local_workspace_env, tm
     real_walk_entries = local_workspace._walk_entries
     swapped = {"done": False}
 
-    def swap_after_walk(root):
-        for entry in real_walk_entries(root):
+    def swap_after_walk(root, *, cancel_check=None):
+        for entry in real_walk_entries(root, cancel_check=cancel_check):
             rel, full, _st = entry
             yield entry
             if not swapped["done"] and rel == "safe-link.jpg":

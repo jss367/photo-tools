@@ -136,6 +136,63 @@ def test_source_tree_size_cancels_between_scandir_entries(tmp_path, monkeypatch)
     assert enumerated == 2
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Windows test runners may not permit symlinks")
+def test_source_tree_size_does_not_follow_queued_directory_replaced_by_symlink(
+    tmp_path, monkeypatch
+):
+    source = tmp_path / "source"
+    child = source / "child"
+    child.mkdir(parents=True)
+    (child / "inside.raw").write_bytes(b"inside")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "outside.raw").write_bytes(b"outside")
+
+    real_scandir = local_workspace.os.scandir
+    swapped = False
+
+    class SwapOnExhaustion:
+        def __init__(self, entries):
+            self.entries = entries
+
+        def __enter__(self):
+            self.entries.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self.entries.__exit__(*args)
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            nonlocal swapped
+            try:
+                return next(self.entries)
+            except StopIteration:
+                if not swapped:
+                    shutil.rmtree(child)
+                    os.symlink(outside, child)
+                    swapped = True
+                raise
+
+    def swapping_scandir(path):
+        entries = real_scandir(path)
+        if (
+            not isinstance(path, int)
+            and os.path.normpath(path) == os.path.normpath(source)
+        ):
+            return SwapOnExhaustion(entries)
+        return entries
+
+    monkeypatch.setattr(local_workspace.os, "scandir", swapping_scandir)
+
+    with pytest.raises(LocalWorkspaceError, match="Symlink escapes"):
+        local_workspace.source_tree_size(str(source))
+
+    assert swapped
+
+
 @pytest.mark.parametrize(
     "probe",
     [

@@ -491,8 +491,8 @@ def _walk_entries(root: str, *, cancel_check=None):
 
     Directories are included (so callers can recreate structure, including
     empty directories); directory symlinks are yielded as link entries and
-    not descended into. Each entry is stat'ed exactly once here — callers
-    classify via the yielded stat instead of re-statting.
+    not descended into. Child directories are re-stat'ed immediately before
+    descent so a symlink replacement cannot redirect traversal outside root.
 
     ``cancel_check`` is checked between ``scandir`` entries and before every
     ``os.lstat``. On a slow network volume, either operation may block, but the
@@ -502,8 +502,17 @@ def _walk_entries(root: str, *, cancel_check=None):
     pending = [(root, None)]
     while pending:
         dirpath, directory_st = pending.pop()
+        if cancel_check and cancel_check():
+            raise LocalWorkspaceCancelled("Folder scan cancelled")
+        current_st = os.lstat(dirpath)
         if directory_st is not None:
-            yield _relative(dirpath, root), dirpath, directory_st
+            yield _relative(dirpath, root), dirpath, current_st
+        elif not stat.S_ISDIR(current_st.st_mode):
+            raise LocalWorkspaceError(
+                f"Workspace root changed during directory scan: {root}"
+            )
+        if not stat.S_ISDIR(current_st.st_mode):
+            continue
         child_directories = []
         try:
             entries = os.scandir(dirpath)

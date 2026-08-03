@@ -52,6 +52,7 @@ def create_local_folder_blueprint(
     ):
         cancelled = threading.Event()
         with preflight_lock:
+            active_key = (int(workspace_id), preflight_client_id)
             cancellation_key = (int(workspace_id), preflight_id)
             # Client-provided monotonic ordering token. Waitress can deliver
             # an older request after a newer one has already registered (the
@@ -81,29 +82,28 @@ def create_local_folder_blueprint(
                 # request, stop it too; the dismissed page no longer needs
                 # either scan. Do not disrupt a scan from another browser page.
                 cancelled_preflight_ids.pop(cancellation_key, None)
-                previous = active_preflights.get(int(workspace_id))
-                if previous is not None and (
-                    preflight_client_id is None
-                    or previous[2] == preflight_client_id
-                ):
+                previous = active_preflights.get(active_key)
+                if previous is not None:
                     previous[1].set()
                 cancelled.set()
                 return cancelled
-            previous = active_preflights.get(int(workspace_id))
+            previous = active_preflights.get(active_key)
             if previous is not None:
                 previous[1].set()
-            active_preflights[int(workspace_id)] = (
+            active_preflights[active_key] = (
                 preflight_id,
                 cancelled,
-                preflight_client_id,
             )
         return cancelled
 
-    def _finish_preflight(workspace_id, preflight_id, cancelled):
+    def _finish_preflight(
+        workspace_id, preflight_id, preflight_client_id, cancelled
+    ):
         with preflight_lock:
-            current = active_preflights.get(int(workspace_id))
-            if current is not None and current[:2] == (preflight_id, cancelled):
-                active_preflights.pop(int(workspace_id), None)
+            active_key = (int(workspace_id), preflight_client_id)
+            current = active_preflights.get(active_key)
+            if current == (preflight_id, cancelled):
+                active_preflights.pop(active_key, None)
 
     def _cancel_preflight(workspace_id, preflight_id):
         with preflight_lock:
@@ -111,11 +111,11 @@ def create_local_folder_blueprint(
             cancelled_preflight_ids[cancellation_key] = None
             while len(cancelled_preflight_ids) > max_cancelled_preflight_ids:
                 cancelled_preflight_ids.pop(next(iter(cancelled_preflight_ids)))
-            current = active_preflights.get(int(workspace_id))
-            if current is None or current[0] != preflight_id:
-                return False
-            current[1].set()
-            return True
+            for active_key, current in active_preflights.items():
+                if active_key[0] == int(workspace_id) and current[0] == preflight_id:
+                    current[1].set()
+                    return True
+            return False
 
     def _active_context():
         db = get_db()
@@ -406,7 +406,12 @@ def create_local_folder_blueprint(
             except LocalWorkspaceError as exc:
                 return json_error(str(exc), 409)
         finally:
-            _finish_preflight(workspace_id, preflight_id, cancelled)
+            _finish_preflight(
+                workspace_id,
+                preflight_id,
+                preflight_client_id,
+                cancelled,
+            )
         return jsonify(result)
 
     @blueprint.post("/api/workspaces/active/local-folders/preflight/cancel")

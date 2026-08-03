@@ -1044,6 +1044,66 @@ def test_new_browser_client_can_restart_preflight_sequence(tmp_path, monkeypatch
     assert refreshed_page.status_code == 200
 
 
+def test_preflights_from_different_browser_clients_do_not_cancel_each_other(
+    tmp_path, monkeypatch
+):
+    first_started = threading.Event()
+    release_first = threading.Event()
+    calls_lock = threading.Lock()
+    calls = 0
+
+    def fake_preflight(
+        _db, _root_ids, _vireo_dir, *, destination_bases=None, cancel_check=None
+    ):
+        nonlocal calls
+        with calls_lock:
+            calls += 1
+            call_number = calls
+        if call_number == 1:
+            first_started.set()
+            assert release_first.wait(5), "test did not release the first page"
+        assert not (cancel_check and cancel_check())
+        return {"folder_count": 1, "total_bytes": call_number, "can_copy": True,
+                "folders": [], "volumes": []}
+
+    app, folder_id = _cancellable_preflight_app(
+        tmp_path, monkeypatch, fake_preflight
+    )
+    first_result = {}
+
+    def request_first_page():
+        with app.test_client() as client:
+            first_result["response"] = client.post(
+                "/api/workspaces/active/local-folders/preflight",
+                json={
+                    "folder_ids": [folder_id],
+                    "preflight_id": "first-page",
+                    "preflight_client_id": "browser-one",
+                    "preflight_seq": 1,
+                },
+            )
+
+    thread = threading.Thread(target=request_first_page)
+    thread.start()
+    assert first_started.wait(5), "first page preflight did not start"
+    with app.test_client() as client:
+        second = client.post(
+            "/api/workspaces/active/local-folders/preflight",
+            json={
+                "folder_ids": [folder_id],
+                "preflight_id": "second-page",
+                "preflight_client_id": "browser-two",
+                "preflight_seq": 1,
+            },
+        )
+    release_first.set()
+    thread.join(5)
+
+    assert not thread.is_alive()
+    assert second.status_code == 200
+    assert first_result["response"].status_code == 200
+
+
 def test_preflight_sequence_cache_is_bounded(tmp_path, monkeypatch):
     def fake_preflight(
         _db, _root_ids, _vireo_dir, *, destination_bases=None, cancel_check=None

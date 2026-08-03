@@ -22,6 +22,35 @@
     return label + ' is ' + status + '. Work Locally will be available when it finishes or is cancelled.';
   }
 
+  function blockerSignature(job) {
+    if (!job) return '';
+    return String(job.id) + ':' + String(job.status || '');
+  }
+
+  async function refreshBlockingJob() {
+    // Poll only the lightweight blocker endpoint. The full /local-folders
+    // payload walks every managed local tree, so hitting it on a keep-alive
+    // timer while nothing is happening would keep the disk busy for large
+    // libraries. Trigger a full load() only when the blocker state actually
+    // changes so the panel re-renders enabled/disabled controls.
+    if (!data) return;
+    try {
+      var payload = await Vireo.api.json(
+        '/api/workspaces/active/local-folders/blocker', {}, {toast: false}
+      );
+      var previous = blockerSignature(data.blocking_job);
+      var next = blockerSignature(payload.blocking_job);
+      if (previous !== next) {
+        await load();
+      }
+    } catch (_error) {
+      // Swallow — the next tick will retry, and any hard error already
+      // surfaces through the full-load code path.
+    } finally {
+      scheduleBlockingJobRefresh();
+    }
+  }
+
   function scheduleBlockingJobRefresh() {
     if (blockingJobTimer) clearTimeout(blockingJobTimer);
     blockingJobTimer = null;
@@ -32,7 +61,7 @@
     var delay = data.blocking_job ? 3000 : 15000;
     blockingJobTimer = setTimeout(function() {
       blockingJobTimer = null;
-      load();
+      refreshBlockingJob();
     }, delay);
   }
 
@@ -453,6 +482,10 @@
     if (actionInFlight || activeJob) return;
     await load();
     if (activeJob) return;
+    if (data && data.blocking_job) {
+      showToast(blockingJobMessage(), 'warning');
+      return;
+    }
     var items = selectedItems(folderIds, true);
     if (!items.length) return;
     if (items.some(function(item) {
@@ -500,6 +533,10 @@
     if (actionInFlight || activeJob) return;
     await load();
     if (activeJob) return;
+    if (data && data.blocking_job) {
+      showToast(blockingJobMessage(), 'warning');
+      return;
+    }
     var items = selectedItems(folderIds, true);
     if (!items.length) return;
     var affected = new Set();

@@ -201,6 +201,28 @@ def create_local_folder_blueprint(
                     )
         return destination_bases, None
 
+    def _blocking_job_payload(db, workspace_id):
+        blocking_job = _busy_job(db, _active_root_ids(db, workspace_id), workspace_id)
+        if blocking_job is None:
+            return None
+        return {
+            "id": blocking_job["id"],
+            "type": blocking_job["type"],
+            "status": blocking_job["status"],
+        }
+
+    @blueprint.get("/api/workspaces/active/local-folders/blocker")
+    def local_folder_blocker():
+        # The full /local-folders payload recursively walks every managed local
+        # tree to compute a change summary, so polling it every few seconds to
+        # detect newly started jobs keeps the disk busy for large libraries.
+        # This endpoint returns only what the UI needs to enable or disable
+        # Work Locally controls, so it can safely be polled instead.
+        db, workspace_id, error = _active_context()
+        if error:
+            return error
+        return jsonify({"blocking_job": _blocking_job_payload(db, workspace_id)})
+
     @blueprint.get("/api/workspaces/active/local-folders")
     def local_folder_status():
         db, workspace_id, error = _active_context()
@@ -212,16 +234,7 @@ def create_local_folder_blueprint(
             return json_error(str(exc), 409)
         payload["legacy_workspace_session"] = bool(legacy_local_state(db, workspace_id))
 
-        blocking_job = _busy_job(db, _active_root_ids(db, workspace_id), workspace_id)
-        payload["blocking_job"] = (
-            {
-                "id": blocking_job["id"],
-                "type": blocking_job["type"],
-                "status": blocking_job["status"],
-            }
-            if blocking_job is not None
-            else None
-        )
+        payload["blocking_job"] = _blocking_job_payload(db, workspace_id)
 
         jobs = []
         active_roots = set(_active_root_ids(db, workspace_id))

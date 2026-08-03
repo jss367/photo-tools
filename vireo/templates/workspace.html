@@ -225,7 +225,9 @@ async function loadWsFolders() {
             html += '<span style="font-size:11px;color:var(--warning);">Copying...</span>';
           } else if (local.state === 'recovery' && local.recovery_kind !== 'sync') {
             html += '<span style="font-size:11px;color:var(--warning);">Local copy needs cleanup</span>';
-            html += '<button onclick="vireoLocalFolders.discard(' + f.id + ')" class="btn btn-secondary" style="padding:4px 9px;font-size:11px;color:var(--danger);">Clean Up</button>';
+            html += '<button onclick="vireoLocalFolders.discard(' + f.id + ')" class="btn btn-secondary"' +
+              (localBlocked ? ' disabled title="' + escapeAttr(localBlockedMessage) + '"' : '') +
+              ' style="padding:4px 9px;font-size:11px;color:var(--danger);' + (localBlocked ? 'opacity:.5;' : '') + '">Clean Up</button>';
           }
         }
         html += '<button onclick="removeFolderFromWs(' + ws.id + ', ' + f.id + ')" style="background:none;border:none;color:var(--danger);cursor:pointer;font-size:16px;" title="Remove from workspace">&times;</button>';

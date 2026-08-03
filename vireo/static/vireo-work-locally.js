@@ -29,9 +29,9 @@
   function loadPreflightClientState() {
     // sessionStorage survives reloads, but browsers may copy it when a tab is
     // duplicated or opened from another tab. Only reuse the stored identity
-    // for an actual reload; a copied browsing context reports a normal
-    // navigation and must get its own server-side cancellation slot.
-    if (isReloadNavigation()) {
+    // for a reload or same-tab history restoration; a copied browsing context
+    // reports a normal navigation and must get its own cancellation slot.
+    if (isRestoredNavigation()) {
       try {
         var stored = JSON.parse(window.sessionStorage.getItem(stagePreflightStorageKey));
         if (
@@ -50,16 +50,18 @@
     return state;
   }
 
-  function isReloadNavigation() {
+  function isRestoredNavigation() {
     try {
       if (window.performance && typeof window.performance.getEntriesByType === 'function') {
         var navigations = window.performance.getEntriesByType('navigation');
-        if (navigations.length) return navigations[0].type === 'reload';
+        if (navigations.length) {
+          return ['reload', 'back_forward'].indexOf(navigations[0].type) >= 0;
+        }
       }
       // Navigation Timing Level 1 fallback for older WebKit versions.
       return Boolean(
         window.performance && window.performance.navigation &&
-        window.performance.navigation.type === 1
+        [1, 2].indexOf(window.performance.navigation.type) >= 0
       );
     } catch (_error) {
       return false;

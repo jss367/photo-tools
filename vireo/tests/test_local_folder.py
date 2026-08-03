@@ -127,7 +127,7 @@ def test_local_copy_preflight_aggregates_folders_on_the_same_disk(
     monkeypatch.setattr(
         service,
         "destination_disk_space",
-        lambda _path: {
+        lambda _path, **_kwargs: {
             "total_bytes": 100_000,
             "free_bytes": 18_000,
             "reserve_bytes": 2_000,
@@ -571,7 +571,9 @@ def test_stage_endpoint_rejects_case_folded_destination_collisions(
     db.close()
 
     monkeypatch.setattr(
-        local_folder_web, "destination_case_insensitive", lambda _path: True
+        local_folder_web,
+        "destination_case_insensitive",
+        lambda _path, **_kwargs: True,
     )
     app = create_app(db_path, thumb_cache_dir=str(thumbs))
     app.config["TESTING"] = True
@@ -613,7 +615,7 @@ def test_preflight_endpoint_returns_destination_probe_error(tmp_path, monkeypatc
     db.set_active_workspace(workspace_id)
     db.close()
 
-    def fail_probe(_path):
+    def fail_probe(_path, **_kwargs):
         raise LocalWorkspaceError("Could not inspect destination filesystem")
 
     monkeypatch.setattr(
@@ -777,7 +779,7 @@ def test_preflight_cancel_stops_destination_probing(tmp_path, monkeypatch):
     release_probe = threading.Event()
     probe_paths = []
 
-    def slow_case_insensitive(final_path):
+    def slow_case_insensitive(final_path, **_kwargs):
         probe_paths.append(final_path)
         if len(probe_paths) == 1:
             first_probe_started.set()

@@ -237,7 +237,9 @@ def create_local_folder_blueprint(
                     "Preflight cancelled during destination validation"
                 )
             try:
-                case_insensitive = destination_case_insensitive(final_path)
+                case_insensitive = destination_case_insensitive(
+                    final_path, cancel_check=cancel_check
+                )
             except LocalWorkspaceError as exc:
                 return None, json_error(str(exc), 409)
             final_destinations.append(

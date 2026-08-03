@@ -101,7 +101,7 @@ def local_space_reserve(total_bytes: int) -> int:
     return min(LOCAL_MAX_RESERVE_BYTES, max(LOCAL_RESERVE_BYTES, proportional))
 
 
-def destination_disk_space(path: str | Path) -> dict:
+def destination_disk_space(path: str | Path, *, cancel_check=None) -> dict:
     """Return capacity details for the volume containing ``path``.
 
     Destination folders commonly do not exist yet. Walk up to the closest
@@ -110,13 +110,21 @@ def destination_disk_space(path: str | Path) -> dict:
     """
     requested = Path(path).expanduser()
     probe = requested
-    while not os.path.lexists(probe):
+    while True:
+        if cancel_check and cancel_check():
+            raise LocalWorkspaceCancelled("Folder scan cancelled")
+        if os.path.lexists(probe):
+            break
         parent = probe.parent
         if parent == probe:
             break
         probe = parent
+    if cancel_check and cancel_check():
+        raise LocalWorkspaceCancelled("Folder scan cancelled")
     try:
         usage = shutil.disk_usage(probe)
+        if cancel_check and cancel_check():
+            raise LocalWorkspaceCancelled("Folder scan cancelled")
         device = os.stat(probe).st_dev
     except OSError as exc:
         raise LocalWorkspaceError(
@@ -131,14 +139,20 @@ def destination_disk_space(path: str | Path) -> dict:
     }
 
 
-def destination_case_insensitive(path: str | Path) -> bool:
+def destination_case_insensitive(path: str | Path, *, cancel_check=None) -> bool:
     """Probe whether the existing volume containing ``path`` folds case."""
     base = Path(path).expanduser()
-    while not base.is_dir():
+    while True:
+        if cancel_check and cancel_check():
+            raise LocalWorkspaceCancelled("Folder scan cancelled")
+        if base.is_dir():
+            break
         parent = base.parent
         if parent == base:
             break
         base = parent
+    if cancel_check and cancel_check():
+        raise LocalWorkspaceCancelled("Folder scan cancelled")
     try:
         fd, probe = tempfile.mkstemp(prefix="VireoCaseProbe-", dir=str(base))
     except OSError as exc:
@@ -147,8 +161,13 @@ def destination_case_insensitive(path: str | Path) -> bool:
         ) from exc
     os.close(fd)
     try:
+        if cancel_check and cancel_check():
+            raise LocalWorkspaceCancelled("Folder scan cancelled")
         lower = os.path.join(os.path.dirname(probe), os.path.basename(probe).lower())
-        return lower != probe and os.path.exists(lower)
+        result = lower != probe and os.path.exists(lower)
+        if cancel_check and cancel_check():
+            raise LocalWorkspaceCancelled("Folder scan cancelled")
+        return result
     finally:
         with suppress(FileNotFoundError):
             os.unlink(probe)

@@ -112,7 +112,7 @@ def local_copy_preflight(
         )
         if cancel_check and cancel_check():
             raise LocalWorkspaceCancelled("Folder scan cancelled")
-        space = destination_disk_space(local_path)
+        space = destination_disk_space(local_path, cancel_check=cancel_check)
         device = int(space["device"])
         volume = volumes_by_device.setdefault(
             device,

@@ -136,6 +136,28 @@ def test_source_tree_size_cancels_between_scandir_entries(tmp_path, monkeypatch)
     assert enumerated == 2
 
 
+@pytest.mark.parametrize(
+    "probe",
+    [
+        local_workspace.destination_disk_space,
+        local_workspace.destination_case_insensitive,
+    ],
+)
+def test_destination_probe_cancels_between_missing_ancestors(tmp_path, probe):
+    checks = 0
+
+    def cancel_check():
+        nonlocal checks
+        checks += 1
+        return checks == 2
+
+    destination = tmp_path / "missing" / "deep" / "photos"
+    with pytest.raises(LocalWorkspaceCancelled, match="Folder scan cancelled"):
+        probe(destination, cancel_check=cancel_check)
+
+    assert checks == 2
+
+
 def test_stage_modify_and_sync_back(local_workspace_env):
     env = local_workspace_env
     result = stage_workspace(env["db"], env["workspace_id"], str(env["vireo_dir"]))

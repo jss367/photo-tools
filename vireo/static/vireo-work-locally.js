@@ -810,6 +810,10 @@
     });
   }
 
+  window.addEventListener('pagehide', function() {
+    cancelStagePreflight(true);
+  });
+
   async function stageFromAnywhere(folderId) {
     if (!data) await load();
     if (activeJob || (data && data.legacy_workspace_session)) {

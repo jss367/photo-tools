@@ -1303,6 +1303,78 @@ def test_new_preflight_supersedes_old_scan(tmp_path, monkeypatch):
     )
 
 
+def test_reloaded_page_supersedes_obsolete_scan_under_same_client_id(
+    tmp_path, monkeypatch
+):
+    """A page reload that reuses its persisted client id (as the browser now
+    does via ``sessionStorage``) has to supersede the obsolete scan still
+    running under that same key. A different client id would create a fresh
+    ``(workspace_id, preflight_client_id)`` slot and let the old scan keep
+    walking the filesystem in parallel with the reloaded page's scan."""
+    from services.local_folder import LocalWorkspaceCancelled
+
+    first_started = threading.Event()
+    release_first = threading.Event()
+    calls_lock = threading.Lock()
+    calls = 0
+
+    def fake_preflight(
+        _db, _root_ids, _vireo_dir, *, destination_bases=None, cancel_check=None
+    ):
+        nonlocal calls
+        with calls_lock:
+            calls += 1
+            call_number = calls
+        if call_number == 1:
+            first_started.set()
+            assert release_first.wait(5), "test did not release the first preflight"
+            if cancel_check and cancel_check():
+                raise LocalWorkspaceCancelled("superseded by reload")
+        return {"folder_count": 1, "total_bytes": call_number, "can_copy": True,
+                "folders": [], "volumes": []}
+
+    app, folder_id = _cancellable_preflight_app(
+        tmp_path, monkeypatch, fake_preflight
+    )
+    original_result = {}
+
+    def request_original():
+        with app.test_client() as client:
+            original_result["response"] = client.post(
+                "/api/workspaces/active/local-folders/preflight",
+                json={
+                    "folder_ids": [folder_id],
+                    "preflight_id": "original-page",
+                    "preflight_client_id": "browser-persisted",
+                    "preflight_seq": 5,
+                },
+            )
+
+    thread = threading.Thread(target=request_original)
+    thread.start()
+    assert first_started.wait(5), "original preflight did not start"
+    with app.test_client() as client:
+        reloaded = client.post(
+            "/api/workspaces/active/local-folders/preflight",
+            json={
+                "folder_ids": [folder_id],
+                "preflight_id": "reloaded-page",
+                "preflight_client_id": "browser-persisted",
+                "preflight_seq": 6,
+            },
+        )
+    release_first.set()
+    thread.join(5)
+
+    assert not thread.is_alive()
+    assert reloaded.status_code == 200
+    assert reloaded.get_json()["total_bytes"] == 2
+    assert original_result["response"].status_code == 409
+    assert original_result["response"].get_json()["error"] == (
+        "Folder size calculation was cancelled"
+    )
+
+
 def test_local_root_under_folder_finds_descendant_session(tmp_path):
     db = Database(str(tmp_path / "vireo.db"))
     workspace_id = db.create_workspace("Ancestor")

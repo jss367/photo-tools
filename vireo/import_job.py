@@ -1509,7 +1509,13 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
     def _stop_requested():
         # Threaded through every destination-side hash read so a Stop can
         # interrupt a read blocked on a dead mount (see _hash_dest_file).
-        return runner.is_cancelled(job["id"])
+        # Nonblocking probe — ``is_cancelled`` would park in
+        # ``wait_if_paused`` for a pausable import, freezing the watchdog
+        # loop itself and stopping the 120s stall timer from running while
+        # the daemon reader can keep touching the archive even though the
+        # UI says the job is paused. Mirrors the rsync watchdog's use of
+        # ``cancellation_requested`` for the same reason.
+        return runner.cancellation_requested(job["id"])
 
     wc_source_paths = {}
     wc_dest_folders = set()
@@ -3275,7 +3281,13 @@ def run_import_job(job, runner, db_path, workspace_id, params):
     def _stop_requested():
         # Threaded through every destination-side hash read so a Stop can
         # interrupt a read blocked on a dead mount (see _hash_dest_file).
-        return runner.is_cancelled(job["id"])
+        # Nonblocking probe — ``is_cancelled`` would park in
+        # ``wait_if_paused`` for a pausable import, freezing the watchdog
+        # loop itself and stopping the 120s stall timer from running while
+        # the daemon reader can keep touching the archive even though the
+        # UI says the job is paused. Mirrors the rsync watchdog's use of
+        # ``cancellation_requested`` for the same reason.
+        return runner.cancellation_requested(job["id"])
 
     # Working-copy extraction is DEFERRED to the end of the whole import
     # run (not per-batch). Rationale: a folder that receives more than

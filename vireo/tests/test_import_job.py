@@ -10408,3 +10408,158 @@ def test_local_import_cancel_skips_post_loop_mount_probe(
         f"post-loop mount probe was not suppressed on cancel "
         f"({probe_calls['count']} calls)"
     )
+
+
+# --------------------------------------------------------------------------
+# The ``_stop_requested`` closures threaded into ``_hash_dest_file`` supervise
+# the watchdog thread that bounds every mount-side hash read. Import jobs are
+# pausable, so ``runner.is_cancelled()`` parks inside ``wait_if_paused`` when
+# a Pause is pending — wiring the watchdog to that pause-aware method would
+# freeze the watchdog loop itself, stopping the 120s stall timer from running
+# while the daemon reader can keep touching the archive at kernel-read speed.
+# Mirrors the rsync watchdog's use of ``cancellation_requested`` for the same
+# reason (see ``test_remote_import_rsync_watchdog_does_not_block_on_pause``).
+# --------------------------------------------------------------------------
+
+
+class _PauseWhileHashingRunner(FakeRunner):
+    """FakeRunner with real JobRunner-shaped pause semantics: is_cancelled
+    blocks during a pending Pause; cancellation_requested does not.
+
+    Raises on the blocking call so a broken closure fails the test loudly
+    instead of hanging the worker thread past its join timeout.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.paused_ids = set()
+
+    def is_cancelled(self, job_id):
+        if job_id in self.paused_ids and job_id not in self.cancelled_ids:
+            raise AssertionError(
+                "hash watchdog called the pause-aware is_cancelled and "
+                "would have blocked the stall/cancel watchdog thread "
+                "during Pause"
+            )
+        return job_id in self.cancelled_ids
+
+    def cancellation_requested(self, job_id):
+        return job_id in self.cancelled_ids
+
+
+def test_local_import_hash_watchdog_does_not_block_on_pause(
+        tmp_path, monkeypatch):
+    """Local-path duplicate-gate: the ``_stop_requested`` closure threaded
+    into ``_hash_dest_file`` must probe cancellation without parking in
+    ``wait_if_paused``. Without the fix, a Pause during a twin hash would
+    freeze the watchdog loop itself — stall timer disabled, Stop unobserved
+    — and the daemon reader keeps hitting the archive."""
+    import import_job as _ij
+    from import_dedup import compute_file_hash
+    from import_job import ImportParams, run_import_job
+
+    card = tmp_path / "card"
+    card.mkdir()
+    card_file = card / "IMG_0300.jpg"
+    Image.new("RGB", (16, 16), "red").save(str(card_file))
+
+    archive = tmp_path / "archive"
+    dest_dir = archive / "twins"
+    dest_dir.mkdir(parents=True)
+    # Real byte-identical twin (not a FIFO) — the duplicate gate hashes
+    # it through ``_hash_dest_file`` to confirm the on-disk bytes match.
+    twin_file = dest_dir / "IMG_0300.jpg"
+    Image.new("RGB", (16, 16), "red").save(str(twin_file))
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws_id = db._active_workspace_id
+    _catalog_twin_row(
+        db, dest_dir, "IMG_0300.jpg",
+        os.path.getsize(str(twin_file)),
+        compute_file_hash(str(twin_file)),
+    )
+
+    runner = _PauseWhileHashingRunner()
+    job = _make_job()
+
+    # Mark the job paused for exactly the window in which the watchdog's
+    # ``cancel_check`` runs. Covers both the pre-open probe (line 788) and
+    # every mid-read chunk boundary (line 817).
+    real_hash_dest_file = _ij._hash_dest_file
+
+    def spy_hash_dest_file(path, cancel_check, **kw):
+        runner.paused_ids.add(job["id"])
+        try:
+            return real_hash_dest_file(path, cancel_check, **kw)
+        finally:
+            runner.paused_ids.discard(job["id"])
+
+    monkeypatch.setattr(_ij, "_hash_dest_file", spy_hash_dest_file)
+
+    # No AssertionError ⇒ the closure probed with the nonblocking method.
+    # The twin's real bytes hash cleanly so the import lands the file as
+    # ``skipped_duplicate``.
+    result = run_import_job(
+        job, runner, db_path, ws_id,
+        ImportParams(sources=[str(card)], destination=str(archive)),
+    )
+    assert result["skipped_duplicate"] == 1, result
+    assert result["failed"] == 0, result
+
+
+def test_remote_import_hash_watchdog_does_not_block_on_pause(
+        tmp_path, monkeypatch):
+    """Remote-path mirror of the local hash-watchdog pause test — the
+    remote ``_stop_requested`` closure has to use ``cancellation_requested``
+    too. Each fix lands twice (see PR description)."""
+    import import_job as _ij
+    from import_dedup import compute_file_hash
+    from import_job import ImportParams, run_import_job
+
+    ra = _remote_archive_for(tmp_path)
+    calls = _remote_calls(ra)
+    _install_fake_remote_rsync(monkeypatch, calls, verify=None)
+
+    card = tmp_path / "card"
+    card.mkdir()
+    card_file = card / "IMG_0300.jpg"
+    Image.new("RGB", (16, 16), "red").save(str(card_file))
+
+    dest_dir = Path(ra["mount_base"]) / "2026" / "2026-01-01"
+    dest_dir.mkdir(parents=True)
+    twin_file = dest_dir / "IMG_0300.jpg"
+    Image.new("RGB", (16, 16), "red").save(str(twin_file))
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws_id = db._active_workspace_id
+    _catalog_twin_row(
+        db, dest_dir, "IMG_0300.jpg",
+        os.path.getsize(str(twin_file)),
+        compute_file_hash(str(twin_file)),
+    )
+
+    runner = _PauseWhileHashingRunner()
+    job = _make_job()
+
+    real_hash_dest_file = _ij._hash_dest_file
+
+    def spy_hash_dest_file(path, cancel_check, **kw):
+        runner.paused_ids.add(job["id"])
+        try:
+            return real_hash_dest_file(path, cancel_check, **kw)
+        finally:
+            runner.paused_ids.discard(job["id"])
+
+    monkeypatch.setattr(_ij, "_hash_dest_file", spy_hash_dest_file)
+
+    result = run_import_job(
+        job, runner, db_path, ws_id,
+        ImportParams(
+            sources=[str(card)], destination=ra["mount_base"],
+            remote_target=ra, verify_by_hash=True,
+        ),
+    )
+    assert result["skipped_duplicate"] == 1, result
+    assert result["failed"] == 0, result

@@ -10413,6 +10413,137 @@ def test_local_import_cancel_skips_post_loop_mount_probe(
 
 
 # --------------------------------------------------------------------------
+# On a PLAIN Stop (user-hit cancel observed by ``runner.is_cancelled`` at the
+# top of the source-file loop) the mount is not necessarily wedged; an
+# earlier file in the same batch may have been copied or adopted while the
+# archive was still healthy, and the share could then have detached in the
+# gap between that operation and the Stop. The post-loop mount probe is the
+# last chance to catch that detach — without it ``landed`` / ``dup_skips``
+# stay accepted and the catalog block trusts a local shadow. See PR #1423
+# review (Codex P2 r3716581282 / r3716581283).
+# --------------------------------------------------------------------------
+
+
+def test_local_import_plain_stop_still_runs_post_loop_mount_probe(
+        tmp_path, monkeypatch):
+    """A plain Stop (not a wedged-mount ``DestReadCancelled``) MUST NOT
+    suppress the post-loop mount probe. If the archive detaches after an
+    earlier file in the batch landed, only this probe can roll it back
+    before the catalog block scans a local shadow."""
+    import pipeline_job as _pj
+    from import_job import ImportParams
+
+    # Two files, one batch (same date -> same destination folder). File
+    # one gets to land; file two's loop-top cancel check breaks.
+    card = _make_card(tmp_path, [
+        ("DSC_0100.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+        ("DSC_0101.jpg", datetime(2026, 7, 3, 11, 0, 0), "green"),
+    ])
+    archive = tmp_path / "archive"
+
+    probe_calls = {"count": 0}
+
+    def spy_unmounted(baseline):
+        probe_calls["count"] += 1
+        # Detach only appears on the post-loop probe: pre-batch (call 1)
+        # and per-file file-one (call 2) must return healthy so file one
+        # successfully lands. On the third call — post-loop — return a
+        # truthy mount root so the ``if mount_lost and landed`` rollback
+        # is exercised.
+        if probe_calls["count"] >= 3:
+            return "/Volumes/NAS"
+        return None
+
+    monkeypatch.setattr(_pj, "_unmounted_since_baseline", spy_unmounted)
+
+    runner = CancelOnImportingRunner()
+    db, ws_id, result = _run_import(
+        tmp_path,
+        ImportParams(sources=[str(card)], destination=str(archive)),
+        runner=runner,
+    )
+
+    assert result["cancelled"] is True
+    # Post-loop probe MUST fire on plain Stop: pre-batch (1) + per-file
+    # for the one file that entered the loop body (2) + post-loop (3).
+    # If the gate ever regresses to ``not cancelled``, the third call
+    # disappears and the rollback below silently stops running.
+    assert probe_calls["count"] == 3, (
+        f"expected 3 mount probes (pre-batch + per-file + post-loop) "
+        f"but got {probe_calls['count']}"
+    )
+    # File one was copied but must be rolled back to failed once the
+    # post-loop probe sees the detach — the archive holds a local shadow
+    # of that file, not the real bytes, so booking it as copied would
+    # let ``safe_to_format`` go green over a card that still holds the
+    # only copy.
+    assert result["copied"] == 0, result
+    assert result["failed"] == 1, result
+    assert result["safe_to_format"] is False, result
+    assert any(
+        "detached" in u["reason"] and "local shadow" in u["reason"]
+        for u in result["unsafe_files"]
+    ), result["unsafe_files"]
+
+
+def test_remote_import_plain_stop_still_runs_post_loop_mount_probe(
+        tmp_path, monkeypatch):
+    """Remote-path mirror of the local plain-Stop probe-firing test.
+    An earlier file in the same batch was queued for rsync as a fresh
+    copy; the share then detaches; a plain Stop breaks the loop. The
+    post-loop probe MUST fire so ``to_transfer`` is rolled back rather
+    than trusted."""
+    import pipeline_job as _pj
+    from import_job import ImportParams, run_import_job
+
+    ra = _remote_archive_for(tmp_path)
+    calls = _remote_calls(ra)
+    _install_fake_remote_rsync(monkeypatch, calls, verify=None)
+
+    card = _make_card(tmp_path, [
+        ("DSC_0100.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+        ("DSC_0101.jpg", datetime(2026, 7, 3, 11, 0, 0), "green"),
+    ])
+
+    probe_calls = {"count": 0}
+
+    def spy_unmounted(baseline):
+        probe_calls["count"] += 1
+        if probe_calls["count"] >= 3:
+            return "/Volumes/NAS"
+        return None
+
+    monkeypatch.setattr(_pj, "_unmounted_since_baseline", spy_unmounted)
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws_id = db._active_workspace_id
+    result = run_import_job(
+        _make_job(), CancelOnImportingRunner(), db_path, ws_id,
+        ImportParams(
+            sources=[str(card)], destination=ra["mount_base"],
+            remote_target=ra,
+        ),
+    )
+
+    assert result["cancelled"] is True
+    assert probe_calls["count"] == 3, (
+        f"expected 3 mount probes (pre-batch + per-file + post-loop) "
+        f"but got {probe_calls['count']}"
+    )
+    # File one was queued for rsync; the post-loop probe must roll it
+    # back to failed. rsync itself is gated on ``not cancelled`` and so
+    # never runs (``copied == 0`` alone doesn't prove the probe fired;
+    # the failed-with-detach reason does).
+    assert result["copied"] == 0, result
+    assert result["failed"] == 1, result
+    assert result["safe_to_format"] is False, result
+    assert any(
+        "detached" in u["reason"] for u in result["unsafe_files"]
+    ), result["unsafe_files"]
+
+
+# --------------------------------------------------------------------------
 # The ``_stop_requested`` closures threaded into ``_hash_dest_file`` supervise
 # the watchdog thread that bounds every mount-side hash read. Import jobs are
 # pausable, so ``runner.is_cancelled()`` parks inside ``wait_if_paused`` when

@@ -2164,15 +2164,23 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
         # help: a detach after it races the transfer and catalog scan,
         # which no amount of probing can prevent.
         #
-        # Skip the probe when the per-file loop above already broke on
-        # cancellation. That break ran because Stop interrupted a
-        # destination-side hash on a possibly-dead mount; probing that
-        # same mount here can block for the mount's own timeout and put
-        # the job right back in the long "cancelling" state this fix set
-        # out to avoid. The rsync path below is already gated on
-        # ``cancelled``, so skipping the probe changes no downstream
-        # decision.
-        if not mount_lost and not cancelled:
+        # Skip the probe ONLY when the per-file loop above broke because
+        # a destination-side hash was interrupted mid-read
+        # (``dest_read_cancelled``): that signal means the mount itself
+        # is misbehaving, so probing it here would block for the mount's
+        # own timeout and put the job right back in the long
+        # "cancelling" state this fix set out to avoid.
+        #
+        # Do NOT skip on a plain-Stop ``cancelled`` (observed by
+        # ``runner.is_cancelled`` at the top of the source-file loop).
+        # An earlier file in this same batch may have been accepted as an
+        # adopted/duplicate claim before the user hit Stop, and if the
+        # share detached between that mount read and the Stop the only
+        # remaining chance to notice — and to roll ``dup_skips`` /
+        # ``adopted_paths`` back so the catalog block below doesn't
+        # trust a local shadow — is this probe. See PR #1423 review
+        # (Codex P2 r3716581282).
+        if not mount_lost and not dest_read_cancelled:
             mount_lost = _unmounted_since_baseline(mount_baseline)
 
         # A detach invalidates every accepted "already present" claim in
@@ -4032,15 +4040,23 @@ def run_import_job(job, runner, db_path, workspace_id, params):
         # it does guarantee is that nothing is booked as archived without
         # a mount check on both sides of every copy in the batch.
         #
-        # Skip the probe when the per-file loop above already broke on
-        # cancellation. That break ran because Stop interrupted a
-        # destination-side hash on a possibly-dead mount; probing that
-        # same mount here can block for the mount's own timeout and put
-        # the job right back in the long "cancelling" state this fix set
-        # out to avoid. Nothing is left to copy on a cancelled batch, so
-        # skipping the probe changes no downstream decision. Mirrors the
-        # remote path's gate above.
-        if not mount_lost and not cancelled:
+        # Skip the probe ONLY when the per-file loop above broke because
+        # a destination-side hash was interrupted mid-read
+        # (``dest_read_cancelled``): that signal means the mount itself
+        # is misbehaving, so probing it here would block for the mount's
+        # own timeout and put the job right back in the long
+        # "cancelling" state this fix set out to avoid.
+        #
+        # Do NOT skip on a plain-Stop ``cancelled`` (observed by
+        # ``runner.is_cancelled`` at the top of the source-file loop).
+        # An earlier file in this same batch may have been copied or
+        # adopted before the user hit Stop, and if the archive mount
+        # dropped during that just-finished operation the only remaining
+        # chance to notice — and to roll ``landed`` / ``dup_skips`` back
+        # so the catalog block below doesn't scan a local shadow — is
+        # this probe. Mirrors the remote path's gate above. See PR #1423
+        # review (Codex P2 r3716581283).
+        if not mount_lost and not dest_read_cancelled:
             mount_lost = _unmounted_since_baseline(mount_baseline)
 
         # Accepted duplicate skips rest on a twin that may live in the

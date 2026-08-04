@@ -779,7 +779,7 @@ def remote_verify_files(rsync_bin, src_specs, rsync_target, remote,
 def _run_rsync_streamed(src_path, dest_spec, rsync_flags, total_files,
                         progress_cb, rsync_bin="rsync", extra_args=None,
                         stall_timeout=RSYNC_STALL_TIMEOUT, src_specs=None,
-                        src_specs_dest_is_dir=True):
+                        src_specs_dest_is_dir=True, cancel_check=None):
     """Run rsync, reporting each transferred file through progress_cb.
 
     rsync's ``--out-format=%n`` prints the relative name of every item it
@@ -810,9 +810,15 @@ def _run_rsync_streamed(src_path, dest_spec, rsync_flags, total_files,
     killed. This is a STALL watchdog rather than a total-runtime cap: a
     healthy but slow transfer (e.g. thousands of RAW files over a network
     share) runs for as long as it keeps moving data, while a genuinely wedged
-    rsync — which the job's cancel path can't reach, since it never sees the
-    subprocess — still gets reaped. The clock resets on every transferred
-    file and on stderr activity, so only true silence trips it.
+    rsync still gets reaped. The clock resets on every transferred file and
+    on stderr activity, so only true silence trips it.
+
+    ``cancel_check`` (optional callable -> bool) is the caller's Stop
+    signal: when it returns True the subprocess is killed within a couple
+    of seconds instead of draining the batch. The kill surfaces as an
+    ordinary nonzero returncode with ``timed_out`` False — the caller
+    already holds the cancel flag it passed in, so it can tell a
+    cancellation from a transfer failure without a fourth return value.
 
     stdout is attached to a pty, not a pipe, wherever the platform allows.
     Apple's openrsync block-buffers stdout when it's a pipe, so its
@@ -866,8 +872,14 @@ def _run_rsync_streamed(src_path, dest_spec, rsync_flags, total_files,
 
     def _watchdog():
         # Poll well below stall_timeout so a stall is detected promptly once
-        # the window elapses, without busy-waiting.
-        while not done.wait(min(stall_timeout, 30)):
+        # the window elapses, without busy-waiting. With a cancel_check the
+        # poll drops to 1s: Stop has to kill the subprocess within a couple
+        # of seconds, not at the stall watchdog's leisurely interval.
+        poll = 1.0 if cancel_check is not None else min(stall_timeout, 30)
+        while not done.wait(poll):
+            if cancel_check is not None and cancel_check():
+                proc.kill()
+                return
             if time.monotonic() - last_activity["t"] > stall_timeout:
                 state["timed_out"] = True
                 proc.kill()

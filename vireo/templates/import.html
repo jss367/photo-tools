@@ -3557,8 +3557,18 @@ function watchJob(jobId) {
 }
 
 function renderProgress(data) {
-  document.getElementById('progressPhase').textContent =
+  let phaseText =
     (data.phase || '') + (data.current_file ? ' · ' + data.current_file : '');
+  // Remote imports report the current batch's actual network transfer as
+  // sub-phase progress. Show it next to the prepared-files counter — the
+  // main bar advances while files are merely inspected and queued, so
+  // without this line "200 / 5,523" reads as 200 files safely copied
+  // while the batch is still crossing the network.
+  if (data.phase_total > 0 && data.phase_label) {
+    phaseText += ' · ' + data.phase_label + ' ' +
+      (data.phase_current || 0) + ' / ' + data.phase_total;
+  }
+  document.getElementById('progressPhase').textContent = phaseText;
   const pct = data.total ? Math.round(100 * data.current / data.total) : 0;
   document.getElementById('progressFill').style.width = pct + '%';
   if (data.folders && Object.keys(data.folders).length) {

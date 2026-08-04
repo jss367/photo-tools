@@ -31,7 +31,11 @@ Reconnaissance notes (Task 2.0, verified 2026-07-04):
 3. Cancellation mirrors the scan job: the work function polls
    ``runner.is_cancelled(job_id)`` at batch boundaries and passes
    ``cancel_check`` into ``scan()``; the runner flips the job status to
-   "cancelled" when the work function returns after a Stop.
+   "cancelled" when the work function returns after a Stop. The remote
+   path additionally passes ``cancel_check`` into the per-batch rsync so
+   Stop kills the subprocess mid-transfer instead of waiting out the
+   batch — the interrupted batch is cancelled work (nothing failed,
+   nothing cataloged), recovered like a mid-batch crash.
 4. Batch unit: files grouped by destination (template) folder,
    processed in template order, chunked to at most
    ``IMPORT_BATCH_SIZE`` files per scan call. Restricted scans only
@@ -118,6 +122,17 @@ def _invalidate_new_images(db, root):
 IMPORT_BATCH_SIZE = 200
 _IMPORT_ETA_PROGRESS_KEYS = (
     "eta_state", "eta_settled", "eta_seconds", "eta_rate_per_min",
+)
+
+# Batch-scoped truth counters for the remote path: how many files of the
+# current per-batch rsync have actually crossed the network, next to the
+# ordinary ``current``/``total`` which advances while files are merely
+# inspected and queued. Uses the same sub-phase progress keys the scanner
+# emits (``phase_current``/``phase_total``/``phase_label``) so the bottom
+# panel's ``bpActiveProgress`` renders the batch counter without changes.
+# Cleared on every ordinary emit so they never outlive their batch.
+_IMPORT_TRANSFER_PROGRESS_KEYS = (
+    "phase_current", "phase_total", "phase_label",
 )
 
 
@@ -1265,7 +1280,7 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
         job["progress"]["current"] = current
         job["progress"]["total"] = total
         job["progress"]["current_file"] = current_file
-        for key in _IMPORT_ETA_PROGRESS_KEYS:
+        for key in _IMPORT_ETA_PROGRESS_KEYS + _IMPORT_TRANSFER_PROGRESS_KEYS:
             job["progress"].pop(key, None)
         job["progress"].update(eta_fields)
         runner.update_step(
@@ -1279,6 +1294,43 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
             job["id"], "progress",
             progress_event(
                 phase, current, total, current_file, **eta_fields,
+            ),
+        )
+
+    def _emit_transfer(rel, transfer_current, transfer_total, current_file):
+        """Report one actually-transferred file of the current batch rsync.
+
+        Leaves ``current``/``total`` (and the ETA fields derived from them)
+        exactly as the last ordinary ``_emit`` set them: this is the truth
+        channel next to the prepared-files counter, not a second driver of
+        it. ``_emit`` clears the transfer keys, so they exist only while a
+        batch is on the wire.
+        """
+        extra = {
+            "phase_current": transfer_current,
+            "phase_total": transfer_total,
+            "phase_label": "Transferring batch",
+            **{k: job["progress"][k] for k in _IMPORT_ETA_PROGRESS_KEYS
+               if k in job["progress"]},
+        }
+        job["progress"]["phase_current"] = transfer_current
+        job["progress"]["phase_total"] = transfer_total
+        job["progress"]["phase_label"] = "Transferring batch"
+        job["progress"]["current_file"] = current_file
+        runner.update_step(
+            job["id"], "import",
+            current_file=current_file,
+            progress={
+                "current": job["progress"]["current"],
+                "total": job["progress"]["total"], **extra,
+            },
+        )
+        runner.push_event(
+            job["id"], "progress",
+            progress_event(
+                f"{rel}: transferring",
+                job["progress"]["current"], job["progress"]["total"],
+                current_file, **extra,
             ),
         )
 
@@ -2081,27 +2133,63 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
                     if bn != sf.name
                 ]
 
-                def _do_rsync(src_specs, target, dest_is_dir, extra_args):
+                def _do_rsync(src_specs, target, dest_is_dir, extra_args,
+                              progress_cb=None):
                     try:
                         rc, stderr, timed_out = move_mod._run_rsync_streamed(
-                            None, target, [], len(src_specs), None,
+                            None, target, [], len(src_specs), progress_cb,
                             rsync_bin=rsync_bin, extra_args=extra_args,
                             src_specs=src_specs,
                             src_specs_dest_is_dir=dest_is_dir,
+                            # Stop must reach the subprocess: a slow batch
+                            # can otherwise pin "cancelling" for hours,
+                            # since cancellation is only observed at file/
+                            # batch boundaries the transfer never yields.
+                            # Non-blocking probe: this fires from the rsync
+                            # watchdog thread, and ``is_cancelled`` would
+                            # park it inside ``wait_if_paused`` on Pause,
+                            # disabling both stall detection and Stop until
+                            # the user resumes. Pause is handled at the
+                            # existing batch-boundary check below.
+                            cancel_check=lambda: runner.cancellation_requested(
+                                job["id"]),
                         )
                         return rc, stderr, timed_out
                     except OSError as exc:
                         return 1, str(exc), False
 
+                def _rsync_cancelled(rc):
+                    # A Stop mid-transfer kills the subprocess via the
+                    # cancel_check above and surfaces as a nonzero exit.
+                    # That is cancelled work, not a pile of per-file
+                    # failures: queued files stay on the card for the next
+                    # run, and whatever rsync landed before the kill is
+                    # adopted by crash-recovery like any mid-batch stop
+                    # (--partial-dir preserves the interrupted file).
+                    # Non-blocking probe matches the watchdog above; the
+                    # batch-boundary ``is_cancelled`` further down is where
+                    # pause is actually observed.
+                    return rc != 0 and runner.cancellation_requested(
+                        job["id"])
+
                 transferred = []   # (sf, dest_basename, src_hash, nas_full_path)
-                # Flat batch: one rsync into the dir.
+                batch_size = len(to_transfer)
+                # Flat batch: one rsync into the dir. rsync names each file
+                # as it lands; forward that as the batch's honest
+                # actually-crossed-the-network counter next to the
+                # prepared-files counter (which already reads ``emitted``).
                 if flat:
                     rc, stderr, timed_out = _do_rsync(
                         [str(sf) for sf, _bn, _sh in flat], rsync_target, True,
-                        extra_args)
+                        extra_args,
+                        progress_cb=lambda done, _tot, name, _label,
+                        _rel=rel, _bs=batch_size:
+                            _emit_transfer(_rel, done, _bs, name))
                     if timed_out:
                         for sf, _bn, _sh in flat:
                             _fail(rel, sf, "rsync stalled (no progress)")
+                    elif _rsync_cancelled(rc):
+                        cancelled = True
                     elif rc != 0:
                         for sf, _bn, _sh in flat:
                             _fail(rel, sf, f"rsync failed: {stderr.strip()}")
@@ -2112,6 +2200,9 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
                 # Renamed files: one rsync each to the explicit NAS file
                 # path (rsync <card> user@host:/dir/DSC_0001_1.jpg).
                 for sf, bn, sh in renamed:
+                    if cancelled or runner.is_cancelled(job["id"]):
+                        cancelled = True
+                        break
                     nas_full = posixpath.join(ssh_dest, bn)
                     rc, stderr, timed_out = _do_rsync(
                         [str(sf)],
@@ -2119,10 +2210,17 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
                         extra_args)
                     if timed_out:
                         _fail(rel, sf, "rsync stalled (no progress)")
+                    elif _rsync_cancelled(rc):
+                        cancelled = True
+                        break
                     elif rc != 0:
                         _fail(rel, sf, f"rsync failed: {stderr.strip()}")
                     else:
                         transferred.append((sf, bn, sh, nas_full))
+                        # ``len(transferred)`` counts only files that truly
+                        # landed, so a failed flat batch can't inflate the
+                        # renamed files' transfer counter.
+                        _emit_transfer(rel, len(transferred), batch_size, bn)
 
                 for sf, bn, src_hash, nas_full in transferred:
                     dest_path = os.path.join(dest_folder, bn)

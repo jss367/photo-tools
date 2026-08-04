@@ -2145,7 +2145,13 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
                             # can otherwise pin "cancelling" for hours,
                             # since cancellation is only observed at file/
                             # batch boundaries the transfer never yields.
-                            cancel_check=lambda: runner.is_cancelled(
+                            # Non-blocking probe: this fires from the rsync
+                            # watchdog thread, and ``is_cancelled`` would
+                            # park it inside ``wait_if_paused`` on Pause,
+                            # disabling both stall detection and Stop until
+                            # the user resumes. Pause is handled at the
+                            # existing batch-boundary check below.
+                            cancel_check=lambda: runner.cancellation_requested(
                                 job["id"]),
                         )
                         return rc, stderr, timed_out
@@ -2160,7 +2166,11 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
                     # run, and whatever rsync landed before the kill is
                     # adopted by crash-recovery like any mid-batch stop
                     # (--partial-dir preserves the interrupted file).
-                    return rc != 0 and runner.is_cancelled(job["id"])
+                    # Non-blocking probe matches the watchdog above; the
+                    # batch-boundary ``is_cancelled`` further down is where
+                    # pause is actually observed.
+                    return rc != 0 and runner.cancellation_requested(
+                        job["id"])
 
                 transferred = []   # (sf, dest_basename, src_hash, nas_full_path)
                 batch_size = len(to_transfer)

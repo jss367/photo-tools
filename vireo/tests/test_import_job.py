@@ -30,6 +30,9 @@ class FakeRunner:
     def is_cancelled(self, job_id):
         return job_id in self.cancelled_ids
 
+    def cancellation_requested(self, job_id):
+        return job_id in self.cancelled_ids
+
 
 def _make_job(job_id="import-test-1"):
     return {
@@ -6854,6 +6857,91 @@ def test_remote_import_stop_kills_in_flight_rsync_batch(
     # cancelled run never claims the card is safe to erase.
     assert result["copied"] == 0, result
     assert result["safe_to_format"] is False, result
+
+
+def test_remote_import_rsync_watchdog_does_not_block_on_pause(
+        tmp_path, monkeypatch):
+    """The rsync watchdog thread's cancel_check must be a non-blocking
+    probe. Import jobs run pausable, and ``runner.is_cancelled()`` parks
+    the caller inside ``wait_if_paused`` when a Pause is pending. Wiring
+    the watchdog to that pause-aware method would silently disable both
+    the stall watchdog and Stop while paused — rsync would keep copying
+    at 50 KB/s until Resume/Cancel. Use ``cancellation_requested()``
+    instead; pause is observed at the existing batch-boundary check."""
+    import move as _move
+    from import_job import ImportParams, run_import_job
+
+    ra = _remote_archive_for(tmp_path)
+    calls = _remote_calls(ra)
+    _install_fake_remote_rsync(monkeypatch, calls, verify=None)
+
+    card = _make_card(tmp_path, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+    ])
+
+    class PauseAwareRunner(FakeRunner):
+        """Mirror JobRunner's pause behaviour: is_cancelled blocks while
+        paused; cancellation_requested does not."""
+
+        def __init__(self):
+            super().__init__()
+            self.paused_ids = set()
+
+        def is_cancelled(self, job_id):
+            if job_id in self.paused_ids and job_id not in self.cancelled_ids:
+                raise AssertionError(
+                    "watchdog called the pause-aware is_cancelled and would "
+                    "have blocked the stall/cancel watchdog thread during "
+                    "Pause")
+            return job_id in self.cancelled_ids
+
+        def cancellation_requested(self, job_id):
+            return job_id in self.cancelled_ids
+
+    runner = PauseAwareRunner()
+    job = _make_job()
+    seen = {"probe_during_pause": None}
+
+    def paused_rsync(src_path, dest_spec, rsync_flags, total_files,
+                    progress_cb, rsync_bin="rsync", extra_args=None,
+                    src_specs=None, src_specs_dest_is_dir=True, **kw):
+        # A Pause arrives mid-transfer. The watchdog's cancel_check must
+        # still be safe to call in that state — a blocking call here is
+        # the exact defect the fix guards against.
+        runner.paused_ids.add(job["id"])
+        cancel_check = kw.get("cancel_check")
+        if cancel_check is not None:
+            seen["probe_during_pause"] = cancel_check()
+        # Simulate a healthy (uncancelled) transfer completing normally.
+        import shutil
+        ssh_path = dest_spec.split(":", 1)[1]
+        rel = os.path.relpath(ssh_path, calls["_ssh_base"])
+        mount_dir = os.path.join(calls["_mount_base"], rel)
+        os.makedirs(mount_dir, exist_ok=True)
+        shutil.copy2(
+            src_specs[0],
+            os.path.join(mount_dir, os.path.basename(src_specs[0])))
+        return (0, "", False)
+
+    monkeypatch.setattr(_move, "_run_rsync_streamed", paused_rsync)
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    # No exception ⇒ watchdog probed cancellation without blocking on the
+    # pause request. The transfer completes on its own since nothing was
+    # cancelled.
+    result = run_import_job(
+        job, runner, db_path, db._active_workspace_id,
+        ImportParams(
+            sources=[str(card)], destination=ra["mount_base"],
+            remote_target=ra, verify_by_hash=False,
+        ),
+    )
+
+    assert seen["probe_during_pause"] is False, (
+        "watchdog's cancel_check returned something other than a "
+        "non-blocking False during Pause")
+    assert result["copied"] == 1, result
 
 
 def test_remote_import_reports_per_file_transfer_progress(

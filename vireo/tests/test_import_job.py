@@ -4,6 +4,8 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from db import Database
@@ -9927,11 +9929,13 @@ def test_dest_read_cancelled_is_an_oserror():
     assert issubclass(DestReadCancelled, OSError)
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="os.mkfifo is POSIX-only; FIFO stands in for a dead SMB mount.",
+)
 def test_hash_dest_file_cancel_interrupts_blocked_read(tmp_path):
     import threading
     import time
-
-    import pytest
 
     from import_job import DestReadCancelled, _hash_dest_file
 
@@ -9952,12 +9956,14 @@ def test_hash_dest_file_cancel_interrupts_blocked_read(tmp_path):
         _release_fifo(fifo)
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="os.mkfifo is POSIX-only; FIFO stands in for a dead SMB mount.",
+)
 def test_hash_dest_file_cancel_pending_never_opens(tmp_path):
     """Stop already requested → raise before touching the file at all: on
     a dead mount the ``open()`` itself blocks, so returning at all proves
     the open was skipped (a FIFO reader with no writer never returns)."""
-    import pytest
-
     from import_job import DestReadCancelled, _hash_dest_file
 
     fifo = tmp_path / "stuck.NEF"
@@ -9966,12 +9972,14 @@ def test_hash_dest_file_cancel_pending_never_opens(tmp_path):
         _hash_dest_file(str(fifo), lambda: True)
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="os.mkfifo is POSIX-only; FIFO stands in for a dead SMB mount.",
+)
 def test_hash_dest_file_stall_raises_plain_oserror(tmp_path):
     """No Stop in flight — a read that produces no data for stall_timeout
     is an unreadable file, the same OSError shape every call site already
     handles (NOT a cancellation)."""
-    import pytest
-
     from import_job import DestReadCancelled, _hash_dest_file
 
     fifo = tmp_path / "stuck.NEF"
@@ -9997,6 +10005,10 @@ def _catalog_twin_row(db, dest_dir, filename, size, file_hash):
     db.conn.commit()
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="os.mkfifo is POSIX-only; FIFO stands in for a dead SMB mount.",
+)
 def test_local_import_cancel_interrupts_stuck_twin_hash(tmp_path):
     """Stop must not wait out a duplicate-gate hash read blocked on a dead
     mount. The cataloged twin here is a FIFO: hashing it blocks forever
@@ -10004,7 +10016,6 @@ def test_local_import_cancel_interrupts_stuck_twin_hash(tmp_path):
     cancel and exit — with the interrupted file neither copied nor
     counted as failed (it stays on the card for the next run)."""
     import threading
-    import time
 
     from import_dedup import compute_file_hash
     from import_job import ImportParams, run_import_job
@@ -10056,6 +10067,10 @@ def test_local_import_cancel_interrupts_stuck_twin_hash(tmp_path):
     assert result["copied"] == 0, result
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="os.mkfifo is POSIX-only; FIFO stands in for a dead SMB mount.",
+)
 def test_remote_import_cancel_interrupts_stuck_twin_hash(
         tmp_path, monkeypatch):
     """Remote-path mirror of the local stuck-twin-hash cancel test — the
@@ -10120,6 +10135,10 @@ def test_remote_import_cancel_interrupts_stuck_twin_hash(
     assert calls["rsync"] == [], calls["rsync"]
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="os.mkfifo is POSIX-only; FIFO stands in for a dead SMB mount.",
+)
 def test_remote_import_cancel_interrupts_stuck_collision_hash(
         tmp_path, monkeypatch):
     """Remote-path mirror of the twin-hash cancel, but for the OTHER
@@ -10233,6 +10252,10 @@ def test_remote_import_cancel_interrupts_stuck_collision_hash(
     )
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="os.mkfifo is POSIX-only; FIFO stands in for a dead SMB mount.",
+)
 def test_remote_import_cancel_skips_post_loop_mount_probe(
         tmp_path, monkeypatch):
     """After Stop interrupts a destination-side hash on the remote path,
@@ -10315,6 +10338,10 @@ def test_remote_import_cancel_skips_post_loop_mount_probe(
     )
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="os.mkfifo is POSIX-only; FIFO stands in for a dead SMB mount.",
+)
 def test_local_import_cancel_skips_post_loop_mount_probe(
         tmp_path, monkeypatch):
     """Local-path mirror of the remote skip-post-loop-mount-probe test.

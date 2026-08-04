@@ -8,6 +8,14 @@ use tauri_plugin_updater::UpdaterExt;
 /// Prevents overlapping update checks from running simultaneously.
 static CHECKING: AtomicBool = AtomicBool::new(false);
 
+/// Whether the currently in-flight check should show its result to the user.
+///
+/// A user-initiated call that lands while a background check is already
+/// running flips this to true so the in-flight check surfaces its "no update"
+/// or check-error outcome — otherwise the "You'll be notified" message we
+/// showed them would be a lie for the silent paths.
+static USER_VISIBLE: AtomicBool = AtomicBool::new(false);
+
 /// Spawn an update check on a background async task.
 ///
 /// When `user_initiated` is true, a dialog is shown even when no update
@@ -21,6 +29,10 @@ pub fn spawn_update_check(app: &AppHandle, user_initiated: bool) {
     if CHECKING.swap(true, Ordering::SeqCst) {
         log::debug!("Update check already in progress, skipping");
         if user_initiated {
+            // Promote the in-flight check to user-visible so it will show a
+            // dialog for the "no update" and check-error outcomes instead of
+            // finishing silently after we told the user they'd be notified.
+            USER_VISIBLE.store(true, Ordering::SeqCst);
             app.dialog()
                 .message(
                     "Vireo is already checking for or downloading an update.\n\n\
@@ -33,13 +45,22 @@ pub fn spawn_update_check(app: &AppHandle, user_initiated: bool) {
         return;
     }
 
+    // We just claimed CHECKING; seed USER_VISIBLE for this run.
+    USER_VISIBLE.store(user_initiated, Ordering::SeqCst);
+
     let handle = app.clone();
     tauri::async_runtime::spawn(async move {
-        match do_update_check(&handle, user_initiated).await {
+        let result = do_update_check(&handle).await;
+        // Read USER_VISIBLE while we still hold CHECKING so a user-initiated
+        // call that raced with our completion either observes CHECKING true
+        // and flips USER_VISIBLE (we see it here), or observes CHECKING false
+        // and starts its own fresh check.
+        let visible = USER_VISIBLE.swap(false, Ordering::SeqCst);
+        match result {
             Ok(()) => {}
             Err(e) => {
                 log::error!("Update check failed: {e}");
-                if user_initiated {
+                if visible {
                     handle
                         .dialog()
                         .message(format!("Could not check for updates:\n{e}"))
@@ -53,10 +74,7 @@ pub fn spawn_update_check(app: &AppHandle, user_initiated: bool) {
     });
 }
 
-async fn do_update_check(
-    app: &AppHandle,
-    user_initiated: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn do_update_check(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
     let updater = app.updater()?;
     let update = match updater.check().await {
         Ok(u) => u,
@@ -169,7 +187,7 @@ async fn do_update_check(
         }
         None => {
             log::info!("No update available");
-            if user_initiated {
+            if USER_VISIBLE.load(Ordering::SeqCst) {
                 app.dialog()
                     .message(format!(
                         "You're running the latest version of Vireo (v{}).",

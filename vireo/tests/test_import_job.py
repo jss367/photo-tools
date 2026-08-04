@@ -6956,8 +6956,6 @@ def test_remote_import_reports_per_file_transfer_progress(
     alongside it. The prep counter itself must NOT move during the
     transfer, and the transfer fields must not outlive the batch in
     ``job["progress"]``."""
-    import shutil
-
     import move as _move
     from import_job import ImportParams, run_import_job
 

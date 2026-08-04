@@ -2182,8 +2182,9 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
                     rc, stderr, timed_out = _do_rsync(
                         [str(sf) for sf, _bn, _sh in flat], rsync_target, True,
                         extra_args,
-                        progress_cb=lambda done, _tot, name, _label:
-                            _emit_transfer(rel, done, batch_size, name))
+                        progress_cb=lambda done, _tot, name, _label,
+                        _rel=rel, _bs=batch_size:
+                            _emit_transfer(_rel, done, _bs, name))
                     if timed_out:
                         for sf, _bn, _sh in flat:
                             _fail(rel, sf, "rsync stalled (no progress)")

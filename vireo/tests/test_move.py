@@ -5573,6 +5573,63 @@ def test_rsync_streamed_runs_as_long_as_it_progresses(monkeypatch):
     assert len(seen) == 12  # progress reported for every transferred file
 
 
+def test_rsync_streamed_cancel_check_kills_transfer(monkeypatch):
+    """When ``cancel_check`` flips true the in-flight rsync subprocess is
+    killed promptly instead of running to batch completion — Stop must reach
+    the transfer, not wait hours for a slow 200-file batch to drain. The
+    kill is reported as an ordinary nonzero exit, NOT as a stall
+    (timed_out stays False): the caller distinguishes cancellation by its
+    own cancel flag."""
+    import move as move_mod
+
+    proc_holder = {}
+
+    def _fake_popen(*_a, **_k):
+        proc = _FakeProc.__new__(_FakeProc)
+        proc.killed = threading.Event()
+        proc.stdout = _SilentStdout(proc.killed)
+        proc.stderr = _FakeStderr()
+        proc.returncode = 0
+        proc_holder["proc"] = proc
+        return proc
+
+    monkeypatch.setattr(move_mod.subprocess, "Popen", _fake_popen)
+
+    start = time.monotonic()
+    rc, stderr, timed_out = move_mod._run_rsync_streamed(
+        "/src", "/dst", [], 10, None, stall_timeout=60.0,
+        cancel_check=lambda: True,
+    )
+    elapsed = time.monotonic() - start
+    assert proc_holder["proc"].killed.is_set()
+    assert timed_out is False
+    assert rc != 0
+    # Killed on the fast cancel poll, not the 30s watchdog interval and
+    # not the 60s stall window. Generous bound for slow CI schedulers.
+    assert elapsed < 20, f"cancel took {elapsed:.1f}s to kill rsync"
+
+
+def test_rsync_streamed_cancel_check_false_leaves_transfer_alone(monkeypatch):
+    """A cancel_check that stays false must not disturb a healthy transfer:
+    every file streams through progress_cb and rsync exits normally."""
+    import move as move_mod
+
+    monkeypatch.setattr(
+        move_mod.subprocess, "Popen",
+        lambda *_a, **_k: _FakeProc(_StreamingStdout(n=5, gap=0.05)),
+    )
+
+    seen = []
+    rc, stderr, timed_out = move_mod._run_rsync_streamed(
+        "/src", "/dst", [], 5,
+        lambda cur, tot, name, phase: seen.append(name),
+        stall_timeout=60.0, cancel_check=lambda: False,
+    )
+    assert rc == 0
+    assert timed_out is False
+    assert len(seen) == 5
+
+
 @pytest.mark.skipif(not hasattr(os, "openpty"), reason="pty is POSIX-only")
 def test_rsync_streamed_survives_block_buffered_rsync(tmp_path):
     """A real child that block-buffers stdout (as Apple's openrsync does when

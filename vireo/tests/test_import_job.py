@@ -6780,6 +6780,167 @@ def test_remote_import_cancel_mid_batch_does_not_start_rsync(
     )
 
 
+def test_remote_import_stop_kills_in_flight_rsync_batch(
+        tmp_path, monkeypatch):
+    """Stop must reach a running per-batch rsync. The job passes the
+    runner's cancel signal into ``_run_rsync_streamed`` as ``cancel_check``
+    (so the watchdog can kill the subprocess), and when the killed rsync
+    returns nonzero the batch is treated as cancelled work — its files are
+    NOT reported as per-file failures. Queued files stay on the card for
+    the next run; whatever rsync landed before the kill is adopted by
+    crash-recovery, exactly like a mid-batch crash."""
+    import shutil
+
+    import move as _move
+    from import_job import ImportParams, run_import_job
+
+    ra = _remote_archive_for(tmp_path)
+    calls = _remote_calls(ra)
+    _install_fake_remote_rsync(monkeypatch, calls, verify=None)
+
+    card = _make_card(tmp_path, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+        ("DSC_0002.jpg", datetime(2026, 7, 3, 10, 5, 0), "green"),
+    ])
+
+    runner = FakeRunner()
+    job = _make_job()
+    seen = {"cancel_check": None, "cancel_check_result": None}
+
+    def killed_rsync(src_path, dest_spec, rsync_flags, total_files,
+                     progress_cb, rsync_bin="rsync", extra_args=None,
+                     src_specs=None, src_specs_dest_is_dir=True, **kw):
+        seen["cancel_check"] = kw.get("cancel_check")
+        # Stop arrives mid-transfer: flip the runner's cancel flag, land
+        # only the first file (the kill interrupted the rest), and return
+        # the killed subprocess's nonzero exit with timed_out=False.
+        runner.cancelled_ids.add(job["id"])
+        if seen["cancel_check"] is not None:
+            seen["cancel_check_result"] = seen["cancel_check"]()
+        ssh_path = dest_spec.split(":", 1)[1]
+        rel = os.path.relpath(ssh_path, calls["_ssh_base"])
+        mount_dir = os.path.join(calls["_mount_base"], rel)
+        os.makedirs(mount_dir, exist_ok=True)
+        shutil.copy2(
+            src_specs[0],
+            os.path.join(mount_dir, os.path.basename(src_specs[0])))
+        return (-9, "", False)
+
+    monkeypatch.setattr(_move, "_run_rsync_streamed", killed_rsync)
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    result = run_import_job(
+        job, runner, db_path, db._active_workspace_id,
+        ImportParams(
+            sources=[str(card)], destination=ra["mount_base"],
+            remote_target=ra, verify_by_hash=True,
+        ),
+    )
+
+    # The transfer received a live cancel_check wired to the runner.
+    assert seen["cancel_check"] is not None, (
+        "the per-batch rsync was started without a cancel_check — Stop "
+        "cannot reach the subprocess")
+    assert seen["cancel_check_result"] is True
+
+    assert result["cancelled"] is True, result
+    # A killed batch is cancelled work, not a pile of per-file failures.
+    assert result["failed"] == 0, result
+    assert not any(
+        "rsync" in u["reason"] for u in result["unsafe_files"]
+    ), result["unsafe_files"]
+    # Nothing was verified/cataloged from the interrupted batch, and a
+    # cancelled run never claims the card is safe to erase.
+    assert result["copied"] == 0, result
+    assert result["safe_to_format"] is False, result
+
+
+def test_remote_import_reports_per_file_transfer_progress(
+        tmp_path, monkeypatch):
+    """The per-batch rsync streams each transferred file; the job must
+    surface that as sub-phase progress (``phase_current``/``phase_total``/
+    ``phase_label`` — the same keys the scanner's metadata phase uses, so
+    the bottom panel renders them as-is) instead of discarding the
+    callback. The prepared-files counter (``current``/``total``) alone
+    reads as "files completed" while the batch is still crossing the
+    network — the UI transparency rule requires the real transfer count
+    alongside it. The prep counter itself must NOT move during the
+    transfer, and the transfer fields must not outlive the batch in
+    ``job["progress"]``."""
+    import shutil
+
+    import move as _move
+    from import_job import ImportParams, run_import_job
+
+    ra = _remote_archive_for(tmp_path)
+    calls = _remote_calls(ra)
+    _install_fake_remote_rsync(monkeypatch, calls, verify=None)
+
+    # Two sources carrying the SAME basename with different capture times
+    # in the same date folder: the second queues as a collision-renamed
+    # single-file rsync (DSC_0001_1.jpg), so the transfer counter must
+    # span the flat batch AND the renamed transfer.
+    card1 = _make_card(tmp_path, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+    ], card_name="card1")
+    card2 = _make_card(tmp_path, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 5, 0), "green"),
+    ], card_name="card2")
+
+    real_fake = _move._run_rsync_streamed  # landing behavior from the seam
+
+    def streaming_rsync(src_path, dest_spec, rsync_flags, total_files,
+                        progress_cb, rsync_bin="rsync", extra_args=None,
+                        src_specs=None, src_specs_dest_is_dir=True, **kw):
+        rc, stderr, timed_out = real_fake(
+            src_path, dest_spec, rsync_flags, total_files, None,
+            rsync_bin=rsync_bin, extra_args=extra_args, src_specs=src_specs,
+            src_specs_dest_is_dir=src_specs_dest_is_dir)
+        if progress_cb is not None:
+            for i, s in enumerate(src_specs, 1):
+                progress_cb(i, total_files, os.path.basename(s),
+                            "Copying files")
+        return rc, stderr, timed_out
+
+    monkeypatch.setattr(_move, "_run_rsync_streamed", streaming_rsync)
+
+    runner = FakeRunner()
+    job = _make_job()
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    result = run_import_job(
+        job, runner, db_path, db._active_workspace_id,
+        ImportParams(
+            sources=[str(card1), str(card2)], destination=ra["mount_base"],
+            remote_target=ra, verify_by_hash=True,
+        ),
+    )
+    assert result["failed"] == 0, result
+    assert result["copied"] == 2, result
+
+    transfer_events = [
+        data for _jid, etype, data in runner.events
+        if etype == "progress" and "phase_current" in data
+    ]
+    assert transfer_events, (
+        "no transfer progress events — the batch rsync's per-file stream "
+        "is being discarded")
+    for ev in transfer_events:
+        assert ev["phase"].endswith(": transferring"), ev
+        assert ev["phase_label"] == "Transferring batch", ev
+        assert ev["phase_total"] == 2, ev
+        # The prepared-files counter must not be inflated or reset by
+        # transfer reporting.
+        assert ev["current"] == 2 and ev["total"] == 2, ev
+    # Both the flat batch file and the collision-renamed file reported.
+    assert max(ev["phase_current"] for ev in transfer_events) == 2
+    # Transfer fields are batch-scoped: cleared once the batch settles.
+    assert "phase_current" not in job["progress"], job["progress"]
+    assert "phase_total" not in job["progress"], job["progress"]
+    assert "phase_label" not in job["progress"], job["progress"]
+
+
 def test_include_paths_imports_only_selected_files(tmp_path):
     """include_paths restricts the copy set; discovered still counts the card."""
     from import_job import ImportParams

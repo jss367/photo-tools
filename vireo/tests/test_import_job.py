@@ -9872,3 +9872,249 @@ def test_remote_import_mount_loss_is_sticky_across_batches(
     # No rsync happened either — both batches short-circuited before the
     # transfer step.
     assert calls["rsync"] == [], calls["rsync"]
+
+
+# --------------------------------------------------------------------------
+# Destination-side hashing must not hold cancellation hostage. On a stale
+# SMB mount a single blocking read can pin the worker for tens of minutes
+# while Stop goes unobserved (cancellation is only polled between files).
+# ``_hash_dest_file`` bounds every mount-side hash read with the job's Stop
+# signal and a stall watchdog. The FIFOs below stand in for a dead network
+# mount — opening one for reading blocks until a writer appears, exactly
+# like a read against a wedged SMB session.
+# --------------------------------------------------------------------------
+
+def _release_fifo(fifo):
+    """Unblock any reader stuck on the FIFO (open the writer side, close →
+    the reader sees EOF). Best-effort cleanup so an abandoned hash worker
+    doesn't outlive its test."""
+    import contextlib
+    with contextlib.suppress(OSError):
+        fd = os.open(str(fifo), os.O_WRONLY | os.O_NONBLOCK)
+        os.close(fd)
+
+
+class CancelOnImportingRunner(FakeRunner):
+    """Flips to cancelled the moment the per-file "importing" progress
+    emit lands — i.e. after the loop-top cancellation check has already
+    passed for that file, right before the duplicate gate's destination
+    reads."""
+
+    def push_event(self, job_id, event_type, data):
+        super().push_event(job_id, event_type, data)
+        if (
+            event_type == "progress"
+            and ": importing" in (data.get("phase") or "")
+        ):
+            self.cancelled_ids.add(job_id)
+
+
+def test_hash_dest_file_matches_compute_file_hash(tmp_path):
+    from import_dedup import compute_file_hash
+    from import_job import _hash_dest_file
+
+    f = tmp_path / "a.jpg"
+    f.write_bytes(b"some destination bytes" * 1000)
+    assert _hash_dest_file(str(f), lambda: False) == \
+        compute_file_hash(str(f))
+
+
+def test_dest_read_cancelled_is_an_oserror():
+    """Call sites without explicit cancel handling catch OSError and treat
+    the file as unreadable — safe-by-default for any unwired site."""
+    from import_job import DestReadCancelled
+
+    assert issubclass(DestReadCancelled, OSError)
+
+
+def test_hash_dest_file_cancel_interrupts_blocked_read(tmp_path):
+    import threading
+    import time
+
+    import pytest
+
+    from import_job import DestReadCancelled, _hash_dest_file
+
+    fifo = tmp_path / "stuck.NEF"
+    os.mkfifo(str(fifo))
+    cancel = threading.Event()
+    timer = threading.Timer(0.3, cancel.set)
+    timer.start()
+    start = time.monotonic()
+    try:
+        with pytest.raises(DestReadCancelled):
+            _hash_dest_file(str(fifo), cancel.is_set)
+        assert time.monotonic() - start < 5.0, (
+            "cancellation took too long to interrupt the blocked read"
+        )
+    finally:
+        timer.cancel()
+        _release_fifo(fifo)
+
+
+def test_hash_dest_file_cancel_pending_never_opens(tmp_path):
+    """Stop already requested → raise before touching the file at all: on
+    a dead mount the ``open()`` itself blocks, so returning at all proves
+    the open was skipped (a FIFO reader with no writer never returns)."""
+    import pytest
+
+    from import_job import DestReadCancelled, _hash_dest_file
+
+    fifo = tmp_path / "stuck.NEF"
+    os.mkfifo(str(fifo))
+    with pytest.raises(DestReadCancelled):
+        _hash_dest_file(str(fifo), lambda: True)
+
+
+def test_hash_dest_file_stall_raises_plain_oserror(tmp_path):
+    """No Stop in flight — a read that produces no data for stall_timeout
+    is an unreadable file, the same OSError shape every call site already
+    handles (NOT a cancellation)."""
+    import pytest
+
+    from import_job import DestReadCancelled, _hash_dest_file
+
+    fifo = tmp_path / "stuck.NEF"
+    os.mkfifo(str(fifo))
+    try:
+        with pytest.raises(OSError) as exc_info:
+            _hash_dest_file(str(fifo), lambda: False, stall_timeout=0.5)
+        assert not isinstance(exc_info.value, DestReadCancelled)
+    finally:
+        _release_fifo(fifo)
+
+
+def _catalog_twin_row(db, dest_dir, filename, size, file_hash):
+    fid = db.conn.execute(
+        "INSERT INTO folders (path, name, status) VALUES (?, ?, 'ok')",
+        (str(dest_dir), os.path.basename(str(dest_dir))),
+    ).lastrowid
+    db.conn.execute(
+        "INSERT INTO photos (folder_id, filename, extension, file_size,"
+        " file_hash) VALUES (?, ?, ?, ?, ?)",
+        (fid, filename, os.path.splitext(filename)[1], size, file_hash),
+    )
+    db.conn.commit()
+
+
+def test_local_import_cancel_interrupts_stuck_twin_hash(tmp_path):
+    """Stop must not wait out a duplicate-gate hash read blocked on a dead
+    mount. The cataloged twin here is a FIFO: hashing it blocks forever
+    until released, like a stale SMB session. The job must notice the
+    cancel and exit — with the interrupted file neither copied nor
+    counted as failed (it stays on the card for the next run)."""
+    import threading
+    import time
+
+    from import_dedup import compute_file_hash
+    from import_job import ImportParams, run_import_job
+
+    card = tmp_path / "card"
+    card.mkdir()
+    card_file = card / "IMG_0300.jpg"
+    Image.new("RGB", (16, 16), "red").save(str(card_file))
+
+    archive = tmp_path / "archive"
+    dest_dir = archive / "old"
+    dest_dir.mkdir(parents=True)
+    twin = dest_dir / "IMG_0300.jpg"
+    os.mkfifo(str(twin))
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws_id = db._active_workspace_id
+    _catalog_twin_row(
+        db, dest_dir, "IMG_0300.jpg",
+        os.path.getsize(str(card_file)), compute_file_hash(str(card_file)),
+    )
+
+    runner = CancelOnImportingRunner()
+    job = _make_job()
+    result_box = {}
+
+    def _run():
+        result_box["result"] = run_import_job(
+            job, runner, db_path, ws_id,
+            ImportParams(sources=[str(card)], destination=str(archive)),
+        )
+
+    worker = threading.Thread(target=_run, daemon=True)
+    worker.start()
+    try:
+        worker.join(timeout=15.0)
+        assert not worker.is_alive(), (
+            "Stop did not interrupt the destination hash read blocked on "
+            "the dead-mount twin"
+        )
+    finally:
+        _release_fifo(twin)
+        worker.join(timeout=5.0)
+
+    result = result_box["result"]
+    assert result["cancelled"] is True
+    assert result["failed"] == 0, result
+    assert result["copied"] == 0, result
+
+
+def test_remote_import_cancel_interrupts_stuck_twin_hash(
+        tmp_path, monkeypatch):
+    """Remote-path mirror of the local stuck-twin-hash cancel test — the
+    remote duplicate gate hashes cataloged twins through the SMB mount
+    too, and must observe Stop the same way. Nothing may reach rsync."""
+    import threading
+
+    from import_dedup import compute_file_hash
+    from import_job import ImportParams, run_import_job
+
+    ra = _remote_archive_for(tmp_path)
+    calls = _remote_calls(ra)
+    _install_fake_remote_rsync(monkeypatch, calls, verify=None)
+
+    card = tmp_path / "card"
+    card.mkdir()
+    card_file = card / "IMG_0300.jpg"
+    Image.new("RGB", (16, 16), "red").save(str(card_file))
+
+    dest_dir = Path(ra["mount_base"]) / "2026" / "2026-01-01"
+    dest_dir.mkdir(parents=True)
+    twin = dest_dir / "IMG_0300.jpg"
+    os.mkfifo(str(twin))
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws_id = db._active_workspace_id
+    _catalog_twin_row(
+        db, dest_dir, "IMG_0300.jpg",
+        os.path.getsize(str(card_file)), compute_file_hash(str(card_file)),
+    )
+
+    runner = CancelOnImportingRunner()
+    job = _make_job()
+    result_box = {}
+
+    def _run():
+        result_box["result"] = run_import_job(
+            job, runner, db_path, ws_id,
+            ImportParams(
+                sources=[str(card)], destination=ra["mount_base"],
+                remote_target=ra, verify_by_hash=True,
+            ),
+        )
+
+    worker = threading.Thread(target=_run, daemon=True)
+    worker.start()
+    try:
+        worker.join(timeout=15.0)
+        assert not worker.is_alive(), (
+            "Stop did not interrupt the destination hash read blocked on "
+            "the dead-mount twin"
+        )
+    finally:
+        _release_fifo(twin)
+        worker.join(timeout=5.0)
+
+    result = result_box["result"]
+    assert result["cancelled"] is True
+    assert result["failed"] == 0, result
+    assert result["copied"] == 0, result
+    assert calls["rsync"] == [], calls["rsync"]

@@ -1834,6 +1834,18 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
         # decisions above happen per file and each one reads the mount —
         # so the mount has to be re-checked at that granularity too.
         mount_lost = None
+        # Sticky signal that a destination-side hash in the per-file loop
+        # below was cancelled mid-read (``DestReadCancelled``). Any such
+        # cancel is evidence the mount is misbehaving, so the post-loop
+        # catalog block MUST skip its ``scan()`` / ``_hash_dest_file``
+        # calls on the same paths — they would hit the same wedged mount
+        # and pin the job in "cancelling" for the mount's own timeout,
+        # exactly the failure mode this PR set out to eliminate. A plain
+        # user Stop on a healthy mount leaves this False (the catalog
+        # runs normally so partially-landed batches stay cataloged the
+        # way ``test_cancel_leaves_valid_partial_catalog`` expects).
+        # See PR #1423 review (Codex P2 r3716433824).
+        dest_read_cancelled = False
         for source_file in batch:
             if runner.is_cancelled(job["id"]):
                 cancelled = True
@@ -1944,6 +1956,7 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
                                     twin_path, _stop_requested)
                             except DestReadCancelled:
                                 cancelled = True
+                                dest_read_cancelled = True
                                 break
                             except OSError:
                                 continue
@@ -2089,6 +2102,7 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
                         # batch touches the mount. The interrupted file
                         # stays on the card for the next run.
                         cancelled = True
+                        dest_read_cancelled = True
                         break
                     except OSError:
                         on_disk = None
@@ -2411,7 +2425,20 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
         # uncataloged mount-side collision. Cataloged duplicate twins are
         # linked directly below; scanning a duplicate-only destination would
         # enumerate/stat the entire mounted NAS folder for no new rows.
-        if landed or adopted_paths:
+        #
+        # Skip when a destination-side hash in the per-file loop above
+        # cancelled mid-read. That signal means the mount is misbehaving,
+        # and ``scan()`` here — plus the ``_hash_dest_file`` re-checks below
+        # for landed and adopted paths — would touch the same mounted
+        # directory and pin the job in "cancelling" for the mount's own
+        # timeout. Already-rsync'd landings and adopted-on-disk paths are
+        # picked up by the next run's crash-recovery adoption (byte-
+        # identical files match by hash and count as ``skipped_duplicate``).
+        # A plain user Stop on a healthy mount leaves
+        # ``dest_read_cancelled`` False, so partially-landed batches keep
+        # cataloging like before. See PR #1423 review (Codex P2
+        # r3716433824).
+        if (landed or adopted_paths) and not dest_read_cancelled:
             landed_paths = {entry[0] for entry in landed}
             # Include collision-loop adopted mount paths so their photo rows
             # get created by the restricted scan. The explicit file set is
@@ -3592,6 +3619,19 @@ def run_import_job(job, runner, db_path, workspace_id, params):
         # keeps the blast radius at one file instead of a whole folder.
         # One ismount call is nothing next to copying and hashing a RAW.
         mount_lost = None
+        # Sticky signal that a destination-side hash in the per-file loop
+        # below was cancelled mid-read (``DestReadCancelled``). Any such
+        # cancel is evidence the mount is misbehaving, so the post-loop
+        # catalog block MUST skip its ``scan()`` / ``_rehash_dest_or_none``
+        # calls on the same paths — they would hit the same wedged mount
+        # and pin the job in "cancelling" for the mount's own timeout,
+        # exactly the failure mode this PR set out to eliminate. A plain
+        # user Stop on a healthy mount leaves this False (the catalog
+        # runs normally so partially-landed batches stay cataloged the
+        # way ``test_cancel_leaves_valid_partial_catalog`` expects).
+        # Mirrors the remote path. See PR #1423 review (Codex P2
+        # r3716433830).
+        dest_read_cancelled = False
 
         for source_file in batch:
             if runner.is_cancelled(job["id"]):
@@ -3727,6 +3767,7 @@ def run_import_job(job, runner, db_path, workspace_id, params):
                                     twin_path, _stop_requested)
                             except DestReadCancelled:
                                 cancelled = True
+                                dest_read_cancelled = True
                                 break
                             except OSError:
                                 continue
@@ -3957,6 +3998,7 @@ def run_import_job(job, runner, db_path, workspace_id, params):
                 # failed — it stays on the card for the next run, like any
                 # file the cancel got to before its batch.
                 cancelled = True
+                dest_read_cancelled = True
                 break
             except OSError as e:
                 _fail(rel, source_file, str(e))
@@ -4054,7 +4096,19 @@ def run_import_job(job, runner, db_path, workspace_id, params):
         # landed on disk must be cataloged before we stop, so every
         # stopping point is a valid catalog state). Bounded by the batch
         # size, so no cancel_check is passed — it runs to completion.
-        if landed:
+        #
+        # Skip when a destination-side hash in the per-file loop above
+        # cancelled mid-read. That signal means the mount is misbehaving,
+        # and ``scan()`` here — plus the ``_rehash_dest_or_none``
+        # re-checks below — would touch the same wedged mount and pin the
+        # job in "cancelling" for the mount's own timeout. Already-copied
+        # landings are picked up by the next run's crash-recovery
+        # adoption (byte-identical files match by hash and count as
+        # ``skipped_duplicate``). A plain user Stop on a healthy mount
+        # leaves ``dest_read_cancelled`` False, so partially-landed
+        # batches keep cataloging like before. Mirrors the remote path.
+        # See PR #1423 review (Codex P2 r3716433830).
+        if landed and not dest_read_cancelled:
             landed_paths = {entry[0] for entry in landed}
             # Capture the pre-scan (photo_id, file_hash) for every landed
             # dest_path. Scanner's own ``_invalidate_derived_caches``

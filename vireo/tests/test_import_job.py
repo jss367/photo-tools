@@ -10327,14 +10327,16 @@ def test_remote_import_cancel_skips_post_loop_mount_probe(
 
     result = result_box["result"]
     assert result["cancelled"] is True
-    # Two calls are expected on the healthy cancel path: pre-batch (once
-    # per batch, before the for-source_file loop) + per-file (once at the
-    # top of the loop, before the twin-hash break). The post-loop probe
-    # (unconditional before the fix) must be suppressed once ``cancelled``
-    # is set — so a third call would signal a regression.
-    assert probe_calls["count"] <= 2, (
-        f"post-loop mount probe was not suppressed on cancel "
-        f"({probe_calls['count']} calls)"
+    # Exactly two calls are expected on this single-file, single-batch
+    # cancel path: pre-batch (once per batch, before the for-source_file
+    # loop) + per-file (once at the top of the loop, before the twin-hash
+    # break). ``== 2`` catches BOTH regressions: a third call would mean
+    # the post-loop probe fired (unconditional before this PR's fix), and
+    # a count below 2 would mean the per-file or pre-batch probe was
+    # accidentally removed.
+    assert probe_calls["count"] == 2, (
+        f"expected exactly 2 mount probes (pre-batch + per-file) but got "
+        f"{probe_calls['count']}"
     )
 
 
@@ -10401,12 +10403,12 @@ def test_local_import_cancel_skips_post_loop_mount_probe(
 
     result = result_box["result"]
     assert result["cancelled"] is True
-    # As on the remote path: two calls are expected (pre-batch +
-    # per-file, before the twin-hash cancel). A third would mean the
-    # post-loop probe (unconditional before the fix) fired.
-    assert probe_calls["count"] <= 2, (
-        f"post-loop mount probe was not suppressed on cancel "
-        f"({probe_calls['count']} calls)"
+    # As on the remote path: exactly two calls are expected (pre-batch +
+    # per-file, before the twin-hash cancel). ``== 2`` catches BOTH a
+    # third call (post-loop probe not suppressed) and a missing probe.
+    assert probe_calls["count"] == 2, (
+        f"expected exactly 2 mount probes (pre-batch + per-file) but got "
+        f"{probe_calls['count']}"
     )
 
 
@@ -10563,3 +10565,250 @@ def test_remote_import_hash_watchdog_does_not_block_on_pause(
     )
     assert result["skipped_duplicate"] == 1, result
     assert result["failed"] == 0, result
+
+
+# --------------------------------------------------------------------------
+# When a destination-side hash cancels mid-read (``DestReadCancelled``), the
+# mount is misbehaving. The post-loop catalog block MUST NOT run: ``scan()``
+# and its ``_hash_dest_file`` re-checks would touch the same wedged mount
+# and pin the job in "cancelling" for the mount's own timeout — the exact
+# failure mode this PR set out to eliminate. Already-landed bytes are picked
+# up by the next run's crash-recovery adoption. A plain user Stop on a
+# healthy mount leaves ``dest_read_cancelled`` False so partially-landed
+# batches keep cataloging like before.
+# --------------------------------------------------------------------------
+
+
+class CancelOnFileImportingRunner(FakeRunner):
+    """Flips to cancelled the moment the "importing" progress emit lands
+    for a specific card filename — so an earlier file in the same batch can
+    complete normally (populating ``landed``/``adopted_paths``) before Stop
+    trips on the target file's destination-side hash."""
+
+    def __init__(self, filename):
+        super().__init__()
+        self.filename = filename
+
+    def push_event(self, job_id, event_type, data):
+        super().push_event(job_id, event_type, data)
+        if (
+            event_type == "progress"
+            and ": importing" in (data.get("phase") or "")
+            and data.get("current_file") == self.filename
+        ):
+            self.cancelled_ids.add(job_id)
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="os.mkfifo is POSIX-only; FIFO stands in for a dead SMB mount.",
+)
+def test_local_import_dest_read_cancel_skips_catalog_scan(
+        tmp_path, monkeypatch):
+    """Local path: an earlier file in the batch fresh-copies and lands.
+    The next file's twin is a FIFO — twin-hash blocks, cancel fires, and
+    ``DestReadCancelled`` trips ``dest_read_cancelled``. The post-loop
+    ``if landed:`` catalog block MUST be skipped: ``scan()`` and the
+    ``_rehash_dest_or_none`` re-checks below would touch the same wedged
+    mount and pin the job in "cancelling"."""
+    import threading
+
+    import import_job as _ij
+    from import_dedup import compute_file_hash
+    from import_job import ImportParams, run_import_job
+
+    card = tmp_path / "card"
+    card.mkdir()
+    a_file = card / "A.jpg"
+    b_file = card / "B.jpg"
+    Image.new("RGB", (16, 16), "red").save(str(a_file))
+    Image.new("RGB", (16, 16), "blue").save(str(b_file))
+
+    archive = tmp_path / "archive"
+    twin_folder = archive / "old"
+    twin_folder.mkdir(parents=True)
+    # Only B has a cataloged twin — A fresh-copies. The twin file is a
+    # FIFO so its hash read blocks forever until released (stands in for
+    # a wedged SMB session).
+    fifo = twin_folder / "B.jpg"
+    os.mkfifo(str(fifo))
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws_id = db._active_workspace_id
+    _catalog_twin_row(
+        db, twin_folder, "B.jpg",
+        os.path.getsize(str(b_file)), compute_file_hash(str(b_file)),
+    )
+
+    scan_calls = []
+    real_scan = _ij.scan if hasattr(_ij, "scan") else None
+
+    def spy_scan(*args, **kwargs):
+        scan_calls.append((args, kwargs))
+        if real_scan is not None:
+            return real_scan(*args, **kwargs)
+        return None
+
+    # Both local and remote paths do ``from scanner import scan`` inside
+    # ``run_import_job``; patch at the scanner module so the fresh import
+    # binds the spy.
+    import scanner
+    monkeypatch.setattr(scanner, "scan", spy_scan)
+
+    runner = CancelOnFileImportingRunner("B.jpg")
+    job = _make_job()
+    result_box = {}
+
+    def _run():
+        result_box["result"] = run_import_job(
+            job, runner, db_path, ws_id,
+            ImportParams(sources=[str(card)], destination=str(archive)),
+        )
+
+    worker = threading.Thread(target=_run, daemon=True)
+    worker.start()
+    try:
+        worker.join(timeout=15.0)
+        assert not worker.is_alive(), (
+            "Stop did not interrupt the destination hash read blocked on "
+            "the dead-mount twin"
+        )
+    finally:
+        _release_fifo(fifo)
+        worker.join(timeout=5.0)
+
+    result = result_box["result"]
+    assert result["cancelled"] is True
+    assert result["failed"] == 0, result
+    # A landed on disk (fresh copy completed before B's cancel), so the
+    # unfixed code would call ``scan()`` here — hitting the same wedged
+    # mount and hanging. The gate on ``dest_read_cancelled`` must suppress
+    # every catalog-block scan.
+    assert scan_calls == [], (
+        f"catalog scan() fired on a cancelled batch after "
+        f"DestReadCancelled — would hang on the wedged mount: "
+        f"{len(scan_calls)} calls"
+    )
+    # A's bytes are still on disk somewhere under the archive, ready for
+    # the next run's crash-recovery adoption. Anywhere under the archive
+    # is fine — the folder-template date depends on system tz, so don't
+    # pin the exact subfolder.
+    assert list(archive.rglob("A.jpg")), (
+        "A's fresh copy should be on disk for the next run to adopt"
+    )
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="os.mkfifo is POSIX-only; FIFO stands in for a dead SMB mount.",
+)
+def test_remote_import_dest_read_cancel_skips_catalog_scan(
+        tmp_path, monkeypatch):
+    """Remote path mirror. An earlier file in the batch is adopted from
+    an already-on-disk (crash-recovery) mount copy, populating
+    ``adopted_paths``. The next file's cataloged twin is a FIFO — twin-
+    hash blocks, cancel fires, ``DestReadCancelled`` trips
+    ``dest_read_cancelled``. The post-loop
+    ``if landed or adopted_paths:`` catalog block MUST be skipped."""
+    import threading
+    from datetime import datetime
+
+    import import_job as _ij
+    from import_dedup import compute_file_hash
+    from import_job import ImportParams, run_import_job
+
+    ra = _remote_archive_for(tmp_path)
+    calls = _remote_calls(ra)
+    _install_fake_remote_rsync(monkeypatch, calls, verify=None)
+
+    card = tmp_path / "card"
+    card.mkdir()
+    a_file = card / "A.jpg"
+    b_file = card / "B.jpg"
+    Image.new("RGB", (16, 16), "red").save(str(a_file))
+    Image.new("RGB", (16, 16), "blue").save(str(b_file))
+    # Pin both card files' mtimes to the same date so the folder-template
+    # resolves to a single deterministic dest_folder — the adopted-on-disk
+    # A candidate and the FIFO twin for B must live in that same folder
+    # for the intra-batch cancel-after-adopt scenario to fire.
+    fixed_dt = datetime(2026, 1, 15, 12, 0, 0)
+    ts = fixed_dt.timestamp()
+    os.utime(str(a_file), (ts, ts))
+    os.utime(str(b_file), (ts, ts))
+
+    dest_dir = Path(ra["mount_base"]) / fixed_dt.strftime("%Y") / \
+        fixed_dt.strftime("%Y-%m-%d")
+    dest_dir.mkdir(parents=True)
+    # A is already on the mount as byte-identical (crash-recovery shape):
+    # the collision loop hashes it, matches, and adopts it into
+    # ``adopted_paths`` without going through rsync.
+    (dest_dir / "A.jpg").write_bytes(a_file.read_bytes())
+
+    # B has a cataloged twin (different folder from ``dest_dir``) whose
+    # on-disk file is a FIFO — twin-hash blocks and Stop trips
+    # DestReadCancelled.
+    twin_folder = Path(ra["mount_base"]) / "old"
+    twin_folder.mkdir()
+    fifo = twin_folder / "B.jpg"
+    os.mkfifo(str(fifo))
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws_id = db._active_workspace_id
+    _catalog_twin_row(
+        db, twin_folder, "B.jpg",
+        os.path.getsize(str(b_file)), compute_file_hash(str(b_file)),
+    )
+
+    scan_calls = []
+    real_scan = _ij.scan if hasattr(_ij, "scan") else None
+
+    def spy_scan(*args, **kwargs):
+        scan_calls.append((args, kwargs))
+        if real_scan is not None:
+            return real_scan(*args, **kwargs)
+        return None
+
+    import scanner
+    monkeypatch.setattr(scanner, "scan", spy_scan)
+
+    runner = CancelOnFileImportingRunner("B.jpg")
+    job = _make_job()
+    result_box = {}
+
+    def _run():
+        result_box["result"] = run_import_job(
+            job, runner, db_path, ws_id,
+            ImportParams(
+                sources=[str(card)], destination=ra["mount_base"],
+                remote_target=ra, verify_by_hash=True,
+            ),
+        )
+
+    worker = threading.Thread(target=_run, daemon=True)
+    worker.start()
+    try:
+        worker.join(timeout=15.0)
+        assert not worker.is_alive(), (
+            "Stop did not interrupt the destination hash read blocked on "
+            "the dead-mount twin"
+        )
+    finally:
+        _release_fifo(fifo)
+        worker.join(timeout=5.0)
+
+    result = result_box["result"]
+    assert result["cancelled"] is True
+    assert result["failed"] == 0, result
+    # A was adopted from the mount before B's cancel, so
+    # ``adopted_paths`` is non-empty. The unfixed code would call
+    # ``scan()`` here — hitting the wedged mount and hanging. The gate on
+    # ``dest_read_cancelled`` must suppress every catalog-block scan.
+    assert scan_calls == [], (
+        f"catalog scan() fired on a cancelled remote batch after "
+        f"DestReadCancelled — would hang on the wedged mount: "
+        f"{len(scan_calls)} calls"
+    )
+    # Nothing rsync'd either — Stop must reach the transfer gate too.
+    assert calls["rsync"] == [], calls["rsync"]

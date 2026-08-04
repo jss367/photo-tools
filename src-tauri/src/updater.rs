@@ -1,11 +1,20 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use tauri::AppHandle;
+use tauri::window::{ProgressBarState, ProgressBarStatus};
+use tauri::{AppHandle, Manager};
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 use tauri_plugin_updater::UpdaterExt;
 
 /// Prevents overlapping update checks from running simultaneously.
 static CHECKING: AtomicBool = AtomicBool::new(false);
+
+/// Whether the currently in-flight check should show its result to the user.
+///
+/// A user-initiated call that lands while a background check is already
+/// running flips this to true so the in-flight check surfaces its "no update"
+/// or check-error outcome — otherwise the "You'll be notified" message we
+/// showed them would be a lie for the silent paths.
+static USER_VISIBLE: AtomicBool = AtomicBool::new(false);
 
 /// Spawn an update check on a background async task.
 ///
@@ -13,21 +22,45 @@ static CHECKING: AtomicBool = AtomicBool::new(false);
 /// is available or when the check fails. Background (automatic) checks
 /// stay silent on "no update" and log errors without bothering the user.
 ///
-/// If a check is already in progress the call is silently ignored.
+/// If a user starts a check while another check or download is in progress,
+/// tell them what is happening instead of making the menu item appear broken.
 pub fn spawn_update_check(app: &AppHandle, user_initiated: bool) {
     // Atomically set the flag; if it was already true another check is running.
     if CHECKING.swap(true, Ordering::SeqCst) {
         log::debug!("Update check already in progress, skipping");
+        if user_initiated {
+            // Promote the in-flight check to user-visible so it will show a
+            // dialog for the "no update" and check-error outcomes instead of
+            // finishing silently after we told the user they'd be notified.
+            USER_VISIBLE.store(true, Ordering::SeqCst);
+            app.dialog()
+                .message(
+                    "Vireo is already checking for or downloading an update.\n\n\
+                     You'll be notified when it is ready.",
+                )
+                .title("Update in Progress")
+                .kind(MessageDialogKind::Info)
+                .show(|_| {});
+        }
         return;
     }
 
+    // We just claimed CHECKING; seed USER_VISIBLE for this run.
+    USER_VISIBLE.store(user_initiated, Ordering::SeqCst);
+
     let handle = app.clone();
     tauri::async_runtime::spawn(async move {
-        match do_update_check(&handle, user_initiated).await {
+        let result = do_update_check(&handle).await;
+        // Read USER_VISIBLE while we still hold CHECKING so a user-initiated
+        // call that raced with our completion either observes CHECKING true
+        // and flips USER_VISIBLE (we see it here), or observes CHECKING false
+        // and starts its own fresh check.
+        let visible = USER_VISIBLE.swap(false, Ordering::SeqCst);
+        match result {
             Ok(()) => {}
             Err(e) => {
                 log::error!("Update check failed: {e}");
-                if user_initiated {
+                if visible {
                     handle
                         .dialog()
                         .message(format!("Could not check for updates:\n{e}"))
@@ -41,10 +74,7 @@ pub fn spawn_update_check(app: &AppHandle, user_initiated: bool) {
     });
 }
 
-async fn do_update_check(
-    app: &AppHandle,
-    user_initiated: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn do_update_check(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
     let updater = app.updater()?;
     let update = match updater.check().await {
         Ok(u) => u,
@@ -69,9 +99,75 @@ async fn do_update_check(
             let version = update.version.clone();
             log::info!("Update available: v{version}");
 
-            update
-                .download_and_install(|_chunk_len, _content_len| {}, || {})
-                .await?;
+            // Checking should give immediate feedback. Previously Vireo began
+            // downloading the (often ~200 MB) package without showing anything
+            // and only opened a dialog after installation had completed.
+            let should_install = app
+                .dialog()
+                .message(format!(
+                    "Vireo v{version} is available.\n\n\
+                     Download and install it now? The download may take several minutes."
+                ))
+                .title("Update Available")
+                .kind(MessageDialogKind::Info)
+                .buttons(MessageDialogButtons::OkCancelCustom(
+                    "Download & Install".into(),
+                    "Later".into(),
+                ))
+                // This update check runs on a background task, so blocking the
+                // task while the native dialog is open does not freeze the UI.
+                .blocking_show();
+
+            if !should_install {
+                log::info!("Update v{version} deferred by user");
+                return Ok(());
+            }
+
+            log::info!("Downloading update v{version}");
+            set_update_progress(app, ProgressBarStatus::Indeterminate, Some(1));
+
+            let progress_handle = app.clone();
+            let finish_handle = app.clone();
+            let mut downloaded = 0_u64;
+            let mut last_progress = 0_u64;
+            let install_result = update
+                .download_and_install(
+                    move |chunk_len, content_len| {
+                        downloaded = downloaded.saturating_add(chunk_len as u64);
+                        let Some(total) = content_len.filter(|total| *total > 0) else {
+                            return;
+                        };
+                        let progress = downloaded.saturating_mul(100) / total;
+                        if progress != last_progress {
+                            last_progress = progress;
+                            set_update_progress(
+                                &progress_handle,
+                                ProgressBarStatus::Normal,
+                                Some(progress.min(100)),
+                            );
+                        }
+                    },
+                    move || {
+                        log::info!("Update download complete; installing");
+                        set_update_progress(
+                            &finish_handle,
+                            ProgressBarStatus::Indeterminate,
+                            Some(100),
+                        );
+                    },
+                )
+                .await;
+            clear_update_progress(app);
+
+            if let Err(e) = install_result {
+                log::error!("Update download or installation failed: {e}");
+                app.dialog()
+                    .message(format!("Could not download or install the update:\n{e}"))
+                    .title("Update Error")
+                    .kind(MessageDialogKind::Error)
+                    .show(|_| {});
+                return Ok(());
+            }
 
             let handle = app.clone();
             app.dialog()
@@ -91,7 +187,7 @@ async fn do_update_check(
         }
         None => {
             log::info!("No update available");
-            if user_initiated {
+            if USER_VISIBLE.load(Ordering::SeqCst) {
                 app.dialog()
                     .message(format!(
                         "You're running the latest version of Vireo (v{}).",
@@ -104,4 +200,19 @@ async fn do_update_check(
             Ok(())
         }
     }
+}
+
+fn set_update_progress(app: &AppHandle, status: ProgressBarStatus, progress: Option<u64>) {
+    if let Some(window) = app.get_webview_window("main") {
+        if let Err(e) = window.set_progress_bar(ProgressBarState {
+            status: Some(status),
+            progress,
+        }) {
+            log::debug!("Could not update updater progress indicator: {e}");
+        }
+    }
+}
+
+fn clear_update_progress(app: &AppHandle) {
+    set_update_progress(app, ProgressBarStatus::None, None);
 }

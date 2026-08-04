@@ -10118,3 +10118,266 @@ def test_remote_import_cancel_interrupts_stuck_twin_hash(
     assert result["failed"] == 0, result
     assert result["copied"] == 0, result
     assert calls["rsync"] == [], calls["rsync"]
+
+
+def test_remote_import_cancel_interrupts_stuck_collision_hash(
+        tmp_path, monkeypatch):
+    """Remote-path mirror of the twin-hash cancel, but for the OTHER
+    destination-side hash on this path: the collision/adopt loop.
+
+    Scenario: a file already sits at the collision candidate path on the
+    mount (crash-recovery shape — landed by an earlier run before catalog)
+    but is NOT cataloged, so the twin-hash branch above finds nothing and
+    execution reaches the ``os.path.exists(cand_mount)`` -> ``_hash_dest_file``
+    branch. That mount is wedged (FIFO). Before the fix, ``DestReadCancelled``
+    was swallowed as ``on_disk = None`` and the ``while True`` loop advanced
+    to the next suffix, calling ``os.path.exists`` / ``_hash_dest_file`` on
+    the same dead mount again. Stop must now leave both the candidate loop
+    and the source-file loop the moment cancellation is observed, so nothing
+    reaches rsync and no further mount work happens."""
+    import threading
+    from datetime import datetime
+
+    from import_job import ImportParams, run_import_job
+
+    ra = _remote_archive_for(tmp_path)
+    calls = _remote_calls(ra)
+    _install_fake_remote_rsync(monkeypatch, calls, verify=None)
+
+    card = tmp_path / "card"
+    card.mkdir()
+    card_file = card / "IMG_0300.jpg"
+    Image.new("RGB", (16, 16), "red").save(str(card_file))
+    # Pin the card file's mtime so the folder-template resolves to a
+    # deterministic dest_folder. Fixed local-time date so the collision
+    # FIFO below sits at the exact ``cand_mount`` path the import job
+    # computes for this file.
+    fixed_dt = datetime(2026, 1, 15, 12, 0, 0)
+    ts = fixed_dt.timestamp()
+    os.utime(str(card_file), (ts, ts))
+
+    dest_dir = Path(ra["mount_base"]) / fixed_dt.strftime("%Y") / \
+        fixed_dt.strftime("%Y-%m-%d")
+    dest_dir.mkdir(parents=True)
+    # Two NOT-cataloged mount files at consecutive suffixes — the primary
+    # candidate blocks the collision hash; the second exists so that
+    # advancing past the primary would re-enter ``os.path.exists`` /
+    # ``_hash_dest_file`` on the same wedged mount. This is the "next
+    # iteration" behavior Codex flagged — leaving the candidate loop on
+    # cancel means the second suffix is never touched.
+    collision = dest_dir / "IMG_0300.jpg"
+    os.mkfifo(str(collision))
+    next_collision = dest_dir / "IMG_0300_1.jpg"
+    os.mkfifo(str(next_collision))
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws_id = db._active_workspace_id
+
+    # Spy on the collision-candidate probe. ``os.path.exists`` gets called
+    # once per candidate iteration, so without the inner break Codex asked
+    # for, cancelling on the primary FIFO's hash would fall through to the
+    # counter+=1/continue path and probe (then hash) the second FIFO on
+    # the same dead mount before the outer ``if cancelled: break`` check
+    # fires.
+    import import_job as _ij
+    real_hash_dest_file = _ij._hash_dest_file
+    hashed_paths = []
+
+    def spy_hash_dest_file(path, cancel_check, **kw):
+        hashed_paths.append(path)
+        return real_hash_dest_file(path, cancel_check, **kw)
+
+    monkeypatch.setattr(_ij, "_hash_dest_file", spy_hash_dest_file)
+
+    runner = CancelOnImportingRunner()
+    job = _make_job()
+    result_box = {}
+
+    def _run():
+        result_box["result"] = run_import_job(
+            job, runner, db_path, ws_id,
+            ImportParams(
+                sources=[str(card)], destination=ra["mount_base"],
+                remote_target=ra, verify_by_hash=True,
+            ),
+        )
+
+    worker = threading.Thread(target=_run, daemon=True)
+    worker.start()
+    try:
+        worker.join(timeout=15.0)
+        assert not worker.is_alive(), (
+            "Stop did not interrupt the collision hash read blocked on "
+            "the dead-mount candidate"
+        )
+    finally:
+        _release_fifo(collision)
+        _release_fifo(next_collision)
+        worker.join(timeout=5.0)
+
+    result = result_box["result"]
+    assert result["cancelled"] is True
+    assert result["failed"] == 0, result
+    assert result["copied"] == 0, result
+    assert calls["rsync"] == [], calls["rsync"]
+    # After the primary candidate's hash raised DestReadCancelled, the
+    # inner break must exit the candidate loop — no second dead-mount
+    # candidate should have been hashed. Without the fix, the code would
+    # advance to ``IMG_0300_1.jpg`` and hash it too before observing
+    # cancellation at the outer batch boundary.
+    dest_hashes = [p for p in hashed_paths if str(dest_dir) in str(p)]
+    assert len(dest_hashes) <= 1, (
+        f"collision loop hashed multiple dead-mount candidates on cancel: "
+        f"{dest_hashes}"
+    )
+
+
+def test_remote_import_cancel_skips_post_loop_mount_probe(
+        tmp_path, monkeypatch):
+    """After Stop interrupts a destination-side hash on the remote path,
+    the post-loop ``_unmounted_since_baseline`` probe MUST NOT fire. On a
+    real wedged mount that probe would block for the mount's own timeout,
+    pinning the job in "cancelling" — exactly the behavior this PR set out
+    to eliminate.
+
+    Spy on the probe: it may run once (the per-file check that ran before
+    the twin-hash cancel), but the second call — post-loop — must be
+    suppressed by the ``not cancelled`` gate."""
+    import threading
+
+    import pipeline_job as _pj
+    from import_dedup import compute_file_hash
+    from import_job import ImportParams, run_import_job
+
+    ra = _remote_archive_for(tmp_path)
+    calls = _remote_calls(ra)
+    _install_fake_remote_rsync(monkeypatch, calls, verify=None)
+
+    card = tmp_path / "card"
+    card.mkdir()
+    card_file = card / "IMG_0300.jpg"
+    Image.new("RGB", (16, 16), "red").save(str(card_file))
+
+    dest_dir = Path(ra["mount_base"]) / "2026" / "2026-01-01"
+    dest_dir.mkdir(parents=True)
+    twin = dest_dir / "IMG_0300.jpg"
+    os.mkfifo(str(twin))
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws_id = db._active_workspace_id
+    _catalog_twin_row(
+        db, dest_dir, "IMG_0300.jpg",
+        os.path.getsize(str(card_file)), compute_file_hash(str(card_file)),
+    )
+
+    probe_calls = {"count": 0}
+
+    def spy_unmounted(baseline):
+        probe_calls["count"] += 1
+        return None
+
+    monkeypatch.setattr(_pj, "_unmounted_since_baseline", spy_unmounted)
+
+    runner = CancelOnImportingRunner()
+    job = _make_job()
+    result_box = {}
+
+    def _run():
+        result_box["result"] = run_import_job(
+            job, runner, db_path, ws_id,
+            ImportParams(
+                sources=[str(card)], destination=ra["mount_base"],
+                remote_target=ra, verify_by_hash=True,
+            ),
+        )
+
+    worker = threading.Thread(target=_run, daemon=True)
+    worker.start()
+    try:
+        worker.join(timeout=15.0)
+        assert not worker.is_alive()
+    finally:
+        _release_fifo(twin)
+        worker.join(timeout=5.0)
+
+    result = result_box["result"]
+    assert result["cancelled"] is True
+    # Two calls are expected on the healthy cancel path: pre-batch (once
+    # per batch, before the for-source_file loop) + per-file (once at the
+    # top of the loop, before the twin-hash break). The post-loop probe
+    # (unconditional before the fix) must be suppressed once ``cancelled``
+    # is set — so a third call would signal a regression.
+    assert probe_calls["count"] <= 2, (
+        f"post-loop mount probe was not suppressed on cancel "
+        f"({probe_calls['count']} calls)"
+    )
+
+
+def test_local_import_cancel_skips_post_loop_mount_probe(
+        tmp_path, monkeypatch):
+    """Local-path mirror of the remote skip-post-loop-mount-probe test.
+    The local path has the same unconditional post-loop probe and the same
+    dead-mount hang risk on a wedged twin hash."""
+    import threading
+
+    import pipeline_job as _pj
+    from import_dedup import compute_file_hash
+    from import_job import ImportParams, run_import_job
+
+    card = tmp_path / "card"
+    card.mkdir()
+    card_file = card / "IMG_0300.jpg"
+    Image.new("RGB", (16, 16), "red").save(str(card_file))
+
+    archive = tmp_path / "archive"
+    dest_dir = archive / "old"
+    dest_dir.mkdir(parents=True)
+    twin = dest_dir / "IMG_0300.jpg"
+    os.mkfifo(str(twin))
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws_id = db._active_workspace_id
+    _catalog_twin_row(
+        db, dest_dir, "IMG_0300.jpg",
+        os.path.getsize(str(card_file)), compute_file_hash(str(card_file)),
+    )
+
+    probe_calls = {"count": 0}
+
+    def spy_unmounted(baseline):
+        probe_calls["count"] += 1
+        return None
+
+    monkeypatch.setattr(_pj, "_unmounted_since_baseline", spy_unmounted)
+
+    runner = CancelOnImportingRunner()
+    job = _make_job()
+    result_box = {}
+
+    def _run():
+        result_box["result"] = run_import_job(
+            job, runner, db_path, ws_id,
+            ImportParams(sources=[str(card)], destination=str(archive)),
+        )
+
+    worker = threading.Thread(target=_run, daemon=True)
+    worker.start()
+    try:
+        worker.join(timeout=15.0)
+        assert not worker.is_alive()
+    finally:
+        _release_fifo(twin)
+        worker.join(timeout=5.0)
+
+    result = result_box["result"]
+    assert result["cancelled"] is True
+    # As on the remote path: two calls are expected (pre-batch +
+    # per-file, before the twin-hash cancel). A third would mean the
+    # post-loop probe (unconditional before the fix) fired.
+    assert probe_calls["count"] <= 2, (
+        f"post-loop mount probe was not suppressed on cancel "
+        f"({probe_calls['count']} calls)"
+    )

@@ -2072,8 +2072,18 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
                         on_disk = _hash_dest_file(
                             cand_mount, _stop_requested)
                     except DestReadCancelled:
+                        # Stop arrived mid-read against a candidate on the
+                        # (possibly dead) mount. Advancing to the next
+                        # suffix would immediately call os.path.exists /
+                        # getsize / _hash_dest_file on the same mount and
+                        # can pin cancelling for the mount's own timeout,
+                        # exactly like the twin-hash branch above. Exit the
+                        # candidate loop; the outer check below then exits
+                        # the source-file loop so nothing else in this
+                        # batch touches the mount. The interrupted file
+                        # stays on the card for the next run.
                         cancelled = True
-                        on_disk = None
+                        break
                     except OSError:
                         on_disk = None
                     if on_disk is not None and on_disk == src_hash:
@@ -2097,6 +2107,13 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
                     counter += 1
                     continue
                 dest_basename = candidate
+                break
+            if cancelled:
+                # Stop interrupted a collision hash above (mirrors the
+                # twin-hash branch's post-loop check). Don't let this file
+                # (or the rest of the batch) fall through to the queue /
+                # rsync path — every further step touches the same
+                # (possibly dead) mount.
                 break
             if adopted:
                 continue
@@ -2126,7 +2143,16 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
         # covered. As on the local path this is the last probe that can
         # help: a detach after it races the transfer and catalog scan,
         # which no amount of probing can prevent.
-        if not mount_lost:
+        #
+        # Skip the probe when the per-file loop above already broke on
+        # cancellation. That break ran because Stop interrupted a
+        # destination-side hash on a possibly-dead mount; probing that
+        # same mount here can block for the mount's own timeout and put
+        # the job right back in the long "cancelling" state this fix set
+        # out to avoid. The rsync path below is already gated on
+        # ``cancelled``, so skipping the probe changes no downstream
+        # decision.
+        if not mount_lost and not cancelled:
             mount_lost = _unmounted_since_baseline(mount_baseline)
 
         # A detach invalidates every accepted "already present" claim in
@@ -3951,7 +3977,16 @@ def run_import_job(job, runner, db_path, workspace_id, params):
         # can make a network filesystem stay mounted across a write. What
         # it does guarantee is that nothing is booked as archived without
         # a mount check on both sides of every copy in the batch.
-        if not mount_lost:
+        #
+        # Skip the probe when the per-file loop above already broke on
+        # cancellation. That break ran because Stop interrupted a
+        # destination-side hash on a possibly-dead mount; probing that
+        # same mount here can block for the mount's own timeout and put
+        # the job right back in the long "cancelling" state this fix set
+        # out to avoid. Nothing is left to copy on a cancelled batch, so
+        # skipping the probe changes no downstream decision. Mirrors the
+        # remote path's gate above.
+        if not mount_lost and not cancelled:
             mount_lost = _unmounted_since_baseline(mount_baseline)
 
         # Accepted duplicate skips rest on a twin that may live in the

@@ -35,7 +35,12 @@ Reconnaissance notes (Task 2.0, verified 2026-07-04):
    path additionally passes ``cancel_check`` into the per-batch rsync so
    Stop kills the subprocess mid-transfer instead of waiting out the
    batch — the interrupted batch is cancelled work (nothing failed,
-   nothing cataloged), recovered like a mid-batch crash.
+   nothing cataloged), recovered like a mid-batch crash. Destination-side
+   hash reads (duplicate gate, crash-recovery adopt, post-scan re-checks)
+   go through ``_hash_dest_file``, which watches the same Stop signal and
+   a stall watchdog — a read blocked on a dead SMB mount can otherwise
+   pin the worker for the mount's own multi-minute timeout per file while
+   cancellation goes unobserved.
 4. Batch unit: files grouped by destination (template) folder,
    processed in template order, chunked to at most
    ``IMPORT_BATCH_SIZE`` files per scan call. Restricted scans only
@@ -58,6 +63,7 @@ import os
 import posixpath
 import shutil
 import sys
+import threading
 import time
 import uuid
 from dataclasses import dataclass
@@ -741,6 +747,85 @@ def _fs_lacks_hardlinks(err):
     return getattr(err, "errno", None) in _HARDLINK_UNSUPPORTED_ERRNOS
 
 
+# Seconds a destination-side hash read may go without producing a single
+# chunk before it is declared stalled. Same philosophy as the rsync stall
+# watchdog in move.py: bound silence, not total runtime — a slow but moving
+# mount read never trips this, a wedged SMB session does.
+DEST_HASH_STALL_TIMEOUT = 120.0
+
+
+class DestReadCancelled(OSError):
+    """Stop arrived while a destination-side read was in flight.
+
+    Subclasses OSError so any call site without explicit cancel handling
+    treats it as an ordinary unreadable-file result (safe by default),
+    while the sites that would otherwise record a failure catch it first
+    and convert it into the job's normal cancelled exit.
+    """
+
+
+def _hash_dest_file(path, cancel_check, *,
+                    stall_timeout=DEST_HASH_STALL_TIMEOUT):
+    """SHA-256 a destination/mount-side file without letting a sick
+    network mount hold cancellation hostage.
+
+    ``compute_file_hash`` is a plain blocking read: against a stale SMB
+    mount a single file can pin the worker for the mount's own timeout
+    (tens of minutes on macOS) per read while Stop goes unobserved —
+    cancellation is only polled between files, so the job sits in
+    "cancelling" for hours. Run the chunked read in a watcher-supervised
+    daemon thread instead:
+
+    - ``cancel_check()`` returns True → ``DestReadCancelled`` within a
+      second, even mid-read.
+    - no chunk lands for ``stall_timeout`` → plain ``OSError``, the same
+      shape an unreadable file already produces at every call site.
+
+    The abandoned worker cannot be killed — the read is stuck in an
+    uninterruptible kernel call — so it is orphaned: a daemon thread that
+    exits when the mount finally returns, never blocking shutdown.
+    """
+    if cancel_check():
+        # The open() itself blocks on a dead mount; don't even touch it.
+        raise DestReadCancelled(f"import cancelled before reading {path}")
+
+    result = {}
+    activity = {"t": time.monotonic()}
+    done = threading.Event()
+
+    def _worker():
+        h = hashlib.sha256()
+        try:
+            with open(path, "rb") as f:
+                while True:
+                    chunk = f.read(65536)
+                    activity["t"] = time.monotonic()
+                    if not chunk:
+                        break
+                    h.update(chunk)
+            result["hash"] = h.hexdigest()
+        except BaseException as exc:  # surfaced on the caller's thread
+            result["exc"] = exc
+        finally:
+            done.set()
+
+    worker = threading.Thread(
+        target=_worker, daemon=True, name="import-dest-hash",
+    )
+    worker.start()
+    while not done.wait(0.5):
+        if cancel_check():
+            raise DestReadCancelled(
+                f"import cancelled while reading {path}")
+        if time.monotonic() - activity["t"] > stall_timeout:
+            raise OSError(
+                f"read of {path} stalled (no data for "
+                f"{stall_timeout:.0f}s; the mount is likely dead)")
+    if "exc" in result:
+        raise result["exc"]
+    return result["hash"]
+
+
 def _key_twin_rows(db, key):
     """Catalog rows whose stored identity equals a source metadata key.
 
@@ -1420,6 +1505,18 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
     folder_counts = {}
     emitted = 0
     cancelled = False
+
+    def _stop_requested():
+        # Threaded through every destination-side hash read so a Stop can
+        # interrupt a read blocked on a dead mount (see _hash_dest_file).
+        # Nonblocking probe — ``is_cancelled`` would park in
+        # ``wait_if_paused`` for a pausable import, freezing the watchdog
+        # loop itself and stopping the 120s stall timer from running while
+        # the daemon reader can keep touching the archive even though the
+        # UI says the job is paused. Mirrors the rsync watchdog's use of
+        # ``cancellation_requested`` for the same reason.
+        return runner.cancellation_requested(job["id"])
+
     wc_source_paths = {}
     wc_dest_folders = set()
     # Photo rows this run created or landed bytes into: fresh copies whose
@@ -1737,6 +1834,18 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
         # decisions above happen per file and each one reads the mount —
         # so the mount has to be re-checked at that granularity too.
         mount_lost = None
+        # Sticky signal that a destination-side hash in the per-file loop
+        # below was cancelled mid-read (``DestReadCancelled``). Any such
+        # cancel is evidence the mount is misbehaving, so the post-loop
+        # catalog block MUST skip its ``scan()`` / ``_hash_dest_file``
+        # calls on the same paths — they would hit the same wedged mount
+        # and pin the job in "cancelling" for the mount's own timeout,
+        # exactly the failure mode this PR set out to eliminate. A plain
+        # user Stop on a healthy mount leaves this False (the catalog
+        # runs normally so partially-landed batches stay cataloged the
+        # way ``test_cancel_leaves_valid_partial_catalog`` expects).
+        # See PR #1423 review (Codex P2 r3716433824).
+        dest_read_cancelled = False
         for source_file in batch:
             if runner.is_cancelled(job["id"]):
                 cancelled = True
@@ -1843,7 +1952,12 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
                             if _path_under_any_source(twin_path):
                                 continue
                             try:
-                                twin_hash = compute_file_hash(twin_path)
+                                twin_hash = _hash_dest_file(
+                                    twin_path, _stop_requested)
+                            except DestReadCancelled:
+                                cancelled = True
+                                dest_read_cancelled = True
+                                break
                             except OSError:
                                 continue
                             if twin_hash is not None and twin_hash == src_hash:
@@ -1858,6 +1972,12 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
                                 # Mirrors the local path's collect-then-
                                 # link pattern. See PR #1113 review.
                                 verified_twin_rows.append(twin)
+                    if cancelled:
+                        # Stop interrupted a twin hash above. Don't let
+                        # this file fall through to the collision checks
+                        # and the transfer queue — every further step
+                        # touches the same (possibly dead) mount.
+                        break
                     if accept:
                         skipped_duplicate += 1
                         dup_skipped += 1
@@ -1968,7 +2088,22 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
                     # Already on disk (crash-recovery/resume). Byte-identical
                     # -> skip; different -> advance to the next suffix.
                     try:
-                        on_disk = compute_file_hash(cand_mount)
+                        on_disk = _hash_dest_file(
+                            cand_mount, _stop_requested)
+                    except DestReadCancelled:
+                        # Stop arrived mid-read against a candidate on the
+                        # (possibly dead) mount. Advancing to the next
+                        # suffix would immediately call os.path.exists /
+                        # getsize / _hash_dest_file on the same mount and
+                        # can pin cancelling for the mount's own timeout,
+                        # exactly like the twin-hash branch above. Exit the
+                        # candidate loop; the outer check below then exits
+                        # the source-file loop so nothing else in this
+                        # batch touches the mount. The interrupted file
+                        # stays on the card for the next run.
+                        cancelled = True
+                        dest_read_cancelled = True
+                        break
                     except OSError:
                         on_disk = None
                     if on_disk is not None and on_disk == src_hash:
@@ -1992,6 +2127,13 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
                     counter += 1
                     continue
                 dest_basename = candidate
+                break
+            if cancelled:
+                # Stop interrupted a collision hash above (mirrors the
+                # twin-hash branch's post-loop check). Don't let this file
+                # (or the rest of the batch) fall through to the queue /
+                # rsync path — every further step touches the same
+                # (possibly dead) mount.
                 break
             if adopted:
                 continue
@@ -2021,7 +2163,24 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
         # covered. As on the local path this is the last probe that can
         # help: a detach after it races the transfer and catalog scan,
         # which no amount of probing can prevent.
-        if not mount_lost:
+        #
+        # Skip the probe ONLY when the per-file loop above broke because
+        # a destination-side hash was interrupted mid-read
+        # (``dest_read_cancelled``): that signal means the mount itself
+        # is misbehaving, so probing it here would block for the mount's
+        # own timeout and put the job right back in the long
+        # "cancelling" state this fix set out to avoid.
+        #
+        # Do NOT skip on a plain-Stop ``cancelled`` (observed by
+        # ``runner.is_cancelled`` at the top of the source-file loop).
+        # An earlier file in this same batch may have been accepted as an
+        # adopted/duplicate claim before the user hit Stop, and if the
+        # share detached between that mount read and the Stop the only
+        # remaining chance to notice — and to roll ``dup_skips`` /
+        # ``adopted_paths`` back so the catalog block below doesn't
+        # trust a local shadow — is this probe. See PR #1423 review
+        # (Codex P2 r3716581282).
+        if not mount_lost and not dest_read_cancelled:
             mount_lost = _unmounted_since_baseline(mount_baseline)
 
         # A detach invalidates every accepted "already present" claim in
@@ -2274,7 +2433,20 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
         # uncataloged mount-side collision. Cataloged duplicate twins are
         # linked directly below; scanning a duplicate-only destination would
         # enumerate/stat the entire mounted NAS folder for no new rows.
-        if landed or adopted_paths:
+        #
+        # Skip when a destination-side hash in the per-file loop above
+        # cancelled mid-read. That signal means the mount is misbehaving,
+        # and ``scan()`` here — plus the ``_hash_dest_file`` re-checks below
+        # for landed and adopted paths — would touch the same mounted
+        # directory and pin the job in "cancelling" for the mount's own
+        # timeout. Already-rsync'd landings and adopted-on-disk paths are
+        # picked up by the next run's crash-recovery adoption (byte-
+        # identical files match by hash and count as ``skipped_duplicate``).
+        # A plain user Stop on a healthy mount leaves
+        # ``dest_read_cancelled`` False, so partially-landed batches keep
+        # cataloging like before. See PR #1423 review (Codex P2
+        # r3716433824).
+        if (landed or adopted_paths) and not dest_read_cancelled:
             landed_paths = {entry[0] for entry in landed}
             # Include collision-loop adopted mount paths so their photo rows
             # get created by the restricted scan. The explicit file set is
@@ -2386,7 +2558,11 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
                     # fallback. See PR #1113 review.
                     if scan_h is None and src_h_norm is not None:
                         try:
-                            mount_hash = compute_file_hash(dest_path)
+                            mount_hash = _hash_dest_file(
+                                dest_path, _stop_requested)
+                        except DestReadCancelled:
+                            cancelled = True
+                            break
                         except OSError:
                             mount_hash = None
                         mount_norm = (
@@ -2477,7 +2653,11 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
                         # gated behind ``verify_by_hash``. See PR #1113
                         # review.
                         try:
-                            mount_hash = compute_file_hash(dest_path)
+                            mount_hash = _hash_dest_file(
+                                dest_path, _stop_requested)
+                        except DestReadCancelled:
+                            cancelled = True
+                            break
                         except OSError:
                             mount_hash = None
                         src_h_norm = (
@@ -2633,7 +2813,10 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
                     # both sides) is still accepted.
                     read_failed = False
                     try:
-                        mount_hash = compute_file_hash(ap)
+                        mount_hash = _hash_dest_file(ap, _stop_requested)
+                    except DestReadCancelled:
+                        cancelled = True
+                        break
                     except OSError:
                         mount_hash = None
                         read_failed = True
@@ -3130,6 +3313,17 @@ def run_import_job(job, runner, db_path, workspace_id, params):
     emitted = 0
     cancelled = False
 
+    def _stop_requested():
+        # Threaded through every destination-side hash read so a Stop can
+        # interrupt a read blocked on a dead mount (see _hash_dest_file).
+        # Nonblocking probe — ``is_cancelled`` would park in
+        # ``wait_if_paused`` for a pausable import, freezing the watchdog
+        # loop itself and stopping the 120s stall timer from running while
+        # the daemon reader can keep touching the archive even though the
+        # UI says the job is paused. Mirrors the rsync watchdog's use of
+        # ``cancellation_requested`` for the same reason.
+        return runner.cancellation_requested(job["id"])
+
     # Working-copy extraction is DEFERRED to the end of the whole import
     # run (not per-batch). Rationale: a folder that receives more than
     # ``IMPORT_BATCH_SIZE`` files splits across multiple batches; a
@@ -3433,6 +3627,19 @@ def run_import_job(job, runner, db_path, workspace_id, params):
         # keeps the blast radius at one file instead of a whole folder.
         # One ismount call is nothing next to copying and hashing a RAW.
         mount_lost = None
+        # Sticky signal that a destination-side hash in the per-file loop
+        # below was cancelled mid-read (``DestReadCancelled``). Any such
+        # cancel is evidence the mount is misbehaving, so the post-loop
+        # catalog block MUST skip its ``scan()`` / ``_rehash_dest_or_none``
+        # calls on the same paths — they would hit the same wedged mount
+        # and pin the job in "cancelling" for the mount's own timeout,
+        # exactly the failure mode this PR set out to eliminate. A plain
+        # user Stop on a healthy mount leaves this False (the catalog
+        # runs normally so partially-landed batches stay cataloged the
+        # way ``test_cancel_leaves_valid_partial_catalog`` expects).
+        # Mirrors the remote path. See PR #1423 review (Codex P2
+        # r3716433830).
+        dest_read_cancelled = False
 
         for source_file in batch:
             if runner.is_cancelled(job["id"]):
@@ -3564,7 +3771,12 @@ def run_import_job(job, runner, db_path, workspace_id, params):
                             if _path_under_any_source(twin_path):
                                 continue
                             try:
-                                twin_hash = compute_file_hash(twin_path)
+                                twin_hash = _hash_dest_file(
+                                    twin_path, _stop_requested)
+                            except DestReadCancelled:
+                                cancelled = True
+                                dest_read_cancelled = True
+                                break
                             except OSError:
                                 continue
                             if twin_hash is not None and twin_hash == src_hash:
@@ -3584,6 +3796,12 @@ def run_import_job(job, runner, db_path, workspace_id, params):
                                 # the on-disk bytes). See PR #1107
                                 # review.
                                 verified_twin_rows.append(twin)
+                    if cancelled:
+                        # Stop interrupted a twin hash above. Don't let
+                        # this file fall through to the adopt/copy path —
+                        # every further step touches the same (possibly
+                        # dead) mount.
+                        break
                     if accept:
                         skipped_duplicate += 1
                         _counts(rel)["skipped_duplicate"] += 1
@@ -3713,7 +3931,8 @@ def run_import_job(job, runner, db_path, workspace_id, params):
                         # case without walking the rest of the directory.
                         adopted_dest = (dest_file, EMPTY_FILE_SHA256)
                     elif src_size == dest_size:
-                        dest_hash = compute_file_hash(dest_file)
+                        dest_hash = _hash_dest_file(
+                            dest_file, _stop_requested)
                         src_h = _src_hash_cached()
                         if src_h is not None and src_h == dest_hash:
                             # Byte-identical file already at the destination
@@ -3750,7 +3969,8 @@ def run_import_job(job, runner, db_path, workspace_id, params):
                             except OSError:
                                 cand_size = -1
                             if cand_size == src_size:
-                                cand_hash = compute_file_hash(candidate)
+                                cand_hash = _hash_dest_file(
+                                    candidate, _stop_requested)
                                 src_h = _src_hash_cached()
                                 if (
                                     cand_hash is not None
@@ -3780,6 +4000,14 @@ def run_import_job(job, runner, db_path, workspace_id, params):
                 ok, file_hash = copy_and_hash_verify(
                     str(source_file), dest_file, src_hash=src_hash,
                 )
+            except DestReadCancelled:
+                # Stop arrived mid-read against the destination (adopt/
+                # collision hashing above). The file is neither copied nor
+                # failed — it stays on the card for the next run, like any
+                # file the cancel got to before its batch.
+                cancelled = True
+                dest_read_cancelled = True
+                break
             except OSError as e:
                 _fail(rel, source_file, str(e))
                 continue
@@ -3811,7 +4039,24 @@ def run_import_job(job, runner, db_path, workspace_id, params):
         # can make a network filesystem stay mounted across a write. What
         # it does guarantee is that nothing is booked as archived without
         # a mount check on both sides of every copy in the batch.
-        if not mount_lost:
+        #
+        # Skip the probe ONLY when the per-file loop above broke because
+        # a destination-side hash was interrupted mid-read
+        # (``dest_read_cancelled``): that signal means the mount itself
+        # is misbehaving, so probing it here would block for the mount's
+        # own timeout and put the job right back in the long
+        # "cancelling" state this fix set out to avoid.
+        #
+        # Do NOT skip on a plain-Stop ``cancelled`` (observed by
+        # ``runner.is_cancelled`` at the top of the source-file loop).
+        # An earlier file in this same batch may have been copied or
+        # adopted before the user hit Stop, and if the archive mount
+        # dropped during that just-finished operation the only remaining
+        # chance to notice — and to roll ``landed`` / ``dup_skips`` back
+        # so the catalog block below doesn't scan a local shadow — is
+        # this probe. Mirrors the remote path's gate above. See PR #1423
+        # review (Codex P2 r3716581283).
+        if not mount_lost and not dest_read_cancelled:
             mount_lost = _unmounted_since_baseline(mount_baseline)
 
         # Accepted duplicate skips rest on a twin that may live in the
@@ -3867,7 +4112,19 @@ def run_import_job(job, runner, db_path, workspace_id, params):
         # landed on disk must be cataloged before we stop, so every
         # stopping point is a valid catalog state). Bounded by the batch
         # size, so no cancel_check is passed — it runs to completion.
-        if landed:
+        #
+        # Skip when a destination-side hash in the per-file loop above
+        # cancelled mid-read. That signal means the mount is misbehaving,
+        # and ``scan()`` here — plus the ``_rehash_dest_or_none``
+        # re-checks below — would touch the same wedged mount and pin the
+        # job in "cancelling" for the mount's own timeout. Already-copied
+        # landings are picked up by the next run's crash-recovery
+        # adoption (byte-identical files match by hash and count as
+        # ``skipped_duplicate``). A plain user Stop on a healthy mount
+        # leaves ``dest_read_cancelled`` False, so partially-landed
+        # batches keep cataloging like before. Mirrors the remote path.
+        # See PR #1423 review (Codex P2 r3716433830).
+        if landed and not dest_read_cancelled:
             landed_paths = {entry[0] for entry in landed}
             # Capture the pre-scan (photo_id, file_hash) for every landed
             # dest_path. Scanner's own ``_invalidate_derived_caches``
@@ -3980,7 +4237,9 @@ def run_import_job(job, runner, db_path, workspace_id, params):
                 accepted as success.
                 """
                 try:
-                    return compute_file_hash(path)
+                    return _hash_dest_file(path, _stop_requested)
+                except DestReadCancelled:
+                    raise
                 except OSError:
                     return None
 
@@ -4016,7 +4275,11 @@ def run_import_job(job, runner, db_path, workspace_id, params):
                         ),
                     ).fetchone()
                     if companion is not None:
-                        actual = _rehash_dest_or_none(dest_path)
+                        try:
+                            actual = _rehash_dest_or_none(dest_path)
+                        except DestReadCancelled:
+                            cancelled = True
+                            break
                         if actual is not None and actual == verified_hash:
                             # Landed JPEG paired with an existing RAW
                             # row. Invalidate the RAW's derived caches
@@ -4085,7 +4348,11 @@ def run_import_job(job, runner, db_path, workspace_id, params):
                         # — if that also fails or disagrees with our
                         # copy-time hash, reclassify to failed instead of
                         # stamping a stale value. See PR #1107 review.
-                        actual = _rehash_dest_or_none(dest_path)
+                        try:
+                            actual = _rehash_dest_or_none(dest_path)
+                        except DestReadCancelled:
+                            cancelled = True
+                            break
                         if actual is not None and actual == verified_hash:
                             db.update_photo_hash_check(
                                 row["id"], "ok", file_hash=verified_hash,

@@ -653,13 +653,24 @@ def test_check_duplicates_recovery_skips_hashing_when_no_collision(
 ):
     """No size collision at the destination → the preview must not hash
     the source. Fresh imports (the common case) stay cheap; hashing is
-    scoped to actual collision candidates."""
+    scoped to actual collision candidates.
+
+    The endpoint uses a function-local ``from scanner import
+    compute_file_hash``, which re-executes on every call and picks up
+    the current ``scanner.compute_file_hash`` — patching that module
+    attribute correctly intercepts. The test also patches
+    ``import_dedup.compute_file_hash`` (a sibling binding) to guard
+    against a future refactor routing hashing through that path, and
+    ends with a positive-control run that MUST see hash calls: without
+    it, a silent no-op patch would make the negative assertion vacuous.
+    """
     app, db, fid = app_and_db
 
     src = _make_dated_source(tmp_path)
     dest = tmp_path / "archive"
     # Planned folder is empty — no candidate at the primary slot at all.
-    (dest / "2026" / "2026-07-03").mkdir(parents=True)
+    planned = dest / "2026" / "2026-07-03"
+    planned.mkdir(parents=True)
 
     import scanner
     hash_calls = []
@@ -670,6 +681,11 @@ def test_check_duplicates_recovery_skips_hashing_when_no_collision(
         return real_hash(path, *a, **kw)
 
     monkeypatch.setattr(scanner, "compute_file_hash", _counting_hash)
+    import import_dedup
+    if hasattr(import_dedup, "compute_file_hash"):
+        monkeypatch.setattr(
+            import_dedup, "compute_file_hash", _counting_hash,
+        )
 
     client = app.test_client()
     resp = client.post("/api/import/check-duplicates", json={
@@ -683,6 +699,26 @@ def test_check_duplicates_recovery_skips_hashing_when_no_collision(
     assert hash_calls == [], (
         f"expected no content hashing without a size collision, got "
         f"{len(hash_calls)} hash call(s): {hash_calls}"
+    )
+
+    # Positive control: with the same patch still in place, forcing a
+    # same-size collision at the primary slot MUST cause the endpoint to
+    # hash. If this doesn't fire, the patch above is a no-op and the
+    # empty-list assertion is meaningless. This is what makes the test
+    # actually verify no-collision-no-hashing rather than passing
+    # trivially on a broken intercept.
+    src_size = os.path.getsize(str(src))
+    (planned / src.name).write_bytes(b"X" * src_size)  # same size, mismatched bytes
+    hash_calls.clear()
+    client.post("/api/import/check-duplicates", json={
+        "paths": [str(src)],
+        "destination": str(dest),
+        "folder_template": "%Y/%Y-%m-%d",
+    })
+    assert hash_calls, (
+        "expected the patched compute_file_hash to be invoked at least "
+        "once when the primary slot has a same-size candidate — patch "
+        "failed to intercept, negative assertion above was vacuous"
     )
 
 

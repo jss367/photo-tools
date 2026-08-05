@@ -14403,6 +14403,7 @@ def test_import_page_returns_200(app_and_db):
     assert "res.unverified_duplicates_only" in html
     assert 'id="safeToFormatPill"' in html
     assert "/api/jobs/import-in-place" in html
+    assert "/api/jobs/import-photos" in html
 
 
 def test_import_page_surfaces_remote_target_load_failure(app_and_db):
@@ -14419,7 +14420,10 @@ def test_import_page_surfaces_remote_target_load_failure(app_and_db):
     assert "AbortController" in html
     assert "retry-link" in html
     assert "Couldn\u2019t load the SSH archive destinations" in html
-    assert "/api/jobs/import-photos" in html
+    # Timeout vs other errors get distinct wording so a hung endpoint
+    # reads differently from a server error or malformed response.
+    assert "didn\u2019t answer within 10 seconds" in html
+    assert "server returned an error or an unreadable response" in html
 
 
 def test_import_page_surfaces_destination_errors_and_recovery_actions(

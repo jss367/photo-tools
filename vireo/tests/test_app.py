@@ -14403,6 +14403,22 @@ def test_import_page_returns_200(app_and_db):
     assert "res.unverified_duplicates_only" in html
     assert 'id="safeToFormatPill"' in html
     assert "/api/jobs/import-in-place" in html
+
+
+def test_import_page_surfaces_remote_target_load_failure(app_and_db):
+    """The Archive Destination dropdown must never lose its SSH options
+    silently: when /api/remote-targets fails or hangs, the page shows a
+    visible error with a Retry control instead of a local-only dropdown
+    that looks complete (import-incident follow-up)."""
+    app, _ = app_and_db
+    client = app.test_client()
+    html = client.get("/import").data.decode()
+    assert 'id="remoteTargetsError"' in html
+    # The loader bounds the fetch (a hung endpoint used to leave the
+    # dropdown local-only with no error at all) and offers a retry.
+    assert "AbortController" in html
+    assert "retry-link" in html
+    assert "Couldn\u2019t load the SSH archive destinations" in html
     assert "/api/jobs/import-photos" in html
 
 

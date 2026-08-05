@@ -18310,32 +18310,258 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         fallback by default, hash-everything when verify_by_hash — so the
         preview's DUPLICATE badges and count are exactly the files the
         import step will skip.
+
+        Optional {"destination": abs path, "folder_template": str} turns on
+        destination-recovery detection: non-duplicate files whose planned
+        destination folder already holds a byte-identical file at the
+        primary name — or at a numeric-suffix slot the run would adopt
+        (``name_1.ext``, ``name_2.ext``, ...) — are streamed as
+        ``recovered`` (with a final ``recovered_count``). Those are the
+        files a cancelled/crashed prior run left at the destination —
+        the import adopts them via crash recovery (verify + catalog, no
+        re-copy), so counting them "to copy" overstates the transfer.
+
+        A size match is the cheap gate: same-size candidates are the only
+        ones the run would even byte-verify, so hashing is scoped to that
+        subset (rare in a fresh import; proportional to actual collisions
+        in a retry). A same-size candidate whose bytes disagree advances
+        the walk the same way ``import_job`` does on a hash mismatch —
+        otherwise the preview would tell the user "not re-copied" for a
+        file the run is about to suffix-copy under a numbered name.
+
+        Optional {"skip_duplicates": false} matches the import job's own
+        gate: when the run has duplicate skipping off, the library-dedup
+        checker isn't consulted (library duplicates get copied anyway),
+        but crash-recovery adoption of byte-identical files at the
+        destination still fires. Passing skip_duplicates=false here
+        mirrors that: no ``duplicates`` are streamed, but ``recovered``
+        still is — so the retry preview after a cancelled dedup-off run
+        doesn't overstate the transfer.
         """
         body = request.get_json(silent=True) or {}
         paths = body.get("paths", [])
         verify_by_hash = bool(body.get("verify_by_hash"))
+        # Default True is the import job's default and preserves the
+        # pre-existing endpoint contract; only the dedup-off preview
+        # branch passes False.
+        skip_duplicates = bool(body.get("skip_duplicates", True))
         if not paths:
             return json_error("paths required", 400)
 
-        from import_dedup import CatalogIndex, DuplicateChecker
+        from import_dedup import (
+            CatalogIndex,
+            DuplicateChecker,
+            source_capture_timestamps,
+        )
+        from ingest import _is_unsafe_path, build_destination_path
+        from scanner import compute_file_hash
+
+        recovery_base = (body.get("destination") or "").strip()
+        folder_template = body.get("folder_template", "%Y/%Y-%m-%d")
+        if recovery_base and not os.path.isabs(recovery_base):
+            return json_error("destination must be an absolute path", 400)
+        if recovery_base and folder_template and _is_unsafe_path(
+                folder_template):
+            return json_error(
+                "folder_template must be a relative path without '..' "
+                "or backslashes", 400)
 
         db = _get_db()
+        # The checker still runs when skip_duplicates=False, but only for
+        # its EXIF-batching side effect (needed by _recovery_candidate in
+        # default mode). check_and_record() is skipped in the generator
+        # below so no library-dedup verdict is produced — matching the
+        # import job, which doesn't create the checker at all in that
+        # mode.
         checker = DuplicateChecker(
             CatalogIndex.from_db(db), verify_by_hash=verify_by_hash,
         )
+
+        # str(path) -> capture datetime for recovery folder planning when
+        # verify_by_hash disables the checker's own EXIF batching.
+        recovery_times = {}
+
+        # name -> size per planned destination folder, one scandir each —
+        # the destination may be a network mount, so listings are batched
+        # rather than stat'ing per candidate file (count round trips).
+        dir_listings = {}
+
+        def _planned_folder_listing(folder):
+            if folder not in dir_listings:
+                entries = {}
+                try:
+                    with os.scandir(folder) as it:
+                        for entry in it:
+                            try:
+                                if entry.is_file(follow_symlinks=False):
+                                    entries[entry.name] = entry.stat(
+                                        follow_symlinks=False).st_size
+                            except OSError:
+                                continue
+                except OSError:
+                    pass  # missing/unreadable folder -> nothing to adopt
+                dir_listings[folder] = entries
+            return dir_listings[folder]
+
+        def _recovery_candidate(path):
+            """True when the planned destination already holds a byte-
+            identical file at the primary name OR at any suffix slot the
+            run would adopt — mirrors ``import_job``'s adopt precondition
+            (size match then byte-verify). A size-matching candidate whose
+            bytes disagree advances the walk the same way a hash mismatch
+            does in the run: otherwise the preview would subtract the
+            file from "to copy" and promise "not re-copied" for a file
+            the run will suffix-copy under a numbered name."""
+            if not recovery_base:
+                return False
+            source_file = Path(path)
+            try:
+                size = source_file.stat().st_size
+            except OSError:
+                return False
+            if size == 0:
+                # Zero-byte placeholders match any empty file by size;
+                # don't claim adoption for them (the duplicate checker
+                # gives them no identity either).
+                return False
+            # Folder planning mirrors ingest._source_file_timestamps:
+            # EXIF capture time falling back to file mtime. In the default
+            # mode checker.prepare() already batched the EXIF reads and
+            # capture_time() is a cache hit; in verify mode prepare() is a
+            # no-op, so the times come from this request's own batch
+            # (below) — never resolved lazily one file at a time.
+            if verify_by_hash:
+                ts = recovery_times.get(str(source_file))
+            else:
+                ts = checker.capture_time(source_file)
+            if ts is None:
+                with contextlib.suppress(OSError, ValueError,
+                                         OverflowError):
+                    ts = datetime.fromtimestamp(
+                        source_file.stat().st_mtime)
+            try:
+                rel_folder = build_destination_path(ts, folder_template)
+            except ValueError:
+                return False
+            folder = (
+                recovery_base if rel_folder in ("", ".")
+                else os.path.join(recovery_base, rel_folder)
+            )
+            listing = _planned_folder_listing(folder)
+            primary_name = source_file.name
+
+            # Lazy source-hash: only computed once, and only if we hit a
+            # size-matching candidate that needs verifying. A typical
+            # fresh import has no size collisions and skips hashing
+            # entirely.
+            src_hash_cache = []
+
+            def _src_hash():
+                if not src_hash_cache:
+                    try:
+                        src_hash_cache.append(compute_file_hash(
+                            str(source_file)))
+                    except OSError:
+                        src_hash_cache.append(None)
+                return src_hash_cache[0]
+
+            def _is_source(cand_path):
+                # Reject destination candidates that ARE the source file
+                # itself — the run rejects that self-copy overlap
+                # (destination is an ancestor of the source AND the
+                # folder template renders back onto the source folder,
+                # e.g. importing /archive/2026/2026-07-03/IMG.jpg into
+                # /archive with %Y/%Y-%m-%d) rather than adopting it, so
+                # the preview must not promise "verified & adopted, not
+                # re-copied" and subtract it from "to copy" for a file
+                # the run will fail. Mirrors import_job's samefile guard
+                # with the same normalized-path fallback for paths that
+                # can't be stat'd.
+                try:
+                    return (
+                        os.path.exists(cand_path)
+                        and os.path.samefile(str(source_file), cand_path)
+                    )
+                except OSError:
+                    return (
+                        os.path.normpath(str(source_file))
+                        == os.path.normpath(cand_path)
+                    )
+
+            def _bytes_match(cand_path):
+                if _is_source(cand_path):
+                    return False
+                sh = _src_hash()
+                if sh is None:
+                    return False
+                try:
+                    return compute_file_hash(cand_path) == sh
+                except OSError:
+                    return False
+
+            primary_size = listing.get(primary_name)
+            primary_path = os.path.join(folder, primary_name)
+            if primary_size == size and _is_source(primary_path):
+                # Destination candidate at the primary slot IS the
+                # source file. The run fails this file entirely rather
+                # than walking suffixes; report as not recovered instead
+                # of falling through to the suffix walk (which could
+                # find a coincidental byte-identical sibling in the
+                # source folder and wrongly claim adoption).
+                return False
+            if primary_size == size:
+                if _bytes_match(primary_path):
+                    return True
+                # Same size, different bytes at the primary slot: the run
+                # will hash-mismatch and advance to the suffix walk.
+            elif primary_size is None:
+                # No collision on the primary name — the run copies to the
+                # primary slot without walking suffixes.
+                return False
+            # Primary slot is taken by a different-sized (or same-sized-
+            # different-bytes) file. Mirror import_job's collision walk
+            # (``name_1.ext``, ``name_2.ext``, ...): stop at the first
+            # free slot (the run would land a fresh copy there — not
+            # recovered), or claim recovery at the first byte-identical
+            # candidate (the run would adopt it). Size-mismatched slots
+            # advance the counter; same-size-different-bytes slots also
+            # advance, mirroring the run's hash-mismatch skip.
+            stem, suffix_ext = os.path.splitext(primary_name)
+            counter = 1
+            while True:
+                candidate = f"{stem}_{counter}{suffix_ext}"
+                cand_size = listing.get(candidate)
+                if cand_size is None:
+                    return False
+                if cand_size == size and _bytes_match(
+                        os.path.join(folder, candidate)):
+                    return True
+                counter += 1
 
         BATCH_SIZE = 20
 
         def generate():
             total = len(paths)
             duplicate_count = 0
+            recovered_count = 0
             batch_duplicates = []
+            batch_recovered = []
             # Batch the EXIF header reads once up front (no-op in
             # verify_by_hash mode). Intra-run duplicate tracking lives in
             # the checker: identical source files not yet in the DB are
             # reported as duplicates of each other, matching the actual
             # import step.
             checker.prepare([Path(p) for p in paths])
+            if recovery_base and verify_by_hash:
+                # prepare() skipped the EXIF batch (verify mode's identity
+                # is the hash), but recovery folder planning still needs
+                # capture times — resolve the whole request in one batch,
+                # not one lazy read per checked file.
+                recovery_times.update({
+                    str(f): dt
+                    for f, dt in source_capture_timestamps(
+                        [Path(p) for p in paths]).items()
+                })
 
             for checked, path in enumerate(paths, 1):
                 # Zero-byte placeholders are non-duplicates (the checker
@@ -18346,17 +18572,34 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 # landed on the last path or on a batch boundary, leaving
                 # the UI unable to deselect those known dupes.
                 try:
-                    if checker.check_and_record(Path(path)):
+                    # When skip_duplicates=False, the import run doesn't
+                    # consult the library-dedup checker at all — every
+                    # source file goes on to the recovery/adopt gate. Skip
+                    # check_and_record() here so a cataloged twin that
+                    # also sits at the destination is streamed as
+                    # ``recovered`` (matching what the run will actually
+                    # do) instead of ``duplicates`` (which the client
+                    # would then not subtract from the transfer count).
+                    if skip_duplicates and checker.check_and_record(
+                            Path(path)):
                         batch_duplicates.append(path)
                         duplicate_count += 1
+                    elif _recovery_candidate(path):
+                        # Duplicate gate first, recovery second — same
+                        # order as the import run, so a cataloged twin
+                        # that also sits at the destination stays a
+                        # duplicate here and a skip there.
+                        batch_recovered.append(path)
+                        recovered_count += 1
                 except OSError:
                     pass  # Skip unreadable/missing files
 
                 if checked % BATCH_SIZE == 0 or checked == total:
-                    yield f"data: {json.dumps({'duplicates': batch_duplicates, 'checked': checked, 'total': total})}\n\n"
+                    yield f"data: {json.dumps({'duplicates': batch_duplicates, 'recovered': batch_recovered, 'checked': checked, 'total': total})}\n\n"
                     batch_duplicates = []
+                    batch_recovered = []
 
-            yield f"data: {json.dumps({'done': True, 'duplicate_count': duplicate_count, 'checked': total, 'total': total})}\n\n"
+            yield f"data: {json.dumps({'done': True, 'duplicate_count': duplicate_count, 'recovered_count': recovered_count, 'checked': total, 'total': total})}\n\n"
 
         return Response(
             generate(),

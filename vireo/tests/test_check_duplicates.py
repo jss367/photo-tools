@@ -290,3 +290,663 @@ def test_check_duplicates_zero_byte_file_does_not_swallow_pending_batch(
         "the duplicate.jpg path needs to surface in a data.duplicates "
         "event so the import UI can deselect it."
     )
+
+
+# --------------------------------------------------------------------------
+# Destination recovery awareness. A cancelled/crashed run leaves files at
+# the planned destination that are not yet cataloged; the import run adopts
+# them via crash recovery (verify + catalog, no re-copy). The preview must
+# say so instead of counting them "to copy" — a catalog-only check reads
+# "5,523 to copy / 0 duplicates" while 9 files already sit on the NAS.
+# --------------------------------------------------------------------------
+
+def _make_dated_source(tmp_path, name="IMG_0100.jpg", color="red"):
+    """A source file whose mtime (no EXIF) plans it into 2026/2026-07-03."""
+    from datetime import datetime
+
+    source = tmp_path / "source"
+    source.mkdir(exist_ok=True)
+    path = source / name
+    Image.new("RGB", (50, 50), color=color).save(str(path))
+    ts = datetime(2026, 7, 3, 10, 0, 0).timestamp()
+    os.utime(str(path), (ts, ts))
+    return path
+
+
+def _recovered_paths(events):
+    out = []
+    for e in events:
+        out.extend(e.get("recovered") or [])
+    return out
+
+
+def test_check_duplicates_reports_files_already_at_destination(
+    app_and_db, tmp_path
+):
+    """Same name + same size at the planned destination folder → streamed
+    as ``recovered``, not counted as duplicate or left in "to copy"."""
+    app, db, fid = app_and_db
+
+    src = _make_dated_source(tmp_path)
+    dest = tmp_path / "archive"
+    planned = dest / "2026" / "2026-07-03"
+    planned.mkdir(parents=True)
+    import shutil
+    shutil.copy2(str(src), str(planned / src.name))
+
+    client = app.test_client()
+    resp = client.post("/api/import/check-duplicates", json={
+        "paths": [str(src)],
+        "destination": str(dest),
+        "folder_template": "%Y/%Y-%m-%d",
+    })
+    assert resp.status_code == 200
+
+    events = parse_sse_events(resp.data)
+    done = [e for e in events if e.get("done")]
+    assert len(done) == 1
+    assert done[0]["duplicate_count"] == 0
+    assert done[0]["recovered_count"] == 1
+    assert str(src) in _recovered_paths(events)
+
+
+def test_check_duplicates_recovery_requires_size_match(app_and_db, tmp_path):
+    """A same-named file with different bytes at the destination is NOT a
+    recovery candidate — the run would suffix-copy the source instead."""
+    app, db, fid = app_and_db
+
+    src = _make_dated_source(tmp_path)
+    dest = tmp_path / "archive"
+    planned = dest / "2026" / "2026-07-03"
+    planned.mkdir(parents=True)
+    (planned / src.name).write_bytes(b"different bytes entirely")
+
+    client = app.test_client()
+    resp = client.post("/api/import/check-duplicates", json={
+        "paths": [str(src)],
+        "destination": str(dest),
+    })
+    events = parse_sse_events(resp.data)
+    done = [e for e in events if e.get("done")]
+    assert done[0]["recovered_count"] == 0
+    assert _recovered_paths(events) == []
+
+
+def test_check_duplicates_catalog_duplicate_wins_over_recovery(
+    app_and_db, tmp_path
+):
+    """A file that is both cataloged (library twin) and present at the
+    planned destination counts as a duplicate — mirroring the run, whose
+    duplicate gate runs before the crash-recovery adopt."""
+    app, db, fid = app_and_db
+
+    library_dir = tmp_path / "library"
+    library_dir.mkdir(exist_ok=True)
+    src = _make_dated_source(tmp_path)
+    import shutil
+    shutil.copy2(str(src), str(library_dir / src.name))
+    from scanner import scan
+    scan(str(library_dir), db)
+
+    dest = tmp_path / "archive"
+    planned = dest / "2026" / "2026-07-03"
+    planned.mkdir(parents=True)
+    shutil.copy2(str(src), str(planned / src.name))
+
+    client = app.test_client()
+    resp = client.post("/api/import/check-duplicates", json={
+        "paths": [str(src)],
+        "destination": str(dest),
+    })
+    events = parse_sse_events(resp.data)
+    done = [e for e in events if e.get("done")]
+    assert done[0]["duplicate_count"] == 1
+    assert done[0]["recovered_count"] == 0
+    assert _recovered_paths(events) == []
+
+
+def test_check_duplicates_no_destination_reports_no_recovery(
+    app_and_db, tmp_path
+):
+    """Without a destination in the request the endpoint behaves exactly
+    as before — zero recovered, no errors."""
+    app, db, fid = app_and_db
+
+    src = _make_dated_source(tmp_path)
+    client = app.test_client()
+    resp = client.post("/api/import/check-duplicates", json={
+        "paths": [str(src)],
+    })
+    assert resp.status_code == 200
+    events = parse_sse_events(resp.data)
+    done = [e for e in events if e.get("done")]
+    assert done[0].get("recovered_count", 0) == 0
+    assert _recovered_paths(events) == []
+
+
+def test_check_duplicates_zero_byte_source_never_recovered(
+    app_and_db, tmp_path
+):
+    """Zero-byte placeholders match any empty destination file by size;
+    don't claim adoption for them (the checker gives them no identity
+    either)."""
+    from datetime import datetime
+
+    app, db, fid = app_and_db
+
+    source = tmp_path / "source"
+    source.mkdir(exist_ok=True)
+    src = source / "DSC_0001.NEF"
+    src.write_bytes(b"")
+    ts = datetime(2026, 7, 3, 10, 0, 0).timestamp()
+    os.utime(str(src), (ts, ts))
+
+    dest = tmp_path / "archive"
+    planned = dest / "2026" / "2026-07-03"
+    planned.mkdir(parents=True)
+    (planned / "DSC_0001.NEF").write_bytes(b"")
+
+    client = app.test_client()
+    resp = client.post("/api/import/check-duplicates", json={
+        "paths": [str(src)],
+        "destination": str(dest),
+    })
+    events = parse_sse_events(resp.data)
+    done = [e for e in events if e.get("done")]
+    assert done[0]["recovered_count"] == 0
+
+
+def test_check_duplicates_rejects_relative_destination(app_and_db, tmp_path):
+    app, db, fid = app_and_db
+    src = _make_dated_source(tmp_path)
+    client = app.test_client()
+    resp = client.post("/api/import/check-duplicates", json={
+        "paths": [str(src)],
+        "destination": "relative/archive",
+    })
+    assert resp.status_code == 400
+
+
+def test_check_duplicates_rejects_unsafe_template(app_and_db, tmp_path):
+    app, db, fid = app_and_db
+    src = _make_dated_source(tmp_path)
+    client = app.test_client()
+    resp = client.post("/api/import/check-duplicates", json={
+        "paths": [str(src)],
+        "destination": str(tmp_path / "archive"),
+        "folder_template": "../escape",
+    })
+    assert resp.status_code == 400
+
+
+def test_check_duplicates_recovery_walks_suffix_slots(app_and_db, tmp_path):
+    """When the primary name is taken by a different file (crash left a
+    colliding placeholder), the run walks ``name_1.ext``/``name_2.ext``
+    and adopts the first byte-identical suffix. Preview must mirror that
+    walk with size-as-proxy — otherwise a collision-retry reports files
+    as "to copy" even though Start hashes and adopts them without
+    transfer."""
+    app, db, fid = app_and_db
+
+    src = _make_dated_source(tmp_path)
+    dest = tmp_path / "archive"
+    planned = dest / "2026" / "2026-07-03"
+    planned.mkdir(parents=True)
+
+    # Primary slot is occupied by a same-named but different-sized file
+    # (e.g. an unrelated existing archive photo). The interrupted run's
+    # previous copy of THIS source landed at IMG_0100_1.jpg — same size
+    # as source, byte-identical (size is the preview's stand-in for that).
+    (planned / src.name).write_bytes(b"different sized existing photo")
+    import shutil
+    shutil.copy2(str(src), str(planned / "IMG_0100_1.jpg"))
+
+    client = app.test_client()
+    resp = client.post("/api/import/check-duplicates", json={
+        "paths": [str(src)],
+        "destination": str(dest),
+        "folder_template": "%Y/%Y-%m-%d",
+    })
+    events = parse_sse_events(resp.data)
+    done = [e for e in events if e.get("done")]
+    assert len(done) == 1
+    assert done[0]["recovered_count"] == 1
+    assert str(src) in _recovered_paths(events)
+
+
+def test_check_duplicates_recovery_stops_at_first_free_suffix(
+    app_and_db, tmp_path
+):
+    """Primary taken by a different-sized file, and every existing suffix
+    slot also differs in size — the run would copy the source to the
+    first free slot (e.g. ``IMG_0100_2.jpg``), so the preview must NOT
+    call this a recovery."""
+    app, db, fid = app_and_db
+
+    src = _make_dated_source(tmp_path)
+    dest = tmp_path / "archive"
+    planned = dest / "2026" / "2026-07-03"
+    planned.mkdir(parents=True)
+
+    (planned / src.name).write_bytes(b"different-sized primary")
+    # IMG_0100_1.jpg exists but is a different size — the run would hash-
+    # skip it and advance to IMG_0100_2.jpg (a free slot), meaning a real
+    # copy happens.
+    (planned / "IMG_0100_1.jpg").write_bytes(
+        b"another different-sized colliding file"
+    )
+
+    client = app.test_client()
+    resp = client.post("/api/import/check-duplicates", json={
+        "paths": [str(src)],
+        "destination": str(dest),
+        "folder_template": "%Y/%Y-%m-%d",
+    })
+    events = parse_sse_events(resp.data)
+    done = [e for e in events if e.get("done")]
+    assert done[0]["recovered_count"] == 0
+    assert _recovered_paths(events) == []
+
+
+def test_check_duplicates_recovery_skips_size_mismatched_suffixes(
+    app_and_db, tmp_path
+):
+    """The walk must advance past size-mismatched suffix slots — mirroring
+    the run's hash-mismatch skip — before adopting a further slot that
+    does size-match. A one-slot-only check would miss the adoption."""
+    app, db, fid = app_and_db
+
+    src = _make_dated_source(tmp_path)
+    dest = tmp_path / "archive"
+    planned = dest / "2026" / "2026-07-03"
+    planned.mkdir(parents=True)
+
+    (planned / src.name).write_bytes(b"different-sized primary")
+    (planned / "IMG_0100_1.jpg").write_bytes(b"another different-sized file")
+    import shutil
+    # IMG_0100_2.jpg is the adopted-from-crash copy of this source.
+    shutil.copy2(str(src), str(planned / "IMG_0100_2.jpg"))
+
+    client = app.test_client()
+    resp = client.post("/api/import/check-duplicates", json={
+        "paths": [str(src)],
+        "destination": str(dest),
+        "folder_template": "%Y/%Y-%m-%d",
+    })
+    events = parse_sse_events(resp.data)
+    done = [e for e in events if e.get("done")]
+    assert done[0]["recovered_count"] == 1
+    assert str(src) in _recovered_paths(events)
+
+
+def test_check_duplicates_recovery_rejects_same_size_different_bytes(
+    app_and_db, tmp_path
+):
+    """A destination file with the same name and byte size but different
+    contents (e.g. a corrupt partial file, or an unrelated coincidence)
+    must NOT be reported as recovered. The import path hashes the
+    candidate and suffix-copies on a mismatch, so the preview would
+    otherwise subtract the file from ``to copy`` and promise "not
+    re-copied" for a file the run will re-copy under a numbered suffix.
+    """
+    app, db, fid = app_and_db
+
+    src = _make_dated_source(tmp_path)
+    dest = tmp_path / "archive"
+    planned = dest / "2026" / "2026-07-03"
+    planned.mkdir(parents=True)
+
+    # Land a same-name same-size but different-content file at the
+    # primary slot. Padded to exactly match the source size.
+    src_size = os.path.getsize(str(src))
+    (planned / src.name).write_bytes(b"X" * src_size)
+
+    client = app.test_client()
+    resp = client.post("/api/import/check-duplicates", json={
+        "paths": [str(src)],
+        "destination": str(dest),
+        "folder_template": "%Y/%Y-%m-%d",
+    })
+    events = parse_sse_events(resp.data)
+    done = [e for e in events if e.get("done")]
+    assert len(done) == 1
+    assert done[0]["recovered_count"] == 0
+    assert _recovered_paths(events) == []
+
+
+def test_check_duplicates_recovery_walks_past_same_size_mismatch_to_adopt(
+    app_and_db, tmp_path
+):
+    """Primary slot has same size but different bytes → the run advances
+    the walk (via hash mismatch) and adopts a further byte-identical
+    suffix. The preview must mirror that walk: advance past same-size-
+    different-bytes slots, adopt the first byte-identical candidate.
+    """
+    app, db, fid = app_and_db
+
+    src = _make_dated_source(tmp_path)
+    dest = tmp_path / "archive"
+    planned = dest / "2026" / "2026-07-03"
+    planned.mkdir(parents=True)
+
+    # Primary slot: same size, different bytes (must not be adopted).
+    src_size = os.path.getsize(str(src))
+    (planned / src.name).write_bytes(b"Y" * src_size)
+    # IMG_0100_1.jpg: byte-identical to source (the run's actual adopt).
+    import shutil
+    shutil.copy2(str(src), str(planned / "IMG_0100_1.jpg"))
+
+    client = app.test_client()
+    resp = client.post("/api/import/check-duplicates", json={
+        "paths": [str(src)],
+        "destination": str(dest),
+        "folder_template": "%Y/%Y-%m-%d",
+    })
+    events = parse_sse_events(resp.data)
+    done = [e for e in events if e.get("done")]
+    assert done[0]["recovered_count"] == 1
+    assert str(src) in _recovered_paths(events)
+
+
+def test_check_duplicates_recovery_skips_hashing_when_no_collision(
+    app_and_db, tmp_path, monkeypatch
+):
+    """No size collision at the destination → the preview must not hash
+    the source. Fresh imports (the common case) stay cheap; hashing is
+    scoped to actual collision candidates."""
+    app, db, fid = app_and_db
+
+    src = _make_dated_source(tmp_path)
+    dest = tmp_path / "archive"
+    # Planned folder is empty — no candidate at the primary slot at all.
+    (dest / "2026" / "2026-07-03").mkdir(parents=True)
+
+    import scanner
+    hash_calls = []
+    real_hash = scanner.compute_file_hash
+
+    def _counting_hash(path, *a, **kw):
+        hash_calls.append(path)
+        return real_hash(path, *a, **kw)
+
+    monkeypatch.setattr(scanner, "compute_file_hash", _counting_hash)
+
+    client = app.test_client()
+    resp = client.post("/api/import/check-duplicates", json={
+        "paths": [str(src)],
+        "destination": str(dest),
+        "folder_template": "%Y/%Y-%m-%d",
+    })
+    events = parse_sse_events(resp.data)
+    done = [e for e in events if e.get("done")]
+    assert done[0]["recovered_count"] == 0
+    assert hash_calls == [], (
+        f"expected no content hashing without a size collision, got "
+        f"{len(hash_calls)} hash call(s): {hash_calls}"
+    )
+
+
+def test_check_duplicates_recovery_batches_exif_reads_in_verify_mode(
+    app_and_db, tmp_path, monkeypatch
+):
+    """verify_by_hash makes checker.prepare() a no-op, so the recovery
+    check must batch its own capture-time resolution — one call for the
+    whole request, not one lazy ExifTool spawn per file."""
+    app, db, fid = app_and_db
+
+    srcs = [
+        _make_dated_source(tmp_path, name=f"IMG_010{i}.jpg", color=c)
+        for i, c in enumerate(["red", "green", "blue"])
+    ]
+    dest = tmp_path / "archive"
+    planned = dest / "2026" / "2026-07-03"
+    planned.mkdir(parents=True)
+    import shutil
+    shutil.copy2(str(srcs[0]), str(planned / srcs[0].name))
+
+    import import_dedup
+    real = import_dedup.source_capture_timestamps
+    calls = []
+
+    def _counting(files, *a, **kw):
+        calls.append(list(files))
+        return real(files, *a, **kw)
+
+    monkeypatch.setattr(
+        import_dedup, "source_capture_timestamps", _counting)
+
+    client = app.test_client()
+    resp = client.post("/api/import/check-duplicates", json={
+        "paths": [str(s) for s in srcs],
+        "verify_by_hash": True,
+        "destination": str(dest),
+    })
+    events = parse_sse_events(resp.data)
+    done = [e for e in events if e.get("done")]
+    assert done[0]["recovered_count"] == 1
+    assert str(srcs[0]) in _recovered_paths(events)
+    assert len(calls) == 1, (
+        f"expected one batched capture-time resolution, got {len(calls)}: "
+        f"{[len(c) for c in calls]}"
+    )
+
+
+# --------------------------------------------------------------------------
+# skip_duplicates=False mirrors the import job's dedup-off mode:
+# library-dedup checker isn't consulted, but crash-recovery adoption of
+# byte-identical files at the destination still fires. The retry preview
+# after a cancelled dedup-off run has to reflect that, or "to copy" would
+# double-count the files a resumed run will adopt without transferring.
+# --------------------------------------------------------------------------
+
+def test_check_duplicates_skip_false_suppresses_duplicate_verdicts(
+    app_and_db, tmp_path
+):
+    """With ``skip_duplicates: false`` no cataloged file is reported as a
+    duplicate — matching the import run's dedup-off mode, which doesn't
+    consult the library checker at all."""
+    app, db, fid = app_and_db
+
+    library_dir = tmp_path / "library"
+    library_dir.mkdir(exist_ok=True)
+    src = _make_dated_source(tmp_path)
+    import shutil
+    shutil.copy2(str(src), str(library_dir / src.name))
+    from scanner import scan
+    scan(str(library_dir), db)
+
+    client = app.test_client()
+    resp = client.post("/api/import/check-duplicates", json={
+        "paths": [str(src)],
+        "skip_duplicates": False,
+    })
+    assert resp.status_code == 200
+    events = parse_sse_events(resp.data)
+    done = [e for e in events if e.get("done")]
+    assert len(done) == 1
+    assert done[0]["duplicate_count"] == 0
+    # No ``duplicates`` batches at all — nothing to subtract from "to copy".
+    for e in events:
+        assert not e.get("duplicates")
+
+
+def test_check_duplicates_skip_false_still_reports_recovery(
+    app_and_db, tmp_path
+):
+    """With ``skip_duplicates: false`` the recovery gate still fires:
+    a byte-identical file at the planned destination is streamed as
+    ``recovered`` so the dedup-off retry preview subtracts it from the
+    transfer count, matching the run's unconditional crash-recovery."""
+    app, db, fid = app_and_db
+
+    src = _make_dated_source(tmp_path)
+    dest = tmp_path / "archive"
+    planned = dest / "2026" / "2026-07-03"
+    planned.mkdir(parents=True)
+    import shutil
+    shutil.copy2(str(src), str(planned / src.name))
+
+    client = app.test_client()
+    resp = client.post("/api/import/check-duplicates", json={
+        "paths": [str(src)],
+        "skip_duplicates": False,
+        "destination": str(dest),
+        "folder_template": "%Y/%Y-%m-%d",
+    })
+    events = parse_sse_events(resp.data)
+    done = [e for e in events if e.get("done")]
+    assert done[0]["duplicate_count"] == 0
+    assert done[0]["recovered_count"] == 1
+    assert str(src) in _recovered_paths(events)
+
+
+def test_check_duplicates_skip_false_reports_cataloged_twin_as_recovered(
+    app_and_db, tmp_path
+):
+    """A file that is BOTH a library twin AND already at the destination:
+    with ``skip_duplicates: false`` it must be streamed as ``recovered``
+    (matching what the dedup-off run does — it doesn't consult the
+    checker, then crash-recovery adopts the on-disk copy). Without this
+    the preview would emit no verdict for it and it would stay counted in
+    "to copy", overstating the transfer after a cancelled dedup-off run
+    of a batch that happened to contain a library duplicate."""
+    app, db, fid = app_and_db
+
+    library_dir = tmp_path / "library"
+    library_dir.mkdir(exist_ok=True)
+    src = _make_dated_source(tmp_path)
+    import shutil
+    shutil.copy2(str(src), str(library_dir / src.name))
+    from scanner import scan
+    scan(str(library_dir), db)
+
+    dest = tmp_path / "archive"
+    planned = dest / "2026" / "2026-07-03"
+    planned.mkdir(parents=True)
+    shutil.copy2(str(src), str(planned / src.name))
+
+    client = app.test_client()
+    resp = client.post("/api/import/check-duplicates", json={
+        "paths": [str(src)],
+        "skip_duplicates": False,
+        "destination": str(dest),
+    })
+    events = parse_sse_events(resp.data)
+    done = [e for e in events if e.get("done")]
+    assert done[0]["duplicate_count"] == 0
+    assert done[0]["recovered_count"] == 1
+    assert str(src) in _recovered_paths(events)
+
+
+def test_check_duplicates_skip_true_by_default_preserves_contract(
+    app_and_db, tmp_path
+):
+    """Omitting ``skip_duplicates`` defaults to True — the pre-existing
+    endpoint contract. A cataloged twin at the destination stays reported
+    as a duplicate (duplicate gate wins over recovery), just like before
+    the flag was introduced."""
+    app, db, fid = app_and_db
+
+    library_dir = tmp_path / "library"
+    library_dir.mkdir(exist_ok=True)
+    src = _make_dated_source(tmp_path)
+    import shutil
+    shutil.copy2(str(src), str(library_dir / src.name))
+    from scanner import scan
+    scan(str(library_dir), db)
+
+    dest = tmp_path / "archive"
+    planned = dest / "2026" / "2026-07-03"
+    planned.mkdir(parents=True)
+    shutil.copy2(str(src), str(planned / src.name))
+
+    client = app.test_client()
+    resp = client.post("/api/import/check-duplicates", json={
+        "paths": [str(src)],
+        "destination": str(dest),
+    })
+    events = parse_sse_events(resp.data)
+    done = [e for e in events if e.get("done")]
+    assert done[0]["duplicate_count"] == 1
+    assert done[0]["recovered_count"] == 0
+
+
+def test_check_duplicates_recovery_skipped_when_candidate_is_source(
+    app_and_db, tmp_path
+):
+    """The destination-folder template renders the planned destination
+    back onto the source folder (e.g. importing
+    /archive/2026/2026-07-03/IMG.jpg with destination /archive and
+    template %Y/%Y-%m-%d), so the primary candidate IS the source file
+    itself. The run rejects that self-copy overlap and fails the file;
+    the preview must NOT promise "verified & adopted, not re-copied"
+    and subtract it from "to copy". Mirrors import_job's samefile guard.
+    """
+    from datetime import datetime
+
+    # Source lives INSIDE what will become the planned destination
+    # folder — archive/2026/2026-07-03 renders back onto itself.
+    archive = tmp_path / "archive"
+    src_folder = archive / "2026" / "2026-07-03"
+    src_folder.mkdir(parents=True)
+    src = src_folder / "IMG_0100.jpg"
+    Image.new("RGB", (50, 50), color="red").save(str(src))
+    ts = datetime(2026, 7, 3, 10, 0, 0).timestamp()
+    os.utime(str(src), (ts, ts))
+
+    app, db, fid = app_and_db
+    client = app.test_client()
+    resp = client.post("/api/import/check-duplicates", json={
+        "paths": [str(src)],
+        "destination": str(archive),
+        "folder_template": "%Y/%Y-%m-%d",
+    })
+    assert resp.status_code == 200
+    events = parse_sse_events(resp.data)
+    done = [e for e in events if e.get("done")]
+    assert done[0]["recovered_count"] == 0
+    assert _recovered_paths(events) == []
+
+
+def test_check_duplicates_recovery_skipped_for_source_via_symlink(
+    app_and_db, tmp_path
+):
+    """Source path and planned-destination candidate resolve to the
+    same inode via a symlinked source directory. os.path.samefile
+    catches it even when the literal paths differ, matching
+    import_job's guard: the run fails the file, so the preview must
+    report not-recovered."""
+    from datetime import datetime
+
+    archive = tmp_path / "archive"
+    real_folder = archive / "2026" / "2026-07-03"
+    real_folder.mkdir(parents=True)
+    real_src = real_folder / "IMG_0200.jpg"
+    Image.new("RGB", (50, 50), color="blue").save(str(real_src))
+    ts = datetime(2026, 7, 3, 10, 0, 0).timestamp()
+    os.utime(str(real_src), (ts, ts))
+
+    # A symlink to the real source folder. Passing the file via the
+    # symlink path makes the literal source string differ from the
+    # planned destination path, but both stat to the same inode.
+    link_folder = tmp_path / "card_link"
+    if not hasattr(os, "symlink"):
+        pytest.skip("symlinks unavailable")
+    try:
+        os.symlink(str(real_folder), str(link_folder))
+    except (OSError, NotImplementedError):
+        pytest.skip("symlink creation not permitted")
+    src_via_link = link_folder / "IMG_0200.jpg"
+
+    app, db, fid = app_and_db
+    client = app.test_client()
+    resp = client.post("/api/import/check-duplicates", json={
+        "paths": [str(src_via_link)],
+        "destination": str(archive),
+        "folder_template": "%Y/%Y-%m-%d",
+    })
+    assert resp.status_code == 200
+    events = parse_sse_events(resp.data)
+    done = [e for e in events if e.get("done")]
+    assert done[0]["recovered_count"] == 0
+    assert _recovered_paths(events) == []

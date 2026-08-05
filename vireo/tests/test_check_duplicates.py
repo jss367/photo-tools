@@ -290,3 +290,235 @@ def test_check_duplicates_zero_byte_file_does_not_swallow_pending_batch(
         "the duplicate.jpg path needs to surface in a data.duplicates "
         "event so the import UI can deselect it."
     )
+
+
+# --------------------------------------------------------------------------
+# Destination recovery awareness. A cancelled/crashed run leaves files at
+# the planned destination that are not yet cataloged; the import run adopts
+# them via crash recovery (verify + catalog, no re-copy). The preview must
+# say so instead of counting them "to copy" — a catalog-only check reads
+# "5,523 to copy / 0 duplicates" while 9 files already sit on the NAS.
+# --------------------------------------------------------------------------
+
+def _make_dated_source(tmp_path, name="IMG_0100.jpg", color="red"):
+    """A source file whose mtime (no EXIF) plans it into 2026/2026-07-03."""
+    from datetime import datetime
+
+    source = tmp_path / "source"
+    source.mkdir(exist_ok=True)
+    path = source / name
+    Image.new("RGB", (50, 50), color=color).save(str(path))
+    ts = datetime(2026, 7, 3, 10, 0, 0).timestamp()
+    os.utime(str(path), (ts, ts))
+    return path
+
+
+def _recovered_paths(events):
+    out = []
+    for e in events:
+        out.extend(e.get("recovered") or [])
+    return out
+
+
+def test_check_duplicates_reports_files_already_at_destination(
+    app_and_db, tmp_path
+):
+    """Same name + same size at the planned destination folder → streamed
+    as ``recovered``, not counted as duplicate or left in "to copy"."""
+    app, db, fid = app_and_db
+
+    src = _make_dated_source(tmp_path)
+    dest = tmp_path / "archive"
+    planned = dest / "2026" / "2026-07-03"
+    planned.mkdir(parents=True)
+    import shutil
+    shutil.copy2(str(src), str(planned / src.name))
+
+    client = app.test_client()
+    resp = client.post("/api/import/check-duplicates", json={
+        "paths": [str(src)],
+        "destination": str(dest),
+        "folder_template": "%Y/%Y-%m-%d",
+    })
+    assert resp.status_code == 200
+
+    events = parse_sse_events(resp.data)
+    done = [e for e in events if e.get("done")]
+    assert len(done) == 1
+    assert done[0]["duplicate_count"] == 0
+    assert done[0]["recovered_count"] == 1
+    assert str(src) in _recovered_paths(events)
+
+
+def test_check_duplicates_recovery_requires_size_match(app_and_db, tmp_path):
+    """A same-named file with different bytes at the destination is NOT a
+    recovery candidate — the run would suffix-copy the source instead."""
+    app, db, fid = app_and_db
+
+    src = _make_dated_source(tmp_path)
+    dest = tmp_path / "archive"
+    planned = dest / "2026" / "2026-07-03"
+    planned.mkdir(parents=True)
+    (planned / src.name).write_bytes(b"different bytes entirely")
+
+    client = app.test_client()
+    resp = client.post("/api/import/check-duplicates", json={
+        "paths": [str(src)],
+        "destination": str(dest),
+    })
+    events = parse_sse_events(resp.data)
+    done = [e for e in events if e.get("done")]
+    assert done[0]["recovered_count"] == 0
+    assert _recovered_paths(events) == []
+
+
+def test_check_duplicates_catalog_duplicate_wins_over_recovery(
+    app_and_db, tmp_path
+):
+    """A file that is both cataloged (library twin) and present at the
+    planned destination counts as a duplicate — mirroring the run, whose
+    duplicate gate runs before the crash-recovery adopt."""
+    app, db, fid = app_and_db
+
+    library_dir = tmp_path / "library"
+    library_dir.mkdir(exist_ok=True)
+    src = _make_dated_source(tmp_path)
+    import shutil
+    shutil.copy2(str(src), str(library_dir / src.name))
+    from scanner import scan
+    scan(str(library_dir), db)
+
+    dest = tmp_path / "archive"
+    planned = dest / "2026" / "2026-07-03"
+    planned.mkdir(parents=True)
+    shutil.copy2(str(src), str(planned / src.name))
+
+    client = app.test_client()
+    resp = client.post("/api/import/check-duplicates", json={
+        "paths": [str(src)],
+        "destination": str(dest),
+    })
+    events = parse_sse_events(resp.data)
+    done = [e for e in events if e.get("done")]
+    assert done[0]["duplicate_count"] == 1
+    assert done[0]["recovered_count"] == 0
+    assert _recovered_paths(events) == []
+
+
+def test_check_duplicates_no_destination_reports_no_recovery(
+    app_and_db, tmp_path
+):
+    """Without a destination in the request the endpoint behaves exactly
+    as before — zero recovered, no errors."""
+    app, db, fid = app_and_db
+
+    src = _make_dated_source(tmp_path)
+    client = app.test_client()
+    resp = client.post("/api/import/check-duplicates", json={
+        "paths": [str(src)],
+    })
+    assert resp.status_code == 200
+    events = parse_sse_events(resp.data)
+    done = [e for e in events if e.get("done")]
+    assert done[0].get("recovered_count", 0) == 0
+    assert _recovered_paths(events) == []
+
+
+def test_check_duplicates_zero_byte_source_never_recovered(
+    app_and_db, tmp_path
+):
+    """Zero-byte placeholders match any empty destination file by size;
+    don't claim adoption for them (the checker gives them no identity
+    either)."""
+    from datetime import datetime
+
+    app, db, fid = app_and_db
+
+    source = tmp_path / "source"
+    source.mkdir(exist_ok=True)
+    src = source / "DSC_0001.NEF"
+    src.write_bytes(b"")
+    ts = datetime(2026, 7, 3, 10, 0, 0).timestamp()
+    os.utime(str(src), (ts, ts))
+
+    dest = tmp_path / "archive"
+    planned = dest / "2026" / "2026-07-03"
+    planned.mkdir(parents=True)
+    (planned / "DSC_0001.NEF").write_bytes(b"")
+
+    client = app.test_client()
+    resp = client.post("/api/import/check-duplicates", json={
+        "paths": [str(src)],
+        "destination": str(dest),
+    })
+    events = parse_sse_events(resp.data)
+    done = [e for e in events if e.get("done")]
+    assert done[0]["recovered_count"] == 0
+
+
+def test_check_duplicates_rejects_relative_destination(app_and_db, tmp_path):
+    app, db, fid = app_and_db
+    src = _make_dated_source(tmp_path)
+    client = app.test_client()
+    resp = client.post("/api/import/check-duplicates", json={
+        "paths": [str(src)],
+        "destination": "relative/archive",
+    })
+    assert resp.status_code == 400
+
+
+def test_check_duplicates_rejects_unsafe_template(app_and_db, tmp_path):
+    app, db, fid = app_and_db
+    src = _make_dated_source(tmp_path)
+    client = app.test_client()
+    resp = client.post("/api/import/check-duplicates", json={
+        "paths": [str(src)],
+        "destination": str(tmp_path / "archive"),
+        "folder_template": "../escape",
+    })
+    assert resp.status_code == 400
+
+
+def test_check_duplicates_recovery_batches_exif_reads_in_verify_mode(
+    app_and_db, tmp_path, monkeypatch
+):
+    """verify_by_hash makes checker.prepare() a no-op, so the recovery
+    check must batch its own capture-time resolution — one call for the
+    whole request, not one lazy ExifTool spawn per file."""
+    app, db, fid = app_and_db
+
+    srcs = [
+        _make_dated_source(tmp_path, name=f"IMG_010{i}.jpg", color=c)
+        for i, c in enumerate(["red", "green", "blue"])
+    ]
+    dest = tmp_path / "archive"
+    planned = dest / "2026" / "2026-07-03"
+    planned.mkdir(parents=True)
+    import shutil
+    shutil.copy2(str(srcs[0]), str(planned / srcs[0].name))
+
+    import import_dedup
+    real = import_dedup.source_capture_timestamps
+    calls = []
+
+    def _counting(files, *a, **kw):
+        calls.append(list(files))
+        return real(files, *a, **kw)
+
+    monkeypatch.setattr(
+        import_dedup, "source_capture_timestamps", _counting)
+
+    client = app.test_client()
+    resp = client.post("/api/import/check-duplicates", json={
+        "paths": [str(s) for s in srcs],
+        "verify_by_hash": True,
+        "destination": str(dest),
+    })
+    events = parse_sse_events(resp.data)
+    done = [e for e in events if e.get("done")]
+    assert done[0]["recovered_count"] == 1
+    assert str(srcs[0]) in _recovered_paths(events)
+    assert len(calls) == 1, (
+        f"expected one batched capture-time resolution, got {len(calls)}: "
+        f"{[len(c) for c in calls]}"
+    )

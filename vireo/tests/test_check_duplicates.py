@@ -869,3 +869,84 @@ def test_check_duplicates_skip_true_by_default_preserves_contract(
     done = [e for e in events if e.get("done")]
     assert done[0]["duplicate_count"] == 1
     assert done[0]["recovered_count"] == 0
+
+
+def test_check_duplicates_recovery_skipped_when_candidate_is_source(
+    app_and_db, tmp_path
+):
+    """The destination-folder template renders the planned destination
+    back onto the source folder (e.g. importing
+    /archive/2026/2026-07-03/IMG.jpg with destination /archive and
+    template %Y/%Y-%m-%d), so the primary candidate IS the source file
+    itself. The run rejects that self-copy overlap and fails the file;
+    the preview must NOT promise "verified & adopted, not re-copied"
+    and subtract it from "to copy". Mirrors import_job's samefile guard.
+    """
+    from datetime import datetime
+
+    # Source lives INSIDE what will become the planned destination
+    # folder — archive/2026/2026-07-03 renders back onto itself.
+    archive = tmp_path / "archive"
+    src_folder = archive / "2026" / "2026-07-03"
+    src_folder.mkdir(parents=True)
+    src = src_folder / "IMG_0100.jpg"
+    Image.new("RGB", (50, 50), color="red").save(str(src))
+    ts = datetime(2026, 7, 3, 10, 0, 0).timestamp()
+    os.utime(str(src), (ts, ts))
+
+    app, db, fid = app_and_db
+    client = app.test_client()
+    resp = client.post("/api/import/check-duplicates", json={
+        "paths": [str(src)],
+        "destination": str(archive),
+        "folder_template": "%Y/%Y-%m-%d",
+    })
+    assert resp.status_code == 200
+    events = parse_sse_events(resp.data)
+    done = [e for e in events if e.get("done")]
+    assert done[0]["recovered_count"] == 0
+    assert _recovered_paths(events) == []
+
+
+def test_check_duplicates_recovery_skipped_for_source_via_symlink(
+    app_and_db, tmp_path
+):
+    """Source path and planned-destination candidate resolve to the
+    same inode via a symlinked source directory. os.path.samefile
+    catches it even when the literal paths differ, matching
+    import_job's guard: the run fails the file, so the preview must
+    report not-recovered."""
+    from datetime import datetime
+
+    archive = tmp_path / "archive"
+    real_folder = archive / "2026" / "2026-07-03"
+    real_folder.mkdir(parents=True)
+    real_src = real_folder / "IMG_0200.jpg"
+    Image.new("RGB", (50, 50), color="blue").save(str(real_src))
+    ts = datetime(2026, 7, 3, 10, 0, 0).timestamp()
+    os.utime(str(real_src), (ts, ts))
+
+    # A symlink to the real source folder. Passing the file via the
+    # symlink path makes the literal source string differ from the
+    # planned destination path, but both stat to the same inode.
+    link_folder = tmp_path / "card_link"
+    if not hasattr(os, "symlink"):
+        pytest.skip("symlinks unavailable")
+    try:
+        os.symlink(str(real_folder), str(link_folder))
+    except (OSError, NotImplementedError):
+        pytest.skip("symlink creation not permitted")
+    src_via_link = link_folder / "IMG_0200.jpg"
+
+    app, db, fid = app_and_db
+    client = app.test_client()
+    resp = client.post("/api/import/check-duplicates", json={
+        "paths": [str(src_via_link)],
+        "destination": str(archive),
+        "folder_template": "%Y/%Y-%m-%d",
+    })
+    assert resp.status_code == 200
+    events = parse_sse_events(resp.data)
+    done = [e for e in events if e.get("done")]
+    assert done[0]["recovered_count"] == 0
+    assert _recovered_paths(events) == []

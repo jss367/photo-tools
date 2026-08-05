@@ -18465,7 +18465,32 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                         src_hash_cache.append(None)
                 return src_hash_cache[0]
 
+            def _is_source(cand_path):
+                # Reject destination candidates that ARE the source file
+                # itself — the run rejects that self-copy overlap
+                # (destination is an ancestor of the source AND the
+                # folder template renders back onto the source folder,
+                # e.g. importing /archive/2026/2026-07-03/IMG.jpg into
+                # /archive with %Y/%Y-%m-%d) rather than adopting it, so
+                # the preview must not promise "verified & adopted, not
+                # re-copied" and subtract it from "to copy" for a file
+                # the run will fail. Mirrors import_job's samefile guard
+                # with the same normalized-path fallback for paths that
+                # can't be stat'd.
+                try:
+                    return (
+                        os.path.exists(cand_path)
+                        and os.path.samefile(str(source_file), cand_path)
+                    )
+                except OSError:
+                    return (
+                        os.path.normpath(str(source_file))
+                        == os.path.normpath(cand_path)
+                    )
+
             def _bytes_match(cand_path):
+                if _is_source(cand_path):
+                    return False
                 sh = _src_hash()
                 if sh is None:
                     return False
@@ -18475,8 +18500,17 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     return False
 
             primary_size = listing.get(primary_name)
+            primary_path = os.path.join(folder, primary_name)
+            if primary_size == size and _is_source(primary_path):
+                # Destination candidate at the primary slot IS the
+                # source file. The run fails this file entirely rather
+                # than walking suffixes; report as not recovered instead
+                # of falling through to the suffix walk (which could
+                # find a coincidental byte-identical sibling in the
+                # source folder and wrongly claim adoption).
+                return False
             if primary_size == size:
-                if _bytes_match(os.path.join(folder, primary_name)):
+                if _bytes_match(primary_path):
                     return True
                 # Same size, different bytes at the primary slot: the run
                 # will hash-mismatch and advance to the suffix walk.

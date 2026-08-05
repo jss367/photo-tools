@@ -18313,10 +18313,12 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
 
         Optional {"destination": abs path, "folder_template": str} turns on
         destination-recovery detection: non-duplicate files whose planned
-        destination folder already holds a same-named same-sized file are
-        streamed as ``recovered`` (with a final ``recovered_count``). Those
-        are the files a cancelled/crashed prior run left at the destination
-        — the import adopts them via crash recovery (verify + catalog, no
+        destination folder already holds a size-matching file at the
+        primary name — or at a numeric-suffix slot the run would adopt
+        (``name_1.ext``, ``name_2.ext``, ...) — are streamed as
+        ``recovered`` (with a final ``recovered_count``). Those are the
+        files a cancelled/crashed prior run left at the destination —
+        the import adopts them via crash recovery (verify + catalog, no
         re-copy), so counting them "to copy" overstates the transfer. Size
         is a cheap proxy for the run's byte-verification: a same-size file
         may still fail the hash check and be suffix-copied, so the UI must
@@ -18375,9 +18377,12 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             return dir_listings[folder]
 
         def _recovery_candidate(path):
-            """True when the planned destination already holds a same-named
-            same-sized file — mirrors the run's adopt precondition (which
-            then byte-verifies before adopting)."""
+            """True when the planned destination already holds a size-matching
+            file at the primary name OR at any suffix slot the run would
+            adopt — mirrors ``import_job``'s adopt precondition (which then
+            byte-verifies). Size is a cheap proxy: the run may still hash-
+            mismatch and land at a further suffix, so the preview shares
+            that same optimism as the primary check."""
             if not recovery_base:
                 return False
             source_file = Path(path)
@@ -18413,8 +18418,33 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 recovery_base if rel_folder in ("", ".")
                 else os.path.join(recovery_base, rel_folder)
             )
-            return _planned_folder_listing(folder).get(
-                source_file.name) == size
+            listing = _planned_folder_listing(folder)
+            primary_name = source_file.name
+            primary_size = listing.get(primary_name)
+            if primary_size == size:
+                return True
+            if primary_size is None:
+                # No collision on the primary name — the run copies to the
+                # primary slot without walking suffixes.
+                return False
+            # Primary slot is taken by a different-sized file. Mirror
+            # import_job's collision walk (``name_1.ext``, ``name_2.ext``,
+            # ...): stop at the first free slot (the run would land a
+            # fresh copy there — not recovered), or claim recovery at the
+            # first size-matching candidate (the run would byte-verify and
+            # adopt it — same size-as-proxy semantics as the primary
+            # check above). Non-matching sizes advance the counter, just
+            # as a hash mismatch does in the run.
+            stem, suffix_ext = os.path.splitext(primary_name)
+            counter = 1
+            while True:
+                candidate = f"{stem}_{counter}{suffix_ext}"
+                cand_size = listing.get(candidate)
+                if cand_size is None:
+                    return False
+                if cand_size == size:
+                    return True
+                counter += 1
 
         BATCH_SIZE = 20
 

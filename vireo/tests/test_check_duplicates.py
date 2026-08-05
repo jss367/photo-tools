@@ -479,6 +479,106 @@ def test_check_duplicates_rejects_unsafe_template(app_and_db, tmp_path):
     assert resp.status_code == 400
 
 
+def test_check_duplicates_recovery_walks_suffix_slots(app_and_db, tmp_path):
+    """When the primary name is taken by a different file (crash left a
+    colliding placeholder), the run walks ``name_1.ext``/``name_2.ext``
+    and adopts the first byte-identical suffix. Preview must mirror that
+    walk with size-as-proxy — otherwise a collision-retry reports files
+    as "to copy" even though Start hashes and adopts them without
+    transfer."""
+    app, db, fid = app_and_db
+
+    src = _make_dated_source(tmp_path)
+    dest = tmp_path / "archive"
+    planned = dest / "2026" / "2026-07-03"
+    planned.mkdir(parents=True)
+
+    # Primary slot is occupied by a same-named but different-sized file
+    # (e.g. an unrelated existing archive photo). The interrupted run's
+    # previous copy of THIS source landed at IMG_0100_1.jpg — same size
+    # as source, byte-identical (size is the preview's stand-in for that).
+    (planned / src.name).write_bytes(b"different sized existing photo")
+    import shutil
+    shutil.copy2(str(src), str(planned / "IMG_0100_1.jpg"))
+
+    client = app.test_client()
+    resp = client.post("/api/import/check-duplicates", json={
+        "paths": [str(src)],
+        "destination": str(dest),
+        "folder_template": "%Y/%Y-%m-%d",
+    })
+    events = parse_sse_events(resp.data)
+    done = [e for e in events if e.get("done")]
+    assert len(done) == 1
+    assert done[0]["recovered_count"] == 1
+    assert str(src) in _recovered_paths(events)
+
+
+def test_check_duplicates_recovery_stops_at_first_free_suffix(
+    app_and_db, tmp_path
+):
+    """Primary taken by a different-sized file, and every existing suffix
+    slot also differs in size — the run would copy the source to the
+    first free slot (e.g. ``IMG_0100_2.jpg``), so the preview must NOT
+    call this a recovery."""
+    app, db, fid = app_and_db
+
+    src = _make_dated_source(tmp_path)
+    dest = tmp_path / "archive"
+    planned = dest / "2026" / "2026-07-03"
+    planned.mkdir(parents=True)
+
+    (planned / src.name).write_bytes(b"different-sized primary")
+    # IMG_0100_1.jpg exists but is a different size — the run would hash-
+    # skip it and advance to IMG_0100_2.jpg (a free slot), meaning a real
+    # copy happens.
+    (planned / "IMG_0100_1.jpg").write_bytes(
+        b"another different-sized colliding file"
+    )
+
+    client = app.test_client()
+    resp = client.post("/api/import/check-duplicates", json={
+        "paths": [str(src)],
+        "destination": str(dest),
+        "folder_template": "%Y/%Y-%m-%d",
+    })
+    events = parse_sse_events(resp.data)
+    done = [e for e in events if e.get("done")]
+    assert done[0]["recovered_count"] == 0
+    assert _recovered_paths(events) == []
+
+
+def test_check_duplicates_recovery_skips_size_mismatched_suffixes(
+    app_and_db, tmp_path
+):
+    """The walk must advance past size-mismatched suffix slots — mirroring
+    the run's hash-mismatch skip — before adopting a further slot that
+    does size-match. A one-slot-only check would miss the adoption."""
+    app, db, fid = app_and_db
+
+    src = _make_dated_source(tmp_path)
+    dest = tmp_path / "archive"
+    planned = dest / "2026" / "2026-07-03"
+    planned.mkdir(parents=True)
+
+    (planned / src.name).write_bytes(b"different-sized primary")
+    (planned / "IMG_0100_1.jpg").write_bytes(b"another different-sized file")
+    import shutil
+    # IMG_0100_2.jpg is the adopted-from-crash copy of this source.
+    shutil.copy2(str(src), str(planned / "IMG_0100_2.jpg"))
+
+    client = app.test_client()
+    resp = client.post("/api/import/check-duplicates", json={
+        "paths": [str(src)],
+        "destination": str(dest),
+        "folder_template": "%Y/%Y-%m-%d",
+    })
+    events = parse_sse_events(resp.data)
+    done = [e for e in events if e.get("done")]
+    assert done[0]["recovered_count"] == 1
+    assert str(src) in _recovered_paths(events)
+
+
 def test_check_duplicates_recovery_batches_exif_reads_in_verify_mode(
     app_and_db, tmp_path, monkeypatch
 ):

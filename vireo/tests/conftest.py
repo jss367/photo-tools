@@ -86,13 +86,7 @@ def _shutdown_created_job_runners(monkeypatch):
     leaked = []
     shutdown_failures = 0
     for runner in reversed(created):
-        # 15s (not 5s): a worker whose HTTP-visible status just went
-        # terminal can still be inside _run_job's finally block draining
-        # the sleep-inhibitor, persisting to job_history, and flushing
-        # logs. Windows CI under xdist load has been observed to run
-        # past 5s there, tripping this shutdown even though the job
-        # actually finished.
-        if runner.shutdown(timeout=15.0):
+        if runner.shutdown(timeout=5.0):
             continue
         shutdown_failures += 1
         leaked.extend(
@@ -216,14 +210,7 @@ def app_and_db(tmp_path, monkeypatch):
 
     app = create_app(db_path=db_path, thumb_cache_dir=thumb_dir, api_token="test-token-123")
     yield app, db
-    # 15s (not 5s): a scan job that raises returns terminal status to the
-    # HTTP poll before its worker's finally block finishes, and that block
-    # on Windows can take several seconds — SleepBlocker.release() joins the
-    # sleep-inhibitor thread with its own 5s timeout, then SQLite job-history
-    # persist and log flushes still have to run. 5s isn't enough headroom on
-    # a loaded xdist Windows runner and the shutdown times out with the
-    # worker mid-finalize.
-    jobs_stopped = app._cleanup_app_resources(job_timeout=15.0)
+    jobs_stopped = app._cleanup_app_resources(job_timeout=5.0)
     db.close()
     if not jobs_stopped:
         pytest.fail("app background jobs did not stop during fixture teardown")
@@ -274,10 +261,7 @@ def client_with_photo(tmp_path, monkeypatch):
 
     app = create_app(db_path=db_path, thumb_cache_dir=str(thumb_dir), api_token="test-token-123")
     yield app, db, pid
-    # See app_and_db for why 15s: Windows worker finalize (sleep-inhibitor
-    # join + SQLite persist + log flushes) can outrun a 5s budget under
-    # xdist load, even after the HTTP-visible status already went terminal.
-    jobs_stopped = app._cleanup_app_resources(job_timeout=15.0)
+    jobs_stopped = app._cleanup_app_resources(job_timeout=5.0)
     db.close()
     if not jobs_stopped:
         pytest.fail("app background jobs did not stop during fixture teardown")

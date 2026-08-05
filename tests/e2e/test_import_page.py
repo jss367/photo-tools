@@ -1355,6 +1355,48 @@ def test_import_dest_structure_invalidation_survives_slow_startup(live_server, p
     expect(page.locator("#destStructure")).to_be_hidden()
 
 
+def test_import_remote_targets_load_while_readiness_is_slow(live_server, page):
+    """A catalog-wide metadata check must not hide configured SSH targets.
+
+    Import readiness can take minutes for a large library.  The destination
+    picker is independent of that check, so populate it while readiness is
+    still in flight instead of leaving only the static local-path option.
+    """
+    url = live_server["url"]
+
+    def readiness(route):
+        # Never fulfill: this models the slow catalog scan without blocking
+        # Playwright's event loop, so independent requests can still finish.
+        pass
+
+    def remote_targets(route):
+        route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({
+                "rsync_available": True,
+                "ssh_available": True,
+                "targets": [{
+                    "id": "nas1",
+                    "name": "Photo NAS",
+                    "user": "photo",
+                    "host": "nas.local",
+                    "remote_path": "/volume1/Photography",
+                    "mount_path": "/Volumes/Photography",
+                }],
+            }),
+        )
+
+    page.route("**/api/import/readiness", readiness)
+    page.route("**/api/remote-targets", remote_targets)
+    page.goto(f"{url}/import", wait_until="domcontentloaded")
+
+    expect(page.locator("#destMode option")).to_have_count(2)
+    expect(page.locator("#destMode option").nth(1)).to_have_text(
+        "Photo NAS — direct transfer over SSH"
+    )
+
+
 def test_import_remote_destination_requires_visible_folder_inside_nas(
     live_server, page,
 ):

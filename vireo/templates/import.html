@@ -3340,7 +3340,82 @@ async function previewImport(opts) {
       renderImportPreviewGrid(files, [], null);
       updateImportSelectionUI();
       retireHideDuplicatesOptIn();
-      summary.textContent = files.length + ' files found · duplicates will be copied';
+      // With duplicate-skipping OFF the run doesn't consult the library
+      // checker, but crash-recovery adoption of byte-identical files at
+      // the destination still fires unconditionally in import_job — so
+      // the honest transfer count still depends on how many of the
+      // discovered files are already sitting at their planned destination
+      // from an interrupted prior run. Fetch recovery-only (paths a
+      // resumed run would adopt without transferring) whenever the
+      // destination is resolvable; the summary subtracts them from
+      // "to copy" the same way the dedup-on branch does. Nothing else in
+      // the UI changes: recovered files stay selected and land in the
+      // preview grid without a badge, because the run still processes
+      // them (verify + catalog) — they're just not re-copied.
+      //
+      // No destination resolvable (in-place preview, or the remote
+      // dropdown hasn't populated yet) → skip the request and show the
+      // count with the old wording. A subsequent preview run after the
+      // form settles will re-check.
+      const recoveryDestNoDedup = resolvedCopyDestination();
+      if (!recoveryDestNoDedup) {
+        summary.textContent = files.length +
+          ' files found · duplicates will be copied';
+        const destData = await renderDestStructure([]);
+        if (requestSeq !== importPreviewSeq) return;
+        if (importPreviewSignatureChanged(requestSignature)) return;
+        if (destData && destData.files) {
+          renderImportPreviewGrid(files, [], destData.files);
+        }
+        return;
+      }
+      summary.textContent = files.length +
+        ' files found — checking for interrupted-run leftovers…';
+      // Reuse the check-duplicates SSE endpoint with skip_duplicates:
+      // false — the server matches the import job's own gate and streams
+      // only ``recovered`` (no ``duplicates``) in this mode. Same
+      // race-condition guards as the dedup-on branch below: a newer
+      // preview cancels this one via requestSeq / signature checks.
+      const recResp = await fetch('/api/import/check-duplicates', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          paths: files.map(f => f.path),
+          verify_by_hash: document.getElementById('chkVerifyByHash').checked,
+          skip_duplicates: false,
+          destination: recoveryDestNoDedup,
+          folder_template: selectedFolderTemplate(),
+        }),
+      });
+      if (!recResp.ok) throw new Error('recovery check failed');
+      const recReader = recResp.body.getReader();
+      const recDecoder = new TextDecoder();
+      let recBuffer = '';
+      const recoveredPathsNoDedup = [];
+      for (;;) {
+        const r = await recReader.read();
+        if (r.done) break;
+        recBuffer += recDecoder.decode(r.value, { stream: true });
+        const parts = recBuffer.split('\n\n');
+        recBuffer = parts.pop();
+        for (const part of parts) {
+          const m = part.match(/^data: (.+)$/m);
+          if (!m) continue;
+          try {
+            const d = JSON.parse(m[1]);
+            if (d.recovered) recoveredPathsNoDedup.push(...d.recovered);
+          } catch (e) { /* partial frame */ }
+        }
+      }
+      if (requestSeq !== importPreviewSeq) return;
+      if (importPreviewSignatureChanged(requestSignature)) return;
+      const recCountNoDedup = recoveredPathsNoDedup.length;
+      summary.textContent = files.length + ' files found · ' +
+        (recCountNoDedup ? recCountNoDedup +
+          ' already at destination from an interrupted import' +
+          ' (verified & adopted on import, not re-copied) · ' : '') +
+        (files.length - recCountNoDedup) +
+        ' to copy · duplicates will be copied';
       // No dedup gate, so every discovered file lands — pass no exclusions
       // so the folder-structure counts match the full copy set.
       const destData = await renderDestStructure([]);

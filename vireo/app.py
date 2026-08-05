@@ -18328,10 +18328,23 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         the walk the same way ``import_job`` does on a hash mismatch —
         otherwise the preview would tell the user "not re-copied" for a
         file the run is about to suffix-copy under a numbered name.
+
+        Optional {"skip_duplicates": false} matches the import job's own
+        gate: when the run has duplicate skipping off, the library-dedup
+        checker isn't consulted (library duplicates get copied anyway),
+        but crash-recovery adoption of byte-identical files at the
+        destination still fires. Passing skip_duplicates=false here
+        mirrors that: no ``duplicates`` are streamed, but ``recovered``
+        still is — so the retry preview after a cancelled dedup-off run
+        doesn't overstate the transfer.
         """
         body = request.get_json(silent=True) or {}
         paths = body.get("paths", [])
         verify_by_hash = bool(body.get("verify_by_hash"))
+        # Default True is the import job's default and preserves the
+        # pre-existing endpoint contract; only the dedup-off preview
+        # branch passes False.
+        skip_duplicates = bool(body.get("skip_duplicates", True))
         if not paths:
             return json_error("paths required", 400)
 
@@ -18354,6 +18367,12 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 "or backslashes", 400)
 
         db = _get_db()
+        # The checker still runs when skip_duplicates=False, but only for
+        # its EXIF-batching side effect (needed by _recovery_candidate in
+        # default mode). check_and_record() is skipped in the generator
+        # below so no library-dedup verdict is produced — matching the
+        # import job, which doesn't create the checker at all in that
+        # mode.
         checker = DuplicateChecker(
             CatalogIndex.from_db(db), verify_by_hash=verify_by_hash,
         )
@@ -18519,7 +18538,16 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 # landed on the last path or on a batch boundary, leaving
                 # the UI unable to deselect those known dupes.
                 try:
-                    if checker.check_and_record(Path(path)):
+                    # When skip_duplicates=False, the import run doesn't
+                    # consult the library-dedup checker at all — every
+                    # source file goes on to the recovery/adopt gate. Skip
+                    # check_and_record() here so a cataloged twin that
+                    # also sits at the destination is streamed as
+                    # ``recovered`` (matching what the run will actually
+                    # do) instead of ``duplicates`` (which the client
+                    # would then not subtract from the transfer count).
+                    if skip_duplicates and checker.check_and_record(
+                            Path(path)):
                         batch_duplicates.append(path)
                         duplicate_count += 1
                     elif _recovery_candidate(path):

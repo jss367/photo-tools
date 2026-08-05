@@ -729,3 +729,143 @@ def test_check_duplicates_recovery_batches_exif_reads_in_verify_mode(
         f"expected one batched capture-time resolution, got {len(calls)}: "
         f"{[len(c) for c in calls]}"
     )
+
+
+# --------------------------------------------------------------------------
+# skip_duplicates=False mirrors the import job's dedup-off mode:
+# library-dedup checker isn't consulted, but crash-recovery adoption of
+# byte-identical files at the destination still fires. The retry preview
+# after a cancelled dedup-off run has to reflect that, or "to copy" would
+# double-count the files a resumed run will adopt without transferring.
+# --------------------------------------------------------------------------
+
+def test_check_duplicates_skip_false_suppresses_duplicate_verdicts(
+    app_and_db, tmp_path
+):
+    """With ``skip_duplicates: false`` no cataloged file is reported as a
+    duplicate — matching the import run's dedup-off mode, which doesn't
+    consult the library checker at all."""
+    app, db, fid = app_and_db
+
+    library_dir = tmp_path / "library"
+    library_dir.mkdir(exist_ok=True)
+    src = _make_dated_source(tmp_path)
+    import shutil
+    shutil.copy2(str(src), str(library_dir / src.name))
+    from scanner import scan
+    scan(str(library_dir), db)
+
+    client = app.test_client()
+    resp = client.post("/api/import/check-duplicates", json={
+        "paths": [str(src)],
+        "skip_duplicates": False,
+    })
+    assert resp.status_code == 200
+    events = parse_sse_events(resp.data)
+    done = [e for e in events if e.get("done")]
+    assert len(done) == 1
+    assert done[0]["duplicate_count"] == 0
+    # No ``duplicates`` batches at all — nothing to subtract from "to copy".
+    for e in events:
+        assert not e.get("duplicates")
+
+
+def test_check_duplicates_skip_false_still_reports_recovery(
+    app_and_db, tmp_path
+):
+    """With ``skip_duplicates: false`` the recovery gate still fires:
+    a byte-identical file at the planned destination is streamed as
+    ``recovered`` so the dedup-off retry preview subtracts it from the
+    transfer count, matching the run's unconditional crash-recovery."""
+    app, db, fid = app_and_db
+
+    src = _make_dated_source(tmp_path)
+    dest = tmp_path / "archive"
+    planned = dest / "2026" / "2026-07-03"
+    planned.mkdir(parents=True)
+    import shutil
+    shutil.copy2(str(src), str(planned / src.name))
+
+    client = app.test_client()
+    resp = client.post("/api/import/check-duplicates", json={
+        "paths": [str(src)],
+        "skip_duplicates": False,
+        "destination": str(dest),
+        "folder_template": "%Y/%Y-%m-%d",
+    })
+    events = parse_sse_events(resp.data)
+    done = [e for e in events if e.get("done")]
+    assert done[0]["duplicate_count"] == 0
+    assert done[0]["recovered_count"] == 1
+    assert str(src) in _recovered_paths(events)
+
+
+def test_check_duplicates_skip_false_reports_cataloged_twin_as_recovered(
+    app_and_db, tmp_path
+):
+    """A file that is BOTH a library twin AND already at the destination:
+    with ``skip_duplicates: false`` it must be streamed as ``recovered``
+    (matching what the dedup-off run does — it doesn't consult the
+    checker, then crash-recovery adopts the on-disk copy). Without this
+    the preview would emit no verdict for it and it would stay counted in
+    "to copy", overstating the transfer after a cancelled dedup-off run
+    of a batch that happened to contain a library duplicate."""
+    app, db, fid = app_and_db
+
+    library_dir = tmp_path / "library"
+    library_dir.mkdir(exist_ok=True)
+    src = _make_dated_source(tmp_path)
+    import shutil
+    shutil.copy2(str(src), str(library_dir / src.name))
+    from scanner import scan
+    scan(str(library_dir), db)
+
+    dest = tmp_path / "archive"
+    planned = dest / "2026" / "2026-07-03"
+    planned.mkdir(parents=True)
+    shutil.copy2(str(src), str(planned / src.name))
+
+    client = app.test_client()
+    resp = client.post("/api/import/check-duplicates", json={
+        "paths": [str(src)],
+        "skip_duplicates": False,
+        "destination": str(dest),
+    })
+    events = parse_sse_events(resp.data)
+    done = [e for e in events if e.get("done")]
+    assert done[0]["duplicate_count"] == 0
+    assert done[0]["recovered_count"] == 1
+    assert str(src) in _recovered_paths(events)
+
+
+def test_check_duplicates_skip_true_by_default_preserves_contract(
+    app_and_db, tmp_path
+):
+    """Omitting ``skip_duplicates`` defaults to True — the pre-existing
+    endpoint contract. A cataloged twin at the destination stays reported
+    as a duplicate (duplicate gate wins over recovery), just like before
+    the flag was introduced."""
+    app, db, fid = app_and_db
+
+    library_dir = tmp_path / "library"
+    library_dir.mkdir(exist_ok=True)
+    src = _make_dated_source(tmp_path)
+    import shutil
+    shutil.copy2(str(src), str(library_dir / src.name))
+    from scanner import scan
+    scan(str(library_dir), db)
+
+    dest = tmp_path / "archive"
+    planned = dest / "2026" / "2026-07-03"
+    planned.mkdir(parents=True)
+    shutil.copy2(str(src), str(planned / src.name))
+
+    client = app.test_client()
+    resp = client.post("/api/import/check-duplicates", json={
+        "paths": [str(src)],
+        "destination": str(dest),
+    })
+    events = parse_sse_events(resp.data)
+    done = [e for e in events if e.get("done")]
+    assert done[0]["duplicate_count"] == 1
+    assert done[0]["recovered_count"] == 0

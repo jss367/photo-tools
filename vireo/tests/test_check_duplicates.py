@@ -579,6 +579,113 @@ def test_check_duplicates_recovery_skips_size_mismatched_suffixes(
     assert str(src) in _recovered_paths(events)
 
 
+def test_check_duplicates_recovery_rejects_same_size_different_bytes(
+    app_and_db, tmp_path
+):
+    """A destination file with the same name and byte size but different
+    contents (e.g. a corrupt partial file, or an unrelated coincidence)
+    must NOT be reported as recovered. The import path hashes the
+    candidate and suffix-copies on a mismatch, so the preview would
+    otherwise subtract the file from ``to copy`` and promise "not
+    re-copied" for a file the run will re-copy under a numbered suffix.
+    """
+    app, db, fid = app_and_db
+
+    src = _make_dated_source(tmp_path)
+    dest = tmp_path / "archive"
+    planned = dest / "2026" / "2026-07-03"
+    planned.mkdir(parents=True)
+
+    # Land a same-name same-size but different-content file at the
+    # primary slot. Padded to exactly match the source size.
+    src_size = os.path.getsize(str(src))
+    (planned / src.name).write_bytes(b"X" * src_size)
+
+    client = app.test_client()
+    resp = client.post("/api/import/check-duplicates", json={
+        "paths": [str(src)],
+        "destination": str(dest),
+        "folder_template": "%Y/%Y-%m-%d",
+    })
+    events = parse_sse_events(resp.data)
+    done = [e for e in events if e.get("done")]
+    assert len(done) == 1
+    assert done[0]["recovered_count"] == 0
+    assert _recovered_paths(events) == []
+
+
+def test_check_duplicates_recovery_walks_past_same_size_mismatch_to_adopt(
+    app_and_db, tmp_path
+):
+    """Primary slot has same size but different bytes → the run advances
+    the walk (via hash mismatch) and adopts a further byte-identical
+    suffix. The preview must mirror that walk: advance past same-size-
+    different-bytes slots, adopt the first byte-identical candidate.
+    """
+    app, db, fid = app_and_db
+
+    src = _make_dated_source(tmp_path)
+    dest = tmp_path / "archive"
+    planned = dest / "2026" / "2026-07-03"
+    planned.mkdir(parents=True)
+
+    # Primary slot: same size, different bytes (must not be adopted).
+    src_size = os.path.getsize(str(src))
+    (planned / src.name).write_bytes(b"Y" * src_size)
+    # IMG_0100_1.jpg: byte-identical to source (the run's actual adopt).
+    import shutil
+    shutil.copy2(str(src), str(planned / "IMG_0100_1.jpg"))
+
+    client = app.test_client()
+    resp = client.post("/api/import/check-duplicates", json={
+        "paths": [str(src)],
+        "destination": str(dest),
+        "folder_template": "%Y/%Y-%m-%d",
+    })
+    events = parse_sse_events(resp.data)
+    done = [e for e in events if e.get("done")]
+    assert done[0]["recovered_count"] == 1
+    assert str(src) in _recovered_paths(events)
+
+
+def test_check_duplicates_recovery_skips_hashing_when_no_collision(
+    app_and_db, tmp_path, monkeypatch
+):
+    """No size collision at the destination → the preview must not hash
+    the source. Fresh imports (the common case) stay cheap; hashing is
+    scoped to actual collision candidates."""
+    app, db, fid = app_and_db
+
+    src = _make_dated_source(tmp_path)
+    dest = tmp_path / "archive"
+    # Planned folder is empty — no candidate at the primary slot at all.
+    (dest / "2026" / "2026-07-03").mkdir(parents=True)
+
+    import scanner
+    hash_calls = []
+    real_hash = scanner.compute_file_hash
+
+    def _counting_hash(path, *a, **kw):
+        hash_calls.append(path)
+        return real_hash(path, *a, **kw)
+
+    monkeypatch.setattr(scanner, "compute_file_hash", _counting_hash)
+
+    client = app.test_client()
+    resp = client.post("/api/import/check-duplicates", json={
+        "paths": [str(src)],
+        "destination": str(dest),
+        "folder_template": "%Y/%Y-%m-%d",
+    })
+    events = parse_sse_events(resp.data)
+    done = [e for e in events if e.get("done")]
+    assert done[0]["recovered_count"] == 0
+    assert hash_calls == [], (
+        f"expected no content hashing without a size collision, got "
+        f"{len(hash_calls)} hash call(s): {hash_calls}"
+    )
+
+
 def test_check_duplicates_recovery_batches_exif_reads_in_verify_mode(
     app_and_db, tmp_path, monkeypatch
 ):

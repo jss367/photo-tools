@@ -3418,10 +3418,11 @@ async function previewImport(opts) {
     // Recovered files stay selected — the import must still process them
     // to verify and catalog the copies already at the destination — but
     // they are not part of the transfer, so "to copy" must not count
-    // them. "verified & adopted on import" is a promise about the run,
-    // hedged on purpose: the preview matched name + size, the run's
-    // byte-check has the final word (a mismatch is re-copied under a
-    // numbered suffix).
+    // them. The preview already byte-verified each size-matching
+    // candidate against its source, so the "not re-copied" promise
+    // matches what the run will do; a same-size-different-bytes
+    // collision would have been advanced past on the server and
+    // reappeared in the "to copy" count.
     const recCount = recoveredPaths.length;
     summary.textContent = files.length + ' files found · ' + dupCount +
       ' already in your library (will be skipped) · ' +

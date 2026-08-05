@@ -18313,16 +18313,21 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
 
         Optional {"destination": abs path, "folder_template": str} turns on
         destination-recovery detection: non-duplicate files whose planned
-        destination folder already holds a size-matching file at the
+        destination folder already holds a byte-identical file at the
         primary name — or at a numeric-suffix slot the run would adopt
         (``name_1.ext``, ``name_2.ext``, ...) — are streamed as
         ``recovered`` (with a final ``recovered_count``). Those are the
         files a cancelled/crashed prior run left at the destination —
         the import adopts them via crash recovery (verify + catalog, no
-        re-copy), so counting them "to copy" overstates the transfer. Size
-        is a cheap proxy for the run's byte-verification: a same-size file
-        may still fail the hash check and be suffix-copied, so the UI must
-        phrase this as "verified & adopted on import", never "done".
+        re-copy), so counting them "to copy" overstates the transfer.
+
+        A size match is the cheap gate: same-size candidates are the only
+        ones the run would even byte-verify, so hashing is scoped to that
+        subset (rare in a fresh import; proportional to actual collisions
+        in a retry). A same-size candidate whose bytes disagree advances
+        the walk the same way ``import_job`` does on a hash mismatch —
+        otherwise the preview would tell the user "not re-copied" for a
+        file the run is about to suffix-copy under a numbered name.
         """
         body = request.get_json(silent=True) or {}
         paths = body.get("paths", [])
@@ -18331,9 +18336,12 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             return json_error("paths required", 400)
 
         from import_dedup import (
-            CatalogIndex, DuplicateChecker, source_capture_timestamps,
+            CatalogIndex,
+            DuplicateChecker,
+            source_capture_timestamps,
         )
         from ingest import _is_unsafe_path, build_destination_path
+        from scanner import compute_file_hash
 
         recovery_base = (body.get("destination") or "").strip()
         folder_template = body.get("folder_template", "%Y/%Y-%m-%d")
@@ -18377,12 +18385,14 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             return dir_listings[folder]
 
         def _recovery_candidate(path):
-            """True when the planned destination already holds a size-matching
-            file at the primary name OR at any suffix slot the run would
-            adopt — mirrors ``import_job``'s adopt precondition (which then
-            byte-verifies). Size is a cheap proxy: the run may still hash-
-            mismatch and land at a further suffix, so the preview shares
-            that same optimism as the primary check."""
+            """True when the planned destination already holds a byte-
+            identical file at the primary name OR at any suffix slot the
+            run would adopt — mirrors ``import_job``'s adopt precondition
+            (size match then byte-verify). A size-matching candidate whose
+            bytes disagree advances the walk the same way a hash mismatch
+            does in the run: otherwise the preview would subtract the
+            file from "to copy" and promise "not re-copied" for a file
+            the run will suffix-copy under a numbered name."""
             if not recovery_base:
                 return False
             source_file = Path(path)
@@ -18420,21 +18430,49 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             )
             listing = _planned_folder_listing(folder)
             primary_name = source_file.name
+
+            # Lazy source-hash: only computed once, and only if we hit a
+            # size-matching candidate that needs verifying. A typical
+            # fresh import has no size collisions and skips hashing
+            # entirely.
+            src_hash_cache = []
+
+            def _src_hash():
+                if not src_hash_cache:
+                    try:
+                        src_hash_cache.append(compute_file_hash(
+                            str(source_file)))
+                    except OSError:
+                        src_hash_cache.append(None)
+                return src_hash_cache[0]
+
+            def _bytes_match(cand_path):
+                sh = _src_hash()
+                if sh is None:
+                    return False
+                try:
+                    return compute_file_hash(cand_path) == sh
+                except OSError:
+                    return False
+
             primary_size = listing.get(primary_name)
             if primary_size == size:
-                return True
-            if primary_size is None:
+                if _bytes_match(os.path.join(folder, primary_name)):
+                    return True
+                # Same size, different bytes at the primary slot: the run
+                # will hash-mismatch and advance to the suffix walk.
+            elif primary_size is None:
                 # No collision on the primary name — the run copies to the
                 # primary slot without walking suffixes.
                 return False
-            # Primary slot is taken by a different-sized file. Mirror
-            # import_job's collision walk (``name_1.ext``, ``name_2.ext``,
-            # ...): stop at the first free slot (the run would land a
-            # fresh copy there — not recovered), or claim recovery at the
-            # first size-matching candidate (the run would byte-verify and
-            # adopt it — same size-as-proxy semantics as the primary
-            # check above). Non-matching sizes advance the counter, just
-            # as a hash mismatch does in the run.
+            # Primary slot is taken by a different-sized (or same-sized-
+            # different-bytes) file. Mirror import_job's collision walk
+            # (``name_1.ext``, ``name_2.ext``, ...): stop at the first
+            # free slot (the run would land a fresh copy there — not
+            # recovered), or claim recovery at the first byte-identical
+            # candidate (the run would adopt it). Size-mismatched slots
+            # advance the counter; same-size-different-bytes slots also
+            # advance, mirroring the run's hash-mismatch skip.
             stem, suffix_ext = os.path.splitext(primary_name)
             counter = 1
             while True:
@@ -18442,7 +18480,8 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 cand_size = listing.get(candidate)
                 if cand_size is None:
                     return False
-                if cand_size == size:
+                if cand_size == size and _bytes_match(
+                        os.path.join(folder, candidate)):
                     return True
                 counter += 1
 

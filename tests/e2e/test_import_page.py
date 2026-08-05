@@ -1389,8 +1389,10 @@ def test_import_remote_targets_load_while_readiness_is_slow(live_server, page):
 
     page.route("**/api/import/readiness", readiness)
     page.route("**/api/remote-targets", remote_targets)
-    page.goto(f"{url}/import", wait_until="domcontentloaded")
+    with page.expect_request("**/api/import/readiness") as readiness_request:
+        page.goto(f"{url}/import", wait_until="domcontentloaded")
 
+    assert readiness_request.value.url.endswith("/api/import/readiness")
     expect(page.locator("#destMode option")).to_have_count(2)
     expect(page.locator("#destMode option").nth(1)).to_have_text(
         "Photo NAS — direct transfer over SSH"

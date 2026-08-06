@@ -58,7 +58,7 @@ A line-by-line phase map (2026-08-06) found:
 - No new transports (e.g. SFTP) — the seam just has to make a third transport
   *possible*, not deliver one.
 - De-duplicating the preflight endpoints' hand-mirrored collision walk
-  (`app.py:18328–18522`) is a stretch goal (PR 7), not a requirement.
+  (`app.py:18328–18522`) is a stretch goal (PR 8), not a requirement.
 
 ## Approaches considered
 
@@ -97,7 +97,8 @@ class _LandedFile:
     src_size: int | None
     src_mtime_ns: int | None
 
-# flush_batch outcome: either a _LandedFile or a per-file failure.
+# Per-file transport outcomes. Cancellation is deliberately NOT a per-file
+# outcome (see the protocol below).
 _FileOutcome = _LandedFile | _FailedFile   # _FailedFile: (source_path, reason)
 
 @dataclass
@@ -131,15 +132,34 @@ class _Transport(Protocol):
     # params.verify_by_hash (rsync alone attests nothing).
     attests_bytes: bool
 
-    def prepare_folder(self, dest_folder, rel) -> str | None   # error reason
     def enqueue(self, src, dest_folder, dest_basename, src_hash,
-                src_size, src_mtime_ns) -> _LandedFile | None
-        # local: copy+verify now, return the outcome
-        # remote: reserve the name, queue for rsync, return None
-    def flush_batch(self, rel, emit_transfer, stop) -> list[_FileOutcome]
-        # local: no-op ([]); remote: _remote_mkdir_p + flat rsync + renamed
-        # rsyncs + optional remote_verify_files, one outcome per queued file
+                src_size, src_mtime_ns) -> _FileOutcome | Queued
+        # local: copy+verify now — _LandedFile on success, _FailedFile on
+        #        a copy/verify error
+        # remote: reserve the name and queue for rsync -> Queued
+    def flush_batch(self, rel, emit_transfer, stop) -> _BatchResult
+        # local: no-op (empty result)
+        # remote: _remote_mkdir_p + flat rsync + per-file renamed rsyncs +
+        #         optional remote_verify_files
+
+@dataclass
+class _BatchResult:
+    outcomes: list[_FileOutcome]
+    cancelled: bool   # user stop observed mid-transfer
+
+class Queued: ...   # sentinel: bytes not moved yet; outcome arrives at flush
 ```
+
+Cancellation is a batch-level fact, not a per-file outcome: today a stopped
+rsync (`_rsync_cancelled`, line 2320) deliberately produces *no* per-file
+failures — queued files stay on the card and partially/fully transferred but
+unverified files stay uncataloged for crash-recovery adoption on the next
+run (the PR #1425 behavior). `_BatchResult.cancelled` carries that state
+back explicitly; the transport never mutates `_ImportRunState`. Folder
+preparation is *not* part of the protocol: the mount guards, local
+`os.makedirs`, and folder-status promotion are byte-identical in both paths
+today and stay in the orchestrator; the SSH-side `_remote_mkdir_p` (already
+inside the transfer phase at line 2276) lives in `RsyncTransport.flush_batch`.
 
 - `LocalTransport` wraps `copy_and_hash_verify`; `RsyncTransport` wraps the
   five existing `move.py` seams (`_ssh_rsh_string`, `rsync_dest_spec`,
@@ -174,7 +194,7 @@ class _Transport(Protocol):
 signature and remains the only public entry (`app.py:26419` untouched). It
 constructs the `Database`, picks the transport from `params.remote_target`,
 and runs the single orchestrator. `_run_remote_import_job` is deleted at the
-end (PR 6).
+end (PR 7).
 
 ## Behavior alignment decisions
 
@@ -186,12 +206,12 @@ means the other path changes to match.
 | 1 | Remote `_emit` never sends the `folders={…}` per-folder snapshot the Import page renders mid-run (local: 3213–3216) | **Bug — adopt local.** Remote imports get the live folder table. |
 | 2 | Local dest-under-source batch refusal neither advances `emitted` nor emits progress (3497–3506); remote does both (1676–1691) | **Bug — adopt remote.** A rejected batch must not freeze the progress bar. |
 | 3 | Missing-mount-root refusal emits `"{rel}: archive unavailable"` locally (3535) but the generic copied/present string remotely (1710) | **Adopt local.** The specific string is the honest signal; the UI treats `phase` as opaque display text, and no test pins the remote wording for this case. |
-| 4 | `landed` 5-tuple (remote) vs 6-tuple (local) with fields transposed | **Structural — `_LandedFile` dataclass** (PR 4). |
-| 5 | Remote registers duplicate-accepts with `_record_checker(source_file)` (2008); local never does (3805–3832) | **Adopt remote** (with its optional-args `_record_checker`). Later same-identity files hit the intra-run cache instead of re-hashing twins — strictly less I/O, same outcome. |
+| 4 | `landed` 5-tuple (remote) vs 6-tuple (local) with fields transposed | **Structural — `_LandedFile` dataclass** (PR 5). |
+| 5 | Remote registers duplicate-accepts with `_record_checker(source_file)` (2008); local never does (3805–3832) | **Adopt local — remove the remote call.** The call passes no `dest_folder`, so it never populates `run_dest_folders` and cannot enable the intra-run fast path at 1922; `DuplicateChecker.record()` costs an extra `os.stat` and only registers `_seen_*` identities, whose sole effect is a narrow renamed-twin-of-an-accepted-duplicate edge that the post-import scan already covers. The helper docstring's "mirrors the local path" claim is false at this call site — this is drift, not design. PR 1 adds a characterization test for the renamed-twin scenario on both paths first so the removal is observable. (Reversed 2026-08-06 after external review; the original "strictly less I/O, same outcome" rationale did not survive contact with `import_dedup.py:413`.) |
 | 6 | Remote path has no `pre_scan_hashes` capture, no `_invalidate_derived_caches`, no `_sweep_untracked_previews_for_photos`, no reclassified-path filtering of WC overrides (local: 4142–4155, 4378–4456, 4466–4484) | **Bug — port to remote.** A remote import that replaces bytes at an existing archive path currently leaves stale thumbnails/previews — exactly the failure the local path fixed in PR #1107. |
 | 7 | WC identity `(size, mtime_ns)` captured before the copy locally (3893) but after the transfer remotely (2419) | **Adopt local.** The tuple should attest the source at decision time; a source that changes mid-transfer must not look "clean". |
 | 8 | Local re-computes the source hash at 3996–3999 instead of reusing `_src_hash_cached()` | **Fix locally.** Pure redundancy; one hash read saved per fresh copy. |
-| 9 | Remote rollback open-coded at 8 sites vs local `_reclassify_landed_failed` | **Structural — shared helper on `_ImportRunState`** (PR 4). |
+| 9 | Remote rollback open-coded at 8 sites vs local `_reclassify_landed_failed` | **Structural — shared helper on `_ImportRunState`** (PR 5). |
 
 Kept as deliberate (transport-required) differences, expressed through the
 protocol rather than duplicated code: transfer sub-progress
@@ -205,39 +225,53 @@ term in `safe_to_format`, and subprocess-level cancellation probes.
 Each PR runs the full suite in CLAUDE.md plus `vireo/tests/test_import_job.py`,
 and goes through the normal PR-agent review cycle.
 
-1. **PR 1 — widen the parity net (tests only).** Extend the
-   local/remote parity harness beyond selection observables: scenarios for
-   duplicate skip, basename collision, crash-recovery adoption, mount loss
-   mid-batch, and stop during a destination read. Fix the two mirror pairs
-   whose fixture geometry diverges (twin parked in a non-template folder
-   locally vs a template-shaped path remotely at test lines ~10012/10074;
-   fresh-copy vs adoption gating at ~10736/10837) so each mirror actually
-   exercises the same branch. This is the net everything else lands on.
+1. **PR 1 — widen the test net (tests only).** Two halves:
+   - *Parity:* extend the local/remote parity harness beyond selection
+     observables — duplicate skip, basename collision, crash-recovery
+     adoption, renamed twin of an accepted duplicate (decision 5), mount
+     loss mid-batch, stop during a destination read. Fix the two mirror
+     pairs whose fixture geometry diverges (twin parked in a non-template
+     folder locally vs a template-shaped path remotely at test lines
+     ~10012/10074; fresh-copy vs adoption gating at ~10736/10837) so each
+     mirror actually exercises the same branch.
+   - *Remote characterization:* the parity harness forces
+     `verify_by_hash=True` (to dodge the vacuous-pass trap), which blinds it
+     to remote-only semantics. Pin those directly, asserting DB effects
+     (photo rows, folder links, `hash_status`) as well as result dicts and
+     event streams: default `verify_by_hash=False` honesty gate; stop
+     partway through a flat rsync batch (cancellation, not per-file
+     failure; nothing cataloged); stop between renamed-file transfers;
+     `remote_verify_files` failure after a successful transfer.
+   This is the net everything else lands on.
 2. **PR 2 — progress/emit alignment.** Decisions 1, 2, 3. User-visible
    fixes; each with a regression test asserting the event stream.
-3. **PR 3 — dedupe/bookkeeping alignment.** Decisions 5, 7, 8, plus port of
-   decision 6 (derived-cache invalidation on remote). Separable from PR 2.
-   For both PR 2 and PR 3: any change to the duplicate/collision/adopt walk
-   must be checked against the hand-mirrored preflight copies at
-   `app.py:18300–18550` and either applied there too or recorded as a
-   deliberate difference (see Risks).
-4. **PR 4 — state consolidation (no behavior change).** `_LandedFile`,
+3. **PR 3 — dedupe/bookkeeping alignment.** Decisions 5, 7, 8. Separable
+   from PR 2. For both PR 2 and PR 3: any change to the
+   duplicate/collision/adopt walk must be checked against the hand-mirrored
+   preflight copies at `app.py:18300–18550` and either applied there too or
+   recorded as a deliberate difference (see Risks).
+4. **PR 4 — port derived-cache invalidation to remote.** Decision 6 alone:
+   it touches scanning, DB state, previews, thumbnails, and working copies,
+   so it gets an isolated PR with DB-level assertions (cache files removed,
+   `pre_scan_hashes` comparison, preview sweep) rather than riding along
+   with the smaller alignments.
+5. **PR 5 — state consolidation (no behavior change).** `_LandedFile`,
    `_ImportRunState`, shared rollback helper, fold remote adoptions into
    `landed` (collapsing the scan-guard difference), single `_record_checker`.
    The parity suite plus byte-identical result dicts are the check.
-5. **PR 5 — extract shared phases (no behavior change).** The
+6. **PR 6 — extract shared phases (no behavior change).** The
    identical/cosmetic phases (setup, normalization, mount baseline, guards,
    discovery, selection, preflight, batching, batch guards, twin linking, WC
    extraction, finalize) become module-level functions taking
    `(state, params, deps)`; both paths call them. The two functions shrink
    to their genuinely divergent cores.
-6. **PR 6 — the merge.** Introduce `_Transport`, `LocalTransport`,
+7. **PR 7 — the merge.** Introduce `_Transport`, `LocalTransport`,
    `RsyncTransport`; one orchestrator batch loop; delete
    `_run_remote_import_job`; repoint the remote tests' monkeypatch seam at
-   the transport. This diff is small *because* of PRs 4–5.
-7. **PR 7 (stretch) — preflight de-mirror.** Share the collision/adopt walk
+   the transport. This diff is small *because* of PRs 5–6.
+8. **PR 8 (stretch) — preflight de-mirror.** Share the collision/adopt walk
    with `/api/import/check-duplicates` and friends (`app.py:18328–18522`),
-   removing the third hand-mirrored copy. Only after PR 6 has soaked.
+   removing the third hand-mirrored copy. Only after PR 7 has soaked.
 
 ## Contract pins (must not change)
 
@@ -264,7 +298,7 @@ and goes through the normal PR-agent review cycle.
 ## Risks
 
 - **Behavior hiding in drift.** Any divergence the phase map classified as
-  cosmetic could turn out load-bearing. Mitigation: PRs 4–5 are
+  cosmetic could turn out load-bearing. Mitigation: PRs 5–6 are
   no-behavior-change by construction and reviewed against byte-identical
   result dicts and event streams; the widened parity suite runs first.
 - **Parity tests passing vacuously.** The existing suite only avoids this by
@@ -275,7 +309,7 @@ and goes through the normal PR-agent review cycle.
   mirror by hand. Each such change must grep `app.py:18300–18550` for the
   mirrored copy and update it (or consciously record the difference) —
   this is exactly the failure mode this project exists to end, and until
-  PR 7 it still has to be handled manually.
+  PR 8 it still has to be handled manually.
 - **Comment loss.** The file's comments are an incident ledger (PR numbers,
   Codex review ids). Extraction PRs move comments with their code verbatim;
   a reviewer checklist item is "no rationale comment dropped".

@@ -97,6 +97,9 @@ class _LandedFile:
     src_size: int | None
     src_mtime_ns: int | None
 
+# flush_batch outcome: either a _LandedFile or a per-file failure.
+_FileOutcome = _LandedFile | _FailedFile   # _FailedFile: (source_path, reason)
+
 @dataclass
 class _ImportRunState:
     # run-scoped counters and ledgers: copied, verified, skipped_duplicate,
@@ -214,6 +217,10 @@ and goes through the normal PR-agent review cycle.
    fixes; each with a regression test asserting the event stream.
 3. **PR 3 — dedupe/bookkeeping alignment.** Decisions 5, 7, 8, plus port of
    decision 6 (derived-cache invalidation on remote). Separable from PR 2.
+   For both PR 2 and PR 3: any change to the duplicate/collision/adopt walk
+   must be checked against the hand-mirrored preflight copies at
+   `app.py:18300–18550` and either applied there too or recorded as a
+   deliberate difference (see Risks).
 4. **PR 4 — state consolidation (no behavior change).** `_LandedFile`,
    `_ImportRunState`, shared rollback helper, fold remote adoptions into
    `landed` (collapsing the scan-guard difference), single `_record_checker`.
@@ -234,7 +241,7 @@ and goes through the normal PR-agent review cycle.
 
 ## Contract pins (must not change)
 
-- `run_import_job` signature; `ImportParams` fields; result dict — same 18
+- `run_import_job` signature; `ImportParams` fields; result dict — same 19
   keys, both paths (`discovered, copied, verified, photo_ids,
   photo_fingerprints, source_snapshots, skipped_duplicate,
   unverified_duplicate, unverified_duplicates_only, failed, safe_to_format,

@@ -1,7 +1,8 @@
 # Import path unification — design
 
 **Date:** 2026-08-06
-**Status:** Draft, pending review
+**Status:** Spec-review approved (two passes); amended 2026-08-06 after
+external review; awaiting maintainer sign-off before implementation planning
 **Scope:** `vireo/import_job.py` (4,700 lines) — merge the hand-mirrored local and
 remote import implementations into one orchestrator with a pluggable transport.
 
@@ -172,7 +173,9 @@ inside the transfer phase at line 2276) lives in `RsyncTransport.flush_batch`.
   the remote transport it is `claimed_basenames`/`queued_src_hashes` under a
   single name. Eager-vs-lazy source hashing is expressed as
   `transport.defers_transfer` forcing evaluation of the (shared) cached-hash
-  closure at enqueue time.
+  closure at enqueue time; when `defers_transfer` is false the orchestrator
+  passes whatever the cache already holds (possibly `None`), preserving the
+  local path's lazy hashing — no eager hash is added to the local path.
 - Catalog stamping unifies on `_LandedFile.verified_hash`: when present,
   compare the scan row's hash against it and stamp `hash_status='ok'`
   (today's local semantics, and today's remote semantics under
@@ -228,8 +231,7 @@ and goes through the normal PR-agent review cycle.
 1. **PR 1 — widen the test net (tests only).** Two halves:
    - *Parity:* extend the local/remote parity harness beyond selection
      observables — duplicate skip, basename collision, crash-recovery
-     adoption, renamed twin of an accepted duplicate (decision 5), mount
-     loss mid-batch, stop during a destination read. Fix the two mirror
+     adoption, mount loss mid-batch, stop during a destination read. Fix the two mirror
      pairs whose fixture geometry diverges (twin parked in a non-template
      folder locally vs a template-shaped path remotely at test lines
      ~10012/10074; fresh-copy vs adoption gating at ~10736/10837) so each
@@ -241,7 +243,10 @@ and goes through the normal PR-agent review cycle.
      event streams: default `verify_by_hash=False` honesty gate; stop
      partway through a flat rsync batch (cancellation, not per-file
      failure; nothing cataloged); stop between renamed-file transfers;
-     `remote_verify_files` failure after a successful transfer.
+     `remote_verify_files` failure after a successful transfer; and the
+     renamed-twin-of-an-accepted-duplicate scenario (decision 5) pinned
+     *per path* — the paths genuinely diverge on it until PR 3, so it
+     cannot be a parity assertion yet.
    This is the net everything else lands on.
 2. **PR 2 — progress/emit alignment.** Decisions 1, 2, 3. User-visible
    fixes; each with a regression test asserting the event stream.

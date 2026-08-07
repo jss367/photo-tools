@@ -6641,6 +6641,49 @@ def test_remote_import_refuses_when_mount_root_absent(tmp_path, monkeypatch):
     )
 
 
+def test_remote_import_missing_mount_root_emits_archive_unavailable(
+        tmp_path, monkeypatch):
+    """Spec decision 3: the missing-mount-root batch refusal must emit
+    the specific ``"{rel}: archive unavailable"`` phase (the local
+    path's honest signal) instead of the generic copied/present summary
+    the remote path historically reused for this failure."""
+    import pipeline_job as _pj
+    from import_job import ImportParams, run_import_job
+
+    ra = _remote_archive_for(tmp_path)
+    calls = _remote_calls(ra)
+    _install_fake_remote_rsync(monkeypatch, calls, verify=None)
+    card = _make_card(tmp_path, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+    ])
+    # Same stub shape as ``test_remote_import_refuses_when_mount_root_absent``:
+    # report the mount root missing only for paths under this run's mount
+    # base (the import is a run-time function-level import in the remote
+    # body, so patching the pipeline_job module attribute intercepts it).
+    monkeypatch.setattr(
+        _pj, "_missing_archive_mount_root",
+        lambda path: (
+            "/Volumes/GoneShare"
+            if path.startswith(ra["mount_base"]) else None
+        ),
+    )
+
+    runner = FakeRunner()
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    result = run_import_job(
+        _make_job(), runner, db_path, db._active_workspace_id,
+        ImportParams(sources=[str(card)], destination=ra["mount_base"],
+                     remote_target=ra, verify_by_hash=True))
+
+    assert result["failed"] == 1, result
+    assert "is not available" in result["unsafe_files"][0]["reason"]
+    phases = [d["phase"] for _, kind, d in runner.events
+              if kind == "progress"]
+    assert any(p.endswith("archive unavailable") for p in phases), phases
+    assert calls["rsync"] == []
+
+
 def test_remote_import_case_only_basename_collision_on_ci_destination(
         tmp_path, monkeypatch):
     """On a case-insensitive destination (macOS APFS/HFS+, SMB, FAT/exFAT),

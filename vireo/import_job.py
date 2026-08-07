@@ -1729,10 +1729,10 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
                     "to create a shadow directory tree under it, which "
                     "would prevent the real share from remounting)",
                 )
+            # Specific refusal phase — mirrors the local path; spec
+            # decision 3.
             _emit(
-                f"{rel}: {_counts(rel)['copied']} copied · "
-                f"{_counts(rel)['skipped_duplicate']} already present",
-                emitted, queued,
+                f"{rel}: archive unavailable", emitted, queued,
             )
             continue
         # Persistent-mount-point case (Linux ``/mnt/<name>`` survives the

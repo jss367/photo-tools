@@ -8684,7 +8684,7 @@ def test_local_and_remote_agree_on_plain_import(tmp_path, monkeypatch):
 def _seed_prior_import(specs):
     """Seed by running a full prior import of ``specs`` through the SAME
     path as the measured run — the seed card lives in a sibling dir."""
-    def seed_local(dest_root, db_path):
+    def seed(dest_root, db_path):
         from import_job import ImportParams, run_import_job
         seed_root = dest_root.parent / "seedcard"
         seed_root.mkdir(exist_ok=True)
@@ -8695,8 +8695,8 @@ def _seed_prior_import(specs):
             db._active_workspace_id,
             ImportParams(sources=[str(card)], destination=str(dest_root),
                          verify_by_hash=True))
-    seed_local.seed_specs = specs
-    return seed_local
+    seed.seed_specs = specs
+    return seed
 
 
 def _seed_file_drop(specs):
@@ -8705,11 +8705,13 @@ def _seed_file_drop(specs):
     exactly like _make_card's (same PIL call, same mtime) so they are
     byte-identical to the measured card's twins."""
     def seed(dest_root, db_path):
-        for name, mtime, *color in specs:
+        for spec in specs:
+            # Same unpack idiom and same PIL call as _make_card, so the
+            # byte-identity contract is upheld by construction.
+            name, mtime, color = spec if len(spec) == 3 else (*spec, "red")
             folder = dest_root / mtime.strftime("%Y/%Y-%m-%d")
             folder.mkdir(parents=True, exist_ok=True)
-            Image.new("RGB", (16, 16), (color or ["red"])[0]).save(
-                str(folder / name))
+            Image.new("RGB", (16, 16), color).save(str(folder / name))
             ts = mtime.timestamp()
             os.utime(str(folder / name), (ts, ts))
     seed.seed_specs = specs
@@ -8818,9 +8820,20 @@ def test_local_adoption_uncataloged_dest_twin_current_behavior(
     on ``_LandedFile.verified_hash`` (PR 5):
     docs/superpowers/specs/2026-08-06-import-path-unification-design.md.
     """
-    name, specs, seed, pkw = _ADOPTION_SCENARIO
+    _name, specs, seed, pkw = _ADOPTION_SCENARIO
+    lroot = tmp_path / "l"; lroot.mkdir()
+    rroot = tmp_path / "r"; rroot.mkdir()
     obs = _run_local_behavior_case(
-        tmp_path, monkeypatch, specs, seed=seed, params_kwargs=pkw)
+        lroot, monkeypatch, specs, seed=seed, params_kwargs=pkw)
+    remote = _run_remote_behavior_case(
+        rroot, monkeypatch, specs, seed=seed, params_kwargs=pkw)
+    # Everything BUT db_photos stays in the parity net: summary, unsafe
+    # ordering, verified, copy_totals etc. must still agree, while the
+    # db_photos divergence is pinned per path (here and in the remote twin
+    # test) until PR 5 re-unifies it.
+    local_rest = dict(obs); local_rest.pop("db_photos")
+    remote_rest = dict(remote); remote_rest.pop("db_photos")
+    assert local_rest == remote_rest
     assert obs["skipped_duplicate"] == 1
     assert obs["copied"] == 0
     assert obs["safe_to_format"] is True
@@ -8835,9 +8848,11 @@ def test_remote_adoption_uncataloged_dest_twin_current_behavior(
     observable EXCEPT the adopted row's ``hash_status``, which stays NULL
     — the ``'ok'`` stamp only runs for freshly-transferred ``landed``
     entries, and remote adoptions live in ``adopted_paths`` instead.
-    See the local twin test above for the spec decision that re-unifies
-    the two (adoptions fold into ``landed``, PR 5)."""
-    name, specs, seed, pkw = _ADOPTION_SCENARIO
+    The agreement half is ASSERTED in the local twin test above (both
+    paths run there, compared minus db_photos); it also cites the spec
+    decision that re-unifies the two (adoptions fold into ``landed``,
+    PR 5)."""
+    _name, specs, seed, pkw = _ADOPTION_SCENARIO
     obs = _run_remote_behavior_case(
         tmp_path, monkeypatch, specs, seed=seed, params_kwargs=pkw)
     assert obs["skipped_duplicate"] == 1

@@ -39,7 +39,7 @@ A line-by-line phase map (2026-08-06) found:
      byte check, so the local path always attests the landed hash; the
      remote path attests only under `verify_by_hash` (a network re-read),
      and otherwise reports `safe_to_format = False` via `remote_unverified`.
-- Nine divergences have **no transport justification** (§ "Behavior
+- Ten divergences have **no transport justification** (§ "Behavior
   alignment" below) — they are drift, and several are user-visible bugs.
 
 ## Goals
@@ -212,7 +212,8 @@ end (PR 7).
 
 ## Behavior alignment decisions
 
-The nine non-transport divergences, each resolved deliberately. "Adopt X"
+The non-transport divergences, each resolved deliberately (1–9 from the
+design phase map; 10 found empirically by PR 1's parity net). "Adopt X"
 means the other path changes to match.
 
 | # | Divergence | Decision |
@@ -226,6 +227,7 @@ means the other path changes to match.
 | 7 | WC identity `(size, mtime_ns)` captured before the copy locally (3893) but after the transfer remotely (2419) | **Adopt local.** The tuple should attest the source at decision time; a source that changes mid-transfer must not look "clean". |
 | 8 | Local re-computes the source hash at 3996–3999 instead of reusing `_src_hash_cached()` | **Fix locally.** Pure redundancy; one hash read saved per fresh copy. |
 | 9 | Remote rollback open-coded at 8 sites vs local `_reclassify_landed_failed` | **Structural — shared helper on `_ImportRunState`** (PR 5). |
+| 10 | Adopted (crash-recovery) files get `hash_status='ok'` stamped locally but stay `NULL` remotely — found empirically by PR 1's parity net (2026-08-07): local adoption folds into `landed` and hits the verify stamp; remote adoption lives in `adopted_paths`, whose validation cross-checks bytes but never stamps | **Adopt local, via the PR 5 structural change.** Folding remote adoptions into `landed` with their verified hash makes the stamp fall out of the unified catalog pass; no separate fix PR. Pinned per-path by `test_{local,remote}_adoption_uncataloged_dest_twin_current_behavior`, which flip when PR 5 lands. |
 
 Kept as deliberate (transport-required) differences, expressed through the
 protocol rather than duplicated code: transfer sub-progress

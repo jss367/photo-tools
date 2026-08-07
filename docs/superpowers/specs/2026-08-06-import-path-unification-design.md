@@ -274,10 +274,19 @@ and goes through the normal PR-agent review cycle.
    so it gets an isolated PR with DB-level assertions (cache files removed,
    `pre_scan_hashes` comparison, preview sweep) rather than riding along
    with the smaller alignments.
-5. **PR 5 — state consolidation (no behavior change).** `_LandedFile`,
-   `_ImportRunState`, shared rollback helper, fold remote adoptions into
-   `landed` (collapsing the scan-guard difference), single `_record_checker`.
-   The parity suite plus byte-identical result dicts are the check.
+5. **PR 5 — state consolidation (mostly no behavior change).**
+   `_LandedFile`, `_ImportRunState`, shared rollback helper, fold remote
+   adoptions into `landed` (collapsing the scan-guard difference), single
+   `_record_checker`. The parity suite plus byte-identical result dicts
+   are the check for everything *except* the single intentional DB-visible
+   change from decision 10: folding remote adoptions into `landed` runs
+   them through the unified catalog stamp, flipping adopted-photo rows
+   from `hash_status=NULL` to `hash_status='ok'` on the remote path (the
+   local path already stamps). This is the whole point of the fold — not
+   incidental churn — so the `test_{local,remote}_adoption_uncataloged_
+   dest_twin_current_behavior` pair must flip in this PR; a "no change"
+   verdict there is a regression that silently omitted the fix. All other
+   parity scenarios and result-dict fields stay byte-identical.
 6. **PR 6 — extract shared phases (no behavior change).** The
    identical/cosmetic phases (setup, normalization, mount baseline, guards,
    discovery, selection, preflight, batching, batch guards, twin linking, WC

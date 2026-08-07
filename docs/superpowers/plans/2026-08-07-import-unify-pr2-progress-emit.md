@@ -15,7 +15,7 @@
 - Repo root: `/Users/julius/conductor/workspaces/vireo/nagoya`; branch `import-unify-pr2-progress-emit` (checked out, tracks origin/main). Commit to it; no new branches. Run tests from repo root.
 - `vireo/import_job.py` implements imports twice: `_run_remote_import_job` (≈1235–3041) and the local body of `run_import_job` (≈3044–4700). This PR deliberately changes ONE path per decision to match the other — the point is alignment, so the "mirrors the other path" comments you touch must stay truthful.
 - The frontend contract: every progress event's `folders={rel: {copied, skipped_duplicate, failed}}` snapshot drives the Import page's live folder table (`vireo/templates/import.html` renders it whenever `data.folders` is present, ~line 3725). `phase` is opaque display text to the UI. Tests pin `"Discovering files"` and `"{rel}: importing"` — do not touch those.
-- PR 1 harness (all in `vireo/tests/test_import_job.py`): `_run_local_behavior_case(root, monkeypatch, specs, *, seed=None, params_kwargs=None, runner=None, verify_by_hash=True)` and `_run_remote_behavior_case(...)` (~8630–8710); `_behavior_observables(result, runner, db, dest_root)` (~8600); `_BEHAVIOR_PARITY_SCENARIOS` + `test_local_and_remote_behavior_results_agree` + positive-control test (~8828–8915). `FakeRunner.events` holds `(job_id, kind, data)`; progress payloads are dicts.
+- PR 1 harness (all in `vireo/tests/test_import_job.py`): `_run_local_behavior_case(root, monkeypatch, specs, *, seed=None, params_kwargs=None, runner=None, verify_by_hash=True)` and `_run_remote_behavior_case(...)` (~8787); `_behavior_observables(result, runner, db, dest_root)` (~8746); `_PARITY_CARD` (~8852); `_BEHAVIOR_PARITY_SCENARIOS` + `test_local_and_remote_behavior_results_agree` + positive-control test below that. `FakeRunner.events` holds `(job_id, kind, data)`; progress payloads are dicts.
 - CHARACTERIZATION vs CHANGE: PR 1 pinned current behavior; THIS PR deliberately changes behavior per the spec. Where an existing test pins the OLD behavior, update it — citing the spec decision in the test's docstring/comment — rather than treating the failure as a regression. Every such update must be listed in the PR body.
 
 ### Task 0: Branch sanity
@@ -60,10 +60,6 @@ def test_remote_import_progress_events_carry_folder_snapshots(
     obs = _run_remote_behavior_case(
         tmp_path, monkeypatch, _PARITY_CARD, runner=runner)
     assert obs["events_missing_folders"] == 0, obs["events_missing_folders"]
-    events = [d for _, kind, d in runner.events if kind == "progress"]
-    transfer_events = [d for d in events if d.get("phase_label")]
-    assert transfer_events, "expected transfer sub-progress events"
-    assert all("folders" in d for d in transfer_events)
     # Final snapshot matches the terminal per-folder result.
     assert obs["folders_final"] == {
         "2026/2026-07-03": {"copied": 3, "skipped_duplicate": 0,
@@ -72,10 +68,23 @@ def test_remote_import_progress_events_carry_folder_snapshots(
 
 (If the folder rel or counts dict shape differs in practice, fix the EXPECTATION to the local path's actual shape — run the same assertions through `_run_local_behavior_case` to see it — never by weakening the all-events check.)
 
+NOTE — transfer events deliberately NOT asserted here: `_install_fake_remote_rsync`'s fake never calls `progress_cb`, so this harness produces zero `_emit_transfer` events and an `assert transfer_events` would be permanently red.
+
+(c) Instead, extend the EXISTING `test_remote_import_reports_per_file_transfer_progress` (~test line 7133) — its `streaming_rsync` wrapper delegates to the installed fake and then calls `progress_cb` per file, so it produces real transfer events. In its per-event assertion loop, add:
+
+```python
+        # Spec decision 1: transfer sub-progress events must also carry
+        # the folders snapshot, or the Import page's folder table blanks
+        # for the duration of every batch transfer.
+        assert "folders" in ev, ev
+```
+
+(Adapt the variable name to the test's actual loop; read it first.) Also add the one-line docstring note to `_behavior_observables` that its `folders`-exclusion comment inherited from `_selection_observables` no longer fully applies — `folders_final` is now compared cross-path (rel keys come from `build_destination_path` on both paths, so equality holds).
+
 - [ ] **Step 2: Run to verify red**
 
-Run: `python -m pytest vireo/tests/test_import_job.py -q -k "behavior or agree_on_plain or folder_snapshots"`
-Expected: the new dedicated test FAILS (`events_missing_folders > 0`), and `test_local_and_remote_behavior_results_agree` + the plain-import baseline FAIL on the new observable keys (remote missing folders). The adoption/renamed-twin characterization pairs may also fail on the new keys — that's the same red, listed now, fixed by the same production change.
+Run: `python -m pytest vireo/tests/test_import_job.py -q -k "behavior or agree_on_plain or folder_snapshots or per_file_transfer_progress"`
+Expected: the new dedicated test FAILS (`events_missing_folders > 0`), `test_local_and_remote_behavior_results_agree` + the plain-import baseline FAIL on the new observable keys (remote missing folders), and `test_remote_import_reports_per_file_transfer_progress` FAILS on the new `"folders" in ev` assertion. The adoption/renamed-twin characterization pairs may also fail on the new keys — that's the same red, listed now, fixed by the same production change.
 
 - [ ] **Step 3: Implement**
 
@@ -116,8 +125,8 @@ Delete the old declaration line (keep any surrounding ledger comments intact; if
 
 - [ ] **Step 4: Run to verify green**
 
-Run: `python -m pytest vireo/tests/test_import_job.py -q -k "behavior or agree_on_plain or folder_snapshots or current_behavior"`
-Expected: ALL pass (parity restored: both paths now emit folders everywhere).
+Run: `python -m pytest vireo/tests/test_import_job.py -q -k "behavior or agree_on_plain or folder_snapshots or current_behavior or per_file_transfer_progress"`
+Expected: ALL pass (parity restored: both paths now emit folders everywhere, including transfer sub-progress events).
 
 - [ ] **Step 5: Sweep for stale pins and commit**
 

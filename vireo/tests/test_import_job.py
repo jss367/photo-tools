@@ -4381,6 +4381,11 @@ def test_remote_import_without_verify_leaves_hashes_null_and_unsafe(
     False with the exact remote-verification reason."""
     from import_job import ImportParams, run_import_job
 
+    # verify_by_hash=False below is also the DEFAULT: an operator who never
+    # touches the toggle gets this honesty gate, so the default must stay
+    # False for the pin to cover default runs.
+    assert ImportParams(sources=[], destination="x").verify_by_hash is False
+
     ra = _remote_archive_for(tmp_path)
     calls = _remote_calls(ra)
     _install_fake_remote_rsync(monkeypatch, calls, verify=None)
@@ -4540,6 +4545,8 @@ def test_remote_import_verify_failure_fails_specific_file(
     )
 
     assert result["failed"] == 1
+    # The sibling that verified still lands and counts as copied.
+    assert result["copied"] == 1, result
     assert result["safe_to_format"] is False
     assert any(
         "DSC_0001.jpg" in u["path"] or "DSC_0001.jpg" in u["reason"]
@@ -6859,6 +6866,10 @@ def test_remote_import_stop_kills_in_flight_rsync_batch(
     # cancelled run never claims the card is safe to erase.
     assert result["copied"] == 0, result
     assert result["safe_to_format"] is False, result
+    # And no catalog row exists for the interrupted batch — the file rsync
+    # landed before the kill is left for the NEXT run's crash-recovery to
+    # adopt, not cataloged by this cancelled run.
+    assert _photo_rows(db) == [], [dict(r) for r in _photo_rows(db)]
 
 
 def test_remote_import_stop_between_renamed_transfers_keeps_completed_files(
@@ -8797,6 +8808,15 @@ def _seed_file_drop(specs):
 
 _TWIN = ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red")
 
+
+def _renamed_twin_case_specs():
+    twin = ("X.jpg", datetime(2026, 7, 3, 10, 0, 0), "red")
+    card = [twin, ("Y.jpg", datetime(2026, 7, 3, 10, 0, 0), "red")]
+    return twin, card
+
+
+_RT_TWIN, _RT_CARD = _renamed_twin_case_specs()
+
 # (id, card specs, seeder, params_kwargs). Each seeds the destination with
 # prior state, then measures an import over it on BOTH copy paths. For the
 # remote runner the seeders receive the MOUNT base as dest_root, so
@@ -8817,6 +8837,13 @@ _BEHAVIOR_PARITY_SCENARIOS = [
     ("mixed_fresh_and_duplicate",
      [_TWIN, ("DSC_0002.jpg", datetime(2026, 7, 3, 11, 0, 0), "green")],
      _seed_prior_import([_TWIN]), {}),
+    # Renamed twin of a cataloged duplicate: card carries X plus a renamed
+    # byte-identical Y against a seeded cataloged X — both skip via
+    # CatalogIndex.known_hashes on both paths. The decision-5 mechanism
+    # notes (why the remote _record_checker call at import_job.py:2008 is
+    # behaviorally dead here) live in the per-path characterization pair
+    # test_local/_remote_renamed_twin_of_accepted_duplicate_current_behavior.
+    ("renamed_twin_skip", _RT_CARD, _seed_prior_import([_RT_TWIN]), {}),
 ]
 
 # Crash-recovery adoption: identical bytes already AT the template path but
@@ -8879,6 +8906,10 @@ def test_behavior_parity_scenarios_exercise_their_branches(
     assert seen["mixed_fresh_and_duplicate"]["copied"] == 1
     assert seen["mixed_fresh_and_duplicate"]["skipped_duplicate"] == 1
     assert seen["mixed_fresh_and_duplicate"]["safe_to_format"] is True
+
+    assert seen["renamed_twin_skip"]["skipped_duplicate"] == 2
+    assert seen["renamed_twin_skip"]["copied"] == 0
+    assert seen["renamed_twin_skip"]["safe_to_format"] is True
     # The adoption scenario's positive control lives in
     # test_local_adoption_uncataloged_dest_twin_current_behavior below.
 
@@ -8941,12 +8972,6 @@ def test_remote_adoption_uncataloged_dest_twin_current_behavior(
     assert obs["db_linked_folders"] == {"2026/2026-07-03"}
 
 
-def _renamed_twin_case_specs():
-    twin = ("X.jpg", datetime(2026, 7, 3, 10, 0, 0), "red")
-    card = [twin, ("Y.jpg", datetime(2026, 7, 3, 10, 0, 0), "red")]
-    return twin, card
-
-
 def test_local_renamed_twin_of_accepted_duplicate_current_behavior(
         tmp_path, monkeypatch):
     """CHARACTERIZATION for spec decision 5 (local half). The local path
@@ -8985,6 +9010,8 @@ def test_local_renamed_twin_of_accepted_duplicate_current_behavior(
     assert obs["safe_to_format"] is True, obs
     # Only the seeded twin is cataloged — renamed Y left no photo row.
     assert obs["db_photos"] == {("2026/2026-07-03", "X.jpg", "ok")}, obs
+    # The seed import linked the day folder; the all-skip run adds none.
+    assert obs["db_linked_folders"] == {"2026/2026-07-03"}, obs
 
 
 def test_remote_renamed_twin_of_accepted_duplicate_current_behavior(
@@ -9014,6 +9041,8 @@ def test_remote_renamed_twin_of_accepted_duplicate_current_behavior(
     assert obs["copied"] == 0, obs
     assert obs["safe_to_format"] is True, obs
     assert obs["db_photos"] == {("2026/2026-07-03", "X.jpg", "ok")}, obs
+    # The seed import linked the day folder; the all-skip run adds none.
+    assert obs["db_linked_folders"] == {"2026/2026-07-03"}, obs
 
 
 def _sel(names, previewed, checked, extra=()):

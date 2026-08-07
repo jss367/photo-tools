@@ -73,7 +73,8 @@ def _behavior_observables(result, runner, db, dest_root):
 
 
 def _run_local_behavior_case(root, monkeypatch, specs, *, seed=None,
-                             params_kwargs=None, runner=None):
+                             params_kwargs=None, runner=None,
+                             verify_by_hash=True):
     """Local-path runner for behavioral parity scenarios.
 
     ``seed(dest_root, db_path)`` runs BEFORE the measured import to
@@ -94,14 +95,15 @@ def _run_local_behavior_case(root, monkeypatch, specs, *, seed=None,
         _make_job(), runner, db_path, db._active_workspace_id,
         ImportParams(
             sources=[str(card)], destination=str(dest_root),
-            verify_by_hash=True, **(params_kwargs or {}),
+            verify_by_hash=verify_by_hash, **(params_kwargs or {}),
         ),
     )
     return _behavior_observables(result, runner, db, dest_root)
 
 
 def _run_remote_behavior_case(root, monkeypatch, specs, *, seed=None,
-                              params_kwargs=None, runner=None):
+                              params_kwargs=None, runner=None,
+                              verify_by_hash=True):
     """Remote-path runner. Mirrors _run_local_behavior_case's geometry:
     the mount base plays the destination root, and ``seed`` receives it.
     Builds the transport seams itself (rather than _run_remote_import) so
@@ -121,7 +123,7 @@ def _run_remote_behavior_case(root, monkeypatch, specs, *, seed=None,
         _make_job(), runner, db_path, db._active_workspace_id,
         ImportParams(
             sources=[str(card)], destination=ra["mount_base"],
-            remote_target=ra, verify_by_hash=True,
+            remote_target=ra, verify_by_hash=verify_by_hash,
             **(params_kwargs or {}),
         ),
     )
@@ -153,7 +155,11 @@ Run: `python -m pytest "vireo/tests/test_import_job.py::test_behavior_harness_sm
 Expected: PASS. If it fails on a key like `db_photos`, inspect whether the
 relpath normalization is wrong (fix harness) or the paths genuinely
 diverge (record it — that's a finding for the spec's decision table, tell
-the user).
+the user). Watch `verified` specifically: `_selection_observables`
+deliberately excluded it, and `_behavior_observables` re-adds it on the
+theory that forced `verify_by_hash=True` makes the two paths agree — if
+the smoke test fails on that key alone, that exclusion was masking a real
+numeric divergence; characterize it, don't hide it again.
 
 - [ ] **Step 3: Keep the smoke test (rename to `test_local_and_remote_agree_on_plain_import`) and commit**
 
@@ -593,9 +599,11 @@ Three possible worlds — handle explicitly:
 1. **Both skip both files** (catalog hash index covers Y): the 2008 call
    is behaviorally dead in this geometry. Note that in both docstrings —
    it strengthens the removal case. Try ONE variation before concluding:
-   `verify_by_hash=False` via `params_kwargs` on a copied pair of tests
-   (`_no_verify` suffix) — key-based matching is where `_seen_keys` could
-   matter. Keep whichever variant differentiates; drop the other.
+   pass `verify_by_hash=False` (a dedicated runner kwarg — do NOT put it
+   in `params_kwargs`, which would collide with the runner's own
+   argument) on a copied pair of tests (`_no_verify` suffix) — key-based
+   matching is where `_seen_keys` could matter. Keep whichever variant
+   differentiates; drop the other.
 2. **Paths differ** (e.g. local copies Y, remote skips it): pin each
    side's actual numbers with a docstring cross-reference to decision 5.
    This is the expected-by-spec outcome.
@@ -669,5 +677,9 @@ gh pr create --base main --title "Import unification PR 1: widen the local/remot
 Body must include: link to the spec file, the parity-scenario list, which
 mirror pairs were geometry-aligned, the decision-5 verdict from Task 6
 Step 2 (which of the three worlds), any divergences moved out of the
-parity list in Task 2 Step 3, and full test results. Per CLAUDE.md, review
+parity list in Task 2 Step 3, and full test results. Also note that the
+spec's "mount loss mid-batch" and "stop during a destination read" parity
+items are delivered as geometry-aligned mirror pairs (Tasks 3–4) rather
+than dict-comparison scenarios — they need FIFOs/cancel timing that don't
+fit the harness — so a spec-vs-PR reviewer doesn't flag them as missing. Per CLAUDE.md, review
 feedback lands on this same branch.

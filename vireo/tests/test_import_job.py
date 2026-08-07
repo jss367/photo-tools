@@ -11252,3 +11252,252 @@ def test_remote_import_dest_read_cancel_skips_catalog_scan(
     )
     # Nothing rsync'd either — Stop must reach the transfer gate too.
     assert calls["rsync"] == [], calls["rsync"]
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="os.mkfifo is POSIX-only; FIFO stands in for a dead SMB mount.",
+)
+def test_local_import_dest_read_cancel_skips_catalog_scan_adoption_path(
+        tmp_path, monkeypatch):
+    """Local path, ADOPTION geometry — mirror of
+    ``test_remote_import_dest_read_cancel_skips_catalog_scan`` (which
+    gates the remote guard's ``adopted_paths`` term). An earlier file in
+    the batch (A) finds a byte-identical, uncataloged copy already at
+    its template destination path and is ADOPTED via the collision loop.
+    On the local path adoption appends straight into ``landed`` (with
+    outcome ``"skipped_duplicate"``) — there is no separate
+    ``adopted_paths`` term in the local guard ``if landed and not
+    dest_read_cancelled:`` — so this geometry gates the ``landed`` term
+    through its adoption feeder. The next file's (B) cataloged twin is a
+    FIFO: twin-hash blocks, cancel fires, ``DestReadCancelled`` trips
+    ``dest_read_cancelled``, and the catalog block MUST be skipped.
+
+    Characterization of the adoption "rollback" (verified against
+    import_job.py): there is NONE on ``dest_read_cancelled``. The
+    adopted file was counted ``skipped_duplicate`` at adopt time and
+    only a ``mount_lost`` probe rolls ``landed`` back — so the run
+    reports ``skipped_duplicate == 1`` even though the scan was
+    suppressed and the adopted file was never cataloged. The pre-
+    existing destination copy stays on disk for the next run's
+    crash-recovery adoption to catalog."""
+    import threading
+    from datetime import datetime
+
+    import import_job as _ij
+    from import_dedup import compute_file_hash
+    from import_job import ImportParams, run_import_job
+
+    card = tmp_path / "card"
+    card.mkdir()
+    a_file = card / "A.jpg"
+    b_file = card / "B.jpg"
+    Image.new("RGB", (16, 16), "red").save(str(a_file))
+    Image.new("RGB", (16, 16), "blue").save(str(b_file))
+    # Pin mtimes so the default ``%Y/%Y-%m-%d`` folder template resolves
+    # to one deterministic dest folder — the pre-written adoption
+    # candidate for A must sit exactly where the import wants to land A.
+    # Mirrors the remote adoption test's mtime pinning.
+    fixed_dt = datetime(2026, 1, 15, 12, 0, 0)
+    ts = fixed_dt.timestamp()
+    os.utime(str(a_file), (ts, ts))
+    os.utime(str(b_file), (ts, ts))
+
+    archive = tmp_path / "archive"
+    dest_dir = archive / fixed_dt.strftime("%Y") / \
+        fixed_dt.strftime("%Y-%m-%d")
+    dest_dir.mkdir(parents=True)
+    # A is already at the destination as byte-identical and UNCATALOGED
+    # (crash-recovery shape): the collision loop hashes it, matches, and
+    # adopts it into ``landed`` without copying. The adopt-time
+    # ``_hash_dest_file`` on this file runs BEFORE B's cancel fires
+    # (CancelOnFileImportingRunner trips on B's "importing" emit), so —
+    # exactly like the remote adoption mirror — the cancel fires at B's
+    # cataloged-twin hash, not at A's adoption hash.
+    (dest_dir / "A.jpg").write_bytes(a_file.read_bytes())
+
+    # B's cataloged twin is a FIFO in a different folder — its hash read
+    # blocks forever until released (stands in for a wedged SMB session).
+    twin_folder = archive / "old"
+    twin_folder.mkdir()
+    fifo = twin_folder / "B.jpg"
+    os.mkfifo(str(fifo))
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws_id = db._active_workspace_id
+    _catalog_twin_row(
+        db, twin_folder, "B.jpg",
+        os.path.getsize(str(b_file)), compute_file_hash(str(b_file)),
+    )
+
+    scan_calls = []
+    real_scan = _ij.scan if hasattr(_ij, "scan") else None
+
+    def spy_scan(*args, **kwargs):
+        scan_calls.append((args, kwargs))
+        if real_scan is not None:
+            return real_scan(*args, **kwargs)
+        return None
+
+    import scanner
+    monkeypatch.setattr(scanner, "scan", spy_scan)
+
+    runner = CancelOnFileImportingRunner("B.jpg")
+    job = _make_job()
+    result_box = {}
+
+    def _run():
+        result_box["result"] = run_import_job(
+            job, runner, db_path, ws_id,
+            ImportParams(sources=[str(card)], destination=str(archive)),
+        )
+
+    worker = threading.Thread(target=_run, daemon=True)
+    worker.start()
+    try:
+        worker.join(timeout=15.0)
+        assert not worker.is_alive(), (
+            "Stop did not interrupt the destination hash read blocked on "
+            "the dead-mount twin"
+        )
+    finally:
+        _release_fifo(fifo)
+        worker.join(timeout=5.0)
+
+    result = result_box["result"]
+    assert result["cancelled"] is True
+    assert result["failed"] == 0, result
+    # A was adopted into ``landed`` before B's cancel, so the unfixed
+    # code would call ``scan()`` here — hitting the same wedged mount
+    # and hanging. The gate on ``dest_read_cancelled`` must suppress
+    # every catalog-block scan.
+    assert scan_calls == [], (
+        f"catalog scan() fired on a cancelled batch after "
+        f"DestReadCancelled — would hang on the wedged mount: "
+        f"{len(scan_calls)} calls"
+    )
+    # Characterization: no adoption rollback on dest_read_cancelled.
+    # The adopt-time counter stands even though the scan was skipped and
+    # nothing was cataloged.
+    assert result["copied"] == 0, result
+    assert result["skipped_duplicate"] == 1, result
+    assert db.conn.execute(
+        "SELECT COUNT(*) FROM photos p JOIN folders f "
+        "ON f.id = p.folder_id WHERE f.path = ?", (str(dest_dir),),
+    ).fetchone()[0] == 0, "adopted file must NOT have been cataloged"
+    # The adopted on-disk copy stays put for the next run to re-adopt.
+    assert (dest_dir / "A.jpg").exists()
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="os.mkfifo is POSIX-only; FIFO stands in for a dead SMB mount.",
+)
+def test_remote_import_dest_read_cancel_skips_catalog_scan_fresh_transfer(
+        tmp_path, monkeypatch):
+    """Remote path, FRESH-TRANSFER geometry — mirror of
+    ``test_local_import_dest_read_cancel_skips_catalog_scan`` (which
+    gates the local guard's ``landed`` term via a fresh copy). No file
+    is pre-written on the mount, so nothing can be adopted: this
+    geometry targets the ``landed`` term of the remote guard ``if
+    (landed or adopted_paths) and not dest_read_cancelled:``.
+
+    Characterization surprise (verified against import_job.py): on the
+    remote path ``landed`` can never actually be non-empty alongside
+    ``dest_read_cancelled`` — transfers are queued per batch and only
+    flushed after the per-file loop, behind ``if to_transfer and not
+    cancelled:``, and every ``dest_read_cancelled = True`` site also
+    sets ``cancelled = True`` and breaks. So here A is queued but never
+    rsync'd (it stays on the card for the next run), ``landed`` stays
+    empty, and the scan skip is doubly protected: by the empty guard
+    subject AND by the ``dest_read_cancelled`` gate. The local mirror
+    genuinely lands A's bytes before the cancel; the remote fresh path
+    structurally cannot — that asymmetry is exactly what this pin
+    records for the unification work."""
+    import threading
+
+    import import_job as _ij
+    from import_dedup import compute_file_hash
+    from import_job import ImportParams, run_import_job
+
+    ra = _remote_archive_for(tmp_path)
+    calls = _remote_calls(ra)
+    _install_fake_remote_rsync(monkeypatch, calls, verify=None)
+
+    card = tmp_path / "card"
+    card.mkdir()
+    a_file = card / "A.jpg"
+    b_file = card / "B.jpg"
+    Image.new("RGB", (16, 16), "red").save(str(a_file))
+    Image.new("RGB", (16, 16), "blue").save(str(b_file))
+    # NO pre-written mount copy of A — pure fresh-transfer geometry. A
+    # is queued for rsync; B's cancel then breaks the batch before the
+    # transfer flush.
+
+    # B has a cataloged twin whose on-disk file is a FIFO — twin-hash
+    # blocks and Stop trips DestReadCancelled, same firing point as the
+    # remote adoption test.
+    twin_folder = Path(ra["mount_base"]) / "old"
+    twin_folder.mkdir()
+    fifo = twin_folder / "B.jpg"
+    os.mkfifo(str(fifo))
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws_id = db._active_workspace_id
+    _catalog_twin_row(
+        db, twin_folder, "B.jpg",
+        os.path.getsize(str(b_file)), compute_file_hash(str(b_file)),
+    )
+
+    scan_calls = []
+    real_scan = _ij.scan if hasattr(_ij, "scan") else None
+
+    def spy_scan(*args, **kwargs):
+        scan_calls.append((args, kwargs))
+        if real_scan is not None:
+            return real_scan(*args, **kwargs)
+        return None
+
+    import scanner
+    monkeypatch.setattr(scanner, "scan", spy_scan)
+
+    runner = CancelOnFileImportingRunner("B.jpg")
+    job = _make_job()
+    result_box = {}
+
+    def _run():
+        result_box["result"] = run_import_job(
+            job, runner, db_path, ws_id,
+            ImportParams(
+                sources=[str(card)], destination=ra["mount_base"],
+                remote_target=ra, verify_by_hash=True,
+            ),
+        )
+
+    worker = threading.Thread(target=_run, daemon=True)
+    worker.start()
+    try:
+        worker.join(timeout=15.0)
+        assert not worker.is_alive(), (
+            "Stop did not interrupt the destination hash read blocked on "
+            "the dead-mount twin"
+        )
+    finally:
+        _release_fifo(fifo)
+        worker.join(timeout=5.0)
+
+    result = result_box["result"]
+    assert result["cancelled"] is True
+    assert result["failed"] == 0, result
+    assert scan_calls == [], (
+        f"catalog scan() fired on a cancelled remote batch after "
+        f"DestReadCancelled — would hang on the wedged mount: "
+        f"{len(scan_calls)} calls"
+    )
+    # Characterization: the cancel reached the transfer gate first, so
+    # A never crossed the network — nothing copied, nothing rsync'd.
+    # A stays on the card for the next run.
+    assert calls["rsync"] == [], calls["rsync"]
+    assert result["copied"] == 0, result

@@ -6936,7 +6936,7 @@ def test_remote_import_stop_between_renamed_transfers_keeps_completed_files(
     # The completed file keeps its outcome: verified and cataloged.
     assert result["copied"] == 1, result
     assert result["verified"] == 1, result
-    suffixed = [(fn, hs) for _rel, fn, hs in
+    suffixed = [(fn, hs) for _rel, fn, _fh, hs in
                 _dest_photo_facts(db, ra["mount_base"])
                 if fn.startswith("DSC_0001")]
     assert ("DSC_0001_1.jpg", "ok") in suffixed, suffixed
@@ -6944,7 +6944,7 @@ def test_remote_import_stop_between_renamed_transfers_keeps_completed_files(
     # DSC_0002 catalog row — suffixed or not — would be a regression;
     # the pre-seeded mount files are never cataloged).
     assert result["failed"] == 0, result
-    assert not any(fn.startswith("DSC_0002") for _rel, fn, _hs in
+    assert not any(fn.startswith("DSC_0002") for _rel, fn, _fh, _hs in
                    _dest_photo_facts(db, ra["mount_base"]))
     assert result["safe_to_format"] is False, result
 
@@ -8615,14 +8615,18 @@ def _selection_observables(result, runner):
 
 def _dest_photo_facts(db, dest_root):
     """DB-level import outcome, normalized for local/remote comparison:
-    {(folder relpath under dest_root, filename, hash_status)}.
-    file_hash presence is implied by hash_status; the hash VALUE is
-    excluded because both paths must agree on it via safe_to_format
-    assertions instead (comparing values here would double-report)."""
+    {(folder relpath under dest_root, filename, file_hash, hash_status)}.
+    The persisted hash VALUE is part of the tuple because
+    ``safe_to_format`` only reports each path's own internal verification;
+    two paths can both return True and stamp ``hash_status='ok'`` while
+    persisting different or stale ``file_hash`` values, which affects
+    deduplication and cache identity. Including it here makes one-sided
+    catalog-hash regressions visible in the parity net."""
     facts = set()
     for row in _photo_rows(db):
         rel = os.path.relpath(row["folder_path"], str(dest_root))
-        facts.add((rel, row["filename"], row["hash_status"]))
+        facts.add((rel, row["filename"], row["file_hash"],
+                   row["hash_status"]))
     return facts
 
 
@@ -8902,7 +8906,7 @@ def test_behavior_parity_scenarios_exercise_their_branches(
 
     assert seen["collision_different_bytes"]["copied"] == 1
     assert any(fn == "DSC_0001_1.jpg"
-               for _rel, fn, _hs in
+               for _rel, fn, _fh, _hs in
                seen["collision_different_bytes"]["db_photos"])
 
     assert seen["mixed_fresh_and_duplicate"]["copied"] == 1
@@ -8930,6 +8934,7 @@ def test_local_adoption_uncataloged_dest_twin_current_behavior(
     on ``_LandedFile.verified_hash`` (PR 5):
     docs/superpowers/specs/2026-08-06-import-path-unification-design.md.
     """
+    from import_dedup import compute_file_hash
     _name, specs, seed, pkw = _ADOPTION_SCENARIO
     lroot = tmp_path / "l"; lroot.mkdir()
     rroot = tmp_path / "r"; rroot.mkdir()
@@ -8947,8 +8952,13 @@ def test_local_adoption_uncataloged_dest_twin_current_behavior(
     assert obs["skipped_duplicate"] == 1
     assert obs["copied"] == 0
     assert obs["safe_to_format"] is True
-    # The adopted file gained a photo row, stamped verified.
-    assert obs["db_photos"] == {("2026/2026-07-03", "DSC_0001.jpg", "ok")}
+    # The adopted file gained a photo row, stamped verified. Hash value
+    # ties the row to the exact bytes on disk so a stale/wrong hash
+    # persisted with hash_status='ok' would still fail this assertion.
+    adopted = lroot / "archive" / "2026" / "2026-07-03" / "DSC_0001.jpg"
+    expected_hash = compute_file_hash(str(adopted))
+    assert obs["db_photos"] == {
+        ("2026/2026-07-03", "DSC_0001.jpg", expected_hash, "ok")}
     assert obs["db_linked_folders"] == {"2026/2026-07-03"}
 
 
@@ -8962,15 +8972,20 @@ def test_remote_adoption_uncataloged_dest_twin_current_behavior(
     paths run there, compared minus db_photos); it also cites the spec
     decision that re-unifies the two (adoptions fold into ``landed``,
     PR 5)."""
+    from import_dedup import compute_file_hash
     _name, specs, seed, pkw = _ADOPTION_SCENARIO
     obs = _run_remote_behavior_case(
         tmp_path, monkeypatch, specs, seed=seed, params_kwargs=pkw)
     assert obs["skipped_duplicate"] == 1
     assert obs["copied"] == 0
     assert obs["safe_to_format"] is True
-    # Photo row exists (adoption cataloged it) but carries no integrity
-    # verdict, unlike the local path's 'ok'.
-    assert obs["db_photos"] == {("2026/2026-07-03", "DSC_0001.jpg", None)}
+    # Photo row exists (adoption cataloged it) — scan() populates
+    # file_hash — but carries no integrity verdict (hash_status stays
+    # NULL), unlike the local path's 'ok'.
+    adopted = tmp_path / "mount" / "2026" / "2026-07-03" / "DSC_0001.jpg"
+    expected_hash = compute_file_hash(str(adopted))
+    assert obs["db_photos"] == {
+        ("2026/2026-07-03", "DSC_0001.jpg", expected_hash, None)}
     assert obs["db_linked_folders"] == {"2026/2026-07-03"}
 
 
@@ -9004,6 +9019,7 @@ def test_local_renamed_twin_of_accepted_duplicate_current_behavior(
     spec's case for removing it (decision 5,
     docs/superpowers/specs/2026-08-06-import-path-unification-design.md).
     """
+    from import_dedup import compute_file_hash
     twin, card = _renamed_twin_case_specs()
     obs = _run_local_behavior_case(
         tmp_path, monkeypatch, card, seed=_seed_prior_import([twin]))
@@ -9011,7 +9027,10 @@ def test_local_renamed_twin_of_accepted_duplicate_current_behavior(
     assert obs["copied"] == 0, obs
     assert obs["safe_to_format"] is True, obs
     # Only the seeded twin is cataloged — renamed Y left no photo row.
-    assert obs["db_photos"] == {("2026/2026-07-03", "X.jpg", "ok")}, obs
+    seeded = tmp_path / "archive" / "2026" / "2026-07-03" / "X.jpg"
+    expected_hash = compute_file_hash(str(seeded))
+    assert obs["db_photos"] == {
+        ("2026/2026-07-03", "X.jpg", expected_hash, "ok")}, obs
     # The seed import linked the day folder; the all-skip run adds none.
     assert obs["db_linked_folders"] == {"2026/2026-07-03"}, obs
 
@@ -9036,13 +9055,17 @@ def test_remote_renamed_twin_of_accepted_duplicate_current_behavior(
     the same reason — see the local twin test's docstring for the traced
     no-EXIF mechanism. Decision 5's removal is a proven no-op here.
     """
+    from import_dedup import compute_file_hash
     twin, card = _renamed_twin_case_specs()
     obs = _run_remote_behavior_case(
         tmp_path, monkeypatch, card, seed=_seed_prior_import([twin]))
     assert obs["skipped_duplicate"] == 2, obs
     assert obs["copied"] == 0, obs
     assert obs["safe_to_format"] is True, obs
-    assert obs["db_photos"] == {("2026/2026-07-03", "X.jpg", "ok")}, obs
+    seeded = tmp_path / "mount" / "2026" / "2026-07-03" / "X.jpg"
+    expected_hash = compute_file_hash(str(seeded))
+    assert obs["db_photos"] == {
+        ("2026/2026-07-03", "X.jpg", expected_hash, "ok")}, obs
     # The seed import linked the day folder; the all-skip run adds none.
     assert obs["db_linked_folders"] == {"2026/2026-07-03"}, obs
 

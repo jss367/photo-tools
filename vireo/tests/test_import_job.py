@@ -6680,7 +6680,10 @@ def test_remote_import_missing_mount_root_emits_archive_unavailable(
     assert "is not available" in result["unsafe_files"][0]["reason"]
     phases = [d["phase"] for _, kind, d in runner.events
               if kind == "progress"]
-    assert any(p.endswith("archive unavailable") for p in phases), phases
+    assert any(p.endswith(": archive unavailable") for p in phases), phases
+    # Guard against a refactor emitting both the honest refusal phase
+    # and the generic copied/present summary for the same batch.
+    assert not any("already present" in p for p in phases), phases
     assert calls["rsync"] == []
 
 
@@ -8976,8 +8979,8 @@ def test_remote_import_progress_events_carry_folder_snapshots(
     """Spec decision 1: the remote path historically never sent the
     ``folders={...}`` snapshot, so the Import page's live folder table
     stayed empty for remote imports. Every progress event must now carry
-    it, and the final snapshot must agree with the result dict's
-    ``folders``."""
+    it, and the final snapshot matches the known terminal per-folder
+    result."""
     runner = FakeRunner()
     obs = _run_remote_behavior_case(
         tmp_path, monkeypatch, _PARITY_CARD, runner=runner)

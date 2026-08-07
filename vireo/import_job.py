@@ -1433,7 +1433,8 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
                 # The Import page re-renders the folder table from each
                 # event, so a transfer event without the snapshot would
                 # blank the table for the whole batch transfer. (``rel_``
-                # to avoid shadowing this function's ``rel`` parameter.)
+                # to avoid confusion with this function's ``rel``
+                # parameter.)
                 folders={
                     rel_: dict(counts)
                     for rel_, counts in folder_counts.items()

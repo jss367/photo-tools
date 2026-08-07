@@ -258,8 +258,9 @@ and goes through the normal PR-agent review cycle.
      failure; nothing cataloged); stop between renamed-file transfers;
      `remote_verify_files` failure after a successful transfer; and the
      renamed-twin-of-an-accepted-duplicate scenario (decision 5) pinned
-     *per path* — the paths genuinely diverge on it until PR 3, so it
-     cannot be a parity assertion yet.
+     *per path* — and, per the empirical world-1 outcome recorded in the
+     decision table (the paths turned out NOT to diverge on it), also
+     promoted into the parity list.
    This is the net everything else lands on.
 2. **PR 2 — progress/emit alignment.** Decisions 1, 2, 3. User-visible
    fixes; each with a regression test asserting the event stream.

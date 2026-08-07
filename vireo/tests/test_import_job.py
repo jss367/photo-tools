@@ -5328,6 +5328,41 @@ def test_remote_import_rejects_dest_folder_under_source(
     ), result["unsafe_files"]
 
 
+def test_local_import_dest_under_source_refusal_reports_progress(
+        tmp_path, monkeypatch):
+    """Spec decision 2: a batch refused because dest_folder resolves
+    inside a source directory must advance ``emitted`` and emit the
+    batch-summary phase, exactly like the remote guard. Historically the
+    local guard did neither, freezing the progress bar at the last
+    pre-refusal value while the whole batch quietly failed."""
+    from import_job import ImportParams, run_import_job
+
+    card = _make_card(tmp_path, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+        ("DSC_0002.jpg", datetime(2026, 7, 3, 10, 5, 0), "green"),
+    ])
+    runner = FakeRunner()
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    # Destination = the card itself: the %Y/%Y-%m-%d dest_folder resolves
+    # under the source root, tripping the batch-level guard (the
+    # /api/jobs/import-photos route refuses this shape up front, but the
+    # job-level guard is the backstop this test pins).
+    result = run_import_job(
+        _make_job(), runner, db_path, db._active_workspace_id,
+        ImportParams(sources=[str(card)], destination=str(card),
+                     verify_by_hash=True))
+
+    assert result["failed"] == 2, result
+    assert result["safe_to_format"] is False, result
+    events = [d for _, kind, d in runner.events if kind == "progress"]
+    # The refusal advances the bar over the whole rejected batch...
+    assert any(d["current"] == 2 and d["total"] == 2 for d in events), events
+    # ...with the same batch-summary phase string the remote path emits.
+    assert any(d["phase"].endswith("0 copied · 0 already present")
+               for d in events), [d["phase"] for d in events]
+
+
 def test_remote_import_no_verify_fails_on_mount_hash_mismatch(
         tmp_path, monkeypatch):
     """Catalog-integrity guard on the no-verify path: when

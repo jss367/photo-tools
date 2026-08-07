@@ -3518,6 +3518,10 @@ def run_import_job(job, runner, db_path, workspace_id, params):
         # See PR #1107 review.
         if _path_under_any_source(dest_folder):
             for source_file in batch:
+                # Count these as emitted so the progress bar reflects the
+                # rejected batch instead of freezing at the last copied
+                # file. Mirrors the remote guard — spec decision 2.
+                emitted += 1
                 _fail(
                     rel, source_file,
                     "destination folder resolves inside a source directory "
@@ -3525,6 +3529,11 @@ def run_import_job(job, runner, db_path, workspace_id, params):
                     "imported); formatting the card would erase the archive "
                     "copy",
                 )
+            _emit(
+                f"{rel}: {_counts(rel)['copied']} copied · "
+                f"{_counts(rel)['skipped_duplicate']} already present",
+                emitted, queued,
+            )
             continue
         # Same guard the remote path applies (see ``_missing_mount_root``
         # in ``_run_remote_import_job``): if the archive's mount root has

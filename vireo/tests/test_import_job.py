@@ -8941,6 +8941,81 @@ def test_remote_adoption_uncataloged_dest_twin_current_behavior(
     assert obs["db_linked_folders"] == {"2026/2026-07-03"}
 
 
+def _renamed_twin_case_specs():
+    twin = ("X.jpg", datetime(2026, 7, 3, 10, 0, 0), "red")
+    card = [twin, ("Y.jpg", datetime(2026, 7, 3, 10, 0, 0), "red")]
+    return twin, card
+
+
+def test_local_renamed_twin_of_accepted_duplicate_current_behavior(
+        tmp_path, monkeypatch):
+    """CHARACTERIZATION for spec decision 5 (local half). The local path
+    does NOT register accepted duplicates with the checker — its accept
+    branch has no counterpart to the remote path's
+    ``_record_checker(source_file)`` (import_job.py:2008).
+
+    ACTUAL: both files skip anyway. The seed import's post-import scan
+    catalogs the twin WITH its file_hash, so ``CatalogIndex.from_db``
+    puts the shared hash in ``known_hashes`` and renamed Y matches in
+    ``DuplicateChecker.match`` (import_dedup.py:369-376) straight from
+    the catalog — the checker's per-run ``_seen_hashes`` is never needed.
+    The skip is then byte-backed by re-hashing the on-disk twin
+    (``_hash_twin_rows`` + ``_hash_dest_file``), same as the plain
+    duplicate_skip scenario.
+
+    A ``verify_by_hash=False`` variant was probed and dropped: it lands
+    in the SAME world on both paths (2 skipped, 0 copied). The metadata
+    key — the one place ``_seen_keys`` could matter — never forms,
+    because these harness JPEGs carry no EXIF and capture time is
+    EXIF-only with no mtime fallback
+    (``import_dedup.source_capture_timestamps``), so ``match`` falls
+    through to the fallback content check and again hits
+    ``known_hashes``. And even with EXIF, ``record``-ing X would add
+    X's key, which renamed Y (different filename) can never match. The
+    2008 call is therefore behaviorally unobservable in this
+    cataloged-twin geometry in both verify modes, which strengthens the
+    spec's case for removing it (decision 5,
+    docs/superpowers/specs/2026-08-06-import-path-unification-design.md).
+    """
+    twin, card = _renamed_twin_case_specs()
+    obs = _run_local_behavior_case(
+        tmp_path, monkeypatch, card, seed=_seed_prior_import([twin]))
+    assert obs["skipped_duplicate"] == 2, obs
+    assert obs["copied"] == 0, obs
+    assert obs["safe_to_format"] is True, obs
+    # Only the seeded twin is cataloged — renamed Y left no photo row.
+    assert obs["db_photos"] == {("2026/2026-07-03", "X.jpg", "ok")}, obs
+
+
+def test_remote_renamed_twin_of_accepted_duplicate_current_behavior(
+        tmp_path, monkeypatch):
+    """CHARACTERIZATION for spec decision 5 (remote half). The remote path
+    registers accepted duplicates via ``_record_checker(source_file)`` at
+    import_job.py:2008; a later PR removes that call, and this test is
+    the tripwire that makes the removal visible — expected to KEEP
+    passing, because the call is behaviorally dead in this geometry.
+
+    ACTUAL: identical to the local half (2 skipped, 0 copied). Renamed Y
+    matches via ``CatalogIndex.known_hashes`` (the seed import's scan
+    cataloged the twin's hash), not via the ``_seen_hashes`` entry the
+    2008 call adds — ``match`` checks ``known_hashes`` first and either
+    membership yields the same ``('hash', …)`` token
+    (import_dedup.py:369-376). The call also never populates the
+    ``run_dest_folders`` intra-run fast path (it passes no dest_folder),
+    so acceptance still goes through the on-disk twin re-hash on both
+    paths. A ``verify_by_hash=False`` probe landed in the same world for
+    the same reason — see the local twin test's docstring for the traced
+    no-EXIF mechanism. Decision 5's removal is a proven no-op here.
+    """
+    twin, card = _renamed_twin_case_specs()
+    obs = _run_remote_behavior_case(
+        tmp_path, monkeypatch, card, seed=_seed_prior_import([twin]))
+    assert obs["skipped_duplicate"] == 2, obs
+    assert obs["copied"] == 0, obs
+    assert obs["safe_to_format"] is True, obs
+    assert obs["db_photos"] == {("2026/2026-07-03", "X.jpg", "ok")}, obs
+
+
 def _sel(names, previewed, checked, extra=()):
     """Build the selection kwargs for a card, by basename."""
     def build(card):

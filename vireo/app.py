@@ -3017,6 +3017,15 @@ def _life_list_alphabetical_key(name):
     return _LIFE_LIST_LEADING_APOSTROPHE_RE.sub("", str(name or "")).lower()
 
 
+# Adaptive flush cadence for the duplicate-check SSE stream. Byte-for-byte
+# hashes on slow cards spend far more than this per file, so each check ends
+# its own event and cancellation is bounded by one file. Metadata-only
+# checks on a 100k-file source blow through hundreds of files inside one
+# window and coalesce naturally, keeping event count in the low hundreds
+# instead of one-per-file. Module-level so tests can override it.
+DUPLICATE_CHECK_FLUSH_INTERVAL_SECONDS = 0.1
+
+
 def create_app(db_path, thumb_cache_dir=None, api_token=None):
     """Create the Flask app for the Vireo photo browser.
 
@@ -18561,6 +18570,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                         [Path(p) for p in paths]).items()
                 })
 
+            last_flush = time.monotonic()
             for checked, path in enumerate(paths, 1):
                 # Zero-byte placeholders are non-duplicates (the checker
                 # gives them no identity), and unreadable/missing files
@@ -18592,15 +18602,25 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 except OSError:
                     pass  # Skip unreadable/missing files
 
-                # Flush after every file. Besides making progress honest for
-                # byte-for-byte checks on slow cards / NAS volumes, each
-                # yield gives the WSGI server a chance to observe that a
-                # superseded browser request disconnected. The abandoned
-                # generator then closes after at most the current file
-                # instead of hashing another 20-file batch in the background.
-                yield f"data: {json.dumps({'duplicates': batch_duplicates, 'recovered': batch_recovered, 'checked': checked, 'total': total})}\n\n"
-                batch_duplicates = []
-                batch_recovered = []
+                # The yield is both how the client learns progress and how
+                # the WSGI server notices that a superseded browser request
+                # disconnected — cheap checks may finish dozens of files
+                # inside one window (a single event covers them all), while
+                # a slow byte-for-byte hash spends longer than the window on
+                # one file (that file gets its own event and cancellation
+                # stops within the next check). ``checked == total``
+                # guarantees the last progress event always ships so the
+                # client sees ``checked == total`` before ``done``.
+                now = time.monotonic()
+                if (
+                    checked == total
+                    or now - last_flush
+                    >= DUPLICATE_CHECK_FLUSH_INTERVAL_SECONDS
+                ):
+                    yield f"data: {json.dumps({'duplicates': batch_duplicates, 'recovered': batch_recovered, 'checked': checked, 'total': total})}\n\n"
+                    batch_duplicates = []
+                    batch_recovered = []
+                    last_flush = now
 
             yield f"data: {json.dumps({'done': True, 'duplicate_count': duplicate_count, 'recovered_count': recovered_count, 'checked': total, 'total': total})}\n\n"
 

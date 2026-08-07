@@ -194,15 +194,13 @@ def test_check_duplicates_all_new(app_and_db, tmp_path):
     assert done[0]["duplicate_count"] == 0
 
 
-def test_check_duplicates_streams_progress_after_every_file(
+def test_check_duplicates_progress_events_are_monotonic(
     app_and_db, tmp_path
 ):
-    """Every completed file is an SSE flush boundary.
-
-    A client that aborts a superseded byte-for-byte preview can only make the
-    WSGI server notice at a yield. Per-file events therefore bound abandoned
-    work to the hash already in progress instead of the old 20-file batch.
-    """
+    """Progress events report a strictly increasing ``checked`` and the
+    correct ``total`` on every event, and the final progress event lands on
+    ``checked == total`` before ``done`` (so the client's percentage never
+    regresses and always finishes at 100%)."""
     app, _db, _fid = app_and_db
 
     source = tmp_path / "source"
@@ -212,6 +210,48 @@ def test_check_duplicates_streams_progress_after_every_file(
         path = source / f"new{index}.jpg"
         Image.new("RGB", (50, 50), color=color).save(str(path))
         paths.append(str(path))
+
+    resp = app.test_client().post(
+        "/api/import/check-duplicates", json={"paths": paths}
+    )
+    events = parse_sse_events(resp.data)
+    progress = [event for event in events if not event.get("done")]
+
+    assert progress, "at least one progress event must precede done"
+    checked_values = [event["checked"] for event in progress]
+    assert checked_values == sorted(set(checked_values)), (
+        "checked must strictly increase across progress events"
+    )
+    assert all(event["total"] == 3 for event in progress)
+    assert progress[-1]["checked"] == 3, (
+        "the final progress event before done must always land on total"
+    )
+
+
+def test_check_duplicates_slow_check_yields_per_file(
+    app_and_db, tmp_path, monkeypatch
+):
+    """When a per-file check exceeds the flush window, each file gets its
+    own event so an aborted preview stops within one file's worth of work
+    (rather than draining a fixed batch first)."""
+    import app as vireo_app
+
+    app, _db, _fid = app_and_db
+
+    source = tmp_path / "source"
+    source.mkdir()
+    paths = []
+    for index, color in enumerate(("red", "green", "blue"), 1):
+        path = source / f"new{index}.jpg"
+        Image.new("RGB", (50, 50), color=color).save(str(path))
+        paths.append(str(path))
+
+    # Zero flush window → every completed file crosses the threshold and
+    # gets its own event, exercising the bounded-cancellation guarantee the
+    # SSE loop was designed for.
+    monkeypatch.setattr(
+        vireo_app, "DUPLICATE_CHECK_FLUSH_INTERVAL_SECONDS", 0.0
+    )
 
     resp = app.test_client().post(
         "/api/import/check-duplicates", json={"paths": paths}

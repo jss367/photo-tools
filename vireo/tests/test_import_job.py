@@ -8721,6 +8721,9 @@ def _dest_photo_facts(db, dest_root):
     facts = set()
     for row in _photo_rows(db):
         rel = os.path.relpath(row["folder_path"], str(dest_root))
+        # Normalize to POSIX separators so parity comparisons and scenario
+        # assertions read identically on Windows and POSIX runners.
+        rel = rel.replace(os.sep, "/")
         facts.add((rel, row["filename"], row["file_hash"],
                    row["hash_status"]))
     return facts
@@ -8736,7 +8739,8 @@ def _linked_folder_rels(db, dest_root):
            WHERE wf.workspace_id = ?""",
         (db._active_workspace_id,),
     ).fetchall()
-    return {os.path.relpath(r["path"], str(dest_root)) for r in rows}
+    return {os.path.relpath(r["path"], str(dest_root)).replace(os.sep, "/")
+            for r in rows}
 
 
 def _behavior_observables(result, runner, db, dest_root):
@@ -8859,8 +8863,10 @@ def test_local_and_remote_agree_on_plain_import(tmp_path, monkeypatch):
     (photo rows and workspace-linked folders, dest-relative) — through the
     local and remote copy paths. Every seeded parity scenario builds on
     this; if the baseline diverges, nothing built on it is trustworthy."""
-    lroot = tmp_path / "l"; lroot.mkdir()
-    rroot = tmp_path / "r"; rroot.mkdir()
+    lroot = tmp_path / "l"
+    lroot.mkdir()
+    rroot = tmp_path / "r"
+    rroot.mkdir()
     local = _run_local_behavior_case(lroot, monkeypatch, _PARITY_CARD)
     remote = _run_remote_behavior_case(rroot, monkeypatch, _PARITY_CARD)
     assert local == remote
@@ -8974,8 +8980,10 @@ def test_local_and_remote_behavior_results_agree(tmp_path, monkeypatch):
     same outcome, DB rows included, on both copy paths."""
     mismatches = []
     for name, specs, seed, pkw in _BEHAVIOR_PARITY_SCENARIOS:
-        lroot = tmp_path / f"local_{name}"; lroot.mkdir()
-        rroot = tmp_path / f"remote_{name}"; rroot.mkdir()
+        lroot = tmp_path / f"local_{name}"
+        lroot.mkdir()
+        rroot = tmp_path / f"remote_{name}"
+        rroot.mkdir()
         local = _run_local_behavior_case(
             lroot, monkeypatch, specs, seed=seed, params_kwargs=pkw)
         remote = _run_remote_behavior_case(
@@ -8992,7 +9000,8 @@ def test_behavior_parity_scenarios_exercise_their_branches(
     branch that stops firing fails here, not silently in parity."""
     seen = {}
     for name, specs, seed, pkw in _BEHAVIOR_PARITY_SCENARIOS:
-        root = tmp_path / name; root.mkdir()
+        root = tmp_path / name
+        root.mkdir()
         seen[name] = _run_local_behavior_case(
             root, monkeypatch, specs, seed=seed, params_kwargs=pkw)
 
@@ -9032,8 +9041,10 @@ def test_local_adoption_uncataloged_dest_twin_current_behavior(
     """
     from import_dedup import compute_file_hash
     _name, specs, seed, pkw = _ADOPTION_SCENARIO
-    lroot = tmp_path / "l"; lroot.mkdir()
-    rroot = tmp_path / "r"; rroot.mkdir()
+    lroot = tmp_path / "l"
+    lroot.mkdir()
+    rroot = tmp_path / "r"
+    rroot.mkdir()
     obs = _run_local_behavior_case(
         lroot, monkeypatch, specs, seed=seed, params_kwargs=pkw)
     remote = _run_remote_behavior_case(
@@ -9042,8 +9053,10 @@ def test_local_adoption_uncataloged_dest_twin_current_behavior(
     # ordering, verified, copy_totals etc. must still agree, while the
     # db_photos divergence is pinned per path (here and in the remote twin
     # test) until PR 5 re-unifies it.
-    local_rest = dict(obs); local_rest.pop("db_photos")
-    remote_rest = dict(remote); remote_rest.pop("db_photos")
+    local_rest = dict(obs)
+    local_rest.pop("db_photos")
+    remote_rest = dict(remote)
+    remote_rest.pop("db_photos")
     assert local_rest == remote_rest
     assert obs["skipped_duplicate"] == 1
     assert obs["copied"] == 0

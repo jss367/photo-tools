@@ -156,7 +156,18 @@ rsync (`_rsync_cancelled`, line 2320) deliberately produces *no* per-file
 failures — queued files stay on the card and partially/fully transferred but
 unverified files stay uncataloged for crash-recovery adoption on the next
 run (the PR #1425 behavior). `_BatchResult.cancelled` carries that state
-back explicitly; the transport never mutates `_ImportRunState`. Folder
+back explicitly; the transport never mutates `_ImportRunState`.
+
+Outcome-completeness invariant: when `cancelled` is false, `flush_batch`
+returns exactly one outcome per queued file. When `cancelled` is true, it
+returns outcomes only for files *conclusively completed before* the
+cancellation; every remaining queued file produces neither a failure nor a
+landing and is left for next-run adoption. This pins today's asymmetry
+between the two rsync shapes: a stop during the flat batch yields no
+outcomes for any flat file — the batch shares one exit code, so no per-file
+completion can be attributed (line 2350) — while a stop between renamed-file
+transfers keeps the outcomes of the per-file rsyncs that already returned
+success (lines 2361–2378). Folder
 preparation is *not* part of the protocol: the mount guards, local
 `os.makedirs`, and folder-status promotion are byte-identical in both paths
 today and stay in the orchestrator; the SSH-side `_remote_mkdir_p` (already
@@ -236,7 +247,7 @@ and goes through the normal PR-agent review cycle.
      folder locally vs a template-shaped path remotely at test lines
      ~10012/10074; fresh-copy vs adoption gating at ~10736/10837) so each
      mirror actually exercises the same branch.
-   - *Remote characterization:* the parity harness forces
+   - *Transport-specific characterization:* the parity harness forces
      `verify_by_hash=True` (to dodge the vacuous-pass trap), which blinds it
      to remote-only semantics. Pin those directly, asserting DB effects
      (photo rows, folder links, `hash_status`) as well as result dicts and

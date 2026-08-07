@@ -6920,19 +6920,22 @@ def test_remote_import_stop_between_renamed_transfers_keeps_completed_files(
 
     # Only the first renamed rsync ran; the loop observed Stop before the
     # second (import_job.py:2361-2364).
-    assert state["renamed_calls"] == 1
+    assert state["renamed_calls"] == 1, state
     assert result["cancelled"] is True
-    # The completed file keeps its outcome...
+    # The completed file keeps its outcome: verified and cataloged.
     assert result["copied"] == 1, result
+    assert result["verified"] == 1, result
     suffixed = [(fn, hs) for _rel, fn, hs in
                 _dest_photo_facts(db, ra["mount_base"])
                 if fn.startswith("DSC_0001")]
-    assert any(fn == "DSC_0001_1.jpg" for fn, _hs in suffixed), suffixed
-    # ...and the un-transferred file is neither failed nor landed.
+    assert ("DSC_0001_1.jpg", "ok") in suffixed, suffixed
+    # ...and the un-transferred file is neither failed nor landed (any
+    # DSC_0002 catalog row — suffixed or not — would be a regression;
+    # the pre-seeded mount files are never cataloged).
     assert result["failed"] == 0, result
-    assert not any(fn.startswith("DSC_0002_") for _rel, fn, _hs in
+    assert not any(fn.startswith("DSC_0002") for _rel, fn, _hs in
                    _dest_photo_facts(db, ra["mount_base"]))
-    assert result["safe_to_format"] is False
+    assert result["safe_to_format"] is False, result
 
 
 def test_remote_import_rsync_watchdog_does_not_block_on_pause(

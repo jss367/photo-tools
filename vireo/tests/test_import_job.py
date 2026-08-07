@@ -10374,7 +10374,12 @@ def test_remote_import_cancel_interrupts_stuck_twin_hash(
         tmp_path, monkeypatch):
     """Remote-path mirror of the local stuck-twin-hash cancel test — the
     remote duplicate gate hashes cataloged twins through the SMB mount
-    too, and must observe Stop the same way. Nothing may reach rsync."""
+    too, and must observe Stop the same way. Nothing may reach rsync.
+
+    Geometry matches the local mirror: the twin lives OFF the template
+    path so only the duplicate-gate twin re-hash can reach it — a
+    template-shaped twin would let the collision/adopt walk satisfy this
+    test with the gate broken."""
     import threading
 
     from import_dedup import compute_file_hash
@@ -10389,7 +10394,7 @@ def test_remote_import_cancel_interrupts_stuck_twin_hash(
     card_file = card / "IMG_0300.jpg"
     Image.new("RGB", (16, 16), "red").save(str(card_file))
 
-    dest_dir = Path(ra["mount_base"]) / "2026" / "2026-01-01"
+    dest_dir = Path(ra["mount_base"]) / "old"
     dest_dir.mkdir(parents=True)
     twin = dest_dir / "IMG_0300.jpg"
     os.mkfifo(str(twin))
@@ -10565,7 +10570,12 @@ def test_remote_import_cancel_skips_post_loop_mount_probe(
 
     Spy on the probe: it may run once (the per-file check that ran before
     the twin-hash cancel), but the second call — post-loop — must be
-    suppressed by the ``not cancelled`` gate."""
+    suppressed by the ``not cancelled`` gate.
+
+    Geometry matches the local mirror: the twin lives OFF the template
+    path so only the duplicate-gate twin re-hash can reach it — a
+    template-shaped twin would let the collision/adopt walk satisfy this
+    test with the gate broken."""
     import threading
 
     import pipeline_job as _pj
@@ -10581,7 +10591,7 @@ def test_remote_import_cancel_skips_post_loop_mount_probe(
     card_file = card / "IMG_0300.jpg"
     Image.new("RGB", (16, 16), "red").save(str(card_file))
 
-    dest_dir = Path(ra["mount_base"]) / "2026" / "2026-01-01"
+    dest_dir = Path(ra["mount_base"]) / "old"
     dest_dir.mkdir(parents=True)
     twin = dest_dir / "IMG_0300.jpg"
     os.mkfifo(str(twin))

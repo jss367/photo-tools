@@ -86,7 +86,12 @@ def _shutdown_created_job_runners(monkeypatch):
     leaked = []
     shutdown_failures = 0
     for runner in reversed(created):
-        if runner.shutdown(timeout=5.0):
+        # Windows CI runners can stretch _persist_job's SQLite retries past
+        # a five-second budget when a worker enters its finally block just
+        # as the test releases the fixture. Give the shutdown enough slack
+        # that a legitimately-completing worker can drain, but keep it
+        # short enough that an actually leaked job still fails the test.
+        if runner.shutdown(timeout=30.0):
             continue
         shutdown_failures += 1
         leaked.extend(
@@ -210,7 +215,11 @@ def app_and_db(tmp_path, monkeypatch):
 
     app = create_app(db_path=db_path, thumb_cache_dir=thumb_dir, api_token="test-token-123")
     yield app, db
-    jobs_stopped = app._cleanup_app_resources(job_timeout=5.0)
+    # Windows CI runners can stretch _persist_job's SQLite retries past a
+    # tight teardown budget when a worker enters its finally block just as
+    # the test releases the fixture. Give the shutdown enough slack that a
+    # legitimately-completing worker can drain without racing teardown.
+    jobs_stopped = app._cleanup_app_resources(job_timeout=30.0)
     db.close()
     if not jobs_stopped:
         pytest.fail("app background jobs did not stop during fixture teardown")
@@ -261,7 +270,9 @@ def client_with_photo(tmp_path, monkeypatch):
 
     app = create_app(db_path=db_path, thumb_cache_dir=str(thumb_dir), api_token="test-token-123")
     yield app, db, pid
-    jobs_stopped = app._cleanup_app_resources(job_timeout=5.0)
+    # Match app_and_db's more generous teardown budget so slow Windows CI
+    # runners don't flag a legitimately-completing worker as a leak.
+    jobs_stopped = app._cleanup_app_resources(job_timeout=30.0)
     db.close()
     if not jobs_stopped:
         pytest.fail("app background jobs did not stop during fixture teardown")

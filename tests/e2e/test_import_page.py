@@ -1230,6 +1230,241 @@ def test_import_duplicate_stream_result_ignored_after_controls_change(
     expect(page.locator("#destStructure")).to_be_hidden()
 
 
+def test_new_import_preview_aborts_superseded_duplicate_stream(
+    live_server, page
+):
+    """Starting a new preview must stop the old hash-heavy stream.
+
+    Sequence guards keep stale results off screen, but without transport
+    cancellation the server keeps reading every source file anyway.
+    """
+    page.goto(f"{live_server['url']}/import")
+    page.locator("#modeCopy").check()
+    page.locator("#destInput").fill("/archive")
+    page.evaluate(
+        """
+        () => {
+          clearScheduledImportPreview();
+          const originalFetch = window.fetch.bind(window);
+          window.__duplicateFetchCount = 0;
+          window.__firstDuplicateAborted = false;
+          window.fetch = (input, init = {}) => {
+            const target = typeof input === 'string' ? input : input.url;
+            if (target && target.indexOf('/api/import/folder-preview') === 0) {
+              return Promise.resolve(new Response(JSON.stringify({
+                files: [{path: '/tmp/card-a/IMG_0001.jpg'}],
+              }), {status: 200, headers: {'Content-Type': 'application/json'}}));
+            }
+            if (target && target.indexOf('/api/import/check-duplicates') === 0) {
+              window.__duplicateFetchCount += 1;
+              if (window.__duplicateFetchCount === 1) {
+                return new Promise((_resolve, reject) => {
+                  init.signal.addEventListener('abort', () => {
+                    window.__firstDuplicateAborted = true;
+                    reject(new DOMException('Aborted', 'AbortError'));
+                  }, {once: true});
+                });
+              }
+              const frame = 'data: ' + JSON.stringify({
+                duplicates: [], recovered: [], checked: 1, total: 1,
+              }) + '\\n\\n' + 'data: ' + JSON.stringify({
+                done: true, duplicate_count: 0, recovered_count: 0,
+                checked: 1, total: 1,
+              }) + '\\n\\n';
+              return Promise.resolve(new Response(frame, {
+                status: 200,
+                headers: {'Content-Type': 'text/event-stream'},
+              }));
+            }
+            if (target && target.indexOf('/api/import/destination-preview') === 0) {
+              return Promise.resolve(new Response(JSON.stringify({folders: []}), {
+                status: 200,
+                headers: {'Content-Type': 'application/json'},
+              }));
+            }
+            return originalFetch(input, init);
+          };
+          addSourcePath('/tmp/card-a');
+          clearScheduledImportPreview();
+        }
+        """
+    )
+
+    page.locator("#btnPreview").click()
+    page.wait_for_function("window.__duplicateFetchCount === 1")
+    page.evaluate("() => { void previewImport(); }")
+
+    page.wait_for_function("window.__firstDuplicateAborted === true")
+    page.wait_for_function("window.__duplicateFetchCount === 2")
+    expect(page.locator("#btnPreview")).to_be_enabled()
+    expect(page.locator("#importError")).to_have_text("")
+
+
+def test_removing_last_source_aborts_in_flight_duplicate_stream(
+    live_server, page
+):
+    """Removing the last source while a preview is running must stop the
+    server-side hash/EXIF work.
+
+    ``scheduleImportPreview()`` short-circuits on an empty source list, so
+    no successor ``previewImport()`` fires — and its own abort (which
+    lives at the top of ``previewImport``) never runs. Before the fix, the
+    UI cleared but the request kept scanning the removed card. The
+    scheduler now aborts the in-flight controller from the short-circuit
+    path itself.
+    """
+    page.goto(f"{live_server['url']}/import")
+    page.locator("#modeCopy").check()
+    page.locator("#destInput").fill("/archive")
+    page.evaluate(
+        """
+        () => {
+          clearScheduledImportPreview();
+          const originalFetch = window.fetch.bind(window);
+          window.__duplicateAborted = false;
+          window.__duplicateStarted = false;
+          window.fetch = (input, init = {}) => {
+            const target = typeof input === 'string' ? input : input.url;
+            if (target && target.indexOf('/api/import/folder-preview') === 0) {
+              return Promise.resolve(new Response(JSON.stringify({
+                files: [{path: '/tmp/card-a/IMG_0001.jpg'}],
+              }), {status: 200, headers: {'Content-Type': 'application/json'}}));
+            }
+            if (target && target.indexOf('/api/import/check-duplicates') === 0) {
+              window.__duplicateStarted = true;
+              return new Promise((_resolve, reject) => {
+                init.signal.addEventListener('abort', () => {
+                  window.__duplicateAborted = true;
+                  reject(new DOMException('Aborted', 'AbortError'));
+                }, {once: true});
+              });
+            }
+            if (target && target.indexOf('/api/import/destination-preview') === 0) {
+              return Promise.resolve(new Response(JSON.stringify({folders: []}), {
+                status: 200,
+                headers: {'Content-Type': 'application/json'},
+              }));
+            }
+            return originalFetch(input, init);
+          };
+          addSourcePath('/tmp/card-a');
+          clearScheduledImportPreview();
+        }
+        """
+    )
+
+    page.locator("#btnPreview").click()
+    page.wait_for_function("window.__duplicateStarted === true")
+    # Drop the last source (mirrors the user clicking × on the only card
+    # while the duplicate stream is still running). Then invoke the same
+    # scheduler the click handler does — that is the code path the
+    # short-circuit lives in.
+    page.evaluate(
+        """
+        () => {
+          sources.splice(0, sources.length);
+          scheduleImportPreview();
+        }
+        """
+    )
+    page.wait_for_function("window.__duplicateAborted === true")
+
+
+def test_re_adding_the_last_source_after_abort_does_not_reuse_stale_paths(
+    live_server, page
+):
+    """Empty-source abort must retire the captured preview too, not just
+    the flight flags.
+
+    Removing the last source mid-stream aborts the in-flight request and
+    clears importPreviewInFlight / importDupStreamPending / importPreviewSeq.
+    Without this fix it left importPreviewCapturedSignature and
+    importPreviewedPaths behind: re-adding the same source inside the 350ms
+    debounce restored a matching signature over an empty grid, so
+    updateStartGate() found no reason to hold Start and lit it up as
+    "Start import (0 files)". Clicking that button then posted the
+    previously discovered paths as include_paths, silently importing every
+    file behind an empty screen.
+    """
+    page.goto(f"{live_server['url']}/import")
+    page.locator("#modeCopy").check()
+    page.locator("#destInput").fill("/archive")
+    page.evaluate(
+        """
+        () => {
+          clearScheduledImportPreview();
+          const originalFetch = window.fetch.bind(window);
+          window.__duplicateStarted = false;
+          window.fetch = (input, init = {}) => {
+            const target = typeof input === 'string' ? input : input.url;
+            if (target && target.indexOf('/api/import/folder-preview') === 0) {
+              return Promise.resolve(new Response(JSON.stringify({
+                files: [{path: '/tmp/card-a/IMG_0001.jpg'},
+                        {path: '/tmp/card-a/IMG_0002.jpg'}],
+              }), {status: 200, headers: {'Content-Type': 'application/json'}}));
+            }
+            if (target && target.indexOf('/api/import/check-duplicates') === 0) {
+              window.__duplicateStarted = true;
+              return new Promise((_resolve, reject) => {
+                init.signal.addEventListener('abort', () => {
+                  reject(new DOMException('Aborted', 'AbortError'));
+                }, {once: true});
+              });
+            }
+            if (target && target.indexOf('/api/import/destination-preview') === 0) {
+              return Promise.resolve(new Response(JSON.stringify({folders: []}), {
+                status: 200,
+                headers: {'Content-Type': 'application/json'},
+              }));
+            }
+            return originalFetch(input, init);
+          };
+          addSourcePath('/tmp/card-a');
+          clearScheduledImportPreview();
+        }
+        """
+    )
+
+    page.locator("#btnPreview").click()
+    page.wait_for_function("window.__duplicateStarted === true")
+    # previewImport() captured the signature and previewed paths before
+    # the duplicate stream started. The bug hinges on those still being
+    # set at this point.
+    page.wait_for_function(
+        "() => importPreviewCapturedSignature !== null "
+        "&& importPreviewedPaths.length > 0"
+    )
+    # Remove the last source mid-stream. This is the empty-source abort
+    # branch inside scheduleImportPreview().
+    page.evaluate(
+        """
+        () => {
+          sources.splice(0, sources.length);
+          scheduleImportPreview();
+        }
+        """
+    )
+    # The fix retires the captured preview alongside the flight flags.
+    page.wait_for_function(
+        "() => importPreviewCapturedSignature === null "
+        "&& importPreviewedPaths.length === 0"
+    )
+    # Re-add the same source inside the 350ms debounce (no timer fired
+    # yet — clearScheduledImportPreview keeps it that way). Before the
+    # fix, updateStartGate() would light up Start with "0 files" here.
+    page.evaluate(
+        """
+        () => {
+          addSourcePath('/tmp/card-a');
+          clearScheduledImportPreview();
+        }
+        """
+    )
+    # Start must NOT read "Start import (0 files)" — the previously
+    # captured paths must not be resurrected against an empty grid.
+    expect(page.locator("#btnStart")).not_to_have_text("Start import (0 files)")
+
+
 def test_import_preview_older_response_does_not_clobber_newer_summary(
     live_server, page
 ):

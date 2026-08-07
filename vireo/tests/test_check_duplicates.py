@@ -194,6 +194,137 @@ def test_check_duplicates_all_new(app_and_db, tmp_path):
     assert done[0]["duplicate_count"] == 0
 
 
+def test_check_duplicates_progress_events_are_monotonic(
+    app_and_db, tmp_path
+):
+    """Progress events report a strictly increasing ``checked`` and the
+    correct ``total`` on every event, and the final progress event lands on
+    ``checked == total`` before ``done`` (so the client's percentage never
+    regresses and always finishes at 100%)."""
+    app, _db, _fid = app_and_db
+
+    source = tmp_path / "source"
+    source.mkdir()
+    paths = []
+    for index, color in enumerate(("red", "green", "blue"), 1):
+        path = source / f"new{index}.jpg"
+        Image.new("RGB", (50, 50), color=color).save(str(path))
+        paths.append(str(path))
+
+    resp = app.test_client().post(
+        "/api/import/check-duplicates", json={"paths": paths}
+    )
+    events = parse_sse_events(resp.data)
+    # Prep-phase heartbeats carry ``preparing``/``total`` but no
+    # ``checked``; the per-file progress events are the ones this
+    # monotonicity contract is about, so filter to those.
+    progress = [
+        event for event in events
+        if not event.get("done") and "checked" in event
+    ]
+
+    assert progress, "at least one progress event must precede done"
+    checked_values = [event["checked"] for event in progress]
+    assert checked_values == sorted(set(checked_values)), (
+        "checked must strictly increase across progress events"
+    )
+    assert all(event["total"] == 3 for event in progress)
+    assert progress[-1]["checked"] == 3, (
+        "the final progress event before done must always land on total"
+    )
+
+
+def test_check_duplicates_slow_check_yields_per_file(
+    app_and_db, tmp_path, monkeypatch
+):
+    """When a per-file check exceeds the flush window, each file gets its
+    own event so an aborted preview stops within one file's worth of work
+    (rather than draining a fixed batch first)."""
+    import app as vireo_app
+
+    app, _db, _fid = app_and_db
+
+    source = tmp_path / "source"
+    source.mkdir()
+    paths = []
+    for index, color in enumerate(("red", "green", "blue"), 1):
+        path = source / f"new{index}.jpg"
+        Image.new("RGB", (50, 50), color=color).save(str(path))
+        paths.append(str(path))
+
+    # Zero flush window → every completed file crosses the threshold and
+    # gets its own event, exercising the bounded-cancellation guarantee the
+    # SSE loop was designed for.
+    monkeypatch.setattr(
+        vireo_app, "DUPLICATE_CHECK_FLUSH_INTERVAL_SECONDS", 0.0
+    )
+
+    resp = app.test_client().post(
+        "/api/import/check-duplicates", json={"paths": paths}
+    )
+    progress = [
+        event for event in parse_sse_events(resp.data)
+        if not event.get("done") and "checked" in event
+    ]
+
+    assert [event["checked"] for event in progress] == [1, 2, 3]
+    assert all(event["total"] == 3 for event in progress)
+
+
+def test_check_duplicates_prep_phase_yields_between_batches(
+    app_and_db, tmp_path, monkeypatch
+):
+    """Metadata prep runs in bounded batches with a heartbeat between
+    each. A single upfront prepare() would leave the WSGI layer unable
+    to notice a superseded browser request during the (potentially long)
+    EXIF-batching phase — chunking with a yield puts a cancellation
+    point every prep-batch worth of I/O."""
+    import app as vireo_app
+
+    app, _db, _fid = app_and_db
+
+    source = tmp_path / "source"
+    source.mkdir()
+    paths = []
+    for index in range(5):
+        path = source / f"card{index}.jpg"
+        Image.new("RGB", (50, 50), color="red").save(str(path))
+        paths.append(str(path))
+
+    # Force one path per prep chunk so the batching contract is visible
+    # even with a tiny test fixture.
+    monkeypatch.setattr(vireo_app, "DUPLICATE_CHECK_PREP_BATCH_SIZE", 1)
+
+    resp = app.test_client().post(
+        "/api/import/check-duplicates", json={"paths": paths}
+    )
+    events = parse_sse_events(resp.data)
+    preparing = [
+        event["preparing"] for event in events if "preparing" in event
+    ]
+    assert preparing == [1, 2, 3, 4, 5], (
+        f"expected one prep heartbeat per batch reaching total; got "
+        f"{preparing}"
+    )
+    # The prep events precede every per-file event — the checker only
+    # walks paths after all of prep is done, and the per-file loop is
+    # what emits ``checked``.
+    order = [
+        "preparing" if "preparing" in event
+        else ("checked" if "checked" in event and not event.get("done")
+              else "done" if event.get("done") else "other")
+        for event in events
+    ]
+    last_prep = max(i for i, tag in enumerate(order) if tag == "preparing")
+    first_checked = next(
+        (i for i, tag in enumerate(order) if tag == "checked"), None
+    )
+    if first_checked is not None:
+        assert last_prep < first_checked, (
+            "prep heartbeats must precede per-file checked events"
+        )
+
+
 def test_check_duplicates_ignores_zero_byte_images(app_and_db, tmp_path):
     """Empty image placeholders should not be reported as duplicate photos."""
     app, db, fid = app_and_db
@@ -248,7 +379,7 @@ def test_check_duplicates_missing_file_skipped(app_and_db, tmp_path):
 def test_check_duplicates_zero_byte_file_does_not_swallow_pending_batch(
     app_and_db, tmp_path
 ):
-    """A zero-byte path at end-of-list (or on a BATCH_SIZE boundary) must
+    """A zero-byte path at end-of-list must
     not eat already-queued ``batch_duplicates``. The pipeline UI only
     learns about duplicates from emitted ``data.duplicates`` events; if
     the end-of-list yield is skipped, ``duplicate_count`` reports the

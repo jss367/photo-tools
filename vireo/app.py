@@ -3017,6 +3017,26 @@ def _life_list_alphabetical_key(name):
     return _LIFE_LIST_LEADING_APOSTROPHE_RE.sub("", str(name or "")).lower()
 
 
+# Adaptive flush cadence for the duplicate-check SSE stream. Byte-for-byte
+# hashes on slow cards spend far more than this per file, so each check ends
+# its own event and cancellation is bounded by one file. Metadata-only
+# checks on a 100k-file source blow through hundreds of files inside one
+# window and coalesce naturally, keeping event count in the low hundreds
+# instead of one-per-file. Module-level so tests can override it.
+DUPLICATE_CHECK_FLUSH_INTERVAL_SECONDS = 0.1
+
+# Chunk size for the duplicate-check prep phase (EXIF batching and, in
+# verify_by_hash + recovery mode, source_capture_timestamps for folder
+# planning). Small enough that a superseded browser request cancels within
+# one chunk's worth of I/O — otherwise a card with tens of thousands of
+# files spends the entire prep phase reading metadata before the WSGI layer
+# ever gets a chance to observe the disconnect. Aligned with
+# metadata._BATCH_SIZE so an outer chunk maps to at most one ExifTool
+# subprocess for its leftovers, keeping subprocess overhead unchanged.
+# Module-level so tests can override it.
+DUPLICATE_CHECK_PREP_BATCH_SIZE = 100
+
+
 def create_app(db_path, thumb_cache_dir=None, api_token=None):
     """Create the Flask app for the Vireo photo browser.
 
@@ -18538,31 +18558,44 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     return True
                 counter += 1
 
-        BATCH_SIZE = 20
-
         def generate():
             total = len(paths)
             duplicate_count = 0
             recovered_count = 0
             batch_duplicates = []
             batch_recovered = []
-            # Batch the EXIF header reads once up front (no-op in
-            # verify_by_hash mode). Intra-run duplicate tracking lives in
+            # Batch the EXIF header reads up front in bounded chunks (no-op
+            # in verify_by_hash mode). Intra-run duplicate tracking lives in
             # the checker: identical source files not yet in the DB are
             # reported as duplicates of each other, matching the actual
-            # import step.
-            checker.prepare([Path(p) for p in paths])
-            if recovery_base and verify_by_hash:
-                # prepare() skipped the EXIF batch (verify mode's identity
-                # is the hash), but recovery folder planning still needs
-                # capture times — resolve the whole request in one batch,
-                # not one lazy read per checked file.
-                recovery_times.update({
-                    str(f): dt
-                    for f, dt in source_capture_timestamps(
-                        [Path(p) for p in paths]).items()
-                })
+            # import step. Chunking with a yield between each chunk lets a
+            # superseded browser request stop this phase within one chunk's
+            # worth of I/O — a single upfront prepare() over tens of
+            # thousands of files would otherwise ignore the disconnect
+            # entirely until the per-file loop begins.
+            prep_paths = [Path(p) for p in paths]
+            prep_batch = DUPLICATE_CHECK_PREP_BATCH_SIZE
+            for prep_start in range(0, len(prep_paths), prep_batch):
+                chunk = prep_paths[prep_start:prep_start + prep_batch]
+                checker.prepare(chunk)
+                if recovery_base and verify_by_hash:
+                    # prepare() skipped the EXIF batch (verify mode's
+                    # identity is the hash), but recovery folder planning
+                    # still needs capture times — resolve them alongside
+                    # the same chunk so both prep paths share the same
+                    # cancellation cadence.
+                    recovery_times.update({
+                        str(f): dt
+                        for f, dt in source_capture_timestamps(chunk).items()
+                    })
+                # Cheap heartbeat frame the client can render as
+                # "preparing metadata…" and, more importantly, the yield
+                # that lets the WSGI server notice a disconnected client
+                # between chunks instead of after the entire prep phase.
+                prepared = prep_start + len(chunk)
+                yield f"data: {json.dumps({'preparing': prepared, 'total': total})}\n\n"
 
+            last_flush = time.monotonic()
             for checked, path in enumerate(paths, 1):
                 # Zero-byte placeholders are non-duplicates (the checker
                 # gives them no identity), and unreadable/missing files
@@ -18594,10 +18627,25 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 except OSError:
                     pass  # Skip unreadable/missing files
 
-                if checked % BATCH_SIZE == 0 or checked == total:
+                # The yield is both how the client learns progress and how
+                # the WSGI server notices that a superseded browser request
+                # disconnected — cheap checks may finish dozens of files
+                # inside one window (a single event covers them all), while
+                # a slow byte-for-byte hash spends longer than the window on
+                # one file (that file gets its own event and cancellation
+                # stops within the next check). ``checked == total``
+                # guarantees the last progress event always ships so the
+                # client sees ``checked == total`` before ``done``.
+                now = time.monotonic()
+                if (
+                    checked == total
+                    or now - last_flush
+                    >= DUPLICATE_CHECK_FLUSH_INTERVAL_SECONDS
+                ):
                     yield f"data: {json.dumps({'duplicates': batch_duplicates, 'recovered': batch_recovered, 'checked': checked, 'total': total})}\n\n"
                     batch_duplicates = []
                     batch_recovered = []
+                    last_flush = now
 
             yield f"data: {json.dumps({'done': True, 'duplicate_count': duplicate_count, 'recovered_count': recovered_count, 'checked': total, 'total': total})}\n\n"
 

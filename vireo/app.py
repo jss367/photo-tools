@@ -18538,8 +18538,6 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     return True
                 counter += 1
 
-        BATCH_SIZE = 20
-
         def generate():
             total = len(paths)
             duplicate_count = 0
@@ -18594,10 +18592,15 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 except OSError:
                     pass  # Skip unreadable/missing files
 
-                if checked % BATCH_SIZE == 0 or checked == total:
-                    yield f"data: {json.dumps({'duplicates': batch_duplicates, 'recovered': batch_recovered, 'checked': checked, 'total': total})}\n\n"
-                    batch_duplicates = []
-                    batch_recovered = []
+                # Flush after every file. Besides making progress honest for
+                # byte-for-byte checks on slow cards / NAS volumes, each
+                # yield gives the WSGI server a chance to observe that a
+                # superseded browser request disconnected. The abandoned
+                # generator then closes after at most the current file
+                # instead of hashing another 20-file batch in the background.
+                yield f"data: {json.dumps({'duplicates': batch_duplicates, 'recovered': batch_recovered, 'checked': checked, 'total': total})}\n\n"
+                batch_duplicates = []
+                batch_recovered = []
 
             yield f"data: {json.dumps({'done': True, 'duplicate_count': duplicate_count, 'recovered_count': recovered_count, 'checked': total, 'total': total})}\n\n"
 

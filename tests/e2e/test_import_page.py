@@ -1230,6 +1230,76 @@ def test_import_duplicate_stream_result_ignored_after_controls_change(
     expect(page.locator("#destStructure")).to_be_hidden()
 
 
+def test_new_import_preview_aborts_superseded_duplicate_stream(
+    live_server, page
+):
+    """Starting a new preview must stop the old hash-heavy stream.
+
+    Sequence guards keep stale results off screen, but without transport
+    cancellation the server keeps reading every source file anyway.
+    """
+    page.goto(f"{live_server['url']}/import")
+    page.locator("#modeCopy").check()
+    page.locator("#destInput").fill("/archive")
+    page.evaluate(
+        """
+        () => {
+          clearScheduledImportPreview();
+          const originalFetch = window.fetch.bind(window);
+          window.__duplicateFetchCount = 0;
+          window.__firstDuplicateAborted = false;
+          window.fetch = (input, init = {}) => {
+            const target = typeof input === 'string' ? input : input.url;
+            if (target && target.indexOf('/api/import/folder-preview') === 0) {
+              return Promise.resolve(new Response(JSON.stringify({
+                files: [{path: '/tmp/card-a/IMG_0001.jpg'}],
+              }), {status: 200, headers: {'Content-Type': 'application/json'}}));
+            }
+            if (target && target.indexOf('/api/import/check-duplicates') === 0) {
+              window.__duplicateFetchCount += 1;
+              if (window.__duplicateFetchCount === 1) {
+                return new Promise((_resolve, reject) => {
+                  init.signal.addEventListener('abort', () => {
+                    window.__firstDuplicateAborted = true;
+                    reject(new DOMException('Aborted', 'AbortError'));
+                  }, {once: true});
+                });
+              }
+              const frame = 'data: ' + JSON.stringify({
+                duplicates: [], recovered: [], checked: 1, total: 1,
+              }) + '\\n\\n' + 'data: ' + JSON.stringify({
+                done: true, duplicate_count: 0, recovered_count: 0,
+                checked: 1, total: 1,
+              }) + '\\n\\n';
+              return Promise.resolve(new Response(frame, {
+                status: 200,
+                headers: {'Content-Type': 'text/event-stream'},
+              }));
+            }
+            if (target && target.indexOf('/api/import/destination-preview') === 0) {
+              return Promise.resolve(new Response(JSON.stringify({folders: []}), {
+                status: 200,
+                headers: {'Content-Type': 'application/json'},
+              }));
+            }
+            return originalFetch(input, init);
+          };
+          addSourcePath('/tmp/card-a');
+          clearScheduledImportPreview();
+        }
+        """
+    )
+
+    page.locator("#btnPreview").click()
+    page.wait_for_function("window.__duplicateFetchCount === 1")
+    page.evaluate("() => { void previewImport(); }")
+
+    page.wait_for_function("window.__firstDuplicateAborted === true")
+    page.wait_for_function("window.__duplicateFetchCount === 2")
+    expect(page.locator("#btnPreview")).to_be_enabled()
+    expect(page.locator("#importError")).to_have_text("")
+
+
 def test_import_preview_older_response_does_not_clobber_newer_summary(
     live_server, page
 ):

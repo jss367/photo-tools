@@ -194,6 +194,37 @@ def test_check_duplicates_all_new(app_and_db, tmp_path):
     assert done[0]["duplicate_count"] == 0
 
 
+def test_check_duplicates_streams_progress_after_every_file(
+    app_and_db, tmp_path
+):
+    """Every completed file is an SSE flush boundary.
+
+    A client that aborts a superseded byte-for-byte preview can only make the
+    WSGI server notice at a yield. Per-file events therefore bound abandoned
+    work to the hash already in progress instead of the old 20-file batch.
+    """
+    app, _db, _fid = app_and_db
+
+    source = tmp_path / "source"
+    source.mkdir()
+    paths = []
+    for index, color in enumerate(("red", "green", "blue"), 1):
+        path = source / f"new{index}.jpg"
+        Image.new("RGB", (50, 50), color=color).save(str(path))
+        paths.append(str(path))
+
+    resp = app.test_client().post(
+        "/api/import/check-duplicates", json={"paths": paths}
+    )
+    progress = [
+        event for event in parse_sse_events(resp.data)
+        if not event.get("done")
+    ]
+
+    assert [event["checked"] for event in progress] == [1, 2, 3]
+    assert all(event["total"] == 3 for event in progress)
+
+
 def test_check_duplicates_ignores_zero_byte_images(app_and_db, tmp_path):
     """Empty image placeholders should not be reported as duplicate photos."""
     app, db, fid = app_and_db
@@ -248,7 +279,7 @@ def test_check_duplicates_missing_file_skipped(app_and_db, tmp_path):
 def test_check_duplicates_zero_byte_file_does_not_swallow_pending_batch(
     app_and_db, tmp_path
 ):
-    """A zero-byte path at end-of-list (or on a BATCH_SIZE boundary) must
+    """A zero-byte path at end-of-list must
     not eat already-queued ``batch_duplicates``. The pipeline UI only
     learns about duplicates from emitted ``data.duplicates`` events; if
     the end-of-list yield is skipped, ``duplicate_count`` reports the

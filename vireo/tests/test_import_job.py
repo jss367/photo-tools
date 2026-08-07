@@ -8469,6 +8469,9 @@ def test_remote_step_summary_claims_a_selection_only_when_applied(
 # assert the observable selection results agree, so a change applied to one
 # path and not the other fails here instead of shipping a wrong
 # format-the-card verdict on whichever path the author wasn't looking at.
+# The block also holds the BEHAVIORAL parity net: seeded-destination
+# scenarios (prior imports, uncataloged file drops) compared at the
+# DB-observable level (photo rows, workspace-linked folders) on both paths.
 
 
 # The four ``unsafe_files`` entries the selection logic owns. Order within
@@ -8673,6 +8676,177 @@ def test_local_and_remote_agree_on_plain_import(tmp_path, monkeypatch):
     local = _run_local_behavior_case(lroot, monkeypatch, _PARITY_CARD)
     remote = _run_remote_behavior_case(rroot, monkeypatch, _PARITY_CARD)
     assert local == remote
+    # Positive anchor: parity of two broken runs (0 copied on both paths)
+    # must not read as a pass.
+    assert local["copied"] == 3
+
+
+def _seed_prior_import(specs):
+    """Seed by running a full prior import of ``specs`` through the SAME
+    path as the measured run — the seed card lives in a sibling dir."""
+    def seed_local(dest_root, db_path):
+        from import_job import ImportParams, run_import_job
+        seed_root = dest_root.parent / "seedcard"
+        seed_root.mkdir(exist_ok=True)
+        card = _make_card(seed_root, specs, card_name="prior")
+        db = Database(db_path)
+        run_import_job(
+            _make_job("seed-import"), FakeRunner(), db_path,
+            db._active_workspace_id,
+            ImportParams(sources=[str(card)], destination=str(dest_root),
+                         verify_by_hash=True))
+    seed_local.seed_specs = specs
+    return seed_local
+
+
+def _seed_file_drop(specs):
+    """Seed by writing files at their template destination WITHOUT
+    cataloging them (simulates a prior crashed run). Files are built
+    exactly like _make_card's (same PIL call, same mtime) so they are
+    byte-identical to the measured card's twins."""
+    def seed(dest_root, db_path):
+        for name, mtime, *color in specs:
+            folder = dest_root / mtime.strftime("%Y/%Y-%m-%d")
+            folder.mkdir(parents=True, exist_ok=True)
+            Image.new("RGB", (16, 16), (color or ["red"])[0]).save(
+                str(folder / name))
+            ts = mtime.timestamp()
+            os.utime(str(folder / name), (ts, ts))
+    seed.seed_specs = specs
+    return seed
+
+
+_TWIN = ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red")
+
+# (id, card specs, seeder, params_kwargs). Each seeds the destination with
+# prior state, then measures an import over it on BOTH copy paths. For the
+# remote runner the seeders receive the MOUNT base as dest_root, so
+# _seed_prior_import's seed import runs locally into the mount — which is
+# exactly what "the NAS already holds cataloged photos" looks like from
+# this machine.
+_BEHAVIOR_PARITY_SCENARIOS = [
+    # Duplicate skip against a cataloged twin: same file re-imported.
+    ("duplicate_skip", [_TWIN], _seed_prior_import([_TWIN]), {}),
+    # Basename collision, different bytes: seed cataloged blue DSC_0001,
+    # import red DSC_0001 -> suffix copy DSC_0001_1.jpg.
+    ("collision_different_bytes", [_TWIN],
+     _seed_prior_import([("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0),
+                          "blue")]), {}),
+    # adoption_uncataloged_dest_twin DIVERGES (adopted row hash_status:
+    # local 'ok', remote NULL) — characterized per-path below, not deleted.
+    # Mixed batch: one fresh copy + one duplicate of a cataloged twin.
+    ("mixed_fresh_and_duplicate",
+     [_TWIN, ("DSC_0002.jpg", datetime(2026, 7, 3, 11, 0, 0), "green")],
+     _seed_prior_import([_TWIN]), {}),
+]
+
+# Crash-recovery adoption: identical bytes already AT the template path but
+# NOT cataloged (plain file drop, no prior import). Kept out of the parity
+# list because the paths genuinely diverge on the adopted row's
+# ``hash_status``; see the per-path characterization pair below.
+_ADOPTION_SCENARIO = (
+    "adoption_uncataloged_dest_twin", [_TWIN], _seed_file_drop([_TWIN]), {})
+
+
+def test_behavior_parity_scenarios_are_distinct():
+    scenarios = _BEHAVIOR_PARITY_SCENARIOS + [_ADOPTION_SCENARIO]
+    names = [n for n, _s, _seed, _p in scenarios]
+    assert len(names) == len(set(names))
+    # seed_specs joins the key because two scenarios legitimately share
+    # measured specs, seeder family AND params, differing only in what the
+    # seeder plants (duplicate_skip vs collision_different_bytes).
+    keys = {(repr(s), seed.__qualname__.split(".")[0],
+             repr(seed.seed_specs), repr(p))
+            for _n, s, seed, p in scenarios}
+    assert len(keys) == len(scenarios)
+
+
+def test_local_and_remote_behavior_results_agree(tmp_path, monkeypatch):
+    """CHARACTERIZATION: seeded-destination scenarios must produce the
+    same outcome, DB rows included, on both copy paths."""
+    mismatches = []
+    for name, specs, seed, pkw in _BEHAVIOR_PARITY_SCENARIOS:
+        lroot = tmp_path / f"local_{name}"; lroot.mkdir()
+        rroot = tmp_path / f"remote_{name}"; rroot.mkdir()
+        local = _run_local_behavior_case(
+            lroot, monkeypatch, specs, seed=seed, params_kwargs=pkw)
+        remote = _run_remote_behavior_case(
+            rroot, monkeypatch, specs, seed=seed, params_kwargs=pkw)
+        if local != remote:
+            mismatches.append((name, local, remote))
+    assert not mismatches, "\n".join(
+        f"{n}:\n  local ={l}\n  remote={r}" for n, l, r in mismatches)
+
+
+def test_behavior_parity_scenarios_exercise_their_branches(
+        tmp_path, monkeypatch):
+    """Positive control: pin each scenario's expected local outcome so a
+    branch that stops firing fails here, not silently in parity."""
+    seen = {}
+    for name, specs, seed, pkw in _BEHAVIOR_PARITY_SCENARIOS:
+        root = tmp_path / name; root.mkdir()
+        seen[name] = _run_local_behavior_case(
+            root, monkeypatch, specs, seed=seed, params_kwargs=pkw)
+
+    assert seen["duplicate_skip"]["skipped_duplicate"] == 1
+    assert seen["duplicate_skip"]["copied"] == 0
+    assert seen["duplicate_skip"]["safe_to_format"] is True
+
+    assert seen["collision_different_bytes"]["copied"] == 1
+    assert any(fn == "DSC_0001_1.jpg"
+               for _rel, fn, _hs in
+               seen["collision_different_bytes"]["db_photos"])
+
+    assert seen["mixed_fresh_and_duplicate"]["copied"] == 1
+    assert seen["mixed_fresh_and_duplicate"]["skipped_duplicate"] == 1
+    assert seen["mixed_fresh_and_duplicate"]["safe_to_format"] is True
+    # The adoption scenario's positive control lives in
+    # test_local_adoption_uncataloged_dest_twin_current_behavior below.
+
+
+def test_local_adoption_uncataloged_dest_twin_current_behavior(
+        tmp_path, monkeypatch):
+    """CHARACTERIZATION: local crash-recovery adoption folds the adopted
+    file into ``landed`` with its verified hash, so the verify_by_hash
+    catalog stamp marks the adopted row ``hash_status='ok'``.
+
+    DIVERGES from the remote path, which keeps adoptions in the separate
+    ``adopted_paths`` dict whose validation cross-checks bytes but never
+    stamps ``hash_status`` (row stays NULL). Re-unified on the local model
+    by the spec's transport-seam decisions — "Adoptions fold into
+    ``landed`` with ``origin='skipped_duplicate'``" and catalog stamping
+    on ``_LandedFile.verified_hash`` (PR 5):
+    docs/superpowers/specs/2026-08-06-import-path-unification-design.md.
+    """
+    name, specs, seed, pkw = _ADOPTION_SCENARIO
+    obs = _run_local_behavior_case(
+        tmp_path, monkeypatch, specs, seed=seed, params_kwargs=pkw)
+    assert obs["skipped_duplicate"] == 1
+    assert obs["copied"] == 0
+    assert obs["safe_to_format"] is True
+    # The adopted file gained a photo row, stamped verified.
+    assert obs["db_photos"] == {("2026/2026-07-03", "DSC_0001.jpg", "ok")}
+    assert obs["db_linked_folders"] == {"2026/2026-07-03"}
+
+
+def test_remote_adoption_uncataloged_dest_twin_current_behavior(
+        tmp_path, monkeypatch):
+    """CHARACTERIZATION: remote adoption agrees with local on every
+    observable EXCEPT the adopted row's ``hash_status``, which stays NULL
+    — the ``'ok'`` stamp only runs for freshly-transferred ``landed``
+    entries, and remote adoptions live in ``adopted_paths`` instead.
+    See the local twin test above for the spec decision that re-unifies
+    the two (adoptions fold into ``landed``, PR 5)."""
+    name, specs, seed, pkw = _ADOPTION_SCENARIO
+    obs = _run_remote_behavior_case(
+        tmp_path, monkeypatch, specs, seed=seed, params_kwargs=pkw)
+    assert obs["skipped_duplicate"] == 1
+    assert obs["copied"] == 0
+    assert obs["safe_to_format"] is True
+    # Photo row exists (adoption cataloged it) but carries no integrity
+    # verdict, unlike the local path's 'ok'.
+    assert obs["db_photos"] == {("2026/2026-07-03", "DSC_0001.jpg", None)}
+    assert obs["db_linked_folders"] == {"2026/2026-07-03"}
 
 
 def _sel(names, previewed, checked, extra=()):

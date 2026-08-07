@@ -1,14 +1,19 @@
 # Free up card space (card cleanup) — design
 
 **Date:** 2026-08-07
-**Status:** Spec-review approved (2026-08-07); amended same day after
-external review (delete-time revalidation, overlap guard, explicit
-metadata-anchored guarantee, manifest lifecycle, own-walk discovery);
-awaiting maintainer sign-off before implementation planning
-**Scope:** New feature: delete files from a local import source (memory card)
-only after verifying, per file and at deletion time, that the identical bytes
-are already in the archive. Two new job types plus an import-page UI section.
-No changes to the import pipeline itself.
+**Status:** Spec-review approved (2026-08-07); amended twice same day
+after external review (first: delete-time revalidation, overlap guard,
+metadata-anchored guarantee, manifest lifecycle, own-walk discovery;
+second: no stat caching across removals, filesystem-aware containment +
+`samefile`, exact-mtime baseline, delete-time expiry, atomic + validated
+manifests); awaiting maintainer sign-off before implementation planning
+**Scope:** New feature: delete files from a local import source (memory
+card) only after verifying, per file and at deletion time, that the card
+file's bytes match a hash that was checksum-verified into the archive and
+that the archive copy is confirmed unchanged since that verification by
+metadata (see "Safety invariant" for the exact guarantee). Two new job
+types plus an import-page UI section. No changes to the import pipeline
+itself.
 
 ## Problem
 
@@ -29,9 +34,10 @@ option: manually guessing which files landed risks deleting the only copy.
 
 ## Goals
 
-1. After any partial (or complete, or historical) import, the user can point
-   Vireo at the card and delete exactly the files whose content is verifiably
-   in the archive — nothing else.
+1. After any partial (or complete, or historical) import, the user can
+   point Vireo at the card and delete exactly the files whose content was
+   checksum-verified into the archive and whose archive copy is confirmed
+   unchanged (by metadata) at deletion time — nothing else.
 2. The preview shown before deletion is computed from ground truth at scan
    time (card bytes + current catalog), never from a stale record of what a
    past run claimed. This is the CORE_PHILOSOPHY transparency rule: the
@@ -85,10 +91,18 @@ before its `os.remove`:
    replacement and card swaps outright.
 2. **Archive side (metadata-anchored):** a fresh catalog query by that
    hash finds at least one row where (a) `hash_status = 'ok'`, (b) the
-   row's resolved archive path is **outside the resolved source tree**
-   (see overlap guard below), and (c) a fresh `stat` of the archive file
-   matches the cataloged `file_size`/`file_mtime` baseline — the same
-   baseline the stored `file_hash` describes.
+   row's archive path is **outside the source tree** under the
+   filesystem-aware containment rules of the overlap guard below, plus an
+   `os.path.samefile` check against the card file where available (same
+   device+inode means the "archive copy" *is* the card file), and (c) a
+   fresh `stat` of the archive file — performed immediately before this
+   specific `os.remove`, never reused from the scan or from an earlier
+   deletion in the same run — matches the cataloged
+   `file_size`/`file_mtime` baseline exactly. Exact equality, not the
+   audit's 1-second window: that tolerance (`audit.py:398`) only
+   classifies an already-detected hash mismatch as modified-vs-corrupt
+   and certifies nothing here, and a false negative from strict equality
+   merely keeps a file (safe, and remedied by a rescan).
 
 What this promises: the deleted bytes were checksum-verified into the
 archive, and the archive copy is metadata-unchanged since the scan that
@@ -112,15 +126,33 @@ guard a selected source could verify *itself*: pick a cataloged archive
 folder (or a card imported in place) and each file's own catalog row would
 mark it deletable — the tool would erase the archive copy. Two levels:
 
-- **Fail fast at scan start:** resolve the source root (`realpath`) and
-  reject the scan with a clear error if it equals, contains, or lies
-  inside any cataloged folder root — across all workspaces, matching the
+- **Containment is filesystem-aware, not string realpath.** `realpath`
+  alone does not close this hole: macOS/Windows default filesystems are
+  case-insensitive but `realpath` doesn't case-normalize, so
+  `/Volumes/card` and `/Volumes/Card` compare unequal while naming the
+  same directory, and FAT/exFAT removable media on Linux are
+  case-insensitive under a case-sensitive parent. The import
+  destination-inside-source guard already solves exactly this
+  (`_casenorm` + `_fs_is_case_insensitive`, `app.py:25641` area, PR
+  #1107): case-fold unconditionally on darwin/win32, probe the actual
+  filesystem on Linux, treat inconclusive probes as case-insensitive
+  (the strict direction). Extract that logic into a shared helper and
+  use it for every containment comparison in this feature. The
+  extraction is a behavior-preserving refactor of the import endpoint's
+  guard — it must not change that guard's decisions, and the existing
+  PR #1107 tests (or equivalent) must still pass against the shared
+  helper.
+- **Fail fast at scan start:** reject the scan with a clear error if the
+  source root equals, contains, or lies inside any cataloged folder root
+  under those containment rules — across all workspaces, matching the
   per-file guard, which is already global because it queries `photos`.
   This tool is for removable media, not the archive.
 - **Per-file invariant (the real guard, at scan and again at delete):** a
-  catalog row qualifies only if its resolved archive path is outside the
-  resolved source tree. Symlinks and mount aliases can defeat the root
-  check; this per-file check is what rule 2(b) above enforces.
+  catalog row qualifies only if its archive path is outside the source
+  tree under the same containment rules, and additionally not
+  `os.path.samefile` with the card file (device+inode identity catches
+  mount aliases that survive both realpath and case-folding). This
+  per-file check is what rule 2(b) above enforces.
 
 ### UX flow
 
@@ -190,10 +222,11 @@ Phases:
    row, so a matched hash is followed by a `photos WHERE file_hash = ?`
    lookup. The file counts as **deletable** only if at least one matching
    row passes the full qualifying test from the safety invariant:
-   `hash_status = 'ok'`, resolved archive path outside the resolved source
-   tree, and a `stat` of the archive file matching the cataloged
-   `file_size`/`file_mtime` baseline (mtime compared with the scanner's
-   existing tolerance). The preview shows the first row that passes. One
+   `hash_status = 'ok'`, archive path outside the source tree (and not
+   `samefile` with the card file) under the overlap guard's containment
+   rules, and a `stat` of the archive file matching the cataloged
+   `file_size`/`file_mtime` baseline exactly. The preview shows the first
+   row that passes. One
    stat round-trip per file over the SMB mount — never a re-read of
    archive bytes. The same test is repeated per file at delete time; here
    it exists so the preview is honest.
@@ -220,12 +253,23 @@ while this feature is global. So the manifest is written as a JSON file to
 `~/.vireo/card_cleanup/<scan_job_id>.json`, and the job *result* carries
 only the bucket totals, the resolved source root, and the manifest path.
 The delete job reads the manifest from disk, which also makes it work
-across an app restart. Lifecycle: each scan start prunes manifest files
-older than 7 days; a delete request whose manifest file is gone gets a 404
-with "manifest expired — re-scan the card" (a re-scan is minutes, and a
-fresh manifest is strictly safer than an old one). The scan is cancellable
-at file boundaries; a cancelled scan writes no manifest and the UI says
-so.
+across an app restart.
+
+The manifest is written atomically (temp file + rename, the pattern the
+codebase already uses for promotions) so a crash mid-scan can never leave
+a truncated manifest that a later delete trusts. On load, the delete job
+validates before acting: schema version recognized, header source root
+present, and every deletable entry's card path contained within that
+source root (under the overlap guard's containment rules) — a manifest
+that fails any check is rejected as corrupt, and nothing is deleted.
+
+Lifecycle: each scan start prunes manifest files older than 7 days, and
+the 7-day limit is *also* enforced when deletion is requested — a delete
+against a manifest older than 7 days is rejected even if no scan ran in
+between to prune it. Either way the user gets "manifest expired — re-scan
+the card" (a re-scan is minutes, and a fresh manifest is strictly safer
+than an old one). The scan is cancellable at file boundaries; a cancelled
+scan writes no manifest and the UI says so.
 
 Duplicate files on the card (two identical copies matching one archive
 photo) are both deletable — the rule is content-based, not one-to-one.
@@ -253,17 +297,21 @@ For each **deletable** manifest entry, immediately before deletion:
 2. **Archive gate (re-validated now, not trusted from the scan)** —
    re-query `photos WHERE file_hash = ?` and require at least one row to
    pass the qualifying test from the safety invariant: `hash_status =
-   'ok'`, resolved path outside the resolved source tree, fresh archive
-   `stat` matching the cataloged size/mtime baseline. If the mount is
-   down, the file was deleted from the archive, or the baseline no longer
-   matches, the card file is **skipped**, not deleted. The scan-time check
-   only made the preview honest; this one is the guarantee.
+   'ok'`, path outside the source tree and not `samefile` with the card
+   file, fresh archive `stat` exactly matching the cataloged size/mtime
+   baseline. If the mount is down, the file was deleted from the archive,
+   or the baseline no longer matches, the card file is **skipped**, not
+   deleted. The scan-time check only made the preview honest; this one is
+   the guarantee.
 3. **Delete** — `os.remove`. Per-file errors (read-only card, vanished
    file) are recorded as **failed** with the OS error; the job continues.
 
-Archive stats are one SMB round-trip per file (results for duplicate card
-files sharing a hash may be cached within the run); archive bytes are
-never re-read — see the safety invariant for the explicit tradeoff.
+Catalog *row* lookups for duplicate card files sharing a hash may be
+cached within the run; the archive **stat may not** — it must be repeated
+immediately before every individual removal, because a cached stat could
+authorize deleting the second duplicate after the archive vanished
+following the first. One SMB stat round-trip per removal; archive bytes
+are never re-read — see the safety invariant for the explicit tradeoff.
 
 Progress is per-file over SSE. Cancellation stops at a file boundary;
 already-deleted files stay deleted and the summary honestly reports
@@ -276,13 +324,17 @@ they exist only for the preview.
 
 - `POST /api/card-cleanup/scan` — body `{source: str, recursive: bool}`.
   Validates that the source path exists and is a directory, and rejects it
-  (400, with copy explaining this tool is for removable media) if its
-  realpath equals, contains, or lies inside any cataloged folder root —
-  the overlap guard's fail-fast half. Returns the job id.
+  (400, with copy explaining this tool is for removable media) if it
+  equals, contains, or lies inside any cataloged folder root under the
+  overlap guard's containment rules — the guard's fail-fast half. Returns
+  the job id.
 - `POST /api/card-cleanup/delete` — body `{scan_job_id}`. Returns the job
   id. 409 if a delete for that manifest is already running; 400 for an
-  unfinished/cancelled scan; 404 for an unknown scan job or an expired
-  (pruned) manifest file, with "re-scan the card" copy.
+  unfinished/cancelled scan or a manifest that fails load-time validation
+  (corrupt, wrong schema, entries outside the source root); 404 for an
+  unknown scan job, a pruned manifest file, or a manifest older than 7
+  days (age is checked at request time, not only at prune time), with
+  "re-scan the card" copy.
 - Progress and results ride the existing job endpoints (stream, status,
   history).
 
@@ -316,18 +368,27 @@ Unit tests with temp directories (no real card or SMB mount):
 - Hash match but archive file missing, or size/mtime off the cataloged
   baseline → kept.
 - Overlap: scan of a source equal to / containing / inside a cataloged
-  folder root → 400. A catalog row whose path is inside the source tree
-  (self-match via symlinked or in-place catalog) never qualifies a file,
-  at scan or delete.
+  folder root → 400, including a case-swapped variant of the root on a
+  case-insensitive filesystem. A catalog row whose path is inside the
+  source tree (self-match via symlinked or in-place catalog) never
+  qualifies a file, at scan or delete; a row that is `samefile` with the
+  card file (mount alias) never qualifies it either.
 - Card gate: file modified between scan and delete → skipped; same-size
   same-mtime content replacement → caught by the delete-time re-hash and
   skipped.
 - Archive gate at delete time: archive file removed or mutated after the
   scan → skipped; archive mount unreachable → all skipped, none deleted.
+- No stat reuse: two identical card files, archive copy removed after the
+  first deletion → the second is skipped (its own fresh stat fails, even
+  with the catalog row cached).
 - Delete after app restart: manifest loads from disk, scan job validated
   via history, deletion proceeds.
-- Manifest expiry: pruned manifest → delete returns 404; scan-start prune
-  removes only files older than 7 days.
+- Manifest expiry: pruned manifest → delete returns 404; a manifest older
+  than 7 days is rejected at delete-request time even when never pruned;
+  scan-start prune removes only files older than 7 days.
+- Manifest validation: truncated/corrupt JSON, unknown schema version, or
+  a deletable entry whose path falls outside the header source root →
+  delete refuses to start, nothing deleted.
 - Cancellation mid-delete → already-deleted files gone, summary counts
   correct.
 - Two identical card files matching one archive photo → both deletable,

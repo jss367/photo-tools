@@ -26,7 +26,7 @@
 
 **Files:**
 - Modify: `vireo/import_job.py:1352-1421` (remote `_emit` / `_emit_transfer`), `:1505` area (remote `folder_counts` declaration)
-- Test: `vireo/tests/test_import_job.py` (`_behavior_observables` ~8600, plus one new test)
+- Test: `vireo/tests/test_import_job.py` (`_behavior_observables` ~8746, one new test, and an added assertion in `test_remote_import_reports_per_file_transfer_progress` ~7133)
 
 - [ ] **Step 1: Write the failing tests**
 

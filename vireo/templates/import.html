@@ -2324,7 +2324,25 @@ function scheduleImportPreview() {
   // import. (wireDestStructureInvalidation also calls this directly; the
   // call is a pure recompute, so running it twice costs nothing.)
   updateStartGate();
-  if (!sources.length) return;
+  if (!sources.length) {
+    // No successor preview will run, so previewImport()'s own abort at
+    // the top of the next flight won't happen. If we don't cancel the
+    // in-flight request here, removing the last source leaves the server
+    // hashing that removed card until it finishes — exactly the resource
+    // contention the AbortController plumbing was added to prevent. The
+    // sequence bump makes the old run's staleness guards fail so its
+    // finally block can't re-enable Start or overwrite the summary.
+    if (importPreviewAbort) {
+      importPreviewAbort.abort();
+      importPreviewAbort = null;
+      importPreviewSeq += 1;
+      importPreviewInFlight = false;
+      importDupStreamPending = false;
+      importPreviewFailed = false;
+      updateStartGate();
+    }
+    return;
+  }
   importPreviewTimer = setTimeout(() => {
     importPreviewTimer = null;
     previewImport({ automatic: true });
@@ -3511,6 +3529,19 @@ async function previewImport(opts) {
             summary.textContent = files.length +
               ' files found — checking for duplicates… ' +
               Number(d.checked).toLocaleString() + ' of ' +
+              Number(d.total).toLocaleString();
+          } else if (!d.done && requestSeq === importPreviewSeq &&
+              !importPreviewSignatureChanged(requestSignature) &&
+              Number.isFinite(Number(d.preparing)) &&
+              Number.isFinite(Number(d.total))) {
+            // Heartbeat from the prep phase (batched EXIF/capture-time
+            // reads before per-file checks begin). Long cards used to
+            // sit on "Discovering files…" through all of prep — this
+            // shows the user work is happening AND surfaces a place the
+            // server pauses long enough to observe a client disconnect.
+            summary.textContent = files.length +
+              ' files found — preparing metadata… ' +
+              Number(d.preparing).toLocaleString() + ' of ' +
               Number(d.total).toLocaleString();
           }
         } catch (e) { /* partial frame */ }

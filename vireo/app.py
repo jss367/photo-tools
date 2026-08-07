@@ -3025,6 +3025,17 @@ def _life_list_alphabetical_key(name):
 # instead of one-per-file. Module-level so tests can override it.
 DUPLICATE_CHECK_FLUSH_INTERVAL_SECONDS = 0.1
 
+# Chunk size for the duplicate-check prep phase (EXIF batching and, in
+# verify_by_hash + recovery mode, source_capture_timestamps for folder
+# planning). Small enough that a superseded browser request cancels within
+# one chunk's worth of I/O — otherwise a card with tens of thousands of
+# files spends the entire prep phase reading metadata before the WSGI layer
+# ever gets a chance to observe the disconnect. Aligned with
+# metadata._BATCH_SIZE so an outer chunk maps to at most one ExifTool
+# subprocess for its leftovers, keeping subprocess overhead unchanged.
+# Module-level so tests can override it.
+DUPLICATE_CHECK_PREP_BATCH_SIZE = 100
+
 
 def create_app(db_path, thumb_cache_dir=None, api_token=None):
     """Create the Flask app for the Vireo photo browser.
@@ -18553,22 +18564,36 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             recovered_count = 0
             batch_duplicates = []
             batch_recovered = []
-            # Batch the EXIF header reads once up front (no-op in
-            # verify_by_hash mode). Intra-run duplicate tracking lives in
+            # Batch the EXIF header reads up front in bounded chunks (no-op
+            # in verify_by_hash mode). Intra-run duplicate tracking lives in
             # the checker: identical source files not yet in the DB are
             # reported as duplicates of each other, matching the actual
-            # import step.
-            checker.prepare([Path(p) for p in paths])
-            if recovery_base and verify_by_hash:
-                # prepare() skipped the EXIF batch (verify mode's identity
-                # is the hash), but recovery folder planning still needs
-                # capture times — resolve the whole request in one batch,
-                # not one lazy read per checked file.
-                recovery_times.update({
-                    str(f): dt
-                    for f, dt in source_capture_timestamps(
-                        [Path(p) for p in paths]).items()
-                })
+            # import step. Chunking with a yield between each chunk lets a
+            # superseded browser request stop this phase within one chunk's
+            # worth of I/O — a single upfront prepare() over tens of
+            # thousands of files would otherwise ignore the disconnect
+            # entirely until the per-file loop begins.
+            prep_paths = [Path(p) for p in paths]
+            prep_batch = DUPLICATE_CHECK_PREP_BATCH_SIZE
+            for prep_start in range(0, len(prep_paths), prep_batch):
+                chunk = prep_paths[prep_start:prep_start + prep_batch]
+                checker.prepare(chunk)
+                if recovery_base and verify_by_hash:
+                    # prepare() skipped the EXIF batch (verify mode's
+                    # identity is the hash), but recovery folder planning
+                    # still needs capture times — resolve them alongside
+                    # the same chunk so both prep paths share the same
+                    # cancellation cadence.
+                    recovery_times.update({
+                        str(f): dt
+                        for f, dt in source_capture_timestamps(chunk).items()
+                    })
+                # Cheap heartbeat frame the client can render as
+                # "preparing metadata…" and, more importantly, the yield
+                # that lets the WSGI server notice a disconnected client
+                # between chunks instead of after the entire prep phase.
+                prepared = prep_start + len(chunk)
+                yield f"data: {json.dumps({'preparing': prepared, 'total': total})}\n\n"
 
             last_flush = time.monotonic()
             for checked, path in enumerate(paths, 1):

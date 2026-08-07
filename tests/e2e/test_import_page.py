@@ -1300,6 +1300,76 @@ def test_new_import_preview_aborts_superseded_duplicate_stream(
     expect(page.locator("#importError")).to_have_text("")
 
 
+def test_removing_last_source_aborts_in_flight_duplicate_stream(
+    live_server, page
+):
+    """Removing the last source while a preview is running must stop the
+    server-side hash/EXIF work.
+
+    ``scheduleImportPreview()`` short-circuits on an empty source list, so
+    no successor ``previewImport()`` fires — and its own abort (which
+    lives at the top of ``previewImport``) never runs. Before the fix, the
+    UI cleared but the request kept scanning the removed card. The
+    scheduler now aborts the in-flight controller from the short-circuit
+    path itself.
+    """
+    page.goto(f"{live_server['url']}/import")
+    page.locator("#modeCopy").check()
+    page.locator("#destInput").fill("/archive")
+    page.evaluate(
+        """
+        () => {
+          clearScheduledImportPreview();
+          const originalFetch = window.fetch.bind(window);
+          window.__duplicateAborted = false;
+          window.__duplicateStarted = false;
+          window.fetch = (input, init = {}) => {
+            const target = typeof input === 'string' ? input : input.url;
+            if (target && target.indexOf('/api/import/folder-preview') === 0) {
+              return Promise.resolve(new Response(JSON.stringify({
+                files: [{path: '/tmp/card-a/IMG_0001.jpg'}],
+              }), {status: 200, headers: {'Content-Type': 'application/json'}}));
+            }
+            if (target && target.indexOf('/api/import/check-duplicates') === 0) {
+              window.__duplicateStarted = true;
+              return new Promise((_resolve, reject) => {
+                init.signal.addEventListener('abort', () => {
+                  window.__duplicateAborted = true;
+                  reject(new DOMException('Aborted', 'AbortError'));
+                }, {once: true});
+              });
+            }
+            if (target && target.indexOf('/api/import/destination-preview') === 0) {
+              return Promise.resolve(new Response(JSON.stringify({folders: []}), {
+                status: 200,
+                headers: {'Content-Type': 'application/json'},
+              }));
+            }
+            return originalFetch(input, init);
+          };
+          addSourcePath('/tmp/card-a');
+          clearScheduledImportPreview();
+        }
+        """
+    )
+
+    page.locator("#btnPreview").click()
+    page.wait_for_function("window.__duplicateStarted === true")
+    # Drop the last source (mirrors the user clicking × on the only card
+    # while the duplicate stream is still running). Then invoke the same
+    # scheduler the click handler does — that is the code path the
+    # short-circuit lives in.
+    page.evaluate(
+        """
+        () => {
+          sources.splice(0, sources.length);
+          scheduleImportPreview();
+        }
+        """
+    )
+    page.wait_for_function("window.__duplicateAborted === true")
+
+
 def test_import_preview_older_response_does_not_clobber_newer_summary(
     live_server, page
 ):

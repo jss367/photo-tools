@@ -6949,6 +6949,102 @@ def test_remote_import_stop_between_renamed_transfers_keeps_completed_files(
     assert result["safe_to_format"] is False, result
 
 
+def test_remote_import_stop_after_flat_batch_keeps_flat_outcomes(
+        tmp_path, monkeypatch):
+    """CHARACTERIZATION (spec: outcome-completeness invariant, mixed
+    geometry). A batch that mixes non-colliding (flat) and colliding
+    (renamed) files runs the flat rsync first (import_job.py:2341-2358),
+    then loops the renamed files one rsync each. A Stop observed at the
+    renamed-loop guard (import_job.py:2361-2364) — AFTER the flat rsync
+    returned success — must keep the flat files' outcomes (verified and
+    cataloged) rather than discarding them as cancelled work. The
+    companion killed-flat test asserts ``copied==0`` when the flat
+    rsync itself is the one killed; this test pins the OTHER direction
+    so a unified ``flush_batch`` that treats ``cancelled=True`` as
+    "throw away every outcome" cannot pass both."""
+    import move as _move
+    from import_job import ImportParams, run_import_job
+
+    ra = _remote_archive_for(tmp_path)
+    calls = _remote_calls(ra)
+    _install_fake_remote_rsync(monkeypatch, calls, verify=None)
+
+    # Same capture date -> same batch. DSC_0001 (no collision) goes down
+    # the flat path; DSC_0002 collides and goes down the renamed path.
+    card = _make_card(tmp_path, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+        ("DSC_0002.jpg", datetime(2026, 7, 3, 10, 5, 0), "green"),
+    ])
+    mount_day = Path(ra["mount_base"]) / "2026" / "2026-07-03"
+    mount_day.mkdir(parents=True)
+    # Only DSC_0002 pre-exists at the destination with different bytes,
+    # so ONLY that one gets suffixed to DSC_0002_1.jpg and takes the
+    # renamed path. DSC_0001 stays flat.
+    Image.new("RGB", (16, 16), "blue").save(
+        str(mount_day / "DSC_0002.jpg"))
+
+    runner = FakeRunner()
+    job = _make_job()
+    base_fake = _move._run_rsync_streamed  # harness fake installed above
+
+    state = {"flat_calls": 0, "renamed_calls": 0}
+
+    def stop_after_flat_batch(src_path, dest_spec, rsync_flags,
+                              total_files, progress_cb,
+                              rsync_bin="rsync", extra_args=None,
+                              src_specs=None,
+                              src_specs_dest_is_dir=True, **kw):
+        rc = base_fake(src_path, dest_spec, rsync_flags, total_files,
+                       progress_cb, rsync_bin=rsync_bin,
+                       extra_args=extra_args, src_specs=src_specs,
+                       src_specs_dest_is_dir=src_specs_dest_is_dir, **kw)
+        if src_specs_dest_is_dir:
+            # The flat batch just completed successfully. Stop arrives
+            # between the flat batch and the first renamed rsync — the
+            # exact race the renamed-loop guard is meant to close.
+            state["flat_calls"] += 1
+            runner.cancelled_ids.add(job["id"])
+        else:
+            state["renamed_calls"] += 1
+        return rc
+
+    monkeypatch.setattr(_move, "_run_rsync_streamed",
+                        stop_after_flat_batch)
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    result = run_import_job(
+        job, runner, db_path, db._active_workspace_id,
+        ImportParams(sources=[str(card)], destination=ra["mount_base"],
+                     remote_target=ra, verify_by_hash=True))
+
+    # The flat batch ran; the renamed loop observed Stop at its guard
+    # (import_job.py:2361-2364) before firing its rsync.
+    assert state["flat_calls"] == 1, state
+    assert state["renamed_calls"] == 0, state
+    assert result["cancelled"] is True, result
+
+    # The completed flat file keeps its outcome: verified and cataloged.
+    # This is the outcome a unified ``flush_batch`` implementation that
+    # discards successful flat outcomes on ``cancelled=True`` would
+    # silently drop.
+    assert result["copied"] == 1, result
+    assert result["verified"] == 1, result
+    flat_rows = [(fn, hs) for _rel, fn, _fh, hs in
+                 _dest_photo_facts(db, ra["mount_base"])
+                 if fn.startswith("DSC_0001")]
+    assert ("DSC_0001.jpg", "ok") in flat_rows, flat_rows
+
+    # ...and the un-transferred renamed file is neither failed nor
+    # landed (any DSC_0002 catalog row — suffixed or not — would be a
+    # regression; the pre-seeded mount file is never cataloged).
+    assert result["failed"] == 0, result
+    assert not any(fn.startswith("DSC_0002") for _rel, fn, _fh, _hs in
+                   _dest_photo_facts(db, ra["mount_base"]))
+    # Cancelled runs never claim the card is safe to erase.
+    assert result["safe_to_format"] is False, result
+
+
 def test_remote_import_rsync_watchdog_does_not_block_on_pause(
         tmp_path, monkeypatch):
     """The rsync watchdog thread's cancel_check must be a non-blocking

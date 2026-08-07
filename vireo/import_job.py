@@ -1354,6 +1354,13 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
         expected_new=(params.checked_count if params.skip_duplicates else None),
     )
 
+    # Live per-folder counters, mutated by the copy loop via _counts() and
+    # snapshotted onto every progress event so the Import page can render
+    # truthful per-folder progress mid-run. Declared before _emit so the
+    # discovery-phase emits see an empty-but-present dict. Mirrors the
+    # local path.
+    folder_counts = {}
+
     def _emit(phase, current, total, current_file="", *, is_importing=False):
         eta_fields = {}
         if total > 0:
@@ -1378,7 +1385,14 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
         runner.push_event(
             job["id"], "progress",
             progress_event(
-                phase, current, total, current_file, **eta_fields,
+                phase, current, total, current_file,
+                # Snapshot (counts dicts mutate as the loop advances; SSE
+                # consumers must see the state at emit time). Mirrors the
+                # local path — spec decision 1.
+                folders={
+                    rel: dict(counts) for rel, counts in folder_counts.items()
+                },
+                **eta_fields,
             ),
         )
 
@@ -1415,7 +1429,16 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
             progress_event(
                 f"{rel}: transferring",
                 job["progress"]["current"], job["progress"]["total"],
-                current_file, **extra,
+                current_file,
+                # The Import page re-renders the folder table from each
+                # event, so a transfer event without the snapshot would
+                # blank the table for the whole batch transfer. (``rel_``
+                # to avoid shadowing this function's ``rel`` parameter.)
+                folders={
+                    rel_: dict(counts)
+                    for rel_, counts in folder_counts.items()
+                },
+                **extra,
             ),
         )
 
@@ -1502,7 +1525,6 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
     unverified_duplicate = 0
     failed = 0
     unsafe_files = []
-    folder_counts = {}
     emitted = 0
     cancelled = False
 

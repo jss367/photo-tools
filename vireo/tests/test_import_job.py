@@ -6866,9 +6866,9 @@ def test_remote_import_stop_kills_in_flight_rsync_batch(
     # cancelled run never claims the card is safe to erase.
     assert result["copied"] == 0, result
     assert result["safe_to_format"] is False, result
-    # And no catalog row exists for the interrupted batch — the file rsync
-    # landed before the kill is left for the NEXT run's crash-recovery to
-    # adopt, not cataloged by this cancelled run.
+    # And no catalog row exists for the interrupted batch — the file that
+    # rsync landed before the kill is left for the NEXT run's crash-recovery
+    # to adopt, not cataloged by this cancelled run.
     assert _photo_rows(db) == [], [dict(r) for r in _photo_rows(db)]
 
 
@@ -8815,6 +8815,8 @@ def _renamed_twin_case_specs():
     return twin, card
 
 
+# Import-time snapshot for the scenario list; the per-path tests call the
+# helper directly.
 _RT_TWIN, _RT_CARD = _renamed_twin_case_specs()
 
 # (id, card specs, seeder, params_kwargs). Each seeds the destination with

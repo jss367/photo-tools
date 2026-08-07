@@ -8522,6 +8522,102 @@ def _selection_observables(result, runner):
     }
 
 
+def _dest_photo_facts(db, dest_root):
+    """DB-level import outcome, normalized for local/remote comparison:
+    {(folder relpath under dest_root, filename, hash_status)}.
+    file_hash presence is implied by hash_status; the hash VALUE is
+    excluded because both paths must agree on it via safe_to_format
+    assertions instead (comparing values here would double-report)."""
+    facts = set()
+    for row in _photo_rows(db):
+        rel = os.path.relpath(row["folder_path"], str(dest_root))
+        facts.add((rel, row["filename"], row["hash_status"]))
+    return facts
+
+
+def _linked_folder_rels(db, dest_root):
+    """Folder paths visible in the active workspace, relative to the
+    destination root. Twin-folder linking is workspace-scoped, so this is
+    where a one-sided _link_duplicate_twin_dirs regression shows up."""
+    rows = db.conn.execute(
+        """SELECT f.path FROM folders f
+           JOIN workspace_folders wf ON wf.folder_id = f.id
+           WHERE wf.workspace_id = ?""",
+        (db._active_workspace_id,),
+    ).fetchall()
+    return {os.path.relpath(r["path"], str(dest_root)) for r in rows}
+
+
+def _behavior_observables(result, runner, db, dest_root):
+    """Superset of _selection_observables: adds DB-level facts. Excludes
+    the same legitimately-divergent keys (photo_ids, folders, errors
+    ordering) plus eta fields."""
+    obs = _selection_observables(result, runner)
+    obs["verified"] = result["verified"]
+    obs["cancelled"] = result["cancelled"]
+    obs["db_photos"] = _dest_photo_facts(db, dest_root)
+    obs["db_linked_folders"] = _linked_folder_rels(db, dest_root)
+    return obs
+
+
+def _run_local_behavior_case(root, monkeypatch, specs, *, seed=None,
+                             params_kwargs=None, runner=None,
+                             verify_by_hash=True):
+    """Local-path runner for behavioral parity scenarios.
+
+    ``seed(dest_root, db_path)`` runs BEFORE the measured import to
+    pre-populate/pre-catalog the destination (e.g. by running a prior
+    import). ``verify_by_hash=True`` for the same anti-vacuity reason as
+    _run_local_selection_case.
+    """
+    from import_job import ImportParams, run_import_job
+
+    card = _make_card(root, specs)
+    dest_root = root / "archive"
+    db_path = str(root / "test.db")
+    db = Database(db_path)
+    if seed is not None:
+        seed(dest_root, db_path)
+    runner = runner or FakeRunner()
+    result = run_import_job(
+        _make_job(), runner, db_path, db._active_workspace_id,
+        ImportParams(
+            sources=[str(card)], destination=str(dest_root),
+            verify_by_hash=verify_by_hash, **(params_kwargs or {}),
+        ),
+    )
+    return _behavior_observables(result, runner, db, dest_root)
+
+
+def _run_remote_behavior_case(root, monkeypatch, specs, *, seed=None,
+                              params_kwargs=None, runner=None,
+                              verify_by_hash=True):
+    """Remote-path runner. Mirrors _run_local_behavior_case's geometry:
+    the mount base plays the destination root, and ``seed`` receives it.
+    Builds the transport seams itself (rather than _run_remote_import) so
+    it can hand ``seed`` the db_path before the measured run."""
+    from import_job import ImportParams, run_import_job
+
+    card = _make_card(root, specs)
+    ra = _remote_archive_for(root)
+    calls = _remote_calls(ra)
+    _install_fake_remote_rsync(monkeypatch, calls, verify=None)
+    db_path = str(root / "test.db")
+    db = Database(db_path)
+    if seed is not None:
+        seed(Path(ra["mount_base"]), db_path)
+    runner = runner or FakeRunner()
+    result = run_import_job(
+        _make_job(), runner, db_path, db._active_workspace_id,
+        ImportParams(
+            sources=[str(card)], destination=ra["mount_base"],
+            remote_target=ra, verify_by_hash=verify_by_hash,
+            **(params_kwargs or {}),
+        ),
+    )
+    return _behavior_observables(result, runner, db, ra["mount_base"])
+
+
 def _run_local_selection_case(root, monkeypatch, specs, selection):
     """Run one selection scenario through the LOCAL copy path.
 
@@ -8563,6 +8659,20 @@ _PARITY_CARD = [
     ("DSC_0002.jpg", datetime(2026, 7, 3, 11, 0, 0), "green"),
     ("DSC_0003.jpg", datetime(2026, 7, 3, 12, 0, 0), "blue"),
 ]
+
+
+def test_local_and_remote_agree_on_plain_import(tmp_path, monkeypatch):
+    """Behavioral-parity baseline: a plain three-file import (no seeding,
+    no selection, no failures) must produce identical behavior observables
+    — result counters, safety verdicts, summaries, and DB-level facts
+    (photo rows and workspace-linked folders, dest-relative) — through the
+    local and remote copy paths. Every seeded parity scenario builds on
+    this; if the baseline diverges, nothing built on it is trustworthy."""
+    lroot = tmp_path / "l"; lroot.mkdir()
+    rroot = tmp_path / "r"; rroot.mkdir()
+    local = _run_local_behavior_case(lroot, monkeypatch, _PARITY_CARD)
+    remote = _run_remote_behavior_case(rroot, monkeypatch, _PARITY_CARD)
+    assert local == remote
 
 
 def _sel(names, previewed, checked, extra=()):

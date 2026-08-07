@@ -1370,6 +1370,101 @@ def test_removing_last_source_aborts_in_flight_duplicate_stream(
     page.wait_for_function("window.__duplicateAborted === true")
 
 
+def test_re_adding_the_last_source_after_abort_does_not_reuse_stale_paths(
+    live_server, page
+):
+    """Empty-source abort must retire the captured preview too, not just
+    the flight flags.
+
+    Removing the last source mid-stream aborts the in-flight request and
+    clears importPreviewInFlight / importDupStreamPending / importPreviewSeq.
+    Without this fix it left importPreviewCapturedSignature and
+    importPreviewedPaths behind: re-adding the same source inside the 350ms
+    debounce restored a matching signature over an empty grid, so
+    updateStartGate() found no reason to hold Start and lit it up as
+    "Start import (0 files)". Clicking that button then posted the
+    previously discovered paths as include_paths, silently importing every
+    file behind an empty screen.
+    """
+    page.goto(f"{live_server['url']}/import")
+    page.locator("#modeCopy").check()
+    page.locator("#destInput").fill("/archive")
+    page.evaluate(
+        """
+        () => {
+          clearScheduledImportPreview();
+          const originalFetch = window.fetch.bind(window);
+          window.__duplicateStarted = false;
+          window.fetch = (input, init = {}) => {
+            const target = typeof input === 'string' ? input : input.url;
+            if (target && target.indexOf('/api/import/folder-preview') === 0) {
+              return Promise.resolve(new Response(JSON.stringify({
+                files: [{path: '/tmp/card-a/IMG_0001.jpg'},
+                        {path: '/tmp/card-a/IMG_0002.jpg'}],
+              }), {status: 200, headers: {'Content-Type': 'application/json'}}));
+            }
+            if (target && target.indexOf('/api/import/check-duplicates') === 0) {
+              window.__duplicateStarted = true;
+              return new Promise((_resolve, reject) => {
+                init.signal.addEventListener('abort', () => {
+                  reject(new DOMException('Aborted', 'AbortError'));
+                }, {once: true});
+              });
+            }
+            if (target && target.indexOf('/api/import/destination-preview') === 0) {
+              return Promise.resolve(new Response(JSON.stringify({folders: []}), {
+                status: 200,
+                headers: {'Content-Type': 'application/json'},
+              }));
+            }
+            return originalFetch(input, init);
+          };
+          addSourcePath('/tmp/card-a');
+          clearScheduledImportPreview();
+        }
+        """
+    )
+
+    page.locator("#btnPreview").click()
+    page.wait_for_function("window.__duplicateStarted === true")
+    # previewImport() captured the signature and previewed paths before
+    # the duplicate stream started. The bug hinges on those still being
+    # set at this point.
+    page.wait_for_function(
+        "() => importPreviewCapturedSignature !== null "
+        "&& importPreviewedPaths.length > 0"
+    )
+    # Remove the last source mid-stream. This is the empty-source abort
+    # branch inside scheduleImportPreview().
+    page.evaluate(
+        """
+        () => {
+          sources.splice(0, sources.length);
+          scheduleImportPreview();
+        }
+        """
+    )
+    # The fix retires the captured preview alongside the flight flags.
+    page.wait_for_function(
+        "() => importPreviewCapturedSignature === null "
+        "&& importPreviewedPaths.length === 0"
+    )
+    # Re-add the same source inside the 350ms debounce (no timer fired
+    # yet — clearScheduledImportPreview keeps it that way). Before the
+    # fix, updateStartGate() would light up Start with "0 files" here.
+    page.evaluate(
+        """
+        () => {
+          addSourcePath('/tmp/card-a');
+          clearScheduledImportPreview();
+        }
+        """
+    )
+    # Start must NOT read "Start import (0 files)" — the previously
+    # captured paths must not be resurrected against an empty grid.
+    expect(page.locator("#btnStart")).not_to_have_text("Start import (0 files)")
+
+
 def test_import_preview_older_response_does_not_clobber_newer_summary(
     live_server, page
 ):

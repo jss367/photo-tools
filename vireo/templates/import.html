@@ -2339,6 +2339,20 @@ function scheduleImportPreview() {
       importPreviewInFlight = false;
       importDupStreamPending = false;
       importPreviewFailed = false;
+      // Retire the captured preview along with the flight. When discovery
+      // had already populated importPreviewCapturedSignature and
+      // importPreviewedPaths before the removal, leaving them behind lets a
+      // re-add of the same source within the 350ms debounce restore a
+      // matching signature over an empty grid: updateStartGate() finds no
+      // reason to hold Start (sig is not stale, dup stream is not pending,
+      // eligible count is zero so the "0 selected" gate never fires),
+      // enables it as "Start import (0 files)", and startImport() posts the
+      // retained importPreviewedPaths as include_paths — importing every
+      // previously-discovered file behind an empty screen. Collapse the
+      // state back to "no preview run" so the next preview owns the truth.
+      importPreviewCapturedSignature = null;
+      importPreviewedPaths = [];
+      updateImportSelectionUI();
       updateStartGate();
     }
     return;

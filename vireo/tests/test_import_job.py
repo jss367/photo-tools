@@ -6861,6 +6861,80 @@ def test_remote_import_stop_kills_in_flight_rsync_batch(
     assert result["safe_to_format"] is False, result
 
 
+def test_remote_import_stop_between_renamed_transfers_keeps_completed_files(
+        tmp_path, monkeypatch):
+    """CHARACTERIZATION (spec: outcome-completeness invariant). Renamed
+    files transfer one rsync each. A Stop after the first file's rsync
+    returned success must keep that file's outcome (verified + cataloged)
+    while the not-yet-transferred file produces neither a failure nor a
+    landing — it stays on the card for the next run."""
+    import move as _move
+    from import_job import ImportParams, run_import_job
+
+    ra = _remote_archive_for(tmp_path)
+    calls = _remote_calls(ra)
+    _install_fake_remote_rsync(monkeypatch, calls, verify=None)
+
+    # Same capture date -> same batch; distinct colors -> distinct bytes.
+    card = _make_card(tmp_path, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+        ("DSC_0002.jpg", datetime(2026, 7, 3, 10, 5, 0), "green"),
+    ])
+    # Force collisions: different-byte files already at the template path.
+    mount_day = Path(ra["mount_base"]) / "2026" / "2026-07-03"
+    mount_day.mkdir(parents=True)
+    for name in ("DSC_0001.jpg", "DSC_0002.jpg"):
+        Image.new("RGB", (16, 16), "blue").save(str(mount_day / name))
+
+    runner = FakeRunner()
+    job = _make_job()
+    base_fake = _move._run_rsync_streamed  # the harness fake installed above
+
+    state = {"renamed_calls": 0}
+
+    def stop_after_first_renamed(src_path, dest_spec, rsync_flags,
+                                 total_files, progress_cb,
+                                 rsync_bin="rsync", extra_args=None,
+                                 src_specs=None,
+                                 src_specs_dest_is_dir=True, **kw):
+        assert not src_specs_dest_is_dir, (
+            "expected only renamed (file-dest) transfers in this geometry")
+        state["renamed_calls"] += 1
+        rc = base_fake(src_path, dest_spec, rsync_flags, total_files,
+                       progress_cb, rsync_bin=rsync_bin,
+                       extra_args=extra_args, src_specs=src_specs,
+                       src_specs_dest_is_dir=src_specs_dest_is_dir, **kw)
+        # Stop arrives after this file completed.
+        runner.cancelled_ids.add(job["id"])
+        return rc
+
+    monkeypatch.setattr(_move, "_run_rsync_streamed",
+                        stop_after_first_renamed)
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    result = run_import_job(
+        job, runner, db_path, db._active_workspace_id,
+        ImportParams(sources=[str(card)], destination=ra["mount_base"],
+                     remote_target=ra, verify_by_hash=True))
+
+    # Only the first renamed rsync ran; the loop observed Stop before the
+    # second (import_job.py:2361-2364).
+    assert state["renamed_calls"] == 1
+    assert result["cancelled"] is True
+    # The completed file keeps its outcome...
+    assert result["copied"] == 1, result
+    suffixed = [(fn, hs) for _rel, fn, hs in
+                _dest_photo_facts(db, ra["mount_base"])
+                if fn.startswith("DSC_0001")]
+    assert any(fn == "DSC_0001_1.jpg" for fn, _hs in suffixed), suffixed
+    # ...and the un-transferred file is neither failed nor landed.
+    assert result["failed"] == 0, result
+    assert not any(fn.startswith("DSC_0002_") for _rel, fn, _hs in
+                   _dest_photo_facts(db, ra["mount_base"]))
+    assert result["safe_to_format"] is False
+
+
 def test_remote_import_rsync_watchdog_does_not_block_on_pause(
         tmp_path, monkeypatch):
     """The rsync watchdog thread's cancel_check must be a non-blocking

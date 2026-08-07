@@ -11711,12 +11711,11 @@ def test_local_import_dest_read_cancel_skips_catalog_scan_adoption_path(
 )
 def test_remote_import_dest_read_cancel_skips_catalog_scan_fresh_transfer(
         tmp_path, monkeypatch):
-    """Remote path, FRESH-TRANSFER geometry — mirror of
+    """Remote path, FRESH-TRANSFER geometry — the asymmetric corner of
+    the 2x2 dest-read-cancel matrix. Mirror of
     ``test_local_import_dest_read_cancel_skips_catalog_scan`` (which
     gates the local guard's ``landed`` term via a fresh copy). No file
-    is pre-written on the mount, so nothing can be adopted: this
-    geometry targets the ``landed`` term of the remote guard ``if
-    (landed or adopted_paths) and not dest_read_cancelled:``.
+    is pre-written on the mount, so nothing can be adopted.
 
     Characterization surprise (verified against import_job.py): on the
     remote path ``landed`` can never actually be non-empty alongside
@@ -11724,12 +11723,21 @@ def test_remote_import_dest_read_cancel_skips_catalog_scan_fresh_transfer(
     flushed after the per-file loop, behind ``if to_transfer and not
     cancelled:``, and every ``dest_read_cancelled = True`` site also
     sets ``cancelled = True`` and breaks. So here A is queued but never
-    rsync'd (it stays on the card for the next run), ``landed`` stays
-    empty, and the scan skip is doubly protected: by the empty guard
-    subject AND by the ``dest_read_cancelled`` gate. The local mirror
-    genuinely lands A's bytes before the cancel; the remote fresh path
-    structurally cannot — that asymmetry is exactly what this pin
-    records for the unification work."""
+    rsync'd (it stays on the card for the next run), and BOTH ``landed``
+    and ``adopted_paths`` stay empty.
+
+    IMPORTANT: this test does NOT independently exercise the
+    ``not dest_read_cancelled`` term of the guard ``if (landed or
+    adopted_paths) and not dest_read_cancelled:``. Because the guard's
+    subject ``(landed or adopted_paths)`` is structurally empty in this
+    geometry, ``scan()`` is doubly protected — removing the
+    ``dest_read_cancelled`` gate would still leave the empty subject
+    suppressing ``scan()``. The three sibling tests in the matrix
+    (local fresh, local adoption, remote adoption) DO exercise the gate
+    with a nonempty subject; this test's role in the matrix is to pin
+    the asymmetric fourth corner — that on remote+fresh cancellation,
+    nothing ever crosses the network and the catalog block is
+    unreachable via its subject rather than via the gate."""
     import threading
 
     import import_job as _ij
@@ -11806,13 +11814,25 @@ def test_remote_import_dest_read_cancel_skips_catalog_scan_fresh_transfer(
     result = result_box["result"]
     assert result["cancelled"] is True
     assert result["failed"] == 0, result
-    assert scan_calls == [], (
-        f"catalog scan() fired on a cancelled remote batch after "
-        f"DestReadCancelled — would hang on the wedged mount: "
-        f"{len(scan_calls)} calls"
-    )
-    # Characterization: the cancel reached the transfer gate first, so
-    # A never crossed the network — nothing copied, nothing rsync'd.
-    # A stays on the card for the next run.
+    # Pin the doubled-protection observables FIRST — this is what makes
+    # this matrix corner asymmetric: on remote+fresh geometry the cancel
+    # reaches the transfer gate before flush, so both ``landed`` and
+    # ``adopted_paths`` are structurally empty at the catalog block.
+    # Nothing rsync'd (proxy for ``landed == []``); nothing adopted
+    # (no pre-written mount copy → ``adopted_paths == []``).
     assert calls["rsync"] == [], calls["rsync"]
     assert result["copied"] == 0, result
+    # ``scan_calls == []`` here is doubly protected — by the empty guard
+    # subject AND by the ``dest_read_cancelled`` gate. This test does NOT
+    # discriminate the ``not dest_read_cancelled`` term on its own; that
+    # term is exercised by the three sibling tests in the 2x2 matrix
+    # (local fresh, local adoption, remote adoption), each of which has
+    # a nonempty ``landed``/``adopted_paths`` at the cancel point. The
+    # role of this test in the matrix is to pin the fourth (asymmetric)
+    # corner: scan is skipped on remote+fresh cancellation because
+    # nothing ever reached the guard's subject to begin with.
+    assert scan_calls == [], (
+        f"catalog scan() fired on the remote fresh-transfer cancel "
+        f"corner — nothing was landed or adopted, so scan() must not "
+        f"run: {len(scan_calls)} calls"
+    )

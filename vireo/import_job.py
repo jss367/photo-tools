@@ -2357,7 +2357,7 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
                         f"archive mount root {mount_lost} detached "
                         "mid-batch; this file landed in a local shadow "
                         "of the archive, not on the share",
-                                            verified_counted_for_copies,
+                        verified_counted_for_copies,
                     )
                 landed = []
             # Trip the run-wide sticky flag so every remaining batch is
@@ -2651,7 +2651,7 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
                 for entry in landed:
                     _reclassify_landed_failed(
                         state, rel, entry, f"catalog scan failed: {e}",
-                                            verified_counted_for_copies,
+                        verified_counted_for_copies,
                     )
                 landed = []
             else:
@@ -2786,7 +2786,7 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
                                    "on the NAS")
                                 + " (mount base is likely stale, "
                                 "unreadable, or misconfigured)",
-                                                            verified_counted_for_copies,
+                                verified_counted_for_copies,
                             )
                             reclassified_landed_paths.add(entry.dest_path)
                             continue
@@ -2800,7 +2800,7 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
                             "scanned mount row hash does not match "
                             "the hash verified on the NAS (mount "
                             "base is likely stale or misconfigured)",
-                                                    verified_counted_for_copies,
+                            verified_counted_for_copies,
                         )
                         reclassified_landed_paths.add(entry.dest_path)
                         continue
@@ -2897,7 +2897,7 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
                                 "not match the hash verified on "
                                 "the NAS (mount base is likely "
                                 "stale or misconfigured)",
-                                                            verified_counted_for_copies,
+                                verified_counted_for_copies,
                             )
                             reclassified_landed_paths.add(entry.dest_path)
                             continue
@@ -2915,7 +2915,7 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
                     _reclassify_landed_failed(
                         state, rel, entry,
                         "not cataloged after scan (no photo row)",
-                                            verified_counted_for_copies,
+                        verified_counted_for_copies,
                     )
                     reclassified_landed_paths.add(entry.dest_path)
             # Invalidate derived caches for any landed/adopted row whose
@@ -4234,7 +4234,7 @@ def run_import_job(job, runner, db_path, workspace_id, params):
                     f"archive mount root {mount_lost} detached mid-batch; "
                     "this file landed in a local shadow of the archive, "
                     "not on the share",
-                                    verified_counted_for_copies,
+                    verified_counted_for_copies,
                 )
             landed = []
 
@@ -4318,7 +4318,7 @@ def run_import_job(job, runner, db_path, workspace_id, params):
                 for entry in landed:
                     _reclassify_landed_failed(
                         state, rel, entry, f"catalog scan failed: {e}",
-                                            verified_counted_for_copies,
+                        verified_counted_for_copies,
                     )
                 landed = []
             else:
@@ -4442,13 +4442,13 @@ def run_import_job(job, runner, db_path, workspace_id, params):
                             state, rel, entry,
                             "paired companion archive bytes no longer "
                             "match the copy-time hash",
-                                                    verified_counted_for_copies,
+                            verified_counted_for_copies,
                         )
                         reclassified_landed_paths.add(dest_path)
                         continue
                     _reclassify_landed_failed(
                         state, rel, entry, "not cataloged after scan",
-                                            verified_counted_for_copies,
+                        verified_counted_for_copies,
                     )
                     reclassified_landed_paths.add(dest_path)
                     continue
@@ -4488,7 +4488,7 @@ def run_import_job(job, runner, db_path, workspace_id, params):
                                 "re-read of the archive file disagrees "
                                 "with the copy-time hash (archive file "
                                 "vanished, changed, or is unreadable)",
-                                                            verified_counted_for_copies,
+                                verified_counted_for_copies,
                             )
                             reclassified_landed_paths.add(dest_path)
                     else:
@@ -4519,7 +4519,7 @@ def run_import_job(job, runner, db_path, workspace_id, params):
                                 "archive file unhashable after copy "
                                 "verification (scan wrote no hash and "
                                 "re-hash disagrees)",
-                                                            verified_counted_for_copies,
+                                verified_counted_for_copies,
                             )
                             reclassified_landed_paths.add(dest_path)
                 else:
@@ -4527,7 +4527,7 @@ def run_import_job(job, runner, db_path, workspace_id, params):
                         state, rel, entry,
                         "destination changed between copy verification and "
                         "catalog scan (hash mismatch)",
-                                            verified_counted_for_copies,
+                        verified_counted_for_copies,
                     )
                     reclassified_landed_paths.add(dest_path)
 

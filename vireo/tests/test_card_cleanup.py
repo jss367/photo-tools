@@ -712,9 +712,16 @@ def test_delete_skips_file_replaced_during_archive_gate(db, tmp_path):
 
     def fetch_then_replace(db_arg, file_hash):
         rows = real_fetch(db_arg, file_hash)
-        os.unlink(card)                      # new inode on rewrite
-        card.write_bytes(b"NEW-ONE")         # same 7-byte size
-        os.utime(card, ns=(entry["mtime_ns"], entry["mtime_ns"]))
+        # Swap via a coexisting temp file + os.replace: unlink-then-
+        # recreate would let ext4 hand the replacement the freed inode
+        # number, silently defeating the inode gate this test pins.
+        # With both files alive before the swap, the inodes are distinct
+        # on every POSIX filesystem — and rename is the realistic
+        # replacement primitive anyway.
+        tmp = card.parent / "replacement.tmp"
+        tmp.write_bytes(b"NEW-ONE")          # same 7-byte size
+        os.utime(tmp, ns=(entry["mtime_ns"], entry["mtime_ns"]))
+        os.replace(tmp, card)
         return rows
 
     with unittest.mock.patch.object(

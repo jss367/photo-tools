@@ -136,6 +136,34 @@ def test_scan_then_manifest_then_delete_end_to_end(app_and_db, tmp_path):
     assert archive_file.exists()
 
 
+def test_scan_job_result_carries_totals_not_entries(app_and_db, tmp_path):
+    """Spec: the scan job's RESULT carries only bucket totals, resolved
+    source root, and the manifest path — never the (potentially
+    multi-MB) per-file entries list. The UI fetches entries from the
+    manifest endpoint instead."""
+    app, db = app_and_db
+    client = app.test_client()
+    _make_verified_pair(db, tmp_path)
+
+    resp = client.post(
+        "/api/card-cleanup/scan",
+        json={"source": str(tmp_path / "card")})
+    scan_job_id = resp.get_json()["job_id"]
+    _wait_for_job(client, scan_job_id)
+
+    job_resp = client.get(f"/api/jobs/{scan_job_id}")
+    assert job_resp.status_code == 200
+    job = job_resp.get_json()
+    result = job["result"]
+    assert "entries" not in result
+    assert result["cancelled"] is False
+    assert result["totals"]["deletable"]["count"] == 1
+    assert result["source_root"] == os.path.realpath(str(tmp_path / "card"))
+    assert result["manifest_path"] == card_cleanup.manifest_path(
+        app.config["CARD_CLEANUP_DIR"], scan_job_id)
+    assert isinstance(result["walk_errors"], int)
+
+
 def test_delete_unknown_scan_job_404(app_and_db):
     app, db = app_and_db
     client = app.test_client()

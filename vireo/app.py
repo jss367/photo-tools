@@ -19106,12 +19106,28 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                         "phase": "Verifying card files against the archive",
                     })
 
-                return card_cleanup.scan_card(
+                manifest = card_cleanup.scan_card(
                     thread_db, source, recursive, card_cleanup_dir,
                     job["id"],
                     progress_cb=progress_cb,
                     should_cancel=lambda: runner.is_cancelled(job["id"]),
                 )
+                if manifest.get("cancelled"):
+                    return {"cancelled": True}
+                # Trimmed on purpose: entries can be a multi-MB blob (one
+                # per card file) and nothing consumes the job result for
+                # them — the UI fetches the manifest endpoint instead.
+                # json-dumping the full manifest into job_history.result,
+                # the SSE complete event, and every /api/jobs/<id> poll
+                # would ship that blob for no reader.
+                return {
+                    "cancelled": False,
+                    "totals": manifest["totals"],
+                    "source_root": manifest["source_root"],
+                    "manifest_path": card_cleanup.manifest_path(
+                        card_cleanup_dir, job["id"]),
+                    "walk_errors": len(manifest["walk_errors"]),
+                }
             finally:
                 thread_db.close()
 
@@ -19123,8 +19139,8 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
 
     @app.route("/api/card-cleanup/<scan_job_id>/manifest")
     def api_card_cleanup_manifest(scan_job_id):
-        """Read back the manifest a completed (or still-running) scan
-        job wrote, so the UI can preview what a delete would remove."""
+        """Read back the manifest a completed scan job wrote, so the UI
+        can preview what a delete would remove."""
         card_cleanup_dir = app.config["CARD_CLEANUP_DIR"]
         try:
             manifest = card_cleanup.load_manifest(

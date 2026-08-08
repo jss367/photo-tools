@@ -3,6 +3,7 @@ scan/delete safety gates. Spec:
 docs/superpowers/specs/2026-08-07-card-cleanup-design.md
 """
 import os
+import shutil
 import unittest.mock
 from datetime import UTC, datetime, timedelta
 
@@ -330,6 +331,18 @@ def test_scan_null_hash_status_kept_with_audit_remedy(db, tmp_path):
     assert "integrity audit" in kept[0]["reason"]
 
 
+def test_scan_failed_hash_status_kept_with_audit_remedy(db, tmp_path):
+    # hash_status is a non-ok STRING (a prior verify run flagged the file),
+    # not NULL — must be kept exactly like the null/unverified case, not
+    # mistaken for "ok" by a truthy/None-only check.
+    _archive_photo(db, tmp_path, hash_status="failed")
+    _card_file(tmp_path)
+    result = _scan(db, tmp_path)
+    kept = _entries(result, "kept")
+    assert len(kept) == 1
+    assert "integrity audit" in kept[0]["reason"]
+
+
 def test_scan_archive_file_missing_kept(db, tmp_path):
     archive_file, _ = _archive_photo(db, tmp_path)
     _card_file(tmp_path)
@@ -530,6 +543,71 @@ def test_delete_archive_removed_after_scan_skips(db, tmp_path):
     assert summary["deleted"] == 0
     assert card.exists()
     assert "archive" in summary["skipped"][0]["reason"]
+
+
+def test_delete_archive_mutated_after_scan_skips(db, tmp_path):
+    # The archive file survives (unlike the removed case above) but its
+    # bytes change between scan and delete — the delete-time re-stat's
+    # size/mtime mismatch must still catch it and keep the card file.
+    archive_file, _ = _archive_photo(db, tmp_path)
+    card = _card_file(tmp_path)
+
+    def mutate_archive():
+        archive_file.write_bytes(b"mutated!")
+
+    summary = _scan_then_delete(db, tmp_path, mutate=mutate_archive)
+    assert summary["deleted"] == 0
+    assert card.exists()
+    assert len(summary["skipped"]) == 1
+    assert "archive" in summary["skipped"][0]["reason"]
+
+
+def test_delete_archive_mount_unreachable_skips_all(db, tmp_path):
+    # Whole archive tree gone (e.g. an unmounted network volume), not
+    # just one file — every deletable card file must be skipped, none
+    # deleted, and each reason must mention the archive.
+    _archive_photo(db, tmp_path)
+    card_a = _card_file(tmp_path, name="IMG_0001.NEF")
+    card_b = _card_file(tmp_path, name="IMG_0002.NEF")
+    archive_root = tmp_path / "archive"
+
+    def remove_archive_tree():
+        shutil.rmtree(archive_root)
+
+    summary = _scan_then_delete(db, tmp_path, mutate=remove_archive_tree)
+    assert summary["deleted"] == 0
+    assert card_a.exists() and card_b.exists()
+    assert len(summary["skipped"]) == 2
+    assert all("archive" in s["reason"] for s in summary["skipped"])
+
+
+def test_delete_time_inside_source_uses_manifest_source_root(db, tmp_path):
+    # The catalog row qualifies at scan time (archive copy is outside the
+    # source), but before delete runs the archive folder is repointed
+    # (via SQL, as if re-cataloged) to a path inside the selected source
+    # tree. delete_verified must re-derive source_root from the manifest
+    # it was handed and re-run the inside-source check itself — this pins
+    # that wiring, not just qualify_rows' logic (already covered at scan
+    # time by test_scan_self_match_inside_source_never_qualifies).
+    archive_file, pid = _archive_photo(db, tmp_path)
+    card = _card_file(tmp_path)
+    row = db.conn.execute(
+        "SELECT folder_id FROM photos WHERE id = ?", (pid,)).fetchone()
+    folder_id = row["folder_id"]
+    card_dir = str(tmp_path / "card" / "DCIM")
+
+    def repoint_inside_source():
+        db.conn.execute(
+            "UPDATE folders SET path = ? WHERE id = ?",
+            (card_dir, folder_id))
+        db.conn.commit()
+
+    summary = _scan_then_delete(db, tmp_path, mutate=repoint_inside_source)
+    assert summary["deleted"] == 0
+    assert card.exists()
+    assert archive_file.exists()  # untouched — never re-read by delete
+    assert len(summary["skipped"]) == 1
+    assert "inside the selected source" in summary["skipped"][0]["reason"]
 
 
 def test_delete_no_stat_reuse_across_duplicates(db, tmp_path):

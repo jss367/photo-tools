@@ -72,10 +72,19 @@ def fs_is_case_insensitive(path):
                     continue
                 original_full = os.path.join(path, name)
                 probe_full = os.path.join(path, swapped)
-                if not os.path.exists(probe_full):
+                # os.stat, not os.path.exists: exists() collapses
+                # permission errors into False, which would classify an
+                # unreadable probe as case-SENSITIVE — the non-strict
+                # direction, contradicting the fallback rule above.
+                # Only a definitive ENOENT proves case sensitivity.
+                try:
+                    os.stat(probe_full)
+                except FileNotFoundError:
                     # Definitive: case-swap resolves to nothing,
                     # so the filesystem distinguishes case.
                     return False
+                except OSError:
+                    return True
                 try:
                     return os.path.samefile(original_full, probe_full)
                 except OSError:
@@ -108,6 +117,8 @@ def path_contains(root, child):
     try:
         root_real = os.path.realpath(root)
         child_real = os.path.realpath(child)
-    except OSError:
+    except (OSError, ValueError):
+        # ValueError: e.g. an embedded null byte — as unresolvable as
+        # any OSError, and the same strict fallback applies.
         return True
     return contains_resolved(root_real, child_real)

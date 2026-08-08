@@ -19051,7 +19051,11 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         """
         body = request.get_json(silent=True) or {}
         source = body.get("source")
-        recursive = bool(body.get("recursive", True))
+        recursive = body.get("recursive", True)
+        if not isinstance(recursive, bool):
+            # bool("false") is True — a stringly-typed client would get
+            # the opposite of what it asked for. JSON booleans only.
+            return json_error("recursive must be a boolean")
         if not source or not isinstance(source, str):
             return json_error("source required")
         if not os.path.isabs(source):
@@ -19183,9 +19187,12 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             return json_error("scan still running — wait for it to finish")
         if scan_job.get("status") != "completed":
             return json_error("scan did not complete — re-scan the card")
-        # One delete per manifest. (A TOCTOU race between two simultaneous
-        # POSTs is acceptable: the per-file gates make a double-delete
-        # skip, not double-fire.)
+        # One delete AT A TIME per manifest — this guards concurrency,
+        # not repetition: after a delete finishes, the manifest still
+        # loads and a second delete may start (its per-file gates skip
+        # everything already gone). (A TOCTOU race between two
+        # simultaneous POSTs is likewise acceptable: the gates make a
+        # double-delete skip, not double-fire.)
         for j in runner.list_jobs():
             if (j.get("type") == "card-cleanup-delete"
                     and j.get("status") in ("queued", "running")
@@ -19218,11 +19225,21 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                         "phase": "Deleting verified files from the card",
                     })
 
-                return card_cleanup.delete_verified(
+                summary = card_cleanup.delete_verified(
                     thread_db, manifest,
                     progress_cb=progress_cb,
                     should_cancel=lambda: runner.is_cancelled(job["id"]),
                 )
+                # Bound the persisted result: skipped/failed can run to
+                # thousands of per-file entries on a wholesale-drifted
+                # card, and this dict lands in job_history.result and
+                # every /api/jobs/<id> poll. Totals stay exact; the
+                # lists carry a generous sample and the UI says when it
+                # is showing a sample.
+                for key in ("skipped", "failed"):
+                    summary[f"{key}_total"] = len(summary[key])
+                    summary[key] = summary[key][:500]
+                return summary
             finally:
                 thread_db.close()
 

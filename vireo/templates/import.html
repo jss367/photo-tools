@@ -5052,13 +5052,19 @@ function cardCleanupRenderDeleteResult(result) {
   const res = result || {};
   const skipped = res.skipped || [];
   const failed = res.failed || [];
+  // The job result bounds these lists to a sample; *_total carries the
+  // exact count (falls back to list length for pre-trim results).
+  const skippedTotal = (typeof res.skipped_total === 'number')
+    ? res.skipped_total : skipped.length;
+  const failedTotal = (typeof res.failed_total === 'number')
+    ? res.failed_total : failed.length;
   const parts = ['Deleted ' + cardCleanupFileCount(res.deleted) +
     ' (' + formatBytes(res.deleted_bytes) + ')'];
-  if (skipped.length) {
-    parts.push(skipped.length.toLocaleString() + ' skipped');
+  if (skippedTotal) {
+    parts.push(skippedTotal.toLocaleString() + ' skipped');
   }
-  if (failed.length) {
-    parts.push(failed.length.toLocaleString() + ' failed');
+  if (failedTotal) {
+    parts.push(failedTotal.toLocaleString() + ' failed');
   }
   if (res.cancelled) {
     parts.push('Cancelled — ' + Number(res.remaining || 0).toLocaleString() +
@@ -5071,9 +5077,17 @@ function cardCleanupRenderDeleteResult(result) {
   skipped.forEach((s) => {
     lines.push('Skipped: ' + s.path + ' — ' + (s.reason || 'no reason given'));
   });
+  if (skippedTotal > skipped.length) {
+    lines.push('…and ' + (skippedTotal - skipped.length).toLocaleString() +
+      ' more skipped files not listed here (the counts above are exact).');
+  }
   failed.forEach((f) => {
     lines.push('Failed: ' + f.path + ' — ' + (f.error || 'no error given'));
   });
+  if (failedTotal > failed.length) {
+    lines.push('…and ' + (failedTotal - failed.length).toLocaleString() +
+      ' more failed files not listed here (the counts above are exact).');
+  }
   const list = document.getElementById('card-cleanup-result-list');
   if (lines.length) {
     list.style.display = '';

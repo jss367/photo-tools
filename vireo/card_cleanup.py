@@ -94,10 +94,14 @@ def prune_manifests(manifest_dir, max_age_days=MANIFEST_MAX_AGE_DAYS):
 def classify_source_files(source, recursive=True, onerror=None):
     """One walk over the card; returns (candidates, ignored), both sorted.
 
-    Mirrors discover_source_files' file_types="both" filter exactly —
-    parity is pinned by a test — but also returns the non-photo files so
-    the preview can show an "ignored, never touched" bucket without a
-    second walk (discover_source_files drops them).
+    Mirrors discover_source_files' file_types="both" filter — parity is
+    pinned by a test — with one deliberate divergence: symlinks are
+    rejected here even though discovery follows them (see the loop
+    comment). The candidate set is therefore a subset of discovery's,
+    which is the direction the spec requires ("the deletable set can
+    never exceed what import considers a photo"). Also returns the
+    non-photo files so the preview can show an "ignored, never touched"
+    bucket without a second walk (discover_source_files drops them).
     """
     source_path = Path(source)
     if is_excluded_scan_path(source_path):

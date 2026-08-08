@@ -344,3 +344,36 @@ def test_scan_rejects_relative_or_nondir_source(app_and_db, tmp_path):
 
     resp3 = client.post("/api/card-cleanup/scan", json={})
     assert resp3.status_code == 400
+
+
+def test_scan_rejects_non_boolean_recursive(app_and_db, tmp_path):
+    # bool("false") is True — stringly-typed clients must get a 400, not
+    # the opposite of what they asked for.
+    app, _ = app_and_db
+    card = tmp_path / "card"
+    card.mkdir()
+    resp = app.test_client().post(
+        "/api/card-cleanup/scan",
+        json={"source": str(card), "recursive": "false"})
+    assert resp.status_code == 400
+    assert "boolean" in resp.get_json()["error"]
+
+
+def test_delete_result_carries_exact_totals(app_and_db, tmp_path):
+    # The job result bounds skipped/failed to a sample; *_total fields
+    # carry the exact counts the UI renders.
+    app, db = app_and_db
+    client = app.test_client()
+    _make_verified_pair(db, tmp_path)
+    resp = client.post("/api/card-cleanup/scan",
+                       json={"source": str(tmp_path / "card")})
+    scan_job_id = resp.get_json()["job_id"]
+    _wait_for_job(client, scan_job_id)
+    resp = client.post("/api/card-cleanup/delete",
+                       json={"scan_job_id": scan_job_id})
+    job_id = resp.get_json()["job_id"]
+    _wait_for_job(client, job_id)
+    result = client.get(f"/api/jobs/{job_id}").get_json()["result"]
+    assert result["skipped_total"] == len(result["skipped"]) == 0
+    assert result["failed_total"] == len(result["failed"]) == 0
+    assert result["deleted"] == 1

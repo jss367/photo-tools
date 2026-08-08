@@ -72,3 +72,28 @@ def test_darwin_always_casefolds(tmp_path):
     root.mkdir()
     swapped = str(tmp_path / "card" / "IMG.NEF")
     assert contains_resolved(str(root), swapped)
+
+
+def test_path_contains_null_byte_is_strict(tmp_path):
+    root = str(tmp_path / "card")
+    os.makedirs(root)
+    assert path_contains(root, root + "/x\x00y") is True
+
+
+def test_probe_permission_error_is_inconclusive(tmp_path, monkeypatch):
+    # exists() would collapse EACCES into "case-sensitive" (the
+    # non-strict direction); the probe must treat an unreadable
+    # case-swapped name as inconclusive → case-insensitive.
+    root = tmp_path / "CardABC"
+    root.mkdir()
+    (root / "alpha.txt").write_text("x")
+    import path_guard as pg
+    real_stat = os.stat
+
+    def denying_stat(p, *a, **kw):
+        if str(p).endswith("Alpha.txt"):
+            raise PermissionError(13, "denied", str(p))
+        return real_stat(p, *a, **kw)
+
+    monkeypatch.setattr(pg.os, "stat", denying_stat)
+    assert pg.fs_is_case_insensitive(str(root)) is True

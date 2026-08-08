@@ -724,3 +724,38 @@ def test_delete_skips_file_replaced_during_archive_gate(db, tmp_path):
     assert len(summary["skipped"]) == 1
     assert card.exists()
     assert card.read_bytes() == b"NEW-ONE"
+
+
+def test_delete_skips_path_redirected_outside_source(db, tmp_path):
+    # Second Codex P1: after the manifest is loaded, the card's DCIM
+    # directory is replaced with a symlink to an external directory
+    # holding a byte-identical file with the manifest's size and mtime.
+    # Every content gate passes (the bytes really are verified-archived);
+    # only the deletion-time containment re-check can refuse to unlink a
+    # path that no longer resolves inside the scanned source.
+    _archive_photo(db, tmp_path)
+    _card_file(tmp_path)
+    scan = _scan(db, tmp_path)
+    assert scan["totals"]["deletable"]["count"] == 1
+    manifest = load_manifest(str(tmp_path / "manifests"), "scan-1")
+    entry = next(e for e in manifest["entries"] if e["bucket"] == "deletable")
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    decoy = outside / "IMG_0001.NEF"
+    decoy.write_bytes(b"raw-one")
+    os.utime(decoy, ns=(entry["mtime_ns"], entry["mtime_ns"]))
+
+    dcim = tmp_path / "card" / "DCIM"
+    import shutil
+    shutil.rmtree(dcim)
+    try:
+        os.symlink(str(outside), str(dcim))
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks unsupported on this filesystem")
+
+    summary = card_cleanup.delete_verified(db, manifest)
+    assert summary["deleted"] == 0
+    assert len(summary["skipped"]) == 1
+    assert "no longer resolves inside" in summary["skipped"][0]["reason"]
+    assert decoy.exists() and decoy.read_bytes() == b"raw-one"

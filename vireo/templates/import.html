@@ -4925,11 +4925,23 @@ function cardCleanupBindBucket(bucket, detailsId, listId) {
     if (!details.open || cardCleanupState.listsRendered[bucket]) return;
     if (!cardCleanupState.manifest) return;
     cardCleanupState.listsRendered[bucket] = true;
+    // Spec ("UX flow"): verified rows show path, size, and the matched
+    // archive copy that justifies the deletion; kept rows show size and
+    // the per-file reason. All fields come straight from the manifest.
     const lines = (cardCleanupState.manifest.entries || [])
       .filter(entry => entry.bucket === bucket)
-      .map(entry => (bucket === 'kept'
-        ? entry.path + ' — ' + (entry.reason || 'not verified')
-        : entry.path));
+      .map(entry => {
+        const size = (typeof entry.size === 'number')
+          ? ' (' + formatBytes(entry.size) + ')' : '';
+        if (bucket === 'kept') {
+          return entry.path + size + ' — ' + (entry.reason || 'not verified');
+        }
+        if (bucket === 'deletable') {
+          return entry.path + size
+            + ' → verified copy: ' + (entry.archive_path || 'unknown');
+        }
+        return entry.path;
+      });
     cardCleanupFillList(listId, lines);
   };
 }

@@ -221,6 +221,7 @@ KEEP_UNREADABLE = "could not read card file"
 SKIP_ALREADY_GONE = "already gone from the card"
 SKIP_CHANGED = "changed on the card since the scan"
 SKIP_CONTENT_CHANGED = "content changed on the card since the scan"
+SKIP_OUTSIDE_SOURCE = "path no longer resolves inside the scanned source"
 
 
 def qualify_rows(rows, source_root_real, card_path):
@@ -438,6 +439,19 @@ def delete_verified(db, manifest, progress_cb=None, should_cancel=None):
         # AND the same manifest baseline immediately before the unlink —
         # shrinking the race window from network-seconds to the
         # stat-to-remove gap.
+        #
+        # Also (second Codex P1): a parent directory swapped for a
+        # symlink can redirect this pathname to a byte-identical file
+        # OUTSIDE the card, which passes every content gate above. The
+        # deletion must stay anchored beneath the scanned source root,
+        # re-proven at deletion time. Residual race (swap between these
+        # checks and the unlink) is microseconds; full immunity would
+        # need dir_fd/O_NOFOLLOW traversal, out of proportion here.
+        if not path_guard.contains_resolved(
+                source_root_real, os.path.realpath(path)):
+            summary["skipped"].append(
+                {"path": path, "reason": SKIP_OUTSIDE_SOURCE})
+            continue
         try:
             st2 = os.stat(path)
         except FileNotFoundError:

@@ -3021,6 +3021,10 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
                     invalidated_photo_ids.add(raw_id)
             db.conn.commit()
             if invalidated_photo_ids:
+                # Mirror scanner.scan()'s post-loop untracked-preview
+                # sweep: orphan preview files with no preview_cache row
+                # would be lazy-adopted on the next request and served as
+                # stale bytes for the just-replaced mount file.
                 from scanner import _sweep_untracked_previews_for_photos
                 _sweep_untracked_previews_for_photos(
                     db, params.vireo_dir, invalidated_photo_ids,

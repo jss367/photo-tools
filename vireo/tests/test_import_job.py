@@ -3705,6 +3705,16 @@ def test_import_invalidates_derived_caches_on_content_change(tmp_path):
     ).lastrowid
     db.conn.commit()
 
+    # Orphan preview file: previews/{pid}_{size}.jpg with NO
+    # preview_cache row (legacy code path / interrupted insert).
+    # Row-driven ``_invalidate_derived_caches`` can't see it — only the
+    # post-loop untracked-preview sweep removes it before it can be
+    # lazy-adopted and served as stale pre-change bytes.
+    previews_dir = vireo_dir / "previews"
+    previews_dir.mkdir()
+    orphan_preview = previews_dir / f"{photo_id}_512.jpg"
+    orphan_preview.write_bytes(b"stale-orphan-preview-bytes")
+
     # Overwrite the archive file with DIFFERENT bytes (simulates: the
     # archive file was deleted/replaced between the prior scan and this
     # import, and the import restores the same filename with new bytes).
@@ -3738,6 +3748,12 @@ def test_import_invalidates_derived_caches_on_content_change(tmp_path):
     # The stale WC file was also unlinked from disk.
     assert not fake_wc.exists(), (
         "content change on a landed row must delete the stale WC file"
+    )
+    # The orphan preview (no preview_cache row) was removed by the
+    # untracked-preview sweep.
+    assert not orphan_preview.exists(), (
+        "untracked-preview sweep must remove orphan preview files for "
+        "invalidated photos"
     )
 
 
@@ -5262,6 +5278,16 @@ def test_remote_import_invalidates_derived_caches_on_content_change(
     ).lastrowid
     db.conn.commit()
 
+    # Orphan preview file: previews/{pid}_{size}.jpg with NO
+    # preview_cache row (legacy code path / interrupted insert).
+    # Row-driven ``_invalidate_derived_caches`` can't see it — only the
+    # post-loop untracked-preview sweep removes it before it can be
+    # lazy-adopted and served as stale pre-change bytes.
+    previews_dir = vireo_dir / "previews"
+    previews_dir.mkdir()
+    orphan_preview = previews_dir / f"{photo_id}_512.jpg"
+    orphan_preview.write_bytes(b"stale-orphan-preview-bytes")
+
     # Remove the mount file (simulates: the mount file was deleted/
     # replaced between the prior scan and this import, and the import
     # restores the same filename with new bytes).
@@ -5296,6 +5322,12 @@ def test_remote_import_invalidates_derived_caches_on_content_change(
     # The stale WC file was also unlinked from disk.
     assert not fake_wc.exists(), (
         "content change on a landed row must delete the stale WC file"
+    )
+    # The orphan preview (no preview_cache row) was removed by the
+    # untracked-preview sweep.
+    assert not orphan_preview.exists(), (
+        "untracked-preview sweep must remove orphan preview files for "
+        "invalidated photos"
     )
 
 

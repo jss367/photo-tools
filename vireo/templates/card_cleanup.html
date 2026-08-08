@@ -711,7 +711,9 @@ function cardCleanupRenderAuditCallout(manifest) {
     return;
   }
   document.getElementById('card-cleanup-audit-text').textContent =
-    cardCleanupFileCount(pending) + ' are kept only because the archive ' +
+    cardCleanupFileCount(pending) +
+    (pending === 1 ? ' is' : ' are') +
+    ' kept only because the archive ' +
     'copy has never been checksum-verified. Vireo will not delete a card ' +
     'file until its archive copy passes a checksum check, and the ' +
     'integrity audit is what performs that check.';

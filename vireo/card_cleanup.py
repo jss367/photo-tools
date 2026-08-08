@@ -318,6 +318,24 @@ def qualify_rows(rows, source_root_real, card_path, contains_check=None):
                 or ast.st_mtime != row["file_mtime"]):
             reason = KEEP_ARCHIVE_CHANGED
             continue
+        # Bind the containment decision to the statted object (Codex P1):
+        # realpath() and os.stat() above are two separate path walks. A
+        # parent directory swapped between them means containment
+        # approved one target while the metadata gate measured another —
+        # and the dev/inode check only rejects the *candidate* itself,
+        # not some other in-source file the redirect landed on.
+        # Re-resolve after the stat and require the resolution unchanged
+        # and still outside the source. A double swap inside this
+        # microsecond window is the accepted residual, same class as the
+        # stat-to-remove gap at the unlink.
+        try:
+            recheck_real = os.path.realpath(archive_path)
+        except (OSError, ValueError):
+            reason = KEEP_ARCHIVE_UNREACHABLE
+            continue
+        if recheck_real != archive_real or contains_check(recheck_real):
+            reason = KEEP_INSIDE_SOURCE
+            continue
         return archive_path, None
     return None, reason
 

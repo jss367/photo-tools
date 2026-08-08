@@ -1069,3 +1069,45 @@ def test_delete_skips_when_parent_redirected_during_final_hash(db, tmp_path):
     assert "no longer resolves inside" in summary["skipped"][0]["reason"]
     # The decoy — the only file behind the redirected path — must survive.
     assert decoy.exists() and decoy.read_bytes() == b"raw-one"
+
+
+def test_qualify_binds_containment_to_statted_object(db, tmp_path, monkeypatch):
+    # Codex P1: realpath() (containment) and os.stat() (metadata gate)
+    # are separate path walks. Swap the archive parent for a symlink
+    # BETWEEN them, pointing at an in-source decoy dir whose file has
+    # the row's exact baseline and a different inode than the candidate:
+    # without the post-stat re-resolution check, the row qualifies on an
+    # "archive copy" that actually lives on the card.
+    archive_file, _ = _archive_photo(db, tmp_path)
+    card = _card_file(tmp_path)
+    row = card_cleanup.fetch_rows_by_hash(db, _sha(str(card)))[0]
+
+    decoy_dir = tmp_path / "card" / "DCIM2"
+    decoy_dir.mkdir(parents=True)
+    decoy = decoy_dir / row["filename"]
+    decoy.write_bytes(b"raw-one")
+    st_arch = os.stat(archive_file)
+    os.utime(decoy, (st_arch.st_atime, st_arch.st_mtime))
+
+    archive_parent = archive_file.parent
+    swapped = []
+    real_stat = os.stat
+
+    def swapping_stat(p, *a, **kw):
+        if str(p) == str(archive_file) and not swapped:
+            swapped.append(True)
+            import shutil
+            shutil.rmtree(archive_parent)
+            try:
+                os.symlink(str(decoy_dir), str(archive_parent))
+            except (OSError, NotImplementedError):
+                pytest.skip("symlinks unsupported on this filesystem")
+        return real_stat(p, *a, **kw)
+
+    monkeypatch.setattr(card_cleanup.os, "stat", swapping_stat)
+    source_root_real = os.path.realpath(str(tmp_path / "card"))
+    result, reason = card_cleanup.qualify_rows(
+        [row], source_root_real, str(card))
+    assert result is None
+    assert reason == card_cleanup.KEEP_INSIDE_SOURCE
+    assert decoy.exists()

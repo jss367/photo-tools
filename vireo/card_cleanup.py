@@ -27,7 +27,7 @@ from image_loader import (
     safe_iter_dir,
     safe_scan_walk,
 )
-from scanner import compute_file_hash  # noqa: F401 — used by Task 4 scan/delete
+from scanner import compute_file_hash
 
 MANIFEST_SCHEMA_VERSION = 1
 MANIFEST_MAX_AGE_DAYS = 7
@@ -188,6 +188,9 @@ def load_manifest(manifest_dir, scan_job_id,
                 "manifest entries malformed — re-scan the card")
         if entry.get("bucket") != "deletable":
             continue
+        if not entry.get("path"):
+            raise ManifestError(
+                "manifest entries malformed — re-scan the card")
         try:
             child_real = os.path.realpath(str(entry.get("path", "")))
         except (OSError, ValueError) as e:
@@ -197,4 +200,151 @@ def load_manifest(manifest_dir, scan_job_id,
         if not path_guard.contains_resolved(root_real, child_real):
             raise ManifestError(
                 "manifest entry outside its source root — re-scan the card")
+    return manifest
+
+
+KEEP_NOT_IN_CATALOG = "not in catalog — not imported yet"
+KEEP_NOT_VERIFIED = (
+    "not verified by a checksummed import — run the integrity audit"
+)
+KEEP_INSIDE_SOURCE = "only catalog copy is inside the selected source"
+KEEP_ARCHIVE_UNREACHABLE = "archive file not reachable"
+KEEP_ARCHIVE_CHANGED = "archive file changed since verification"
+KEEP_UNREADABLE = "could not read card file"
+
+
+def qualify_rows(rows, source_root_real, card_path):
+    """Archive-side test from the spec's safety invariant.
+
+    Returns (archive_path, None) for the first row that passes, else
+    (None, keep_reason). The archive stat happens HERE, fresh, on every
+    call — callers may cache rows, never this function's result.
+    """
+    if not rows:
+        return None, KEEP_NOT_IN_CATALOG
+    reason = KEEP_NOT_VERIFIED
+    try:
+        card_st = os.stat(card_path)
+    except OSError:
+        return None, KEEP_UNREADABLE
+    for row in rows:
+        if row["hash_status"] != "ok":
+            continue
+        if not row["folder_path"]:
+            continue
+        archive_path = os.path.join(row["folder_path"], row["filename"])
+        if path_guard.contains_resolved(
+                source_root_real, os.path.realpath(archive_path)):
+            reason = KEEP_INSIDE_SOURCE
+            continue
+        try:
+            ast = os.stat(archive_path)
+        except OSError:
+            reason = KEEP_ARCHIVE_UNREACHABLE
+            continue
+        # samefile semantics without a second round trip: a mount alias
+        # that survived realpath + case-folding still shares dev+inode.
+        if (ast.st_dev, ast.st_ino) == (card_st.st_dev, card_st.st_ino):
+            reason = KEEP_INSIDE_SOURCE
+            continue
+        if row["file_size"] is None or row["file_mtime"] is None:
+            reason = KEEP_ARCHIVE_CHANGED
+            continue
+        # Exact equality — the audit's 1s window classifies an
+        # already-detected mismatch and certifies nothing here; a false
+        # negative just keeps a file.
+        if (ast.st_size != row["file_size"]
+                or ast.st_mtime != row["file_mtime"]):
+            reason = KEEP_ARCHIVE_CHANGED
+            continue
+        return archive_path, None
+    return None, reason
+
+
+_ROWS_BY_HASH_SQL = """
+    SELECT p.filename, p.file_size, p.file_mtime, p.hash_status,
+           f.path AS folder_path
+    FROM photos p LEFT JOIN folders f ON f.id = p.folder_id
+    WHERE p.file_hash = ?
+"""
+
+
+def fetch_rows_by_hash(db, file_hash):
+    return db.conn.execute(_ROWS_BY_HASH_SQL, (file_hash,)).fetchall()
+
+
+def _load_catalog_by_hash(db):
+    """One pass over the catalog for the scan — a per-file SELECT over an
+    unindexed file_hash column would rescan the photos table for every
+    card file."""
+    rows = db.conn.execute("""
+        SELECT p.filename, p.file_size, p.file_mtime, p.hash_status,
+               p.file_hash, f.path AS folder_path
+        FROM photos p LEFT JOIN folders f ON f.id = p.folder_id
+        WHERE p.file_hash IS NOT NULL
+    """).fetchall()
+    by_hash = {}
+    for row in rows:
+        by_hash.setdefault(row["file_hash"], []).append(row)
+    return by_hash
+
+
+def scan_card(db, source, recursive, manifest_dir, scan_job_id,
+              progress_cb=None, should_cancel=None):
+    source_root_real = os.path.realpath(source)
+    walk_errors = []
+    candidates, ignored = classify_source_files(
+        source, recursive=recursive,
+        onerror=lambda e: walk_errors.append(str(e)))
+    by_hash = _load_catalog_by_hash(db)
+    entries = []
+    totals = {
+        "deletable": {"count": 0, "bytes": 0},
+        "kept": {"count": 0, "bytes": 0},
+        "ignored": {"count": len(ignored)},
+    }
+    for i, f in enumerate(candidates):
+        if should_cancel is not None and should_cancel():
+            return {"cancelled": True}
+        if progress_cb is not None:
+            progress_cb(i + 1, len(candidates), f.name)
+        try:
+            st = os.stat(f)
+            file_hash = compute_file_hash(str(f))
+        except OSError as e:
+            entries.append({
+                "path": str(f), "bucket": "kept",
+                "reason": f"{KEEP_UNREADABLE}: {e}",
+            })
+            totals["kept"]["count"] += 1
+            continue
+        entry = {
+            "path": str(f), "size": st.st_size,
+            "mtime_ns": st.st_mtime_ns, "hash": file_hash,
+        }
+        archive_path, reason = qualify_rows(
+            by_hash.get(file_hash, []), source_root_real, str(f))
+        if archive_path is not None:
+            entry.update(bucket="deletable", archive_path=archive_path)
+            totals["deletable"]["count"] += 1
+            totals["deletable"]["bytes"] += st.st_size
+        else:
+            entry.update(bucket="kept", reason=reason)
+            totals["kept"]["count"] += 1
+            totals["kept"]["bytes"] += st.st_size
+        entries.append(entry)
+    for f in ignored:
+        entries.append({"path": str(f), "bucket": "ignored"})
+    manifest = {
+        "schema_version": MANIFEST_SCHEMA_VERSION,
+        "scan_job_id": scan_job_id,
+        "created_at": datetime.now(UTC).isoformat(),
+        "source_root": source_root_real,
+        "recursive": bool(recursive),
+        "entries": entries,
+        "walk_errors": walk_errors,
+        "totals": totals,
+    }
+    write_manifest(manifest_dir, manifest)
+    manifest["cancelled"] = False
     return manifest

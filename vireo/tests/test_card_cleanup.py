@@ -15,6 +15,7 @@ from card_cleanup import (
     prune_manifests,
     write_manifest,
 )
+from scanner import compute_file_hash as _sha
 
 
 def _manifest(tmp_path, **overrides):
@@ -177,6 +178,27 @@ def test_load_rejects_deletable_entry_with_null_byte(tmp_path):
         load_manifest(mdir, "scan-1")
 
 
+def test_load_rejects_source_root_with_null_byte(tmp_path):
+    # isabs("/x\x00y") passes; realpath() raises ValueError. Covers the
+    # hoisted source-root-unresolvable branch distinctly from a bad
+    # entry path.
+    mdir = str(tmp_path / "manifests")
+    write_manifest(
+        mdir, _manifest(tmp_path, source_root=str(tmp_path / "x\x00y")))
+    with pytest.raises(ManifestError):
+        load_manifest(mdir, "scan-1")
+
+
+def test_load_rejects_deletable_entry_without_path(tmp_path):
+    (tmp_path / "card").mkdir()
+    entry = {"size": 1, "mtime_ns": 1, "hash": "h", "bucket": "deletable"}
+    mdir = str(tmp_path / "manifests")
+    write_manifest(mdir, _manifest(tmp_path, entries=[entry]))
+    with pytest.raises(ManifestError) as exc:
+        load_manifest(mdir, "scan-1")
+    assert "malformed" in str(exc.value)
+
+
 def _make_card(tmp_path):
     card = tmp_path / "card"
     (card / "DCIM" / "100").mkdir(parents=True)
@@ -186,6 +208,8 @@ def _make_card(tmp_path):
     (card / "DCIM" / "100" / ".hidden.jpg").write_bytes(b"dot")
     (card / "MISC" / "sub").mkdir(parents=True)
     (card / "MISC" / "sub" / "firmware.bin").write_bytes(b"fw")
+    (card / "ROOT_0001.JPG").write_bytes(b"root-jpg")
+    (card / "readme.txt").write_bytes(b"txt")
     return card
 
 
@@ -194,8 +218,10 @@ def test_classify_buckets(tmp_path):
     candidates, ignored = classify_source_files(str(card))
     cand_names = {p.name for p in candidates}
     ign_names = {p.name for p in ignored}
-    assert cand_names == {"IMG_0001.NEF", "IMG_0002.JPG"}
-    assert ign_names == {"IMG_0001.XMP", ".hidden.jpg", "firmware.bin"}
+    assert cand_names == {"IMG_0001.NEF", "IMG_0002.JPG", "ROOT_0001.JPG"}
+    assert ign_names == {
+        "IMG_0001.XMP", ".hidden.jpg", "firmware.bin", "readme.txt",
+    }
 
 
 def test_classify_parity_with_discover_source_files(tmp_path):
@@ -217,3 +243,179 @@ def test_classify_missing_source_reports_onerror(tmp_path):
         str(tmp_path / "nope"), onerror=errors.append)
     assert candidates == [] and ignored == []
     assert len(errors) == 1 and isinstance(errors[0], OSError)
+
+
+# The `db` fixture comes from vireo/tests/conftest.py (~line 158) — a
+# Database on a temp file. Do not redefine it here.
+
+
+def _archive_photo(db, tmp_path, name="IMG_0001.NEF", content=b"raw-one",
+                   hash_status="ok", folder="archive/2026/2026-08-01"):
+    """Create an archive file on disk + its cataloged, verified row."""
+    folder_path = tmp_path / folder
+    folder_path.mkdir(parents=True, exist_ok=True)
+    f = folder_path / name
+    f.write_bytes(content)
+    st = os.stat(f)
+    fid = db.add_folder(str(folder_path))
+    pid = db.add_photo(
+        folder_id=fid, filename=name, extension=os.path.splitext(name)[1],
+        file_size=st.st_size, file_mtime=st.st_mtime,
+        file_hash=_sha(str(f)),
+    )
+    if hash_status is not None:
+        db.update_photo_hash_check(pid, hash_status)
+    return f, pid
+
+
+def _card_file(tmp_path, name="IMG_0001.NEF", content=b"raw-one"):
+    card = tmp_path / "card" / "DCIM"
+    card.mkdir(parents=True, exist_ok=True)
+    f = card / name
+    f.write_bytes(content)
+    return f
+
+
+def _scan(db, tmp_path, **kwargs):
+    return card_cleanup.scan_card(
+        db, str(tmp_path / "card"), True,
+        str(tmp_path / "manifests"), "scan-1", **kwargs)
+
+
+def _entries(result, bucket):
+    return [e for e in result["entries"] if e["bucket"] == bucket]
+
+
+def test_scan_verified_file_is_deletable(db, tmp_path):
+    archive_file, _ = _archive_photo(db, tmp_path)
+    _card_file(tmp_path)
+    result = _scan(db, tmp_path)
+    deletable = _entries(result, "deletable")
+    assert len(deletable) == 1
+    assert deletable[0]["archive_path"] == str(archive_file)
+    assert result["totals"]["deletable"]["count"] == 1
+    # Manifest landed on disk and revalidates.
+    loaded = load_manifest(str(tmp_path / "manifests"), "scan-1")
+    assert loaded["source_root"] == os.path.realpath(str(tmp_path / "card"))
+
+
+def test_scan_uncataloged_file_kept(db, tmp_path):
+    _card_file(tmp_path, content=b"never-imported")
+    result = _scan(db, tmp_path)
+    kept = _entries(result, "kept")
+    assert len(kept) == 1 and "not in catalog" in kept[0]["reason"]
+
+
+def test_scan_null_hash_status_kept_with_audit_remedy(db, tmp_path):
+    # Scan-cataloged archives: file_hash set, hash_status NULL. Kept —
+    # and the reason must point at the remedy, or the tool reads broken.
+    _archive_photo(db, tmp_path, hash_status=None)
+    _card_file(tmp_path)
+    result = _scan(db, tmp_path)
+    kept = _entries(result, "kept")
+    assert len(kept) == 1
+    assert "integrity audit" in kept[0]["reason"]
+
+
+def test_scan_archive_file_missing_kept(db, tmp_path):
+    archive_file, _ = _archive_photo(db, tmp_path)
+    _card_file(tmp_path)
+    os.unlink(archive_file)
+    result = _scan(db, tmp_path)
+    assert len(_entries(result, "kept")) == 1
+    assert len(_entries(result, "deletable")) == 0
+
+
+def test_scan_archive_mtime_off_baseline_kept(db, tmp_path):
+    # Exact equality, not the audit's 1s window: any drift keeps the file.
+    archive_file, _ = _archive_photo(db, tmp_path)
+    _card_file(tmp_path)
+    st = os.stat(archive_file)
+    os.utime(archive_file, (st.st_atime, st.st_mtime + 0.5))
+    result = _scan(db, tmp_path)
+    assert len(_entries(result, "deletable")) == 0
+    assert "changed since verification" in _entries(result, "kept")[0]["reason"]
+
+
+def test_scan_self_match_inside_source_never_qualifies(db, tmp_path):
+    # The only catalog copy lives inside the selected source tree: the
+    # file must NOT be deletable (it would be deleting the archive copy).
+    _archive_photo(db, tmp_path, folder="card/DCIM")
+    result = _scan(db, tmp_path)
+    assert len(_entries(result, "deletable")) == 0
+    kept = _entries(result, "kept")
+    assert len(kept) == 1 and "inside the selected source" in kept[0]["reason"]
+
+
+def test_qualify_rejects_hardlink_alias_of_card_file(db, tmp_path):
+    # Mount-alias/samefile gate: the cataloged "archive copy" lives
+    # outside the source tree by path, but it's a hardlink to the card
+    # file itself — same dev+inode. Deleting the card file would leave
+    # the archive path as the only name for bytes we just proved existed
+    # twice; the spec says such a row never qualifies.
+    card = _card_file(tmp_path)
+    folder_path = tmp_path / "archive" / "2026"
+    folder_path.mkdir(parents=True)
+    alias = folder_path / "IMG_0001.NEF"
+    try:
+        os.link(card, alias)
+    except (OSError, NotImplementedError):
+        pytest.skip("hardlinks unsupported on this filesystem")
+    st = os.stat(alias)
+    fid = db.add_folder(str(folder_path))
+    pid = db.add_photo(
+        folder_id=fid, filename="IMG_0001.NEF", extension=".NEF",
+        file_size=st.st_size, file_mtime=st.st_mtime,
+        file_hash=_sha(str(alias)),
+    )
+    db.update_photo_hash_check(pid, "ok")
+    result = _scan(db, tmp_path)
+    assert len(_entries(result, "deletable")) == 0
+    kept = _entries(result, "kept")
+    assert len(kept) == 1 and "inside the selected source" in kept[0]["reason"]
+
+
+def test_scan_duplicate_card_files_both_deletable(db, tmp_path):
+    _archive_photo(db, tmp_path)
+    _card_file(tmp_path, name="IMG_0001.NEF")
+    _card_file(tmp_path, name="IMG_0001_copy.NEF")
+    result = _scan(db, tmp_path)
+    assert len(_entries(result, "deletable")) == 2
+
+
+def test_scan_two_rows_one_qualifying_is_deletable(db, tmp_path):
+    # Same hash cataloged twice; only one row passes → still deletable,
+    # preview shows the passing row's path.
+    bad_archive, _ = _archive_photo(db, tmp_path, folder="archive/a")
+    good_archive, _ = _archive_photo(db, tmp_path, folder="archive/b")
+    os.unlink(bad_archive)
+    _card_file(tmp_path)
+    result = _scan(db, tmp_path)
+    deletable = _entries(result, "deletable")
+    assert len(deletable) == 1
+    assert deletable[0]["archive_path"] == str(good_archive)
+
+
+def test_scan_cancellation_writes_no_manifest(db, tmp_path):
+    _archive_photo(db, tmp_path)
+    _card_file(tmp_path)
+    result = _scan(db, tmp_path, should_cancel=lambda: True)
+    assert result["cancelled"] is True
+    assert not os.path.exists(
+        card_cleanup.manifest_path(str(tmp_path / "manifests"), "scan-1"))
+
+
+def test_scan_hashes_each_card_file_once(db, tmp_path, monkeypatch):
+    _archive_photo(db, tmp_path)
+    _card_file(tmp_path)
+    calls = []
+    real = card_cleanup.compute_file_hash
+
+    def counting(path, *a, **kw):
+        calls.append(str(path))
+        return real(path, *a, **kw)
+
+    monkeypatch.setattr(card_cleanup, "compute_file_hash", counting)
+    _scan(db, tmp_path)
+    card_calls = [p for p in calls if "card" in p]
+    assert len(card_calls) == 1

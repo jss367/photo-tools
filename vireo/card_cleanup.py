@@ -430,6 +430,29 @@ def delete_verified(db, manifest, progress_cb=None, should_cancel=None):
         if archive_path is None:
             summary["skipped"].append({"path": path, "reason": reason})
             continue
+        # Unlink gate (Codex P1 review): the archive gate above can take
+        # SMB-round-trip time, and os.remove resolves the pathname again.
+        # If another writer replaced this name meanwhile (camera reusing
+        # a filename, sync tool), the bytes at `path` are no longer the
+        # ones the card gate hashed. Re-stat and require the same inode
+        # AND the same manifest baseline immediately before the unlink —
+        # shrinking the race window from network-seconds to the
+        # stat-to-remove gap.
+        try:
+            st2 = os.stat(path)
+        except FileNotFoundError:
+            summary["skipped"].append(
+                {"path": path, "reason": SKIP_ALREADY_GONE})
+            continue
+        except OSError as e:
+            summary["failed"].append({"path": path, "error": str(e)})
+            continue
+        if ((st2.st_dev, st2.st_ino) != (st.st_dev, st.st_ino)
+                or st2.st_size != entry["size"]
+                or st2.st_mtime_ns != entry["mtime_ns"]):
+            summary["skipped"].append(
+                {"path": path, "reason": SKIP_CHANGED})
+            continue
         try:
             os.remove(path)
         except OSError as e:

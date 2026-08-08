@@ -695,3 +695,32 @@ def test_delete_only_touches_deletable_bucket(db, tmp_path):
     summary = _scan_then_delete(db, tmp_path)
     assert summary["deleted"] == 1
     assert stray.exists()
+
+
+def test_delete_skips_file_replaced_during_archive_gate(db, tmp_path):
+    # TOCTOU guard (Codex P1): the pathname is replaced while the archive
+    # gate runs — after the card re-hash, before os.remove. The
+    # replacement has the SAME size and the mtime forced back to the
+    # manifest value, so only the final inode re-stat can catch it.
+    _archive_photo(db, tmp_path)
+    card = _card_file(tmp_path)  # content b"raw-one", 7 bytes
+    scan = _scan(db, tmp_path)
+    assert scan["totals"]["deletable"]["count"] == 1
+    manifest = load_manifest(str(tmp_path / "manifests"), "scan-1")
+    entry = next(e for e in manifest["entries"] if e["bucket"] == "deletable")
+    real_fetch = card_cleanup.fetch_rows_by_hash
+
+    def fetch_then_replace(db_arg, file_hash):
+        rows = real_fetch(db_arg, file_hash)
+        os.unlink(card)                      # new inode on rewrite
+        card.write_bytes(b"NEW-ONE")         # same 7-byte size
+        os.utime(card, ns=(entry["mtime_ns"], entry["mtime_ns"]))
+        return rows
+
+    with unittest.mock.patch.object(
+            card_cleanup, "fetch_rows_by_hash", fetch_then_replace):
+        summary = card_cleanup.delete_verified(db, manifest)
+    assert summary["deleted"] == 0
+    assert len(summary["skipped"]) == 1
+    assert card.exists()
+    assert card.read_bytes() == b"NEW-ONE"

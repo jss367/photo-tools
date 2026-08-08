@@ -11198,6 +11198,9 @@ def test_remote_import_mount_detach_after_adoption_rolls_back_once(
     # Reason wording proves WHICH block failed each file: the post-loop
     # rollback blocks, not the per-file probe (whose wording is
     # "detached while this batch was being prepared").
+    # These two asserts are flip-3-sensitive: after Task 5's fold,
+    # adopted A rolls back via the landed block with the MOUNT dest path
+    # and "local shadow" wording — update them consciously there.
     reason_a = _unsafe_reason(result, str(card / "DSC_0100.jpg"))
     assert "cannot be confirmed" in reason_a, reason_a
     reason_b = _unsafe_reason(result, str(card / "DSC_0101.jpg"))
@@ -11265,7 +11268,7 @@ def test_local_import_mount_detach_after_adoption_rolls_back_once(
     # Both files were rolled back by the ``landed`` block (dest-side
     # paths + "local shadow" wording), proving the detach was handled at
     # the post-loop probe, not by the per-file probe (card-side paths,
-    # "being prepared" wording).
+    # "detached while this batch was copying" wording).
     assert _unsafe_paths(result) == {
         str(day_dir / "DSC_0100.jpg"), str(day_dir / "DSC_0101.jpg"),
     }, result["unsafe_files"]

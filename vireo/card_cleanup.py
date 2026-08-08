@@ -195,6 +195,14 @@ def load_manifest(manifest_dir, scan_job_id,
     # Case-fold acceptance inside contains_resolved is still fine here —
     # a case-swapped path within the root is genuinely still within it,
     # and the delete job's per-file gates are the deeper defense.
+    # Null bytes are rejected explicitly rather than via realpath's
+    # exception: POSIX realpath raises ValueError on them but Windows'
+    # ntpath.realpath swallows the error and returns the string
+    # unchanged, which would let the path sail through validation and
+    # crash later at the stat/unlink. Uniform check, uniform outcome.
+    if "\x00" in str(source_root):
+        raise ManifestError(
+            "manifest source root unresolvable — re-scan the card")
     try:
         root_real = os.path.realpath(source_root)
     except (OSError, ValueError) as e:
@@ -215,6 +223,11 @@ def load_manifest(manifest_dir, scan_job_id,
                 or not entry.get("hash")):
             raise ManifestError(
                 "manifest entries malformed — re-scan the card")
+        # Same explicit null-byte rejection as the source root above —
+        # Windows realpath would pass the string through unchanged.
+        if "\x00" in str(entry.get("path", "")):
+            raise ManifestError(
+                "manifest entry outside its source root — re-scan the card")
         try:
             child_real = os.path.realpath(str(entry.get("path", "")))
         except (OSError, ValueError) as e:

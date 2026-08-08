@@ -89,7 +89,9 @@
 
 (The existing bare `db.conn.commit()` at 2890 is REPLACED by this sequence; Task 2 extends the same block with the diff loop. `invalidated_photo_ids` is declared here so Task 2 only inserts the diff loop above the companion loop.)
 
-- [ ] **Step 4: Fix the stale LOCAL comment** at 4268-4272: it says "Skip when the JPEG was adopted (`origin == "skipped_duplicate"`)" but the code (4331-4356) deliberately invalidates regardless of origin and says so. Rewrite the 4268-4272 comment to match the code (adoption only proves the JPEG bytes pre-existed, not that the RAW was already paired). One comment, no code change.
+- [ ] **Step 4: Fix TWO stale LOCAL comments** (comments only, no code change):
+  1. 4268-4272: says "Skip when the JPEG was adopted (`origin == "skipped_duplicate"`)" but the code (4331-4356) deliberately invalidates regardless of origin and says so. Rewrite to match the code (adoption only proves the JPEG bytes pre-existed, not that the RAW was already paired).
+  2. 4426-4439: says "The batch scan ran with `vireo_dir=None` ... scanner's own `_invalidate_derived_caches` ... was bypassed" — contradicting the actual scan call (4220 passes `vireo_dir`) and the newer comment at 4177-4189. Rewrite to the defense-in-depth framing (scanner's own invalidation fires; this loop covers legacy rows/codepath changes).
 
 - [ ] **Step 5: Verify green + sweep.** The new test passes; `python -m pytest vireo/tests/test_import_job.py -q -k "invalidates or companion or pairs"` all pass; full file → 215 passed, 1 skipped.
 
@@ -131,7 +133,7 @@
 
 (ii) Failed-adopted tracking: the adopted-validation failure `continue`s (2817-2825, 2866-2877, 2878-2888) leave their key in `adopted_paths`. Add `failed_adopted_paths = set()` (declared next to Task 1's `raw_companion_invalidations`) and `failed_adopted_paths.add(ap)` at each of the three failure sites (read each; `ap` is the loop's mount-path variable). Local needs no analogue for `landed` (its rollbacks keep entries → it filters via `reclassified_landed_paths`; remote's `landed` self-filters) — this set is the remote's one reclassified-style structure, scoped to adoptions.
 
-(iii) The diff loop, inserted ABOVE Task 1's companion loop (inside the same `if params.vireo_dir:`): iterate surviving `landed` entries (hash at `entry[2]`) AND surviving adoptions (`for ap, (adopt_source, a_hash) in adopted_paths.items()` skipping `failed_adopted_paths`; read the actual tuple shape at ~2178/2146 first). For each path: skip if not in `pre_scan_hashes`; compare `pre_scan_hashes[path]` vs the copy-time hash with local's EXACT semantics (no zero-byte normalization — add local's-parity comment noting the shared quirk); re-query the row id; `_invalidate_derived_caches(...)`; collect into `invalidated_photo_ids`. Mirror local 4441-4481's structure and comments.
+(iii) The diff loop, inserted ABOVE Task 1's companion loop (inside the same `if params.vireo_dir:`): iterate surviving `landed` entries (hash at `entry[2]`) AND surviving adoptions (`for ap, (adopt_source, a_hash) in adopted_paths.items()` skipping `failed_adopted_paths`; the population site is at ~2160 — read the actual tuple shape there first). For each path: skip if not in `pre_scan_hashes`; compare `pre_scan_hashes[path]` vs the copy-time hash with local's EXACT semantics (no zero-byte normalization — add local's-parity comment noting the shared quirk); re-query the row id; `_invalidate_derived_caches(...)`; collect into `invalidated_photo_ids`. Mirror local 4441-4481's structure and comments.
 
 - [ ] **Step 4: Green + full file.** The two mirror tests still pass; the Task 1 test still passes; full file → 217 passed, 1 skipped.
 

@@ -1803,8 +1803,7 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
         # cataloged twin's bytes are confirmed at the destination; the local
         # path re-hashes the twin's archive file. On the mount that file is
         # locally readable, so reuse the same on-disk re-hash contract.
-        to_transfer = []   # (source_file, dest_basename, src_hash,
-        #                     src_size, src_mtime_ns)
+        to_transfer = []   # (source_file, dest_basename, src_hash, src_size, src_mtime_ns)
         dup_skipped = 0
         # Twin folders (under destination) whose bytes we RE-HASHED this run
         # and confirmed against source hashes — safe to scan/link into the
@@ -2041,24 +2040,26 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
             # names taken by earlier files IN THIS BATCH; the mount is
             # locally readable so already-landed bytes are checked on disk.
             dest_basename = source_file.name
+            # Working-copy identity, captured at decision time — before
+            # any bytes move — so a source that changes mid-transfer
+            # cannot look clean to the working-copy identity check.
+            # Mirrors the local path, which stats before it hashes (and,
+            # like it, fails the file when the source cannot be stat'd —
+            # stat-first also means a vanished source costs one syscall,
+            # not a full hash read that gets thrown away). Spec
+            # decision 7.
+            try:
+                st = source_file.stat()
+                src_size, src_mtime_ns = st.st_size, st.st_mtime_ns
+            except OSError as e:
+                _fail(rel, source_file, str(e))
+                continue
             try:
                 src_hash = (
                     checker.content_hash(source_file)
                     if checker is not None
                     else compute_file_hash(str(source_file))
                 )
-            except OSError as e:
-                _fail(rel, source_file, str(e))
-                continue
-            # Working-copy identity, captured at decision time — before
-            # any bytes move — so a source that changes mid-transfer
-            # cannot look clean to the working-copy identity check.
-            # Mirrors the local path, which stats before the copy (and,
-            # like it, fails the file when the source cannot be stat'd).
-            # Spec decision 7.
-            try:
-                st = source_file.stat()
-                src_size, src_mtime_ns = st.st_size, st.st_mtime_ns
             except OSError as e:
                 _fail(rel, source_file, str(e))
                 continue
@@ -2372,8 +2373,7 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
                     return rc != 0 and runner.cancellation_requested(
                         job["id"])
 
-                transferred = []   # (sf, dest_basename, src_hash,
-                #                     src_size, src_mtime_ns, nas_full_path)
+                transferred = []   # (sf, dest_basename, src_hash, src_size, src_mtime_ns, nas_full_path)
                 batch_size = len(to_transfer)
                 # Flat batch: one rsync into the dir. rsync names each file
                 # as it lands; forward that as the batch's honest

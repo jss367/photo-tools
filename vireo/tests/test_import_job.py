@@ -1987,6 +1987,8 @@ def test_remote_import_wc_identity_captured_before_transfer(
     assert result["copied"] == 1, result
     assert captured, "working-copy extraction never ran"
     [(dest_path, (sf, sz, mt))] = captured["source_paths"].items()
+    # ``wc_source_paths`` is keyed by the mount-side destination path.
+    assert dest_path.endswith("DSC_0001.jpg")
     assert sf == str(src)
     # Identity attests the source BEFORE the mid-transfer mutation.
     assert (sz, mt) == (pre_size, pre_mtime_ns), (sz, mt)

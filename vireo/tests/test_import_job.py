@@ -11114,6 +11114,165 @@ def test_remote_import_mount_loss_is_sticky_across_batches(
     assert calls["rsync"] == [], calls["rsync"]
 
 
+def test_remote_import_mount_detach_after_adoption_rolls_back_once(
+        tmp_path, monkeypatch):
+    """An adoption's mount-detach rollback must decrement exactly once.
+
+    Today a remote adoption is booked in ``dup_skips`` (plus
+    ``adopted_paths``); the PR 5a fold moves it into ``landed`` with
+    origin ``"skipped_duplicate"`` and adds a mount-lost ``landed``
+    rollback. If the fold forgets to DELETE the adoption branch's
+    ``dup_skips.append``, the same file is rolled back by BOTH blocks
+    and ``skipped_duplicate`` goes to -1 on a detach after an adoption.
+    This test pins the single decrement across that refactor: exactly 0,
+    never negative.
+
+    Geometry: one 2-file batch (same capture date). File A has a
+    byte-identical, uncataloged twin pre-seeded at its mount destination
+    (crash-recovery shape -> the collision walk adopts it); file B is
+    fresh and gets queued for rsync. The probe spy stays healthy through
+    the batch-boundary probe and both per-file probes, then reports a
+    detach from the POST-LOOP probe onward — after both files were
+    decided, before transfer/catalog.
+    """
+    import shutil
+
+    import pipeline_job as _pj
+    from import_job import ImportParams, run_import_job
+
+    ra = _remote_archive_for(tmp_path)
+    calls = _remote_calls(ra)
+    _install_fake_remote_rsync(monkeypatch, calls, verify=None)
+    mount_base = ra["mount_base"]
+
+    card = _make_card(tmp_path, [
+        ("DSC_0100.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+        ("DSC_0101.jpg", datetime(2026, 7, 3, 11, 0, 0), "green"),
+    ])
+
+    # Byte-identical twin already at file A's mount destination,
+    # uncataloged (no DB rows) — the duplicate gate finds nothing, the
+    # collision walk hashes the on-disk twin and adopts it.
+    day_dir = os.path.join(mount_base, "2026", "2026-07-03")
+    os.makedirs(day_dir)
+    shutil.copy2(str(card / "DSC_0100.jpg"),
+                 os.path.join(day_dir, "DSC_0100.jpg"))
+
+    probe_calls = {"count": 0}
+
+    def spy_unmounted(baseline):
+        probe_calls["count"] += 1
+        # Healthy for batch-boundary (1) and the per-file probes for A
+        # (2) and B (3); detached from the post-loop probe (4) onward.
+        if probe_calls["count"] >= 4:
+            return "/Volumes/NAS"
+        return None
+
+    monkeypatch.setattr(_pj, "_unmounted_since_baseline", spy_unmounted)
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws_id = db._active_workspace_id
+    result = run_import_job(
+        _make_job(), FakeRunner(), db_path, ws_id, ImportParams(
+            sources=[str(card)], destination=mount_base,
+            remote_target=ra, verify_by_hash=True,
+        ),
+    )
+
+    # The per-file loop completed (both files decided) and the detach
+    # was first seen at the post-loop probe — not earlier, not at a
+    # next-batch boundary (there is no next batch).
+    assert probe_calls["count"] == 4, (
+        f"expected 4 mount probes (batch-boundary + 2x per-file + "
+        f"post-loop) but got {probe_calls['count']}"
+    )
+    # THE pin: adopted file A's skipped_duplicate is rolled back exactly
+    # once. A double rollback (dup_skips AND landed, post-fold) yields -1.
+    assert result["skipped_duplicate"] == 0, result
+    assert result["copied"] == 0, result
+    assert result["failed"] == 2, result
+    assert result["safe_to_format"] is False, result
+    # Detach was observed before the transfer step ever ran.
+    assert calls["rsync"] == [], calls["rsync"]
+    # Reason wording proves WHICH block failed each file: the post-loop
+    # rollback blocks, not the per-file probe (whose wording is
+    # "detached while this batch was being prepared").
+    reason_a = _unsafe_reason(result, str(card / "DSC_0100.jpg"))
+    assert "cannot be confirmed" in reason_a, reason_a
+    reason_b = _unsafe_reason(result, str(card / "DSC_0101.jpg"))
+    assert "detached before this file was transferred" in reason_b, reason_b
+
+
+def test_local_import_mount_detach_after_adoption_rolls_back_once(
+        tmp_path, monkeypatch):
+    """Local mirror of the remote adoption single-rollback pin.
+
+    Local adoptions are booked straight into ``landed`` with origin
+    ``"skipped_duplicate"`` (never ``dup_skips``) and rolled back on
+    mount detach via ``_reclassify_landed_failed`` — the exact shape the
+    PR 5a fold gives the remote path. Pinning the local counter at
+    exactly 0 keeps the two paths' single-decrement behavior verifiably
+    identical while the remote bookkeeping moves.
+
+    Geometry mirrors the remote test: one 2-file batch, file A's
+    byte-identical uncataloged twin pre-seeded at the archive
+    destination (adopted), file B fresh (copied), detach first visible
+    at the post-loop probe.
+    """
+    import shutil
+
+    import pipeline_job as _pj
+    from import_job import ImportParams
+
+    card = _make_card(tmp_path, [
+        ("DSC_0100.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+        ("DSC_0101.jpg", datetime(2026, 7, 3, 11, 0, 0), "green"),
+    ])
+    archive = tmp_path / "archive"
+    day_dir = archive / "2026" / "2026-07-03"
+    day_dir.mkdir(parents=True)
+    shutil.copy2(str(card / "DSC_0100.jpg"), str(day_dir / "DSC_0100.jpg"))
+
+    probe_calls = {"count": 0}
+
+    def spy_unmounted(baseline):
+        probe_calls["count"] += 1
+        # Healthy for batch-boundary (1) and the per-file probes for A
+        # (2) and B (3); detached from the post-loop probe (4) onward.
+        if probe_calls["count"] >= 4:
+            return "/Volumes/NAS"
+        return None
+
+    monkeypatch.setattr(_pj, "_unmounted_since_baseline", spy_unmounted)
+
+    db, ws_id, result = _run_import(
+        tmp_path,
+        ImportParams(sources=[str(card)], destination=str(archive)),
+    )
+
+    # Loop completed; detach first seen at the post-loop probe (single
+    # batch — a next-batch boundary probe does not exist here).
+    assert probe_calls["count"] == 4, (
+        f"expected 4 mount probes (batch-boundary + 2x per-file + "
+        f"post-loop) but got {probe_calls['count']}"
+    )
+    # THE pin: adoption rolled back exactly once (0, never -1).
+    assert result["skipped_duplicate"] == 0, result
+    assert result["copied"] == 0, result
+    assert result["failed"] == 2, result
+    assert result["safe_to_format"] is False, result
+    # Both files were rolled back by the ``landed`` block (dest-side
+    # paths + "local shadow" wording), proving the detach was handled at
+    # the post-loop probe, not by the per-file probe (card-side paths,
+    # "being prepared" wording).
+    assert _unsafe_paths(result) == {
+        str(day_dir / "DSC_0100.jpg"), str(day_dir / "DSC_0101.jpg"),
+    }, result["unsafe_files"]
+    for u in result["unsafe_files"]:
+        assert "local shadow" in u["reason"], u
+
+
 # --------------------------------------------------------------------------
 # Destination-side hashing must not hold cancellation hostage. On a stale
 # SMB mount a single blocking read can pin the worker for tens of minutes

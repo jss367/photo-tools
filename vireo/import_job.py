@@ -872,6 +872,192 @@ def _build_destination_context(db, params):
     )
 
 
+def _make_emitter(job, runner, state, eta):
+    """Build the per-run progress emitter shared by both import paths.
+
+    ``state.folder_counts``: live per-folder counters, mutated by the
+    copy loop via _counts() and snapshotted onto every progress event
+    so the Import page can render truthful per-folder progress mid-run
+    (not just from the terminal result).
+    """
+    def _emit(phase, current, total, current_file="", *, is_importing=False):
+        eta_fields = {}
+        if total > 0:
+            if is_importing:
+                eta.note_importing(state.copied)
+            else:
+                eta.note_batch_complete(current, state.copied)
+            eta_fields = eta.fields(total)
+        job["progress"]["current"] = current
+        job["progress"]["total"] = total
+        job["progress"]["current_file"] = current_file
+        # ONE body serves both paths because clearing the transfer keys
+        # is a PROVEN no-op on the local path: those keys are only ever
+        # written by the remote-only ``_emit_transfer`` (nested in
+        # ``_run_remote_import_job``) and never seeded by JobRunner —
+        # every job "progress" dict it builds is exactly
+        # ``{current, total, current_file}`` (jobs.py:552/626/1042).
+        # push_event mirroring cannot introduce them locally either,
+        # since local progress events never carry them.
+        for key in _IMPORT_ETA_PROGRESS_KEYS + _IMPORT_TRANSFER_PROGRESS_KEYS:
+            job["progress"].pop(key, None)
+        job["progress"].update(eta_fields)
+        runner.update_step(
+            job["id"], "import",
+            current_file=current_file,
+            progress={
+                "current": current, "total": total, **eta_fields,
+            },
+        )
+        runner.push_event(
+            job["id"], "progress",
+            progress_event(
+                phase, current, total, current_file,
+                # Snapshot (counts dicts mutate as the loop advances; SSE
+                # consumers must see the state at emit time). Both paths
+                # send the folder table — spec decision 1.
+                folders={
+                    rel: dict(counts) for rel, counts in state.folder_counts.items()
+                },
+                **eta_fields,
+            ),
+        )
+    return _emit
+
+
+class _ImportPlan(NamedTuple):
+    """Everything the pre-loop planning phase produces for one run.
+
+    Destructure BY NAME, never by position — same rationale as
+    ``_Selection``: most fields are same-typed, so a transposed
+    positional unpack would still run, still type-check, and still pass
+    the local/remote parity test (which compares the two paths to each
+    other and cannot see a transposition applied to both). ``files``
+    and ``timestamps`` are already consumed by the batching step inside
+    ``_plan_import``; they ride along for PR 7's orchestrator.
+    """
+
+    files: list
+    discovered: int
+    source_snapshots: dict
+    include_paths: set | None
+    queued: int
+    deselected: int
+    vanished_paths: set
+    appeared: int
+    checker: object  # DuplicateChecker | None
+    timestamps: dict
+    batches: list
+
+
+def _plan_import(db, params, emit, state):
+    """Discovery → source snapshots → selection → checker → batching.
+
+    ORDERING IS LOAD-BEARING: ``_capture_source_snapshots`` runs before
+    ``_apply_selection`` and before any copy work — see the block
+    comment at the snapshot call.
+    """
+    # --- Discover ---------------------------------------------------
+    # Enumeration errors (permission denied, macOS TCC block on a
+    # removable volume, unreadable subtree) get silently swallowed by
+    # os.walk-style callbacks by default. If we ignored them, discovered
+    # would just be smaller than reality and safe_to_format could still
+    # flip green over a card whose contents were never actually visited.
+    # Track them explicitly: each is a bucket-of-its-own failure entry
+    # tied to the source path where it occurred.
+    emit("Discovering files", 0, 0)
+    files = []
+
+    def _discovery_onerror(exc):
+        state.discovery_errors.append(exc)
+        log.warning("Import discovery error: %s", exc)
+
+    for src in params.sources:
+        files.extend(discover_source_files(
+            src, params.file_types, recursive=params.recursive,
+            onerror=_discovery_onerror,
+        ))
+    discovered = len(files)
+    # Snapshot the discovered source metadata NOW — before selection filters
+    # the copy set, before any copy work, and before duplicate hashing. The
+    # retry-side signature check re-enumerates each source in full and
+    # compares the current signature to what the parent recorded; capturing
+    # the snapshot AFTER ``_apply_selection`` would mean a per-file import
+    # only ever stored a signature over its selected subset, and the retry's
+    # full-enumeration signature would never match — an unchanged card
+    # would be rejected as drifted, and correcting that by having retry
+    # also filter would leave nothing gating a card whose deselected files
+    # were replaced or removed. Pre-selection capture keeps both sides on
+    # the same enumeration. Capturing before copy also matters so a card
+    # ejected or momentarily unreadable mid-run doesn't backfill ``-1``
+    # sizes for files we successfully enumerated — reinserting the card
+    # and retrying is a common recovery workflow, and the retry-side
+    # signature check must have a snapshot taken from the source as
+    # observed at run start to accept it.
+    source_snapshots = _capture_source_snapshots(files, params.sources)
+
+    # Selection: filter the copy set and measure drift. Shared by both
+    # copy paths — see ``_apply_selection`` for why each condition is
+    # shaped the way it is. Destructured BY NAME, not by position: four of
+    # the six fields are plain ints and two are sets, so a positional unpack
+    # that transposed a same-typed pair (``queued``/``deselected``,
+    # ``queued``/``appeared``) would still run, still type-check, and still
+    # pass the local/remote parity test — which compares the two paths to
+    # each other and so cannot see a transposition applied to both.
+    _sel = _apply_selection(files, params)
+    files = _sel.files
+    include_paths = _sel.include_paths
+    queued = _sel.queued
+    deselected = _sel.deselected
+    vanished_paths = _sel.vanished_paths
+    appeared = _sel.appeared
+
+    checker = None
+    if params.skip_duplicates:
+        checker = DuplicateChecker(
+            CatalogIndex.from_db(db), verify_by_hash=params.verify_by_hash,
+        )
+        checker.prepare(files)
+
+    # Folder-planning timestamps: EXIF first (reusing the checker's batched
+    # reads in metadata mode), file mtime fallback.
+    timestamps = _source_file_timestamps(
+        files,
+        capture_times=(
+            {str(f): checker.capture_time(f) for f in files}
+            if checker is not None and not checker.verify_by_hash
+            else None
+        ),
+    )
+
+    # Group by destination (template) folder, template order, then chunk.
+    groups = {}
+    for f in files:
+        rel = build_destination_path(
+            timestamps.get(f), params.folder_template,
+        ) or "."
+        groups.setdefault(rel, []).append(f)
+    batches = []
+    for rel in sorted(groups):
+        group = groups[rel]
+        for i in range(0, len(group), IMPORT_BATCH_SIZE):
+            batches.append((rel, group[i:i + IMPORT_BATCH_SIZE]))
+
+    return _ImportPlan(
+        files=files,
+        discovered=discovered,
+        source_snapshots=source_snapshots,
+        include_paths=include_paths,
+        queued=queued,
+        deselected=deselected,
+        vanished_paths=vanished_paths,
+        appeared=appeared,
+        checker=checker,
+        timestamps=timestamps,
+        batches=batches,
+    )
+
+
 def copy_and_hash_verify(src, dst, *, src_hash=None):
     """Copy ``src`` to ``dst`` and verify the landed bytes by content hash.
 
@@ -1585,45 +1771,7 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
         expected_new=(params.checked_count if params.skip_duplicates else None),
     )
 
-    # ``state.folder_counts``: live per-folder counters, mutated by the
-    # copy loop via _counts() and snapshotted onto every progress event
-    # so the Import page can render truthful per-folder progress
-    # mid-run. Mirrors the local path.
-
-    def _emit(phase, current, total, current_file="", *, is_importing=False):
-        eta_fields = {}
-        if total > 0:
-            if is_importing:
-                eta.note_importing(state.copied)
-            else:
-                eta.note_batch_complete(current, state.copied)
-            eta_fields = eta.fields(total)
-        job["progress"]["current"] = current
-        job["progress"]["total"] = total
-        job["progress"]["current_file"] = current_file
-        for key in _IMPORT_ETA_PROGRESS_KEYS + _IMPORT_TRANSFER_PROGRESS_KEYS:
-            job["progress"].pop(key, None)
-        job["progress"].update(eta_fields)
-        runner.update_step(
-            job["id"], "import",
-            current_file=current_file,
-            progress={
-                "current": current, "total": total, **eta_fields,
-            },
-        )
-        runner.push_event(
-            job["id"], "progress",
-            progress_event(
-                phase, current, total, current_file,
-                # Snapshot (counts dicts mutate as the loop advances; SSE
-                # consumers must see the state at emit time). Mirrors the
-                # local path — spec decision 1.
-                folders={
-                    rel: dict(counts) for rel, counts in state.folder_counts.items()
-                },
-                **eta_fields,
-            ),
-        )
+    _emit = _make_emitter(job, runner, state, eta)
 
     def _emit_transfer(rel, transfer_current, transfer_total, current_file):
         """Report one actually-transferred file of the current batch rsync.
@@ -1672,81 +1820,21 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
             ),
         )
 
-    # --- Discover (same enumeration-error handling as the local path) ---
-    _emit("Discovering files", 0, 0)
-    files = []
-
-    def _discovery_onerror(exc):
-        state.discovery_errors.append(exc)
-        log.warning("Import discovery error: %s", exc)
-
-    for src in params.sources:
-        files.extend(discover_source_files(
-            src, params.file_types, recursive=params.recursive,
-            onerror=_discovery_onerror,
-        ))
-    discovered = len(files)
-    # Snapshot the discovered source metadata NOW — before selection filters
-    # the copy set, before any copy work, and before duplicate hashing. The
-    # retry-side signature check re-enumerates each source in full and
-    # compares the current signature to what the parent recorded; capturing
-    # the snapshot AFTER ``_apply_selection`` would mean a per-file import
-    # only ever stored a signature over its selected subset, and the retry's
-    # full-enumeration signature would never match — an unchanged card
-    # would be rejected as drifted, and correcting that by having retry
-    # also filter would leave nothing gating a card whose deselected files
-    # were replaced or removed. Pre-selection capture keeps both sides on
-    # the same enumeration. Capturing before copy also matters so a card
-    # ejected or momentarily unreadable mid-run doesn't backfill ``-1``
-    # sizes for files we successfully enumerated — reinserting the card
-    # and retrying is a common recovery workflow, and the retry-side
-    # signature check must have a snapshot taken from the source as
-    # observed at run start to accept it.
-    source_snapshots = _capture_source_snapshots(files, params.sources)
-
-    # Selection: filter the copy set and measure drift. Shared with the local
-    # path — see ``_apply_selection`` for why each condition is shaped the
-    # way it is. Destructured BY NAME, not by position: four of the six
-    # fields are plain ints and two are sets, so a positional unpack that
-    # transposed a same-typed pair (``queued``/``deselected``,
-    # ``queued``/``appeared``) would still run, still type-check, and still
-    # pass the local/remote parity test — which compares the two paths to
-    # each other and so cannot see a transposition applied to both.
-    _sel = _apply_selection(files, params)
-    files = _sel.files
-    include_paths = _sel.include_paths
-    queued = _sel.queued
-    deselected = _sel.deselected
-    vanished_paths = _sel.vanished_paths
-    appeared = _sel.appeared
-
-    checker = None
-    if params.skip_duplicates:
-        checker = DuplicateChecker(
-            CatalogIndex.from_db(db), verify_by_hash=params.verify_by_hash,
-        )
-        checker.prepare(files)
-
-    timestamps = _source_file_timestamps(
-        files,
-        capture_times=(
-            {str(f): checker.capture_time(f) for f in files}
-            if checker is not None and not checker.verify_by_hash
-            else None
-        ),
-    )
-
-    groups = {}
-    for f in files:
-        rel = build_destination_path(
-            timestamps.get(f), params.folder_template,
-        ) or "."
-        groups.setdefault(rel, []).append(f)
-    batches = []
-    for rel in sorted(groups):
-        group = groups[rel]
-        for i in range(0, len(group), IMPORT_BATCH_SIZE):
-            batches.append((rel, group[i:i + IMPORT_BATCH_SIZE]))
+    # --- Discover → select → batch (shared planning phase) --------------
+    # Destructured BY NAME (see ``_ImportPlan``: same-typed field
+    # transpositions survive a positional unpack and the parity test).
+    # ``plan.files``/``plan.timestamps`` are consumed inside the planner;
+    # the loop below works from ``batches``.
+    plan = _plan_import(db, params, _emit, state)
+    discovered = plan.discovered
+    source_snapshots = plan.source_snapshots
+    include_paths = plan.include_paths
+    queued = plan.queued
+    deselected = plan.deselected
+    vanished_paths = plan.vanished_paths
+    appeared = plan.appeared
+    checker = plan.checker
+    batches = plan.batches
 
     # --- Ledger ---------------------------------------------------------
     # (On ``state``.) ``state.verified``: count of files independently
@@ -3347,122 +3435,23 @@ def run_import_job(job, runner, db_path, workspace_id, params):
         expected_new=(params.checked_count if params.skip_duplicates else None),
     )
 
-    # ``state.folder_counts``: live per-folder counters, mutated by the
-    # copy loop via _counts() and snapshotted onto every progress event
-    # so the Import page can render truthful per-folder progress mid-run
-    # (not just from the terminal result).
+    _emit = _make_emitter(job, runner, state, eta)
 
-    def _emit(phase, current, total, current_file="", *, is_importing=False):
-        eta_fields = {}
-        if total > 0:
-            if is_importing:
-                eta.note_importing(state.copied)
-            else:
-                eta.note_batch_complete(current, state.copied)
-            eta_fields = eta.fields(total)
-        job["progress"]["current"] = current
-        job["progress"]["total"] = total
-        job["progress"]["current_file"] = current_file
-        for key in _IMPORT_ETA_PROGRESS_KEYS:
-            job["progress"].pop(key, None)
-        job["progress"].update(eta_fields)
-        runner.update_step(
-            job["id"], "import",
-            current_file=current_file,
-            progress={
-                "current": current, "total": total, **eta_fields,
-            },
-        )
-        runner.push_event(
-            job["id"], "progress",
-            progress_event(
-                phase, current, total, current_file,
-                # Snapshot (counts dicts mutate as the loop advances; SSE
-                # consumers must see the state at emit time).
-                folders={
-                    rel: dict(counts) for rel, counts in state.folder_counts.items()
-                },
-                **eta_fields,
-            ),
-        )
-
-    # --- Discover ---------------------------------------------------
-    # Enumeration errors (permission denied, macOS TCC block on a
-    # removable volume, unreadable subtree) get silently swallowed by
-    # os.walk-style callbacks by default. If we ignored them, discovered
-    # would just be smaller than reality and safe_to_format could still
-    # flip green over a card whose contents were never actually visited.
-    # Track them explicitly: each is a bucket-of-its-own failure entry
-    # tied to the source path where it occurred.
-    _emit("Discovering files", 0, 0)
-    files = []
-
-    def _discovery_onerror(exc):
-        state.discovery_errors.append(exc)
-        log.warning("Import discovery error: %s", exc)
-
-    for src in params.sources:
-        files.extend(discover_source_files(
-            src, params.file_types, recursive=params.recursive,
-            onerror=_discovery_onerror,
-        ))
-    discovered = len(files)
-    # Snapshot the discovered source metadata NOW — before selection filters
-    # the copy set, before any copy work, and before duplicate hashing. See
-    # the matching block in ``run_import_job`` for the full rationale: retry
-    # re-enumerates each source in full and would refuse an unchanged card
-    # if the parent's stored signature only covered the selected subset,
-    # and pre-copy capture keeps a mid-run ejection from backfilling ``-1``
-    # sizes over a snapshot that would otherwise refuse the natural
-    # reinsert-and-retry recovery.
-    source_snapshots = _capture_source_snapshots(files, params.sources)
-
-    # Selection: filter the copy set and measure drift. Shared with the
-    # remote path — see ``_apply_selection`` for why each condition is
-    # shaped the way it is. Destructured BY NAME, not by position: four of
-    # the six fields are plain ints and two are sets, so a positional unpack
-    # that transposed a same-typed pair (``queued``/``deselected``,
-    # ``queued``/``appeared``) would still run, still type-check, and still
-    # pass the local/remote parity test — which compares the two paths to
-    # each other and so cannot see a transposition applied to both.
-    _sel = _apply_selection(files, params)
-    files = _sel.files
-    include_paths = _sel.include_paths
-    queued = _sel.queued
-    deselected = _sel.deselected
-    vanished_paths = _sel.vanished_paths
-    appeared = _sel.appeared
-
-    checker = None
-    if params.skip_duplicates:
-        checker = DuplicateChecker(
-            CatalogIndex.from_db(db), verify_by_hash=params.verify_by_hash,
-        )
-        checker.prepare(files)
-
-    # Folder-planning timestamps: EXIF first (reusing the checker's batched
-    # reads in metadata mode), file mtime fallback.
-    timestamps = _source_file_timestamps(
-        files,
-        capture_times=(
-            {str(f): checker.capture_time(f) for f in files}
-            if checker is not None and not checker.verify_by_hash
-            else None
-        ),
-    )
-
-    # Group by destination (template) folder, template order, then chunk.
-    groups = {}
-    for f in files:
-        rel = build_destination_path(
-            timestamps.get(f), params.folder_template,
-        ) or "."
-        groups.setdefault(rel, []).append(f)
-    batches = []
-    for rel in sorted(groups):
-        group = groups[rel]
-        for i in range(0, len(group), IMPORT_BATCH_SIZE):
-            batches.append((rel, group[i:i + IMPORT_BATCH_SIZE]))
+    # --- Discover → select → batch (shared planning phase) ----------
+    # Destructured BY NAME (see ``_ImportPlan``: same-typed field
+    # transpositions survive a positional unpack and the parity test).
+    # ``plan.files``/``plan.timestamps`` are consumed inside the planner;
+    # the loop below works from ``batches``.
+    plan = _plan_import(db, params, _emit, state)
+    discovered = plan.discovered
+    source_snapshots = plan.source_snapshots
+    include_paths = plan.include_paths
+    queued = plan.queued
+    deselected = plan.deselected
+    vanished_paths = plan.vanished_paths
+    appeared = plan.appeared
+    checker = plan.checker
+    batches = plan.batches
 
     # --- Ledger -----------------------------------------------------
     # Every discovered file ends in exactly one terminal bucket on

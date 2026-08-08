@@ -19063,6 +19063,14 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         # this tool is for removable media, not the archive. The per-file
         # guard in card_cleanup.qualify_rows is the real invariant; this
         # is the clear early error.
+        #
+        # Cost: O(folders) realpath calls at request time, plus (on Linux,
+        # where contains_resolved probes case sensitivity) a listdir of
+        # each root. Acceptable at the thousands-of-rows scale of a local
+        # folders table with local paths. Revisit — cache the resolved
+        # roots, or narrow the candidate set by prefix first — if folder
+        # counts grow much larger or roots live on network mounts where
+        # each realpath/listdir is a round trip.
         source_real = os.path.realpath(source)
         for row in db.conn.execute("SELECT path FROM folders").fetchall():
             froot = row["path"]
@@ -19153,6 +19161,10 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             scan_job = dict(row) if row is not None else None
         if scan_job is None or scan_job.get("type") != "card-cleanup-scan":
             return json_error("unknown scan job", status=404)
+        if scan_job.get("status") in ("queued", "running"):
+            # Mid-flight, not a dead end: telling the user to re-scan here
+            # would throw away a scan that is about to succeed.
+            return json_error("scan still running — wait for it to finish")
         if scan_job.get("status") != "completed":
             return json_error("scan did not complete — re-scan the card")
         # One delete per manifest. (A TOCTOU race between two simultaneous

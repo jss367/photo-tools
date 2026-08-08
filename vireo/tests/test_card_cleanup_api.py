@@ -158,6 +158,33 @@ def test_delete_refuses_cancelled_scan(app_and_db):
     assert resp.status_code == 400
 
 
+def test_delete_refuses_running_scan_without_telling_user_to_rescan(
+        app_and_db):
+    """A delete requested while the scan is still going is early, not
+    doomed — the error must say to wait, not to re-scan."""
+    app, db = app_and_db
+    client = app.test_client()
+    db.conn.execute(
+        "INSERT INTO job_history (id, type, status, started_at) "
+        "VALUES (?, ?, ?, ?)",
+        ("scan-run", "card-cleanup-scan", "running", "2026-08-08T00:00:00"),
+    )
+    db.conn.commit()
+    resp = client.post(
+        "/api/card-cleanup/delete", json={"scan_job_id": "scan-run"})
+    assert resp.status_code == 400
+    error = resp.get_json()["error"]
+    assert "still running" in error
+    assert "re-scan" not in error
+
+
+def test_manifest_unknown_scan_job_404(app_and_db):
+    app, db = app_and_db
+    client = app.test_client()
+    resp = client.get("/api/card-cleanup/nope/manifest")
+    assert resp.status_code == 404
+
+
 def test_delete_after_restart_uses_history_and_disk_manifest(
         app_and_db, tmp_path):
     app, db = app_and_db
@@ -241,6 +268,9 @@ def test_delete_concurrent_delete_409(app_and_db, tmp_path, monkeypatch):
 
     monkeypatch.setattr(
         card_cleanup, "delete_verified", blocking_delete_verified)
+    # Bound before the try so a failure on the first POST surfaces as
+    # itself, not as a NameError raised from the finally drain.
+    job1_id = None
     try:
         resp1 = client.post(
             "/api/card-cleanup/delete", json={"scan_job_id": scan_job_id})
@@ -266,7 +296,8 @@ def test_delete_concurrent_delete_409(app_and_db, tmp_path, monkeypatch):
         release.set()
         monkeypatch.setattr(
             card_cleanup, "delete_verified", real_delete_verified)
-        _wait_for_job(client, job1_id)
+        if job1_id:
+            _wait_for_job(client, job1_id)
 
 
 def test_scan_rejects_relative_or_nondir_source(app_and_db, tmp_path):

@@ -4775,16 +4775,29 @@ async function cardCleanupFinishJob(jobId, kind) {
   if (cardCleanupState.finishedJobId === jobId) return;
   cardCleanupState.finishedJobId = jobId;
   let job = null;
+  // The stream is already gone by the time we poll, so say what the page
+  // is actually doing instead of leaving the last SSE line under a bar
+  // that has stopped moving.
+  document.getElementById('card-cleanup-phase').textContent =
+    'Checking job status…';
   for (let i = 0; i < 30; i++) {
-    const resp = await fetch('/api/jobs/' + encodeURIComponent(jobId));
-    if (resp.ok) {
-      const polled = await resp.json();
-      if (polled.status && polled.status !== 'running'
-          && polled.status !== 'queued') {
-        job = polled;
-        break;
+    // A poll that throws (server restarting, network dropped — the very
+    // conditions that killed the stream) must not escape as an unhandled
+    // rejection: that would skip the cleanup below and leave a frozen bar,
+    // a live Cancel button pointing at a stale job, and a disabled Scan
+    // button until reload. Treat it as one failed attempt and keep going
+    // toward the timeout path.
+    try {
+      const resp = await fetch('/api/jobs/' + encodeURIComponent(jobId));
+      if (resp.ok) {
+        const polled = await resp.json();
+        if (polled.status && polled.status !== 'running'
+            && polled.status !== 'queued') {
+          job = polled;
+          break;
+        }
       }
-    }
+    } catch (e) { /* retry below */ }
     await new Promise(r => setTimeout(r, 1000));
   }
   cardCleanupState.jobId = null;

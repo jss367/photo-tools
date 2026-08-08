@@ -233,13 +233,20 @@ def qualify_rows(rows, source_root_real, card_path):
         if not row["folder_path"]:
             continue
         archive_path = os.path.join(row["folder_path"], row["filename"])
-        if path_guard.contains_resolved(
-                source_root_real, os.path.realpath(archive_path)):
+        try:
+            archive_real = os.path.realpath(archive_path)
+        except (OSError, ValueError):
+            # Containment is unknown, not disproven — a row we can't
+            # even resolve must not be treated as "inside the source"
+            # (which would be silently wrong) or crash the whole job.
+            reason = KEEP_ARCHIVE_UNREACHABLE
+            continue
+        if path_guard.contains_resolved(source_root_real, archive_real):
             reason = KEEP_INSIDE_SOURCE
             continue
         try:
             ast = os.stat(archive_path)
-        except OSError:
+        except (OSError, ValueError):
             reason = KEEP_ARCHIVE_UNREACHABLE
             continue
         # samefile semantics without a second round trip: a mount alias
@@ -346,5 +353,71 @@ def scan_card(db, source, recursive, manifest_dir, scan_job_id,
         "totals": totals,
     }
     write_manifest(manifest_dir, manifest)
+    # Job-result flag only — deliberately NOT part of the persisted
+    # manifest (added after write_manifest). A completed scan's manifest
+    # on disk has no "cancelled" key; don't "fix" this into the schema.
     manifest["cancelled"] = False
     return manifest
+
+
+def delete_verified(db, manifest, progress_cb=None, should_cancel=None):
+    """Delete the manifest's deletable bucket, re-proving the invariant
+    per file immediately before each unlink. Never reads the kept or
+    ignored buckets."""
+    source_root_real = os.path.realpath(manifest["source_root"])
+    deletable = [e for e in manifest["entries"]
+                 if e.get("bucket") == "deletable"]
+    summary = {
+        "deleted": 0, "deleted_bytes": 0,
+        "skipped": [], "failed": [],
+        "cancelled": False, "remaining": 0,
+    }
+    for i, entry in enumerate(deletable):
+        if should_cancel is not None and should_cancel():
+            summary["cancelled"] = True
+            summary["remaining"] = len(deletable) - i
+            break
+        path = entry["path"]
+        if progress_cb is not None:
+            progress_cb(i + 1, len(deletable), os.path.basename(path))
+        # Card gate: cheap stat pre-check, then full re-hash. Size+mtime
+        # alone cannot detect a swapped card or same-size replacement.
+        try:
+            st = os.stat(path)
+        except FileNotFoundError:
+            summary["skipped"].append(
+                {"path": path, "reason": "already gone from the card"})
+            continue
+        except OSError as e:
+            summary["failed"].append({"path": path, "error": str(e)})
+            continue
+        if (st.st_size != entry["size"]
+                or st.st_mtime_ns != entry["mtime_ns"]):
+            summary["skipped"].append(
+                {"path": path, "reason": "changed on the card since the scan"})
+            continue
+        try:
+            current_hash = compute_file_hash(path)
+        except OSError as e:
+            summary["failed"].append({"path": path, "error": str(e)})
+            continue
+        if current_hash != entry["hash"]:
+            summary["skipped"].append(
+                {"path": path,
+                 "reason": "content changed on the card since the scan"})
+            continue
+        # Archive gate: fresh rows, fresh stat — never reused from the
+        # scan or from an earlier deletion in this run.
+        archive_path, reason = qualify_rows(
+            fetch_rows_by_hash(db, entry["hash"]), source_root_real, path)
+        if archive_path is None:
+            summary["skipped"].append({"path": path, "reason": reason})
+            continue
+        try:
+            os.remove(path)
+        except OSError as e:
+            summary["failed"].append({"path": path, "error": str(e)})
+            continue
+        summary["deleted"] += 1
+        summary["deleted_bytes"] += entry["size"]
+    return summary

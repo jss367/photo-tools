@@ -3,6 +3,7 @@ scan/delete safety gates. Spec:
 docs/superpowers/specs/2026-08-07-card-cleanup-design.md
 """
 import os
+import unittest.mock
 from datetime import UTC, datetime, timedelta
 
 import card_cleanup
@@ -419,3 +420,188 @@ def test_scan_hashes_each_card_file_once(db, tmp_path, monkeypatch):
     _scan(db, tmp_path)
     card_calls = [p for p in calls if "card" in p]
     assert len(card_calls) == 1
+
+
+def test_qualify_rows_null_archive_stat_baseline_keeps(db, tmp_path):
+    # Scan-cataloged rows can have NULL file_size/file_mtime even when
+    # hash_status is "ok" (e.g. legacy rows) — must not raise, must keep.
+    archive_file, _ = _archive_photo(db, tmp_path)
+    card = _card_file(tmp_path)
+    source_root_real = os.path.realpath(str(tmp_path / "card"))
+    rows = [{
+        "filename": os.path.basename(str(archive_file)),
+        "file_size": None, "file_mtime": None,
+        "hash_status": "ok",
+        "folder_path": os.path.dirname(str(archive_file)),
+    }]
+    archive_path, reason = card_cleanup.qualify_rows(
+        rows, source_root_real, str(card))
+    assert archive_path is None
+    assert reason == card_cleanup.KEEP_ARCHIVE_CHANGED
+
+
+def test_qualify_rows_missing_card_file_unreadable(db, tmp_path):
+    # Unreachable from scan_card (it only calls qualify_rows on files it
+    # just stat'd) — but delete_verified could race a vanished card file
+    # in between its own stat and the archive gate call.
+    archive_file, _ = _archive_photo(db, tmp_path)
+    source_root_real = os.path.realpath(str(tmp_path / "card"))
+    rows = [{
+        "filename": os.path.basename(str(archive_file)),
+        "file_size": None, "file_mtime": None,
+        "hash_status": "ok",
+        "folder_path": os.path.dirname(str(archive_file)),
+    }]
+    archive_path, reason = card_cleanup.qualify_rows(
+        rows, source_root_real, str(tmp_path / "card" / "gone.NEF"))
+    assert archive_path is None
+    assert reason == card_cleanup.KEEP_UNREADABLE
+
+
+def _scan_then_delete(db, tmp_path, mutate=None, should_cancel=None):
+    scan = _scan(db, tmp_path)
+    assert scan["totals"]["deletable"]["count"] >= 1
+    manifest = load_manifest(str(tmp_path / "manifests"), "scan-1")
+    if mutate is not None:
+        mutate()
+    return card_cleanup.delete_verified(
+        db, manifest, should_cancel=should_cancel)
+
+
+def test_delete_happy_path_two_duplicates_both_deleted(db, tmp_path):
+    # Spec: two identical card files matching one archive photo — both
+    # deletable, both deleted.
+    _archive_photo(db, tmp_path)
+    card_a = _card_file(tmp_path, name="IMG_0001.NEF")
+    card_b = _card_file(tmp_path, name="IMG_0001_copy.NEF")
+    summary = _scan_then_delete(db, tmp_path)
+    assert summary["deleted"] == 2
+    assert not card_a.exists() and not card_b.exists()
+    assert summary["skipped"] == [] and summary["failed"] == []
+
+
+def test_delete_skips_file_changed_since_scan(db, tmp_path):
+    _archive_photo(db, tmp_path)
+    card = _card_file(tmp_path)
+
+    def rewrite():
+        card.write_bytes(b"new-shot-reusing-name")
+
+    summary = _scan_then_delete(db, tmp_path, mutate=rewrite)
+    assert summary["deleted"] == 0
+    assert len(summary["skipped"]) == 1
+    assert card.exists()
+
+
+def test_delete_rehash_catches_same_size_same_mtime_swap(db, tmp_path):
+    # Same byte count, mtime forced back to the manifest value: only the
+    # delete-time re-hash can catch this (FAT mtimes are 2s-granular).
+    _archive_photo(db, tmp_path)
+    card = _card_file(tmp_path)  # content b"raw-one", 7 bytes
+    st = os.stat(card)
+
+    def swap():
+        card.write_bytes(b"raw-two")  # also 7 bytes
+        os.utime(card, ns=(st.st_atime_ns, st.st_mtime_ns))
+
+    summary = _scan_then_delete(db, tmp_path, mutate=swap)
+    assert summary["deleted"] == 0
+    assert len(summary["skipped"]) == 1
+    assert card.exists()
+
+
+def test_delete_archive_removed_after_scan_skips(db, tmp_path):
+    archive_file, _ = _archive_photo(db, tmp_path)
+    card = _card_file(tmp_path)
+    summary = _scan_then_delete(
+        db, tmp_path, mutate=lambda: os.unlink(archive_file))
+    assert summary["deleted"] == 0
+    assert card.exists()
+    assert "archive" in summary["skipped"][0]["reason"]
+
+
+def test_delete_no_stat_reuse_across_duplicates(db, tmp_path):
+    # Two identical card files; archive copy vanishes after the first
+    # deletion. The second file's own fresh stat must fail — a cached
+    # scan-time (or first-delete-time) result would wrongly authorize it.
+    archive_file, _ = _archive_photo(db, tmp_path)
+    card_a = _card_file(tmp_path, name="IMG_0001.NEF")
+    card_b = _card_file(tmp_path, name="IMG_0002.NEF")
+    scan = _scan(db, tmp_path)
+    assert scan["totals"]["deletable"]["count"] == 2
+    manifest = load_manifest(str(tmp_path / "manifests"), "scan-1")
+
+    deleted_once = []
+    real_remove = os.remove
+
+    def remove_then_kill_archive(path, *a, **kw):
+        real_remove(path, *a, **kw)
+        if not deleted_once:
+            deleted_once.append(path)
+            real_remove(archive_file)
+
+    with unittest.mock.patch.object(
+            card_cleanup.os, "remove", remove_then_kill_archive):
+        summary = card_cleanup.delete_verified(db, manifest)
+    assert summary["deleted"] == 1
+    assert len(summary["skipped"]) == 1
+    assert card_a.exists() != card_b.exists()  # exactly one survived
+
+
+def test_delete_cancellation_honest_summary(db, tmp_path):
+    _archive_photo(db, tmp_path)
+    _card_file(tmp_path, name="IMG_0001.NEF")
+    _card_file(tmp_path, name="IMG_0002.NEF")
+    calls = []
+
+    def cancel_after_first():
+        calls.append(1)
+        return len(calls) > 1
+
+    summary = _scan_then_delete(
+        db, tmp_path, should_cancel=cancel_after_first)
+    assert summary["cancelled"] is True
+    assert summary["deleted"] + summary["remaining"] == 2
+
+
+def test_delete_vanished_card_file_counts_skipped(db, tmp_path):
+    _archive_photo(db, tmp_path)
+    card = _card_file(tmp_path)
+    summary = _scan_then_delete(db, tmp_path, mutate=lambda: os.unlink(card))
+    assert summary["deleted"] == 0
+    assert "already gone" in summary["skipped"][0]["reason"]
+
+
+def test_delete_per_file_failure_continues(db, tmp_path):
+    # A permission error on one file is recorded as failed; the job
+    # moves on and still deletes the rest.
+    _archive_photo(db, tmp_path)
+    card_a = _card_file(tmp_path, name="IMG_0001.NEF")
+    card_b = _card_file(tmp_path, name="IMG_0002.NEF")
+    scan = _scan(db, tmp_path)
+    assert scan["totals"]["deletable"]["count"] == 2
+    manifest = load_manifest(str(tmp_path / "manifests"), "scan-1")
+    real_remove = os.remove
+    failed_path = str(card_a)
+
+    def failing_remove(path, *a, **kw):
+        if str(path) == failed_path:
+            raise PermissionError(13, "read-only card", failed_path)
+        real_remove(path, *a, **kw)
+
+    with unittest.mock.patch.object(
+            card_cleanup.os, "remove", failing_remove):
+        summary = card_cleanup.delete_verified(db, manifest)
+    assert summary["deleted"] == 1
+    assert len(summary["failed"]) == 1
+    assert summary["failed"][0]["path"] == failed_path
+    assert card_a.exists() and not card_b.exists()
+
+
+def test_delete_only_touches_deletable_bucket(db, tmp_path):
+    _archive_photo(db, tmp_path)
+    _card_file(tmp_path)
+    stray = _card_file(tmp_path, name="IMG_KEEP.NEF", content=b"unimported")
+    summary = _scan_then_delete(db, tmp_path)
+    assert summary["deleted"] == 1
+    assert stray.exists()

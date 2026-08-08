@@ -46,9 +46,30 @@ echo ""
 # --- Sync version across all manifests ---
 echo "==> Syncing version..."
 python scripts/sync_version.py "$NEW_VERSION"
-echo "==> Updating Cargo.lock..."
-(cd src-tauri && cargo generate-lockfile)
+# `--workspace` rewrites only the `vireo` entry in Cargo.lock so it matches the
+# version sync_version.py just wrote to Cargo.toml. Do NOT use
+# `cargo generate-lockfile` here: it re-resolves every third-party crate to the
+# newest compatible version, so a release silently ships dependency bumps that
+# no CI run has ever compiled. That is how v0.32.3 picked up zune-core 0.5.2 —
+# published three hours earlier, broken, yanked shortly after — and failed the
+# macOS build. Dependency updates belong in reviewed Dependabot PRs; see
+# .github/dependabot.yml.
+echo "==> Updating Cargo.lock (workspace version only)..."
+(cd src-tauri && cargo update --workspace)
 echo ""
+
+# --- Verify the Rust dependency graph compiles (publish path only) ---
+# The publish path never builds locally — CI does that, but only *after* the tag
+# is pushed, so a dependency that does not compile is discovered 20 minutes into
+# a tagged build with the tag already public. `cargo check --locked` compiles
+# every dependency for this host in a couple of minutes and also asserts that
+# Cargo.lock is complete and in sync with Cargo.toml. The non-publish path skips
+# this because the full local build below already covers it.
+if $PUBLISH; then
+    echo "==> Checking Rust dependency graph..."
+    (cd src-tauri && cargo check --locked)
+    echo ""
+fi
 
 # --- Run E2E tests ---
 echo "==> Running E2E tests..."

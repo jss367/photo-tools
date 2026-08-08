@@ -31,6 +31,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from urllib.parse import quote, urlsplit
 
+import path_guard
 import places
 from db import (
     _LIFE_LIST_ANCESTOR_SUPPRESSION_CLAUSE,
@@ -25644,78 +25645,10 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         # format once ``copied + skipped_duplicate == discovered``; if the
         # destination lives inside the card, formatting the card also erases
         # the supposed archive copy, so allowing this is a data-loss trap.
-        #
-        # macOS's default APFS/HFS+ volumes and Windows NTFS are
-        # case-INSENSITIVE, so ``/Volumes/Card`` and ``/volumes/card`` are
-        # the same directory but ``realpath`` doesn't case-normalize on
-        # POSIX (macOS reports as POSIX). On Linux, a platform-wide
-        # case-sensitivity assumption misses FAT/exFAT/NTFS-mounted
-        # removable media (typical SD-card setup) that sit under a
-        # case-sensitive ext4 parent — the user's real card mount point
-        # can be case-insensitive even when the root filesystem isn't.
-        # Compare case-folded on darwin/win32 unconditionally, and on
-        # Linux probe each source's actual filesystem: if the resolved
-        # path with an alpha character case-swapped still stat's to the
-        # same inode, the mount is case-insensitive and both sides of
-        # the containment comparison need case-folding for that source.
-        _case_insensitive_platform = sys.platform in ("darwin", "win32")
-
-        def _casenorm(p):
-            return p.casefold() if _case_insensitive_platform else p
-
-        def _fs_is_case_insensitive(path):
-            """Probe whether the filesystem at ``path`` treats case as insensitive.
-
-            List an entry inside ``path`` and check whether accessing it
-            under a case-swapped name resolves to the same inode. Probing
-            *inside* the directory (rather than swapping characters in
-            ``path`` itself) is essential when a case-insensitive mount
-            sits under a case-sensitive parent — a FAT/exFAT SD card
-            mounted at ``/mnt/Card`` on Linux under an ext4 root: the
-            ext4 ``/mnt`` cannot resolve ``/Mnt`` or a differently-cased
-            ``Card`` entry (mount-point dentries are stored in the
-            parent FS), so swapping characters in the ``path`` string
-            always reports case-sensitive regardless of the card's own
-            semantics.
-
-            Any inconclusive result (unlistable, empty, no
-            alpha-containing entry, or a stat error while comparing)
-            returns True so the containment check falls back to
-            case-fold — the stricter direction of this safety guard.
-            A false positive on a case-sensitive filesystem can only
-            reject a legitimate destination (recoverable UX error the
-            user immediately sees and fixes by picking a different
-            path), whereas a false negative on a case-insensitive
-            filesystem accepts a case-collision destination inside the
-            card and lets ``safe_to_format`` later green-light
-            formatting while the archive lives on it. The reviewer's
-            example: an SD card whose root contains only numeric
-            top-level directories (Nikon-style ``100``/``101``/``102``)
-            has no alpha-containing entry to probe with. See PR #1107
-            review.
-            """
-            try:
-                entries = os.listdir(path)
-            except OSError:
-                return True
-            for name in entries:
-                for i, c in enumerate(name):
-                    if c.isalpha():
-                        swapped = name[:i] + c.swapcase() + name[i + 1:]
-                        if swapped == name:
-                            continue
-                        original_full = os.path.join(path, name)
-                        probe_full = os.path.join(path, swapped)
-                        if not os.path.exists(probe_full):
-                            # Definitive: case-swap resolves to nothing,
-                            # so the filesystem distinguishes case.
-                            return False
-                        try:
-                            return os.path.samefile(original_full, probe_full)
-                        except OSError:
-                            return True
-            return True
-
+        # Case-fold handling (darwin/win32 unconditional, Linux per-mount
+        # probe) lives in path_guard — see its module docstring and the
+        # fs_is_case_insensitive() docstring for the full rationale
+        # (PR #1107 review).
         try:
             dest_real = os.path.realpath(destination)
         except OSError as e:
@@ -25727,21 +25660,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 # Source unresolvable — the os.path.isdir check above
                 # already handled non-existent sources; nothing more to say.
                 continue
-            # Per-source case-fold decision: platform is enough on
-            # darwin/win32; on Linux, probe the actual source mount.
-            per_source_ci = _case_insensitive_platform or (
-                not _case_insensitive_platform
-                and _fs_is_case_insensitive(source_real)
-            )
-            if per_source_ci:
-                source_cmp = source_real.casefold().rstrip(os.sep)
-                dest_cmp = dest_real.casefold()
-            else:
-                source_cmp = source_real.rstrip(os.sep)
-                dest_cmp = dest_real
-            if dest_cmp == source_cmp or dest_cmp.startswith(
-                source_cmp + os.sep
-            ):
+            if path_guard.contains_resolved(source_real, dest_real):
                 return json_error(
                     f"destination cannot be inside a source directory "
                     f"(destination={destination!r}, source={s!r}); "

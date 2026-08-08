@@ -9964,6 +9964,147 @@ def test_remote_zero_byte_adopted_companion_revalidates_before_stamping(
         in reasons[dest_key], reasons
 
 
+def test_local_zero_byte_adoption_revalidates_before_stamping(
+        tmp_path, monkeypatch):
+    """Local mirror of
+    ``test_remote_zero_byte_adoption_revalidates_before_stamping``: the
+    local stamping loop's zero-byte convention branch stamped
+    ``hash_status='ok'`` with no archive re-read ("Status only"), so an
+    empty adopted file that vanished between scan and stamping kept its
+    ``skipped_duplicate`` booking and ``safe_to_format`` went True over
+    an archive path that no longer holds the file. The remote loop
+    gained the re-read when Codex flagged it on PR #1437 (P1
+    r3741224300); this pins the same check on the local path — the
+    pre-existing hole the remote fold inherited FROM local.
+    ``skip_duplicates=False`` reaches the checker-less zero-byte adopt
+    branch, mirroring the remote geometry exactly."""
+    import scanner as _scanner
+    from import_job import ImportParams, run_import_job
+
+    card = tmp_path / "card"
+    card.mkdir()
+    card_file = card / "empty.jpg"
+    card_file.write_bytes(b"")
+    ts = datetime(2026, 7, 3, 10, 0, 0).timestamp()
+    os.utime(str(card_file), (ts, ts))
+
+    archive = tmp_path / "archive"
+    seed_folder = archive / "2026" / "2026-07-03"
+    seed_folder.mkdir(parents=True)
+    adopted_dest_path = seed_folder / "empty.jpg"
+    adopted_dest_path.write_bytes(b"")
+    os.utime(str(adopted_dest_path), (ts, ts))
+
+    real_scan = _scanner.scan
+    deleted = {}
+
+    def deleting_scan(*args, **kwargs):
+        result = real_scan(*args, **kwargs)
+        if not deleted and adopted_dest_path.exists():
+            adopted_dest_path.unlink()
+            deleted["done"] = True
+        return result
+
+    monkeypatch.setattr(_scanner, "scan", deleting_scan)
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    runner = FakeRunner()
+    result = run_import_job(
+        _make_job(), runner, db_path, db._active_workspace_id,
+        ImportParams(
+            sources=[str(card)], destination=str(archive),
+            verify_by_hash=True, skip_duplicates=False,
+        ),
+    )
+    obs = _behavior_observables(result, runner, db, archive)
+
+    assert deleted, "the scan wrapper never saw the adopted file"
+    assert obs["skipped_duplicate"] == 0, obs
+    assert obs["failed"] == 1, obs
+    assert obs["safe_to_format"] is False, obs
+    dest_key = str(adopted_dest_path)
+    reasons = {p: r for p, r in obs["unsafe"]}
+    assert dest_key in reasons, obs["unsafe"]
+    assert "scan wrote no archive row hash" in reasons[dest_key], reasons
+
+
+def test_local_zero_byte_adopted_companion_revalidates_before_stamping(
+        tmp_path, monkeypatch):
+    """Local mirror of
+    ``test_remote_zero_byte_adopted_companion_revalidates_before_stamping``
+    — expected to pass WITHOUT a production change: the local companion
+    branch compares the re-read hash un-normalized (``actual is not None
+    and actual == verified_hash``), so a legitimately empty companion
+    (``EMPTY_FILE_SHA256 == EMPTY_FILE_SHA256``) passes while an
+    OSError re-read (``None``) fails — it never had the remote branch's
+    normalize-then-compare hole. This green pin completes the 2x2 and
+    keeps the paths' zero-byte companion semantics verifiably aligned."""
+    import scanner as _scanner
+    from import_job import ImportParams, run_import_job
+
+    archive = tmp_path / "archive"
+    dest_dir = archive / "2026" / "2026-07-03"
+    dest_dir.mkdir(parents=True)
+    raw_seed = dest_dir / "_seed.jpg"
+    Image.new("RGB", (16, 16), "red").save(str(raw_seed))
+    raw_bytes = raw_seed.read_bytes() + b"RAW-SENSOR-DATA"
+    raw_seed.unlink()
+    raw_archive = dest_dir / "DSC_0800.NEF"
+    raw_archive.write_bytes(raw_bytes)
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws_id = db._active_workspace_id
+    fid = db.conn.execute(
+        "INSERT INTO folders (path, name, status) VALUES (?, ?, 'ok')",
+        (str(dest_dir), dest_dir.name),
+    ).lastrowid
+    db.conn.execute(
+        "INSERT INTO photos (folder_id, filename, extension, file_size,"
+        " file_hash) VALUES (?, ?, '.nef', ?, ?)",
+        (fid, "DSC_0800.NEF", len(raw_bytes), "deadbeef" * 8),
+    )
+    db.conn.commit()
+
+    card = tmp_path / "card"
+    card.mkdir()
+    card_file = card / "DSC_0800.jpg"
+    card_file.write_bytes(b"")
+    ts = datetime(2026, 7, 3, 10, 0, 0).timestamp()
+    os.utime(str(card_file), (ts, ts))
+    adopted_dest_path = dest_dir / "DSC_0800.jpg"
+    adopted_dest_path.write_bytes(b"")
+    os.utime(str(adopted_dest_path), (ts, ts))
+
+    real_scan = _scanner.scan
+    deleted = {}
+
+    def deleting_scan(*args, **kwargs):
+        result = real_scan(*args, **kwargs)
+        if not deleted and adopted_dest_path.exists():
+            adopted_dest_path.unlink()
+            deleted["done"] = True
+        return result
+
+    monkeypatch.setattr(_scanner, "scan", deleting_scan)
+
+    runner = FakeRunner()
+    result = run_import_job(
+        _make_job(), runner, db_path, ws_id,
+        ImportParams(
+            sources=[str(card)], destination=str(archive),
+            verify_by_hash=True, skip_duplicates=False,
+        ),
+    )
+    obs = _behavior_observables(result, runner, db, archive)
+
+    assert deleted, "the scan wrapper never saw the adopted companion"
+    assert obs["skipped_duplicate"] == 0, obs
+    assert obs["failed"] == 1, obs
+    assert obs["safe_to_format"] is False, obs
+
+
 def test_local_renamed_twin_of_accepted_duplicate_current_behavior(
         tmp_path, monkeypatch):
     """CHARACTERIZATION for spec decision 5 (local half). The local path

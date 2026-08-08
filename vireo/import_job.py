@@ -4497,11 +4497,35 @@ def run_import_job(job, runner, db_path, workspace_id, params):
                     if verified_hash == EMPTY_FILE_SHA256:
                         # Zero-byte convention: EMPTY_FILE_SHA256 never
                         # lands in file_hash (it would collide with every
-                        # other empty file). Status only.
-                        db.update_photo_hash_check(
-                            row["id"], "ok", commit=False,
-                        )
-                        imported_photo_ids.add(row["id"])
+                        # other empty file), so a NULL row hash is
+                        # expected here — but do not stamp blind. Re-read
+                        # the archive path so an empty file that vanished
+                        # or became unreadable between scan and stamping
+                        # fails instead of keeping hash_status='ok' with
+                        # safe_to_format green over a missing file.
+                        # Mirrors the remote loop's zero-byte re-read
+                        # (PR #1437 review, Codex P1 r3741224300 — the
+                        # remote fold inherited this hole FROM this
+                        # branch, and the fix landed remote-only).
+                        try:
+                            actual = _rehash_dest_or_none(dest_path)
+                        except DestReadCancelled:
+                            cancelled = True
+                            break
+                        if actual == EMPTY_FILE_SHA256:
+                            db.update_photo_hash_check(
+                                row["id"], "ok", commit=False,
+                            )
+                            imported_photo_ids.add(row["id"])
+                        else:
+                            _reclassify_landed_failed(
+                                rel, entry,
+                                "scan wrote no archive row hash and a "
+                                "re-read of the archive file disagrees "
+                                "with the copy-time hash (archive file "
+                                "vanished, changed, or is unreadable)",
+                            )
+                            reclassified_landed_paths.add(dest_path)
                     else:
                         # Non-empty file with NULL file_hash after scan
                         # means scanner._compute_file_features couldn't

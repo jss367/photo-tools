@@ -158,6 +158,7 @@ GET          /api/workspaces/active/subject-types
 GET          /audit
 GET          /best-batch
 GET          /browse
+GET          /card-cleanup
 GET          /compare
 GET          /config-defaults.js
 GET          /cull

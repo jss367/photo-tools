@@ -388,3 +388,27 @@ def test_endpoints_reject_non_object_json_body(app_and_db):
         resp = client.post(url, json=5)
         assert resp.status_code == 400, url
         assert "JSON object" in resp.get_json()["error"]
+
+
+def test_card_cleanup_page_renders(app_and_db):
+    # The flow lives on its own page now (spec:
+    # docs/superpowers/specs/2026-08-08-card-cleanup-page-design.md).
+    app, _ = app_and_db
+    resp = app.test_client().get("/card-cleanup")
+    assert resp.status_code == 200
+    body = resp.get_data(as_text=True)
+    assert "card-cleanup-section" in body
+    assert "card-cleanup-scan-btn" in body
+    # The integrity-audit affordance is part of the page, not the import page.
+    assert "card-cleanup-audit-btn" in body
+
+
+def test_import_page_links_to_card_cleanup_instead_of_hosting_it(app_and_db):
+    app, _ = app_and_db
+    resp = app.test_client().get("/import")
+    assert resp.status_code == 200
+    body = resp.get_data(as_text=True)
+    assert "card-cleanup-section" not in body
+    # The entry point stays: it now navigates to the dedicated page.
+    assert "btnFreeUpCardSpace" in body
+    assert "/card-cleanup" in body

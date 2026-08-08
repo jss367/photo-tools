@@ -5328,6 +5328,41 @@ def test_remote_import_rejects_dest_folder_under_source(
     ), result["unsafe_files"]
 
 
+def test_local_import_dest_under_source_refusal_reports_progress(
+        tmp_path, monkeypatch):
+    """Spec decision 2: a batch refused because dest_folder resolves
+    inside a source directory must advance ``emitted`` and emit the
+    batch-summary phase, exactly like the remote guard. Historically the
+    local guard did neither, freezing the progress bar at the last
+    pre-refusal value while the whole batch quietly failed."""
+    from import_job import ImportParams, run_import_job
+
+    card = _make_card(tmp_path, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+        ("DSC_0002.jpg", datetime(2026, 7, 3, 10, 5, 0), "green"),
+    ])
+    runner = FakeRunner()
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    # Destination = the card itself: the %Y/%Y-%m-%d dest_folder resolves
+    # under the source root, tripping the batch-level guard (the
+    # /api/jobs/import-photos route refuses this shape up front, but the
+    # job-level guard is the backstop this test pins).
+    result = run_import_job(
+        _make_job(), runner, db_path, db._active_workspace_id,
+        ImportParams(sources=[str(card)], destination=str(card),
+                     verify_by_hash=True))
+
+    assert result["failed"] == 2, result
+    assert result["safe_to_format"] is False, result
+    events = [d for _, kind, d in runner.events if kind == "progress"]
+    # The refusal advances the bar over the whole rejected batch...
+    assert any(d["current"] == 2 and d["total"] == 2 for d in events), events
+    # ...with the same batch-summary phase string the remote path emits.
+    assert any(d["phase"].endswith("0 copied · 0 already present")
+               for d in events), [d["phase"] for d in events]
+
+
 def test_remote_import_no_verify_fails_on_mount_hash_mismatch(
         tmp_path, monkeypatch):
     """Catalog-integrity guard on the no-verify path: when
@@ -6606,6 +6641,52 @@ def test_remote_import_refuses_when_mount_root_absent(tmp_path, monkeypatch):
     )
 
 
+def test_remote_import_missing_mount_root_emits_archive_unavailable(
+        tmp_path, monkeypatch):
+    """Spec decision 3: the missing-mount-root batch refusal must emit
+    the specific ``"{rel}: archive unavailable"`` phase (the local
+    path's honest signal) instead of the generic copied/present summary
+    the remote path historically reused for this failure."""
+    import pipeline_job as _pj
+    from import_job import ImportParams, run_import_job
+
+    ra = _remote_archive_for(tmp_path)
+    calls = _remote_calls(ra)
+    _install_fake_remote_rsync(monkeypatch, calls, verify=None)
+    card = _make_card(tmp_path, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+    ])
+    # Same stub shape as ``test_remote_import_refuses_when_mount_root_absent``:
+    # report the mount root missing only for paths under this run's mount
+    # base (the import is a run-time function-level import in the remote
+    # body, so patching the pipeline_job module attribute intercepts it).
+    monkeypatch.setattr(
+        _pj, "_missing_archive_mount_root",
+        lambda path: (
+            "/Volumes/GoneShare"
+            if path.startswith(ra["mount_base"]) else None
+        ),
+    )
+
+    runner = FakeRunner()
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    result = run_import_job(
+        _make_job(), runner, db_path, db._active_workspace_id,
+        ImportParams(sources=[str(card)], destination=ra["mount_base"],
+                     remote_target=ra, verify_by_hash=True))
+
+    assert result["failed"] == 1, result
+    assert "is not available" in result["unsafe_files"][0]["reason"]
+    phases = [d["phase"] for _, kind, d in runner.events
+              if kind == "progress"]
+    assert any(p.endswith(": archive unavailable") for p in phases), phases
+    # Guard against a refactor emitting both the honest refusal phase
+    # and the generic copied/present summary for the same batch.
+    assert not any("already present" in p for p in phases), phases
+    assert calls["rsync"] == []
+
+
 def test_remote_import_case_only_basename_collision_on_ci_destination(
         tmp_path, monkeypatch):
     """On a case-insensitive destination (macOS APFS/HFS+, SMB, FAT/exFAT),
@@ -7205,6 +7286,10 @@ def test_remote_import_reports_per_file_transfer_progress(
         # The prepared-files counter must not be inflated or reset by
         # transfer reporting.
         assert ev["current"] == 2 and ev["total"] == 2, ev
+        # Spec decision 1: transfer sub-progress events must also carry
+        # the folders snapshot, or the Import page's folder table blanks
+        # for the duration of every batch transfer.
+        assert "folders" in ev, ev
     # Both the flat batch file and the collision-renamed file reported.
     assert max(ev["phase_current"] for ev in transfer_events) == 2
     # Transfer fields are batch-scoped: cleared once the batch settles.
@@ -8746,12 +8831,26 @@ def _linked_folder_rels(db, dest_root):
 def _behavior_observables(result, runner, db, dest_root):
     """Superset of _selection_observables: adds DB-level facts. Excludes
     the same legitimately-divergent keys (photo_ids, folders, errors
-    ordering) plus eta fields."""
+    ordering) plus eta fields.
+
+    Note: the inherited "excludes folders" rationale no longer fully
+    applies — ``folders_final`` (the per-folder snapshot on the last
+    progress event) IS compared cross-path now: rel keys come from
+    ``build_destination_path`` on both paths, so equality holds."""
     obs = _selection_observables(result, runner)
     obs["verified"] = result["verified"]
     obs["cancelled"] = result["cancelled"]
     obs["db_photos"] = _dest_photo_facts(db, dest_root)
     obs["db_linked_folders"] = _linked_folder_rels(db, dest_root)
+    # Decision 1 (spec): every progress event must carry the per-folder
+    # snapshot the Import page renders. Count the events that don't, and
+    # capture the final snapshot for cross-path comparison.
+    events = [d for _, kind, d in runner.events if kind == "progress"]
+    obs["events_missing_folders"] = sum(
+        1 for d in events if "folders" not in d)
+    obs["folders_final"] = (
+        {rel: dict(c) for rel, c in events[-1]["folders"].items()}
+        if events and "folders" in events[-1] else None)
     return obs
 
 
@@ -8873,6 +8972,22 @@ def test_local_and_remote_agree_on_plain_import(tmp_path, monkeypatch):
     # Positive anchor: parity of two broken runs (0 copied on both paths)
     # must not read as a pass.
     assert local["copied"] == 3
+
+
+def test_remote_import_progress_events_carry_folder_snapshots(
+        tmp_path, monkeypatch):
+    """Spec decision 1: the remote path historically never sent the
+    ``folders={...}`` snapshot, so the Import page's live folder table
+    stayed empty for remote imports. Every progress event must now carry
+    it, and the final snapshot matches the known terminal per-folder
+    result."""
+    runner = FakeRunner()
+    obs = _run_remote_behavior_case(
+        tmp_path, monkeypatch, _PARITY_CARD, runner=runner)
+    assert obs["events_missing_folders"] == 0, obs["events_missing_folders"]
+    assert obs["folders_final"] == {
+        "2026/2026-07-03": {"copied": 3, "skipped_duplicate": 0,
+                            "failed": 0}}
 
 
 def _seed_prior_import(specs):

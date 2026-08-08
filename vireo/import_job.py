@@ -1354,6 +1354,13 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
         expected_new=(params.checked_count if params.skip_duplicates else None),
     )
 
+    # Live per-folder counters, mutated by the copy loop via _counts() and
+    # snapshotted onto every progress event so the Import page can render
+    # truthful per-folder progress mid-run. Declared before _emit so the
+    # discovery-phase emits see an empty-but-present dict. Mirrors the
+    # local path.
+    folder_counts = {}
+
     def _emit(phase, current, total, current_file="", *, is_importing=False):
         eta_fields = {}
         if total > 0:
@@ -1378,7 +1385,14 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
         runner.push_event(
             job["id"], "progress",
             progress_event(
-                phase, current, total, current_file, **eta_fields,
+                phase, current, total, current_file,
+                # Snapshot (counts dicts mutate as the loop advances; SSE
+                # consumers must see the state at emit time). Mirrors the
+                # local path — spec decision 1.
+                folders={
+                    rel: dict(counts) for rel, counts in folder_counts.items()
+                },
+                **eta_fields,
             ),
         )
 
@@ -1415,7 +1429,17 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
             progress_event(
                 f"{rel}: transferring",
                 job["progress"]["current"], job["progress"]["total"],
-                current_file, **extra,
+                current_file,
+                # The Import page re-renders the folder table from each
+                # event, so a transfer event without the snapshot would
+                # blank the table for the whole batch transfer. (``rel_``
+                # to avoid confusion with this function's ``rel``
+                # parameter.)
+                folders={
+                    rel_: dict(counts)
+                    for rel_, counts in folder_counts.items()
+                },
+                **extra,
             ),
         )
 
@@ -1502,7 +1526,6 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
     unverified_duplicate = 0
     failed = 0
     unsafe_files = []
-    folder_counts = {}
     emitted = 0
     cancelled = False
 
@@ -1707,10 +1730,10 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
                     "to create a shadow directory tree under it, which "
                     "would prevent the real share from remounting)",
                 )
+            # Specific refusal phase — mirrors the local path; spec
+            # decision 3.
             _emit(
-                f"{rel}: {_counts(rel)['copied']} copied · "
-                f"{_counts(rel)['skipped_duplicate']} already present",
-                emitted, queued,
+                f"{rel}: archive unavailable", emitted, queued,
             )
             continue
         # Persistent-mount-point case (Linux ``/mnt/<name>`` survives the
@@ -3496,6 +3519,10 @@ def run_import_job(job, runner, db_path, workspace_id, params):
         # See PR #1107 review.
         if _path_under_any_source(dest_folder):
             for source_file in batch:
+                # Count these as emitted so the progress bar reflects the
+                # rejected batch instead of freezing at the last copied
+                # file. Mirrors the remote guard — spec decision 2.
+                emitted += 1
                 _fail(
                     rel, source_file,
                     "destination folder resolves inside a source directory "
@@ -3503,6 +3530,11 @@ def run_import_job(job, runner, db_path, workspace_id, params):
                     "imported); formatting the card would erase the archive "
                     "copy",
                 )
+            _emit(
+                f"{rel}: {_counts(rel)['copied']} copied · "
+                f"{_counts(rel)['skipped_duplicate']} already present",
+                emitted, queued,
+            )
             continue
         # Same guard the remote path applies (see ``_missing_mount_root``
         # in ``_run_remote_import_job``): if the archive's mount root has

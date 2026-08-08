@@ -12,22 +12,22 @@ The safety invariant, enforced immediately before every unlink:
     deletable set would cost more than the import this tool reclaims.
 """
 import contextlib
-import errno
+import errno  # noqa: F401 — used by Task 3-5 scan/delete
 import json
 import os
 import tempfile
 import time
-from datetime import datetime, timezone
-from pathlib import Path
+from datetime import UTC, datetime
+from pathlib import Path  # noqa: F401 — used by Task 3-5 scan/delete
 
 import path_guard
-from image_loader import (
+from image_loader import (  # noqa: F401 — used by Task 3-5 scan/delete
     SUPPORTED_EXTENSIONS,
     is_excluded_scan_path,
     safe_iter_dir,
     safe_scan_walk,
 )
-from scanner import compute_file_hash
+from scanner import compute_file_hash  # noqa: F401 — used by Task 3-5 scan/delete
 
 MANIFEST_SCHEMA_VERSION = 1
 MANIFEST_MAX_AGE_DAYS = 7
@@ -75,11 +75,15 @@ def write_manifest(manifest_dir, manifest):
 
 
 def prune_manifests(manifest_dir, max_age_days=MANIFEST_MAX_AGE_DAYS):
+    """Remove manifests older than max_age_days, plus any orphaned
+    ``*.tmp`` write-manifest temp files (a hard crash between
+    ``mkstemp`` and ``os.replace`` would otherwise leave them
+    forever)."""
     if not os.path.isdir(manifest_dir):
         return
     cutoff = time.time() - max_age_days * 86400
     for name in os.listdir(manifest_dir):
-        if not name.endswith(".json"):
+        if not (name.endswith(".json") or name.endswith(".tmp")):
             continue
         full = os.path.join(manifest_dir, name)
         with contextlib.suppress(OSError):
@@ -98,7 +102,8 @@ def load_manifest(manifest_dir, scan_job_id,
         with open(path, encoding="utf-8") as f:
             manifest = json.load(f)
     except (OSError, ValueError) as e:
-        raise ManifestError(f"manifest unreadable or corrupt: {e}") from e
+        raise ManifestError(
+            "manifest unreadable or corrupt — re-scan the card") from e
     if (not isinstance(manifest, dict)
             or manifest.get("schema_version") != MANIFEST_SCHEMA_VERSION):
         raise ManifestError("manifest schema not recognized — re-scan the card")
@@ -107,9 +112,10 @@ def load_manifest(manifest_dir, scan_job_id,
         raise ManifestError("manifest missing source root — re-scan the card")
     try:
         created = datetime.fromisoformat(manifest.get("created_at"))
-        age = datetime.now(timezone.utc) - created
-    except (TypeError, ValueError):
-        raise ManifestError("manifest missing timestamp — re-scan the card")
+        age = datetime.now(UTC) - created
+    except (TypeError, ValueError) as e:
+        raise ManifestError(
+            "manifest timestamp invalid — re-scan the card") from e
     # Age is enforced here — at request time — not only by the
     # scan-start prune.
     if age.total_seconds() > max_age_days * 86400:
@@ -118,10 +124,27 @@ def load_manifest(manifest_dir, scan_job_id,
     entries = manifest.get("entries")
     if not isinstance(entries, list):
         raise ManifestError("manifest entries malformed — re-scan the card")
+    # path_guard.path_contains() returns True on "can't tell" — the
+    # strict direction for a guard that *disqualifies* on containment.
+    # Here containment is a *required* condition for the entry to be
+    # accepted, so that polarity is inverted: an unresolvable path must
+    # fail closed (rejected), not fail open (accepted). Resolve both
+    # sides ourselves and use contains_resolved() directly; a realpath
+    # OSError is treated as "outside" rather than "inside". Case-fold
+    # acceptance inside contains_resolved is still fine here — a
+    # case-swapped path within the root is genuinely still within it,
+    # and the delete job's per-file gates are the deeper defense.
     for entry in entries:
         if entry.get("bucket") != "deletable":
             continue
-        if not path_guard.path_contains(source_root, str(entry.get("path", ""))):
+        try:
+            root_real = os.path.realpath(source_root)
+            child_real = os.path.realpath(str(entry.get("path", "")))
+        except OSError as e:
+            raise ManifestError(
+                "manifest entry outside its source root — re-scan the card"
+            ) from e
+        if not path_guard.contains_resolved(root_real, child_real):
             raise ManifestError(
                 "manifest entry outside its source root — re-scan the card")
     return manifest

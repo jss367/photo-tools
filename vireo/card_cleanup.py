@@ -241,6 +241,11 @@ def load_manifest(manifest_dir, scan_job_id,
 
 
 KEEP_NOT_IN_CATALOG = "not in catalog — not imported yet"
+# The card-cleanup page keys its "Verify archive hashes" callout off this
+# reason: card_cleanup.html matches the tail "run the integrity audit" in
+# each kept entry to count the files an audit would unblock. Reword this
+# and the callout silently stops appearing — change both together, and
+# test_audit_callout_reason_stays_in_sync guards the pair.
 KEEP_NOT_VERIFIED = (
     "not verified by a checksummed import — run the integrity audit"
 )

@@ -412,3 +412,15 @@ def test_import_page_links_to_card_cleanup_instead_of_hosting_it(app_and_db):
     # The entry point stays: it now navigates to the dedicated page.
     assert "btnFreeUpCardSpace" in body
     assert "/card-cleanup" in body
+
+
+def test_audit_callout_reason_stays_in_sync(app_and_db):
+    """The page's audit callout counts kept entries by matching a tail of
+    KEEP_NOT_VERIFIED. That coupling is invisible from either side, so pin
+    both ends: the served page must carry the literal it matches on, and
+    the reason it matches must still contain it."""
+    app, _ = app_and_db
+    matched = "run the integrity audit"
+    assert matched in card_cleanup.KEEP_NOT_VERIFIED
+    body = app.test_client().get("/card-cleanup").get_data(as_text=True)
+    assert f"CARD_CLEANUP_AUDIT_REASON = '{matched}'" in body

@@ -16,7 +16,6 @@ body { display: flex; flex-direction: column; height: 100vh; }
 .card-cleanup-wrap { max-width: 760px; margin: 0 auto; display: flex; flex-direction: column; gap: 16px; }
 .page-title { font-size: 20px; color: var(--text-primary); }
 .card { background: var(--bg-secondary); border: 1px solid var(--border-primary); border-radius: 8px; padding: 16px; }
-.card h3 { margin: 0 0 10px 0; font-size: 14px; color: var(--text-primary); }
 .row { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; flex-wrap: wrap; }
 .row label { font-size: 12px; color: var(--text-secondary); }
 .row input[type=text] {
@@ -257,7 +256,46 @@ const cardCleanupState = {
   manifest: null,
   listsRendered: {},    // bucket -> true once its <li>s are in the DOM
   confirmEscHandler: null,
+  busyRestore: null,    // delete button/hint state saved while a job runs
 };
+
+/* Exactly one job at a time. Starting a second one while this page is
+   watching a job would close the first job's stream and overwrite
+   `jobId`, so that job's completion handler would never run: the finished
+   run would be orphaned from the page (blank status, stuck buttons) while
+   it kept going on the server. Rather than let a click do that silently,
+   the three start buttons are disabled for the duration of any run — and
+   the Delete button, being the destructive one, says why. */
+function cardCleanupSetBusy(running, opts) {
+  const scanBtn = document.getElementById('card-cleanup-scan-btn');
+  const deleteBtn = document.getElementById('card-cleanup-delete-btn');
+  const auditBtn = document.getElementById('card-cleanup-audit-btn');
+  const deleteHint = document.getElementById('card-cleanup-delete-hint');
+  if (running) {
+    // Whether Delete may be pressed depends on the manifest (and on
+    // whether a deletion already ran), so restore what was there rather
+    // than recomputing it.
+    if (cardCleanupState.busyRestore === null) {
+      cardCleanupState.busyRestore = {
+        deleteDisabled: deleteBtn.disabled,
+        deleteHint: deleteHint.textContent,
+      };
+    }
+    scanBtn.disabled = true;
+    auditBtn.disabled = true;
+    deleteBtn.disabled = true;
+    if (opts && opts.deleteHint) deleteHint.textContent = opts.deleteHint;
+    return;
+  }
+  const restore = cardCleanupState.busyRestore;
+  cardCleanupState.busyRestore = null;
+  scanBtn.disabled = false;
+  auditBtn.disabled = false;
+  if (restore) {
+    deleteBtn.disabled = restore.deleteDisabled;
+    deleteHint.textContent = restore.deleteHint;
+  }
+}
 
 // The manifest reason that this page's audit callout answers. Mirrors
 // card_cleanup.KEEP_NOT_VERIFIED — matched on the distinctive tail so a
@@ -472,8 +510,7 @@ async function cardCleanupStartScan() {
   cardCleanupSetError('');
   cardCleanupResetPreview();
   document.getElementById('card-cleanup-result').style.display = 'none';
-  const scanBtn = document.getElementById('card-cleanup-scan-btn');
-  scanBtn.disabled = true;
+  cardCleanupSetBusy(true);
   try {
     const resp = await fetch('/api/card-cleanup/scan', {
       method: 'POST',
@@ -487,7 +524,7 @@ async function cardCleanupStartScan() {
     cardCleanupState.scanJobId = data.job_id;
     cardCleanupWatchJob(data.job_id, 'scan', 'Starting scan…');
   } catch (e) {
-    scanBtn.disabled = false;
+    cardCleanupSetBusy(false);
     cardCleanupSetError(String(e.message || e));
   }
 }
@@ -573,7 +610,9 @@ async function cardCleanupFinishJob(jobId, kind) {
   cardCleanupState.jobId = null;
   document.getElementById('card-cleanup-cancel-btn').style.display = 'none';
   document.getElementById('card-cleanup-progress').style.display = 'none';
-  document.getElementById('card-cleanup-scan-btn').disabled = false;
+  // Buttons come back first; the per-kind branches below then overwrite
+  // the Delete button and its hint with what this run's outcome means.
+  cardCleanupSetBusy(false);
   const status = job && job.status;
   const jobError = job && (job.errors || [])[0];
   if (kind === 'scan') {
@@ -730,8 +769,13 @@ function cardCleanupRenderAuditCallout(manifest) {
 
 async function cardCleanupStartAudit() {
   if (cardCleanupState.jobId) return;  // a run is already streaming
-  const btn = document.getElementById('card-cleanup-audit-btn');
-  btn.disabled = true;
+  // Verification changes what counts as verified, so the preview's Delete
+  // button describes a state that is being rewritten underneath it. Say
+  // that where the Delete button is, not only up here.
+  cardCleanupSetBusy(true, {
+    deleteHint: 'Verification is running — deletion is available when it ' +
+      'finishes.',
+  });
   document.getElementById('card-cleanup-audit-rescan-btn').style.display = 'none';
   document.getElementById('card-cleanup-audit-status').textContent = '';
   cardCleanupSetError('');
@@ -745,15 +789,16 @@ async function cardCleanupStartAudit() {
     if (!resp.ok) throw new Error(data.error || 'verification failed to start');
     cardCleanupWatchJob(data.job_id, 'audit', 'Starting hash verification…');
   } catch (e) {
-    btn.disabled = false;
+    // Nothing started, so nothing is running: give the buttons back.
+    cardCleanupSetBusy(false);
     cardCleanupSetError(String(e.message || e));
   }
 }
 
+// The buttons are already re-enabled by cardCleanupSetBusy(false) in
+// cardCleanupFinishJob's cleanup; this only reports what the run found.
 function cardCleanupFinishAudit(job, status, jobError) {
-  const btn = document.getElementById('card-cleanup-audit-btn');
   const statusEl = document.getElementById('card-cleanup-audit-status');
-  btn.disabled = false;
   if (status === 'completed' && job && job.result) {
     const r = job.result;
     const problems = (r.modified || 0) + (r.corrupt || 0) + (r.unreadable || 0);
@@ -852,6 +897,10 @@ function cardCleanupResetPreview() {
 }
 
 function cardCleanupOpenConfirm() {
+  // Defence in depth: cardCleanupSetBusy already disables this button
+  // while a scan, deletion, or verification is running, and starting a
+  // deletion on top of one of those would strand the running job.
+  if (cardCleanupState.jobId) return;
   const manifest = cardCleanupState.manifest;
   if (!manifest) return;
   const deletable = (manifest.totals || {}).deletable || { count: 0, bytes: 0 };
@@ -887,6 +936,15 @@ function cardCleanupCloseConfirm() {
 }
 
 async function cardCleanupConfirmDelete() {
+  // A job that started while this dialog was open (or one the page picked
+  // up again) must not be replaced by the delete watch below — say so
+  // instead of quietly doing nothing or stranding it.
+  if (cardCleanupState.jobId) {
+    cardCleanupCloseConfirm();
+    cardCleanupSetError('Another job is still running — nothing was ' +
+      'deleted. Wait for it to finish, then delete.');
+    return;
+  }
   const confirmBtn = document.getElementById('card-cleanup-confirm-btn');
   confirmBtn.disabled = true;
   try {
@@ -911,8 +969,7 @@ async function cardCleanupConfirmDelete() {
     }
     cardCleanupSetError('');
     document.getElementById('card-cleanup-result').style.display = 'none';
-    document.getElementById('card-cleanup-delete-btn').disabled = true;
-    document.getElementById('card-cleanup-scan-btn').disabled = true;
+    cardCleanupSetBusy(true);
     cardCleanupWatchJob(data.job_id, 'delete', 'Starting deletion…');
   } catch (e) {
     cardCleanupCloseConfirm();

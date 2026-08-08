@@ -540,6 +540,39 @@ def test_qualify_rows_missing_card_file_unreadable(db, tmp_path):
     assert reason == card_cleanup.KEEP_UNREADABLE
 
 
+def test_qualify_rows_rejects_non_regular_archive_replacement(db, tmp_path):
+    # Codex P2: a verified archive pathname replaced with a directory (or
+    # FIFO/socket) whose size/mtime happen to match the catalog baseline
+    # must NOT be treated as the surviving archive copy. Without an
+    # S_ISREG gate on the archive stat, a 4096-byte directory with the
+    # cataloged mtime could authorize deleting the card's real bytes
+    # even though no readable archive file remains.
+    archive_file, _ = _archive_photo(db, tmp_path)
+    card = _card_file(tmp_path)
+    archive_st = os.stat(archive_file)
+    os.unlink(archive_file)
+    os.mkdir(archive_file)
+    os.utime(
+        archive_file,
+        ns=(archive_st.st_atime_ns, archive_st.st_mtime_ns))
+    replaced_st = os.stat(archive_file)
+    source_root_real = os.path.realpath(str(tmp_path / "card"))
+    rows = [{
+        "filename": os.path.basename(str(archive_file)),
+        # Match the replacement's stats exactly — if the S_ISREG check
+        # doesn't run first, the size/mtime equality passes and the
+        # directory would qualify as the archive copy.
+        "file_size": replaced_st.st_size,
+        "file_mtime": replaced_st.st_mtime,
+        "hash_status": "ok",
+        "folder_path": os.path.dirname(str(archive_file)),
+    }]
+    archive_path, reason = card_cleanup.qualify_rows(
+        rows, source_root_real, str(card))
+    assert archive_path is None
+    assert reason == card_cleanup.KEEP_ARCHIVE_CHANGED
+
+
 def _scan_then_delete(db, tmp_path, mutate=None, should_cancel=None):
     scan = _scan(db, tmp_path)
     assert scan["totals"]["deletable"]["count"] >= 1

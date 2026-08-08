@@ -19168,11 +19168,16 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
 
         Background job: re-verifies every file against the card and the
         archive immediately before each unlink (see card_cleanup.delete_
-        verified). Validates the referencing scan job via the live runner
-        first, falling back to job_history so a delete can still be
-        requested for a scan whose job fell out of the runner's in-memory
-        table (e.g. after a process restart) as long as its manifest is
-        still on disk.
+        verified). Live-status check first (runner then job_history) —
+        so an in-flight or explicitly non-completed scan surfaces a
+        precise error — falling back to the on-disk manifest as the
+        authoritative authorization. The manifest is written only by
+        scan_card at completion (see write_manifest), survives for
+        MANIFEST_MAX_AGE_DAYS, and load_manifest re-validates schema,
+        source root, expiry, and every entry's containment; runner
+        state is cleared by a restart and job_history is pruned at 100
+        per workspace, but a valid manifest on disk is still enough
+        proof to authorize a delete against that scan.
         """
         body = request.get_json(silent=True) or {}
         if not isinstance(body, dict):
@@ -19184,19 +19189,29 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         runner = app._job_runner
         active_ws = db._active_workspace_id
 
+        scan_status = None
         scan_job = runner.get(scan_job_id)
-        if scan_job is None:
+        if scan_job is not None:
+            if scan_job.get("type") != "card-cleanup-scan":
+                return json_error("unknown scan job", status=404)
+            scan_status = scan_job.get("status")
+        else:
             row = db.conn.execute(
                 "SELECT type, status FROM job_history WHERE id = ?",
                 (scan_job_id,)).fetchone()
-            scan_job = dict(row) if row is not None else None
-        if scan_job is None or scan_job.get("type") != "card-cleanup-scan":
-            return json_error("unknown scan job", status=404)
-        if scan_job.get("status") in ("queued", "running"):
+            if row is not None:
+                if row["type"] != "card-cleanup-scan":
+                    return json_error("unknown scan job", status=404)
+                scan_status = row["status"]
+
+        if scan_status in ("queued", "running"):
             # Mid-flight, not a dead end: telling the user to re-scan here
             # would throw away a scan that is about to succeed.
             return json_error("scan still running — wait for it to finish")
-        if scan_job.get("status") != "completed":
+        if scan_status is not None and scan_status != "completed":
+            # Definitive non-completed terminal status (cancelled/failed);
+            # the manifest, if one exists, refers to a scan that did not
+            # finish successfully.
             return json_error("scan did not complete — re-scan the card")
         # One delete AT A TIME per manifest — this guards concurrency,
         # not repetition: after a delete finishes, the manifest still
@@ -19212,6 +19227,14 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 return json_error(
                     "a delete for this scan is already running", status=409)
         card_cleanup_dir = app.config["CARD_CLEANUP_DIR"]
+        # Manifest existence + strict validation is the authorization
+        # when neither runner nor job_history retains the scan (Codex
+        # P2): job_history is pruned at 100 entries per workspace, but
+        # a manifest that scan_card wrote survives up to 7 days. Any
+        # scan_job_id not backed by a scan job in this state falls
+        # through to a 404 "manifest expired — re-scan the card" from
+        # load_manifest — same status class as the previous "unknown
+        # scan job", and more actionable.
         try:
             manifest = card_cleanup.load_manifest(
                 card_cleanup_dir, scan_job_id)

@@ -303,6 +303,15 @@ def qualify_rows(rows, source_root_real, card_path, contains_check=None):
         except (OSError, ValueError):
             reason = KEEP_ARCHIVE_UNREACHABLE
             continue
+        # A verified archive is a regular file (Codex P2). If the path
+        # now stats to a directory, FIFO, socket, or other non-regular
+        # object — even one whose size and mtime happen to match the
+        # catalog baseline — the archive we verified is gone. Reject
+        # before the size/mtime check so a directory of the same size
+        # as the photo cannot masquerade as the surviving copy.
+        if not stat_mod.S_ISREG(ast.st_mode):
+            reason = KEEP_ARCHIVE_CHANGED
+            continue
         # samefile semantics without a second round trip: a mount alias
         # that survived realpath + case-folding still shares dev+inode.
         if (ast.st_dev, ast.st_ino) == (card_st.st_dev, card_st.st_ino):

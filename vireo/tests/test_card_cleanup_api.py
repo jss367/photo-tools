@@ -247,6 +247,41 @@ def test_delete_after_restart_uses_history_and_disk_manifest(
     assert archive_file.exists()
 
 
+def test_delete_after_history_pruned_uses_disk_manifest(
+        app_and_db, tmp_path):
+    # Codex P2: job_history is pruned at 100 terminal jobs per workspace
+    # (jobs.py _persist_job), so running 100 later jobs before requesting
+    # a delete would leave the scan_job_id absent from both the in-memory
+    # runner (restart) and job_history. A valid manifest on disk survives
+    # for MANIFEST_MAX_AGE_DAYS and is proof enough that the scan
+    # completed — the delete must still be authorized, not rejected as
+    # "unknown scan job".
+    app, db = app_and_db
+    client = app.test_client()
+    archive_file, card_file = _make_verified_pair(db, tmp_path)
+
+    manifest_dir = app.config["CARD_CLEANUP_DIR"]
+    result = card_cleanup.scan_card(
+        db, str(tmp_path / "card"), True, manifest_dir, "scan-pruned")
+    assert result["totals"]["deletable"]["count"] == 1
+
+    # Simulate restart + history pruning: no runner entry, no job_history
+    # row. Only the manifest on disk remains.
+    assert app._job_runner.get("scan-pruned") is None
+    assert db.conn.execute(
+        "SELECT 1 FROM job_history WHERE id = ?",
+        ("scan-pruned",)).fetchone() is None
+
+    delete_resp = client.post(
+        "/api/card-cleanup/delete", json={"scan_job_id": "scan-pruned"})
+    assert delete_resp.status_code == 200
+    delete_job_id = delete_resp.get_json()["job_id"]
+    _wait_for_job(client, delete_job_id)
+
+    assert not card_file.exists()
+    assert archive_file.exists()
+
+
 def test_delete_expired_manifest_404(app_and_db, tmp_path):
     app, db = app_and_db
     client = app.test_client()

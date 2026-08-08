@@ -571,7 +571,7 @@ class ImportParams:
     thumb_cache_dir: str | None = None
 
 
-@dataclass
+@dataclass(frozen=True)
 class _LandedFile:
     """One file this batch landed (fresh copy/transfer) or adopted.
 
@@ -608,7 +608,7 @@ class _ImportRunState:
     # plus one f-string interpolation of the path into a failure reason.
     mount_ever_lost: str | None = None
     dup_link_failed: bool = False
-    unsafe_files: list = field(default_factory=list)
+    unsafe_files: list = field(default_factory=list)  # [{path, reason}]
     folder_counts: dict = field(default_factory=dict)
     discovery_errors: list = field(default_factory=list)
     imported_photo_ids: set = field(default_factory=set)
@@ -617,6 +617,79 @@ class _ImportRunState:
     run_verified_hashes: dict = field(default_factory=dict)
     wc_source_paths: dict = field(default_factory=dict)
     wc_dest_folders: set = field(default_factory=set)
+
+
+def _counts(state, rel):
+    return state.folder_counts.setdefault(
+        rel, {"copied": 0, "skipped_duplicate": 0, "failed": 0},
+    )
+
+
+def _fail(state, rel, source_file, reason):
+    state.failed += 1
+    _counts(state, rel)["failed"] += 1
+    state.unsafe_files.append({"path": str(source_file), "reason": reason})
+    log.warning("%s failed for %s: %s", state.log_label, source_file, reason)
+
+
+def _reclassify_landed_failed(state, rel, entry, reason,
+                              verified_counted_for_copies):
+    """Move a landed file's count from copied/skipped_duplicate to failed.
+
+    A landed entry has already been booked into ``copied`` (fresh copy)
+    or ``skipped_duplicate`` (crash-recovery adopt) at the moment its
+    bytes were verified on disk. When a later step in the batch pass
+    (scan itself failing, a missing catalog row after scan, or a
+    hash mismatch against what scan re-hashed) forces this file into
+    the ``failed`` bucket, the origin count must be rolled back —
+    otherwise the exactly-one-terminal-bucket invariant breaks and
+    ``copied + skipped_duplicate + failed`` exceeds ``discovered``.
+
+    ``verified_counted_for_copies``: whether each ``copied`` booking
+    also incremented ``verified``, so the rollback must undo both. (PR
+    7's transport ``attests_bytes`` absorbs this flag.)
+    """
+    dest_path = entry.dest_path
+    origin = entry.origin
+    if origin == "copied":
+        state.copied -= 1
+        if verified_counted_for_copies:
+            state.verified -= 1
+        _counts(state, rel)["copied"] -= 1
+    elif origin == "skipped_duplicate":
+        state.skipped_duplicate -= 1
+        _counts(state, rel)["skipped_duplicate"] -= 1
+    _fail(state, rel, dest_path, reason)
+
+
+def _record_checker(state, checker, source_file, dest_folder, file_hash):
+    """Register a landed/adopted file's identity with the intra-run checker.
+
+    Without this the checker only sees the pre-run catalog, so a later
+    byte-identical card file with a different basename in the same run
+    is copied/cataloged again instead of being recognized as an
+    intra-run duplicate (spec decision 5): every caller passes the
+    landed/adopted ``dest_folder`` and verified ``file_hash``, recorded
+    unconditionally per token. ``DuplicateChecker.record``
+    re-``os.stat``s the source path — on removable media yanked after
+    this file's bytes were verified, that raises ``OSError`` and would
+    kill the whole background job. Swallow it: the run keeps its
+    already-verified landings and only loses the intra-run dedupe
+    optimization. See PR #1113 review.
+    """
+    if checker is None:
+        return
+    try:
+        tokens = checker.record(source_file)
+    except OSError as e:
+        log.warning(
+            "Duplicate-checker record() failed for %s (dest %s): %s",
+            source_file, dest_folder, e,
+        )
+        return
+    for tok in tokens:
+        state.run_dest_folders[tok] = dest_folder
+        state.run_verified_hashes[tok] = file_hash
 
 
 def copy_and_hash_verify(src, dst, *, src_hash=None):
@@ -1594,41 +1667,6 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
     # DB link; if it fails, safe_to_format must remain false
     # (``state.dup_link_failed``).
 
-    def _counts(rel):
-        return state.folder_counts.setdefault(
-            rel, {"copied": 0, "skipped_duplicate": 0, "failed": 0},
-        )
-
-    def _fail(rel, source_file, reason):
-        state.failed += 1
-        _counts(rel)["failed"] += 1
-        state.unsafe_files.append({"path": str(source_file), "reason": reason})
-        log.warning("Remote import failed for %s: %s", source_file, reason)
-
-    def _reclassify_landed_failed(rel, entry, reason):
-        """Move a landed file's count from copied/skipped_duplicate to failed.
-
-        A landed entry has already been booked into ``copied`` (fresh copy)
-        or ``skipped_duplicate`` (crash-recovery adopt) at the moment its
-        bytes were verified on disk. When a later step in the batch pass
-        (scan itself failing, a missing catalog row after scan, or a
-        hash mismatch against what scan re-hashed) forces this file into
-        the ``failed`` bucket, the origin count must be rolled back —
-        otherwise the exactly-one-terminal-bucket invariant breaks and
-        ``copied + skipped_duplicate + failed`` exceeds ``discovered``.
-        """
-        dest_path = entry.dest_path
-        origin = entry.origin
-        if origin == "copied":
-            state.copied -= 1
-            if verified_counted_for_copies:
-                state.verified -= 1
-            _counts(rel)["copied"] -= 1
-        elif origin == "skipped_duplicate":
-            state.skipped_duplicate -= 1
-            _counts(rel)["skipped_duplicate"] -= 1
-        _fail(rel, dest_path, reason)
-
     # Intra-run bookkeeping (``state.run_dest_folders`` /
     # ``state.run_verified_hashes``) so a second byte-identical card
     # file (with a
@@ -1681,34 +1719,14 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
     def _missing_mount_root():
         return _missing_archive_mount_root(destination)
 
-    def _record_checker(source_file, dest_folder, file_hash):
-        """Register a landed/adopted file's identity with the intra-run checker.
-
-        Without this the checker only sees the pre-run catalog, so a later
-        byte-identical card file with a different basename in the same run
-        is rsynced/cataloged again instead of being recognized as an
-        intra-run duplicate. Same shape as the local path's
-        ``_record_checker`` (spec decision 5, toward a single shared
-        helper): every caller passes the landed/adopted ``dest_folder``
-        and verified ``file_hash``, recorded unconditionally per token.
-        ``DuplicateChecker.record`` re-``os.stat``s the source path — swallow
-        OSError (removable media yanked mid-run) so the run keeps its
-        already-verified landings and only loses the intra-run dedupe
-        optimization. See PR #1113 review.
-        """
-        if checker is None:
-            return
-        try:
-            tokens = checker.record(source_file)
-        except OSError as e:
-            log.warning(
-                "Duplicate-checker record() failed for %s: %s",
-                source_file, e,
-            )
-            return
-        for tok in tokens:
-            state.run_dest_folders[tok] = dest_folder
-            state.run_verified_hashes[tok] = file_hash
+    # Whether each ``copied`` booking also incremented ``verified``:
+    # the remote path books ``verified`` only when
+    # ``params.verify_by_hash`` made the independent card->NAS check,
+    # so ``_reclassify_landed_failed`` must undo ``verified`` only in
+    # that case. (The local path hash-verifies every copy and sets
+    # this to True. PR 7's transport ``attests_bytes`` absorbs this
+    # flag.)
+    verified_counted_for_copies = params.verify_by_hash
 
     for rel, batch in batches:
         if runner.is_cancelled(job["id"]):
@@ -1726,7 +1744,7 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
             for source_file in batch:
                 state.emitted += 1
                 _fail(
-                    rel, source_file,
+                    state, rel, source_file,
                     f"archive mount root {state.mount_ever_lost} detached "
                     "earlier in this import; the intra-run duplicate "
                     "cache still holds identities for files whose "
@@ -1762,15 +1780,15 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
             for source_file in batch:
                 state.emitted += 1
                 _fail(
-                    rel, source_file,
+                    state, rel, source_file,
                     "destination folder resolves inside a source directory "
                     "(dest_folder would be created under the card being "
                     "imported); formatting the card would erase the archive "
                     "copy",
                 )
             _emit(
-                f"{rel}: {_counts(rel)['copied']} copied · "
-                f"{_counts(rel)['skipped_duplicate']} already present",
+                f"{rel}: {_counts(state, rel)['copied']} copied · "
+                f"{_counts(state, rel)['skipped_duplicate']} already present",
                 state.emitted, queued,
             )
             continue
@@ -1786,7 +1804,7 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
             for source_file in batch:
                 state.emitted += 1
                 _fail(
-                    rel, source_file,
+                    state, rel, source_file,
                     f"archive mount root {missing_mount_root} is not "
                     "available (destination drive is not mounted; refusing "
                     "to create a shadow directory tree under it, which "
@@ -1810,7 +1828,7 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
             for source_file in batch:
                 state.emitted += 1
                 _fail(
-                    rel, source_file,
+                    state, rel, source_file,
                     f"archive mount root {stale_mount_root} is no longer "
                     "mounted (it was at the start of this import; the "
                     "directory persists but the share has detached, so "
@@ -1832,7 +1850,7 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
             for source_file in batch:
                 state.emitted += 1
                 _fail(
-                    rel, source_file,
+                    state, rel, source_file,
                     f"could not create destination folder {dest_folder}: {e}",
                 )
             _emit(
@@ -1906,14 +1924,6 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
         # card looks safe to erase. Mirrors the local path's ``dup_skips``.
         # See PR #1396 review (Codex P1 r3688498501 / r3688501706).
         dup_skips = []
-        # Whether each ``copied`` booking also incremented ``verified``:
-        # the remote path books ``verified`` only when
-        # ``params.verify_by_hash`` made the independent card->NAS check,
-        # so ``_reclassify_landed_failed`` must undo ``verified`` only in
-        # that case. (The local path hash-verifies every copy and sets
-        # this to True. PR 7's transport ``attests_bytes`` absorbs this
-        # flag.)
-        verified_counted_for_copies = params.verify_by_hash
         # dest_paths the post-scan cross-checks reclassified from
         # ``copied`` to ``failed``. The entries stay in ``landed``
         # (mutating a list during its own iteration is error-prone), so
@@ -1948,7 +1958,7 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
             if mount_lost:
                 state.emitted += 1
                 _fail(
-                    rel, source_file,
+                    state, rel, source_file,
                     f"archive mount root {mount_lost} detached while this "
                     "batch was being prepared (the directory persists but "
                     "the share is gone, so neither a transfer nor a "
@@ -1964,7 +1974,7 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
                 try:
                     token = checker.match(source_file)
                 except OSError as e:
-                    _fail(rel, source_file, f"duplicate check failed: {e}")
+                    _fail(state, rel, source_file, f"duplicate check failed: {e}")
                     continue
                 if token is not None:
                     if (
@@ -1977,7 +1987,7 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
                         if likely_rows:
                             state.skipped_duplicate += 1
                             state.unverified_duplicate += 1
-                            _counts(rel)["skipped_duplicate"] += 1
+                            _counts(state, rel)["skipped_duplicate"] += 1
                             dup_skips.append((source_file, True))
                             dup_dirs.update(_linkable_twin_dirs(
                                 likely_rows, _path_under_destination,
@@ -1994,7 +2004,7 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
                         try:
                             src_hash = checker.content_hash(source_file)
                         except OSError as e:
-                            _fail(rel, source_file,
+                            _fail(state, rel, source_file,
                                   f"duplicate check failed: {e}")
                             continue
                     accept = False
@@ -2072,7 +2082,7 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
                         break
                     if accept:
                         state.skipped_duplicate += 1
-                        _counts(rel)["skipped_duplicate"] += 1
+                        _counts(state, rel)["skipped_duplicate"] += 1
                         dup_skips.append((source_file, False))
                         # Preserve the verified twin folders so the follow-
                         # up direct link can pull them into the active
@@ -2119,7 +2129,7 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
                 st = source_file.stat()
                 src_size, src_mtime_ns = st.st_size, st.st_mtime_ns
             except OSError as e:
-                _fail(rel, source_file, str(e))
+                _fail(state, rel, source_file, str(e))
                 continue
             try:
                 src_hash = (
@@ -2128,7 +2138,7 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
                     else compute_file_hash(str(source_file))
                 )
             except OSError as e:
-                _fail(rel, source_file, str(e))
+                _fail(state, rel, source_file, str(e))
                 continue
             # Intra-batch same-content dedup: an earlier file THIS BATCH
             # queued a byte-identical source under a different basename
@@ -2151,9 +2161,9 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
                 and src_hash in queued_src_hashes
             ):
                 state.skipped_duplicate += 1
-                _counts(rel)["skipped_duplicate"] += 1
+                _counts(state, rel)["skipped_duplicate"] += 1
                 dup_skips.append((source_file, False))
-                _record_checker(source_file, dest_folder, src_hash)
+                _record_checker(state, checker, source_file, dest_folder, src_hash)
                 continue
             stem, suffix = os.path.splitext(source_file.name)
             counter = 0
@@ -2179,9 +2189,9 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
                         and claimed_basenames[candidate_key] == src_hash
                     ):
                         state.skipped_duplicate += 1
-                        _counts(rel)["skipped_duplicate"] += 1
+                        _counts(state, rel)["skipped_duplicate"] += 1
                         dup_skips.append((source_file, False))
-                        _record_checker(source_file, dest_folder, src_hash)
+                        _record_checker(state, checker, source_file, dest_folder, src_hash)
                         adopted = True
                         break
                     counter += 1
@@ -2210,7 +2220,7 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
                         on_disk = None
                     if on_disk is not None and on_disk == src_hash:
                         state.skipped_duplicate += 1
-                        _counts(rel)["skipped_duplicate"] += 1
+                        _counts(state, rel)["skipped_duplicate"] += 1
                         claimed_basenames[candidate_key] = src_hash
                         # Fold the adoption into ``landed`` (origin
                         # "skipped_duplicate") so the restricted scan
@@ -2240,7 +2250,7 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
                             src_size=src_size,
                             src_mtime_ns=src_mtime_ns,
                         ))
-                        _record_checker(source_file, dest_folder, src_hash)
+                        _record_checker(state, checker, source_file, dest_folder, src_hash)
                         adopted = True
                         break
                     counter += 1
@@ -2313,11 +2323,11 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
         if mount_lost:
             for skipped_file, counted_unverified in dup_skips:
                 state.skipped_duplicate -= 1
-                _counts(rel)["skipped_duplicate"] -= 1
+                _counts(state, rel)["skipped_duplicate"] -= 1
                 if counted_unverified:
                     state.unverified_duplicate -= 1
                 _fail(
-                    rel, skipped_file,
+                    state, rel, skipped_file,
                     f"archive mount root {mount_lost} detached mid-batch; "
                     "the duplicate this file matched cannot be confirmed "
                     "to be on the archive rather than in a local shadow",
@@ -2327,7 +2337,7 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
             for queued_file, _dest_basename, _queued_hash, _sz, _mt \
                     in to_transfer:
                 _fail(
-                    rel, queued_file,
+                    state, rel, queued_file,
                     f"archive mount root {mount_lost} detached before this "
                     "file was transferred",
                 )
@@ -2343,10 +2353,11 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
             if landed:
                 for entry in landed:
                     _reclassify_landed_failed(
-                        rel, entry,
+                        state, rel, entry,
                         f"archive mount root {mount_lost} detached "
                         "mid-batch; this file landed in a local shadow "
                         "of the archive, not on the share",
+                                            verified_counted_for_copies,
                     )
                 landed = []
             # Trip the run-wide sticky flag so every remaining batch is
@@ -2412,7 +2423,7 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
             ok_mkdir, mkdir_detail = move_mod._remote_mkdir_p(remote, ssh_dest)
             if not ok_mkdir:
                 for sf, _bn, _sh, _sz, _mt in to_transfer:
-                    _fail(rel, sf,
+                    _fail(state, rel, sf,
                           f"remote mkdir failed for {ssh_dest}: {mkdir_detail}")
             else:
                 # Split into the flat fast path (dest basename == card
@@ -2485,12 +2496,12 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
                             _emit_transfer(_rel, done, _bs, name))
                     if timed_out:
                         for sf, _bn, _sh, _sz, _mt in flat:
-                            _fail(rel, sf, "rsync stalled (no progress)")
+                            _fail(state, rel, sf, "rsync stalled (no progress)")
                     elif _rsync_cancelled(rc):
                         state.cancelled = True
                     elif rc != 0:
                         for sf, _bn, _sh, _sz, _mt in flat:
-                            _fail(rel, sf, f"rsync failed: {stderr.strip()}")
+                            _fail(state, rel, sf, f"rsync failed: {stderr.strip()}")
                     else:
                         for sf, bn, sh, sz, mt in flat:
                             transferred.append((
@@ -2508,12 +2519,12 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
                         move_mod.rsync_dest_spec(remote, nas_full), False,
                         extra_args)
                     if timed_out:
-                        _fail(rel, sf, "rsync stalled (no progress)")
+                        _fail(state, rel, sf, "rsync stalled (no progress)")
                     elif _rsync_cancelled(rc):
                         state.cancelled = True
                         break
                     elif rc != 0:
-                        _fail(rel, sf, f"rsync failed: {stderr.strip()}")
+                        _fail(state, rel, sf, f"rsync failed: {stderr.strip()}")
                     else:
                         transferred.append((sf, bn, sh, sz, mt, nas_full))
                         # ``len(transferred)`` counts only files that truly
@@ -2554,11 +2565,11 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
                                 else f"remote verification: '{name}' missing "
                                      f"or differs at destination"
                             )
-                            _fail(rel, sf, reason)
+                            _fail(state, rel, sf, reason)
                             continue
                     state.copied += 1
-                    _counts(rel)["copied"] += 1
-                    if params.verify_by_hash:
+                    _counts(state, rel)["copied"] += 1
+                    if verified_counted_for_copies:
                         state.verified += 1
                     landed.append(_LandedFile(
                         dest_path=dest_path,
@@ -2568,7 +2579,7 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
                         src_size=sz,
                         src_mtime_ns=mt,
                     ))
-                    _record_checker(sf, dest_folder, src_hash)
+                    _record_checker(state, checker, sf, dest_folder, src_hash)
 
         # --- Catalog this batch ----------------------------------------
         # Scan only files that were freshly transferred or adopted from an
@@ -2639,7 +2650,8 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
                 # to failed) so the ledger never double-counts.
                 for entry in landed:
                     _reclassify_landed_failed(
-                        rel, entry, f"catalog scan failed: {e}",
+                        state, rel, entry, f"catalog scan failed: {e}",
+                                            verified_counted_for_copies,
                     )
                 landed = []
             else:
@@ -2765,7 +2777,7 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
                         )
                         if read_failed or mount_norm != src_h_norm:
                             _reclassify_landed_failed(
-                                rel, entry,
+                                state, rel, entry,
                                 "scan wrote no mount row hash and a re-"
                                 "read of the mount file "
                                 + ("disagrees with the source hash"
@@ -2774,12 +2786,13 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
                                    "on the NAS")
                                 + " (mount base is likely stale, "
                                 "unreadable, or misconfigured)",
+                                                            verified_counted_for_copies,
                             )
                             reclassified_landed_paths.add(entry.dest_path)
                             continue
                     elif scan_h is not None and scan_h != src_h_norm:
                         _reclassify_landed_failed(
-                            rel, entry,
+                            state, rel, entry,
                             "scanned mount row hash does not match "
                             "the source hash (mount base is likely "
                             "stale or misconfigured)"
@@ -2787,6 +2800,7 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
                             "scanned mount row hash does not match "
                             "the hash verified on the NAS (mount "
                             "base is likely stale or misconfigured)",
+                                                    verified_counted_for_copies,
                         )
                         reclassified_landed_paths.add(entry.dest_path)
                         continue
@@ -2870,7 +2884,7 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
                         )
                         if read_failed or mount_norm != src_h_norm:
                             _reclassify_landed_failed(
-                                rel, entry,
+                                state, rel, entry,
                                 "paired companion mount bytes could "
                                 "not be read"
                                 if read_failed else
@@ -2883,6 +2897,7 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
                                 "not match the hash verified on "
                                 "the NAS (mount base is likely "
                                 "stale or misconfigured)",
+                                                            verified_counted_for_copies,
                             )
                             reclassified_landed_paths.add(entry.dest_path)
                             continue
@@ -2898,8 +2913,9 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
                         state.imported_photo_ids.add(companion["id"])
                         continue
                     _reclassify_landed_failed(
-                        rel, entry,
+                        state, rel, entry,
                         "not cataloged after scan (no photo row)",
+                                            verified_counted_for_copies,
                     )
                     reclassified_landed_paths.add(entry.dest_path)
             # Invalidate derived caches for any landed/adopted row whose
@@ -3033,8 +3049,8 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
                         ),
                     })
         _emit(
-            f"{rel}: {_counts(rel)['copied']} copied · "
-            f"{_counts(rel)['skipped_duplicate']} already present",
+            f"{rel}: {_counts(state, rel)['copied']} copied · "
+            f"{_counts(state, rel)['skipped_duplicate']} already present",
             state.emitted, queued,
         )
         if state.cancelled:
@@ -3520,68 +3536,6 @@ def run_import_job(job, runner, db_path, workspace_id, params):
     # Same rationale as the remote path (see PR #1400 review, Codex P2
     # r3688614624).
 
-    def _counts(rel):
-        return state.folder_counts.setdefault(
-            rel, {"copied": 0, "skipped_duplicate": 0, "failed": 0},
-        )
-
-    def _fail(rel, source_file, reason):
-        state.failed += 1
-        _counts(rel)["failed"] += 1
-        state.unsafe_files.append({"path": str(source_file), "reason": reason})
-        log.warning("Import failed for %s: %s", source_file, reason)
-
-    def _reclassify_landed_failed(rel, entry, reason):
-        """Move a landed file's count from copied/skipped_duplicate to failed.
-
-        A landed entry has already been booked into ``copied`` (fresh copy)
-        or ``skipped_duplicate`` (crash-recovery adopt) at the moment its
-        bytes were verified on disk. When a later step in the batch pass
-        (scan itself failing, a missing catalog row after scan, or a
-        hash mismatch against what scan re-hashed) forces this file into
-        the ``failed`` bucket, the origin count must be rolled back —
-        otherwise the exactly-one-terminal-bucket invariant breaks and
-        ``copied + skipped_duplicate + failed`` exceeds ``discovered``.
-        """
-        dest_path = entry.dest_path
-        origin = entry.origin
-        if origin == "copied":
-            state.copied -= 1
-            if verified_counted_for_copies:
-                state.verified -= 1
-            _counts(rel)["copied"] -= 1
-        elif origin == "skipped_duplicate":
-            state.skipped_duplicate -= 1
-            _counts(rel)["skipped_duplicate"] -= 1
-        _fail(rel, dest_path, reason)
-
-    def _record_checker(source_file, dest_folder, file_hash):
-        """Register a landed file's identity with the intra-run checker.
-
-        ``DuplicateChecker.record`` re-``os.stat``s the source path — on
-        removable media that was yanked just after ``copy_and_hash_verify``
-        succeeded, that raises ``OSError`` and would kill the whole
-        background job even though this file's bytes are already
-        verified at ``dest_folder``. Swallow the error, keep the copy in
-        the ledger, and accept that later intra-run tokens for this
-        file's identity won't dedupe: the archive is intact, the run
-        just loses a small cache-hit optimization.
-        """
-        if checker is None:
-            return
-        try:
-            tokens = checker.record(source_file)
-        except OSError as e:
-            log.warning(
-                "Duplicate-checker record() failed for %s after landing "
-                "at %s: %s",
-                source_file, dest_folder, e,
-            )
-            return
-        for tok in tokens:
-            state.run_dest_folders[tok] = dest_folder
-            state.run_verified_hashes[tok] = file_hash
-
     # Dup-folder linking runs in a SEPARATE ``scan(restrict_dirs=…)`` call
     # after the duplicate skip; its exception was previously logged and
     # swallowed, leaving safe_to_format true while the imported
@@ -3589,6 +3543,14 @@ def run_import_job(job, runner, db_path, workspace_id, params):
     # explicitly (``state.dup_link_failed``) so safe_to_format reflects
     # "workspace can actually see these bytes" and not just "the bytes
     # are somewhere on disk".
+
+    # Whether each ``copied`` booking also incremented ``verified``:
+    # the local path hash-verifies every copy (``copy_and_hash_verify``
+    # reads the landed bytes back), so ``_reclassify_landed_failed``
+    # must always undo both. (The remote path books ``verified`` only
+    # under ``params.verify_by_hash`` and sets this accordingly. PR
+    # 7's transport ``attests_bytes`` absorbs this flag.)
+    verified_counted_for_copies = True
 
     for rel, batch in batches:
         if runner.is_cancelled(job["id"]):
@@ -3606,7 +3568,7 @@ def run_import_job(job, runner, db_path, workspace_id, params):
             for source_file in batch:
                 state.emitted += 1
                 _fail(
-                    rel, source_file,
+                    state, rel, source_file,
                     f"archive mount root {state.mount_ever_lost} detached "
                     "earlier in this import; the intra-run duplicate "
                     "cache still holds identities for files whose "
@@ -3644,15 +3606,15 @@ def run_import_job(job, runner, db_path, workspace_id, params):
                 # file. Mirrors the remote guard — spec decision 2.
                 state.emitted += 1
                 _fail(
-                    rel, source_file,
+                    state, rel, source_file,
                     "destination folder resolves inside a source directory "
                     "(dest_folder would be created under the card being "
                     "imported); formatting the card would erase the archive "
                     "copy",
                 )
             _emit(
-                f"{rel}: {_counts(rel)['copied']} copied · "
-                f"{_counts(rel)['skipped_duplicate']} already present",
+                f"{rel}: {_counts(state, rel)['copied']} copied · "
+                f"{_counts(state, rel)['skipped_duplicate']} already present",
                 state.emitted, queued,
             )
             continue
@@ -3678,7 +3640,7 @@ def run_import_job(job, runner, db_path, workspace_id, params):
                 # the card is quietly failing.
                 state.emitted += 1
                 _fail(
-                    rel, source_file,
+                    state, rel, source_file,
                     f"archive mount root {missing_mount_root} is not "
                     "available (destination drive is not mounted; refusing "
                     "to create a shadow directory tree under it, which "
@@ -3703,7 +3665,7 @@ def run_import_job(job, runner, db_path, workspace_id, params):
             for source_file in batch:
                 state.emitted += 1
                 _fail(
-                    rel, source_file,
+                    state, rel, source_file,
                     f"archive mount root {stale_mount_root} is no longer "
                     "mounted (it was at the start of this import; the "
                     "directory persists but the share has detached, so "
@@ -3727,7 +3689,7 @@ def run_import_job(job, runner, db_path, workspace_id, params):
             for source_file in batch:
                 state.emitted += 1
                 _fail(
-                    rel, source_file,
+                    state, rel, source_file,
                     f"could not create destination folder {dest_folder}: {e}",
                 )
             _emit(
@@ -3764,13 +3726,6 @@ def run_import_job(job, runner, db_path, workspace_id, params):
         # working-copy extraction so it reads local card bytes, never the
         # just-written archive copy.
         landed = []
-        # Whether each ``copied`` booking also incremented ``verified``:
-        # the local path hash-verifies every copy (``copy_and_hash_verify``
-        # reads the landed bytes back), so ``_reclassify_landed_failed``
-        # must always undo both. (The remote path books ``verified`` only
-        # under ``params.verify_by_hash`` and sets this accordingly. PR
-        # 7's transport ``attests_bytes`` absorbs this flag.)
-        verified_counted_for_copies = True
         dup_dirs = set()
         # Duplicate skips accepted in this batch that never enter
         # ``landed`` — (source_file, counted_unverified). An accepted skip
@@ -3781,6 +3736,17 @@ def run_import_job(job, runner, db_path, workspace_id, params):
         # report safe_to_format True over an archive holding nothing.
         # See PR #1396 review (Codex P1 r3687506040).
         dup_skips = []
+        # dest_paths that hash-stamping reclassified from
+        # copied/skipped_duplicate to failed. The entries stay in
+        # ``landed`` (mutating a list during its own iteration is
+        # error-prone), so we filter them out of the working-copy
+        # override map below — otherwise the deferred
+        # ``_extract_working_copies`` would read card-side bytes for
+        # a photo whose catalog row is missing (JPEG-pair miss aside)
+        # or whose archive bytes no longer match what we copied, and
+        # cache a working copy that doesn't correspond to what the
+        # rest of the app sees at the archive path. See PR #1107 review.
+        reclassified_landed_paths = set()
         # Sticky once tripped: a batch can hold hundreds of files (the
         # 2026-07-26 folder held 200), and when it is the only batch there
         # is no later batch boundary to catch a detach. Probing per file
@@ -3810,7 +3776,7 @@ def run_import_job(job, runner, db_path, workspace_id, params):
             if mount_lost:
                 state.emitted += 1
                 _fail(
-                    rel, source_file,
+                    state, rel, source_file,
                     f"archive mount root {mount_lost} detached while this "
                     "batch was copying (the directory persists but the "
                     "share is gone, so further writes would land on the "
@@ -3828,7 +3794,7 @@ def run_import_job(job, runner, db_path, workspace_id, params):
                 try:
                     token = checker.match(source_file)
                 except OSError as e:
-                    _fail(rel, source_file, f"duplicate check failed: {e}")
+                    _fail(state, rel, source_file, f"duplicate check failed: {e}")
                     continue
                 if token is not None:
                     if (
@@ -3841,7 +3807,7 @@ def run_import_job(job, runner, db_path, workspace_id, params):
                         if likely_rows:
                             state.skipped_duplicate += 1
                             state.unverified_duplicate += 1
-                            _counts(rel)["skipped_duplicate"] += 1
+                            _counts(state, rel)["skipped_duplicate"] += 1
                             dup_skips.append((source_file, True))
                             dup_dirs.update(_linkable_twin_dirs(
                                 likely_rows, _path_under_destination,
@@ -3878,7 +3844,7 @@ def run_import_job(job, runner, db_path, workspace_id, params):
                             src_hash = checker.content_hash(source_file)
                         except OSError as e:
                             _fail(
-                                rel, source_file,
+                                state, rel, source_file,
                                 f"duplicate check failed: {e}",
                             )
                             continue
@@ -3964,7 +3930,7 @@ def run_import_job(job, runner, db_path, workspace_id, params):
                         break
                     if accept:
                         state.skipped_duplicate += 1
-                        _counts(rel)["skipped_duplicate"] += 1
+                        _counts(state, rel)["skipped_duplicate"] += 1
                         dup_skips.append((source_file, False))
                         # verified_twin_rows carries only twins whose
                         # bytes we re-hashed and matched this run — the
@@ -4033,7 +3999,7 @@ def run_import_job(job, runner, db_path, workspace_id, params):
             dest_under_source = _path_under_any_source(dest_file)
             if same_file or dest_under_source:
                 _fail(
-                    rel, source_file,
+                    state, rel, source_file,
                     "destination file resolves inside a source directory "
                     "(dest_file would live under the card being imported); "
                     "formatting the card would erase the archive copy",
@@ -4053,7 +4019,7 @@ def run_import_job(job, runner, db_path, workspace_id, params):
             try:
                 src_stat = source_file.stat()
             except OSError as e:
-                _fail(rel, source_file, str(e))
+                _fail(state, rel, source_file, str(e))
                 continue
             src_size = src_stat.st_size
             src_mtime_ns = src_stat.st_mtime_ns
@@ -4144,7 +4110,7 @@ def run_import_job(job, runner, db_path, workspace_id, params):
                 if adopted_dest is not None:
                     dest_file, adopt_hash = adopted_dest
                     state.skipped_duplicate += 1
-                    _counts(rel)["skipped_duplicate"] += 1
+                    _counts(state, rel)["skipped_duplicate"] += 1
                     landed.append(
                         _LandedFile(
                             dest_path=dest_file,
@@ -4155,7 +4121,7 @@ def run_import_job(job, runner, db_path, workspace_id, params):
                             src_mtime_ns=src_mtime_ns,
                         ),
                     )
-                    _record_checker(source_file, dest_folder, adopt_hash)
+                    _record_checker(state, checker, source_file, dest_folder, adopt_hash)
                     continue
 
                 src_hash = (
@@ -4174,18 +4140,18 @@ def run_import_job(job, runner, db_path, workspace_id, params):
                 dest_read_cancelled = True
                 break
             except OSError as e:
-                _fail(rel, source_file, str(e))
+                _fail(state, rel, source_file, str(e))
                 continue
             if not ok:
                 _fail(
-                    rel, source_file,
+                    state, rel, source_file,
                     "copy verification failed (destination bytes do not "
                     "match the source)",
                 )
                 continue
             state.copied += 1
             state.verified += 1
-            _counts(rel)["copied"] += 1
+            _counts(state, rel)["copied"] += 1
             landed.append(
                 _LandedFile(
                     dest_path=dest_file,
@@ -4196,7 +4162,7 @@ def run_import_job(job, runner, db_path, workspace_id, params):
                     src_mtime_ns=src_mtime_ns,
                 ),
             )
-            _record_checker(source_file, dest_folder, file_hash)
+            _record_checker(state, checker, source_file, dest_folder, file_hash)
 
         # The per-file probe runs BEFORE each copy, so it cannot see a
         # detach that happens during the last (or only) file — there is no
@@ -4242,11 +4208,11 @@ def run_import_job(job, runner, db_path, workspace_id, params):
         if mount_lost and dup_skips:
             for skipped_file, counted_unverified in dup_skips:
                 state.skipped_duplicate -= 1
-                _counts(rel)["skipped_duplicate"] -= 1
+                _counts(state, rel)["skipped_duplicate"] -= 1
                 if counted_unverified:
                     state.unverified_duplicate -= 1
                 _fail(
-                    rel, skipped_file,
+                    state, rel, skipped_file,
                     f"archive mount root {mount_lost} detached mid-batch; "
                     "the duplicate this file matched cannot be confirmed "
                     "to be on the archive rather than in a local shadow",
@@ -4264,10 +4230,11 @@ def run_import_job(job, runner, db_path, workspace_id, params):
         if mount_lost and landed:
             for entry in landed:
                 _reclassify_landed_failed(
-                    rel, entry,
+                    state, rel, entry,
                     f"archive mount root {mount_lost} detached mid-batch; "
                     "this file landed in a local shadow of the archive, "
                     "not on the share",
+                                    verified_counted_for_copies,
                 )
             landed = []
 
@@ -4350,7 +4317,8 @@ def run_import_job(job, runner, db_path, workspace_id, params):
                 # to failed) so the ledger never double-counts.
                 for entry in landed:
                     _reclassify_landed_failed(
-                        rel, entry, f"catalog scan failed: {e}",
+                        state, rel, entry, f"catalog scan failed: {e}",
+                                            verified_counted_for_copies,
                     )
                 landed = []
             else:
@@ -4362,18 +4330,6 @@ def run_import_job(job, runner, db_path, workspace_id, params):
                 # the cache expires or another full scan runs. Mirrors
                 # api_job_scan / api_job_import_full / pipeline_job.
                 _invalidate_new_images(db, dest_folder)
-
-            # dest_paths that hash-stamping reclassified from
-            # copied/skipped_duplicate to failed. The entries stay in
-            # ``landed`` (mutating a list during its own iteration is
-            # error-prone), so we filter them out of the working-copy
-            # override map below — otherwise the deferred
-            # ``_extract_working_copies`` would read card-side bytes for
-            # a photo whose catalog row is missing (JPEG-pair miss aside)
-            # or whose archive bytes no longer match what we copied, and
-            # cache a working copy that doesn't correspond to what the
-            # rest of the app sees at the archive path. See PR #1107 review.
-            reclassified_landed_paths = set()
 
             # RAW rows whose derived caches need invalidation because a
             # newly-landed JPEG became (or already was) their companion.
@@ -4483,14 +4439,16 @@ def run_import_job(job, runner, db_path, workspace_id, params):
                             state.imported_photo_ids.add(companion["id"])
                             continue
                         _reclassify_landed_failed(
-                            rel, entry,
+                            state, rel, entry,
                             "paired companion archive bytes no longer "
                             "match the copy-time hash",
+                                                    verified_counted_for_copies,
                         )
                         reclassified_landed_paths.add(dest_path)
                         continue
                     _reclassify_landed_failed(
-                        rel, entry, "not cataloged after scan",
+                        state, rel, entry, "not cataloged after scan",
+                                            verified_counted_for_copies,
                     )
                     reclassified_landed_paths.add(dest_path)
                     continue
@@ -4525,11 +4483,12 @@ def run_import_job(job, runner, db_path, workspace_id, params):
                             state.imported_photo_ids.add(row["id"])
                         else:
                             _reclassify_landed_failed(
-                                rel, entry,
+                                state, rel, entry,
                                 "scan wrote no archive row hash and a "
                                 "re-read of the archive file disagrees "
                                 "with the copy-time hash (archive file "
                                 "vanished, changed, or is unreadable)",
+                                                            verified_counted_for_copies,
                             )
                             reclassified_landed_paths.add(dest_path)
                     else:
@@ -4556,17 +4515,19 @@ def run_import_job(job, runner, db_path, workspace_id, params):
                             state.imported_photo_ids.add(row["id"])
                         else:
                             _reclassify_landed_failed(
-                                rel, entry,
+                                state, rel, entry,
                                 "archive file unhashable after copy "
                                 "verification (scan wrote no hash and "
                                 "re-hash disagrees)",
+                                                            verified_counted_for_copies,
                             )
                             reclassified_landed_paths.add(dest_path)
                 else:
                     _reclassify_landed_failed(
-                        rel, entry,
+                        state, rel, entry,
                         "destination changed between copy verification and "
                         "catalog scan (hash mismatch)",
+                                            verified_counted_for_copies,
                     )
                     reclassified_landed_paths.add(dest_path)
 
@@ -4702,8 +4663,8 @@ def run_import_job(job, runner, db_path, workspace_id, params):
                         ),
                     })
         _emit(
-            f"{rel}: {_counts(rel)['copied']} copied · "
-            f"{_counts(rel)['skipped_duplicate']} already present",
+            f"{rel}: {_counts(state, rel)['copied']} copied · "
+            f"{_counts(state, rel)['skipped_duplicate']} already present",
             state.emitted, queued,
         )
 

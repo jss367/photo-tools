@@ -144,6 +144,9 @@ def test_make_case_folded_check_probes_once(tmp_path, monkeypatch):
         return False
 
     monkeypatch.setattr(pg, "_probe_uncached", counting_probe)
+    # Force the probe path: darwin/win32 short-circuit before probing,
+    # so without this the probe count is 0 there, not 1.
+    monkeypatch.setattr(pg, "is_case_insensitive_platform", lambda: False)
     check = make_case_folded_check(str(root))
     for _ in range(10):
         check(str(root / "photos" / "IMG.NEF"))

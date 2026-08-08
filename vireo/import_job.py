@@ -1804,7 +1804,6 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
         # path re-hashes the twin's archive file. On the mount that file is
         # locally readable, so reuse the same on-disk re-hash contract.
         to_transfer = []   # (source_file, dest_basename, src_hash, src_size, src_mtime_ns)
-        dup_skipped = 0
         # Twin folders (under destination) whose bytes we RE-HASHED this run
         # and confirmed against source hashes — safe to scan/link into the
         # active workspace after this batch's fresh-scan runs. Mirrors the
@@ -1908,7 +1907,6 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
                         if likely_rows:
                             skipped_duplicate += 1
                             unverified_duplicate += 1
-                            dup_skipped += 1
                             _counts(rel)["skipped_duplicate"] += 1
                             dup_skips.append((source_file, True))
                             dup_dirs.update(_linkable_twin_dirs(
@@ -2004,7 +2002,6 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
                         break
                     if accept:
                         skipped_duplicate += 1
-                        dup_skipped += 1
                         _counts(rel)["skipped_duplicate"] += 1
                         dup_skips.append((source_file, False))
                         # Preserve the verified twin folders so the follow-
@@ -2084,7 +2081,6 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
                 and src_hash in queued_src_hashes
             ):
                 skipped_duplicate += 1
-                dup_skipped += 1
                 _counts(rel)["skipped_duplicate"] += 1
                 dup_skips.append((source_file, False))
                 _record_checker(source_file, dest_folder, src_hash)
@@ -2113,7 +2109,6 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
                         and claimed_basenames[candidate_key] == src_hash
                     ):
                         skipped_duplicate += 1
-                        dup_skipped += 1
                         _counts(rel)["skipped_duplicate"] += 1
                         dup_skips.append((source_file, False))
                         _record_checker(source_file, dest_folder, src_hash)
@@ -2145,7 +2140,6 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
                         on_disk = None
                     if on_disk is not None and on_disk == src_hash:
                         skipped_duplicate += 1
-                        dup_skipped += 1
                         _counts(rel)["skipped_duplicate"] += 1
                         dup_skips.append((source_file, False))
                         claimed_basenames[candidate_key] = src_hash
@@ -2231,7 +2225,6 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
         if mount_lost:
             for skipped_file, counted_unverified in dup_skips:
                 skipped_duplicate -= 1
-                dup_skipped -= 1
                 _counts(rel)["skipped_duplicate"] -= 1
                 if counted_unverified:
                     unverified_duplicate -= 1
@@ -2267,9 +2260,9 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
         # were queued (decided but not yet sent). Without this guard the
         # rsync block below would start copying a partial batch after Stop
         # was requested. Queued files that never rsync stay on the card
-        # and will be picked up by the next run; ``dup_skipped`` /
-        # ``adopted_paths`` for files already visible on the mount are
-        # still cataloged by the batch-scan block below. See PR #1113
+        # and will be picked up by the next run; ``adopted_paths`` for
+        # files already visible on the mount are still cataloged by the
+        # batch-scan block below. See PR #1113
         # review.
         if to_transfer and not cancelled:
             # ``--ignore-existing`` protects against basename-race overwrites:
@@ -2857,7 +2850,6 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
                     # skipped it). Roll back the skip and fail the
                     # source file.
                     skipped_duplicate -= 1
-                    dup_skipped -= 1
                     _counts(rel)["skipped_duplicate"] -= 1
                     _fail(
                         rel, adopt_source,
@@ -2908,7 +2900,6 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
                     )
                     if read_failed or mount_norm != src_h_norm:
                         skipped_duplicate -= 1
-                        dup_skipped -= 1
                         _counts(rel)["skipped_duplicate"] -= 1
                         _fail(
                             rel, adopt_source,
@@ -2921,7 +2912,6 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
                         continue
                 elif scan_h != src_h_norm:
                     skipped_duplicate -= 1
-                    dup_skipped -= 1
                     _counts(rel)["skipped_duplicate"] -= 1
                     _fail(
                         rel, adopt_source,

@@ -2492,6 +2492,26 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
             # also what prevents a duplicate-only import from falling back
             # to a whole-directory discovery walk. See PR #1113 review.
             scan_files = landed_paths | set(adopted_paths.keys())
+            # Pre-scan snapshot of any photo row already cataloged at a
+            # path this batch will scan (landed AND adopted — remote
+            # adoptions live in ``adopted_paths``, outside ``landed``, so
+            # capturing over ``landed`` alone would drop the adoption
+            # coverage the local path gets for free). Compared after the
+            # scan to invalidate derived caches for rows whose content
+            # identity changed. Defense-in-depth next to the scanner's
+            # own ``content_identity_changed`` invalidation, for rows/
+            # codepaths the scanner misses (legacy NULL-hash rows).
+            # Mirrors the local path — spec decision 6.
+            pre_scan_hashes = {}
+            for sp in scan_files:
+                row = db.conn.execute(
+                    """SELECT p.id, p.file_hash FROM photos p
+                       JOIN folders f ON f.id = p.folder_id
+                       WHERE f.path = ? AND p.filename = ?""",
+                    (os.path.dirname(sp), os.path.basename(sp)),
+                ).fetchone()
+                if row is not None:
+                    pre_scan_hashes[sp] = row["file_hash"]
             try:
                 # A landed path is not necessarily uncataloged: a stale row
                 # can survive for a file deleted off the archive, and if
@@ -2541,6 +2561,25 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
             # NULL hash_status/hash_checked_at (scan may set file_hash,
             # but we don't claim an integrity verdict we didn't
             # independently make).
+            #
+            # RAW rows that gained a JPEG companion this batch. The
+            # scan's pair-merge only invalidates the RAW's derived
+            # caches when an edit recipe transfers, so a RAW whose
+            # working copy / thumb / previews were rendered RAW-only
+            # keeps serving them after pairing. Collect every such RAW
+            # id (transferred AND adopted JPEGs — adoption only proves
+            # the JPEG bytes pre-existed on the mount, not that the RAW
+            # already carried companion_path) and invalidate below.
+            # Mirrors the local path — spec decision 6.
+            raw_companion_invalidations = set()
+            # Adopted mount paths whose post-scan validation failed (the
+            # failure ``continue``s below leave the key in
+            # ``adopted_paths``, unlike ``landed`` which self-filters on
+            # failure). The diff loop below skips these — invalidating a
+            # row we just failed/rolled back would act on unproven bytes.
+            # The remote counterpart of the local path's
+            # ``reclassified_landed_paths``, scoped to adoptions.
+            failed_adopted_paths = set()
             for dest_path, _sf, src_hash, _sz, _mt in list(landed):
                 row = db.conn.execute(
                     """SELECT p.id, p.file_hash FROM photos p
@@ -2734,6 +2773,9 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
                         # what the chaining hook should process, so its
                         # id joins ``imported_photo_ids``. See PR #1113
                         # review.
+                        # Collected for the post-validation invalidation
+                        # loop — see the raw_companion_invalidations decl.
+                        raw_companion_invalidations.add(companion["id"])
                         imported_photo_ids.add(companion["id"])
                         continue
                     copied -= 1
@@ -2823,6 +2865,7 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
                         "replaced before catalog scan (no photo row "
                         "and no companion row)",
                     )
+                    failed_adopted_paths.add(ap)
                     continue
                 src_h_norm = (
                     None if adopt_src_hash == EMPTY_FILE_SHA256
@@ -2874,6 +2917,7 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
                             "replaced or became unreadable between the "
                             "adopt-time hash check and catalog scan)",
                         )
+                        failed_adopted_paths.add(ap)
                         continue
                 elif scan_h != src_h_norm:
                     skipped_duplicate -= 1
@@ -2885,9 +2929,106 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
                         "with the source hash (mount base is likely "
                         "stale or misconfigured)",
                     )
+                    failed_adopted_paths.add(ap)
                     continue
+                if is_companion:
+                    # Collected for the post-validation invalidation
+                    # loop — see the raw_companion_invalidations decl.
+                    raw_companion_invalidations.add(row_id)
                 imported_photo_ids.add(row_id)
+
+            # Invalidate derived caches for any landed/adopted row whose
+            # bytes differ from what was there pre-scan. The batch scan
+            # passes ``vireo_dir`` through, so scanner's own
+            # ``_invalidate_derived_caches`` already fires on rows it
+            # detects as content-changed; this loop is defense-in-depth
+            # for legacy rows and codepath changes the scanner misses
+            # (see the ``pre_scan_hashes`` capture comment above), and
+            # is idempotent with scanner's call. Without it, imports
+            # that restore a replaced-then-deleted mount file could
+            # leave stale ``working_copy_path``/thumb/preview files
+            # pointing at the previous bytes, and the deferred
+            # end-of-run ``_extract_working_copies`` skips rows whose
+            # ``working_copy_path`` is already set — so the WC never
+            # rebuilds against the new mount bytes. Mirrors the local
+            # path — spec decision 6.
+            invalidated_photo_ids = set()
+            if params.vireo_dir:
+                from scanner import _invalidate_derived_caches
+                # Surviving entries only: failed direct rows were
+                # filtered out of ``landed`` in place; failed adoptions
+                # are skipped via ``failed_adopted_paths``. Copy-time
+                # hash: ``landed`` carries it at index 2, adoptions at
+                # index 1 of their ``adopted_paths`` value tuple.
+                changed_candidates = [
+                    (entry[0], entry[2]) for entry in landed
+                ] + [
+                    (ap, a_hash)
+                    for ap, (_asrc, a_hash) in adopted_paths.items()
+                    if ap not in failed_adopted_paths
+                ]
+                for cand_path, copy_hash in changed_candidates:
+                    if cand_path not in pre_scan_hashes:
+                        # No pre-scan row (fresh insert) — no derived
+                        # caches exist for this photo yet.
+                        continue
+                    # A pre-scan row existed. Its ``file_hash`` may be
+                    # ``NULL`` (legacy row, or a prior scan that couldn't
+                    # read the file), and such a row can still carry
+                    # ``working_copy_path``/thumb/preview caches from
+                    # earlier processing. Scanner's own content-change
+                    # path treats ``NULL -> concrete hash`` as an
+                    # invalidating transition (see scanner.scan()'s
+                    # ``content_identity_changed`` block); mirror that
+                    # here so restoring a deleted mount file whose
+                    # legacy row lost its hash still clears the stale
+                    # derived caches. Compared raw, matching the local
+                    # path's diff loop exactly — deliberately NOT
+                    # normalizing the zero-byte convention (scan writes
+                    # NULL, copy-time hashing yields EMPTY_FILE_SHA256),
+                    # so a pre-existing zero-byte row is spuriously
+                    # invalidated. Harmless, and shared with local so
+                    # PR 5 unifies identical behavior.
+                    pre_hash = pre_scan_hashes[cand_path]
+                    if pre_hash == copy_hash:
+                        continue
+                    row = db.conn.execute(
+                        """SELECT p.id FROM photos p
+                           JOIN folders f ON f.id = p.folder_id
+                           WHERE f.path = ? AND p.filename = ?""",
+                        (
+                            os.path.dirname(cand_path),
+                            os.path.basename(cand_path),
+                        ),
+                    ).fetchone()
+                    if row is None:
+                        continue
+                    _invalidate_derived_caches(
+                        db, params.vireo_dir, row["id"],
+                        thumb_cache_dir=params.thumb_cache_dir,
+                    )
+                    invalidated_photo_ids.add(row["id"])
+
+                # RAW rows whose companion JPEG we just landed —
+                # covered by the same untracked-preview sweep below so
+                # orphaned preview files from the prior companion state
+                # don't get lazy-adopted on the next request.
+                for raw_id in raw_companion_invalidations:
+                    _invalidate_derived_caches(
+                        db, params.vireo_dir, raw_id,
+                        thumb_cache_dir=params.thumb_cache_dir,
+                    )
+                    invalidated_photo_ids.add(raw_id)
             db.conn.commit()
+            if invalidated_photo_ids:
+                # Mirror scanner.scan()'s post-loop untracked-preview
+                # sweep: orphan preview files with no preview_cache row
+                # would be lazy-adopted on the next request and served as
+                # stale bytes for the just-replaced mount file.
+                from scanner import _sweep_untracked_previews_for_photos
+                _sweep_untracked_previews_for_photos(
+                    db, params.vireo_dir, invalidated_photo_ids,
+                )
 
             if params.vireo_dir:
                 for dest_path, sf, _sh, sz, mt in landed:
@@ -4265,11 +4406,11 @@ def run_import_job(job, runner, db_path, workspace_id, params):
             # strategy), and the deferred ``_extract_working_copies``
             # skips rows whose ``working_copy_path IS NOT NULL``. Without
             # invalidation the UI keeps serving derived files for the
-            # previous companion state. Skip when the JPEG was adopted
-            # (``origin == "skipped_duplicate"``): its bytes were already
-            # at the archive path before this run, so any RAW cache
-            # derived from them is by construction consistent. See PR
-            # #1107 review.
+            # previous companion state. Collected regardless of origin —
+            # adoption (``origin == "skipped_duplicate"``) only proves
+            # the JPEG bytes were already at the archive path, NOT that
+            # the RAW row already carried ``companion_path`` for this
+            # JPEG (see the accept branch below). See PR #1107 review.
             raw_companion_invalidations = set()
 
             def _rehash_dest_or_none(path):
@@ -4424,17 +4565,17 @@ def run_import_job(job, runner, db_path, workspace_id, params):
                     reclassified_landed_paths.add(dest_path)
 
             # Invalidate derived caches for any landed row whose bytes
-            # differ from what was there pre-scan. The batch scan ran with
-            # ``vireo_dir=None`` (per-batch WC extraction would race
-            # RAW+JPEG pairing across batch boundaries), so scanner's own
-            # ``_invalidate_derived_caches`` on content change was
-            # bypassed. Do it here for the same set of rows the scanner
-            # would have caught: existing rows whose new hash differs from
-            # the pre-scan hash. Without this, imports that restore a
-            # replaced-then-deleted archive file leave stale
-            # ``working_copy_path``/thumb/preview files pointing at the
-            # previous bytes, and the deferred end-of-run
-            # ``_extract_working_copies`` skips rows whose
+            # differ from what was there pre-scan. The batch scan passes
+            # ``vireo_dir`` through, so scanner's own
+            # ``_invalidate_derived_caches`` already fires on rows it
+            # detects as content-changed; this loop is defense-in-depth
+            # for legacy rows and codepath changes the scanner misses
+            # (see the ``pre_scan_hashes`` capture comment above), and
+            # is idempotent with scanner's call. Without it, imports
+            # that restore a replaced-then-deleted archive file could
+            # leave stale ``working_copy_path``/thumb/preview files
+            # pointing at the previous bytes, and the deferred
+            # end-of-run ``_extract_working_copies`` skips rows whose
             # ``working_copy_path`` is already set — so the WC never
             # rebuilds against the new archive bytes. See PR #1107 review.
             invalidated_photo_ids = set()

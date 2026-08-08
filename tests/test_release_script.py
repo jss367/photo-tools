@@ -1,10 +1,15 @@
 """Guards on the release process.
 
-Both tests exist because of the v0.32.3 release failure: `scripts/release.sh`
+These tests exist because of the v0.32.3 release failure: `scripts/release.sh`
 ran `cargo generate-lockfile`, which re-resolved every third-party crate to the
 newest compatible version. That pulled in zune-core 0.5.2 — published three
 hours earlier, broken, and yanked 35 minutes later — and the macOS build failed
 after the tag had already been pushed.
+
+The ordering assertions matter as much as the presence ones. A compile gate that
+runs *after* `git tag` protects nothing: the tag is the point of no return, so a
+guard that only checked for the command's existence would still pass while the
+protection it describes had been silently lost.
 """
 import re
 import tomllib
@@ -15,12 +20,53 @@ RELEASE_SH = REPO_ROOT / "scripts" / "release.sh"
 CARGO_LOCK = REPO_ROOT / "src-tauri" / "Cargo.lock"
 PYPROJECT = REPO_ROOT / "pyproject.toml"
 
+LOCKFILE_SYNC = r"^\s*\(cd src-tauri && cargo update --workspace\)"
+DEPENDENCY_CHECK = r"^\s*\(cd src-tauri && cargo check --locked\)"
+TAG_COMMAND = r'^\s*git tag "'
+PUBLISH_GUARD = r"^if\s+\$PUBLISH\s*;\s*then\s*$"
 
-def _uncommented_lines(text):
+
+def _code_lines():
+    """release.sh with comments and blanks blanked out, line indices preserved.
+
+    Blanking rather than dropping keeps index comparisons meaningful, and stops
+    a command named in a comment from satisfying a presence assertion.
+    """
     return [
-        line for line in text.splitlines()
-        if line.strip() and not line.lstrip().startswith("#")
+        "" if (not line.strip() or line.lstrip().startswith("#")) else line
+        for line in RELEASE_SH.read_text().splitlines()
     ]
+
+
+def _sole_index(lines, pattern):
+    """Index of the one line matching `pattern`, asserting it is unambiguous."""
+    hits = [i for i, line in enumerate(lines) if re.search(pattern, line)]
+    assert len(hits) == 1, (
+        f"expected exactly one line in scripts/release.sh matching {pattern!r}, "
+        f"found {len(hits)} (lines {[i + 1 for i in hits]})"
+    )
+    return hits[0]
+
+
+def _publish_block_ranges(lines):
+    """(start, end) index pairs for each `if $PUBLISH; then ... fi` block.
+
+    Tracks if/fi nesting so a `$PUBLISH` block containing inner conditionals
+    still resolves to its own `fi` rather than the first one encountered.
+    """
+    ranges = []
+    open_blocks = []
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if re.match(r"^if\s", stripped):
+            open_blocks.append((i, line))
+        elif stripped == "fi":
+            assert open_blocks, f"unbalanced `fi` at scripts/release.sh:{i + 1}"
+            start, opener = open_blocks.pop()
+            if re.match(PUBLISH_GUARD, opener):
+                ranges.append((start, i))
+    assert not open_blocks, "unbalanced `if` in scripts/release.sh"
+    return ranges
 
 
 def test_release_does_not_regenerate_the_whole_lockfile():
@@ -29,26 +75,48 @@ def test_release_does_not_regenerate_the_whole_lockfile():
     `cargo update --workspace` rewrites only the `vireo` entry;
     `cargo generate-lockfile` rewrites everything.
     """
-    code = _uncommented_lines(RELEASE_SH.read_text())
-    offenders = [line for line in code if "cargo generate-lockfile" in line]
+    lines = _code_lines()
+    offenders = [
+        i + 1 for i, line in enumerate(lines) if "cargo generate-lockfile" in line
+    ]
     assert not offenders, (
         "scripts/release.sh must not run `cargo generate-lockfile` — it bumps "
         "every dependency to the newest compatible version at tag time, with no "
-        "CI run in between. Use `cargo update --workspace`. Offending lines: "
-        f"{offenders}"
+        f"CI run in between. Use `cargo update --workspace`. Lines: {offenders}"
     )
-    assert any("cargo update --workspace" in line for line in code), (
-        "scripts/release.sh must sync the workspace version into Cargo.lock "
-        "with `cargo update --workspace`"
+    _sole_index(lines, LOCKFILE_SYNC)
+
+
+def test_lockfile_sync_runs_before_tagging():
+    """A lock synced after tagging would not be in the tagged commit."""
+    lines = _code_lines()
+    assert _sole_index(lines, LOCKFILE_SYNC) < _sole_index(lines, TAG_COMMAND), (
+        "`cargo update --workspace` must run before `git tag` so the tagged "
+        "commit contains the synced Cargo.lock"
     )
 
 
-def test_release_compiles_dependencies_before_tagging():
-    """The publish path builds nothing locally, so it needs a compile gate."""
-    code = _uncommented_lines(RELEASE_SH.read_text())
-    assert any("cargo check --locked" in line for line in code), (
-        "scripts/release.sh must run `cargo check --locked` before tagging so a "
-        "dependency that does not compile is caught before the tag is pushed"
+def test_dependency_check_gates_the_tag():
+    """The compile gate is worthless unless it can still stop the tag.
+
+    The publish path builds nothing locally, so this is the only thing standing
+    between a broken dependency and a pushed tag.
+    """
+    lines = _code_lines()
+    check = _sole_index(lines, DEPENDENCY_CHECK)
+    tag = _sole_index(lines, TAG_COMMAND)
+
+    assert check < tag, (
+        "`cargo check --locked` must run before `git tag` — after the tag is "
+        "pushed it cannot prevent a broken release, which is the whole point"
+    )
+
+    blocks = _publish_block_ranges(lines)
+    assert blocks, "no `if $PUBLISH; then` block found in scripts/release.sh"
+    assert any(start < check < end for start, end in blocks), (
+        "`cargo check --locked` must sit inside an `if $PUBLISH; then` block. "
+        "The non-publish path already does a full local build, so running it "
+        "unconditionally just duplicates that compile."
     )
 
 

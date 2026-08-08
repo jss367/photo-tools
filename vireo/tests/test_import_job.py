@@ -3707,9 +3707,13 @@ def test_import_invalidates_derived_caches_on_content_change(tmp_path):
 
     # Orphan preview file: previews/{pid}_{size}.jpg with NO
     # preview_cache row (legacy code path / interrupted insert).
-    # Row-driven ``_invalidate_derived_caches`` can't see it — only the
-    # post-loop untracked-preview sweep removes it before it can be
-    # lazy-adopted and served as stale pre-change bytes.
+    # Row-driven ``_invalidate_derived_caches`` can't see it; an
+    # untracked-preview sweep removes it before it can be lazy-adopted
+    # and served as stale pre-change bytes. In this content-change
+    # geometry EITHER sweep suffices — scan()'s own internal sweep also
+    # covers it — so this asserts "some sweep ran"; the pairing tests
+    # isolate the import job's sweep call with a geometry scan()'s
+    # sweep set never contains.
     previews_dir = vireo_dir / "previews"
     previews_dir.mkdir()
     orphan_preview = previews_dir / f"{photo_id}_512.jpg"
@@ -3875,6 +3879,17 @@ def test_import_invalidates_raw_caches_when_new_jpeg_pairs(tmp_path):
     )
     db.conn.commit()
 
+    # Orphan preview file for the RAW: previews/{raw_photo_id}_512.jpg
+    # with NO preview_cache row. In this companion-pair geometry the
+    # RAW's id never enters scan()'s own internal sweep set (pairing is
+    # not a content change), so ONLY the import job's post-batch
+    # ``_sweep_untracked_previews_for_photos`` call can remove it —
+    # this seed isolates that call site.
+    previews_dir = vireo_dir / "previews"
+    previews_dir.mkdir()
+    orphan_preview = previews_dir / f"{raw_photo_id}_512.jpg"
+    orphan_preview.write_bytes(b"stale-orphan-preview-bytes")
+
     # Card holds a NEW JPEG that will land at DSC_0800.jpg and pair with
     # the existing RAW during the batch scan.
     card = _make_card(tmp_path, [
@@ -3917,6 +3932,13 @@ def test_import_invalidates_raw_caches_when_new_jpeg_pairs(tmp_path):
             "the file is unlinked or overwritten with a fresh WC from "
             "the verified companion JPEG"
         )
+    # The RAW's orphan preview (no preview_cache row) is gone. Scan()'s
+    # internal sweep never sees companion-paired RAW ids, so only the
+    # import job's own sweep call can have removed it.
+    assert not orphan_preview.exists(), (
+        "the import-path untracked-preview sweep must remove the paired "
+        "RAW's orphan preview files"
+    )
 
 
 def test_key_duplicate_links_only_byte_verified_twin_folder(tmp_path):
@@ -5280,9 +5302,13 @@ def test_remote_import_invalidates_derived_caches_on_content_change(
 
     # Orphan preview file: previews/{pid}_{size}.jpg with NO
     # preview_cache row (legacy code path / interrupted insert).
-    # Row-driven ``_invalidate_derived_caches`` can't see it — only the
-    # post-loop untracked-preview sweep removes it before it can be
-    # lazy-adopted and served as stale pre-change bytes.
+    # Row-driven ``_invalidate_derived_caches`` can't see it; an
+    # untracked-preview sweep removes it before it can be lazy-adopted
+    # and served as stale pre-change bytes. In this content-change
+    # geometry EITHER sweep suffices — scan()'s own internal sweep also
+    # covers it — so this asserts "some sweep ran"; the pairing tests
+    # isolate the import job's sweep call with a geometry scan()'s
+    # sweep set never contains.
     previews_dir = vireo_dir / "previews"
     previews_dir.mkdir()
     orphan_preview = previews_dir / f"{photo_id}_512.jpg"
@@ -5462,6 +5488,17 @@ def test_remote_import_invalidates_raw_caches_when_new_jpeg_pairs(
     )
     db.conn.commit()
 
+    # Orphan preview file for the RAW: previews/{raw_photo_id}_512.jpg
+    # with NO preview_cache row. In this companion-pair geometry the
+    # RAW's id never enters scan()'s own internal sweep set (pairing is
+    # not a content change), so ONLY the import job's post-batch
+    # ``_sweep_untracked_previews_for_photos`` call can remove it —
+    # this seed isolates that call site.
+    previews_dir = vireo_dir / "previews"
+    previews_dir.mkdir()
+    orphan_preview = previews_dir / f"{raw_photo_id}_512.jpg"
+    orphan_preview.write_bytes(b"stale-orphan-preview-bytes")
+
     # Card holds a NEW JPEG that will land at DSC_0800.jpg and pair with
     # the existing RAW during the batch scan.
     card = _make_card(tmp_path, [
@@ -5506,6 +5543,13 @@ def test_remote_import_invalidates_raw_caches_when_new_jpeg_pairs(
             "the file is unlinked or overwritten with a fresh WC from "
             "the verified companion JPEG"
         )
+    # The RAW's orphan preview (no preview_cache row) is gone. Scan()'s
+    # internal sweep never sees companion-paired RAW ids, so only the
+    # import job's own sweep call can have removed it.
+    assert not orphan_preview.exists(), (
+        "the import-path untracked-preview sweep must remove the paired "
+        "RAW's orphan preview files"
+    )
 
 
 def test_remote_import_invalidates_raw_caches_when_adopted_jpeg_pairs(

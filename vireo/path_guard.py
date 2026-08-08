@@ -32,11 +32,15 @@ def is_case_insensitive_platform():
 # Probe results keyed by (realpath, st_dev). The per-file guards call
 # contains_resolved in tight loops (one call per catalog row per card
 # file), and each uncached call would listdir-probe the same root on
-# Linux. st_dev in the key invalidates the entry when a different
-# filesystem is mounted at the same path (card swapped at the same
-# mount point) — a plain path key could serve a stale, non-strict
-# answer. Inconclusive probes are cached too: they are stable for a
-# given mount and the cached value (True) is the strict direction.
+# Linux. Only True (case-insensitive — the STRICT answer) is ever
+# cached: st_dev identifies the backing device, not a mount
+# generation, so a card swapped or reformatted through the same reused
+# device node can keep the key — and a stale True merely over-folds
+# (can only reject more), while a stale False would do case-sensitive
+# comparisons against a FAT card and let the destination-inside-source
+# guard accept a case-collision destination ON the card. Case-sensitive
+# roots therefore re-probe on every call, which is just the pre-cache
+# behavior for them.
 _probe_cache = {}
 _PROBE_CACHE_MAX = 256
 
@@ -79,7 +83,7 @@ def fs_is_case_insensitive(path):
     if cache_key is not None and cache_key in _probe_cache:
         return _probe_cache[cache_key]
     result = _probe_uncached(path)
-    if cache_key is not None:
+    if cache_key is not None and result is True:
         if len(_probe_cache) >= _PROBE_CACHE_MAX:
             _probe_cache.clear()
         _probe_cache[cache_key] = result

@@ -99,21 +99,40 @@ def test_probe_permission_error_is_inconclusive(tmp_path, monkeypatch):
     assert pg.fs_is_case_insensitive(str(root)) is True
 
 
-def test_probe_result_is_cached_per_device(tmp_path, monkeypatch):
+def test_probe_caches_only_the_strict_result(tmp_path, monkeypatch):
+    # Only True (case-insensitive, the strict answer) is cached: st_dev
+    # identifies the backing device, not a mount generation, so a card
+    # swapped through the same reused device node can keep the cache
+    # key. A stale True merely over-folds; a stale False would run
+    # case-sensitive comparisons against a FAT card.
     import path_guard as pg
     root = tmp_path / "CacheProbe"
     root.mkdir()
-    (root / "alpha.txt").write_text("x")
     pg._probe_cache.clear()
     calls = []
-    real_listdir = os.listdir
 
-    def counting_listdir(p, *a, **kw):
-        calls.append(str(p))
-        return real_listdir(p, *a, **kw)
+    def fake_probe(path):
+        calls.append(str(path))
+        return True
 
-    monkeypatch.setattr(pg.os, "listdir", counting_listdir)
-    first = pg.fs_is_case_insensitive(str(root))
-    second = pg.fs_is_case_insensitive(str(root))
-    assert first == second
-    assert len(calls) == 1
+    monkeypatch.setattr(pg, "_probe_uncached", fake_probe)
+    assert pg.fs_is_case_insensitive(str(root)) is True
+    assert pg.fs_is_case_insensitive(str(root)) is True
+    assert len(calls) == 1  # strict result served from cache
+
+
+def test_probe_never_caches_case_sensitive(tmp_path, monkeypatch):
+    import path_guard as pg
+    root = tmp_path / "NoCacheProbe"
+    root.mkdir()
+    pg._probe_cache.clear()
+    calls = []
+
+    def fake_probe(path):
+        calls.append(str(path))
+        return False
+
+    monkeypatch.setattr(pg, "_probe_uncached", fake_probe)
+    assert pg.fs_is_case_insensitive(str(root)) is False
+    assert pg.fs_is_case_insensitive(str(root)) is False
+    assert len(calls) == 2  # non-strict result re-probed every call

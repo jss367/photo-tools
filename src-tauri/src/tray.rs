@@ -250,16 +250,17 @@ pub fn is_browser_mode(app: &AppHandle) -> bool {
 /// Query the Flask backend for jobs known to the in-memory runner.
 fn fetch_jobs(port: u16, token: Option<&str>) -> Vec<JobInfo> {
     let url = format!("http://127.0.0.1:{}/api/jobs", port);
-    let agent = ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_secs(2))
-        .timeout_read(Duration::from_secs(5))
-        .build();
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_connect(Some(Duration::from_secs(2)))
+        .timeout_recv_response(Some(Duration::from_secs(5)))
+        .build()
+        .into();
     let mut request = agent.get(&url);
     if let Some(token) = token {
-        request = request.set("X-Vireo-Token", token);
+        request = request.header("X-Vireo-Token", token);
     }
     match request.call() {
-        Ok(resp) => match resp.into_string() {
+        Ok(mut resp) => match resp.body_mut().read_to_string() {
             Ok(body) => match serde_json::from_str::<JobsResponse>(&body) {
                 Ok(data) => data.active,
                 Err(e) => {

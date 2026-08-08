@@ -11581,7 +11581,7 @@ def test_remote_import_mount_detach_after_adoption_rolls_back_once(
     assert calls["rsync"] == [], calls["rsync"]
     # Reason wording proves WHICH block failed each file: the post-loop
     # rollback blocks, not the per-file probe (whose wording is
-    # "detached while this batch was being prepared").
+    # "detached while this batch was in progress").
     # Flip 3 (PR 5a fold): adopted A now rolls back via the mount-lost
     # ``landed`` block — MOUNT dest path subject + the local path's
     # "local shadow" wording (pre-fold it went through ``dup_skips``
@@ -11655,7 +11655,7 @@ def test_local_import_mount_detach_after_adoption_rolls_back_once(
     # Both files were rolled back by the ``landed`` block (dest-side
     # paths + "local shadow" wording), proving the detach was handled at
     # the post-loop probe, not by the per-file probe (card-side paths,
-    # "detached while this batch was copying" wording).
+    # "detached while this batch was in progress" wording).
     assert _unsafe_paths(result) == {
         str(day_dir / "DSC_0100.jpg"), str(day_dir / "DSC_0101.jpg"),
     }, result["unsafe_files"]

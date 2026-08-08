@@ -2203,8 +2203,8 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
                     f"archive mount root {stale_mount_root} is no longer "
                     "mounted (it was at the start of this import; the "
                     "directory persists but the share has detached, so "
-                    "cataloging here would read a local shadow of the "
-                    "archive)",
+                    "copying here would write to the local disk under a "
+                    "stale mount point)",
                 )
             _emit(
                 f"{rel}: archive unmounted", state.emitted, queued,
@@ -2331,8 +2331,8 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
                 _fail(
                     state, rel, source_file,
                     f"archive mount root {mount_lost} detached while this "
-                    "batch was being prepared (the directory persists but "
-                    "the share is gone, so neither a transfer nor a "
+                    "batch was in progress (the directory persists but "
+                    "the share is gone, so neither further writes nor a "
                     "duplicate match against it can be trusted)",
                 )
                 continue
@@ -3618,8 +3618,8 @@ def run_import_job(job, runner, db_path, workspace_id, params):
                     f"archive mount root {state.mount_ever_lost} detached "
                     "earlier in this import; the intra-run duplicate "
                     "cache still holds identities for files whose "
-                    "landing was rolled back, so no further batch can "
-                    "be trusted to consult it",
+                    "archive claim was rolled back, so no further batch "
+                    "can be trusted to consult it",
                 )
             _emit(
                 f"{rel}: archive unmounted", state.emitted, queued,
@@ -3826,9 +3826,9 @@ def run_import_job(job, runner, db_path, workspace_id, params):
                 _fail(
                     state, rel, source_file,
                     f"archive mount root {mount_lost} detached while this "
-                    "batch was copying (the directory persists but the "
-                    "share is gone, so further writes would land on the "
-                    "local disk under a stale mount point)",
+                    "batch was in progress (the directory persists but "
+                    "the share is gone, so neither further writes nor a "
+                    "duplicate match against it can be trusted)",
                 )
                 continue
             state.emitted += 1

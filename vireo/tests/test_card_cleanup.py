@@ -9,6 +9,7 @@ import card_cleanup
 import pytest
 from card_cleanup import (
     ManifestError,
+    classify_source_files,
     load_manifest,
     manifest_path,
     prune_manifests,
@@ -154,3 +155,65 @@ def test_write_manifest_json_dump_failure_leaves_no_tmp_file(tmp_path):
     with pytest.raises(TypeError):
         write_manifest(mdir, bad)
     assert os.listdir(mdir) == []
+
+
+def test_load_rejects_non_dict_entry(tmp_path):
+    (tmp_path / "card").mkdir()
+    mdir = str(tmp_path / "manifests")
+    write_manifest(mdir, _manifest(tmp_path, entries=[1]))
+    with pytest.raises(ManifestError):
+        load_manifest(mdir, "scan-1")
+
+
+def test_load_rejects_deletable_entry_with_null_byte(tmp_path):
+    (tmp_path / "card").mkdir()
+    entry = {
+        "path": str(tmp_path / "card" / "x\x00y.nef"),
+        "size": 1, "mtime_ns": 1, "hash": "h", "bucket": "deletable",
+    }
+    mdir = str(tmp_path / "manifests")
+    write_manifest(mdir, _manifest(tmp_path, entries=[entry]))
+    with pytest.raises(ManifestError):
+        load_manifest(mdir, "scan-1")
+
+
+def _make_card(tmp_path):
+    card = tmp_path / "card"
+    (card / "DCIM" / "100").mkdir(parents=True)
+    (card / "DCIM" / "100" / "IMG_0001.NEF").write_bytes(b"raw-one")
+    (card / "DCIM" / "100" / "IMG_0002.JPG").write_bytes(b"jpg-two")
+    (card / "DCIM" / "100" / "IMG_0001.XMP").write_bytes(b"sidecar")
+    (card / "DCIM" / "100" / ".hidden.jpg").write_bytes(b"dot")
+    (card / "MISC" / "sub").mkdir(parents=True)
+    (card / "MISC" / "sub" / "firmware.bin").write_bytes(b"fw")
+    return card
+
+
+def test_classify_buckets(tmp_path):
+    card = _make_card(tmp_path)
+    candidates, ignored = classify_source_files(str(card))
+    cand_names = {p.name for p in candidates}
+    ign_names = {p.name for p in ignored}
+    assert cand_names == {"IMG_0001.NEF", "IMG_0002.JPG"}
+    assert ign_names == {"IMG_0001.XMP", ".hidden.jpg", "firmware.bin"}
+
+
+def test_classify_parity_with_discover_source_files(tmp_path):
+    # The deletable set may never exceed what an import would consider a
+    # photo — pin our filter to discovery's, byte for byte.
+    from ingest import discover_source_files
+    card = _make_card(tmp_path)
+    candidates, _ = classify_source_files(str(card), recursive=True)
+    assert candidates == discover_source_files(
+        str(card), file_types="both", recursive=True)
+    candidates_flat, _ = classify_source_files(str(card), recursive=False)
+    assert candidates_flat == discover_source_files(
+        str(card), file_types="both", recursive=False)
+
+
+def test_classify_missing_source_reports_onerror(tmp_path):
+    errors = []
+    candidates, ignored = classify_source_files(
+        str(tmp_path / "nope"), onerror=errors.append)
+    assert candidates == [] and ignored == []
+    assert len(errors) == 1 and isinstance(errors[0], OSError)

@@ -12,22 +12,22 @@ The safety invariant, enforced immediately before every unlink:
     deletable set would cost more than the import this tool reclaims.
 """
 import contextlib
-import errno  # noqa: F401 — used by Task 3-5 scan/delete
+import errno
 import json
 import os
 import tempfile
 import time
 from datetime import UTC, datetime
-from pathlib import Path  # noqa: F401 — used by Task 3-5 scan/delete
+from pathlib import Path
 
 import path_guard
-from image_loader import (  # noqa: F401 — used by Task 3-5 scan/delete
+from image_loader import (
     SUPPORTED_EXTENSIONS,
     is_excluded_scan_path,
     safe_iter_dir,
     safe_scan_walk,
 )
-from scanner import compute_file_hash  # noqa: F401 — used by Task 3-5 scan/delete
+from scanner import compute_file_hash  # noqa: F401 — used by Task 4 scan/delete
 
 MANIFEST_SCHEMA_VERSION = 1
 MANIFEST_MAX_AGE_DAYS = 7
@@ -91,6 +91,48 @@ def prune_manifests(manifest_dir, max_age_days=MANIFEST_MAX_AGE_DAYS):
                 os.unlink(full)
 
 
+def classify_source_files(source, recursive=True, onerror=None):
+    """One walk over the card; returns (candidates, ignored), both sorted.
+
+    Mirrors discover_source_files' file_types="both" filter exactly —
+    parity is pinned by a test — but also returns the non-photo files so
+    the preview can show an "ignored, never touched" bucket without a
+    second walk (discover_source_files drops them).
+    """
+    source_path = Path(source)
+    if is_excluded_scan_path(source_path):
+        if onerror is not None:
+            onerror(PermissionError(
+                errno.EACCES, "source is an excluded data bundle",
+                str(source_path)))
+        return [], []
+    if not source_path.is_dir():
+        if onerror is not None:
+            onerror(FileNotFoundError(
+                errno.ENOENT, "source is not an accessible directory",
+                str(source_path)))
+        return [], []
+    if recursive:
+        def _walk():
+            for dirpath, _dirnames, filenames in safe_scan_walk(
+                    str(source_path), onerror=onerror):
+                for name in filenames:
+                    yield Path(dirpath) / name
+        entries = _walk()
+    else:
+        entries = safe_iter_dir(str(source_path), onerror=onerror)
+    candidates, ignored = [], []
+    for f in entries:
+        if not f.is_file():
+            continue
+        if (f.suffix.lower() in SUPPORTED_EXTENSIONS
+                and not f.name.startswith(".")):
+            candidates.append(f)
+        else:
+            ignored.append(f)
+    return sorted(candidates), sorted(ignored)
+
+
 def load_manifest(manifest_dir, scan_job_id,
                   max_age_days=MANIFEST_MAX_AGE_DAYS):
     """Load + validate. Everything here must pass before any delete."""
@@ -130,17 +172,25 @@ def load_manifest(manifest_dir, scan_job_id,
     # accepted, so that polarity is inverted: an unresolvable path must
     # fail closed (rejected), not fail open (accepted). Resolve both
     # sides ourselves and use contains_resolved() directly; a realpath
-    # OSError is treated as "outside" rather than "inside". Case-fold
-    # acceptance inside contains_resolved is still fine here — a
-    # case-swapped path within the root is genuinely still within it,
+    # failure is treated as "outside" rather than "inside" (OSError from
+    # an unreadable path, ValueError from e.g. an embedded null byte).
+    # Case-fold acceptance inside contains_resolved is still fine here —
+    # a case-swapped path within the root is genuinely still within it,
     # and the delete job's per-file gates are the deeper defense.
+    try:
+        root_real = os.path.realpath(source_root)
+    except (OSError, ValueError) as e:
+        raise ManifestError(
+            "manifest source root unresolvable — re-scan the card") from e
     for entry in entries:
+        if not isinstance(entry, dict):
+            raise ManifestError(
+                "manifest entries malformed — re-scan the card")
         if entry.get("bucket") != "deletable":
             continue
         try:
-            root_real = os.path.realpath(source_root)
             child_real = os.path.realpath(str(entry.get("path", "")))
-        except OSError as e:
+        except (OSError, ValueError) as e:
             raise ManifestError(
                 "manifest entry outside its source root — re-scan the card"
             ) from e

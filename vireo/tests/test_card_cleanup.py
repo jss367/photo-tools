@@ -793,3 +793,38 @@ def test_delete_skips_path_redirected_outside_source(db, tmp_path):
     assert len(summary["skipped"]) == 1
     assert "no longer resolves inside" in summary["skipped"][0]["reason"]
     assert decoy.exists() and decoy.read_bytes() == b"raw-one"
+
+
+def test_delete_skips_when_card_path_becomes_symlink_post_scan(db, tmp_path):
+    # Codex P2: scan classifies only regular files, but a post-scan swap
+    # of a scanned pathname for a symlink to a byte-identical file with
+    # the same size and mtime would let os.stat follow the link. The
+    # delete would then unlink only the symlink while crediting the
+    # target's full bytes as reclaimed. lstat + explicit S_ISLNK
+    # rejection at the delete gate keeps the destructive step anchored
+    # to the object the scan hashed.
+    _archive_photo(db, tmp_path)
+    card = _card_file(tmp_path)  # content b"raw-one", 7 bytes
+    scan = _scan(db, tmp_path)
+    assert scan["totals"]["deletable"]["count"] == 1
+    manifest = load_manifest(str(tmp_path / "manifests"), "scan-1")
+    entry = next(e for e in manifest["entries"] if e["bucket"] == "deletable")
+
+    target = card.parent / "IMG_0001_copy.NEF"
+    target.write_bytes(b"raw-one")
+    os.utime(target, ns=(entry["mtime_ns"], entry["mtime_ns"]))
+    os.unlink(card)
+    try:
+        os.symlink(str(target), str(card))
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks unsupported on this filesystem")
+
+    summary = card_cleanup.delete_verified(db, manifest)
+    assert summary["deleted"] == 0
+    assert summary["deleted_bytes"] == 0
+    assert len(summary["skipped"]) == 1
+    assert summary["skipped"][0]["reason"] == card_cleanup.SKIP_SYMLINK
+    # The symlink itself and the byte-identical target both survive: the
+    # tool refused to operate on a link it never classified.
+    assert card.is_symlink()
+    assert target.exists() and target.read_bytes() == b"raw-one"

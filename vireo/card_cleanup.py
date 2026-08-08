@@ -15,6 +15,7 @@ import contextlib
 import errno
 import json
 import os
+import stat as stat_mod
 import tempfile
 import time
 from datetime import UTC, datetime
@@ -164,10 +165,17 @@ def load_manifest(manifest_dir, scan_job_id,
         raise ManifestError("manifest missing source root — re-scan the card")
     try:
         created = datetime.fromisoformat(manifest.get("created_at"))
-        age = datetime.now(UTC) - created
     except (TypeError, ValueError) as e:
         raise ManifestError(
             "manifest timestamp invalid — re-scan the card") from e
+    # fromisoformat accepts a naive stamp like "2026-08-08T12:00:00";
+    # subtracting a naive from an aware datetime raises TypeError, so
+    # reject naive timestamps up front. Corrupt manifests must surface
+    # as ManifestError (HTTP 400), never a bare TypeError bubbling up.
+    if created.tzinfo is None or created.utcoffset() is None:
+        raise ManifestError(
+            "manifest timestamp invalid — re-scan the card")
+    age = datetime.now(UTC) - created
     # Age is enforced here — at request time — not only by the
     # scan-start prune.
     if age.total_seconds() > max_age_days * 86400:
@@ -232,6 +240,7 @@ SKIP_ALREADY_GONE = "already gone from the card"
 SKIP_CHANGED = "changed on the card since the scan"
 SKIP_CONTENT_CHANGED = "content changed on the card since the scan"
 SKIP_OUTSIDE_SOURCE = "path no longer resolves inside the scanned source"
+SKIP_SYMLINK = "path is now a symlink — refuses to follow at delete time"
 
 
 def qualify_rows(rows, source_root_real, card_path):
@@ -407,14 +416,26 @@ def delete_verified(db, manifest, progress_cb=None, should_cancel=None):
             progress_cb(i + 1, len(deletable), os.path.basename(path))
         # Card gate: cheap stat pre-check, then full re-hash. Size+mtime
         # alone cannot detect a swapped card or same-size replacement.
+        #
+        # lstat, not stat: scan rejects symlinks at classification, but a
+        # post-scan swap of the pathname for a symlink to a byte-identical
+        # file would let os.stat follow the link — every content gate
+        # would then operate on the target, and os.remove would unlink
+        # only the link while the delete summary credited the target's
+        # full bytes as reclaimed. Rejecting symlinks here keeps the
+        # delete anchored to the object the scan hashed.
         try:
-            st = os.stat(path)
+            st = os.lstat(path)
         except FileNotFoundError:
             summary["skipped"].append(
                 {"path": path, "reason": SKIP_ALREADY_GONE})
             continue
         except OSError as e:
             summary["failed"].append({"path": path, "error": str(e)})
+            continue
+        if stat_mod.S_ISLNK(st.st_mode):
+            summary["skipped"].append(
+                {"path": path, "reason": SKIP_SYMLINK})
             continue
         if (st.st_size != entry["size"]
                 or st.st_mtime_ns != entry["mtime_ns"]):
@@ -463,13 +484,17 @@ def delete_verified(db, manifest, progress_cb=None, should_cancel=None):
                 {"path": path, "reason": SKIP_OUTSIDE_SOURCE})
             continue
         try:
-            st2 = os.stat(path)
+            st2 = os.lstat(path)
         except FileNotFoundError:
             summary["skipped"].append(
                 {"path": path, "reason": SKIP_ALREADY_GONE})
             continue
         except OSError as e:
             summary["failed"].append({"path": path, "error": str(e)})
+            continue
+        if stat_mod.S_ISLNK(st2.st_mode):
+            summary["skipped"].append(
+                {"path": path, "reason": SKIP_SYMLINK})
             continue
         if ((st2.st_dev, st2.st_ino) != (st.st_dev, st.st_ino)
                 or st2.st_size != entry["size"]

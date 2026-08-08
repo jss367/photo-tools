@@ -1931,6 +1931,67 @@ def test_wc_extraction_deferred_to_after_last_batch(tmp_path, monkeypatch):
     )
 
 
+def test_remote_import_wc_identity_captured_before_transfer(
+        tmp_path, monkeypatch):
+    """Spec decision 7: the working-copy identity tuple ``(size,
+    mtime_ns)`` must attest the SOURCE at decision time. The remote path
+    historically stat'd the source AFTER the transfer, so a source that
+    changed mid-transfer (card glitch, live folder) still looked clean
+    to the working-copy identity check. Mirrors the local path, which
+    stats before the copy."""
+    import move as _move
+    import scanner as _scanner
+
+    ra = _remote_archive_for(tmp_path)
+    calls = _remote_calls(ra)
+    _install_fake_remote_rsync(monkeypatch, calls, verify=None)
+    card = _make_card(tmp_path, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+    ])
+    src = card / "DSC_0001.jpg"
+    pre_size = src.stat().st_size
+    pre_mtime_ns = src.stat().st_mtime_ns
+
+    base_fake = _move._run_rsync_streamed  # the harness fake
+
+    def mutating_rsync(*args, **kw):
+        rc = base_fake(*args, **kw)
+        # The source changes while/just after the batch is on the wire:
+        # append a byte and bump mtime. Decision-time capture must not
+        # see this.
+        with open(src, "ab") as fh:
+            fh.write(b"x")
+        os.utime(src, ns=(pre_mtime_ns + 5_000_000_000,
+                          pre_mtime_ns + 5_000_000_000))
+        return rc
+
+    monkeypatch.setattr(_move, "_run_rsync_streamed", mutating_rsync)
+
+    captured = {}
+
+    def spy_extract(*args, **kwargs):
+        captured["source_paths"] = dict(kwargs.get("source_paths") or {})
+        return None
+
+    monkeypatch.setattr(_scanner, "_extract_working_copies", spy_extract)
+
+    from import_job import ImportParams, run_import_job
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    result = run_import_job(
+        _make_job(), FakeRunner(), db_path, db._active_workspace_id,
+        ImportParams(sources=[str(card)], destination=ra["mount_base"],
+                     remote_target=ra, verify_by_hash=True,
+                     vireo_dir=str(tmp_path / "vdir")))
+
+    assert result["copied"] == 1, result
+    assert captured, "working-copy extraction never ran"
+    [(dest_path, (sf, sz, mt))] = captured["source_paths"].items()
+    assert sf == str(src)
+    # Identity attests the source BEFORE the mid-transfer mutation.
+    assert (sz, mt) == (pre_size, pre_mtime_ns), (sz, mt)
+
+
 # --- Codex 2026-07-05 followups: two findings not addressed by 9e0834af ----
 
 def test_checker_record_oserror_does_not_kill_job(tmp_path, monkeypatch):

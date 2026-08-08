@@ -786,6 +786,13 @@ def test_delete_skips_file_replaced_during_archive_gate(db, tmp_path):
         summary = card_cleanup.delete_verified(db, manifest)
     assert summary["deleted"] == 0
     assert len(summary["skipped"]) == 1
+    # Pin the reason: the final rehash after the archive gate catches this
+    # replacement first (bytes now differ from the manifest hash), before
+    # the inode/metadata gate ever runs. If a future refactor moves that
+    # rehash back before the archive gate, the metadata gate at the tail
+    # would still skip the file — but as SKIP_CHANGED, not
+    # SKIP_CONTENT_CHANGED — and this assertion would catch the reorder.
+    assert summary["skipped"][0]["reason"] == card_cleanup.SKIP_CONTENT_CHANGED
     assert card.exists()
     assert card.read_bytes() == b"NEW-ONE"
 

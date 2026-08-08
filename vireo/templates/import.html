@@ -549,7 +549,7 @@ body { display: flex; flex-direction: column; height: 100vh; }
                 style="display:none;" onclick="cardCleanupCancelJob()">Cancel</button>
       </div>
       <div class="field-error" id="card-cleanup-error" role="alert" aria-live="assertive"></div>
-      <div id="card-cleanup-progress" style="display:none;">
+      <div id="card-cleanup-progress" style="display:none;" aria-live="polite">
         <div class="row"><span class="hint" id="card-cleanup-phase"></span></div>
         <div class="progress-bar"><div id="card-cleanup-progress-fill"></div></div>
       </div>
@@ -581,7 +581,8 @@ body { display: flex; flex-direction: column; height: 100vh; }
         </div>
       </div>
       <div id="card-cleanup-result" style="display:none;">
-        <div class="hint" id="card-cleanup-result-summary" style="margin-top:10px;"></div>
+        <div class="hint" id="card-cleanup-result-summary"
+             aria-live="polite" style="margin-top:10px;"></div>
         <ul class="staging-details" id="card-cleanup-result-list" style="display:none;"></ul>
       </div>
     </details>
@@ -4692,7 +4693,14 @@ function cardCleanupOpenFromImport() {
 }
 
 async function cardCleanupStartScan() {
-  if (cardCleanupState.jobId) return;  // a run is already streaming
+  if (cardCleanupState.jobId) {
+    // Tell the user why the click was ignored rather than silently doing
+    // nothing while their card sits unscanned.
+    cardCleanupSetError(
+      'A card-cleanup job is already running — wait for it to finish ' +
+      'or Cancel it before scanning again.');
+    return;
+  }
   const source = (document.getElementById('card-cleanup-source').value || '').trim();
   const recursive = document.getElementById('card-cleanup-recursive').checked;
   if (!source) {
@@ -4710,10 +4718,16 @@ async function cardCleanupStartScan() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ source, recursive }),
     });
-    const data = await resp.json();
+    // A non-JSON response (proxy 502 HTML page, server crash) must not
+    // become "SyntaxError: Unexpected token '<'" for the user — surface
+    // the HTTP status instead.
+    const data = await resp.json().catch(() => ({}));
     // The 400s here are written for the user (archive overlap, unreadable
     // path) — show the server's own words rather than a generic failure.
-    if (!resp.ok) throw new Error(data.error || 'scan failed to start');
+    if (!resp.ok) {
+      throw new Error(
+        data.error || ('scan failed to start (HTTP ' + resp.status + ')'));
+    }
     cardCleanupState.scanJobId = data.job_id;
     cardCleanupWatchJob(data.job_id, 'scan', 'Starting scan…');
   } catch (e) {
@@ -4843,13 +4857,18 @@ async function cardCleanupLoadManifest() {
   try {
     const resp = await fetch('/api/card-cleanup/' +
       encodeURIComponent(cardCleanupState.scanJobId) + '/manifest');
-    const data = await resp.json();
+    // Tolerate a non-JSON body (proxy error page) so the 404 branch and
+    // the generic failure below still fire on their status alone.
+    const data = await resp.json().catch(() => ({}));
     if (resp.status === 404) {
       cardCleanupState.scanJobId = null;
       cardCleanupSetError('Preview expired — re-scan the card.', { rescan: true });
       return;
     }
-    if (!resp.ok) throw new Error(data.error || 'the preview could not be loaded');
+    if (!resp.ok) {
+      throw new Error(data.error ||
+        ('the preview could not be loaded (HTTP ' + resp.status + ')'));
+    }
     cardCleanupRenderManifest(data);
   } catch (e) {
     cardCleanupSetError(String(e.message || e));
@@ -4982,6 +5001,9 @@ function cardCleanupOpenConfirm() {
   if (!manifest) return;
   const deletable = (manifest.totals || {}).deletable || { count: 0, bytes: 0 };
   if (!deletable.count) return;
+  // Remember what the keyboard user was on so Cancel/Escape returns them
+  // there instead of dropping focus to <body> and losing their place.
+  cardCleanupState.confirmReturnFocus = document.activeElement;
   document.getElementById('card-cleanup-confirm-count').textContent =
     'Deleting ' + cardCleanupFileCount(deletable.count) + ' (' +
     formatBytes(deletable.bytes) + ') from ' +
@@ -5010,6 +5032,11 @@ function cardCleanupCloseConfirm() {
     cardCleanupState.confirmEscHandler = null;
   }
   document.body.style.overflow = '';
+  const prev = cardCleanupState.confirmReturnFocus;
+  cardCleanupState.confirmReturnFocus = null;
+  if (prev && typeof prev.focus === 'function') {
+    try { prev.focus(); } catch (e) { /* element gone — nothing to restore to */ }
+  }
 }
 
 async function cardCleanupConfirmDelete() {
@@ -5021,7 +5048,10 @@ async function cardCleanupConfirmDelete() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ scan_job_id: cardCleanupState.scanJobId }),
     });
-    const data = await resp.json();
+    // A non-JSON failure body must still close the dialog and produce a
+    // status-based error, not a parser exception the catch turns into
+    // "SyntaxError" text.
+    const data = await resp.json().catch(() => ({}));
     cardCleanupCloseConfirm();
     if (!resp.ok) {
       if (resp.status === 404) {
@@ -5031,7 +5061,8 @@ async function cardCleanupConfirmDelete() {
         cardCleanupResetPreview();
         cardCleanupSetError('Preview expired — re-scan the card.', { rescan: true });
       } else {
-        cardCleanupSetError(data.error || 'deletion failed to start');
+        cardCleanupSetError(data.error ||
+          ('deletion failed to start (HTTP ' + resp.status + ')'));
       }
       return;
     }

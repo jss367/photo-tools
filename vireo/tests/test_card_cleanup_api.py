@@ -107,6 +107,10 @@ def test_scan_rejects_case_swapped_overlap(app_and_db, tmp_path):
         "/api/card-cleanup/scan",
         json={"source": str(tmp_path / "archive")})
     assert resp.status_code == 400
+    # Pin the message text so this test exercises case-aware containment
+    # rather than the "source not accessible" fallback — the same 400 would
+    # come back if realpath simply couldn't find the case-swapped source.
+    assert "removable media" in resp.get_json()["error"]
 
 
 def test_scan_then_manifest_then_delete_end_to_end(app_and_db, tmp_path):

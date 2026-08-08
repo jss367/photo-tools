@@ -31,6 +31,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from urllib.parse import quote, urlsplit
 
+import card_cleanup
 import path_guard
 import places
 from db import (
@@ -3065,6 +3066,9 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
     )
     app.config["REQUIRE_EXIFTOOL_FOR_IMPORT"] = (
         os.environ.get("VIREO_REQUIRE_EXIFTOOL_FOR_IMPORT", "1") != "0"
+    )
+    app.config["CARD_CLEANUP_DIR"] = os.path.join(
+        os.path.dirname(os.path.abspath(db_path)), "card_cleanup"
     )
 
     # Schema creation and migrations are startup work, never request work.
@@ -19034,6 +19038,170 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             )
 
         job_id = runner.start("verify-hashes", work, workspace_id=active_ws)
+        return jsonify({"job_id": job_id})
+
+    @app.route("/api/card-cleanup/scan", methods=["POST"])
+    def api_card_cleanup_scan():
+        """Scan a removable-media source and write a manifest of files
+        that are safely deletable (verified elsewhere in the archive).
+
+        Background job: the manifest is written to disk by
+        card_cleanup.scan_card and read back by the manifest/delete
+        endpoints below, keyed by this job's id.
+        """
+        body = request.get_json(silent=True) or {}
+        source = body.get("source")
+        recursive = bool(body.get("recursive", True))
+        if not source or not isinstance(source, str):
+            return json_error("source required")
+        if not os.path.isabs(source):
+            return json_error("source must be an absolute path")
+        if not os.path.isdir(source):
+            return json_error("source is not an accessible directory")
+        db = _get_db()
+        # Overlap fail-fast, across all workspaces (folders is global):
+        # this tool is for removable media, not the archive. The per-file
+        # guard in card_cleanup.qualify_rows is the real invariant; this
+        # is the clear early error.
+        source_real = os.path.realpath(source)
+        for row in db.conn.execute("SELECT path FROM folders").fetchall():
+            froot = row["path"]
+            if not froot:
+                continue
+            froot_real = os.path.realpath(froot)
+            if (path_guard.contains_resolved(source_real, froot_real)
+                    or path_guard.contains_resolved(froot_real, source_real)):
+                return json_error(
+                    "the selected source overlaps the cataloged archive "
+                    f"folder {froot!r}; this tool is for removable media "
+                    "like memory cards, not archive folders")
+        card_cleanup_dir = app.config["CARD_CLEANUP_DIR"]
+        card_cleanup.prune_manifests(card_cleanup_dir)
+
+        runner = app._job_runner
+        active_ws = db._active_workspace_id
+
+        def work(job):
+            thread_db = Database(db_path)
+            try:
+                if active_ws is not None:
+                    thread_db.set_active_workspace(active_ws)
+
+                def progress_cb(current, total, filename):
+                    # Throttle SSE events; hashing is per-file fast on
+                    # small files and the stream doesn't need every one.
+                    if current % 10 != 0 and current not in (1, total):
+                        return
+                    runner.push_event(job["id"], "progress", {
+                        "current": current, "total": total,
+                        "current_file": filename,
+                        "phase": "Verifying card files against the archive",
+                    })
+
+                return card_cleanup.scan_card(
+                    thread_db, source, recursive, card_cleanup_dir,
+                    job["id"],
+                    progress_cb=progress_cb,
+                    should_cancel=lambda: runner.is_cancelled(job["id"]),
+                )
+            finally:
+                thread_db.close()
+
+        job_id = runner.start(
+            "card-cleanup-scan", work,
+            config={"source": source, "recursive": recursive},
+            workspace_id=active_ws)
+        return jsonify({"job_id": job_id})
+
+    @app.route("/api/card-cleanup/<scan_job_id>/manifest")
+    def api_card_cleanup_manifest(scan_job_id):
+        """Read back the manifest a completed (or still-running) scan
+        job wrote, so the UI can preview what a delete would remove."""
+        card_cleanup_dir = app.config["CARD_CLEANUP_DIR"]
+        try:
+            manifest = card_cleanup.load_manifest(
+                card_cleanup_dir, scan_job_id)
+        except card_cleanup.ManifestError as e:
+            return json_error(str(e), status=e.http_status)
+        return jsonify(manifest)
+
+    @app.route("/api/card-cleanup/delete", methods=["POST"])
+    def api_card_cleanup_delete():
+        """Delete the deletable bucket of a scan's manifest.
+
+        Background job: re-verifies every file against the card and the
+        archive immediately before each unlink (see card_cleanup.delete_
+        verified). Validates the referencing scan job via the live runner
+        first, falling back to job_history so a delete can still be
+        requested for a scan whose job fell out of the runner's in-memory
+        table (e.g. after a process restart) as long as its manifest is
+        still on disk.
+        """
+        body = request.get_json(silent=True) or {}
+        scan_job_id = body.get("scan_job_id")
+        if not scan_job_id or not isinstance(scan_job_id, str):
+            return json_error("scan_job_id required")
+        db = _get_db()
+        runner = app._job_runner
+        active_ws = db._active_workspace_id
+
+        scan_job = runner.get(scan_job_id)
+        if scan_job is None:
+            row = db.conn.execute(
+                "SELECT type, status FROM job_history WHERE id = ?",
+                (scan_job_id,)).fetchone()
+            scan_job = dict(row) if row is not None else None
+        if scan_job is None or scan_job.get("type") != "card-cleanup-scan":
+            return json_error("unknown scan job", status=404)
+        if scan_job.get("status") != "completed":
+            return json_error("scan did not complete — re-scan the card")
+        # One delete per manifest. (A TOCTOU race between two simultaneous
+        # POSTs is acceptable: the per-file gates make a double-delete
+        # skip, not double-fire.)
+        for j in runner.list_jobs():
+            if (j.get("type") == "card-cleanup-delete"
+                    and j.get("status") in ("queued", "running")
+                    and (j.get("config") or {}).get("scan_job_id")
+                    == scan_job_id):
+                return json_error(
+                    "a delete for this scan is already running", status=409)
+        card_cleanup_dir = app.config["CARD_CLEANUP_DIR"]
+        try:
+            manifest = card_cleanup.load_manifest(
+                card_cleanup_dir, scan_job_id)
+        except card_cleanup.ManifestError as e:
+            return json_error(str(e), status=e.http_status)
+        if not any(e.get("bucket") == "deletable"
+                   for e in manifest["entries"]):
+            return json_error("nothing to delete — no verified files")
+
+        def work(job):
+            thread_db = Database(db_path)
+            try:
+                if active_ws is not None:
+                    thread_db.set_active_workspace(active_ws)
+
+                def progress_cb(current, total, filename):
+                    # Not throttled — deletions are the events the user
+                    # watches, unlike the scan's per-file hashing.
+                    runner.push_event(job["id"], "progress", {
+                        "current": current, "total": total,
+                        "current_file": filename,
+                        "phase": "Deleting verified files from the card",
+                    })
+
+                return card_cleanup.delete_verified(
+                    thread_db, manifest,
+                    progress_cb=progress_cb,
+                    should_cancel=lambda: runner.is_cancelled(job["id"]),
+                )
+            finally:
+                thread_db.close()
+
+        job_id = runner.start(
+            "card-cleanup-delete", work,
+            config={"scan_job_id": scan_job_id},
+            workspace_id=active_ws)
         return jsonify({"job_id": job_id})
 
     @app.route("/api/audit/resolve", methods=["POST"])

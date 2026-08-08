@@ -191,6 +191,12 @@ def load_manifest(manifest_dir, scan_job_id,
         if not entry.get("path"):
             raise ManifestError(
                 "manifest entries malformed — re-scan the card")
+        if (not isinstance(entry.get("size"), int)
+                or not isinstance(entry.get("mtime_ns"), int)
+                or not isinstance(entry.get("hash"), str)
+                or not entry.get("hash")):
+            raise ManifestError(
+                "manifest entries malformed — re-scan the card")
         try:
             child_real = os.path.realpath(str(entry.get("path", "")))
         except (OSError, ValueError) as e:
@@ -211,6 +217,10 @@ KEEP_INSIDE_SOURCE = "only catalog copy is inside the selected source"
 KEEP_ARCHIVE_UNREACHABLE = "archive file not reachable"
 KEEP_ARCHIVE_CHANGED = "archive file changed since verification"
 KEEP_UNREADABLE = "could not read card file"
+
+SKIP_ALREADY_GONE = "already gone from the card"
+SKIP_CHANGED = "changed on the card since the scan"
+SKIP_CONTENT_CHANGED = "content changed on the card since the scan"
 
 
 def qualify_rows(rows, source_root_real, card_path):
@@ -363,7 +373,11 @@ def scan_card(db, source, recursive, manifest_dir, scan_job_id,
 def delete_verified(db, manifest, progress_cb=None, should_cancel=None):
     """Delete the manifest's deletable bucket, re-proving the invariant
     per file immediately before each unlink. Never reads the kept or
-    ignored buckets."""
+    ignored buckets.
+
+    The manifest must come from load_manifest (validated); raw dicts are
+    not a supported input.
+    """
     source_root_real = os.path.realpath(manifest["source_root"])
     deletable = [e for e in manifest["entries"]
                  if e.get("bucket") == "deletable"]
@@ -386,7 +400,7 @@ def delete_verified(db, manifest, progress_cb=None, should_cancel=None):
             st = os.stat(path)
         except FileNotFoundError:
             summary["skipped"].append(
-                {"path": path, "reason": "already gone from the card"})
+                {"path": path, "reason": SKIP_ALREADY_GONE})
             continue
         except OSError as e:
             summary["failed"].append({"path": path, "error": str(e)})
@@ -394,7 +408,7 @@ def delete_verified(db, manifest, progress_cb=None, should_cancel=None):
         if (st.st_size != entry["size"]
                 or st.st_mtime_ns != entry["mtime_ns"]):
             summary["skipped"].append(
-                {"path": path, "reason": "changed on the card since the scan"})
+                {"path": path, "reason": SKIP_CHANGED})
             continue
         try:
             current_hash = compute_file_hash(path)
@@ -403,13 +417,16 @@ def delete_verified(db, manifest, progress_cb=None, should_cancel=None):
             continue
         if current_hash != entry["hash"]:
             summary["skipped"].append(
-                {"path": path,
-                 "reason": "content changed on the card since the scan"})
+                {"path": path, "reason": SKIP_CONTENT_CHANGED})
             continue
         # Archive gate: fresh rows, fresh stat — never reused from the
-        # scan or from an earlier deletion in this run.
+        # scan or from an earlier deletion in this run. Keyed on
+        # current_hash (not entry["hash"]) — the equality check just
+        # above proves them equal, but this makes the lookup
+        # self-evidently correct without needing to trace back to that
+        # check.
         archive_path, reason = qualify_rows(
-            fetch_rows_by_hash(db, entry["hash"]), source_root_real, path)
+            fetch_rows_by_hash(db, current_hash), source_root_real, path)
         if archive_path is None:
             summary["skipped"].append({"path": path, "reason": reason})
             continue

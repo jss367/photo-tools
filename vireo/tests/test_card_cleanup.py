@@ -200,6 +200,18 @@ def test_load_rejects_deletable_entry_without_path(tmp_path):
     assert "malformed" in str(exc.value)
 
 
+def test_load_rejects_deletable_entry_missing_size_hash_mtime(tmp_path):
+    (tmp_path / "card").mkdir()
+    entry = {
+        "path": str(tmp_path / "card" / "x.nef"), "bucket": "deletable",
+    }
+    mdir = str(tmp_path / "manifests")
+    write_manifest(mdir, _manifest(tmp_path, entries=[entry]))
+    with pytest.raises(ManifestError) as exc:
+        load_manifest(mdir, "scan-1")
+    assert "malformed" in str(exc.value)
+
+
 def _make_card(tmp_path):
     card = tmp_path / "card"
     (card / "DCIM" / "100").mkdir(parents=True)

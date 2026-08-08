@@ -474,6 +474,35 @@ def test_scan_hashes_each_card_file_once(db, tmp_path, monkeypatch):
     assert len(card_calls) == 1
 
 
+def test_scan_unreadable_after_stat_credits_size_to_kept_bytes(
+        db, tmp_path, monkeypatch):
+    # Codex P2: os.stat succeeds but hashing fails (transient read error
+    # or missing read permission). st.st_size is truthful, so it must be
+    # included both in the entry and in totals.kept.bytes — a
+    # wholesale-unreadable card would otherwise report gigabytes as
+    # "0 bytes kept" while the preview shows those files under the kept
+    # bucket.
+    unreadable = _card_file(
+        tmp_path, name="IMG_UNREADABLE.NEF",
+        content=b"twelve-bytes")  # 12 bytes
+    real_hash = card_cleanup.compute_file_hash
+
+    def failing_hash(path, *a, **kw):
+        if str(path) == str(unreadable):
+            raise PermissionError(13, "denied", str(path))
+        return real_hash(path, *a, **kw)
+
+    monkeypatch.setattr(card_cleanup, "compute_file_hash", failing_hash)
+    result = _scan(db, tmp_path)
+    kept = _entries(result, "kept")
+    assert len(kept) == 1
+    assert kept[0]["path"] == str(unreadable)
+    assert kept[0]["size"] == 12
+    assert card_cleanup.KEEP_UNREADABLE in kept[0]["reason"]
+    assert result["totals"]["kept"]["count"] == 1
+    assert result["totals"]["kept"]["bytes"] == 12
+
+
 def test_qualify_rows_null_archive_stat_baseline_keeps(db, tmp_path):
     # Scan-cataloged rows can have NULL file_size/file_mtime even when
     # hash_status is "ok" (e.g. legacy rows) — must not raise, must keep.
@@ -756,6 +785,48 @@ def test_delete_skips_file_replaced_during_archive_gate(db, tmp_path):
         summary = card_cleanup.delete_verified(db, manifest)
     assert summary["deleted"] == 0
     assert len(summary["skipped"]) == 1
+    assert card.exists()
+    assert card.read_bytes() == b"NEW-ONE"
+
+
+def test_delete_skips_inplace_rewrite_during_archive_gate(db, tmp_path):
+    # Final-rehash gate (Codex P1 follow-up): the initial delete-time hash
+    # runs BEFORE the potentially slow archive gate. If the file is
+    # rewritten in place during the archive gate — same inode (open/write
+    # preserves it), same size, mtime forced back to the manifest value
+    # (FAT is 2s-granular; a camera reusing a filename in that window is
+    # the realistic case) — every metadata gate passes but the bytes at
+    # unlink time are not the ones we authorized. Only a rehash right
+    # before os.remove can catch this.
+    _archive_photo(db, tmp_path)
+    card = _card_file(tmp_path)  # content b"raw-one", 7 bytes
+    scan = _scan(db, tmp_path)
+    assert scan["totals"]["deletable"]["count"] == 1
+    manifest = load_manifest(str(tmp_path / "manifests"), "scan-1")
+    entry = next(e for e in manifest["entries"] if e["bucket"] == "deletable")
+    real_fetch = card_cleanup.fetch_rows_by_hash
+    original_ino = os.stat(card).st_ino
+
+    def fetch_then_inplace_rewrite(db_arg, file_hash):
+        rows = real_fetch(db_arg, file_hash)
+        # Open the same inode and overwrite in place — do NOT unlink and
+        # recreate. This is the scenario the metadata gates cannot see:
+        # inode, size, and mtime all preserved.
+        with open(card, "r+b") as f:
+            f.seek(0)
+            f.write(b"NEW-ONE")  # also 7 bytes
+        os.utime(card, ns=(entry["mtime_ns"], entry["mtime_ns"]))
+        return rows
+
+    with unittest.mock.patch.object(
+            card_cleanup, "fetch_rows_by_hash", fetch_then_inplace_rewrite):
+        summary = card_cleanup.delete_verified(db, manifest)
+    # Inode preserved: metadata gates would have passed. Only the final
+    # rehash can catch the swap — assert both the outcome and the reason.
+    assert os.stat(card).st_ino == original_ino
+    assert summary["deleted"] == 0
+    assert len(summary["skipped"]) == 1
+    assert summary["skipped"][0]["reason"] == card_cleanup.SKIP_CONTENT_CHANGED
     assert card.exists()
     assert card.read_bytes() == b"NEW-ONE"
 

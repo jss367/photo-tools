@@ -360,13 +360,28 @@ def scan_card(db, source, recursive, manifest_dir, scan_job_id,
             progress_cb(i + 1, len(candidates), f.name)
         try:
             st = os.stat(f)
-            file_hash = compute_file_hash(str(f))
         except OSError as e:
+            # No stat → no size known; count only.
             entries.append({
                 "path": str(f), "bucket": "kept",
                 "reason": f"{KEEP_UNREADABLE}: {e}",
             })
             totals["kept"]["count"] += 1
+            continue
+        try:
+            file_hash = compute_file_hash(str(f))
+        except OSError as e:
+            # Stat succeeded but read/hash failed (permission, transient
+            # read error). st.st_size is truthful; crediting it to
+            # kept.bytes keeps the preview honest — a wholesale-unreadable
+            # card would otherwise report gigabytes as "0 bytes kept".
+            entries.append({
+                "path": str(f), "bucket": "kept",
+                "size": st.st_size,
+                "reason": f"{KEEP_UNREADABLE}: {e}",
+            })
+            totals["kept"]["count"] += 1
+            totals["kept"]["bytes"] += st.st_size
             continue
         entry = {
             "path": str(f), "size": st.st_size,
@@ -520,6 +535,24 @@ def delete_verified(db, manifest, progress_cb=None, should_cancel=None):
                 or st2.st_mtime_ns != entry["mtime_ns"]):
             summary["skipped"].append(
                 {"path": path, "reason": SKIP_CHANGED})
+            continue
+        # Final content re-hash (Codex P1 review): the archive gate above
+        # can take SMB-round-trip time. A same-inode in-place rewrite that
+        # preserves size and forces mtime back to the manifest value (FAT
+        # is 2s-granular; a camera reusing a filename in that window is
+        # the realistic case) passes every metadata check but hashes to
+        # different bytes than the ones we authorized. Repeat the hash
+        # immediately before the unlink and require it to still match
+        # the manifest — the only witness of content mutation with
+        # metadata forged back to the baseline.
+        try:
+            final_hash = compute_file_hash(path)
+        except OSError as e:
+            summary["failed"].append({"path": path, "error": str(e)})
+            continue
+        if final_hash != entry["hash"]:
+            summary["skipped"].append(
+                {"path": path, "reason": SKIP_CONTENT_CHANGED})
             continue
         try:
             os.remove(path)

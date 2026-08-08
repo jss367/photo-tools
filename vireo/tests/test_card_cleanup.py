@@ -899,3 +899,85 @@ def test_delete_skips_when_card_path_becomes_symlink_post_scan(db, tmp_path):
     # tool refused to operate on a link it never classified.
     assert card.is_symlink()
     assert target.exists() and target.read_bytes() == b"raw-one"
+
+
+def test_delete_skips_when_archive_dies_during_final_hash(db, tmp_path):
+    # Codex P1: gate 1 authorizes, then the final card re-hash reads the
+    # whole file (seconds on real photos). If the archive vanishes during
+    # that hash, gate 1's authorization is stale. A second archive gate
+    # immediately before os.remove must catch the death — otherwise the
+    # card copy would be the ONLY remaining copy at unlink time.
+    archive_file, _ = _archive_photo(db, tmp_path)
+    card = _card_file(tmp_path)
+    scan = _scan(db, tmp_path)
+    assert scan["totals"]["deletable"]["count"] == 1
+    manifest = load_manifest(str(tmp_path / "manifests"), "scan-1")
+    real_hash = card_cleanup.compute_file_hash
+    hash_calls = []
+
+    def hash_kill_archive_before_final(path, *a, **kw):
+        # Two hash calls per candidate in delete_verified: initial (fast
+        # reject) and final (right before unlink). Simulate the archive
+        # dying during the final call by unlinking it just before this
+        # invocation returns.
+        hash_calls.append(str(path))
+        result = real_hash(path, *a, **kw)
+        if len(hash_calls) == 2:
+            os.unlink(archive_file)
+        return result
+
+    with unittest.mock.patch.object(
+            card_cleanup, "compute_file_hash", hash_kill_archive_before_final):
+        summary = card_cleanup.delete_verified(db, manifest)
+    assert summary["deleted"] == 0
+    assert card.exists()
+    assert len(summary["skipped"]) == 1
+    assert "archive" in summary["skipped"][0]["reason"]
+
+
+def test_delete_skips_when_parent_redirected_during_final_hash(db, tmp_path):
+    # Codex P1: after both archive gate 1 and gate 2 authorize, if the
+    # parent directory is swapped for a symlink to a byte-identical
+    # external copy during the final hash, every content gate still
+    # passes — but os.remove would unlink the external file. The final
+    # containment recheck must run AFTER the final hash, not before it.
+    _archive_photo(db, tmp_path)
+    card = _card_file(tmp_path)  # content b"raw-one", 7 bytes
+    scan = _scan(db, tmp_path)
+    assert scan["totals"]["deletable"]["count"] == 1
+    manifest = load_manifest(str(tmp_path / "manifests"), "scan-1")
+    entry = next(e for e in manifest["entries"] if e["bucket"] == "deletable")
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    decoy = outside / "IMG_0001.NEF"
+    decoy.write_bytes(b"raw-one")
+    os.utime(decoy, ns=(entry["mtime_ns"], entry["mtime_ns"]))
+
+    real_hash = card_cleanup.compute_file_hash
+    hash_calls = []
+
+    def hash_then_swap_parent(path, *a, **kw):
+        hash_calls.append(str(path))
+        result = real_hash(path, *a, **kw)
+        if len(hash_calls) == 2:
+            # Second hash call is the FINAL rehash. Swap the parent
+            # directory for a symlink to `outside` after the read has
+            # already committed to card bytes but before containment
+            # is re-verified.
+            dcim = tmp_path / "card" / "DCIM"
+            shutil.rmtree(dcim)
+            try:
+                os.symlink(str(outside), str(dcim))
+            except (OSError, NotImplementedError):
+                pytest.skip("symlinks unsupported on this filesystem")
+        return result
+
+    with unittest.mock.patch.object(
+            card_cleanup, "compute_file_hash", hash_then_swap_parent):
+        summary = card_cleanup.delete_verified(db, manifest)
+    assert summary["deleted"] == 0
+    assert len(summary["skipped"]) == 1
+    assert "no longer resolves inside" in summary["skipped"][0]["reason"]
+    # The decoy — the only file behind the redirected path — must survive.
+    assert decoy.exists() and decoy.read_bytes() == b"raw-one"

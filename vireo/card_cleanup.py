@@ -483,42 +483,60 @@ def delete_verified(db, manifest, progress_cb=None, should_cancel=None):
                 {"path": path, "reason": SKIP_CHANGED})
             continue
         try:
-            current_hash = compute_file_hash(path)
+            initial_hash = compute_file_hash(path)
         except OSError as e:
             summary["failed"].append({"path": path, "error": str(e)})
             continue
-        if current_hash != entry["hash"]:
+        if initial_hash != entry["hash"]:
             summary["skipped"].append(
                 {"path": path, "reason": SKIP_CONTENT_CHANGED})
             continue
-        # Archive gate: fresh rows, fresh stat — never reused from the
-        # scan or from an earlier deletion in this run. Keyed on
-        # current_hash (not entry["hash"]) — the equality check just
-        # above proves them equal, but this makes the lookup
-        # self-evidently correct without needing to trace back to that
-        # check.
+        # Archive gate 1: fresh rows, fresh stat. Early fail if the
+        # archive is unreachable or has lost the verified copy — spares
+        # the second full-file read below.
         archive_path, reason = qualify_rows(
-            fetch_rows_by_hash(db, current_hash), source_root_real, path,
+            fetch_rows_by_hash(db, initial_hash), source_root_real, path,
             contains_check)
         if archive_path is None:
             summary["skipped"].append({"path": path, "reason": reason})
             continue
-        # Unlink gate (Codex P1 review): the archive gate above can take
-        # SMB-round-trip time, and os.remove resolves the pathname again.
-        # If another writer replaced this name meanwhile (camera reusing
-        # a filename, sync tool), the bytes at `path` are no longer the
-        # ones the card gate hashed. Re-stat and require the same inode
-        # AND the same manifest baseline immediately before the unlink —
-        # shrinking the race window from network-seconds to the
-        # stat-to-remove gap.
-        #
-        # Also (second Codex P1): a parent directory swapped for a
-        # symlink can redirect this pathname to a byte-identical file
-        # OUTSIDE the card, which passes every content gate above. The
-        # deletion must stay anchored beneath the scanned source root,
-        # re-proven at deletion time. Residual race (swap between these
-        # checks and the unlink) is microseconds; full immunity would
-        # need dir_fd/O_NOFOLLOW traversal, out of proportion here.
+        # Final card re-hash (Codex P1 review): the archive gate above
+        # can take SMB-round-trip time. A same-inode in-place rewrite that
+        # preserves size and forces mtime back to the manifest value (FAT
+        # is 2s-granular; a camera reusing a filename in that window is
+        # the realistic case) passes every metadata check but hashes to
+        # different bytes than the ones we authorized.
+        try:
+            final_hash = compute_file_hash(path)
+        except OSError as e:
+            summary["failed"].append({"path": path, "error": str(e)})
+            continue
+        if final_hash != entry["hash"]:
+            summary["skipped"].append(
+                {"path": path, "reason": SKIP_CONTENT_CHANGED})
+            continue
+        # Archive gate 2 (Codex P1): the final hash reads the whole file
+        # and can take seconds. If the archive dies (unmount, SMB drop,
+        # sync process rewriting it) during that window, gate 1's
+        # authorization is stale — deleting the card copy would destroy
+        # the only remaining copy. Re-verify freshness immediately
+        # before the unlink so an authorized archive is the LAST thing
+        # checked, not the first.
+        archive_path, reason = qualify_rows(
+            fetch_rows_by_hash(db, final_hash), source_root_real, path,
+            contains_check)
+        if archive_path is None:
+            summary["skipped"].append({"path": path, "reason": reason})
+            continue
+        # Path gate (Codex P1): a parent directory swapped for a symlink
+        # DURING the final hash can redirect this pathname to a
+        # byte-identical file outside the scanned source — bytes hash
+        # identically, both archive gates pass, but os.remove would
+        # unlink the external file. Both containment and the final
+        # inode/symlink recheck must run AFTER the final hash, not before
+        # it. Residual race (swap between these checks and the unlink)
+        # is microseconds; full immunity would need dir_fd/O_NOFOLLOW
+        # traversal, out of proportion here.
         if not contains_check(os.path.realpath(path)):
             summary["skipped"].append(
                 {"path": path, "reason": SKIP_OUTSIDE_SOURCE})
@@ -547,24 +565,6 @@ def delete_verified(db, manifest, progress_cb=None, should_cancel=None):
                 or st2.st_mtime_ns != entry["mtime_ns"]):
             summary["skipped"].append(
                 {"path": path, "reason": SKIP_CHANGED})
-            continue
-        # Final content re-hash (Codex P1 review): the archive gate above
-        # can take SMB-round-trip time. A same-inode in-place rewrite that
-        # preserves size and forces mtime back to the manifest value (FAT
-        # is 2s-granular; a camera reusing a filename in that window is
-        # the realistic case) passes every metadata check but hashes to
-        # different bytes than the ones we authorized. Repeat the hash
-        # immediately before the unlink and require it to still match
-        # the manifest — the only witness of content mutation with
-        # metadata forged back to the baseline.
-        try:
-            final_hash = compute_file_hash(path)
-        except OSError as e:
-            summary["failed"].append({"path": path, "error": str(e)})
-            continue
-        if final_hash != entry["hash"]:
-            summary["skipped"].append(
-                {"path": path, "reason": SKIP_CONTENT_CHANGED})
             continue
         try:
             os.remove(path)

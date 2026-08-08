@@ -203,10 +203,11 @@ fn wait_for_health(
         // that accepts TCP but never responds can block this loop forever
         // and prevent the timeout path from killing the child.
         let probe_timeout = std::cmp::min(HEALTH_PROBE_TIMEOUT, timeout - elapsed);
-        let agent = ureq::AgentBuilder::new()
-            .timeout_connect(probe_timeout)
-            .timeout(probe_timeout)
-            .build();
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .timeout_connect(Some(probe_timeout))
+            .timeout_global(Some(probe_timeout))
+            .build()
+            .into();
         match agent.get(&url).call() {
             Ok(resp) if resp.status() == 200 => return Ok(()),
             _ => {
@@ -234,17 +235,18 @@ fn read_runtime_json(path: &std::path::Path) -> Option<RuntimeInfo> {
 
 fn runtime_health_is_vireo(port: u16, token: &str, timeout: Duration) -> bool {
     let url = format!("http://127.0.0.1:{}/api/v1/health", port);
-    let agent = ureq::AgentBuilder::new()
-        .timeout_connect(timeout)
-        .timeout_read(timeout)
-        .build();
-    let Ok(resp) = agent.get(&url).set("X-Vireo-Token", token).call() else {
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_connect(Some(timeout))
+        .timeout_recv_response(Some(timeout))
+        .build()
+        .into();
+    let Ok(mut resp) = agent.get(&url).header("X-Vireo-Token", token).call() else {
         return false;
     };
     if resp.status() != 200 {
         return false;
     }
-    let Ok(body) = resp.into_string() else {
+    let Ok(body) = resp.body_mut().read_to_string() else {
         return false;
     };
     let Ok(health) = serde_json::from_str::<HealthResponse>(&body) else {
@@ -573,7 +575,7 @@ pub fn stop_sidecar(state: &SidecarState) {
             .is_some();
 
         let url = format!("http://127.0.0.1:{}/api/shutdown", state.port);
-        let _ = ureq::post(&url).set("X-Vireo-Shutdown", "1").call();
+        let _ = ureq::post(&url).header("X-Vireo-Shutdown", "1").send_empty();
         // Give the sidecar a moment to shut down gracefully
         std::thread::sleep(Duration::from_millis(500));
         // Force-kill if still running

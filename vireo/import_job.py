@@ -1058,6 +1058,197 @@ def _plan_import(db, params, emit, state):
     )
 
 
+def _finalize_import(job, runner, db, state, params, *,
+                     discovered, include_paths, source_snapshots,
+                     deselected, vanished_paths, appeared,
+                     remote_unverified=False):
+    """Terminal status, safety verdicts, and the shared 19-key result dict.
+
+    ``remote_unverified`` is the one transport-required term: the remote
+    path passes ``not params.verify_by_hash`` (see the honesty-gate
+    comment at its append below); the local path hash-verifies every
+    copy, so it calls with the default ``False`` and every
+    ``remote_unverified`` term degenerates to a no-op.
+    """
+    status = "cancelled" if state.cancelled else (
+        "failed" if state.failed else "completed"
+    )
+    summary = _selection_summary(
+        params, include_paths, discovered=discovered, copied=state.copied,
+        skipped_duplicate=state.skipped_duplicate, failed=state.failed,
+    )
+    runner.update_step(
+        job["id"], "import",
+        status="failed" if status == "failed" else "completed",
+        summary=summary,
+    )
+
+    # Discovery/enumeration errors must flip safe_to_format off — a
+    # permission-denied subtree yields no files (``discovered`` shrinks),
+    # so a naive check of ``copied + skipped_duplicate == discovered``
+    # would still pass and the UI would tell the user it's safe to format
+    # a card whose contents were never verified. Surface each error into
+    # ``unsafe_files`` (path = the enumeration failure's own filename when
+    # available, otherwise ``<discovery>``) so the caller can show what
+    # went unseen.
+    for exc in state.discovery_errors:
+        state.unsafe_files.append({
+            "path": str(getattr(exc, "filename", None) or "<discovery>"),
+            "reason": f"source enumeration failed: {exc}",
+        })
+
+    # Safe to format iff every discovered file reached a verified
+    # terminal bucket: hash-verified fresh copy, or duplicate whose bytes
+    # verifiably exist (hash-backed match, or key match re-hashed against
+    # its cataloged twin), AND every source was walked cleanly, AND every
+    # duplicate-only batch's direct workspace link succeeded (otherwise the
+    # imported duplicates are on disk but not visible in the workspace),
+    # AND the run enumerated the card's full supported-file set. Any
+    # narrowing of the walk falls into ``partial_scope``: a narrowed
+    # ``file_types`` ("raw", "jpeg", or a custom extension list) leaves
+    # the un-selected supported photos on the card entirely unseen, and
+    # ``recursive=False`` skips every subdirectory of every source root.
+    # In both cases ``discovered`` covers only a subset of what the card
+    # actually holds, so the naive ``copied + skipped_duplicate ==
+    # discovered`` check would go green even though the card still holds
+    # files the pill is expected to cover. A cancelled run leaves
+    # unprocessed files, so it is never safe. This pill means exactly
+    # what it says.
+    #
+    # A list-form ``file_types`` whose members cover every
+    # ``SUPPORTED_EXTENSIONS`` entry is NOT actually filtered — the
+    # pipeline UI's ``getIngestFileTypes()`` returns exactly this shape
+    # when the user checks every box, and ``discover_source_files``
+    # walks it identically to ``"both"``. Treating it as partial would
+    # leave ``safe_to_format`` permanently false over an unfiltered
+    # import. Normalize to leading-dot lowercase to match how
+    # SUPPORTED_EXTENSIONS is stored; unknown extensions in the list
+    # are ignored (they can't be in SUPPORTED_EXTENSIONS regardless).
+    # See PR #1107 review.
+    partial_scope = not params.recursive
+    if params.file_types != "both":
+        if isinstance(params.file_types, list):
+            normalized_types = {
+                ("." + e.lower().lstrip("."))
+                for e in params.file_types
+                if isinstance(e, str) and e
+            }
+            partial_scope = partial_scope or not SUPPORTED_EXTENSIONS.issubset(
+                normalized_types,
+            )
+        else:
+            partial_scope = True
+
+    # Honesty gate: a remote import is only safe to format when every
+    # discovered file was INDEPENDENTLY hash-confirmed at the destination —
+    # which only happens on the checksum-verification path. Without
+    # verify_by_hash the transfer relied on rsync's own integrity checking,
+    # which we do not surface as a format-the-card guarantee. Report exactly
+    # that with the plan's reason string.
+    if remote_unverified and discovered > 0:
+        state.unsafe_files.append({
+            "path": "<remote>",
+            "reason": "enable verify_by_hash for remote verification",
+        })
+    if state.unverified_duplicate:
+        state.unsafe_files.append({
+            "path": "Likely duplicates",
+            "reason": (
+                f"{state.unverified_duplicate} matched by filename, byte size, "
+                "and capture time but were not compared byte-for-byte"
+            ),
+        })
+    # Selection drift entries.
+    _append_selection_unsafe(
+        state.unsafe_files, deselected=deselected, vanished_paths=vanished_paths,
+        appeared=appeared,
+    )
+    safe_to_format = (
+        not state.cancelled
+        and state.failed == 0
+        and not state.discovery_errors
+        and not state.dup_link_failed
+        and not partial_scope
+        and not remote_unverified
+        and state.unverified_duplicate == 0
+        and (state.copied + state.skipped_duplicate) == discovered
+        and not _selection_blocks_format(
+            deselected=deselected, vanished_paths=vanished_paths)
+    )
+    # ``unverified_duplicate`` requires ``not verify_by_hash``, which is
+    # exactly ``remote_unverified``, so this block is unreachable on the
+    # remote path today. The selection condition is wired anyway: the mutual
+    # exclusion is incidental, and a change to either flag would silently
+    # reopen the hole.
+    unverified_duplicates_only = (
+        state.unverified_duplicate > 0
+        and not state.cancelled
+        and state.failed == 0
+        and not state.discovery_errors
+        and not state.dup_link_failed
+        and not partial_scope
+        and not remote_unverified
+        and (state.copied + state.skipped_duplicate) == discovered
+        and not _selection_blocks_format(
+            deselected=deselected, vanished_paths=vanished_paths)
+    )
+    result = {
+        "discovered": discovered,
+        "copied": state.copied,
+        "verified": state.verified,
+        # Photo rows the after-import chaining hook should process.
+        # Duplicate-only imports intentionally return an empty list so
+        # ``_chain_after_import`` skips into its "no new photos" branch
+        # instead of enqueueing an empty process run — same convention as
+        # the local path. Without this the remote import always missed
+        # after-import processing. See PR #1113 review.
+        "photo_ids": sorted(state.imported_photo_ids),
+        # Stable-identity map so a recovery retry can verify each carried
+        # ID still points at the same file. Without this the retry
+        # authorizes any current photo row that happens to share an ID
+        # with something the parent landed — an especially real risk
+        # after users delete recent imports (SQLite reuses the freed
+        # IDs on the next insert).
+        "photo_fingerprints": _capture_photo_fingerprints(
+            db, state.imported_photo_ids,
+        ),
+        # Per-source signature over the discovered file set so a
+        # recovery retry can detect a source whose contents changed
+        # between the failed run and the retry — e.g. a different SD
+        # card mounted at the same path, or new photos added to the
+        # same card. Captured at DISCOVERY time (see the ``source_snapshots``
+        # capture in ``_plan_import``); recording it here instead
+        # would let a mid-copy card ejection stamp ``-1`` sizes and
+        # refuse a legitimate reinsert-and-retry recovery.
+        "source_snapshots": source_snapshots,
+        "skipped_duplicate": state.skipped_duplicate,
+        "unverified_duplicate": state.unverified_duplicate,
+        "unverified_duplicates_only": unverified_duplicates_only,
+        "failed": state.failed,
+        "safe_to_format": safe_to_format,
+        "unsafe_files": state.unsafe_files,
+        "folders": state.folder_counts,
+        "cancelled": state.cancelled,
+        "discovery_errors": len(state.discovery_errors),
+        # Selection drift, for the caller's readout. ``files_appeared`` is a
+        # clamped net delta (card size minus previewed count), so it reads 0
+        # — never negative — when more files vanished than arrived.
+        "files_appeared": appeared,
+        "files_vanished": len(vanished_paths),
+        # JobRunner's mixed-outcome convention: a run with any failed
+        # file, unseen source subtree, or workspace-link failure is
+        # recorded "failed" (with per-file / per-operation reasons),
+        # never "completed".
+        "ok": (
+            state.failed == 0
+            and not state.discovery_errors
+            and not state.dup_link_failed
+        ),
+        "errors": [f"{u['path']}: {u['reason']}" for u in state.unsafe_files],
+    }
+    return result
+
+
 def copy_and_hash_verify(src, dst, *, src_hash=None):
     """Copy ``src`` to ``dst`` and verify the landed bytes by content hash.
 
@@ -3255,141 +3446,16 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
         if runner.is_cancelled(job["id"]):
             state.cancelled = True
 
-    status = "cancelled" if state.cancelled else (
-        "failed" if state.failed else "completed"
+    # ``remote_unverified`` is the honesty gate — only the
+    # checksum-verification path independently confirms bytes at the
+    # destination; see the append inside ``_finalize_import``.
+    return _finalize_import(
+        job, runner, db, state, params,
+        discovered=discovered, include_paths=include_paths,
+        source_snapshots=source_snapshots, deselected=deselected,
+        vanished_paths=vanished_paths, appeared=appeared,
+        remote_unverified=not params.verify_by_hash,
     )
-    summary = _selection_summary(
-        params, include_paths, discovered=discovered, copied=state.copied,
-        skipped_duplicate=state.skipped_duplicate, failed=state.failed,
-    )
-    runner.update_step(
-        job["id"], "import",
-        status="failed" if status == "failed" else "completed",
-        summary=summary,
-    )
-
-    for exc in state.discovery_errors:
-        state.unsafe_files.append({
-            "path": str(getattr(exc, "filename", None) or "<discovery>"),
-            "reason": f"source enumeration failed: {exc}",
-        })
-
-    # Scope narrowing (same rules as the local path).
-    partial_scope = not params.recursive
-    if params.file_types != "both":
-        if isinstance(params.file_types, list):
-            normalized_types = {
-                ("." + e.lower().lstrip("."))
-                for e in params.file_types
-                if isinstance(e, str) and e
-            }
-            partial_scope = partial_scope or not SUPPORTED_EXTENSIONS.issubset(
-                normalized_types,
-            )
-        else:
-            partial_scope = True
-
-    # Honesty gate: a remote import is only safe to format when every
-    # discovered file was INDEPENDENTLY hash-confirmed at the destination —
-    # which only happens on the checksum-verification path. Without
-    # verify_by_hash the transfer relied on rsync's own integrity checking,
-    # which we do not surface as a format-the-card guarantee. Report exactly
-    # that with the plan's reason string.
-    remote_unverified = not params.verify_by_hash
-    if remote_unverified and discovered > 0:
-        state.unsafe_files.append({
-            "path": "<remote>",
-            "reason": "enable verify_by_hash for remote verification",
-        })
-    if state.unverified_duplicate:
-        state.unsafe_files.append({
-            "path": "Likely duplicates",
-            "reason": (
-                f"{state.unverified_duplicate} matched by filename, byte size, "
-                "and capture time but were not compared byte-for-byte"
-            ),
-        })
-    # Selection drift entries. Shared with the local path.
-    _append_selection_unsafe(
-        state.unsafe_files, deselected=deselected, vanished_paths=vanished_paths,
-        appeared=appeared,
-    )
-    safe_to_format = (
-        not state.cancelled
-        and state.failed == 0
-        and not state.discovery_errors
-        and not state.dup_link_failed
-        and not partial_scope
-        and not remote_unverified
-        and state.unverified_duplicate == 0
-        and (state.copied + state.skipped_duplicate) == discovered
-        and not _selection_blocks_format(
-            deselected=deselected, vanished_paths=vanished_paths)
-    )
-    # ``unverified_duplicate`` requires ``not verify_by_hash``, which is
-    # exactly ``remote_unverified``, so this block is unreachable on the
-    # remote path today. The selection condition is wired anyway: the mutual
-    # exclusion is incidental, and a change to either flag would silently
-    # reopen the hole.
-    unverified_duplicates_only = (
-        state.unverified_duplicate > 0
-        and not state.cancelled
-        and state.failed == 0
-        and not state.discovery_errors
-        and not state.dup_link_failed
-        and not partial_scope
-        and not remote_unverified
-        and (state.copied + state.skipped_duplicate) == discovered
-        and not _selection_blocks_format(
-            deselected=deselected, vanished_paths=vanished_paths)
-    )
-    result = {
-        "discovered": discovered,
-        "copied": state.copied,
-        "verified": state.verified,
-        # Photo rows the after-import chaining hook should process.
-        # Duplicate-only imports intentionally return an empty list so
-        # ``_chain_after_import`` skips into its "no new photos" branch
-        # instead of enqueueing an empty process run — same convention as
-        # the local path. Without this the remote import always missed
-        # after-import processing. See PR #1113 review.
-        "photo_ids": sorted(state.imported_photo_ids),
-        # Stable-identity map so a recovery retry can verify each carried
-        # ID still points at the same file. Without this the retry
-        # authorizes any current photo row that happens to share an ID
-        # with something the parent landed — an especially real risk
-        # after users delete recent imports (SQLite reuses the freed
-        # IDs on the next insert).
-        "photo_fingerprints": _capture_photo_fingerprints(
-            db, state.imported_photo_ids,
-        ),
-        # Per-source signature over the discovered file set so a
-        # recovery retry can detect a source whose contents changed
-        # between the failed run and the retry — e.g. a different SD
-        # card mounted at the same path, or new photos added to the
-        # same card. Captured at DISCOVERY time (see the ``source_snapshots``
-        # assignment above the copy loop); recording it here instead
-        # would let a mid-copy card ejection stamp ``-1`` sizes and
-        # refuse a legitimate reinsert-and-retry recovery.
-        "source_snapshots": source_snapshots,
-        "skipped_duplicate": state.skipped_duplicate,
-        "unverified_duplicate": state.unverified_duplicate,
-        "unverified_duplicates_only": unverified_duplicates_only,
-        "failed": state.failed,
-        "safe_to_format": safe_to_format,
-        "unsafe_files": state.unsafe_files,
-        "folders": state.folder_counts,
-        "cancelled": state.cancelled,
-        "discovery_errors": len(state.discovery_errors),
-        # Selection drift, for the caller's readout. ``files_appeared`` is a
-        # clamped net delta (card size minus previewed count), so it reads 0
-        # — never negative — when more files vanished than arrived.
-        "files_appeared": appeared,
-        "files_vanished": len(vanished_paths),
-        "ok": (state.failed == 0 and not state.discovery_errors and not state.dup_link_failed),
-        "errors": [f"{u['path']}: {u['reason']}" for u in state.unsafe_files],
-    }
-    return result
 
 
 def run_import_job(job, runner, db_path, workspace_id, params):
@@ -4684,155 +4750,11 @@ def run_import_job(job, runner, db_path, workspace_id, params):
         if runner.is_cancelled(job["id"]):
             state.cancelled = True
 
-    status = "cancelled" if state.cancelled else (
-        "failed" if state.failed else "completed"
+    # Every ``remote_unverified`` term in the finalizer degenerates to a
+    # no-op here (default False): the local path hash-verifies every copy.
+    return _finalize_import(
+        job, runner, db, state, params,
+        discovered=discovered, include_paths=include_paths,
+        source_snapshots=source_snapshots, deselected=deselected,
+        vanished_paths=vanished_paths, appeared=appeared,
     )
-    summary = _selection_summary(
-        params, include_paths, discovered=discovered, copied=state.copied,
-        skipped_duplicate=state.skipped_duplicate, failed=state.failed,
-    )
-    runner.update_step(
-        job["id"], "import",
-        status="failed" if status == "failed" else "completed",
-        summary=summary,
-    )
-
-    # Discovery/enumeration errors must flip safe_to_format off — a
-    # permission-denied subtree yields no files (``discovered`` shrinks),
-    # so a naive check of ``copied + skipped_duplicate == discovered``
-    # would still pass and the UI would tell the user it's safe to format
-    # a card whose contents were never verified. Surface each error into
-    # ``unsafe_files`` (path = the enumeration failure's own filename when
-    # available, otherwise ``<discovery>``) so the caller can show what
-    # went unseen.
-    for exc in state.discovery_errors:
-        state.unsafe_files.append({
-            "path": str(getattr(exc, "filename", None) or "<discovery>"),
-            "reason": f"source enumeration failed: {exc}",
-        })
-
-    # Safe to format iff every discovered file reached a verified
-    # terminal bucket: hash-verified fresh copy, or duplicate whose bytes
-    # verifiably exist (hash-backed match, or key match re-hashed against
-    # its cataloged twin), AND every source was walked cleanly, AND every
-    # duplicate-only batch's direct workspace link succeeded (otherwise the
-    # imported duplicates are on disk but not visible in the workspace),
-    # AND the run enumerated the card's full supported-file set. Any
-    # narrowing of the walk falls into ``partial_scope``: a narrowed
-    # ``file_types`` ("raw", "jpeg", or a custom extension list) leaves
-    # the un-selected supported photos on the card entirely unseen, and
-    # ``recursive=False`` skips every subdirectory of every source root.
-    # In both cases ``discovered`` covers only a subset of what the card
-    # actually holds, so the naive ``copied + skipped_duplicate ==
-    # discovered`` check would go green even though the card still holds
-    # files the pill is expected to cover. A cancelled run leaves
-    # unprocessed files, so it is never safe. This pill means exactly
-    # what it says.
-    #
-    # A list-form ``file_types`` whose members cover every
-    # ``SUPPORTED_EXTENSIONS`` entry is NOT actually filtered — the
-    # pipeline UI's ``getIngestFileTypes()`` returns exactly this shape
-    # when the user checks every box, and ``discover_source_files``
-    # walks it identically to ``"both"``. Treating it as partial would
-    # leave ``safe_to_format`` permanently false over an unfiltered
-    # import. Normalize to leading-dot lowercase to match how
-    # SUPPORTED_EXTENSIONS is stored; unknown extensions in the list
-    # are ignored (they can't be in SUPPORTED_EXTENSIONS regardless).
-    # See PR #1107 review.
-    partial_scope = not params.recursive
-    if params.file_types != "both":
-        if isinstance(params.file_types, list):
-            normalized_types = {
-                ("." + e.lower().lstrip("."))
-                for e in params.file_types
-                if isinstance(e, str) and e
-            }
-            partial_scope = partial_scope or not SUPPORTED_EXTENSIONS.issubset(
-                normalized_types,
-            )
-        else:
-            partial_scope = True
-    if state.unverified_duplicate:
-        state.unsafe_files.append({
-            "path": "Likely duplicates",
-            "reason": (
-                f"{state.unverified_duplicate} matched by filename, byte size, "
-                "and capture time but were not compared byte-for-byte"
-            ),
-        })
-    # Selection drift entries. Shared with the remote path.
-    _append_selection_unsafe(
-        state.unsafe_files, deselected=deselected, vanished_paths=vanished_paths,
-        appeared=appeared,
-    )
-    safe_to_format = (
-        not state.cancelled
-        and state.failed == 0
-        and not state.discovery_errors
-        and not state.dup_link_failed
-        and not partial_scope
-        and state.unverified_duplicate == 0
-        and (state.copied + state.skipped_duplicate) == discovered
-        and not _selection_blocks_format(
-            deselected=deselected, vanished_paths=vanished_paths)
-    )
-    unverified_duplicates_only = (
-        state.unverified_duplicate > 0
-        and not state.cancelled
-        and state.failed == 0
-        and not state.discovery_errors
-        and not state.dup_link_failed
-        and not partial_scope
-        and (state.copied + state.skipped_duplicate) == discovered
-        and not _selection_blocks_format(
-            deselected=deselected, vanished_paths=vanished_paths)
-    )
-    result = {
-        "discovered": discovered,
-        "copied": state.copied,
-        "verified": state.verified,
-        "photo_ids": sorted(state.imported_photo_ids),
-        # Stable-identity map so a recovery retry can verify each carried
-        # ID still points at the same file. Without this the retry
-        # authorizes any current photo row that happens to share an ID
-        # with something the parent landed — an especially real risk
-        # after users delete recent imports (SQLite reuses the freed
-        # IDs on the next insert).
-        "photo_fingerprints": _capture_photo_fingerprints(
-            db, state.imported_photo_ids,
-        ),
-        # Per-source signature over the discovered file set so a
-        # recovery retry can detect a source whose contents changed
-        # between the failed run and the retry — e.g. a different SD
-        # card mounted at the same path, or new photos added to the
-        # same card. Captured at DISCOVERY time (see the ``source_snapshots``
-        # assignment above the copy loop); recording it here instead
-        # would let a mid-copy card ejection stamp ``-1`` sizes and
-        # refuse a legitimate reinsert-and-retry recovery.
-        "source_snapshots": source_snapshots,
-        "skipped_duplicate": state.skipped_duplicate,
-        "unverified_duplicate": state.unverified_duplicate,
-        "unverified_duplicates_only": unverified_duplicates_only,
-        "failed": state.failed,
-        "safe_to_format": safe_to_format,
-        "unsafe_files": state.unsafe_files,
-        "folders": state.folder_counts,
-        "cancelled": state.cancelled,
-        "discovery_errors": len(state.discovery_errors),
-        # Selection drift, for the caller's readout. ``files_appeared`` is a
-        # clamped net delta (card size minus previewed count), so it reads 0
-        # — never negative — when more files vanished than arrived.
-        "files_appeared": appeared,
-        "files_vanished": len(vanished_paths),
-        # JobRunner's mixed-outcome convention: a run with any failed
-        # file, unseen source subtree, or workspace-link failure is
-        # recorded "failed" (with per-file / per-operation reasons),
-        # never "completed".
-        "ok": (
-            state.failed == 0
-            and not state.discovery_errors
-            and not state.dup_link_failed
-        ),
-        "errors": [f"{u['path']}: {u['reason']}" for u in state.unsafe_files],
-    }
-    return result

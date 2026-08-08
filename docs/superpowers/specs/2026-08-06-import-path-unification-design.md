@@ -213,8 +213,9 @@ end (PR 7).
 ## Behavior alignment decisions
 
 The non-transport divergences, each resolved deliberately (1–9 from the
-design phase map; 10 found empirically by PR 1's parity net). "Adopt X"
-means the other path changes to match.
+design phase map; 10 found empirically by PR 1's parity net; 11 found by
+the 2026-08-08 extraction phase map). "Adopt X" means the other path
+changes to match.
 
 | # | Divergence | Decision |
 |---|---|---|
@@ -228,6 +229,7 @@ means the other path changes to match.
 | 8 | Local re-computes the source hash at 3996–3999 instead of reusing `_src_hash_cached()` | **No change — premise disproven (2026-08-08, PR 3).** `DuplicateChecker.content_hash` memoizes per source path (`import_dedup.py:319-327`), so with a checker the copy-site call is a cache hit whenever a hash was computed earlier in the run — and otherwise performs a read `copy_and_hash_verify` would do itself anyway (its `src_hash is None` branch runs a standalone `compute_file_hash(src)`). With no checker, reusing `_src_hash_cached()` is read-neutral: the standalone read merely moves, with a marginal saving only on the rare collision-walk path. No redundant I/O exists; the call-site duplication itself dissolves in PR 5's shared cached-hash closure. |
 | 9 | Remote rollback open-coded at 8 sites vs local `_reclassify_landed_failed` | **Structural — shared helper on `_ImportRunState`** (PR 5). |
 | 10 | Adopted (crash-recovery) files get `hash_status='ok'` stamped locally but stay `NULL` remotely — found empirically by PR 1's parity net (2026-08-07): local adoption folds into `landed` and hits the verify stamp; remote adoption lives in `adopted_paths`, whose validation cross-checks bytes but never stamps | **Adopt local, via the PR 5 structural change.** Folding remote adoptions into `landed` with their verified hash makes the stamp fall out of the unified catalog pass; no separate fix PR. Pinned per-path by `test_{local,remote}_adoption_uncataloged_dest_twin_current_behavior`, which flip when PR 5 lands. |
+| 11 | Local stamping loop backfills `file_hash` on scan-NULL rows (`update_photo_hash_check(..., "ok", file_hash=verified_hash)`, ~L4511–4514 — NOT the non-backfilling stamp at L4480–4482 just above it, which handles the zero-byte case); remote stamps `"ok"` without backfilling — found by the 2026-08-08 extraction phase map (D4). Related, same loop: a zero-byte normalization-convention split (D2/D3) — remote normalizes `EMPTY_FILE_SHA256` → `None` at hash time with a `read_failed` flag; local compares raw hashes and its `verified_hash` is never `None`. | **Deferred to the stamping align-then-extract PR (6b): adopt local (backfill on both paths) unless review finds a reason the remote's NULL is load-bearing; until then the stamping loops stay per-function.** For D2/D3, unify by normalizing at `_LandedFile` construction in 6b so both loops see the same convention. |
 
 Kept as deliberate (transport-required) differences, expressed through the
 protocol rather than duplicated code: transfer sub-progress
@@ -304,10 +306,23 @@ and goes through the normal PR-agent review cycle.
    extraction, finalize) become module-level functions taking
    `(state, params, deps)`; both paths call them. The two functions shrink
    to their genuinely divergent cores.
+   *Update 2026-08-08: extraction lands as this PR, minus the stamping
+   loop — the 2026-08-08 phase map showed it hides a genuine behavioral
+   divergence (11/D4: local-only `file_hash` backfill) plus the zero-byte
+   normalization-convention split (D2/D3), so it is carved out into a new
+   **PR 6b — stamping alignment + extraction (behavior PR: D4, D2/D3)**
+   between PR 6 and PR 7: align per decision 11 first, then extract the
+   now-identical loop.*
 7. **PR 7 — the merge.** Introduce `_Transport`, `LocalTransport`,
    `RsyncTransport`; one orchestrator batch loop; delete
    `_run_remote_import_job`; repoint the remote tests' monkeypatch seam at
    the transport. This diff is small *because* of PRs 5–6.
+   *Residual asymmetry (recorded by the 2026-08-08 extraction phase map):
+   the local-only per-file `same_file`/dest-under-source guard
+   (import_job.py L3963–4007) has no remote counterpart — the remote path
+   only applies the batch-level dest-under-source guard. PR 7 must decide
+   keep-both/port/drop deliberately rather than letting the merge pick a
+   winner silently.*
 8. **PR 8 (stretch) — preflight de-mirror.** Share the collision/adopt walk
    with `/api/import/check-duplicates` and friends (`app.py:18328–18522`),
    removing the third hand-mirrored copy. Only after PR 7 has soaked.

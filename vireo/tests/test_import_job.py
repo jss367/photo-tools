@@ -1931,6 +1931,69 @@ def test_wc_extraction_deferred_to_after_last_batch(tmp_path, monkeypatch):
     )
 
 
+def test_remote_import_wc_identity_captured_before_transfer(
+        tmp_path, monkeypatch):
+    """Spec decision 7: the working-copy identity tuple ``(size,
+    mtime_ns)`` must attest the SOURCE at decision time. The remote path
+    historically stat'd the source AFTER the transfer, so a source that
+    changed mid-transfer (card glitch, live folder) still looked clean
+    to the working-copy identity check. Mirrors the local path, which
+    stats before the copy."""
+    import move as _move
+    import scanner as _scanner
+
+    ra = _remote_archive_for(tmp_path)
+    calls = _remote_calls(ra)
+    _install_fake_remote_rsync(monkeypatch, calls, verify=None)
+    card = _make_card(tmp_path, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+    ])
+    src = card / "DSC_0001.jpg"
+    pre_size = src.stat().st_size
+    pre_mtime_ns = src.stat().st_mtime_ns
+
+    base_fake = _move._run_rsync_streamed  # the harness fake
+
+    def mutating_rsync(*args, **kw):
+        rc = base_fake(*args, **kw)
+        # The source changes while/just after the batch is on the wire:
+        # append a byte and bump mtime. Decision-time capture must not
+        # see this.
+        with open(src, "ab") as fh:
+            fh.write(b"x")
+        os.utime(src, ns=(pre_mtime_ns + 5_000_000_000,
+                          pre_mtime_ns + 5_000_000_000))
+        return rc
+
+    monkeypatch.setattr(_move, "_run_rsync_streamed", mutating_rsync)
+
+    captured = {}
+
+    def spy_extract(*args, **kwargs):
+        captured["source_paths"] = dict(kwargs.get("source_paths") or {})
+        return None
+
+    monkeypatch.setattr(_scanner, "_extract_working_copies", spy_extract)
+
+    from import_job import ImportParams, run_import_job
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    result = run_import_job(
+        _make_job(), FakeRunner(), db_path, db._active_workspace_id,
+        ImportParams(sources=[str(card)], destination=ra["mount_base"],
+                     remote_target=ra, verify_by_hash=True,
+                     vireo_dir=str(tmp_path / "vdir")))
+
+    assert result["copied"] == 1, result
+    assert captured, "working-copy extraction never ran"
+    [(dest_path, (sf, sz, mt))] = captured["source_paths"].items()
+    # ``wc_source_paths`` is keyed by the mount-side destination path.
+    assert dest_path.endswith("DSC_0001.jpg")
+    assert sf == str(src)
+    # Identity attests the source BEFORE the mid-transfer mutation.
+    assert (sz, mt) == (pre_size, pre_mtime_ns), (sz, mt)
+
+
 # --- Codex 2026-07-05 followups: two findings not addressed by 9e0834af ----
 
 def test_checker_record_oserror_does_not_kill_job(tmp_path, monkeypatch):
@@ -9063,8 +9126,9 @@ _BEHAVIOR_PARITY_SCENARIOS = [
     # Renamed twin of a cataloged duplicate: card carries X plus a renamed
     # byte-identical Y against a seeded cataloged X — both skip via
     # CatalogIndex.known_hashes on both paths. The decision-5 mechanism
-    # notes (why the remote _record_checker call at import_job.py:2008 is
-    # behaviorally dead here) live in the per-path characterization pair
+    # notes (why the remote accept-branch _record_checker(source_file)
+    # call, removed in PR 3, was behaviorally dead here) live in the
+    # per-path characterization pair
     # test_local/_remote_renamed_twin_of_accepted_duplicate_current_behavior.
     ("renamed_twin_skip", _RT_CARD, _seed_prior_import([_RT_TWIN]), {}),
 ]
@@ -9217,8 +9281,8 @@ def test_local_renamed_twin_of_accepted_duplicate_current_behavior(
         tmp_path, monkeypatch):
     """CHARACTERIZATION for spec decision 5 (local half). The local path
     does NOT register accepted duplicates with the checker — its accept
-    branch has no counterpart to the remote path's
-    ``_record_checker(source_file)`` (import_job.py:2008).
+    branch never had a counterpart to the remote path's source-only
+    ``_record_checker(source_file)`` call (removed in PR 3).
 
     ACTUAL: both files skip anyway. The seed import's post-import scan
     catalogs the twin WITH its file_hash, so ``CatalogIndex.from_db``
@@ -9238,9 +9302,9 @@ def test_local_renamed_twin_of_accepted_duplicate_current_behavior(
     through to the fallback content check and again hits
     ``known_hashes``. And even with EXIF, ``record``-ing X would add
     X's key, which renamed Y (different filename) can never match. The
-    2008 call is therefore behaviorally unobservable in this
-    cataloged-twin geometry in both verify modes, which strengthens the
-    spec's case for removing it (decision 5,
+    remote accept-branch call was therefore behaviorally unobservable in
+    this cataloged-twin geometry in both verify modes, which is why PR 3
+    removed it as a no-op (decision 5,
     docs/superpowers/specs/2026-08-06-import-path-unification-design.md).
     """
     from import_dedup import compute_file_hash
@@ -9262,22 +9326,23 @@ def test_local_renamed_twin_of_accepted_duplicate_current_behavior(
 def test_remote_renamed_twin_of_accepted_duplicate_current_behavior(
         tmp_path, monkeypatch):
     """CHARACTERIZATION for spec decision 5 (remote half). The remote path
-    registers accepted duplicates via ``_record_checker(source_file)`` at
-    import_job.py:2008; a later PR removes that call, and this test is
-    the tripwire that makes the removal visible — expected to KEEP
-    passing, because the call is behaviorally dead in this geometry.
+    used to register accepted duplicates via a source-only
+    ``_record_checker(source_file)`` call in its duplicate-accept branch;
+    PR 3 removed that call, and this test was the tripwire that pinned
+    the removal as a no-op — it passed unchanged before and after,
+    because the call was behaviorally dead in this geometry.
 
     ACTUAL: identical to the local half (2 skipped, 0 copied). Renamed Y
     matches via ``CatalogIndex.known_hashes`` (the seed import's scan
     cataloged the twin's hash), not via the ``_seen_hashes`` entry the
-    2008 call adds — ``match`` checks ``known_hashes`` first and either
-    membership yields the same ``('hash', …)`` token
-    (import_dedup.py:369-376). The call also never populates the
-    ``run_dest_folders`` intra-run fast path (it passes no dest_folder),
+    removed call added — ``match`` checks ``known_hashes`` first and
+    either membership yields the same ``('hash', …)`` token
+    (import_dedup.py:369-376). The call also never populated the
+    ``run_dest_folders`` intra-run fast path (it passed no dest_folder),
     so acceptance still goes through the on-disk twin re-hash on both
     paths. A ``verify_by_hash=False`` probe landed in the same world for
     the same reason — see the local twin test's docstring for the traced
-    no-EXIF mechanism. Decision 5's removal is a proven no-op here.
+    no-EXIF mechanism. Decision 5's removal was a proven no-op here.
     """
     from import_dedup import compute_file_hash
     twin, card = _renamed_twin_case_specs()

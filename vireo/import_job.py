@@ -1620,13 +1620,16 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
     def _missing_mount_root():
         return _missing_archive_mount_root(destination)
 
-    def _record_checker(source_file, dest_folder=None, file_hash=None):
+    def _record_checker(source_file, dest_folder, file_hash):
         """Register a landed/adopted file's identity with the intra-run checker.
 
         Without this the checker only sees the pre-run catalog, so a later
         byte-identical card file with a different basename in the same run
         is rsynced/cataloged again instead of being recognized as an
-        intra-run duplicate. Mirrors the local path's ``_record_checker``.
+        intra-run duplicate. Same shape as the local path's
+        ``_record_checker`` (spec decision 5, toward a single shared
+        helper): every caller passes the landed/adopted ``dest_folder``
+        and verified ``file_hash``, recorded unconditionally per token.
         ``DuplicateChecker.record`` re-``os.stat``s the source path — swallow
         OSError (removable media yanked mid-run) so the run keeps its
         already-verified landings and only loses the intra-run dedupe
@@ -1643,10 +1646,8 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
             )
             return
         for tok in tokens:
-            if dest_folder is not None:
-                run_dest_folders[tok] = dest_folder
-            if file_hash is not None:
-                run_verified_hashes[tok] = file_hash
+            run_dest_folders[tok] = dest_folder
+            run_verified_hashes[tok] = file_hash
 
     for rel, batch in batches:
         if runner.is_cancelled(job["id"]):
@@ -1802,7 +1803,7 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
         # cataloged twin's bytes are confirmed at the destination; the local
         # path re-hashes the twin's archive file. On the mount that file is
         # locally readable, so reuse the same on-disk re-hash contract.
-        to_transfer = []           # (source_file, dest_basename, src_hash)
+        to_transfer = []   # (source_file, dest_basename, src_hash, src_size, src_mtime_ns)
         dup_skipped = 0
         # Twin folders (under destination) whose bytes we RE-HASHED this run
         # and confirmed against source hashes — safe to scan/link into the
@@ -2028,7 +2029,6 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
                         run_dest = run_dest_folders.get(token)
                         if run_dest is not None:
                             dup_dirs.add(run_dest)
-                        _record_checker(source_file)
                         continue
             # Collision parity (FIX 2): rsync lands files flat by basename,
             # so two different card files with the same basename in one batch
@@ -2040,6 +2040,20 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
             # names taken by earlier files IN THIS BATCH; the mount is
             # locally readable so already-landed bytes are checked on disk.
             dest_basename = source_file.name
+            # Working-copy identity, captured at decision time — before
+            # any bytes move — so a source that changes mid-transfer
+            # cannot look clean to the working-copy identity check.
+            # Mirrors the local path, which stats before it hashes (and,
+            # like it, fails the file when the source cannot be stat'd —
+            # stat-first also means a vanished source costs one syscall,
+            # not a full hash read that gets thrown away). Spec
+            # decision 7.
+            try:
+                st = source_file.stat()
+                src_size, src_mtime_ns = st.st_size, st.st_mtime_ns
+            except OSError as e:
+                _fail(rel, source_file, str(e))
+                continue
             try:
                 src_hash = (
                     checker.content_hash(source_file)
@@ -2167,7 +2181,9 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
             # ``skip_duplicates=False`` would just be dead state.
             if checker is not None and src_hash is not None:
                 queued_src_hashes[src_hash] = dest_folder
-            to_transfer.append((source_file, dest_basename, src_hash))
+            to_transfer.append(
+                (source_file, dest_basename, src_hash,
+                 src_size, src_mtime_ns))
 
         # --- Per-batch rsync -------------------------------------------
         # landed carries the card-side src_hash so the catalog-stamping loop
@@ -2227,7 +2243,8 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
                 )
             dup_skips = []
             dup_dirs = set()
-            for queued_file, _dest_basename, _queued_hash in to_transfer:
+            for queued_file, _dest_basename, _queued_hash, _sz, _mt \
+                    in to_transfer:
                 _fail(
                     rel, queued_file,
                     f"archive mount root {mount_lost} detached before this "
@@ -2298,7 +2315,7 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
             # rsync creates the leaf itself but not intermediate parents.
             ok_mkdir, mkdir_detail = move_mod._remote_mkdir_p(remote, ssh_dest)
             if not ok_mkdir:
-                for sf, _bn, _sh in to_transfer:
+                for sf, _bn, _sh, _sz, _mt in to_transfer:
                     _fail(rel, sf,
                           f"remote mkdir failed for {ssh_dest}: {mkdir_detail}")
             else:
@@ -2307,11 +2324,13 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
                 # verified individually to an explicit NAS filename, since a
                 # flat --files-from list to one dir can't rename).
                 flat = [
-                    (sf, bn, sh) for sf, bn, sh in to_transfer
+                    (sf, bn, sh, sz, mt)
+                    for sf, bn, sh, sz, mt in to_transfer
                     if bn == sf.name
                 ]
                 renamed = [
-                    (sf, bn, sh) for sf, bn, sh in to_transfer
+                    (sf, bn, sh, sz, mt)
+                    for sf, bn, sh, sz, mt in to_transfer
                     if bn != sf.name
                 ]
 
@@ -2354,7 +2373,7 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
                     return rc != 0 and runner.cancellation_requested(
                         job["id"])
 
-                transferred = []   # (sf, dest_basename, src_hash, nas_full_path)
+                transferred = []   # (sf, dest_basename, src_hash, src_size, src_mtime_ns, nas_full_path)
                 batch_size = len(to_transfer)
                 # Flat batch: one rsync into the dir. rsync names each file
                 # as it lands; forward that as the batch's honest
@@ -2362,26 +2381,28 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
                 # prepared-files counter (which already reads ``emitted``).
                 if flat:
                     rc, stderr, timed_out = _do_rsync(
-                        [str(sf) for sf, _bn, _sh in flat], rsync_target, True,
+                        [str(sf) for sf, _bn, _sh, _sz, _mt in flat],
+                        rsync_target, True,
                         extra_args,
                         progress_cb=lambda done, _tot, name, _label,
                         _rel=rel, _bs=batch_size:
                             _emit_transfer(_rel, done, _bs, name))
                     if timed_out:
-                        for sf, _bn, _sh in flat:
+                        for sf, _bn, _sh, _sz, _mt in flat:
                             _fail(rel, sf, "rsync stalled (no progress)")
                     elif _rsync_cancelled(rc):
                         cancelled = True
                     elif rc != 0:
-                        for sf, _bn, _sh in flat:
+                        for sf, _bn, _sh, _sz, _mt in flat:
                             _fail(rel, sf, f"rsync failed: {stderr.strip()}")
                     else:
-                        for sf, bn, sh in flat:
+                        for sf, bn, sh, sz, mt in flat:
                             transferred.append((
-                                sf, bn, sh, posixpath.join(ssh_dest, bn)))
+                                sf, bn, sh, sz, mt,
+                                posixpath.join(ssh_dest, bn)))
                 # Renamed files: one rsync each to the explicit NAS file
                 # path (rsync <card> user@host:/dir/DSC_0001_1.jpg).
-                for sf, bn, sh in renamed:
+                for sf, bn, sh, sz, mt in renamed:
                     if cancelled or runner.is_cancelled(job["id"]):
                         cancelled = True
                         break
@@ -2398,13 +2419,13 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
                     elif rc != 0:
                         _fail(rel, sf, f"rsync failed: {stderr.strip()}")
                     else:
-                        transferred.append((sf, bn, sh, nas_full))
+                        transferred.append((sf, bn, sh, sz, mt, nas_full))
                         # ``len(transferred)`` counts only files that truly
                         # landed, so a failed flat batch can't inflate the
                         # renamed files' transfer counter.
                         _emit_transfer(rel, len(transferred), batch_size, bn)
 
-                for sf, bn, src_hash, nas_full in transferred:
+                for sf, bn, src_hash, sz, mt, nas_full in transferred:
                     dest_path = os.path.join(dest_folder, bn)
                     # Independent verification (Task 2.7 FIX 1): card -> NAS,
                     # opt-in behind ``verify_by_hash`` (it reads every NAS
@@ -2439,11 +2460,6 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
                             )
                             _fail(rel, sf, reason)
                             continue
-                    try:
-                        st = sf.stat()
-                        sz, mt = st.st_size, st.st_mtime_ns
-                    except OSError:
-                        sz, mt = None, None
                     copied += 1
                     _counts(rel)["copied"] += 1
                     if params.verify_by_hash:

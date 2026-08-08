@@ -9063,8 +9063,9 @@ _BEHAVIOR_PARITY_SCENARIOS = [
     # Renamed twin of a cataloged duplicate: card carries X plus a renamed
     # byte-identical Y against a seeded cataloged X — both skip via
     # CatalogIndex.known_hashes on both paths. The decision-5 mechanism
-    # notes (why the remote _record_checker call at import_job.py:2008 is
-    # behaviorally dead here) live in the per-path characterization pair
+    # notes (why the remote accept-branch _record_checker(source_file)
+    # call, removed in PR 3, was behaviorally dead here) live in the
+    # per-path characterization pair
     # test_local/_remote_renamed_twin_of_accepted_duplicate_current_behavior.
     ("renamed_twin_skip", _RT_CARD, _seed_prior_import([_RT_TWIN]), {}),
 ]
@@ -9217,8 +9218,8 @@ def test_local_renamed_twin_of_accepted_duplicate_current_behavior(
         tmp_path, monkeypatch):
     """CHARACTERIZATION for spec decision 5 (local half). The local path
     does NOT register accepted duplicates with the checker — its accept
-    branch has no counterpart to the remote path's
-    ``_record_checker(source_file)`` (import_job.py:2008).
+    branch never had a counterpart to the remote path's source-only
+    ``_record_checker(source_file)`` call (removed in PR 3).
 
     ACTUAL: both files skip anyway. The seed import's post-import scan
     catalogs the twin WITH its file_hash, so ``CatalogIndex.from_db``
@@ -9238,9 +9239,9 @@ def test_local_renamed_twin_of_accepted_duplicate_current_behavior(
     through to the fallback content check and again hits
     ``known_hashes``. And even with EXIF, ``record``-ing X would add
     X's key, which renamed Y (different filename) can never match. The
-    2008 call is therefore behaviorally unobservable in this
-    cataloged-twin geometry in both verify modes, which strengthens the
-    spec's case for removing it (decision 5,
+    remote accept-branch call was therefore behaviorally unobservable in
+    this cataloged-twin geometry in both verify modes, which is why PR 3
+    removed it as a no-op (decision 5,
     docs/superpowers/specs/2026-08-06-import-path-unification-design.md).
     """
     from import_dedup import compute_file_hash
@@ -9262,22 +9263,23 @@ def test_local_renamed_twin_of_accepted_duplicate_current_behavior(
 def test_remote_renamed_twin_of_accepted_duplicate_current_behavior(
         tmp_path, monkeypatch):
     """CHARACTERIZATION for spec decision 5 (remote half). The remote path
-    registers accepted duplicates via ``_record_checker(source_file)`` at
-    import_job.py:2008; a later PR removes that call, and this test is
-    the tripwire that makes the removal visible — expected to KEEP
-    passing, because the call is behaviorally dead in this geometry.
+    used to register accepted duplicates via a source-only
+    ``_record_checker(source_file)`` call in its duplicate-accept branch;
+    PR 3 removed that call, and this test was the tripwire that pinned
+    the removal as a no-op — it passed unchanged before and after,
+    because the call was behaviorally dead in this geometry.
 
     ACTUAL: identical to the local half (2 skipped, 0 copied). Renamed Y
     matches via ``CatalogIndex.known_hashes`` (the seed import's scan
     cataloged the twin's hash), not via the ``_seen_hashes`` entry the
-    2008 call adds — ``match`` checks ``known_hashes`` first and either
-    membership yields the same ``('hash', …)`` token
-    (import_dedup.py:369-376). The call also never populates the
-    ``run_dest_folders`` intra-run fast path (it passes no dest_folder),
+    removed call added — ``match`` checks ``known_hashes`` first and
+    either membership yields the same ``('hash', …)`` token
+    (import_dedup.py:369-376). The call also never populated the
+    ``run_dest_folders`` intra-run fast path (it passed no dest_folder),
     so acceptance still goes through the on-disk twin re-hash on both
     paths. A ``verify_by_hash=False`` probe landed in the same world for
     the same reason — see the local twin test's docstring for the traced
-    no-EXIF mechanism. Decision 5's removal is a proven no-op here.
+    no-EXIF mechanism. Decision 5's removal was a proven no-op here.
     """
     from import_dedup import compute_file_hash
     twin, card = _renamed_twin_case_specs()

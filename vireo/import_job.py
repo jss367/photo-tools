@@ -1620,13 +1620,16 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
     def _missing_mount_root():
         return _missing_archive_mount_root(destination)
 
-    def _record_checker(source_file, dest_folder=None, file_hash=None):
+    def _record_checker(source_file, dest_folder, file_hash):
         """Register a landed/adopted file's identity with the intra-run checker.
 
         Without this the checker only sees the pre-run catalog, so a later
         byte-identical card file with a different basename in the same run
         is rsynced/cataloged again instead of being recognized as an
-        intra-run duplicate. Mirrors the local path's ``_record_checker``.
+        intra-run duplicate. Same shape as the local path's
+        ``_record_checker`` (spec decision 5, toward a single shared
+        helper): every caller passes the landed/adopted ``dest_folder``
+        and verified ``file_hash``, recorded unconditionally per token.
         ``DuplicateChecker.record`` re-``os.stat``s the source path — swallow
         OSError (removable media yanked mid-run) so the run keeps its
         already-verified landings and only loses the intra-run dedupe
@@ -1643,10 +1646,8 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
             )
             return
         for tok in tokens:
-            if dest_folder is not None:
-                run_dest_folders[tok] = dest_folder
-            if file_hash is not None:
-                run_verified_hashes[tok] = file_hash
+            run_dest_folders[tok] = dest_folder
+            run_verified_hashes[tok] = file_hash
 
     for rel, batch in batches:
         if runner.is_cancelled(job["id"]):
@@ -2028,7 +2029,6 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
                         run_dest = run_dest_folders.get(token)
                         if run_dest is not None:
                             dup_dirs.add(run_dest)
-                        _record_checker(source_file)
                         continue
             # Collision parity (FIX 2): rsync lands files flat by basename,
             # so two different card files with the same basename in one batch

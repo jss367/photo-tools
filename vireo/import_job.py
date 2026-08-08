@@ -692,6 +692,186 @@ def _record_checker(state, checker, source_file, dest_folder, file_hash):
         state.run_verified_hashes[tok] = file_hash
 
 
+def _make_stop_check(runner, job):
+    """Build the nonblocking stop probe shared by both import paths.
+
+    Threaded through every destination-side hash read so a Stop can
+    interrupt a read blocked on a dead mount (see _hash_dest_file).
+    Nonblocking probe — ``is_cancelled`` would park in
+    ``wait_if_paused`` for a pausable import, freezing the watchdog
+    loop itself and stopping the 120s stall timer from running while
+    the daemon reader can keep touching the archive even though the
+    UI says the job is paused. Mirrors the rsync watchdog's use of
+    ``cancellation_requested`` for the same reason.
+    """
+    def _stop_requested():
+        return runner.cancellation_requested(job["id"])
+    return _stop_requested
+
+
+@dataclass(frozen=True)
+class _DestContext:
+    """Normalized destination plus the run-scoped guards derived from it.
+
+    Built once per run by ``_build_destination_context``; both import
+    paths consume the same bundle. ``fold_basename`` backs the remote
+    path's intra-batch collision map and is unused — free and harmless —
+    on the local path until PR 7 merges the loops.
+    """
+    destination: str
+    mount_baseline: dict  # mount-root candidate -> was-live-at-run-start
+    path_under_any_source: object  # callable(path) -> bool
+    path_under_destination: object  # callable(path) -> bool
+    fold_basename: object  # callable(name) -> str
+
+
+def _build_destination_context(db, params):
+    """Normalize the destination and derive the run-scoped guards.
+
+    ORDERING IS LOAD-BEARING: normalize first, capture the live-mount
+    baseline immediately after (before the caller runs discovery,
+    catalog-index construction or timestamp extraction), then build the
+    source/destination predicates against the normalized path. This
+    function preserves that order by construction — see the block
+    comments below for why each step sits where it does.
+    """
+    # Function-level import mirrors the two import-path bodies: pipeline_job
+    # imports from this module, so a module-level import would be a cycle.
+    from pipeline_job import (
+        _archive_mount_baseline,
+        _load_known_mount_roots,
+        _record_known_mount_roots,
+    )
+
+    # Normalize once — the raw destination string is passed as ``root`` to
+    # both the copy layout (``os.path.normpath(os.path.join(destination,
+    # rel))``) and to ``scan(root, …, restrict_dirs=[dest_folder])``.
+    # ``scanner._ensure_folder`` stops walking the folder chain when the
+    # parent equals the scan root string; a destination like
+    # ``/photos/tmp/../archive`` copies into the normalized
+    # ``/photos/archive/…`` but the restricted scan root would remain the
+    # dot-segment form, so the recursion never reaches root and the scan
+    # loses those files (copied bytes then bucket as catalog failures).
+    #
+    # Also resolve symlinks (``realpath``) so a destination like ``/photos``
+    # symlinked at ``/Volumes/Photos`` matches cataloged twin folders whose
+    # ``folders.path`` was scanned under the real archive root — otherwise
+    # duplicate matching compares paths from prior catalog scans against
+    # this destination. Sources are already ``realpath``-resolved (see
+    # ``_norm_source``); doing the same to destination keeps the two sides
+    # symmetric. See PR #1107 review.
+    #
+    # On the remote (SSH) path ``params.destination`` is the catalog/mount
+    # base — the route sets it to mount_path/subpath — and the same
+    # normalization applies.
+    try:
+        destination = os.path.realpath(os.path.normpath(str(params.destination)))
+    except OSError:
+        destination = os.path.normpath(str(params.destination))
+
+    # Which of the destination's mount-root candidates are live mounts.
+    # Captured HERE — immediately after normalization, before discovery,
+    # catalog-index construction or timestamp extraction — because all of
+    # those are slow against a network archive (the 2026-07-30 incident
+    # spent eight minutes just enumerating the destination). A share that
+    # detached during that window would be recorded as already-unmounted,
+    # the mounted → unmounted transition would never fire, and the guard
+    # would be silently disarmed for the rest of the run. See PR #1396
+    # review (Codex P1 r3687336684).
+    #
+    # Keying on the transition (rather than "is it mounted?") is what lets
+    # an ordinary local directory at a mount-shaped path stay usable: it
+    # is False here and stays False, so it never trips the check.
+    #
+    # ``known_mount_roots`` seeds True from a persistent record of
+    # mount roots ever observed live. Without it, a share that detached
+    # BEFORE the run started (baseline is False from the outset) escapes
+    # the guard: no True → False transition can fire against a False
+    # baseline, so the persistent ``/mnt/<name>`` stub still passes the
+    # per-batch check and copies land on the local disk (on the remote
+    # path, rsync would still push to the NAS while the per-batch
+    # mount-side scan reads a fresh local shadow). Cross-run history
+    # closes that hole; a hand-made local dir is never observed as a
+    # live mount and stays out of the known-set. See PR #1396 review
+    # (Codex P1 r3687401636).
+    known_mount_roots = _load_known_mount_roots(db)
+    mount_baseline = _archive_mount_baseline(destination, known_mount_roots)
+    _record_known_mount_roots(db, mount_baseline)
+
+    # Reject cataloged twins that live under the card being imported. The
+    # /api/jobs/import-photos route already refuses destinations that sit
+    # inside a source (formatting the card would erase the archive copy),
+    # but the duplicate acceptance loop separately trusts any cataloged
+    # twin whose bytes hash to ``src_hash`` — including a stale row for a
+    # previously scanned mounted card. That twin's re-hash just re-reads
+    # the very card file being imported, so accepting it as duplicate
+    # proof would flip ``safe_to_format`` green over a card whose bytes
+    # never made it to the archive (remotely: whose bytes never crossed
+    # the network). Shared by both import paths. See PR #1107 review.
+    _path_under_any_source = _build_source_root_guard(params.sources)
+
+    # Destination containment for cataloged twin folders. Used to scope
+    # ``_linkable_twin_dirs`` to twins under the destination/mount base —
+    # an off-destination twin in some other library root is none of this
+    # import's business. ``destination`` is already ``realpath``-resolved
+    # above so a symlinked destination like ``/photos`` ->
+    # ``/Volumes/Photos`` matches twin folders cataloged under
+    # ``/Volumes/Photos/…``. Case-different spellings on case-insensitive
+    # mounts (SMB, FAT, HFS+/APFS/exFAT) still need explicit
+    # case-folding: ``realpath`` on APFS preserves the case the user
+    # gave. Probe the destination's own filesystem (walking up to the
+    # closest existing ancestor when the destination itself hasn't been
+    # created yet); default to case-insensitive on inconclusive results
+    # so a differently-cased twin folder under the destination is still
+    # linked to the workspace — otherwise ``safe_to_format`` can go
+    # green while the imported photo stays invisible in the active
+    # workspace. See PR #1107 review.
+    def _probe_dir_case_insensitive(path):
+        p = os.path.normpath(path)
+        while True:
+            if os.path.isdir(p):
+                return _fs_is_case_insensitive(p)
+            parent = os.path.dirname(p)
+            if parent == p:
+                return True
+            p = parent
+
+    _dest_ci = _CASE_INSENSITIVE_PLATFORM or _probe_dir_case_insensitive(destination)
+    _dest_root_norm = (
+        destination.casefold() if _dest_ci else destination
+    ).rstrip(os.sep)
+
+    def _path_under_destination(path):
+        if not _dest_root_norm:
+            return False
+        try:
+            real = os.path.realpath(path)
+        except OSError:
+            real = str(path)
+        cmp = (real.casefold() if _dest_ci else real).rstrip(os.sep)
+        return cmp == _dest_root_norm or cmp.startswith(_dest_root_norm + os.sep)
+
+    # Case-insensitive destinations (macOS APFS/HFS+, SMB, FAT/exFAT)
+    # collapse basenames that differ only by case onto the same on-disk
+    # file. The intra-batch collision map ``claimed_basenames`` keys by
+    # basename, so keying it case-foldedly there makes a second file whose
+    # basename differs from an earlier queued file's only by case (e.g.
+    # ``IMG_0001.JPG`` then ``img_0001.jpg``) collide and advance through
+    # numeric suffixes, instead of being sent to the same effective
+    # receiver path where ``--ignore-existing`` would silently drop it and
+    # the later catalog/hash validation would fail. See PR #1113 review.
+    def _fold_basename(name):
+        return name.casefold() if _dest_ci else name
+
+    return _DestContext(
+        destination=destination,
+        mount_baseline=mount_baseline,
+        path_under_any_source=_path_under_any_source,
+        path_under_destination=_path_under_destination,
+        fold_basename=_fold_basename,
+    )
+
+
 def copy_and_hash_verify(src, dst, *, src_hash=None):
     """Copy ``src`` to ``dst`` and verify the landed bytes by content hash.
 
@@ -1374,10 +1554,7 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
     off-loaded but its landing wasn't independently hash-confirmed.
     """
     from pipeline_job import (
-        _archive_mount_baseline,
-        _load_known_mount_roots,
         _missing_archive_mount_root,
-        _record_known_mount_roots,
         _unmounted_since_baseline,
     )
     from scanner import scan
@@ -1386,82 +1563,15 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
     remote = rt["remote"]                 # build_remote_move_spec dict
     rsync_bin = rt.get("rsync_bin") or remote.get("rsync_bin")
     ssh_base = rt["ssh_base"]             # remote_path/subpath (NAS side)
-    # The catalog/mount base is params.destination (the route sets it to
-    # mount_path/subpath). Normalize identically to the local path.
-    try:
-        destination = os.path.realpath(os.path.normpath(str(params.destination)))
-    except OSError:
-        destination = os.path.normpath(str(params.destination))
-
-    # Live-mount baseline for the destination, captured before discovery
-    # for the same reason as the local path: a detach during the slow
-    # pre-copy phases would otherwise be baked in as "never mounted" and
-    # disarm the guard. See ``_archive_mount_baseline`` and PR #1396
-    # review (Codex P1 r3687336684).
-    #
-    # Cross-run mount history: seed the baseline True for mount roots we
-    # previously observed live, then persist any candidate we see live
-    # this run. Without this, an SMB share that detached BEFORE the run
-    # started never earns a True → False transition; rsync would still
-    # push to the NAS while the per-batch mount-side scan reads a fresh
-    # local shadow. See PR #1396 review (Codex P1 r3687401636).
-    known_mount_roots = _load_known_mount_roots(db)
-    mount_baseline = _archive_mount_baseline(destination, known_mount_roots)
-    _record_known_mount_roots(db, mount_baseline)
-
-    # Reject cataloged twins that live under the card being imported: a stale
-    # scan of the mounted card can leave a photos row whose ``folder_path``
-    # IS the card, and re-hashing it just re-reads the very source we're
-    # supposed to be copying off — which would count the file as
-    # ``skipped_duplicate`` and, when ``verify_by_hash`` is on, still let
-    # ``safe_to_format`` go green over a card whose bytes never crossed the
-    # network. Mirrors the local path's ``_path_under_any_source`` filter.
-    _path_under_any_source = _build_source_root_guard(params.sources)
-
-    # Destination containment for cataloged twin folders. Used to scope
-    # ``_linkable_twin_dirs`` to twins under the mount base — an off-
-    # destination twin in some other library root is none of this import's
-    # business. Case-fold on inconclusive/insensitive filesystems (SMB, FAT,
-    # HFS+/APFS) so a differently-cased twin under the mount still matches;
-    # otherwise a duplicate-only remote import could report
-    # ``safe_to_format=True`` while the twin's folder never gets linked
-    # into the active workspace. Mirrors the local path.
-    def _probe_dir_case_insensitive(path):
-        p = os.path.normpath(path)
-        while True:
-            if os.path.isdir(p):
-                return _fs_is_case_insensitive(p)
-            parent = os.path.dirname(p)
-            if parent == p:
-                return True
-            p = parent
-
-    _dest_ci = _CASE_INSENSITIVE_PLATFORM or _probe_dir_case_insensitive(destination)
-    _dest_root_norm = (
-        destination.casefold() if _dest_ci else destination
-    ).rstrip(os.sep)
-
-    def _path_under_destination(path):
-        if not _dest_root_norm:
-            return False
-        try:
-            real = os.path.realpath(path)
-        except OSError:
-            real = str(path)
-        cmp = (real.casefold() if _dest_ci else real).rstrip(os.sep)
-        return cmp == _dest_root_norm or cmp.startswith(_dest_root_norm + os.sep)
-
-    # Case-insensitive destinations (macOS APFS/HFS+, SMB, FAT/exFAT)
-    # collapse basenames that differ only by case onto the same on-disk
-    # file. The intra-batch collision map ``claimed_basenames`` keys by
-    # basename, so keying it case-foldedly there makes a second file whose
-    # basename differs from an earlier queued file's only by case (e.g.
-    # ``IMG_0001.JPG`` then ``img_0001.jpg``) collide and advance through
-    # numeric suffixes, instead of being sent to the same effective
-    # receiver path where ``--ignore-existing`` would silently drop it and
-    # the later catalog/hash validation would fail. See PR #1113 review.
-    def _fold_basename(name):
-        return name.casefold() if _dest_ci else name
+    # Normalized destination + mount baseline + guards, shared with the
+    # local path. See ``_build_destination_context`` — the ordering
+    # inside it (normalize → baseline → guards) is load-bearing.
+    ctx = _build_destination_context(db, params)
+    destination = ctx.destination
+    mount_baseline = ctx.mount_baseline
+    _path_under_any_source = ctx.path_under_any_source
+    _path_under_destination = ctx.path_under_destination
+    _fold_basename = ctx.fold_basename
 
     import move as move_mod
 
@@ -1642,16 +1752,7 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
     # (On ``state``.) ``state.verified``: count of files independently
     # checksum-verified.
 
-    def _stop_requested():
-        # Threaded through every destination-side hash read so a Stop can
-        # interrupt a read blocked on a dead mount (see _hash_dest_file).
-        # Nonblocking probe — ``is_cancelled`` would park in
-        # ``wait_if_paused`` for a pausable import, freezing the watchdog
-        # loop itself and stopping the 120s stall timer from running while
-        # the daemon reader can keep touching the archive even though the
-        # UI says the job is paused. Mirrors the rsync watchdog's use of
-        # ``cancellation_requested`` for the same reason.
-        return runner.cancellation_requested(job["id"])
+    _stop_requested = _make_stop_check(runner, job)
 
     # ``state.imported_photo_ids``: photo rows this run created or
     # landed bytes into: fresh copies whose
@@ -1693,31 +1794,6 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
     # the only real copy. Refusing every remaining batch once a detach
     # has been observed keeps the stale intra-run cache from ever being
     # consulted. See PR #1400 review (Codex P2 r3688614624).
-
-    # Mount-root check (Task 2.7 late follow-up): when a saved remote
-    # target's local mount root is not mounted (for example ``/Volumes/NAS``
-    # or ``/mnt/NAS`` is absent because the share isn't attached), a naive
-    # ``os.makedirs(dest_folder, exist_ok=True)`` in the batch loop below
-    # would create the whole mount tree as an empty local shadow directory
-    # on the internal disk. The SSH rsync still writes to the NAS, but the
-    # subsequent scan reads the fresh local shadow and leaves the import
-    # uncataloged/failed; worse, on macOS/Linux that shadow root can also
-    # prevent the real share from remounting at the configured path. Fail
-    # the batch's files with a clear reason instead. Reuses the
-    # pipeline path's ``_missing_archive_mount_root`` helper (only fires
-    # for the ``/Volumes/X``, ``/mnt/X``, and ``/media/user/X`` shapes that
-    # denote removable/network mount roots).
-    #
-    # Re-probed per batch rather than once up front: a card import runs
-    # for hours against a network archive, and the share can drop *during*
-    # the run (a Tailscale/SMB archive unmounted two hours into an import
-    # on 2026-07-30, after which ``os.makedirs`` walked straight into the
-    # vacated mount point). A start-of-job preflight cannot see that. The
-    # probe is a couple of ``os.path.lexists`` calls on the mount root, so
-    # paying it once per destination folder is free next to the copy work.
-    # See PR #1113 review.
-    def _missing_mount_root():
-        return _missing_archive_mount_root(destination)
 
     # Whether each ``copied`` booking also incremented ``verified``:
     # the remote path books ``verified`` only when
@@ -1792,14 +1868,30 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
                 state.emitted, queued,
             )
             continue
-        # Mount-root check (see the ``_missing_mount_root`` helper near the
-        # top of this function). Same shape as the dest-under-source guard:
-        # fail every file in the batch with a specific reason and skip the
-        # batch instead of letting ``os.makedirs`` create a local shadow of
-        # the unmounted destination. Re-probed here, per batch, so a share
-        # that drops mid-run is caught at the next batch boundary rather
-        # than only at job start. See PR #1113 review.
-        missing_mount_root = _missing_mount_root()
+        # Mount-root check (Task 2.7 late follow-up): when a saved remote
+        # target's local mount root is not mounted (for example ``/Volumes/NAS``
+        # or ``/mnt/NAS`` is absent because the share isn't attached), a naive
+        # ``os.makedirs(dest_folder, exist_ok=True)`` below
+        # would create the whole mount tree as an empty local shadow directory
+        # on the internal disk. The SSH rsync still writes to the NAS, but the
+        # subsequent scan reads the fresh local shadow and leaves the import
+        # uncataloged/failed; worse, on macOS/Linux that shadow root can also
+        # prevent the real share from remounting at the configured path. Fail
+        # the batch's files with a clear reason and skip the batch instead —
+        # same shape as the dest-under-source guard above. Reuses the
+        # pipeline path's ``_missing_archive_mount_root`` helper (only fires
+        # for the ``/Volumes/X``, ``/mnt/X``, and ``/media/user/X`` shapes that
+        # denote removable/network mount roots).
+        #
+        # Re-probed per batch rather than once up front: a card import runs
+        # for hours against a network archive, and the share can drop *during*
+        # the run (a Tailscale/SMB archive unmounted two hours into an import
+        # on 2026-07-30, after which ``os.makedirs`` walked straight into the
+        # vacated mount point). A start-of-job preflight cannot see that. The
+        # probe is a couple of ``os.path.lexists`` calls on the mount root, so
+        # paying it once per destination folder is free next to the copy work.
+        # See PR #1113 review.
+        missing_mount_root = _missing_archive_mount_root(destination)
         if missing_mount_root:
             for source_file in batch:
                 state.emitted += 1
@@ -3220,10 +3312,7 @@ def run_import_job(job, runner, db_path, workspace_id, params):
     verified file cataloged and nothing else.
     """
     from pipeline_job import (
-        _archive_mount_baseline,
-        _load_known_mount_roots,
         _missing_archive_mount_root,
-        _record_known_mount_roots,
         _unmounted_since_baseline,
     )
     from scanner import scan
@@ -3238,104 +3327,15 @@ def run_import_job(job, runner, db_path, workspace_id, params):
         # unchanged. See Task 2.7.
         return _run_remote_import_job(job, runner, db, workspace_id, params)
 
-    # Normalize once — the raw destination string is passed as ``root`` to
-    # both the copy layout (``os.path.normpath(os.path.join(destination,
-    # rel))``) and to ``scan(root, …, restrict_dirs=[dest_folder])``.
-    # ``scanner._ensure_folder`` stops walking the folder chain when the
-    # parent equals the scan root string; a destination like
-    # ``/photos/tmp/../archive`` copies into the normalized
-    # ``/photos/archive/…`` but the restricted scan root would remain the
-    # dot-segment form, so the recursion never reaches root and the scan
-    # loses those files (copied bytes then bucket as catalog failures).
-    #
-    # Also resolve symlinks (``realpath``) so a destination like ``/photos``
-    # symlinked at ``/Volumes/Photos`` matches cataloged twin folders whose
-    # ``folders.path`` was scanned under the real archive root — otherwise
-    # duplicate matching compares paths from prior catalog scans against
-    # this destination. Sources are already ``realpath``-resolved (see
-    # ``_norm_source``); doing the same to destination keeps the two sides
-    # symmetric. See PR #1107 review.
-    try:
-        destination = os.path.realpath(os.path.normpath(str(params.destination)))
-    except OSError:
-        destination = os.path.normpath(str(params.destination))
-
-    # Which of the destination's mount-root candidates are live mounts.
-    # Captured HERE — immediately after normalization, before discovery,
-    # catalog-index construction or timestamp extraction — because all of
-    # those are slow against a network archive (the 2026-07-30 incident
-    # spent eight minutes just enumerating the destination). A share that
-    # detached during that window would be recorded as already-unmounted,
-    # the mounted → unmounted transition would never fire, and the guard
-    # would be silently disarmed for the rest of the run. See PR #1396
-    # review (Codex P1 r3687336684).
-    #
-    # Keying on the transition (rather than "is it mounted?") is what lets
-    # an ordinary local directory at a mount-shaped path stay usable: it
-    # is False here and stays False, so it never trips the check.
-    #
-    # ``known_mounted_roots`` seeds True from a persistent record of
-    # mount roots ever observed live. Without it, a share that detached
-    # BEFORE the run started (baseline is False from the outset) escapes
-    # the guard: no True → False transition can fire against a False
-    # baseline, so the persistent ``/mnt/<name>`` stub still passes the
-    # per-batch check and copies land on the local disk. Cross-run
-    # history closes that hole; a hand-made local dir is never observed
-    # as a live mount and stays out of the known-set. See PR #1396
-    # review (Codex P1 r3687401636).
-    known_mount_roots = _load_known_mount_roots(db)
-    mount_baseline = _archive_mount_baseline(destination, known_mount_roots)
-    _record_known_mount_roots(db, mount_baseline)
-
-    # Reject cataloged twins that live under the card being imported. The
-    # /api/jobs/import-photos route already refuses destinations that sit
-    # inside a source (formatting the card would erase the archive copy),
-    # but the duplicate acceptance loop separately trusts any cataloged
-    # twin whose bytes hash to ``src_hash`` — including a stale row for a
-    # previously scanned mounted card. That twin's re-hash just re-reads
-    # the very card file being imported, so accepting it as duplicate
-    # proof would flip ``safe_to_format`` green over a card whose bytes
-    # never made it to the archive. The guard is shared with the remote
-    # (SSH) path via the module-level factory. See PR #1107 review.
-    _path_under_any_source = _build_source_root_guard(params.sources)
-
-    # Destination containment for cataloged twin folders. ``destination``
-    # is already ``realpath``-resolved above so a symlinked destination
-    # like ``/photos`` -> ``/Volumes/Photos`` matches twin folders
-    # cataloged under ``/Volumes/Photos/…``. Case-different spellings on
-    # case-insensitive mounts (HFS+/APFS/exFAT) still need explicit
-    # case-folding: ``realpath`` on APFS preserves the case the user
-    # gave. Probe the destination's own filesystem (walking up to the
-    # closest existing ancestor when the destination itself hasn't been
-    # created yet); default to case-insensitive on inconclusive results
-    # so a differently-cased twin folder under the destination is still
-    # linked to the workspace — otherwise ``safe_to_format`` can go
-    # green while the imported photo stays invisible in the active
-    # workspace. See PR #1107 review.
-    def _probe_dir_case_insensitive(path):
-        p = os.path.normpath(path)
-        while True:
-            if os.path.isdir(p):
-                return _fs_is_case_insensitive(p)
-            parent = os.path.dirname(p)
-            if parent == p:
-                return True
-            p = parent
-
-    _dest_ci = _CASE_INSENSITIVE_PLATFORM or _probe_dir_case_insensitive(destination)
-    _dest_root_norm = (
-        destination.casefold() if _dest_ci else destination
-    ).rstrip(os.sep)
-
-    def _path_under_destination(path):
-        if not _dest_root_norm:
-            return False
-        try:
-            real = os.path.realpath(path)
-        except OSError:
-            real = str(path)
-        cmp = (real.casefold() if _dest_ci else real).rstrip(os.sep)
-        return cmp == _dest_root_norm or cmp.startswith(_dest_root_norm + os.sep)
+    # Normalized destination + mount baseline + guards, shared with the
+    # remote path. See ``_build_destination_context`` — the ordering
+    # inside it (normalize → baseline → guards) is load-bearing.
+    # (``ctx.fold_basename`` is remote-only until PR 7.)
+    ctx = _build_destination_context(db, params)
+    destination = ctx.destination
+    mount_baseline = ctx.mount_baseline
+    _path_under_any_source = ctx.path_under_any_source
+    _path_under_destination = ctx.path_under_destination
 
     runner.set_steps(job["id"], [
         {"id": "import", "label": "Copy & catalog"},
@@ -3473,16 +3473,7 @@ def run_import_job(job, runner, db_path, workspace_id, params):
     # are excluded — a duplicates-only import chains to "no new
     # photos", not an empty run).
 
-    def _stop_requested():
-        # Threaded through every destination-side hash read so a Stop can
-        # interrupt a read blocked on a dead mount (see _hash_dest_file).
-        # Nonblocking probe — ``is_cancelled`` would park in
-        # ``wait_if_paused`` for a pausable import, freezing the watchdog
-        # loop itself and stopping the 120s stall timer from running while
-        # the daemon reader can keep touching the archive even though the
-        # UI says the job is paused. Mirrors the rsync watchdog's use of
-        # ``cancellation_requested`` for the same reason.
-        return runner.cancellation_requested(job["id"])
+    _stop_requested = _make_stop_check(runner, job)
 
     # Working-copy extraction is DEFERRED to the end of the whole import
     # run (not per-batch). Rationale: a folder that receives more than
@@ -3618,8 +3609,10 @@ def run_import_job(job, runner, db_path, workspace_id, params):
                 state.emitted, queued,
             )
             continue
-        # Same guard the remote path applies (see ``_missing_mount_root``
-        # in ``_run_remote_import_job``): if the archive's mount root has
+        # Same guard the remote path applies (same
+        # ``_missing_archive_mount_root`` probe, same rationale — see the
+        # mount-root check in ``_run_remote_import_job``): if the
+        # archive's mount root has
         # gone (share never attached, or unmounted mid-run), refuse the
         # batch instead of letting ``os.makedirs`` recreate the vacated
         # mount point as a plain local directory. That shadow tree would

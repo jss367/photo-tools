@@ -17,12 +17,12 @@
 - **Nested helpers (current def lines).** Remote: `_probe_dir_case_insensitive` 1325, `_path_under_destination` 1340, `_fold_basename` 1359, `_emit` 1381, `_emit_transfer` 1416, `_discovery_onerror` 1468, `_stop_requested` 1549, `_counts` 1576, `_fail` 1581 (`nonlocal failed` 1582), `_reclassify_landed_failed` 1588 (`nonlocal copied, verified, skipped_duplicate` 1600), `_missing_mount_root` 1662, `_record_checker` 1665, `_do_rsync` 2414, `_rsync_cancelled` 2439. Local: probe 3280, path-under 3295, `_emit` 3322, `_discovery_onerror` 3368, `_stop_requested` 3452, `_counts` 3515, `_fail` 3520 (nonlocal 3521), `_reclassify_landed_failed` 3527 (nonlocal 3539), `_record_checker` 3552, `_src_hash_cached` 4062, `_rehash_dest_or_none` 4392.
 - **This PR hoists exactly FOUR helpers**: `_counts`, `_fail`, `_reclassify_landed_failed`, `_record_checker` — the pure state manipulators, byte-identical between paths except two LOG-ONLY wordings. Everything else (emitters, probes, transport bits) stays nested; PR 6 owns those.
 - **Migrated state names (18)** — run-scoped, present in BOTH functions, moving into `_ImportRunState`: `copied`, `verified`, `skipped_duplicate`, `unverified_duplicate`, `failed`, `emitted`, `cancelled`, `unsafe_files`, `folder_counts`, `discovery_errors`, `imported_photo_ids`, `linked_dup_dirs`, `dup_link_failed`, `run_dest_folders`, `run_verified_hashes`, `mount_ever_lost`, `wc_source_paths`, `wc_dest_folders`. NOT migrated (stay as locals): `eta`, `checker`, `queued`, `batches`, `destination`, `mount_baseline`, per-batch state (`landed`, `dup_dirs`, `dup_skips`, `mount_lost`, `dest_read_cancelled`, `reclassified_landed_paths`, `to_transfer`, `claimed_basenames`, `queued_src_hashes`, remote transfer vars), and `verified_counted_for_copies` (loop-invariant local — see below).
-- **The silent-shadow hazard:** `copied += 1` → must become `state.copied += 1`; a missed one binds a NEW function-local `copied` at first assignment and every later read in that scope sees the wrong value — no exception. This is why the audit commands in Task 4 are mandatory, not advisory.
+- **The shadow hazard:** once the bare initializations are deleted, a missed `copied += 1` fails LOUDLY (`UnboundLocalError`); the genuinely SILENT misses are the plain rebinds — `cancelled = True`, `dup_link_failed = True`, `mount_ever_lost = mount_lost` — which quietly create a dead function-local while `state.<name>` keeps its stale value. This is why the audit commands in Task 4 are mandatory, not advisory.
 - **Log-only wording changes (the only observable deltas; list in the PR body):**
   1. `_record_checker`'s OSError warning unifies to `"Duplicate-checker record() failed for %s (dest %s): %s"` — the local variant said "after landing at %s", which is wrong for the remote's enqueue-time skip callers (flagged in PR #1433's body for exactly this reconciliation).
   2. `_fail`'s warning keeps its per-path prefix via `state.log_label` (`"Remote import"` / `"Import"`), so log lines stay byte-identical.
 - **Carry-overs from 5a's reviews (all no-behavior-change, land in Task 3):**
-  1. Booking/rollback pairing: the remote `verified` booking site (`if params.verify_by_hash: verified += 1` — the one in the post-transfer accounting loop near 2542; NOT the two `update_photo_hash_check` stamp sites at 2517/2774) switches to `if verified_counted_for_copies:` so increment and decrement share one predicate (PR 7's `attests_bytes` then switches both at once).
+  1. Booking/rollback pairing: the remote `verified` booking site (`if params.verify_by_hash: verified += 1` — the one in the post-transfer accounting loop at 2542-2543, right after the `copied` booking; NOT 2517, the `remote_verify_files` verification guard, and NOT 2775, the sole remote `update_photo_hash_check` stamp site) switches to `if verified_counted_for_copies:` so increment and decrement share one predicate (PR 7's `attests_bytes` then switches both at once).
   2. `verified_counted_for_copies` moves OUT of the per-batch loop to just before it (it's loop-invariant; today the remote helper at 1588 closes over a name first bound at 1897 inside the loop — works via late binding, needlessly fragile).
   3. Local `reclassified_landed_paths` decl moves up into the per-batch state block (mirroring remote's placement).
   4. `_LandedFile` gains `frozen=True` (entries are never mutated by design — the reclassified set exists precisely to avoid mutation).
@@ -55,7 +55,9 @@ class _ImportRunState:
     failed: int = 0
     emitted: int = 0
     cancelled: bool = False
-    mount_ever_lost: bool = False
+    # None or a mount-root path string; consumers are truthiness-only
+    # plus one f-string interpolation of the path into a failure reason.
+    mount_ever_lost: str | None = None
     dup_link_failed: bool = False
     unsafe_files: list = field(default_factory=list)
     folder_counts: dict = field(default_factory=dict)
@@ -119,6 +121,22 @@ for n in copied verified skipped_duplicate unverified_duplicate failed emitted c
   echo "== $n"; grep -nE "(^|[^.\w\"'])${n}\b" vireo/import_job.py | grep -vE "state\.${n}|def |#|\"|'" ; done
 ```
 
-Review every hit by eye (e.g. `copied=` keyword args to `_selection_summary` are fine; a bare `copied += 1` is the bug). Also: `grep -n "nonlocal" vireo/import_job.py` → only hits outside the two functions (expect none in them).
+Review every hit by eye (e.g. `copied=` keyword args to `_selection_summary` are fine; a bare `cancelled = True` is the bug). Also: `grep -n "nonlocal" vireo/import_job.py` → expect zero hits in the two functions. Belt-and-braces (catches what the grep's comment/quote filters could hide): a `symtable` check asserting none of the 18 names remain locals of either function:
+
+```bash
+python3 - <<'PY'
+import symtable
+src = open('vireo/import_job.py').read()
+names = set('copied verified skipped_duplicate unverified_duplicate failed emitted cancelled unsafe_files folder_counts discovery_errors imported_photo_ids linked_dup_dirs dup_link_failed run_dest_folders run_verified_hashes mount_ever_lost wc_source_paths wc_dest_folders'.split())
+top = symtable.symtable(src, 'import_job.py', 'exec')
+for fn in ('_run_remote_import_job', 'run_import_job'):
+    t = top.lookup(fn).get_namespace()
+    bad = sorted(n for n in names if n in set(t.get_identifiers())
+                 and t.lookup(n).is_local())
+    print(fn, 'OK' if not bad else f'LEAKED LOCALS: {bad}')
+PY
+```
+
+Both lines must print OK.
 - [ ] **Step 2:** Full file (225/1) + required CLAUDE.md suite (expect 2077 passed, 14 skipped, 1 known env failure).
 - [ ] **Step 3:** Push; `gh pr create --base main --title "Import unification PR 5b: run-state object and helper hoist" --body ...` — body covers: the 5a/5b split pointer; the 18 migrated names; the four hoisted helpers with the two log-wording notes; the four 5a-review carry-overs; the audit output; "no behavior change — suite counts identical at every commit"; notes for PR 6 (the emitters and probes are next; `_reclassify_landed_failed`'s `verified_counted_for_copies` param is the seam PR 7's `attests_bytes` replaces). End with the Claude Code attribution line.

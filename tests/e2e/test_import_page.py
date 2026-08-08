@@ -2145,9 +2145,10 @@ def test_import_browse_button_opens_folder_browser_fallback(live_server, page):
     browser = page.locator("[data-testid='import-folder-browser']")
     expect(browser).to_have_class(re.compile(r"\bopen\b"))
     expect(page.locator("#folderBrowserTitle")).to_have_text("Select Source Folders")
-    expect(page.locator(".folder-browser-panel")).to_have_attribute("role", "dialog")
-    expect(page.locator(".folder-browser-panel")).to_have_attribute("aria-modal", "true")
-    expect(page.locator(".folder-browser-panel")).to_have_attribute(
+    panel = browser.locator(".folder-browser-panel")
+    expect(panel).to_have_attribute("role", "dialog")
+    expect(panel).to_have_attribute("aria-modal", "true")
+    expect(panel).to_have_attribute(
         "aria-labelledby", "folderBrowserTitle")
 
 
@@ -2444,14 +2445,13 @@ def test_import_folder_browser_escape_closes_modal(live_server, page):
     page.evaluate("window.pickDirectory = async () => null")
 
     page.locator("[data-testid='import-source-browse-btn']").click()
-    expect(page.locator("[data-testid='import-folder-browser']")).to_have_class(
-        re.compile(r"\bopen\b"))
-    expect(page.locator(".folder-browser-close")).to_be_focused()
+    browser = page.locator("[data-testid='import-folder-browser']")
+    expect(browser).to_have_class(re.compile(r"\bopen\b"))
+    expect(browser.locator(".folder-browser-close")).to_be_focused()
 
     page.keyboard.press("Escape")
 
-    expect(page.locator("[data-testid='import-folder-browser']")).not_to_have_class(
-        re.compile(r"\bopen\b"))
+    expect(browser).not_to_have_class(re.compile(r"\bopen\b"))
 
 
 def test_import_destination_structure_hides_when_folder_browser_picks_destination(

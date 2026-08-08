@@ -575,7 +575,9 @@ pub fn stop_sidecar(state: &SidecarState) {
             .is_some();
 
         let url = format!("http://127.0.0.1:{}/api/shutdown", state.port);
-        let _ = ureq::post(&url).header("X-Vireo-Shutdown", "1").send_empty();
+        let _ = ureq::post(&url)
+            .header("X-Vireo-Shutdown", "1")
+            .send_empty();
         // Give the sidecar a moment to shut down gracefully
         std::thread::sleep(Duration::from_millis(500));
         // Force-kill if still running

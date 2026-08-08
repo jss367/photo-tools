@@ -866,6 +866,43 @@ def test_delete_skips_path_redirected_outside_source(db, tmp_path):
     assert decoy.exists() and decoy.read_bytes() == b"raw-one"
 
 
+def test_delete_uses_manifest_source_root_not_re_resolved(db, tmp_path):
+    # Codex P1 review of commit 2efff02f: if the scanned root itself is
+    # renamed and replaced by a symlink pointing at a different tree,
+    # re-resolving the manifest's already-canonical source_root at delete
+    # time would re-anchor every containment check to the swap target.
+    # A byte-identical file at the same relative path there would then
+    # pass every gate and be unlinked outside the scanned card. The delete
+    # must use the manifest's stored source_root verbatim.
+    _archive_photo(db, tmp_path)
+    card_file = _card_file(tmp_path)
+    contents = card_file.read_bytes()
+    scan = _scan(db, tmp_path)
+    assert scan["totals"]["deletable"]["count"] == 1
+    manifest = load_manifest(str(tmp_path / "manifests"), "scan-1")
+    entry = next(e for e in manifest["entries"] if e["bucket"] == "deletable")
+
+    swapped = tmp_path / "swapped_root"
+    (swapped / "DCIM").mkdir(parents=True)
+    twin = swapped / "DCIM" / card_file.name
+    twin.write_bytes(contents)
+    os.utime(twin, ns=(entry["mtime_ns"], entry["mtime_ns"]))
+
+    original = tmp_path / "card"
+    original.rename(tmp_path / "card_moved")
+    try:
+        os.symlink(str(swapped), str(original))
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks unsupported on this filesystem")
+
+    summary = card_cleanup.delete_verified(db, manifest)
+
+    assert summary["deleted"] == 0
+    assert twin.exists() and twin.read_bytes() == contents
+    assert len(summary["skipped"]) == 1
+    assert summary["skipped"][0]["reason"] == card_cleanup.SKIP_OUTSIDE_SOURCE
+
+
 def test_delete_skips_when_card_path_becomes_symlink_post_scan(db, tmp_path):
     # Codex P2: scan classifies only regular files, but a post-scan swap
     # of a scanned pathname for a symlink to a byte-identical file with

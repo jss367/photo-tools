@@ -437,7 +437,14 @@ def delete_verified(db, manifest, progress_cb=None, should_cancel=None):
     The manifest must come from load_manifest (validated); raw dicts are
     not a supported input.
     """
-    source_root_real = os.path.realpath(manifest["source_root"])
+    # Use the manifest's source_root verbatim (Codex P1 review) — it was
+    # realpath'd at scan time (see scan_card) and persisted as the
+    # canonical anchor. Re-resolving here would follow a post-scan symlink
+    # swap of the root itself (e.g. /Volumes/CARD/DCIM renamed and replaced
+    # by a symlink pointing at /elsewhere), re-anchoring every containment
+    # check to the attacker-controlled target and letting a matching file
+    # there pass every gate and be unlinked outside the scanned card.
+    source_root_real = manifest["source_root"]
     contains_check = path_guard.make_case_folded_check(source_root_real)
     deletable = [e for e in manifest["entries"]
                  if e.get("bucket") == "deletable"]

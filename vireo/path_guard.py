@@ -29,6 +29,18 @@ def is_case_insensitive_platform():
     return sys.platform in ("darwin", "win32")
 
 
+# Probe results keyed by (realpath, st_dev). The per-file guards call
+# contains_resolved in tight loops (one call per catalog row per card
+# file), and each uncached call would listdir-probe the same root on
+# Linux. st_dev in the key invalidates the entry when a different
+# filesystem is mounted at the same path (card swapped at the same
+# mount point) — a plain path key could serve a stale, non-strict
+# answer. Inconclusive probes are cached too: they are stable for a
+# given mount and the cached value (True) is the strict direction.
+_probe_cache = {}
+_PROBE_CACHE_MAX = 256
+
+
 def fs_is_case_insensitive(path):
     """Probe whether the filesystem at ``path`` treats case as insensitive.
 
@@ -60,6 +72,21 @@ def fs_is_case_insensitive(path):
     has no alpha-containing entry to probe with. See PR #1107
     review.
     """
+    try:
+        cache_key = (os.path.realpath(path), os.stat(path).st_dev)
+    except (OSError, ValueError):
+        cache_key = None
+    if cache_key is not None and cache_key in _probe_cache:
+        return _probe_cache[cache_key]
+    result = _probe_uncached(path)
+    if cache_key is not None:
+        if len(_probe_cache) >= _PROBE_CACHE_MAX:
+            _probe_cache.clear()
+        _probe_cache[cache_key] = result
+    return result
+
+
+def _probe_uncached(path):
     try:
         entries = os.listdir(path)
     except OSError:

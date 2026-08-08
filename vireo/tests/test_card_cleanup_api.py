@@ -377,3 +377,14 @@ def test_delete_result_carries_exact_totals(app_and_db, tmp_path):
     assert result["skipped_total"] == len(result["skipped"]) == 0
     assert result["failed_total"] == len(result["failed"]) == 0
     assert result["deleted"] == 1
+
+
+def test_endpoints_reject_non_object_json_body(app_and_db):
+    # get_json returns 5 for a valid non-object JSON document; the
+    # endpoints must 400, not 500 on body.get.
+    app, _ = app_and_db
+    client = app.test_client()
+    for url in ("/api/card-cleanup/scan", "/api/card-cleanup/delete"):
+        resp = client.post(url, json=5)
+        assert resp.status_code == 400, url
+        assert "JSON object" in resp.get_json()["error"]

@@ -483,6 +483,12 @@ def delete_verified(db, manifest, progress_cb=None, should_cancel=None):
             summary["skipped"].append(
                 {"path": path, "reason": SKIP_OUTSIDE_SOURCE})
             continue
+        # lstat, not stat: a scanned regular file swapped for a symlink
+        # would otherwise be followed to its (byte-identical) target,
+        # pass every identity check on the target's stats, and then
+        # os.remove would unlink only the link while the summary credits
+        # the target's full size. lstat sees the link itself, whose
+        # inode/size/mtime cannot match the scanned file's baseline.
         try:
             st2 = os.lstat(path)
         except FileNotFoundError:

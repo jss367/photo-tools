@@ -97,3 +97,23 @@ def test_probe_permission_error_is_inconclusive(tmp_path, monkeypatch):
 
     monkeypatch.setattr(pg.os, "stat", denying_stat)
     assert pg.fs_is_case_insensitive(str(root)) is True
+
+
+def test_probe_result_is_cached_per_device(tmp_path, monkeypatch):
+    import path_guard as pg
+    root = tmp_path / "CacheProbe"
+    root.mkdir()
+    (root / "alpha.txt").write_text("x")
+    pg._probe_cache.clear()
+    calls = []
+    real_listdir = os.listdir
+
+    def counting_listdir(p, *a, **kw):
+        calls.append(str(p))
+        return real_listdir(p, *a, **kw)
+
+    monkeypatch.setattr(pg.os, "listdir", counting_listdir)
+    first = pg.fs_is_case_insensitive(str(root))
+    second = pg.fs_is_case_insensitive(str(root))
+    assert first == second
+    assert len(calls) == 1

@@ -3186,6 +3186,11 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     body = {}
                 else:
                     body = request.get_json(silent=True) or {}
+                    if not isinstance(body, dict):
+                        # Valid non-object JSON (5, "x", [..]) — the
+                        # .get() calls below would 500 the response of
+                        # any endpoint after it already ran.
+                        body = {}
                 if "/rating" in path:
                     detail = f" rating={body.get('rating')}"
                 elif "/flag" in path:
@@ -19050,6 +19055,10 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         endpoints below, keyed by this job's id.
         """
         body = request.get_json(silent=True) or {}
+        if not isinstance(body, dict):
+            # get_json happily returns 5 or "x" for valid non-object
+            # JSON; body.get would then 500.
+            return json_error("request body must be a JSON object")
         source = body.get("source")
         recursive = body.get("recursive", True)
         if not isinstance(recursive, bool):
@@ -19166,6 +19175,8 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         still on disk.
         """
         body = request.get_json(silent=True) or {}
+        if not isinstance(body, dict):
+            return json_error("request body must be a JSON object")
         scan_job_id = body.get("scan_job_id")
         if not scan_job_id or not isinstance(scan_job_id, str):
             return json_error("scan_job_id required")

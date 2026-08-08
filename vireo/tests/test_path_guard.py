@@ -8,7 +8,6 @@ import os
 import sys
 
 import pytest
-
 from path_guard import contains_resolved, fs_is_case_insensitive, path_contains
 
 

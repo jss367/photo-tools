@@ -571,6 +571,23 @@ class ImportParams:
     thumb_cache_dir: str | None = None
 
 
+@dataclass
+class _LandedFile:
+    """One file this batch landed (fresh copy/transfer) or adopted.
+
+    ``verified_hash`` is the hash the import attests is at ``dest_path``
+    (copy-time hash locally; card-side hash remotely). ``origin`` is
+    "copied" or "skipped_duplicate" (adoption) and drives rollback
+    accounting in ``_reclassify_landed_failed``.
+    """
+    dest_path: str
+    verified_hash: str | None
+    source_path: str
+    origin: str
+    src_size: int | None
+    src_mtime_ns: int | None
+
+
 def copy_and_hash_verify(src, dst, *, src_hash=None):
     """Copy ``src`` to ``dst`` and verify the landed bytes by content hash.
 
@@ -3571,8 +3588,8 @@ def run_import_job(job, runner, db_path, workspace_id, params):
         ``copied + skipped_duplicate + failed`` exceeds ``discovered``.
         """
         nonlocal copied, verified, skipped_duplicate
-        dest_path = entry[0]
-        origin = entry[3]
+        dest_path = entry.dest_path
+        origin = entry.origin
         if origin == "copied":
             copied -= 1
             verified -= 1
@@ -3784,11 +3801,12 @@ def run_import_job(job, runner, db_path, workspace_id, params):
         )
         db.conn.commit()
 
-        # (dest_path, verified_hash, card_source) for this batch's
-        # landed files — fresh copies plus byte-identical files already
-        # present at the destination (the crash-recovery path). The card
-        # source feeds working-copy extraction so it reads local card
-        # bytes, never the just-written archive copy.
+        # ``_LandedFile`` entries for this batch's landed files — fresh
+        # copies (``origin="copied"``) plus byte-identical files already
+        # present at the destination (the crash-recovery adoption path,
+        # ``origin="skipped_duplicate"``). ``source_path`` feeds
+        # working-copy extraction so it reads local card bytes, never the
+        # just-written archive copy.
         landed = []
         dup_dirs = set()
         # Duplicate skips accepted in this batch that never enter
@@ -4165,9 +4183,14 @@ def run_import_job(job, runner, db_path, workspace_id, params):
                     skipped_duplicate += 1
                     _counts(rel)["skipped_duplicate"] += 1
                     landed.append(
-                        (dest_file, adopt_hash, str(source_file),
-                         "skipped_duplicate",
-                         src_size, src_mtime_ns),
+                        _LandedFile(
+                            dest_path=dest_file,
+                            verified_hash=adopt_hash,
+                            source_path=str(source_file),
+                            origin="skipped_duplicate",
+                            src_size=src_size,
+                            src_mtime_ns=src_mtime_ns,
+                        ),
                     )
                     _record_checker(source_file, dest_folder, adopt_hash)
                     continue
@@ -4201,8 +4224,14 @@ def run_import_job(job, runner, db_path, workspace_id, params):
             verified += 1
             _counts(rel)["copied"] += 1
             landed.append(
-                (dest_file, file_hash, str(source_file), "copied",
-                 src_size, src_mtime_ns),
+                _LandedFile(
+                    dest_path=dest_file,
+                    verified_hash=file_hash,
+                    source_path=str(source_file),
+                    origin="copied",
+                    src_size=src_size,
+                    src_mtime_ns=src_mtime_ns,
+                ),
             )
             _record_checker(source_file, dest_folder, file_hash)
 
@@ -4304,7 +4333,7 @@ def run_import_job(job, runner, db_path, workspace_id, params):
         # batches keep cataloging like before. Mirrors the remote path.
         # See PR #1423 review (Codex P2 r3716433830).
         if landed and not dest_read_cancelled:
-            landed_paths = {entry[0] for entry in landed}
+            landed_paths = {entry.dest_path for entry in landed}
             # Capture the pre-scan (photo_id, file_hash) for every landed
             # dest_path. Scanner's own ``_invalidate_derived_caches``
             # fires on content-changed rows during the batch scan below
@@ -4320,7 +4349,7 @@ def run_import_job(job, runner, db_path, workspace_id, params):
             # #1107 review.
             pre_scan_hashes = {}
             for entry in landed:
-                dest_path = entry[0]
+                dest_path = entry.dest_path
                 row = db.conn.execute(
                     """SELECT p.id, p.file_hash FROM photos p
                        JOIN folders f ON f.id = p.folder_id
@@ -4425,8 +4454,8 @@ def run_import_job(job, runner, db_path, workspace_id, params):
             # Stamp the verified hashes in the integrity-audit vocabulary,
             # cross-checked against what scan() stored.
             for entry in landed:
-                dest_path = entry[0]
-                verified_hash = entry[1]
+                dest_path = entry.dest_path
+                verified_hash = entry.verified_hash
                 row = db.conn.execute(
                     """SELECT p.id, p.file_hash FROM photos p
                        JOIN folders f ON f.id = p.folder_id
@@ -4572,7 +4601,7 @@ def run_import_job(job, runner, db_path, workspace_id, params):
             if params.vireo_dir:
                 from scanner import _invalidate_derived_caches
                 for entry in landed:
-                    dest_path = entry[0]
+                    dest_path = entry.dest_path
                     if dest_path in reclassified_landed_paths:
                         continue
                     if dest_path not in pre_scan_hashes:
@@ -4591,7 +4620,7 @@ def run_import_job(job, runner, db_path, workspace_id, params):
                     # legacy row lost its hash still clears the stale
                     # derived caches. See PR #1107 review.
                     pre_hash = pre_scan_hashes[dest_path]
-                    verified_hash = entry[1]
+                    verified_hash = entry.verified_hash
                     if pre_hash == verified_hash:
                         continue
                     row = db.conn.execute(
@@ -4644,7 +4673,7 @@ def run_import_job(job, runner, db_path, workspace_id, params):
             # predicate then skips.
             if params.vireo_dir:
                 for entry in landed:
-                    dest_path = entry[0]
+                    dest_path = entry.dest_path
                     if dest_path in reclassified_landed_paths:
                         # Reclassified to failed by hash stamping above
                         # (missing row or archive-vs-copy hash mismatch).
@@ -4654,9 +4683,9 @@ def run_import_job(job, runner, db_path, workspace_id, params):
                         # of caching a WC of bytes the archive no longer
                         # has.
                         continue
-                    src_path = entry[2]
-                    exp_size = entry[4]
-                    exp_mtime_ns = entry[5]
+                    src_path = entry.source_path
+                    exp_size = entry.src_size
+                    exp_mtime_ns = entry.src_mtime_ns
                     wc_source_paths[dest_path] = (
                         src_path, exp_size, exp_mtime_ns,
                     )

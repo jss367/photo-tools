@@ -2815,6 +2815,23 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
                         # ``verified``/``hash_status`` accounting is
                         # gated behind ``verify_by_hash``. See PR #1113
                         # review.
+                        # Same OSError-distinguishing shape as the
+                        # non-companion branch above: a zero-byte
+                        # adopted companion (``src_hash ==
+                        # EMPTY_FILE_SHA256`` → ``src_h_norm ==
+                        # None``) whose mount file vanished or became
+                        # unreadable between the adopt-time hash and
+                        # this loop would surface here as
+                        # ``mount_hash = None`` and ``mount_norm ==
+                        # src_h_norm == None`` — comparison passes,
+                        # the RAW row joins ``imported_photo_ids``,
+                        # and ``safe_to_format`` could go green over
+                        # a companion that is no longer there. The
+                        # removed ``adopted_paths`` validator treated
+                        # ``OSError`` as failure; preserve that
+                        # explicit read-failure flag here. See PR
+                        # #1437 review (Codex P1 r3741254301).
+                        read_failed = False
                         try:
                             mount_hash = _hash_dest_file(
                                 dest_path, _stop_requested)
@@ -2823,6 +2840,7 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
                             break
                         except OSError:
                             mount_hash = None
+                            read_failed = True
                         src_h_norm = (
                             None if src_hash == EMPTY_FILE_SHA256
                             else src_hash
@@ -2831,9 +2849,12 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
                             None if mount_hash == EMPTY_FILE_SHA256
                             else mount_hash
                         )
-                        if mount_norm != src_h_norm:
+                        if read_failed or mount_norm != src_h_norm:
                             _reclassify_landed_failed(
                                 rel, entry,
+                                "paired companion mount bytes could "
+                                "not be read"
+                                if read_failed else
                                 "paired companion mount bytes do "
                                 "not match the source hash (mount "
                                 "base is likely stale or "

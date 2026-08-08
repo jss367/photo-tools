@@ -9858,6 +9858,112 @@ def test_remote_zero_byte_adoption_revalidates_before_stamping(
     assert "scan wrote no mount row hash" in reasons[dest_key], reasons
 
 
+def test_remote_zero_byte_adopted_companion_revalidates_before_stamping(
+        tmp_path, monkeypatch):
+    """Companion-branch twin of
+    ``test_remote_zero_byte_adoption_revalidates_before_stamping``:
+    a zero-byte JPEG adopted next to a same-basename RAW takes the
+    pair-merged (``companion_path``) branch of the stamping loop. Pre-
+    fix, that branch converted ``OSError`` from ``_hash_dest_file`` to
+    ``mount_hash = None``, and since ``EMPTY_FILE_SHA256`` normalizes to
+    ``None`` on both sides too, the mount-lost companion would pass the
+    ``mount_norm != src_h_norm`` check silently — the RAW would join
+    ``imported_photo_ids`` and the JPEG's ``skipped_duplicate`` booking
+    would keep ``safe_to_format`` green over a companion that is no
+    longer there. The direct-row fix inside the non-companion branch
+    doesn't cover this: pair-merged JPEGs never enter that branch (they
+    have no photo row of their own after scan). This pins the
+    ``read_failed`` flag that the companion branch now carries.
+    See PR #1437 review (Codex P1 r3741254301).
+    """
+    import scanner as _scanner
+    from import_job import ImportParams, run_import_job
+
+    ra = _remote_archive_for(tmp_path)
+    calls = _remote_calls(ra)
+    _install_fake_remote_rsync(monkeypatch, calls, verify=None)
+
+    # Cataloged RAW at the mount, standalone (no companion_path yet).
+    mount_dir = os.path.join(ra["mount_base"], "2026", "2026-07-03")
+    os.makedirs(mount_dir, exist_ok=True)
+    raw_seed = os.path.join(mount_dir, "_seed.jpg")
+    Image.new("RGB", (16, 16), "red").save(raw_seed)
+    raw_bytes = Path(raw_seed).read_bytes() + b"RAW-SENSOR-DATA"
+    os.unlink(raw_seed)
+    raw_archive = os.path.join(mount_dir, "DSC_0800.NEF")
+    with open(raw_archive, "wb") as f:
+        f.write(raw_bytes)
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws_id = db._active_workspace_id
+    fid = db.conn.execute(
+        "INSERT INTO folders (path, name, status) VALUES (?, ?, 'ok')",
+        (mount_dir, os.path.basename(mount_dir)),
+    ).lastrowid
+    db.conn.execute(
+        "INSERT INTO photos (folder_id, filename, extension, file_size,"
+        " file_hash) VALUES (?, ?, '.nef', ?, ?)",
+        (fid, "DSC_0800.NEF", len(raw_bytes), "deadbeef" * 8),
+    )
+    db.conn.commit()
+
+    # Zero-byte JPEG on the card, and the SAME zero-byte JPEG already at
+    # the template mount path — the collision walk adopts it as
+    # ``skipped_duplicate`` (both hashes equal ``EMPTY_FILE_SHA256`` via
+    # the checker-less ``compute_file_hash`` path).
+    card = tmp_path / "card"
+    card.mkdir()
+    card_file = card / "DSC_0800.jpg"
+    card_file.write_bytes(b"")
+    ts = datetime(2026, 7, 3, 10, 0, 0).timestamp()
+    os.utime(str(card_file), (ts, ts))
+    adopted_dest_path = Path(mount_dir) / "DSC_0800.jpg"
+    adopted_dest_path.write_bytes(b"")
+    os.utime(str(adopted_dest_path), (ts, ts))
+
+    real_scan = _scanner.scan
+    deleted = {}
+
+    def deleting_scan(*args, **kwargs):
+        # scan() first (pair-merges the JPEG into the RAW's
+        # ``companion_path``; the JPEG's own photo row is deleted by the
+        # pair-merge, so the stamping loop will fall through to the
+        # companion branch), THEN the mount JPEG disappears. Mirrors an
+        # SMB share dropping the file between scan and the stamping
+        # loop's re-read.
+        result = real_scan(*args, **kwargs)
+        if not deleted and adopted_dest_path.exists():
+            adopted_dest_path.unlink()
+            deleted["done"] = True
+        return result
+
+    monkeypatch.setattr(_scanner, "scan", deleting_scan)
+
+    runner = FakeRunner()
+    result = run_import_job(
+        _make_job(), runner, db_path, ws_id,
+        ImportParams(
+            sources=[str(card)], destination=ra["mount_base"],
+            remote_target=ra, verify_by_hash=True,
+            skip_duplicates=False,
+        ),
+    )
+    obs = _behavior_observables(result, runner, db, ra["mount_base"])
+
+    assert deleted, "the scan wrapper never saw the adopted companion"
+    # Rolled back exactly once (0, never -1) and reported as failed with
+    # the mount dest path as the ``unsafe_files`` subject.
+    assert obs["skipped_duplicate"] == 0, obs
+    assert obs["failed"] == 1, obs
+    assert obs["safe_to_format"] is False, obs
+    dest_key = str(adopted_dest_path)
+    reasons = {p: r for p, r in obs["unsafe"]}
+    assert dest_key in reasons, obs["unsafe"]
+    assert "paired companion mount bytes could not be read" \
+        in reasons[dest_key], reasons
+
+
 def test_local_renamed_twin_of_accepted_duplicate_current_behavior(
         tmp_path, monkeypatch):
     """CHARACTERIZATION for spec decision 5 (local half). The local path

@@ -2710,7 +2710,27 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
                     # the mount file directly as the last-line check;
                     # mirrors the local path's ``_rehash_dest_or_none``
                     # fallback. See PR #1113 review.
-                    if scan_h is None and src_h_norm is not None:
+                    #
+                    # Zero-byte adopted files (``skip_duplicates=False``
+                    # only: the checker path returns ``None`` from
+                    # ``content_hash`` so the collision walk never
+                    # matches an empty source against an empty on-disk
+                    # candidate) reach this point with ``src_h_norm ==
+                    # scan_h == None``. Pre-fold, the deleted
+                    # ``adopted_paths`` validation pass always called
+                    # ``_hash_dest_file`` when ``scan_h`` was ``None``
+                    # and treated ``OSError`` as failure — without that,
+                    # an empty adopted file that vanished or became
+                    # unreadable between the adopt-time hash and the
+                    # stamping loop would keep its ``skipped_duplicate``
+                    # booking and get ``hash_status='ok'``, and
+                    # ``safe_to_format`` could go green over an archive
+                    # file that is no longer there. Distinguish OSError
+                    # from a legitimate empty mount file so the empty-
+                    # source, empty-mount case still passes. See PR
+                    # #1437 review (Codex P1 r3741224300).
+                    if scan_h is None:
+                        read_failed = False
                         try:
                             mount_hash = _hash_dest_file(
                                 dest_path, _stop_requested)
@@ -2719,11 +2739,12 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
                             break
                         except OSError:
                             mount_hash = None
+                            read_failed = True
                         mount_norm = (
                             None if mount_hash == EMPTY_FILE_SHA256
                             else mount_hash
                         )
-                        if mount_norm is None or mount_norm != src_h_norm:
+                        if read_failed or mount_norm != src_h_norm:
                             _reclassify_landed_failed(
                                 rel, entry,
                                 "scan wrote no mount row hash and a re-"

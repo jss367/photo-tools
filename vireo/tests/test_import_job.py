@@ -9763,6 +9763,101 @@ def test_remote_adopted_file_scan_mismatch_fails_with_mount_subject(
     assert "scanned mount row hash does not match" in reasons[adopted_dest]
 
 
+def test_remote_zero_byte_adoption_revalidates_before_stamping(
+        tmp_path, monkeypatch):
+    """A zero-byte adopted file whose mount copy vanishes between the
+    adoption hash check and the stamping loop must fail rather than
+    keep its ``skipped_duplicate`` booking + ``hash_status='ok'`` stamp.
+
+    Pre-fix, the folded stamping loop's ``if scan_h is None and
+    src_h_norm is not None`` gate skipped the mount re-read whenever
+    ``src_h_norm`` was None too — the zero-byte convention normalizes
+    ``EMPTY_FILE_SHA256`` to ``None`` on both sides, and scan writes
+    ``file_hash=NULL`` for zero-byte files, so both sides were ``None``.
+    That let an empty adopted file that disappeared between scan and
+    stamping keep its skip counted, get ``hash_status='ok'`` stamped,
+    and ``safe_to_format`` would go True over an archive path that no
+    longer holds the bytes. This pins the fix that restores the
+    deleted ``adopted_paths`` validation's OSError-treated-as-failure
+    check inside the unified loop.
+
+    ``skip_duplicates=False`` is required to reach this branch: the
+    checker path's ``CatalogIndex.content_hash`` returns ``None`` for
+    zero-byte sources, so the collision walk's ``on_disk == src_hash``
+    (with ``on_disk == EMPTY_FILE_SHA256`` from ``_hash_dest_file``)
+    never matches when a checker is installed — the checker-less
+    fallback path is where empty-vs-empty adoption fires.
+    See PR #1437 review (Codex P1 r3741224300).
+    """
+    import scanner as _scanner
+    from import_job import ImportParams, run_import_job
+
+    # Zero-byte card file (bypasses _make_card's PIL image path; the
+    # import discovery only checks extension, so an empty .jpg is
+    # enumerated with EXIF-less capture-time falling back to mtime).
+    card = tmp_path / "card"
+    card.mkdir()
+    card_file = card / "empty.jpg"
+    card_file.write_bytes(b"")
+    ts = datetime(2026, 7, 3, 10, 0, 0).timestamp()
+    os.utime(str(card_file), (ts, ts))
+
+    ra = _remote_archive_for(tmp_path)
+    calls = _remote_calls(ra)
+    _install_fake_remote_rsync(monkeypatch, calls, verify=None)
+
+    # Seed the destination with a matching zero-byte file at the
+    # template path so the collision walk adopts it as
+    # skipped_duplicate. Same folder convention as _seed_file_drop.
+    mount_base = Path(ra["mount_base"])
+    seed_folder = mount_base / "2026" / "2026-07-03"
+    seed_folder.mkdir(parents=True)
+    adopted_dest_path = seed_folder / "empty.jpg"
+    adopted_dest_path.write_bytes(b"")
+    os.utime(str(adopted_dest_path), (ts, ts))
+
+    real_scan = _scanner.scan
+    deleted = {}
+
+    def deleting_scan(*args, **kwargs):
+        # scan() first (writes the row with file_hash=NULL for the
+        # zero-byte file), THEN the mount file disappears — mirrors an
+        # SMB share dropping the file between scan and the stamping
+        # loop. The pre-fix stamping loop skipped the mount re-read
+        # for zero-byte-on-both-sides and would have stamped ok over a
+        # missing archive file.
+        result = real_scan(*args, **kwargs)
+        if not deleted and adopted_dest_path.exists():
+            adopted_dest_path.unlink()
+            deleted["done"] = True
+        return result
+
+    monkeypatch.setattr(_scanner, "scan", deleting_scan)
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    runner = FakeRunner()
+    result = run_import_job(
+        _make_job(), runner, db_path, db._active_workspace_id,
+        ImportParams(
+            sources=[str(card)], destination=ra["mount_base"],
+            remote_target=ra, verify_by_hash=True,
+            skip_duplicates=False,
+        ),
+    )
+    obs = _behavior_observables(result, runner, db, ra["mount_base"])
+
+    assert deleted, "the scan wrapper never saw the adopted file"
+    # Rolled back exactly once (0, never -1) and reported as failed.
+    assert obs["skipped_duplicate"] == 0, obs
+    assert obs["failed"] == 1, obs
+    assert obs["safe_to_format"] is False, obs
+    dest_key = str(adopted_dest_path)
+    reasons = {p: r for p, r in obs["unsafe"]}
+    assert dest_key in reasons, obs["unsafe"]
+    assert "scan wrote no mount row hash" in reasons[dest_key], reasons
+
+
 def test_local_renamed_twin_of_accepted_duplicate_current_behavior(
         tmp_path, monkeypatch):
     """CHARACTERIZATION for spec decision 5 (local half). The local path

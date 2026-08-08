@@ -123,7 +123,13 @@ def classify_source_files(source, recursive=True, onerror=None):
         entries = safe_iter_dir(str(source_path), onerror=onerror)
     candidates, ignored = [], []
     for f in entries:
-        if not f.is_file():
+        # Symlinks resolve to bytes stored elsewhere. If we followed one
+        # (Path.is_file does), the size/hash recorded here would be the
+        # target's, but os.remove(path) unlinks only the link — no card
+        # space is reclaimed and delete_verified would credit the
+        # target's full size as "deleted bytes". Reject at classification
+        # so a symlink can never enter the deletable set.
+        if f.is_symlink() or not f.is_file():
             continue
         if (f.suffix.lower() in SUPPORTED_EXTENSIONS
                 and not f.name.startswith(".")):

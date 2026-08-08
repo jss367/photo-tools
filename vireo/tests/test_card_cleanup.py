@@ -251,6 +251,33 @@ def test_classify_parity_with_discover_source_files(tmp_path):
         str(card), file_types="both", recursive=False)
 
 
+def test_classify_rejects_symlinks(tmp_path):
+    # Codex P2: Path.is_file() follows symlinks, so a symlink to a real
+    # photo would be classified as deletable — hashed for the target's
+    # size, then os.remove would unlink only the link. delete_verified
+    # would then credit the target's full size as "deleted bytes" even
+    # though no card space is reclaimed and the actual photo still
+    # exists. Symlinks must not enter the deletable set.
+    card = tmp_path / "card"
+    card.mkdir()
+    real = tmp_path / "elsewhere" / "IMG_0001.NEF"
+    real.parent.mkdir()
+    real.write_bytes(b"raw-one")
+    link = card / "IMG_LINK.NEF"
+    try:
+        os.symlink(str(real), str(link))
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks unsupported on this filesystem")
+    # Non-symlink control so we know classification is still running.
+    (card / "IMG_REAL.NEF").write_bytes(b"raw-two")
+    candidates, ignored = classify_source_files(str(card))
+    cand_names = {p.name for p in candidates}
+    ign_names = {p.name for p in ignored}
+    assert "IMG_LINK.NEF" not in cand_names
+    assert "IMG_LINK.NEF" not in ign_names
+    assert cand_names == {"IMG_REAL.NEF"}
+
+
 def test_classify_missing_source_reports_onerror(tmp_path):
     errors = []
     candidates, ignored = classify_source_files(

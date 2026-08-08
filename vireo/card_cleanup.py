@@ -254,6 +254,8 @@ SKIP_CHANGED = "changed on the card since the scan"
 SKIP_CONTENT_CHANGED = "content changed on the card since the scan"
 SKIP_OUTSIDE_SOURCE = "path no longer resolves inside the scanned source"
 SKIP_SYMLINK = "path is now a symlink — refuses to follow at delete time"
+SKIP_NOT_REGULAR = (
+    "path is not a regular file — refuses to open at delete time")
 
 
 def qualify_rows(rows, source_root_real, card_path, contains_check=None):
@@ -484,6 +486,17 @@ def delete_verified(db, manifest, progress_cb=None, should_cancel=None):
             summary["skipped"].append(
                 {"path": path, "reason": SKIP_SYMLINK})
             continue
+        # Codex P2: not just symlinks — any non-regular replacement must
+        # be rejected BEFORE compute_file_hash. A scanned zero-byte photo
+        # replaced by a FIFO (or socket/device) with size 0 and mtime
+        # forced back to the manifest value would pass the S_ISLNK reject
+        # and the size/mtime check, then compute_file_hash would block
+        # forever opening the pipe — cancellation is checked only at file
+        # boundaries, so the delete job hangs.
+        if not stat_mod.S_ISREG(st.st_mode):
+            summary["skipped"].append(
+                {"path": path, "reason": SKIP_NOT_REGULAR})
+            continue
         if (st.st_size != entry["size"]
                 or st.st_mtime_ns != entry["mtime_ns"]):
             summary["skipped"].append(
@@ -566,6 +579,15 @@ def delete_verified(db, manifest, progress_cb=None, should_cancel=None):
         if stat_mod.S_ISLNK(st2.st_mode):
             summary["skipped"].append(
                 {"path": path, "reason": SKIP_SYMLINK})
+            continue
+        # Codex P2 (mirror of gate 1): a swap for a FIFO/socket/device
+        # after the final hash would pass the S_ISLNK reject and the
+        # dev/inode baseline (a new inode fails that check anyway), but
+        # defence-in-depth: keep both gates identical so an added
+        # code path can't relax one without the other.
+        if not stat_mod.S_ISREG(st2.st_mode):
+            summary["skipped"].append(
+                {"path": path, "reason": SKIP_NOT_REGULAR})
             continue
         if ((st2.st_dev, st2.st_ino) != (st.st_dev, st.st_ino)
                 or st2.st_size != entry["size"]

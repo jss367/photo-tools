@@ -4,6 +4,7 @@ docs/superpowers/specs/2026-08-07-card-cleanup-design.md
 """
 import os
 import shutil
+import stat
 import unittest.mock
 from datetime import UTC, datetime, timedelta
 
@@ -936,6 +937,56 @@ def test_delete_skips_when_card_path_becomes_symlink_post_scan(db, tmp_path):
     # tool refused to operate on a link it never classified.
     assert card.is_symlink()
     assert target.exists() and target.read_bytes() == b"raw-one"
+
+
+def test_delete_skips_when_card_path_becomes_fifo_post_scan(
+        db, tmp_path, monkeypatch):
+    # Codex P2: rejecting only symlinks at the delete gate leaves other
+    # non-regular replacements open. A scanned zero-byte photo swapped
+    # for a FIFO whose mtime is forced back to the manifest value passes
+    # the S_ISLNK reject and the size/mtime check; compute_file_hash
+    # then blocks forever opening the pipe, and cancellation is checked
+    # only at file boundaries, so the whole delete job hangs. Both lstat
+    # gates must reject any non-regular file BEFORE the hash open.
+    if not hasattr(os, "mkfifo"):
+        pytest.skip("mkfifo unsupported on this platform")
+    _archive_photo(db, tmp_path, content=b"")
+    card = _card_file(tmp_path, content=b"")
+    scan = _scan(db, tmp_path)
+    assert scan["totals"]["deletable"]["count"] == 1
+    manifest = load_manifest(str(tmp_path / "manifests"), "scan-1")
+    entry = next(e for e in manifest["entries"] if e["bucket"] == "deletable")
+
+    os.unlink(card)
+    try:
+        os.mkfifo(str(card))
+    except OSError:
+        pytest.skip("mkfifo unsupported on this filesystem")
+    os.utime(card, ns=(entry["mtime_ns"], entry["mtime_ns"]))
+
+    # compute_file_hash on a FIFO would block on open indefinitely. Prove
+    # the gate rejects the replacement BEFORE any hash call happens.
+    hash_calls = []
+    real_hash = card_cleanup.compute_file_hash
+
+    def guarded_hash(path, *a, **kw):
+        hash_calls.append(path)
+        raise AssertionError(
+            "compute_file_hash must not be called on a non-regular replacement")
+
+    monkeypatch.setattr(card_cleanup, "compute_file_hash", guarded_hash)
+    try:
+        summary = card_cleanup.delete_verified(db, manifest)
+    finally:
+        monkeypatch.setattr(card_cleanup, "compute_file_hash", real_hash)
+
+    assert hash_calls == []
+    assert summary["deleted"] == 0
+    assert summary["deleted_bytes"] == 0
+    assert len(summary["skipped"]) == 1
+    assert summary["skipped"][0]["reason"] == card_cleanup.SKIP_NOT_REGULAR
+    # The FIFO is left untouched — the tool refused to operate on it.
+    assert stat.S_ISFIFO(os.lstat(card).st_mode)
 
 
 def test_delete_skips_when_archive_dies_during_final_hash(db, tmp_path):

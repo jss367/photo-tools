@@ -256,15 +256,24 @@ SKIP_OUTSIDE_SOURCE = "path no longer resolves inside the scanned source"
 SKIP_SYMLINK = "path is now a symlink — refuses to follow at delete time"
 
 
-def qualify_rows(rows, source_root_real, card_path):
+def qualify_rows(rows, source_root_real, card_path, contains_check=None):
     """Archive-side test from the spec's safety invariant.
 
     Returns (archive_path, None) for the first row that passes, else
     (None, keep_reason). The archive stat happens HERE, fresh, on every
     call — callers may cache rows, never this function's result.
+
+    ``contains_check`` is an optional bound containment predicate from
+    ``path_guard.make_case_folded_check(source_root_real)`` — the
+    scan/delete loops pass one so per-file catalog work does not reprobe
+    the source filesystem on every candidate. Single-shot callers can
+    omit it; the fallback matches the plain ``contains_resolved`` call.
     """
     if not rows:
         return None, KEEP_NOT_IN_CATALOG
+    if contains_check is None:
+        def contains_check(child_real):
+            return path_guard.contains_resolved(source_root_real, child_real)
     reason = KEEP_NOT_VERIFIED
     try:
         card_st = os.stat(card_path)
@@ -284,7 +293,7 @@ def qualify_rows(rows, source_root_real, card_path):
             # (which would be silently wrong) or crash the whole job.
             reason = KEEP_ARCHIVE_UNREACHABLE
             continue
-        if path_guard.contains_resolved(source_root_real, archive_real):
+        if contains_check(archive_real):
             reason = KEEP_INSIDE_SOURCE
             continue
         try:
@@ -342,6 +351,7 @@ def _load_catalog_by_hash(db):
 def scan_card(db, source, recursive, manifest_dir, scan_job_id,
               progress_cb=None, should_cancel=None):
     source_root_real = os.path.realpath(source)
+    contains_check = path_guard.make_case_folded_check(source_root_real)
     walk_errors = []
     candidates, ignored = classify_source_files(
         source, recursive=recursive,
@@ -388,7 +398,8 @@ def scan_card(db, source, recursive, manifest_dir, scan_job_id,
             "mtime_ns": st.st_mtime_ns, "hash": file_hash,
         }
         archive_path, reason = qualify_rows(
-            by_hash.get(file_hash, []), source_root_real, str(f))
+            by_hash.get(file_hash, []), source_root_real, str(f),
+            contains_check)
         if archive_path is not None:
             entry.update(bucket="deletable", archive_path=archive_path)
             totals["deletable"]["count"] += 1
@@ -427,6 +438,7 @@ def delete_verified(db, manifest, progress_cb=None, should_cancel=None):
     not a supported input.
     """
     source_root_real = os.path.realpath(manifest["source_root"])
+    contains_check = path_guard.make_case_folded_check(source_root_real)
     deletable = [e for e in manifest["entries"]
                  if e.get("bucket") == "deletable"]
     summary = {
@@ -486,7 +498,8 @@ def delete_verified(db, manifest, progress_cb=None, should_cancel=None):
         # self-evidently correct without needing to trace back to that
         # check.
         archive_path, reason = qualify_rows(
-            fetch_rows_by_hash(db, current_hash), source_root_real, path)
+            fetch_rows_by_hash(db, current_hash), source_root_real, path,
+            contains_check)
         if archive_path is None:
             summary["skipped"].append({"path": path, "reason": reason})
             continue
@@ -506,8 +519,7 @@ def delete_verified(db, manifest, progress_cb=None, should_cancel=None):
         # re-proven at deletion time. Residual race (swap between these
         # checks and the unlink) is microseconds; full immunity would
         # need dir_fd/O_NOFOLLOW traversal, out of proportion here.
-        if not path_guard.contains_resolved(
-                source_root_real, os.path.realpath(path)):
+        if not contains_check(os.path.realpath(path)):
             summary["skipped"].append(
                 {"path": path, "reason": SKIP_OUTSIDE_SOURCE})
             continue

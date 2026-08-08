@@ -8,7 +8,12 @@ import os
 import sys
 
 import pytest
-from path_guard import contains_resolved, fs_is_case_insensitive, path_contains
+from path_guard import (
+    contains_resolved,
+    fs_is_case_insensitive,
+    make_case_folded_check,
+    path_contains,
+)
 
 
 def test_contains_equal_and_nested(tmp_path):
@@ -119,6 +124,43 @@ def test_probe_caches_only_the_strict_result(tmp_path, monkeypatch):
     assert pg.fs_is_case_insensitive(str(root)) is True
     assert pg.fs_is_case_insensitive(str(root)) is True
     assert len(calls) == 1  # strict result served from cache
+
+
+def test_make_case_folded_check_probes_once(tmp_path, monkeypatch):
+    # Tight-loop consumers (scan/delete) call the containment check
+    # thousands of times per run. contains_resolved reprobes the root's
+    # filesystem for every False result (the module cache stores only
+    # True), so the bound helper must lift the probe to once per run.
+    import path_guard as pg
+    root = tmp_path / "BoundCheck"
+    root.mkdir()
+    (root / "photos").mkdir()
+    pg._probe_cache.clear()
+    probe_calls = []
+
+    def counting_probe(path):
+        probe_calls.append(str(path))
+        # Return False so the module cache never intercepts a repeat.
+        return False
+
+    monkeypatch.setattr(pg, "_probe_uncached", counting_probe)
+    check = make_case_folded_check(str(root))
+    for _ in range(10):
+        check(str(root / "photos" / "IMG.NEF"))
+    assert len(probe_calls) == 1
+
+
+def test_make_case_folded_check_agrees_with_contains_resolved(tmp_path):
+    # Behavioral parity with the plain call — the bound helper must
+    # decide the same containment for the same inputs.
+    root = tmp_path / "card"
+    root.mkdir()
+    root_real = os.path.realpath(str(root))
+    check = make_case_folded_check(root_real)
+    child_inside = os.path.realpath(str(root / "DCIM" / "IMG.NEF"))
+    child_outside = os.path.realpath(str(tmp_path / "elsewhere" / "x"))
+    assert check(child_inside) == contains_resolved(root_real, child_inside)
+    assert check(child_outside) == contains_resolved(root_real, child_outside)
 
 
 def test_probe_never_caches_case_sensitive(tmp_path, monkeypatch):

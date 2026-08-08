@@ -129,6 +129,13 @@ def contains_resolved(root_real, child_real):
     Both arguments must already be realpath'd. Case sensitivity is
     decided per root: unconditional case-fold on darwin/win32; on Linux,
     probe the root's actual filesystem.
+
+    Single-shot; per-file loops against the same root should use
+    ``make_case_folded_check`` instead — this call reprobes the root's
+    filesystem on Linux when the result would be False (case-sensitive
+    results are deliberately not cached; see the module cache comment
+    above), which turns a scan of N card files into Θ(N) uncached
+    listdirs on top of the O(N) real work.
     """
     if is_case_insensitive_platform() or fs_is_case_insensitive(root_real):
         root_cmp = root_real.casefold().rstrip(os.sep)
@@ -137,6 +144,31 @@ def contains_resolved(root_real, child_real):
         root_cmp = root_real.rstrip(os.sep)
         child_cmp = child_real
     return child_cmp == root_cmp or child_cmp.startswith(root_cmp + os.sep)
+
+
+def make_case_folded_check(root_real):
+    """Bind ``root_real`` and pre-decide case sensitivity once.
+
+    ``contains_resolved`` reprobes the root's filesystem on Linux for
+    every call whose answer would be False (the module cache stores only
+    the strict True result, and only True — see the ``_probe_cache``
+    comment above), so a scan or delete that calls it per catalog row per
+    card file walks each directory once per row. Binding at the top of
+    the run collapses that to one probe and also sidesteps the module
+    cache's remount blind spot: the probe runs fresh every scan/delete.
+    """
+    case_insensitive = (
+        is_case_insensitive_platform() or fs_is_case_insensitive(root_real))
+    if case_insensitive:
+        root_cmp = root_real.casefold().rstrip(os.sep)
+    else:
+        root_cmp = root_real.rstrip(os.sep)
+
+    def check(child_real):
+        child_cmp = child_real.casefold() if case_insensitive else child_real
+        return (child_cmp == root_cmp
+                or child_cmp.startswith(root_cmp + os.sep))
+    return check
 
 
 def path_contains(root, child):

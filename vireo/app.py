@@ -1725,6 +1725,41 @@ def _network_volume_roots(run=subprocess.run):
     }
 
 
+def _network_root_reachable(root, timeout=_MOUNT_QUERY_TIMEOUT_SECS,
+                             run=subprocess.run):
+    """Bounded, out-of-process reachability probe for a mounted network root.
+
+    ``mount`` listing a share and Finder reporting a file's absence are
+    not sufficient signals that the underlying server is actually reachable:
+    an SMB mount can remain in the kernel mount table while its server is
+    unreachable, and Finder's ``exists`` query can then return false from
+    cached parent metadata even though the photo will reappear on
+    reconnect. Repeating the same Finder query does not detect this — it
+    reuses the same cache. A ``stat`` on the mount root in a bounded
+    subprocess is an *independent* signal: it does not touch Finder, and
+    the subprocess is killed on timeout so an unresponsive share cannot
+    hang the caller.
+
+    Returns ``True`` only when ``stat`` completed in time and reported the
+    root as a directory. Any other outcome (timeout, non-zero exit, error)
+    is treated as unreachable so the caller fails closed.
+    """
+    if sys.platform != "darwin":
+        return False
+    try:
+        result = run(
+            ["/usr/bin/stat", "-f", "%HT", root],
+            capture_output=True, text=True,
+            timeout=timeout,
+            **no_window_kwargs(),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    if result.returncode != 0:
+        return False
+    return (result.stdout or "").strip() == "Directory"
+
+
 def _expand_first_symlink_prefix(filepath):
     """Expand one local symlink prefix without resolving its target.
 
@@ -2094,7 +2129,8 @@ def _path_confirmed_gone(filepath, expected_parent_dev=None):
     )
 
 
-def _trash_paths(filepaths, progress_callback=None, already_missing_out=None):
+def _trash_paths(filepaths, progress_callback=None, already_missing_out=None,
+                 network_roots=None):
     """Move paths to Trash and return ``(moved, successful, failures)``.
 
     Missing paths are successful (the requested end state already holds) but
@@ -2112,6 +2148,15 @@ def _trash_paths(filepaths, progress_callback=None, already_missing_out=None):
     "already missing" rather than as trashed, so a duplicate-cleanup that
     finds every loser already gone can return an explicit terminal
     result instead of a silent ``{trashed: 0}``.
+
+    ``network_roots`` lets a caller reuse a mount-table classification it
+    already performed. Without it we re-query ``_network_volume_roots()``,
+    but if that second query times out or fails the helper would only fall
+    back to ``/Volumes`` paths — silently reclassifying an already-known
+    custom mount point (``/Users/me/mnt/photos``) as local, which is the
+    exact case we routed through Finder in the first place. Endpoints that
+    stat the mount table before calling us should pass the successful
+    result through so the classification cannot be lost.
     """
     ordered = list(dict.fromkeys(filepaths))
     successful = set()
@@ -2121,7 +2166,8 @@ def _trash_paths(filepaths, progress_callback=None, already_missing_out=None):
     finder_candidates = []
     network_finder_candidates = set()
     send_errors = {}
-    network_roots = _network_volume_roots()
+    if network_roots is None:
+        network_roots = _network_volume_roots()
     processed = set()
 
     def report_processed(filepath):
@@ -2214,7 +2260,8 @@ def _trash_paths(filepaths, progress_callback=None, already_missing_out=None):
                     report_processed(filepath)
 
     def _finder_missing_is_trustworthy(
-        filepath, current_network_roots, confirmed_network_missing,
+        filepath, current_network_roots, reachable_network_roots,
+        confirmed_network_missing,
     ):
         """Reject Finder's "missing" outcome when the underlying mount is gone.
 
@@ -2225,15 +2272,20 @@ def _trash_paths(filepaths, progress_callback=None, already_missing_out=None):
         silently detached mount. Accepting "missing" in that case would
         prune the catalog row for a photo that reappears on remount.
 
-        For network-classified paths we require the mount table (already
-        re-queried once per Finder batch by the caller and passed in via
-        ``current_network_roots``) to still list a root the path resolves
-        into. Doing the recheck per batch instead of per path stops a
-        single retry of many already-moved paths from spawning up to one
-        ``mount`` subprocess per path — a 20-item batch could otherwise
-        wait up to ``_MOUNT_QUERY_TIMEOUT_SECS`` × 20 seconds in the worst
-        case. For local fallbacks we reuse the parent-device snapshot
-        check that guards the send2trash path already.
+        For network-classified paths we require three independent signals:
+        (1) the mount table (already re-queried once per Finder batch by
+        the caller and passed in via ``current_network_roots``) still
+        lists a root the path resolves into; (2) an out-of-process
+        ``stat`` probe on that root — separate from Finder's cache —
+        actually responds within its bounded timeout, so a still-listed
+        but unreachable SMB server cannot masquerade as "empty"; and (3)
+        Finder's second-look ``exists`` query also confirmed the path as
+        missing. Doing the mount recheck and reachability probes per
+        batch instead of per path keeps the worst-case cost bounded — a
+        20-item retry of already-moved paths would otherwise spawn one
+        ``mount`` (or ``stat``) subprocess per path. For local fallbacks
+        we reuse the parent-device snapshot check that guards the
+        send2trash path already.
         """
         if filepath in network_finder_candidates:
             if current_network_roots is None:
@@ -2241,10 +2293,16 @@ def _trash_paths(filepaths, progress_callback=None, already_missing_out=None):
                 # confirm the volume is still mounted, so refuse to trust
                 # "missing" and let the caller retry.
                 return False
-            return (
-                _path_on_network_volume(filepath, current_network_roots)
-                and filepath in confirmed_network_missing
-            )
+            if not _path_on_network_volume(filepath, current_network_roots):
+                return False
+            if filepath not in confirmed_network_missing:
+                return False
+            # An independent reachability signal that does not share
+            # Finder's exists-cache: if the mount root itself does not
+            # respond to a bounded out-of-process stat, treat "missing"
+            # as a false negative from an unreachable server rather than
+            # as evidence the photo is gone.
+            return _path_on_network_volume(filepath, reachable_network_roots)
         return _path_confirmed_gone(filepath, parent_devs.get(filepath))
 
     for finder_batch in _chunked(
@@ -2269,6 +2327,11 @@ def _trash_paths(filepaths, progress_callback=None, already_missing_out=None):
             batch_network_roots = (
                 _network_volume_roots() if batch_network_missing else None
             )
+            # Probe each still-relevant mount root with a bounded
+            # out-of-process ``stat`` — a signal independent of Finder's
+            # exists-cache — so a still-listed but unreachable SMB server
+            # cannot make ``missing`` outcomes look legitimate.
+            reachable_network_roots = set()
             confirmed_network_missing = set()
             finder_recheck_errors = set()
             if batch_network_missing and batch_network_roots is not None:
@@ -2277,6 +2340,21 @@ def _trash_paths(filepaths, progress_callback=None, already_missing_out=None):
                     if path in network_finder_candidates
                     and _path_on_network_volume(path, batch_network_roots)
                 }
+                relevant_roots = set()
+                for path in paths_still_on_network:
+                    normalized = os.path.normpath(os.path.abspath(path))
+                    for root in batch_network_roots:
+                        try:
+                            if os.path.commonpath(
+                                (normalized, root)
+                            ) == root:
+                                relevant_roots.add(root)
+                                break
+                        except ValueError:
+                            continue
+                for root in relevant_roots:
+                    if _network_root_reachable(root):
+                        reachable_network_roots.add(root)
                 if paths_still_on_network:
                     try:
                         (
@@ -2307,6 +2385,7 @@ def _trash_paths(filepaths, progress_callback=None, already_missing_out=None):
             for missing_path in finder_missing_paths:
                 if _finder_missing_is_trustworthy(
                     missing_path, batch_network_roots,
+                    reachable_network_roots,
                     confirmed_network_missing,
                 ):
                     successful.add(missing_path)
@@ -22433,9 +22512,16 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         # already surfaces "file already missing" and the network branch
         # must match so cleanup is a terminal state either way.
         already_missing_paths = set()
+        # Reuse the mount-table snapshot we already took at line 22392.
+        # ``_trash_paths`` would otherwise re-query it, and if that second
+        # query times out or fails it can only fall back to ``/Volumes``
+        # paths — silently reclassifying custom-mount shares (already
+        # correctly categorised here) as local and reintroducing the
+        # unbounded-I/O hang this routing exists to prevent.
         trashed, successful_paths, trash_failures = _trash_paths(
             [filepath for _pid, filepath in trash_candidates],
             already_missing_out=already_missing_paths,
+            network_roots=network_roots,
         )
         failure_by_path = {
             failure["path"]: failure for failure in trash_failures

@@ -359,11 +359,48 @@ def test_scan_null_hash_status_kept_with_audit_remedy(db, tmp_path):
     assert "integrity audit" in kept[0]["reason"]
 
 
-def test_scan_failed_hash_status_kept_with_audit_remedy(db, tmp_path):
+def test_scan_failed_hash_status_kept_but_not_audit_remedy(db, tmp_path):
     # hash_status is a non-ok STRING (a prior verify run flagged the file),
     # not NULL — must be kept exactly like the null/unverified case, not
-    # mistaken for "ok" by a truthy/None-only check.
-    _archive_photo(db, tmp_path, hash_status="failed")
+    # mistaken for "ok" by a truthy/None-only check. Distinct from the
+    # NULL case: re-running verification would just reproduce the same
+    # bad verdict, so the reason must NOT point at the integrity audit
+    # (Codex P2 review) — the callout keys off that phrase and would
+    # otherwise ask the user to re-verify a file it can't help.
+    _archive_photo(db, tmp_path, hash_status="modified")
+    _card_file(tmp_path)
+    result = _scan(db, tmp_path)
+    kept = _entries(result, "kept")
+    assert len(kept) == 1
+    assert "integrity audit" not in kept[0]["reason"]
+    assert "failed" in kept[0]["reason"]
+    assert "Audit page" in kept[0]["reason"]
+
+
+@pytest.mark.parametrize("bad_status", ["modified", "corrupt", "unreadable"])
+def test_scan_specific_failed_hash_statuses_all_kept_with_failed_reason(
+        db, tmp_path, bad_status):
+    # All three real failed-verdict values from verify_hashes should route
+    # to KEEP_ARCHIVE_HASH_FAILED, not KEEP_NOT_VERIFIED — the audit page
+    # is the remedy for each, not another verify run.
+    _archive_photo(db, tmp_path, hash_status=bad_status)
+    _card_file(tmp_path)
+    result = _scan(db, tmp_path)
+    kept = _entries(result, "kept")
+    assert len(kept) == 1
+    assert kept[0]["reason"] == card_cleanup.KEEP_ARCHIVE_HASH_FAILED
+
+
+def test_scan_mixed_null_and_failed_prefers_audit_remedy(db, tmp_path):
+    # Two archive rows share a card file's hash — one never checked, one
+    # already flagged. The NULL row is remediable by a verify run (its
+    # verdict could turn "ok"), so the reason must stay on the audit
+    # remedy; a failed row alongside it must not silently downgrade the
+    # message to "see the Audit page" and lose the offer to verify.
+    _archive_photo(db, tmp_path, name="IMG_A.NEF", content=b"raw-one",
+                   hash_status=None, folder="archive/2026/a")
+    _archive_photo(db, tmp_path, name="IMG_B.NEF", content=b"raw-one",
+                   hash_status="modified", folder="archive/2026/b")
     _card_file(tmp_path)
     result = _scan(db, tmp_path)
     kept = _entries(result, "kept")

@@ -424,3 +424,19 @@ def test_audit_callout_reason_stays_in_sync(app_and_db):
     assert matched in card_cleanup.KEEP_NOT_VERIFIED
     body = app.test_client().get("/card-cleanup").get_data(as_text=True)
     assert f"CARD_CLEANUP_AUDIT_REASON = '{matched}'" in body
+
+
+def test_hash_failed_callout_reason_stays_in_sync(app_and_db):
+    """The hash-failed callout has the same shape of coupling as the
+    audit callout (Codex P2 review): the page filters kept entries by a
+    tail of KEEP_ARCHIVE_HASH_FAILED. Pin both ends so a reword on either
+    side stops silently. Also assert the two literals do NOT overlap —
+    if they did, a KEEP_ARCHIVE_HASH_FAILED entry would count toward the
+    audit callout and get double-remediated."""
+    app, _ = app_and_db
+    matched = "see the Audit page"
+    assert matched in card_cleanup.KEEP_ARCHIVE_HASH_FAILED
+    body = app.test_client().get("/card-cleanup").get_data(as_text=True)
+    assert f"CARD_CLEANUP_HASH_FAILED_REASON = '{matched}'" in body
+    assert matched not in card_cleanup.KEEP_NOT_VERIFIED
+    assert "run the integrity audit" not in card_cleanup.KEEP_ARCHIVE_HASH_FAILED

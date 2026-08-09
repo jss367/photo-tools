@@ -167,6 +167,15 @@ body { display: flex; flex-direction: column; height: 100vh; }
           </div>
           <div class="hint" id="card-cleanup-audit-status" style="margin-top:6px;"></div>
         </div>
+        <!-- Shown when kept entries are held back because their archive
+             copies failed a prior integrity check. Distinct from the
+             audit callout above: re-running verify would just reproduce
+             the same failed verdict, so this points at the Audit page
+             (accept/restore) instead of offering a verify button. -->
+        <div class="card-cleanup-audit" id="card-cleanup-hash-failed"
+             style="display:none;">
+          <div id="card-cleanup-hash-failed-text"></div>
+        </div>
         <details class="card-cleanup-bucket" id="card-cleanup-deletable-details">
           <summary id="card-cleanup-deletable-summary"></summary>
           <ul class="staging-details" id="card-cleanup-deletable-list"></ul>
@@ -304,6 +313,12 @@ function cardCleanupSetBusy(running, opts) {
 // card_cleanup.KEEP_NOT_VERIFIED — matched on the distinctive tail so a
 // reason with extra detail appended still counts.
 const CARD_CLEANUP_AUDIT_REASON = 'run the integrity audit';
+// The manifest reason that this page's hash-failed callout answers.
+// Mirrors card_cleanup.KEEP_ARCHIVE_HASH_FAILED — kept distinct from
+// CARD_CLEANUP_AUDIT_REASON so a check-failed row cannot pretend to be a
+// never-checked one and get double-counted (or vice versa). Same tail
+// match as above; test_hash_failed_callout_reason_stays_in_sync pins it.
+const CARD_CLEANUP_HASH_FAILED_REASON = 'see the Audit page';
 
 function formatBytes(n) {
   n = Number(n || 0);
@@ -715,6 +730,7 @@ function cardCleanupRenderManifest(manifest) {
     ' ignored (not photo files Vireo imports)';
 
   cardCleanupRenderAuditCallout(manifest);
+  cardCleanupRenderHashFailedCallout(manifest);
 
   cardCleanupBindBucket('deletable', 'card-cleanup-deletable-details',
     'card-cleanup-deletable-list');
@@ -776,6 +792,36 @@ function cardCleanupRenderAuditCallout(manifest) {
   document.getElementById('card-cleanup-audit-btn').disabled = false;
   document.getElementById('card-cleanup-audit-rescan-btn').style.display = 'none';
   document.getElementById('card-cleanup-audit-status').textContent = '';
+  callout.style.display = '';
+}
+
+/* ---------- Hash-failed affordance ----------
+   Kept entries whose archive copies were checked and came back
+   modified/corrupt/unreadable. They look like unverified rows to a
+   casual read of the kept list but re-running verification would just
+   reproduce the same bad verdict — the remedy is on the Audit page. */
+function cardCleanupHashFailedCount(manifest) {
+  return (manifest.entries || []).filter(entry =>
+    entry.bucket === 'kept'
+    && String(entry.reason || '').indexOf(
+        CARD_CLEANUP_HASH_FAILED_REASON) !== -1
+  ).length;
+}
+
+function cardCleanupRenderHashFailedCallout(manifest) {
+  const callout = document.getElementById('card-cleanup-hash-failed');
+  const failed = cardCleanupHashFailedCount(manifest);
+  if (!failed) {
+    callout.style.display = 'none';
+    return;
+  }
+  document.getElementById('card-cleanup-hash-failed-text').textContent =
+    cardCleanupFileCount(failed) +
+    (failed === 1 ? ' is' : ' are') +
+    ' kept because the archive copy has already failed an integrity ' +
+    'check (modified, corrupt, or unreadable). Re-running verification ' +
+    'would only reproduce that verdict — open the Audit page to accept ' +
+    'the current bytes, restore from backup, or investigate.';
   callout.style.display = '';
 }
 
@@ -925,6 +971,7 @@ function cardCleanupResetPreview() {
   document.getElementById('card-cleanup-preview').style.display = 'none';
   document.getElementById('card-cleanup-incomplete').style.display = 'none';
   document.getElementById('card-cleanup-audit').style.display = 'none';
+  document.getElementById('card-cleanup-hash-failed').style.display = 'none';
   const deleteBtn = document.getElementById('card-cleanup-delete-btn');
   deleteBtn.disabled = true;
   document.getElementById('card-cleanup-delete-hint').textContent = '';

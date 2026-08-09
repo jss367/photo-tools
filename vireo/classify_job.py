@@ -213,7 +213,9 @@ def _load_labels(
     return labels, use_tol
 
 
-def _record_labels_fingerprint(db, fingerprint, labels, sources):
+def _record_labels_fingerprint(
+    db, fingerprint, labels, sources, full_fingerprint=None,
+):
     """Populate the labels_fingerprints sidecar. Cosmetic — powers UX lookups."""
     display = ", ".join(os.path.basename(s) for s in (sources or [])) or None
     db.upsert_labels_fingerprint(
@@ -221,6 +223,7 @@ def _record_labels_fingerprint(db, fingerprint, labels, sources):
         display_name=display,
         sources=sources,
         label_count=len(labels or []),
+        full_fingerprint=full_fingerprint,
     )
 
 
@@ -480,9 +483,63 @@ def _detect_batch(photos, folders, runner, job, reclassify, db,
             # matching detector_runs row, or the reverse for empty scenes).
             # Failures from `detect_animals` were handled by the ``is None``
             # early-continue above and must not poison the skip set.
+            detector_runtime = job.get("_detector_runtime_fingerprint") or "legacy"
+            portable_input = None
+            portable_photo_hash = None
+            if detector_runtime != "legacy":
+                identity_row = db.conn.execute(
+                    "SELECT file_hash, companion_path FROM photos WHERE id = ?",
+                    (photo["id"],),
+                ).fetchone()
+                if (
+                    identity_row is not None
+                    and not identity_row["companion_path"]
+                ):
+                    try:
+                        from computation_cache import source_input
+
+                        portable_photo_hash = identity_row["file_hash"]
+                        _input_block, portable_input = source_input(
+                            portable_photo_hash, "vireo-detector-source-v1",
+                        )
+                    except (TypeError, ValueError):
+                        portable_input = None
+                        portable_photo_hash = None
             det_ids = db.write_detection_batch(
                 photo["id"], "megadetector-v6", detections,
+                runtime_fingerprint=detector_runtime,
+                input_fingerprint=portable_input,
+                force_runtime_replace=reclassify,
             )
+
+            # Publication follows the database commit.  A store failure must
+            # never turn successful inference into a failed detector run.
+            if portable_input is not None:
+                try:
+                    from computation_cache import publish_detection_artifact
+
+                    normalized_detections = [{
+                        "box": {
+                            "x": row["box_x"], "y": row["box_y"],
+                            "w": row["box_w"], "h": row["box_h"],
+                        },
+                        "confidence": row["detector_confidence"],
+                        "category": row["category"],
+                    } for row in db.get_detections(
+                        photo["id"], min_conf=0,
+                        detector_model="megadetector-v6",
+                    )]
+                    publish_detection_artifact(
+                        portable_photo_hash,
+                        "megadetector-v6",
+                        detector_runtime,
+                        normalized_detections,
+                    )
+                except Exception:
+                    log.warning(
+                        "Could not publish portable detector result for photo %s",
+                        photo["id"], exc_info=True,
+                    )
 
             if detections:
                 detected += 1
@@ -621,9 +678,24 @@ def _detect_subjects(photos, folders, runner, job, reclassify, db):
     # Resolve cached-detection state before running MegaDetector so we can skip
     # the weight download entirely when every photo already has a detector_runs
     # row (including empty-scene rows with box_count=0).
+    detector_runtime = None
+    if not reclassify:
+        try:
+            from computation_cache import megadetector_runtime_fingerprint
+
+            detector_runtime = megadetector_runtime_fingerprint()
+        except (OSError, ValueError):
+            detector_runtime = None
     already_detected_ids = (
-        db.get_detector_run_photo_ids("megadetector-v6") if not reclassify else set()
+        db.get_detector_run_photo_ids(
+            "megadetector-v6", runtime_fingerprint=detector_runtime,
+        )
+        if not reclassify and detector_runtime is not None
+        else db.get_detector_run_photo_ids("megadetector-v6")
+        if not reclassify
+        else set()
     )
+    job["_detector_runtime_fingerprint"] = detector_runtime
 
     # Track photos whose state we mutated (clear_detections + write_detection_batch
     # in reclassify mode). Declared up here so the except handlers and early
@@ -677,7 +749,15 @@ def _detect_subjects(photos, folders, runner, job, reclassify, db):
                 job["_detect_processed_ids"] = processed_for_rebuild
                 return {}, 0
 
-            ensure_megadetector_weights(progress_callback=_dl_progress)
+            weights_path = ensure_megadetector_weights(progress_callback=_dl_progress)
+            from computation_cache import megadetector_runtime_fingerprint
+
+            detector_runtime = megadetector_runtime_fingerprint(weights_path)
+            job["_detector_runtime_fingerprint"] = detector_runtime
+            if not reclassify:
+                already_detected_ids = db.get_detector_run_photo_ids(
+                    "megadetector-v6", runtime_fingerprint=detector_runtime,
+                )
 
         runner.push_event(
             job["id"],
@@ -1048,6 +1128,28 @@ def _classify_photos(
     total = len(photos)
     batch = []
     cancelled = False
+    portable_labels_full = job.get("_labels_fingerprint_full")
+    portable_model_identity = job.get("_classifier_model_identity")
+
+    def _runtime_aware_run_keys(detection_id):
+        expected_runtime = None
+        if portable_labels_full and portable_model_identity:
+            try:
+                from computation_cache import classifier_runtime_for_detection
+
+                expected_runtime = classifier_runtime_for_detection(
+                    db,
+                    detection_id,
+                    portable_model_identity,
+                    portable_labels_full,
+                )
+            except (OSError, ValueError):
+                expected_runtime = None
+        if expected_runtime is None:
+            return db.get_classifier_run_keys(detection_id)
+        return db.get_classifier_run_keys(
+            detection_id, runtime_fingerprint=expected_runtime,
+        )
 
     start_time = time.time()
 
@@ -1152,7 +1254,7 @@ def _classify_photos(
                 # otherwise the photo is stranded until the user forces
                 # --reclassify. Fall through to re-classify instead.
                 if not reclassify:
-                    run_keys = db.get_classifier_run_keys(detection["id"])
+                    run_keys = _runtime_aware_run_keys(detection["id"])
                     if (model_name, fp) in run_keys:
                         cached = db.get_predictions_for_detection(
                             detection["id"],
@@ -1224,7 +1326,11 @@ def _classify_photos(
                 if len(batch) >= _BATCH_SIZE:
                     pre_len = len(raw_results)
                     failed += _flush_batch(batch, clf, model_type, model_name, db, raw_results, top_k=top_k)
-                    _record_batch_classifier_runs(db, batch, model_name, fp, raw_results, pre_len)
+                    _record_batch_classifier_runs(
+                        db, batch, model_name, fp, raw_results, pre_len,
+                        labels_fingerprint_full=job.get("_labels_fingerprint_full"),
+                        model_identity=job.get("_classifier_model_identity"),
+                    )
                     batch = []
         else:
             # No detections — use (or create) a full-image synthetic detection
@@ -1242,11 +1348,34 @@ def _classify_photos(
             else:
                 full_image_det = [{"box": {"x": 0, "y": 0, "w": 1, "h": 1},
                                    "confidence": 0, "category": "animal"}]
+                from computation_cache import (
+                    full_image_runtime_fingerprint,
+                    source_input,
+                )
+                full_runtime = full_image_runtime_fingerprint()
+                identity = db.conn.execute(
+                    "SELECT file_hash, companion_path FROM photos WHERE id = ?",
+                    (photo["id"],),
+                ).fetchone()
+                full_input = None
+                if identity is not None and not identity["companion_path"]:
+                    try:
+                        _block, full_input = source_input(
+                            identity["file_hash"], "vireo-detector-source-v1",
+                        )
+                    except ValueError:
+                        full_input = None
                 full_det_ids = db.save_detections(
                     photo["id"], full_image_det,
                     detector_model="full-image",
+                    runtime_fingerprint=full_runtime,
                 )
                 full_det_id = full_det_ids[0]
+                db.record_detector_run(
+                    photo["id"], "full-image", box_count=1,
+                    runtime_fingerprint=full_runtime,
+                    input_fingerprint=full_input,
+                )
             # Gate check for the synthetic full-image detection too.
             # Mirror the regular detection branch: when gated, surface the
             # cached top-1 prediction into raw_results so downstream
@@ -1254,7 +1383,7 @@ def _classify_photos(
             # reruns silently drop cached full-image photos even though
             # those photos were intentionally kept in the cache.
             if not reclassify:
-                run_keys = db.get_classifier_run_keys(full_det_id)
+                run_keys = _runtime_aware_run_keys(full_det_id)
                 if (model_name, fp) in run_keys:
                     cached = db.get_predictions_for_detection(
                         full_det_id,
@@ -1324,7 +1453,11 @@ def _classify_photos(
             if len(batch) >= _BATCH_SIZE:
                 pre_len = len(raw_results)
                 failed += _flush_batch(batch, clf, model_type, model_name, db, raw_results, top_k=top_k)
-                _record_batch_classifier_runs(db, batch, model_name, fp, raw_results, pre_len)
+                _record_batch_classifier_runs(
+                    db, batch, model_name, fp, raw_results, pre_len,
+                    labels_fingerprint_full=job.get("_labels_fingerprint_full"),
+                    model_identity=job.get("_classifier_model_identity"),
+                )
                 batch = []
 
     # Flush remaining images. The pending batch holds photos that haven't
@@ -1339,13 +1472,18 @@ def _classify_photos(
     if batch and (not cancelled or reclassify):
         pre_len = len(raw_results)
         failed += _flush_batch(batch, clf, model_type, model_name, db, raw_results, top_k=top_k)
-        _record_batch_classifier_runs(db, batch, model_name, fp, raw_results, pre_len)
+        _record_batch_classifier_runs(
+            db, batch, model_name, fp, raw_results, pre_len,
+            labels_fingerprint_full=job.get("_labels_fingerprint_full"),
+            model_identity=job.get("_classifier_model_identity"),
+        )
 
     return raw_results, failed, skipped_existing
 
 
 def _record_batch_classifier_runs(
     db, batch, model_name, labels_fingerprint, raw_results, raw_results_start=0,
+    labels_fingerprint_full=None, model_identity=None,
 ):
     """Record classifier_runs rows for every detection in ``batch``.
 
@@ -1385,7 +1523,25 @@ def _record_batch_classifier_runs(
         db.record_classifier_run(
             did, model_name, labels_fingerprint,
             prediction_count=n,
+            labels_fingerprint_full=labels_fingerprint_full,
         )
+        if labels_fingerprint_full and model_identity:
+            try:
+                from computation_cache import promote_and_publish_classifier_run
+
+                promote_and_publish_classifier_run(
+                    db,
+                    did,
+                    model_name,
+                    labels_fingerprint,
+                    labels_fingerprint_full,
+                    model_identity,
+                )
+            except Exception:
+                log.warning(
+                    "Could not publish portable classifier result for detection %s",
+                    did, exc_info=True,
+                )
 
 
 def _store_match_prediction(
@@ -2006,6 +2162,27 @@ def run_classify_job(job, runner, db_path, workspace_id, params, vireo_dir=None)
                 "failed": 0,
             }
 
+        # Photos may have been cataloged after a bundle import. Apply any
+        # matching stored objects before model resolution so their raw results
+        # participate in the ordinary database cache gates.
+        try:
+            from computation_cache import materialize_local_store
+
+            reused = (
+                materialize_local_store(thread_db)
+                if not params.reclassify else {}
+            )
+            if reused.get("detector_runs_applied") or reused.get(
+                "classifier_runs_applied"
+            ):
+                log.info(
+                    "Portable cache applied %d detector and %d classifier runs",
+                    reused.get("detector_runs_applied", 0),
+                    reused.get("classifier_runs_applied", 0),
+                )
+        except Exception:
+            log.warning("Could not apply local computation cache", exc_info=True)
+
         # Cancellation gate before the expensive phases (model resolution,
         # weight download, inference). The job loops below also check
         # per-photo; _run_job flips the terminal status to 'cancelled'.
@@ -2079,10 +2256,29 @@ def run_classify_job(job, runner, db_path, workspace_id, params, vireo_dir=None)
         # Compute a content-addressable fingerprint for the active label set.
         # Kept in scope so downstream classifier_runs writes can record the
         # exact (classifier_model, labels_fingerprint) that produced a result.
-        from labels_fingerprint import compute_fingerprint
+        from labels_fingerprint import compute_fingerprint, compute_full_fingerprint
         fp = compute_fingerprint(labels)
+        fp_full = compute_full_fingerprint(labels)
+        if len(fp_full) != 64:
+            fp_full = None
+        try:
+            from computation_cache import classifier_model_identity, fingerprint
+
+            classifier_identity = classifier_model_identity(active_model)
+            if fp_full is None and use_tol and classifier_identity:
+                fp_full = fingerprint({
+                    "label_space": "tree-of-life",
+                    "model": classifier_identity,
+                })
+        except (OSError, ValueError):
+            classifier_identity = None
         label_sources = _resolve_label_sources(params, thread_db)
-        _record_labels_fingerprint(thread_db, fp, labels, sources=label_sources)
+        _record_labels_fingerprint(
+            thread_db, fp, labels, sources=label_sources,
+            full_fingerprint=fp_full,
+        )
+        job["_labels_fingerprint_full"] = fp_full
+        job["_classifier_model_identity"] = classifier_identity
 
         tax_summary = "Taxonomy loaded" if tax else "No taxonomy"
         labels_summary = f"{len(labels)} labels" if labels else ("Tree of Life" if use_tol else "no labels")

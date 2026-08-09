@@ -3052,6 +3052,9 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         __name__, template_folder=os.path.join(os.path.dirname(__file__), "templates")
     )
     app.config["DB_PATH"] = db_path
+    app.config["COMPUTATION_CACHE_DIR"] = os.path.expanduser(
+        "~/.vireo/computation-cache"
+    )
     app.config["THUMB_CACHE_DIR"] = thumb_cache_dir or os.path.expanduser(
         "~/.vireo/thumbnails"
     )
@@ -16583,6 +16586,97 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             cfg.save(payload)
             _settings_post_save_side_effects(cfg.load())
         return jsonify({"ok": True})
+
+    def _computation_store():
+        from computation_cache import ArtifactStore
+
+        return ArtifactStore(app.config["COMPUTATION_CACHE_DIR"])
+
+    @app.route("/api/computation-cache")
+    def api_computation_cache_status():
+        """Return local portable-object and currently exportable-run counts."""
+        from computation_cache import exportable_run_counts
+
+        export_summary = exportable_run_counts(_get_db())
+        return jsonify({
+            **_computation_store().stats(),
+            "exportable": export_summary,
+            "experimental": True,
+            "artifact_schema": 1,
+        })
+
+    @app.route("/api/computation-cache/export")
+    def api_computation_cache_export():
+        """Download portable detector/classifier results as a cache bundle."""
+        import datetime as _datetime
+
+        from computation_cache import exportable_artifacts, write_bundle
+
+        requested = request.args.get("types", "detection,classification")
+        artifact_types = {part.strip() for part in requested.split(",") if part.strip()}
+        try:
+            database_artifacts, summary = exportable_artifacts(
+                _get_db(), artifact_types=artifact_types,
+            )
+            stored_artifacts = [
+                artifact for _digest, artifact
+                in (_computation_store().iter_artifacts() or ())
+                if artifact["type"] in artifact_types
+            ]
+            fd, temp_path = tempfile.mkstemp(suffix=".vireo-cache")
+            os.close(fd)
+            try:
+                manifest = write_bundle(
+                    temp_path,
+                    [*database_artifacts, *stored_artifacts],
+                    device_label=request.args.get("device_label") or None,
+                )
+                with open(temp_path, "rb") as handle:
+                    body = handle.read()
+            finally:
+                with contextlib.suppress(OSError):
+                    os.unlink(temp_path)
+        except ValueError as exc:
+            return json_error(str(exc), status=400)
+
+        today = _datetime.date.today().isoformat()
+        response = make_response(body)
+        response.headers["Content-Type"] = "application/vnd.vireo.cache+zip"
+        response.headers["Content-Disposition"] = (
+            f'attachment; filename="vireo-results-{today}.vireo-cache"'
+        )
+        response.headers["X-Vireo-Cache-Objects"] = str(manifest["object_count"])
+        response.headers["X-Vireo-Cache-Skipped-Legacy"] = str(
+            summary["skipped_legacy"]
+        )
+        return response
+
+    @app.route("/api/computation-cache/import", methods=["POST"])
+    def api_computation_cache_import():
+        """Validate, store, and immediately apply an uploaded cache bundle."""
+        import zipfile
+
+        from computation_cache import (
+            CacheFormatError,
+            import_bundle,
+            materialize_artifacts,
+        )
+
+        upload = request.files.get("file")
+        if upload is None or not upload.filename:
+            return json_error("a .vireo-cache file is required", status=400)
+        try:
+            imported = import_bundle(upload.stream, _computation_store())
+            applied = materialize_artifacts(_get_db(), imported["artifacts"])
+        except (CacheFormatError, zipfile.BadZipFile) as exc:
+            return json_error(str(exc), status=400)
+        return jsonify({
+            "ok": True,
+            "objects": imported["manifest"]["object_count"],
+            "added": imported["added"],
+            "already_present": imported["already_present"],
+            **applied,
+        })
 
     @app.route("/api/darktable/status")
     def api_darktable_status():

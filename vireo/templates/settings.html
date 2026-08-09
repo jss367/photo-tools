@@ -129,6 +129,26 @@
     </div>
   </div>
 
+  <!-- Portable computation cache -->
+  <div class="section" id="computationCacheSection">
+    <div class="section-title">Computation Cache <span style="font-size:11px;color:var(--warning);font-weight:normal;">Experimental</span></div>
+    <p style="font-size:13px;color:var(--text-dim);margin:0 0 10px;line-height:1.5;">
+      Share completed animal detection and species-classification work with another Vireo computer.
+      Bundles contain machine results only&mdash;never originals, paths, XMP, or accepted/rejected review decisions.
+    </p>
+    <div style="display:flex;gap:16px;align-items:center;flex-wrap:wrap;margin-bottom:10px;font-size:12px;color:var(--text-secondary);">
+      <label><input type="checkbox" id="cacheExportDetections" checked> Detection</label>
+      <label><input type="checkbox" id="cacheExportClassifications" checked> Species classification</label>
+      <span id="computationCacheStatus" style="color:var(--text-dim);">Loading&hellip;</span>
+    </div>
+    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+      <button class="btn-sm" id="computationCacheExportBtn" onclick="exportComputationCache()" style="margin-left:0;">Export Results&hellip;</button>
+      <button class="btn-sm" id="computationCacheImportBtn" onclick="document.getElementById('computationCacheImportInput').click()">Import Results&hellip;</button>
+      <input type="file" id="computationCacheImportInput" accept=".vireo-cache,application/zip,application/vnd.vireo.cache+zip" style="display:none;" onchange="importComputationCache(this.files[0]); this.value='';">
+      <span id="computationCacheAction" style="font-size:12px;color:var(--text-dim);"></span>
+    </div>
+  </div>
+
   <!-- Models -->
   <div class="section">
     <div class="section-title">Models</div>
@@ -1138,6 +1158,7 @@ loadScanRoots();
 loadVersion();
 loadThemePicker();
 loadAllSettings();
+loadComputationCacheStatus();
 
 var SETTINGS_FIND_STATE = {
   marks: [],
@@ -4037,6 +4058,77 @@ async function loadDetectionCacheStats() {
     el.textContent = pc + ' ' + photoWord + ' \u00D7 ' + mc + ' ' + modelWord + ' cached';
   } catch(e) {
     el.textContent = 'Failed to load';
+  }
+}
+
+/* ---------- Portable Computation Cache ---------- */
+async function loadComputationCacheStatus() {
+  var el = document.getElementById('computationCacheStatus');
+  if (!el) return;
+  try {
+    var data = await safeFetch('/api/computation-cache', {}, { toast: false });
+    var exportable = data.exportable || {};
+    var runs = (exportable.detector_runs || 0) + (exportable.classifier_runs || 0);
+    var stored = data.object_count || 0;
+    el.textContent = runs.toLocaleString() + ' exportable runs; ' +
+      stored.toLocaleString() + ' imported/local objects (' + formatBytes(data.total_bytes || 0) + ')';
+  } catch (e) {
+    el.textContent = 'Status unavailable';
+  }
+}
+
+function selectedComputationCacheTypes() {
+  var types = [];
+  if (document.getElementById('cacheExportDetections').checked) types.push('detection');
+  if (document.getElementById('cacheExportClassifications').checked) types.push('classification');
+  return types;
+}
+
+function exportComputationCache() {
+  var types = selectedComputationCacheTypes();
+  if (!types.length) {
+    alert('Select at least one result type to export.');
+    return;
+  }
+  var action = document.getElementById('computationCacheAction');
+  action.textContent = 'Preparing download…';
+  window.location.href = '/api/computation-cache/export?types=' + encodeURIComponent(types.join(','));
+  window.setTimeout(function() {
+    action.textContent = 'Download requested. Legacy results without a portable runtime identity are skipped.';
+  }, 500);
+}
+
+async function importComputationCache(file) {
+  if (!file) return;
+  var button = document.getElementById('computationCacheImportBtn');
+  var action = document.getElementById('computationCacheAction');
+  button.disabled = true;
+  action.style.color = 'var(--text-dim)';
+  action.textContent = 'Validating and applying ' + file.name + '…';
+  var form = new FormData();
+  form.append('file', file, file.name);
+  try {
+    var response = await fetch('/api/computation-cache/import', {
+      method: 'POST',
+      body: form,
+    });
+    var data = await response.json().catch(function() { return {}; });
+    if (!response.ok) throw new Error(data.error || response.statusText || 'Import failed');
+    action.style.color = 'var(--accent)';
+    action.textContent = 'Imported ' + (data.added || 0).toLocaleString() +
+      ' new objects; applied ' + (data.detector_runs_applied || 0).toLocaleString() +
+      ' detector and ' + (data.classifier_runs_applied || 0).toLocaleString() +
+      ' classifier runs to ' + (data.matched_photos || 0).toLocaleString() + ' matching photos.';
+    if (data.pinned_older_runtime) {
+      action.textContent += ' ' + data.pinned_older_runtime.toLocaleString() +
+        ' reviewed older results were preserved.';
+    }
+    await loadComputationCacheStatus();
+  } catch (error) {
+    action.style.color = 'var(--danger)';
+    action.textContent = error && error.message ? error.message : 'Import failed';
+  } finally {
+    button.disabled = false;
   }
 }
 

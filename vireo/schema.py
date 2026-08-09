@@ -881,6 +881,61 @@ def _validate_legacy_detector_alias_merge(conn):
         raise RuntimeError("schema migration validation failed: detector repair broke foreign keys")
 
 
+_PORTABLE_CACHE_COLUMNS = {
+    "detections": {
+        "runtime_fingerprint": "TEXT NOT NULL DEFAULT 'legacy'",
+    },
+    "predictions": {
+        "labels_fingerprint_full": "TEXT",
+    },
+    "detector_runs": {
+        "runtime_fingerprint": "TEXT NOT NULL DEFAULT 'legacy'",
+        "input_fingerprint": "TEXT",
+    },
+    "classifier_runs": {
+        "labels_fingerprint_full": "TEXT",
+        "runtime_fingerprint": "TEXT NOT NULL DEFAULT 'legacy'",
+        "input_fingerprint": "TEXT",
+    },
+    "labels_fingerprints": {
+        "full_fingerprint": "TEXT",
+    },
+}
+
+
+def _add_portable_cache_identity(conn):
+    """Add sidecar identity without changing existing cache primary keys.
+
+    The 12-character label fingerprint remains part of the historical PKs.
+    Replacing it with a full digest would turn every upgraded classifier run
+    into a cache miss, so portable/full identities live in nullable companion
+    columns instead. Existing rows keep the explicit ``legacy`` runtime and
+    remain valid local hits, but are not safe to export.
+    """
+    for table, columns in _PORTABLE_CACHE_COLUMNS.items():
+        existing = {
+            row[1] for row in conn.execute(f"PRAGMA table_info({table})")
+        }
+        for column, declaration in columns.items():
+            if column not in existing:
+                conn.execute(
+                    f"ALTER TABLE {table} ADD COLUMN {column} {declaration}"
+                )
+
+
+def _validate_portable_cache_identity(conn):
+    for table, columns in _PORTABLE_CACHE_COLUMNS.items():
+        existing = {
+            row[1] for row in conn.execute(f"PRAGMA table_info({table})")
+        }
+        missing = set(columns) - existing
+        if missing:
+            raise RuntimeError(
+                "schema migration validation failed: "
+                f"{table} missing portable-cache columns {sorted(missing)}"
+            )
+
+
 MIGRATIONS = (
     Migration(
         version=5,
@@ -903,6 +958,12 @@ MIGRATIONS = (
         name="merge-legacy-megadetector-alias",
         apply=_merge_legacy_detector_alias,
         validate=_validate_legacy_detector_alias_merge,
+    ),
+    Migration(
+        version=9,
+        name="add-portable-computation-cache-identity",
+        apply=_add_portable_cache_identity,
+        validate=_validate_portable_cache_identity,
     ),
 )
 

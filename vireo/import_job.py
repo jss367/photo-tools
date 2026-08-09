@@ -56,6 +56,7 @@ Reconnaissance notes (Task 2.0, verified 2026-07-04):
 
 import contextlib
 import errno
+import functools
 import hashlib
 import json
 import logging
@@ -1073,6 +1074,24 @@ def _rollback_on_mount_loss(state, batch_st, verified_counted_for_copies,
     # removal API). LAST — see the docstring. See PR #1400 review
     # (Codex P2 r3688614624).
     state.mount_ever_lost = batch_st.mount_lost
+
+
+def _drop_queued_transfers(state, batch_st, rel):
+    # Queued-but-untransferred files: nothing landed, so no
+    # counter rollback — book the failure and drop the queue
+    # so the rsync below has nothing to send.
+    #
+    # (Formerly a nested def whose default-arg binding of
+    # ``batch_st`` / ``rel`` silenced ruff B023; module-level
+    # explicit parameters replace that binding.)
+    for queued_file, _dest_basename, _queued_hash, _sz, _mt \
+            in batch_st.to_transfer:
+        _fail(
+            state, rel, queued_file,
+            f"archive mount root {batch_st.mount_lost} detached before "
+            "this file was transferred",
+        )
+    batch_st.to_transfer = []
 
 
 # Verdicts returned by _duplicate_gate. The CALLER maps them onto the
@@ -3018,8 +3037,6 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
     ctx = _build_destination_context(db, params)
     destination = ctx.destination
     mount_baseline = ctx.mount_baseline
-    _path_under_any_source = ctx.path_under_any_source
-    _path_under_destination = ctx.path_under_destination
     _fold_basename = ctx.fold_basename
 
     import move as move_mod
@@ -3441,27 +3458,10 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
         # (Only adoptions can be in ``landed`` at this point — fresh
         # transfers append after the rsync below.)
         if batch_st.mount_lost:
-            # Default-arg binding of ``batch_st`` / ``rel`` silences
-            # ruff B023 (loop variables captured by a nested def) — the
-            # callback runs synchronously inside ``_rollback_on_mount_loss``
-            # in this same iteration, so late-binding was never a real
-            # hazard, but binding at definition time makes that explicit.
-            def _drop_queued_transfers(batch_st=batch_st, rel=rel):
-                # Queued-but-untransferred files: nothing landed, so no
-                # counter rollback — book the failure and drop the queue
-                # so the rsync below has nothing to send.
-                for queued_file, _dest_basename, _queued_hash, _sz, _mt \
-                        in batch_st.to_transfer:
-                    _fail(
-                        state, rel, queued_file,
-                        f"archive mount root {batch_st.mount_lost} detached before "
-                        "this file was transferred",
-                    )
-                batch_st.to_transfer = []
-
             _rollback_on_mount_loss(
                 state, batch_st, verified_counted_for_copies,
-                extra_rollback=_drop_queued_transfers,
+                extra_rollback=functools.partial(
+                    _drop_queued_transfers, state, batch_st, rel),
             )
 
         # Honor cancellation before any network transfer starts. The break
@@ -3818,7 +3818,6 @@ def run_import_job(job, runner, db_path, workspace_id, params):
     destination = ctx.destination
     mount_baseline = ctx.mount_baseline
     _path_under_any_source = ctx.path_under_any_source
-    _path_under_destination = ctx.path_under_destination
 
     runner.set_steps(job["id"], [
         {"id": "import", "label": "Copy & catalog"},
@@ -4223,6 +4222,11 @@ def run_import_job(job, runner, db_path, workspace_id, params):
         if batch_st.mount_lost:
             _rollback_on_mount_loss(
                 state, batch_st, verified_counted_for_copies,
+                # No-op here: the local path copies immediately, so
+                # ``batch_st.to_transfer`` is always empty — passed
+                # unconditionally to keep both call sites identical.
+                extra_rollback=functools.partial(
+                    _drop_queued_transfers, state, batch_st, rel),
             )
 
         # --- Catalog this batch (even when cancelled mid-batch: what

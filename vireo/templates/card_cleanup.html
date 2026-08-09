@@ -1103,8 +1103,19 @@ async function cardCleanupConfirmDelete() {
     cardCleanupWatchJob(data.job_id, 'delete', 'Starting deletion…');
   } catch (e) {
     cardCleanupCloseConfirm();
-    cardCleanupSetBusy(false);
-    cardCleanupSetError(String(e.message || e));
+    // The POST failed at the network layer, so the server may have
+    // accepted the delete and queued the destructive job before the
+    // connection dropped — we simply don't know (Codex P2 review).
+    // Unlocking here would let a second job start and hijack the page's
+    // jobId while the deletion continues unseen, so keep Scan / Verify /
+    // Delete disabled and send the user to the Jobs page for the actual
+    // outcome. A page reload rebuilds the busy state from a fresh
+    // manifest once they've confirmed what happened.
+    cardCleanupSetError(
+      'The delete request never got a response, so we cannot tell whether ' +
+      'the server queued the deletion. Check the Jobs page for a delete ' +
+      'that started around now, then reload this page to work with the ' +
+      'card again. (' + String(e.message || e) + ')');
   } finally {
     confirmBtn.disabled = false;
   }

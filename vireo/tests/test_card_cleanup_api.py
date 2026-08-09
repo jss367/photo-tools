@@ -495,18 +495,25 @@ def test_finish_audit_disables_delete_until_rescan(app_and_db):
 
 
 def test_confirm_delete_locks_page_before_post(app_and_db):
-    """Codex P2 review (commit 96137e3): cardCleanupConfirmDelete must set
-    the page-wide busy state *before* the POST /api/card-cleanup/delete
-    request is issued, not after the response arrives.
+    """Codex P2 reviews (commits 96137e3 and 012aec2c): cardCleanupConfirmDelete
+    must set the page-wide busy state *before* the POST /api/card-cleanup/delete
+    request is issued, and its failure paths must treat HTTP failures and
+    network errors differently.
 
-    The confirm dialog can be dismissed (backdrop click or Escape) while
-    the request is pending. If Scan and Verify remained enabled during
+    Ordering: the confirm dialog can be dismissed (backdrop click or Escape)
+    while the request is pending. If Scan and Verify remained enabled during
     that window, the user could kick off a second job whose watch would
     overwrite this delete's jobId — the exact orphan the single-busy-state
     owner exists to prevent, and one that could strand a destructive
-    deletion. Pinning the ordering here — busy set before the fetch, and
-    cleared on failure paths so buttons don't remain dead — so a refactor
-    can't quietly re-open the gap."""
+    deletion. Busy must be set before the fetch so a dismissal never opens
+    the gap.
+
+    Failure handling: an HTTP response proves whether the server queued the
+    delete, so !resp.ok can hand the buttons back. A `fetch` rejection is
+    ambiguous — the POST may have reached the server and started the
+    destructive job before the connection dropped — so the catch must NOT
+    unlock, and must direct the user to the Jobs page. Pinning both here so
+    a refactor can't quietly re-open the gap."""
     app, _ = app_and_db
     body = app.test_client().get("/card-cleanup").get_data(as_text=True)
     start = body.index("async function cardCleanupConfirmDelete(")
@@ -521,11 +528,34 @@ def test_confirm_delete_locks_page_before_post(app_and_db):
         "so a dialog dismissal during the pending request can't leave "
         "Scan/Verify live and race a second job into cardCleanupWatchJob"
     )
-    # Failure paths must release the lock — both the non-OK response branch
-    # and the network-error catch, so the user isn't stranded with a dead
-    # page after a definitive failure.
-    assert section.count("cardCleanupSetBusy(false)") >= 2, (
-        "both the !resp.ok branch and the catch block must call "
-        "cardCleanupSetBusy(false) to release the page-wide lock on "
-        "definitive failure"
+    # An HTTP response that proves nothing was queued (!resp.ok) must
+    # release the lock so the user isn't stranded with a dead page.
+    ok_branch_start = section.index("if (!resp.ok)")
+    ok_branch_end = section.index("cardCleanupWatchJob", ok_branch_start)
+    ok_branch = section[ok_branch_start:ok_branch_end]
+    assert "cardCleanupSetBusy(false)" in ok_branch, (
+        "the !resp.ok branch must call cardCleanupSetBusy(false) — the "
+        "server said the delete was not queued, so the page can safely hand "
+        "the buttons back"
+    )
+    # The catch branch is different: `fetch` rejects for network errors
+    # where the request may or may not have reached the server. If the
+    # server already queued the delete, the destructive job is running
+    # unseen — unlocking would let a second job overwrite this page's
+    # jobId (the exact orphan the single-busy-state owner exists to
+    # prevent). Codex P2 (commit 012aec2c) called this out: only unlock
+    # after an HTTP response proves no job was queued; treat network
+    # errors as unknown-running and direct the user to Jobs.
+    catch_start = section.index("} catch (e) {")
+    catch_end = section.index("} finally {", catch_start)
+    catch_body = section[catch_start:catch_end]
+    assert "cardCleanupSetBusy(false)" not in catch_body, (
+        "the network-error catch must NOT release the page lock — the "
+        "server may have queued the delete before the connection dropped, "
+        "and unlocking would let a second job race the destructive job"
+    )
+    assert "Jobs page" in catch_body, (
+        "the network-error catch must direct the user to the Jobs page so "
+        "they can find out whether the server queued the delete before the "
+        "connection dropped"
     )

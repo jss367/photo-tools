@@ -1855,7 +1855,7 @@ def _move_to_volume_trash(filepath):
 
 
 def _trash_via_finder(filepaths, timeout=_FINDER_TRASH_TIMEOUT_SECS):
-    """Trash one or more files via one bounded Finder AppleScript call.
+    """Trash paths via one bounded Finder call with per-item outcomes.
 
     Fallback for when send2trash fails (e.g. external volumes where the
     legacy Carbon API can't locate .Trashes). macOS-only: on Linux/Windows
@@ -1863,9 +1863,12 @@ def _trash_via_finder(filepaths, timeout=_FINDER_TRASH_TIMEOUT_SECS):
     equivalent fallback. Raising here (instead of spawning a doomed
     ``osascript``) lets the caller surface the original send2trash failure.
 
-    A timeout is mandatory because Finder can otherwise wait indefinitely on
-    an unavailable SMB share. Callers retain catalog rows after any error or
-    timeout, since Finder may have completed only part of a batch.
+    The script catches each path's error and continues so a retry containing
+    files already moved by a timed-out earlier batch cannot abort before later
+    files. A missing source counts as successful only when Finder can still
+    reach its parent directory; an unavailable mount therefore remains a safe
+    failure. The return shape matches :func:`_trash_paths`: moved count,
+    successful paths (including already-missing ones), and failure details.
     """
     if sys.platform != "darwin":
         raise OSError("Finder trash fallback is only available on macOS")
@@ -1874,15 +1877,39 @@ def _trash_via_finder(filepaths, timeout=_FINDER_TRASH_TIMEOUT_SECS):
     else:
         filepaths = [os.fspath(path) for path in filepaths]
     if not filepaths:
-        return
+        return 0, set(), []
     result = subprocess.run(
         [
             "osascript",
             "-e", "on run argv",
+            "-e", "set statuses to {}",
             "-e", "repeat with posixPath in argv",
+            "-e", "set statusValue to \"error\"",
             "-e", "set fileRef to POSIX file (contents of posixPath)",
+            "-e", "try",
             "-e", "tell application \"Finder\" to delete fileRef",
+            "-e", "set statusValue to \"moved\"",
+            "-e", "on error",
+            "-e", "try",
+            "-e", (
+                "set parentPath to do shell script \"/usr/bin/dirname \" & "
+                "quoted form of (contents of posixPath)"
+            ),
+            "-e", "set parentRef to POSIX file parentPath",
+            "-e", "tell application \"Finder\"",
+            "-e", "set sourceExists to exists fileRef",
+            "-e", "set parentExists to exists parentRef",
+            "-e", "end tell",
+            "-e", (
+                "if (not sourceExists) and parentExists then "
+                "set statusValue to \"missing\""
+            ),
+            "-e", "end try",
+            "-e", "end try",
+            "-e", "set end of statuses to statusValue",
             "-e", "end repeat",
+            "-e", "set AppleScript's text item delimiters to linefeed",
+            "-e", "return statuses as text",
             "-e", "end run",
             "--",
             *filepaths,
@@ -1894,6 +1921,25 @@ def _trash_via_finder(filepaths, timeout=_FINDER_TRASH_TIMEOUT_SECS):
     )
     if result.returncode != 0:
         raise OSError(result.stderr.strip() or f"Finder trash failed ({result.returncode})")
+    statuses = result.stdout.splitlines()
+    if len(statuses) != len(filepaths):
+        raise OSError(
+            "Finder trash returned an invalid per-file status response"
+        )
+    successful = set()
+    failures = []
+    moved = 0
+    for filepath, outcome in zip(filepaths, statuses, strict=True):
+        if outcome == "moved":
+            moved += 1
+            successful.add(filepath)
+        elif outcome == "missing":
+            successful.add(filepath)
+        else:
+            failures.append({
+                "path": filepath, "error": "Finder Trash failed",
+            })
+    return moved, successful, failures
 
 
 def _snapshot_parent_device(filepath):
@@ -2057,10 +2103,14 @@ def _trash_paths(filepaths, progress_callback=None):
     for finder_batch in _chunked(
         finder_candidates, size=_FINDER_TRASH_BATCH_SIZE,
     ):
-        finder_completed = False
         try:
-            _trash_via_finder(finder_batch)
-            finder_completed = True
+            finder_moved, finder_successful, finder_failures = (
+                _trash_via_finder(finder_batch)
+            )
+            moved += finder_moved
+            successful.update(finder_successful)
+            for failure in finder_failures:
+                send_errors[failure["path"]] = failure["error"]
         except subprocess.TimeoutExpired:
             log.warning(
                 "Finder Trash timed out after %ss for %d file(s)",
@@ -2076,15 +2126,6 @@ def _trash_paths(filepaths, progress_callback=None):
             for filepath in finder_batch:
                 send_errors[filepath] = str(exc) or "Finder Trash failed"
         for filepath in finder_batch:
-            # A zero Finder exit status means every requested move completed.
-            # After an error or timeout, retain every catalog row even if
-            # Finder may have moved a prefix of the batch.  Rechecking those
-            # paths here would put the worker straight back into potentially
-            # unbounded SMB stat calls; a retry safely reconciles files that
-            # were already moved.
-            if finder_completed:
-                successful.add(filepath)
-                moved += 1
             report_processed(filepath)
 
     failures = []

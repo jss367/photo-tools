@@ -3791,7 +3791,7 @@ def test_trash_via_finder_guarded_off_mac(monkeypatch):
 
 
 def test_trash_via_finder_batches_paths_and_sets_timeout(monkeypatch):
-    """Finder fallback uses one bounded AppleScript process for a batch."""
+    """Finder uses one bounded process and reconciles per-path outcomes."""
     import types
 
     import app as app_module
@@ -3801,10 +3801,14 @@ def test_trash_via_finder_batches_paths_and_sets_timeout(monkeypatch):
 
     def fake_run(argv, **kwargs):
         calls.append((argv, kwargs))
-        return types.SimpleNamespace(returncode=0, stderr="")
+        return types.SimpleNamespace(
+            returncode=0, stderr="", stdout="missing\nmoved\n",
+        )
 
     monkeypatch.setattr(app_module.subprocess, "run", fake_run)
-    app_module._trash_via_finder(["/Volumes/X/a.NEF", "/Volumes/X/b.NEF"])
+    result = app_module._trash_via_finder([
+        "/Volumes/X/a.NEF", "/Volumes/X/b.NEF",
+    ])
 
     assert len(calls) == 1
     argv, kwargs = calls[0]
@@ -3812,6 +3816,11 @@ def test_trash_via_finder_batches_paths_and_sets_timeout(monkeypatch):
     assert "/Volumes/X/b.NEF" in argv
     assert "repeat with posixPath in argv" in argv
     assert kwargs["timeout"] == app_module._FINDER_TRASH_TIMEOUT_SECS
+    assert result == (
+        1,
+        {"/Volumes/X/a.NEF", "/Volumes/X/b.NEF"},
+        [],
+    )
 
 
 def test_move_to_volume_trash_renames_without_finder(monkeypatch, tmp_path):
@@ -4018,6 +4027,7 @@ def test_trash_paths_routes_network_volume_directly_to_bounded_finder(
         finder_calls.append(list(paths))
         for path in paths:
             os.remove(path)
+        return len(paths), set(paths), []
 
     monkeypatch.setattr(app_module, "_trash_via_finder", finder_trash)
     progress = []

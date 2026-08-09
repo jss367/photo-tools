@@ -3609,6 +3609,33 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
                             )
                             batch_st.reclassified_landed_paths.add(entry.dest_path)
                             continue
+                        # Scan left the row's file_hash NULL and the
+                        # mount re-read agrees with the hash this import
+                        # recorded — backfill it so the row doesn't stay
+                        # hashless until the next full scan (spec
+                        # decision 11: adopt the local loop's backfill).
+                        # Zero-byte exclusion: EMPTY_FILE_SHA256 never
+                        # lands in photos.file_hash (it would collide as
+                        # an exact duplicate of every other empty file
+                        # and empty_hash_needs_repair would churn
+                        # repairs), so empty files pass file_hash=None,
+                        # which update_photo_hash_check treats as
+                        # status-only — the row keeps scan's NULL.
+                        if params.verify_by_hash:
+                            db.update_photo_hash_check(
+                                row["id"], "ok",
+                                file_hash=(
+                                    src_hash
+                                    if src_hash != EMPTY_FILE_SHA256
+                                    else None
+                                ),
+                                commit=False,
+                            )
+                        # Fresh mount row this run stamped as valid —
+                        # the after-import chaining hook builds its
+                        # process job collection from these ids. Stays
+                        # OUTSIDE the verify gate on every accept path.
+                        state.imported_photo_ids.add(row["id"])
                     elif scan_h is not None and scan_h != src_h_norm:
                         _reclassify_landed_failed(
                             state, rel, entry,
@@ -3623,14 +3650,19 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
                         )
                         batch_st.reclassified_landed_paths.add(entry.dest_path)
                         continue
-                    if params.verify_by_hash:
-                        db.update_photo_hash_check(
-                            row["id"], "ok", commit=False,
-                        )
-                    # Fresh mount row this run stamped as valid — the
-                    # after-import chaining hook builds its process job
-                    # collection from these ids.
-                    state.imported_photo_ids.add(row["id"])
+                    else:
+                        # Scan's row hash matches — no backfill needed,
+                        # the row already holds the hash (local doesn't
+                        # backfill on this path either).
+                        if params.verify_by_hash:
+                            db.update_photo_hash_check(
+                                row["id"], "ok", commit=False,
+                            )
+                        # Fresh mount row this run stamped as valid —
+                        # the after-import chaining hook builds its
+                        # process job collection from these ids. Stays
+                        # OUTSIDE the verify gate on every accept path.
+                        state.imported_photo_ids.add(row["id"])
                 else:
                     # RAW+JPEG pairing merges the JPEG's photo row into
                     # the RAW primary (companion_path) and deletes the

@@ -6568,6 +6568,117 @@ def test_remote_import_null_scan_hash_with_stale_mount_fails(
             rows["DSC_0001.jpg"])
 
 
+def test_remote_import_backfills_file_hash_when_scan_left_null(
+        tmp_path, monkeypatch):
+    """Spec decision 11 (D4): when scan() leaves a non-empty landed
+    file's row with ``file_hash`` NULL and the mount re-read agrees with
+    the hash this import recorded, the remote path must backfill
+    ``photos.file_hash`` with that hash — mirroring the local stamping
+    loop's ``update_photo_hash_check(..., "ok", file_hash=...)``.
+    Without the backfill the row's NULL persists until the next full
+    scan, so exact-duplicate detection and hash-based features see a
+    hashless row for a file whose bytes were just verified."""
+    import scanner as _scanner
+    from import_dedup import compute_file_hash
+    from import_job import ImportParams, run_import_job
+
+    ra = _remote_archive_for(tmp_path)
+    calls = _remote_calls(ra)
+    _install_fake_remote_rsync(monkeypatch, calls, verify=None)
+
+    card = _make_card(tmp_path, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+    ])
+
+    db_path = str(tmp_path / "test.db")
+
+    # Wrap scan() to null out the file_hash the scanner wrote, forcing
+    # the row-exists-but-hash-unknown branch (same NULL-forcing shape as
+    # test_remote_import_null_scan_hash_but_mount_matches_still_ok).
+    orig_scan = _scanner.scan
+
+    def scan_then_null_hash(destination, db_arg, **kw):
+        rv = orig_scan(destination, db_arg, **kw)
+        db_arg.conn.execute(
+            "UPDATE photos SET file_hash = NULL "
+            "WHERE filename = 'DSC_0001.jpg'"
+        )
+        db_arg.conn.commit()
+        return rv
+
+    monkeypatch.setattr(_scanner, "scan", scan_then_null_hash)
+
+    db = Database(db_path)
+    ws_id = db._active_workspace_id
+    result = run_import_job(
+        _make_job(), FakeRunner(), db_path, ws_id,
+        ImportParams(
+            sources=[str(card)], destination=ra["mount_base"],
+            remote_target=ra, verify_by_hash=True,
+        ),
+    )
+
+    assert result["failed"] == 0, result
+    assert result["copied"] == 1, result
+    mount_file = os.path.join(
+        ra["mount_base"], "2026", "2026-07-03", "DSC_0001.jpg",
+    )
+    rows = {r["filename"]: r for r in _photo_rows(db)}
+    row = rows["DSC_0001.jpg"]
+    assert row["hash_status"] == "ok", dict(row)
+    assert row["file_hash"] == compute_file_hash(mount_file), dict(row)
+
+
+def test_local_import_backfills_file_hash_when_scan_left_null(
+        tmp_path, monkeypatch):
+    """Local mirror of
+    ``test_remote_import_backfills_file_hash_when_scan_left_null`` —
+    expected to pass WITHOUT a production change: it characterizes the
+    local stamping loop's existing non-empty-NULL-hash backfill
+    (``update_photo_hash_check(..., "ok", file_hash=verified_hash)``)
+    that spec decision 11 adopts for the remote path."""
+    import scanner as _scanner
+    from import_dedup import compute_file_hash
+    from import_job import ImportParams, run_import_job
+
+    card = _make_card(tmp_path, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+    ])
+    archive = tmp_path / "archive"
+
+    orig_scan = _scanner.scan
+
+    def scan_then_null_hash(destination, db_arg, **kw):
+        rv = orig_scan(destination, db_arg, **kw)
+        db_arg.conn.execute(
+            "UPDATE photos SET file_hash = NULL "
+            "WHERE filename = 'DSC_0001.jpg'"
+        )
+        db_arg.conn.commit()
+        return rv
+
+    monkeypatch.setattr(_scanner, "scan", scan_then_null_hash)
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws_id = db._active_workspace_id
+    result = run_import_job(
+        _make_job(), FakeRunner(), db_path, ws_id,
+        ImportParams(
+            sources=[str(card)], destination=str(archive),
+            verify_by_hash=True,
+        ),
+    )
+
+    assert result["failed"] == 0, result
+    assert result["copied"] == 1, result
+    dest_file = archive / "2026" / "2026-07-03" / "DSC_0001.jpg"
+    rows = {r["filename"]: r for r in _photo_rows(db)}
+    row = rows["DSC_0001.jpg"]
+    assert row["hash_status"] == "ok", dict(row)
+    assert row["file_hash"] == compute_file_hash(str(dest_file)), dict(row)
+
+
 def test_remote_import_paired_jpeg_no_verify_fails_on_mount_mismatch(
         tmp_path, monkeypatch):
     """Companion parity with the non-companion branch: without
@@ -10103,6 +10214,99 @@ def test_local_zero_byte_adopted_companion_revalidates_before_stamping(
     assert obs["skipped_duplicate"] == 0, obs
     assert obs["failed"] == 1, obs
     assert obs["safe_to_format"] is False, obs
+
+
+def test_remote_zero_byte_accept_leaves_file_hash_null(
+        tmp_path, monkeypatch):
+    """Guard for spec decision 11's zero-byte exclusion (the backfill
+    trap): a zero-byte accept must leave the row's ``file_hash`` NULL.
+    Backfilling ``EMPTY_FILE_SHA256`` into ``photos.file_hash`` would
+    recreate the collision the scanner's zero-byte NULL convention
+    exists to prevent (every empty file would become an exact duplicate
+    of every other, and ``empty_hash_needs_repair`` would churn
+    repairs). Same adoption geometry as
+    ``test_remote_zero_byte_adoption_revalidates_before_stamping`` but
+    WITHOUT the deletion step — the accept path, not the failure path."""
+    from import_job import ImportParams, run_import_job
+
+    card = tmp_path / "card"
+    card.mkdir()
+    card_file = card / "empty.jpg"
+    card_file.write_bytes(b"")
+    ts = datetime(2026, 7, 3, 10, 0, 0).timestamp()
+    os.utime(str(card_file), (ts, ts))
+
+    ra = _remote_archive_for(tmp_path)
+    calls = _remote_calls(ra)
+    _install_fake_remote_rsync(monkeypatch, calls, verify=None)
+
+    mount_base = Path(ra["mount_base"])
+    seed_folder = mount_base / "2026" / "2026-07-03"
+    seed_folder.mkdir(parents=True)
+    adopted_dest_path = seed_folder / "empty.jpg"
+    adopted_dest_path.write_bytes(b"")
+    os.utime(str(adopted_dest_path), (ts, ts))
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    result = run_import_job(
+        _make_job(), FakeRunner(), db_path, db._active_workspace_id,
+        ImportParams(
+            sources=[str(card)], destination=ra["mount_base"],
+            remote_target=ra, verify_by_hash=True,
+            skip_duplicates=False,
+        ),
+    )
+
+    assert result["skipped_duplicate"] == 1, result
+    assert result["failed"] == 0, result
+    rows = {r["filename"]: r for r in _photo_rows(db)}
+    row = rows["empty.jpg"]
+    assert row["hash_status"] == "ok", dict(row)
+    assert row["file_hash"] is None, dict(row)
+
+
+def test_local_zero_byte_accept_leaves_file_hash_null(
+        tmp_path, monkeypatch):
+    """Local mirror of
+    ``test_remote_zero_byte_accept_leaves_file_hash_null``: the local
+    zero-byte stamp deliberately omits ``file_hash`` so the row keeps
+    scan's NULL (``EMPTY_FILE_SHA256`` never lands in the column). Same
+    adoption geometry as
+    ``test_local_zero_byte_adoption_revalidates_before_stamping``
+    WITHOUT the deletion step."""
+    from import_job import ImportParams, run_import_job
+
+    card = tmp_path / "card"
+    card.mkdir()
+    card_file = card / "empty.jpg"
+    card_file.write_bytes(b"")
+    ts = datetime(2026, 7, 3, 10, 0, 0).timestamp()
+    os.utime(str(card_file), (ts, ts))
+
+    archive = tmp_path / "archive"
+    seed_folder = archive / "2026" / "2026-07-03"
+    seed_folder.mkdir(parents=True)
+    adopted_dest_path = seed_folder / "empty.jpg"
+    adopted_dest_path.write_bytes(b"")
+    os.utime(str(adopted_dest_path), (ts, ts))
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    result = run_import_job(
+        _make_job(), FakeRunner(), db_path, db._active_workspace_id,
+        ImportParams(
+            sources=[str(card)], destination=str(archive),
+            verify_by_hash=True, skip_duplicates=False,
+        ),
+    )
+
+    assert result["skipped_duplicate"] == 1, result
+    assert result["failed"] == 0, result
+    rows = {r["filename"]: r for r in _photo_rows(db)}
+    row = rows["empty.jpg"]
+    assert row["hash_status"] == "ok", dict(row)
+    assert row["file_hash"] is None, dict(row)
 
 
 def test_local_renamed_twin_of_accepted_duplicate_current_behavior(

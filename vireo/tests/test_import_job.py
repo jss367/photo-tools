@@ -8972,10 +8972,11 @@ def test_step_summary_claims_a_selection_only_when_one_was_applied(tmp_path):
 
 # --- Selection on the REMOTE copy path --------------------------------------
 #
-# ``run_import_job`` delegates the whole run to ``_run_remote_import_job``
+# ``run_import_job`` runs its single orchestrator over ``_RsyncTransport``
 # whenever ``params.remote_target`` is set (the user picked a saved NAS
-# target), so every selection behaviour asserted above for the local path has
-# to be asserted again here — the two functions share no code.
+# target). These pins date from when the remote path was a separate
+# function sharing no code; they remain as regression cover for the
+# transport-parameterized selection behaviour.
 #
 # EVERY test below passes ``verify_by_hash=True``. Without it
 # ``remote_unverified`` is True, both verdicts are already False, and the
@@ -9615,8 +9616,8 @@ def test_remote_step_summary_claims_a_selection_only_when_applied(
 
 
 # --- Local/remote selection parity -------------------------------------
-# The two copy paths (``run_import_job`` and ``_run_remote_import_job``)
-# carry the same selection logic. These tests are the safety net for that:
+# The two transports behind ``run_import_job`` (local copies and rsync)
+# must carry the same selection logic. These tests are the safety net:
 # they drive IDENTICAL selection payloads through BOTH entry points and
 # assert the observable selection results agree, so a change applied to one
 # path and not the other fails here instead of shipping a wrong
@@ -10902,8 +10903,8 @@ def test_selection_filter_matches_unresolved_paths_remote(
 def test_local_import_refuses_when_mount_root_absent(tmp_path, monkeypatch):
     """The LOCAL copy path needs the same mount-root guard as the remote one.
 
-    ``_run_remote_import_job`` refuses to ``os.makedirs`` into an absent
-    mount root (PR #1113), but ``run_import_job``'s own batch loop had no
+    The remote path has refused to ``os.makedirs`` into an absent mount
+    root since PR #1113, but the local batch loop originally had no
     such check — it called ``os.makedirs(dest_folder)`` unconditionally.
     On a platform where the mount point survives unmount (Linux
     ``/mnt/<name>``) that silently builds a shadow tree on the internal

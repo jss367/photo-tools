@@ -202,6 +202,64 @@ inside the transfer phase at line 2276) lives in `RsyncTransport.flush_batch`.
   probes inside `_do_rsync`/`_rsync_cancelled`), which is inherently
   transport-specific.
 
+#### PR 7 as-built adaptations (2026-08-10)
+
+The protocol sketch above is the design-phase shape. PR 7's implementation
+deliberately adapts it in three ways; each is a considered decision, not
+drift:
+
+1. **Verdict-style `enqueue`, not the pure `_FileOutcome | Queued` /
+   `_BatchResult` form.** The real per-file middle has FIVE terminal shapes,
+   not two: landed, failed, intra-batch duplicate-skip (with its
+   `dup_skips` booking), adopted landing, and dest-read-cancelled (which
+   breaks the whole batch). Additionally, `_record_checker` needs the RAW
+   source hash — un-normalized, i.e. `None` for a remote zero-byte file —
+   while `_LandedFile.verified_hash` was normalized to `EMPTY_FILE_SHA256`
+   in PR 6b; threading the raw hash through pure value types is a redesign,
+   not a move. So `enqueue` mirrors the proven `_duplicate_gate` idiom
+   (PR #1423): it mutates `state`/`batch_st` and returns a verdict constant
+   (`_ENQ_HANDLED` / `_ENQ_QUEUED` / `_ENQ_CANCELLED`; the caller maps
+   CANCELLED → break, same contract as `_GATE_CANCELLED`). The pure
+   `_BatchResult` form remains a PR 7b option — it needs a `record_hash`
+   field beside `verified_hash` plus a pinned zero-byte
+   `run_verified_hashes` asymmetry first.
+2. **Two collision/adopt walks retained, one inside each transport** — the
+   sketch's single shared walk with a reservation map is deferred. The two
+   walks still differ on seven axes: loop shape; reservation map (remote
+   consults `claimed_basenames`/`queued_src_hashes`, local has none);
+   local's size pre-check before hashing candidates (an I/O difference);
+   local's explicit zero-byte adopt branch, which remote can only reach
+   checker-less (a live per-transport behavior split); eager vs lazy source
+   hashing; `DestReadCancelled` propagation; and output shape. Unifying
+   them inside "the merge PR" would hide at least three behavior flips with
+   no red-green of their own — and the Non-goals section is explicit that
+   the seam must make a third transport POSSIBLE, not unify everything.
+   Walk unification is PR 7b, each flip red-green'd individually.
+3. **`defers_transfer` is dropped.** It existed only to parameterize the
+   shared walk's hashing strategy; with two walks (adaptation 2) it has no
+   reader.
+
+`flush_batch` as built also deviates from the sketch: it mutates
+`state`/`batch_st` rather than returning a `_BatchResult` (consistent with
+adaptation 1); `_emit_transfer` is transport-internal rather than a
+parameter; and it deliberately keeps TWO distinct cancel probes — the
+watchdog's non-blocking `cancellation_requested` and the loop-boundary
+pausing `is_cancelled` — instead of the sketch's single `stop` parameter,
+because collapsing them would change when a stop pauses vs merely polls.
+The outcome-completeness invariant above holds unchanged (a flat-batch
+cancel yields zero outcomes; a renamed-phase cancel keeps prior successes).
+
+**Seam preservation — do not repoint the monkeypatch surface.** All 29
+`monkeypatch.setattr(_move, ...)` sites (15 `_run_rsync_streamed`, 9
+`_remote_mkdir_p`, 5 `remote_verify_files`; 64 uses of the shared
+`_install_fake_remote_rsync` installer) keep working without churn because
+`_RsyncTransport` keeps `import move as move_mod` and resolves
+`move_mod.<name>(...)` at call time. Call-shape constraints:
+`_run_rsync_streamed`'s call shape must stay BYTE-IDENTICAL — four tests
+wrap the installed fake and re-call it with the same argument layout — and
+`remote_verify_files` must keep its
+`(rsync_bin, src_specs, rsync_target, remote, dest_is_dir=…)` shape.
+
 ### Entry point
 
 `run_import_job(job, runner, db_path, workspace_id, params)` keeps its exact
@@ -230,6 +288,7 @@ changes to match.
 | 9 | Remote rollback open-coded at 8 sites vs local `_reclassify_landed_failed` | **Structural — shared helper on `_ImportRunState`** (PR 5). |
 | 10 | Adopted (crash-recovery) files get `hash_status='ok'` stamped locally but stay `NULL` remotely — found empirically by PR 1's parity net (2026-08-07): local adoption folds into `landed` and hits the verify stamp; remote adoption lives in `adopted_paths`, whose validation cross-checks bytes but never stamps | **Adopt local, via the PR 5 structural change.** Folding remote adoptions into `landed` with their verified hash makes the stamp fall out of the unified catalog pass; no separate fix PR. Pinned per-path by `test_{local,remote}_adoption_uncataloged_dest_twin_current_behavior`, which flip when PR 5 lands. |
 | 11 | Local stamping loop backfills `file_hash` on scan-NULL rows (`update_photo_hash_check(..., "ok", file_hash=verified_hash)`, ~L4511–4514 — NOT the non-backfilling stamp at L4480–4482 just above it, which handles the zero-byte case); remote stamps `"ok"` without backfilling — found by the 2026-08-08 extraction phase map (D4). Related, same loop: a zero-byte normalization-convention split (D2/D3) — remote normalizes `EMPTY_FILE_SHA256` → `None` at hash time with a `read_failed` flag; local compares raw hashes and its `verified_hash` is never `None`. | **RESOLVED 2026-08-09 (PR 6b): adopt local, with the zero-byte exclusion.** Remote backfills `file_hash` only on the scan-NULL re-read-agree path, and only with non-`EMPTY_FILE_SHA256` hashes: `file_hash=(src_hash if src_hash != EMPTY_FILE_SHA256 else None)`. Backfilling `EMPTY_FILE_SHA256` would recreate the collision the scanner's zero-byte NULL convention exists to prevent (scanner nulls empty-file hashes; `empty_hash_needs_repair` would churn repairs). The scan-hash-agrees path needs no backfill — the row already holds the hash (local doesn't backfill there either). For D2/D3, unify by normalizing at `_LandedFile` construction in 6b so both loops see the same convention. |
+| 12 | Local has a per-file dest-safety guard (`os.path.samefile` + realpath'd dest-under-source check) before copying; remote has only the folder-level `_batch_preflight` guard | **Port to remote (PR 7, red-green).** The per-file guard is NOT subsumed by the folder guard: it additionally catches `os.path.samefile` identity (hard-links/symlinks to the same inode) and a `dest_file` that is itself a symlink resolving back into the card — realpath'd at file level, where the folder guard only realpaths the folder. On remote, that geometry is exactly the safe_to_format-over-unbacked-bytes hazard the batch guard's own comment describes; today remote has no per-file defense (the collision walk would hash the symlink target — the card file itself — byte-match, and adopt). Porting is a pure tightening: it can only convert an accept into a failure in an already-unsafe geometry; expected existing-suite flips: zero. Red-green in PR 7: a remote import whose `dest_file` is symlinked into the card with `verify_by_hash=True` must yield `failed == 1`, `safe_to_format is False`. HONESTY CONSTRAINT: a source-backed SUFFIX candidate (e.g. a symlink at `name_1.ext` into the card with different bytes at the primary name) is caught by NEITHER guard on EITHER path — that per-candidate gap is pre-existing on local, and this port deliberately preserves parity rather than closing it (closing it is its own behavior change; PR 7b/follow-up). Guard comments must never claim suffix coverage that doesn't exist. |
 
 Kept as deliberate (transport-required) differences, expressed through the
 protocol rather than duplicated code: transfer sub-progress

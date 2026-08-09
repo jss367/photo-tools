@@ -2750,10 +2750,8 @@ def run_classify_job(job, runner, db_path, workspace_id, params, vireo_dir=None)
         # weights, missing revision file) working as before.
         desired_model_identity = None
         try:
-            from computation_cache import (
-                classifier_model_identity,
-                fingerprint as identity_fingerprint,
-            )
+            from computation_cache import classifier_model_identity
+            from computation_cache import fingerprint as identity_fingerprint
 
             if peek_model and peek_model.get("weights_path"):
                 desired_model_identity = classifier_model_identity(peek_model)

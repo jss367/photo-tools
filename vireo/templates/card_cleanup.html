@@ -886,6 +886,12 @@ async function cardCleanupStartAudit() {
 
 // The buttons are already re-enabled by cardCleanupSetBusy(false) in
 // cardCleanupFinishJob's cleanup; this only reports what the run found.
+// Verification can flip previously-ok rows to modified/corrupt/unreadable,
+// so the preview's deletable count/bytes may no longer describe what a
+// deletion would actually touch. Disable Delete until the user takes the
+// re-scan surfaced below — the backend re-checks and skips invalid rows,
+// but the confirmation dialog would still show stale totals against a
+// valid subset the user never agreed to.
 function cardCleanupFinishAudit(job, status, jobError) {
   const statusEl = document.getElementById('card-cleanup-audit-status');
   if (status === 'completed' || status === 'cancelled') {
@@ -893,6 +899,10 @@ function cardCleanupFinishAudit(job, status, jobError) {
     // could not have covered (other workspaces' folders).
     cardCleanupState.auditCompleted = true;
   }
+  const deleteBtn = document.getElementById('card-cleanup-delete-btn');
+  deleteBtn.disabled = true;
+  document.getElementById('card-cleanup-delete-hint').textContent
+    = 'Verification may have changed which files count as verified — re-scan the card before deleting.';
   if (status === 'completed' && job && job.result) {
     const r = job.result;
     const problems = (r.modified || 0) + (r.corrupt || 0) + (r.unreadable || 0);

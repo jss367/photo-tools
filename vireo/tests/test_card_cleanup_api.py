@@ -461,3 +461,34 @@ def test_hash_failed_callout_states_audit_workspace_scope(app_and_db):
     # drop the guidance the Codex P2 asked for.
     assert "Audit page shows flagged rows for the current workspace only" in body
     assert "switch to that workspace to find it there" in body
+
+
+def test_finish_audit_disables_delete_until_rescan(app_and_db):
+    """Codex P2 review (commit 1213fec): finishing or cancelling the
+    verify-hashes run must invalidate the preview's Delete affordance,
+    because verification can flip previously-ok rows to modified/corrupt/
+    unreadable — the confirmation dialog would then advertise stale file
+    and byte totals against a subset the user never agreed to. The audit
+    handler must both disable the Delete button and swap in a hint that
+    tells the user to re-scan (the button surfaced next to the audit
+    status). Pin the literal here so the guardrail can't be silently
+    reworded away."""
+    app, _ = app_and_db
+    body = app.test_client().get("/card-cleanup").get_data(as_text=True)
+    finish = body.index("function cardCleanupFinishAudit(")
+    # Snap out a window around the handler body. The next function in the
+    # file is cardCleanupBindBucket; slice up to whichever declaration
+    # follows so this test does not accidentally match code elsewhere.
+    end = body.index("function cardCleanupBindBucket(", finish)
+    section = body[finish:end]
+    # The Delete button is disabled inside the handler, not just via the
+    # separate cardCleanupSetBusy(false) that ran first (which restores
+    # the pre-verify enabled state).
+    assert "deleteBtn.disabled = true" in section
+    # The user-facing hint that replaces whatever cardCleanupSetBusy
+    # restored — pinned verbatim so a reword can't drop the "re-scan
+    # first" instruction the Codex P2 asked for.
+    assert (
+        "Verification may have changed which files count as verified — "
+        "re-scan the card before deleting."
+    ) in section

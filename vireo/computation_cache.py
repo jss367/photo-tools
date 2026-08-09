@@ -602,13 +602,21 @@ def validate_artifact(artifact):
                 "labels.display_name must be a string of at most 500 chars"
             )
         label_count = labels.get("count")
+        # SQLite integer columns are signed 64-bit; a bundle carrying an
+        # arbitrarily large JSON int (e.g. 10**100) would pass a naive
+        # non-negativity check and only fail with OverflowError when
+        # materialize_artifacts binds the value.  By that point the bundle
+        # object has already been published, leaving an unmaterialized
+        # entry behind.  Reject out-of-range values up-front instead.
+        _SQLITE_INT64_MAX = (1 << 63) - 1
         if label_count is not None and (
             isinstance(label_count, bool)
             or not isinstance(label_count, int)
             or label_count < 0
+            or label_count > _SQLITE_INT64_MAX
         ):
             raise CacheFormatError(
-                "labels.count must be a non-negative integer"
+                "labels.count must be a non-negative integer within SQLite's 64-bit range"
             )
         detector_runtime = artifact.get("detector_runtime_fingerprint")
         if not _is_sha256(detector_runtime):

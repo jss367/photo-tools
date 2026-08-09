@@ -517,6 +517,28 @@ def test_fresh_classifier_run_is_promoted_and_published(tmp_path):
     assert any(item["type"] == "classification" for item in artifacts)
 
 
+def test_labels_count_out_of_sqlite_int64_range_is_rejected():
+    """A bundle carrying an arbitrarily large JSON integer for
+    ``labels.count`` (e.g. 10**100) would pass a naive non-negativity
+    check and only fail with ``OverflowError`` when materialization binds
+    the value to a SQLite integer column — leaving the bundle object
+    already published in the local store.  Reject out-of-range values
+    up front instead.
+    """
+    artifact = classification_artifact()
+    artifact["labels"]["count"] = 10 ** 100
+    with pytest.raises(CacheFormatError, match="SQLite"):
+        validate_artifact(artifact)
+
+    # Boundary check: exactly 2**63 - 1 (the SQLite signed int64 max)
+    # is accepted; one past it is rejected.
+    artifact["labels"]["count"] = (1 << 63) - 1
+    assert validate_artifact(artifact)["labels"]["count"] == (1 << 63) - 1
+    artifact["labels"]["count"] = 1 << 63
+    with pytest.raises(CacheFormatError, match="SQLite"):
+        validate_artifact(artifact)
+
+
 def test_taxonomy_field_shape_is_validated_before_publishing():
     artifact = classification_artifact(candidates=[{
         "species": "Robin",

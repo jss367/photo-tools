@@ -352,12 +352,14 @@ def _all_photos_cache_satisfied(
     the user's requested identity.  A photo with no detections at all is
     also unsatisfied so we still fall through to detection.
 
-    When neither filter is supplied (fresh-install fallback path), we
-    additionally require every covered detection to share the SAME
-    ``(classifier_model, labels_fingerprint)`` pair.  Otherwise the
+    When either filter is unsupplied (fresh-install fallback path or a
+    partially resolved request where only one of model/fingerprint is
+    known), we additionally require every covered detection to share the
+    SAME ``(classifier_model, labels_fingerprint)`` pair.  Otherwise the
     downstream cached-only finalize adopts the first row's identity and
     reconciles every other row against it — silently swapping the
-    classifier identity on detections covered by a different pair.
+    unbound component of the classifier identity on detections covered
+    by a different pair.
     """
     if not photo_ids:
         return False
@@ -376,7 +378,7 @@ def _all_photos_cache_satisfied(
     covered = 0
     covered_photos = 0
     distinct_identities = set()
-    identity_gate = classifier_model is None and labels_fingerprint is None
+    identity_gate = classifier_model is None or labels_fingerprint is None
 
     # Chunk ``photo_ids`` so a large collection (per_page=999999) does
     # not blow past SQLite's default SQLITE_MAX_VARIABLE_NUMBER (999)
@@ -2175,7 +2177,16 @@ def _finalize_cached_only(
 
     folders = {f["id"]: f["path"] for f in thread_db.get_folder_tree()}
     photo_ids = [p["id"] for p in photos]
-    detection_map = thread_db.get_detections_for_photos(photo_ids, min_conf=0)
+    # Apply the workspace-effective detector_confidence so imported bundles
+    # from a machine with a lower threshold don't surface subjects the
+    # destination workspace would hide.  The normal (non-cache) classify path
+    # filters detections with the same threshold before grouping/review.
+    import config as cfg
+    effective_cfg = thread_db.get_effective_config(cfg.load())
+    det_conf_threshold = effective_cfg.get("detector_confidence", 0.2)
+    detection_map = thread_db.get_detections_for_photos(
+        photo_ids, min_conf=det_conf_threshold,
+    )
 
     runner.update_step(job["id"], "classify", status="running")
 

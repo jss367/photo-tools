@@ -5685,6 +5685,119 @@ def test_all_photos_cache_satisfied_requires_every_photo_covered(tmp_path):
     assert _all_photos_cache_satisfied(db, []) is False
 
 
+def test_all_photos_cache_satisfied_requires_common_identity_when_either_unresolved(
+    tmp_path,
+):
+    """When only one of (classifier_model, labels_fingerprint) is known —
+    e.g. a fresh install where the model name is available but its label
+    sources aren't — cached rows may still legitimately span multiple
+    values for the unbound component.  ``_finalize_cached_only`` adopts
+    the first row's identity for reconciliation, so the satisfaction
+    check must refuse to short-circuit unless every covered row agrees
+    on that component too.
+    """
+    from classify_job import _all_photos_cache_satisfied
+    from db import Database
+
+    db = Database(str(tmp_path / "test.db"))
+    ws = db.ensure_default_workspace()
+    db.set_active_workspace(ws)
+    folder_id = db.add_folder("/tmp/p", name="p")
+    pid = db.add_photo(
+        folder_id, "a.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+    )
+    det_ids = db.save_detections(pid, [
+        {"box": {"x": 0, "y": 0, "w": 1, "h": 1}, "confidence": 0.9, "category": "animal"},
+        {"box": {"x": 2, "y": 2, "w": 1, "h": 1}, "confidence": 0.9, "category": "animal"},
+    ], detector_model="megadetector-v6")
+    # Same classifier, DIFFERENT label fingerprints across the two runs.
+    db.record_classifier_run(det_ids[0], "BioCLIP", "fp-a", prediction_count=1)
+    db.record_classifier_run(det_ids[1], "BioCLIP", "fp-b", prediction_count=1)
+
+    # Model known, fingerprint unresolved: the identity gate must refuse
+    # this because the cached rows disagree on the unbound fingerprint.
+    assert _all_photos_cache_satisfied(
+        db, [pid], classifier_model="BioCLIP", labels_fingerprint=None,
+    ) is False
+    # Fingerprint known, model unresolved: mirror case (all rows share
+    # the classifier, so if fingerprint is filtered to just one, only
+    # matching rows count — narrow the coverage instead).
+    assert _all_photos_cache_satisfied(
+        db, [pid], classifier_model=None, labels_fingerprint="fp-a",
+    ) is False
+    # Both fully specified: filter narrows to a single identity, gate
+    # not needed — but only one detection matches, so coverage fails.
+    assert _all_photos_cache_satisfied(
+        db, [pid], classifier_model="BioCLIP", labels_fingerprint="fp-a",
+    ) is False
+
+
+def test_finalize_cached_only_respects_workspace_detector_threshold(
+    tmp_path, monkeypatch,
+):
+    """A bundle imported from a machine with a lower detector_confidence
+    can materialize classifier runs for raw detections that the
+    destination workspace's threshold would hide.  The cache-only
+    finalize path must apply the workspace-effective threshold before
+    grouping — otherwise importing results silently changes which
+    subjects are surfaced to review.
+    """
+    import config as cfg
+    from classify_job import ClassifyParams, run_classify_job
+    from db import Database
+
+    monkeypatch.setattr(cfg, "CONFIG_PATH", str(tmp_path / "config.json"))
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    # A workspace whose effective threshold hides everything below 0.5.
+    ws = db.create_workspace(
+        "Strict", config_overrides={"detector_confidence": 0.5},
+    )
+    db.set_active_workspace(ws)
+    folder_id = db.add_folder("/tmp/p", name="p")
+    pid = db.add_photo(
+        folder_id, "a.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+    )
+    # Two detections: one clearly above the workspace threshold, one
+    # clearly below.  Both carry cached classifier runs so the
+    # ``_all_photos_cache_satisfied`` check accepts the short-circuit.
+    det_ids = db.save_detections(pid, [
+        {"box": {"x": 0, "y": 0, "w": 1, "h": 1}, "confidence": 0.9, "category": "animal"},
+        {"box": {"x": 2, "y": 2, "w": 1, "h": 1}, "confidence": 0.3, "category": "animal"},
+    ], detector_model="megadetector-v6")
+    for det_id, species in zip(det_ids, ["Robin", "Sparrow"], strict=True):
+        db.add_prediction(det_id, species=species, confidence=0.9,
+                          model="BioCLIP", labels_fingerprint="fp-cached")
+        db.record_classifier_run(det_id, "BioCLIP", "fp-cached",
+                                 prediction_count=1)
+
+    coll_id = db.add_collection(
+        "c", '[{"field":"photo_ids","value":[' + str(pid) + ']}]',
+    )
+
+    import classify_job as classify_job_mod
+    monkeypatch.setattr(classify_job_mod, "get_active_model", lambda: None)
+    monkeypatch.setattr(classify_job_mod, "get_models", lambda: [])
+
+    runner = FakeRunner()
+    job = _make_job()
+    params = ClassifyParams(
+        collection_id=coll_id,
+        labels_files=None, labels_file=None,
+        model_id=None, model_name=None,
+        grouping_window=0, similarity_threshold=0.99,
+        reclassify=False,
+    )
+
+    result = run_classify_job(job, runner, db_path, ws, params)
+    # Only the above-threshold detection reaches finalization.  Without
+    # the workspace threshold the count would be 2.
+    assert result["already_classified"] == 1
+
+
 def test_run_classify_job_short_circuits_when_cache_covers_every_photo(
     tmp_path, monkeypatch,
 ):

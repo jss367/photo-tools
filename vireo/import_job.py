@@ -576,12 +576,17 @@ class _LandedFile:
     """One file this batch landed (fresh copy/transfer) or adopted.
 
     ``verified_hash`` is the hash the import attests is at ``dest_path``
-    (copy-time hash locally; card-side hash remotely). ``origin`` is
-    "copied" or "skipped_duplicate" (adoption) and drives rollback
-    accounting in ``_reclassify_landed_failed``.
+    (copy-time hash locally; card-side hash remotely). Never None: the
+    ledger convention for zero-byte files is ``EMPTY_FILE_SHA256``,
+    normalized at the construction sites (``checker.content_hash``
+    returns None for size-0; scan's photo-row convention is NULL —
+    consumers that compare against row hashes normalize EMPTY → None
+    themselves). ``origin`` is "copied" or "skipped_duplicate"
+    (adoption) and drives rollback accounting in
+    ``_reclassify_landed_failed``.
     """
     dest_path: str
-    verified_hash: str | None
+    verified_hash: str
     source_path: str
     origin: str
     src_size: int | None
@@ -1362,6 +1367,198 @@ def _catalog_scan_and_prescan(state, batch_st, db, params, scan, destination,
         # api_job_scan / api_job_import_full / pipeline_job.
         _invalidate_new_images(db, batch_st.dest_folder)
     return pre_scan_hashes
+
+
+
+def _stamp_landed_and_validate_catalog(state, batch_st, db, params, rel, *,
+                                       attests_bytes, dest_noun,
+                                       stop_requested):
+    """Cross-check every landed file against what scan() cataloged and
+    stamp the integrity verdicts; returns the RAW photo ids whose
+    derived caches need invalidation because a landed JPEG became (or
+    already was) their companion (the caller passes them to
+    ``_invalidate_changed_and_sweep``).
+
+    ``entry.verified_hash`` is the hash this import recorded when the
+    bytes landed (copy-time hash locally, card-side hash remotely).
+    Catalog integrity is checked in BOTH verify modes; the wording of
+    the failure reasons says "recorded", not "verified", because a
+    no-verify remote run computed the card-side hash but verified
+    nothing destination-side.
+
+    Invariants (spec PR 6b — do not regress):
+
+    - The ``hash_status='ok'`` stamps run ONLY behind ``attests_bytes``
+      (== each caller's ``verified_counted_for_copies``: ``True``
+      locally, where every copy is hash-verified;
+      ``params.verify_by_hash`` remotely) — the stamp is the
+      independent byte-attestation, not just "scan and import agree".
+    - ``state.imported_photo_ids.add`` runs on EVERY accept path and
+      stays OUTSIDE that gate: the after-import chaining hook builds
+      its process job collection from these ids even on no-verify runs.
+    - The scan-NULL backfill (spec decision 11) excludes
+      ``EMPTY_FILE_SHA256``: zero-byte accepts pass ``file_hash=None``
+      (``update_photo_hash_check``'s status-only arm), keeping scan's
+      NULL — backfilling EMPTY would recreate the every-empty-file
+      collision the zero-byte convention exists to prevent.
+
+    ``dest_noun`` ("archive" locally, "mount" remotely) parameterizes
+    the user-visible failure reasons; ``stop_requested`` is the
+    caller's cancellation poll, threaded into the destination re-reads.
+    """
+    raw_companion_invalidations = set()
+    for entry in batch_st.landed:
+        dest_path = entry.dest_path
+        verified_hash = entry.verified_hash
+        row = db.conn.execute(
+            """SELECT p.id, p.file_hash FROM photos p
+               JOIN folders f ON f.id = p.folder_id
+               WHERE f.path = ? AND p.filename = ?""",
+            (os.path.dirname(dest_path),
+             os.path.basename(dest_path)),
+        ).fetchone()
+        if row is None:
+            # RAW+JPEG pairing merges the JPEG's photo row into
+            # the RAW primary (companion_path) and deletes the
+            # JPEG's own row, so a landed JPEG whose sibling RAW
+            # was scanned in the same batch legitimately has no
+            # row of its own. Look it up as another row's
+            # companion_path before deciding "not cataloged".
+            # See PR #1107/#1113 reviews.
+            companion = db.conn.execute(
+                """SELECT p.id FROM photos p
+                   JOIN folders f ON f.id = p.folder_id
+                   WHERE f.path = ? AND p.companion_path = ?""",
+                (os.path.dirname(dest_path),
+                 os.path.basename(dest_path)),
+            ).fetchone()
+            if companion is not None:
+                # The paired JPEG's own row is gone by design,
+                # so the row branch below can't cross-check its
+                # bytes. Re-read the destination file here in
+                # BOTH verify modes — paired JPEGs need the same
+                # stale-destination catalog-integrity guard or
+                # after-import processing would enqueue against
+                # the wrong companion. ``None`` from the re-read
+                # unambiguously means unreadable:
+                # ``verified_hash`` is never None (zero-byte
+                # normalizes to ``EMPTY_FILE_SHA256`` at
+                # ``_LandedFile`` construction), so an empty
+                # companion whose file vanished cannot be
+                # confused with a legitimately empty one. See
+                # PR #1107/#1113/#1437 reviews.
+                try:
+                    actual = _rehash_dest_or_none(
+                        dest_path, stop_requested)
+                except DestReadCancelled:
+                    state.cancelled = True
+                    break
+                if actual is not None and actual == verified_hash:
+                    # Invalidate the RAW's derived caches
+                    # regardless of origin: adoption only proves
+                    # the JPEG bytes were already at the dest
+                    # path, NOT that the RAW row already carried
+                    # ``companion_path`` for this JPEG. A prior
+                    # partial run or backfill may have left the
+                    # RAW as RAW-only, and the deferred
+                    # end-of-run ``_extract_working_copies``
+                    # skips rows whose ``working_copy_path IS
+                    # NOT NULL`` — a stale RAW-only cache would
+                    # persist past this import otherwise. See
+                    # PR #1107 review.
+                    raw_companion_invalidations.add(
+                        companion["id"],
+                    )
+                    # The landed JPEG's bytes are represented on
+                    # the RAW primary — that row is what the
+                    # chaining hook should process.
+                    state.imported_photo_ids.add(companion["id"])
+                    continue
+                _reclassify_landed_failed(
+                    state, rel, entry,
+                    f"paired companion {dest_noun} bytes could "
+                    "not be read"
+                    if actual is None else
+                    f"paired companion {dest_noun} bytes do not "
+                    "match the hash this import recorded "
+                    f"({dest_noun} base is likely stale or "
+                    "misconfigured)",
+                    attests_bytes,
+                )
+                batch_st.reclassified_landed_paths.add(dest_path)
+                continue
+            _reclassify_landed_failed(
+                state, rel, entry,
+                "not cataloged after scan (no photo row)",
+                attests_bytes,
+            )
+            batch_st.reclassified_landed_paths.add(dest_path)
+            continue
+        if row["file_hash"] == verified_hash:
+            if attests_bytes:
+                db.update_photo_hash_check(
+                    row["id"], "ok", commit=False,
+                )
+            state.imported_photo_ids.add(row["id"])
+        elif row["file_hash"] is None:
+            # scan() legitimately writes NULL for zero-byte
+            # files (the convention keeps ``EMPTY_FILE_SHA256``
+            # out of ``photos.file_hash``) and can leave NULL
+            # when its own read failed (large files, prior
+            # partial scan, or a suppressed read error). Don't
+            # stamp blind either way: re-read the destination
+            # file as the last-line check so a file that
+            # vanished, changed, or became unreadable between
+            # scan and stamping fails instead of keeping
+            # ``hash_status='ok'`` with ``safe_to_format``
+            # green. See PR #1107/#1113/#1437 reviews.
+            try:
+                actual = _rehash_dest_or_none(
+                    dest_path, stop_requested)
+            except DestReadCancelled:
+                state.cancelled = True
+                break
+            if actual is not None and actual == verified_hash:
+                # Backfill the row hash scan couldn't write
+                # (spec decision 11) — except the zero-byte
+                # case, where ``file_hash=None`` hits
+                # ``update_photo_hash_check``'s status-only arm
+                # and the row keeps scan's NULL (backfilling
+                # EMPTY would recreate the every-empty-file
+                # collision the convention exists to prevent).
+                if attests_bytes:
+                    db.update_photo_hash_check(
+                        row["id"], "ok",
+                        file_hash=(
+                            verified_hash
+                            if verified_hash != EMPTY_FILE_SHA256
+                            else None
+                        ),
+                        commit=False,
+                    )
+                state.imported_photo_ids.add(row["id"])
+            else:
+                _reclassify_landed_failed(
+                    state, rel, entry,
+                    f"scan wrote no {dest_noun} row hash and a "
+                    f"re-read of the {dest_noun} file disagrees "
+                    "with the hash this import recorded "
+                    f"({dest_noun} file is likely stale, "
+                    "unreadable, or misconfigured)",
+                    attests_bytes,
+                )
+                batch_st.reclassified_landed_paths.add(dest_path)
+        else:
+            _reclassify_landed_failed(
+                state, rel, entry,
+                f"scanned {dest_noun} row hash does not match "
+                "the hash this import recorded "
+                f"({dest_noun} base is likely stale or "
+                "misconfigured)",
+                attests_bytes,
+            )
+            batch_st.reclassified_landed_paths.add(dest_path)
+    return raw_companion_invalidations
 
 
 def _invalidate_changed_and_sweep(state, batch_st, db, params,
@@ -2358,6 +2555,27 @@ def _hash_dest_file(path, cancel_check, *,
     return result["hash"]
 
 
+def _rehash_dest_or_none(path, stop_requested):
+    """Re-hash a landed destination file, returning None on read failure.
+
+    The stamping loop's last-line check that the bytes currently at the
+    destination path still match the hash this import recorded —
+    necessary any time the scan-side hash is missing (paired-JPEG row
+    deletion) or NULL (zero-byte convention aside, a NULL means the
+    scan-side read failed between landing and scan). ``None``
+    unambiguously means unreadable: ``_LandedFile.verified_hash`` is
+    never None, so callers comparing against it cannot confuse a read
+    failure with a legitimately empty file. Re-raises
+    ``DestReadCancelled`` from a stop request.
+    """
+    try:
+        return _hash_dest_file(path, stop_requested)
+    except DestReadCancelled:
+        raise
+    except OSError:
+        return None
+
+
 def _key_twin_rows(db, key):
     """Catalog rows whose stored identity equals a source metadata key.
 
@@ -3132,7 +3350,19 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
                         # exactly 0). See PR #1113 review.
                         batch_st.landed.append(_LandedFile(
                             dest_path=cand_mount,
-                            verified_hash=src_hash,
+                            # checker.content_hash returns None for
+                            # size-0; the ledger convention is EMPTY,
+                            # scan's row convention is NULL —
+                            # normalize here, once, instead of in
+                            # every consumer. (The adopt gate above
+                            # filters ``src_hash is None``, so this
+                            # arm is defensive at this site.) Do NOT
+                            # normalize ``src_hash`` itself: the
+                            # intra-batch dedup maps rely on the None
+                            # convention.
+                            verified_hash=src_hash
+                            if src_hash is not None
+                            else EMPTY_FILE_SHA256,
                             source_path=str(source_file),
                             origin="skipped_duplicate",
                             src_size=src_size,
@@ -3439,7 +3669,18 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
                         state.verified += 1
                     batch_st.landed.append(_LandedFile(
                         dest_path=dest_path,
-                        verified_hash=src_hash,
+                        # checker.content_hash returns None for size-0;
+                        # the ledger convention is EMPTY, scan's row
+                        # convention is NULL — normalize here, once,
+                        # instead of in every consumer. Do NOT
+                        # normalize ``src_hash`` itself: the
+                        # intra-batch dedup maps
+                        # (claimed_basenames/queued_src_hashes), the
+                        # adopt gate, and ``_record_checker`` rely on
+                        # the None convention.
+                        verified_hash=src_hash
+                        if src_hash is not None
+                        else EMPTY_FILE_SHA256,
                         source_path=str(sf),
                         origin="copied",
                         src_size=sz,
@@ -3498,245 +3739,12 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
             # the JPEG bytes pre-existed on the mount, not that the RAW
             # already carried companion_path) and invalidate below.
             # Mirrors the local path — spec decision 6.
-            raw_companion_invalidations = set()
-            # NOTE: this stamping loop is deliberately NOT extracted —
-            # it hides divergence 11 (local-only file_hash backfill)
-            # and the zero-byte normalization split; it is unified in
-            # the spec's PR 6b (align-then-extract). See the decision
-            # table in the import-path-unification spec.
-            for entry in list(batch_st.landed):
-                dest_path = entry.dest_path
-                src_hash = entry.verified_hash
-                row = db.conn.execute(
-                    """SELECT p.id, p.file_hash FROM photos p
-                       JOIN folders f ON f.id = p.folder_id
-                       WHERE f.path = ? AND p.filename = ?""",
-                    (os.path.dirname(dest_path),
-                     os.path.basename(dest_path)),
-                ).fetchone()
-                if row is not None:
-                    # Cross-check the scanned MOUNT row's hash against the
-                    # source hash (the bytes we intended to land). This
-                    # runs even without ``verify_by_hash`` because catalog
-                    # integrity is a separate concern from the format
-                    # honesty gate: a stale/misconfigured mount that
-                    # happens to already contain ``<folder>/<filename>``
-                    # for a name we ``--ignore-existing``-transferred, or
-                    # a receiver-side race that left a different file at
-                    # that path, would otherwise be cataloged against
-                    # unrelated bytes while ``safe_to_format=False``
-                    # (correct on the format side, but the workspace
-                    # catalog now points at the wrong photo). The
-                    # ``hash_status='ok'`` stamp still runs ONLY behind
-                    # ``verify_by_hash`` — that stamp is the independent
-                    # card→NAS attestation, not just "scan and source
-                    # agree on the mount view". Mirrors the local path's
-                    # cross-check against ``verified_hash``. See PR #1113
-                    # review.
-                    #
-                    # Normalize zero-byte convention on both sides:
-                    # scan() writes NULL for zero-byte files;
-                    # ``checker.content_hash`` returns None; a
-                    # checker-less ``compute_file_hash`` returns
-                    # ``EMPTY_FILE_SHA256``. Treat all three as
-                    # equivalent so an empty card file matches its
-                    # empty catalog row.
-                    scan_h = row["file_hash"]
-                    if scan_h == EMPTY_FILE_SHA256:
-                        scan_h = None
-                    src_h_norm = (
-                        None if src_hash == EMPTY_FILE_SHA256
-                        else src_hash
-                    )
-                    # scan() can legitimately leave ``file_hash`` NULL
-                    # (large files, prior partial scan, tests that stub
-                    # the hash step, or a read/permission failure that
-                    # scanner suppresses). A missing scan hash doesn't
-                    # prove anything on its own, but silently accepting
-                    # would let a stale/unreadable mount stamp ``ok``
-                    # under ``verify_by_hash`` — the NAS checksum only
-                    # proves card bytes reached the SSH target, not that
-                    # the cataloged mount path holds those bytes. Rehash
-                    # the mount file directly as the last-line check;
-                    # mirrors the local path's ``_rehash_dest_or_none``
-                    # fallback. See PR #1113 review.
-                    #
-                    # Zero-byte adopted files (``skip_duplicates=False``
-                    # only: the checker path returns ``None`` from
-                    # ``content_hash`` so the collision walk never
-                    # matches an empty source against an empty on-disk
-                    # candidate) reach this point with ``src_h_norm ==
-                    # scan_h == None``. Pre-fold, the deleted
-                    # ``adopted_paths`` validation pass always called
-                    # ``_hash_dest_file`` when ``scan_h`` was ``None``
-                    # and treated ``OSError`` as failure — without that,
-                    # an empty adopted file that vanished or became
-                    # unreadable between the adopt-time hash and the
-                    # stamping loop would keep its ``skipped_duplicate``
-                    # booking and get ``hash_status='ok'``, and
-                    # ``safe_to_format`` could go green over an archive
-                    # file that is no longer there. Distinguish OSError
-                    # from a legitimate empty mount file so the empty-
-                    # source, empty-mount case still passes. See PR
-                    # #1437 review (Codex P1 r3741224300).
-                    if scan_h is None:
-                        read_failed = False
-                        try:
-                            mount_hash = _hash_dest_file(
-                                dest_path, _stop_requested)
-                        except DestReadCancelled:
-                            state.cancelled = True
-                            break
-                        except OSError:
-                            mount_hash = None
-                            read_failed = True
-                        mount_norm = (
-                            None if mount_hash == EMPTY_FILE_SHA256
-                            else mount_hash
-                        )
-                        if read_failed or mount_norm != src_h_norm:
-                            _reclassify_landed_failed(
-                                state, rel, entry,
-                                "scan wrote no mount row hash and a re-"
-                                "read of the mount file "
-                                + ("disagrees with the source hash"
-                                   if not params.verify_by_hash else
-                                   "disagrees with the hash verified "
-                                   "on the NAS")
-                                + " (mount base is likely stale, "
-                                "unreadable, or misconfigured)",
-                                verified_counted_for_copies,
-                            )
-                            batch_st.reclassified_landed_paths.add(entry.dest_path)
-                            continue
-                    elif scan_h is not None and scan_h != src_h_norm:
-                        _reclassify_landed_failed(
-                            state, rel, entry,
-                            "scanned mount row hash does not match "
-                            "the source hash (mount base is likely "
-                            "stale or misconfigured)"
-                            if not params.verify_by_hash else
-                            "scanned mount row hash does not match "
-                            "the hash verified on the NAS (mount "
-                            "base is likely stale or misconfigured)",
-                            verified_counted_for_copies,
-                        )
-                        batch_st.reclassified_landed_paths.add(entry.dest_path)
-                        continue
-                    if params.verify_by_hash:
-                        db.update_photo_hash_check(
-                            row["id"], "ok", commit=False,
-                        )
-                    # Fresh mount row this run stamped as valid — the
-                    # after-import chaining hook builds its process job
-                    # collection from these ids.
-                    state.imported_photo_ids.add(row["id"])
-                else:
-                    # RAW+JPEG pairing merges the JPEG's photo row into
-                    # the RAW primary (companion_path) and deletes the
-                    # JPEG's own row, so a landed JPEG whose sibling RAW
-                    # was scanned in the same batch legitimately has no
-                    # row of its own. Look it up as another row's
-                    # companion_path before deciding "not cataloged".
-                    # When verifying, cross-check the mount JPEG bytes
-                    # against the hash confirmed card->NAS (same
-                    # stale-mount guard the non-companion branch runs
-                    # above). Mirrors the local path's companion lookup.
-                    # See PR #1113 review.
-                    companion = db.conn.execute(
-                        """SELECT p.id FROM photos p
-                           JOIN folders f ON f.id = p.folder_id
-                           WHERE f.path = ? AND p.companion_path = ?""",
-                        (os.path.dirname(dest_path),
-                         os.path.basename(dest_path)),
-                    ).fetchone()
-                    if companion is not None:
-                        # The paired JPEG's own photo row is gone by
-                        # design (pair-scan merges it into the RAW
-                        # primary), so the non-companion branch above
-                        # can't cross-check its bytes for us. Hash the
-                        # mount JPEG here regardless of
-                        # ``verify_by_hash`` — the non-companion branch
-                        # compares ``scan_h`` vs ``src_h_norm`` even in
-                        # no-verify mode as a stale-mount catalog-
-                        # integrity guard, and paired JPEGs need the
-                        # same protection or a stale/misconfigured
-                        # mount with a same-named but different JPEG
-                        # would enqueue after-import processing against
-                        # the wrong companion. Only the
-                        # ``verified``/``hash_status`` accounting is
-                        # gated behind ``verify_by_hash``. See PR #1113
-                        # review.
-                        # Same OSError-distinguishing shape as the
-                        # non-companion branch above: a zero-byte
-                        # adopted companion (``src_hash ==
-                        # EMPTY_FILE_SHA256`` → ``src_h_norm ==
-                        # None``) whose mount file vanished or became
-                        # unreadable between the adopt-time hash and
-                        # this loop would surface here as
-                        # ``mount_hash = None`` and ``mount_norm ==
-                        # src_h_norm == None`` — comparison passes,
-                        # the RAW row joins ``imported_photo_ids``,
-                        # and ``safe_to_format`` could go green over
-                        # a companion that is no longer there. The
-                        # removed ``adopted_paths`` validator treated
-                        # ``OSError`` as failure; preserve that
-                        # explicit read-failure flag here. See PR
-                        # #1437 review (Codex P1 r3741254301).
-                        read_failed = False
-                        try:
-                            mount_hash = _hash_dest_file(
-                                dest_path, _stop_requested)
-                        except DestReadCancelled:
-                            state.cancelled = True
-                            break
-                        except OSError:
-                            mount_hash = None
-                            read_failed = True
-                        src_h_norm = (
-                            None if src_hash == EMPTY_FILE_SHA256
-                            else src_hash
-                        )
-                        mount_norm = (
-                            None if mount_hash == EMPTY_FILE_SHA256
-                            else mount_hash
-                        )
-                        if read_failed or mount_norm != src_h_norm:
-                            _reclassify_landed_failed(
-                                state, rel, entry,
-                                "paired companion mount bytes could "
-                                "not be read"
-                                if read_failed else
-                                "paired companion mount bytes do "
-                                "not match the source hash (mount "
-                                "base is likely stale or "
-                                "misconfigured)"
-                                if not params.verify_by_hash else
-                                "paired companion mount bytes do "
-                                "not match the hash verified on "
-                                "the NAS (mount base is likely "
-                                "stale or misconfigured)",
-                                verified_counted_for_copies,
-                            )
-                            batch_st.reclassified_landed_paths.add(entry.dest_path)
-                            continue
-                        # JPEG bytes are represented by the RAW row's
-                        # companion_path — accept as landed; leave the
-                        # copied/verified counters alone. The RAW row is
-                        # what the chaining hook should process, so its
-                        # id joins ``imported_photo_ids``. See PR #1113
-                        # review.
-                        # Collected for the post-validation invalidation
-                        # loop — see the raw_companion_invalidations decl.
-                        raw_companion_invalidations.add(companion["id"])
-                        state.imported_photo_ids.add(companion["id"])
-                        continue
-                    _reclassify_landed_failed(
-                        state, rel, entry,
-                        "not cataloged after scan (no photo row)",
-                        verified_counted_for_copies,
-                    )
-                    batch_st.reclassified_landed_paths.add(entry.dest_path)
+            raw_companion_invalidations = _stamp_landed_and_validate_catalog(
+                state, batch_st, db, params, rel,
+                attests_bytes=verified_counted_for_copies,
+                dest_noun="mount",
+                stop_requested=_stop_requested,
+            )
             # Invalidate derived caches for any landed/adopted row whose
             # bytes differ from what was there pre-scan. The batch scan
             # passes ``vireo_dir`` through, so scanner's own
@@ -4256,193 +4264,15 @@ def run_import_job(job, runner, db_path, workspace_id, params):
             # adoption (``origin == "skipped_duplicate"``) only proves
             # the JPEG bytes were already at the archive path, NOT that
             # the RAW row already carried ``companion_path`` for this
-            # JPEG (see the accept branch below). See PR #1107 review.
-            raw_companion_invalidations = set()
-            # NOTE: this stamping loop is deliberately NOT extracted —
-            # it hides divergence 11 (local-only file_hash backfill)
-            # and the zero-byte normalization split; it is unified in
-            # the spec's PR 6b (align-then-extract). See the decision
-            # table in the import-path-unification spec.
-
-            def _rehash_dest_or_none(path):
-                """Re-hash the archive file, returning None on read failure.
-
-                Used as the last-line check that the bytes currently at the
-                archive path still match what ``copy_and_hash_verify()``
-                landed — necessary any time the scan-side hash is missing
-                (paired-JPEG row deletion) or NULL (scanner hashed the empty
-                zero-byte convention aside, a NULL means the archive read
-                failed between promote and scan). Without it, mutation of
-                the archive file between promote and scan would still be
-                accepted as success.
-                """
-                try:
-                    return _hash_dest_file(path, _stop_requested)
-                except DestReadCancelled:
-                    raise
-                except OSError:
-                    return None
-
-            # Stamp the verified hashes in the integrity-audit vocabulary,
-            # cross-checked against what scan() stored.
-            for entry in batch_st.landed:
-                dest_path = entry.dest_path
-                verified_hash = entry.verified_hash
-                row = db.conn.execute(
-                    """SELECT p.id, p.file_hash FROM photos p
-                       JOIN folders f ON f.id = p.folder_id
-                       WHERE f.path = ? AND p.filename = ?""",
-                    (os.path.dirname(dest_path), os.path.basename(dest_path)),
-                ).fetchone()
-                if row is None:
-                    # RAW+JPEG pairing merges the JPEG's photo row into the
-                    # RAW primary (companion_path); the JPEG's own row is
-                    # gone by design and the bytes are represented on the
-                    # RAW. But the pair lookup can't tell us the JPEG's
-                    # archive bytes are still the ones we verified — the
-                    # archive file could have been rewritten or corrupted
-                    # between promote and the restricted scan. Re-read the
-                    # archive path and require its hash to still equal
-                    # ``verified_hash`` before counting the JPEG landed;
-                    # otherwise reclassify to failed. See PR #1107 review.
-                    companion = db.conn.execute(
-                        """SELECT p.id FROM photos p
-                           JOIN folders f ON f.id = p.folder_id
-                           WHERE f.path = ? AND p.companion_path = ?""",
-                        (
-                            os.path.dirname(dest_path),
-                            os.path.basename(dest_path),
-                        ),
-                    ).fetchone()
-                    if companion is not None:
-                        try:
-                            actual = _rehash_dest_or_none(dest_path)
-                        except DestReadCancelled:
-                            state.cancelled = True
-                            break
-                        if actual is not None and actual == verified_hash:
-                            # Landed JPEG paired with an existing RAW
-                            # row. Invalidate the RAW's derived caches
-                            # regardless of origin: adoption
-                            # (``skipped_duplicate``) only proves the
-                            # JPEG bytes were already at the archive
-                            # path, NOT that the RAW row already carried
-                            # ``companion_path`` for this JPEG. A prior
-                            # partial run or backfill may have left the
-                            # RAW as RAW-only (with a
-                            # ``working_copy_path`` or
-                            # ``working_copy_failed_at`` built without
-                            # knowing this companion existed); the
-                            # deferred end-of-run
-                            # ``_extract_working_copies`` skips RAWs
-                            # whose ``working_copy_path IS NOT NULL``,
-                            # so a stale RAW-only cache would persist
-                            # past this import and the UI would keep
-                            # serving derived files for the pre-pair
-                            # state. Fresh-copy JPEGs need this too
-                            # (RAW may have been standalone or paired
-                            # with a since-deleted companion). See PR
-                            # #1107 review.
-                            raw_companion_invalidations.add(
-                                companion["id"],
-                            )
-                            # The landed JPEG's bytes are now represented
-                            # on the RAW primary — that row is what the
-                            # chaining hook should process.
-                            state.imported_photo_ids.add(companion["id"])
-                            continue
-                        _reclassify_landed_failed(
-                            state, rel, entry,
-                            "paired companion archive bytes no longer "
-                            "match the copy-time hash",
-                            verified_counted_for_copies,
-                        )
-                        batch_st.reclassified_landed_paths.add(dest_path)
-                        continue
-                    _reclassify_landed_failed(
-                        state, rel, entry, "not cataloged after scan",
-                        verified_counted_for_copies,
-                    )
-                    batch_st.reclassified_landed_paths.add(dest_path)
-                    continue
-                if row["file_hash"] == verified_hash:
-                    db.update_photo_hash_check(
-                        row["id"], "ok", commit=False,
-                    )
-                    state.imported_photo_ids.add(row["id"])
-                elif row["file_hash"] is None:
-                    if verified_hash == EMPTY_FILE_SHA256:
-                        # Zero-byte convention: EMPTY_FILE_SHA256 never
-                        # lands in file_hash (it would collide with every
-                        # other empty file), so a NULL row hash is
-                        # expected here — but do not stamp blind. Re-read
-                        # the archive path so an empty file that vanished
-                        # or became unreadable between scan and stamping
-                        # fails instead of keeping hash_status='ok' with
-                        # safe_to_format green over a missing file.
-                        # Mirrors the remote loop's zero-byte re-read
-                        # (PR #1437 review, Codex P1 r3741224300 — the
-                        # remote fold inherited this hole FROM this
-                        # branch, and the fix landed remote-only).
-                        try:
-                            actual = _rehash_dest_or_none(dest_path)
-                        except DestReadCancelled:
-                            state.cancelled = True
-                            break
-                        if actual == EMPTY_FILE_SHA256:
-                            db.update_photo_hash_check(
-                                row["id"], "ok", commit=False,
-                            )
-                            state.imported_photo_ids.add(row["id"])
-                        else:
-                            _reclassify_landed_failed(
-                                state, rel, entry,
-                                "scan wrote no archive row hash and a "
-                                "re-read of the archive file disagrees "
-                                "with the copy-time hash (archive file "
-                                "vanished, changed, or is unreadable)",
-                                verified_counted_for_copies,
-                            )
-                            batch_st.reclassified_landed_paths.add(dest_path)
-                    else:
-                        # Non-empty file with NULL file_hash after scan
-                        # means scanner._compute_file_features couldn't
-                        # read the archive file (unreadable between
-                        # promote and scan). Trusting the copy-time hash
-                        # here would flip ``safe_to_format`` green for
-                        # bytes we can't currently verify on disk. Re-
-                        # hash the archive path from here as a last check
-                        # — if that also fails or disagrees with our
-                        # copy-time hash, reclassify to failed instead of
-                        # stamping a stale value. See PR #1107 review.
-                        try:
-                            actual = _rehash_dest_or_none(dest_path)
-                        except DestReadCancelled:
-                            state.cancelled = True
-                            break
-                        if actual is not None and actual == verified_hash:
-                            db.update_photo_hash_check(
-                                row["id"], "ok", file_hash=verified_hash,
-                                commit=False,
-                            )
-                            state.imported_photo_ids.add(row["id"])
-                        else:
-                            _reclassify_landed_failed(
-                                state, rel, entry,
-                                "archive file unhashable after copy "
-                                "verification (scan wrote no hash and "
-                                "re-hash disagrees)",
-                                verified_counted_for_copies,
-                            )
-                            batch_st.reclassified_landed_paths.add(dest_path)
-                else:
-                    _reclassify_landed_failed(
-                        state, rel, entry,
-                        "destination changed between copy verification and "
-                        "catalog scan (hash mismatch)",
-                        verified_counted_for_copies,
-                    )
-                    batch_st.reclassified_landed_paths.add(dest_path)
+            # JPEG (see the companion accept branch in
+            # ``_stamp_landed_and_validate_catalog``). See PR #1107
+            # review.
+            raw_companion_invalidations = _stamp_landed_and_validate_catalog(
+                state, batch_st, db, params, rel,
+                attests_bytes=verified_counted_for_copies,
+                dest_noun="archive",
+                stop_requested=_stop_requested,
+            )
 
             # Invalidate derived caches for any landed row whose bytes
             # differ from what was there pre-scan. The batch scan passes

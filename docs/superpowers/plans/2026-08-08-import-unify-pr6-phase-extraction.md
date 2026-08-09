@@ -68,3 +68,18 @@
 - [ ] Symtable/grep audit for the batch-state names (same discipline as 5b; recursive variant).
 - [ ] Full file (225/1) + required CLAUDE.md suite (2077/14/1 known env failure).
 - [ ] Push; PR: title `"Import unification PR 6: extract the shared import phases"`, base main. Body: spec/plan links; the fresh-map methodology (stripped-diff verification); the extraction inventory with line counts; the proven-no-op transfer-keys note; the three narration alignments; what deliberately STAYS (stamping loops → PR 6b with divergence 11; collision/adopt walk + transfer → PR 7; local-only per-file guard recorded for PR 7); suite counts identical at every commit; the audit artifacts. End with the Claude Code attribution line.
+
+## As built (erratum, 2026-08-09)
+
+Two deltas between this plan and what merged in PR #1444; the merged code is
+the source of truth.
+
+- **Seven commits, not six.** The goal line says "six suite-green commits";
+  seven production commits landed — the Task 6 batch-state/preflight/rollback
+  work split into two commits (narration alignment landed separately from the
+  batch-state extraction) so each stayed individually reviewable.
+- **As-built signatures differ from the Task 6 sketch:**
+  - `_rollback_on_mount_loss` takes no `rel` parameter — it reads
+    `batch_st.rel` instead.
+  - `_batch_preflight` returns `dest_folder` (or `None` → caller `continue`s)
+    and takes a `missing_root_check` parameter.

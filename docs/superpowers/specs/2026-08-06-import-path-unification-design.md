@@ -229,7 +229,7 @@ changes to match.
 | 8 | Local re-computes the source hash at 3996–3999 instead of reusing `_src_hash_cached()` | **No change — premise disproven (2026-08-08, PR 3).** `DuplicateChecker.content_hash` memoizes per source path (`import_dedup.py:319-327`), so with a checker the copy-site call is a cache hit whenever a hash was computed earlier in the run — and otherwise performs a read `copy_and_hash_verify` would do itself anyway (its `src_hash is None` branch runs a standalone `compute_file_hash(src)`). With no checker, reusing `_src_hash_cached()` is read-neutral: the standalone read merely moves, with a marginal saving only on the rare collision-walk path. No redundant I/O exists; the call-site duplication itself dissolves in PR 5's shared cached-hash closure. |
 | 9 | Remote rollback open-coded at 8 sites vs local `_reclassify_landed_failed` | **Structural — shared helper on `_ImportRunState`** (PR 5). |
 | 10 | Adopted (crash-recovery) files get `hash_status='ok'` stamped locally but stay `NULL` remotely — found empirically by PR 1's parity net (2026-08-07): local adoption folds into `landed` and hits the verify stamp; remote adoption lives in `adopted_paths`, whose validation cross-checks bytes but never stamps | **Adopt local, via the PR 5 structural change.** Folding remote adoptions into `landed` with their verified hash makes the stamp fall out of the unified catalog pass; no separate fix PR. Pinned per-path by `test_{local,remote}_adoption_uncataloged_dest_twin_current_behavior`, which flip when PR 5 lands. |
-| 11 | Local stamping loop backfills `file_hash` on scan-NULL rows (`update_photo_hash_check(..., "ok", file_hash=verified_hash)`, ~L4511–4514 — NOT the non-backfilling stamp at L4480–4482 just above it, which handles the zero-byte case); remote stamps `"ok"` without backfilling — found by the 2026-08-08 extraction phase map (D4). Related, same loop: a zero-byte normalization-convention split (D2/D3) — remote normalizes `EMPTY_FILE_SHA256` → `None` at hash time with a `read_failed` flag; local compares raw hashes and its `verified_hash` is never `None`. | **Deferred to the stamping align-then-extract PR (6b): adopt local (backfill on both paths) unless review finds a reason the remote's NULL is load-bearing; until then the stamping loops stay per-function.** For D2/D3, unify by normalizing at `_LandedFile` construction in 6b so both loops see the same convention. |
+| 11 | Local stamping loop backfills `file_hash` on scan-NULL rows (`update_photo_hash_check(..., "ok", file_hash=verified_hash)`, ~L4511–4514 — NOT the non-backfilling stamp at L4480–4482 just above it, which handles the zero-byte case); remote stamps `"ok"` without backfilling — found by the 2026-08-08 extraction phase map (D4). Related, same loop: a zero-byte normalization-convention split (D2/D3) — remote normalizes `EMPTY_FILE_SHA256` → `None` at hash time with a `read_failed` flag; local compares raw hashes and its `verified_hash` is never `None`. | **RESOLVED 2026-08-09 (PR 6b): adopt local, with the zero-byte exclusion.** Remote backfills `file_hash` only on the scan-NULL re-read-agree path, and only with non-`EMPTY_FILE_SHA256` hashes: `file_hash=(src_hash if src_hash != EMPTY_FILE_SHA256 else None)`. Backfilling `EMPTY_FILE_SHA256` would recreate the collision the scanner's zero-byte NULL convention exists to prevent (scanner nulls empty-file hashes; `empty_hash_needs_repair` would churn repairs). The scan-hash-agrees path needs no backfill — the row already holds the hash (local doesn't backfill there either). For D2/D3, unify by normalizing at `_LandedFile` construction in 6b so both loops see the same convention. |
 
 Kept as deliberate (transport-required) differences, expressed through the
 protocol rather than duplicated code: transfer sub-progress
@@ -313,6 +313,17 @@ and goes through the normal PR-agent review cycle.
    **PR 6b — stamping alignment + extraction (behavior PR: D4, D2/D3)**
    between PR 6 and PR 7: align per decision 11 first, then extract the
    now-identical loop.*
+   *Update 2026-08-09: PR 6b lands as four production commits, each
+   individually reviewable: (1) D4 red-green — remote backfills `file_hash`
+   on the scan-NULL re-read-agree path with the zero-byte exclusion
+   (decision 11, now RESOLVED); (2) D2/D3 — normalize zero-byte
+   `verified_hash` to `EMPTY_FILE_SHA256` at `_LandedFile` construction,
+   with the one externally-visible flip (remote zero-byte re-import now
+   invalidates derived caches, matching local) pinned by its own test;
+   (3) D1 + messages — gate stamps on `attests_bytes`
+   (≡ `verified_counted_for_copies`, zero-flip) and unify the reason
+   strings via a `dest_noun` parameter; (4) mechanical extraction of the
+   now-textually-identical loop as `_stamp_landed_and_validate_catalog`.*
 7. **PR 7 — the merge.** Introduce `_Transport`, `LocalTransport`,
    `RsyncTransport`; one orchestrator batch loop; delete
    `_run_remote_import_job`; repoint the remote tests' monkeypatch seam at

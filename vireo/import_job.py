@@ -734,7 +734,7 @@ def _fail(state, rel, source_file, reason):
 
 
 def _reclassify_landed_failed(state, rel, entry, reason,
-                              verified_counted_for_copies):
+                              attests_bytes):
     """Move a landed file's count from copied/skipped_duplicate to failed.
 
     A landed entry has already been booked into ``copied`` (fresh copy)
@@ -746,15 +746,16 @@ def _reclassify_landed_failed(state, rel, entry, reason,
     otherwise the exactly-one-terminal-bucket invariant breaks and
     ``copied + skipped_duplicate + failed`` exceeds ``discovered``.
 
-    ``verified_counted_for_copies``: whether each ``copied`` booking
-    also incremented ``verified``, so the rollback must undo both. (PR
-    7's transport ``attests_bytes`` absorbs this flag.)
+    ``attests_bytes``: whether each ``copied`` booking
+    also incremented ``verified``, so the rollback must undo both.
+    (Named for the transport attribute it becomes; the attribute
+    itself lands with the transport classes later in PR 7.)
     """
     dest_path = entry.dest_path
     origin = entry.origin
     if origin == "copied":
         state.copied -= 1
-        if verified_counted_for_copies:
+        if attests_bytes:
             state.verified -= 1
         _counts(state, rel)["copied"] -= 1
     elif origin == "skipped_duplicate":
@@ -1007,7 +1008,7 @@ def _batch_preflight(state, emit, db, *, rel, batch, queued, ctx,
     return dest_folder
 
 
-def _rollback_on_mount_loss(state, batch_st, verified_counted_for_copies,
+def _rollback_on_mount_loss(state, batch_st, attests_bytes,
                             extra_rollback=None):
     """Undo this batch's bookings after a mount-loss detection.
 
@@ -1064,7 +1065,7 @@ def _rollback_on_mount_loss(state, batch_st, verified_counted_for_copies,
             f"archive mount root {batch_st.mount_lost} detached "
             "mid-batch; this file landed in a local shadow "
             "of the archive, not on the share",
-            verified_counted_for_copies,
+            attests_bytes,
         )
     batch_st.landed = []
     # Trip the run-wide sticky flag so every remaining batch is
@@ -1290,7 +1291,7 @@ def _duplicate_gate(state, batch_st, *, source_file, rel, checker, db,
 
 
 def _catalog_scan_and_prescan(state, batch_st, db, params, scan, destination,
-                              rel, verified_counted_for_copies):
+                              rel, attests_bytes):
     """Run the restricted per-batch catalog scan for everything in
     ``batch_st.landed`` (fresh copies/transfers AND adoptions), capturing
     each landed path's pre-scan photo-row hash first so the caller's
@@ -1373,7 +1374,7 @@ def _catalog_scan_and_prescan(state, batch_st, db, params, scan, destination,
         for entry in batch_st.landed:
             _reclassify_landed_failed(
                 state, rel, entry, f"catalog scan failed: {e}",
-                verified_counted_for_copies,
+                attests_bytes,
             )
         batch_st.landed = []
     else:
@@ -1408,8 +1409,7 @@ def _stamp_landed_and_validate_catalog(state, batch_st, db, params, rel, *,
     Invariants (spec PR 6b — do not regress):
 
     - The ``hash_status='ok'`` stamps run ONLY behind ``attests_bytes``
-      (== each caller's ``verified_counted_for_copies``: ``True``
-      locally, where every copy is hash-verified;
+      (``True`` locally, where every copy is hash-verified;
       ``params.verify_by_hash`` remotely) — the stamp is the
       independent byte-attestation, not just "scan and import agree".
     - ``state.imported_photo_ids.add`` runs on EVERY accept path and
@@ -3168,9 +3168,10 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
     # ``params.verify_by_hash`` made the independent card->NAS check,
     # so ``_reclassify_landed_failed`` must undo ``verified`` only in
     # that case. (The local path hash-verifies every copy and sets
-    # this to True. PR 7's transport ``attests_bytes`` absorbs this
-    # flag.)
-    verified_counted_for_copies = params.verify_by_hash
+    # this to True. The flag bears the transport attribute's name;
+    # the attribute itself lands with the transport classes later
+    # in PR 7.)
+    attests_bytes = params.verify_by_hash
 
     for rel, batch in batches:
         if runner.is_cancelled(job["id"]):
@@ -3459,7 +3460,7 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
         # transfers append after the rsync below.)
         if batch_st.mount_lost:
             _rollback_on_mount_loss(
-                state, batch_st, verified_counted_for_copies,
+                state, batch_st, attests_bytes,
                 extra_rollback=functools.partial(
                     _drop_queued_transfers, state, batch_st, rel),
             )
@@ -3665,7 +3666,7 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
                             continue
                     state.copied += 1
                     _counts(state, rel)["copied"] += 1
-                    if verified_counted_for_copies:
+                    if attests_bytes:
                         state.verified += 1
                     batch_st.landed.append(_LandedFile(
                         dest_path=dest_path,
@@ -3709,7 +3710,7 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
         if batch_st.landed and not batch_st.dest_read_cancelled:
             pre_scan_hashes = _catalog_scan_and_prescan(
                 state, batch_st, db, params, scan, destination, rel,
-                verified_counted_for_copies,
+                attests_bytes,
             )
 
             # Catalog-row presence is required on BOTH paths: the route's
@@ -3741,7 +3742,7 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
             # Mirrors the local path — spec decision 6.
             raw_companion_invalidations = _stamp_landed_and_validate_catalog(
                 state, batch_st, db, params, rel,
-                attests_bytes=verified_counted_for_copies,
+                attests_bytes=attests_bytes,
                 dest_noun="mount",
                 stop_requested=_stop_requested,
             )
@@ -3783,7 +3784,7 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
         discovered=discovered, include_paths=include_paths,
         source_snapshots=source_snapshots, deselected=deselected,
         vanished_paths=vanished_paths, appeared=appeared,
-        remote_unverified=not params.verify_by_hash,
+        remote_unverified=not attests_bytes,
     )
 
 
@@ -3922,9 +3923,10 @@ def run_import_job(job, runner, db_path, workspace_id, params):
     # the local path hash-verifies every copy (``copy_and_hash_verify``
     # reads the landed bytes back), so ``_reclassify_landed_failed``
     # must always undo both. (The remote path books ``verified`` only
-    # under ``params.verify_by_hash`` and sets this accordingly. PR
-    # 7's transport ``attests_bytes`` absorbs this flag.)
-    verified_counted_for_copies = True
+    # under ``params.verify_by_hash`` and sets this accordingly. The
+    # flag bears the transport attribute's name; the attribute itself
+    # lands with the transport classes later in PR 7.)
+    attests_bytes = True
 
     for rel, batch in batches:
         if runner.is_cancelled(job["id"]):
@@ -4221,7 +4223,7 @@ def run_import_job(job, runner, db_path, workspace_id, params):
         # per-bucket rationale and the load-bearing rollback order.
         if batch_st.mount_lost:
             _rollback_on_mount_loss(
-                state, batch_st, verified_counted_for_copies,
+                state, batch_st, attests_bytes,
                 # No-op here: the local path copies immediately, so
                 # ``batch_st.to_transfer`` is always empty — passed
                 # unconditionally to keep both call sites identical.
@@ -4248,7 +4250,7 @@ def run_import_job(job, runner, db_path, workspace_id, params):
         if batch_st.landed and not batch_st.dest_read_cancelled:
             pre_scan_hashes = _catalog_scan_and_prescan(
                 state, batch_st, db, params, scan, destination, rel,
-                verified_counted_for_copies,
+                attests_bytes,
             )
 
             # RAW rows whose derived caches need invalidation because a
@@ -4273,7 +4275,7 @@ def run_import_job(job, runner, db_path, workspace_id, params):
             # review.
             raw_companion_invalidations = _stamp_landed_and_validate_catalog(
                 state, batch_st, db, params, rel,
-                attests_bytes=verified_counted_for_copies,
+                attests_bytes=attests_bytes,
                 dest_noun="archive",
                 stop_requested=_stop_requested,
             )

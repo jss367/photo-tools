@@ -4084,6 +4084,15 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                 from taxonomy import load_local_taxonomy
                 tax = load_local_taxonomy()
                 loaded_models["tax"] = tax
+                # Portable identity for the taxonomy backing this pipeline.
+                # Threaded through publish and cache-match paths so that
+                # classifier runs made against one taxonomy revision are
+                # not conflated with runs from a different revision on
+                # another installation. See computation_cache.taxonomy_identity.
+                from computation_cache import (
+                    taxonomy_identity as _taxonomy_identity_fn,
+                )
+                loaded_models["taxonomy_identity"] = _taxonomy_identity_fn(tax)
                 loaded_models["resolved_specs"] = resolved_specs
 
                 # Load the first classifier so classify_stage can start as soon
@@ -4506,11 +4515,15 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                                     classifier_runtime_fingerprint,
                                 )
 
+                                pl_tax_identity = loaded_models.get(
+                                    "taxonomy_identity", "no-tax",
+                                )
                                 for det_rt in (detector_runtime, full_runtime):
                                     if not det_rt:
                                         continue
                                     crt = classifier_runtime_fingerprint(
                                         pl_identity, pl_fp_full, det_rt,
+                                        taxonomy_identity=pl_tax_identity,
                                     )
                                     if crt:
                                         known_classifier_runtimes.add(crt)
@@ -5375,6 +5388,9 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                                     portable_model_identity = loaded_models.get(
                                         "classifier_model_identity"
                                     )
+                                    portable_tax_identity = loaded_models.get(
+                                        "taxonomy_identity", "no-tax",
+                                    )
                                     if portable_labels_full and portable_model_identity:
                                         from computation_cache import (
                                             classifier_runtime_for_detection,
@@ -5386,6 +5402,9 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                                                 detection["id"],
                                                 portable_model_identity,
                                                 portable_labels_full,
+                                                taxonomy_identity=(
+                                                    portable_tax_identity
+                                                ),
                                             )
                                         )
                                     run_keys = thread_db.get_classifier_run_keys(
@@ -5753,6 +5772,9 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                         ),
                         model_identity=loaded_models.get(
                             "classifier_model_identity"
+                        ),
+                        taxonomy_identity=loaded_models.get(
+                            "taxonomy_identity", "no-tax",
                         ),
                     )
                     preds = group_result["predictions_stored"]

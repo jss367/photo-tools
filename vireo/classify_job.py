@@ -336,6 +336,7 @@ def _all_photos_cache_satisfied(
     db, photo_ids, classifier_model=None, labels_fingerprint=None,
     detector_confidence=0.0,
     model_identity=None, labels_fingerprint_full=None,
+    taxonomy_identity="no-tax",
 ):
     """True when every classifiable detection already has a matching run.
 
@@ -424,6 +425,7 @@ def _all_photos_cache_satisfied(
             for dr in detector_runtimes:
                 expected = classifier_runtime_fingerprint(
                     model_identity, labels_fingerprint_full, dr,
+                    taxonomy_identity=taxonomy_identity,
                 )
                 if expected:
                     expected_runtimes.add(expected)
@@ -1356,6 +1358,7 @@ def _classify_photos(
     cancelled = False
     portable_labels_full = job.get("_labels_fingerprint_full")
     portable_model_identity = job.get("_classifier_model_identity")
+    portable_taxonomy_identity = job.get("_taxonomy_identity", "no-tax")
 
     def _runtime_aware_run_keys(detection_id):
         expected_runtime = None
@@ -1368,6 +1371,7 @@ def _classify_photos(
                     detection_id,
                     portable_model_identity,
                     portable_labels_full,
+                    taxonomy_identity=portable_taxonomy_identity,
                 )
             except (OSError, ValueError):
                 expected_runtime = None
@@ -1766,6 +1770,7 @@ def _record_batch_classifier_runs(
 def _publish_classifier_runs_for_raw_results(
     db, raw_results, classifier_model, labels_fingerprint,
     labels_fingerprint_full=None, model_identity=None,
+    taxonomy_identity="no-tax",
 ):
     """Publish portable classifier artifacts for freshly-classified detections.
 
@@ -1801,6 +1806,7 @@ def _publish_classifier_runs_for_raw_results(
                 labels_fingerprint,
                 labels_fingerprint_full,
                 model_identity,
+                taxonomy_identity=taxonomy_identity,
             )
         except Exception:
             log.warning(
@@ -2776,6 +2782,18 @@ def run_classify_job(job, runner, db_path, workspace_id, params, vireo_dir=None)
         cache_detector_confidence = cache_effective_cfg.get(
             "detector_confidence", 0.2,
         )
+        # Peek the local taxonomy identity so the expected classifier
+        # runtimes computed inside ``_all_photos_cache_satisfied`` include
+        # the taxonomy axis. Otherwise the check would compute expected
+        # runtimes with "no-tax" while installed classifier_runs carry
+        # the real taxonomy digest — the cached-only shortcut would then
+        # never fire on installs that use taxonomy. ``load_local_taxonomy``
+        # is cached, so the actual load in Phase 2 below is free.
+        from computation_cache import (
+            local_taxonomy_identity as _peek_tax_identity,
+        )
+
+        cache_taxonomy_identity = _peek_tax_identity()
         if not params.reclassify and _all_photos_cache_satisfied(
             thread_db, [p["id"] for p in photos],
             classifier_model=desired_classifier_model,
@@ -2783,6 +2801,7 @@ def run_classify_job(job, runner, db_path, workspace_id, params, vireo_dir=None)
             detector_confidence=cache_detector_confidence,
             model_identity=desired_model_identity,
             labels_fingerprint_full=desired_labels_fingerprint_full,
+            taxonomy_identity=cache_taxonomy_identity,
         ):
             log.info(
                 "Classify job: every photo has cached classifier runs — "
@@ -2873,6 +2892,8 @@ def run_classify_job(job, runner, db_path, workspace_id, params, vireo_dir=None)
         )
         job["_labels_fingerprint_full"] = fp_full
         job["_classifier_model_identity"] = classifier_identity
+        from computation_cache import taxonomy_identity as _taxonomy_identity
+        job["_taxonomy_identity"] = _taxonomy_identity(tax)
 
         tax_summary = "Taxonomy loaded" if tax else "No taxonomy"
         labels_summary = f"{len(labels)} labels" if labels else ("Tree of Life" if use_tol else "no labels")
@@ -3217,6 +3238,7 @@ def run_classify_job(job, runner, db_path, workspace_id, params, vireo_dir=None)
                 # though this install just proved it can reproduce the
                 # exact same runtime.
                 known_classifier_runtimes = set()
+                job_tax_identity = job.get("_taxonomy_identity", "no-tax")
                 if fp_full and classifier_identity:
                     try:
                         from computation_cache import (
@@ -3228,6 +3250,7 @@ def run_classify_job(job, runner, db_path, workspace_id, params, vireo_dir=None)
                                 continue
                             crt = classifier_runtime_fingerprint(
                                 classifier_identity, fp_full, det_runtime,
+                                taxonomy_identity=job_tax_identity,
                             )
                             if crt:
                                 known_classifier_runtimes.add(crt)
@@ -3347,6 +3370,7 @@ def run_classify_job(job, runner, db_path, workspace_id, params, vireo_dir=None)
             thread_db, raw_results, model_name, fp,
             labels_fingerprint_full=job.get("_labels_fingerprint_full"),
             model_identity=job.get("_classifier_model_identity"),
+            taxonomy_identity=job.get("_taxonomy_identity", "no-tax"),
         )
         finalize_parts = [f"{group_result['predictions_stored']} predictions"]
         if group_result["burst_groups"]:

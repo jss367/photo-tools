@@ -203,14 +203,68 @@ def classifier_model_identity(active_model):
     return identity
 
 
+def taxonomy_identity(tax):
+    """Portable identity for the taxonomy backing a classifier's outputs.
+
+    Included in ``classifier_runtime_fingerprint`` so a classifier run
+    produced with one taxonomy revision is not conflated with a run
+    produced against a different revision on another installation. The
+    Timm classifier consults taxonomy to resolve common names (when the
+    model's ``label_descriptions.json`` doesn't cover a class) and to
+    build the ``taxonomy`` hierarchy stored on every prediction, both of
+    which land in the published artifact — so two taxonomies produce
+    semantically distinct output for the same raw class id. Mirrors
+    ``pipeline_job._taxonomy_fingerprint`` in intent, but returns a
+    portable content identity rather than a session-local stat tuple.
+
+    ``None`` → ``"no-tax"``. A loaded ``Taxonomy`` returns the SHA-256 of
+    its backing file. Missing or unreadable paths fall back to
+    ``"no-tax"`` — the taxonomy was unavailable, so the run was made
+    without enrichment.
+    """
+    if tax is None:
+        return "no-tax"
+    path = getattr(tax, "_path", None)
+    if not isinstance(path, str) or not path:
+        return "no-tax"
+    try:
+        return sha256_file(path)
+    except OSError:
+        return "no-tax"
+
+
+def local_taxonomy_identity():
+    """Peek the local taxonomy identity without keeping the parse alive.
+
+    Callers that need to compute an expected classifier runtime BEFORE
+    the pipeline has loaded ``tax`` (the standalone Classify cache-check
+    at the peek stage, the built-in ``_is_recognized_classifier_runtime``
+    fallback in ``materialize_artifacts``) use this instead of loading a
+    fresh ``Taxonomy`` twice. ``load_local_taxonomy`` returns a shared
+    cached instance so the follow-up load in the classify flow is free.
+    """
+    try:
+        from taxonomy import load_local_taxonomy
+    except ImportError:
+        return "no-tax"
+    try:
+        tax = load_local_taxonomy()
+    except Exception:
+        return "no-tax"
+    return taxonomy_identity(tax)
+
+
 def classifier_runtime_fingerprint(
     model_identity, labels_fingerprint_full, detector_runtime,
+    taxonomy_identity="no-tax",
 ):
     if (
         not isinstance(model_identity, dict)
         or not _is_sha256(labels_fingerprint_full)
         or not _is_sha256(detector_runtime)
     ):
+        return None
+    if not isinstance(taxonomy_identity, str) or not taxonomy_identity:
         return None
     return runtime_fingerprint({
         "type": "classification",
@@ -219,12 +273,14 @@ def classifier_runtime_fingerprint(
         "detector_runtime_fingerprint": detector_runtime,
         "input_recipe": "vireo-classifier-crops-v1",
         "preprocess": "model-config-owned-v1",
+        "output_enrichment": {"taxonomy_identity": taxonomy_identity},
         "comparison_policy": "provider-tolerance-experimental-v1",
     })
 
 
 def classifier_runtime_for_detection(
     db, detection_id, model_identity, labels_fingerprint_full,
+    taxonomy_identity="no-tax",
 ):
     row = db.conn.execute(
         "SELECT runtime_fingerprint FROM detections WHERE id = ?",
@@ -236,6 +292,7 @@ def classifier_runtime_for_detection(
         model_identity,
         labels_fingerprint_full,
         row["runtime_fingerprint"],
+        taxonomy_identity=taxonomy_identity,
     )
 
 
@@ -282,6 +339,7 @@ def promote_and_publish_classifier_run(
     labels_fingerprint_full,
     model_identity,
     store=None,
+    taxonomy_identity="no-tax",
 ):
     """Attach portable identity to one fresh run and publish its raw output."""
     if not _is_sha256(labels_fingerprint_full):
@@ -312,6 +370,7 @@ def promote_and_publish_classifier_run(
         return None
     classifier_runtime = classifier_runtime_fingerprint(
         model_identity, labels_fingerprint_full, row["runtime_fingerprint"],
+        taxonomy_identity=taxonomy_identity,
     )
     if classifier_runtime is None:
         return None
@@ -379,6 +438,7 @@ def promote_and_publish_classifier_run(
             "display_name": label_meta["display_name"] if label_meta else None,
             "count": label_meta["label_count"] if label_meta else None,
         },
+        "output_enrichment": {"taxonomy_identity": taxonomy_identity},
         "completed": True,
         "subjects": [subject],
     }
@@ -659,6 +719,17 @@ def validate_artifact(artifact):
             raise CacheFormatError(
                 "classification artifact needs detector_runtime_fingerprint"
             )
+        enrichment = artifact.get("output_enrichment")
+        if enrichment is not None:
+            if not isinstance(enrichment, dict):
+                raise CacheFormatError(
+                    "output_enrichment must be an object when present"
+                )
+            tax_id = enrichment.get("taxonomy_identity")
+            if not isinstance(tax_id, str) or not tax_id or len(tax_id) > 128:
+                raise CacheFormatError(
+                    "output_enrichment.taxonomy_identity must be a bounded string"
+                )
         if artifact["input"].get("source_sha256") != artifact["photo_sha256"]:
             raise CacheFormatError("classification input source does not match photo")
         if (
@@ -1411,11 +1482,24 @@ def _is_recognized_classifier_runtime(
         or not _is_sha256(detector_runtime)
     ):
         return False
+    # Peek the local taxonomy identity: an install with taxonomy loaded
+    # produces classifier runs whose runtime_fingerprint bakes in that
+    # taxonomy's content hash. Without this, imports from another install
+    # with matching model/labels/detector but different (or no) taxonomy
+    # would be treated as unknown runtimes even though this install would
+    # reproduce the hash exactly. Only the *local* identity is accepted:
+    # an artifact whose taxonomy_identity does not match this install is
+    # a semantic mismatch (different species/hierarchy enrichment) and
+    # must stay quarantined until re-classified against the local
+    # taxonomy — same policy the model/labels/detector-runtime dimensions
+    # already enforce.
+    tax_id = local_taxonomy_identity()
     for identity in _local_classifier_runtimes(
         classifier_model, identity_cache,
     ):
         expected = classifier_runtime_fingerprint(
             identity, labels_fingerprint_full, detector_runtime,
+            taxonomy_identity=tax_id,
         )
         if expected == classifier_runtime:
             return True

@@ -546,8 +546,17 @@ def validate_artifact(artifact):
                 raise CacheFormatError("detection category must be a string")
         else:
             candidates = subject.get("candidates")
-            if not isinstance(candidates, list):
-                raise CacheFormatError("classification subject needs candidates")
+            # Reject empty candidate lists — a completed classification
+            # subject with no predictions still writes a classifier_runs
+            # marker on materialize, which _all_photos_cache_satisfied
+            # counts as covered.  That would let a bundle containing
+            # empty subjects short-circuit an entire Classify job and
+            # leave the photo permanently unclassified until a forced
+            # reclassify.
+            if not isinstance(candidates, list) or not candidates:
+                raise CacheFormatError(
+                    "classification subject needs at least one candidate"
+                )
             for candidate in candidates:
                 if not isinstance(candidate, dict):
                     raise CacheFormatError("classification candidate must be an object")
@@ -570,6 +579,27 @@ def validate_artifact(artifact):
         short = labels.get("short_fingerprint")
         if not isinstance(short, str) or not short or len(short) > 64:
             raise CacheFormatError("labels.short_fingerprint is invalid")
+        # Optional scalar metadata is bound directly to SQLite text/int
+        # columns by materialize_artifacts.  A list or dict here would
+        # surface as an uncaught binding error mid-write and leave the
+        # supposedly-validated object in the local store, so validate
+        # its shape up-front alongside the fingerprints.
+        display_name = labels.get("display_name")
+        if display_name is not None and (
+            not isinstance(display_name, str) or len(display_name) > 500
+        ):
+            raise CacheFormatError(
+                "labels.display_name must be a string of at most 500 chars"
+            )
+        label_count = labels.get("count")
+        if label_count is not None and (
+            isinstance(label_count, bool)
+            or not isinstance(label_count, int)
+            or label_count < 0
+        ):
+            raise CacheFormatError(
+                "labels.count must be a non-negative integer"
+            )
         detector_runtime = artifact.get("detector_runtime_fingerprint")
         if not _is_sha256(detector_runtime):
             raise CacheFormatError(

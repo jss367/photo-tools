@@ -2290,7 +2290,13 @@ def run_classify_job(job, runner, db_path, workspace_id, params, vireo_dir=None)
                     (m for m in get_models() if m["id"] == params.model_id),
                     None,
                 )
-                if peek_model and peek_model.get("downloaded"):
+                if peek_model:
+                    # Preserve the explicitly requested model identity
+                    # even when the weights aren't downloaded yet.
+                    # Otherwise ``_all_photos_cache_satisfied`` would
+                    # treat any classifier's cached runs as valid for
+                    # this explicit request and silently return
+                    # wrong-model results on a fresh install.
                     desired_classifier_model = (
                         params.model_name or peek_model.get("name")
                     )
@@ -2690,17 +2696,22 @@ def run_classify_job(job, runner, db_path, workspace_id, params, vireo_dir=None)
                     known_runtimes.add(local_runtime)
 
                 # Pre-create full-image anchors for empty-scene photos.
+                # For photos that already carry a legacy full-image
+                # detection (upgraded catalogs where the detection
+                # predates the portable-runtime columns), also promote
+                # the ``detector_runs`` row to the current portable
+                # runtime.  Without the promotion, materialize's
+                # classifier gate would defer any imported full-image
+                # classification because the stored runtime fingerprint
+                # doesn't match ``full_runtime`` — and the classify
+                # loop would fall back to real inference (or fail with
+                # "No model available" on a fresh machine).
                 full_runtime = full_image_runtime_fingerprint()
                 empty_scene_ids = [
                     photo["id"] for photo in photos
                     if not detection_map.get(photo["id"])
                 ]
                 for photo_id in empty_scene_ids:
-                    existing_full = thread_db.get_detections(
-                        photo_id, detector_model="full-image", min_conf=0,
-                    )
-                    if existing_full:
-                        continue
                     identity = thread_db.conn.execute(
                         """SELECT file_hash, companion_path
                            FROM photos WHERE id = ?""",
@@ -2715,21 +2726,35 @@ def run_classify_job(job, runner, db_path, workspace_id, params, vireo_dir=None)
                             )
                         except ValueError:
                             full_input = None
-                    thread_db.save_detections(
-                        photo_id,
-                        [{
-                            "box": {"x": 0, "y": 0, "w": 1, "h": 1},
-                            "confidence": 0,
-                            "category": "animal",
-                        }],
-                        detector_model="full-image",
-                        runtime_fingerprint=full_runtime,
+                    existing_full = thread_db.get_detections(
+                        photo_id, detector_model="full-image", min_conf=0,
                     )
-                    thread_db.record_detector_run(
-                        photo_id, "full-image", box_count=1,
-                        runtime_fingerprint=full_runtime,
-                        input_fingerprint=full_input,
-                    )
+                    if not existing_full:
+                        thread_db.save_detections(
+                            photo_id,
+                            [{
+                                "box": {"x": 0, "y": 0, "w": 1, "h": 1},
+                                "confidence": 0,
+                                "category": "animal",
+                            }],
+                            detector_model="full-image",
+                            runtime_fingerprint=full_runtime,
+                        )
+                    existing_run = thread_db.conn.execute(
+                        """SELECT runtime_fingerprint FROM detector_runs
+                           WHERE photo_id = ?
+                             AND detector_model = 'full-image'""",
+                        (photo_id,),
+                    ).fetchone()
+                    if (
+                        existing_run is None
+                        or existing_run["runtime_fingerprint"] != full_runtime
+                    ):
+                        thread_db.record_detector_run(
+                            photo_id, "full-image", box_count=1,
+                            runtime_fingerprint=full_runtime,
+                            input_fingerprint=full_input,
+                        )
 
                 # Compute the classifier runtimes this job would produce
                 # so cached classifications from other machines that

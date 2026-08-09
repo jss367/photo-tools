@@ -4386,6 +4386,13 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                             source_input,
                         )
 
+                        # Pre-create full-image anchors for empty-scene
+                        # photos, and promote any legacy full-image
+                        # ``detector_runs`` row to the portable runtime
+                        # so imported full-image classifications
+                        # actually attach on materialize instead of
+                        # being deferred by the runtime-fingerprint
+                        # gate.
                         full_runtime = full_image_runtime_fingerprint()
                         empty_scene_ids = [
                             photo["id"] for photo in photos
@@ -4393,12 +4400,6 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                             and not this_run_detections.get(photo["id"])
                         ]
                         for photo_id in empty_scene_ids:
-                            existing_full = thread_db.get_detections(
-                                photo_id, detector_model="full-image",
-                                min_conf=0,
-                            )
-                            if existing_full:
-                                continue
                             identity = thread_db.conn.execute(
                                 """SELECT file_hash, companion_path
                                    FROM photos WHERE id = ?""",
@@ -4416,21 +4417,37 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                                     )
                                 except ValueError:
                                     full_input = None
-                            thread_db.save_detections(
-                                photo_id,
-                                [{
-                                    "box": {"x": 0, "y": 0, "w": 1, "h": 1},
-                                    "confidence": 0,
-                                    "category": "animal",
-                                }],
-                                detector_model="full-image",
-                                runtime_fingerprint=full_runtime,
+                            existing_full = thread_db.get_detections(
+                                photo_id, detector_model="full-image",
+                                min_conf=0,
                             )
-                            thread_db.record_detector_run(
-                                photo_id, "full-image", box_count=1,
-                                runtime_fingerprint=full_runtime,
-                                input_fingerprint=full_input,
-                            )
+                            if not existing_full:
+                                thread_db.save_detections(
+                                    photo_id,
+                                    [{
+                                        "box": {"x": 0, "y": 0, "w": 1, "h": 1},
+                                        "confidence": 0,
+                                        "category": "animal",
+                                    }],
+                                    detector_model="full-image",
+                                    runtime_fingerprint=full_runtime,
+                                )
+                            existing_run = thread_db.conn.execute(
+                                """SELECT runtime_fingerprint FROM detector_runs
+                                   WHERE photo_id = ?
+                                     AND detector_model = 'full-image'""",
+                                (photo_id,),
+                            ).fetchone()
+                            if (
+                                existing_run is None
+                                or existing_run["runtime_fingerprint"]
+                                != full_runtime
+                            ):
+                                thread_db.record_detector_run(
+                                    photo_id, "full-image", box_count=1,
+                                    runtime_fingerprint=full_runtime,
+                                    input_fingerprint=full_input,
+                                )
 
                         known_runtimes = {full_runtime}
                         if detector_runtime is not None:

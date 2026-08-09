@@ -58,6 +58,41 @@ def detection_artifact(subjects=None):
     }
 
 
+def classification_artifact(candidates=None, classifier_runtime=None):
+    box = {"x": 0.1, "y": 0.2, "w": 0.3, "h": 0.4}
+    subjects = [{"key": "d0", "kind": "box", "box": box, "category": "animal"}]
+    subjects[0]["candidates"] = candidates if candidates is not None else [{
+        "species": "Robin",
+        "confidence": 0.9,
+    }]
+    if classifier_runtime is None:
+        classifier_runtime = runtime_fingerprint({
+            "type": "classification",
+            "model": "bioclip-2.5",
+            "weights_sha256": "4" * 64,
+            "labels_fingerprint": "3" * 64,
+            "detector_runtime_fingerprint": RUNTIME,
+        })
+    input_block, input_fp = classification_input(PHOTO_HASH, RUNTIME, subjects)
+    return {
+        "artifact_schema": 1,
+        "type": "classification",
+        "classifier_model": "bioclip-2.5",
+        "detector_model": "megadetector-v6",
+        "detector_runtime_fingerprint": RUNTIME,
+        "labels": {
+            "fingerprint": "3" * 64,
+            "short_fingerprint": ("3" * 12),
+        },
+        "photo_sha256": PHOTO_HASH,
+        "runtime_fingerprint": classifier_runtime,
+        "input_fingerprint": input_fp,
+        "input": input_block,
+        "completed": True,
+        "subjects": subjects,
+    }
+
+
 def test_canonical_json_normalizes_negative_zero_and_rejects_nan():
     assert canonical_bytes({"z": -0.0, "a": 1}) == b'{"a":1,"z":0.0}'
     with pytest.raises(CacheFormatError, match="NaN"):
@@ -301,7 +336,9 @@ def test_database_export_bundle_import_and_duplicate_fanout(tmp_path):
     )
     destination.conn.commit()
 
-    applied = materialize_artifacts(destination, imported["artifacts"])
+    applied = materialize_artifacts(
+        destination, imported["artifacts"], known_runtimes={RUNTIME},
+    )
     assert applied["matched_photos"] == 2
     assert applied["detector_runs_applied"] == 2
     assert applied["classifier_runs_applied"] == 2
@@ -321,14 +358,25 @@ def test_database_export_bundle_import_and_duplicate_fanout(tmp_path):
         "SELECT COUNT(*) AS c FROM prediction_review",
     ).fetchone()["c"] == 0, "portable output must not transfer review state"
 
-    repeat = materialize_artifacts(destination, imported["artifacts"])
+    repeat = materialize_artifacts(
+        destination, imported["artifacts"], known_runtimes={RUNTIME},
+    )
     assert repeat["detector_runs_applied"] == 0
     assert repeat["classifier_runs_applied"] == 0
     assert repeat["already_materialized"] == 4
 
 
-def test_computation_cache_http_export_and_import(app_and_db, tmp_path):
+def test_computation_cache_http_export_and_import(app_and_db, tmp_path, monkeypatch):
     app, db = app_and_db
+    # Materialization refuses to plant detector rows carrying an unknown
+    # runtime; monkeypatch the local fingerprint so the fake ``RUNTIME``
+    # value the test fixture writes is treated as this install's runtime.
+    import computation_cache
+
+    monkeypatch.setattr(
+        computation_cache, "megadetector_runtime_fingerprint",
+        lambda *_args, **_kwargs: RUNTIME,
+    )
     app.config["COMPUTATION_CACHE_DIR"] = str(tmp_path / "http-store")
     photo_id = db.conn.execute("SELECT id FROM photos ORDER BY id LIMIT 1").fetchone()["id"]
     db.conn.execute(
@@ -455,3 +503,85 @@ def test_fresh_classifier_run_is_promoted_and_published(tmp_path):
     artifacts, summary = exportable_artifacts(source)
     assert summary["classifier_runs"] == 1
     assert any(item["type"] == "classification" for item in artifacts)
+
+
+def test_taxonomy_field_shape_is_validated_before_publishing():
+    artifact = classification_artifact(candidates=[{
+        "species": "Robin",
+        "confidence": 0.9,
+        "taxonomy": ["genus", "Erithacus"],
+    }])
+    with pytest.raises(CacheFormatError, match="taxonomy must be an object"):
+        validate_artifact(artifact)
+
+    artifact = classification_artifact(candidates=[{
+        "species": "Robin",
+        "confidence": 0.9,
+        "taxonomy": {"genus": ["Erithacus"]},
+    }])
+    with pytest.raises(CacheFormatError, match="taxonomy field 'genus'"):
+        validate_artifact(artifact)
+
+    # A valid taxonomy — omitted or all-string fields — passes through.
+    ok = classification_artifact(candidates=[{
+        "species": "Robin",
+        "confidence": 0.9,
+        "taxonomy": {"genus": "Erithacus", "family": "Muscicapidae"},
+    }])
+    assert validate_artifact(ok)["subjects"][0]["candidates"][0]["taxonomy"] == {
+        "genus": "Erithacus", "family": "Muscicapidae",
+    }
+
+
+def test_unknown_detector_runtime_is_quarantined_not_installed(tmp_path):
+    destination, _folder_id, photo_id = _database_with_photo(
+        tmp_path / "destination.db", "photo.jpg",
+    )
+    # Neither the built-in ``full-image`` synthetic runtime nor the
+    # currently-installed MegaDetector fingerprint matches RUNTIME, so
+    # ``materialize_artifacts`` (without an override) must decline to plant
+    # arbitrary-runtime detections in the catalog.
+    applied = materialize_artifacts(destination, [detection_artifact()])
+    assert applied["unknown_runtime"] == 1
+    assert applied["detector_runs_applied"] == 0
+    assert destination.conn.execute(
+        "SELECT COUNT(*) AS c FROM detector_runs WHERE photo_id = ?",
+        (photo_id,),
+    ).fetchone()["c"] == 0
+
+    # A caller that recognizes the runtime (e.g. after weights install)
+    # can pass it explicitly and the same artifact then materializes.
+    applied_ok = materialize_artifacts(
+        destination, [detection_artifact()], known_runtimes={RUNTIME},
+    )
+    assert applied_ok["detector_runs_applied"] == 1
+    assert applied_ok["unknown_runtime"] == 0
+
+
+def test_classification_deferred_until_detector_run_available(tmp_path):
+    destination, _folder_id, photo_id = _database_with_photo(
+        tmp_path / "destination.db", "photo.jpg",
+    )
+    labels_short = "3" * 12
+    destination.upsert_labels_fingerprint(
+        labels_short, "Test labels", [], 1, full_fingerprint="3" * 64,
+    )
+    # Only the classification artifact is present — no detector artifact
+    # was exported.  materialize_artifacts must count it as deferred (not
+    # applied) since the detector_run dependency does not exist yet.
+    only_classification = [classification_artifact()]
+    deferred = materialize_artifacts(
+        destination, only_classification, known_runtimes={RUNTIME},
+    )
+    assert deferred["classifier_runs_applied"] == 0
+    assert deferred["classifier_deferred_pending_detection"] >= 1
+
+    # Once the detector dependency is materialized (or produced locally
+    # by a subsequent detection run), reapplying picks the classifier up.
+    together = materialize_artifacts(
+        destination,
+        [detection_artifact(), classification_artifact()],
+        known_runtimes={RUNTIME},
+    )
+    assert together["detector_runs_applied"] == 1
+    assert together["classifier_runs_applied"] == 1

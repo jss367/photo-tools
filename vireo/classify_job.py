@@ -332,6 +332,33 @@ def _classify_detection_gated(db, detection_id, classifier_model,
     return predictions
 
 
+def _all_photos_cache_satisfied(db, photo_ids):
+    """True when every photo already has a completed classifier run.
+
+    Used to short-circuit model resolution when a bundle import (or an
+    earlier run) has already produced results for the whole collection.
+    A fresh install with no downloaded classifier weights can then reuse
+    imported predictions instead of failing with "No model available".
+
+    "Satisfied" here means: for every photo in the collection, at least
+    one detection has a matching classifier_runs row.  A photo with no
+    detections at all is treated as unsatisfied so we still fall through
+    to detection + classification.
+    """
+    if not photo_ids:
+        return False
+    placeholders = ",".join("?" for _ in photo_ids)
+    row = db.conn.execute(
+        f"""SELECT COUNT(DISTINCT d.photo_id) AS covered
+             FROM detections d
+             JOIN classifier_runs cr ON cr.detection_id = d.id
+            WHERE d.photo_id IN ({placeholders})""",
+        list(photo_ids),
+    ).fetchone()
+    covered = (row["covered"] if row else 0) or 0
+    return covered == len(photo_ids)
+
+
 def _resolve_label_sources(params, db):
     """Return list of source file paths used to build the active label set.
 
@@ -2204,6 +2231,35 @@ def run_classify_job(job, runner, db_path, workspace_id, params, vireo_dir=None)
                 "failed": 0,
             }
 
+        # Model resolution is otherwise unavoidable — get_active_model()
+        # raises "No model available" on a fresh install with no downloads.
+        # But when materialization has already covered every photo, the
+        # classifier is not going to add any work: skip resolution and
+        # finish so an all-cache-hit run on a fresh machine still succeeds.
+        if not params.reclassify and _all_photos_cache_satisfied(
+            thread_db, [p["id"] for p in photos],
+        ):
+            log.info(
+                "Classify job: every photo has cached classifier runs — "
+                "skipping model resolution and detection",
+            )
+            _finalize_remaining_steps(
+                runner, job["id"],
+                ["load_taxonomy", "load_model", "detect", "classify",
+                 "finalize"],
+                status="completed",
+                summary="Reused cached classification results",
+            )
+            return {
+                "total": total,
+                "predictions_stored": 0,
+                "burst_groups": 0,
+                "already_classified": total,
+                "already_labeled": 0,
+                "detected": 0,
+                "failed": 0,
+            }
+
         # Resolve model (deferred until we know there is work to do)
         if params.model_id:
             all_models = get_models()
@@ -2501,6 +2557,37 @@ def run_classify_job(job, runner, db_path, workspace_id, params, vireo_dir=None)
                 job["id"], "detect", status="completed",
                 summary=f"{detected} animals detected in {total} photos",
             )
+
+        # Reapply the local computation cache now that detection has run.
+        # Classification artifacts whose detector dependency was absent at
+        # the pre-detection materialize call get a second chance to land
+        # here, so a bundle containing only classifications still populates
+        # predictions instead of being silently dropped.
+        if not params.reclassify:
+            try:
+                from computation_cache import (
+                    materialize_local_store,
+                    megadetector_runtime_fingerprint,
+                )
+
+                try:
+                    local_runtime = megadetector_runtime_fingerprint()
+                except (OSError, ValueError):
+                    local_runtime = None
+                reapplied = materialize_local_store(
+                    thread_db,
+                    known_runtimes={local_runtime} if local_runtime else None,
+                )
+                if reapplied.get("classifier_runs_applied"):
+                    log.info(
+                        "Portable cache added %d classifier runs after detect",
+                        reapplied["classifier_runs_applied"],
+                    )
+            except Exception:
+                log.warning(
+                    "Could not reapply local computation cache after detect",
+                    exc_info=True,
+                )
 
         # Phase 6: Classify each photo. The per-detection classifier_runs
         # gate inside _classify_photos skips already-done detections and

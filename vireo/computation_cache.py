@@ -463,6 +463,33 @@ def _validate_confidence(value):
         raise CacheFormatError("confidence must be finite and in [0, 1]")
 
 
+_TAXONOMY_SCALAR_FIELDS = frozenset({
+    "scientific_name", "kingdom", "phylum", "class", "order", "family", "genus",
+})
+
+
+def _validate_candidate_taxonomy(taxonomy):
+    # A candidate may omit taxonomy entirely.  When present it must be a JSON
+    # object whose recognized fields are optional strings — materialization
+    # binds these directly to SQLite text columns, so a list or nested object
+    # here would surface as an uncaught ``TypeError`` mid-write and leave the
+    # bundle half-applied.  Reject the whole artifact up front instead.
+    if taxonomy is None:
+        return
+    if not isinstance(taxonomy, dict):
+        raise CacheFormatError("candidate taxonomy must be an object")
+    for field in _TAXONOMY_SCALAR_FIELDS:
+        if field not in taxonomy:
+            continue
+        value = taxonomy[field]
+        if value is None:
+            continue
+        if not isinstance(value, str) or len(value) > 500:
+            raise CacheFormatError(
+                f"candidate taxonomy field {field!r} must be a string"
+            )
+
+
 def validate_artifact(artifact):
     """Validate one artifact and return its normalized data-only form."""
     artifact = _normalize_json(artifact)
@@ -528,6 +555,7 @@ def validate_artifact(artifact):
                 if not isinstance(species, str) or not species or len(species) > 500:
                     raise CacheFormatError("candidate species must be a non-empty string")
                 _validate_confidence(candidate.get("confidence"))
+                _validate_candidate_taxonomy(candidate.get("taxonomy"))
 
     if artifact["type"] == "classification":
         if not isinstance(artifact.get("classifier_model"), str):
@@ -1078,7 +1106,38 @@ def _manual_review_exists(conn, detection_id, classifier_model, labels_short):
     return row is not None
 
 
-def materialize_artifacts(db, artifacts):
+def _is_recognized_detector_runtime(detector_model, runtime, extra=None):
+    """True when this Vireo install can identify the artifact's runtime.
+
+    A bundle produced by a newer or foreign runtime carries a well-formed
+    fingerprint that this catalog cannot describe or reproduce.  Installing
+    such rows would let matching classification artifacts surface too, so
+    materialization skips them until the local install recognizes the
+    runtime (e.g. matching MegaDetector weights are downloaded).  The
+    artifact itself remains in the object store and a later
+    ``materialize_local_store`` picks it up once the runtime is known.
+
+    ``extra`` may hold additional trusted runtime fingerprints — callers
+    that already validated a runtime through some other channel (tests
+    seeding fixtures, an install-time weight registry) pass them here so
+    the built-in local check does not have to grow special cases.
+    """
+    if not _is_sha256(runtime):
+        return False
+    if extra and runtime in extra:
+        return True
+    if detector_model == "full-image":
+        return runtime == full_image_runtime_fingerprint()
+    if detector_model == "megadetector-v6":
+        try:
+            local = megadetector_runtime_fingerprint()
+        except (OSError, ValueError):
+            return False
+        return local is not None and runtime == local
+    return False
+
+
+def materialize_artifacts(db, artifacts, known_runtimes=None):
     """Apply portable output to every matching non-rejected catalog row.
 
     Review rows are never inserted.  Existing matching materializations are
@@ -1094,6 +1153,8 @@ def materialize_artifacts(db, artifacts):
         "stored_unmatched": 0,
         "pinned_older_runtime": 0,
         "label_collisions": 0,
+        "unknown_runtime": 0,
+        "classifier_deferred_pending_detection": 0,
     }
     matched_photo_ids = set()
 
@@ -1110,6 +1171,15 @@ def materialize_artifacts(db, artifacts):
         matched_photo_ids.update(row["id"] for row in photos)
 
         if artifact["type"] == "detection":
+            if not _is_recognized_detector_runtime(
+                artifact["detector_model"], artifact["runtime_fingerprint"],
+                extra=known_runtimes,
+            ):
+                # Quarantine: keep the object in the store but don't plant a
+                # detector_runs row this install cannot describe.  A future
+                # materialize call after weights install will recognize it.
+                result["unknown_runtime"] += 1
+                continue
             detections = [{
                 "box": subject["box"],
                 "confidence": subject["confidence"],
@@ -1175,6 +1245,11 @@ def materialize_artifacts(db, artifacts):
                 or detector_run["runtime_fingerprint"]
                 != artifact["detector_runtime_fingerprint"]
             ):
+                # Detector dependency not yet available on this install.
+                # A follow-up materialize call after detection runs (or
+                # after the detector's own artifacts are recognized) will
+                # pick these up.
+                result["classifier_deferred_pending_detection"] += 1
                 continue
             from detection_id import detection_id as compute_detection_id
             from keyword_normalization import normalize_keyword_display
@@ -1306,7 +1381,7 @@ def materialize_artifacts(db, artifacts):
     return result
 
 
-def materialize_local_store(db, store=None):
+def materialize_local_store(db, store=None, known_runtimes=None):
     """Apply stored objects that match the catalog's current photo hashes."""
     store = store or ArtifactStore()
     artifacts = [artifact for _digest, artifact in (store.iter_artifacts() or ())]
@@ -1316,4 +1391,4 @@ def materialize_local_store(db, store=None):
             "detector_runs_applied": 0,
             "classifier_runs_applied": 0,
         }
-    return materialize_artifacts(db, artifacts)
+    return materialize_artifacts(db, artifacts, known_runtimes=known_runtimes)

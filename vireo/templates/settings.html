@@ -4123,6 +4123,18 @@ async function importComputationCache(file) {
       action.textContent += ' ' + data.pinned_older_runtime.toLocaleString() +
         ' reviewed older results were preserved.';
     }
+    if (data.unknown_runtime) {
+      action.textContent += ' ' + data.unknown_runtime.toLocaleString() +
+        ' detection object(s) came from a runtime this install does not' +
+        ' recognize and were kept in the local store until matching' +
+        ' weights are installed.';
+    }
+    if (data.classifier_deferred_pending_detection) {
+      action.textContent += ' ' +
+        data.classifier_deferred_pending_detection.toLocaleString() +
+        ' classification object(s) are waiting for a matching detector run' +
+        ' — re-run classification after detection to apply them.';
+    }
     await loadComputationCacheStatus();
   } catch (error) {
     action.style.color = 'var(--danger)';

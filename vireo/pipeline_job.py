@@ -4364,6 +4364,35 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                 # with no detections AND no predictions. See classify_stage for
                 # the actual delete.
 
+                # Reapply the local computation cache now that fresh
+                # detector_runs exist. Classification artifacts whose
+                # detector dependency was absent at the pre-detection
+                # materialize call get a second chance to land here, so
+                # bundles carrying only classifications still surface.
+                if not params.reclassify and detector_runtime is not None:
+                    try:
+                        from computation_cache import materialize_local_store
+
+                        post = materialize_local_store(
+                            thread_db, known_runtimes={detector_runtime},
+                        )
+                        if post.get("classifier_runs_applied"):
+                            prior = detect_state.get("portable_reused") or {}
+                            prior_applied = prior.get(
+                                "classifier_runs_applied", 0,
+                            )
+                            merged = dict(prior)
+                            merged["classifier_runs_applied"] = (
+                                prior_applied
+                                + post["classifier_runs_applied"]
+                            )
+                            detect_state["portable_reused"] = merged
+                    except Exception:
+                        log.warning(
+                            "Could not reapply local computation cache after detect",
+                            exc_info=True,
+                        )
+
                 stages["detect"]["status"] = "completed"
                 runner.update_step(
                     job["id"], "detect", status="completed",

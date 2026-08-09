@@ -5651,3 +5651,98 @@ def test_burst_consensus_non_ascii_case_variants_stay_split(tmp_path):
         )
         assert kwargs["vote_count"] is None
         assert kwargs["individual"] is None
+
+
+def test_all_photos_cache_satisfied_requires_every_photo_covered(tmp_path):
+    from classify_job import _all_photos_cache_satisfied
+    from db import Database
+
+    db = Database(str(tmp_path / "test.db"))
+    ws = db.ensure_default_workspace()
+    db.set_active_workspace(ws)
+    folder_id = db.add_folder("/tmp/p", name="p")
+    covered = db.add_photo(
+        folder_id, "covered.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+    )
+    uncovered = db.add_photo(
+        folder_id, "bare.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+    )
+    det_id = db.save_detections(covered, [
+        {"box": {"x": 0, "y": 0, "w": 1, "h": 1}, "confidence": 0.9, "category": "animal"},
+    ], detector_model="megadetector-v6")[0]
+    db.record_classifier_run(det_id, "BioCLIP", "abc123", prediction_count=1)
+
+    assert _all_photos_cache_satisfied(db, [covered]) is True
+    assert _all_photos_cache_satisfied(db, [covered, uncovered]) is False
+    # Empty photo list: no work possible, treated as not-satisfied so the
+    # caller falls through to normal empty-collection handling.
+    assert _all_photos_cache_satisfied(db, []) is False
+
+
+def test_run_classify_job_short_circuits_when_cache_covers_every_photo(
+    tmp_path, monkeypatch,
+):
+    """A fresh install with an imported cache but no classifier weights
+    must not fail with "No model available" — every photo already has a
+    completed classifier run, so model resolution is unnecessary.
+    """
+    import config as cfg
+    from classify_job import ClassifyParams, run_classify_job
+    from db import Database
+
+    monkeypatch.setattr(cfg, "CONFIG_PATH", str(tmp_path / "config.json"))
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws = db.ensure_default_workspace()
+    db.set_active_workspace(ws)
+    folder_id = db.add_folder("/tmp/p", name="p")
+    pid = db.add_photo(
+        folder_id, "a.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+    )
+    det_id = db.save_detections(pid, [
+        {"box": {"x": 0, "y": 0, "w": 1, "h": 1}, "confidence": 0.9,
+         "category": "animal"},
+    ], detector_model="megadetector-v6")[0]
+    db.add_prediction(det_id, species="Robin", confidence=0.9,
+                      model="BioCLIP", labels_fingerprint="fp-cached")
+    db.record_classifier_run(det_id, "BioCLIP", "fp-cached",
+                             prediction_count=1)
+
+    coll_id = db.add_collection(
+        "c", '[{"field":"photo_ids","value":[' + str(pid) + ']}]',
+    )
+
+    # Model resolution WOULD fail here — no active model exists. The
+    # short-circuit must run before this raises.
+    import classify_job as classify_job_mod
+    monkeypatch.setattr(classify_job_mod, "get_active_model", lambda: None)
+    monkeypatch.setattr(classify_job_mod, "get_models", lambda: [])
+
+    runner = FakeRunner()
+    job = _make_job()
+    params = ClassifyParams(
+        collection_id=coll_id,
+        labels_files=None,
+        labels_file=None,
+        model_id=None,
+        model_name=None,
+        grouping_window=0,
+        similarity_threshold=0.99,
+        reclassify=False,
+    )
+
+    result = run_classify_job(job, runner, db_path, ws, params)
+    assert result["already_classified"] == result["total"] == 1
+    assert result["failed"] == 0
+    # The cached prediction must still be there — the short-circuit
+    # must not touch the DB.
+    db2 = Database(db_path)
+    db2.set_active_workspace(ws)
+    assert db2.conn.execute(
+        "SELECT COUNT(*) AS n FROM predictions WHERE detection_id = ?",
+        (det_id,),
+    ).fetchone()["n"] == 1

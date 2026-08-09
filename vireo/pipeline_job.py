@@ -4369,12 +4369,113 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                 # detector dependency was absent at the pre-detection
                 # materialize call get a second chance to land here, so
                 # bundles carrying only classifications still surface.
-                if not params.reclassify and detector_runtime is not None:
+                #
+                # We ALSO pre-create synthetic full-image detector rows
+                # for every empty-scene photo before the reapply. The
+                # classify stage below creates those rows lazily
+                # per-photo, so without pre-creating them here a cached
+                # full_image classification artifact has no anchor to
+                # attach to at reapply time — the classify stage then
+                # runs the classifier itself even though the answer is
+                # already sitting in the local store.
+                if not params.reclassify:
                     try:
-                        from computation_cache import materialize_local_store
+                        from computation_cache import (
+                            full_image_runtime_fingerprint,
+                            materialize_local_store,
+                            source_input,
+                        )
 
+                        full_runtime = full_image_runtime_fingerprint()
+                        empty_scene_ids = [
+                            photo["id"] for photo in photos
+                            if photo["id"] in processed_ids
+                            and not this_run_detections.get(photo["id"])
+                        ]
+                        for photo_id in empty_scene_ids:
+                            existing_full = thread_db.get_detections(
+                                photo_id, detector_model="full-image",
+                                min_conf=0,
+                            )
+                            if existing_full:
+                                continue
+                            identity = thread_db.conn.execute(
+                                """SELECT file_hash, companion_path
+                                   FROM photos WHERE id = ?""",
+                                (photo_id,),
+                            ).fetchone()
+                            full_input = None
+                            if (
+                                identity is not None
+                                and not identity["companion_path"]
+                            ):
+                                try:
+                                    _block, full_input = source_input(
+                                        identity["file_hash"],
+                                        "vireo-detector-source-v1",
+                                    )
+                                except ValueError:
+                                    full_input = None
+                            thread_db.save_detections(
+                                photo_id,
+                                [{
+                                    "box": {"x": 0, "y": 0, "w": 1, "h": 1},
+                                    "confidence": 0,
+                                    "category": "animal",
+                                }],
+                                detector_model="full-image",
+                                runtime_fingerprint=full_runtime,
+                            )
+                            thread_db.record_detector_run(
+                                photo_id, "full-image", box_count=1,
+                                runtime_fingerprint=full_runtime,
+                                input_fingerprint=full_input,
+                            )
+
+                        known_runtimes = {full_runtime}
+                        if detector_runtime is not None:
+                            known_runtimes.add(detector_runtime)
+                        # Compute expected classifier runtimes for any
+                        # classifier the model_loader stage already
+                        # resolved. Without this the classifier-runtime
+                        # quarantine drops bundle classifications even
+                        # when this install carries the exact matching
+                        # classifier. Multi-classifier pipelines only
+                        # get the first classifier's runtime here;
+                        # later classifiers land during their own
+                        # classify_stage invocations of the cache.
+                        known_classifier_runtimes = set()
+                        pl_identity = loaded_models.get(
+                            "classifier_model_identity",
+                        )
+                        pl_fp_full = loaded_models.get(
+                            "labels_fingerprint_full",
+                        )
+                        if (
+                            pl_identity
+                            and isinstance(pl_fp_full, str)
+                            and len(pl_fp_full) == 64
+                        ):
+                            try:
+                                from computation_cache import (
+                                    classifier_runtime_fingerprint,
+                                )
+
+                                for det_rt in (detector_runtime, full_runtime):
+                                    if not det_rt:
+                                        continue
+                                    crt = classifier_runtime_fingerprint(
+                                        pl_identity, pl_fp_full, det_rt,
+                                    )
+                                    if crt:
+                                        known_classifier_runtimes.add(crt)
+                            except Exception:
+                                known_classifier_runtimes = set()
                         post = materialize_local_store(
-                            thread_db, known_runtimes={detector_runtime},
+                            thread_db, known_runtimes=known_runtimes,
+                            known_classifier_runtimes=(
+                                known_classifier_runtimes or None
+                            ),
                         )
                         if post.get("classifier_runs_applied"):
                             prior = detect_state.get("portable_reused") or {}

@@ -332,31 +332,68 @@ def _classify_detection_gated(db, detection_id, classifier_model,
     return predictions
 
 
-def _all_photos_cache_satisfied(db, photo_ids):
-    """True when every photo already has a completed classifier run.
+def _all_photos_cache_satisfied(
+    db, photo_ids, classifier_model=None, labels_fingerprint=None,
+):
+    """True when every detection on every photo already has a matching run.
 
     Used to short-circuit model resolution when a bundle import (or an
     earlier run) has already produced results for the whole collection.
     A fresh install with no downloaded classifier weights can then reuse
     imported predictions instead of failing with "No model available".
 
-    "Satisfied" here means: for every photo in the collection, at least
-    one detection has a matching classifier_runs row.  A photo with no
-    detections at all is treated as unsatisfied so we still fall through
-    to detection + classification.
+    "Satisfied" here means: every photo in the collection has at least
+    one detection, and every one of its detections has a matching
+    ``classifier_runs`` row.  When ``classifier_model`` and/or
+    ``labels_fingerprint`` are given, matching also requires the run to
+    carry that exact model name / label set — a photo whose detections
+    only carry runs for a different model or label set is treated as
+    unsatisfied so the caller falls through to real classification with
+    the user's requested identity.  A photo with no detections at all is
+    also unsatisfied so we still fall through to detection.
     """
     if not photo_ids:
         return False
     placeholders = ",".join("?" for _ in photo_ids)
+    filter_sql = ""
+    filter_args = []
+    if classifier_model is not None:
+        filter_sql += " AND cr.classifier_model = ?"
+        filter_args.append(classifier_model)
+    if labels_fingerprint is not None:
+        filter_sql += " AND cr.labels_fingerprint = ?"
+        filter_args.append(labels_fingerprint)
+
+    # Every detection must have a matching run.  A single covered
+    # detection on a photo with multiple detections used to fool the old
+    # per-photo check — that let a second detection surface unclassified.
+    # ``classifier_runs`` has no surrogate id column; use
+    # ``cr.detection_id`` (NOT NULL PK member) as the presence sentinel.
     row = db.conn.execute(
-        f"""SELECT COUNT(DISTINCT d.photo_id) AS covered
+        f"""SELECT COUNT(*) AS total,
+                   SUM(CASE WHEN cr.detection_id IS NOT NULL THEN 1 ELSE 0 END)
+                     AS covered
              FROM detections d
-             JOIN classifier_runs cr ON cr.detection_id = d.id
+             LEFT JOIN classifier_runs cr
+               ON cr.detection_id = d.id{filter_sql}
             WHERE d.photo_id IN ({placeholders})""",
+        filter_args + list(photo_ids),
+    ).fetchone()
+    total = (row["total"] if row else 0) or 0
+    covered = (row["covered"] if row else 0) or 0
+    if total == 0 or covered != total:
+        return False
+
+    # Every photo must have at least one detection — an empty-scene photo
+    # with no full-image anchor yet is unsatisfied so we still create it.
+    photo_row = db.conn.execute(
+        f"""SELECT COUNT(DISTINCT photo_id) AS covered_photos
+             FROM detections
+            WHERE photo_id IN ({placeholders})""",
         list(photo_ids),
     ).fetchone()
-    covered = (row["covered"] if row else 0) or 0
-    return covered == len(photo_ids)
+    covered_photos = (photo_row["covered_photos"] if photo_row else 0) or 0
+    return covered_photos == len(photo_ids)
 
 
 def _resolve_label_sources(params, db):
@@ -2236,8 +2273,71 @@ def run_classify_job(job, runner, db_path, workspace_id, params, vireo_dir=None)
         # But when materialization has already covered every photo, the
         # classifier is not going to add any work: skip resolution and
         # finish so an all-cache-hit run on a fresh machine still succeeds.
+        #
+        # Opportunistically resolve the requested classifier name and its
+        # labels_fingerprint before checking so a cache built with a
+        # DIFFERENT model or label set does not silently pass as
+        # "satisfied".  When we can't resolve either (no downloaded model
+        # AND no labels file), we still fall through to the permissive
+        # any-run check — the whole point of the short-circuit is the
+        # fresh-install case where nothing else is available.
+        desired_classifier_model = None
+        desired_labels_fingerprint = None
+        peek_model = None
+        try:
+            if params.model_id:
+                peek_model = next(
+                    (m for m in get_models() if m["id"] == params.model_id),
+                    None,
+                )
+                if peek_model and peek_model.get("downloaded"):
+                    desired_classifier_model = (
+                        params.model_name or peek_model.get("name")
+                    )
+            elif params.model_name:
+                desired_classifier_model = params.model_name
+                peek_model = next(
+                    (
+                        m for m in get_models()
+                        if m.get("name") == params.model_name
+                    ),
+                    None,
+                )
+            else:
+                peek_model = get_active_model()
+                if peek_model:
+                    desired_classifier_model = (
+                        params.model_name or peek_model.get("name")
+                    )
+        except Exception:
+            desired_classifier_model = None
+            peek_model = None
+        # Compute labels_fingerprint from the user-selected label sources
+        # so a cache built from a DIFFERENT label set does not silently
+        # pass as satisfied.  Uses the same _load_labels path that later
+        # produces the authoritative fingerprint, but tolerates failure
+        # (missing weights on a fresh install, TOL path unavailable) —
+        # in that case desired_labels_fingerprint stays None and the
+        # check falls back to model-only filtering.
+        try:
+            from labels_fingerprint import compute_fingerprint
+
+            peek_labels, peek_use_tol = _load_labels(
+                model_type=(peek_model or {}).get("model_type", "bioclip"),
+                model_str=(peek_model or {}).get("model_str", ""),
+                labels_file=params.labels_file,
+                labels_files=params.labels_files,
+                db=thread_db,
+                model_dir=(peek_model or {}).get("weights_path"),
+            )
+            desired_labels_fingerprint = compute_fingerprint(peek_labels)
+        except Exception:
+            desired_labels_fingerprint = None
+
         if not params.reclassify and _all_photos_cache_satisfied(
             thread_db, [p["id"] for p in photos],
+            classifier_model=desired_classifier_model,
+            labels_fingerprint=desired_labels_fingerprint,
         ):
             log.info(
                 "Classify job: every photo has cached classifier runs — "
@@ -2563,20 +2663,104 @@ def run_classify_job(job, runner, db_path, workspace_id, params, vireo_dir=None)
         # the pre-detection materialize call get a second chance to land
         # here, so a bundle containing only classifications still populates
         # predictions instead of being silently dropped.
+        #
+        # We ALSO pre-create synthetic full-image detector rows for every
+        # empty-scene photo before this reapply.  The classify loop below
+        # creates those rows lazily per-photo, so without pre-creating
+        # them here a cached full_image classification artifact has no
+        # anchor to attach to at reapply time — the classify loop then
+        # runs the classifier itself (or, on a fresh machine, fails with
+        # "No model available") even though the answer is already sitting
+        # in the local store.
         if not params.reclassify:
             try:
                 from computation_cache import (
+                    full_image_runtime_fingerprint,
                     materialize_local_store,
                     megadetector_runtime_fingerprint,
+                    source_input,
                 )
 
                 try:
                     local_runtime = megadetector_runtime_fingerprint()
                 except (OSError, ValueError):
                     local_runtime = None
+                known_runtimes = {full_image_runtime_fingerprint()}
+                if local_runtime:
+                    known_runtimes.add(local_runtime)
+
+                # Pre-create full-image anchors for empty-scene photos.
+                full_runtime = full_image_runtime_fingerprint()
+                empty_scene_ids = [
+                    photo["id"] for photo in photos
+                    if not detection_map.get(photo["id"])
+                ]
+                for photo_id in empty_scene_ids:
+                    existing_full = thread_db.get_detections(
+                        photo_id, detector_model="full-image", min_conf=0,
+                    )
+                    if existing_full:
+                        continue
+                    identity = thread_db.conn.execute(
+                        """SELECT file_hash, companion_path
+                           FROM photos WHERE id = ?""",
+                        (photo_id,),
+                    ).fetchone()
+                    full_input = None
+                    if identity is not None and not identity["companion_path"]:
+                        try:
+                            _block, full_input = source_input(
+                                identity["file_hash"],
+                                "vireo-detector-source-v1",
+                            )
+                        except ValueError:
+                            full_input = None
+                    thread_db.save_detections(
+                        photo_id,
+                        [{
+                            "box": {"x": 0, "y": 0, "w": 1, "h": 1},
+                            "confidence": 0,
+                            "category": "animal",
+                        }],
+                        detector_model="full-image",
+                        runtime_fingerprint=full_runtime,
+                    )
+                    thread_db.record_detector_run(
+                        photo_id, "full-image", box_count=1,
+                        runtime_fingerprint=full_runtime,
+                        input_fingerprint=full_input,
+                    )
+
+                # Compute the classifier runtimes this job would produce
+                # so cached classifications from other machines that
+                # match are accepted at reapply time. Without this the
+                # classifier-runtime quarantine would drop them even
+                # though this install just proved it can reproduce the
+                # exact same runtime.
+                known_classifier_runtimes = set()
+                if fp_full and classifier_identity:
+                    try:
+                        from computation_cache import (
+                            classifier_runtime_fingerprint,
+                        )
+
+                        for det_runtime in (local_runtime, full_runtime):
+                            if not det_runtime:
+                                continue
+                            crt = classifier_runtime_fingerprint(
+                                classifier_identity, fp_full, det_runtime,
+                            )
+                            if crt:
+                                known_classifier_runtimes.add(crt)
+                    except Exception:
+                        known_classifier_runtimes = set()
+
                 reapplied = materialize_local_store(
                     thread_db,
-                    known_runtimes={local_runtime} if local_runtime else None,
+                    known_runtimes=known_runtimes,
+                    known_classifier_runtimes=(
+                        known_classifier_runtimes or None
+                    ),
                 )
                 if reapplied.get("classifier_runs_applied"):
                     log.info(

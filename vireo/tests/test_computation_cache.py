@@ -33,6 +33,13 @@ RUNTIME = runtime_fingerprint({
     "weights_sha256": "2" * 64,
     "pipeline": "detector-v1",
 })
+CLASSIFIER_RUNTIME = runtime_fingerprint({
+    "type": "classification",
+    "model": "bioclip-2.5",
+    "weights_sha256": "4" * 64,
+    "labels_fingerprint": "3" * 64,
+    "detector_runtime_fingerprint": RUNTIME,
+})
 
 
 def detection_artifact(subjects=None):
@@ -337,7 +344,9 @@ def test_database_export_bundle_import_and_duplicate_fanout(tmp_path):
     destination.conn.commit()
 
     applied = materialize_artifacts(
-        destination, imported["artifacts"], known_runtimes={RUNTIME},
+        destination, imported["artifacts"],
+        known_runtimes={RUNTIME},
+        known_classifier_runtimes={CLASSIFIER_RUNTIME},
     )
     assert applied["matched_photos"] == 2
     assert applied["detector_runs_applied"] == 2
@@ -359,7 +368,9 @@ def test_database_export_bundle_import_and_duplicate_fanout(tmp_path):
     ).fetchone()["c"] == 0, "portable output must not transfer review state"
 
     repeat = materialize_artifacts(
-        destination, imported["artifacts"], known_runtimes={RUNTIME},
+        destination, imported["artifacts"],
+        known_runtimes={RUNTIME},
+        known_classifier_runtimes={CLASSIFIER_RUNTIME},
     )
     assert repeat["detector_runs_applied"] == 0
     assert repeat["classifier_runs_applied"] == 0
@@ -571,7 +582,9 @@ def test_classification_deferred_until_detector_run_available(tmp_path):
     # applied) since the detector_run dependency does not exist yet.
     only_classification = [classification_artifact()]
     deferred = materialize_artifacts(
-        destination, only_classification, known_runtimes={RUNTIME},
+        destination, only_classification,
+        known_runtimes={RUNTIME},
+        known_classifier_runtimes={CLASSIFIER_RUNTIME},
     )
     assert deferred["classifier_runs_applied"] == 0
     assert deferred["classifier_deferred_pending_detection"] >= 1
@@ -582,6 +595,51 @@ def test_classification_deferred_until_detector_run_available(tmp_path):
         destination,
         [detection_artifact(), classification_artifact()],
         known_runtimes={RUNTIME},
+        known_classifier_runtimes={CLASSIFIER_RUNTIME},
     )
     assert together["detector_runs_applied"] == 1
     assert together["classifier_runs_applied"] == 1
+
+
+def test_unknown_classifier_runtime_is_quarantined_not_installed(tmp_path):
+    """A classification artifact whose classifier runtime this install
+    cannot reproduce must stay quarantined in the object store — its
+    predictions must not surface as authoritative results until a
+    matching classifier is verified locally or the caller explicitly
+    trusts the runtime.
+    """
+    destination, _folder_id, _photo_id = _database_with_photo(
+        tmp_path / "destination.db", "photo.jpg",
+    )
+    destination.upsert_labels_fingerprint(
+        "3" * 12, "Test labels", [], 1, full_fingerprint="3" * 64,
+    )
+
+    # Detector runtime is recognized (via known_runtimes), but no
+    # classifier runtime is trusted and no local classifier can
+    # reproduce the artifact's runtime_fingerprint. The classification
+    # must be counted as unknown_classifier_runtime and NOT applied.
+    applied = materialize_artifacts(
+        destination,
+        [detection_artifact(), classification_artifact()],
+        known_runtimes={RUNTIME},
+    )
+    assert applied["detector_runs_applied"] == 1
+    assert applied["classifier_runs_applied"] == 0
+    assert applied["unknown_classifier_runtime"] == 1
+    assert destination.conn.execute(
+        "SELECT COUNT(*) AS c FROM predictions",
+    ).fetchone()["c"] == 0
+
+    # A caller that has verified the classifier through some other
+    # channel (a classify job that just resolved its own runtime, an
+    # install-time model registry) can pass it explicitly and the
+    # same artifact then materializes.
+    applied_ok = materialize_artifacts(
+        destination,
+        [detection_artifact(), classification_artifact()],
+        known_runtimes={RUNTIME},
+        known_classifier_runtimes={CLASSIFIER_RUNTIME},
+    )
+    assert applied_ok["classifier_runs_applied"] == 1
+    assert applied_ok["unknown_classifier_runtime"] == 0

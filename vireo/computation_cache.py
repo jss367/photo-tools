@@ -1137,14 +1137,107 @@ def _is_recognized_detector_runtime(detector_model, runtime, extra=None):
     return False
 
 
-def materialize_artifacts(db, artifacts, known_runtimes=None):
+def _local_classifier_runtimes(classifier_model, cache):
+    """Yield locally-derivable classifier runtimes with matching model name.
+
+    A classifier runtime encodes ``(model_identity, labels_fingerprint,
+    detector_runtime)``.  Bundle artifacts carry the derived hash rather
+    than the ingredients, so recognition asks: for this ``classifier_model``
+    name, does any installed classifier produce the same hash for the
+    same labels + detector runtime?  This helper returns just the model
+    identities so the caller can plug in the artifact's own labels /
+    detector runtime before comparing.
+
+    ``cache`` is a mutable dict scoped to one materialize call — we hash
+    each classifier only once regardless of how many artifacts reference
+    it.
+    """
+    if classifier_model in cache:
+        return cache[classifier_model]
+    identities = []
+    try:
+        from models import get_models
+    except ImportError:
+        cache[classifier_model] = identities
+        return identities
+    try:
+        installed = get_models()
+    except Exception:
+        cache[classifier_model] = identities
+        return identities
+    for model in installed:
+        if not model.get("downloaded"):
+            continue
+        if model.get("name") != classifier_model:
+            continue
+        try:
+            identity = classifier_model_identity(model)
+        except (OSError, ValueError):
+            identity = None
+        if identity is not None:
+            identities.append(identity)
+    cache[classifier_model] = identities
+    return identities
+
+
+def _is_recognized_classifier_runtime(
+    classifier_model,
+    labels_fingerprint_full,
+    detector_runtime,
+    classifier_runtime,
+    identity_cache,
+    extra=None,
+):
+    """True when this install can reproduce the artifact's classifier runtime.
+
+    A classification artifact carries only the derived
+    ``runtime_fingerprint``.  To trust it, this install must be able to
+    recreate that hash from its own installed classifier for the same
+    labels + detector runtime.  A newer, foreign, or renamed classifier
+    fails this test and its predictions are quarantined in the object
+    store until a matching classifier lands.  Callers that already
+    validated a runtime through some other channel (tests seeding
+    fixtures, an active classify job that just resolved its own runtime)
+    pass it via ``extra`` so the built-in check does not have to grow
+    special cases.
+    """
+    if not _is_sha256(classifier_runtime):
+        return False
+    if extra and classifier_runtime in extra:
+        return True
+    if (
+        not _is_sha256(labels_fingerprint_full)
+        or not _is_sha256(detector_runtime)
+    ):
+        return False
+    for identity in _local_classifier_runtimes(
+        classifier_model, identity_cache,
+    ):
+        expected = classifier_runtime_fingerprint(
+            identity, labels_fingerprint_full, detector_runtime,
+        )
+        if expected == classifier_runtime:
+            return True
+    return False
+
+
+def materialize_artifacts(
+    db, artifacts, known_runtimes=None, known_classifier_runtimes=None,
+):
     """Apply portable output to every matching non-rejected catalog row.
 
     Review rows are never inserted.  Existing matching materializations are
     left alone, so a later artifact cannot churn already-surfaced results.
+
+    ``known_runtimes`` extends the built-in whitelist of DETECTOR runtimes
+    this install recognizes.  ``known_classifier_runtimes`` does the same
+    for classifier runtimes — callers with additional trust context (a
+    classify job that just resolved its own runtime) pass them here so
+    the built-in local check does not have to grow special cases.
     """
     normalized = [validate_artifact(artifact) for artifact in artifacts]
     normalized.sort(key=lambda item: item["type"] != "detection")
+    identity_cache = {}
     result = {
         "matched_photos": 0,
         "detector_runs_applied": 0,
@@ -1154,6 +1247,7 @@ def materialize_artifacts(db, artifacts, known_runtimes=None):
         "pinned_older_runtime": 0,
         "label_collisions": 0,
         "unknown_runtime": 0,
+        "unknown_classifier_runtime": 0,
         "classifier_deferred_pending_detection": 0,
     }
     matched_photo_ids = set()
@@ -1231,6 +1325,24 @@ def materialize_artifacts(db, artifacts, known_runtimes=None):
         ).fetchone()
         if collision:
             result["label_collisions"] += 1
+            continue
+
+        # Quarantine classification artifacts whose classifier runtime
+        # this install cannot reproduce.  The detector-runtime gate above
+        # only proves this catalog can describe the source detections;
+        # the classifier itself may still be a newer, foreign, or
+        # renamed model whose predictions would silently surface as
+        # authoritative results.  A future materialize call after the
+        # matching classifier is installed will pick these up.
+        if not _is_recognized_classifier_runtime(
+            artifact["classifier_model"],
+            labels["fingerprint"],
+            artifact["detector_runtime_fingerprint"],
+            artifact["runtime_fingerprint"],
+            identity_cache,
+            extra=known_classifier_runtimes,
+        ):
+            result["unknown_classifier_runtime"] += 1
             continue
 
         for photo in photos:
@@ -1381,7 +1493,9 @@ def materialize_artifacts(db, artifacts, known_runtimes=None):
     return result
 
 
-def materialize_local_store(db, store=None, known_runtimes=None):
+def materialize_local_store(
+    db, store=None, known_runtimes=None, known_classifier_runtimes=None,
+):
     """Apply stored objects that match the catalog's current photo hashes."""
     store = store or ArtifactStore()
     artifacts = [artifact for _digest, artifact in (store.iter_artifacts() or ())]
@@ -1391,4 +1505,8 @@ def materialize_local_store(db, store=None, known_runtimes=None):
             "detector_runs_applied": 0,
             "classifier_runs_applied": 0,
         }
-    return materialize_artifacts(db, artifacts, known_runtimes=known_runtimes)
+    return materialize_artifacts(
+        db, artifacts,
+        known_runtimes=known_runtimes,
+        known_classifier_runtimes=known_classifier_runtimes,
+    )

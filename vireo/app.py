@@ -16667,7 +16667,28 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             return json_error("a .vireo-cache file is required", status=400)
         try:
             imported = import_bundle(upload.stream, _computation_store())
-            applied = materialize_artifacts(_get_db(), imported["artifacts"])
+            # An explicit user-initiated import is a trust action for the
+            # runtimes this bundle carries: quarantine gates for unknown
+            # detector/classifier runtimes exist to keep drive-by
+            # materialize calls from surfacing foreign inference, but
+            # here the user chose the source. Whitelist the artifact-
+            # supplied fingerprints so the objects they just uploaded
+            # actually plant instead of getting stranded in the store.
+            detector_rts = {
+                artifact["runtime_fingerprint"]
+                for artifact in imported["artifacts"]
+                if artifact.get("type") == "detection"
+            }
+            classifier_rts = {
+                artifact["runtime_fingerprint"]
+                for artifact in imported["artifacts"]
+                if artifact.get("type") == "classification"
+            }
+            applied = materialize_artifacts(
+                _get_db(), imported["artifacts"],
+                known_runtimes=detector_rts,
+                known_classifier_runtimes=classifier_rts,
+            )
         except (CacheFormatError, zipfile.BadZipFile) as exc:
             return json_error(str(exc), status=400)
         return jsonify({

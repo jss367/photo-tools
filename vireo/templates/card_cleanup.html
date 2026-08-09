@@ -686,10 +686,22 @@ async function cardCleanupFinishJob(jobId, kind) {
 }
 
 async function cardCleanupLoadManifest() {
+  // Codex P2 (commit 16a3f8e4): capture the scan we are loading FOR so a
+  // response that arrives after a second scan has taken ownership of
+  // scanJobId cannot render scan #1's manifest over scan #2's state.
+  // Without this guard, cardCleanupFinishJob unlocks the buttons before
+  // awaiting the manifest; a user who changes the source and starts
+  // scan #2 during that await would see scan #1's totals/source rendered
+  // by the late response and the confirmation dialog would advertise a
+  // set the delete POST (which uses the current scanJobId) would not
+  // actually operate on. It would also clobber the 404-clears-scanJobId
+  // path and the error message.
+  const requestedScanJobId = cardCleanupState.scanJobId;
   try {
     const resp = await fetch('/api/card-cleanup/' +
-      encodeURIComponent(cardCleanupState.scanJobId) + '/manifest');
+      encodeURIComponent(requestedScanJobId) + '/manifest');
     const data = await resp.json();
+    if (cardCleanupState.scanJobId !== requestedScanJobId) return;
     if (resp.status === 404) {
       cardCleanupState.scanJobId = null;
       cardCleanupSetError('Preview expired — re-scan the card.', { rescan: true });
@@ -698,6 +710,7 @@ async function cardCleanupLoadManifest() {
     if (!resp.ok) throw new Error(data.error || 'the preview could not be loaded');
     cardCleanupRenderManifest(data);
   } catch (e) {
+    if (cardCleanupState.scanJobId !== requestedScanJobId) return;
     cardCleanupSetError(String(e.message || e));
   }
 }

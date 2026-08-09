@@ -629,3 +629,61 @@ def test_start_audit_keeps_page_locked_on_ambiguous_start(app_and_db):
         "the JSON-parse catch on a 2xx response must direct the user to the "
         "Jobs page for the actual outcome"
     )
+
+
+def test_load_manifest_discards_stale_scan_response(app_and_db):
+    """Codex P2 review (commit 16a3f8e4): cardCleanupLoadManifest must
+    discard responses whose scan job id is no longer current.
+
+    Scenario: cardCleanupFinishJob unlocks the buttons and then awaits
+    cardCleanupLoadManifest() for scan #1. During that await a user can
+    change the source and start scan #2, which sets scanJobId to jobId2.
+    If scan #1's response then arrives it would (a) render scan #1's
+    source and totals over scan #2's state via cardCleanupRenderManifest
+    — including re-enabling the Delete button based on scan #1's
+    deletable count — while the delete POST uses cardCleanupState.
+    scanJobId, which is now jobId2, so the confirmation dialog would
+    advertise a set that does not match the manifest the destructive job
+    would operate on; or (b) on a 404, null out scanJobId and clobber
+    scan #2's identity; or (c) surface scan #1's fetch/parse error as if
+    scan #2 had failed.
+
+    Fix: capture scanJobId at request time and drop the response on both
+    the success and error paths when it has moved on. Pinning both paths
+    here so a refactor cannot quietly re-open either one.
+    """
+    app, _ = app_and_db
+    body = app.test_client().get("/card-cleanup").get_data(as_text=True)
+    start = body.index("async function cardCleanupLoadManifest(")
+    end = body.index("function cardCleanupRenderManifest(", start)
+    section = body[start:end]
+    # The success path must run its stale-response check before ANY
+    # state mutation or render — both the 404 handler (which nulls
+    # scanJobId) and cardCleanupRenderManifest (which shows scan #1's
+    # totals and re-enables Delete based on them) would corrupt scan #2's
+    # state if reached with a stale response.
+    first_mutation_idx = min(
+        section.index("cardCleanupState.scanJobId = null"),
+        section.index("cardCleanupRenderManifest("),
+    )
+    pre_mutation = section[:first_mutation_idx]
+    assert "cardCleanupState.scanJobId !==" in pre_mutation, (
+        "cardCleanupLoadManifest must compare state.scanJobId against the "
+        "job id captured before the fetch, and return early on mismatch, "
+        "BEFORE touching state or rendering — otherwise a scan started "
+        "during the fetch will be overwritten by the stale response and "
+        "the Delete confirmation will advertise numbers that do not match "
+        "the manifest the delete POST would operate on"
+    )
+    # The error path (network failure, unreadable body, !resp.ok throw)
+    # must also discard on mismatch — a scan #2 in flight should not
+    # inherit scan #1's error banner as if it had failed itself.
+    catch_idx = section.index("} catch (e) {")
+    catch_body = section[catch_idx:]
+    assert "cardCleanupState.scanJobId !==" in catch_body, (
+        "the catch branch of cardCleanupLoadManifest must also check "
+        "state.scanJobId — a fetch or parse error on the stale scan #1 "
+        "response must not surface as an error message while scan #2 is "
+        "running, because it would misattribute the failure to the scan "
+        "the user is currently watching"
+    )

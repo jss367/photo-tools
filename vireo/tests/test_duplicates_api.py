@@ -460,6 +460,72 @@ def test_delete_loser_files_validates_input(app_and_db):
     ).status_code == 400
 
 
+def test_delete_loser_files_skips_isfile_preflight_on_network_paths(
+    app_and_db, tmp_path, monkeypatch,
+):
+    """Duplicate cleanup must never stat a network path from the request
+    thread. On an unhealthy SMB share ``os.path.isfile`` can block
+    indefinitely, and a failed stat would be misread as "already missing"
+    and drop the DB row for a photo that reappears when the mount comes
+    back. Classify the path via the bounded mount table first and hand
+    network candidates straight to ``_trash_paths``.
+    """
+    import os
+
+    import app as app_module
+
+    app, db = app_and_db
+    _w, l, _wp, loser_path = _seed_pair_with_real_files(db, tmp_path, "NETDUP")
+
+    # Advertise the loser's folder as a network mount so the classifier
+    # routes it through the safe path.
+    volume_root = os.path.dirname(loser_path)
+    monkeypatch.setattr(
+        app_module, "_network_volume_roots", lambda: {volume_root},
+    )
+
+    real_isfile = os.path.isfile
+    stat_calls = []
+
+    def guarded_isfile(path):
+        stat_calls.append(path)
+        if path == loser_path:
+            raise AssertionError(
+                "network path must not reach os.path.isfile in the endpoint",
+            )
+        return real_isfile(path)
+
+    monkeypatch.setattr(app_module.os.path, "isfile", guarded_isfile)
+
+    trash_calls = []
+
+    def record_trash(paths, progress_callback=None):
+        trash_calls.append(list(paths))
+        for path in paths:
+            real_isfile(path) and os.remove(path)
+        return len(paths), set(paths), []
+
+    monkeypatch.setattr(app_module, "_trash_paths", record_trash)
+
+    client = app.test_client()
+    resp = client.post(
+        "/api/duplicates/delete-loser-files",
+        json={"photo_ids": [l]},
+    )
+    assert resp.status_code == 200
+    body = resp.get_json()
+    assert body["trashed"] == 1
+    assert body["failed"] == []
+    # Endpoint delegated the loser's network path to _trash_paths without
+    # first stat'ing it — the safety-net assertion in guarded_isfile would
+    # have failed the test otherwise.
+    assert trash_calls == [[loser_path]]
+    # DB row was still dropped so the summary count reflects the delete.
+    assert db.conn.execute(
+        "SELECT 1 FROM photos WHERE id=?", (l,),
+    ).fetchone() is None
+
+
 # ---------------------------------------------------------------------------
 # /api/duplicates/disk-cleanup-summary
 # ---------------------------------------------------------------------------

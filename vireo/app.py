@@ -1868,10 +1868,13 @@ def _trash_via_finder(filepaths, timeout=_FINDER_TRASH_TIMEOUT_SECS):
 
     The script catches each path's error and continues so a retry containing
     files already moved by a timed-out earlier batch cannot abort before later
-    files. A missing source counts as successful only when Finder can still
-    reach its parent directory; an unavailable mount therefore remains a safe
-    failure. The return shape matches :func:`_trash_paths`: moved count,
-    successful paths (including already-missing ones), and failure details.
+    files. Returns ``(moved_paths, missing_paths, failures)``. A "missing"
+    outcome (Finder saw ``sourceExists=false`` but the parent directory still
+    exists) is reported separately so the caller can revalidate mount
+    identity before accepting it: an unmounted network volume leaves its
+    mount-point directory in place on the underlying local FS, so Finder's
+    ``parentExists`` check alone cannot distinguish a genuine delete from a
+    silently detached mount.
     """
     if sys.platform != "darwin":
         raise OSError("Finder trash fallback is only available on macOS")
@@ -1929,20 +1932,19 @@ def _trash_via_finder(filepaths, timeout=_FINDER_TRASH_TIMEOUT_SECS):
         raise OSError(
             "Finder trash returned an invalid per-file status response"
         )
-    successful = set()
+    moved_paths = set()
+    missing_paths = set()
     failures = []
-    moved = 0
     for filepath, outcome in zip(filepaths, statuses, strict=True):
         if outcome == "moved":
-            moved += 1
-            successful.add(filepath)
+            moved_paths.add(filepath)
         elif outcome == "missing":
-            successful.add(filepath)
+            missing_paths.add(filepath)
         else:
             failures.append({
                 "path": filepath, "error": "Finder Trash failed",
             })
-    return moved, successful, failures
+    return moved_paths, missing_paths, failures
 
 
 def _snapshot_parent_device(filepath):
@@ -2013,6 +2015,7 @@ def _trash_paths(filepaths, progress_callback=None):
     fallback = []
     preflight_errors = {}
     finder_candidates = []
+    network_finder_candidates = set()
     send_errors = {}
     network_roots = _network_volume_roots()
     processed = set()
@@ -2034,6 +2037,7 @@ def _trash_paths(filepaths, progress_callback=None):
     for filepath in ordered:
         if _path_on_network_volume(filepath, network_roots):
             finder_candidates.append(filepath)
+            network_finder_candidates.add(filepath)
             send_errors[filepath] = "Network volume Trash operation failed"
         else:
             local_paths.append(filepath)
@@ -2103,15 +2107,53 @@ def _trash_paths(filepaths, progress_callback=None):
                 else:
                     report_processed(filepath)
 
+    def _finder_missing_is_trustworthy(filepath):
+        """Reject Finder's "missing" outcome when the underlying mount is gone.
+
+        Finder reports "missing" when ``sourceExists=false`` but
+        ``parentExists=true``. An unmounted network volume leaves its
+        mount-point directory in place on the underlying local FS, so the
+        parent-exists check alone cannot distinguish a genuine delete from a
+        silently detached mount. Accepting "missing" in that case would
+        prune the catalog row for a photo that reappears on remount.
+
+        For network-classified paths we re-query the kernel mount table
+        (bounded by ``_MOUNT_QUERY_TIMEOUT_SECS``) and require the path to
+        still resolve to a listed network root. For local fallbacks we
+        reuse the parent-device snapshot check that guards the send2trash
+        path already.
+        """
+        if filepath in network_finder_candidates:
+            current_roots = _network_volume_roots()
+            if current_roots is None:
+                # Mount discovery failed on the recheck too — we cannot
+                # confirm the volume is still mounted, so refuse to trust
+                # "missing" and let the caller retry.
+                return False
+            return _path_on_network_volume(filepath, current_roots)
+        return _path_confirmed_gone(filepath, parent_devs.get(filepath))
+
     for finder_batch in _chunked(
         finder_candidates, size=_FINDER_TRASH_BATCH_SIZE,
     ):
         try:
-            finder_moved, finder_successful, finder_failures = (
+            finder_moved_paths, finder_missing_paths, finder_failures = (
                 _trash_via_finder(finder_batch)
             )
-            moved += finder_moved
-            successful.update(finder_successful)
+            moved += len(finder_moved_paths)
+            successful.update(finder_moved_paths)
+            for missing_path in finder_missing_paths:
+                if _finder_missing_is_trustworthy(missing_path):
+                    successful.add(missing_path)
+                else:
+                    send_errors[missing_path] = (
+                        "Source path is unreachable"
+                    )
+                    log.warning(
+                        "Rejecting Finder 'missing' outcome for %s: "
+                        "underlying mount appears to have detached",
+                        missing_path,
+                    )
             for failure in finder_failures:
                 send_errors[failure["path"]] = failure["error"]
         except subprocess.TimeoutExpired:
@@ -22171,6 +22213,16 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         trashed_pids = []
         skipped = []
         failed = []
+        # Classify paths via the bounded kernel mount table BEFORE any
+        # per-path stat. Calling ``os.path.isfile`` on an unhealthy SMB path
+        # can block indefinitely inside this endpoint, meaning the new
+        # network routing inside ``_trash_paths`` would never even be
+        # reached; a stat failure would also be misread as "already
+        # missing" and drop the DB row for a photo that reappears on
+        # remount. Local paths keep the existing preflight — a fast, safe
+        # stat on the local FS — so the "file already missing" reporting
+        # contract for manually-cleaned local losers is preserved.
+        network_roots = _network_volume_roots()
         for pid in photo_ids:
             row = rows_by_id.get(pid)
             if row is None:
@@ -22186,6 +22238,15 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 skipped.append({"id": pid, "reason": "no duplicate winner exists"})
                 continue
             filepath = os.path.join(row["folder_path"] or "", row["filename"] or "")
+            if _path_on_network_volume(filepath, network_roots):
+                # Never stat a network path from this thread — delegate
+                # entirely to ``_trash_paths``, which routes network
+                # candidates through a time-bounded Finder subprocess. If
+                # the file is truly gone, Finder will report "missing" and
+                # the bounded mount-identity revalidation there decides
+                # whether to accept it as end-state or preserve the row.
+                trash_candidates.append((pid, filepath))
+                continue
             file_existed = os.path.isfile(filepath)
             if not file_existed:
                 # File was removed outside Vireo (e.g. user trashed in Finder).

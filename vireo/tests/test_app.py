@@ -3816,9 +3816,12 @@ def test_trash_via_finder_batches_paths_and_sets_timeout(monkeypatch):
     assert "/Volumes/X/b.NEF" in argv
     assert "repeat with posixPath in argv" in argv
     assert kwargs["timeout"] == app_module._FINDER_TRASH_TIMEOUT_SECS
+    # Moved and missing outcomes are surfaced separately so the caller can
+    # revalidate mount identity before accepting "missing" — an unmounted
+    # network volume also satisfies Finder's ``parentExists`` check.
     assert result == (
-        1,
-        {"/Volumes/X/a.NEF", "/Volumes/X/b.NEF"},
+        {"/Volumes/X/b.NEF"},
+        {"/Volumes/X/a.NEF"},
         [],
     )
 
@@ -4027,7 +4030,7 @@ def test_trash_paths_routes_network_volume_directly_to_bounded_finder(
         finder_calls.append(list(paths))
         for path in paths:
             os.remove(path)
-        return len(paths), set(paths), []
+        return set(paths), set(), []
 
     monkeypatch.setattr(app_module, "_trash_via_finder", finder_trash)
     progress = []
@@ -4348,6 +4351,180 @@ def test_trash_paths_rejects_success_when_mount_replaced_by_local_fs(
     assert moved == 0
     assert successful == set()
     assert [failure["path"] for failure in failures] == [str(photo)]
+
+
+def test_trash_paths_rejects_finder_missing_when_network_mount_detached(
+    monkeypatch, tmp_path,
+):
+    """A network mount that silently detaches leaves its mount-point
+    directory in place on the underlying local FS, so Finder observes
+    ``sourceExists=false`` and ``parentExists=true`` and reports "missing".
+    Accepting that would prune the catalog row for a photo that reappears
+    when the mount comes back. Re-query the mount table before trusting
+    the missing outcome and preserve the row as a failure when the
+    original network root is gone.
+    """
+    import app as app_module
+
+    volume = tmp_path / "SMB_Share"
+    volume.mkdir()
+    photo = volume / "bird.NEF"
+
+    monkeypatch.setattr(app_module.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        app_module, "_volume_root_for_path", lambda _p: str(volume),
+    )
+
+    # First call classifies the path as network-backed; the second call
+    # (from the missing-outcome revalidation) reports the mount as gone.
+    mount_calls = iter([{str(volume)}, set()])
+    monkeypatch.setattr(
+        app_module, "_network_volume_roots", lambda: next(mount_calls),
+    )
+
+    def finder_reports_missing(paths):
+        # Finder saw sourceExists=false and parentExists=true, so it would
+        # have reported "missing" — the mount-point directory is still
+        # visible on the underlying local FS.
+        return set(), set(paths), []
+
+    monkeypatch.setattr(app_module, "_trash_via_finder", finder_reports_missing)
+
+    moved, successful, failures = app_module._trash_paths([str(photo)])
+
+    assert moved == 0
+    assert successful == set()
+    assert [f["path"] for f in failures] == [str(photo)]
+    assert failures[0]["error"] == "Source path is unreachable"
+
+
+def test_trash_paths_accepts_finder_missing_when_network_mount_still_live(
+    monkeypatch, tmp_path,
+):
+    """A file legitimately absent on a still-mounted network volume is a
+    valid end state: revalidation must not turn it into a spurious failure.
+    """
+    import app as app_module
+
+    volume = tmp_path / "SMB_Share"
+    volume.mkdir()
+    photo = volume / "bird.NEF"
+
+    monkeypatch.setattr(app_module.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        app_module, "_volume_root_for_path", lambda _p: str(volume),
+    )
+    monkeypatch.setattr(
+        app_module, "_network_volume_roots", lambda: {str(volume)},
+    )
+
+    def finder_reports_missing(paths):
+        return set(), set(paths), []
+
+    monkeypatch.setattr(app_module, "_trash_via_finder", finder_reports_missing)
+
+    moved, successful, failures = app_module._trash_paths([str(photo)])
+
+    assert moved == 0
+    assert successful == {str(photo)}
+    assert failures == []
+
+
+def test_trash_paths_rejects_finder_missing_when_mount_recheck_fails(
+    monkeypatch, tmp_path,
+):
+    """If we cannot even re-read the kernel mount table on the revalidation
+    call, fail closed and preserve the path as a failure rather than
+    accepting Finder's "missing" outcome for a possibly-detached network
+    mount.
+    """
+    import app as app_module
+
+    volume = tmp_path / "SMB_Share"
+    volume.mkdir()
+    photo = volume / "bird.NEF"
+
+    monkeypatch.setattr(app_module.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        app_module, "_volume_root_for_path", lambda _p: str(volume),
+    )
+    mount_calls = iter([{str(volume)}, None])
+    monkeypatch.setattr(
+        app_module, "_network_volume_roots", lambda: next(mount_calls),
+    )
+
+    def finder_reports_missing(paths):
+        return set(), set(paths), []
+
+    monkeypatch.setattr(app_module, "_trash_via_finder", finder_reports_missing)
+
+    moved, successful, failures = app_module._trash_paths([str(photo)])
+
+    assert moved == 0
+    assert successful == set()
+    assert [f["path"] for f in failures] == [str(photo)]
+
+
+def test_trash_paths_rejects_finder_missing_when_local_parent_device_drifts(
+    monkeypatch, tmp_path,
+):
+    """The local-fallback branch (send2trash failed, path handed to Finder)
+    must apply the same mount-identity check. A pre-op parent snapshot
+    lets us detect the case where the parent directory now stats on a
+    different device — the mount was replaced by the underlying local FS
+    while the file appeared to move — and refuse the "missing" acceptance.
+    """
+    import app as app_module
+    import send2trash
+
+    mount_root = tmp_path / "mnt_photos"
+    mount_root.mkdir()
+    photo = mount_root / "bird.NEF"
+    photo.write_bytes(b"raw")
+
+    baseline_dev = os.stat(str(mount_root)).st_dev
+    monkeypatch.setattr(app_module.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        app_module, "_volume_root_for_path", lambda _p: None,
+    )
+    monkeypatch.setattr(
+        app_module, "_network_volume_roots", lambda: set(),
+    )
+    monkeypatch.setattr(app_module, "_move_to_volume_trash", lambda _p: False)
+
+    real_stat = os.stat
+
+    def send2trash_raises_after_mount_drops(path):
+        # Simulate the mount detaching mid-op: the file appears gone but
+        # the parent directory now belongs to a different device.
+        os.unlink(path)
+
+        def stat_with_shifted_dev(target, *args, **kwargs):
+            result = real_stat(target, *args, **kwargs)
+            if os.path.normpath(target) == os.path.normpath(str(mount_root)):
+                class _Shifted:
+                    st_dev = baseline_dev + 1
+                    st_mode = result.st_mode
+                return _Shifted()
+            return result
+
+        monkeypatch.setattr(app_module.os, "stat", stat_with_shifted_dev)
+        raise OSError("Network volume unavailable")
+
+    monkeypatch.setattr(
+        send2trash, "send2trash", send2trash_raises_after_mount_drops,
+    )
+
+    def finder_reports_missing(paths):
+        return set(), set(paths), []
+
+    monkeypatch.setattr(app_module, "_trash_via_finder", finder_reports_missing)
+
+    moved, successful, failures = app_module._trash_paths([str(photo)])
+
+    assert moved == 0
+    assert successful == set()
+    assert [f["path"] for f in failures] == [str(photo)]
 
 
 def test_navbar_js_fallbacks_match_python_constants():

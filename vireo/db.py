@@ -376,7 +376,7 @@ ALL_NAV_IDS = frozenset({
     "import",
     "pipeline", "jobs", "pipeline_review", "pipeline_rapid_review", "review", "cull",
     "misses", "highlights", "life_list", "browse", "edit", "map", "location_review", "variants",
-    "dashboard", "storage", "audit", "move", "id_conflicts",
+    "dashboard", "storage", "audit", "card_cleanup", "move", "id_conflicts",
     "settings", "workspace", "lightroom", "shortcuts",
     "keywords", "duplicates", "logs",
 })

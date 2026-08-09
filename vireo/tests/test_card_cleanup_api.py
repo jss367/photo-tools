@@ -388,3 +388,302 @@ def test_endpoints_reject_non_object_json_body(app_and_db):
         resp = client.post(url, json=5)
         assert resp.status_code == 400, url
         assert "JSON object" in resp.get_json()["error"]
+
+
+def test_card_cleanup_page_renders(app_and_db):
+    # The flow lives on its own page now (spec:
+    # docs/superpowers/specs/2026-08-08-card-cleanup-page-design.md).
+    app, _ = app_and_db
+    resp = app.test_client().get("/card-cleanup")
+    assert resp.status_code == 200
+    body = resp.get_data(as_text=True)
+    assert "card-cleanup-section" in body
+    assert "card-cleanup-scan-btn" in body
+    # The integrity-audit affordance is part of the page, not the import page.
+    assert "card-cleanup-audit-btn" in body
+
+
+def test_import_page_links_to_card_cleanup_instead_of_hosting_it(app_and_db):
+    app, _ = app_and_db
+    resp = app.test_client().get("/import")
+    assert resp.status_code == 200
+    body = resp.get_data(as_text=True)
+    assert "card-cleanup-section" not in body
+    # The entry point stays: it now navigates to the dedicated page.
+    assert "btnFreeUpCardSpace" in body
+    assert "/card-cleanup" in body
+
+
+def test_audit_callout_reason_stays_in_sync(app_and_db):
+    """The page's audit callout counts kept entries by matching a tail of
+    KEEP_NOT_VERIFIED. That coupling is invisible from either side, so pin
+    both ends: the served page must carry the literal it matches on, and
+    the reason it matches must still contain it."""
+    app, _ = app_and_db
+    matched = "run the integrity audit"
+    assert matched in card_cleanup.KEEP_NOT_VERIFIED
+    body = app.test_client().get("/card-cleanup").get_data(as_text=True)
+    assert f"CARD_CLEANUP_AUDIT_REASON = '{matched}'" in body
+
+
+def test_hash_failed_callout_reason_stays_in_sync(app_and_db):
+    """The hash-failed callout has the same shape of coupling as the
+    audit callout (Codex P2 review): the page filters kept entries by a
+    tail of KEEP_ARCHIVE_HASH_FAILED. Pin both ends so a reword on either
+    side stops silently. Also assert the two literals do NOT overlap —
+    if they did, a KEEP_ARCHIVE_HASH_FAILED entry would count toward the
+    audit callout and get double-remediated."""
+    app, _ = app_and_db
+    matched = "see the Audit page"
+    assert matched in card_cleanup.KEEP_ARCHIVE_HASH_FAILED
+    body = app.test_client().get("/card-cleanup").get_data(as_text=True)
+    assert f"CARD_CLEANUP_HASH_FAILED_REASON = '{matched}'" in body
+    assert matched not in card_cleanup.KEEP_NOT_VERIFIED
+    assert "run the integrity audit" not in card_cleanup.KEEP_ARCHIVE_HASH_FAILED
+
+
+def test_hash_failed_callout_states_audit_workspace_scope(app_and_db):
+    """Second-order Codex P2 review: the audit remedy suggested by the
+    hash-failed callout is only reachable when the failed row is in the
+    active workspace, because Database.get_integrity_flagged() filters
+    to the active workspace but _load_catalog_by_hash() matches globally.
+    The callout must say so up front so the user does not click through
+    to an empty Audit page — mirroring the workspace-scope note added
+    to the verify-hashes callout for the same asymmetry."""
+    app, _ = app_and_db
+    body = app.test_client().get("/card-cleanup").get_data(as_text=True)
+    # A dedicated hint element for the scope note, rendered inside the
+    # hash-failed callout container.
+    assert 'id="card-cleanup-hash-failed-scope"' in body
+    # The copy itself: names the current-workspace scope of the Audit
+    # page and tells the user how to reach a failed row in a different
+    # workspace's folders. Pinned literally so a reword does not quietly
+    # drop the guidance the Codex P2 asked for.
+    assert "Audit page shows flagged rows for the current workspace only" in body
+    assert "switch to that workspace to find it there" in body
+
+
+def test_finish_audit_disables_delete_until_rescan(app_and_db):
+    """Codex P2 review (commit 1213fec): finishing or cancelling the
+    verify-hashes run must invalidate the preview's Delete affordance,
+    because verification can flip previously-ok rows to modified/corrupt/
+    unreadable — the confirmation dialog would then advertise stale file
+    and byte totals against a subset the user never agreed to. The audit
+    handler must both disable the Delete button and swap in a hint that
+    tells the user to re-scan (the button surfaced next to the audit
+    status). Pin the literal here so the guardrail can't be silently
+    reworded away."""
+    app, _ = app_and_db
+    body = app.test_client().get("/card-cleanup").get_data(as_text=True)
+    finish = body.index("function cardCleanupFinishAudit(")
+    # Snap out a window around the handler body. The next function in the
+    # file is cardCleanupBindBucket; slice up to whichever declaration
+    # follows so this test does not accidentally match code elsewhere.
+    end = body.index("function cardCleanupBindBucket(", finish)
+    section = body[finish:end]
+    # The Delete button is disabled inside the handler, not just via the
+    # separate cardCleanupSetBusy(false) that ran first (which restores
+    # the pre-verify enabled state).
+    assert "deleteBtn.disabled = true" in section
+    # The user-facing hint that replaces whatever cardCleanupSetBusy
+    # restored — pinned verbatim so a reword can't drop the "re-scan
+    # first" instruction the Codex P2 asked for.
+    assert (
+        "Verification may have changed which files count as verified — "
+        "re-scan the card before deleting."
+    ) in section
+
+
+def test_confirm_delete_locks_page_before_post(app_and_db):
+    """Codex P2 reviews (commits 96137e3 and 012aec2c): cardCleanupConfirmDelete
+    must set the page-wide busy state *before* the POST /api/card-cleanup/delete
+    request is issued, and its failure paths must treat HTTP failures and
+    network errors differently.
+
+    Ordering: the confirm dialog can be dismissed (backdrop click or Escape)
+    while the request is pending. If Scan and Verify remained enabled during
+    that window, the user could kick off a second job whose watch would
+    overwrite this delete's jobId — the exact orphan the single-busy-state
+    owner exists to prevent, and one that could strand a destructive
+    deletion. Busy must be set before the fetch so a dismissal never opens
+    the gap.
+
+    Failure handling: an HTTP response proves whether the server queued the
+    delete, so !resp.ok can hand the buttons back. A `fetch` rejection is
+    ambiguous — the POST may have reached the server and started the
+    destructive job before the connection dropped — so the catch must NOT
+    unlock, and must direct the user to the Jobs page. Pinning both here so
+    a refactor can't quietly re-open the gap."""
+    app, _ = app_and_db
+    body = app.test_client().get("/card-cleanup").get_data(as_text=True)
+    start = body.index("async function cardCleanupConfirmDelete(")
+    end = body.index("function cardCleanupRenderDeleteResult(", start)
+    section = body[start:end]
+    # Busy must be set BEFORE the fetch — locate both and require the
+    # setBusy call to come first.
+    fetch_idx = section.index("/api/card-cleanup/delete")
+    busy_true_idx = section.index("cardCleanupSetBusy(true")
+    assert busy_true_idx < fetch_idx, (
+        "cardCleanupSetBusy(true) must run before the delete POST is issued "
+        "so a dialog dismissal during the pending request can't leave "
+        "Scan/Verify live and race a second job into cardCleanupWatchJob"
+    )
+    # An HTTP response that proves nothing was queued (!resp.ok) must
+    # release the lock so the user isn't stranded with a dead page.
+    ok_branch_start = section.index("if (!resp.ok)")
+    ok_branch_end = section.index("cardCleanupWatchJob", ok_branch_start)
+    ok_branch = section[ok_branch_start:ok_branch_end]
+    assert "cardCleanupSetBusy(false)" in ok_branch, (
+        "the !resp.ok branch must call cardCleanupSetBusy(false) — the "
+        "server said the delete was not queued, so the page can safely hand "
+        "the buttons back"
+    )
+    # The catch branch is different: `fetch` rejects for network errors
+    # where the request may or may not have reached the server. If the
+    # server already queued the delete, the destructive job is running
+    # unseen — unlocking would let a second job overwrite this page's
+    # jobId (the exact orphan the single-busy-state owner exists to
+    # prevent). Codex P2 (commit 012aec2c) called this out: only unlock
+    # after an HTTP response proves no job was queued; treat network
+    # errors as unknown-running and direct the user to Jobs.
+    catch_start = section.index("} catch (e) {")
+    catch_end = section.index("} finally {", catch_start)
+    catch_body = section[catch_start:catch_end]
+    assert "cardCleanupSetBusy(false)" not in catch_body, (
+        "the network-error catch must NOT release the page lock — the "
+        "server may have queued the delete before the connection dropped, "
+        "and unlocking would let a second job race the destructive job"
+    )
+    assert "Jobs page" in catch_body, (
+        "the network-error catch must direct the user to the Jobs page so "
+        "they can find out whether the server queued the delete before the "
+        "connection dropped"
+    )
+
+
+def test_start_audit_keeps_page_locked_on_ambiguous_start(app_and_db):
+    """Codex P1 review (commit 5afcb0ba): cardCleanupStartAudit must not
+    release the page-wide busy lock on outcomes that don't prove whether the
+    server queued the verify-hashes job.
+
+    If the audit is silently running while Scan/Verify/Delete come back live,
+    a subsequent delete can race it. delete_verified() trusts the currently
+    committed hash_status plus archive size/mtime rather than re-hashing
+    archive bytes, so a row the audit is about to flip from `ok` to
+    modified/corrupt/unreadable could still qualify for deletion — removing
+    the good card copy of a file whose archive copy is silently rotting. Same
+    guarantee the delete-start path pins in test_confirm_delete_locks_page_
+    before_post; pinning both invariants here so a refactor can't quietly
+    re-open the gap."""
+    app, _ = app_and_db
+    body = app.test_client().get("/card-cleanup").get_data(as_text=True)
+    start = body.index("async function cardCleanupStartAudit(")
+    end = body.index("function cardCleanupFinishAudit(", start)
+    section = body[start:end]
+    # An HTTP response that proves nothing was queued (!resp.ok) must
+    # release the lock so the user isn't stranded with a dead page.
+    ok_branch_start = section.index("if (!resp.ok)")
+    # The branch closes before the JSON re-parse below; scope to just that
+    # arm by ending at the trailing "return;" and its closing brace.
+    ok_branch_end = section.index("let data;", ok_branch_start)
+    ok_branch = section[ok_branch_start:ok_branch_end]
+    assert "cardCleanupSetBusy(false)" in ok_branch, (
+        "the !resp.ok branch must call cardCleanupSetBusy(false) — the "
+        "server said the verify-hashes job was not queued, so the page can "
+        "safely hand the buttons back"
+    )
+    # The network-error catch on the fetch itself must NOT unlock — the
+    # POST may have reached the server and started api_job_verify_hashes()
+    # before the connection dropped, and the delete path trusts hash_status
+    # in the DB rather than re-hashing archive bytes, so a concurrent delete
+    # could remove the good card copy of a file the audit is silently
+    # detecting as corrupt.
+    fetch_catch_start = section.index("resp = await fetch(")
+    fetch_catch_start = section.index("} catch (e) {", fetch_catch_start)
+    fetch_catch_end = section.index("if (!resp.ok)", fetch_catch_start)
+    fetch_catch_body = section[fetch_catch_start:fetch_catch_end]
+    assert "cardCleanupSetBusy(false)" not in fetch_catch_body, (
+        "the fetch-rejection catch on cardCleanupStartAudit must NOT release "
+        "the page lock — the POST may have reached the server and queued the "
+        "verify-hashes job before the connection dropped, and unlocking "
+        "would let a concurrent delete race the audit"
+    )
+    assert "Jobs page" in fetch_catch_body, (
+        "the fetch-rejection catch must direct the user to the Jobs page so "
+        "they can find out whether the server queued the verify-hashes job"
+    )
+    # The JSON-parse catch on the OK response is the second ambiguous
+    # outcome: a 2xx status means api_job_verify_hashes() returned, but if
+    # the body couldn't be decoded we can't be sure the job wasn't queued.
+    # Same reasoning — keep the lock, route to Jobs.
+    json_catch_start = section.index("data = await resp.json()")
+    json_catch_start = section.index("} catch (e) {", json_catch_start)
+    json_catch_end = section.index("cardCleanupWatchJob(", json_catch_start)
+    json_catch_body = section[json_catch_start:json_catch_end]
+    assert "cardCleanupSetBusy(false)" not in json_catch_body, (
+        "the JSON-parse catch on a 2xx response must NOT release the page "
+        "lock — the server returned OK, so api_job_verify_hashes() may have "
+        "queued the audit even though we can't read the response body"
+    )
+    assert "Jobs page" in json_catch_body, (
+        "the JSON-parse catch on a 2xx response must direct the user to the "
+        "Jobs page for the actual outcome"
+    )
+
+
+def test_load_manifest_discards_stale_scan_response(app_and_db):
+    """Codex P2 review (commit 16a3f8e4): cardCleanupLoadManifest must
+    discard responses whose scan job id is no longer current.
+
+    Scenario: cardCleanupFinishJob unlocks the buttons and then awaits
+    cardCleanupLoadManifest() for scan #1. During that await a user can
+    change the source and start scan #2, which sets scanJobId to jobId2.
+    If scan #1's response then arrives it would (a) render scan #1's
+    source and totals over scan #2's state via cardCleanupRenderManifest
+    — including re-enabling the Delete button based on scan #1's
+    deletable count — while the delete POST uses cardCleanupState.
+    scanJobId, which is now jobId2, so the confirmation dialog would
+    advertise a set that does not match the manifest the destructive job
+    would operate on; or (b) on a 404, null out scanJobId and clobber
+    scan #2's identity; or (c) surface scan #1's fetch/parse error as if
+    scan #2 had failed.
+
+    Fix: capture scanJobId at request time and drop the response on both
+    the success and error paths when it has moved on. Pinning both paths
+    here so a refactor cannot quietly re-open either one.
+    """
+    app, _ = app_and_db
+    body = app.test_client().get("/card-cleanup").get_data(as_text=True)
+    start = body.index("async function cardCleanupLoadManifest(")
+    end = body.index("function cardCleanupRenderManifest(", start)
+    section = body[start:end]
+    # The success path must run its stale-response check before ANY
+    # state mutation or render — both the 404 handler (which nulls
+    # scanJobId) and cardCleanupRenderManifest (which shows scan #1's
+    # totals and re-enables Delete based on them) would corrupt scan #2's
+    # state if reached with a stale response.
+    first_mutation_idx = min(
+        section.index("cardCleanupState.scanJobId = null"),
+        section.index("cardCleanupRenderManifest("),
+    )
+    pre_mutation = section[:first_mutation_idx]
+    assert "cardCleanupState.scanJobId !==" in pre_mutation, (
+        "cardCleanupLoadManifest must compare state.scanJobId against the "
+        "job id captured before the fetch, and return early on mismatch, "
+        "BEFORE touching state or rendering — otherwise a scan started "
+        "during the fetch will be overwritten by the stale response and "
+        "the Delete confirmation will advertise numbers that do not match "
+        "the manifest the delete POST would operate on"
+    )
+    # The error path (network failure, unreadable body, !resp.ok throw)
+    # must also discard on mismatch — a scan #2 in flight should not
+    # inherit scan #1's error banner as if it had failed itself.
+    catch_idx = section.index("} catch (e) {")
+    catch_body = section[catch_idx:]
+    assert "cardCleanupState.scanJobId !==" in catch_body, (
+        "the catch branch of cardCleanupLoadManifest must also check "
+        "state.scanJobId — a fetch or parse error on the stale scan #1 "
+        "response must not surface as an error message while scan #2 is "
+        "running, because it would misattribute the failure to the scan "
+        "the user is currently watching"
+    )

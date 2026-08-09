@@ -32,6 +32,7 @@ _TEMPLATES = {
     "/misses": "misses.html",
     "/logs": "logs.html",
     "/import": "import.html",
+    "/card-cleanup": "card_cleanup.html",
     "/dashboard": "stats.html",
 }
 

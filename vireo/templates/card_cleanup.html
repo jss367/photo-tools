@@ -1,0 +1,1293 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<link rel="icon" type="image/png" href="/favicon.ico">
+<link rel="apple-touch-icon" href="/static/apple-touch-icon.png">
+<link rel="stylesheet" href="/static/vireo-base.css">
+<title>Vireo - Card Cleanup</title>
+<style>
+/* Page CSS is a deliberate minimal copy of the import page's: this flow
+   moved off that page and has to keep looking like itself. Only the
+   classes this page actually uses were brought over. */
+body { display: flex; flex-direction: column; height: 100vh; }
+.content { flex: 1; overflow-y: auto; padding: 20px; }
+.card-cleanup-wrap { max-width: 760px; margin: 0 auto; display: flex; flex-direction: column; gap: 16px; }
+.page-title { font-size: 20px; color: var(--text-primary); }
+.card { background: var(--bg-secondary); border: 1px solid var(--border-primary); border-radius: 8px; padding: 16px; }
+.row { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; flex-wrap: wrap; }
+.row label { font-size: 12px; color: var(--text-secondary); }
+.row input[type=text] {
+  background: var(--bg-tertiary); color: var(--text-primary);
+  border: 1px solid var(--border-secondary); border-radius: 4px;
+  padding: 6px 10px; font-size: 12px; outline: none; flex: 1; min-width: 220px;
+}
+.row input[type=text]:focus { border-color: var(--accent); }
+.btn { background: var(--bg-tertiary); color: var(--text-primary); border: 1px solid var(--border-secondary); border-radius: 4px; padding: 6px 12px; font-size: 12px; cursor: pointer; }
+.btn-primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+.btn:disabled { opacity: 0.5; cursor: default; }
+.hint { font-size: 11px; color: var(--text-secondary); }
+.field-error {
+  display: none; width: 100%; margin: -2px 0 8px; padding-left: 2px;
+  color: var(--danger); font-size: 12px; font-weight: 600;
+}
+.field-error.visible { display: block; }
+.field-error .retry-link {
+  background: none; border: none; padding: 0; cursor: pointer;
+  color: inherit; font: inherit; text-decoration: underline;
+}
+.progress-bar { height: 8px; background: var(--bg-tertiary); border-radius: 4px; overflow: hidden; }
+.progress-bar > div { height: 100%; background: var(--accent); width: 0; transition: width 0.2s; }
+.staging-details { margin: 8px 0 0 0; padding-left: 18px; font-size: 11px; color: var(--text-secondary); max-height: 120px; overflow: auto; }
+.folder-browser-overlay {
+  display: none; position: fixed; inset: 0; z-index: 1001;
+  background: rgba(0, 0, 0, 0.45); align-items: center; justify-content: center;
+}
+.folder-browser-overlay.open { display: flex; }
+.folder-browser-panel {
+  width: min(720px, calc(100vw - 32px)); max-height: calc(100vh - 64px);
+  background: var(--bg-secondary); border: 1px solid var(--border-primary);
+  border-radius: 8px; box-shadow: 0 18px 60px rgba(0,0,0,0.35);
+  display: flex; flex-direction: column; overflow: hidden;
+}
+.folder-browser-header {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 14px 16px; border-bottom: 1px solid var(--border-primary);
+}
+.folder-browser-header h3 { margin: 0; }
+.folder-browser-close { background: none; border: none; color: var(--text-secondary); font-size: 22px; cursor: pointer; }
+.folder-browser-body { padding: 12px 16px; display: flex; flex-direction: column; gap: 10px; min-height: 0; }
+.folder-browser-shortcuts { display: flex; gap: 8px; flex-wrap: wrap; }
+.folder-browser-path { font-size: 12px; color: var(--text-secondary); overflow-wrap: anywhere; }
+.folder-browser-list {
+  height: 320px; overflow: auto; border: 1px solid var(--border-primary);
+  border-radius: 6px; background: var(--bg-tertiary);
+}
+.folder-browser-item {
+  padding: 8px 10px; font-size: 12px; color: var(--text-primary);
+  cursor: pointer; border-bottom: 1px solid color-mix(in srgb, var(--border-primary) 60%, transparent);
+  display: flex; align-items: center; gap: 8px;
+}
+.folder-browser-item:hover { background: var(--bg-hover, rgba(255,255,255,0.05)); }
+.folder-browser-item-name {
+  flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.folder-browser-empty { padding: 14px; font-size: 12px; color: var(--text-secondary); }
+.folder-browser-actions {
+  display: flex; gap: 8px; justify-content: flex-end;
+  padding: 12px 16px; border-top: 1px solid var(--border-primary);
+}
+.card-cleanup-bucket { margin-top: 6px; }
+.card-cleanup-bucket > summary { cursor: pointer; font-size: 12px; color: var(--text-primary); }
+/* Same callout shape as the import page's .managed-archive-callout, in
+   warning colours: an incomplete preview must not read as a quiet
+   footnote. */
+.card-cleanup-warning {
+  font-size: 12px; color: var(--text-primary); margin: 8px 0;
+  padding: 8px 10px; border-radius: 6px; overflow-wrap: anywhere;
+  background: color-mix(in srgb, var(--warning, #bf8700) 12%, transparent);
+  border: 1px solid color-mix(in srgb, var(--warning, #bf8700) 45%, transparent);
+}
+/* The audit callout is an offer, not a problem — neutral chrome so it
+   doesn't compete with the incomplete-preview warning above it. */
+.card-cleanup-audit {
+  font-size: 12px; color: var(--text-primary); margin: 8px 0;
+  padding: 10px; border-radius: 6px;
+  background: var(--bg-tertiary); border: 1px solid var(--border-primary);
+}
+.card-cleanup-audit .hint { display: block; margin-top: 6px; }
+/* Taller than .staging-details: these lists run to thousands of files. */
+#card-cleanup-section .staging-details { max-height: 220px; }
+.card-cleanup-confirm-list { margin: 0; padding-left: 18px; font-size: 13px; color: var(--text-primary); }
+.card-cleanup-confirm-list li { margin-bottom: 10px; overflow-wrap: anywhere; }
+</style>
+</head>
+<body>
+{% include '_navbar.html' %}
+
+<div class="content">
+  <div class="card-cleanup-wrap">
+    <h2 class="page-title">Free up card space</h2>
+
+    <!-- Free up card space: deletes card files ONLY where the same bytes
+         are already verified in the archive. Reached from the navbar or
+         from the import page's result card, which links here with the
+         finished import's card path in ?source=. -->
+    <div class="card" id="card-cleanup-section">
+      <div class="hint">
+        Checks a memory card against the archive and deletes only the files
+        whose archive copy is verified. Everything else stays on the card.
+      </div>
+      <div class="row" id="card-cleanup-picker-row" style="margin-top:10px;">
+        <button class="btn btn-primary" type="button" id="card-cleanup-browse-btn"
+                data-testid="card-cleanup-browse-btn"
+                onclick="cardCleanupBrowse()">Browse...</button>
+        <input type="text" id="card-cleanup-source" list="volumeDatalist"
+               aria-label="Card folder to check"
+               placeholder="or type a card/folder path">
+        <datalist id="volumeDatalist"></datalist>
+      </div>
+      <div class="hint" id="card-cleanup-source-note" style="display:none;"></div>
+      <div class="row">
+        <label><input type="checkbox" id="card-cleanup-recursive" checked> Include subfolders</label>
+      </div>
+      <div class="row">
+        <button class="btn btn-primary" type="button" id="card-cleanup-scan-btn"
+                onclick="cardCleanupStartScan()">Scan card</button>
+        <button class="btn" type="button" id="card-cleanup-cancel-btn"
+                style="display:none;" onclick="cardCleanupCancelJob()">Cancel</button>
+      </div>
+      <div class="field-error" id="card-cleanup-error" role="alert" aria-live="assertive"></div>
+      <div id="card-cleanup-progress" style="display:none;">
+        <div class="row"><span class="hint" id="card-cleanup-phase"></span></div>
+        <div class="progress-bar"><div id="card-cleanup-progress-fill"></div></div>
+      </div>
+      <div id="card-cleanup-preview" style="display:none;">
+        <div class="card-cleanup-warning" id="card-cleanup-incomplete" style="display:none;">
+          <div id="card-cleanup-incomplete-text"></div>
+          <details class="card-cleanup-bucket" id="card-cleanup-walk-errors-details">
+            <summary id="card-cleanup-walk-errors-summary"></summary>
+            <ul class="staging-details" id="card-cleanup-walk-errors"></ul>
+          </details>
+        </div>
+        <div class="hint" id="card-cleanup-scanned-root" style="margin-bottom:6px;"></div>
+        <!-- Shown only when the scan's own kept reasons say the integrity
+             audit is what is missing. -->
+        <div class="card-cleanup-audit" id="card-cleanup-audit" style="display:none;">
+          <div id="card-cleanup-audit-text"></div>
+          <span class="hint" id="card-cleanup-audit-cost"></span>
+          <span class="hint" id="card-cleanup-audit-scope-note"
+                style="display:none;"></span>
+          <div class="row" style="margin-top:8px;margin-bottom:0;">
+            <button class="btn btn-primary" type="button" id="card-cleanup-audit-btn"
+                    onclick="cardCleanupStartAudit()">Verify archive hashes</button>
+            <button class="btn" type="button" id="card-cleanup-audit-rescan-btn"
+                    style="display:none;" onclick="cardCleanupStartScan()">Re-scan card</button>
+          </div>
+          <div class="hint" id="card-cleanup-audit-status" style="margin-top:6px;"></div>
+        </div>
+        <!-- Shown when kept entries are held back because their archive
+             copies failed a prior integrity check. Distinct from the
+             audit callout above: re-running verify would just reproduce
+             the same failed verdict, so this points at the Audit page
+             (accept/restore) instead of offering a verify button. -->
+        <div class="card-cleanup-audit" id="card-cleanup-hash-failed"
+             style="display:none;">
+          <div id="card-cleanup-hash-failed-text"></div>
+          <span class="hint" id="card-cleanup-hash-failed-scope"></span>
+        </div>
+        <details class="card-cleanup-bucket" id="card-cleanup-deletable-details">
+          <summary id="card-cleanup-deletable-summary"></summary>
+          <ul class="staging-details" id="card-cleanup-deletable-list"></ul>
+        </details>
+        <details class="card-cleanup-bucket" id="card-cleanup-kept-details">
+          <summary id="card-cleanup-kept-summary"></summary>
+          <ul class="staging-details" id="card-cleanup-kept-list"></ul>
+        </details>
+        <details class="card-cleanup-bucket" id="card-cleanup-ignored-details">
+          <summary id="card-cleanup-ignored-summary"></summary>
+          <ul class="staging-details" id="card-cleanup-ignored-list"></ul>
+        </details>
+        <div class="row" style="margin-top:12px;">
+          <button class="btn btn-primary" type="button" id="card-cleanup-delete-btn"
+                  disabled onclick="cardCleanupOpenConfirm()">Delete verified files</button>
+          <span class="hint" id="card-cleanup-delete-hint"></span>
+        </div>
+      </div>
+      <div id="card-cleanup-result" style="display:none;">
+        <div class="hint" id="card-cleanup-result-summary" style="margin-top:10px;"></div>
+        <ul class="staging-details" id="card-cleanup-result-list" style="display:none;"></ul>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Single-select folder browser: a minimal copy of the import page's,
+     kept to the one mode this page needs (pick one card folder). -->
+<div class="folder-browser-overlay" id="cardFolderBrowser" data-testid="card-folder-browser">
+  <div class="folder-browser-panel" role="dialog" aria-modal="true" aria-labelledby="folderBrowserTitle">
+    <div class="folder-browser-header">
+      <h3 id="folderBrowserTitle">Select Card Folder</h3>
+      <button class="folder-browser-close" type="button" onclick="closeCardFolderBrowser()">&times;</button>
+    </div>
+    <div class="folder-browser-body">
+      <div class="folder-browser-shortcuts">
+        <button class="btn" type="button" onclick="browseCardFolderTo(null)">Home</button>
+        <button class="btn" type="button" onclick="browseCardFolderTo('__pictures__')">Pictures</button>
+        <button class="btn" type="button" onclick="browseCardFolderTo('__volumes__')">Volumes</button>
+      </div>
+      <div class="folder-browser-path" id="folderBrowserPath"></div>
+      <div class="folder-browser-list" id="folderBrowserList"></div>
+    </div>
+    <div class="folder-browser-actions">
+      <button class="btn" type="button" onclick="closeCardFolderBrowser()">Cancel</button>
+      <button class="btn btn-primary" type="button" id="folderBrowserSelectBtn" onclick="selectCardBrowserFolder()">Select This Folder</button>
+    </div>
+  </div>
+</div>
+
+<!-- Delete confirmation. Reuses the folder browser's overlay/panel classes:
+     they are this page's only modal chrome, named after their first user. -->
+<div class="folder-browser-overlay" id="card-cleanup-confirm"
+     data-testid="card-cleanup-confirm">
+  <div class="folder-browser-panel" role="dialog" aria-modal="true"
+       aria-labelledby="card-cleanup-confirm-title">
+    <div class="folder-browser-header">
+      <h3 id="card-cleanup-confirm-title">Delete verified files from the card?</h3>
+      <button class="folder-browser-close" type="button"
+              onclick="cardCleanupCloseConfirm()">&times;</button>
+    </div>
+    <div class="folder-browser-body">
+      <div id="card-cleanup-confirm-count" class="folder-browser-path"></div>
+      <ul class="card-cleanup-confirm-list">
+        <li>Deletion is permanent — memory cards have no trash.</li>
+        <li>After deletion, the archive holds the only copy of these photos.</li>
+        <li>What "verified" means: each file's archive copy passed a checksum check (at import or integrity audit) and is confirmed unchanged since by size and timestamp; the card copy itself is re-checksummed at the moment of deletion. Archive bytes are not re-downloaded.</li>
+      </ul>
+    </div>
+    <div class="folder-browser-actions">
+      <button class="btn" type="button" onclick="cardCleanupCloseConfirm()">Cancel</button>
+      <button class="btn btn-primary" type="button" id="card-cleanup-confirm-btn"
+              onclick="cardCleanupConfirmDelete()">Delete verified files</button>
+    </div>
+  </div>
+</div>
+
+<script>
+/* ---------- Free up card space ----------
+   Deletes card files only where the archive copy is verified. Every count
+   and byte total shown here is read straight out of the scan manifest —
+   this page never estimates, and it marks the preview incomplete
+   whenever the card walk hit a folder it could not read. */
+const cardCleanupState = {
+  scanJobId: null,      // manifest key of the last scan we started
+  jobId: null,          // job currently streaming (scan, delete, or audit)
+  finishedJobId: null,  // guards the double 'complete' + 'error' callback
+  es: null,             // this page's job stream
+  manifest: null,
+  listsRendered: {},    // bucket -> true once its <li>s are in the DOM
+  confirmEscHandler: null,
+  busyRestore: null,    // delete button/hint state saved while a job runs
+  auditCompleted: false, // a verify-hashes run finished during this page visit
+};
+
+/* Exactly one job at a time. Starting a second one while this page is
+   watching a job would close the first job's stream and overwrite
+   `jobId`, so that job's completion handler would never run: the finished
+   run would be orphaned from the page (blank status, stuck buttons) while
+   it kept going on the server. Rather than let a click do that silently,
+   the three start buttons are disabled for the duration of any run — and
+   the Delete button, being the destructive one, says why. */
+function cardCleanupSetBusy(running, opts) {
+  const scanBtn = document.getElementById('card-cleanup-scan-btn');
+  const deleteBtn = document.getElementById('card-cleanup-delete-btn');
+  const auditBtn = document.getElementById('card-cleanup-audit-btn');
+  const deleteHint = document.getElementById('card-cleanup-delete-hint');
+  if (running) {
+    // Whether Delete may be pressed depends on the manifest (and on
+    // whether a deletion already ran), so restore what was there rather
+    // than recomputing it.
+    if (cardCleanupState.busyRestore === null) {
+      cardCleanupState.busyRestore = {
+        deleteDisabled: deleteBtn.disabled,
+        deleteHint: deleteHint.textContent,
+      };
+    }
+    scanBtn.disabled = true;
+    auditBtn.disabled = true;
+    deleteBtn.disabled = true;
+    if (opts && opts.deleteHint) deleteHint.textContent = opts.deleteHint;
+    return;
+  }
+  const restore = cardCleanupState.busyRestore;
+  cardCleanupState.busyRestore = null;
+  scanBtn.disabled = false;
+  auditBtn.disabled = false;
+  if (restore) {
+    deleteBtn.disabled = restore.deleteDisabled;
+    deleteHint.textContent = restore.deleteHint;
+  }
+}
+
+// The manifest reason that this page's audit callout answers. Mirrors
+// card_cleanup.KEEP_NOT_VERIFIED — matched on the distinctive tail so a
+// reason with extra detail appended still counts.
+const CARD_CLEANUP_AUDIT_REASON = 'run the integrity audit';
+// The manifest reason that this page's hash-failed callout answers.
+// Mirrors card_cleanup.KEEP_ARCHIVE_HASH_FAILED — kept distinct from
+// CARD_CLEANUP_AUDIT_REASON so a check-failed row cannot pretend to be a
+// never-checked one and get double-counted (or vice versa). Same tail
+// match as above; test_hash_failed_callout_reason_stays_in_sync pins it.
+const CARD_CLEANUP_HASH_FAILED_REASON = 'see the Audit page';
+
+function formatBytes(n) {
+  n = Number(n || 0);
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let i = 0;
+  while (n >= 1024 && i < units.length - 1) { n /= 1024; i += 1; }
+  return (i === 0 ? String(n) : n.toFixed(n >= 10 ? 1 : 2)) + ' ' + units[i];
+}
+
+function cardEscapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, (ch) => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+  }[ch]));
+}
+
+function cardCleanupFileCount(n) {
+  const count = Number(n || 0);
+  return count.toLocaleString() + (count === 1 ? ' file' : ' files');
+}
+
+function cardCleanupSetError(msg, opts) {
+  const el = document.getElementById('card-cleanup-error');
+  el.textContent = '';
+  el.classList.toggle('visible', !!msg);
+  if (!msg) return;
+  el.append(msg);
+  if (opts && opts.rescan) {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'retry-link';
+    btn.textContent = 'Re-scan';
+    btn.addEventListener('click', () => cardCleanupStartScan());
+    el.append(' ', btn);
+  }
+}
+
+/* ---------- Single-select folder browser ----------
+   Minimal copy of the import page's browser: same /api/browse and
+   /api/volumes endpoints, one folder at a time, no photo counts. */
+let cardBrowserPath = '';
+let cardBrowserHomePath = '';
+let cardBrowserSeq = 0;
+let cardBrowserEscHandler = null;
+
+async function cardCleanupBrowse() {
+  // Same shape as the import page's browseForSource(): native picker
+  // when the desktop shell offers one, in-page browser otherwise.
+  if (typeof pickDirectory === 'function') {
+    const seqBeforePicker = cardBrowserSeq;
+    const result = await pickDirectory('Select the card folder');
+    if (result) {
+      const path = Array.isArray(result) ? result[0] : result;
+      if (path) document.getElementById('card-cleanup-source').value = path;
+      return;
+    }
+    if (typeof isTauri === 'function' && isTauri()) return;
+    if (cardBrowserSeq !== seqBeforePicker) {
+      openCardFolderBrowser({ skipInitialBrowse: true });
+      return;
+    }
+  }
+  openCardFolderBrowser();
+}
+
+function openCardFolderBrowser(opts = {}) {
+  const overlay = document.getElementById('cardFolderBrowser');
+  overlay.classList.add('open');
+  overlay.onclick = (e) => {
+    if (e.target === overlay) closeCardFolderBrowser();
+  };
+  if (cardBrowserEscHandler) {
+    document.removeEventListener('keydown', cardBrowserEscHandler);
+  }
+  cardBrowserEscHandler = (e) => {
+    if (e.key === 'Escape') closeCardFolderBrowser();
+  };
+  document.addEventListener('keydown', cardBrowserEscHandler);
+  document.body.style.overflow = 'hidden';
+  const firstAction = overlay.querySelector('button');
+  if (firstAction) firstAction.focus();
+  const startPath = (document.getElementById('card-cleanup-source').value || '').trim();
+  if (!opts.skipInitialBrowse) browseCardFolderTo(startPath || null);
+}
+
+function closeCardFolderBrowser() {
+  document.getElementById('cardFolderBrowser').classList.remove('open');
+  if (cardBrowserEscHandler) {
+    document.removeEventListener('keydown', cardBrowserEscHandler);
+    cardBrowserEscHandler = null;
+  }
+  document.body.style.overflow = '';
+}
+
+async function browseCardFolderTo(path) {
+  const seq = ++cardBrowserSeq;
+  // Clear the stale selection while this async navigation is pending.
+  // Without this, clicking "Select This Folder" during a slow or failing
+  // fetch submits the previous folder instead of the one requested.
+  cardBrowserPath = '';
+  const selectBtn = document.getElementById('folderBrowserSelectBtn');
+  if (selectBtn) selectBtn.disabled = true;
+  document.getElementById('folderBrowserPath').textContent = 'Loading…';
+  document.getElementById('folderBrowserList').innerHTML =
+    '<div class="folder-browser-empty">Loading…</div>';
+  let url = '/api/browse';
+  if (path === '__pictures__') {
+    if (!cardBrowserHomePath) {
+      try {
+        const homeResp = await fetch('/api/browse');
+        if (seq !== cardBrowserSeq || !homeResp.ok) return;
+        const home = await homeResp.json();
+        cardBrowserHomePath = home.path || '';
+      } catch (e) {
+        return;
+      }
+    }
+    url = '/api/browse?path=' + encodeURIComponent(cardBrowserHomePath + '/Pictures');
+  } else if (path === '__volumes__') {
+    if (navigator.userAgent.indexOf('Mac') < 0) {
+      try {
+        const resp = await fetch('/api/volumes');
+        if (seq !== cardBrowserSeq || !resp.ok) return;
+        const volumes = await resp.json();
+        cardBrowserPath = '';
+        renderCardFolderBrowser({ path: '', dirs: volumes || [] }, { syntheticRoot: true });
+      } catch (e) { /* ignore */ }
+      return;
+    }
+    url = '/api/browse?path=' + encodeURIComponent('/Volumes');
+  } else if (path) {
+    url = '/api/browse?path=' + encodeURIComponent(path);
+  }
+
+  try {
+    const resp = await fetch(url);
+    if (seq !== cardBrowserSeq) return;
+    if (!resp.ok) {
+      const data = await resp.json().catch(() => ({}));
+      document.getElementById('folderBrowserPath').textContent =
+        data.error || 'Could not open folder.';
+      document.getElementById('folderBrowserList').innerHTML =
+        '<div class="folder-browser-empty">Could not open folder.</div>';
+      return;
+    }
+    const data = await resp.json();
+    cardBrowserPath = data.path || '';
+    if (!path) cardBrowserHomePath = cardBrowserPath;
+    renderCardFolderBrowser(data);
+  } catch (e) {
+    document.getElementById('folderBrowserPath').textContent = String(e.message || e);
+    document.getElementById('folderBrowserList').innerHTML =
+      '<div class="folder-browser-empty">Could not open folder.</div>';
+  }
+}
+
+function renderCardFolderBrowser(data, opts) {
+  document.getElementById('folderBrowserPath').textContent = data.path || 'Volumes';
+  const list = document.getElementById('folderBrowserList');
+  const dirs = data.dirs || [];
+  let html = '';
+  const syntheticRoot = opts && opts.syntheticRoot;
+  let parent = '';
+  if (data.path && data.path.indexOf('\\') !== -1) {
+    parent = data.path.replace(/[\\\/]?[^\\\/]+[\\\/]?$/, '') || data.path;
+    if (/^[A-Za-z]:$/.test(parent)) parent += '\\';
+  } else if (data.path) {
+    parent = data.path.substring(0, data.path.lastIndexOf('/')) || '/';
+  }
+  if (data.path && data.path !== '/' && parent && parent !== data.path) {
+    html += '<div class="folder-browser-item" data-browse-path="' + cardEscapeHtml(parent) + '" data-parent-link="1">' +
+      '<span class="folder-browser-item-name">&#128193; ..</span></div>';
+  }
+  dirs.forEach((d) => {
+    html += '<div class="folder-browser-item" data-browse-path="' + cardEscapeHtml(d.path) + '">' +
+      '<span class="folder-browser-item-name">&#128193; ' + cardEscapeHtml(d.name || d.path) + '</span></div>';
+  });
+  if (!html) {
+    html = '<div class="folder-browser-empty">' +
+      (syntheticRoot ? 'No volumes found.' : 'No subfolders.') + '</div>';
+  }
+  list.innerHTML = html;
+  // Single-select: a click navigates into the folder, and the actions bar
+  // selects wherever you are standing.
+  list.onclick = (e) => {
+    const item = e.target.closest('.folder-browser-item[data-browse-path]');
+    if (!item) return;
+    browseCardFolderTo(item.getAttribute('data-browse-path'));
+  };
+  const selectBtn = document.getElementById('folderBrowserSelectBtn');
+  if (selectBtn) selectBtn.disabled = !cardBrowserPath;
+}
+
+function selectCardBrowserFolder() {
+  if (!cardBrowserPath) return;
+  document.getElementById('card-cleanup-source').value = cardBrowserPath;
+  closeCardFolderBrowser();
+}
+
+async function cardCleanupStartScan() {
+  if (cardCleanupState.jobId) return;  // a run is already streaming
+  const source = (document.getElementById('card-cleanup-source').value || '').trim();
+  const recursive = document.getElementById('card-cleanup-recursive').checked;
+  if (!source) {
+    cardCleanupSetError('Choose the card folder to check.');
+    return;
+  }
+  cardCleanupSetError('');
+  cardCleanupResetPreview();
+  document.getElementById('card-cleanup-result').style.display = 'none';
+  cardCleanupSetBusy(true);
+  try {
+    const resp = await fetch('/api/card-cleanup/scan', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ source, recursive }),
+    });
+    const data = await resp.json();
+    // The 400s here are written for the user (archive overlap, unreadable
+    // path) — show the server's own words rather than a generic failure.
+    if (!resp.ok) throw new Error(data.error || 'scan failed to start');
+    cardCleanupState.scanJobId = data.job_id;
+    cardCleanupWatchJob(data.job_id, 'scan', 'Starting scan…');
+  } catch (e) {
+    cardCleanupSetBusy(false);
+    cardCleanupSetError(String(e.message || e));
+  }
+}
+
+function cardCleanupWatchJob(jobId, kind, startingPhase) {
+  cardCleanupState.jobId = jobId;
+  cardCleanupState.finishedJobId = null;
+  document.getElementById('card-cleanup-progress').style.display = '';
+  document.getElementById('card-cleanup-phase').textContent = startingPhase;
+  document.getElementById('card-cleanup-progress-fill').style.width = '0%';
+  const cancelBtn = document.getElementById('card-cleanup-cancel-btn');
+  cancelBtn.style.display = '';
+  cancelBtn.disabled = false;
+  cancelBtn.textContent = 'Cancel';
+  if (cardCleanupState.es) { cardCleanupState.es.close(); cardCleanupState.es = null; }
+  cardCleanupState.es =
+    new EventSource('/api/jobs/' + encodeURIComponent(jobId) + '/stream');
+  cardCleanupState.es.addEventListener('progress', (evt) => {
+    try { cardCleanupRenderProgress(JSON.parse(evt.data)); } catch (e) { /* ignore */ }
+  });
+  cardCleanupState.es.addEventListener('complete', () => {
+    cardCleanupCloseStream();
+    cardCleanupFinishJob(jobId, kind);
+  });
+  cardCleanupState.es.addEventListener('error', () => {
+    // Stream dropped (server restart, network) — fall back to polling the
+    // job rather than pretending progress continues.
+    cardCleanupCloseStream();
+    cardCleanupFinishJob(jobId, kind);
+  });
+}
+
+function cardCleanupCloseStream() {
+  if (cardCleanupState.es) {
+    cardCleanupState.es.close();
+    cardCleanupState.es = null;
+  }
+}
+
+function cardCleanupRenderProgress(data) {
+  const parts = [];
+  if (data.phase) parts.push(data.phase);
+  if (data.total) {
+    parts.push(Number(data.current || 0).toLocaleString() + ' / ' +
+      Number(data.total).toLocaleString());
+  }
+  if (data.current_file) parts.push(data.current_file);
+  document.getElementById('card-cleanup-phase').textContent = parts.join(' · ');
+  const pct = data.total ? Math.round(100 * data.current / data.total) : 0;
+  document.getElementById('card-cleanup-progress-fill').style.width = pct + '%';
+}
+
+async function cardCleanupFinishJob(jobId, kind) {
+  // 'complete' and 'error' can both fire for one job; only finish once.
+  if (cardCleanupState.finishedJobId === jobId) return;
+  cardCleanupState.finishedJobId = jobId;
+  let job = null;
+  // The stream is already gone by the time we poll, so say what the page
+  // is actually doing instead of leaving the last SSE line under a bar
+  // that has stopped moving.
+  document.getElementById('card-cleanup-phase').textContent =
+    'Checking job status…';
+  // Poll until the job actually reaches a terminal state (CodeRabbit
+  // review): a transient stream drop used to fall into a 30-second poll
+  // that then gave up — re-enabling the buttons while the job kept
+  // running on the server, exactly the orphaning the busy discipline
+  // exists to prevent. Scans and audits here legitimately run for many
+  // minutes, so poll indefinitely — 1s for the first 30 attempts, then
+  // 10s — and stop only on a terminal status or when the server says it
+  // no longer knows the job (a restart pruned it: several consecutive
+  // 404s), which gets the honest lost-track copy below.
+  let notFound = 0;
+  for (let i = 0; ; i++) {
+    // A poll that throws (server restarting, network dropped — the very
+    // conditions that killed the stream) must not escape as an unhandled
+    // rejection: that would skip the cleanup below and leave a frozen bar,
+    // a live Cancel button pointing at a stale job, and a disabled Scan
+    // button until reload. Treat it as one failed attempt and keep going.
+    try {
+      const resp = await fetch('/api/jobs/' + encodeURIComponent(jobId));
+      if (resp.ok) {
+        notFound = 0;
+        const polled = await resp.json();
+        if (polled.status && polled.status !== 'running'
+            && polled.status !== 'queued') {
+          job = polled;
+          break;
+        }
+        if (polled.progress) cardCleanupRenderProgress(polled.progress);
+      } else if (resp.status === 404) {
+        notFound += 1;
+        if (notFound >= 3) break;
+      }
+    } catch (e) { /* retry below */ }
+    await new Promise(r => setTimeout(r, i < 30 ? 1000 : 10000));
+  }
+  cardCleanupState.jobId = null;
+  document.getElementById('card-cleanup-cancel-btn').style.display = 'none';
+  document.getElementById('card-cleanup-progress').style.display = 'none';
+  // Buttons come back first; the per-kind branches below then overwrite
+  // the Delete button and its hint with what this run's outcome means.
+  cardCleanupSetBusy(false);
+  const status = job && job.status;
+  const jobError = job && (job.errors || [])[0];
+  if (kind === 'scan') {
+    if (status === 'completed') {
+      await cardCleanupLoadManifest();
+    } else if (status === 'cancelled') {
+      cardCleanupSetError(
+        'Scan cancelled — no files were checked against the archive, and ' +
+        'nothing was deleted. Scan again when you are ready.');
+    } else if (status) {
+      cardCleanupSetError('Scan ' + status + ' — no preview was produced' +
+        (jobError ? ': ' + jobError : '.'));
+    } else {
+      cardCleanupSetError(
+        'The scan is still running but this page lost track of it — ' +
+        'check the Jobs page.');
+    }
+    return;
+  }
+  if (kind === 'audit') {
+    cardCleanupFinishAudit(job, status, jobError);
+    return;
+  }
+  // Delete: the per-file outcome lives in the job result, so a job that
+  // ended without one has to say so rather than imply a clean run.
+  if (job && job.result) {
+    cardCleanupRenderDeleteResult(job.result);
+  } else if (status) {
+    cardCleanupSetError('Deletion ' + status +
+      ' and its summary could not be loaded' +
+      (jobError ? ': ' + jobError : '') + ' — check the Jobs page for what ' +
+      'was deleted, then re-scan the card.');
+  } else {
+    cardCleanupSetError(
+      'The deletion is still running but this page lost track of it — ' +
+      'check the Jobs page.');
+  }
+}
+
+async function cardCleanupLoadManifest() {
+  // Codex P2 (commit 16a3f8e4): capture the scan we are loading FOR so a
+  // response that arrives after a second scan has taken ownership of
+  // scanJobId cannot render scan #1's manifest over scan #2's state.
+  // Without this guard, cardCleanupFinishJob unlocks the buttons before
+  // awaiting the manifest; a user who changes the source and starts
+  // scan #2 during that await would see scan #1's totals/source rendered
+  // by the late response and the confirmation dialog would advertise a
+  // set the delete POST (which uses the current scanJobId) would not
+  // actually operate on. It would also clobber the 404-clears-scanJobId
+  // path and the error message.
+  const requestedScanJobId = cardCleanupState.scanJobId;
+  try {
+    const resp = await fetch('/api/card-cleanup/' +
+      encodeURIComponent(requestedScanJobId) + '/manifest');
+    const data = await resp.json();
+    if (cardCleanupState.scanJobId !== requestedScanJobId) return;
+    if (resp.status === 404) {
+      cardCleanupState.scanJobId = null;
+      cardCleanupSetError('Preview expired — re-scan the card.', { rescan: true });
+      return;
+    }
+    if (!resp.ok) throw new Error(data.error || 'the preview could not be loaded');
+    cardCleanupRenderManifest(data);
+  } catch (e) {
+    if (cardCleanupState.scanJobId !== requestedScanJobId) return;
+    cardCleanupSetError(String(e.message || e));
+  }
+}
+
+function cardCleanupRenderManifest(manifest) {
+  cardCleanupState.manifest = manifest;
+  cardCleanupState.listsRendered = {};
+  const totals = manifest.totals || {};
+  const deletable = totals.deletable || { count: 0, bytes: 0 };
+  const kept = totals.kept || { count: 0, bytes: 0 };
+  const ignored = totals.ignored || { count: 0 };
+  const walkErrors = (manifest.walk_errors || []).map(String);
+
+  // Unmissable and above the numbers: a walk that skipped folders means
+  // the counts below are a floor, not the whole card.
+  const incomplete = document.getElementById('card-cleanup-incomplete');
+  if (walkErrors.length) {
+    incomplete.style.display = '';
+    document.getElementById('card-cleanup-incomplete-text').textContent =
+      'Some folders could not be read; this preview is incomplete. Files ' +
+      'that were not seen will never be deleted.';
+    document.getElementById('card-cleanup-walk-errors-summary').textContent =
+      walkErrors.length.toLocaleString() + ' folder ' +
+      (walkErrors.length === 1 ? 'error' : 'errors');
+    cardCleanupFillList('card-cleanup-walk-errors', walkErrors);
+  } else {
+    incomplete.style.display = 'none';
+  }
+
+  document.getElementById('card-cleanup-scanned-root').textContent =
+    'Checked ' + (manifest.source_root || '') +
+    (manifest.recursive
+      ? ' and its subfolders'
+      : ' only (subfolders were not included)');
+
+  document.getElementById('card-cleanup-deletable-summary').textContent =
+    cardCleanupFileCount(deletable.count) + ' / ' +
+    formatBytes(deletable.bytes) +
+    ' verified in the archive — safe to delete';
+  document.getElementById('card-cleanup-kept-summary').textContent =
+    cardCleanupFileCount(kept.count) + ' / ' + formatBytes(kept.bytes) +
+    ' not verified — will be kept';
+  document.getElementById('card-cleanup-ignored-summary').textContent =
+    cardCleanupFileCount(ignored.count) +
+    ' ignored (not photo files Vireo imports)';
+
+  cardCleanupRenderAuditCallout(manifest);
+  cardCleanupRenderHashFailedCallout(manifest);
+
+  cardCleanupBindBucket('deletable', 'card-cleanup-deletable-details',
+    'card-cleanup-deletable-list');
+  cardCleanupBindBucket('kept', 'card-cleanup-kept-details',
+    'card-cleanup-kept-list');
+  cardCleanupBindBucket('ignored', 'card-cleanup-ignored-details',
+    'card-cleanup-ignored-list');
+
+  const deleteBtn = document.getElementById('card-cleanup-delete-btn');
+  deleteBtn.disabled = deletable.count === 0;
+  document.getElementById('card-cleanup-delete-hint').textContent =
+    deletable.count === 0
+      ? 'Nothing on this card is verified in the archive, so there is ' +
+        'nothing safe to delete.'
+      : 'Deletes the ' + cardCleanupFileCount(deletable.count) +
+        ' listed as verified above, and nothing else.';
+  document.getElementById('card-cleanup-preview').style.display = '';
+}
+
+/* ---------- Integrity-audit affordance ----------
+   The scan itself tells us when the archive audit is the missing step:
+   every kept entry whose reason is KEEP_NOT_VERIFIED. The count below is
+   those entries, not an estimate. */
+function cardCleanupAuditPendingCount(manifest) {
+  return (manifest.entries || []).filter(entry =>
+    entry.bucket === 'kept'
+    && String(entry.reason || '').indexOf(CARD_CLEANUP_AUDIT_REASON) !== -1
+  ).length;
+}
+
+function cardCleanupRenderAuditCallout(manifest) {
+  const callout = document.getElementById('card-cleanup-audit');
+  const pending = cardCleanupAuditPendingCount(manifest);
+  if (!pending) {
+    callout.style.display = 'none';
+    return;
+  }
+  document.getElementById('card-cleanup-audit-text').textContent =
+    cardCleanupFileCount(pending) +
+    (pending === 1 ? ' is' : ' are') +
+    ' kept only because the archive ' +
+    'copy has never been checksum-verified. Vireo will not delete a card ' +
+    'file until its archive copy passes a checksum check, and the ' +
+    'integrity audit is what performs that check.';
+  // Scope honesty (Codex P2 review): the card scan matches photos across
+  // ALL workspaces, but the verify-hashes job covers only the folders in
+  // the CURRENT workspace. If some of these files' archive copies live
+  // in another workspace's folders, verifying here will not touch them —
+  // say so up front, and cardCleanupRenderStillUnverifiedHint says it
+  // again, specifically, when a post-audit re-scan proves it happened.
+  document.getElementById('card-cleanup-audit-cost').textContent =
+    'Verifying re-reads and re-checksums every archive file in the ' +
+    'current workspace, not just these — over a VPN’d network mount ' +
+    'that is slow, so it is best run on a machine close to the NAS. ' +
+    'Archive copies that belong to a different workspace are not ' +
+    'covered; switch to that workspace to verify them.';
+  cardCleanupRenderStillUnverifiedHint(pending);
+  document.getElementById('card-cleanup-audit-btn').style.display = '';
+  document.getElementById('card-cleanup-audit-btn').disabled = false;
+  document.getElementById('card-cleanup-audit-rescan-btn').style.display = 'none';
+  document.getElementById('card-cleanup-audit-status').textContent = '';
+  callout.style.display = '';
+}
+
+/* ---------- Hash-failed affordance ----------
+   Kept entries whose archive copies were checked and came back
+   modified/corrupt/unreadable. They look like unverified rows to a
+   casual read of the kept list but re-running verification would just
+   reproduce the same bad verdict — the remedy is on the Audit page. */
+function cardCleanupHashFailedCount(manifest) {
+  return (manifest.entries || []).filter(entry =>
+    entry.bucket === 'kept'
+    && String(entry.reason || '').indexOf(
+        CARD_CLEANUP_HASH_FAILED_REASON) !== -1
+  ).length;
+}
+
+function cardCleanupRenderHashFailedCallout(manifest) {
+  const callout = document.getElementById('card-cleanup-hash-failed');
+  const failed = cardCleanupHashFailedCount(manifest);
+  if (!failed) {
+    callout.style.display = 'none';
+    return;
+  }
+  document.getElementById('card-cleanup-hash-failed-text').textContent =
+    cardCleanupFileCount(failed) +
+    (failed === 1 ? ' is' : ' are') +
+    ' kept because the archive copy has already failed an integrity ' +
+    'check (modified, corrupt, or unreadable). Re-running verification ' +
+    'would only reproduce that verdict — open the Audit page to accept ' +
+    'the current bytes, restore from backup, or investigate.';
+  // Scope honesty (Codex P2 review): the card scan matches photos across
+  // ALL workspaces, but the Audit page only lists flagged rows for the
+  // CURRENT workspace. If the failed archive copy belongs to a folder in
+  // a different workspace, the suggested Audit remedy is unreachable
+  // from here — say so up front, matching the audit callout's approach.
+  document.getElementById('card-cleanup-hash-failed-scope').textContent =
+    'The Audit page shows flagged rows for the current workspace only. ' +
+    'If the failed archive copy lives in a folder from a different ' +
+    'workspace, switch to that workspace to find it there.';
+  callout.style.display = '';
+}
+
+/* After a verification has run, files still pending on the next scan are
+   exactly the ones verification could not reach — most likely archive
+   copies in folders that belong to a different workspace (the scan
+   matches globally; verify-hashes covers only the current workspace's
+   folders). Say that specifically instead of letting the callout loop. */
+function cardCleanupRenderStillUnverifiedHint(pending) {
+  const note = document.getElementById('card-cleanup-audit-scope-note');
+  if (!cardCleanupState.auditCompleted || !pending) {
+    note.style.display = 'none';
+    note.textContent = '';
+    return;
+  }
+  note.textContent =
+    'Still unverified after the last verification run: these files’ ' +
+    'archive copies were not covered by it — most likely they belong to ' +
+    'folders in a different workspace (or the run was cancelled before ' +
+    'reaching them). Switch to the workspace that holds those folders ' +
+    'and verify there, then re-scan here.';
+  note.style.display = 'block';
+}
+
+async function cardCleanupStartAudit() {
+  if (cardCleanupState.jobId) return;  // a run is already streaming
+  // Verification changes what counts as verified, so the preview's Delete
+  // button describes a state that is being rewritten underneath it. Say
+  // that where the Delete button is, not only up here.
+  cardCleanupSetBusy(true, {
+    deleteHint: 'Verification is running — deletion is available when it ' +
+      'finishes.',
+  });
+  document.getElementById('card-cleanup-audit-rescan-btn').style.display = 'none';
+  document.getElementById('card-cleanup-audit-status').textContent = '';
+  cardCleanupSetError('');
+  // Failure handling here mirrors cardCleanupConfirmDelete (Codex P1 review
+  // on commit 5afcb0ba). Only a definitive HTTP response proves whether the
+  // server queued the audit — an fetch rejection or an unreadable body
+  // could mean api_job_verify_hashes() is already running. If the page
+  // unlocked in that gap, delete_verified() would trust the currently
+  // committed hash_status plus archive size/mtime rather than re-hashing
+  // archive bytes, so a concurrent delete could qualify a row on its old
+  // `ok` verdict while the audit is flipping it to modified/corrupt/
+  // unreadable — and remove the good card copy. Keep Scan/Verify/Delete
+  // disabled on any ambiguous outcome and send the user to Jobs, only
+  // unlocking when the server proves nothing was queued.
+  let resp;
+  try {
+    resp = await fetch('/api/jobs/verify-hashes', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: '{}',
+    });
+  } catch (e) {
+    cardCleanupSetError(
+      'The verify request never got a response, so we cannot tell whether ' +
+      'the server queued the audit. Check the Jobs page for a verify-hashes ' +
+      'job that started around now, then reload this page to work with the ' +
+      'card again. (' + String(e.message || e) + ')');
+    return;
+  }
+  if (!resp.ok) {
+    // The server proved nothing was queued — hand the buttons back before
+    // showing the error.
+    cardCleanupSetBusy(false);
+    let msg = 'verification failed to start';
+    try {
+      const data = await resp.json();
+      if (data && data.error) msg = data.error;
+    } catch (_) { /* keep default */ }
+    cardCleanupSetError(msg);
+    return;
+  }
+  let data;
+  try {
+    data = await resp.json();
+  } catch (e) {
+    // 2xx response, unreadable body: the audit may already be running.
+    // Same reasoning as the network catch above — keep the page locked and
+    // route the user to Jobs rather than freeing the destructive path.
+    cardCleanupSetError(
+      'The verify request returned OK but its response could not be read, ' +
+      'so the audit may already be running. Check the Jobs page for a ' +
+      'verify-hashes job that started around now, then reload this page to ' +
+      'work with the card again. (' + String(e.message || e) + ')');
+    return;
+  }
+  cardCleanupWatchJob(data.job_id, 'audit', 'Starting hash verification…');
+}
+
+// The buttons are already re-enabled by cardCleanupSetBusy(false) in
+// cardCleanupFinishJob's cleanup; this only reports what the run found.
+// Verification can flip previously-ok rows to modified/corrupt/unreadable,
+// so the preview's deletable count/bytes may no longer describe what a
+// deletion would actually touch. Disable Delete until the user takes the
+// re-scan surfaced below — the backend re-checks and skips invalid rows,
+// but the confirmation dialog would still show stale totals against a
+// valid subset the user never agreed to.
+function cardCleanupFinishAudit(job, status, jobError) {
+  const statusEl = document.getElementById('card-cleanup-audit-status');
+  if (status === 'completed' || status === 'cancelled') {
+    // Lets the next re-scan's callout explain files that verification
+    // could not have covered (other workspaces' folders).
+    cardCleanupState.auditCompleted = true;
+  }
+  const deleteBtn = document.getElementById('card-cleanup-delete-btn');
+  deleteBtn.disabled = true;
+  document.getElementById('card-cleanup-delete-hint').textContent
+    = 'Verification may have changed which files count as verified — re-scan the card before deleting.';
+  if (status === 'completed' && job && job.result) {
+    const r = job.result;
+    const problems = (r.modified || 0) + (r.corrupt || 0) + (r.unreadable || 0);
+    const parts = [cardCleanupFileCount(r.checked) + ' checked'];
+    if (r.baselined) {
+      parts.push(Number(r.baselined).toLocaleString() +
+        ' baselined (no prior hash)');
+    }
+    if (r.missing) {
+      parts.push(Number(r.missing).toLocaleString() +
+        ' missing (see the Audit page)');
+    }
+    parts.push(problems
+      ? problems.toLocaleString() + ' problems found (see the Audit page)'
+      : 'no problems');
+    if (r.cancelled) parts.push('cancelled before the whole archive was read');
+    statusEl.textContent = parts.join(' · ') +
+      '. The preview above is from the earlier scan — re-scan the card to ' +
+      'see what is verified now.';
+  } else if (status === 'cancelled') {
+    statusEl.textContent =
+      'Verification cancelled — the files it had already checked keep ' +
+      'their new verdicts; the rest are unchanged.';
+  } else if (status) {
+    statusEl.textContent = 'Verification ' + status +
+      (jobError ? ': ' + jobError : '.') +
+      ' Check the Jobs page for what it managed to check.';
+  } else {
+    statusEl.textContent =
+      'The verification is still running but this page lost track of it — ' +
+      'check the Jobs page.';
+  }
+  document.getElementById('card-cleanup-audit-rescan-btn').style.display = '';
+}
+
+// Bucket lists run to thousands of rows, so build them the first time the
+// user opens that group rather than on every scan.
+function cardCleanupBindBucket(bucket, detailsId, listId) {
+  const details = document.getElementById(detailsId);
+  details.open = false;
+  details.ontoggle = () => {
+    if (!details.open || cardCleanupState.listsRendered[bucket]) return;
+    if (!cardCleanupState.manifest) return;
+    cardCleanupState.listsRendered[bucket] = true;
+    // Spec ("UX flow"): verified rows show path, size, and the matched
+    // archive copy that justifies the deletion; kept rows show size and
+    // the per-file reason. All fields come straight from the manifest.
+    const lines = (cardCleanupState.manifest.entries || [])
+      .filter(entry => entry.bucket === bucket)
+      .map(entry => {
+        const size = (typeof entry.size === 'number')
+          ? ' (' + formatBytes(entry.size) + ')' : '';
+        if (bucket === 'kept') {
+          return entry.path + size + ' — ' + (entry.reason || 'not verified');
+        }
+        if (bucket === 'deletable') {
+          return entry.path + size
+            + ' → verified copy: ' + (entry.archive_path || 'unknown');
+        }
+        return entry.path;
+      });
+    cardCleanupFillList(listId, lines);
+  };
+}
+
+function cardCleanupFillList(listId, lines) {
+  const list = document.getElementById(listId);
+  list.innerHTML = '';
+  const frag = document.createDocumentFragment();
+  if (!lines.length) {
+    const li = document.createElement('li');
+    li.textContent = 'No files in this group.';
+    frag.appendChild(li);
+  }
+  lines.forEach((line) => {
+    const li = document.createElement('li');
+    li.textContent = line;
+    frag.appendChild(li);
+  });
+  list.appendChild(frag);
+}
+
+function cardCleanupResetPreview() {
+  cardCleanupState.manifest = null;
+  cardCleanupState.listsRendered = {};
+  document.getElementById('card-cleanup-preview').style.display = 'none';
+  document.getElementById('card-cleanup-incomplete').style.display = 'none';
+  document.getElementById('card-cleanup-audit').style.display = 'none';
+  document.getElementById('card-cleanup-hash-failed').style.display = 'none';
+  const deleteBtn = document.getElementById('card-cleanup-delete-btn');
+  deleteBtn.disabled = true;
+  document.getElementById('card-cleanup-delete-hint').textContent = '';
+  [
+    'card-cleanup-deletable-details', 'card-cleanup-kept-details',
+    'card-cleanup-ignored-details', 'card-cleanup-walk-errors-details',
+  ].forEach((id) => { document.getElementById(id).open = false; });
+}
+
+function cardCleanupOpenConfirm() {
+  // Defence in depth: cardCleanupSetBusy already disables this button
+  // while a scan, deletion, or verification is running, and starting a
+  // deletion on top of one of those would strand the running job.
+  if (cardCleanupState.jobId) return;
+  const manifest = cardCleanupState.manifest;
+  if (!manifest) return;
+  const deletable = (manifest.totals || {}).deletable || { count: 0, bytes: 0 };
+  if (!deletable.count) return;
+  document.getElementById('card-cleanup-confirm-count').textContent =
+    'Deleting ' + cardCleanupFileCount(deletable.count) + ' (' +
+    formatBytes(deletable.bytes) + ') from ' +
+    (manifest.source_root || 'the card') + '.';
+  const overlay = document.getElementById('card-cleanup-confirm');
+  overlay.classList.add('open');
+  overlay.onclick = (e) => { if (e.target === overlay) cardCleanupCloseConfirm(); };
+  if (cardCleanupState.confirmEscHandler) {
+    document.removeEventListener('keydown', cardCleanupState.confirmEscHandler);
+  }
+  cardCleanupState.confirmEscHandler = (e) => {
+    if (e.key === 'Escape') cardCleanupCloseConfirm();
+  };
+  document.addEventListener('keydown', cardCleanupState.confirmEscHandler);
+  document.body.style.overflow = 'hidden';
+  // Focus the dialog's first control (the close button), not the delete
+  // button — a stray Enter must not delete anything.
+  const firstAction = overlay.querySelector('button');
+  if (firstAction) firstAction.focus();
+}
+
+function cardCleanupCloseConfirm() {
+  document.getElementById('card-cleanup-confirm').classList.remove('open');
+  if (cardCleanupState.confirmEscHandler) {
+    document.removeEventListener('keydown', cardCleanupState.confirmEscHandler);
+    cardCleanupState.confirmEscHandler = null;
+  }
+  document.body.style.overflow = '';
+}
+
+async function cardCleanupConfirmDelete() {
+  // A job that started while this dialog was open (or one the page picked
+  // up again) must not be replaced by the delete watch below — say so
+  // instead of quietly doing nothing or stranding it.
+  if (cardCleanupState.jobId) {
+    cardCleanupCloseConfirm();
+    cardCleanupSetError('Another job is still running — nothing was ' +
+      'deleted. Wait for it to finish, then delete.');
+    return;
+  }
+  const confirmBtn = document.getElementById('card-cleanup-confirm-btn');
+  confirmBtn.disabled = true;
+  // Lock the page before the POST goes out (Codex P2 review). The confirm
+  // dialog can be dismissed (backdrop click, Escape) while this request is
+  // pending; if Scan and Verify stayed live in that gap, a second job could
+  // start and its watch would overwrite this delete's jobId — including the
+  // destructive path. Setting busy now disables Scan/Verify/Delete regardless
+  // of whether the dialog is still up when the response arrives. Clear it on
+  // any definitive failure so the user isn't left with dead buttons.
+  cardCleanupSetBusy(true, {
+    deleteHint: 'Deletion is starting…',
+  });
+  try {
+    const resp = await fetch('/api/card-cleanup/delete', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ scan_job_id: cardCleanupState.scanJobId }),
+    });
+    const data = await resp.json();
+    cardCleanupCloseConfirm();
+    if (!resp.ok) {
+      // Nothing was queued — hand the buttons back before showing the error.
+      cardCleanupSetBusy(false);
+      if (resp.status === 404) {
+        // The manifest is gone, so the preview above no longer describes
+        // anything that can be deleted — take it down with the error.
+        cardCleanupState.scanJobId = null;
+        cardCleanupResetPreview();
+        cardCleanupSetError('Preview expired — re-scan the card.', { rescan: true });
+      } else {
+        cardCleanupSetError(data.error || 'deletion failed to start');
+      }
+      return;
+    }
+    cardCleanupSetError('');
+    document.getElementById('card-cleanup-result').style.display = 'none';
+    cardCleanupWatchJob(data.job_id, 'delete', 'Starting deletion…');
+  } catch (e) {
+    cardCleanupCloseConfirm();
+    // The POST failed at the network layer, so the server may have
+    // accepted the delete and queued the destructive job before the
+    // connection dropped — we simply don't know (Codex P2 review).
+    // Unlocking here would let a second job start and hijack the page's
+    // jobId while the deletion continues unseen, so keep Scan / Verify /
+    // Delete disabled and send the user to the Jobs page for the actual
+    // outcome. A page reload rebuilds the busy state from a fresh
+    // manifest once they've confirmed what happened.
+    cardCleanupSetError(
+      'The delete request never got a response, so we cannot tell whether ' +
+      'the server queued the deletion. Check the Jobs page for a delete ' +
+      'that started around now, then reload this page to work with the ' +
+      'card again. (' + String(e.message || e) + ')');
+  } finally {
+    confirmBtn.disabled = false;
+  }
+}
+
+function cardCleanupRenderDeleteResult(result) {
+  const res = result || {};
+  const skipped = res.skipped || [];
+  const failed = res.failed || [];
+  // The job result bounds these lists to a sample; *_total carries the
+  // exact count (falls back to list length for pre-trim results).
+  const skippedTotal = (typeof res.skipped_total === 'number')
+    ? res.skipped_total : skipped.length;
+  const failedTotal = (typeof res.failed_total === 'number')
+    ? res.failed_total : failed.length;
+  const parts = ['Deleted ' + cardCleanupFileCount(res.deleted) +
+    ' (' + formatBytes(res.deleted_bytes) + ')'];
+  if (skippedTotal) {
+    parts.push(skippedTotal.toLocaleString() + ' skipped');
+  }
+  if (failedTotal) {
+    parts.push(failedTotal.toLocaleString() + ' failed');
+  }
+  if (res.cancelled) {
+    parts.push('Cancelled — ' + Number(res.remaining || 0).toLocaleString() +
+      ' files not yet processed.');
+  }
+  document.getElementById('card-cleanup-result').style.display = '';
+  document.getElementById('card-cleanup-result-summary').textContent =
+    parts.join(' · ');
+  const lines = [];
+  skipped.forEach((s) => {
+    lines.push('Skipped: ' + s.path + ' — ' + (s.reason || 'no reason given'));
+  });
+  if (skippedTotal > skipped.length) {
+    lines.push('…and ' + (skippedTotal - skipped.length).toLocaleString() +
+      ' more skipped files not listed here (the counts above are exact).');
+  }
+  failed.forEach((f) => {
+    lines.push('Failed: ' + f.path + ' — ' + (f.error || 'no error given'));
+  });
+  if (failedTotal > failed.length) {
+    lines.push('…and ' + (failedTotal - failed.length).toLocaleString() +
+      ' more failed files not listed here (the counts above are exact).');
+  }
+  const list = document.getElementById('card-cleanup-result-list');
+  if (lines.length) {
+    list.style.display = '';
+    cardCleanupFillList('card-cleanup-result-list', lines);
+  } else {
+    list.style.display = 'none';
+    list.innerHTML = '';
+  }
+  // The manifest describes files that are now gone, so the preview above
+  // is history. Say so instead of leaving a live-looking Delete button.
+  document.getElementById('card-cleanup-delete-btn').disabled = true;
+  document.getElementById('card-cleanup-delete-hint').textContent =
+    'These numbers describe the scan that ran before this deletion — ' +
+    'scan again to see what is still on the card.';
+}
+
+async function cardCleanupCancelJob() {
+  const jobId = cardCleanupState.jobId;
+  if (!jobId) return;
+  const btn = document.getElementById('card-cleanup-cancel-btn');
+  btn.disabled = true;
+  btn.textContent = 'Cancelling…';
+  try {
+    const resp = await fetch(
+      '/api/jobs/' + encodeURIComponent(jobId) + '/cancel', { method: 'POST' });
+    if (!resp.ok) {
+      const data = await resp.json().catch(() => ({}));
+      btn.disabled = false;
+      btn.textContent = 'Cancel';
+      cardCleanupSetError(data.error || 'Unable to cancel the job.');
+    }
+  } catch (e) {
+    btn.disabled = false;
+    btn.textContent = 'Cancel';
+    cardCleanupSetError(String(e.message || e));
+  }
+}
+
+async function loadVolumeSuggestions() {
+  try {
+    const resp = await fetch('/api/volumes');
+    if (!resp.ok) return;
+    const volumes = await resp.json();
+    const dl = document.getElementById('volumeDatalist');
+    (volumes || []).forEach((v) => {
+      const opt = document.createElement('option');
+      opt.value = v.path || v;
+      dl.appendChild(opt);
+    });
+  } catch (e) { /* suggestions only */ }
+}
+
+// The import page's result card links here with the finished import's card
+// path; multi-source imports pass the first one in ?source= and the rest
+// in ?others= so this page can name them instead of silently dropping them.
+function cardCleanupApplyQueryParams() {
+  const params = new URLSearchParams(window.location.search);
+  const source = (params.get('source') || '').trim();
+  if (source) document.getElementById('card-cleanup-source').value = source;
+  const others = params.getAll('others').filter(s => s && s.trim());
+  const note = document.getElementById('card-cleanup-source-note');
+  if (others.length) {
+    note.style.display = '';
+    note.textContent =
+      'That import used ' + (others.length + 1) +
+      ' source folders; this filled in the first one. Check the others one ' +
+      'at a time: ' + others.join(', ');
+  } else {
+    note.style.display = 'none';
+    note.textContent = '';
+  }
+}
+
+cardCleanupApplyQueryParams();
+loadVolumeSuggestions();
+</script>
+</body>
+</html>

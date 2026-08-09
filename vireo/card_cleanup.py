@@ -241,8 +241,23 @@ def load_manifest(manifest_dir, scan_job_id,
 
 
 KEEP_NOT_IN_CATALOG = "not in catalog — not imported yet"
+# The card-cleanup page keys its "Verify archive hashes" callout off this
+# reason: card_cleanup.html matches the tail "run the integrity audit" in
+# each kept entry to count the files an audit would unblock. Reword this
+# and the callout silently stops appearing — change both together, and
+# test_audit_callout_reason_stays_in_sync guards the pair.
 KEEP_NOT_VERIFIED = (
     "not verified by a checksummed import — run the integrity audit"
+)
+# Codex P2: distinguished from KEEP_NOT_VERIFIED so the callout does NOT
+# offer to re-verify these — the archive rows have already been checked
+# and the verdict was modified/corrupt/unreadable. Re-running verify
+# reproduces the same bad verdict rather than establishing an "ok" copy;
+# the remedy lives on the Audit page (accept current hash, restore from
+# backup, or investigate). The Audit-callout tail must NOT appear here or
+# these files would be counted alongside the truly-unchecked ones.
+KEEP_ARCHIVE_HASH_FAILED = (
+    "archive copy failed a prior integrity check — see the Audit page"
 )
 KEEP_INSIDE_SOURCE = "only catalog copy is inside the selected source"
 KEEP_ARCHIVE_UNREACHABLE = "archive file not reachable"
@@ -276,13 +291,28 @@ def qualify_rows(rows, source_root_real, card_path, contains_check=None):
     if contains_check is None:
         def contains_check(child_real):
             return path_guard.contains_resolved(source_root_real, child_real)
-    reason = KEEP_NOT_VERIFIED
+    # Codex P2: KEEP_NOT_VERIFIED reads to the user as "the audit hasn't
+    # run yet — running it would unblock this", so it must apply only when
+    # a NULL hash_status row is why the file is being kept. Rows with a
+    # non-NULL, non-"ok" status (modified/corrupt/unreadable) have already
+    # been verified; re-running verification reproduces the same verdict
+    # and the remedy lives on the Audit page, so those rows fall back to
+    # KEEP_ARCHIVE_HASH_FAILED instead. A specific reason from an "ok"
+    # row that failed a later gate (unreachable / changed / inside source)
+    # still wins over both — that's the closest-to-success signal we have.
+    saw_never_checked = False
+    saw_check_failed = False
+    reason = None
     try:
         card_st = os.stat(card_path)
     except OSError:
         return None, KEEP_UNREADABLE
     for row in rows:
         if row["hash_status"] != "ok":
+            if row["hash_status"] is None:
+                saw_never_checked = True
+            else:
+                saw_check_failed = True
             continue
         if not row["folder_path"]:
             continue
@@ -337,6 +367,21 @@ def qualify_rows(rows, source_root_real, card_path, contains_check=None):
             reason = KEEP_INSIDE_SOURCE
             continue
         return archive_path, None
+    if reason is None:
+        # No "ok" row got as far as a specific rejection — fall back to
+        # the most accurate blame for what's on file. NULL wins the tie:
+        # a mix of never-checked and check-failed rows is still remediable
+        # by an audit (a never-checked row could turn "ok" and unlock the
+        # file), whereas the failed rows are just extra failed rows.
+        if saw_never_checked:
+            reason = KEEP_NOT_VERIFIED
+        elif saw_check_failed:
+            reason = KEEP_ARCHIVE_HASH_FAILED
+        else:
+            # No non-ok rows and no ok row got a specific reason — the
+            # only shapes left are ok rows with an empty folder_path. Kept
+            # for a stat-shaped reason we can't state precisely.
+            reason = KEEP_ARCHIVE_UNREACHABLE
     return None, reason
 
 

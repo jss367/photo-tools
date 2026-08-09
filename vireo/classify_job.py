@@ -2457,7 +2457,10 @@ def _finalize_cached_only(
     }
 
 
-def run_classify_job(job, runner, db_path, workspace_id, params, vireo_dir=None):
+def run_classify_job(
+    job, runner, db_path, workspace_id, params, vireo_dir=None,
+    computation_cache_dir=None,
+):
     """Execute classification job. Called by JobRunner in a background thread.
 
     Args:
@@ -2468,6 +2471,11 @@ def run_classify_job(job, runner, db_path, workspace_id, params, vireo_dir=None)
         params: ClassifyParams with request parameters
         vireo_dir: optional path to ~/.vireo/; when set, classification uses
             pre-extracted working copy JPEGs instead of decoding RAW files.
+        computation_cache_dir: portable-cache root the HTTP import route
+            writes to (``app.config["COMPUTATION_CACHE_DIR"]``). When
+            provided, background materialization reads from the same store
+            so bundles imported before their photos were cataloged still
+            plant on the next classify run outside the default location.
     """
     thread_db = Database(db_path)
     try:
@@ -2608,10 +2616,14 @@ def run_classify_job(job, runner, db_path, workspace_id, params, vireo_dir=None)
         # matching stored objects before model resolution so their raw results
         # participate in the ordinary database cache gates.
         try:
-            from computation_cache import materialize_local_store
+            from computation_cache import ArtifactStore, materialize_local_store
 
+            cache_store = (
+                ArtifactStore(computation_cache_dir)
+                if computation_cache_dir else None
+            )
             reused = (
-                materialize_local_store(thread_db)
+                materialize_local_store(thread_db, store=cache_store)
                 if not params.reclassify else {}
             )
             if reused.get("detector_runs_applied") or reused.get(
@@ -3257,8 +3269,15 @@ def run_classify_job(job, runner, db_path, workspace_id, params, vireo_dir=None)
                     except Exception:
                         known_classifier_runtimes = set()
 
+                from computation_cache import ArtifactStore
+
+                reapply_store = (
+                    ArtifactStore(computation_cache_dir)
+                    if computation_cache_dir else None
+                )
                 reapplied = materialize_local_store(
                     thread_db,
+                    store=reapply_store,
                     known_runtimes=known_runtimes,
                     known_classifier_runtimes=(
                         known_classifier_runtimes or None

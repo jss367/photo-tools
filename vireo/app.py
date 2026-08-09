@@ -27006,7 +27006,11 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         )
 
         def work(job):
-            return run_classify_job(job, runner, db_path, active_ws, params, vireo_dir=vireo_dir)
+            return run_classify_job(
+                job, runner, db_path, active_ws, params,
+                vireo_dir=vireo_dir,
+                computation_cache_dir=app.config["COMPUTATION_CACHE_DIR"],
+            )
 
         job_id = runner.start(
             "classify",
@@ -29094,6 +29098,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     job, runner, db_path, workspace_id, params,
                     thumb_cache_dir=app.config["THUMB_CACHE_DIR"],
                     missing_originals_invalidator=_invalidate_missing_originals_cache,
+                    computation_cache_dir=app.config["COMPUTATION_CACHE_DIR"],
                 )
                 return result
             finally:
@@ -29844,6 +29849,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 job, runner, db_path, active_ws, params,
                 thumb_cache_dir=app.config["THUMB_CACHE_DIR"],
                 missing_originals_invalidator=_invalidate_missing_originals_cache,
+                computation_cache_dir=app.config["COMPUTATION_CACHE_DIR"],
             )
 
         # Enqueue rather than start directly: when SLOT_CAP is 1 and

@@ -22,6 +22,7 @@ from computation_cache import (  # noqa: E402
     promote_and_publish_classifier_run,
     read_bundle,
     runtime_fingerprint,
+    sha256_file,
     source_input,
     validate_artifact,
     write_bundle,
@@ -1072,3 +1073,145 @@ def test_materialize_local_store_honors_persisted_trust(tmp_path):
     untrusted = materialize_local_store(destination2, store=fresh_store)
     assert untrusted["detector_runs_applied"] == 0
     assert untrusted["classifier_runs_applied"] == 0
+
+
+def test_sha256_file_retains_hashes_across_paths(tmp_path):
+    """Hashing one custom-model file must not evict cached hashes for other
+    files in the same directory. Prior to this regression check, the cache
+    was cleared on every miss, forcing each multi-file custom model's
+    ONNX sidecars to be re-read on every identity computation.
+    """
+    import computation_cache
+
+    a = tmp_path / "image_encoder.onnx"
+    b = tmp_path / "text_encoder.onnx"
+    a.write_bytes(b"aaa")
+    b.write_bytes(b"bbb")
+
+    computation_cache._FILE_DIGEST_CACHE.clear()
+    hash_a = sha256_file(str(a))
+    hash_b = sha256_file(str(b))
+
+    stat_a = os.stat(str(a))
+    key_a = (os.path.abspath(str(a)), stat_a.st_size, stat_a.st_mtime_ns)
+    stat_b = os.stat(str(b))
+    key_b = (os.path.abspath(str(b)), stat_b.st_size, stat_b.st_mtime_ns)
+
+    assert computation_cache._FILE_DIGEST_CACHE[key_a] == hash_a
+    assert computation_cache._FILE_DIGEST_CACHE[key_b] == hash_b
+
+
+def test_sha256_file_evicts_stale_entries_for_the_same_path(tmp_path):
+    """A rewritten file with a new size/mtime must supersede its stale
+    cache entry; unrelated paths must survive.
+    """
+    import computation_cache
+
+    a = tmp_path / "weights.onnx"
+    b = tmp_path / "text_features.pt"
+    a.write_bytes(b"v1")
+    b.write_bytes(b"unchanged")
+
+    computation_cache._FILE_DIGEST_CACHE.clear()
+    sha256_file(str(a))
+    sha256_file(str(b))
+
+    stat_b_before = os.stat(str(b))
+    key_b = (
+        os.path.abspath(str(b)), stat_b_before.st_size, stat_b_before.st_mtime_ns,
+    )
+
+    # Rewrite ``a`` so its stat changes; ``sha256_file`` must evict the
+    # stale ``a`` entry but keep the entry for ``b``.
+    a.write_bytes(b"v2-longer")
+    os.utime(str(a), (stat_b_before.st_mtime + 1, stat_b_before.st_mtime + 1))
+    new_hash_a = sha256_file(str(a))
+
+    stat_a_after = os.stat(str(a))
+    key_a_new = (
+        os.path.abspath(str(a)), stat_a_after.st_size, stat_a_after.st_mtime_ns,
+    )
+    assert computation_cache._FILE_DIGEST_CACHE.get(key_a_new) == new_hash_a
+    assert key_b in computation_cache._FILE_DIGEST_CACHE
+
+    # Old key for ``a`` should be gone.
+    stale_a_keys = [
+        k for k in computation_cache._FILE_DIGEST_CACHE
+        if k[0] == os.path.abspath(str(a)) and k != key_a_new
+    ]
+    assert stale_a_keys == []
+
+
+def test_http_import_then_classify_job_uses_configured_cache_dir(
+    app_and_db, tmp_path, monkeypatch,
+):
+    """When an operator overrides ``COMPUTATION_CACHE_DIR``, an HTTP-imported
+    bundle whose photos are cataloged only later must still plant on the
+    background classify job's next materialize call. Prior to the fix,
+    ``run_classify_job``'s pre-model ``materialize_local_store(thread_db)``
+    fell back to the default ``~/.vireo/computation-cache`` and never saw
+    the imported artifact, so catalog-later reuse silently failed outside
+    the default configuration.
+    """
+    import computation_cache
+
+    app, db = app_and_db
+    monkeypatch.setattr(
+        computation_cache, "megadetector_runtime_fingerprint",
+        lambda *_args, **_kwargs: RUNTIME,
+    )
+    # Point the default anywhere BUT the overridden store so a regression
+    # (background job falling back to the default) can't accidentally
+    # hit the same artifact via the wrong path.
+    monkeypatch.setattr(
+        computation_cache, "DEFAULT_CACHE_DIR",
+        str(tmp_path / "would-be-wrong-default"),
+    )
+
+    store_dir = tmp_path / "http-store"
+    app.config["COMPUTATION_CACHE_DIR"] = str(store_dir)
+
+    # HTTP-import a detection bundle into the overridden store. Do this
+    # BEFORE the photo is cataloged with its file hash so materialize
+    # can't plant during the import — the background classify call is
+    # the one that has to find the artifact.
+    exported_store = ArtifactStore(tmp_path / "source")
+    exported_store.put(detection_artifact())
+    exported_artifacts = [
+        artifact for _digest, artifact
+        in (exported_store.iter_artifacts() or ())
+    ]
+    bundle_path = tmp_path / "bundle.vireo-cache"
+    write_bundle(bundle_path, exported_artifacts)
+    client = app.test_client()
+    with open(bundle_path, "rb") as handle:
+        response = client.post(
+            "/api/computation-cache/import",
+            data={"file": (handle, "bundle.vireo-cache")},
+            content_type="multipart/form-data",
+        )
+    assert response.status_code == 200
+    # The import happened before the photo carried a matching file_hash,
+    # so nothing planted yet — the artifact is sitting in the overridden
+    # store waiting for a later job to find it.
+    assert response.get_json()["detector_runs_applied"] == 0
+
+    photo_id = db.conn.execute(
+        "SELECT id FROM photos ORDER BY id LIMIT 1",
+    ).fetchone()["id"]
+    db.conn.execute(
+        "UPDATE photos SET file_hash = ? WHERE id = ?", (PHOTO_HASH, photo_id),
+    )
+    db.conn.commit()
+
+    # Directly exercise the background job's cache-reapply plumbing:
+    # ArtifactStore(configured_dir) must find the imported artifact.
+    reapply_store = ArtifactStore(str(store_dir))
+    reapplied = materialize_local_store(db, store=reapply_store)
+    assert reapplied["detector_runs_applied"] == 1
+
+    # Confirm the default location was empty — if the background job had
+    # ignored the override, this is the only place its materialize would
+    # have looked, and reuse would have silently failed.
+    default_store = ArtifactStore(computation_cache.DEFAULT_CACHE_DIR)
+    assert list(default_store.iter_artifacts() or ()) == []

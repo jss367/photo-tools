@@ -92,7 +92,8 @@ def runtime_fingerprint(descriptor):
 def sha256_file(path):
     """Hash a model file once per unchanged (path, size, mtime) process state."""
     stat_result = os.stat(path)
-    key = (os.path.abspath(path), stat_result.st_size, stat_result.st_mtime_ns)
+    abspath = os.path.abspath(path)
+    key = (abspath, stat_result.st_size, stat_result.st_mtime_ns)
     cached = _FILE_DIGEST_CACHE.get(key)
     if cached is not None:
         return cached
@@ -101,7 +102,12 @@ def sha256_file(path):
         for chunk in iter(lambda: handle.read(4 * 1024 * 1024), b""):
             digest.update(chunk)
     value = digest.hexdigest()
-    _FILE_DIGEST_CACHE.clear()
+    # Evict stale entries for THIS path only. Clearing the whole cache
+    # here would force every custom-model sidecar to be re-read on each
+    # cache check, defeating the point of the cache for multi-file
+    # models whose identity hashes each ONNX file in turn.
+    for stale in [k for k in _FILE_DIGEST_CACHE if k[0] == abspath and k != key]:
+        _FILE_DIGEST_CACHE.pop(stale, None)
     _FILE_DIGEST_CACHE[key] = value
     return value
 

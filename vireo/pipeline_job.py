@@ -1364,7 +1364,8 @@ def _collapse_scan_roots(paths):
 
 def run_pipeline_job(job, runner, db_path, workspace_id, params,
                      thumb_cache_dir=None,
-                     missing_originals_invalidator=None):
+                     missing_originals_invalidator=None,
+                     computation_cache_dir=None):
     """Execute streaming pipeline. Called by JobRunner in a background thread.
 
     Args:
@@ -1384,6 +1385,11 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
             api_job_scan / api_job_import_full so a pipeline scan that
             touches disk doesn't leave GET /api/photos/missing serving a
             pre-scan ghost list.
+        computation_cache_dir: portable-cache root the HTTP import route
+            writes to (``app.config["COMPUTATION_CACHE_DIR"]``). When
+            provided, the detect stage reads from the same store so bundles
+            imported before their photos were cataloged still plant outside
+            the default location.
 
     Returns:
         dict with stage results, duration, and errors
@@ -4237,10 +4243,17 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                 detect_state["ran"] = True
 
                 try:
-                    from computation_cache import materialize_local_store
+                    from computation_cache import (
+                        ArtifactStore,
+                        materialize_local_store,
+                    )
 
+                    cache_store = (
+                        ArtifactStore(computation_cache_dir)
+                        if computation_cache_dir else None
+                    )
                     reused = (
-                        materialize_local_store(thread_db)
+                        materialize_local_store(thread_db, store=cache_store)
                         if not params.reclassify else {}
                     )
                     detect_state["portable_reused"] = reused
@@ -4529,8 +4542,15 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                                         known_classifier_runtimes.add(crt)
                             except Exception:
                                 known_classifier_runtimes = set()
+                        from computation_cache import ArtifactStore
+
+                        reapply_store = (
+                            ArtifactStore(computation_cache_dir)
+                            if computation_cache_dir else None
+                        )
                         post = materialize_local_store(
-                            thread_db, known_runtimes=known_runtimes,
+                            thread_db, store=reapply_store,
+                            known_runtimes=known_runtimes,
                             known_classifier_runtimes=(
                                 known_classifier_runtimes or None
                             ),

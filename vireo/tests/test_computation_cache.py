@@ -565,6 +565,128 @@ def test_fresh_classifier_run_is_promoted_and_published(tmp_path):
     assert any(item["type"] == "classification" for item in artifacts)
 
 
+def test_working_copy_backed_classifier_run_stays_local_only(tmp_path):
+    """A photo with a ``working_copy_path`` was classified from the
+    extracted working-copy JPEG (see ``classify_job._prepare_image``
+    when ``vireo_dir`` is set), not from the original bytes. The v1
+    input identity carries only ``p.file_hash``, so publishing that run
+    would advertise a working-copy-derived prediction as if it came from
+    the original — a foreign install (or the same install with a
+    different working copy) would then materialize predictions computed
+    on different pixels. The publisher must decline these runs.
+    """
+    source, _folder_id, photo_id = _database_with_photo(
+        tmp_path / "source.db", "source.jpg",
+    )
+    source.conn.execute(
+        "UPDATE photos SET working_copy_path = ? WHERE id = ?",
+        (str(tmp_path / "wc" / "source.jpg"), photo_id),
+    )
+    source.conn.commit()
+
+    _input, detector_input_fp = source_input(
+        PHOTO_HASH, "vireo-detector-source-v1",
+    )
+    box = {"x": 0.1, "y": 0.2, "w": 0.3, "h": 0.4}
+    detection_id = source.write_detection_batch(
+        photo_id,
+        "megadetector-v6",
+        [{"box": box, "confidence": 0.91, "category": "animal"}],
+        runtime_fingerprint=RUNTIME,
+        input_fingerprint=detector_input_fp,
+    )[0]
+    labels_full = "5" * 64
+    labels_short = labels_full[:12]
+    source.upsert_labels_fingerprint(
+        labels_short, "Test birds", [], 1, full_fingerprint=labels_full,
+    )
+    source.add_prediction(
+        detection_id, "Robin", 0.92, "BioCLIP",
+        labels_fingerprint=labels_short,
+    )
+    source.record_classifier_run(
+        detection_id, "BioCLIP", labels_short, prediction_count=1,
+    )
+
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    (model_dir / "image_encoder.onnx").write_bytes(b"exact model bytes")
+    identity = classifier_model_identity({
+        "id": "bioclip-test",
+        "model_str": "ViT-test",
+        "model_type": "bioclip",
+        "weights_path": str(model_dir),
+        "files": ["image_encoder.onnx"],
+        "source": "custom",
+    })
+    store = ArtifactStore(tmp_path / "store")
+    digest = promote_and_publish_classifier_run(
+        source, detection_id, "BioCLIP", labels_short,
+        labels_full, identity, store=store,
+    )
+    assert digest is None, (
+        "working-copy-backed runs must not publish — pixels differ from "
+        "the original bytes the v1 input identity advertises"
+    )
+    run = source.conn.execute(
+        "SELECT runtime_fingerprint FROM classifier_runs "
+        "WHERE detection_id = ?", (detection_id,),
+    ).fetchone()
+    assert run["runtime_fingerprint"] == "legacy", (
+        "declined publish must leave the classifier_runs row on 'legacy' "
+        "so exportable_artifacts continues to skip it"
+    )
+    assert list(store.iter_artifacts()) == []
+
+
+def test_companion_backed_destination_photo_is_not_materialized(tmp_path):
+    """A v1 artifact declares only the original ``photo_sha256``.  When
+    the destination catalog has a photo with the same original file_hash
+    but a ``companion_path`` (RAW+JPEG), Vireo processes the companion
+    rendition — different pixels — so applying the artifact would install
+    detections/classifications for a rendition the sender did not compute
+    on.  ``materialize_artifacts`` must skip companion-backed rows and
+    leave the object stored-unmatched instead.
+    """
+    destination, folder_id, plain_photo_id = _database_with_photo(
+        tmp_path / "destination.db", "plain.jpg",
+    )
+    # Skip the auto-duplicate resolver (which would reject one of the
+    # two rows) by setting the shared hash via UPDATE after insert —
+    # the scanner path uses the same shape.
+    companion_photo_id = destination.add_photo(
+        folder_id=folder_id,
+        filename="raw-plus-jpeg.cr2",
+        extension=".cr2",
+        file_size=2048,
+        file_mtime=2.0,
+    )
+    destination.conn.execute(
+        "UPDATE photos SET companion_path = ?, file_hash = ? WHERE id = ?",
+        ("/tmp/photos/raw-plus-jpeg.jpg", PHOTO_HASH, companion_photo_id),
+    )
+    destination.conn.commit()
+
+    result = materialize_artifacts(
+        destination, [detection_artifact()],
+        known_runtimes={RUNTIME},
+    )
+    assert result["detector_runs_applied"] == 1, (
+        "the plain (non-companion) sibling must still receive the artifact"
+    )
+
+    applied_photo_ids = [
+        row["photo_id"] for row in destination.conn.execute(
+            "SELECT photo_id FROM detector_runs "
+            "WHERE detector_model = 'megadetector-v6' ORDER BY photo_id"
+        ).fetchall()
+    ]
+    assert applied_photo_ids == [plain_photo_id], (
+        "companion-backed photo must be excluded from materialization even "
+        "when it shares the original file_hash — its rendition can differ"
+    )
+
+
 def test_tree_of_life_sentinel_short_fingerprint_is_accepted():
     """Tree-of-Life classification uses the well-known ``tol`` sentinel as
     the classifier_runs short key (compute_fingerprint([]) → "tol") while

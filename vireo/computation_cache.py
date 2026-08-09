@@ -289,15 +289,23 @@ def promote_and_publish_classifier_run(
     row = db.conn.execute(
         """SELECT d.photo_id, d.detector_model, d.runtime_fingerprint,
                   d.box_x, d.box_y, d.box_w, d.box_h, d.category,
-                  p.file_hash, p.companion_path
+                  p.file_hash, p.companion_path, p.working_copy_path
            FROM detections d
            JOIN photos p ON p.id = d.photo_id
            WHERE d.id = ?""",
         (detection_id,),
     ).fetchone()
+    # Working-copy-backed photos also stay local-only: ``_prepare_image``
+    # feeds the extracted working-copy JPEG (a specific rendition/recipe
+    # of the original) to the classifier when ``vireo_dir`` is set, but
+    # the v1 input identity carries only ``p.file_hash``. Publishing the
+    # result would advertise it as computed from the original bytes, so
+    # a destination that decodes the original — or that has a different
+    # working copy — would materialize predictions made on foreign pixels.
     if (
         row is None
         or row["companion_path"]
+        or row["working_copy_path"]
         or not _is_sha256(row["file_hash"])
         or not _is_sha256(row["runtime_fingerprint"])
     ):
@@ -1446,9 +1454,19 @@ def materialize_artifacts(
     matched_photo_ids = set()
 
     for artifact in normalized:
+        # v1 artifacts carry only the original ``photo_sha256`` in their
+        # input identity. When a destination photo has a
+        # ``companion_path`` (RAW+JPEG), Vireo processes the companion
+        # rendition, whose pixels can differ from the original even though
+        # both photos share the RAW's ``file_hash``. Materializing the
+        # original-only artifact onto that row would install detections
+        # and classifications for the wrong rendition, silently replacing
+        # locally correct results. Until an artifact variant declares
+        # companion identity, skip companion-backed catalog rows.
         photos = db.conn.execute(
             """SELECT id FROM photos
-               WHERE file_hash = ? AND (flag IS NULL OR flag != 'rejected')
+               WHERE file_hash = ? AND companion_path IS NULL
+                 AND (flag IS NULL OR flag != 'rejected')
                ORDER BY id""",
             (artifact["photo_sha256"],),
         ).fetchall()

@@ -559,3 +559,73 @@ def test_confirm_delete_locks_page_before_post(app_and_db):
         "they can find out whether the server queued the delete before the "
         "connection dropped"
     )
+
+
+def test_start_audit_keeps_page_locked_on_ambiguous_start(app_and_db):
+    """Codex P1 review (commit 5afcb0ba): cardCleanupStartAudit must not
+    release the page-wide busy lock on outcomes that don't prove whether the
+    server queued the verify-hashes job.
+
+    If the audit is silently running while Scan/Verify/Delete come back live,
+    a subsequent delete can race it. delete_verified() trusts the currently
+    committed hash_status plus archive size/mtime rather than re-hashing
+    archive bytes, so a row the audit is about to flip from `ok` to
+    modified/corrupt/unreadable could still qualify for deletion — removing
+    the good card copy of a file whose archive copy is silently rotting. Same
+    guarantee the delete-start path pins in test_confirm_delete_locks_page_
+    before_post; pinning both invariants here so a refactor can't quietly
+    re-open the gap."""
+    app, _ = app_and_db
+    body = app.test_client().get("/card-cleanup").get_data(as_text=True)
+    start = body.index("async function cardCleanupStartAudit(")
+    end = body.index("function cardCleanupFinishAudit(", start)
+    section = body[start:end]
+    # An HTTP response that proves nothing was queued (!resp.ok) must
+    # release the lock so the user isn't stranded with a dead page.
+    ok_branch_start = section.index("if (!resp.ok)")
+    # The branch closes before the JSON re-parse below; scope to just that
+    # arm by ending at the trailing "return;" and its closing brace.
+    ok_branch_end = section.index("let data;", ok_branch_start)
+    ok_branch = section[ok_branch_start:ok_branch_end]
+    assert "cardCleanupSetBusy(false)" in ok_branch, (
+        "the !resp.ok branch must call cardCleanupSetBusy(false) — the "
+        "server said the verify-hashes job was not queued, so the page can "
+        "safely hand the buttons back"
+    )
+    # The network-error catch on the fetch itself must NOT unlock — the
+    # POST may have reached the server and started api_job_verify_hashes()
+    # before the connection dropped, and the delete path trusts hash_status
+    # in the DB rather than re-hashing archive bytes, so a concurrent delete
+    # could remove the good card copy of a file the audit is silently
+    # detecting as corrupt.
+    fetch_catch_start = section.index("resp = await fetch(")
+    fetch_catch_start = section.index("} catch (e) {", fetch_catch_start)
+    fetch_catch_end = section.index("if (!resp.ok)", fetch_catch_start)
+    fetch_catch_body = section[fetch_catch_start:fetch_catch_end]
+    assert "cardCleanupSetBusy(false)" not in fetch_catch_body, (
+        "the fetch-rejection catch on cardCleanupStartAudit must NOT release "
+        "the page lock — the POST may have reached the server and queued the "
+        "verify-hashes job before the connection dropped, and unlocking "
+        "would let a concurrent delete race the audit"
+    )
+    assert "Jobs page" in fetch_catch_body, (
+        "the fetch-rejection catch must direct the user to the Jobs page so "
+        "they can find out whether the server queued the verify-hashes job"
+    )
+    # The JSON-parse catch on the OK response is the second ambiguous
+    # outcome: a 2xx status means api_job_verify_hashes() returned, but if
+    # the body couldn't be decoded we can't be sure the job wasn't queued.
+    # Same reasoning — keep the lock, route to Jobs.
+    json_catch_start = section.index("data = await resp.json()")
+    json_catch_start = section.index("} catch (e) {", json_catch_start)
+    json_catch_end = section.index("cardCleanupWatchJob(", json_catch_start)
+    json_catch_body = section[json_catch_start:json_catch_end]
+    assert "cardCleanupSetBusy(false)" not in json_catch_body, (
+        "the JSON-parse catch on a 2xx response must NOT release the page "
+        "lock — the server returned OK, so api_job_verify_hashes() may have "
+        "queued the audit even though we can't read the response body"
+    )
+    assert "Jobs page" in json_catch_body, (
+        "the JSON-parse catch on a 2xx response must direct the user to the "
+        "Jobs page for the actual outcome"
+    )

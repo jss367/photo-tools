@@ -882,20 +882,59 @@ async function cardCleanupStartAudit() {
   document.getElementById('card-cleanup-audit-rescan-btn').style.display = 'none';
   document.getElementById('card-cleanup-audit-status').textContent = '';
   cardCleanupSetError('');
+  // Failure handling here mirrors cardCleanupConfirmDelete (Codex P1 review
+  // on commit 5afcb0ba). Only a definitive HTTP response proves whether the
+  // server queued the audit — an fetch rejection or an unreadable body
+  // could mean api_job_verify_hashes() is already running. If the page
+  // unlocked in that gap, delete_verified() would trust the currently
+  // committed hash_status plus archive size/mtime rather than re-hashing
+  // archive bytes, so a concurrent delete could qualify a row on its old
+  // `ok` verdict while the audit is flipping it to modified/corrupt/
+  // unreadable — and remove the good card copy. Keep Scan/Verify/Delete
+  // disabled on any ambiguous outcome and send the user to Jobs, only
+  // unlocking when the server proves nothing was queued.
+  let resp;
   try {
-    const resp = await fetch('/api/jobs/verify-hashes', {
+    resp = await fetch('/api/jobs/verify-hashes', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: '{}',
     });
-    const data = await resp.json();
-    if (!resp.ok) throw new Error(data.error || 'verification failed to start');
-    cardCleanupWatchJob(data.job_id, 'audit', 'Starting hash verification…');
   } catch (e) {
-    // Nothing started, so nothing is running: give the buttons back.
-    cardCleanupSetBusy(false);
-    cardCleanupSetError(String(e.message || e));
+    cardCleanupSetError(
+      'The verify request never got a response, so we cannot tell whether ' +
+      'the server queued the audit. Check the Jobs page for a verify-hashes ' +
+      'job that started around now, then reload this page to work with the ' +
+      'card again. (' + String(e.message || e) + ')');
+    return;
   }
+  if (!resp.ok) {
+    // The server proved nothing was queued — hand the buttons back before
+    // showing the error.
+    cardCleanupSetBusy(false);
+    let msg = 'verification failed to start';
+    try {
+      const data = await resp.json();
+      if (data && data.error) msg = data.error;
+    } catch (_) { /* keep default */ }
+    cardCleanupSetError(msg);
+    return;
+  }
+  let data;
+  try {
+    data = await resp.json();
+  } catch (e) {
+    // 2xx response, unreadable body: the audit may already be running.
+    // Same reasoning as the network catch above — keep the page locked and
+    // route the user to Jobs rather than freeing the destructive path.
+    cardCleanupSetError(
+      'The verify request returned OK but its response could not be read, ' +
+      'so the audit may already be running. Check the Jobs page for a ' +
+      'verify-hashes job that started around now, then reload this page to ' +
+      'work with the card again. (' + String(e.message || e) + ')');
+    return;
+  }
+  cardCleanupWatchJob(data.job_id, 'audit', 'Starting hash verification…');
 }
 
 // The buttons are already re-enabled by cardCleanupSetBusy(false) in

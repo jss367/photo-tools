@@ -5934,6 +5934,34 @@ def test_all_photos_cache_satisfied_requires_common_identity_when_either_unresol
         db, [pid], classifier_model="BioCLIP", labels_fingerprint="fp-a",
     ) is False
 
+    # A historical row outside the resolved model filter must not pollute
+    # the distinct-identity gate. Both classifiable detections below are
+    # covered by BioCLIP/fp-a; the unrelated model is merely extra history.
+    pid2 = db.add_photo(
+        folder_id, "b.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+    )
+    det2 = db.save_detections(pid2, [
+        {"box": {"x": 4, "y": 4, "w": 1, "h": 1}, "confidence": 0.9,
+         "category": "animal"},
+        {"box": {"x": 6, "y": 6, "w": 1, "h": 1}, "confidence": 0.9,
+         "category": "animal"},
+    ], detector_model="megadetector-v6")
+    for det_id in det2:
+        db.record_classifier_run(det_id, "BioCLIP", "fp-a", prediction_count=1)
+        db.add_prediction(
+            det_id, species="Robin", confidence=0.9, model="BioCLIP",
+            labels_fingerprint="fp-a",
+        )
+    db.record_classifier_run(det2[0], "Other", "fp-x", prediction_count=1)
+    db.add_prediction(
+        det2[0], species="Other bird", confidence=0.8, model="Other",
+        labels_fingerprint="fp-x",
+    )
+    assert _all_photos_cache_satisfied(
+        db, [pid2], classifier_model="BioCLIP", labels_fingerprint=None,
+    ) is True
+
 
 def test_finalize_cached_only_respects_workspace_detector_threshold(
     tmp_path, monkeypatch,
@@ -5964,17 +5992,16 @@ def test_finalize_cached_only_respects_workspace_detector_threshold(
         file_size=100, file_mtime=1.0,
     )
     # Two detections: one clearly above the workspace threshold, one
-    # clearly below.  Both carry cached classifier runs so the
-    # ``_all_photos_cache_satisfied`` check accepts the short-circuit.
+    # clearly below. Only the classifiable, above-threshold row needs a
+    # cached run for the all-cache-hit shortcut to be valid.
     det_ids = db.save_detections(pid, [
         {"box": {"x": 0, "y": 0, "w": 1, "h": 1}, "confidence": 0.9, "category": "animal"},
         {"box": {"x": 2, "y": 2, "w": 1, "h": 1}, "confidence": 0.3, "category": "animal"},
     ], detector_model="megadetector-v6")
-    for det_id, species in zip(det_ids, ["Robin", "Sparrow"], strict=True):
-        db.add_prediction(det_id, species=species, confidence=0.9,
-                          model="BioCLIP", labels_fingerprint="fp-cached")
-        db.record_classifier_run(det_id, "BioCLIP", "fp-cached",
-                                 prediction_count=1)
+    db.add_prediction(det_ids[0], species="Robin", confidence=0.9,
+                      model="BioCLIP", labels_fingerprint="fp-cached")
+    db.record_classifier_run(det_ids[0], "BioCLIP", "fp-cached",
+                             prediction_count=1)
 
     coll_id = db.add_collection(
         "c", '[{"field":"photo_ids","value":[' + str(pid) + ']}]',
@@ -5997,6 +6024,57 @@ def test_finalize_cached_only_respects_workspace_detector_threshold(
     result = run_classify_job(job, runner, db_path, ws, params)
     # Only the above-threshold detection reaches finalization.  Without
     # the workspace threshold the count would be 2.
+    assert result["already_classified"] == 1
+
+
+def test_finalize_cached_only_includes_zero_confidence_full_image_anchor(
+    tmp_path, monkeypatch,
+):
+    """Full-image anchors bypass the positive MegaDetector threshold."""
+    import classify_job as classify_job_mod
+    import config as cfg
+    from classify_job import ClassifyParams, run_classify_job
+    from db import Database
+
+    monkeypatch.setattr(cfg, "CONFIG_PATH", str(tmp_path / "config.json"))
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws = db.ensure_default_workspace()
+    db.set_active_workspace(ws)
+    folder_id = db.add_folder("/tmp/p", name="p")
+    pid = db.add_photo(
+        folder_id, "empty.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+    )
+    det_id = db.save_detections(pid, [{
+        "box": {"x": 0, "y": 0, "w": 1, "h": 1},
+        "confidence": 0,
+        "category": "animal",
+    }], detector_model="full-image")[0]
+    db.add_prediction(
+        det_id, species="Full-image Robin", confidence=0.9,
+        model="BioCLIP", labels_fingerprint="fp-cached",
+    )
+    db.record_classifier_run(
+        det_id, "BioCLIP", "fp-cached", prediction_count=1,
+    )
+    collection_id = db.add_collection(
+        "empty", json.dumps([{"field": "photo_ids", "value": [pid]}]),
+    )
+
+    monkeypatch.setattr(classify_job_mod, "get_active_model", lambda: None)
+    monkeypatch.setattr(classify_job_mod, "get_models", lambda: [])
+    result = run_classify_job(
+        _make_job(), FakeRunner(), db_path, ws,
+        ClassifyParams(
+            collection_id=collection_id,
+            labels_files=None, labels_file=None,
+            model_id=None, model_name=None,
+            grouping_window=0, similarity_threshold=0.99,
+            reclassify=False,
+        ),
+    )
+
     assert result["already_classified"] == 1
 
 

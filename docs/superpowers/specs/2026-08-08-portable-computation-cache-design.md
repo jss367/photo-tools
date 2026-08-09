@@ -142,11 +142,12 @@ These are recommendations for review, not yet approved decisions.
 
 Settings gains a **Computation Cache** section with **Export Results…**.
 
-The export sheet offers:
+The phase-one controls offer:
 
-- scope: selected folders or all processed photos;
+- scope: all processed photos (selected-folder scope is follow-up work);
 - artifact types: Detection and Species classification (both selected by
-  default);
+  default); selecting Species classification automatically includes its
+  Detection dependency;
 - destination: a file ending in `.vireo-cache`.
 
 Before writing, Vireo reports how many photos have reusable results for the
@@ -156,8 +157,9 @@ counts would be misleading here. Export can hash missing non-empty photos after
 explicit confirmation; it does not silently read terabytes of originals and it
 does not repeatedly chase deliberately NULL hashes for empty files.
 
-The completion summary reports photos, detector runs, classifier runs, bundle
-size, skipped legacy results, and failures.
+The completion summary labels each unit explicitly: unique artifacts, affected
+catalog photo rows, detector runs, classifier runs, bundle bytes, artifacts
+stored for later, skipped legacy rows, and failures.
 
 ### Import on computer B
 
@@ -180,7 +182,8 @@ later, the next Process/Classify run discovers and applies the cached result.
 
 During processing, progress and the final job card show a line such as:
 
-> Reused 1,248 detector results and 1,103 classifications from imported cache.
+> Reused 1,248 detector-run artifacts across 1,310 catalog photo rows and
+> 1,103 classifier-run artifacts; stored 87 artifacts for later.
 
 The review UI does not need a permanent badge on every card. Prediction detail
 may show optional provenance: origin device label, Vireo version, execution

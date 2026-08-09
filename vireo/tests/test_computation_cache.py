@@ -320,6 +320,12 @@ def test_database_export_bundle_import_and_duplicate_fanout(tmp_path):
     assert {artifact["type"] for artifact in artifacts} == {
         "detection", "classification",
     }
+    classification_only, _classification_summary = exportable_artifacts(
+        source, artifact_types={"classification"},
+    )
+    assert {artifact["type"] for artifact in classification_only} == {
+        "detection", "classification",
+    }, "classification exports must include their detector dependency"
 
     bundle = tmp_path / "shared.vireo-cache"
     write_bundle(bundle, artifacts)

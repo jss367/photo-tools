@@ -334,8 +334,9 @@ def _classify_detection_gated(db, detection_id, classifier_model,
 
 def _all_photos_cache_satisfied(
     db, photo_ids, classifier_model=None, labels_fingerprint=None,
+    detector_confidence=0.0,
 ):
-    """True when every detection on every photo already has a matching run.
+    """True when every classifiable detection already has a matching run.
 
     Used to short-circuit model resolution when a bundle import (or an
     earlier run) has already produced results for the whole collection.
@@ -343,8 +344,9 @@ def _all_photos_cache_satisfied(
     imported predictions instead of failing with "No model available".
 
     "Satisfied" here means: every photo in the collection has at least
-    one detection, and every one of its detections has a matching
-    ``classifier_runs`` row.  When ``classifier_model`` and/or
+    one detection eligible at the workspace threshold (with synthetic
+    full-image anchors always eligible), and every eligible detection has a
+    matching ``classifier_runs`` row.  When ``classifier_model`` and/or
     ``labels_fingerprint`` are given, matching also requires the run to
     carry that exact model name / label set — a photo whose detections
     only carry runs for a different model or label set is treated as
@@ -393,6 +395,12 @@ def _all_photos_cache_satisfied(
         "AND pr.classifier_model = cr.classifier_model "
         "AND pr.labels_fingerprint = cr.labels_fingerprint)"
     )
+    classifiable_detection = (
+        "(d.detector_model = 'full-image' OR "
+        "(d.detector_model != 'full-image' "
+        "AND COALESCE(d.category, 'animal') = 'animal' "
+        "AND d.detector_confidence >= ?))"
+    )
 
     total = 0
     covered = 0
@@ -414,8 +422,9 @@ def _all_photos_cache_satisfied(
                  FROM detections d
                  LEFT JOIN classifier_runs cr
                    ON cr.detection_id = d.id{filter_sql}
-                WHERE d.photo_id IN ({placeholders})""",
-            filter_args + list(chunk),
+                WHERE {classifiable_detection}
+                  AND d.photo_id IN ({placeholders})""",
+            filter_args + [detector_confidence] + list(chunk),
         ).fetchone()
         total += (row["total"] if row else 0) or 0
         covered += (row["covered"] if row else 0) or 0
@@ -423,8 +432,12 @@ def _all_photos_cache_satisfied(
         photo_row = db.conn.execute(
             f"""SELECT COUNT(DISTINCT photo_id) AS covered_photos
                  FROM detections
-                WHERE photo_id IN ({placeholders})""",
-            list(chunk),
+                WHERE (detector_model = 'full-image' OR
+                       (detector_model != 'full-image'
+                        AND COALESCE(category, 'animal') = 'animal'
+                        AND detector_confidence >= ?))
+                  AND photo_id IN ({placeholders})""",
+            [detector_confidence] + list(chunk),
         ).fetchone()
         covered_photos += (
             (photo_row["covered_photos"] if photo_row else 0) or 0
@@ -445,8 +458,9 @@ def _all_photos_cache_satisfied(
                      JOIN classifier_runs cr
                        ON cr.detection_id = d.id
                     WHERE d.photo_id IN ({placeholders})
-                      AND {predictions_exists}""",
-                list(chunk),
+                      AND {classifiable_detection}
+                      AND {predictions_exists}{filter_sql}""",
+                list(chunk) + [detector_confidence] + filter_args,
             ):
                 distinct_identities.add(
                     (identity_row["m"], identity_row["fp"])
@@ -2251,6 +2265,28 @@ def _finalize_cached_only(
     detection_map = thread_db.get_detections_for_photos(
         photo_ids, min_conf=det_conf_threshold,
     )
+    detection_map = {
+        photo_id: [
+            detection for detection in detections
+            if detection.get("detector_model") != "full-image"
+            and detection.get("category", "animal") == "animal"
+        ]
+        for photo_id, detections in detection_map.items()
+    }
+    # Synthetic full-image anchors intentionally have confidence 0, so the
+    # positive MegaDetector threshold above hides them. They are nevertheless
+    # classifier inputs and must participate in cached-only reconciliation.
+    # Fetch them independently at min_conf=0 and merge them back.
+    full_image_map = thread_db.get_detections_for_photos(
+        photo_ids, min_conf=0, detector_model="full-image",
+    )
+    for photo_id, detections in full_image_map.items():
+        existing = detection_map.setdefault(photo_id, [])
+        existing_ids = {detection["id"] for detection in existing}
+        existing.extend(
+            detection for detection in detections
+            if detection["id"] not in existing_ids
+        )
 
     runner.update_step(job["id"], "classify", status="running")
 
@@ -2633,10 +2669,17 @@ def run_classify_job(job, runner, db_path, workspace_id, params, vireo_dir=None)
         except Exception:
             desired_labels_fingerprint = None
 
+        import config as cfg
+
+        cache_effective_cfg = thread_db.get_effective_config(cfg.load())
+        cache_detector_confidence = cache_effective_cfg.get(
+            "detector_confidence", 0.2,
+        )
         if not params.reclassify and _all_photos_cache_satisfied(
             thread_db, [p["id"] for p in photos],
             classifier_model=desired_classifier_model,
             labels_fingerprint=desired_labels_fingerprint,
+            detector_confidence=cache_detector_confidence,
         ):
             log.info(
                 "Classify job: every photo has cached classifier runs — "

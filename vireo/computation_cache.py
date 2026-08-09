@@ -1037,6 +1037,11 @@ def exportable_artifacts(db, artifact_types=None):
     unknown = artifact_types - _ARTIFACT_TYPES
     if unknown:
         raise CacheFormatError(f"unknown artifact types: {sorted(unknown)!r}")
+    # Classification subjects are keyed to detector-owned boxes. Keep the
+    # export dependency-closed so a destination can materialize the imported
+    # classifier runs without first reproducing detection locally.
+    if "classification" in artifact_types:
+        artifact_types.add("detection")
     artifacts = []
     summary = {
         "detector_runs": 0,

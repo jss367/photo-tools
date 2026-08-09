@@ -17874,13 +17874,20 @@ class Database:
         full_fingerprint=None,
     ):
         import json
+        # COALESCE full_fingerprint so a later call recording the same
+        # short fingerprint without the 64-char digest (e.g. after an
+        # OSError/ValueError fallback in _record_labels_fingerprint) does
+        # not overwrite a previously stored full digest with NULL.
         self.conn.execute(
             """INSERT INTO labels_fingerprints
                  (fingerprint, full_fingerprint, display_name,
                   sources_json, label_count)
                VALUES (?, ?, ?, ?, ?)
                ON CONFLICT(fingerprint)
-               DO UPDATE SET full_fingerprint = excluded.full_fingerprint,
+               DO UPDATE SET full_fingerprint = COALESCE(
+                                 excluded.full_fingerprint,
+                                 labels_fingerprints.full_fingerprint
+                             ),
                              display_name = excluded.display_name,
                              sources_json = excluded.sources_json,
                              label_count  = excluded.label_count""",

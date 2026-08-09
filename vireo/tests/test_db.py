@@ -8243,7 +8243,20 @@ def test_runtime_change_preserves_output_reviewed_in_any_workspace(tmp_path):
         runtime_fingerprint="runtime-b", input_fingerprint="input-a",
         force_runtime_replace=True,
     )
-    assert forced != [old_id]
+    # Contract: force_runtime_replace=True must actually persist ONE
+    # detection under the new runtime.  An empty result would mean the
+    # forced write deleted the reviewed row and wrote nothing — exactly
+    # the regression the reviewed-pin gate is meant to prevent.
+    assert len(forced) == 1
+    assert forced[0] != old_id
+    forced_run = db.conn.execute(
+        """SELECT runtime_fingerprint FROM detector_runs
+           WHERE photo_id = ? AND detector_model = ?""",
+        (photo_id, "megadetector-v6"),
+    ).fetchone()
+    assert forced_run["runtime_fingerprint"] == "runtime-b", (
+        "force_runtime_replace=True must advance detector_runs.runtime_fingerprint"
+    )
     assert db.conn.execute(
         "SELECT 1 FROM prediction_review WHERE workspace_id = ?", (ws_b,),
     ).fetchone() is None

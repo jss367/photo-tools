@@ -5181,9 +5181,13 @@ def test_run_classify_job_reclassify_cancel_classifies_empty_scene_processed(tmp
     # No prior full-image synthetic detection exists for photo 1 — the
     # classifier creates one for the full-image fallback path.
     mock_db_instance.get_detections.return_value = []
-    # save_detections returns a synthetic detection id for the full-image
-    # fallback that _classify_photos creates for empty-scene photos.
+    # save_detections + write_detection_batch both return the synthetic
+    # detection id for the full-image fallback path.  The classify loop
+    # now writes both the detection and the detector_runs row in a single
+    # ``write_detection_batch`` transaction to avoid torn state on crash,
+    # so the mock has to answer that call too.
     mock_db_instance.save_detections.return_value = [201]
+    mock_db_instance.write_detection_batch.return_value = [201]
 
     fake_model = {
         "id": "test-model",

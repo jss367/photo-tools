@@ -351,10 +351,18 @@ def _all_photos_cache_satisfied(
     unsatisfied so the caller falls through to real classification with
     the user's requested identity.  A photo with no detections at all is
     also unsatisfied so we still fall through to detection.
+
+    When neither filter is supplied (fresh-install fallback path), we
+    additionally require every covered detection to share the SAME
+    ``(classifier_model, labels_fingerprint)`` pair.  Otherwise the
+    downstream cached-only finalize adopts the first row's identity and
+    reconciles every other row against it — silently swapping the
+    classifier identity on detections covered by a different pair.
     """
     if not photo_ids:
         return False
-    placeholders = ",".join("?" for _ in photo_ids)
+    from db import _chunks  # module-level helper, avoids exceeding SQLITE_MAX_VARIABLE_NUMBER
+
     filter_sql = ""
     filter_args = []
     if classifier_model is not None:
@@ -364,35 +372,62 @@ def _all_photos_cache_satisfied(
         filter_sql += " AND cr.labels_fingerprint = ?"
         filter_args.append(labels_fingerprint)
 
-    # Every detection must have a matching run.  A single covered
-    # detection on a photo with multiple detections used to fool the old
-    # per-photo check — that let a second detection surface unclassified.
-    # ``classifier_runs`` has no surrogate id column; use
-    # ``cr.detection_id`` (NOT NULL PK member) as the presence sentinel.
-    row = db.conn.execute(
-        f"""SELECT COUNT(*) AS total,
-                   SUM(CASE WHEN cr.detection_id IS NOT NULL THEN 1 ELSE 0 END)
-                     AS covered
-             FROM detections d
-             LEFT JOIN classifier_runs cr
-               ON cr.detection_id = d.id{filter_sql}
-            WHERE d.photo_id IN ({placeholders})""",
-        filter_args + list(photo_ids),
-    ).fetchone()
-    total = (row["total"] if row else 0) or 0
-    covered = (row["covered"] if row else 0) or 0
+    total = 0
+    covered = 0
+    covered_photos = 0
+    distinct_identities = set()
+    identity_gate = classifier_model is None and labels_fingerprint is None
+
+    # Chunk ``photo_ids`` so a large collection (per_page=999999) does
+    # not blow past SQLite's default SQLITE_MAX_VARIABLE_NUMBER (999)
+    # and fail the whole classify job.
+    for chunk in _chunks(photo_ids):
+        placeholders = ",".join("?" for _ in chunk)
+        row = db.conn.execute(
+            f"""SELECT COUNT(*) AS total,
+                       SUM(CASE WHEN cr.detection_id IS NOT NULL THEN 1 ELSE 0 END)
+                         AS covered
+                 FROM detections d
+                 LEFT JOIN classifier_runs cr
+                   ON cr.detection_id = d.id{filter_sql}
+                WHERE d.photo_id IN ({placeholders})""",
+            filter_args + list(chunk),
+        ).fetchone()
+        total += (row["total"] if row else 0) or 0
+        covered += (row["covered"] if row else 0) or 0
+
+        photo_row = db.conn.execute(
+            f"""SELECT COUNT(DISTINCT photo_id) AS covered_photos
+                 FROM detections
+                WHERE photo_id IN ({placeholders})""",
+            list(chunk),
+        ).fetchone()
+        covered_photos += (
+            (photo_row["covered_photos"] if photo_row else 0) or 0
+        )
+
+        if identity_gate:
+            # Track how many distinct (model, fp) pairs cover this
+            # chunk's classifier_runs so the caller can't finalize
+            # under a single identity when several are actually
+            # present.  We short-circuit as soon as two are seen.
+            for identity_row in db.conn.execute(
+                f"""SELECT DISTINCT cr.classifier_model AS m,
+                                    cr.labels_fingerprint AS fp
+                     FROM detections d
+                     JOIN classifier_runs cr
+                       ON cr.detection_id = d.id
+                    WHERE d.photo_id IN ({placeholders})""",
+                list(chunk),
+            ):
+                distinct_identities.add(
+                    (identity_row["m"], identity_row["fp"])
+                )
+                if len(distinct_identities) > 1:
+                    return False
+
     if total == 0 or covered != total:
         return False
-
-    # Every photo must have at least one detection — an empty-scene photo
-    # with no full-image anchor yet is unsatisfied so we still create it.
-    photo_row = db.conn.execute(
-        f"""SELECT COUNT(DISTINCT photo_id) AS covered_photos
-             FROM detections
-            WHERE photo_id IN ({placeholders})""",
-        list(photo_ids),
-    ).fetchone()
-    covered_photos = (photo_row["covered_photos"] if photo_row else 0) or 0
     return covered_photos == len(photo_ids)
 
 
@@ -578,27 +613,50 @@ def _detect_batch(photos, folders, runner, job, reclassify, db,
 
             # Publication follows the database commit.  A store failure must
             # never turn successful inference into a failed detector run.
+            #
+            # ``write_detection_batch`` returns early (leaving the stored
+            # detector_runs.runtime_fingerprint at its OLD value) when a
+            # runtime change is proposed against a review-pinned run and
+            # ``force_runtime_replace`` is False.  Publishing with the new
+            # ``detector_runtime`` in that case would attach a foreign
+            # runtime identity to boxes that were actually produced by an
+            # older runtime — the artifact is content-addressed and
+            # exportable, so downstream catalogs would trust that lie.
+            # Read back the persisted runtime and only publish when it
+            # equals the runtime we intended to write.
             if portable_input is not None:
                 try:
                     from computation_cache import publish_detection_artifact
 
-                    normalized_detections = [{
-                        "box": {
-                            "x": row["box_x"], "y": row["box_y"],
-                            "w": row["box_w"], "h": row["box_h"],
-                        },
-                        "confidence": row["detector_confidence"],
-                        "category": row["category"],
-                    } for row in db.get_detections(
-                        photo["id"], min_conf=0,
-                        detector_model="megadetector-v6",
-                    )]
-                    publish_detection_artifact(
-                        portable_photo_hash,
-                        "megadetector-v6",
-                        detector_runtime,
-                        normalized_detections,
+                    persisted_runtime_row = db.conn.execute(
+                        """SELECT runtime_fingerprint
+                           FROM detector_runs
+                           WHERE photo_id = ?
+                             AND detector_model = 'megadetector-v6'""",
+                        (photo["id"],),
+                    ).fetchone()
+                    persisted_runtime = (
+                        persisted_runtime_row["runtime_fingerprint"]
+                        if persisted_runtime_row else None
                     )
+                    if persisted_runtime == detector_runtime:
+                        normalized_detections = [{
+                            "box": {
+                                "x": row["box_x"], "y": row["box_y"],
+                                "w": row["box_w"], "h": row["box_h"],
+                            },
+                            "confidence": row["detector_confidence"],
+                            "category": row["category"],
+                        } for row in db.get_detections(
+                            photo["id"], min_conf=0,
+                            detector_model="megadetector-v6",
+                        )]
+                        publish_detection_artifact(
+                            portable_photo_hash,
+                            "megadetector-v6",
+                            detector_runtime,
+                            normalized_detections,
+                        )
                 except Exception:
                     log.warning(
                         "Could not publish portable detector result for photo %s",
@@ -1429,17 +1487,18 @@ def _classify_photos(
                         )
                     except ValueError:
                         full_input = None
-                full_det_ids = db.save_detections(
-                    photo["id"], full_image_det,
-                    detector_model="full-image",
-                    runtime_fingerprint=full_runtime,
-                )
-                full_det_id = full_det_ids[0]
-                db.record_detector_run(
-                    photo["id"], "full-image", box_count=1,
+                # Wrap both writes in the single ``write_detection_batch``
+                # transaction so a crash between save_detections and
+                # record_detector_run can't leave a full-image detection
+                # row without its matching detector_runs row — that torn
+                # state would fool the runtime-aware reuse gates into
+                # treating the photo as never detected.
+                full_det_ids = db.write_detection_batch(
+                    photo["id"], "full-image", full_image_det,
                     runtime_fingerprint=full_runtime,
                     input_fingerprint=full_input,
                 )
+                full_det_id = full_det_ids[0]
             # Gate check for the synthetic full-image detection too.
             # Mirror the regular detection branch: when gated, surface the
             # cached top-1 prediction into raw_results so downstream
@@ -2863,6 +2922,10 @@ def run_classify_job(job, runner, db_path, workspace_id, params, vireo_dir=None)
                     photo["id"] for photo in photos
                     if not detection_map.get(photo["id"])
                 ]
+                # Import CacheFormatError locally so a NULL / non-canonical
+                # file_hash escapes into full_input=None instead of the
+                # outer except Exception (which would abandon reapply).
+                from computation_cache import CacheFormatError
                 for photo_id in empty_scene_ids:
                     identity = thread_db.conn.execute(
                         """SELECT file_hash, companion_path
@@ -2876,7 +2939,7 @@ def run_classify_job(job, runner, db_path, workspace_id, params, vireo_dir=None)
                                 identity["file_hash"],
                                 "vireo-detector-source-v1",
                             )
-                        except ValueError:
+                        except (ValueError, CacheFormatError):
                             full_input = None
                     existing_full = thread_db.get_detections(
                         photo_id, detector_model="full-image", min_conf=0,
@@ -2892,6 +2955,24 @@ def run_classify_job(job, runner, db_path, workspace_id, params, vireo_dir=None)
                             detector_model="full-image",
                             runtime_fingerprint=full_runtime,
                         )
+                    else:
+                        # Promote a legacy full-image detection row so its
+                        # ``runtime_fingerprint`` matches the run we're
+                        # about to record.  ``exportable_artifacts`` reads
+                        # the detector runtime from ``detections`` — if we
+                        # leave the row at ``'legacy'`` an export skips
+                        # the attached classifier run and emits an empty
+                        # full-image detection artifact for this photo.
+                        thread_db.conn.execute(
+                            """UPDATE detections
+                                  SET runtime_fingerprint = ?
+                                WHERE photo_id = ?
+                                  AND detector_model = 'full-image'
+                                  AND (runtime_fingerprint IS NULL
+                                       OR runtime_fingerprint != ?)""",
+                            (full_runtime, photo_id, full_runtime),
+                        )
+                        thread_db.conn.commit()
                     existing_run = thread_db.conn.execute(
                         """SELECT runtime_fingerprint FROM detector_runs
                            WHERE photo_id = ?

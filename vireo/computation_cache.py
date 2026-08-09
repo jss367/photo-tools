@@ -574,11 +574,21 @@ def validate_artifact(artifact):
         labels = artifact.get("labels")
         if not isinstance(labels, dict):
             raise CacheFormatError("classification artifact needs labels metadata")
-        if not _is_sha256(labels.get("fingerprint")):
+        full_fp = labels.get("fingerprint")
+        if not _is_sha256(full_fp):
             raise CacheFormatError("labels.fingerprint must be a full SHA-256")
         short = labels.get("short_fingerprint")
         if not isinstance(short, str) or not short or len(short) > 64:
             raise CacheFormatError("labels.short_fingerprint is invalid")
+        # short_fingerprint is a cache key for classifier_runs — normal jobs
+        # derive it from the first 12 characters of the full digest.  An
+        # arbitrary short key would let a crafted bundle claim an unrelated
+        # historical row (e.g. a legacy row with full_fingerprint IS NULL)
+        # and replace its unreviewed predictions under a foreign label set.
+        if short != full_fp[:12]:
+            raise CacheFormatError(
+                "labels.short_fingerprint must be the first 12 chars of labels.fingerprint"
+            )
         # Optional scalar metadata is bound directly to SQLite text/int
         # columns by materialize_artifacts.  A list or dict here would
         # surface as an uncaught binding error mid-write and leave the
@@ -677,6 +687,15 @@ class ArtifactStore:
                 created = True
             except FileExistsError:
                 created = False
+            except OSError:
+                # os.link raises EXDEV, EPERM, or ENOSYS on filesystems
+                # without hard-link support (exFAT, network mounts, some
+                # Windows volumes). Objects are content-addressed, so
+                # replacing an existing file with identical bytes is
+                # safe; fall back to os.replace to keep bundle import
+                # and result publication working on those volumes.
+                os.replace(temp_name, destination)
+                created = True
             if not created and destination.read_bytes() != body:
                 raise CacheFormatError("content-addressed object collision")
         finally:
@@ -889,8 +908,17 @@ def read_bundle(source):
         members = _safe_zip_members(archive)
         if "manifest.json" not in members:
             raise CacheFormatError("bundle has no manifest.json")
+        manifest_info = members["manifest.json"]
+        manifest_cap = MAX_MANIFEST_BYTES + 1
         try:
-            manifest = json.loads(archive.read("manifest.json"))
+            with archive.open(manifest_info, "r") as handle:
+                manifest_bytes = handle.read(manifest_cap)
+        except (OSError, zipfile.BadZipFile) as exc:
+            raise CacheFormatError("bundle manifest is not readable") from exc
+        if len(manifest_bytes) > MAX_MANIFEST_BYTES:
+            raise CacheFormatError("bundle manifest exceeds maximum size")
+        try:
+            manifest = json.loads(manifest_bytes)
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise CacheFormatError("bundle manifest is not valid JSON") from exc
         if not isinstance(manifest, dict):
@@ -925,7 +953,16 @@ def read_bundle(source):
             info = members.get(name)
             if info is None or info.file_size != size:
                 raise CacheFormatError("bundle object size does not match manifest")
-            body = archive.read(info)
+            # Stream the member with a hard byte cap instead of
+            # ``archive.read(info)``: the ZIP central-directory
+            # ``file_size`` is attacker-controlled, so a member declaring
+            # ``file_size = size`` could still expand into gigabytes and
+            # exhaust memory before the size/CRC checks fire. Reading
+            # one byte past the cap lets us reject the member without
+            # ever allocating the full uncompressed stream.
+            cap = max(size, 0) + 1
+            with archive.open(info, "r") as handle:
+                body = handle.read(cap)
             if len(body) != size or hashlib.sha256(body).hexdigest() != digest:
                 raise CacheFormatError("bundle object digest mismatch")
             try:
@@ -1244,7 +1281,9 @@ def _is_recognized_detector_runtime(detector_model, runtime, extra=None):
     if detector_model == "megadetector-v6":
         try:
             local = megadetector_runtime_fingerprint()
-        except (OSError, ValueError):
+        except (ImportError, OSError, ValueError):
+            # ImportError also fires when the `detector` module is not
+            # installed on this instance — quarantine, don't propagate.
             return False
         return local is not None and runtime == local
     return False
@@ -1486,7 +1525,10 @@ def materialize_artifacts(
                           sources_json, label_count)
                        VALUES (?, ?, ?, '[]', ?)
                        ON CONFLICT(fingerprint) DO UPDATE SET
-                         full_fingerprint = excluded.full_fingerprint,
+                         full_fingerprint = COALESCE(
+                             excluded.full_fingerprint,
+                             labels_fingerprints.full_fingerprint
+                         ),
                          display_name = COALESCE(excluded.display_name, display_name),
                          label_count = COALESCE(excluded.label_count, label_count)""",
                     (

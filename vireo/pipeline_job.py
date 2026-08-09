@@ -4381,6 +4381,7 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                 if not params.reclassify:
                     try:
                         from computation_cache import (
+                            CacheFormatError,
                             full_image_runtime_fingerprint,
                             materialize_local_store,
                             source_input,
@@ -4415,7 +4416,14 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                                         identity["file_hash"],
                                         "vireo-detector-source-v1",
                                     )
-                                except ValueError:
+                                except (ValueError, CacheFormatError):
+                                    # source_input raises CacheFormatError on
+                                    # NULL / non-canonical file_hash values.
+                                    # Falling through to the outer
+                                    # ``except Exception`` would abandon the
+                                    # post-detect reapply for the whole
+                                    # detect stage; keep full_input=None so
+                                    # the surrounding write still runs.
                                     full_input = None
                             existing_full = thread_db.get_detections(
                                 photo_id, detector_model="full-image",
@@ -4432,6 +4440,26 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                                     detector_model="full-image",
                                     runtime_fingerprint=full_runtime,
                                 )
+                            else:
+                                # Promote a legacy full-image detection so
+                                # its runtime_fingerprint matches the run
+                                # we're about to record. exportable_artifacts
+                                # reads the detector runtime from
+                                # ``detections`` — leaving it at 'legacy'
+                                # makes future exports emit an empty
+                                # full-image detection artifact for this
+                                # photo, dropping the attached classifier
+                                # run.
+                                thread_db.conn.execute(
+                                    """UPDATE detections
+                                          SET runtime_fingerprint = ?
+                                        WHERE photo_id = ?
+                                          AND detector_model = 'full-image'
+                                          AND (runtime_fingerprint IS NULL
+                                               OR runtime_fingerprint != ?)""",
+                                    (full_runtime, photo_id, full_runtime),
+                                )
+                                thread_db.conn.commit()
                             existing_run = thread_db.conn.execute(
                                 """SELECT runtime_fingerprint FROM detector_runs
                                    WHERE photo_id = ?
@@ -5296,22 +5324,23 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                                             )
                                         except ValueError:
                                             full_input = None
-                                    full_det_ids = thread_db.save_detections(
-                                        photo["id"],
+                                    # Combine save_detections + record_detector_run
+                                    # into one transaction via write_detection_batch
+                                    # so a crash between them can't leave a
+                                    # full-image detection row without its matching
+                                    # detector_runs row — mirroring the invariant
+                                    # documented for write_detection_batch.
+                                    full_det_ids = thread_db.write_detection_batch(
+                                        photo["id"], "full-image",
                                         [{
                                             "box": {"x": 0, "y": 0, "w": 1, "h": 1},
                                             "confidence": 0,
                                             "category": "animal",
                                         }],
-                                        detector_model="full-image",
-                                        runtime_fingerprint=full_runtime,
-                                    )
-                                    full_det_id = full_det_ids[0]
-                                    thread_db.record_detector_run(
-                                        photo["id"], "full-image", box_count=1,
                                         runtime_fingerprint=full_runtime,
                                         input_fingerprint=full_input,
                                     )
+                                    full_det_id = full_det_ids[0]
                                 detections_to_classify = [{
                                     "id": full_det_id,
                                     "box_x": 0,

@@ -5738,11 +5738,162 @@ def test_run_classify_job_short_circuits_when_cache_covers_every_photo(
     result = run_classify_job(job, runner, db_path, ws, params)
     assert result["already_classified"] == result["total"] == 1
     assert result["failed"] == 0
-    # The cached prediction must still be there — the short-circuit
-    # must not touch the DB.
+    # Cached prediction stays exactly one row — the finalization pass
+    # updates review state / grouping in place but must not double up
+    # the ``predictions`` row for a reused detection.
     db2 = Database(db_path)
     db2.set_active_workspace(ws)
     assert db2.conn.execute(
         "SELECT COUNT(*) AS n FROM predictions WHERE detection_id = ?",
         (det_id,),
     ).fetchone()["n"] == 1
+
+
+def test_run_classify_job_rejects_unknown_model_id_before_cache_shortcut(
+    tmp_path, monkeypatch,
+):
+    """A stale job referencing a deleted model must fail with 'not found',
+    not silently succeed by matching any classifier's cached rows.
+    """
+    import config as cfg
+    from classify_job import ClassifyParams, run_classify_job
+    from db import Database
+
+    monkeypatch.setattr(cfg, "CONFIG_PATH", str(tmp_path / "config.json"))
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws = db.ensure_default_workspace()
+    db.set_active_workspace(ws)
+    folder_id = db.add_folder("/tmp/p", name="p")
+    pid = db.add_photo(
+        folder_id, "a.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+    )
+    det_id = db.save_detections(pid, [
+        {"box": {"x": 0, "y": 0, "w": 1, "h": 1}, "confidence": 0.9,
+         "category": "animal"},
+    ], detector_model="megadetector-v6")[0]
+    # A classifier run exists — but from a different (unrelated) model
+    # under a different name than the request. Without the explicit-id
+    # rejection, the cache satisfaction check would accept it since
+    # ``desired_classifier_model`` would fall back to None.
+    db.add_prediction(det_id, species="Robin", confidence=0.9,
+                      model="SomeOtherModel", labels_fingerprint="fp-x")
+    db.record_classifier_run(det_id, "SomeOtherModel", "fp-x",
+                             prediction_count=1)
+
+    coll_id = db.add_collection(
+        "c", '[{"field":"photo_ids","value":[' + str(pid) + ']}]',
+    )
+
+    import classify_job as classify_job_mod
+    monkeypatch.setattr(classify_job_mod, "get_active_model", lambda: None)
+    # get_models returns models but NONE match the requested id.
+    monkeypatch.setattr(
+        classify_job_mod, "get_models",
+        lambda: [{"id": "other-id", "name": "SomeOtherModel",
+                  "downloaded": True, "model_type": "bioclip",
+                  "model_str": "", "weights_path": ""}],
+    )
+
+    runner = FakeRunner()
+    job = _make_job()
+    params = ClassifyParams(
+        collection_id=coll_id,
+        labels_files=None, labels_file=None,
+        model_id="stale-id",  # references a model no longer in get_models
+        model_name=None,
+        grouping_window=0, similarity_threshold=0.99, reclassify=False,
+    )
+
+    with pytest.raises(RuntimeError, match="stale-id.*not found"):
+        run_classify_job(job, runner, db_path, ws, params)
+
+
+def test_run_classify_job_reconciles_group_metadata_on_reuse(
+    tmp_path, monkeypatch,
+):
+    """When every photo is cache-satisfied, the finalize pass must still
+    run: bursts must get a group_id, otherwise imported predictions never
+    receive the consensus / group metadata a fresh classification pass
+    produces.
+    """
+    import config as cfg
+    from classify_job import ClassifyParams, run_classify_job
+    from db import Database
+
+    monkeypatch.setattr(cfg, "CONFIG_PATH", str(tmp_path / "config.json"))
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws = db.ensure_default_workspace()
+    db.set_active_workspace(ws)
+    folder_id = db.add_folder("/tmp/p", name="p")
+    # Two photos captured within a burst window — imported cache carries
+    # matching predictions for each so grouping/consensus should apply.
+    pid_a = db.add_photo(
+        folder_id, "a.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+        timestamp="2024-01-01T10:00:00",
+    )
+    pid_b = db.add_photo(
+        folder_id, "b.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+        timestamp="2024-01-01T10:00:01",
+    )
+    det_a = db.save_detections(pid_a, [
+        {"box": {"x": 0, "y": 0, "w": 1, "h": 1}, "confidence": 0.9,
+         "category": "animal"},
+    ], detector_model="megadetector-v6")[0]
+    det_b = db.save_detections(pid_b, [
+        {"box": {"x": 0, "y": 0, "w": 1, "h": 1}, "confidence": 0.9,
+         "category": "animal"},
+    ], detector_model="megadetector-v6")[0]
+    for det_id in (det_a, det_b):
+        db.add_prediction(det_id, species="Robin", confidence=0.9,
+                          model="BioCLIP", labels_fingerprint="fp-cached")
+        db.record_classifier_run(det_id, "BioCLIP", "fp-cached",
+                                 prediction_count=1)
+
+    coll_id = db.add_collection(
+        "c",
+        '[{"field":"photo_ids","value":['
+        + str(pid_a) + ',' + str(pid_b) + ']}]',
+    )
+
+    import classify_job as classify_job_mod
+    monkeypatch.setattr(classify_job_mod, "get_active_model", lambda: None)
+    monkeypatch.setattr(classify_job_mod, "get_models", lambda: [])
+
+    runner = FakeRunner()
+    job = _make_job()
+    params = ClassifyParams(
+        collection_id=coll_id,
+        labels_files=None, labels_file=None,
+        model_id=None, model_name=None,
+        grouping_window=10, similarity_threshold=0.99, reclassify=False,
+    )
+
+    result = run_classify_job(job, runner, db_path, ws, params)
+    assert result["failed"] == 0
+    # Burst grouping must have run — two nearby photos with the same
+    # species belong in one reviewable group. Old code returned early
+    # and left prediction_review.group_id NULL on the reused rows.
+    db2 = Database(db_path)
+    db2.set_active_workspace(ws)
+    rows = db2.conn.execute(
+        """SELECT pr_rev.group_id AS group_id
+             FROM predictions pr
+             JOIN prediction_review pr_rev
+               ON pr_rev.prediction_id = pr.id
+              AND pr_rev.workspace_id = ?
+            WHERE pr.detection_id IN (?, ?)""",
+        (ws, det_a, det_b),
+    ).fetchall()
+    assert len(rows) == 2
+    group_ids = {r["group_id"] for r in rows}
+    assert None not in group_ids, (
+        "group metadata should be stamped by the reused-cache finalize path"
+    )
+    assert len(group_ids) == 1, "both frames should share one burst group"

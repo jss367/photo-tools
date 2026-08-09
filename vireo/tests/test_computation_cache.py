@@ -18,6 +18,7 @@ from computation_cache import (  # noqa: E402
     exportable_artifacts,
     import_bundle,
     materialize_artifacts,
+    materialize_local_store,
     promote_and_publish_classifier_run,
     read_bundle,
     runtime_fingerprint,
@@ -643,3 +644,73 @@ def test_unknown_classifier_runtime_is_quarantined_not_installed(tmp_path):
     )
     assert applied_ok["classifier_runs_applied"] == 1
     assert applied_ok["unknown_classifier_runtime"] == 0
+
+
+def test_artifact_store_persists_trusted_runtimes(tmp_path):
+    """Trust recorded on import survives store re-instantiation and merges."""
+    store = ArtifactStore(tmp_path / "cache")
+    assert store.trusted_runtimes() == (set(), set())
+    store.record_trusted_runtimes(
+        detector_runtimes={RUNTIME},
+        classifier_runtimes={CLASSIFIER_RUNTIME},
+    )
+    # Fresh instance reads back the same on-disk trust — this is what
+    # subsequent classify_job / pipeline calls rely on.
+    reread = ArtifactStore(tmp_path / "cache")
+    det, clf = reread.trusted_runtimes()
+    assert det == {RUNTIME}
+    assert clf == {CLASSIFIER_RUNTIME}
+
+    # A second record merges rather than replacing.
+    other_runtime = "a" * 64
+    reread.record_trusted_runtimes(detector_runtimes={other_runtime})
+    det, clf = ArtifactStore(tmp_path / "cache").trusted_runtimes()
+    assert det == {RUNTIME, other_runtime}
+    assert clf == {CLASSIFIER_RUNTIME}
+
+    # Malformed fingerprints are silently dropped — record_trusted_runtimes
+    # only persists lowercase SHA-256s so a corrupted trust.json can never
+    # widen the whitelist to arbitrary strings.
+    reread.record_trusted_runtimes(detector_runtimes={"not-a-hash"})
+    det, _ = ArtifactStore(tmp_path / "cache").trusted_runtimes()
+    assert "not-a-hash" not in det
+
+
+def test_materialize_local_store_honors_persisted_trust(tmp_path):
+    """A bundle imported before the photo exists still lands on rescan."""
+    destination, _folder_id, _photo_id = _database_with_photo(
+        tmp_path / "destination.db", "photo.jpg",
+    )
+    destination.upsert_labels_fingerprint(
+        "3" * 12, "Test labels", [], 1, full_fingerprint="3" * 64,
+    )
+    store = ArtifactStore(tmp_path / "cache")
+    # Publish detector + classifier artifacts into the store as an import
+    # would, then record the trust decision the API endpoint takes.
+    for artifact in (detection_artifact(), classification_artifact()):
+        store.put(artifact)
+    store.record_trusted_runtimes(
+        detector_runtimes={RUNTIME},
+        classifier_runtimes={CLASSIFIER_RUNTIME},
+    )
+
+    # No per-call known_runtimes supplied — mirrors the run_classify_job /
+    # pipeline_job flow where nothing about the bundle's trust survived
+    # the original import HTTP call.
+    applied = materialize_local_store(destination, store=store)
+    assert applied["detector_runs_applied"] == 1
+    assert applied["classifier_runs_applied"] == 1
+
+    # Without persisted trust, the same store would have quarantined both.
+    fresh_store = ArtifactStore(tmp_path / "cache-untrusted")
+    for artifact in (detection_artifact(), classification_artifact()):
+        fresh_store.put(artifact)
+    destination2, _f, _p = _database_with_photo(
+        tmp_path / "destination2.db", "photo.jpg",
+    )
+    destination2.upsert_labels_fingerprint(
+        "3" * 12, "Test labels", [], 1, full_fingerprint="3" * 64,
+    )
+    untrusted = materialize_local_store(destination2, store=fresh_store)
+    assert untrusted["detector_runs_applied"] == 0
+    assert untrusted["classifier_runs_applied"] == 0

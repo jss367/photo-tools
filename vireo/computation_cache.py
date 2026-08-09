@@ -712,6 +712,89 @@ class ArtifactStore:
                 continue
         return {"object_count": count, "total_bytes": total}
 
+    @property
+    def trust_path(self):
+        return self.root / "trust.json"
+
+    def trusted_runtimes(self):
+        """Return (detector, classifier) runtime fingerprints trusted by this store.
+
+        Populated by ``record_trusted_runtimes`` when the user imports a
+        bundle. Later ``materialize_local_store`` calls read this file so
+        bundles imported before their matching photos landed still plant
+        once the photos are cataloged — the import-time whitelist was
+        one-shot per HTTP request and could not reach the later reapply.
+        """
+        path = self.trust_path
+        try:
+            body = path.read_bytes()
+        except FileNotFoundError:
+            return set(), set()
+        except OSError:
+            return set(), set()
+        try:
+            data = json.loads(body)
+        except (ValueError, json.JSONDecodeError):
+            return set(), set()
+        if not isinstance(data, dict):
+            return set(), set()
+        detector = {
+            value for value in (data.get("detector_runtimes") or [])
+            if _is_sha256(value)
+        }
+        classifier = {
+            value for value in (data.get("classifier_runtimes") or [])
+            if _is_sha256(value)
+        }
+        return detector, classifier
+
+    def record_trusted_runtimes(
+        self, detector_runtimes=None, classifier_runtimes=None,
+    ):
+        """Merge runtime fingerprints into the persisted trust set.
+
+        An explicit bundle import is a trust action for the runtimes the
+        user chose to accept. Persisting them lets subsequent
+        ``materialize_local_store`` calls plant matching artifacts whose
+        photos hadn't been cataloged at import time.
+        """
+        detector = {
+            value for value in (detector_runtimes or ())
+            if _is_sha256(value)
+        }
+        classifier = {
+            value for value in (classifier_runtimes or ())
+            if _is_sha256(value)
+        }
+        if not detector and not classifier:
+            return
+        existing_det, existing_clf = self.trusted_runtimes()
+        merged_det = sorted(existing_det | detector)
+        merged_clf = sorted(existing_clf | classifier)
+        if (
+            set(merged_det) == existing_det
+            and set(merged_clf) == existing_clf
+        ):
+            return
+        payload = {
+            "detector_runtimes": merged_det,
+            "classifier_runtimes": merged_clf,
+        }
+        self.root.mkdir(parents=True, exist_ok=True)
+        body = canonical_bytes(payload)
+        fd, temp_name = tempfile.mkstemp(
+            prefix=".trust-", suffix=".json", dir=self.root,
+        )
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(body)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp_name, self.trust_path)
+        finally:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(temp_name)
+
 
 def write_bundle(destination, artifacts, device_label=None):
     """Atomically write a validated `.vireo-cache` ZIP bundle."""
@@ -1526,8 +1609,23 @@ def materialize_artifacts(
 def materialize_local_store(
     db, store=None, known_runtimes=None, known_classifier_runtimes=None,
 ):
-    """Apply stored objects that match the catalog's current photo hashes."""
+    """Apply stored objects that match the catalog's current photo hashes.
+
+    Runtime fingerprints previously recorded via
+    ``ArtifactStore.record_trusted_runtimes`` are unioned into the
+    ``known_runtimes`` / ``known_classifier_runtimes`` sets so that
+    artifacts whose photos were cataloged after their import bundle
+    landed still plant on the next call — the import-time whitelist was
+    scoped to one HTTP request and could not reach the later reapply.
+    """
     store = store or ArtifactStore()
+    persisted_det, persisted_clf = store.trusted_runtimes()
+    if persisted_det:
+        known_runtimes = set(known_runtimes or ()) | persisted_det
+    if persisted_clf:
+        known_classifier_runtimes = (
+            set(known_classifier_runtimes or ()) | persisted_clf
+        )
     artifacts = [artifact for _digest, artifact in (store.iter_artifacts() or ())]
     if not artifacts:
         return {

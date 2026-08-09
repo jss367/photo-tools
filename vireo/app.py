@@ -16666,7 +16666,8 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         if upload is None or not upload.filename:
             return json_error("a .vireo-cache file is required", status=400)
         try:
-            imported = import_bundle(upload.stream, _computation_store())
+            store = _computation_store()
+            imported = import_bundle(upload.stream, store)
             # An explicit user-initiated import is a trust action for the
             # runtimes this bundle carries: quarantine gates for unknown
             # detector/classifier runtimes exist to keep drive-by
@@ -16684,6 +16685,16 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 for artifact in imported["artifacts"]
                 if artifact.get("type") == "classification"
             }
+            # Persist the trust so later materialize_local_store calls
+            # from run_classify_job / the pipeline accept these runtimes
+            # too. Without persistence, a bundle imported before its
+            # matching photos are cataloged would leave those artifacts
+            # quarantined forever — the one-shot whitelist below only
+            # covers this HTTP call.
+            store.record_trusted_runtimes(
+                detector_runtimes=detector_rts,
+                classifier_runtimes=classifier_rts,
+            )
             applied = materialize_artifacts(
                 _get_db(), imported["artifacts"],
                 known_runtimes=detector_rts,

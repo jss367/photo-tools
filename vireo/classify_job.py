@@ -2079,6 +2079,146 @@ def _finalize_remaining_steps(runner, job_id, step_ids, status, summary):
         runner.update_step(job_id, step_id, status=status, summary=summary)
 
 
+def _finalize_cached_only(
+    thread_db, runner, job, params, photos,
+    classifier_model, labels_fingerprint,
+):
+    """Reconcile imported classifier results without loading a model.
+
+    ``_all_photos_cache_satisfied`` proves every detection already has a
+    matching classifier_run row, so no inference is needed. But those
+    rows still carry ``category='new'`` from the materialize path and
+    lack burst grouping metadata — the ordinary finalize path
+    (``_store_grouped_predictions``) performs auto-match reconciliation
+    against destination XMP/taxonomy and stamps group_id / vote counts.
+    Skipping it silently leaves imported predictions unreconciled, which
+    is why the earlier early-return "success" was actually a bug.
+
+    Returns the count dict ``run_classify_job`` returns to the runner.
+    """
+    from datetime import datetime as dt
+
+    from taxonomy import load_local_taxonomy
+
+    total = len(photos)
+
+    runner.update_step(job["id"], "load_taxonomy", status="running")
+    tax = load_local_taxonomy()
+    runner.update_step(
+        job["id"], "load_taxonomy",
+        status="completed",
+        summary="Taxonomy loaded" if tax else "No taxonomy",
+    )
+    _finalize_remaining_steps(
+        runner, job["id"], ["load_model", "detect"],
+        status="completed", summary="Reused cached results",
+    )
+
+    folders = {f["id"]: f["path"] for f in thread_db.get_folder_tree()}
+    photo_ids = [p["id"] for p in photos]
+    detection_map = thread_db.get_detections_for_photos(photo_ids, min_conf=0)
+
+    runner.update_step(job["id"], "classify", status="running")
+
+    raw_results = []
+    resolved_model = classifier_model
+    resolved_fingerprint = labels_fingerprint
+    reused_predictions = 0
+    for photo in photos:
+        folder_path = folders.get(photo["folder_id"], "")
+        image_path = os.path.join(folder_path, photo["filename"])
+        timestamp = None
+        if photo["timestamp"]:
+            try:
+                timestamp = dt.fromisoformat(photo["timestamp"])
+            except Exception:
+                timestamp = None
+        for detection in detection_map.get(photo["id"], []):
+            cached = thread_db.get_predictions_for_detection(
+                detection["id"],
+                classifier_model=classifier_model,
+                labels_fingerprint=labels_fingerprint,
+                min_classifier_conf=0,
+            )
+            if not cached:
+                continue
+            top = cached[0]
+            # When the caller didn't request a specific (model, fp), the
+            # satisfaction check accepts any classifier's cached row.
+            # Adopt the first cached row's identity so the reconcile
+            # UPDATE below hits the same rows we consumed from — passing
+            # None here would leave the reconcile matching zero rows.
+            if resolved_model is None:
+                resolved_model = top["classifier_model"]
+            if resolved_fingerprint is None:
+                resolved_fingerprint = top["labels_fingerprint"]
+            raw_results.append({
+                "photo": photo,
+                "detection_id": detection["id"],
+                "folder_path": folder_path,
+                "image_path": image_path,
+                "prediction": top["species"],
+                "confidence": top["confidence"],
+                "timestamp": timestamp,
+                "filename": photo["filename"],
+                "embedding": None,
+                "taxonomy": None,
+                "alternatives": [],
+                "_existing": True,
+            })
+            reused_predictions += 1
+    runner.update_step(
+        job["id"], "classify",
+        status="completed",
+        summary=(
+            f"{reused_predictions} cached"
+            if reused_predictions else "No cached predictions"
+        ),
+    )
+
+    runner.update_step(job["id"], "finalize", status="running")
+    runner.push_event(
+        job["id"], "progress",
+        {
+            "current": total,
+            "total": total,
+            "current_file": "Grouping bursts and computing consensus...",
+            "rate": 0,
+            "phase": "Finalizing results",
+        },
+    )
+    group_result = _store_grouped_predictions(
+        raw_results=raw_results,
+        job_id=job["id"],
+        model_name=resolved_model,
+        grouping_window=params.grouping_window,
+        similarity_threshold=params.similarity_threshold,
+        tax=tax,
+        db=thread_db,
+        labels_fingerprint=resolved_fingerprint or "legacy",
+    )
+    finalize_parts = [f"{group_result['predictions_stored']} predictions"]
+    if group_result["burst_groups"]:
+        finalize_parts.append(f"{group_result['burst_groups']} burst groups")
+    if group_result["already_labeled"]:
+        finalize_parts.append(
+            f"{group_result['already_labeled']} already labeled"
+        )
+    runner.update_step(
+        job["id"], "finalize",
+        status="completed", summary=", ".join(finalize_parts),
+    )
+    return {
+        "total": total,
+        "predictions_stored": group_result["predictions_stored"],
+        "burst_groups": group_result["burst_groups"],
+        "already_classified": reused_predictions,
+        "already_labeled": group_result["already_labeled"],
+        "detected": 0,
+        "failed": 0,
+    }
+
+
 def run_classify_job(job, runner, db_path, workspace_id, params, vireo_dir=None):
     """Execute classification job. Called by JobRunner in a background thread.
 
@@ -2284,6 +2424,12 @@ def run_classify_job(job, runner, db_path, workspace_id, params, vireo_dir=None)
         desired_classifier_model = None
         desired_labels_fingerprint = None
         peek_model = None
+        # ``model_id_missing`` distinguishes "the requested model really is
+        # gone from the catalog" (a stale job referencing a deleted model)
+        # from a transient ``get_models()`` failure. The catch-all below
+        # nulls out the transient case; a bare miss stays flagged so we
+        # can raise the definitive error before the cache shortcut.
+        model_id_missing = False
         try:
             if params.model_id:
                 peek_model = next(
@@ -2300,6 +2446,8 @@ def run_classify_job(job, runner, db_path, workspace_id, params, vireo_dir=None)
                     desired_classifier_model = (
                         params.model_name or peek_model.get("name")
                     )
+                else:
+                    model_id_missing = True
             elif params.model_name:
                 desired_classifier_model = params.model_name
                 peek_model = next(
@@ -2318,6 +2466,17 @@ def run_classify_job(job, runner, db_path, workspace_id, params, vireo_dir=None)
         except Exception:
             desired_classifier_model = None
             peek_model = None
+            model_id_missing = False
+
+        # An unknown model_id must never fall through to the cache
+        # shortcut. Without this, ``desired_classifier_model`` stays
+        # ``None`` and ``_all_photos_cache_satisfied`` accepts runs from
+        # any classifier, silently reporting success for a request that
+        # would otherwise raise "not found or not downloaded" below.
+        if model_id_missing:
+            raise RuntimeError(
+                f"Model '{params.model_id}' not found or not downloaded."
+            )
         # Compute labels_fingerprint from the user-selected label sources
         # so a cache built from a DIFFERENT label set does not silently
         # pass as satisfied.  Uses the same _load_labels path that later
@@ -2349,22 +2508,15 @@ def run_classify_job(job, runner, db_path, workspace_id, params, vireo_dir=None)
                 "Classify job: every photo has cached classifier runs — "
                 "skipping model resolution and detection",
             )
-            _finalize_remaining_steps(
-                runner, job["id"],
-                ["load_taxonomy", "load_model", "detect", "classify",
-                 "finalize"],
-                status="completed",
-                summary="Reused cached classification results",
+            # Route reused rows through the ordinary finalize path so
+            # imported predictions get auto-match reconciliation against
+            # destination XMP/taxonomy and burst grouping metadata, which
+            # the earlier early-return silently skipped.
+            return _finalize_cached_only(
+                thread_db, runner, job, params, photos,
+                classifier_model=desired_classifier_model,
+                labels_fingerprint=desired_labels_fingerprint,
             )
-            return {
-                "total": total,
-                "predictions_stored": 0,
-                "burst_groups": 0,
-                "already_classified": total,
-                "already_labeled": 0,
-                "detected": 0,
-                "failed": 0,
-            }
 
         # Resolve model (deferred until we know there is work to do)
         if params.model_id:

@@ -441,6 +441,48 @@ def test_computation_cache_http_export_and_import(app_and_db, tmp_path, monkeypa
     ).fetchone()["runtime_fingerprint"] == RUNTIME
 
 
+def test_classification_only_export_forwards_stored_detector_dependencies(
+    app_and_db, tmp_path, monkeypatch,
+):
+    """``exportable_artifacts`` dependency-closes its output so classifier
+    exports always drag their detector dependencies along.  The HTTP
+    route must mirror that expansion for the local object store too —
+    otherwise detector artifacts forwarded from ``iter_artifacts`` (e.g.
+    imports whose photos were not yet cataloged when they landed) get
+    dropped whenever the user picks only "Species classification", and a
+    destination without the detector run has to reproduce detection from
+    weights it may not have.
+    """
+    import computation_cache
+
+    app, _db = app_and_db
+    monkeypatch.setattr(
+        computation_cache, "megadetector_runtime_fingerprint",
+        lambda *_args, **_kwargs: RUNTIME,
+    )
+    store_dir = tmp_path / "http-store"
+    app.config["COMPUTATION_CACHE_DIR"] = str(store_dir)
+
+    # Plant a detection artifact directly in the local object store — this
+    # is exactly the shape ``iter_artifacts`` returns for objects imported
+    # before their photos were cataloged.
+    store = computation_cache.ArtifactStore(store_dir)
+    detection = detection_artifact()
+    store.put(detection)
+
+    response = app.test_client().get(
+        "/api/computation-cache/export?types=classification",
+    )
+    assert response.status_code == 200
+    _manifest, artifacts = read_bundle(io.BytesIO(response.data))
+    detection_types = [a["type"] for a in artifacts if a["type"] == "detection"]
+    assert detection_types, (
+        "classification-only export must forward detector artifacts from the "
+        "local object store so the destination can materialize the classifier "
+        "runs without loading detector weights"
+    )
+
+
 def test_computation_cache_http_rejects_invalid_bundle(app_and_db, tmp_path):
     app, _db = app_and_db
     store_root = tmp_path / "http-store"
@@ -521,6 +563,40 @@ def test_fresh_classifier_run_is_promoted_and_published(tmp_path):
     artifacts, summary = exportable_artifacts(source)
     assert summary["classifier_runs"] == 1
     assert any(item["type"] == "classification" for item in artifacts)
+
+
+def test_tree_of_life_sentinel_short_fingerprint_is_accepted():
+    """Tree-of-Life classification uses the well-known ``tol`` sentinel as
+    the classifier_runs short key (compute_fingerprint([]) → "tol") while
+    classify/pipeline jobs synthesize a portable 64-char labels.fingerprint
+    from the classifier identity. The digest-prefix rule that guards other
+    label sets must not reject this synthetic identity — otherwise
+    ``promote_and_publish_classifier_run`` marks the row portable and then
+    fails to publish, and a later default export returns 400.
+    """
+    from labels_fingerprint import TOL_SENTINEL
+
+    artifact = classification_artifact()
+    artifact["labels"]["fingerprint"] = "a" * 64
+    artifact["labels"]["short_fingerprint"] = TOL_SENTINEL
+    assert (
+        validate_artifact(artifact)["labels"]["short_fingerprint"]
+        == TOL_SENTINEL
+    )
+
+
+def test_non_tol_short_fingerprint_that_does_not_match_full_is_rejected():
+    """The TOL exemption must not weaken the guard for arbitrary short keys.
+    A crafted bundle claiming ``short_fingerprint="legacy"`` — which
+    matches the historical placeholder for pre-migration rows — with a
+    mismatched full digest would still be able to replace unreviewed
+    predictions on a legacy row under a foreign label set.
+    """
+    artifact = classification_artifact()
+    artifact["labels"]["fingerprint"] = "b" * 64
+    artifact["labels"]["short_fingerprint"] = "legacy"
+    with pytest.raises(CacheFormatError, match="first 12 chars"):
+        validate_artifact(artifact)
 
 
 def test_labels_count_out_of_sqlite_int64_range_is_rejected():

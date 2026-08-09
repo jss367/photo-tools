@@ -16614,6 +16614,15 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
 
         requested = request.args.get("types", "detection,classification")
         artifact_types = {part.strip() for part in requested.split(",") if part.strip()}
+        # exportable_artifacts dependency-closes the copy set — a classifier
+        # export always drags its detector dependencies along.  Mirror that
+        # expansion here so detector artifacts forwarded from the local
+        # object store (e.g. imports whose photos were not yet cataloged
+        # when they landed) travel with the classifications that reference
+        # them; otherwise the destination has to reproduce detection from
+        # model weights it may not have.
+        if "classification" in artifact_types:
+            artifact_types = artifact_types | {"detection"}
         try:
             database_artifacts, summary = exportable_artifacts(
                 _get_db(), artifact_types=artifact_types,

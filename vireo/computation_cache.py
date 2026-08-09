@@ -604,7 +604,16 @@ def validate_artifact(artifact):
         # arbitrary short key would let a crafted bundle claim an unrelated
         # historical row (e.g. a legacy row with full_fingerprint IS NULL)
         # and replace its unreviewed predictions under a foreign label set.
-        if short != full_fp[:12]:
+        #
+        # Tree-of-Life mode is the documented exception: compute_fingerprint([])
+        # returns the "tol" sentinel as the classifier_runs short key, while
+        # classify_job synthesizes a portable 64-char labels.fingerprint from
+        # the classifier identity.  The sentinel is a well-known constant, not
+        # attacker-controlled, and cannot impersonate a legacy row (whose short
+        # key is "legacy"), so exempt it from the digest-prefix check.
+        from labels_fingerprint import TOL_SENTINEL
+
+        if short != TOL_SENTINEL and short != full_fp[:12]:
             raise CacheFormatError(
                 "labels.short_fingerprint must be the first 12 chars of labels.fingerprint"
             )

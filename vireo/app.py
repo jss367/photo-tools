@@ -2014,7 +2014,7 @@ def _trash_via_finder(filepaths, timeout=_FINDER_TRASH_TIMEOUT_SECS):
     else:
         filepaths = [os.fspath(path) for path in filepaths]
     if not filepaths:
-        return 0, set(), []
+        return set(), set(), []
     result = subprocess.run(
         [
             "osascript",

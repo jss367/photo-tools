@@ -3790,6 +3790,22 @@ def test_trash_via_finder_guarded_off_mac(monkeypatch):
     assert called == [], "osascript must not be spawned off macOS"
 
 
+def test_trash_via_finder_empty_input_returns_empty_sets(monkeypatch):
+    """The no-op result preserves the per-path outcome tuple contract."""
+    import app as app_module
+
+    monkeypatch.setattr(app_module.sys, "platform", "darwin")
+
+    def unexpected_run(*args, **kwargs):
+        raise AssertionError("empty input must not spawn Finder")
+
+    monkeypatch.setattr(
+        app_module.subprocess, "run", unexpected_run,
+    )
+
+    assert app_module._trash_via_finder([]) == (set(), set(), [])
+
+
 def test_trash_via_finder_batches_paths_and_sets_timeout(monkeypatch):
     """Finder uses one bounded process and reconciles per-path outcomes."""
     import types
@@ -4385,7 +4401,10 @@ def test_trash_paths_rejects_success_when_mount_replaced_by_local_fs(
             if os.path.normpath(target) == os.path.normpath(str(mount_root)):
                 class _Shifted:
                     st_dev = baseline_dev + 1
-                    st_mode = result.st_mode
+
+                    def __getattr__(self, name):
+                        return getattr(result, name)
+
                 return _Shifted()
             return result
 
@@ -4627,8 +4646,8 @@ def test_trash_paths_reuses_one_mount_recheck_per_finder_batch(
     """A retry containing many paths already moved by an earlier timed-out
     Finder call comes back with every path in Finder's ``missing`` set.
     Re-running ``_network_volume_roots`` per path would spawn one ``mount``
-    subprocess per path — a 20-item batch could burn up to
-    ``_MOUNT_QUERY_TIMEOUT_SECS`` × 20 seconds in the worst case, undoing
+    subprocess per path — a full batch could multiply the mount timeout
+    by the number of paths in the worst case, undoing
     the bounded batch behaviour this code is supposed to guarantee. The
     recheck must happen at most once per Finder batch.
     """
@@ -4636,7 +4655,10 @@ def test_trash_paths_reuses_one_mount_recheck_per_finder_batch(
 
     volume = tmp_path / "SMB_Share"
     volume.mkdir()
-    photos = [str(volume / f"bird-{i:02d}.NEF") for i in range(20)]
+    batch_size = app_module._FINDER_TRASH_BATCH_SIZE
+    photos = [
+        str(volume / f"bird-{i:02d}.NEF") for i in range(batch_size)
+    ]
 
     monkeypatch.setattr(app_module.sys, "platform", "darwin")
     monkeypatch.setattr(
@@ -4678,11 +4700,13 @@ def test_trash_paths_reuses_one_mount_recheck_per_finder_batch(
     assert moved == 0
     assert successful == set(photos)
     assert failures == []
-    # One classification call at the top of _trash_paths + one recheck for
-    # the single Finder batch. Never one-per-path.
-    assert len(mount_call_paths) == 2
+    expected_batches = (len(photos) + batch_size - 1) // batch_size
+    # One classification call at the top of _trash_paths + one recheck per
+    # Finder batch. Never one-per-path.
+    assert len(mount_call_paths) == 1 + expected_batches
+    assert len(photos) > 2
     # Reachability probe runs once per relevant mount root per batch —
-    # a 20-path retry all under the same root must not spawn per-path
+    # a full-batch retry under the same root must not spawn per-path
     # ``stat`` subprocesses either, else this bounded-batch guarantee
     # falls back to O(N) subprocess launches under the mount timeout.
     assert reachability_calls == [str(volume)]

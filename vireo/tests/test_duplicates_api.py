@@ -499,10 +499,14 @@ def test_delete_loser_files_skips_isfile_preflight_on_network_paths(
 
     trash_calls = []
 
-    def record_trash(paths, progress_callback=None, already_missing_out=None):
+    def record_trash(
+        paths, progress_callback=None, already_missing_out=None,
+        network_roots=None,
+    ):
         trash_calls.append(list(paths))
         for path in paths:
-            real_isfile(path) and os.remove(path)
+            if real_isfile(path):
+                os.remove(path)
         return len(paths), set(paths), []
 
     monkeypatch.setattr(app_module, "_trash_paths", record_trash)
@@ -556,6 +560,7 @@ def test_delete_loser_files_reports_already_missing_network_losers_as_skipped(
     # ``moved`` is zero, and ``already_missing_out`` is populated.
     def already_missing_trash(
         paths, progress_callback=None, already_missing_out=None,
+        network_roots=None,
     ):
         paths = list(paths)
         if already_missing_out is not None:
@@ -578,6 +583,7 @@ def test_delete_loser_files_reports_already_missing_network_losers_as_skipped(
         s["id"] == l and s["reason"] == "file already missing"
         for s in body["skipped"]
     ), body
+    assert body["trashed"] == 0
     assert body["failed"] == []
     # DB row is dropped so the disk-cleanup-summary count reflects it.
     assert db.conn.execute(

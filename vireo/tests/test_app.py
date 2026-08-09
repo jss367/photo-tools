@@ -4527,6 +4527,107 @@ def test_trash_paths_rejects_finder_missing_when_local_parent_device_drifts(
     assert [f["path"] for f in failures] == [str(photo)]
 
 
+def test_trash_paths_reuses_one_mount_recheck_per_finder_batch(
+    monkeypatch, tmp_path,
+):
+    """A retry containing many paths already moved by an earlier timed-out
+    Finder call comes back with every path in Finder's ``missing`` set.
+    Re-running ``_network_volume_roots`` per path would spawn one ``mount``
+    subprocess per path — a 20-item batch could burn up to
+    ``_MOUNT_QUERY_TIMEOUT_SECS`` × 20 seconds in the worst case, undoing
+    the bounded batch behaviour this code is supposed to guarantee. The
+    recheck must happen at most once per Finder batch.
+    """
+    import app as app_module
+
+    volume = tmp_path / "SMB_Share"
+    volume.mkdir()
+    photos = [str(volume / f"bird-{i:02d}.NEF") for i in range(20)]
+
+    monkeypatch.setattr(app_module.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        app_module, "_volume_root_for_path", lambda _p: str(volume),
+    )
+
+    mount_call_paths = []
+    original_volume_set = {str(volume)}
+
+    def counting_mount_query():
+        mount_call_paths.append("call")
+        return original_volume_set
+
+    monkeypatch.setattr(
+        app_module, "_network_volume_roots", counting_mount_query,
+    )
+
+    def finder_reports_missing(paths):
+        return set(), set(paths), []
+
+    monkeypatch.setattr(app_module, "_trash_via_finder", finder_reports_missing)
+
+    moved, successful, failures = app_module._trash_paths(photos)
+
+    assert moved == 0
+    assert successful == set(photos)
+    assert failures == []
+    # One classification call at the top of _trash_paths + one recheck for
+    # the single Finder batch. Never one-per-path.
+    assert len(mount_call_paths) == 2
+
+
+def test_trash_paths_exposes_already_missing_paths_via_out_parameter(
+    monkeypatch, tmp_path,
+):
+    """Callers surface "already missing" as a distinct terminal state (the
+    duplicate-cleanup endpoint reports it as ``skipped`` with reason
+    "file already missing"). ``_trash_paths`` must therefore be able to
+    tell those apart from paths it actually trashed — a bare
+    ``successful`` set can't, because both moved-to-Trash paths and
+    already-gone paths belong there. When an ``already_missing_out`` set
+    is passed, the function populates it with any path treated as
+    successful because the end state already held.
+    """
+    import app as app_module
+
+    volume = tmp_path / "SMB_Share"
+    volume.mkdir()
+    live_photo = volume / "live.NEF"
+    already_gone = str(volume / "gone.NEF")
+
+    monkeypatch.setattr(app_module.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        app_module, "_volume_root_for_path", lambda _p: str(volume),
+    )
+    monkeypatch.setattr(
+        app_module, "_network_volume_roots", lambda: {str(volume)},
+    )
+
+    def finder_returns_mixed(paths):
+        moved = set()
+        missing = set()
+        for path in paths:
+            if path == str(live_photo):
+                moved.add(path)
+            else:
+                missing.add(path)
+        return moved, missing, []
+
+    monkeypatch.setattr(app_module, "_trash_via_finder", finder_returns_mixed)
+
+    already_missing = set()
+    moved, successful, failures = app_module._trash_paths(
+        [str(live_photo), already_gone],
+        already_missing_out=already_missing,
+    )
+
+    # The Finder-moved path counts as trashed; the missing one is a
+    # successful-but-already-gone terminal state.
+    assert moved == 1
+    assert successful == {str(live_photo), already_gone}
+    assert failures == []
+    assert already_missing == {already_gone}
+
+
 def test_navbar_js_fallbacks_match_python_constants():
     """The hardcoded fallback lists in _navbar.html must mirror the
     canonical Python lists. The navbar's JS uses these fallbacks when

@@ -499,7 +499,7 @@ def test_delete_loser_files_skips_isfile_preflight_on_network_paths(
 
     trash_calls = []
 
-    def record_trash(paths, progress_callback=None):
+    def record_trash(paths, progress_callback=None, already_missing_out=None):
         trash_calls.append(list(paths))
         for path in paths:
             real_isfile(path) and os.remove(path)
@@ -521,6 +521,65 @@ def test_delete_loser_files_skips_isfile_preflight_on_network_paths(
     # have failed the test otherwise.
     assert trash_calls == [[loser_path]]
     # DB row was still dropped so the summary count reflects the delete.
+    assert db.conn.execute(
+        "SELECT 1 FROM photos WHERE id=?", (l,),
+    ).fetchone() is None
+
+
+def test_delete_loser_files_reports_already_missing_network_losers_as_skipped(
+    app_and_db, tmp_path, monkeypatch,
+):
+    """A network loser that is already absent on the still-mounted share must
+    produce an explicit terminal outcome. Without preserving the "file
+    already missing" signal, ``_trash_paths`` would return the path in
+    ``successful`` with ``trashed=0`` and the endpoint would answer
+    ``{trashed: 0, skipped: [], failed: []}`` — the UI's
+    ``trashOneLoserFile`` has no matching branch and the card stays stuck
+    on "Moving to Trash..." even though cleanup finished.
+    """
+    import os
+
+    import app as app_module
+
+    app, db = app_and_db
+    _w, l, _wp, loser_path = _seed_pair_with_real_files(db, tmp_path, "NETMISS")
+
+    # Advertise the loser's folder as a network mount so the endpoint
+    # routes it through _trash_paths without stat'ing it first.
+    volume_root = os.path.dirname(loser_path)
+    monkeypatch.setattr(
+        app_module, "_network_volume_roots", lambda: {volume_root},
+    )
+
+    # Real _trash_paths behaviour when Finder reports "missing" for a
+    # still-mounted network volume: path lands in ``successful`` but
+    # ``moved`` is zero, and ``already_missing_out`` is populated.
+    def already_missing_trash(
+        paths, progress_callback=None, already_missing_out=None,
+    ):
+        paths = list(paths)
+        if already_missing_out is not None:
+            already_missing_out.update(paths)
+        return 0, set(paths), []
+
+    monkeypatch.setattr(app_module, "_trash_paths", already_missing_trash)
+
+    client = app.test_client()
+    resp = client.post(
+        "/api/duplicates/delete-loser-files",
+        json={"photo_ids": [l]},
+    )
+    assert resp.status_code == 200
+    body = resp.get_json()
+    # The endpoint surfaces the terminal state as "file already missing"
+    # (same wording as the local branch) — the UI has a matching case
+    # that clears "Moving to Trash..." and the card is no longer stuck.
+    assert any(
+        s["id"] == l and s["reason"] == "file already missing"
+        for s in body["skipped"]
+    ), body
+    assert body["failed"] == []
+    # DB row is dropped so the disk-cleanup-summary count reflects it.
     assert db.conn.execute(
         "SELECT 1 FROM photos WHERE id=?", (l,),
     ).fetchone() is None

@@ -1998,7 +1998,7 @@ def _path_confirmed_gone(filepath, expected_parent_dev=None):
     )
 
 
-def _trash_paths(filepaths, progress_callback=None):
+def _trash_paths(filepaths, progress_callback=None, already_missing_out=None):
     """Move paths to Trash and return ``(moved, successful, failures)``.
 
     Missing paths are successful (the requested end state already holds) but
@@ -2008,6 +2008,14 @@ def _trash_paths(filepaths, progress_callback=None):
     go directly to the time-bounded Finder subprocess. Remaining paths use
     send2trash individually so failures can be attributed, then one Finder
     process per bounded batch.
+
+    ``already_missing_out``, when a mutable set, is populated with every
+    path treated as successful because the requested end state already
+    held (local preflight found it absent, or Finder reported it missing
+    on a still-mounted volume). Callers surface those to users as
+    "already missing" rather than as trashed, so a duplicate-cleanup that
+    finds every loser already gone can return an explicit terminal
+    result instead of a silent ``{trashed: 0}``.
     """
     ordered = list(dict.fromkeys(filepaths))
     successful = set()
@@ -2062,6 +2070,8 @@ def _trash_paths(filepaths, progress_callback=None):
             if _path_confirmed_gone(filepath, parent_devs.get(filepath)):
                 log.warning("File already missing: %s", filepath)
                 successful.add(filepath)
+                if already_missing_out is not None:
+                    already_missing_out.add(filepath)
             else:
                 preflight_errors[filepath] = (
                     "Source path is unreachable"
@@ -2107,7 +2117,7 @@ def _trash_paths(filepaths, progress_callback=None):
                 else:
                     report_processed(filepath)
 
-    def _finder_missing_is_trustworthy(filepath):
+    def _finder_missing_is_trustworthy(filepath, current_network_roots):
         """Reject Finder's "missing" outcome when the underlying mount is gone.
 
         Finder reports "missing" when ``sourceExists=false`` but
@@ -2117,20 +2127,23 @@ def _trash_paths(filepaths, progress_callback=None):
         silently detached mount. Accepting "missing" in that case would
         prune the catalog row for a photo that reappears on remount.
 
-        For network-classified paths we re-query the kernel mount table
-        (bounded by ``_MOUNT_QUERY_TIMEOUT_SECS``) and require the path to
-        still resolve to a listed network root. For local fallbacks we
-        reuse the parent-device snapshot check that guards the send2trash
-        path already.
+        For network-classified paths we require the mount table (already
+        re-queried once per Finder batch by the caller and passed in via
+        ``current_network_roots``) to still list a root the path resolves
+        into. Doing the recheck per batch instead of per path stops a
+        single retry of many already-moved paths from spawning up to one
+        ``mount`` subprocess per path — a 20-item batch could otherwise
+        wait up to ``_MOUNT_QUERY_TIMEOUT_SECS`` × 20 seconds in the worst
+        case. For local fallbacks we reuse the parent-device snapshot
+        check that guards the send2trash path already.
         """
         if filepath in network_finder_candidates:
-            current_roots = _network_volume_roots()
-            if current_roots is None:
-                # Mount discovery failed on the recheck too — we cannot
+            if current_network_roots is None:
+                # Mount discovery failed on the recheck — we cannot
                 # confirm the volume is still mounted, so refuse to trust
                 # "missing" and let the caller retry.
                 return False
-            return _path_on_network_volume(filepath, current_roots)
+            return _path_on_network_volume(filepath, current_network_roots)
         return _path_confirmed_gone(filepath, parent_devs.get(filepath))
 
     for finder_batch in _chunked(
@@ -2142,9 +2155,26 @@ def _trash_paths(filepaths, progress_callback=None):
             )
             moved += len(finder_moved_paths)
             successful.update(finder_moved_paths)
+            # Query the mount table at most once per batch. A retry that
+            # contains many paths already moved by an earlier timed-out
+            # Finder call comes back with every path in ``missing`` — doing
+            # a fresh ``mount`` subprocess per path could otherwise burn up
+            # to ``_MOUNT_QUERY_TIMEOUT_SECS`` × ``len(batch)`` seconds and
+            # undermine the bounded batch behaviour this code establishes.
+            batch_network_missing = any(
+                path in network_finder_candidates
+                for path in finder_missing_paths
+            )
+            batch_network_roots = (
+                _network_volume_roots() if batch_network_missing else None
+            )
             for missing_path in finder_missing_paths:
-                if _finder_missing_is_trustworthy(missing_path):
+                if _finder_missing_is_trustworthy(
+                    missing_path, batch_network_roots,
+                ):
                     successful.add(missing_path)
+                    if already_missing_out is not None:
+                        already_missing_out.add(missing_path)
                 else:
                     send_errors[missing_path] = (
                         "Source path is unreachable"
@@ -22259,14 +22289,27 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 continue
             trash_candidates.append((pid, filepath))
 
+        # Track paths whose end state already held (local preflight found
+        # them absent, or Finder reported them missing on a still-mounted
+        # network volume). Without this the network path would silently
+        # succeed with ``trashed: 0`` and empty ``skipped``/``failed``,
+        # leaving the UI stuck on "Moving to Trash..." — the local branch
+        # already surfaces "file already missing" and the network branch
+        # must match so cleanup is a terminal state either way.
+        already_missing_paths = set()
         trashed, successful_paths, trash_failures = _trash_paths(
             [filepath for _pid, filepath in trash_candidates],
+            already_missing_out=already_missing_paths,
         )
         failure_by_path = {
             failure["path"]: failure for failure in trash_failures
         }
         for pid, filepath in trash_candidates:
             if filepath in successful_paths:
+                if filepath in already_missing_paths:
+                    skipped.append({
+                        "id": pid, "reason": "file already missing",
+                    })
                 trashed_pids.append(pid)
                 continue
             failure = failure_by_path.get(filepath) or {}

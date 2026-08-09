@@ -3936,6 +3936,109 @@ def test_move_to_volume_trash_preserves_committed_rename_after_reported_error(
     assert trashed.read_bytes() == b"raw"
 
 
+def test_network_volume_roots_reads_mount_table_without_resolving_hosts(
+    monkeypatch,
+):
+    """Trash routing only needs mount points, not NAS DNS lookups."""
+    from types import SimpleNamespace
+
+    import app as app_module
+
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append((argv, kwargs))
+        return SimpleNamespace(
+            returncode=0,
+            stdout=(
+                "//user@nas/Photography on /Volumes/Photography "
+                "(smbfs, nodev, nosuid)\n"
+                "/dev/disk4s1 on /Volumes/CARD (exfat, local)\n"
+            ),
+        )
+
+    monkeypatch.setattr(app_module.sys, "platform", "darwin")
+
+    assert app_module._network_volume_roots(run=fake_run) == {
+        "/Volumes/Photography",
+    }
+    assert calls[0][0] == ["mount"]
+    assert calls[0][1]["timeout"] == app_module._MOUNT_QUERY_TIMEOUT_SECS
+
+
+def test_trash_paths_routes_network_volume_directly_to_bounded_finder(
+    monkeypatch, tmp_path,
+):
+    """SMB paths must never reach in-process rename or send2trash calls."""
+    import app as app_module
+    import send2trash
+
+    volume = tmp_path / "Photography"
+    source_dir = volume / "Raw"
+    source_dir.mkdir(parents=True)
+    first = source_dir / "first.NEF"
+    second = source_dir / "second.NEF"
+    first.write_bytes(b"one")
+    second.write_bytes(b"two")
+
+    monkeypatch.setattr(app_module.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        app_module, "_volume_root_for_path", lambda _path: str(volume),
+    )
+    monkeypatch.setattr(
+        app_module, "_network_volume_roots", lambda: {str(volume)},
+    )
+    monkeypatch.setattr(
+        app_module, "_move_to_volume_trash",
+        lambda _path: (_ for _ in ()).throw(
+            AssertionError("network path reached direct rename")
+        ),
+    )
+    monkeypatch.setattr(
+        send2trash, "send2trash",
+        lambda _path: (_ for _ in ()).throw(
+            AssertionError("network path reached send2trash")
+        ),
+    )
+    finder_calls = []
+
+    def finder_trash(paths):
+        finder_calls.append(list(paths))
+        for path in paths:
+            os.remove(path)
+
+    monkeypatch.setattr(app_module, "_trash_via_finder", finder_trash)
+    progress = []
+
+    moved, successful, failures = app_module._trash_paths(
+        [str(first), str(second)],
+        progress_callback=lambda current, total, filename: progress.append(
+            (current, total, filename)
+        ),
+    )
+
+    assert finder_calls == [[str(first), str(second)]]
+    assert moved == 2
+    assert successful == {str(first), str(second)}
+    assert failures == []
+    assert progress == [(1, 2, "first.NEF"), (2, 2, "second.NEF")]
+
+
+def test_network_mount_discovery_failure_avoids_direct_volume_rename(
+    monkeypatch,
+):
+    """Fail closed when the kernel mount table cannot be queried."""
+    import app as app_module
+
+    monkeypatch.setattr(
+        app_module, "_volume_root_for_path", lambda _path: "/Volumes/X",
+    )
+
+    assert app_module._path_on_network_volume(
+        "/Volumes/X/bird.NEF", None,
+    ) is True
+
+
 def test_trash_paths_batches_finder_fallback_and_retains_timeout_failures(
     monkeypatch, tmp_path,
 ):

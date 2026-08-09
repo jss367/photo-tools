@@ -34,6 +34,7 @@ from urllib.parse import quote, urlsplit
 import card_cleanup
 import path_guard
 import places
+import remote_setup
 from db import (
     _LIFE_LIST_ANCESTOR_SUPPRESSION_CLAUSE,
     KEYWORD_TYPES,
@@ -1680,6 +1681,7 @@ def _file_manager_labels():
 
 _FINDER_TRASH_TIMEOUT_SECS = 30
 _FINDER_TRASH_BATCH_SIZE = 20
+_MOUNT_QUERY_TIMEOUT_SECS = 5
 
 
 def _volume_root_for_path(filepath):
@@ -1692,6 +1694,51 @@ def _volume_root_for_path(filepath):
     if len(parts) < 4 or parts[0] != "" or parts[1] != "Volumes" or not parts[2]:
         return None
     return os.sep.join(parts[:3])
+
+
+def _network_volume_roots(run=subprocess.run):
+    """Return mounted macOS network-volume roots without touching the shares.
+
+    ``mount`` reads the kernel mount table, so this stays responsive even when
+    an SMB server is unhealthy.  ``None`` means the mount table could not be
+    read; callers fail closed and treat ``/Volumes`` paths as network-backed
+    rather than risking an unbounded in-process filesystem call.
+    """
+    if sys.platform != "darwin":
+        return set()
+    try:
+        result = run(
+            ["mount"], capture_output=True, text=True,
+            timeout=_MOUNT_QUERY_TIMEOUT_SECS,
+            **no_window_kwargs(),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    return {
+        os.path.normpath(row["mount_point"])
+        for row in remote_setup.parse_mount_output(result.stdout or "")
+    }
+
+
+def _path_on_network_volume(filepath, network_roots):
+    """Whether ``filepath`` should avoid in-process mounted-volume I/O."""
+    volume_root = _volume_root_for_path(filepath)
+    if volume_root is None:
+        return False
+    if network_roots is None:
+        # Mount discovery failed.  Prefer the bounded Finder path for any
+        # mounted volume to an os.replace() that can wedge the server forever.
+        return True
+    normalized = os.path.normpath(os.path.abspath(filepath))
+    for root in network_roots:
+        try:
+            if os.path.commonpath((normalized, root)) == root:
+                return True
+        except ValueError:
+            continue
+    return False
 
 
 def _ensure_volume_trashes_dir(filepath, ensured_volumes):
@@ -1721,13 +1768,15 @@ def _ensure_volume_trashes_dir(filepath, ensured_volumes):
 
 
 def _move_to_volume_trash(filepath):
-    """Move one file directly into its mounted volume's Trash directory.
+    """Move one file directly into a local mounted volume's Trash directory.
 
     Finder ultimately performs a same-volume move into
     ``/Volumes/<name>/.Trashes/<uid>``. Doing that move directly avoids the
-    legacy Carbon ``send2trash`` failure and the multi-second AppleScript
-    round trip seen on SMB/NAS mounts. Returns ``True`` only when the move
-    completed; callers retain their normal trash fallbacks on ``False``.
+    legacy Carbon ``send2trash`` failure on removable drives. Network mounts
+    must be filtered by :func:`_trash_paths` before calling this helper because
+    their rename syscall can block indefinitely. Returns ``True`` only when
+    the move completed; callers retain their normal trash fallbacks on
+    ``False``.
     """
     if sys.platform != "darwin":
         return False
@@ -1818,8 +1867,8 @@ def _trash_via_finder(filepaths, timeout=_FINDER_TRASH_TIMEOUT_SECS):
     ``osascript``) lets the caller surface the original send2trash failure.
 
     A timeout is mandatory because Finder can otherwise wait indefinitely on
-    an unavailable SMB share. Callers verify path existence after any error,
-    since Finder may have completed only part of a batch before failing.
+    an unavailable SMB share. Callers retain catalog rows after any error or
+    timeout, since Finder may have completed only part of a batch.
     """
     if sys.platform != "darwin":
         raise OSError("Finder trash fallback is only available on macOS")
@@ -1901,19 +1950,36 @@ def _path_confirmed_gone(filepath, expected_parent_dev=None):
     )
 
 
-def _trash_paths(filepaths):
+def _trash_paths(filepaths, progress_callback=None):
     """Move paths to Trash and return ``(moved, successful, failures)``.
 
     Missing paths are successful (the requested end state already holds) but
     are not counted as moved. On macOS mounted volumes we try a direct,
-    same-volume rename first. Remaining paths use send2trash individually so
-    failures can be attributed, then one Finder process per bounded batch.
+    same-volume rename first. Network volumes skip all in-process move APIs:
+    an SMB ``rename(2)`` can wait in the kernel indefinitely, so those paths
+    go directly to the time-bounded Finder subprocess. Remaining paths use
+    send2trash individually so failures can be attributed, then one Finder
+    process per bounded batch.
     """
     ordered = list(dict.fromkeys(filepaths))
     successful = set()
     moved = 0
     fallback = []
     preflight_errors = {}
+    finder_candidates = []
+    send_errors = {}
+    network_roots = _network_volume_roots()
+    processed = set()
+
+    def report_processed(filepath):
+        if filepath in processed:
+            return
+        processed.add(filepath)
+        if progress_callback:
+            progress_callback(
+                len(processed), len(ordered), os.path.basename(filepath),
+            )
+
     # Snapshot each parent's st_dev before we touch anything. A network
     # mount that vanishes mid-batch can leave the mount-point directory
     # visible on the underlying local FS, so ``os.path.isdir`` alone would
@@ -1941,15 +2007,23 @@ def _trash_paths(filepaths):
                 log.warning(
                     "Trash preflight: source unreachable for %s", filepath,
                 )
+            report_processed(filepath)
+            continue
+        if _path_on_network_volume(filepath, network_roots):
+            # Finder runs out of process with a hard timeout.  Do not call the
+            # direct os.replace or send2trash paths here: both execute mounted-
+            # volume syscalls inside this server and can pin a worker forever
+            # when macOS is reconnecting an unhealthy SMB share.
+            finder_candidates.append(filepath)
+            send_errors[filepath] = "Network volume Trash operation failed"
             continue
         if _move_to_volume_trash(filepath):
             successful.add(filepath)
             moved += 1
+            report_processed(filepath)
         else:
             fallback.append(filepath)
 
-    finder_candidates = []
-    send_errors = {}
     if fallback:
         from send2trash import send2trash as _trash
         for filepath in fallback:
@@ -1957,6 +2031,7 @@ def _trash_paths(filepaths):
                 _trash(filepath)
                 successful.add(filepath)
                 moved += 1
+                report_processed(filepath)
             except BaseException as exc:
                 if isinstance(exc, (KeyboardInterrupt, GeneratorExit)):
                     raise
@@ -1970,30 +2045,46 @@ def _trash_paths(filepaths):
                 if _path_confirmed_gone(filepath, parent_devs.get(filepath)):
                     successful.add(filepath)
                     moved += 1
+                    report_processed(filepath)
                     continue
                 send_errors[filepath] = str(exc)
                 if sys.platform == "darwin":
                     finder_candidates.append(filepath)
+                else:
+                    report_processed(filepath)
 
     for finder_batch in _chunked(
         finder_candidates, size=_FINDER_TRASH_BATCH_SIZE,
     ):
+        finder_completed = False
         try:
             _trash_via_finder(finder_batch)
+            finder_completed = True
         except subprocess.TimeoutExpired:
             log.warning(
                 "Finder Trash timed out after %ss for %d file(s)",
                 _FINDER_TRASH_TIMEOUT_SECS, len(finder_batch),
             )
-        except Exception:
+            for filepath in finder_batch:
+                send_errors[filepath] = (
+                    f"Finder Trash timed out after "
+                    f"{_FINDER_TRASH_TIMEOUT_SECS}s"
+                )
+        except Exception as exc:
             log.warning("Finder Trash failed for a file batch", exc_info=True)
+            for filepath in finder_batch:
+                send_errors[filepath] = str(exc) or "Finder Trash failed"
         for filepath in finder_batch:
-            # Only accept "gone" when the parent directory is still reachable
-            # AND its device matches the pre-op snapshot; otherwise a stat
-            # against a stale/replaced mount point would read as success.
-            if _path_confirmed_gone(filepath, parent_devs.get(filepath)):
+            # A zero Finder exit status means every requested move completed.
+            # After an error or timeout, retain every catalog row even if
+            # Finder may have moved a prefix of the batch.  Rechecking those
+            # paths here would put the worker straight back into potentially
+            # unbounded SMB stat calls; a retry safely reconciles files that
+            # were already moved.
+            if finder_completed:
                 successful.add(filepath)
                 moved += 1
+            report_processed(filepath)
 
     failures = []
     for filepath in ordered:
@@ -10505,11 +10596,26 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         ))
         emit(disk_phase, 0, len(all_disk_paths))
 
+        disk_paths_finished = 0
+
         def operate(paths_to_change):
+            nonlocal disk_paths_finished
             if not paths_to_change:
                 return 0, set(), []
             if mode == "disk":
-                return _trash_paths(paths_to_change)
+                progress_offset = disk_paths_finished
+
+                def trash_progress(current, _total, filename):
+                    emit(
+                        disk_phase, progress_offset + current,
+                        len(all_disk_paths), filename,
+                    )
+
+                result = _trash_paths(
+                    paths_to_change, progress_callback=trash_progress,
+                )
+                disk_paths_finished += len(paths_to_change)
+                return result
             successful = set()
             failures = []
             removed = 0
@@ -10542,6 +10648,11 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                             "path": filepath,
                             "error": "Source path is unreachable",
                         })
+                    disk_paths_finished += 1
+                    emit(
+                        disk_phase, disk_paths_finished,
+                        len(all_disk_paths), os.path.basename(filepath),
+                    )
                     continue
                 try:
                     os.remove(filepath)
@@ -10553,6 +10664,11 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                         exc_info=True,
                     )
                     failures.append({"path": filepath, "error": str(exc)})
+                disk_paths_finished += 1
+                emit(
+                    disk_phase, disk_paths_finished,
+                    len(all_disk_paths), os.path.basename(filepath),
+                )
             return removed, successful, failures
 
         companion_paths = list(dict.fromkeys(

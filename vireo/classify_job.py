@@ -360,6 +360,15 @@ def _all_photos_cache_satisfied(
     reconciles every other row against it — silently swapping the
     unbound component of the classifier identity on detections covered
     by a different pair.
+
+    A classifier_run row is only counted as covered when at least one
+    matching ``predictions`` row exists.  Local jobs write classifier_runs
+    in ``_record_batch_classifier_runs`` *before* ``_store_grouped_predictions``
+    persists the corresponding prediction rows; if the job crashes or
+    finalization raises in that window, a naive coverage count would still
+    call every detection "covered" and the retry would enter
+    ``_finalize_cached_only`` and report success without repairing the
+    missing prediction rows.
     """
     if not photo_ids:
         return False
@@ -374,6 +383,17 @@ def _all_photos_cache_satisfied(
         filter_sql += " AND cr.labels_fingerprint = ?"
         filter_args.append(labels_fingerprint)
 
+    # Only classifier_runs backed by at least one predictions row count as
+    # cache-satisfying.  See docstring — a classifier_run without matching
+    # predictions is a torn write from a crashed local job, not a
+    # reusable cache row.
+    predictions_exists = (
+        "EXISTS (SELECT 1 FROM predictions pr "
+        "WHERE pr.detection_id = cr.detection_id "
+        "AND pr.classifier_model = cr.classifier_model "
+        "AND pr.labels_fingerprint = cr.labels_fingerprint)"
+    )
+
     total = 0
     covered = 0
     covered_photos = 0
@@ -387,7 +407,9 @@ def _all_photos_cache_satisfied(
         placeholders = ",".join("?" for _ in chunk)
         row = db.conn.execute(
             f"""SELECT COUNT(*) AS total,
-                       SUM(CASE WHEN cr.detection_id IS NOT NULL THEN 1 ELSE 0 END)
+                       SUM(CASE WHEN cr.detection_id IS NOT NULL
+                                 AND {predictions_exists}
+                                THEN 1 ELSE 0 END)
                          AS covered
                  FROM detections d
                  LEFT JOIN classifier_runs cr
@@ -413,13 +435,17 @@ def _all_photos_cache_satisfied(
             # chunk's classifier_runs so the caller can't finalize
             # under a single identity when several are actually
             # present.  We short-circuit as soon as two are seen.
+            # Same predictions-must-exist filter as the coverage
+            # query: a torn classifier_runs row without predictions
+            # is not a real identity that can satisfy the cache.
             for identity_row in db.conn.execute(
                 f"""SELECT DISTINCT cr.classifier_model AS m,
                                     cr.labels_fingerprint AS fp
                      FROM detections d
                      JOIN classifier_runs cr
                        ON cr.detection_id = d.id
-                    WHERE d.photo_id IN ({placeholders})""",
+                    WHERE d.photo_id IN ({placeholders})
+                      AND {predictions_exists}""",
                 list(chunk),
             ):
                 distinct_identities.add(
@@ -1618,8 +1644,17 @@ def _record_batch_classifier_runs(
     (``raw_results[raw_results_start:]``) are tallied. Earlier rows belong to
     prior batches; re-scanning the whole growing list on every flush would
     make the bookkeeping O(n^2) across a large collection. Called after
-    _flush_batch has committed predictions so the run row is only written for
-    detections that actually produced output.
+    _flush_batch has appended to ``raw_results`` so the run row is only
+    written for detections that actually produced classifier output.
+
+    Portable-artifact promotion (``promote_and_publish_classifier_run``) is
+    NOT done here even when ``labels_fingerprint_full`` /
+    ``model_identity`` are provided — that function reads the persisted
+    ``predictions`` rows to synthesize the exportable artifact, and those
+    rows are not written until ``_store_grouped_predictions`` runs later.
+    Callers must invoke ``_publish_classifier_runs_for_raw_results`` after
+    ``_store_grouped_predictions`` completes so fresh runs do not stay
+    stranded on ``runtime_fingerprint = 'legacy'``.
     """
     if not batch:
         return
@@ -1650,23 +1685,52 @@ def _record_batch_classifier_runs(
             prediction_count=n,
             labels_fingerprint_full=labels_fingerprint_full,
         )
-        if labels_fingerprint_full and model_identity:
-            try:
-                from computation_cache import promote_and_publish_classifier_run
 
-                promote_and_publish_classifier_run(
-                    db,
-                    did,
-                    model_name,
-                    labels_fingerprint,
-                    labels_fingerprint_full,
-                    model_identity,
-                )
-            except Exception:
-                log.warning(
-                    "Could not publish portable classifier result for detection %s",
-                    did, exc_info=True,
-                )
+
+def _publish_classifier_runs_for_raw_results(
+    db, raw_results, classifier_model, labels_fingerprint,
+    labels_fingerprint_full=None, model_identity=None,
+):
+    """Publish portable classifier artifacts for freshly-classified detections.
+
+    ``promote_and_publish_classifier_run`` reads the persisted ``predictions``
+    rows for a detection to build the exportable artifact and only then
+    stamps the classifier_runs row with the real ``runtime_fingerprint``.
+    Predictions are written by ``_store_grouped_predictions``, so the
+    promotion pass belongs AFTER it — running it earlier (inside
+    ``_record_batch_classifier_runs``, before those rows exist) silently
+    no-ops and leaves classifier_runs stranded on
+    ``runtime_fingerprint = 'legacy'``, excluding those runs from cache
+    bundle exports.
+
+    Entries from the reuse path carry ``_existing = True``; their
+    runtime_fingerprint is already populated from the earlier successful
+    publish, so they are skipped here.
+    """
+    if not labels_fingerprint_full or not model_identity or not raw_results:
+        return
+    from computation_cache import promote_and_publish_classifier_run
+
+    seen: set = set()
+    for result in raw_results:
+        det_id = result.get("detection_id")
+        if det_id is None or det_id in seen or result.get("_existing"):
+            continue
+        seen.add(det_id)
+        try:
+            promote_and_publish_classifier_run(
+                db,
+                det_id,
+                classifier_model,
+                labels_fingerprint,
+                labels_fingerprint_full,
+                model_identity,
+            )
+        except Exception:
+            log.warning(
+                "Could not publish portable classifier result for detection %s",
+                det_id, exc_info=True,
+            )
 
 
 def _store_match_prediction(
@@ -3127,6 +3191,16 @@ def run_classify_job(job, runner, db_path, workspace_id, params, vireo_dir=None)
             tax=tax,
             db=thread_db,
             labels_fingerprint=fp,
+        )
+        # promote_and_publish reads persisted predictions written by
+        # _store_grouped_predictions above; running it inside
+        # _record_batch_classifier_runs would no-op because those rows
+        # don't exist yet, leaving fresh classifier_runs stranded on
+        # runtime_fingerprint = 'legacy' and out of bundle exports.
+        _publish_classifier_runs_for_raw_results(
+            thread_db, raw_results, model_name, fp,
+            labels_fingerprint_full=job.get("_labels_fingerprint_full"),
+            model_identity=job.get("_classifier_model_identity"),
         )
         finalize_parts = [f"{group_result['predictions_stored']} predictions"]
         if group_result["burst_groups"]:

@@ -535,6 +535,25 @@ def validate_artifact(artifact):
             raise CacheFormatError(f"unsupported subject kind {kind!r}")
         if kind == "box":
             _validate_box(subject.get("box"))
+            # Category is optional on classification box subjects
+            # (materialize falls back to "animal") but MUST be a bounded
+            # string when supplied.  ``compute_detection_id`` feeds it to
+            # ``positive_int_hash``, which calls ``len()`` on each part —
+            # a bool/int/None would raise ``TypeError`` mid-materialization
+            # after the bundle object has already been published, leaving
+            # an unmaterialized entry behind and returning 500 to the
+            # import route.  Detection artifacts still require the field
+            # to be present (checked further below).
+            if "category" in subject:
+                category = subject["category"]
+                if (
+                    not isinstance(category, str)
+                    or not category
+                    or len(category) > 80
+                ):
+                    raise CacheFormatError(
+                        "subject category must be a non-empty string"
+                    )
         elif "box" in subject:
             raise CacheFormatError("full_image subject must not contain a box")
 

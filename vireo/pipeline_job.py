@@ -4637,6 +4637,7 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                     _BATCH_SIZE,
                     _flush_batch,
                     _prepare_image,
+                    _publish_classifier_runs_for_raw_results,
                     _record_batch_classifier_runs,
                     _store_grouped_predictions,
                 )
@@ -5738,6 +5739,21 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                         raw_results, job["id"], model_name,
                         grouping_window, similarity_threshold, tax, thread_db,
                         labels_fingerprint=spec_fp,
+                    )
+                    # promote_and_publish reads persisted predictions written
+                    # by _store_grouped_predictions above; running it inside
+                    # _record_batch_classifier_runs would no-op because those
+                    # rows don't exist yet, leaving fresh classifier_runs
+                    # stranded on runtime_fingerprint = 'legacy' and out of
+                    # bundle exports.
+                    _publish_classifier_runs_for_raw_results(
+                        thread_db, raw_results, model_name, spec_fp,
+                        labels_fingerprint_full=loaded_models.get(
+                            "labels_fingerprint_full"
+                        ),
+                        model_identity=loaded_models.get(
+                            "classifier_model_identity"
+                        ),
                     )
                     preds = group_result["predictions_stored"]
                     total_predictions_stored += preds

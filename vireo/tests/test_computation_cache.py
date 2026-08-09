@@ -539,6 +539,41 @@ def test_labels_count_out_of_sqlite_int64_range_is_rejected():
         validate_artifact(artifact)
 
 
+def test_classification_box_category_shape_is_validated_before_publishing():
+    """A classification box subject may omit ``category`` (materialize falls
+    back to ``"animal"``) but a non-string value must be rejected up
+    front. ``compute_detection_id`` feeds category to ``positive_int_hash``
+    which calls ``len()`` on it; a bool/int/None would raise ``TypeError``
+    mid-materialization AFTER the bundle object had already been
+    published, leaving an unmaterialized entry behind and returning 500
+    to the import route. ``classification_input`` hashes only key/kind/box,
+    so mutating category after construction keeps the input_fingerprint
+    valid — the shape check has to run before the type check would ever
+    fire.
+    """
+    for bad in (True, False, 42, None, [], {"x": 1}):
+        artifact = classification_artifact()
+        artifact["subjects"][0]["category"] = bad
+        with pytest.raises(CacheFormatError, match="category"):
+            validate_artifact(artifact)
+
+    # An empty string or overly long value is also rejected — the field
+    # is meant to carry a short taxonomic label like ``"animal"``.
+    artifact = classification_artifact()
+    artifact["subjects"][0]["category"] = ""
+    with pytest.raises(CacheFormatError, match="category"):
+        validate_artifact(artifact)
+    artifact = classification_artifact()
+    artifact["subjects"][0]["category"] = "x" * 200
+    with pytest.raises(CacheFormatError, match="category"):
+        validate_artifact(artifact)
+
+    # Omission is allowed — materialize supplies the default.
+    artifact = classification_artifact()
+    del artifact["subjects"][0]["category"]
+    assert "category" not in validate_artifact(artifact)["subjects"][0]
+
+
 def test_taxonomy_field_shape_is_validated_before_publishing():
     artifact = classification_artifact(candidates=[{
         "species": "Robin",

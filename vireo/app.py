@@ -15,6 +15,7 @@ import logging
 import logging.handlers
 import math
 import os
+import posixpath
 import queue
 import re
 import secrets
@@ -1717,7 +1718,9 @@ def _network_volume_roots(run=subprocess.run):
     if result.returncode != 0:
         return None
     return {
-        os.path.normpath(row["mount_point"])
+        # ``mount`` always reports macOS/POSIX paths.  Keep parsing independent
+        # of the host running the test suite (notably Windows' ``ntpath``).
+        posixpath.normpath(row["mount_point"])
         for row in remote_setup.parse_mount_output(result.stdout or "")
     }
 

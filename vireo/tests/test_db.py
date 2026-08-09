@@ -18397,7 +18397,7 @@ def test_count_classifier_runs_ignores_non_animal_detections(tmp_path):
 def test_all_nav_ids_covers_every_page():
     from db import ALL_NAV_IDS
     expected = {
-        "import",
+        "import", "card_cleanup",
         "pipeline", "jobs", "pipeline_review", "pipeline_rapid_review", "review", "cull",
         "misses", "highlights", "life_list", "browse", "edit", "map", "location_review", "variants",
         "dashboard", "storage", "audit", "move", "id_conflicts",

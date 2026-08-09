@@ -6964,7 +6964,7 @@ def test_remote_import_paired_jpeg_no_verify_fails_on_mount_mismatch(
     assert result["safe_to_format"] is False, result
     assert any(
         "paired companion mount bytes" in u["reason"]
-        and "source hash" in u["reason"]
+        and "hash this import recorded" in u["reason"]
         for u in result["unsafe_files"]
     ), result["unsafe_files"]
 

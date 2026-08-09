@@ -1724,13 +1724,10 @@ def _network_volume_roots(run=subprocess.run):
 
 def _path_on_network_volume(filepath, network_roots):
     """Whether ``filepath`` should avoid in-process mounted-volume I/O."""
-    volume_root = _volume_root_for_path(filepath)
-    if volume_root is None:
-        return False
     if network_roots is None:
         # Mount discovery failed.  Prefer the bounded Finder path for any
         # mounted volume to an os.replace() that can wedge the server forever.
-        return True
+        return _volume_root_for_path(filepath) is not None
     normalized = os.path.normpath(os.path.abspath(filepath))
     for root in network_roots:
         try:
@@ -1980,14 +1977,26 @@ def _trash_paths(filepaths, progress_callback=None):
                 len(processed), len(ordered), os.path.basename(filepath),
             )
 
-    # Snapshot each parent's st_dev before we touch anything. A network
+    # Classify paths using the kernel mount table before any source or parent
+    # stat.  Those metadata calls can themselves block indefinitely while an
+    # unhealthy SMB mount is reconnecting, so network candidates must go
+    # straight to the bounded Finder subprocess.
+    local_paths = []
+    for filepath in ordered:
+        if _path_on_network_volume(filepath, network_roots):
+            finder_candidates.append(filepath)
+            send_errors[filepath] = "Network volume Trash operation failed"
+        else:
+            local_paths.append(filepath)
+
+    # Snapshot each local parent's st_dev before we touch anything. A network
     # mount that vanishes mid-batch can leave the mount-point directory
     # visible on the underlying local FS, so ``os.path.isdir`` alone would
     # accept the file as gone. Comparing pre-op vs post-op st_dev catches
     # the mount drop even when the directory still stats cleanly.
-    parent_devs = {path: _snapshot_parent_device(path) for path in ordered}
+    parent_devs = {path: _snapshot_parent_device(path) for path in local_paths}
 
-    for filepath in ordered:
+    for filepath in local_paths:
         if not os.path.isfile(filepath):
             # ``os.path.isfile`` returning False is ambiguous on network
             # volumes — it also happens when the underlying stat fails
@@ -2008,14 +2017,6 @@ def _trash_paths(filepaths, progress_callback=None):
                     "Trash preflight: source unreachable for %s", filepath,
                 )
             report_processed(filepath)
-            continue
-        if _path_on_network_volume(filepath, network_roots):
-            # Finder runs out of process with a hard timeout.  Do not call the
-            # direct os.replace or send2trash paths here: both execute mounted-
-            # volume syscalls inside this server and can pin a worker forever
-            # when macOS is reconnecting an unhealthy SMB share.
-            finder_candidates.append(filepath)
-            send_errors[filepath] = "Network volume Trash operation failed"
             continue
         if _move_to_volume_trash(filepath):
             successful.add(filepath)

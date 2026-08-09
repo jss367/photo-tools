@@ -3989,6 +3989,18 @@ def test_trash_paths_routes_network_volume_directly_to_bounded_finder(
         app_module, "_network_volume_roots", lambda: {str(volume)},
     )
     monkeypatch.setattr(
+        app_module, "_snapshot_parent_device",
+        lambda _path: (_ for _ in ()).throw(
+            AssertionError("network path reached parent stat")
+        ),
+    )
+    monkeypatch.setattr(
+        app_module.os.path, "isfile",
+        lambda _path: (_ for _ in ()).throw(
+            AssertionError("network path reached source stat")
+        ),
+    )
+    monkeypatch.setattr(
         app_module, "_move_to_volume_trash",
         lambda _path: (_ for _ in ()).throw(
             AssertionError("network path reached direct rename")
@@ -4037,6 +4049,21 @@ def test_network_mount_discovery_failure_avoids_direct_volume_rename(
     assert app_module._path_on_network_volume(
         "/Volumes/X/bird.NEF", None,
     ) is True
+
+
+def test_path_on_network_volume_accepts_custom_mount_point(tmp_path):
+    """Network shares need not be mounted below macOS's /Volumes folder."""
+    import app as app_module
+
+    mount_root = tmp_path / "mnt" / "photos"
+    photo = mount_root / "Raw" / "bird.NEF"
+
+    assert app_module._path_on_network_volume(
+        str(photo), {str(mount_root)},
+    ) is True
+    assert app_module._path_on_network_volume(
+        str(tmp_path / "local" / "bird.NEF"), {str(mount_root)},
+    ) is False
 
 
 def test_trash_paths_batches_finder_fallback_and_retains_timeout_failures(

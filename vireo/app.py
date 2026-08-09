@@ -1737,11 +1737,10 @@ def _expand_first_symlink_prefix(filepath):
         normalized = os.path.normpath(os.path.abspath(filepath))
     except (OSError, TypeError, ValueError):
         return None
-    parts = normalized.split(os.sep)
-    prefix = os.sep
-    for index, part in enumerate(parts[1:], start=1):
-        if not part:
-            continue
+    drive, tail = os.path.splitdrive(normalized)
+    parts = [part for part in tail.split(os.sep) if part]
+    prefix = drive + os.sep
+    for index, part in enumerate(parts):
         prefix = os.path.join(prefix, part)
         try:
             target = os.readlink(prefix)

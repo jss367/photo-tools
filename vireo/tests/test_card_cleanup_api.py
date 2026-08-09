@@ -492,3 +492,40 @@ def test_finish_audit_disables_delete_until_rescan(app_and_db):
         "Verification may have changed which files count as verified — "
         "re-scan the card before deleting."
     ) in section
+
+
+def test_confirm_delete_locks_page_before_post(app_and_db):
+    """Codex P2 review (commit 96137e3): cardCleanupConfirmDelete must set
+    the page-wide busy state *before* the POST /api/card-cleanup/delete
+    request is issued, not after the response arrives.
+
+    The confirm dialog can be dismissed (backdrop click or Escape) while
+    the request is pending. If Scan and Verify remained enabled during
+    that window, the user could kick off a second job whose watch would
+    overwrite this delete's jobId — the exact orphan the single-busy-state
+    owner exists to prevent, and one that could strand a destructive
+    deletion. Pinning the ordering here — busy set before the fetch, and
+    cleared on failure paths so buttons don't remain dead — so a refactor
+    can't quietly re-open the gap."""
+    app, _ = app_and_db
+    body = app.test_client().get("/card-cleanup").get_data(as_text=True)
+    start = body.index("async function cardCleanupConfirmDelete(")
+    end = body.index("function cardCleanupRenderDeleteResult(", start)
+    section = body[start:end]
+    # Busy must be set BEFORE the fetch — locate both and require the
+    # setBusy call to come first.
+    fetch_idx = section.index("/api/card-cleanup/delete")
+    busy_true_idx = section.index("cardCleanupSetBusy(true")
+    assert busy_true_idx < fetch_idx, (
+        "cardCleanupSetBusy(true) must run before the delete POST is issued "
+        "so a dialog dismissal during the pending request can't leave "
+        "Scan/Verify live and race a second job into cardCleanupWatchJob"
+    )
+    # Failure paths must release the lock — both the non-OK response branch
+    # and the network-error catch, so the user isn't stranded with a dead
+    # page after a definitive failure.
+    assert section.count("cardCleanupSetBusy(false)") >= 2, (
+        "both the !resp.ok branch and the catch block must call "
+        "cardCleanupSetBusy(false) to release the page-wide lock on "
+        "definitive failure"
+    )

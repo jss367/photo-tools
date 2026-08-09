@@ -1066,6 +1066,16 @@ async function cardCleanupConfirmDelete() {
   }
   const confirmBtn = document.getElementById('card-cleanup-confirm-btn');
   confirmBtn.disabled = true;
+  // Lock the page before the POST goes out (Codex P2 review). The confirm
+  // dialog can be dismissed (backdrop click, Escape) while this request is
+  // pending; if Scan and Verify stayed live in that gap, a second job could
+  // start and its watch would overwrite this delete's jobId — including the
+  // destructive path. Setting busy now disables Scan/Verify/Delete regardless
+  // of whether the dialog is still up when the response arrives. Clear it on
+  // any definitive failure so the user isn't left with dead buttons.
+  cardCleanupSetBusy(true, {
+    deleteHint: 'Deletion is starting…',
+  });
   try {
     const resp = await fetch('/api/card-cleanup/delete', {
       method: 'POST',
@@ -1075,6 +1085,8 @@ async function cardCleanupConfirmDelete() {
     const data = await resp.json();
     cardCleanupCloseConfirm();
     if (!resp.ok) {
+      // Nothing was queued — hand the buttons back before showing the error.
+      cardCleanupSetBusy(false);
       if (resp.status === 404) {
         // The manifest is gone, so the preview above no longer describes
         // anything that can be deleted — take it down with the error.
@@ -1088,10 +1100,10 @@ async function cardCleanupConfirmDelete() {
     }
     cardCleanupSetError('');
     document.getElementById('card-cleanup-result').style.display = 'none';
-    cardCleanupSetBusy(true);
     cardCleanupWatchJob(data.job_id, 'delete', 'Starting deletion…');
   } catch (e) {
     cardCleanupCloseConfirm();
+    cardCleanupSetBusy(false);
     cardCleanupSetError(String(e.message || e));
   } finally {
     confirmBtn.disabled = false;

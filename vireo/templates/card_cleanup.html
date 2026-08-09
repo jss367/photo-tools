@@ -175,6 +175,7 @@ body { display: flex; flex-direction: column; height: 100vh; }
         <div class="card-cleanup-audit" id="card-cleanup-hash-failed"
              style="display:none;">
           <div id="card-cleanup-hash-failed-text"></div>
+          <span class="hint" id="card-cleanup-hash-failed-scope"></span>
         </div>
         <details class="card-cleanup-bucket" id="card-cleanup-deletable-details">
           <summary id="card-cleanup-deletable-summary"></summary>
@@ -822,6 +823,15 @@ function cardCleanupRenderHashFailedCallout(manifest) {
     'check (modified, corrupt, or unreadable). Re-running verification ' +
     'would only reproduce that verdict — open the Audit page to accept ' +
     'the current bytes, restore from backup, or investigate.';
+  // Scope honesty (Codex P2 review): the card scan matches photos across
+  // ALL workspaces, but the Audit page only lists flagged rows for the
+  // CURRENT workspace. If the failed archive copy belongs to a folder in
+  // a different workspace, the suggested Audit remedy is unreachable
+  // from here — say so up front, matching the audit callout's approach.
+  document.getElementById('card-cleanup-hash-failed-scope').textContent =
+    'The Audit page shows flagged rows for the current workspace only. ' +
+    'If the failed archive copy lives in a folder from a different ' +
+    'workspace, switch to that workspace to find it there.';
   callout.style.display = '';
 }
 

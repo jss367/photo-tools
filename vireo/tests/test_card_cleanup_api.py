@@ -440,3 +440,24 @@ def test_hash_failed_callout_reason_stays_in_sync(app_and_db):
     assert f"CARD_CLEANUP_HASH_FAILED_REASON = '{matched}'" in body
     assert matched not in card_cleanup.KEEP_NOT_VERIFIED
     assert "run the integrity audit" not in card_cleanup.KEEP_ARCHIVE_HASH_FAILED
+
+
+def test_hash_failed_callout_states_audit_workspace_scope(app_and_db):
+    """Second-order Codex P2 review: the audit remedy suggested by the
+    hash-failed callout is only reachable when the failed row is in the
+    active workspace, because Database.get_integrity_flagged() filters
+    to the active workspace but _load_catalog_by_hash() matches globally.
+    The callout must say so up front so the user does not click through
+    to an empty Audit page — mirroring the workspace-scope note added
+    to the verify-hashes callout for the same asymmetry."""
+    app, _ = app_and_db
+    body = app.test_client().get("/card-cleanup").get_data(as_text=True)
+    # A dedicated hint element for the scope note, rendered inside the
+    # hash-failed callout container.
+    assert 'id="card-cleanup-hash-failed-scope"' in body
+    # The copy itself: names the current-workspace scope of the Audit
+    # page and tells the user how to reach a failed row in a different
+    # workspace's folders. Pinned literally so a reword does not quietly
+    # drop the guidance the Codex P2 asked for.
+    assert "Audit page shows flagged rows for the current workspace only" in body
+    assert "switch to that workspace to find it there" in body

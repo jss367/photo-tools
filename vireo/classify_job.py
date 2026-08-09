@@ -2269,7 +2269,7 @@ def _finalize_cached_only(
         photo_id: [
             detection for detection in detections
             if detection.get("detector_model") != "full-image"
-            and detection.get("category", "animal") == "animal"
+            and (detection.get("category") or "animal") == "animal"
         ]
         for photo_id, detections in detection_map.items()
     }

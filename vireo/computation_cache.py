@@ -1462,10 +1462,12 @@ def materialize_artifacts(
         # original-only artifact onto that row would install detections
         # and classifications for the wrong rendition, silently replacing
         # locally correct results. Until an artifact variant declares
-        # companion identity, skip companion-backed catalog rows.
+        # companion or working-copy identity, skip catalog rows backed by
+        # either alternate rendition.
         photos = db.conn.execute(
             """SELECT id FROM photos
                WHERE file_hash = ? AND companion_path IS NULL
+                 AND working_copy_path IS NULL
                  AND (flag IS NULL OR flag != 'rejected')
                ORDER BY id""",
             (artifact["photo_sha256"],),

@@ -6078,6 +6078,62 @@ def test_finalize_cached_only_includes_zero_confidence_full_image_anchor(
     assert result["already_classified"] == 1
 
 
+def test_finalize_cached_only_treats_null_category_as_animal(
+    tmp_path, monkeypatch,
+):
+    """Legacy NULL categories match the cache-coverage SQL's animal default."""
+    import classify_job as classify_job_mod
+    import config as cfg
+    from classify_job import ClassifyParams, run_classify_job
+    from db import Database
+
+    monkeypatch.setattr(cfg, "CONFIG_PATH", str(tmp_path / "config.json"))
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    workspace_id = db.ensure_default_workspace()
+    db.set_active_workspace(workspace_id)
+    folder_id = db.add_folder("/tmp/p", name="p")
+    photo_id = db.add_photo(
+        folder_id, "legacy.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+    )
+    detection_id = db.save_detections(photo_id, [{
+        "box": {"x": 0, "y": 0, "w": 1, "h": 1},
+        "confidence": 0.9,
+        "category": "animal",
+    }], detector_model="megadetector-v6")[0]
+    db.conn.execute(
+        "UPDATE detections SET category = NULL WHERE id = ?",
+        (detection_id,),
+    )
+    db.add_prediction(
+        detection_id, species="Robin", confidence=0.9,
+        model="BioCLIP", labels_fingerprint="fp-cached",
+    )
+    db.record_classifier_run(
+        detection_id, "BioCLIP", "fp-cached", prediction_count=1,
+    )
+    db.conn.commit()
+    collection_id = db.add_collection(
+        "legacy", json.dumps([{"field": "photo_ids", "value": [photo_id]}]),
+    )
+
+    monkeypatch.setattr(classify_job_mod, "get_active_model", lambda: None)
+    monkeypatch.setattr(classify_job_mod, "get_models", lambda: [])
+    result = run_classify_job(
+        _make_job(), FakeRunner(), db_path, workspace_id,
+        ClassifyParams(
+            collection_id=collection_id,
+            labels_files=None, labels_file=None,
+            model_id=None, model_name=None,
+            grouping_window=0, similarity_threshold=0.99,
+            reclassify=False,
+        ),
+    )
+
+    assert result["already_classified"] == 1
+
+
 def test_run_classify_job_short_circuits_when_cache_covers_every_photo(
     tmp_path, monkeypatch,
 ):

@@ -687,6 +687,43 @@ def test_companion_backed_destination_photo_is_not_materialized(tmp_path):
     )
 
 
+def test_working_copy_backed_destination_photo_is_not_materialized(tmp_path):
+    """A v1 artifact identifies only the original bytes, so it cannot be
+    applied to a destination that classifies a derived working-copy JPEG.
+    """
+    destination, folder_id, plain_photo_id = _database_with_photo(
+        tmp_path / "destination.db", "plain.jpg",
+    )
+    working_copy_photo_id = destination.add_photo(
+        folder_id=folder_id,
+        filename="edited.jpg",
+        extension=".jpg",
+        file_size=2048,
+        file_mtime=2.0,
+    )
+    destination.conn.execute(
+        "UPDATE photos SET working_copy_path = ?, file_hash = ? WHERE id = ?",
+        ("working/edited.jpg", PHOTO_HASH, working_copy_photo_id),
+    )
+    destination.conn.commit()
+
+    result = materialize_artifacts(
+        destination, [detection_artifact()],
+        known_runtimes={RUNTIME},
+    )
+    assert result["detector_runs_applied"] == 1
+    applied_photo_ids = [
+        row["photo_id"] for row in destination.conn.execute(
+            "SELECT photo_id FROM detector_runs "
+            "WHERE detector_model = 'megadetector-v6' ORDER BY photo_id"
+        ).fetchall()
+    ]
+    assert applied_photo_ids == [plain_photo_id], (
+        "working-copy-backed photos must be excluded because the artifact "
+        "does not identify the derived rendition's pixels"
+    )
+
+
 def test_tree_of_life_sentinel_short_fingerprint_is_accepted():
     """Tree-of-Life classification uses the well-known ``tol`` sentinel as
     the classifier_runs short key (compute_fingerprint([]) → "tol") while

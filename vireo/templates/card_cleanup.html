@@ -157,6 +157,8 @@ body { display: flex; flex-direction: column; height: 100vh; }
         <div class="card-cleanup-audit" id="card-cleanup-audit" style="display:none;">
           <div id="card-cleanup-audit-text"></div>
           <span class="hint" id="card-cleanup-audit-cost"></span>
+          <span class="hint" id="card-cleanup-audit-scope-note"
+                style="display:none;"></span>
           <div class="row" style="margin-top:8px;margin-bottom:0;">
             <button class="btn btn-primary" type="button" id="card-cleanup-audit-btn"
                     onclick="cardCleanupStartAudit()">Verify archive hashes</button>
@@ -257,6 +259,7 @@ const cardCleanupState = {
   listsRendered: {},    // bucket -> true once its <li>s are in the DOM
   confirmEscHandler: null,
   busyRestore: null,    // delete button/hint state saved while a job runs
+  auditCompleted: false, // a verify-hashes run finished during this page visit
 };
 
 /* Exactly one job at a time. Starting a second one while this page is
@@ -756,15 +759,45 @@ function cardCleanupRenderAuditCallout(manifest) {
     'copy has never been checksum-verified. Vireo will not delete a card ' +
     'file until its archive copy passes a checksum check, and the ' +
     'integrity audit is what performs that check.';
+  // Scope honesty (Codex P2 review): the card scan matches photos across
+  // ALL workspaces, but the verify-hashes job covers only the folders in
+  // the CURRENT workspace. If some of these files' archive copies live
+  // in another workspace's folders, verifying here will not touch them —
+  // say so up front, and cardCleanupRenderStillUnverifiedHint says it
+  // again, specifically, when a post-audit re-scan proves it happened.
   document.getElementById('card-cleanup-audit-cost').textContent =
-    'Verifying re-reads and re-checksums every file in the archive, not ' +
-    'just these — over a VPN’d network mount that is slow, so it is ' +
-    'best run on a machine close to the NAS.';
+    'Verifying re-reads and re-checksums every archive file in the ' +
+    'current workspace, not just these — over a VPN’d network mount ' +
+    'that is slow, so it is best run on a machine close to the NAS. ' +
+    'Archive copies that belong to a different workspace are not ' +
+    'covered; switch to that workspace to verify them.';
+  cardCleanupRenderStillUnverifiedHint(pending);
   document.getElementById('card-cleanup-audit-btn').style.display = '';
   document.getElementById('card-cleanup-audit-btn').disabled = false;
   document.getElementById('card-cleanup-audit-rescan-btn').style.display = 'none';
   document.getElementById('card-cleanup-audit-status').textContent = '';
   callout.style.display = '';
+}
+
+/* After a verification has run, files still pending on the next scan are
+   exactly the ones verification could not reach — most likely archive
+   copies in folders that belong to a different workspace (the scan
+   matches globally; verify-hashes covers only the current workspace's
+   folders). Say that specifically instead of letting the callout loop. */
+function cardCleanupRenderStillUnverifiedHint(pending) {
+  const note = document.getElementById('card-cleanup-audit-scope-note');
+  if (!cardCleanupState.auditCompleted || !pending) {
+    note.style.display = 'none';
+    note.textContent = '';
+    return;
+  }
+  note.textContent =
+    'Still unverified after the last verification run: these files’ ' +
+    'archive copies were not covered by it — most likely they belong to ' +
+    'folders in a different workspace (or the run was cancelled before ' +
+    'reaching them). Switch to the workspace that holds those folders ' +
+    'and verify there, then re-scan here.';
+  note.style.display = 'block';
 }
 
 async function cardCleanupStartAudit() {
@@ -799,6 +832,11 @@ async function cardCleanupStartAudit() {
 // cardCleanupFinishJob's cleanup; this only reports what the run found.
 function cardCleanupFinishAudit(job, status, jobError) {
   const statusEl = document.getElementById('card-cleanup-audit-status');
+  if (status === 'completed' || status === 'cancelled') {
+    // Lets the next re-scan's callout explain files that verification
+    // could not have covered (other workspaces' folders).
+    cardCleanupState.auditCompleted = true;
+  }
   if (status === 'completed' && job && job.result) {
     const r = job.result;
     const problems = (r.modified || 0) + (r.corrupt || 0) + (r.unreadable || 0);

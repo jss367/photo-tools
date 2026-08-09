@@ -2342,16 +2342,10 @@ def _trash_paths(filepaths, progress_callback=None, already_missing_out=None,
                 }
                 relevant_roots = set()
                 for path in paths_still_on_network:
-                    normalized = os.path.normpath(os.path.abspath(path))
                     for root in batch_network_roots:
-                        try:
-                            if os.path.commonpath(
-                                (normalized, root)
-                            ) == root:
-                                relevant_roots.add(root)
-                                break
-                        except ValueError:
-                            continue
+                        if _path_on_network_volume(path, {root}):
+                            relevant_roots.add(root)
+                            break
                 for root in relevant_roots:
                     if _network_root_reachable(root):
                         reachable_network_roots.add(root)

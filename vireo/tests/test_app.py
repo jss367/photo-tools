@@ -4795,6 +4795,44 @@ def test_trash_paths_rejects_finder_missing_when_mount_root_unreachable(
     assert [f["path"] for f in failures] == [str(photo)]
 
 
+def test_trash_paths_accepts_missing_through_symlinked_network_root(
+    monkeypatch, tmp_path,
+):
+    """The reachability probe matches the expanded network-root spelling."""
+    import app as app_module
+
+    volume = tmp_path / "SMB_Share"
+    volume.mkdir()
+    selected_root = tmp_path / "selected-photos"
+    selected_root.symlink_to(volume, target_is_directory=True)
+    photo = str(selected_root / "bird.NEF")
+    reachability_calls = []
+
+    monkeypatch.setattr(app_module.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        app_module, "_network_volume_roots", lambda: {str(volume)},
+    )
+    monkeypatch.setattr(
+        app_module, "_network_root_reachable",
+        lambda root: reachability_calls.append(root) or True,
+    )
+    monkeypatch.setattr(
+        app_module, "_trash_via_finder",
+        lambda paths: (set(), set(paths), []),
+    )
+    monkeypatch.setattr(
+        app_module, "_missing_paths_via_finder",
+        lambda paths: (set(paths), set(), []),
+    )
+
+    moved, successful, failures = app_module._trash_paths([photo])
+
+    assert moved == 0
+    assert successful == {photo}
+    assert failures == []
+    assert reachability_calls == [str(volume)]
+
+
 def test_network_root_reachable_uses_bounded_subprocess(monkeypatch):
     """The reachability probe must run out-of-process with a bounded
     timeout — an in-process ``os.stat`` on the mount root would still

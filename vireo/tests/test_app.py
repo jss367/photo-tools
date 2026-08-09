@@ -3826,6 +3826,37 @@ def test_trash_via_finder_batches_paths_and_sets_timeout(monkeypatch):
     )
 
 
+def test_missing_paths_via_finder_reports_per_path_status(monkeypatch):
+    """The bounded post-remount check distinguishes absent and live files."""
+    from types import SimpleNamespace
+
+    import app as app_module
+
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append((argv, kwargs))
+        return SimpleNamespace(
+            returncode=0, stdout="missing\nexists\nerror\n", stderr="",
+        )
+
+    monkeypatch.setattr(app_module.subprocess, "run", fake_run)
+
+    missing, existing, failures = app_module._missing_paths_via_finder([
+        "/Volumes/X/gone.NEF",
+        "/Volumes/X/back.NEF",
+        "/Volumes/X/unknown.NEF",
+    ])
+
+    assert missing == {"/Volumes/X/gone.NEF"}
+    assert existing == {"/Volumes/X/back.NEF"}
+    assert failures == [{
+        "path": "/Volumes/X/unknown.NEF",
+        "error": "Finder existence check failed",
+    }]
+    assert calls[0][1]["timeout"] == app_module._FINDER_TRASH_TIMEOUT_SECS
+
+
 def test_move_to_volume_trash_renames_without_finder(monkeypatch, tmp_path):
     """Mounted-volume fast path performs a same-volume move into .Trashes."""
     import app as app_module
@@ -4077,6 +4108,25 @@ def test_path_on_network_volume_accepts_custom_mount_point(tmp_path):
     assert app_module._path_on_network_volume(
         str(tmp_path / "local" / "bird.NEF"), {str(mount_root)},
     ) is False
+
+
+def test_path_on_network_volume_expands_local_symlink_prefix(
+    monkeypatch, tmp_path,
+):
+    """A selected local symlink into a NAS remains network-classified."""
+    import app as app_module
+
+    network_root = tmp_path / "NAS"
+    network_root.mkdir()
+    selected_root = tmp_path / "selected-photos"
+    selected_root.symlink_to(network_root, target_is_directory=True)
+    photo = selected_root / "Raw" / "bird.NEF"
+
+    monkeypatch.setattr(app_module.sys, "platform", "darwin")
+
+    assert app_module._path_on_network_volume(
+        str(photo), {str(network_root)},
+    ) is True
 
 
 def test_trash_paths_batches_finder_fallback_and_retains_timeout_failures(
@@ -4389,6 +4439,10 @@ def test_trash_paths_rejects_finder_missing_when_network_mount_detached(
         return set(), set(paths), []
 
     monkeypatch.setattr(app_module, "_trash_via_finder", finder_reports_missing)
+    monkeypatch.setattr(
+        app_module, "_missing_paths_via_finder",
+        lambda paths: (set(paths), set(), []),
+    )
 
     moved, successful, failures = app_module._trash_paths([str(photo)])
 
@@ -4422,12 +4476,49 @@ def test_trash_paths_accepts_finder_missing_when_network_mount_still_live(
         return set(), set(paths), []
 
     monkeypatch.setattr(app_module, "_trash_via_finder", finder_reports_missing)
+    monkeypatch.setattr(
+        app_module, "_missing_paths_via_finder",
+        lambda paths: (set(paths), set(), []),
+    )
 
     moved, successful, failures = app_module._trash_paths([str(photo)])
 
     assert moved == 0
     assert successful == {str(photo)}
     assert failures == []
+
+
+def test_trash_paths_rejects_missing_when_file_reappears_after_remount(
+    monkeypatch, tmp_path,
+):
+    """A same-root reconnect must not turn a reappeared photo into success."""
+    import app as app_module
+
+    volume = tmp_path / "SMB_Share"
+    volume.mkdir()
+    photo = str(volume / "bird.NEF")
+
+    monkeypatch.setattr(app_module.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        app_module, "_network_volume_roots", lambda: {str(volume)},
+    )
+    monkeypatch.setattr(
+        app_module, "_trash_via_finder",
+        lambda paths: (set(), set(paths), []),
+    )
+    monkeypatch.setattr(
+        app_module, "_missing_paths_via_finder",
+        lambda paths: (set(), set(paths), []),
+    )
+
+    moved, successful, failures = app_module._trash_paths([photo])
+
+    assert moved == 0
+    assert successful == set()
+    assert failures == [{
+        "path": photo,
+        "error": "Source reappeared during Trash operation",
+    }]
 
 
 def test_trash_paths_rejects_finder_missing_when_mount_recheck_fails(
@@ -4564,6 +4655,10 @@ def test_trash_paths_reuses_one_mount_recheck_per_finder_batch(
         return set(), set(paths), []
 
     monkeypatch.setattr(app_module, "_trash_via_finder", finder_reports_missing)
+    monkeypatch.setattr(
+        app_module, "_missing_paths_via_finder",
+        lambda paths: (set(paths), set(), []),
+    )
 
     moved, successful, failures = app_module._trash_paths(photos)
 
@@ -4613,6 +4708,10 @@ def test_trash_paths_exposes_already_missing_paths_via_out_parameter(
         return moved, missing, []
 
     monkeypatch.setattr(app_module, "_trash_via_finder", finder_returns_mixed)
+    monkeypatch.setattr(
+        app_module, "_missing_paths_via_finder",
+        lambda paths: (set(paths), set(), []),
+    )
 
     already_missing = set()
     moved, successful, failures = app_module._trash_paths(

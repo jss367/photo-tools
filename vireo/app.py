@@ -1725,20 +1725,117 @@ def _network_volume_roots(run=subprocess.run):
     }
 
 
+def _expand_first_symlink_prefix(filepath):
+    """Expand one local symlink prefix without resolving its target.
+
+    ``realpath`` follows the target and can block when that target is an
+    unhealthy network share. Reading the first symlink itself only touches
+    its local directory entry; the unvisited suffix is then appended
+    lexically so network-volume classification stays free of share I/O.
+    """
+    try:
+        normalized = os.path.normpath(os.path.abspath(filepath))
+    except (OSError, TypeError, ValueError):
+        return None
+    parts = normalized.split(os.sep)
+    prefix = os.sep
+    for index, part in enumerate(parts[1:], start=1):
+        if not part:
+            continue
+        prefix = os.path.join(prefix, part)
+        try:
+            target = os.readlink(prefix)
+        except OSError:
+            continue
+        if not os.path.isabs(target):
+            target = os.path.join(os.path.dirname(prefix), target)
+        return os.path.normpath(os.path.join(target, *parts[index + 1:]))
+    return None
+
+
 def _path_on_network_volume(filepath, network_roots):
     """Whether ``filepath`` should avoid in-process mounted-volume I/O."""
-    if network_roots is None:
-        # Mount discovery failed.  Prefer the bounded Finder path for any
-        # mounted volume to an os.replace() that can wedge the server forever.
-        return _volume_root_for_path(filepath) is not None
     normalized = os.path.normpath(os.path.abspath(filepath))
-    for root in network_roots:
-        try:
-            if os.path.commonpath((normalized, root)) == root:
+    for _depth in range(16):
+        if network_roots is None:
+            # Mount discovery failed. Prefer bounded Finder handling for any
+            # /Volumes path, including one reached through a local symlink.
+            if _volume_root_for_path(normalized) is not None:
                 return True
-        except ValueError:
-            continue
-    return False
+        else:
+            for root in network_roots:
+                try:
+                    if os.path.commonpath((normalized, root)) == root:
+                        return True
+                except ValueError:
+                    continue
+        if sys.platform != "darwin":
+            return False
+        expanded = _expand_first_symlink_prefix(normalized)
+        if expanded is None:
+            return False
+        normalized = expanded
+    # A symlink loop or unusually deep chain cannot be classified safely.
+    # Fail closed on macOS so no subsequent stat reaches a possible share.
+    return True
+
+
+def _missing_paths_via_finder(filepaths, timeout=_FINDER_TRASH_TIMEOUT_SECS):
+    """Boundedly confirm which paths remain absent according to Finder."""
+    filepaths = [os.fspath(path) for path in filepaths]
+    if not filepaths:
+        return set(), set(), []
+    result = subprocess.run(
+        [
+            "osascript",
+            "-e", "on run argv",
+            "-e", "set statuses to {}",
+            "-e", "repeat with posixPath in argv",
+            "-e", "set statusValue to \"error\"",
+            "-e", "try",
+            "-e", "set fileRef to POSIX file (contents of posixPath)",
+            "-e", "tell application \"Finder\"",
+            "-e", "if exists fileRef then",
+            "-e", "set statusValue to \"exists\"",
+            "-e", "else",
+            "-e", "set statusValue to \"missing\"",
+            "-e", "end if",
+            "-e", "end tell",
+            "-e", "end try",
+            "-e", "set end of statuses to statusValue",
+            "-e", "end repeat",
+            "-e", "set AppleScript's text item delimiters to linefeed",
+            "-e", "return statuses as text",
+            "-e", "end run",
+            "--",
+            *filepaths,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        **no_window_kwargs(),
+    )
+    if result.returncode != 0:
+        raise OSError(
+            result.stderr.strip()
+            or f"Finder existence check failed ({result.returncode})"
+        )
+    statuses = result.stdout.splitlines()
+    if len(statuses) != len(filepaths):
+        raise OSError("Finder returned an invalid existence response")
+    missing = set()
+    existing = set()
+    failures = []
+    for filepath, outcome in zip(filepaths, statuses, strict=True):
+        if outcome == "missing":
+            missing.add(filepath)
+        elif outcome == "exists":
+            existing.add(filepath)
+        else:
+            failures.append({
+                "path": filepath, "error": "Finder existence check failed",
+            })
+    return missing, existing, failures
 
 
 def _ensure_volume_trashes_dir(filepath, ensured_volumes):
@@ -2117,7 +2214,9 @@ def _trash_paths(filepaths, progress_callback=None, already_missing_out=None):
                 else:
                     report_processed(filepath)
 
-    def _finder_missing_is_trustworthy(filepath, current_network_roots):
+    def _finder_missing_is_trustworthy(
+        filepath, current_network_roots, confirmed_network_missing,
+    ):
         """Reject Finder's "missing" outcome when the underlying mount is gone.
 
         Finder reports "missing" when ``sourceExists=false`` but
@@ -2143,7 +2242,10 @@ def _trash_paths(filepaths, progress_callback=None, already_missing_out=None):
                 # confirm the volume is still mounted, so refuse to trust
                 # "missing" and let the caller retry.
                 return False
-            return _path_on_network_volume(filepath, current_network_roots)
+            return (
+                _path_on_network_volume(filepath, current_network_roots)
+                and filepath in confirmed_network_missing
+            )
         return _path_confirmed_gone(filepath, parent_devs.get(filepath))
 
     for finder_batch in _chunked(
@@ -2168,17 +2270,52 @@ def _trash_paths(filepaths, progress_callback=None, already_missing_out=None):
             batch_network_roots = (
                 _network_volume_roots() if batch_network_missing else None
             )
+            confirmed_network_missing = set()
+            finder_recheck_errors = set()
+            if batch_network_missing and batch_network_roots is not None:
+                paths_still_on_network = {
+                    path for path in finder_missing_paths
+                    if path in network_finder_candidates
+                    and _path_on_network_volume(path, batch_network_roots)
+                }
+                if paths_still_on_network:
+                    try:
+                        (
+                            confirmed_network_missing,
+                            reappeared_paths,
+                            recheck_failures,
+                        ) = _missing_paths_via_finder(paths_still_on_network)
+                        for path in reappeared_paths:
+                            finder_recheck_errors.add(path)
+                            send_errors[path] = (
+                                "Source reappeared during Trash operation"
+                            )
+                        for failure in recheck_failures:
+                            finder_recheck_errors.add(failure["path"])
+                            send_errors[failure["path"]] = failure["error"]
+                    except subprocess.TimeoutExpired:
+                        for path in paths_still_on_network:
+                            finder_recheck_errors.add(path)
+                            send_errors[path] = (
+                                "Finder existence check timed out"
+                            )
+                    except Exception as exc:
+                        for path in paths_still_on_network:
+                            finder_recheck_errors.add(path)
+                            send_errors[path] = (
+                                str(exc) or "Finder existence check failed"
+                            )
             for missing_path in finder_missing_paths:
                 if _finder_missing_is_trustworthy(
                     missing_path, batch_network_roots,
+                    confirmed_network_missing,
                 ):
                     successful.add(missing_path)
                     if already_missing_out is not None:
                         already_missing_out.add(missing_path)
                 else:
-                    send_errors[missing_path] = (
-                        "Source path is unreachable"
-                    )
+                    if missing_path not in finder_recheck_errors:
+                        send_errors[missing_path] = "Source path is unreachable"
                     log.warning(
                         "Rejecting Finder 'missing' outcome for %s: "
                         "underlying mount appears to have detached",

@@ -6031,6 +6031,75 @@ def test_remote_import_rejects_dest_folder_under_source(
     ), result["unsafe_files"]
 
 
+def test_remote_import_rejects_dest_file_symlinked_into_source(
+        tmp_path, monkeypatch):
+    """Spec decision 12: the per-file dest-safety guard runs on the remote
+    path too. Geometry: the template ``dest_file`` on the mount is a
+    SYMLINK pointing back into the card. The folder-level batch guard
+    passes (``dest_folder`` is a normal mount directory, not under any
+    source), but without the per-file guard the collision walk hashes the
+    symlink's target — the card file itself — byte-matches it, and adopts
+    it as ``skipped_duplicate``; with ``verify_by_hash=True``
+    ``safe_to_format`` can then go green over bytes that exist nowhere but
+    the card. The guard (ported from the local path) must fail the file
+    instead: ``os.path.samefile`` sees through the link at file level,
+    where the folder guard only realpaths the folder."""
+    card = _make_card(tmp_path, [
+        ("DSC_0031.jpg", datetime(2026, 7, 3, 10, 0, 0), "navy"),
+    ])
+    # Pre-create the day dir on the mount and plant a symlink at the
+    # primary dest name, resolving back into the card.
+    mount_day = tmp_path / "mount" / "2026" / "2026-07-03"
+    mount_day.mkdir(parents=True)
+    os.symlink(str(card / "DSC_0031.jpg"), str(mount_day / "DSC_0031.jpg"))
+
+    result, calls = _run_remote_import(
+        tmp_path, monkeypatch,
+        dict(sources=[str(card)], skip_duplicates=False),
+    )
+
+    assert result["failed"] == 1, result
+    assert result["skipped_duplicate"] == 0, result
+    assert result["copied"] == 0, result
+    assert result["safe_to_format"] is False, result
+    assert any(
+        "resolves inside a source directory" in u["reason"]
+        for u in result["unsafe_files"]
+    ), result["unsafe_files"]
+
+
+def test_local_import_rejects_dest_file_symlinked_into_source(tmp_path):
+    """Local half of decision 12's cross-transport symmetry: the exact
+    symlinked-``dest_file`` geometry the remote test above pins. The local
+    per-file guard has always caught this (``os.path.samefile`` resolves
+    the symlink to the card file's inode), so this test is GREEN before
+    the decision-12 port — it exists so both transports pin the same
+    geometry with the same assertions."""
+    from import_job import ImportParams
+
+    card = _make_card(tmp_path, [
+        ("DSC_0032.jpg", datetime(2026, 7, 3, 10, 0, 0), "plum"),
+    ])
+    archive = tmp_path / "archive"
+    day = archive / "2026" / "2026-07-03"
+    day.mkdir(parents=True)
+    os.symlink(str(card / "DSC_0032.jpg"), str(day / "DSC_0032.jpg"))
+
+    db, ws_id, result = _run_import(tmp_path, ImportParams(
+        sources=[str(card)], destination=str(archive),
+        skip_duplicates=False,
+    ))
+
+    assert result["failed"] == 1, result
+    assert result["skipped_duplicate"] == 0, result
+    assert result["copied"] == 0, result
+    assert result["safe_to_format"] is False, result
+    assert any(
+        "resolves inside a source directory" in u["reason"]
+        for u in result["unsafe_files"]
+    ), result["unsafe_files"]
+
+
 def test_local_import_dest_under_source_refusal_reports_progress(
         tmp_path, monkeypatch):
     """Spec decision 2: a batch refused because dest_folder resolves

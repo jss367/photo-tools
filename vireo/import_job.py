@@ -847,7 +847,8 @@ def _batch_preflight(state, emit, db, *, rel, batch, queued, ctx,
         if rel != "." else ctx.destination
     )
     # Reject the whole batch before creating any directories on the
-    # card. The local path's per-file loop already refuses ``dest_file``
+    # card. The per-file guard (``_reject_source_backed_dest``, both
+    # paths) already refuses ``dest_file``
     # under a source, but that check runs AFTER ``os.makedirs``, so
     # a rejected unsafe import would still create the archive
     # directory tree on the source (or raise on read-only media,
@@ -1006,6 +1007,76 @@ def _batch_preflight(state, emit, db, *, rel, batch, queued, ctx,
     db.conn.commit()
 
     return dest_folder
+
+
+def _reject_source_backed_dest(state, ctx, *, rel, source_file, dest_file):
+    """Per-file dest-safety guard (spec decision 12): fail a ``dest_file``
+    that IS the source file or resolves under any source root. Returns
+    True when the file was rejected (booked failed; the caller skips it).
+
+    Complements ``_batch_preflight``'s folder-level guard, which realpaths
+    only ``dest_folder`` and so cannot see ``os.path.samefile`` identity
+    (hard-links/symlinks to the same inode) or a ``dest_file`` that is
+    itself a symlink resolving back into the card. Runs on BOTH
+    transports: on the remote path this geometry is exactly the
+    safe_to_format-over-unbacked-bytes hazard the batch guard's own
+    comment describes — before the port the collision walk hashed the
+    source-backed dest, byte-matched it, and adopted it.
+
+    KNOWN GAP (pre-existing, deliberately preserved): a source-backed
+    SUFFIX candidate (e.g. a symlink at ``name_1.ext`` into the card,
+    with different bytes at the primary name) is caught by NEITHER this
+    guard NOR the folder guard on EITHER path — collision-walk candidates
+    are not probed here. That per-candidate gap predates the port on the
+    local path, and the port preserves parity rather than closing it
+    (closing it is its own behavior change; a PR 7b/follow-up item). Do
+    not claim suffix coverage for this guard.
+    """
+    # Reject the source-under-destination overlap where the folder
+    # template maps the source right back to its own directory
+    # (e.g. source ``/archive/2026/2026-07-05``, destination
+    # ``/archive``, template ``%Y/%Y-%m-%d`` → dest_file IS the
+    # source file). The API rejects destinations INSIDE any source;
+    # this catches the opposite direction, where the destination is
+    # a legal ancestor but the template resolves back to the source
+    # directory. Without this the collision walk's adopt branch hashes
+    # the source against itself, records it as ``skipped_duplicate``,
+    # and safe_to_format goes green — deleting/formatting the
+    # source then erases the only copy. See PR #1107 review.
+    try:
+        same_file = (
+            os.path.exists(dest_file)
+            and os.path.samefile(str(source_file), dest_file)
+        )
+    except OSError:
+        # Fall back to normalized-path equality when samefile can't
+        # stat (e.g. the destination is a stale entry). Prefer a
+        # false positive here (fail this file) over a false
+        # negative that lets the adopt branch loop back onto the
+        # source itself.
+        same_file = (
+            os.path.normpath(str(source_file))
+            == os.path.normpath(dest_file)
+        )
+    # Also reject any dest_file (not just an exact self-copy) that
+    # resolves under any source root. Example: source
+    # ``/Volumes/Card/DCIM``, destination ``/Volumes/Card``,
+    # template ``DCIM/Archive/%Y`` — dest_file lands at
+    # ``/Volumes/Card/DCIM/Archive/2026/<name>``, which is NOT the
+    # source file (samefile is False) but is still inside the card.
+    # A copy there is counted as ``copied``, safe_to_format can go
+    # green, and formatting the card erases the "archive" copy too.
+    # See PR #1107 review.
+    dest_under_source = ctx.path_under_any_source(dest_file)
+    if same_file or dest_under_source:
+        _fail(
+            state, rel, source_file,
+            "destination file resolves inside a source directory "
+            "(dest_file would live under the card being imported); "
+            "formatting the card would erase the archive copy",
+        )
+        return True
+    return False
 
 
 def _rollback_on_mount_loss(state, batch_st, attests_bytes,
@@ -3241,6 +3312,19 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
             # names taken by earlier files IN THIS BATCH; the mount is
             # locally readable so already-landed bytes are checked on disk.
             dest_basename = source_file.name
+            # Per-file dest-safety guard (spec decision 12), ported from
+            # the local path. Runs BEFORE the collision walk so the walk
+            # never hashes a source-backed primary dest path — a
+            # ``dest_file`` symlinked into the card would otherwise
+            # byte-match its own target and be adopted as
+            # ``skipped_duplicate`` over bytes only the card holds. See
+            # ``_reject_source_backed_dest`` for the known
+            # suffix-candidate gap it deliberately does not close.
+            if _reject_source_backed_dest(
+                state, ctx, rel=rel, source_file=source_file,
+                dest_file=os.path.join(dest_folder, source_file.name),
+            ):
+                continue
             # Working-copy identity, captured at decision time — before
             # any bytes move — so a source that changes mid-transfer
             # cannot look clean to the working-copy identity check.
@@ -3818,7 +3902,6 @@ def run_import_job(job, runner, db_path, workspace_id, params):
     ctx = _build_destination_context(db, params)
     destination = ctx.destination
     mount_baseline = ctx.mount_baseline
-    _path_under_any_source = ctx.path_under_any_source
 
     runner.set_steps(job["id"], [
         {"id": "import", "label": "Copy & catalog"},
@@ -3983,49 +4066,14 @@ def run_import_job(job, runner, db_path, workspace_id, params):
 
             # Destination path + collision handling (mirrors ingest()).
             dest_file = os.path.join(dest_folder, source_file.name)
-            # Reject the source-under-destination overlap where the folder
-            # template maps the source right back to its own directory
-            # (e.g. source ``/archive/2026/2026-07-05``, destination
-            # ``/archive``, template ``%Y/%Y-%m-%d`` → dest_file IS the
-            # source file). The API rejects destinations INSIDE any source;
-            # this catches the opposite direction, where the destination is
-            # a legal ancestor but the template resolves back to the source
-            # directory. Without this the adopt branch below hashes the
-            # source against itself, records it as ``skipped_duplicate``,
-            # and safe_to_format goes green — deleting/formatting the
-            # source then erases the only copy. See PR #1107 review.
-            try:
-                same_file = (
-                    os.path.exists(dest_file)
-                    and os.path.samefile(str(source_file), dest_file)
-                )
-            except OSError:
-                # Fall back to normalized-path equality when samefile can't
-                # stat (e.g. the destination is a stale entry). Prefer a
-                # false positive here (fail this file) over a false
-                # negative that lets the adopt branch loop back onto the
-                # source itself.
-                same_file = (
-                    os.path.normpath(str(source_file))
-                    == os.path.normpath(dest_file)
-                )
-            # Also reject any dest_file (not just an exact self-copy) that
-            # resolves under any source root. Example: source
-            # ``/Volumes/Card/DCIM``, destination ``/Volumes/Card``,
-            # template ``DCIM/Archive/%Y`` — dest_file lands at
-            # ``/Volumes/Card/DCIM/Archive/2026/<name>``, which is NOT the
-            # source file (samefile is False) but is still inside the card.
-            # A copy there is counted as ``copied``, safe_to_format can go
-            # green, and formatting the card erases the "archive" copy too.
-            # See PR #1107 review.
-            dest_under_source = _path_under_any_source(dest_file)
-            if same_file or dest_under_source:
-                _fail(
-                    state, rel, source_file,
-                    "destination file resolves inside a source directory "
-                    "(dest_file would live under the card being imported); "
-                    "formatting the card would erase the archive copy",
-                )
+            # Per-file dest-safety guard — spec decision 12. See
+            # ``_reject_source_backed_dest`` for the geometry it catches
+            # beyond the folder-level guard and for the known
+            # suffix-candidate gap it deliberately does not close.
+            if _reject_source_backed_dest(
+                state, ctx, rel=rel, source_file=source_file,
+                dest_file=dest_file,
+            ):
                 continue
             # Capture card-side (size, mtime_ns) BEFORE the copy so the
             # deferred working-copy pass can identity-check the card

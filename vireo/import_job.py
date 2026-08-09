@@ -3211,7 +3211,12 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
         # (Only adoptions can be in ``landed`` at this point — fresh
         # transfers append after the rsync below.)
         if batch_st.mount_lost:
-            def _drop_queued_transfers():
+            # Default-arg binding of ``batch_st`` / ``rel`` silences
+            # ruff B023 (loop variables captured by a nested def) — the
+            # callback runs synchronously inside ``_rollback_on_mount_loss``
+            # in this same iteration, so late-binding was never a real
+            # hazard, but binding at definition time makes that explicit.
+            def _drop_queued_transfers(batch_st=batch_st, rel=rel):
                 # Queued-but-untransferred files: nothing landed, so no
                 # counter rollback — book the failure and drop the queue
                 # so the rsync below has nothing to send.

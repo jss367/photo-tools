@@ -1437,6 +1437,55 @@ def materialize_artifacts(
     the built-in local check does not have to grow special cases.
     """
     normalized = [validate_artifact(artifact) for artifact in artifacts]
+    # Trusted detection artifacts for the same (photo, detector_model)
+    # can carry multiple runtime_fingerprints -- e.g. the local store
+    # was populated by successive imports from different weights.  Every
+    # ``materialize_local_store`` call would otherwise write each of
+    # them in turn, and each runtime change deletes the currently
+    # selected detections and cascades their unreviewed predictions.
+    # The result is churn on every reapply plus a settled winner of
+    # whichever runtime happens to sort last.  Collapse to one artifact
+    # per logical (photo, detector_model) run before the loop, preferring
+    # whichever runtime the catalog already has installed so routine
+    # cache reapplication is a no-op; ties fall back to a deterministic
+    # runtime_fingerprint sort so repeated calls stay stable.
+    detection_by_key = {}
+    other_artifacts = []
+    for artifact in normalized:
+        if artifact["type"] != "detection":
+            other_artifacts.append(artifact)
+            continue
+        key = (artifact["photo_sha256"], artifact["detector_model"])
+        detection_by_key.setdefault(key, []).append(artifact)
+    chosen_detections = []
+    for (photo_sha256, detector_model), candidates in detection_by_key.items():
+        if len(candidates) == 1:
+            chosen_detections.append(candidates[0])
+            continue
+        existing = db.conn.execute(
+            """SELECT dr.runtime_fingerprint
+               FROM detector_runs dr
+               JOIN photos p ON p.id = dr.photo_id
+               WHERE p.file_hash = ? AND dr.detector_model = ?
+                 AND p.companion_path IS NULL
+                 AND p.working_copy_path IS NULL
+                 AND (p.flag IS NULL OR p.flag != 'rejected')
+               LIMIT 1""",
+            (photo_sha256, detector_model),
+        ).fetchone()
+        existing_runtime = (
+            existing["runtime_fingerprint"] if existing else None
+        )
+        match = next(
+            (c for c in candidates
+             if c["runtime_fingerprint"] == existing_runtime),
+            None,
+        )
+        chosen_detections.append(
+            match if match is not None
+            else min(candidates, key=lambda a: a["runtime_fingerprint"])
+        )
+    normalized = chosen_detections + other_artifacts
     normalized.sort(key=lambda item: item["type"] != "detection")
     identity_cache = {}
     result = {

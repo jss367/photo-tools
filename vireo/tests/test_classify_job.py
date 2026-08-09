@@ -5963,6 +5963,135 @@ def test_all_photos_cache_satisfied_requires_common_identity_when_either_unresol
     ) is True
 
 
+def test_all_photos_cache_satisfied_rejects_stale_classifier_runtime(tmp_path):
+    """When classifier weights or preprocessing change under the same
+    ``classifier_model`` and label fingerprint, an unreviewed
+    classifier_runs row from the OLD runtime must not satisfy this
+    join.  Without the runtime filter, ``run_classify_job`` would
+    shortcut to ``_finalize_cached_only`` on wrong-runtime results
+    even though the ordinary ``_classify_photos`` gate would reject
+    them via ``_runtime_aware_run_keys``.
+
+    A manually-reviewed row must still count so the pin exception
+    survives runtime changes until an explicit reclassify.
+    """
+    from classify_job import _all_photos_cache_satisfied
+    from computation_cache import (
+        classifier_model_identity,
+        classifier_runtime_fingerprint,
+        runtime_fingerprint,
+        source_input,
+    )
+    from db import Database
+
+    db = Database(str(tmp_path / "test.db"))
+    ws = db.ensure_default_workspace()
+    db.set_active_workspace(ws)
+    folder_id = db.add_folder("/tmp/p", name="p")
+    pid = db.add_photo(
+        folder_id, "a.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+    )
+    detector_runtime = runtime_fingerprint({
+        "type": "detection", "model": "megadetector-v6",
+        "weights_sha256": "2" * 64, "pipeline": "detector-v1",
+    })
+    _input, det_input_fp = source_input(
+        "0" * 64, "vireo-detector-source-v1",
+    )
+    det_id = db.write_detection_batch(
+        pid, "megadetector-v6",
+        [{"box": {"x": 0, "y": 0, "w": 1, "h": 1},
+          "confidence": 0.9, "category": "animal"}],
+        runtime_fingerprint=detector_runtime,
+        input_fingerprint=det_input_fp,
+    )[0]
+
+    labels_full = "5" * 64
+    labels_short = labels_full[:12]
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    (model_dir / "image_encoder.onnx").write_bytes(b"exact model bytes")
+    identity = classifier_model_identity({
+        "id": "bioclip-test",
+        "model_str": "ViT-test",
+        "model_type": "bioclip",
+        "weights_path": str(model_dir),
+        "files": ["image_encoder.onnx"],
+        "source": "custom",
+    })
+    expected_runtime = classifier_runtime_fingerprint(
+        identity, labels_full, detector_runtime,
+    )
+    assert expected_runtime is not None
+
+    # A stale classifier_run: same (model, labels_short) but wrong
+    # runtime_fingerprint (older classifier weights).
+    stale_runtime = "9" * 64
+    db.conn.execute(
+        """INSERT INTO classifier_runs
+             (detection_id, classifier_model, labels_fingerprint,
+              runtime_fingerprint, prediction_count)
+           VALUES (?, ?, ?, ?, ?)""",
+        (det_id, "BioCLIP", labels_short, stale_runtime, 1),
+    )
+    db.add_prediction(
+        det_id, species="Robin", confidence=0.9, model="BioCLIP",
+        labels_fingerprint=labels_short,
+    )
+    db.conn.commit()
+
+    # Without runtime constraint, historic behavior would treat this as
+    # satisfied.  Confirm the old-shape call still returns True so we
+    # know the fix is what changes the answer, not an unrelated regression.
+    assert _all_photos_cache_satisfied(
+        db, [pid], classifier_model="BioCLIP",
+        labels_fingerprint=labels_short,
+    ) is True
+
+    # With the runtime constraint the stale row must be excluded.
+    assert _all_photos_cache_satisfied(
+        db, [pid], classifier_model="BioCLIP",
+        labels_fingerprint=labels_short,
+        model_identity=identity, labels_fingerprint_full=labels_full,
+    ) is False
+
+    # A row with the CORRECT runtime satisfies the check.
+    db.conn.execute(
+        "UPDATE classifier_runs SET runtime_fingerprint = ? WHERE detection_id = ?",
+        (expected_runtime, det_id),
+    )
+    db.conn.commit()
+    assert _all_photos_cache_satisfied(
+        db, [pid], classifier_model="BioCLIP",
+        labels_fingerprint=labels_short,
+        model_identity=identity, labels_fingerprint_full=labels_full,
+    ) is True
+
+    # A stale row with a real manual-review pin stays authoritative —
+    # the pin exception mirrors ``get_classifier_run_keys``' behavior.
+    db.conn.execute(
+        "UPDATE classifier_runs SET runtime_fingerprint = ? WHERE detection_id = ?",
+        (stale_runtime, det_id),
+    )
+    pred_row = db.conn.execute(
+        "SELECT id FROM predictions WHERE detection_id = ?",
+        (det_id,),
+    ).fetchone()
+    db.conn.execute(
+        """INSERT INTO prediction_review
+             (prediction_id, workspace_id, status, reviewed_at, individual)
+           VALUES (?, ?, 'accepted', datetime('now'), 'user-choice')""",
+        (pred_row["id"], ws),
+    )
+    db.conn.commit()
+    assert _all_photos_cache_satisfied(
+        db, [pid], classifier_model="BioCLIP",
+        labels_fingerprint=labels_short,
+        model_identity=identity, labels_fingerprint_full=labels_full,
+    ) is True
+
+
 def test_finalize_cached_only_respects_workspace_detector_threshold(
     tmp_path, monkeypatch,
 ):

@@ -335,6 +335,7 @@ def _classify_detection_gated(db, detection_id, classifier_model,
 def _all_photos_cache_satisfied(
     db, photo_ids, classifier_model=None, labels_fingerprint=None,
     detector_confidence=0.0,
+    model_identity=None, labels_fingerprint_full=None,
 ):
     """True when every classifiable detection already has a matching run.
 
@@ -363,6 +364,18 @@ def _all_photos_cache_satisfied(
     unbound component of the classifier identity on detections covered
     by a different pair.
 
+    When both ``model_identity`` and ``labels_fingerprint_full`` are
+    given, coverage additionally filters by the derived classifier
+    runtime.  Without it, an old classifier_runs row (weights or
+    preprocessing changed under the same ``classifier_model``) still
+    satisfies this join and the caller shortcuts to
+    ``_finalize_cached_only`` on stale results — the ordinary
+    ``_classify_photos`` gate would reject that mismatch via
+    ``_runtime_aware_run_keys``.  ``runtime_fingerprint = 'legacy'``
+    stays accepted for pre-portable rows, and manually reviewed rows
+    (real accept/reject decisions, not auto-match) remain authoritative
+    across runtime changes until an explicit reclassify.
+
     A classifier_run row is only counted as covered when at least one
     matching ``predictions`` row exists.  Local jobs write classifier_runs
     in ``_record_batch_classifier_runs`` *before* ``_store_grouped_predictions``
@@ -384,6 +397,55 @@ def _all_photos_cache_satisfied(
     if labels_fingerprint is not None:
         filter_sql += " AND cr.labels_fingerprint = ?"
         filter_args.append(labels_fingerprint)
+
+    # Derive the set of expected classifier runtime_fingerprints.  A
+    # classifier runtime encodes (model_identity, labels_full,
+    # detector_runtime), so each distinct detector runtime in the
+    # collection produces its own expected classifier runtime.  Empty
+    # when the caller couldn't resolve either input (fresh install with
+    # no downloaded weights) — the runtime filter is then omitted and
+    # we keep the historic model/labels-only behavior.
+    expected_runtimes = set()
+    if model_identity is not None and labels_fingerprint_full:
+        try:
+            from computation_cache import classifier_runtime_fingerprint
+
+            detector_runtimes = set()
+            for chunk in _chunks(photo_ids):
+                placeholders = ",".join("?" for _ in chunk)
+                for r in db.conn.execute(
+                    f"""SELECT DISTINCT runtime_fingerprint
+                         FROM detector_runs
+                         WHERE photo_id IN ({placeholders})""",
+                    list(chunk),
+                ):
+                    if r["runtime_fingerprint"]:
+                        detector_runtimes.add(r["runtime_fingerprint"])
+            for dr in detector_runtimes:
+                expected = classifier_runtime_fingerprint(
+                    model_identity, labels_fingerprint_full, dr,
+                )
+                if expected:
+                    expected_runtimes.add(expected)
+        except (OSError, ValueError):
+            expected_runtimes = set()
+
+    runtime_clause = ""
+    runtime_args = []
+    if expected_runtimes:
+        placeholders = ",".join("?" for _ in expected_runtimes)
+        runtime_clause = (
+            f" AND (cr.runtime_fingerprint IN ({placeholders})"
+            " OR cr.runtime_fingerprint = 'legacy'"
+            " OR EXISTS (SELECT 1 FROM predictions p"
+            " JOIN prediction_review pr ON pr.prediction_id = p.id"
+            " WHERE p.detection_id = cr.detection_id"
+            " AND p.classifier_model = cr.classifier_model"
+            " AND p.labels_fingerprint = cr.labels_fingerprint"
+            " AND pr.status IN ('accepted', 'rejected')"
+            " AND COALESCE(pr.individual, '') != ?))"
+        )
+        runtime_args = list(expected_runtimes) + [AUTO_MATCH_REVIEW_MARKER]
 
     # Only classifier_runs backed by at least one predictions row count as
     # cache-satisfying.  See docstring — a classifier_run without matching
@@ -421,10 +483,10 @@ def _all_photos_cache_satisfied(
                          AS covered
                  FROM detections d
                  LEFT JOIN classifier_runs cr
-                   ON cr.detection_id = d.id{filter_sql}
+                   ON cr.detection_id = d.id{filter_sql}{runtime_clause}
                 WHERE {classifiable_detection}
                   AND d.photo_id IN ({placeholders})""",
-            filter_args + [detector_confidence] + list(chunk),
+            filter_args + runtime_args + [detector_confidence] + list(chunk),
         ).fetchone()
         total += (row["total"] if row else 0) or 0
         covered += (row["covered"] if row else 0) or 0
@@ -459,8 +521,8 @@ def _all_photos_cache_satisfied(
                        ON cr.detection_id = d.id
                     WHERE d.photo_id IN ({placeholders})
                       AND {classifiable_detection}
-                      AND {predictions_exists}{filter_sql}""",
-                list(chunk) + [detector_confidence] + filter_args,
+                      AND {predictions_exists}{filter_sql}{runtime_clause}""",
+                list(chunk) + [detector_confidence] + filter_args + runtime_args,
             ):
                 distinct_identities.add(
                     (identity_row["m"], identity_row["fp"])
@@ -2654,8 +2716,14 @@ def run_classify_job(job, runner, db_path, workspace_id, params, vireo_dir=None)
         # (missing weights on a fresh install, TOL path unavailable) —
         # in that case desired_labels_fingerprint stays None and the
         # check falls back to model-only filtering.
+        desired_labels_fingerprint_full = None
+        peek_labels = None
+        peek_use_tol = False
         try:
-            from labels_fingerprint import compute_fingerprint
+            from labels_fingerprint import (
+                compute_fingerprint,
+                compute_full_fingerprint,
+            )
 
             peek_labels, peek_use_tol = _load_labels(
                 model_type=(peek_model or {}).get("model_type", "bioclip"),
@@ -2666,8 +2734,43 @@ def run_classify_job(job, runner, db_path, workspace_id, params, vireo_dir=None)
                 model_dir=(peek_model or {}).get("weights_path"),
             )
             desired_labels_fingerprint = compute_fingerprint(peek_labels)
+            fp_full_peek = compute_full_fingerprint(peek_labels)
+            if isinstance(fp_full_peek, str) and len(fp_full_peek) == 64:
+                desired_labels_fingerprint_full = fp_full_peek
         except Exception:
             desired_labels_fingerprint = None
+
+        # Resolve the installed classifier's portable identity so the
+        # cache check can filter classifier_runs by runtime_fingerprint.
+        # Without this, a stale run (weights or preprocessing changed
+        # under the same classifier_model, unchanged label fingerprint)
+        # still satisfies the coverage join and the caller shortcuts to
+        # ``_finalize_cached_only`` on wrong-runtime results.  Falling
+        # back to ``None`` keeps the fresh-install case (undownloaded
+        # weights, missing revision file) working as before.
+        desired_model_identity = None
+        try:
+            from computation_cache import (
+                classifier_model_identity,
+                fingerprint as identity_fingerprint,
+            )
+
+            if peek_model and peek_model.get("weights_path"):
+                desired_model_identity = classifier_model_identity(peek_model)
+            if (
+                desired_labels_fingerprint_full is None
+                and peek_use_tol
+                and desired_model_identity
+            ):
+                # Tree-of-Life mode uses a synthetic labels_full that
+                # does not require ``peek_labels`` to be non-empty.
+                # Mirrors the fp_full fallback later in the job.
+                desired_labels_fingerprint_full = identity_fingerprint({
+                    "label_space": "tree-of-life",
+                    "model": desired_model_identity,
+                })
+        except (OSError, ValueError):
+            desired_model_identity = None
 
         import config as cfg
 
@@ -2680,6 +2783,8 @@ def run_classify_job(job, runner, db_path, workspace_id, params, vireo_dir=None)
             classifier_model=desired_classifier_model,
             labels_fingerprint=desired_labels_fingerprint,
             detector_confidence=cache_detector_confidence,
+            model_identity=desired_model_identity,
+            labels_fingerprint_full=desired_labels_fingerprint_full,
         ):
             log.info(
                 "Classify job: every photo has cached classifier runs — "

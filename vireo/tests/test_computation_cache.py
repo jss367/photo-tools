@@ -868,6 +868,66 @@ def test_unknown_detector_runtime_is_quarantined_not_installed(tmp_path):
     assert applied_ok["unknown_runtime"] == 0
 
 
+def test_materialize_selects_single_detection_per_photo_and_model(tmp_path):
+    """When the local store holds trusted detection artifacts from
+    multiple runtimes for the same (photo, detector_model), materialize
+    must NOT feed them all through ``write_detection_batch`` in
+    sequence.  Each runtime change deletes the previously selected
+    detections and cascades their unreviewed predictions; the settled
+    winner would then depend on iteration order rather than on which
+    runtime the catalog already has installed.  Materialize must pick
+    one candidate per logical run so re-application is a no-op and
+    routine reapply cannot churn detections.
+    """
+    destination, _folder_id, photo_id = _database_with_photo(
+        tmp_path / "destination.db", "photo.jpg",
+    )
+
+    other_runtime = runtime_fingerprint({
+        "type": "detection",
+        "model": "megadetector-v6",
+        "weights_sha256": "9" * 64,
+        "pipeline": "detector-v1",
+    })
+    other = detection_artifact()
+    other["runtime_fingerprint"] = other_runtime
+
+    # First pass: no existing detector_runs, both runtimes trusted.
+    # Expect exactly one detector_runs row (not two writes that churn).
+    first = materialize_artifacts(
+        destination, [detection_artifact(), other],
+        known_runtimes={RUNTIME, other_runtime},
+    )
+    assert first["detector_runs_applied"] == 1
+    installed = destination.conn.execute(
+        """SELECT runtime_fingerprint FROM detector_runs
+           WHERE photo_id = ? AND detector_model = 'megadetector-v6'""",
+        (photo_id,),
+    ).fetchone()
+    assert installed is not None
+    installed_runtime = installed["runtime_fingerprint"]
+    assert installed_runtime in {RUNTIME, other_runtime}
+
+    # Second pass with the same inputs: the catalog now has an existing
+    # runtime; materialize must PREFER the matching artifact so the
+    # write is an idempotent no-op rather than a churn between runtimes.
+    second = materialize_artifacts(
+        destination, [detection_artifact(), other],
+        known_runtimes={RUNTIME, other_runtime},
+    )
+    assert second["detector_runs_applied"] == 0
+    assert second["already_materialized"] == 1
+    still_installed = destination.conn.execute(
+        """SELECT runtime_fingerprint FROM detector_runs
+           WHERE photo_id = ? AND detector_model = 'megadetector-v6'""",
+        (photo_id,),
+    ).fetchone()["runtime_fingerprint"]
+    assert still_installed == installed_runtime, (
+        "Re-materialization must not swap runtimes; the loop was "
+        "churning through every candidate again."
+    )
+
+
 def test_classification_deferred_until_detector_run_available(tmp_path):
     destination, _folder_id, photo_id = _database_with_photo(
         tmp_path / "destination.db", "photo.jpg",

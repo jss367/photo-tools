@@ -576,12 +576,17 @@ class _LandedFile:
     """One file this batch landed (fresh copy/transfer) or adopted.
 
     ``verified_hash`` is the hash the import attests is at ``dest_path``
-    (copy-time hash locally; card-side hash remotely). ``origin`` is
-    "copied" or "skipped_duplicate" (adoption) and drives rollback
-    accounting in ``_reclassify_landed_failed``.
+    (copy-time hash locally; card-side hash remotely). Never None: the
+    ledger convention for zero-byte files is ``EMPTY_FILE_SHA256``,
+    normalized at the construction sites (``checker.content_hash``
+    returns None for size-0; scan's photo-row convention is NULL —
+    consumers that compare against row hashes normalize EMPTY → None
+    themselves). ``origin`` is "copied" or "skipped_duplicate"
+    (adoption) and drives rollback accounting in
+    ``_reclassify_landed_failed``.
     """
     dest_path: str
-    verified_hash: str | None
+    verified_hash: str
     source_path: str
     origin: str
     src_size: int | None
@@ -3132,7 +3137,19 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
                         # exactly 0). See PR #1113 review.
                         batch_st.landed.append(_LandedFile(
                             dest_path=cand_mount,
-                            verified_hash=src_hash,
+                            # checker.content_hash returns None for
+                            # size-0; the ledger convention is EMPTY,
+                            # scan's row convention is NULL —
+                            # normalize here, once, instead of in
+                            # every consumer. (The adopt gate above
+                            # filters ``src_hash is None``, so this
+                            # arm is defensive at this site.) Do NOT
+                            # normalize ``src_hash`` itself: the
+                            # intra-batch dedup maps rely on the None
+                            # convention.
+                            verified_hash=src_hash
+                            if src_hash is not None
+                            else EMPTY_FILE_SHA256,
                             source_path=str(source_file),
                             origin="skipped_duplicate",
                             src_size=src_size,
@@ -3439,7 +3456,18 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
                         state.verified += 1
                     batch_st.landed.append(_LandedFile(
                         dest_path=dest_path,
-                        verified_hash=src_hash,
+                        # checker.content_hash returns None for size-0;
+                        # the ledger convention is EMPTY, scan's row
+                        # convention is NULL — normalize here, once,
+                        # instead of in every consumer. Do NOT
+                        # normalize ``src_hash`` itself: the
+                        # intra-batch dedup maps
+                        # (claimed_basenames/queued_src_hashes), the
+                        # adopt gate, and ``_record_checker`` rely on
+                        # the None convention.
+                        verified_hash=src_hash
+                        if src_hash is not None
+                        else EMPTY_FILE_SHA256,
                         source_path=str(sf),
                         origin="copied",
                         src_size=sz,
@@ -3534,13 +3562,13 @@ def _run_remote_import_job(job, runner, db, workspace_id, params):
                     # cross-check against ``verified_hash``. See PR #1113
                     # review.
                     #
-                    # Normalize zero-byte convention on both sides:
-                    # scan() writes NULL for zero-byte files;
-                    # ``checker.content_hash`` returns None; a
-                    # checker-less ``compute_file_hash`` returns
-                    # ``EMPTY_FILE_SHA256``. Treat all three as
-                    # equivalent so an empty card file matches its
-                    # empty catalog row.
+                    # Normalize zero-byte convention on both sides for
+                    # the ROW comparison: scan() writes NULL for
+                    # zero-byte files, while ``entry.verified_hash``
+                    # is never None (zero-byte is normalized to
+                    # ``EMPTY_FILE_SHA256`` at ``_LandedFile``
+                    # construction). Map EMPTY → None on both sides so
+                    # an empty card file matches its empty catalog row.
                     scan_h = row["file_hash"]
                     if scan_h == EMPTY_FILE_SHA256:
                         scan_h = None

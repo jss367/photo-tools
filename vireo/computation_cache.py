@@ -7,6 +7,7 @@ objects are published to the local store.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import math
@@ -16,7 +17,6 @@ import tempfile
 import zipfile
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
-
 
 ARTIFACT_SCHEMA = 1
 BUNDLE_FORMAT = 1
@@ -622,10 +622,8 @@ class ArtifactStore:
             if not created and destination.read_bytes() != body:
                 raise CacheFormatError("content-addressed object collision")
         finally:
-            try:
+            with contextlib.suppress(FileNotFoundError):
                 os.unlink(temp_name)
-            except FileNotFoundError:
-                pass
         return digest, created
 
     def iter_artifacts(self):
@@ -699,10 +697,8 @@ def write_bundle(destination, artifacts, device_label=None):
                 archive.writestr(f"objects/{digest}.json", body)
         os.replace(temp_name, destination)
     finally:
-        try:
+        with contextlib.suppress(FileNotFoundError):
             os.unlink(temp_name)
-        except FileNotFoundError:
-            pass
     return manifest
 
 

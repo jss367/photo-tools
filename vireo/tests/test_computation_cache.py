@@ -1,5 +1,4 @@
 import io
-import json
 import os
 import sys
 import zipfile
@@ -26,7 +25,6 @@ from computation_cache import (  # noqa: E402
     validate_artifact,
     write_bundle,
 )
-
 
 PHOTO_HASH = "1" * 64
 RUNTIME = runtime_fingerprint({

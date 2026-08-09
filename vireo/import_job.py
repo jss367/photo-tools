@@ -3088,6 +3088,69 @@ _ENQ_QUEUED = "queued"
 _ENQ_CANCELLED = "cancelled"
 
 
+def _book_copied(state, rel, attests_bytes):
+    """Book one landed copy into the run counters.
+
+    The two pre-merge sites incremented in different statement orders
+    (local: copied → verified → folder count; rsync: copied → folder
+    count → verified-if-attested). The statements are independent
+    increments with no reads between them, so one order is picked here:
+    copied → folder count → verified when the transport attests bytes
+    (``attests_bytes=True`` reproduces the local transport's
+    unconditional increment).
+    """
+    state.copied += 1
+    _counts(state, rel)["copied"] += 1
+    if attests_bytes:
+        state.verified += 1
+
+
+def _book_adoption(state, batch_st, checker, *, rel, source_file, dest_path,
+                   verified_hash, record_hash, src_size, src_mtime_ns):
+    """Book one crash-recovery adoption: count the duplicate skip, fold
+    the file into ``landed`` with origin "skipped_duplicate" (see the
+    rsync call site's rationale comment for why adoptions ride
+    ``landed`` and deliberately NOT ``dup_skips``), and register the
+    identity with the intra-run checker.
+
+    ``verified_hash`` is the ledger-normalized hash (never None — the
+    zero-byte convention is ``EMPTY_FILE_SHA256``); ``record_hash`` is
+    the RAW source hash the checker's intra-batch maps rely on (still
+    None for a zero-byte source on the rsync transport).
+    """
+    state.skipped_duplicate += 1
+    _counts(state, rel)["skipped_duplicate"] += 1
+    batch_st.landed.append(_LandedFile(
+        dest_path=dest_path,
+        verified_hash=verified_hash,
+        source_path=str(source_file),
+        origin="skipped_duplicate",
+        src_size=src_size,
+        src_mtime_ns=src_mtime_ns,
+    ))
+    _record_checker(
+        state, checker, source_file, batch_st.dest_folder, record_hash,
+    )
+
+
+def _landed_copied(source_file, *, dest_path, verified_hash, src_size,
+                   src_mtime_ns):
+    """The ``origin="copied"`` ledger entry, shared by both transports.
+
+    ``verified_hash`` arrives ledger-normalized (``EMPTY_FILE_SHA256``
+    for zero-byte, never None) — see the call sites' normalization
+    comments for the raw-vs-normalized split.
+    """
+    return _LandedFile(
+        dest_path=dest_path,
+        verified_hash=verified_hash,
+        source_path=str(source_file),
+        origin="copied",
+        src_size=src_size,
+        src_mtime_ns=src_mtime_ns,
+    )
+
+
 class _LocalTransport:
     """Byte transport for a locally mounted archive destination.
 
@@ -3218,19 +3281,15 @@ class _LocalTransport:
 
             if adopted_dest is not None:
                 dest_file, adopt_hash = adopted_dest
-                state.skipped_duplicate += 1
-                _counts(state, rel)["skipped_duplicate"] += 1
-                batch_st.landed.append(
-                    _LandedFile(
-                        dest_path=dest_file,
-                        verified_hash=adopt_hash,
-                        source_path=str(source_file),
-                        origin="skipped_duplicate",
-                        src_size=src_size,
-                        src_mtime_ns=src_mtime_ns,
-                    ),
+                # ``adopt_hash`` is already ledger-normalized (the
+                # zero-byte branch above adopts with EMPTY_FILE_SHA256),
+                # so it serves as both the ledger and the record hash.
+                _book_adoption(
+                    state, batch_st, checker, rel=rel,
+                    source_file=source_file, dest_path=dest_file,
+                    verified_hash=adopt_hash, record_hash=adopt_hash,
+                    src_size=src_size, src_mtime_ns=src_mtime_ns,
                 )
-                _record_checker(state, checker, source_file, dest_folder, adopt_hash)
                 return _ENQ_HANDLED
 
             src_hash = (
@@ -3258,19 +3317,14 @@ class _LocalTransport:
                 "match the source)",
             )
             return _ENQ_HANDLED
-        state.copied += 1
-        state.verified += 1
-        _counts(state, rel)["copied"] += 1
-        batch_st.landed.append(
-            _LandedFile(
-                dest_path=dest_file,
-                verified_hash=file_hash,
-                source_path=str(source_file),
-                origin="copied",
-                src_size=src_size,
-                src_mtime_ns=src_mtime_ns,
-            ),
-        )
+        _book_copied(state, rel, self.attests_bytes)
+        batch_st.landed.append(_landed_copied(
+            source_file, dest_path=dest_file,
+            # ``copy_and_hash_verify`` returns the destination-read hash
+            # (EMPTY_FILE_SHA256 for zero-byte) — already ledger-normalized.
+            verified_hash=file_hash,
+            src_size=src_size, src_mtime_ns=src_mtime_ns,
+        ))
         _record_checker(state, checker, source_file, dest_folder, file_hash)
         return _ENQ_HANDLED
 
@@ -3526,8 +3580,6 @@ class _RsyncTransport:
                 except OSError:
                     on_disk = None
                 if on_disk is not None and on_disk == src_hash:
-                    state.skipped_duplicate += 1
-                    _counts(state, rel)["skipped_duplicate"] += 1
                     batch_st.claimed_basenames[candidate_key] = src_hash
                     # Fold the adoption into ``landed`` (origin
                     # "skipped_duplicate") so the restricted scan
@@ -3549,8 +3601,9 @@ class _RsyncTransport:
                     # decrement ``skipped_duplicate`` twice (the
                     # mount-detach-after-adoption pins hold it at
                     # exactly 0). See PR #1113 review.
-                    batch_st.landed.append(_LandedFile(
-                        dest_path=cand_mount,
+                    _book_adoption(
+                        state, batch_st, checker, rel=rel,
+                        source_file=source_file, dest_path=cand_mount,
                         # checker.content_hash returns None for
                         # size-0; the ledger convention is EMPTY,
                         # scan's row convention is NULL —
@@ -3560,16 +3613,13 @@ class _RsyncTransport:
                         # arm is defensive at this site.) Do NOT
                         # normalize ``src_hash`` itself: the
                         # intra-batch dedup maps rely on the None
-                        # convention.
+                        # convention — hence the raw ``record_hash``.
                         verified_hash=src_hash
                         if src_hash is not None
                         else EMPTY_FILE_SHA256,
-                        source_path=str(source_file),
-                        origin="skipped_duplicate",
-                        src_size=src_size,
-                        src_mtime_ns=src_mtime_ns,
-                    ))
-                    _record_checker(state, checker, source_file, dest_folder, src_hash)
+                        record_hash=src_hash,
+                        src_size=src_size, src_mtime_ns=src_mtime_ns,
+                    )
                     adopted = True
                     break
                 counter += 1
@@ -3817,12 +3867,9 @@ class _RsyncTransport:
                             )
                             _fail(state, rel, sf, reason)
                             continue
-                    state.copied += 1
-                    _counts(state, rel)["copied"] += 1
-                    if attests_bytes:
-                        state.verified += 1
-                    batch_st.landed.append(_LandedFile(
-                        dest_path=dest_path,
+                    _book_copied(state, rel, attests_bytes)
+                    batch_st.landed.append(_landed_copied(
+                        sf, dest_path=dest_path,
                         # checker.content_hash returns None for size-0;
                         # the ledger convention is EMPTY, scan's row
                         # convention is NULL — normalize here, once,
@@ -3835,10 +3882,7 @@ class _RsyncTransport:
                         verified_hash=src_hash
                         if src_hash is not None
                         else EMPTY_FILE_SHA256,
-                        source_path=str(sf),
-                        origin="copied",
-                        src_size=sz,
-                        src_mtime_ns=mt,
+                        src_size=sz, src_mtime_ns=mt,
                     ))
                     _record_checker(state, checker, sf, dest_folder, src_hash)
 
@@ -4046,18 +4090,16 @@ def run_import_job(job, runner, db_path, workspace_id, params):
             if verdict is _GATE_SKIPPED:
                 continue
 
-            # Primary dest path, computed for the guard below. The
-            # transport's ``enqueue`` recomputes the identical value
-            # internally (a verbatim-moved line) — deliberate duplication
-            # to keep the transport move pure.
-            dest_file = os.path.join(dest_folder, source_file.name)
             # Per-file dest-safety guard — spec decision 12. See
             # ``_reject_source_backed_dest`` for the geometry it catches
             # beyond the folder-level guard and for the known
-            # suffix-candidate gap it deliberately does not close.
+            # suffix-candidate gap it deliberately does not close. (The
+            # primary-name join here is also computed inside each
+            # transport's ``enqueue``; the guard only needs the path,
+            # not a shared binding.)
             if _reject_source_backed_dest(
                 state, ctx, rel=rel, source_file=source_file,
-                dest_file=dest_file,
+                dest_file=os.path.join(dest_folder, source_file.name),
             ):
                 continue
 
@@ -4219,11 +4261,12 @@ def run_import_job(job, runner, db_path, workspace_id, params):
     # independently confirms bytes at the destination may leave it
     # False; see the append inside ``_finalize_import``. Degenerates to
     # False on the local transport (every copy is hash-verified),
-    # exactly the parameter's old default there.
+    # exactly the parameter's old default there. ``attests_bytes`` is
+    # the run-constant binding of ``transport.attests_bytes`` above.
     return _finalize_import(
         job, runner, db, state, params,
         discovered=discovered, include_paths=include_paths,
         source_snapshots=source_snapshots, deselected=deselected,
         vanished_paths=vanished_paths, appeared=appeared,
-        remote_unverified=not transport.attests_bytes,
+        remote_unverified=not attests_bytes,
     )

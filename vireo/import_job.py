@@ -3151,6 +3151,162 @@ def _landed_copied(source_file, *, dest_path, verified_hash, src_size,
     )
 
 
+# Verdicts from ``_resolve_dest_collision``. _WALK_HANDLED means the file
+# reached a terminal bucket inside the walk (a crash-recovery adoption or
+# an intra-batch duplicate skip) and is fully booked — the caller returns
+# _ENQ_HANDLED. _WALK_PLACED carries the destination BASENAME the caller
+# must copy/queue the bytes to. Cancellation is NOT a verdict: the walk
+# lets ``DestReadCancelled`` propagate to each transport's existing
+# handler, which is the only place that knows how to book it.
+_WALK_HANDLED = "handled"
+_WALK_PLACED = "placed"
+
+
+def _resolve_dest_collision(state, batch_st, ctx, *, source_file, rel,
+                            checker, src_hash_fn, src_size, src_mtime_ns,
+                            claims, stop_requested):
+    """Walk the primary basename and its numeric suffixes to an adoption,
+    an intra-batch duplicate skip, or a free destination basename.
+
+    ONE walk for both transports (PR 7b; PR 7 adaptation 2 left a
+    hand-mirrored copy inside each of them). The two remaining
+    transport-shaped inputs are parameters rather than branches:
+
+    ``src_hash_fn``: zero-arg callable returning the RAW source hash —
+    ``None`` means a checker'd zero-byte source, the convention the
+    intra-batch maps rely on. Memoized-lazy on the local transport (which
+    may never need a source hash at all), precomputed on rsync (which
+    already hashed eagerly for its ``queued_src_hashes`` dedup). Called
+    only where a hash is genuinely required, and always AFTER the
+    destination read, so a Stop mid-read is observed before the card is
+    touched.
+
+    ``claims``: the rsync transport's batch-scoped ``claimed_basenames``
+    reservation map, or ``None`` on the local transport — where the
+    filesystem itself is the reservation, because bytes land inside
+    ``enqueue`` rather than at the batch's flush. That asymmetry is
+    inherent to deferred transfer, not drift: for a same-basename
+    byte-identical sibling the local path adopts the copy it just made
+    while rsync dup-skips against the claim.
+
+    ``DestReadCancelled`` (and any source-read ``OSError`` from
+    ``src_hash_fn``) propagate to the caller's existing handlers. An
+    unreadable *candidate*, by contrast, is advanced past — it is a
+    destination artifact, not a source problem.
+
+    Returns ``(_WALK_HANDLED, None)`` or ``(_WALK_PLACED, basename)``.
+    """
+    stem, suffix = os.path.splitext(source_file.name)
+    counter = 0
+    while True:
+        candidate = (source_file.name if counter == 0
+                     else f"{stem}_{counter}{suffix}")
+        cand_path = os.path.join(batch_st.dest_folder, candidate)
+        if claims is not None:
+            candidate_key = ctx.fold_basename(candidate)
+            if candidate_key in claims:
+                # Claimed earlier in this batch (a same-basename sibling
+                # already queued). If that sibling has our exact bytes,
+                # skip as an intra-batch duplicate; otherwise advance.
+                # Gated on ``checker``: with ``skip_duplicates=False``
+                # both files must be queued under distinct suffixes
+                # instead of the second being counted as
+                # ``skipped_duplicate`` — which would otherwise let a
+                # verified run report ``safe_to_format=True`` because
+                # ``copied + skipped_duplicate == discovered`` without an
+                # off-card row for it. See PR #1113 review.
+                if checker is not None and claims[candidate_key] == src_hash_fn():
+                    state.skipped_duplicate += 1
+                    _counts(state, rel)["skipped_duplicate"] += 1
+                    batch_st.dup_skips.append((source_file, False))
+                    _record_checker(state, checker, source_file,
+                                    batch_st.dest_folder, src_hash_fn())
+                    return _WALK_HANDLED, None
+                counter += 1
+                continue
+        if os.path.exists(cand_path):
+            # Already on disk. Byte-identical -> adopt; different ->
+            # advance to the next suffix. Adopting matters because a
+            # crash-interrupted retry may already have written THIS
+            # source's bytes under an earlier suffix: an earlier run
+            # copied a colliding different file to ``name.ext``, put this
+            # source's bytes at ``name_1.ext``, then died before its
+            # scan. Advancing past ``name_1.ext`` without hashing it
+            # would re-copy identical bytes to ``name_2.ext`` and leave
+            # two archive copies of one source photo. See PR #1107
+            # review.
+            try:
+                cand_size = os.path.getsize(cand_path)
+            except OSError:
+                # Unreadable candidate: advance rather than fail the
+                # source file (PR 7b flip C). Deliberately not folded
+                # into the zero-byte test below — a failed stat must
+                # never read as "empty".
+                counter += 1
+                continue
+            if src_size == 0 and cand_size == 0:
+                # Zero-byte twin: identical by definition, but kept out
+                # of the duplicate-identity index (see ingest), so it is
+                # an adopted landing rather than a cataloged twin — a
+                # crash may have left these bytes on disk before any
+                # folder/photo row was committed. Size, not hash: a
+                # checker'd zero-byte source hashes to None by
+                # convention and could never match. Adopts at ANY
+                # candidate position on both transports (PR 7b flip A).
+                adopt = (cand_path, EMPTY_FILE_SHA256, EMPTY_FILE_SHA256)
+            elif cand_size == src_size:
+                # Size pre-check: equal hashes imply equal sizes, so a
+                # mismatch rules out a byte match without reading the
+                # file. The archive is often a network mount.
+                try:
+                    cand_hash = _hash_dest_file(cand_path, stop_requested)
+                except DestReadCancelled:
+                    # MUST come first: DestReadCancelled subclasses
+                    # OSError, so the advance handler below would
+                    # otherwise absorb a Stop and let the run keep
+                    # touching the wedged destination (PR #1423).
+                    raise
+                except OSError:
+                    cand_hash = None
+                src_hash = src_hash_fn()
+                if (cand_hash is not None and src_hash is not None
+                        and cand_hash == src_hash):
+                    # Byte-identical file already at the destination
+                    # (e.g. a previous run died between copy and
+                    # catalog). Treat as landed: catalog + stamp it
+                    # rather than skipping — the designed self-heal for
+                    # crash-shaped interruptions. ``src_hash`` is
+                    # non-None here by the gate, so it serves as both
+                    # the ledger and the raw record hash.
+                    adopt = (cand_path, src_hash, src_hash)
+                else:
+                    adopt = None
+            else:
+                adopt = None
+            if adopt is None:
+                counter += 1
+                continue
+            dest_path, verified_hash, record_hash = adopt
+            if claims is not None:
+                # Claim with the RAW hash (``None`` for a checker'd
+                # zero-byte source) so a later same-basename sibling
+                # compares against the same convention the queued path
+                # uses.
+                claims[ctx.fold_basename(candidate)] = src_hash_fn()
+            # ``_book_adoption`` folds the file into ``landed`` with
+            # origin "skipped_duplicate" — deliberately NOT ``dup_skips``
+            # — so the restricted scan catalogs it and the rollback
+            # decrements the right counter. See its docstring.
+            _book_adoption(
+                state, batch_st, checker, rel=rel,
+                source_file=source_file, dest_path=dest_path,
+                verified_hash=verified_hash, record_hash=record_hash,
+                src_size=src_size, src_mtime_ns=src_mtime_ns,
+            )
+            return _WALK_HANDLED, None
+        return _WALK_PLACED, candidate
+
+
 class _LocalTransport:
     """Byte transport for a locally mounted archive destination.
 
@@ -3171,12 +3327,10 @@ class _LocalTransport:
     def enqueue(self, state, batch_st, *, source_file, rel, checker,
                 stop_requested):
         # Local-rebinding shim: the body below is the local path's
-        # per-file middle, moved verbatim; these bindings keep its lines
-        # byte-identical to the pre-move text.
+        # per-file middle (moved verbatim in PR 7; its collision walk is
+        # shared with the rsync transport since PR 7b).
         dest_folder = batch_st.dest_folder
         _stop_requested = stop_requested
-        # Destination path + collision handling (mirrors ingest()).
-        dest_file = os.path.join(dest_folder, source_file.name)
         # Capture card-side (size, mtime_ns) BEFORE the copy so the
         # deferred working-copy pass can identity-check the card
         # override at extraction time. Byte-identical files have the
@@ -3196,11 +3350,11 @@ class _LocalTransport:
         src_size = src_stat.st_size
         src_mtime_ns = src_stat.st_mtime_ns
         try:
-            # Source hash is potentially needed by three checks below
-            # (primary-name adopt, per-suffix candidate adopt, and the
-            # copy_and_hash_verify src_hash arg). Compute lazily and
-            # cache in a small closure so nothing hashes the card
-            # twice.
+            # Source hash is potentially needed by the shared collision
+            # walk (once per hashed candidate) and by the
+            # copy_and_hash_verify src_hash arg. Compute lazily and cache
+            # in a small closure so nothing hashes the card twice — and
+            # so a run with no collisions never hashes the card at all.
             _sh_cache = [False, None]
 
             def _src_hash_cached(
@@ -3215,137 +3369,20 @@ class _LocalTransport:
                     )
                 return _sh_cache[1]
 
-            adopted_dest = None  # (path, hash) when byte-identical twin found
-
-            if os.path.exists(dest_file):
-                try:
-                    dest_size = os.path.getsize(dest_file)
-                except OSError:
-                    # An unreadable CANDIDATE is a destination artifact,
-                    # not a source problem: this OSError used to escape
-                    # to the handler below and fail a perfectly healthy
-                    # card file. Advance instead (the rsync walk always
-                    # has), which imports the photo at the next safe
-                    # slot; if the destination is genuinely broken rather
-                    # than just this one entry, the copy right below
-                    # fails with the real error anyway. -1 (not 0) so an
-                    # unreadable candidate can never be mistaken for an
-                    # empty one by the zero-byte branch. PR 7b flip C.
-                    dest_size = -1
-                if src_size == 0 and dest_size == 0:
-                    # Zero-byte twin: identical by definition, but kept
-                    # out of the duplicate-identity index (see ingest).
-                    # Treat it as an adopted landing, not a cataloged
-                    # twin: a crash may have left these bytes on disk
-                    # before any folder/photo row was committed. The
-                    # exact-file batch scan below catalogs that recovery
-                    # case without walking the rest of the directory.
-                    adopted_dest = (dest_file, EMPTY_FILE_SHA256)
-                elif src_size == dest_size:
-                    try:
-                        dest_hash = _hash_dest_file(
-                            dest_file, _stop_requested)
-                    except DestReadCancelled:
-                        # MUST come first: DestReadCancelled subclasses
-                        # OSError, so the advance handler below would
-                        # otherwise swallow a Stop into "unreadable
-                        # candidate" and let the run keep touching the
-                        # wedged destination. Re-raise to the outer
-                        # cancel handler. PR 7b flip C.
-                        raise
-                    except OSError:
-                        # Advance rather than fail the source file — see
-                        # the getsize handler above.
-                        dest_hash = None
-                    src_h = _src_hash_cached()
-                    if src_h is not None and src_h == dest_hash:
-                        # Byte-identical file already at the destination
-                        # (e.g. a previous run died between copy and
-                        # catalog). Treat as landed: catalog + stamp it
-                        # rather than skipping — this is the designed
-                        # self-heal for crash-shaped interruptions.
-                        adopted_dest = (dest_file, src_h)
-                if adopted_dest is None:
-                    # Different content, same primary name — advance
-                    # through numeric suffixes. But a crash-interrupted
-                    # retry may already have written THIS source's bytes
-                    # under an earlier suffix: an earlier run copied a
-                    # colliding different file to ``name.ext`` and put
-                    # this source's bytes at ``name_1.ext``, then died
-                    # before its scan. Advancing past ``name_1.ext``
-                    # without hashing it would re-copy identical bytes
-                    # to ``name_2.ext`` and leave two archive copies of
-                    # one source photo. Hash-match every existing
-                    # suffix candidate and adopt on a match; on no
-                    # match, land at the next free suffix. See PR #1107
-                    # review.
-                    stem, suffix = os.path.splitext(source_file.name)
-                    counter = 1
-                    while True:
-                        candidate = os.path.join(
-                            dest_folder, f"{stem}_{counter}{suffix}",
-                        )
-                        if not os.path.exists(candidate):
-                            dest_file = candidate
-                            break
-                        try:
-                            cand_size = os.path.getsize(candidate)
-                        except OSError:
-                            cand_size = -1
-                        if src_size == 0 and cand_size == 0:
-                            # Zero-byte twin at a SUFFIX position — the
-                            # same rule the primary-name branch above has
-                            # always applied, and for the same reason:
-                            # all empty files are identical, so an empty
-                            # candidate always IS this source's bytes.
-                            # It has to be a size comparison rather than
-                            # a hash one because a checker'd zero-byte
-                            # source hashes to None by convention and can
-                            # never match on-disk bytes; without this the
-                            # run copies yet another empty file to the
-                            # next suffix. (``cand_size`` is -1, not 0,
-                            # when the stat failed, so an unreadable
-                            # candidate cannot be mistaken for an empty
-                            # one.) PR 7b flip A, spec decision 13's
-                            # neighbourhood.
-                            adopted_dest = (candidate, EMPTY_FILE_SHA256)
-                            break
-                        if cand_size == src_size:
-                            try:
-                                cand_hash = _hash_dest_file(
-                                    candidate, _stop_requested)
-                            except DestReadCancelled:
-                                # First, for the same reason as the
-                                # primary-name handler above.
-                                raise
-                            except OSError:
-                                # Advance past the sick candidate; the
-                                # ``cand_hash is not None`` gate below
-                                # then falls through to counter += 1.
-                                # PR 7b flip C.
-                                cand_hash = None
-                            src_h = _src_hash_cached()
-                            if (
-                                cand_hash is not None
-                                and src_h is not None
-                                and cand_hash == src_h
-                            ):
-                                adopted_dest = (candidate, src_h)
-                                break
-                        counter += 1
-
-            if adopted_dest is not None:
-                dest_file, adopt_hash = adopted_dest
-                # ``adopt_hash`` is already ledger-normalized (the
-                # zero-byte branch above adopts with EMPTY_FILE_SHA256),
-                # so it serves as both the ledger and the record hash.
-                _book_adoption(
-                    state, batch_st, checker, rel=rel,
-                    source_file=source_file, dest_path=dest_file,
-                    verified_hash=adopt_hash, record_hash=adopt_hash,
-                    src_size=src_size, src_mtime_ns=src_mtime_ns,
-                )
+            # Destination basename + collision handling, shared with
+            # the rsync transport (``_resolve_dest_collision``). No
+            # reservation map: bytes land inside this method, so the
+            # filesystem itself is the reservation.
+            verdict, dest_basename = _resolve_dest_collision(
+                state, batch_st, self._ctx,
+                source_file=source_file, rel=rel, checker=checker,
+                src_hash_fn=_src_hash_cached,
+                src_size=src_size, src_mtime_ns=src_mtime_ns,
+                claims=None, stop_requested=_stop_requested,
+            )
+            if verdict is _WALK_HANDLED:
                 return _ENQ_HANDLED
+            dest_file = os.path.join(dest_folder, dest_basename)
 
             src_hash = (
                 checker.content_hash(source_file)
@@ -3523,16 +3560,6 @@ class _RsyncTransport:
         dest_folder = batch_st.dest_folder
         _fold_basename = self._ctx.fold_basename
         _stop_requested = stop_requested
-        # Collision parity (FIX 2): rsync lands files flat by basename,
-        # so two different card files with the same basename in one batch
-        # would clobber on the NAS. Assign a distinct dest basename per
-        # colliding file, mirroring ingest()/the local path: a byte-
-        # identical file already at the destination (a prior run's copy,
-        # or an earlier card file this batch) is a skip; a different one
-        # advances through numeric suffixes. ``claimed_basenames`` tracks
-        # names taken by earlier files IN THIS BATCH; the mount is
-        # locally readable so already-landed bytes are checked on disk.
-        dest_basename = source_file.name
         # Working-copy identity, captured at decision time — before
         # any bytes move — so a source that changes mid-transfer
         # cannot look clean to the working-copy identity check.
@@ -3581,159 +3608,41 @@ class _RsyncTransport:
             batch_st.dup_skips.append((source_file, False))
             _record_checker(state, checker, source_file, dest_folder, src_hash)
             return _ENQ_HANDLED
-        stem, suffix = os.path.splitext(source_file.name)
-        counter = 0
-        adopted = False
-        while True:
-            candidate = (
-                source_file.name if counter == 0
-                else f"{stem}_{counter}{suffix}"
+        # Collision parity (FIX 2): rsync lands files flat by basename,
+        # so two different card files with the same basename in one batch
+        # would clobber on the NAS. Assign a distinct dest basename per
+        # colliding file, mirroring ingest()/the local path: a byte-
+        # identical file already at the destination (a prior run's copy,
+        # or an earlier card file this batch) is a skip; a different one
+        # advances through numeric suffixes. ``claimed_basenames`` tracks
+        # names taken by earlier files IN THIS BATCH; the mount is
+        # locally readable so already-landed bytes are checked on disk.
+        # The walk itself is shared with the local transport (PR 7b);
+        # ``src_hash`` is already computed above for the intra-batch
+        # dedup, so the callable is a constant here rather than lazy.
+        try:
+            verdict, dest_basename = _resolve_dest_collision(
+                state, batch_st, self._ctx,
+                source_file=source_file, rel=rel, checker=checker,
+                src_hash_fn=lambda: src_hash,
+                src_size=src_size, src_mtime_ns=src_mtime_ns,
+                claims=batch_st.claimed_basenames,
+                stop_requested=_stop_requested,
             )
-            cand_mount = os.path.join(dest_folder, candidate)
-            candidate_key = _fold_basename(candidate)
-            if candidate_key in batch_st.claimed_basenames:
-                # Claimed earlier in this batch (a same-basename sibling
-                # already queued). If that sibling has our exact bytes,
-                # skip as an intra-batch duplicate; otherwise advance.
-                # Gated on ``checker`` for the same reason as the
-                # different-basename intra-batch dedup above: when
-                # ``skip_duplicates=False``, both files must be
-                # queued under distinct suffixes instead of the
-                # second one being counted as ``skipped_duplicate``.
-                if (
-                    checker is not None
-                    and batch_st.claimed_basenames[candidate_key] == src_hash
-                ):
-                    state.skipped_duplicate += 1
-                    _counts(state, rel)["skipped_duplicate"] += 1
-                    batch_st.dup_skips.append((source_file, False))
-                    _record_checker(state, checker, source_file, dest_folder, src_hash)
-                    adopted = True
-                    break
-                counter += 1
-                continue
-            if os.path.exists(cand_mount):
-                # Already on disk (crash-recovery/resume). Byte-identical
-                # -> skip; different -> advance to the next suffix.
-                try:
-                    cand_size = os.path.getsize(cand_mount)
-                except OSError:
-                    # An unreadable candidate is a destination artifact,
-                    # not a source problem — same disposition as the
-                    # hash-OSError advance below, one probe earlier.
-                    counter += 1
-                    continue
-                if src_size == 0 and cand_size == 0:
-                    # Zero-byte twin: adopt at ANY candidate position,
-                    # matching the local walk. With a checker
-                    # ``src_hash`` is None for an empty source (the
-                    # zero-byte convention), so the on-disk hash
-                    # comparison below can never match and this size
-                    # comparison is the only way an empty twin is ever
-                    # recognized here. ``DuplicateChecker.record()``
-                    # returns () for a zero-byte source, so the ledger's
-                    # raw-vs-normalized ``record_hash`` split has no
-                    # observable difference at this call site and the
-                    # local branch's EMPTY_FILE_SHA256 is used for both.
-                    # The claim below keeps the RAW convention
-                    # (``src_hash``, i.e. None under a checker) so a
-                    # later same-basename empty sibling compares
-                    # None == None and dup-skips, exactly as the queued
-                    # path already claims raw hashes. PR 7b flip A.
-                    batch_st.claimed_basenames[candidate_key] = src_hash
-                    _book_adoption(
-                        state, batch_st, checker, rel=rel,
-                        source_file=source_file, dest_path=cand_mount,
-                        verified_hash=EMPTY_FILE_SHA256,
-                        record_hash=EMPTY_FILE_SHA256,
-                        src_size=src_size, src_mtime_ns=src_mtime_ns,
-                    )
-                    adopted = True
-                    break
-                if cand_size != src_size:
-                    # Size pre-check, matching the local walk: equal
-                    # hashes imply equal sizes, so a size mismatch rules
-                    # out a byte match without reading the file. Outcome-
-                    # invisible; what it buys is round trips — the
-                    # archive is a network mount and a full hash read of
-                    # a candidate that cannot match is pure waste.
-                    # PR 7b flip B.
-                    counter += 1
-                    continue
-                try:
-                    on_disk = _hash_dest_file(
-                        cand_mount, _stop_requested)
-                except DestReadCancelled:
-                    # Stop arrived mid-read against a candidate on the
-                    # (possibly dead) mount. Advancing to the next
-                    # suffix would immediately call os.path.exists /
-                    # getsize / _hash_dest_file on the same mount and
-                    # can pin cancelling for the mount's own timeout,
-                    # exactly like the twin-hash branch above. Exit the
-                    # candidate loop; the outer check below then exits
-                    # the source-file loop so nothing else in this
-                    # batch touches the mount. The interrupted file
-                    # stays on the card for the next run.
-                    state.cancelled = True
-                    batch_st.dest_read_cancelled = True
-                    break
-                except OSError:
-                    on_disk = None
-                if on_disk is not None and on_disk == src_hash:
-                    batch_st.claimed_basenames[candidate_key] = src_hash
-                    # Fold the adoption into ``landed`` (origin
-                    # "skipped_duplicate") so the restricted scan
-                    # below picks the mount path up — without this
-                    # entry the scan's explicit file set would skip
-                    # the adopted-but-uncataloged file and
-                    # ``copied + skipped_duplicate == discovered``
-                    # could still let a verified run report
-                    # ``safe_to_format=True`` with no photo row —
-                    # and so the post-scan stamping loop re-checks
-                    # that the mount bytes still equal
-                    # ``verified_hash`` before leaving the skip
-                    # counted. Rollback goes through
-                    # ``_reclassify_landed_failed``, whose origin
-                    # switch decrements ``skipped_duplicate``, NOT
-                    # ``copied``. Deliberately NOT also booked into
-                    # ``dup_skips``: the mount-lost block rolls back
-                    # both ledgers, and double-booking would
-                    # decrement ``skipped_duplicate`` twice (the
-                    # mount-detach-after-adoption pins hold it at
-                    # exactly 0). See PR #1113 review.
-                    _book_adoption(
-                        state, batch_st, checker, rel=rel,
-                        source_file=source_file, dest_path=cand_mount,
-                        # checker.content_hash returns None for
-                        # size-0; the ledger convention is EMPTY,
-                        # scan's row convention is NULL —
-                        # normalize here, once, instead of in
-                        # every consumer. (The adopt gate above
-                        # filters ``src_hash is None``, so this
-                        # arm is defensive at this site.) Do NOT
-                        # normalize ``src_hash`` itself: the
-                        # intra-batch dedup maps rely on the None
-                        # convention — hence the raw ``record_hash``.
-                        verified_hash=src_hash
-                        if src_hash is not None
-                        else EMPTY_FILE_SHA256,
-                        record_hash=src_hash,
-                        src_size=src_size, src_mtime_ns=src_mtime_ns,
-                    )
-                    adopted = True
-                    break
-                counter += 1
-                continue
-            dest_basename = candidate
-            break
-        if state.cancelled:
-            # Stop interrupted a collision hash above (mirrors the
-            # twin-hash branch's post-loop check). Don't let this file
-            # (or the rest of the batch) fall through to the queue /
-            # rsync path — every further step touches the same
-            # (possibly dead) mount.
+        except DestReadCancelled:
+            # Stop arrived mid-read against a candidate on the (possibly
+            # dead) mount. Neither this file nor the rest of the batch
+            # may take another step: every one of them touches the same
+            # mount, and advancing would pin cancelling for the mount's
+            # own timeout. The file stays on the card for the next run.
+            # (Before PR 7b this was caught per-candidate inside the loop
+            # and re-checked after it; the walk propagates instead, so
+            # both transports book a dest-read cancel in exactly one
+            # place. See PR #1423.)
+            state.cancelled = True
+            batch_st.dest_read_cancelled = True
             return _ENQ_CANCELLED
-        if adopted:
+        if verdict is _WALK_HANDLED:
             return _ENQ_HANDLED
         batch_st.claimed_basenames[_fold_basename(dest_basename)] = src_hash
         # Only track queued source hashes when duplicate skipping is

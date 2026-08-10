@@ -304,6 +304,40 @@ Two further decisions recorded here:
   no-collision fast path stays unpolled so a Stop racing the orchestrator's
   loop-top check cannot flip an otherwise-clean copy into a cancellation.
   Pinned by `test_{local,remote}_walk_observes_stop_while_advancing_candidates`.
+  **Second round (same review):** the first version of this poll raised
+  `DestReadCancelled`, which was wrong. That exception means a destination
+  *read* was interrupted, so its handlers set `dest_read_cancelled`, which
+  suppresses both the post-loop mount probe and the batch's catalog pass —
+  breaking the invariant the catalog block itself documents ("a plain user
+  Stop on a healthy mount leaves `dest_read_cancelled` False, so
+  partially-landed batches keep cataloging like before", PR #1423 review).
+  A Stop seen between probes is no evidence of a sick mount. The walk now
+  returns a distinct `_WALK_CANCELLED` verdict; both transports set
+  `state.cancelled` and return `_ENQ_CANCELLED` without touching
+  `dest_read_cancelled`. The two pins were rebuilt as two-file batches
+  where the earlier file lands (local: fresh copy; remote: adoption, since
+  a queued transfer is not in `landed` at the cancel point) and must still
+  be cataloged; neutralization confirms both go red under the raising
+  version.
+- **Non-regular collision candidates (CodeRabbit review of PR #1450,
+  Major — adopted, severity corrected).** FIFOs, device nodes and sockets
+  stat as size 0, so flip A's `src_size == 0 and cand_size == 0` branch
+  would adopt one for a zero-byte source *without reading it*. The walk now
+  takes one `os.stat` and advances unless `S_ISREG`. The size-matched
+  branch needs no guard — it reads the candidate, and a blocked FIFO read
+  becomes an `OSError` advance via `_hash_dest_file`'s watchdog. Severity
+  correction: the review predicted a silent `skipped_duplicate` with
+  `safe_to_format` going green; observed pre-fix behavior is that the
+  post-scan validation finds no photo row and reclassifies the file to
+  FAILED, so this is a spurious-failure bug of the same class as the
+  dangling-symlink hole, not a data-safety one. Pinned by
+  `test_zero_byte_source_does_not_adopt_a_fifo_candidate`. Note the
+  knock-on: this screening also filtered the FIFOs out of
+  `test_remote_import_cancel_interrupts_stuck_collision_hash` before its
+  wedged read — caught by the `== 1` assertion tightened earlier in this
+  PR — so that fixture now presents its FIFOs as regular files of the
+  source's size via an `os.stat` stub, keeping the genuine blocking
+  `open()` that is the only property it needs a FIFO for.
 - **Preflight-mirror reconciliation (the PR 3 standing obligation).** Every
   change to the collision/adopt walk must be checked against the
   hand-mirrored copy in `app.py`'s recovery preview

@@ -63,6 +63,7 @@ import logging
 import os
 import posixpath
 import shutil
+import stat as stat_mod
 import sys
 import threading
 import time
@@ -3190,6 +3191,17 @@ def _landed_copied(source_file, *, dest_path, verified_hash, src_size,
 # handler, which is the only place that knows how to book it.
 _WALK_HANDLED = "handled"
 _WALK_PLACED = "placed"
+# A plain Stop observed BETWEEN candidate probes. Deliberately distinct
+# from ``DestReadCancelled``, which the walk still lets propagate: that
+# exception means a destination READ was interrupted mid-flight, i.e. the
+# mount may be wedged, and its handlers set ``dest_read_cancelled``, which
+# suppresses both the post-loop mount probe and the batch's catalog pass.
+# A healthy Stop observed between probes is no evidence of a sick mount,
+# and suppressing the catalog pass for it would leave already-copied files
+# uncataloged until some later run adopted them. See the catalog block's
+# "A plain user Stop on a healthy mount leaves dest_read_cancelled False"
+# comment, and the Codex review of PR #1450.
+_WALK_CANCELLED = "cancelled"
 
 
 def _resolve_dest_collision(state, batch_st, ctx, *, source_file, rel,
@@ -3237,21 +3249,21 @@ def _resolve_dest_collision(state, batch_st, ctx, *, source_file, rel,
             # which is the walk's only other cancellation poll. Without
             # this a Stop goes unobserved for the whole collision chain
             # while the walk keeps probing a (possibly slow, possibly
-            # dying) network destination. Raise the same
-            # DestReadCancelled the hash raises so both transports book
-            # it through the handler they already have. Codex review of
-            # PR #1450; before flip B the rsync walk got this for free by
-            # hashing every existing candidate, and the local walk — which
-            # has always size-gated — never had it at all.
+            # dying) network destination. Codex review of PR #1450;
+            # before flip B the rsync walk got this for free by hashing
+            # every existing candidate, and the local walk — which has
+            # always size-gated — never had it at all.
+            #
+            # Reported as a VERDICT, not as ``DestReadCancelled``: no
+            # destination read was interrupted here, so this must not
+            # set ``dest_read_cancelled`` and suppress the batch's mount
+            # probe and catalog pass. See ``_WALK_CANCELLED``.
             #
             # Gated on ``counter`` deliberately: the no-collision fast
             # path stays unpolled, so a Stop racing the orchestrator's
             # loop-top check cannot flip an otherwise-clean copy into a
             # cancellation.
-            raise DestReadCancelled(
-                f"import cancelled while resolving a destination name "
-                f"for {source_file}"
-            )
+            return _WALK_CANCELLED, None
         candidate = (source_file.name if counter == 0
                      else f"{stem}_{counter}{suffix}")
         cand_path = os.path.join(batch_st.dest_folder, candidate)
@@ -3325,7 +3337,7 @@ def _resolve_dest_collision(state, batch_st, ctx, *, source_file, rel,
             # two archive copies of one source photo. See PR #1107
             # review.
             try:
-                cand_size = os.path.getsize(cand_path)
+                cand_stat = os.stat(cand_path)
             except OSError:
                 # Unreadable candidate: advance rather than fail the
                 # source file (PR 7b flip C). Deliberately not folded
@@ -3333,6 +3345,22 @@ def _resolve_dest_collision(state, batch_st, ctx, *, source_file, rel,
                 # never read as "empty".
                 counter += 1
                 continue
+            if not stat_mod.S_ISREG(cand_stat.st_mode):
+                # FIFOs, device nodes and sockets all stat as size 0, so
+                # the zero-byte branch below would adopt one as this
+                # source's archive copy without ever reading it. (Today
+                # that ends as a spurious failure rather than a silent
+                # lie — the post-scan validation finds no photo row and
+                # reclassifies the file to failed — but failing a healthy
+                # card file over a stray FIFO is still wrong.) The
+                # size-MATCHED branch needs no such guard: it reads the
+                # candidate, and a blocked FIFO read becomes an OSError
+                # advance via _hash_dest_file's watchdog. A directory at
+                # the candidate name lands here too, and advancing is
+                # equally right for it. CodeRabbit review of PR #1450.
+                counter += 1
+                continue
+            cand_size = cand_stat.st_size
             if src_size == 0 and cand_size == 0:
                 # Zero-byte twin: identical by definition, but kept out
                 # of the duplicate-identity index (see ingest), so it is
@@ -3471,6 +3499,13 @@ class _LocalTransport:
             )
             if verdict is _WALK_HANDLED:
                 return _ENQ_HANDLED
+            if verdict is _WALK_CANCELLED:
+                # Plain Stop between candidate probes. Book the run as
+                # cancelled but leave ``dest_read_cancelled`` alone —
+                # the mount is healthy, so this batch's earlier landings
+                # must still be probed and cataloged.
+                state.cancelled = True
+                return _ENQ_CANCELLED
             dest_file = os.path.join(dest_folder, dest_basename)
 
             src_hash = (
@@ -3733,6 +3768,13 @@ class _RsyncTransport:
             return _ENQ_CANCELLED
         if verdict is _WALK_HANDLED:
             return _ENQ_HANDLED
+        if verdict is _WALK_CANCELLED:
+            # Plain Stop between candidate probes — see the local
+            # transport's twin. Not a dest-read cancel: the mount is
+            # healthy, so this batch's earlier adoptions must still be
+            # probed and cataloged.
+            state.cancelled = True
+            return _ENQ_CANCELLED
         batch_st.claimed_basenames[_fold_basename(dest_basename)] = src_hash
         # Only track queued source hashes when duplicate skipping is
         # enabled — the intra-batch dedup that consults this map is
@@ -4208,8 +4250,13 @@ def run_import_job(job, runner, db_path, workspace_id, params):
                 checker=checker, stop_requested=_stop_requested,
             )
             if verdict is _ENQ_CANCELLED:
-                # Stop interrupted a destination read inside the transport
-                # — nothing further this batch may touch the mount.
+                # Stop was observed inside the transport — either a
+                # destination read was interrupted mid-flight (the
+                # transport also set ``dest_read_cancelled``, and nothing
+                # further this batch may touch the mount) or the walk saw
+                # a plain Stop between candidate probes (mount healthy;
+                # the batch's earlier landings still get probed and
+                # cataloged below). Either way, stop feeding files.
                 break
             # _ENQ_HANDLED / _ENQ_QUEUED: the file reached a terminal
             # bucket (or an adopted landing) inside the transport, or its

@@ -12455,25 +12455,37 @@ def test_remote_import_cancel_interrupts_stuck_collision_hash(
     db = Database(db_path)
     ws_id = db._active_workspace_id
 
-    # FIXTURE ADAPTATION (PR 7b flip B). The walk now gates candidate
-    # hashing on a size match, and a FIFO stats as size 0 — so without
-    # this stub the wedged candidates would be advanced past without ever
-    # being read, and every assertion below would pass vacuously. A real
-    # wedged SMB candidate does not report size 0 (its stat blocks, or
-    # returns the real size); the FIFO's 0 is an artifact of how this
-    # test simulates a dead mount, so the fixture is what the gate
-    # invalidates, not the property under test. Report the source size
-    # for the two FIFOs and delegate everything else.
+    # FIXTURE ADAPTATION (PR 7b). The walk screens candidates on their
+    # stat before reading them — a size match (flip B) and a regular-file
+    # check (CodeRabbit review of #1450) — and a FIFO fails BOTH: it
+    # reports size 0 and mode S_IFIFO. Without this stub the wedged
+    # candidates would be advanced past without ever being read and every
+    # assertion below would pass vacuously.
+    #
+    # A real wedged SMB candidate is a REGULAR file of the expected size
+    # whose READ blocks; that blocking read is the only property this
+    # test needs a FIFO for, and its mode and 0 size are artifacts of the
+    # simulation. So present the two FIFOs as regular files of the
+    # source's size and let the genuine blocking open() still happen —
+    # the fixture is what the screening invalidates, not the property
+    # under test.
+    import stat as _stat
     _card_size = os.path.getsize(str(card_file))
     _fifo_paths = {str(collision), str(next_collision)}
-    _real_getsize = os.path.getsize
+    _real_stat = os.stat
 
-    def _getsize_with_live_fifos(path):
+    def _stat_with_live_fifos(path, *args, **kwargs):
+        st = _real_stat(path, *args, **kwargs)
         if str(path) in _fifo_paths:
-            return _card_size
-        return _real_getsize(path)
+            return os.stat_result((
+                (st.st_mode & ~_stat.S_IFMT(st.st_mode)) | _stat.S_IFREG,
+                st.st_ino, st.st_dev, st.st_nlink, st.st_uid, st.st_gid,
+                _card_size,
+                int(st.st_atime), int(st.st_mtime), int(st.st_ctime),
+            ))
+        return st
 
-    monkeypatch.setattr(os.path, "getsize", _getsize_with_live_fifos)
+    monkeypatch.setattr(os, "stat", _stat_with_live_fifos)
 
     # Spy on the collision-candidate probe. ``os.path.exists`` gets called
     # once per candidate iteration, so without the inner break Codex asked
@@ -12532,8 +12544,9 @@ def test_remote_import_cancel_interrupts_stuck_collision_hash(
         f"the collision loop must hash EXACTLY ONE dead-mount candidate "
         f"on cancel: more than one means it advanced past the wedged "
         f"primary instead of leaving the loop; zero means the walk never "
-        f"reached the read this test exists to interrupt (the flip-B size "
-        f"gate skipping the FIFO would look like that) — {dest_hashes}"
+        f"reached the read this test exists to interrupt (any candidate "
+        f"screening that filters the FIFO out before the read — the size "
+        f"gate, the regular-file check — looks like that) — {dest_hashes}"
     )
 
 
@@ -14207,77 +14220,121 @@ def _mismatched_chain(dest_dir, card_file, names):
         (dest_dir / name).write_bytes(base + b"\x00" * (17 * (i + 1)))
 
 
-def _dest_getsize_spy(monkeypatch, dest_dir):
-    """Count ``os.path.getsize`` probes inside ``dest_dir`` only."""
+def _candidate_probe_spy(monkeypatch, dest_dir, name_prefix):
+    """Count the walk's candidate probes for one source file.
+
+    Spies ``os.path.lexists``, which the walk calls exactly once per
+    candidate iteration (and which nothing else on this path calls for
+    files in ``dest_dir``), filtered to the candidates of a single source
+    basename. Counting the size probe instead would be fragile: whether
+    that is ``getsize`` or ``stat`` is an implementation detail, and it
+    is only reached for candidates that exist.
+    """
     probed = []
-    real = os.path.getsize
+    real = os.path.lexists
 
     def spy(path):
-        if os.path.dirname(str(path)) == str(dest_dir):
-            probed.append(str(path))
+        p = str(path)
+        if (os.path.dirname(p) == str(dest_dir)
+                and os.path.basename(p).startswith(name_prefix)):
+            probed.append(p)
         return real(path)
 
-    monkeypatch.setattr(os.path, "getsize", spy)
+    monkeypatch.setattr(os.path, "lexists", spy)
     return probed
 
 
 def test_local_walk_observes_stop_while_advancing_candidates(
         tmp_path, monkeypatch):
     """Stop must be observed while advancing a size-mismatched collision
-    chain, not only when a candidate gets hashed."""
+    chain, not only when a candidate gets hashed — AND it must stay an
+    ordinary cancellation.
+
+    The batch's earlier file lands cleanly before Stop arrives, so it has
+    to be cataloged: a plain Stop on a healthy mount leaves
+    ``dest_read_cancelled`` False, and the catalog block's own comment
+    promises partially-landed batches keep cataloging. Reporting this poll
+    as ``DestReadCancelled`` would break that promise (Codex review of
+    #1450) — it would also suppress the post-loop mount probe, which is
+    the last chance to notice a detach during the copy that just finished.
+    """
     from import_job import ImportParams, run_import_job
 
-    card = _make_card(tmp_path, [
-        ("IMG_0400.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
-    ])
+    card = tmp_path / "card"
+    card.mkdir()
+    for name, color in (("A_0400.jpg", "red"), ("B_0400.jpg", "blue")):
+        Image.new("RGB", (16, 16), color).save(str(card / name))
+        ts = datetime(2026, 7, 3, 10, 0, 0).timestamp()
+        os.utime(str(card / name), (ts, ts))
+
     archive = tmp_path / "archive"
     dest_dir = archive / "2026" / "2026-07-03"
-    _mismatched_chain(dest_dir, card / "IMG_0400.jpg", [
-        "IMG_0400.jpg", "IMG_0400_1.jpg", "IMG_0400_2.jpg",
+    # Only B collides — A fresh-copies and lands before the Stop.
+    _mismatched_chain(dest_dir, card / "B_0400.jpg", [
+        "B_0400.jpg", "B_0400_1.jpg", "B_0400_2.jpg",
     ])
-    probed = _dest_getsize_spy(monkeypatch, dest_dir)
+    probed = _candidate_probe_spy(monkeypatch, dest_dir, "B_0400")
 
     db_path = str(tmp_path / "test.db")
     db = Database(db_path)
     result = run_import_job(
-        _make_job(), CancelOnImportingRunner(), db_path,
+        _make_job(), CancelOnFileImportingRunner("B_0400.jpg"), db_path,
         db._active_workspace_id,
         ImportParams(sources=[str(card)], destination=str(archive)),
     )
 
     assert result["cancelled"] is True, result
-    assert result["copied"] == 0, result
     assert result["failed"] == 0, result
+    # A landed before the Stop; B never did.
+    assert result["copied"] == 1, result
+    assert (dest_dir / "A_0400.jpg").exists()
+    assert not (dest_dir / "B_0400_3.jpg").exists(), \
+        sorted(os.listdir(str(dest_dir)))
     # The walk stopped at the first advance instead of walking the chain
     # to a free slot and copying there.
-    assert not (dest_dir / "IMG_0400_3.jpg").exists(), \
-        sorted(os.listdir(str(dest_dir)))
     assert len(probed) == 1, probed
+    # THE REGRESSION GUARD: an ordinary Stop must not suppress the
+    # batch's catalog pass. A is on disk, so A must have a photo row.
+    rows = [r["filename"] for r in _photo_rows(db)]
+    assert rows == ["A_0400.jpg"], rows
 
 
 def test_remote_walk_observes_stop_while_advancing_candidates(
         tmp_path, monkeypatch):
-    """Remote half — the same shared-walk poll, so the same code satisfies
-    both."""
+    """Remote half — the same shared-walk verdict, so the same code
+    satisfies both.
+
+    The earlier file is a crash-recovery ADOPTION rather than a fresh
+    copy: remote transfers are queued and flushed per batch, so a fresh
+    file would not be in ``landed`` at the cancel point and the catalog
+    assertion would pass vacuously.
+    """
     from import_job import ImportParams, run_import_job
 
     ra = _remote_archive_for(tmp_path)
     calls = _remote_calls(ra)
     _install_fake_remote_rsync(monkeypatch, calls, verify=None)
 
-    card = _make_card(tmp_path, [
-        ("IMG_0400.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
-    ])
+    card = tmp_path / "card"
+    card.mkdir()
+    for name, color in (("A_0400.jpg", "red"), ("B_0400.jpg", "blue")):
+        Image.new("RGB", (16, 16), color).save(str(card / name))
+        ts = datetime(2026, 7, 3, 10, 0, 0).timestamp()
+        os.utime(str(card / name), (ts, ts))
+
     mount_dir = Path(ra["mount_base"]) / "2026" / "2026-07-03"
-    _mismatched_chain(mount_dir, card / "IMG_0400.jpg", [
-        "IMG_0400.jpg", "IMG_0400_1.jpg", "IMG_0400_2.jpg",
+    _mismatched_chain(mount_dir, card / "B_0400.jpg", [
+        "B_0400.jpg", "B_0400_1.jpg", "B_0400_2.jpg",
     ])
-    probed = _dest_getsize_spy(monkeypatch, mount_dir)
+    # A is already on the mount byte-identical and uncataloged, so it is
+    # adopted into ``landed`` before B's Stop.
+    (mount_dir / "A_0400.jpg").write_bytes((card / "A_0400.jpg").read_bytes())
+    probed = _candidate_probe_spy(monkeypatch, mount_dir, "B_0400")
 
     db_path = str(tmp_path / "test.db")
     db = Database(db_path)
     result = run_import_job(
-        _make_job(), CancelOnImportingRunner(), db_path,
+        _make_job(), CancelOnFileImportingRunner("B_0400.jpg"), db_path,
         db._active_workspace_id,
         ImportParams(
             sources=[str(card)], destination=ra["mount_base"],
@@ -14286,9 +14343,63 @@ def test_remote_walk_observes_stop_while_advancing_candidates(
     )
 
     assert result["cancelled"] is True, result
-    assert result["copied"] == 0, result
     assert result["failed"] == 0, result
+    assert result["copied"] == 0, result
+    assert result["skipped_duplicate"] == 1, result
     assert calls["rsync"] == [], calls["rsync"]
-    assert not (mount_dir / "IMG_0400_3.jpg").exists(), \
+    assert not (mount_dir / "B_0400_3.jpg").exists(), \
         sorted(os.listdir(str(mount_dir)))
+    # B's walk probed exactly one candidate before the Stop was
+    # observed, instead of chaining to the free slot past it.
     assert len(probed) == 1, probed
+    # THE REGRESSION GUARD, remote half.
+    rows = [r["filename"] for r in _photo_rows(db)]
+    assert rows == ["A_0400.jpg"], rows
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="os.mkfifo is POSIX-only; FIFO stands in for a non-regular entry.",
+)
+def test_zero_byte_source_does_not_adopt_a_fifo_candidate(tmp_path):
+    """CodeRabbit review of #1450: a non-regular entry must never be
+    adopted as this source's archive copy.
+
+    FIFOs, device nodes and sockets all stat as size 0, so flip A's
+    ``src_size == 0 and cand_size == 0`` branch would adopt one for a
+    zero-byte source, without ever reading it. Observed pre-fix outcome:
+    the FIFO is adopted, the catalog scan produces no photo row for it,
+    and the post-scan validation reclassifies the file to FAILED with
+    "not cataloged after scan" — so a healthy card file is refused over a
+    stray FIFO. (The review predicted a silent ``skipped_duplicate`` with
+    ``safe_to_format`` going green; the rollback machinery prevents that,
+    so this is a spurious-failure bug of the same class as the
+    dangling-symlink hole, not a data-safety one.) The size-MATCHED branch is
+    protected by its read (hashing a FIFO blocks until the watchdog turns
+    it into an OSError advance); the zero-byte branch adopts without
+    reading anything, so it needs an explicit regular-file check.
+
+    The walk is shared, so this covers both transports.
+    """
+    from import_job import ImportParams
+
+    card, _src = _make_zero_byte_card(tmp_path, name="EMPTY.jpg")
+    archive = tmp_path / "archive"
+    dest_dir = archive / "2026" / "2026-07-03"
+    dest_dir.mkdir(parents=True)
+    fifo = dest_dir / "EMPTY.jpg"
+    os.mkfifo(str(fifo))
+
+    db, ws_id, result = _run_import(tmp_path, ImportParams(
+        sources=[str(card)], destination=str(archive),
+    ))
+
+    assert result["failed"] == 0, result["unsafe_files"]
+    assert result["skipped_duplicate"] == 0, result
+    assert result["copied"] == 1, result
+    # A real, regular archive file at the next slot; the FIFO untouched.
+    landed = dest_dir / "EMPTY_1.jpg"
+    assert landed.is_file() and not landed.is_fifo()
+    assert fifo.is_fifo()
+    rows = [r["filename"] for r in _photo_rows(db)]
+    assert rows == ["EMPTY_1.jpg"], rows

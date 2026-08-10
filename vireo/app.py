@@ -1684,6 +1684,15 @@ _FINDER_TRASH_TIMEOUT_SECS = 30
 _FINDER_TRASH_BATCH_SIZE = 20
 _MOUNT_QUERY_TIMEOUT_SECS = 5
 
+# Distinct from ``None`` so ``_trash_paths`` can tell "caller didn't pass
+# network_roots" (re-query is safe) apart from "caller's own mount query
+# already failed and it is passing that fail-closed signal through"
+# (re-querying would overwrite the caller's classification with a stale
+# or empty set the moment the share detaches, reclassifying an
+# already-known custom mount point as local and reintroducing the
+# unbounded-I/O hang this routing exists to prevent).
+_NETWORK_ROOTS_UNSET = object()
+
 
 def _volume_root_for_path(filepath):
     """Return ``/Volumes/<name>`` for a path on a macOS mounted volume."""
@@ -2175,7 +2184,7 @@ def _path_confirmed_gone(filepath, expected_parent_dev=None):
 
 
 def _trash_paths(filepaths, progress_callback=None, already_missing_out=None,
-                 network_roots=None):
+                 network_roots=_NETWORK_ROOTS_UNSET):
     """Move paths to Trash and return ``(moved, successful, failures)``.
 
     Missing paths are successful (the requested end state already holds) but
@@ -2195,13 +2204,13 @@ def _trash_paths(filepaths, progress_callback=None, already_missing_out=None,
     result instead of a silent ``{trashed: 0}``.
 
     ``network_roots`` lets a caller reuse a mount-table classification it
-    already performed. Without it we re-query ``_network_volume_roots()``,
-    but if that second query times out or fails the helper would only fall
-    back to ``/Volumes`` paths — silently reclassifying an already-known
-    custom mount point (``/Users/me/mnt/photos``) as local, which is the
-    exact case we routed through Finder in the first place. Endpoints that
-    stat the mount table before calling us should pass the successful
-    result through so the classification cannot be lost.
+    already performed. When omitted we re-query ``_network_volume_roots()``.
+    Callers whose own mount query already failed should pass ``None``
+    explicitly: that preserves the fail-closed classification they made
+    against ``/Volumes`` paths instead of us re-querying and — if the second
+    query succeeds with the share now detached — silently reclassifying an
+    already-known custom mount point (``/Users/me/mnt/photos``) as local,
+    which is the exact case we routed through Finder in the first place.
     """
     ordered = list(dict.fromkeys(filepaths))
     successful = set()
@@ -2211,7 +2220,7 @@ def _trash_paths(filepaths, progress_callback=None, already_missing_out=None,
     finder_candidates = []
     network_finder_candidates = set()
     send_errors = {}
-    if network_roots is None:
+    if network_roots is _NETWORK_ROOTS_UNSET:
         network_roots = _network_volume_roots()
     processed = set()
 
@@ -22566,12 +22575,14 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         # already surfaces "file already missing" and the network branch
         # must match so cleanup is a terminal state either way.
         already_missing_paths = set()
-        # Reuse the mount-table snapshot we already took at line 22392.
-        # ``_trash_paths`` would otherwise re-query it, and if that second
-        # query times out or fails it can only fall back to ``/Volumes``
-        # paths — silently reclassifying custom-mount shares (already
-        # correctly categorised here) as local and reintroducing the
-        # unbounded-I/O hang this routing exists to prevent.
+        # Pass through our mount-table snapshot — including an explicit
+        # ``None`` when our own query failed — so ``_trash_paths`` does
+        # not re-query and overwrite our fail-closed classification. If
+        # its second query happened to succeed after the share detached,
+        # a custom-mount path we already flagged network (via the
+        # ``/Volumes`` fallback in ``_path_on_network_volume``) would be
+        # silently reclassified as local, reintroducing the unbounded-I/O
+        # hang this routing exists to prevent.
         trashed, successful_paths, trash_failures = _trash_paths(
             [filepath for _pid, filepath in trash_candidates],
             already_missing_out=already_missing_paths,

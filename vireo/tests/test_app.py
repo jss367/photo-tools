@@ -5094,6 +5094,50 @@ def test_trash_paths_honors_caller_supplied_network_roots(
     assert query_calls == []
 
 
+def test_trash_paths_preserves_explicit_none_network_roots(
+    monkeypatch, tmp_path,
+):
+    """A caller whose own mount query failed passes ``network_roots=None``
+    to signal fail-closed. ``_trash_paths`` must not treat that as
+    "argument not supplied" and re-query: if the second query happens to
+    succeed after the share detaches, a ``/Volumes/...`` path the caller
+    had already classified as network via the ``/Volumes`` fallback would
+    be silently reclassified as local, allowing unbounded in-process I/O
+    on an unhealthy share.
+    """
+    import app as app_module
+
+    monkeypatch.setattr(app_module.sys, "platform", "darwin")
+    photo = "/Volumes/NAS/bird.NEF"
+
+    query_calls = []
+
+    def would_hang():
+        query_calls.append("call")
+        raise AssertionError(
+            "_trash_paths must honor an explicit network_roots=None (the "
+            "caller's mount query already failed) and not re-query",
+        )
+
+    monkeypatch.setattr(app_module, "_network_volume_roots", would_hang)
+    monkeypatch.setattr(
+        app_module, "_trash_via_finder",
+        lambda paths: (set(paths), set(), []),
+    )
+
+    moved, successful, failures = app_module._trash_paths(
+        [photo], network_roots=None,
+    )
+
+    # The fail-closed ``/Volumes`` fallback in ``_path_on_network_volume``
+    # routed the path through Finder, so it lands as moved without any
+    # in-process stat or mount re-query touching the share.
+    assert moved == 1
+    assert successful == {photo}
+    assert failures == []
+    assert query_calls == []
+
+
 def test_navbar_js_fallbacks_match_python_constants():
     """The hardcoded fallback lists in _navbar.html must mirror the
     canonical Python lists. The navbar's JS uses these fallbacks when

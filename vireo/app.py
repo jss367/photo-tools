@@ -1837,13 +1837,15 @@ def _deepest_network_root_for_path(filepath, network_roots):
         best_len = -1
         for root in network_roots:
             try:
-                if os.path.commonpath((normalized, root)) == root:
+                if (
+                    os.path.commonpath((normalized, root)) == root
+                    and len(root) > best_len
+                ):
                     # Longest matching root wins so nested mounts probe the
                     # inner share rather than an outer one that happens to
                     # be iterated first from the roots set.
-                    if len(root) > best_len:
-                        best = root
-                        best_len = len(root)
+                    best = root
+                    best_len = len(root)
             except ValueError:
                 continue
         if best is not None:

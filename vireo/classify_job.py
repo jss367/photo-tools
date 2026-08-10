@@ -757,11 +757,22 @@ def _detect_batch(photos, folders, runner, job, reclassify, db,
                             photo["id"], min_conf=0,
                             detector_model="megadetector-v6",
                         )]
+                        # Reconstruct the configured ArtifactStore from
+                        # the path stashed by ``run_classify_job`` /
+                        # ``run_pipeline_job`` so newly published detector
+                        # artifacts honor ``COMPUTATION_CACHE_DIR``
+                        # instead of landing in the default location.
+                        from computation_cache import ArtifactStore
+                        _cache_dir = job.get("_computation_cache_dir")
+                        _publish_store = (
+                            ArtifactStore(_cache_dir) if _cache_dir else None
+                        )
                         publish_detection_artifact(
                             portable_photo_hash,
                             "megadetector-v6",
                             detector_runtime,
                             normalized_detections,
+                            store=_publish_store,
                         )
                 except Exception:
                     log.warning(
@@ -1770,7 +1781,7 @@ def _record_batch_classifier_runs(
 def _publish_classifier_runs_for_raw_results(
     db, raw_results, classifier_model, labels_fingerprint,
     labels_fingerprint_full=None, model_identity=None,
-    taxonomy_identity="no-tax",
+    taxonomy_identity="no-tax", store=None,
 ):
     """Publish portable classifier artifacts for freshly-classified detections.
 
@@ -1787,6 +1798,12 @@ def _publish_classifier_runs_for_raw_results(
     Entries from the reuse path carry ``_existing = True``; their
     runtime_fingerprint is already populated from the earlier successful
     publish, so they are skipped here.
+
+    ``store`` is the caller's configured ``ArtifactStore``. Callers that
+    honor ``COMPUTATION_CACHE_DIR`` must forward the job's store here so
+    freshly promoted artifacts land in the same cache the status / export /
+    catalog-reapplication paths use; passing ``None`` falls back to the
+    default ``~/.vireo/computation-cache`` location.
     """
     if not labels_fingerprint_full or not model_identity or not raw_results:
         return
@@ -1806,6 +1823,7 @@ def _publish_classifier_runs_for_raw_results(
                 labels_fingerprint,
                 labels_fingerprint_full,
                 model_identity,
+                store=store,
                 taxonomy_identity=taxonomy_identity,
             )
         except Exception:
@@ -2482,6 +2500,19 @@ def run_classify_job(
         thread_db.set_active_workspace(workspace_id)
         job["_start_time"] = time.time()
 
+        # Stash the job's configured cache root so downstream helpers
+        # publish freshly computed artifacts into the SAME cache the
+        # status / export / catalog-reapplication paths use when
+        # ``COMPUTATION_CACHE_DIR`` is overridden. Without this,
+        # ``publish_detection_artifact`` and ``promote_and_publish_classifier_run``
+        # fall back to the default ``~/.vireo/computation-cache`` and the
+        # newly written artifacts disappear from the configured cache as
+        # soon as the backing database rows are removed. The path (not the
+        # ``ArtifactStore`` instance) is stashed so ``jsonify(job)`` on the
+        # /api/jobs/<id> route keeps working — the helpers reconstruct the
+        # lightweight wrapper on demand.
+        job["_computation_cache_dir"] = computation_cache_dir
+
         runner.set_steps(job["id"], [
             {"id": "load_photos", "label": "Load photos"},
             {"id": "load_taxonomy", "label": "Load taxonomy"},
@@ -2714,9 +2745,24 @@ def run_classify_job(
                         params.model_name or peek_model.get("name")
                     )
         except Exception:
-            desired_classifier_model = None
+            # A raising get_models() here left both peek and constraints
+            # unresolved. Clearing ``model_id_missing`` or
+            # ``desired_classifier_model`` unconditionally would let
+            # ``_all_photos_cache_satisfied`` silently accept cached
+            # runs from a classifier the caller did not select. Preserve
+            # the explicit request so either the guard below propagates
+            # the lookup failure or the cache filter still rejects
+            # wrong-model runs.
             peek_model = None
-            model_id_missing = False
+            if params.model_id:
+                desired_classifier_model = None
+                model_id_missing = True
+            elif params.model_name:
+                desired_classifier_model = params.model_name
+                model_id_missing = False
+            else:
+                desired_classifier_model = None
+                model_id_missing = False
 
         # An unknown model_id must never fall through to the cache
         # shortcut. Without this, ``desired_classifier_model`` stays
@@ -3385,11 +3431,21 @@ def run_classify_job(
         # _record_batch_classifier_runs would no-op because those rows
         # don't exist yet, leaving fresh classifier_runs stranded on
         # runtime_fingerprint = 'legacy' and out of bundle exports.
+        # Reconstruct the configured ArtifactStore from the path stashed
+        # by ``run_classify_job`` so the classifier artifacts land in the
+        # same cache the status / export paths use, matching
+        # ``publish_detection_artifact``'s behavior above.
+        from computation_cache import ArtifactStore
+        _publish_cache_dir = job.get("_computation_cache_dir")
+        _publish_store = (
+            ArtifactStore(_publish_cache_dir) if _publish_cache_dir else None
+        )
         _publish_classifier_runs_for_raw_results(
             thread_db, raw_results, model_name, fp,
             labels_fingerprint_full=job.get("_labels_fingerprint_full"),
             model_identity=job.get("_classifier_model_identity"),
             taxonomy_identity=job.get("_taxonomy_identity", "no-tax"),
+            store=_publish_store,
         )
         finalize_parts = [f"{group_result['predictions_stored']} predictions"]
         if group_result["burst_groups"]:

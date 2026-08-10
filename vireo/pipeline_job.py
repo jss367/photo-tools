@@ -1395,6 +1395,18 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
         dict with stage results, duration, and errors
     """
     job["_start_time"] = time.time()
+    # Stash the job's configured cache root so downstream helpers
+    # (``publish_detection_artifact`` inside ``_detect_batch``,
+    # ``promote_and_publish_classifier_run`` inside the per-model publish
+    # pass) write freshly computed artifacts into the SAME cache the
+    # status / export / catalog-reapplication paths use when
+    # ``COMPUTATION_CACHE_DIR`` is overridden. Without this the publishers
+    # fall back to the default ``~/.vireo/computation-cache`` and the
+    # artifacts disappear from the configured cache as soon as the backing
+    # database rows are removed. The path (not an ``ArtifactStore``
+    # instance) is stashed so ``jsonify(job)`` on the /api/jobs/<id> route
+    # keeps working — the helpers reconstruct the wrapper on demand.
+    job["_computation_cache_dir"] = computation_cache_dir
     abort = threading.Event()
     pause_gate = _PipelinePauseGate(runner, job["id"])
     pause_context = threading.local()
@@ -5785,6 +5797,17 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                     # rows don't exist yet, leaving fresh classifier_runs
                     # stranded on runtime_fingerprint = 'legacy' and out of
                     # bundle exports.
+                    # Reconstruct the configured ArtifactStore from the
+                    # path stashed by ``run_pipeline_job`` so classifier
+                    # artifacts published here land in the same cache the
+                    # status / export / catalog-reapplication paths use
+                    # when ``COMPUTATION_CACHE_DIR`` is overridden.
+                    from computation_cache import ArtifactStore
+                    _publish_cache_dir = job.get("_computation_cache_dir")
+                    _publish_store = (
+                        ArtifactStore(_publish_cache_dir)
+                        if _publish_cache_dir else None
+                    )
                     _publish_classifier_runs_for_raw_results(
                         thread_db, raw_results, model_name, spec_fp,
                         labels_fingerprint_full=loaded_models.get(
@@ -5796,6 +5819,7 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                         taxonomy_identity=loaded_models.get(
                             "taxonomy_identity", "no-tax",
                         ),
+                        store=_publish_store,
                     )
                     preds = group_result["predictions_stored"]
                     total_predictions_stored += preds

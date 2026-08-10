@@ -13708,3 +13708,118 @@ def test_local_cancel_during_suffix_candidate_hash_is_a_cancel(
     assert sorted(os.listdir(str(dest_dir))) == [
         "IMG_0300.jpg", "IMG_0300_1.jpg",
     ], sorted(os.listdir(str(dest_dir)))
+
+
+# --- PR 7b flip A: zero-byte twins adopt at ANY candidate position -------
+#
+# Before the flip the two walks disagreed twice over zero-byte sources.
+# Local had an explicit zero-byte adopt branch, but only at the PRIMARY
+# name; at a suffix position a checker'd zero-byte source hashes to None
+# and can never match, so it landed a pointless extra empty copy. Remote
+# had no branch at all: with a checker its ``src_hash`` is None, so even
+# the primary-name empty twin never matched and got suffixed.
+#
+# Unified rule, both transports, every candidate position:
+# ``src_size == 0 and cand_size == 0`` adopts. All zero-byte files are
+# identical by definition, which is exactly why local shipped the branch;
+# ``DuplicateChecker.record()`` returns ``()`` for a zero-byte source, so
+# the raw-vs-normalized ``record_hash`` split is unobservable here.
+#
+# The checker-LESS halves of both branches (``skip_duplicates=False``,
+# where the source hash is a real EMPTY_FILE_SHA256 and matches on-disk)
+# already adopted before this flip and are pinned by
+# ``test_{local,remote}_zero_byte_adoption_revalidates_before_stamping``.
+
+def _make_zero_byte_card(tmp_path, name="IMG_0001.jpg",
+                         when=datetime(2026, 7, 3, 10, 0, 0)):
+    card = tmp_path / "card"
+    card.mkdir(exist_ok=True)
+    src = card / name
+    src.touch()
+    ts = when.timestamp()
+    os.utime(str(src), (ts, ts))
+    return card, src
+
+
+def test_remote_zero_byte_twin_at_primary_adopts_with_checker(
+        tmp_path, monkeypatch):
+    """Remote, duplicate skipping ON: an empty file already on the mount at
+    the primary name must be ADOPTED, not suffixed.
+
+    With a checker the source hash is None (the zero-byte convention), so
+    the on-disk hash comparison can never match and the walk used to
+    advance — transferring a second empty file to ``IMG_0001_1.jpg`` and
+    cataloging two rows for one card photo.
+    """
+    from import_job import EMPTY_FILE_SHA256, ImportParams, run_import_job
+
+    ra = _remote_archive_for(tmp_path)
+    calls = _remote_calls(ra)
+    _install_fake_remote_rsync(monkeypatch, calls, verify=None)
+
+    card, _src = _make_zero_byte_card(tmp_path)
+    mount_dir = Path(ra["mount_base"]) / "2026" / "2026-07-03"
+    mount_dir.mkdir(parents=True)
+    (mount_dir / "IMG_0001.jpg").touch()
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws_id = db._active_workspace_id
+    result = run_import_job(
+        _make_job(), FakeRunner(), db_path, ws_id,
+        ImportParams(
+            sources=[str(card)], destination=ra["mount_base"],
+            remote_target=ra, verify_by_hash=True,
+        ),
+    )
+
+    assert result["failed"] == 0, result["unsafe_files"]
+    assert result["copied"] == 0, result
+    assert result["skipped_duplicate"] == 1, result
+    # Nothing crossed the transport, and no suffixed empty twin exists.
+    assert calls["rsync"] == [], calls["rsync"]
+    assert sorted(os.listdir(str(mount_dir))) == ["IMG_0001.jpg"], \
+        sorted(os.listdir(str(mount_dir)))
+    # The adoption rides ``landed``, so it is cataloged and stamped like
+    # the local path's zero-byte adopt (spec decisions 10/11: the row's
+    # file_hash stays NULL under the scanner's zero-byte convention).
+    rows = _photo_rows(db)
+    assert len(rows) == 1, [dict(r) for r in rows]
+    assert rows[0]["filename"] == "IMG_0001.jpg"
+    assert rows[0]["hash_status"] == "ok"
+    assert rows[0]["file_hash"] in (None, EMPTY_FILE_SHA256)
+
+
+def test_local_zero_byte_suffix_candidate_adopts_with_checker(tmp_path):
+    """Local, duplicate skipping ON: an empty file already at a SUFFIX
+    candidate must be adopted, exactly as one at the primary name is.
+
+    Local's zero-byte branch only ever ran at the primary name; in the
+    suffix loop a checker'd zero-byte source hashes to None, never matched,
+    and the run copied a third empty file to ``IMG_0001_2.jpg``.
+    """
+    from import_job import ImportParams
+
+    card, src = _make_zero_byte_card(tmp_path)
+    archive = tmp_path / "archive"
+    dest_dir = archive / "2026" / "2026-07-03"
+    dest_dir.mkdir(parents=True)
+    # Primary name taken by an unrelated NON-empty file (so the primary
+    # zero-byte branch cannot fire), this source's empty twin parked at
+    # the first suffix by a prior run that died before its scan.
+    Image.new("RGB", (16, 16), "blue").save(str(dest_dir / "IMG_0001.jpg"))
+    (dest_dir / "IMG_0001_1.jpg").touch()
+
+    db, ws_id, result = _run_import(tmp_path, ImportParams(
+        sources=[str(card)], destination=str(archive),
+    ))
+
+    assert result["failed"] == 0, result["unsafe_files"]
+    assert result["copied"] == 0, result
+    assert result["skipped_duplicate"] == 1, result
+    assert sorted(os.listdir(str(dest_dir))) == [
+        "IMG_0001.jpg", "IMG_0001_1.jpg",
+    ], sorted(os.listdir(str(dest_dir)))
+    adopted = [r for r in _photo_rows(db) if r["filename"] == "IMG_0001_1.jpg"]
+    assert len(adopted) == 1, [dict(r) for r in _photo_rows(db)]
+    assert adopted[0]["hash_status"] == "ok"

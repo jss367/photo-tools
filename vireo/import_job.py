@@ -3266,6 +3266,24 @@ class _LocalTransport:
                             cand_size = os.path.getsize(candidate)
                         except OSError:
                             cand_size = -1
+                        if src_size == 0 and cand_size == 0:
+                            # Zero-byte twin at a SUFFIX position — the
+                            # same rule the primary-name branch above has
+                            # always applied, and for the same reason:
+                            # all empty files are identical, so an empty
+                            # candidate always IS this source's bytes.
+                            # It has to be a size comparison rather than
+                            # a hash one because a checker'd zero-byte
+                            # source hashes to None by convention and can
+                            # never match on-disk bytes; without this the
+                            # run copies yet another empty file to the
+                            # next suffix. (``cand_size`` is -1, not 0,
+                            # when the stat failed, so an unreadable
+                            # candidate cannot be mistaken for an empty
+                            # one.) PR 7b flip A, spec decision 13's
+                            # neighbourhood.
+                            adopted_dest = (candidate, EMPTY_FILE_SHA256)
+                            break
                         if cand_size == src_size:
                             cand_hash = _hash_dest_file(
                                 candidate, _stop_requested)
@@ -3560,6 +3578,41 @@ class _RsyncTransport:
             if os.path.exists(cand_mount):
                 # Already on disk (crash-recovery/resume). Byte-identical
                 # -> skip; different -> advance to the next suffix.
+                try:
+                    cand_size = os.path.getsize(cand_mount)
+                except OSError:
+                    # An unreadable candidate is a destination artifact,
+                    # not a source problem — same disposition as the
+                    # hash-OSError advance below, one probe earlier.
+                    counter += 1
+                    continue
+                if src_size == 0 and cand_size == 0:
+                    # Zero-byte twin: adopt at ANY candidate position,
+                    # matching the local walk. With a checker
+                    # ``src_hash`` is None for an empty source (the
+                    # zero-byte convention), so the on-disk hash
+                    # comparison below can never match and this size
+                    # comparison is the only way an empty twin is ever
+                    # recognized here. ``DuplicateChecker.record()``
+                    # returns () for a zero-byte source, so the ledger's
+                    # raw-vs-normalized ``record_hash`` split has no
+                    # observable difference at this call site and the
+                    # local branch's EMPTY_FILE_SHA256 is used for both.
+                    # The claim below keeps the RAW convention
+                    # (``src_hash``, i.e. None under a checker) so a
+                    # later same-basename empty sibling compares
+                    # None == None and dup-skips, exactly as the queued
+                    # path already claims raw hashes. PR 7b flip A.
+                    batch_st.claimed_basenames[candidate_key] = src_hash
+                    _book_adoption(
+                        state, batch_st, checker, rel=rel,
+                        source_file=source_file, dest_path=cand_mount,
+                        verified_hash=EMPTY_FILE_SHA256,
+                        record_hash=EMPTY_FILE_SHA256,
+                        src_size=src_size, src_mtime_ns=src_mtime_ns,
+                    )
+                    adopted = True
+                    break
                 try:
                     on_disk = _hash_dest_file(
                         cand_mount, _stop_requested)

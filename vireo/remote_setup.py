@@ -21,10 +21,17 @@ import time
 import urllib.parse
 
 # `mount` line: "<source> on <mount point> (<fstype>, opt, ...)".
-# The source is space-free for the network filesystems we accept (smbfs/afp
-# URL-encode spaces; nfs is host:/path), while the mount point may contain
-# spaces — so split at the FIRST " on " (non-greedy source).
-_MOUNT_RE = re.compile(r"^(?P<src>\S+?) on (?P<mp>.+) \((?P<opts>[^()]*)\)$")
+# Sources for the network filesystems we accept happen to be space-free
+# (smbfs/afp URL-encode spaces; nfs is host:/path), but macOS also emits
+# multi-word sources for automount triggers such as ``map auto_home on
+# /System/Volumes/Data/home (autofs, ...)``. Restricting the source to
+# ``\S+`` silently dropped those lines and let paths beneath the automount
+# be classified as local — the exact failure mode the fail-closed probe
+# path is designed to avoid. Anchor the split by requiring the mount point
+# to start with ``/`` instead: the non-greedy source stops at the FIRST
+# ``" on /"`` boundary, which unambiguously separates ``<src>`` from the
+# absolute mount path.
+_MOUNT_RE = re.compile(r"^(?P<src>.+?) on (?P<mp>/.*) \((?P<opts>[^()]*)\)$")
 # smbfs/afp source: //[user@]host/share  (URL-encoded)
 _SMB_SRC_RE = re.compile(r"^//(?:(?P<user>[^@/]+)@)?(?P<host>[^/]+)/(?P<share>.+)$")
 # nfs source: host:/export/path — host may be a hostname, IPv4, or a
@@ -36,6 +43,16 @@ _NFS_SRC_RE = re.compile(
 )
 
 _NETWORK_FS = ("smbfs", "nfs", "afpfs", "webdav")
+# autofs is deliberately excluded: an autofs entry is an automount trigger,
+# not local storage, and the target it resolves to can be an unavailable
+# network share. Treating it as local would let ``_path_on_network_volume``
+# route callers through in-process ``stat``/``isfile`` calls that trip the
+# automount and block indefinitely — the exact failure mode the fail-closed
+# probe path is designed to avoid.
+_LOCAL_FS = frozenset({
+    "apfs", "cd9660", "devfs", "exfat", "fdesc", "hfs",
+    "msdos", "nullfs", "procfs", "tmpfs", "udf", "union",
+})
 
 
 def platform_supported():
@@ -51,17 +68,39 @@ def platform_supported():
     return sys.platform == "darwin"
 
 
+def parse_mount_table(text):
+    """Parse macOS ``mount`` output without classifying its filesystems."""
+    rows = []
+    for line in text.splitlines():
+        match = _MOUNT_RE.match(line.strip())
+        if not match:
+            continue
+        rows.append({
+            "source": match.group("src"),
+            "mount_point": match.group("mp"),
+            "fs_type": (match.group("opts").split(",")[0] or "").strip(),
+        })
+    return rows
+
+
+def mount_type_is_network_or_unknown(fs_type):
+    """Fail closed for mount types that are not explicitly known-local.
+
+    New network filesystem implementations must not silently gain local-file
+    semantics in safety-sensitive callers such as Trash routing. Unknown local
+    filesystems may take a slower Finder path until added to ``_LOCAL_FS``.
+    """
+    return (fs_type or "").strip().lower() not in _LOCAL_FS
+
+
 def parse_mount_output(text):
     """Parse ``mount`` output into network-share rows the wizard can offer."""
     rows = []
-    for line in text.splitlines():
-        m = _MOUNT_RE.match(line.strip())
-        if not m:
-            continue
-        fs_type = (m.group("opts").split(",")[0] or "").strip()
+    for mount in parse_mount_table(text):
+        fs_type = mount["fs_type"]
         if fs_type not in _NETWORK_FS:
             continue
-        src, mount_point = m.group("src"), m.group("mp")
+        src, mount_point = mount["source"], mount["mount_point"]
         if fs_type == "nfs":
             n = _NFS_SRC_RE.match(src)
             if not n:

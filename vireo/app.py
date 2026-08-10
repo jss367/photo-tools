@@ -1684,6 +1684,10 @@ def _file_manager_labels():
 _FINDER_TRASH_TIMEOUT_SECS = 30
 _FINDER_TRASH_BATCH_SIZE = 20
 _MOUNT_QUERY_TIMEOUT_SECS = 5
+_MAX_NETWORK_PROBES = 8
+_NETWORK_PROBE_RESERVED = object()
+_NETWORK_PROBE_LOCK = threading.Lock()
+_NETWORK_PROBES = {}
 
 # Distinct from ``None`` so ``_trash_paths`` can tell "caller didn't pass
 # network_roots" (re-query is safe) apart from "caller's own mount query
@@ -1693,6 +1697,25 @@ _MOUNT_QUERY_TIMEOUT_SECS = 5
 # already-known custom mount point as local and reintroducing the
 # unbounded-I/O hang this routing exists to prevent).
 _NETWORK_ROOTS_UNSET = object()
+
+
+class _NetworkVolumeRoots(set):
+    """Network roots plus the live /Volumes roots from one mount snapshot."""
+
+    def __init__(self, network_roots=(), mounted_volume_roots=()):
+        super().__init__(network_roots)
+        self.mounted_volume_roots = frozenset(mounted_volume_roots)
+
+
+def _mounted_volume_roots(mounts):
+    """Return live top-level ``/Volumes/<name>`` roots from parsed mounts."""
+    roots = set()
+    for mount in mounts:
+        normalized = posixpath.normpath(mount["mount_point"])
+        parts = normalized.split("/")
+        if len(parts) == 3 and parts[1] == "Volumes" and parts[2]:
+            roots.add(normalized)
+    return roots
 
 
 def _volume_root_for_path(filepath):
@@ -1727,16 +1750,66 @@ def _network_volume_roots(run=subprocess.run):
         return None
     if result.returncode != 0:
         return None
-    return {
+    output = result.stdout or ""
+    mounts = remote_setup.parse_mount_table(output)
+    return _NetworkVolumeRoots(
         # ``mount`` always reports macOS/POSIX paths.  Keep parsing independent
         # of the host running the test suite (notably Windows' ``ntpath``).
-        posixpath.normpath(row["mount_point"])
-        for row in remote_setup.parse_mount_output(result.stdout or "")
-    }
+        (
+            posixpath.normpath(mount["mount_point"])
+            for mount in mounts
+            if remote_setup.mount_type_is_network_or_unknown(
+                mount["fs_type"],
+            )
+        ),
+        _mounted_volume_roots(mounts),
+    )
+
+
+def _reserve_network_probe(root):
+    """Reserve a bounded probe slot, reusing one already active per root."""
+    with _NETWORK_PROBE_LOCK:
+        if root in _NETWORK_PROBES:
+            return False
+        if len(_NETWORK_PROBES) >= _MAX_NETWORK_PROBES:
+            return False
+        _NETWORK_PROBES[root] = _NETWORK_PROBE_RESERVED
+        return True
+
+
+def _release_network_probe(root, owner):
+    """Release ``root`` only when it is still owned by this probe."""
+    with _NETWORK_PROBE_LOCK:
+        if _NETWORK_PROBES.get(root) is owner:
+            _NETWORK_PROBES.pop(root, None)
+
+
+def _reap_abandoned_network_probe(root, process):
+    """Reap a timed-out probe away from the request path."""
+    try:
+        process.communicate()
+    except (OSError, ValueError, subprocess.SubprocessError):
+        pass
+    finally:
+        _release_network_probe(root, process)
+
+
+def _abandon_network_probe(root, process):
+    """Kill a timed-out probe without synchronously waiting for it."""
+    try:
+        process.kill()
+    except OSError:
+        pass
+    threading.Thread(
+        target=_reap_abandoned_network_probe,
+        args=(root, process),
+        name="vireo-network-probe-reaper",
+        daemon=True,
+    ).start()
 
 
 def _network_root_reachable(root, timeout=_MOUNT_QUERY_TIMEOUT_SECS,
-                             run=subprocess.run):
+                             run=None, popen=subprocess.Popen):
     """Bounded, out-of-process reachability probe for a mounted network root.
 
     ``mount`` listing a share and Finder reporting a file's absence are
@@ -1746,9 +1819,12 @@ def _network_root_reachable(root, timeout=_MOUNT_QUERY_TIMEOUT_SECS,
     cached parent metadata even though the photo will reappear on
     reconnect. Repeating the same Finder query does not detect this — it
     reuses the same cache. A ``stat`` on the mount root in a bounded
-    subprocess is an *independent* signal: it does not touch Finder, and
-    the subprocess is killed on timeout so an unresponsive share cannot
-    hang the caller.
+    subprocess is an *independent* signal: it does not touch Finder. On
+    timeout the child is killed and reaped on a daemon thread so an
+    uninterruptible filesystem call cannot hold the request thread in
+    Python's usual synchronous kill-and-wait timeout cleanup. Active probes
+    are reused per root and globally capped so retries cannot accumulate an
+    unbounded number of stuck children and reaper threads.
 
     Returns ``True`` only when ``stat`` completed in time and reported the
     root as a directory. Any other outcome (timeout, non-zero exit, error)
@@ -1756,18 +1832,54 @@ def _network_root_reachable(root, timeout=_MOUNT_QUERY_TIMEOUT_SECS,
     """
     if sys.platform != "darwin":
         return False
+    argv = ["/usr/bin/stat", "-f", "%HT", root]
+    if run is not None:
+        try:
+            result = run(
+                argv, capture_output=True, text=True, timeout=timeout,
+                **no_window_kwargs(),
+            )
+        except (OSError, subprocess.SubprocessError):
+            return False
+        return (
+            result.returncode == 0
+            and (result.stdout or "").strip() == "Directory"
+        )
     try:
-        result = run(
-            ["/usr/bin/stat", "-f", "%HT", root],
-            capture_output=True, text=True,
-            timeout=timeout,
+        root_key = os.path.normcase(os.path.normpath(os.fspath(root)))
+    except (TypeError, ValueError):
+        return False
+    if not _reserve_network_probe(root_key):
+        return False
+
+    process = None
+    abandoned = False
+    try:
+        process = popen(
+            argv,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
             **no_window_kwargs(),
         )
+        with _NETWORK_PROBE_LOCK:
+            _NETWORK_PROBES[root_key] = process
+        stdout, _stderr = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        abandoned = True
+        _abandon_network_probe(root_key, process)
+        return False
     except (OSError, subprocess.SubprocessError):
+        if process is not None:
+            abandoned = True
+            _abandon_network_probe(root_key, process)
+        else:
+            _release_network_probe(root_key, _NETWORK_PROBE_RESERVED)
         return False
-    if result.returncode != 0:
-        return False
-    return (result.stdout or "").strip() == "Directory"
+    finally:
+        if process is not None and not abandoned:
+            _release_network_probe(root_key, process)
+    return process.returncode == 0 and (stdout or "").strip() == "Directory"
 
 
 def _expand_first_symlink_prefix(filepath):
@@ -1809,19 +1921,35 @@ def _expand_first_symlink_prefix(filepath):
 def _path_on_network_volume(filepath, network_roots):
     """Whether ``filepath`` should avoid in-process mounted-volume I/O."""
     normalized = os.path.normpath(os.path.abspath(filepath))
+    if network_roots is None:
+        # Discovery failed, so there is no trustworthy evidence that any
+        # candidate is local. Route every macOS path through bounded Finder
+        # handling instead of risking an in-process stat on a custom mount.
+        # Preserve the explicit /Volumes fallback on non-macOS test hosts.
+        return (
+            sys.platform == "darwin"
+            or _volume_root_for_path(normalized) is not None
+        )
     for _depth in range(16):
-        if network_roots is None:
-            # Mount discovery failed. Prefer bounded Finder handling for any
-            # /Volumes path, including one reached through a local symlink.
-            if _volume_root_for_path(normalized) is not None:
-                return True
-        else:
-            for root in network_roots:
-                try:
-                    if os.path.commonpath((normalized, root)) == root:
-                        return True
-                except ValueError:
-                    continue
+        for root in network_roots:
+            try:
+                if os.path.commonpath((normalized, root)) == root:
+                    return True
+            except ValueError:
+                continue
+        if sys.platform == "darwin":
+            volume_root = _volume_root_for_path(normalized)
+            if volume_root is not None:
+                mounted_roots = getattr(
+                    network_roots, "mounted_volume_roots", None,
+                )
+                # A detached network mount disappears from the snapshot but
+                # leaves its /Volumes directory behind. Conversely, a live
+                # local USB/APFS root in the same snapshot must retain the
+                # local-trash path. Plain sets from older callers/tests carry
+                # no liveness evidence, so continue to fail closed for them.
+                if mounted_roots is None or volume_root not in mounted_roots:
+                    return True
         if sys.platform != "darwin":
             return False
         expanded = _expand_first_symlink_prefix(normalized)

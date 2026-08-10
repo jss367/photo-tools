@@ -4013,13 +4013,19 @@ def test_network_volume_roots_reads_mount_table_without_resolving_hosts(
                 "//user@nas/Photography on /Volumes/Photography "
                 "(smbfs, nodev, nosuid)\n"
                 "/dev/disk4s1 on /Volumes/CARD (exfat, local)\n"
+                "nas:/archive on /Volumes/Archive (sshfs, nodev)\n"
             ),
         )
 
     monkeypatch.setattr(app_module.sys, "platform", "darwin")
 
     assert app_module._network_volume_roots(run=fake_run) == {
-        "/Volumes/Photography",
+        "/Volumes/Photography", "/Volumes/Archive",
+    }
+    assert app_module._network_volume_roots(
+        run=fake_run,
+    ).mounted_volume_roots == {
+        "/Volumes/Photography", "/Volumes/CARD", "/Volumes/Archive",
     }
     assert calls[0][0] == ["mount"]
     assert calls[0][1]["timeout"] == app_module._MOUNT_QUERY_TIMEOUT_SECS
@@ -5020,6 +5026,158 @@ def test_network_root_reachable_fails_closed_on_timeout(monkeypatch):
     )
 
 
+def test_network_root_reachable_does_not_wait_to_reap_timeout(monkeypatch):
+    """A wedged probe is reaped off-thread after the caller returns."""
+    import subprocess
+    import threading
+
+    import app as app_module
+
+    monkeypatch.setattr(app_module.sys, "platform", "darwin")
+    reaper_started = threading.Event()
+    release_reaper = threading.Event()
+    reaper_finished = threading.Event()
+
+    class WedgedProcess:
+        returncode = None
+
+        def communicate(self, timeout=None):
+            if timeout is not None:
+                raise subprocess.TimeoutExpired(["stat"], timeout)
+            reaper_started.set()
+            release_reaper.wait(timeout=2)
+            reaper_finished.set()
+            return "", ""
+
+        def kill(self):
+            return None
+
+    assert app_module._network_root_reachable(
+        "/Volumes/NAS", popen=lambda *args, **kwargs: WedgedProcess(),
+    ) is False
+    assert not reaper_finished.is_set()
+    assert reaper_started.wait(timeout=1)
+    release_reaper.set()
+    assert reaper_finished.wait(timeout=1)
+
+
+def test_network_root_reachable_reuses_abandoned_probe(monkeypatch):
+    """Retries for a wedged root must not spawn more children or reapers."""
+    import subprocess
+    import threading
+    import time
+
+    import app as app_module
+
+    monkeypatch.setattr(app_module.sys, "platform", "darwin")
+    release_reaper = threading.Event()
+    popen_calls = []
+
+    class WedgedProcess:
+        returncode = None
+
+        def communicate(self, timeout=None):
+            if timeout is not None:
+                raise subprocess.TimeoutExpired(["stat"], timeout)
+            release_reaper.wait(timeout=2)
+            return "", ""
+
+        def kill(self):
+            return None
+
+    class HealthyProcess:
+        returncode = 0
+
+        def communicate(self, timeout=None):
+            return "Directory\n", ""
+
+    def fake_popen(*args, **kwargs):
+        popen_calls.append(args)
+        if len(popen_calls) == 1:
+            return WedgedProcess()
+        return HealthyProcess()
+
+    root = "/Volumes/NAS"
+    root_key = app_module.os.path.normcase(app_module.os.path.normpath(root))
+    try:
+        assert app_module._network_root_reachable(root, popen=fake_popen) is False
+        assert app_module._network_root_reachable(root, popen=fake_popen) is False
+        assert len(popen_calls) == 1
+    finally:
+        release_reaper.set()
+
+    deadline = time.monotonic() + 1
+    while time.monotonic() < deadline:
+        with app_module._NETWORK_PROBE_LOCK:
+            if root_key not in app_module._NETWORK_PROBES:
+                break
+        time.sleep(0.01)
+
+    assert app_module._network_root_reachable(root, popen=fake_popen) is True
+    assert len(popen_calls) == 2
+
+
+def test_network_root_reachable_caps_abandoned_probes(monkeypatch):
+    """Distinct wedged roots cannot grow the process/thread count forever."""
+    import subprocess
+    import threading
+    import time
+
+    import app as app_module
+
+    monkeypatch.setattr(app_module.sys, "platform", "darwin")
+    monkeypatch.setattr(app_module, "_MAX_NETWORK_PROBES", 2)
+    release_reapers = threading.Event()
+    popen_calls = []
+
+    class WedgedProcess:
+        returncode = None
+
+        def communicate(self, timeout=None):
+            if timeout is not None:
+                raise subprocess.TimeoutExpired(["stat"], timeout)
+            release_reapers.wait(timeout=2)
+            return "", ""
+
+        def kill(self):
+            return None
+
+    def fake_popen(*args, **kwargs):
+        popen_calls.append(args)
+        return WedgedProcess()
+
+    roots = ["/Volumes/NAS-1", "/Volumes/NAS-2"]
+    root_keys = [
+        app_module.os.path.normcase(app_module.os.path.normpath(root))
+        for root in roots
+    ]
+    try:
+        for root in roots:
+            assert (
+                app_module._network_root_reachable(root, popen=fake_popen)
+                is False
+            )
+        assert (
+            app_module._network_root_reachable(
+                "/Volumes/NAS-3", popen=fake_popen,
+            )
+            is False
+        )
+        assert len(popen_calls) == 2
+    finally:
+        release_reapers.set()
+
+    deadline = time.monotonic() + 1
+    while time.monotonic() < deadline:
+        with app_module._NETWORK_PROBE_LOCK:
+            if not any(key in app_module._NETWORK_PROBES for key in root_keys):
+                break
+        time.sleep(0.01)
+
+    with app_module._NETWORK_PROBE_LOCK:
+        assert not any(key in app_module._NETWORK_PROBES for key in root_keys)
+
+
 def test_network_root_reachable_returns_false_off_mac(monkeypatch):
     """The probe only runs on macOS. On other platforms callers already
     do not route through Finder, so the probe never needs to answer
@@ -5040,6 +5198,162 @@ def test_network_root_reachable_returns_false_off_mac(monkeypatch):
         is False
     )
     assert called == []
+
+
+def test_path_on_network_volume_fails_closed_for_detached_volume(monkeypatch):
+    """An absent mount-table entry does not make /Volumes paths local."""
+    import app as app_module
+
+    monkeypatch.setattr(app_module.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        app_module, "_volume_root_for_path", lambda _path: "/Volumes/NAS",
+    )
+
+    assert app_module._path_on_network_volume(
+        "/Volumes/NAS/bird.NEF", set(),
+    ) is True
+
+
+def test_path_on_network_volume_preserves_live_local_volume(monkeypatch):
+    """A live USB/APFS volume keeps the direct local-trash route."""
+    import app as app_module
+
+    volume = "/Volumes/CARD"
+    roots = app_module._NetworkVolumeRoots((), {volume})
+    monkeypatch.setattr(app_module.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        app_module, "_volume_root_for_path", lambda _path: volume,
+    )
+
+    assert app_module._path_on_network_volume(
+        f"{volume}/bird.NEF", roots,
+    ) is False
+
+
+def test_trash_paths_preserves_live_local_volume_fast_path(monkeypatch, tmp_path):
+    """Healthy local volumes still use the direct mounted-volume Trash path."""
+    import app as app_module
+
+    volume = tmp_path / "CARD"
+    volume.mkdir()
+    photo = volume / "bird.NEF"
+    photo.write_bytes(b"raw")
+    roots = app_module._NetworkVolumeRoots((), {str(volume)})
+    direct_calls = []
+
+    monkeypatch.setattr(app_module.sys, "platform", "darwin")
+    monkeypatch.setattr(app_module, "_network_volume_roots", lambda: roots)
+    monkeypatch.setattr(
+        app_module, "_volume_root_for_path", lambda _path: str(volume),
+    )
+    monkeypatch.setattr(
+        app_module, "_move_to_volume_trash",
+        lambda path: direct_calls.append(path) or True,
+    )
+    monkeypatch.setattr(
+        app_module, "_trash_via_finder",
+        lambda _paths: (_ for _ in ()).throw(
+            AssertionError("live local volume reached Finder"),
+        ),
+    )
+
+    moved, successful, failures = app_module._trash_paths([str(photo)])
+
+    assert moved == 1
+    assert successful == {str(photo)}
+    assert failures == []
+    assert direct_calls == [str(photo)]
+
+
+def test_path_on_network_volume_fails_closed_when_discovery_fails(monkeypatch):
+    """A failed mount query protects custom macOS mount locations too."""
+    import app as app_module
+
+    monkeypatch.setattr(app_module.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        app_module, "_volume_root_for_path", lambda _path: None,
+    )
+
+    assert app_module._path_on_network_volume(
+        "/Users/me/mnt/photos/bird.NEF", None,
+    ) is True
+
+
+def test_trash_paths_preserves_detached_volume_missing_from_mount_table(
+    monkeypatch, tmp_path,
+):
+    """Initial discovery cannot mistake a detached /Volumes path for local."""
+    import app as app_module
+
+    volume = tmp_path / "NAS"
+    photo = str(volume / "bird.NEF")
+    monkeypatch.setattr(app_module.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        app_module, "_volume_root_for_path", lambda _path: str(volume),
+    )
+    monkeypatch.setattr(app_module, "_network_volume_roots", lambda: set())
+    monkeypatch.setattr(
+        app_module, "_snapshot_parent_device",
+        lambda _path: (_ for _ in ()).throw(
+            AssertionError("detached network path reached parent stat"),
+        ),
+    )
+    monkeypatch.setattr(
+        app_module.os.path, "isfile",
+        lambda _path: (_ for _ in ()).throw(
+            AssertionError("detached network path reached source stat"),
+        ),
+    )
+    monkeypatch.setattr(
+        app_module, "_trash_via_finder",
+        lambda paths: (set(), set(paths), []),
+    )
+    monkeypatch.setattr(
+        app_module, "_missing_paths_via_finder",
+        lambda paths: (set(paths), set(), []),
+    )
+
+    moved, successful, failures = app_module._trash_paths([photo])
+
+    assert moved == 0
+    assert successful == set()
+    assert failures == [{"path": photo, "error": "Source path is unreachable"}]
+
+
+def test_trash_paths_routes_custom_path_when_mount_discovery_fails(
+    monkeypatch, tmp_path,
+):
+    """A failed mount query keeps custom mounts off in-process I/O."""
+    import app as app_module
+
+    photo = str(tmp_path / "custom-mount" / "bird.NEF")
+    monkeypatch.setattr(app_module.sys, "platform", "darwin")
+    monkeypatch.setattr(app_module, "_network_volume_roots", lambda: None)
+    monkeypatch.setattr(
+        app_module, "_volume_root_for_path", lambda _path: None,
+    )
+    monkeypatch.setattr(
+        app_module, "_snapshot_parent_device",
+        lambda _path: (_ for _ in ()).throw(
+            AssertionError("custom network path reached parent stat"),
+        ),
+    )
+    monkeypatch.setattr(
+        app_module.os.path, "isfile",
+        lambda _path: (_ for _ in ()).throw(
+            AssertionError("custom network path reached source stat"),
+        ),
+    )
+    monkeypatch.setattr(
+        app_module, "_trash_via_finder",
+        lambda paths: (set(paths), set(), []),
+    )
+
+    moved, successful, failures = app_module._trash_paths([photo])
+
+    assert moved == 1
+    assert successful == {photo}
+    assert failures == []
 
 
 def test_delete_loser_files_preserves_endpoint_network_classification(

@@ -56,6 +56,74 @@ def test_parse_ignores_non_network_and_garbage():
     assert remote_setup.parse_mount_output(LOCAL + "\nnot a mount line\n") == []
 
 
+def test_parse_mount_table_preserves_unclassified_and_complex_mount_points():
+    unusual = (
+        "server:/archive on /Volumes/Photo on Film (Archive) "
+        "(sshfs, nodev)"
+    )
+
+    assert remote_setup.parse_mount_table(LOCAL + "\n" + unusual) == [
+        {"source": "/dev/disk3s1s1", "mount_point": "/", "fs_type": "apfs"},
+        {
+            "source": "server:/archive",
+            "mount_point": "/Volumes/Photo on Film (Archive)",
+            "fs_type": "sshfs",
+        },
+    ]
+
+
+def test_parse_mount_table_keeps_multiword_autofs_sources():
+    # macOS emits automount entries like ``map auto_home on
+    # /System/Volumes/Data/home (autofs, ...)`` where the source itself
+    # contains a space. Dropping those rows would let paths beneath the
+    # trigger fall through to the local-classification branch and reach
+    # the blocking in-process ``stat``/``isfile`` path when the target is
+    # an unavailable network share — exactly the failure the fail-closed
+    # probe is meant to prevent.
+    auto_home = (
+        "map auto_home on /System/Volumes/Data/home "
+        "(autofs, automounted, nobrowse)"
+    )
+    fstab = (
+        "map -fstab on /System/Volumes/Data/Network/Servers "
+        "(autofs, automounted, nobrowse)"
+    )
+
+    rows = remote_setup.parse_mount_table(auto_home + "\n" + fstab)
+
+    assert rows == [
+        {
+            "source": "map auto_home",
+            "mount_point": "/System/Volumes/Data/home",
+            "fs_type": "autofs",
+        },
+        {
+            "source": "map -fstab",
+            "mount_point": "/System/Volumes/Data/Network/Servers",
+            "fs_type": "autofs",
+        },
+    ]
+    # Retained rows must classify as network-or-unknown so callers route
+    # them through the bounded probe path rather than the in-process
+    # ``stat``/``isfile`` that trips the automount.
+    assert all(
+        remote_setup.mount_type_is_network_or_unknown(row["fs_type"])
+        for row in rows
+    )
+
+
+def test_unknown_mount_types_fail_closed_as_possibly_network_backed():
+    assert remote_setup.mount_type_is_network_or_unknown("apfs") is False
+    assert remote_setup.mount_type_is_network_or_unknown("exfat") is False
+    assert remote_setup.mount_type_is_network_or_unknown("smbfs") is True
+    assert remote_setup.mount_type_is_network_or_unknown("sshfs") is True
+    # autofs is an automount trigger, not local storage: its target can be an
+    # unavailable network share, so callers must route through the bounded
+    # probe path rather than issuing in-process stat/isfile that would trip
+    # the automount and block.
+    assert remote_setup.mount_type_is_network_or_unknown("autofs") is True
+
+
 def test_parse_afpfs_and_ipv6_hosts():
     afp = "//julius@mynas._afpovertcp._tcp.local/Media on /Volumes/Media (afpfs, nodev, nosuid, mounted by julius)"
     v6 = "//admin@[fe80::1%25en0]/Backup on /Volumes/Backup (smbfs, nodev, nosuid, mounted by julius)"

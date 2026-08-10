@@ -14030,3 +14030,153 @@ def test_local_unhashable_suffix_candidate_advances(tmp_path, monkeypatch):
     assert result["copied"] == 1, result
     landed = [r for r in _photo_rows(db) if r["filename"] == "IMG_0001_2.jpg"]
     assert len(landed) == 1, [dict(r) for r in _photo_rows(db)]
+
+
+# --- PR 7b flip D (spec decision 13): the walk refuses source-backed and
+# --- dangling candidates -------------------------------------------------
+#
+# Written ONCE, in the shared walk, and therefore true on both transports
+# by construction. That is the whole point of the extraction above: the
+# failure mode this project exists to end is a fix landing on one
+# hand-mirrored path while the other silently keeps the bug.
+#
+# Decision 12 gave the orchestrator a per-file guard for the PRIMARY dest
+# name, and its docstring was explicit that suffix candidates were NOT
+# covered on either path. This is that gap.
+
+def _card_symlink_geometry(root, *, dest_dir, dangling=False):
+    """Card with IMG_0001.jpg; ``dest_dir`` gets a different-bytes file at
+    the primary name and a symlink at the first suffix.
+
+    Returns ``(card, card_file, link, link_target)``. With
+    ``dangling=True`` the link points at a path inside the card that does
+    not exist.
+    """
+    card = _make_card(root, [
+        ("IMG_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+    ])
+    card_file = card / "IMG_0001.jpg"
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    Image.new("RGB", (16, 16), "blue").save(str(dest_dir / "IMG_0001.jpg"))
+    link = dest_dir / "IMG_0001_1.jpg"
+    target = (card / "NOT_THERE.jpg") if dangling else card_file
+    os.symlink(str(target), str(link))
+    return card, card_file, link, target
+
+
+def test_local_source_backed_suffix_candidate_not_adopted(
+        tmp_path, caplog):
+    """A suffix candidate that is a symlink back into the card must never
+    be adopted.
+
+    The data-loss shape: the walk hashes the link, reads the CARD's own
+    bytes through it, matches them against themselves, books
+    ``skipped_duplicate``, and ``safe_to_format`` goes green — over bytes
+    that exist nowhere but the card. Format the card and the photo is gone.
+    Advance past it instead and import the file at a real slot.
+    """
+    import logging
+
+    from import_job import ImportParams
+
+    archive = tmp_path / "archive"
+    dest_dir = archive / "2026" / "2026-07-03"
+    card, card_file, link, _target = _card_symlink_geometry(
+        tmp_path, dest_dir=dest_dir)
+
+    with caplog.at_level(logging.WARNING, logger="import_job"):
+        db, ws_id, result = _run_import(tmp_path, ImportParams(
+            sources=[str(card)], destination=str(archive),
+        ))
+
+    assert result["failed"] == 0, result["unsafe_files"]
+    assert result["skipped_duplicate"] == 0, result
+    assert result["copied"] == 1, result
+    # Real bytes at a real slot — not a symlink, and not the card's inode.
+    landed = dest_dir / "IMG_0001_2.jpg"
+    assert landed.exists() and not landed.is_symlink()
+    assert landed.read_bytes() == card_file.read_bytes()
+    assert not os.path.samefile(str(landed), str(card_file))
+    # The poisoned candidate is untouched.
+    assert link.is_symlink()
+    assert os.readlink(str(link)) == str(card_file)
+    assert any(
+        str(link) in r.getMessage() and "source media" in r.getMessage()
+        for r in caplog.records
+    ), [r.getMessage() for r in caplog.records]
+
+
+def test_remote_source_backed_suffix_candidate_not_adopted(
+        tmp_path, monkeypatch):
+    """Remote half of the same rule — and, because the walk is shared, it
+    is satisfied by exactly the same code as the local half."""
+    from import_job import ImportParams, run_import_job
+
+    ra = _remote_archive_for(tmp_path)
+    calls = _remote_calls(ra)
+    _install_fake_remote_rsync(monkeypatch, calls, verify=None)
+
+    mount_dir = Path(ra["mount_base"]) / "2026" / "2026-07-03"
+    card, card_file, link, _target = _card_symlink_geometry(
+        tmp_path, dest_dir=mount_dir)
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws_id = db._active_workspace_id
+    result = run_import_job(
+        _make_job(), FakeRunner(), db_path, ws_id,
+        ImportParams(
+            sources=[str(card)], destination=ra["mount_base"],
+            remote_target=ra, verify_by_hash=True,
+        ),
+    )
+
+    assert result["failed"] == 0, result["unsafe_files"]
+    assert result["skipped_duplicate"] == 0, result
+    assert result["copied"] == 1, result
+    landed = mount_dir / "IMG_0001_2.jpg"
+    assert landed.exists() and not landed.is_symlink()
+    assert landed.read_bytes() == card_file.read_bytes()
+    assert link.is_symlink()
+    rows = [r["filename"] for r in _photo_rows(db)]
+    assert rows == ["IMG_0001_2.jpg"], rows
+
+
+def test_local_dangling_symlink_slot_is_not_a_free_slot(tmp_path):
+    """A dangling symlink at a candidate name must be advanced past, not
+    chosen as the landing slot.
+
+    ``os.path.exists`` follows the link and reports False, so the walk
+    picked the name — and then ``copy_and_hash_verify``'s no-overwrite
+    ``os.link`` promote hit the directory entry that does exist and raised
+    ``FileExistsError``, failing a healthy card file with the thoroughly
+    misleading reason "copy verification failed (destination bytes do not
+    match the source)". ``lexists`` closes it.
+
+    (The PR 7b plan predicted a write-THROUGH here — archive bytes landing
+    at the link target, possibly back on the card. That was checked before
+    implementing and is not what happens: the copy goes to a hidden
+    sibling temp and is promoted by link/rename, neither of which follows
+    the link. The hole is a spurious failure, not data loss. Recorded in
+    spec decision row 13.)
+    """
+    from import_job import ImportParams
+
+    archive = tmp_path / "archive"
+    dest_dir = archive / "2026" / "2026-07-03"
+    card, card_file, link, target = _card_symlink_geometry(
+        tmp_path, dest_dir=dest_dir, dangling=True)
+
+    db, ws_id, result = _run_import(tmp_path, ImportParams(
+        sources=[str(card)], destination=str(archive),
+    ))
+
+    assert result["failed"] == 0, result["unsafe_files"]
+    assert result["copied"] == 1, result
+    landed = dest_dir / "IMG_0001_2.jpg"
+    assert landed.exists() and not landed.is_symlink()
+    assert landed.read_bytes() == card_file.read_bytes()
+    # The link is untouched and still dangling — nothing was written
+    # through it onto the card.
+    assert link.is_symlink()
+    assert not target.exists()

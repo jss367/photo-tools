@@ -861,12 +861,17 @@ def _batch_preflight(state, emit, db, *, rel, batch, queued, ctx,
     # gate: when the mount base is an ancestor of a selected source and
     # the folder template maps back into that source folder,
     # ``dest_folder`` (and therefore every ``cand_mount`` under it)
-    # resolves inside a source root. The per-file collision loop would
-    # hash those source-backed ``cand_mount`` files, byte-match them
-    # against the card, and count them as ``skipped_duplicate`` — with
+    # resolves inside a source root. The per-file collision walk would
+    # hash those source-backed candidates, byte-match them against the
+    # card, and count them as ``skipped_duplicate`` — with
     # ``verify_by_hash=true`` that would let ``safe_to_format`` go
     # green over a card whose bytes never crossed the network. See PR
-    # #1113 review.
+    # #1113 review. (Since spec decision 13 the shared walk refuses
+    # source-backed candidates on its own, so that is now defense in
+    # depth rather than the only guard — but this batch-level refusal
+    # is still the one that keeps ``os.makedirs`` off the card, and it
+    # is still the honest verdict for a geometry where EVERY candidate
+    # is poisoned rather than just one entry.)
     if ctx.path_under_any_source(dest_folder):
         for source_file in batch:
             # Count these as emitted so the progress bar reflects the
@@ -1009,6 +1014,65 @@ def _batch_preflight(state, emit, db, *, rel, batch, queued, ctx,
     return dest_folder
 
 
+def _is_source_backed_dest(ctx, source_file, dest_path):
+    """True when ``dest_path`` IS the source file or resolves under any
+    source root — i.e. writing to it, or adopting it, would attest bytes
+    the card still owns.
+
+    ONE pair of probes, shared by the orchestrator's per-file guard (spec
+    decision 12, which fails the file) and the collision walk's candidate
+    check (decision 13, which advances past it). They disagreed on nothing
+    before; keeping them one function is what stops them from ever
+    starting to. Note that both probes stat/realpath the destination, so
+    the walk pays them only for candidates that actually exist.
+
+    KNOWN-REMAINING: a candidate hardlinked to a DIFFERENT card file has
+    no path- or inode-visible tie to *this* source — ``samefile`` is False
+    and its realpath is its own path — so neither probe sees it. Catching
+    that needs ``st_dev`` comparison against the source roots; out of
+    scope for PR 7b and recorded in spec row 13.
+    """
+    # Reject the source-under-destination overlap where the folder
+    # template maps the source right back to its own directory
+    # (e.g. source ``/archive/2026/2026-07-05``, destination
+    # ``/archive``, template ``%Y/%Y-%m-%d`` → dest_path IS the
+    # source file). The API rejects destinations INSIDE any source;
+    # this catches the opposite direction, where the destination is
+    # a legal ancestor but the template resolves back to the source
+    # directory. Without this the collision walk's adopt branch hashes
+    # the source against itself, records it as ``skipped_duplicate``,
+    # and safe_to_format goes green — deleting/formatting the
+    # source then erases the only copy. See PR #1107 review.
+    try:
+        same_file = (
+            os.path.exists(dest_path)
+            and os.path.samefile(str(source_file), dest_path)
+        )
+    except OSError:
+        # Fall back to normalized-path equality when samefile can't
+        # stat (e.g. the destination is a stale entry). Prefer a
+        # false positive here over a false negative that lets the
+        # adopt branch loop back onto the source itself.
+        same_file = (
+            os.path.normpath(str(source_file))
+            == os.path.normpath(dest_path)
+        )
+    if same_file:
+        return True
+    # Also reject any dest_path (not just an exact self-copy) that
+    # resolves under any source root. Example: source
+    # ``/Volumes/Card/DCIM``, destination ``/Volumes/Card``,
+    # template ``DCIM/Archive/%Y`` — dest_path lands at
+    # ``/Volumes/Card/DCIM/Archive/2026/<name>``, which is NOT the
+    # source file (samefile is False) but is still inside the card.
+    # A copy there is counted as ``copied``, safe_to_format can go
+    # green, and formatting the card erases the "archive" copy too.
+    # ``path_under_any_source`` realpaths its argument, so this is
+    # also what catches a candidate that is a SYMLINK into the card.
+    # See PR #1107 review.
+    return ctx.path_under_any_source(dest_path)
+
+
 def _reject_source_backed_dest(state, ctx, *, rel, source_file, dest_file):
     """Per-file dest-safety guard (spec decision 12): fail a ``dest_file``
     that IS the source file or resolves under any source root. Returns
@@ -1023,52 +1087,18 @@ def _reject_source_backed_dest(state, ctx, *, rel, source_file, dest_file):
     comment describes — before the port the collision walk hashed the
     source-backed dest, byte-matched it, and adopted it.
 
-    KNOWN GAP (pre-existing, deliberately preserved): a source-backed
-    SUFFIX candidate (e.g. a symlink at ``name_1.ext`` into the card,
-    with different bytes at the primary name) is caught by NEITHER this
-    guard NOR the folder guard on EITHER path — collision-walk candidates
-    are not probed here. That per-candidate gap predates the port on the
-    local path, and the port preserves parity rather than closing it
-    (closing it is its own behavior change; a PR 7b/follow-up item). Do
-    not claim suffix coverage for this guard.
+    SUFFIX candidates are handled elsewhere, and differently. This guard
+    only sees the PRIMARY dest name; the collision walk probes each
+    candidate it visits with the same ``_is_source_backed_dest`` and
+    ADVANCES past a source-backed one rather than failing the file (spec
+    decision 13, closed in PR 7b — before that it hashed such a candidate,
+    byte-matched the card against itself, and adopted it). The two
+    dispositions differ deliberately: this guard's geometry is a folder
+    template that resolves back into the card, which poisons every suffix
+    too, so there is no safe slot to advance to; a single symlinked entry
+    at ``name_1.ext`` poisons only itself. Do not "unify" them.
     """
-    # Reject the source-under-destination overlap where the folder
-    # template maps the source right back to its own directory
-    # (e.g. source ``/archive/2026/2026-07-05``, destination
-    # ``/archive``, template ``%Y/%Y-%m-%d`` → dest_file IS the
-    # source file). The API rejects destinations INSIDE any source;
-    # this catches the opposite direction, where the destination is
-    # a legal ancestor but the template resolves back to the source
-    # directory. Without this the collision walk's adopt branch hashes
-    # the source against itself, records it as ``skipped_duplicate``,
-    # and safe_to_format goes green — deleting/formatting the
-    # source then erases the only copy. See PR #1107 review.
-    try:
-        same_file = (
-            os.path.exists(dest_file)
-            and os.path.samefile(str(source_file), dest_file)
-        )
-    except OSError:
-        # Fall back to normalized-path equality when samefile can't
-        # stat (e.g. the destination is a stale entry). Prefer a
-        # false positive here (fail this file) over a false
-        # negative that lets the adopt branch loop back onto the
-        # source itself.
-        same_file = (
-            os.path.normpath(str(source_file))
-            == os.path.normpath(dest_file)
-        )
-    # Also reject any dest_file (not just an exact self-copy) that
-    # resolves under any source root. Example: source
-    # ``/Volumes/Card/DCIM``, destination ``/Volumes/Card``,
-    # template ``DCIM/Archive/%Y`` — dest_file lands at
-    # ``/Volumes/Card/DCIM/Archive/2026/<name>``, which is NOT the
-    # source file (samefile is False) but is still inside the card.
-    # A copy there is counted as ``copied``, safe_to_format can go
-    # green, and formatting the card erases the "archive" copy too.
-    # See PR #1107 review.
-    dest_under_source = ctx.path_under_any_source(dest_file)
-    if same_file or dest_under_source:
+    if _is_source_backed_dest(ctx, source_file, dest_file):
         _fail(
             state, rel, source_file,
             "destination file resolves inside a source directory "
@@ -3224,7 +3254,43 @@ def _resolve_dest_collision(state, batch_st, ctx, *, source_file, rel,
                     return _WALK_HANDLED, None
                 counter += 1
                 continue
-        if os.path.exists(cand_path):
+        if os.path.lexists(cand_path):
+            # ``lexists``, not ``exists``: a DANGLING symlink is a
+            # directory entry that this walk must not treat as a free
+            # slot. ``exists`` follows the link and reports False, so the
+            # name got picked — and then ``copy_and_hash_verify``'s
+            # no-overwrite ``os.link`` promote hit the entry that does
+            # exist, raised FileExistsError, and failed a healthy card
+            # file with the misleading reason "copy verification failed".
+            # (It does not write THROUGH the link: the copy goes to a
+            # hidden sibling temp and is promoted by link/rename, neither
+            # of which follows a symlink. Verified before the fix; see
+            # spec row 13.) Nothing to adopt either — there are no bytes
+            # behind it — so advance.
+            if not os.path.exists(cand_path):
+                counter += 1
+                continue
+            # Never hash, and never adopt, a candidate that is really
+            # source media (spec decision 13). The hazard is precise: the
+            # walk would read the CARD's own bytes back through the link,
+            # byte-match them against themselves, book
+            # ``skipped_duplicate``, and let ``safe_to_format`` go green
+            # over bytes that exist nowhere but the card. Unlike the
+            # orchestrator's primary-name guard this ADVANCES rather than
+            # failing the file: one poisoned entry does not poison the
+            # sibling slots, so the photo can still be imported safely.
+            # (At counter 0 the orchestrator's guard has already rejected
+            # this geometry with the same two probes, so this can only
+            # fire from counter 1 on — it is kept unconditional so the
+            # walk does not depend on its caller's ordering.)
+            if _is_source_backed_dest(ctx, source_file, cand_path):
+                log.warning(
+                    "%s: destination candidate %s resolves to source "
+                    "media; skipping it (never adopt bytes the card "
+                    "still owns)", state.log_label, cand_path,
+                )
+                counter += 1
+                continue
             # Already on disk. Byte-identical -> adopt; different ->
             # advance to the next suffix. Adopting matters because a
             # crash-interrupted retry may already have written THIS
@@ -4101,8 +4167,10 @@ def run_import_job(job, runner, db_path, workspace_id, params):
 
             # Per-file dest-safety guard — spec decision 12. See
             # ``_reject_source_backed_dest`` for the geometry it catches
-            # beyond the folder-level guard and for the known
-            # suffix-candidate gap it deliberately does not close. (The
+            # beyond the folder-level guard, and for why it FAILS the
+            # file where the shared collision walk (which probes its own
+            # candidates with the same ``_is_source_backed_dest`` since
+            # spec decision 13) merely advances past one. (The
             # primary-name join here is also computed inside each
             # transport's ``enqueue``; the guard only needs the path,
             # not a shared binding.)

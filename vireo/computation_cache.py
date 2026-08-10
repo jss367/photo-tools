@@ -12,6 +12,7 @@ import hashlib
 import json
 import math
 import os
+import shutil
 import stat
 import tempfile
 import zipfile
@@ -1138,10 +1139,15 @@ def read_bundle(source, on_artifact=None):
 def import_bundle(source, store):
     """Validate the whole bundle, then immutably publish its objects.
 
-    Streams each artifact through the store as soon as it validates, so
-    the whole bundle never sits in memory at once.  Only the runtime
-    fingerprint sets are retained across the walk (bounded by the count
-    of distinct runtimes, not by artifact size).  The returned artifact
+    Validation is all-or-nothing: each artifact is spooled to a
+    temporary directory as it validates, and objects are committed to
+    the store only after ``read_bundle`` has verified every artifact
+    body and every manifest-level check (declared members and total
+    ``uncompressed_bytes``).  A malformed later object or a wrong
+    manifest total therefore leaves the store untouched instead of
+    persisting the earlier objects that had already parsed cleanly.
+    Peak memory stays bounded to a single artifact — the spool lives
+    on disk, not in the parsed-artifact list.  The returned artifact
     list is intentionally empty in this streaming mode — callers that
     need to plant these artifacts on a database should read them back
     from ``store`` (e.g. via ``materialize_local_store``) after import.
@@ -1151,20 +1157,42 @@ def import_bundle(source, store):
     detector_runtimes = set()
     classifier_runtimes = set()
 
-    def _publish(artifact):
-        nonlocal added, existing
-        _digest, created = store.put(artifact)
-        if created:
-            added += 1
-        else:
-            existing += 1
-        artifact_type = artifact.get("type")
-        if artifact_type == "detection":
-            detector_runtimes.add(artifact["runtime_fingerprint"])
-        elif artifact_type == "classification":
-            classifier_runtimes.add(artifact["runtime_fingerprint"])
+    spool = tempfile.mkdtemp(prefix="vireo-import-spool-")
+    try:
+        # (digest, spool_path, artifact_type, runtime_fingerprint)
+        staged = []
 
-    manifest, _artifacts = read_bundle(source, on_artifact=_publish)
+        def _stage(artifact):
+            body = canonical_bytes(artifact)
+            digest = hashlib.sha256(body).hexdigest()
+            path = os.path.join(spool, f"{digest}.json")
+            with open(path, "wb") as handle:
+                handle.write(body)
+            staged.append((
+                digest,
+                path,
+                artifact.get("type"),
+                artifact.get("runtime_fingerprint"),
+            ))
+
+        manifest, _artifacts = read_bundle(source, on_artifact=_stage)
+
+        for _digest, path, artifact_type, runtime in staged:
+            with open(path, "rb") as handle:
+                body = handle.read()
+            artifact = validate_artifact(json.loads(body))
+            _committed, created = store.put(artifact)
+            if created:
+                added += 1
+            else:
+                existing += 1
+            if artifact_type == "detection":
+                detector_runtimes.add(runtime)
+            elif artifact_type == "classification":
+                classifier_runtimes.add(runtime)
+    finally:
+        shutil.rmtree(spool, ignore_errors=True)
+
     return {
         "manifest": manifest,
         "artifacts": [],

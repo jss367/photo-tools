@@ -255,6 +255,51 @@ def test_corrupt_bundle_publishes_nothing(tmp_path):
     assert not (tmp_path / "store").exists()
 
 
+def _second_detection_artifact():
+    return detection_artifact(subjects=[{
+        "key": "d0",
+        "kind": "box",
+        "box": {"x": 0.5, "y": 0.55, "w": 0.25, "h": 0.3},
+        "confidence": 0.7654321,
+        "category": "animal",
+    }])
+
+
+def test_multi_object_bundle_bad_late_object_publishes_nothing(tmp_path):
+    good = tmp_path / "good.vireo-cache"
+    bad = tmp_path / "bad.vireo-cache"
+    write_bundle(good, [detection_artifact(), _second_detection_artifact()])
+
+    def corrupt_last(members):
+        object_names = sorted(name for name in members if name.startswith("objects/"))
+        assert len(object_names) == 2
+        members[object_names[-1]] = members[object_names[-1]] + b" "
+
+    _rewrite_bundle(good, bad, corrupt_last)
+    store = ArtifactStore(tmp_path / "store")
+    with pytest.raises(CacheFormatError, match="size|digest"):
+        import_bundle(bad, store)
+    assert not (tmp_path / "store").exists()
+
+
+def test_multi_object_bundle_bad_manifest_total_publishes_nothing(tmp_path):
+    good = tmp_path / "good.vireo-cache"
+    bad = tmp_path / "bad.vireo-cache"
+    write_bundle(good, [detection_artifact(), _second_detection_artifact()])
+
+    def bump_total(members):
+        import json as _json
+        manifest = _json.loads(members["manifest.json"])
+        manifest["uncompressed_bytes"] = manifest["uncompressed_bytes"] + 1
+        members["manifest.json"] = canonical_bytes(manifest)
+
+    _rewrite_bundle(good, bad, bump_total)
+    store = ArtifactStore(tmp_path / "store")
+    with pytest.raises(CacheFormatError, match="byte total"):
+        import_bundle(bad, store)
+    assert not (tmp_path / "store").exists()
+
+
 def test_bundle_rejects_traversal_and_undeclared_members(tmp_path):
     bundle = tmp_path / "unsafe.vireo-cache"
     manifest = {

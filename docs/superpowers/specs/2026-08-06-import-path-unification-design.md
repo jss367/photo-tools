@@ -373,21 +373,37 @@ Two further decisions recorded here:
   - *Flip C (advance past unreadable candidates)* — a candidate whose stat
     fails is dropped from `_planned_folder_listing`, so the preview
     already reached "not recovered", matching the run's new landing.
-  - *Symlinked candidates (Codex review of PR #1450, round 4 — fixed).*
-    `_planned_folder_listing` recorded only
+  - *Symlinked candidates (Codex review of PR #1450, rounds 4-5 — TRIED,
+    REVERTED, deferred to PR 8).* Round 4 observed that
+    `_planned_folder_listing` records only
     `is_file(follow_symlinks=False)` entries, so a candidate that is a
-    symlink to an off-card regular file read as a free slot, while the walk
-    stats candidates with `os.stat` (which follows) and adopts on a byte
-    match. The listing now follows symlinks. Scope correction: the report
-    tied this to the newly-supported zero-byte cases, but it applies to
-    ordinary files too and predates PR 7b entirely — the RED test carries
-    real bytes for exactly that reason, and
-    `test_symlinked_offcard_candidate_is_adopted` pins the run side so the
-    preview's new answer is anchored to observed behavior rather than
-    inference. A symlink back into the card is still refused (by
-    `_is_source` in `_bytes_match`, mirroring the walk's source-backed
-    refusal), and dangling symlinks plus non-regular entries still stay out
-    of the listing, matching the walk's ENOENT advance and `S_ISREG` guard.
+    symlink to an off-card regular file reads as a free slot while the
+    walk stats candidates with `os.stat` (which follows) and adopts on a
+    byte match. True, and broader than reported — it applies to ordinary
+    files, not just the newly-supported zero-byte cases, and predates
+    PR 7b entirely. Fixed by following symlinks; round 5 then showed that
+    fix created a worse problem, and it was reverted. The walk refuses any
+    candidate resolving under ANY source root, whereas this endpoint's
+    `_is_source` can only compare `samefile` against the CURRENT source
+    file — so a symlink to a *different* card file with identical bytes
+    was reported as recovered. That is an OVER-claim: the preview would
+    promise "already safe at the destination" for bytes that live only on
+    the card, which is the direction that can talk a user into wiping it.
+    The endpoint receives `paths`, never the import's source roots, so it
+    cannot rebuild that guard; every version available here is an
+    approximation, and an approximation in a safety-relevant preview is
+    not worth trading a safe under-report for. Reverted to excluding
+    symlinks — the preview under-reports recovery for the off-card-match
+    geometry, which is the safe direction — and both halves are pinned:
+    `test_check_duplicates_symlinked_candidate_is_not_reported_recovered`
+    (the accepted under-report) and
+    `test_check_duplicates_never_reports_recovery_via_a_card_symlink`
+    (the over-report that must never come back; it goes red under the
+    reverted version). The run side is pinned by
+    `test_symlinked_offcard_candidate_is_adopted` so the divergence is
+    documented from both ends. **PR 8 resolves this properly** by giving
+    the preview the shared walk — and with it the real
+    `path_under_any_source` guard.
   - *Still divergent, pre-existing, PR 8's business:* the preview's suffix
     walk **stops** at the first slot absent from its listing
     (`cand_size is None → return False`), where the run advances. Symlinks

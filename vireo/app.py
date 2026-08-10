@@ -19221,26 +19221,39 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     with os.scandir(folder) as it:
                         for entry in it:
                             try:
-                                # FOLLOW symlinks, because the import walk
-                                # does: it stats candidates with os.stat
-                                # and adopts one whose bytes match, so a
-                                # symlink to an off-card regular file IS a
-                                # recovery. Listing it as absent made the
-                                # preview promise a transfer the run would
-                                # not perform. A symlink back into the
-                                # card is still excluded from recovery —
-                                # by ``_is_source`` in ``_bytes_match``,
-                                # mirroring the walk's own source-backed
-                                # refusal — and a DANGLING symlink stays
-                                # out of the listing because is_file()
-                                # follows it and finds nothing, matching
-                                # the walk's ENOENT advance. Non-regular
-                                # entries (FIFOs, device nodes) also stay
-                                # out, mirroring the walk's S_ISREG guard.
-                                # Codex review of PR #1450.
-                                if entry.is_file(follow_symlinks=True):
+                                # Symlinks are deliberately EXCLUDED, and
+                                # this is a considered trade, not an
+                                # oversight. The import walk follows them
+                                # (os.stat) and adopts a symlink to an
+                                # off-card regular file whose bytes match,
+                                # so excluding them makes the preview
+                                # UNDER-report recovery for that geometry
+                                # — it says "will copy" for a file the run
+                                # adopts. That is the safe direction to be
+                                # wrong in.
+                                #
+                                # Following them was tried (PR 7b) and
+                                # reverted: the walk refuses a candidate
+                                # resolving under ANY source root, while
+                                # this endpoint's ``_is_source`` can only
+                                # compare ``samefile`` against the CURRENT
+                                # source file. A symlink to a *different*
+                                # card file with identical bytes therefore
+                                # slipped through and was reported as
+                                # recovered — an OVER-claim, promising
+                                # "already safe at the destination" for
+                                # bytes that live only on the card. This
+                                # endpoint receives ``paths``, not the
+                                # import's source roots, so it cannot
+                                # reconstruct that guard; doing this right
+                                # needs the shared walk, i.e. the PR 8
+                                # de-mirror. Trading a safe under-report
+                                # for an unsafe over-report is not worth
+                                # it in the meantime.
+                                # Codex review of PR #1450, rounds 4-5.
+                                if entry.is_file(follow_symlinks=False):
                                     entries[entry.name] = entry.stat(
-                                        follow_symlinks=True).st_size
+                                        follow_symlinks=False).st_size
                             except OSError:
                                 continue
                 except OSError:

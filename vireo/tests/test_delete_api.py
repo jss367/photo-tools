@@ -364,7 +364,7 @@ def test_api_batch_delete_disk_failure_retains_catalog_row(
     real_file = os.path.join(folder_path, photo["filename"])
     Image.new("RGB", (10, 10)).save(real_file)
 
-    def fail_trash(paths):
+    def fail_trash(paths, progress_callback=None):
         paths = list(paths)
         return 0, set(), [
             {"path": path, "error": "SMB Trash unavailable"} for path in paths
@@ -410,7 +410,7 @@ def test_api_batch_delete_disk_partial_failure_deletes_only_successes(
     Image.new("RGB", (10, 10)).save(success_path)
     Image.new("RGB", (10, 10)).save(failed_path)
 
-    def partial_trash(paths):
+    def partial_trash(paths, progress_callback=None):
         paths = list(paths)
         successes = {p for p in paths if p == success_path}
         for p in successes:
@@ -468,7 +468,7 @@ def test_api_batch_delete_skips_row_whose_identity_changed_mid_delete(
     dest_file = os.path.join(dest_folder, "bird.jpg")
     Image.new("RGB", (10, 10)).save(dest_file)
 
-    def concurrent_move_then_trash(paths):
+    def concurrent_move_then_trash(paths, progress_callback=None):
         # Emulate move-photos committing a new folder_id while the trash
         # stub runs. The source file was already removed by the "move" so
         # the real trash step (had it run) would treat the path as
@@ -523,7 +523,7 @@ def test_api_batch_delete_treats_concurrently_deleted_row_as_completed(
     )
     os.makedirs(folder_path, exist_ok=True)
 
-    def concurrent_delete_then_trash(paths):
+    def concurrent_delete_then_trash(paths, progress_callback=None):
         # A racing delete finished the same row before revalidation runs.
         db.conn.execute("DELETE FROM photos WHERE id = ?", (pid,))
         db.conn.commit()
@@ -580,7 +580,7 @@ def test_api_batch_delete_disk_targets_absolute_companion_path(
 
     seen_paths = []
 
-    def record_trash(paths):
+    def record_trash(paths, progress_callback=None):
         paths = list(paths)
         seen_paths.append(paths)
         removed = set()
@@ -642,7 +642,7 @@ def test_api_batch_delete_skips_row_whose_folder_path_changed_mid_delete(
     moved_file = os.path.join(renamed_folder, "bird.jpg")
     Image.new("RGB", (10, 10)).save(moved_file)
 
-    def concurrent_folder_rename_then_trash(paths):
+    def concurrent_folder_rename_then_trash(paths, progress_callback=None):
         # Simulate move-folder committing a new folders.path mid-delete while
         # keeping folder_id and filename intact — the same photo row now
         # points at moved_file instead of the resolved original_folder path.
@@ -704,7 +704,7 @@ def test_api_batch_delete_disk_revalidates_companion_pairing_before_delete(
         f.write(b"raw bytes")
     Image.new("RGB", (10, 10)).save(jpeg_file)
 
-    def concurrent_pair_then_trash(paths):
+    def concurrent_pair_then_trash(paths, progress_callback=None):
         # Emulate scanner pairing committing a new companion_path on the RAW
         # mid-delete. The (folder_id, filename, folder_path) tuple is
         # unchanged, but the row now claims the JPEG as its companion and
@@ -768,7 +768,7 @@ def test_api_batch_delete_companion_failure_does_not_move_primary(
 
     calls = []
 
-    def fail_companion(paths):
+    def fail_companion(paths, progress_callback=None):
         paths = list(paths)
         calls.append(paths)
         return 0, set(), [

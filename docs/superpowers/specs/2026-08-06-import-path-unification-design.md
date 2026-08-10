@@ -290,6 +290,35 @@ Two further decisions recorded here:
   `_duplicate_gate` / `enqueue` / the walk, `_book_adoption` already carries
   the raw-vs-normalized hash split that motivated the deferral, and no third
   transport is on any horizon. YAGNI.
+- **Preflight-mirror reconciliation (the PR 3 standing obligation).** Every
+  change to the collision/adopt walk must be checked against the
+  hand-mirrored copy in `app.py`'s recovery preview
+  (`_recovery_candidate` / `_planned_folder_listing`, ~L19217–19366) and
+  either applied there or recorded as a deliberate difference. Checked for
+  all four PR 7b flips; **no `app.py` change is needed, and two of the
+  flips close existing preview/ingest divergences**:
+  - *Flip A (zero-byte adopt at any position)* — the preview already
+    reported these as recovered, because its `_src_hash` uses
+    `compute_file_hash` (a real `EMPTY_FILE_SHA256`, not the checker's
+    `None`) and a zero-byte candidate is in the listing at size 0. Before
+    the flip the run suffixed such a file while the preview promised
+    recovery. Now they agree.
+  - *Flip D (source-backed candidates)* — the preview's `_bytes_match`
+    already begins with `_is_source(cand_path)` and advances, so it
+    modelled advance-past while the run adopted. Now they agree.
+  - *Flip B (size pre-check)* — the preview has always size-gated; it is
+    invisible to it anyway.
+  - *Flip C (advance past unreadable candidates)* — a candidate whose stat
+    fails is dropped from `_planned_folder_listing`, so the preview
+    already reached "not recovered", matching the run's new landing.
+  - *Still divergent, pre-existing, PR 8's business:* the preview's suffix
+    walk **stops** at the first slot absent from its listing
+    (`cand_size is None → return False`), where the run advances. Symlinks
+    are absent from the listing (`is_file(follow_symlinks=False)`), so a
+    poisoned or dangling entry at `name_1.ext` with this source's bytes at
+    `name_2.ext` is "not recovered" to the preview and an adoption to the
+    run. That corner diverged before PR 7b too (in the opposite direction),
+    and de-mirroring is what PR 8 is for.
 - **Axis-3 test adaptation.** `test_remote_import_cancel_interrupts_stuck_collision_hash`
   simulates a wedged mount with FIFOs at the collision-candidate paths, and a
   FIFO stats as size 0 — so the new size pre-check would advance past it

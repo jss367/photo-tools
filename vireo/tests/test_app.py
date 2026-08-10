@@ -5108,7 +5108,11 @@ def test_trash_paths_preserves_explicit_none_network_roots(
     import app as app_module
 
     monkeypatch.setattr(app_module.sys, "platform", "darwin")
-    photo = "/Volumes/NAS/bird.NEF"
+    volume = tmp_path / "NAS"
+    photo = str(volume / "bird.NEF")
+    monkeypatch.setattr(
+        app_module, "_volume_root_for_path", lambda _path: str(volume),
+    )
 
     query_calls = []
 

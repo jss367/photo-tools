@@ -1790,6 +1790,15 @@ def _expand_first_symlink_prefix(filepath):
             target = os.readlink(prefix)
         except OSError:
             continue
+        if os.name == "nt":
+            # Windows junctions commonly expose their substitution path
+            # through os.readlink() with an extended-length prefix. Strip it
+            # so comparisons against ordinary drive or UNC mount roots use
+            # the same spelling.
+            if target.startswith("\\\\?\\UNC\\"):
+                target = "\\\\" + target[8:]
+            elif target.startswith("\\\\?\\"):
+                target = target[4:]
         if not os.path.isabs(target):
             target = os.path.join(os.path.dirname(prefix), target)
         return os.path.normpath(os.path.join(target, *parts[index + 1:]))

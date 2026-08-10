@@ -555,12 +555,21 @@ def test_check_duplicates_no_destination_reports_no_recovery(
     assert _recovered_paths(events) == []
 
 
-def test_check_duplicates_zero_byte_source_never_recovered(
+def test_check_duplicates_zero_byte_source_is_recovered(
     app_and_db, tmp_path
 ):
-    """Zero-byte placeholders match any empty destination file by size;
-    don't claim adoption for them (the checker gives them no identity
-    either)."""
+    """A zero-byte source with an empty file already at the planned
+    destination name IS a recovery — the preview must say so.
+
+    This flipped in PR 7b. The endpoint used to return False for every
+    zero-byte source, reasoning that "the checker gives them no identity
+    either" — but that conflates duplicate identity with crash-recovery
+    adoption. The import job adopts an empty candidate for an empty
+    source (at the primary name on the local path since long before PR
+    7b, and at every candidate position on both transports since flip
+    A), so the old answer left the preview counting a file as a transfer
+    the run would never perform.
+    """
     from datetime import datetime
 
     app, db, fid = app_and_db
@@ -584,7 +593,82 @@ def test_check_duplicates_zero_byte_source_never_recovered(
     })
     events = parse_sse_events(resp.data)
     done = [e for e in events if e.get("done")]
+    assert done[0]["recovered_count"] == 1
+    assert str(src) in _recovered_paths(events)
+
+
+def test_check_duplicates_zero_byte_source_recovered_at_suffix_slot(
+    app_and_db, tmp_path
+):
+    """Same rule one slot along: a non-empty file holds the primary name
+    and this source's empty twin sits at the first suffix. Mirrors
+    ``test_local_zero_byte_suffix_candidate_adopts_with_checker`` in the
+    import-job suite (PR 7b flip A)."""
+    from datetime import datetime
+
+    app, db, fid = app_and_db
+
+    source = tmp_path / "source"
+    source.mkdir(exist_ok=True)
+    src = source / "DSC_0001.NEF"
+    src.write_bytes(b"")
+    ts = datetime(2026, 7, 3, 10, 0, 0).timestamp()
+    os.utime(str(src), (ts, ts))
+
+    dest = tmp_path / "archive"
+    planned = dest / "2026" / "2026-07-03"
+    planned.mkdir(parents=True)
+    (planned / "DSC_0001.NEF").write_bytes(b"not empty")
+    (planned / "DSC_0001_1.NEF").write_bytes(b"")
+
+    client = app.test_client()
+    resp = client.post("/api/import/check-duplicates", json={
+        "paths": [str(src)],
+        "destination": str(dest),
+    })
+    events = parse_sse_events(resp.data)
+    done = [e for e in events if e.get("done")]
+    assert done[0]["recovered_count"] == 1
+    assert str(src) in _recovered_paths(events)
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="os.mkfifo is POSIX-only.",
+)
+def test_check_duplicates_zero_byte_source_not_recovered_from_fifo(
+    app_and_db, tmp_path
+):
+    """A FIFO at the planned name is not a recovery, matching the import
+    job's S_ISREG guard: it stats as size 0, so without the regular-file
+    rule both sides would treat it as this empty source's archive copy.
+    The preview gets this right for free — ``_planned_folder_listing``
+    only records ``is_file(follow_symlinks=False)`` entries."""
+    from datetime import datetime
+
+    app, db, fid = app_and_db
+
+    source = tmp_path / "source"
+    source.mkdir(exist_ok=True)
+    src = source / "DSC_0001.NEF"
+    src.write_bytes(b"")
+    ts = datetime(2026, 7, 3, 10, 0, 0).timestamp()
+    os.utime(str(src), (ts, ts))
+
+    dest = tmp_path / "archive"
+    planned = dest / "2026" / "2026-07-03"
+    planned.mkdir(parents=True)
+    os.mkfifo(str(planned / "DSC_0001.NEF"))
+
+    client = app.test_client()
+    resp = client.post("/api/import/check-duplicates", json={
+        "paths": [str(src)],
+        "destination": str(dest),
+    })
+    events = parse_sse_events(resp.data)
+    done = [e for e in events if e.get("done")]
     assert done[0]["recovered_count"] == 0
+    assert _recovered_paths(events) == []
 
 
 def test_check_duplicates_rejects_relative_destination(app_and_db, tmp_path):

@@ -343,17 +343,31 @@ Two further decisions recorded here:
   hand-mirrored copy in `app.py`'s recovery preview
   (`_recovery_candidate` / `_planned_folder_listing`, ~L19217–19366) and
   either applied there or recorded as a deliberate difference. Checked for
-  all four PR 7b flips; **no `app.py` change is needed, and two of the
-  flips close existing preview/ingest divergences**:
-  - *Flip A (zero-byte adopt at any position)* — the preview already
-    reported these as recovered, because its `_src_hash` uses
-    `compute_file_hash` (a real `EMPTY_FILE_SHA256`, not the checker's
-    `None`) and a zero-byte candidate is in the listing at size 0. Before
-    the flip the run suffixed such a file while the preview promised
-    recovery. Now they agree.
+  all four PR 7b flips.
+  - *Flip A (zero-byte adopt at any position)* — **CORRECTED 2026-08-10
+    after the Codex review of PR #1450.** The first version of this
+    reconciliation claimed the preview already reported zero-byte twins as
+    recovered and that flip A closed a divergence. That was wrong: the
+    endpoint had an early `if size == 0: return False` (app.py ~L19250)
+    that short-circuits before any of the listing/hash logic the claim
+    relied on, pinned by `test_check_duplicates_zero_byte_source_never_recovered`.
+    The truth is the opposite — the divergence PRE-EXISTED (the local
+    primary-name zero-byte adopt is older than this PR) and flip A
+    WIDENED it to the local-suffix and both remote positions. Discharged
+    by applying the change rather than recording it: the early return is
+    removed, so the generic path answers correctly on its own
+    (`_src_hash` uses `compute_file_hash`, so an empty source hashes to
+    `EMPTY_FILE_SHA256` rather than the checker's `None`, and matches an
+    empty candidate). Non-regular entries stay excluded for free —
+    `_planned_folder_listing` records only
+    `is_file(follow_symlinks=False)` entries, which is exactly what the
+    run's new `S_ISREG` guard does. The old pin is flipped and renamed
+    `..._is_recovered`, with new suffix-slot and FIFO cases.
   - *Flip D (source-backed candidates)* — the preview's `_bytes_match`
     already begins with `_is_source(cand_path)` and advances, so it
-    modelled advance-past while the run adopted. Now they agree.
+    modelled advance-past while the run adopted. Now they agree. (This
+    half of the original claim was re-checked when flip A's half turned
+    out to be wrong, and it holds.)
   - *Flip B (size pre-check)* — the preview has always size-gated; it is
     invisible to it anyway.
   - *Flip C (advance past unreadable candidates)* — a candidate whose stat

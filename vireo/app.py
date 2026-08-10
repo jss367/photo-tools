@@ -19247,11 +19247,25 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 size = source_file.stat().st_size
             except OSError:
                 return False
-            if size == 0:
-                # Zero-byte placeholders match any empty file by size;
-                # don't claim adoption for them (the duplicate checker
-                # gives them no identity either).
-                return False
+            # NOTE: zero-byte sources are NOT special-cased here. They
+            # used to return False on the reasoning that "the duplicate
+            # checker gives them no identity either" — but that conflates
+            # duplicate identity with crash-recovery adoption, which is
+            # what this preview is about. ``_resolve_dest_collision``
+            # adopts an empty candidate for an empty source at every
+            # candidate position on both transports (spec PR 7b flip A;
+            # the local primary-name case predates it), so returning
+            # False here left the preview counting those files as
+            # transfers the run would never perform. The generic path
+            # below gets this right on its own: ``_src_hash`` uses
+            # ``compute_file_hash``, so an empty source hashes to
+            # EMPTY_FILE_SHA256 rather than the checker's None, and it
+            # matches an empty candidate. Non-regular entries (FIFOs,
+            # device nodes) stay excluded because
+            # ``_planned_folder_listing`` only records
+            # ``is_file(follow_symlinks=False)`` entries — which is also
+            # what the run's own S_ISREG guard does. Codex review of
+            # PR #1450.
             # Folder planning mirrors ingest._source_file_timestamps:
             # EXIF capture time falling back to file mtime. In the default
             # mode checker.prepare() already batched the EXIF reads and

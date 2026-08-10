@@ -4207,6 +4207,36 @@ def test_snapshot_mode_hides_selection_and_says_what_it_will_import(
     expect(page.locator("#modeInPlace")).to_be_disabled()
 
 
+def test_snapshot_mode_loads_while_import_readiness_is_slow(
+        live_server, page):
+    """A metadata-repair count must not hold a captured import hostage.
+
+    Snapshot activation only needs the frozen list and its preview.  Import
+    readiness is independent advisory work and can take minutes on a large
+    catalog, so the captured count and controls must render while that request
+    is still in flight.
+    """
+    page.goto(f"{live_server['url']}/import")  # warm the app before routing
+    _stub_snapshot_import(page, _files(1))
+
+    def readiness(route):
+        # Never fulfill: model a catalog-wide metadata check that is still
+        # running while the snapshot endpoints answer normally.
+        pass
+
+    page.route("**/api/import/readiness", readiness)
+    page.goto(
+        f"{live_server['url']}/import?new_images=42",
+        wait_until="domcontentloaded",
+    )
+
+    expect(page.locator("#newImagesImportSource")).to_contain_text(
+        "1 newly detected image",
+    )
+    expect(page.locator("#modeInPlace")).to_be_disabled()
+    expect(page.locator("#importPreviewGrid")).to_be_visible()
+
+
 def test_snapshot_mode_withholds_selection_even_if_the_mode_radio_flips(
         live_server, page):
     """importSelectionEnabled()'s snapshot clause is not decoration.

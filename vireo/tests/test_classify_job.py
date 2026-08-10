@@ -2549,6 +2549,190 @@ def test_record_batch_classifier_runs_skips_zero_count(tmp_path):
     assert keys_failed == set(), "failed detection must NOT be cached"
 
 
+def test_publish_classifier_runs_promotes_after_predictions_persist(tmp_path):
+    """``_publish_classifier_runs_for_raw_results`` must run AFTER
+    ``_store_grouped_predictions`` writes prediction rows.
+
+    ``promote_and_publish_classifier_run`` reads the persisted
+    ``predictions`` rows to synthesize the exportable artifact and only
+    then stamps the classifier_runs row with the real
+    ``runtime_fingerprint``. If we call it earlier — inside
+    ``_record_batch_classifier_runs``, before predictions exist — the
+    read returns nothing, the promote silently returns ``None``, and the
+    classifier_runs row is left on ``runtime_fingerprint = 'legacy'``.
+    ``exportable_artifacts`` filters by real (SHA-256) runtime, so those
+    runs are silently omitted from cache bundle exports.
+    """
+    from computation_cache import (
+        ArtifactStore,
+        classifier_model_identity,
+        exportable_artifacts,
+    )
+    from db import Database
+
+    photo_hash = "1" * 64
+    db = Database(str(tmp_path / "src.db"))
+    folder_id = db.add_folder("/tmp/photos")
+    ws = db.create_workspace("A")
+    db._active_workspace_id = ws
+    db.add_workspace_folder(ws, folder_id)
+    photo_id = db.add_photo(
+        folder_id, "a.jpg", extension=".jpg", file_size=100,
+        file_mtime=1.0, file_hash=photo_hash,
+    )
+
+    # Detector run with a real (non-legacy) runtime fingerprint — the
+    # classification artifact composes with the detector runtime.
+    from computation_cache import runtime_fingerprint, source_input
+
+    detector_runtime = runtime_fingerprint({
+        "type": "detection", "model": "megadetector-v6",
+        "weights_sha256": "2" * 64, "pipeline": "detector-v1",
+    })
+    _input, det_input_fp = source_input(
+        photo_hash, "vireo-detector-source-v1",
+    )
+    det_id = db.write_detection_batch(
+        photo_id, "megadetector-v6",
+        [{"box": {"x": 0.1, "y": 0.2, "w": 0.3, "h": 0.4},
+          "confidence": 0.9, "category": "animal"}],
+        runtime_fingerprint=detector_runtime,
+        input_fingerprint=det_input_fp,
+    )[0]
+
+    labels_full = "5" * 64
+    labels_short = labels_full[:12]
+    db.upsert_labels_fingerprint(
+        labels_short, "Test birds", [], 1, full_fingerprint=labels_full,
+    )
+
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    (model_dir / "image_encoder.onnx").write_bytes(b"exact model bytes")
+    identity = classifier_model_identity({
+        "id": "bioclip-test",
+        "model_str": "ViT-test",
+        "model_type": "bioclip",
+        "weights_path": str(model_dir),
+        "files": ["image_encoder.onnx"],
+        "source": "custom",
+    })
+
+    import classify_job
+    batch = [{"detection_id": det_id, "img": object()}]
+    raw_results = [{
+        "detection_id": det_id, "species": "Robin", "confidence": 0.9,
+    }]
+
+    # First, _record_batch_classifier_runs runs *before* predictions
+    # exist — matches what _classify_photos does after _flush_batch
+    # appends to raw_results.  This writes the classifier_runs row but
+    # MUST NOT try to publish yet.
+    classify_job._record_batch_classifier_runs(
+        db, batch, "BioCLIP", labels_short, raw_results,
+        labels_fingerprint_full=labels_full, model_identity=identity,
+    )
+    run = db.conn.execute(
+        "SELECT runtime_fingerprint FROM classifier_runs "
+        "WHERE detection_id = ?", (det_id,),
+    ).fetchone()
+    assert run["runtime_fingerprint"] == "legacy", (
+        "record_batch must NOT attempt to publish before predictions "
+        "are persisted — that call silently no-ops and leaves the run "
+        "stranded on 'legacy' runtime"
+    )
+
+    # Publishing without the persisted prediction rows still no-ops.
+    store = ArtifactStore(tmp_path / "store")
+    classify_job._publish_classifier_runs_for_raw_results(
+        db, raw_results, "BioCLIP", labels_short,
+        labels_fingerprint_full=labels_full, model_identity=identity,
+    )
+    run = db.conn.execute(
+        "SELECT runtime_fingerprint FROM classifier_runs "
+        "WHERE detection_id = ?", (det_id,),
+    ).fetchone()
+    assert run["runtime_fingerprint"] == "legacy"
+
+    # Simulate _store_grouped_predictions persisting the prediction row,
+    # then re-run the publish pass — the classifier_runs row now gets
+    # its real runtime_fingerprint and the artifact appears in exports.
+    db.add_prediction(
+        det_id, species="Robin", confidence=0.9, model="BioCLIP",
+        labels_fingerprint=labels_short,
+    )
+    classify_job._publish_classifier_runs_for_raw_results(
+        db, raw_results, "BioCLIP", labels_short,
+        labels_fingerprint_full=labels_full, model_identity=identity,
+        # No `store` param on the helper — the default ArtifactStore
+        # writes to the configured cache dir.  Publishing to that store
+        # is a side-effect; the assertions below hit the DB stamp and
+        # the exportable_artifacts view, which do not depend on which
+        # store received the artifact.
+    )
+    run = db.conn.execute(
+        "SELECT runtime_fingerprint, input_fingerprint, labels_fingerprint_full "
+        "FROM classifier_runs WHERE detection_id = ?", (det_id,),
+    ).fetchone()
+    assert run["labels_fingerprint_full"] == labels_full
+    assert len(run["runtime_fingerprint"]) == 64
+    assert run["runtime_fingerprint"] != "legacy"
+    assert len(run["input_fingerprint"]) == 64
+
+    # The classifier run is now visible to bundle export.
+    _artifacts, summary = exportable_artifacts(db)
+    assert summary["classifier_runs"] == 1
+
+
+def test_all_photos_cache_satisfied_requires_matching_predictions_row(tmp_path):
+    """A classifier_runs row with no matching ``predictions`` row is a
+    torn write from a crashed local job — ``_record_batch_classifier_runs``
+    commits the run *before* ``_store_grouped_predictions`` persists the
+    prediction rows.  Counting it as covered would make the retry enter
+    ``_finalize_cached_only``, which skips the missing prediction rows
+    entirely and reports success without repairing them.
+    """
+    from classify_job import _all_photos_cache_satisfied
+    from db import Database
+
+    db = Database(str(tmp_path / "test.db"))
+    ws = db.ensure_default_workspace()
+    db.set_active_workspace(ws)
+    folder_id = db.add_folder("/tmp/p", name="p")
+    pid = db.add_photo(
+        folder_id, "a.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+    )
+    det_id = db.save_detections(pid, [
+        {"box": {"x": 0, "y": 0, "w": 1, "h": 1}, "confidence": 0.9,
+         "category": "animal"},
+    ], detector_model="megadetector-v6")[0]
+
+    # Torn write: classifier_runs exists, predictions do not.
+    db.record_classifier_run(det_id, "BioCLIP", "fp-cached",
+                             prediction_count=1)
+
+    # Coverage query must refuse — with either the fully-specified
+    # (model + fp) form and the fresh-install (both-unspecified) form.
+    assert _all_photos_cache_satisfied(
+        db, [pid], classifier_model="BioCLIP",
+        labels_fingerprint="fp-cached",
+    ) is False
+    assert _all_photos_cache_satisfied(db, [pid]) is False
+
+    # After the missing prediction row lands, cache is now really
+    # satisfied.
+    db.add_prediction(
+        det_id, species="Robin", confidence=0.9, model="BioCLIP",
+        labels_fingerprint="fp-cached",
+    )
+    assert _all_photos_cache_satisfied(
+        db, [pid], classifier_model="BioCLIP",
+        labels_fingerprint="fp-cached",
+    ) is True
+    assert _all_photos_cache_satisfied(db, [pid]) is True
+
+
 def test_classifier_fingerprint_upserted(tmp_path, monkeypatch):
     """When a classifier runs, the labels fingerprint is upserted."""
     from db import Database
@@ -5181,9 +5365,13 @@ def test_run_classify_job_reclassify_cancel_classifies_empty_scene_processed(tmp
     # No prior full-image synthetic detection exists for photo 1 — the
     # classifier creates one for the full-image fallback path.
     mock_db_instance.get_detections.return_value = []
-    # save_detections returns a synthetic detection id for the full-image
-    # fallback that _classify_photos creates for empty-scene photos.
+    # save_detections + write_detection_batch both return the synthetic
+    # detection id for the full-image fallback path.  The classify loop
+    # now writes both the detection and the detector_runs row in a single
+    # ``write_detection_batch`` transaction to avoid torn state on crash,
+    # so the mock has to answer that call too.
     mock_db_instance.save_detections.return_value = [201]
+    mock_db_instance.write_detection_batch.return_value = [201]
 
     fake_model = {
         "id": "test-model",
@@ -5651,3 +5839,643 @@ def test_burst_consensus_non_ascii_case_variants_stay_split(tmp_path):
         )
         assert kwargs["vote_count"] is None
         assert kwargs["individual"] is None
+
+
+def test_all_photos_cache_satisfied_requires_every_photo_covered(tmp_path):
+    from classify_job import _all_photos_cache_satisfied
+    from db import Database
+
+    db = Database(str(tmp_path / "test.db"))
+    ws = db.ensure_default_workspace()
+    db.set_active_workspace(ws)
+    folder_id = db.add_folder("/tmp/p", name="p")
+    covered = db.add_photo(
+        folder_id, "covered.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+    )
+    uncovered = db.add_photo(
+        folder_id, "bare.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+    )
+    det_id = db.save_detections(covered, [
+        {"box": {"x": 0, "y": 0, "w": 1, "h": 1}, "confidence": 0.9, "category": "animal"},
+    ], detector_model="megadetector-v6")[0]
+    # A classifier_run row without a matching predictions row is a torn
+    # write from a crashed local job — _all_photos_cache_satisfied must
+    # reject it as unsatisfied so the retry re-runs classification
+    # instead of shortcutting to _finalize_cached_only.
+    db.record_classifier_run(det_id, "BioCLIP", "abc123", prediction_count=1)
+    db.add_prediction(
+        det_id, species="Robin", confidence=0.9, model="BioCLIP",
+        labels_fingerprint="abc123",
+    )
+
+    assert _all_photos_cache_satisfied(db, [covered]) is True
+    assert _all_photos_cache_satisfied(db, [covered, uncovered]) is False
+    # Empty photo list: no work possible, treated as not-satisfied so the
+    # caller falls through to normal empty-collection handling.
+    assert _all_photos_cache_satisfied(db, []) is False
+
+
+def test_all_photos_cache_satisfied_requires_common_identity_when_either_unresolved(
+    tmp_path,
+):
+    """When only one of (classifier_model, labels_fingerprint) is known —
+    e.g. a fresh install where the model name is available but its label
+    sources aren't — cached rows may still legitimately span multiple
+    values for the unbound component.  ``_finalize_cached_only`` adopts
+    the first row's identity for reconciliation, so the satisfaction
+    check must refuse to short-circuit unless every covered row agrees
+    on that component too.
+    """
+    from classify_job import _all_photos_cache_satisfied
+    from db import Database
+
+    db = Database(str(tmp_path / "test.db"))
+    ws = db.ensure_default_workspace()
+    db.set_active_workspace(ws)
+    folder_id = db.add_folder("/tmp/p", name="p")
+    pid = db.add_photo(
+        folder_id, "a.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+    )
+    det_ids = db.save_detections(pid, [
+        {"box": {"x": 0, "y": 0, "w": 1, "h": 1}, "confidence": 0.9, "category": "animal"},
+        {"box": {"x": 2, "y": 2, "w": 1, "h": 1}, "confidence": 0.9, "category": "animal"},
+    ], detector_model="megadetector-v6")
+    # Same classifier, DIFFERENT label fingerprints across the two runs.
+    # Add matching predictions rows so the coverage query treats each
+    # classifier_run as a genuine cache row rather than a torn write.
+    db.record_classifier_run(det_ids[0], "BioCLIP", "fp-a", prediction_count=1)
+    db.add_prediction(
+        det_ids[0], species="Robin", confidence=0.9, model="BioCLIP",
+        labels_fingerprint="fp-a",
+    )
+    db.record_classifier_run(det_ids[1], "BioCLIP", "fp-b", prediction_count=1)
+    db.add_prediction(
+        det_ids[1], species="Sparrow", confidence=0.9, model="BioCLIP",
+        labels_fingerprint="fp-b",
+    )
+
+    # Model known, fingerprint unresolved: the identity gate must refuse
+    # this because the cached rows disagree on the unbound fingerprint.
+    assert _all_photos_cache_satisfied(
+        db, [pid], classifier_model="BioCLIP", labels_fingerprint=None,
+    ) is False
+    # Fingerprint known, model unresolved: mirror case (all rows share
+    # the classifier, so if fingerprint is filtered to just one, only
+    # matching rows count — narrow the coverage instead).
+    assert _all_photos_cache_satisfied(
+        db, [pid], classifier_model=None, labels_fingerprint="fp-a",
+    ) is False
+    # Both fully specified: filter narrows to a single identity, gate
+    # not needed — but only one detection matches, so coverage fails.
+    assert _all_photos_cache_satisfied(
+        db, [pid], classifier_model="BioCLIP", labels_fingerprint="fp-a",
+    ) is False
+
+    # A historical row outside the resolved model filter must not pollute
+    # the distinct-identity gate. Both classifiable detections below are
+    # covered by BioCLIP/fp-a; the unrelated model is merely extra history.
+    pid2 = db.add_photo(
+        folder_id, "b.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+    )
+    det2 = db.save_detections(pid2, [
+        {"box": {"x": 4, "y": 4, "w": 1, "h": 1}, "confidence": 0.9,
+         "category": "animal"},
+        {"box": {"x": 6, "y": 6, "w": 1, "h": 1}, "confidence": 0.9,
+         "category": "animal"},
+    ], detector_model="megadetector-v6")
+    for det_id in det2:
+        db.record_classifier_run(det_id, "BioCLIP", "fp-a", prediction_count=1)
+        db.add_prediction(
+            det_id, species="Robin", confidence=0.9, model="BioCLIP",
+            labels_fingerprint="fp-a",
+        )
+    db.record_classifier_run(det2[0], "Other", "fp-x", prediction_count=1)
+    db.add_prediction(
+        det2[0], species="Other bird", confidence=0.8, model="Other",
+        labels_fingerprint="fp-x",
+    )
+    assert _all_photos_cache_satisfied(
+        db, [pid2], classifier_model="BioCLIP", labels_fingerprint=None,
+    ) is True
+
+
+def test_all_photos_cache_satisfied_rejects_stale_classifier_runtime(tmp_path):
+    """When classifier weights or preprocessing change under the same
+    ``classifier_model`` and label fingerprint, an unreviewed
+    classifier_runs row from the OLD runtime must not satisfy this
+    join.  Without the runtime filter, ``run_classify_job`` would
+    shortcut to ``_finalize_cached_only`` on wrong-runtime results
+    even though the ordinary ``_classify_photos`` gate would reject
+    them via ``_runtime_aware_run_keys``.
+
+    A manually-reviewed row must still count so the pin exception
+    survives runtime changes until an explicit reclassify.
+    """
+    from classify_job import _all_photos_cache_satisfied
+    from computation_cache import (
+        classifier_model_identity,
+        classifier_runtime_fingerprint,
+        runtime_fingerprint,
+        source_input,
+    )
+    from db import Database
+
+    db = Database(str(tmp_path / "test.db"))
+    ws = db.ensure_default_workspace()
+    db.set_active_workspace(ws)
+    folder_id = db.add_folder("/tmp/p", name="p")
+    pid = db.add_photo(
+        folder_id, "a.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+    )
+    detector_runtime = runtime_fingerprint({
+        "type": "detection", "model": "megadetector-v6",
+        "weights_sha256": "2" * 64, "pipeline": "detector-v1",
+    })
+    _input, det_input_fp = source_input(
+        "0" * 64, "vireo-detector-source-v1",
+    )
+    det_id = db.write_detection_batch(
+        pid, "megadetector-v6",
+        [{"box": {"x": 0, "y": 0, "w": 1, "h": 1},
+          "confidence": 0.9, "category": "animal"}],
+        runtime_fingerprint=detector_runtime,
+        input_fingerprint=det_input_fp,
+    )[0]
+
+    labels_full = "5" * 64
+    labels_short = labels_full[:12]
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    (model_dir / "image_encoder.onnx").write_bytes(b"exact model bytes")
+    identity = classifier_model_identity({
+        "id": "bioclip-test",
+        "model_str": "ViT-test",
+        "model_type": "bioclip",
+        "weights_path": str(model_dir),
+        "files": ["image_encoder.onnx"],
+        "source": "custom",
+    })
+    expected_runtime = classifier_runtime_fingerprint(
+        identity, labels_full, detector_runtime,
+    )
+    assert expected_runtime is not None
+
+    # A stale classifier_run: same (model, labels_short) but wrong
+    # runtime_fingerprint (older classifier weights).
+    stale_runtime = "9" * 64
+    db.conn.execute(
+        """INSERT INTO classifier_runs
+             (detection_id, classifier_model, labels_fingerprint,
+              runtime_fingerprint, prediction_count)
+           VALUES (?, ?, ?, ?, ?)""",
+        (det_id, "BioCLIP", labels_short, stale_runtime, 1),
+    )
+    db.add_prediction(
+        det_id, species="Robin", confidence=0.9, model="BioCLIP",
+        labels_fingerprint=labels_short,
+    )
+    db.conn.commit()
+
+    # Without runtime constraint, historic behavior would treat this as
+    # satisfied.  Confirm the old-shape call still returns True so we
+    # know the fix is what changes the answer, not an unrelated regression.
+    assert _all_photos_cache_satisfied(
+        db, [pid], classifier_model="BioCLIP",
+        labels_fingerprint=labels_short,
+    ) is True
+
+    # With the runtime constraint the stale row must be excluded.
+    assert _all_photos_cache_satisfied(
+        db, [pid], classifier_model="BioCLIP",
+        labels_fingerprint=labels_short,
+        model_identity=identity, labels_fingerprint_full=labels_full,
+    ) is False
+
+    # A row with the CORRECT runtime satisfies the check.
+    db.conn.execute(
+        "UPDATE classifier_runs SET runtime_fingerprint = ? WHERE detection_id = ?",
+        (expected_runtime, det_id),
+    )
+    db.conn.commit()
+    assert _all_photos_cache_satisfied(
+        db, [pid], classifier_model="BioCLIP",
+        labels_fingerprint=labels_short,
+        model_identity=identity, labels_fingerprint_full=labels_full,
+    ) is True
+
+    # A stale row with a real manual-review pin stays authoritative —
+    # the pin exception mirrors ``get_classifier_run_keys``' behavior.
+    db.conn.execute(
+        "UPDATE classifier_runs SET runtime_fingerprint = ? WHERE detection_id = ?",
+        (stale_runtime, det_id),
+    )
+    pred_row = db.conn.execute(
+        "SELECT id FROM predictions WHERE detection_id = ?",
+        (det_id,),
+    ).fetchone()
+    db.conn.execute(
+        """INSERT INTO prediction_review
+             (prediction_id, workspace_id, status, reviewed_at, individual)
+           VALUES (?, ?, 'accepted', datetime('now'), 'user-choice')""",
+        (pred_row["id"], ws),
+    )
+    db.conn.commit()
+    assert _all_photos_cache_satisfied(
+        db, [pid], classifier_model="BioCLIP",
+        labels_fingerprint=labels_short,
+        model_identity=identity, labels_fingerprint_full=labels_full,
+    ) is True
+
+
+def test_finalize_cached_only_respects_workspace_detector_threshold(
+    tmp_path, monkeypatch,
+):
+    """A bundle imported from a machine with a lower detector_confidence
+    can materialize classifier runs for raw detections that the
+    destination workspace's threshold would hide.  The cache-only
+    finalize path must apply the workspace-effective threshold before
+    grouping — otherwise importing results silently changes which
+    subjects are surfaced to review.
+    """
+    import config as cfg
+    from classify_job import ClassifyParams, run_classify_job
+    from db import Database
+
+    monkeypatch.setattr(cfg, "CONFIG_PATH", str(tmp_path / "config.json"))
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    # A workspace whose effective threshold hides everything below 0.5.
+    ws = db.create_workspace(
+        "Strict", config_overrides={"detector_confidence": 0.5},
+    )
+    db.set_active_workspace(ws)
+    folder_id = db.add_folder("/tmp/p", name="p")
+    pid = db.add_photo(
+        folder_id, "a.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+    )
+    # Two detections: one clearly above the workspace threshold, one
+    # clearly below. Only the classifiable, above-threshold row needs a
+    # cached run for the all-cache-hit shortcut to be valid.
+    det_ids = db.save_detections(pid, [
+        {"box": {"x": 0, "y": 0, "w": 1, "h": 1}, "confidence": 0.9, "category": "animal"},
+        {"box": {"x": 2, "y": 2, "w": 1, "h": 1}, "confidence": 0.3, "category": "animal"},
+    ], detector_model="megadetector-v6")
+    db.add_prediction(det_ids[0], species="Robin", confidence=0.9,
+                      model="BioCLIP", labels_fingerprint="fp-cached")
+    db.record_classifier_run(det_ids[0], "BioCLIP", "fp-cached",
+                             prediction_count=1)
+
+    coll_id = db.add_collection(
+        "c", '[{"field":"photo_ids","value":[' + str(pid) + ']}]',
+    )
+
+    import classify_job as classify_job_mod
+    monkeypatch.setattr(classify_job_mod, "get_active_model", lambda: None)
+    monkeypatch.setattr(classify_job_mod, "get_models", lambda: [])
+
+    runner = FakeRunner()
+    job = _make_job()
+    params = ClassifyParams(
+        collection_id=coll_id,
+        labels_files=None, labels_file=None,
+        model_id=None, model_name=None,
+        grouping_window=0, similarity_threshold=0.99,
+        reclassify=False,
+    )
+
+    result = run_classify_job(job, runner, db_path, ws, params)
+    # Only the above-threshold detection reaches finalization.  Without
+    # the workspace threshold the count would be 2.
+    assert result["already_classified"] == 1
+
+
+def test_finalize_cached_only_includes_zero_confidence_full_image_anchor(
+    tmp_path, monkeypatch,
+):
+    """Full-image anchors bypass the positive MegaDetector threshold."""
+    import classify_job as classify_job_mod
+    import config as cfg
+    from classify_job import ClassifyParams, run_classify_job
+    from db import Database
+
+    monkeypatch.setattr(cfg, "CONFIG_PATH", str(tmp_path / "config.json"))
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws = db.ensure_default_workspace()
+    db.set_active_workspace(ws)
+    folder_id = db.add_folder("/tmp/p", name="p")
+    pid = db.add_photo(
+        folder_id, "empty.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+    )
+    det_id = db.save_detections(pid, [{
+        "box": {"x": 0, "y": 0, "w": 1, "h": 1},
+        "confidence": 0,
+        "category": "animal",
+    }], detector_model="full-image")[0]
+    db.add_prediction(
+        det_id, species="Full-image Robin", confidence=0.9,
+        model="BioCLIP", labels_fingerprint="fp-cached",
+    )
+    db.record_classifier_run(
+        det_id, "BioCLIP", "fp-cached", prediction_count=1,
+    )
+    collection_id = db.add_collection(
+        "empty", json.dumps([{"field": "photo_ids", "value": [pid]}]),
+    )
+
+    monkeypatch.setattr(classify_job_mod, "get_active_model", lambda: None)
+    monkeypatch.setattr(classify_job_mod, "get_models", lambda: [])
+    result = run_classify_job(
+        _make_job(), FakeRunner(), db_path, ws,
+        ClassifyParams(
+            collection_id=collection_id,
+            labels_files=None, labels_file=None,
+            model_id=None, model_name=None,
+            grouping_window=0, similarity_threshold=0.99,
+            reclassify=False,
+        ),
+    )
+
+    assert result["already_classified"] == 1
+
+
+def test_finalize_cached_only_treats_null_category_as_animal(
+    tmp_path, monkeypatch,
+):
+    """Legacy NULL categories match the cache-coverage SQL's animal default."""
+    import classify_job as classify_job_mod
+    import config as cfg
+    from classify_job import ClassifyParams, run_classify_job
+    from db import Database
+
+    monkeypatch.setattr(cfg, "CONFIG_PATH", str(tmp_path / "config.json"))
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    workspace_id = db.ensure_default_workspace()
+    db.set_active_workspace(workspace_id)
+    folder_id = db.add_folder("/tmp/p", name="p")
+    photo_id = db.add_photo(
+        folder_id, "legacy.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+    )
+    detection_id = db.save_detections(photo_id, [{
+        "box": {"x": 0, "y": 0, "w": 1, "h": 1},
+        "confidence": 0.9,
+        "category": "animal",
+    }], detector_model="megadetector-v6")[0]
+    db.conn.execute(
+        "UPDATE detections SET category = NULL WHERE id = ?",
+        (detection_id,),
+    )
+    db.add_prediction(
+        detection_id, species="Robin", confidence=0.9,
+        model="BioCLIP", labels_fingerprint="fp-cached",
+    )
+    db.record_classifier_run(
+        detection_id, "BioCLIP", "fp-cached", prediction_count=1,
+    )
+    db.conn.commit()
+    collection_id = db.add_collection(
+        "legacy", json.dumps([{"field": "photo_ids", "value": [photo_id]}]),
+    )
+
+    monkeypatch.setattr(classify_job_mod, "get_active_model", lambda: None)
+    monkeypatch.setattr(classify_job_mod, "get_models", lambda: [])
+    result = run_classify_job(
+        _make_job(), FakeRunner(), db_path, workspace_id,
+        ClassifyParams(
+            collection_id=collection_id,
+            labels_files=None, labels_file=None,
+            model_id=None, model_name=None,
+            grouping_window=0, similarity_threshold=0.99,
+            reclassify=False,
+        ),
+    )
+
+    assert result["already_classified"] == 1
+
+
+def test_run_classify_job_short_circuits_when_cache_covers_every_photo(
+    tmp_path, monkeypatch,
+):
+    """A fresh install with an imported cache but no classifier weights
+    must not fail with "No model available" — every photo already has a
+    completed classifier run, so model resolution is unnecessary.
+    """
+    import config as cfg
+    from classify_job import ClassifyParams, run_classify_job
+    from db import Database
+
+    monkeypatch.setattr(cfg, "CONFIG_PATH", str(tmp_path / "config.json"))
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws = db.ensure_default_workspace()
+    db.set_active_workspace(ws)
+    folder_id = db.add_folder("/tmp/p", name="p")
+    pid = db.add_photo(
+        folder_id, "a.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+    )
+    det_id = db.save_detections(pid, [
+        {"box": {"x": 0, "y": 0, "w": 1, "h": 1}, "confidence": 0.9,
+         "category": "animal"},
+    ], detector_model="megadetector-v6")[0]
+    db.add_prediction(det_id, species="Robin", confidence=0.9,
+                      model="BioCLIP", labels_fingerprint="fp-cached")
+    db.record_classifier_run(det_id, "BioCLIP", "fp-cached",
+                             prediction_count=1)
+
+    coll_id = db.add_collection(
+        "c", '[{"field":"photo_ids","value":[' + str(pid) + ']}]',
+    )
+
+    # Model resolution WOULD fail here — no active model exists. The
+    # short-circuit must run before this raises.
+    import classify_job as classify_job_mod
+    monkeypatch.setattr(classify_job_mod, "get_active_model", lambda: None)
+    monkeypatch.setattr(classify_job_mod, "get_models", lambda: [])
+
+    runner = FakeRunner()
+    job = _make_job()
+    params = ClassifyParams(
+        collection_id=coll_id,
+        labels_files=None,
+        labels_file=None,
+        model_id=None,
+        model_name=None,
+        grouping_window=0,
+        similarity_threshold=0.99,
+        reclassify=False,
+    )
+
+    result = run_classify_job(job, runner, db_path, ws, params)
+    assert result["already_classified"] == result["total"] == 1
+    assert result["failed"] == 0
+    # Cached prediction stays exactly one row — the finalization pass
+    # updates review state / grouping in place but must not double up
+    # the ``predictions`` row for a reused detection.
+    db2 = Database(db_path)
+    db2.set_active_workspace(ws)
+    assert db2.conn.execute(
+        "SELECT COUNT(*) AS n FROM predictions WHERE detection_id = ?",
+        (det_id,),
+    ).fetchone()["n"] == 1
+
+
+def test_run_classify_job_rejects_unknown_model_id_before_cache_shortcut(
+    tmp_path, monkeypatch,
+):
+    """A stale job referencing a deleted model must fail with 'not found',
+    not silently succeed by matching any classifier's cached rows.
+    """
+    import config as cfg
+    from classify_job import ClassifyParams, run_classify_job
+    from db import Database
+
+    monkeypatch.setattr(cfg, "CONFIG_PATH", str(tmp_path / "config.json"))
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws = db.ensure_default_workspace()
+    db.set_active_workspace(ws)
+    folder_id = db.add_folder("/tmp/p", name="p")
+    pid = db.add_photo(
+        folder_id, "a.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+    )
+    det_id = db.save_detections(pid, [
+        {"box": {"x": 0, "y": 0, "w": 1, "h": 1}, "confidence": 0.9,
+         "category": "animal"},
+    ], detector_model="megadetector-v6")[0]
+    # A classifier run exists — but from a different (unrelated) model
+    # under a different name than the request. Without the explicit-id
+    # rejection, the cache satisfaction check would accept it since
+    # ``desired_classifier_model`` would fall back to None.
+    db.add_prediction(det_id, species="Robin", confidence=0.9,
+                      model="SomeOtherModel", labels_fingerprint="fp-x")
+    db.record_classifier_run(det_id, "SomeOtherModel", "fp-x",
+                             prediction_count=1)
+
+    coll_id = db.add_collection(
+        "c", '[{"field":"photo_ids","value":[' + str(pid) + ']}]',
+    )
+
+    import classify_job as classify_job_mod
+    monkeypatch.setattr(classify_job_mod, "get_active_model", lambda: None)
+    # get_models returns models but NONE match the requested id.
+    monkeypatch.setattr(
+        classify_job_mod, "get_models",
+        lambda: [{"id": "other-id", "name": "SomeOtherModel",
+                  "downloaded": True, "model_type": "bioclip",
+                  "model_str": "", "weights_path": ""}],
+    )
+
+    runner = FakeRunner()
+    job = _make_job()
+    params = ClassifyParams(
+        collection_id=coll_id,
+        labels_files=None, labels_file=None,
+        model_id="stale-id",  # references a model no longer in get_models
+        model_name=None,
+        grouping_window=0, similarity_threshold=0.99, reclassify=False,
+    )
+
+    with pytest.raises(RuntimeError, match="stale-id.*not found"):
+        run_classify_job(job, runner, db_path, ws, params)
+
+
+def test_run_classify_job_reconciles_group_metadata_on_reuse(
+    tmp_path, monkeypatch,
+):
+    """When every photo is cache-satisfied, the finalize pass must still
+    run: bursts must get a group_id, otherwise imported predictions never
+    receive the consensus / group metadata a fresh classification pass
+    produces.
+    """
+    import config as cfg
+    from classify_job import ClassifyParams, run_classify_job
+    from db import Database
+
+    monkeypatch.setattr(cfg, "CONFIG_PATH", str(tmp_path / "config.json"))
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws = db.ensure_default_workspace()
+    db.set_active_workspace(ws)
+    folder_id = db.add_folder("/tmp/p", name="p")
+    # Two photos captured within a burst window — imported cache carries
+    # matching predictions for each so grouping/consensus should apply.
+    pid_a = db.add_photo(
+        folder_id, "a.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+        timestamp="2024-01-01T10:00:00",
+    )
+    pid_b = db.add_photo(
+        folder_id, "b.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+        timestamp="2024-01-01T10:00:01",
+    )
+    det_a = db.save_detections(pid_a, [
+        {"box": {"x": 0, "y": 0, "w": 1, "h": 1}, "confidence": 0.9,
+         "category": "animal"},
+    ], detector_model="megadetector-v6")[0]
+    det_b = db.save_detections(pid_b, [
+        {"box": {"x": 0, "y": 0, "w": 1, "h": 1}, "confidence": 0.9,
+         "category": "animal"},
+    ], detector_model="megadetector-v6")[0]
+    for det_id in (det_a, det_b):
+        db.add_prediction(det_id, species="Robin", confidence=0.9,
+                          model="BioCLIP", labels_fingerprint="fp-cached")
+        db.record_classifier_run(det_id, "BioCLIP", "fp-cached",
+                                 prediction_count=1)
+
+    coll_id = db.add_collection(
+        "c",
+        '[{"field":"photo_ids","value":['
+        + str(pid_a) + ',' + str(pid_b) + ']}]',
+    )
+
+    import classify_job as classify_job_mod
+    monkeypatch.setattr(classify_job_mod, "get_active_model", lambda: None)
+    monkeypatch.setattr(classify_job_mod, "get_models", lambda: [])
+
+    runner = FakeRunner()
+    job = _make_job()
+    params = ClassifyParams(
+        collection_id=coll_id,
+        labels_files=None, labels_file=None,
+        model_id=None, model_name=None,
+        grouping_window=10, similarity_threshold=0.99, reclassify=False,
+    )
+
+    result = run_classify_job(job, runner, db_path, ws, params)
+    assert result["failed"] == 0
+    # Burst grouping must have run — two nearby photos with the same
+    # species belong in one reviewable group. Old code returned early
+    # and left prediction_review.group_id NULL on the reused rows.
+    db2 = Database(db_path)
+    db2.set_active_workspace(ws)
+    rows = db2.conn.execute(
+        """SELECT pr_rev.group_id AS group_id
+             FROM predictions pr
+             JOIN prediction_review pr_rev
+               ON pr_rev.prediction_id = pr.id
+              AND pr_rev.workspace_id = ?
+            WHERE pr.detection_id IN (?, ?)""",
+        (ws, det_a, det_b),
+    ).fetchall()
+    assert len(rows) == 2
+    group_ids = {r["group_id"] for r in rows}
+    assert None not in group_ids, (
+        "group metadata should be stamped by the reused-cache finalize path"
+    )
+    assert len(group_ids) == 1, "both frames should share one burst group"

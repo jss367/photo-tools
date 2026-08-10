@@ -8140,6 +8140,128 @@ def test_write_detection_batch_retires_stale_rows(tmp_path):
     )
 
 
+def test_runtime_change_retires_unreviewed_detector_output(tmp_path):
+    """A different detector runtime owns a different materialized result.
+
+    Unreviewed output may be retired, including predictions that depend on
+    detections the replacement no longer produces.
+    """
+    from db import Database
+
+    db = Database(str(tmp_path / "test.db"))
+    folder_id = db.add_folder("/tmp/p")
+    ws = db.create_workspace("A")
+    db._active_workspace_id = ws
+    db.add_workspace_folder(ws, folder_id)
+    photo_id = db.add_photo(
+        folder_id=folder_id, filename="a.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+    )
+    first = {"box": {"x": 0.1, "y": 0.1, "w": 0.2, "h": 0.2},
+             "confidence": 0.9, "category": "animal"}
+    second = {"box": {"x": 0.5, "y": 0.5, "w": 0.2, "h": 0.2},
+              "confidence": 0.8, "category": "animal"}
+
+    old_id = db.write_detection_batch(
+        photo_id, "megadetector-v6", [first],
+        runtime_fingerprint="runtime-a", input_fingerprint="input-a",
+    )[0]
+    db.add_prediction(old_id, "Robin", 0.95, "bioclip")
+
+    new_ids = db.write_detection_batch(
+        photo_id, "megadetector-v6", [second],
+        runtime_fingerprint="runtime-b", input_fingerprint="input-a",
+    )
+    assert len(new_ids) == 1
+    assert new_ids[0] != old_id
+    assert db.conn.execute(
+        "SELECT 1 FROM detections WHERE id = ?", (old_id,),
+    ).fetchone() is None
+    assert db.conn.execute(
+        "SELECT 1 FROM predictions WHERE detection_id = ?", (old_id,),
+    ).fetchone() is None
+    run = db.conn.execute(
+        """SELECT runtime_fingerprint, input_fingerprint
+           FROM detector_runs
+           WHERE photo_id = ? AND detector_model = ?""",
+        (photo_id, "megadetector-v6"),
+    ).fetchone()
+    assert dict(run) == {
+        "runtime_fingerprint": "runtime-b",
+        "input_fingerprint": "input-a",
+    }
+
+
+def test_runtime_change_preserves_output_reviewed_in_any_workspace(tmp_path):
+    """A manual review in another workspace pins the detector result."""
+    from db import Database
+
+    db = Database(str(tmp_path / "test.db"))
+    folder_id = db.add_folder("/tmp/p")
+    ws_a = db.create_workspace("A")
+    ws_b = db.create_workspace("B")
+    for ws in (ws_a, ws_b):
+        db.add_workspace_folder(ws, folder_id)
+    db._active_workspace_id = ws_a
+    photo_id = db.add_photo(
+        folder_id=folder_id, filename="a.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+    )
+    first = {"box": {"x": 0.1, "y": 0.1, "w": 0.2, "h": 0.2},
+             "confidence": 0.9, "category": "animal"}
+    second = {"box": {"x": 0.5, "y": 0.5, "w": 0.2, "h": 0.2},
+              "confidence": 0.8, "category": "animal"}
+    old_id = db.write_detection_batch(
+        photo_id, "megadetector-v6", [first],
+        runtime_fingerprint="runtime-a", input_fingerprint="input-a",
+    )[0]
+
+    db._active_workspace_id = ws_b
+    db.add_prediction(
+        old_id, "Robin", 0.95, "bioclip", status="accepted",
+        individual="reviewed by user",
+    )
+    returned = db.write_detection_batch(
+        photo_id, "megadetector-v6", [second],
+        runtime_fingerprint="runtime-b", input_fingerprint="input-a",
+    )
+
+    assert returned == [old_id]
+    assert db.detector_run_is_pinned(photo_id, "megadetector-v6")
+    run = db.conn.execute(
+        """SELECT runtime_fingerprint FROM detector_runs
+           WHERE photo_id = ? AND detector_model = ?""",
+        (photo_id, "megadetector-v6"),
+    ).fetchone()
+    assert run["runtime_fingerprint"] == "runtime-a"
+    assert photo_id in db.get_detector_run_photo_ids(
+        "megadetector-v6", runtime_fingerprint="runtime-b",
+    ), "a pinned older runtime should suppress redundant inference"
+
+    forced = db.write_detection_batch(
+        photo_id, "megadetector-v6", [second],
+        runtime_fingerprint="runtime-b", input_fingerprint="input-a",
+        force_runtime_replace=True,
+    )
+    # Contract: force_runtime_replace=True must actually persist ONE
+    # detection under the new runtime.  An empty result would mean the
+    # forced write deleted the reviewed row and wrote nothing — exactly
+    # the regression the reviewed-pin gate is meant to prevent.
+    assert len(forced) == 1
+    assert forced[0] != old_id
+    forced_run = db.conn.execute(
+        """SELECT runtime_fingerprint FROM detector_runs
+           WHERE photo_id = ? AND detector_model = ?""",
+        (photo_id, "megadetector-v6"),
+    ).fetchone()
+    assert forced_run["runtime_fingerprint"] == "runtime-b", (
+        "force_runtime_replace=True must advance detector_runs.runtime_fingerprint"
+    )
+    assert db.conn.execute(
+        "SELECT 1 FROM prediction_review WHERE workspace_id = ?", (ws_b,),
+    ).fetchone() is None
+
+
 def test_write_detection_batch_second_writer_does_not_cascade_predictions(tmp_path):
     """The race: pipeline A writes detections, classify writes predictions
     against them, pipeline B writes the same detections again. With

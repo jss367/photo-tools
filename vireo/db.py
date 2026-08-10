@@ -821,6 +821,7 @@ class Database:
                 id                  INTEGER PRIMARY KEY,
                 photo_id            INTEGER NOT NULL REFERENCES photos(id) ON DELETE CASCADE,
                 detector_model      TEXT NOT NULL DEFAULT 'megadetector-v6',
+                runtime_fingerprint TEXT NOT NULL DEFAULT 'legacy',
                 box_x               REAL,
                 box_y               REAL,
                 box_w               REAL,
@@ -866,6 +867,7 @@ class Database:
                 detection_id         INTEGER NOT NULL REFERENCES detections(id) ON DELETE CASCADE,
                 classifier_model     TEXT NOT NULL,
                 labels_fingerprint   TEXT NOT NULL DEFAULT 'legacy',
+                labels_fingerprint_full TEXT,
                 species              TEXT,
                 confidence           REAL,
                 category             TEXT,
@@ -883,6 +885,8 @@ class Database:
             CREATE TABLE IF NOT EXISTS detector_runs (
                 photo_id        INTEGER NOT NULL REFERENCES photos(id) ON DELETE CASCADE,
                 detector_model  TEXT NOT NULL,
+                runtime_fingerprint TEXT NOT NULL DEFAULT 'legacy',
+                input_fingerprint TEXT,
                 run_at          TEXT DEFAULT (datetime('now')),
                 box_count       INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (photo_id, detector_model)
@@ -892,6 +896,9 @@ class Database:
                 detection_id         INTEGER NOT NULL REFERENCES detections(id) ON DELETE CASCADE,
                 classifier_model     TEXT NOT NULL,
                 labels_fingerprint   TEXT NOT NULL,
+                labels_fingerprint_full TEXT,
+                runtime_fingerprint TEXT NOT NULL DEFAULT 'legacy',
+                input_fingerprint TEXT,
                 run_at               TEXT DEFAULT (datetime('now')),
                 prediction_count     INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (detection_id, classifier_model, labels_fingerprint)
@@ -908,6 +915,7 @@ class Database:
 
             CREATE TABLE IF NOT EXISTS labels_fingerprints (
                 fingerprint    TEXT PRIMARY KEY,
+                full_fingerprint TEXT,
                 display_name   TEXT,
                 sources_json   TEXT,
                 label_count    INTEGER,
@@ -15748,6 +15756,7 @@ class Database:
         individual=None,
         taxonomy=None,
         labels_fingerprint="legacy",
+        labels_fingerprint_full=None,
         preserve_manual_review=False,
     ):
         """Store a classification prediction for a detection.
@@ -15795,14 +15804,16 @@ class Database:
         cur = self.conn.execute(
             """INSERT OR IGNORE INTO predictions
                (detection_id, classifier_model, labels_fingerprint,
+                labels_fingerprint_full,
                 species, confidence, category,
                 taxonomy_kingdom, taxonomy_phylum, taxonomy_class,
                 taxonomy_order, taxonomy_family, taxonomy_genus, scientific_name)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 detection_id,
                 model,
                 labels_fingerprint,
+                labels_fingerprint_full,
                 species,
                 confidence,
                 category,
@@ -15830,6 +15841,13 @@ class Database:
                 (detection_id, model, labels_fingerprint, species),
             ).fetchone()
             pred_id = row["id"] if row else None
+            if pred_id is not None and labels_fingerprint_full is not None:
+                self.conn.execute(
+                    """UPDATE predictions
+                       SET labels_fingerprint_full = ?
+                       WHERE id = ? AND labels_fingerprint_full IS NULL""",
+                    (labels_fingerprint_full, pred_id),
+                )
         # Write workspace-scoped review state only when the caller actually
         # supplied something beyond the defaults. Keeping pending rows out of
         # prediction_review is intentional: absence == pending.
@@ -17537,18 +17555,30 @@ class Database:
 
     # -- Detections --
 
-    def record_detector_run(self, photo_id, detector_model, box_count):
+    def record_detector_run(
+        self,
+        photo_id,
+        detector_model,
+        box_count,
+        runtime_fingerprint="legacy",
+        input_fingerprint=None,
+    ):
         """Record that `detector_model` was run on `photo_id`.
 
         Global across workspaces — the output is a pure function of (photo, model).
         """
         self.conn.execute(
-            """INSERT INTO detector_runs (photo_id, detector_model, box_count)
-               VALUES (?, ?, ?)
+            """INSERT INTO detector_runs
+                 (photo_id, detector_model, runtime_fingerprint,
+                  input_fingerprint, box_count)
+               VALUES (?, ?, ?, ?, ?)
                ON CONFLICT(photo_id, detector_model)
-               DO UPDATE SET box_count = excluded.box_count,
+               DO UPDATE SET runtime_fingerprint = excluded.runtime_fingerprint,
+                             input_fingerprint = excluded.input_fingerprint,
+                             box_count = excluded.box_count,
                              run_at = datetime('now')""",
-            (photo_id, detector_model, box_count),
+            (photo_id, detector_model, runtime_fingerprint,
+             input_fingerprint, box_count),
         )
         self.conn.commit()
 
@@ -17568,7 +17598,31 @@ class Database:
         return {"photo_count": r["photo_count"] or 0,
                 "model_count": r["model_count"] or 0}
 
-    def get_detector_run_photo_ids(self, detector_model):
+    def detector_run_is_pinned(self, photo_id, detector_model):
+        """Return whether any workspace manually reviewed this detector output.
+
+        Review state belongs to predictions, but replacing a detector runtime
+        can delete the detection and cascade through both predictions and
+        reviews.  A real accepted/rejected decision therefore pins the whole
+        (photo, detector_model) result.  Auto-created taxonomy-match reviews
+        are reproducible cache state and deliberately do not pin it.
+        """
+        row = self.conn.execute(
+            """SELECT 1
+               FROM detections d
+               JOIN predictions p ON p.detection_id = d.id
+               JOIN prediction_review pr ON pr.prediction_id = p.id
+               WHERE d.photo_id = ? AND d.detector_model = ?
+                 AND pr.status IN ('accepted', 'rejected')
+                 AND COALESCE(pr.individual, '') != ?
+               LIMIT 1""",
+            (photo_id, detector_model, AUTO_MATCH_REVIEW_MARKER),
+        ).fetchone()
+        return row is not None
+
+    def get_detector_run_photo_ids(
+        self, detector_model, runtime_fingerprint=None,
+    ):
         """Return the set of photo_ids with a consistent cached detector run.
 
         Includes empty-scene photos (box_count=0) — which is the whole point:
@@ -17581,37 +17635,94 @@ class Database:
         photos in the skip set would strand them on full-image fallback
         until the user manually forces another reclassify.
         """
+        params = [detector_model]
+        runtime_clause = ""
+        if runtime_fingerprint is not None:
+            # A reviewed older runtime remains authoritative until an explicit
+            # reclassify.  Include it in the hit set so callers avoid doing
+            # inference whose result write_detection_batch would reject.
+            runtime_clause = """
+                 AND (
+                      dr.runtime_fingerprint = ?
+                      OR dr.runtime_fingerprint = 'legacy'
+                      OR EXISTS (
+                          SELECT 1
+                          FROM detections pd
+                          JOIN predictions pp ON pp.detection_id = pd.id
+                          JOIN prediction_review pr ON pr.prediction_id = pp.id
+                          WHERE pd.photo_id = dr.photo_id
+                            AND pd.detector_model = dr.detector_model
+                            AND pr.status IN ('accepted', 'rejected')
+                            AND COALESCE(pr.individual, '') != ?
+                      )
+                 )"""
+            params.extend([runtime_fingerprint, AUTO_MATCH_REVIEW_MARKER])
         rows = self.conn.execute(
             """SELECT dr.photo_id
                FROM detector_runs dr
                WHERE dr.detector_model = ?
+               """ + runtime_clause + """
                  AND (dr.box_count = 0
                       OR EXISTS (SELECT 1 FROM detections d
                                  WHERE d.photo_id = dr.photo_id
                                    AND d.detector_model = dr.detector_model))""",
-            (detector_model,),
+            params,
         ).fetchall()
         return {r["photo_id"] for r in rows}
 
-    def record_classifier_run(self, detection_id, classifier_model,
-                               labels_fingerprint, prediction_count):
+    def record_classifier_run(
+        self,
+        detection_id,
+        classifier_model,
+        labels_fingerprint,
+        prediction_count,
+        labels_fingerprint_full=None,
+        runtime_fingerprint="legacy",
+        input_fingerprint=None,
+    ):
         self.conn.execute(
             """INSERT INTO classifier_runs
-                 (detection_id, classifier_model, labels_fingerprint, prediction_count)
-               VALUES (?, ?, ?, ?)
+                 (detection_id, classifier_model, labels_fingerprint,
+                  labels_fingerprint_full, runtime_fingerprint,
+                  input_fingerprint, prediction_count)
+               VALUES (?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(detection_id, classifier_model, labels_fingerprint)
-               DO UPDATE SET prediction_count = excluded.prediction_count,
+               DO UPDATE SET labels_fingerprint_full =
+                                 excluded.labels_fingerprint_full,
+                             runtime_fingerprint = excluded.runtime_fingerprint,
+                             input_fingerprint = excluded.input_fingerprint,
+                             prediction_count = excluded.prediction_count,
                              run_at = datetime('now')""",
-            (detection_id, classifier_model, labels_fingerprint, prediction_count),
+            (detection_id, classifier_model, labels_fingerprint,
+             labels_fingerprint_full, runtime_fingerprint,
+             input_fingerprint, prediction_count),
         )
         commit_with_retry(self.conn)
 
-    def get_classifier_run_keys(self, detection_id):
+    def get_classifier_run_keys(self, detection_id, runtime_fingerprint=None):
+        params = [detection_id]
+        runtime_clause = ""
+        if runtime_fingerprint is not None:
+            runtime_clause = """
+               AND (
+                    cr.runtime_fingerprint = ?
+                    OR cr.runtime_fingerprint = 'legacy'
+                    OR EXISTS (
+                        SELECT 1 FROM predictions p
+                        JOIN prediction_review pr ON pr.prediction_id = p.id
+                        WHERE p.detection_id = cr.detection_id
+                          AND p.classifier_model = cr.classifier_model
+                          AND p.labels_fingerprint = cr.labels_fingerprint
+                          AND pr.status IN ('accepted', 'rejected')
+                          AND COALESCE(pr.individual, '') != ?
+                    )
+               )"""
+            params.extend([runtime_fingerprint, AUTO_MATCH_REVIEW_MARKER])
         rows = self.conn.execute(
-            """SELECT classifier_model, labels_fingerprint
-               FROM classifier_runs
-               WHERE detection_id = ?""",
-            (detection_id,),
+            """SELECT cr.classifier_model, cr.labels_fingerprint
+               FROM classifier_runs cr
+               WHERE cr.detection_id = ?""" + runtime_clause,
+            params,
         ).fetchall()
         return {(r["classifier_model"], r["labels_fingerprint"]) for r in rows}
 
@@ -17735,7 +17846,8 @@ class Database:
         """
         import json
         rows = self.conn.execute(
-            "SELECT fingerprint, display_name, sources_json, label_count "
+            "SELECT fingerprint, full_fingerprint, display_name, "
+            "sources_json, label_count "
             "FROM labels_fingerprints"
         ).fetchall()
         out = []
@@ -17746,23 +17858,41 @@ class Database:
                 sources = []
             out.append({
                 "fingerprint": r["fingerprint"],
+                "full_fingerprint": r["full_fingerprint"],
                 "display_name": r["display_name"],
                 "sources": sources,
                 "label_count": r["label_count"],
             })
         return out
 
-    def upsert_labels_fingerprint(self, fingerprint, display_name, sources, label_count):
+    def upsert_labels_fingerprint(
+        self,
+        fingerprint,
+        display_name,
+        sources,
+        label_count,
+        full_fingerprint=None,
+    ):
         import json
+        # COALESCE full_fingerprint so a later call recording the same
+        # short fingerprint without the 64-char digest (e.g. after an
+        # OSError/ValueError fallback in _record_labels_fingerprint) does
+        # not overwrite a previously stored full digest with NULL.
         self.conn.execute(
             """INSERT INTO labels_fingerprints
-                 (fingerprint, display_name, sources_json, label_count)
-               VALUES (?, ?, ?, ?)
+                 (fingerprint, full_fingerprint, display_name,
+                  sources_json, label_count)
+               VALUES (?, ?, ?, ?, ?)
                ON CONFLICT(fingerprint)
-               DO UPDATE SET display_name = excluded.display_name,
+               DO UPDATE SET full_fingerprint = COALESCE(
+                                 excluded.full_fingerprint,
+                                 labels_fingerprints.full_fingerprint
+                             ),
+                             display_name = excluded.display_name,
                              sources_json = excluded.sources_json,
                              label_count  = excluded.label_count""",
-            (fingerprint, display_name, json.dumps(sources or []), label_count),
+            (fingerprint, full_fingerprint, display_name,
+             json.dumps(sources or []), label_count),
         )
         self.conn.commit()
 
@@ -17789,7 +17919,13 @@ class Database:
         )
         self.conn.commit()
 
-    def save_detections(self, photo_id, detections, detector_model):
+    def save_detections(
+        self,
+        photo_id,
+        detections,
+        detector_model,
+        runtime_fingerprint="legacy",
+    ):
         """Replace all detections for (photo_id, detector_model) with the given list.
 
         Global: no workspace scoping. The model's output is a pure function of
@@ -17810,11 +17946,19 @@ class Database:
         """
         if detector_model is None:
             raise ValueError("detector_model is required")
-        ids = self._upsert_detection_rows(photo_id, detector_model, detections)
+        ids = self._upsert_detection_rows(
+            photo_id, detector_model, detections, runtime_fingerprint,
+        )
         commit_with_retry(self.conn)
         return ids
 
-    def _upsert_detection_rows(self, photo_id, detector_model, detections):
+    def _upsert_detection_rows(
+        self,
+        photo_id,
+        detector_model,
+        detections,
+        runtime_fingerprint="legacy",
+    ):
         """Content-addressed UPSERT of detection rows for one (photo, model).
 
         Returns the list of unique IDs in first-seen order. Does NOT commit —
@@ -17858,19 +18002,20 @@ class Database:
             # pipeline has already written for this detection.
             self.conn.execute(
                 """INSERT INTO detections
-                     (id, photo_id, detector_model, box_x, box_y, box_w, box_h,
-                      detector_confidence, category)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     (id, photo_id, detector_model, runtime_fingerprint,
+                      box_x, box_y, box_w, box_h, detector_confidence, category)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(id) DO UPDATE SET
                      photo_id = excluded.photo_id,
                      detector_model = excluded.detector_model,
+                     runtime_fingerprint = excluded.runtime_fingerprint,
                      box_x = excluded.box_x,
                      box_y = excluded.box_y,
                      box_w = excluded.box_w,
                      box_h = excluded.box_h,
                      detector_confidence = excluded.detector_confidence,
                      category = excluded.category""",
-                (det_id, photo_id, detector_model,
+                (det_id, photo_id, detector_model, runtime_fingerprint,
                  box["x"], box["y"], box["w"], box["h"],
                  det["confidence"], category),
             )
@@ -17882,8 +18027,10 @@ class Database:
         # `new_ids` set, so neither deletes the other's rows.
         new_ids = set(ids)
         existing = [r["id"] for r in self.conn.execute(
-            "SELECT id FROM detections WHERE photo_id = ? AND detector_model = ?",
-            (photo_id, detector_model),
+            """SELECT id FROM detections
+               WHERE photo_id = ? AND detector_model = ?
+                 AND runtime_fingerprint = ?""",
+            (photo_id, detector_model, runtime_fingerprint),
         ).fetchall()]
         stale = [eid for eid in existing if eid not in new_ids]
         # Chunk to stay under SQLite's compile-time SQLITE_MAX_VARIABLE_NUMBER
@@ -17900,7 +18047,15 @@ class Database:
             )
         return ids
 
-    def write_detection_batch(self, photo_id, detector_model, detections):
+    def write_detection_batch(
+        self,
+        photo_id,
+        detector_model,
+        detections,
+        runtime_fingerprint="legacy",
+        input_fingerprint=None,
+        force_runtime_replace=False,
+    ):
         """Atomically replace detections and record the detector_runs row.
 
         Combines `save_detections` and `record_detector_run` under a single
@@ -17921,14 +18076,58 @@ class Database:
         if detector_model is None:
             raise ValueError("detector_model is required")
         try:
-            ids = self._upsert_detection_rows(photo_id, detector_model, detections)
+            previous = self.conn.execute(
+                """SELECT runtime_fingerprint, input_fingerprint
+                   FROM detector_runs
+                   WHERE photo_id = ? AND detector_model = ?""",
+                (photo_id, detector_model),
+            ).fetchone()
+            identity_changed = previous is not None and (
+                previous["runtime_fingerprint"] != runtime_fingerprint
+                or (
+                    previous["input_fingerprint"] is not None
+                    and input_fingerprint is not None
+                    and previous["input_fingerprint"] != input_fingerprint
+                )
+            )
+            if (
+                identity_changed
+                and not force_runtime_replace
+                and self.detector_run_is_pinned(photo_id, detector_model)
+            ):
+                rows = self.conn.execute(
+                    """SELECT id FROM detections
+                       WHERE photo_id = ? AND detector_model = ?
+                       ORDER BY detector_confidence DESC, id ASC""",
+                    (photo_id, detector_model),
+                ).fetchall()
+                return [row["id"] for row in rows]
+
+            if identity_changed:
+                # Runtime ownership changes are an explicit retirement event.
+                # Deleting first prevents old-runtime rows from surviving the
+                # new run's same-runtime stale-row sweep.
+                self.conn.execute(
+                    """DELETE FROM detections
+                       WHERE photo_id = ? AND detector_model = ?""",
+                    (photo_id, detector_model),
+                )
+
+            ids = self._upsert_detection_rows(
+                photo_id, detector_model, detections, runtime_fingerprint,
+            )
             self.conn.execute(
-                """INSERT INTO detector_runs (photo_id, detector_model, box_count)
-                   VALUES (?, ?, ?)
+                """INSERT INTO detector_runs
+                     (photo_id, detector_model, runtime_fingerprint,
+                      input_fingerprint, box_count)
+                   VALUES (?, ?, ?, ?, ?)
                    ON CONFLICT(photo_id, detector_model)
-                   DO UPDATE SET box_count = excluded.box_count,
+                   DO UPDATE SET runtime_fingerprint = excluded.runtime_fingerprint,
+                                 input_fingerprint = excluded.input_fingerprint,
+                                 box_count = excluded.box_count,
                                  run_at = datetime('now')""",
-                (photo_id, detector_model, len(ids)),
+                (photo_id, detector_model, runtime_fingerprint,
+                 input_fingerprint, len(ids)),
             )
             commit_with_retry(self.conn)
             return ids

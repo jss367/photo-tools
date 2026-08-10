@@ -3696,6 +3696,9 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         __name__, template_folder=os.path.join(os.path.dirname(__file__), "templates")
     )
     app.config["DB_PATH"] = db_path
+    app.config["COMPUTATION_CACHE_DIR"] = os.path.expanduser(
+        "~/.vireo/computation-cache"
+    )
     app.config["THUMB_CACHE_DIR"] = thumb_cache_dir or os.path.expanduser(
         "~/.vireo/thumbnails"
     )
@@ -17261,6 +17264,134 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             _settings_post_save_side_effects(cfg.load())
         return jsonify({"ok": True})
 
+    def _computation_store():
+        from computation_cache import ArtifactStore
+
+        return ArtifactStore(app.config["COMPUTATION_CACHE_DIR"])
+
+    @app.route("/api/computation-cache")
+    def api_computation_cache_status():
+        """Return local portable-object and currently exportable-run counts."""
+        from computation_cache import exportable_run_counts
+
+        export_summary = exportable_run_counts(_get_db())
+        return jsonify({
+            **_computation_store().stats(),
+            "exportable": export_summary,
+            "experimental": True,
+            "artifact_schema": 1,
+        })
+
+    @app.route("/api/computation-cache/export")
+    def api_computation_cache_export():
+        """Download portable detector/classifier results as a cache bundle."""
+        import datetime as _datetime
+
+        from computation_cache import exportable_artifacts, write_bundle
+
+        requested = request.args.get("types", "detection,classification")
+        artifact_types = {part.strip() for part in requested.split(",") if part.strip()}
+        # exportable_artifacts dependency-closes the copy set — a classifier
+        # export always drags its detector dependencies along.  Mirror that
+        # expansion here so detector artifacts forwarded from the local
+        # object store (e.g. imports whose photos were not yet cataloged
+        # when they landed) travel with the classifications that reference
+        # them; otherwise the destination has to reproduce detection from
+        # model weights it may not have.
+        if "classification" in artifact_types:
+            artifact_types = artifact_types | {"detection"}
+        try:
+            database_artifacts, summary = exportable_artifacts(
+                _get_db(), artifact_types=artifact_types,
+            )
+            stored_artifacts = [
+                artifact for _digest, artifact
+                in (_computation_store().iter_artifacts() or ())
+                if artifact["type"] in artifact_types
+            ]
+            fd, temp_path = tempfile.mkstemp(suffix=".vireo-cache")
+            os.close(fd)
+            try:
+                manifest = write_bundle(
+                    temp_path,
+                    [*database_artifacts, *stored_artifacts],
+                    device_label=request.args.get("device_label") or None,
+                )
+                with open(temp_path, "rb") as handle:
+                    body = handle.read()
+            finally:
+                with contextlib.suppress(OSError):
+                    os.unlink(temp_path)
+        except ValueError as exc:
+            return json_error(str(exc), status=400)
+
+        today = _datetime.date.today().isoformat()
+        response = make_response(body)
+        response.headers["Content-Type"] = "application/vnd.vireo.cache+zip"
+        response.headers["Content-Disposition"] = (
+            f'attachment; filename="vireo-results-{today}.vireo-cache"'
+        )
+        response.headers["X-Vireo-Cache-Objects"] = str(manifest["object_count"])
+        response.headers["X-Vireo-Cache-Skipped-Legacy"] = str(
+            summary["skipped_legacy"]
+        )
+        return response
+
+    @app.route("/api/computation-cache/import", methods=["POST"])
+    def api_computation_cache_import():
+        """Validate, store, and immediately apply an uploaded cache bundle."""
+        import zipfile
+
+        from computation_cache import (
+            CacheFormatError,
+            import_bundle,
+            materialize_local_store,
+        )
+
+        upload = request.files.get("file")
+        if upload is None or not upload.filename:
+            return json_error("a .vireo-cache file is required", status=400)
+        try:
+            store = _computation_store()
+            # Stream the upload through the store so a large bundle never
+            # accumulates every parsed artifact in Python at once — the
+            # returned "artifacts" field is intentionally empty and
+            # materialization reads back from the store's on-disk objects.
+            imported = import_bundle(upload.stream, store)
+            # An explicit user-initiated import is a trust action for the
+            # runtimes this bundle carries: quarantine gates for unknown
+            # detector/classifier runtimes exist to keep drive-by
+            # materialize calls from surfacing foreign inference, but
+            # here the user chose the source. Whitelist the artifact-
+            # supplied fingerprints so the objects they just uploaded
+            # actually plant instead of getting stranded in the store.
+            detector_rts = imported["detector_runtimes"]
+            classifier_rts = imported["classifier_runtimes"]
+            # Persist the trust so later materialize_local_store calls
+            # from run_classify_job / the pipeline accept these runtimes
+            # too. Without persistence, a bundle imported before its
+            # matching photos are cataloged would leave those artifacts
+            # quarantined forever — the one-shot whitelist below only
+            # covers this HTTP call.
+            store.record_trusted_runtimes(
+                detector_runtimes=detector_rts,
+                classifier_runtimes=classifier_rts,
+            )
+            applied = materialize_local_store(
+                _get_db(), store=store,
+                known_runtimes=detector_rts,
+                known_classifier_runtimes=classifier_rts,
+            )
+        except (CacheFormatError, zipfile.BadZipFile) as exc:
+            return json_error(str(exc), status=400)
+        return jsonify({
+            "ok": True,
+            "objects": imported["manifest"]["object_count"],
+            "added": imported["added"],
+            "already_present": imported["already_present"],
+            **applied,
+        })
+
     @app.route("/api/darktable/status")
     def api_darktable_status():
         import config as cfg
@@ -27722,7 +27853,11 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         )
 
         def work(job):
-            return run_classify_job(job, runner, db_path, active_ws, params, vireo_dir=vireo_dir)
+            return run_classify_job(
+                job, runner, db_path, active_ws, params,
+                vireo_dir=vireo_dir,
+                computation_cache_dir=app.config["COMPUTATION_CACHE_DIR"],
+            )
 
         job_id = runner.start(
             "classify",
@@ -29810,6 +29945,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     job, runner, db_path, workspace_id, params,
                     thumb_cache_dir=app.config["THUMB_CACHE_DIR"],
                     missing_originals_invalidator=_invalidate_missing_originals_cache,
+                    computation_cache_dir=app.config["COMPUTATION_CACHE_DIR"],
                 )
                 return result
             finally:
@@ -30560,6 +30696,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 job, runner, db_path, active_ws, params,
                 thumb_cache_dir=app.config["THUMB_CACHE_DIR"],
                 missing_originals_invalidator=_invalidate_missing_originals_cache,
+                computation_cache_dir=app.config["COMPUTATION_CACHE_DIR"],
             )
 
         # Enqueue rather than start directly: when SLOT_CAP is 1 and

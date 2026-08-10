@@ -33,6 +33,8 @@ GET          /api/classify/readiness
 GET          /api/collections
 GET          /api/collections/<int:collection_id>/photo-ids
 GET          /api/collections/<int:collection_id>/photos
+GET          /api/computation-cache
+GET          /api/computation-cache/export
 GET          /api/config
 GET          /api/coverage
 GET          /api/culling/results
@@ -229,6 +231,7 @@ POST         /api/collections
 POST         /api/collections/<int:collection_id>/add-photos
 POST         /api/collections/<int:collection_id>/duplicate
 POST         /api/collections/preview
+POST         /api/computation-cache/import
 POST         /api/config
 POST         /api/culling/apply
 POST         /api/duplicates/apply

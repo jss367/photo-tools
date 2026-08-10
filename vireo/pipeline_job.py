@@ -1031,6 +1031,7 @@ def _retry_thumbnail_with_working_copy(
 _CLASSIFIER_BUNDLE_FIELDS = (
     "clf", "model_type", "model_name", "model_str",
     "labels", "use_tol", "active_model", "labels_fingerprint",
+    "labels_fingerprint_full", "classifier_model_identity",
 )
 
 
@@ -1363,7 +1364,8 @@ def _collapse_scan_roots(paths):
 
 def run_pipeline_job(job, runner, db_path, workspace_id, params,
                      thumb_cache_dir=None,
-                     missing_originals_invalidator=None):
+                     missing_originals_invalidator=None,
+                     computation_cache_dir=None):
     """Execute streaming pipeline. Called by JobRunner in a background thread.
 
     Args:
@@ -1383,11 +1385,28 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
             api_job_scan / api_job_import_full so a pipeline scan that
             touches disk doesn't leave GET /api/photos/missing serving a
             pre-scan ghost list.
+        computation_cache_dir: portable-cache root the HTTP import route
+            writes to (``app.config["COMPUTATION_CACHE_DIR"]``). When
+            provided, the detect stage reads from the same store so bundles
+            imported before their photos were cataloged still plant outside
+            the default location.
 
     Returns:
         dict with stage results, duration, and errors
     """
     job["_start_time"] = time.time()
+    # Stash the job's configured cache root so downstream helpers
+    # (``publish_detection_artifact`` inside ``_detect_batch``,
+    # ``promote_and_publish_classifier_run`` inside the per-model publish
+    # pass) write freshly computed artifacts into the SAME cache the
+    # status / export / catalog-reapplication paths use when
+    # ``COMPUTATION_CACHE_DIR`` is overridden. Without this the publishers
+    # fall back to the default ``~/.vireo/computation-cache`` and the
+    # artifacts disappear from the configured cache as soon as the backing
+    # database rows are removed. The path (not an ``ArtifactStore``
+    # instance) is stashed so ``jsonify(job)`` on the /api/jobs/<id> route
+    # keeps working — the helpers reconstruct the wrapper on demand.
+    job["_computation_cache_dir"] = computation_cache_dir
     abort = threading.Event()
     pause_gate = _PipelinePauseGate(runner, job["id"])
     pause_context = threading.local()
@@ -3757,7 +3776,7 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                 _record_labels_fingerprint,
                 _resolve_label_sources,
             )
-            from labels_fingerprint import compute_fingerprint
+            from labels_fingerprint import compute_fingerprint, compute_full_fingerprint
             from models import _classify_model_state
 
             model_str = active_model["model_str"]
@@ -3779,8 +3798,14 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
             # so classify_stage can pass it to record_classifier_run for each
             # (detection, model, fingerprint) triple.
             fp = compute_fingerprint(labels)
+            fp_full = compute_full_fingerprint(labels)
+            if len(fp_full) != 64:
+                fp_full = None
             label_sources = _resolve_label_sources(params, thread_db)
-            _record_labels_fingerprint(thread_db, fp, labels, sources=label_sources)
+            _record_labels_fingerprint(
+                thread_db, fp, labels, sources=label_sources,
+                full_fingerprint=fp_full,
+            )
 
             # Preflight: validate the on-disk model before handing it to
             # ONNXRuntime. A stale _check_onnx_downloaded result (e.g. after
@@ -3974,6 +3999,22 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                     ) from load_err
                 raise
 
+            try:
+                from computation_cache import classifier_model_identity, fingerprint
+
+                portable_model_identity = classifier_model_identity(active_model)
+                if fp_full is None and use_tol and portable_model_identity:
+                    fp_full = fingerprint({
+                        "label_space": "tree-of-life",
+                        "model": portable_model_identity,
+                    })
+                    _record_labels_fingerprint(
+                        thread_db, fp, labels, sources=label_sources,
+                        full_fingerprint=fp_full,
+                    )
+            except (OSError, ValueError):
+                portable_model_identity = None
+
             return {
                 "clf": clf,
                 "_cache_handle": cache_handle,
@@ -3982,6 +4023,8 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                 "model_str": model_str,
                 "labels": labels,
                 "labels_fingerprint": fp,
+                "labels_fingerprint_full": fp_full,
+                "classifier_model_identity": portable_model_identity,
                 "use_tol": use_tol,
                 "active_model": active_model,
             }
@@ -4059,6 +4102,15 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                 from taxonomy import load_local_taxonomy
                 tax = load_local_taxonomy()
                 loaded_models["tax"] = tax
+                # Portable identity for the taxonomy backing this pipeline.
+                # Threaded through publish and cache-match paths so that
+                # classifier runs made against one taxonomy revision are
+                # not conflated with runs from a different revision on
+                # another installation. See computation_cache.taxonomy_identity.
+                from computation_cache import (
+                    taxonomy_identity as _taxonomy_identity_fn,
+                )
+                loaded_models["taxonomy_identity"] = _taxonomy_identity_fn(tax)
                 loaded_models["resolved_specs"] = resolved_specs
 
                 # Load the first classifier so classify_stage can start as soon
@@ -4202,6 +4254,27 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                 detect_state["folders"] = folders
                 detect_state["ran"] = True
 
+                try:
+                    from computation_cache import (
+                        ArtifactStore,
+                        materialize_local_store,
+                    )
+
+                    cache_store = (
+                        ArtifactStore(computation_cache_dir)
+                        if computation_cache_dir else None
+                    )
+                    reused = (
+                        materialize_local_store(thread_db, store=cache_store)
+                        if not params.reclassify else {}
+                    )
+                    detect_state["portable_reused"] = reused
+                except Exception:
+                    log.warning(
+                        "Could not apply local computation cache", exc_info=True,
+                    )
+                    detect_state["portable_reused"] = {}
+
                 # Reclassify semantics (see prior interleaved implementation for
                 # history): start with an empty already_detected so EVERY photo
                 # is re-detected; snapshot pre-run detection IDs so we can purge
@@ -4212,15 +4285,31 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                 # re-detected forever by a legacy detections-only seed.
                 if params.reclassify:
                     already_detected: set = set()
+                    detector_runtime = None
                     photo_ids_list = [p["id"] for p in photos]
                     pre_run_det_ids: dict = getattr(
                         thread_db, "get_detection_ids_for_photos", lambda _: {}
                     )(photo_ids_list)
                 else:
-                    already_detected = set(
-                        thread_db.get_detector_run_photo_ids("megadetector-v6")
-                    )
+                    try:
+                        from computation_cache import megadetector_runtime_fingerprint
+
+                        detector_runtime = megadetector_runtime_fingerprint()
+                    except (OSError, ValueError):
+                        detector_runtime = None
+                    if detector_runtime is not None:
+                        already_detected = set(
+                            thread_db.get_detector_run_photo_ids(
+                                "megadetector-v6",
+                                runtime_fingerprint=detector_runtime,
+                            )
+                        )
+                    else:
+                        already_detected = set(
+                            thread_db.get_detector_run_photo_ids("megadetector-v6")
+                        )
                     pre_run_det_ids = {}
+                job["_detector_runtime_fingerprint"] = detector_runtime
                 detect_state["pre_run_det_ids"] = pre_run_det_ids
 
                 # Ensure MegaDetector weights only when we actually need fresh
@@ -4241,7 +4330,20 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                             runner, job["id"], stages, "detect", phase,
                         )
 
-                    ensure_megadetector_weights(progress_callback=_dl_progress)
+                    weights_path = ensure_megadetector_weights(
+                        progress_callback=_dl_progress,
+                    )
+                    from computation_cache import megadetector_runtime_fingerprint
+
+                    detector_runtime = megadetector_runtime_fingerprint(weights_path)
+                    job["_detector_runtime_fingerprint"] = detector_runtime
+                    if not params.reclassify and detector_runtime is not None:
+                        already_detected = set(
+                            thread_db.get_detector_run_photo_ids(
+                                "megadetector-v6",
+                                runtime_fingerprint=detector_runtime,
+                            )
+                        )
 
                 this_run_detections: dict = detect_state["detections"]
                 processed_ids: set = detect_state["processed_ids"]
@@ -4295,6 +4397,192 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                 # every classifier ends up failing to load — leaving the user
                 # with no detections AND no predictions. See classify_stage for
                 # the actual delete.
+
+                # Reapply the local computation cache now that fresh
+                # detector_runs exist. Classification artifacts whose
+                # detector dependency was absent at the pre-detection
+                # materialize call get a second chance to land here, so
+                # bundles carrying only classifications still surface.
+                #
+                # We ALSO pre-create synthetic full-image detector rows
+                # for every empty-scene photo before the reapply. The
+                # classify stage below creates those rows lazily
+                # per-photo, so without pre-creating them here a cached
+                # full_image classification artifact has no anchor to
+                # attach to at reapply time — the classify stage then
+                # runs the classifier itself even though the answer is
+                # already sitting in the local store.
+                if not params.reclassify:
+                    try:
+                        from computation_cache import (
+                            CacheFormatError,
+                            full_image_runtime_fingerprint,
+                            materialize_local_store,
+                            source_input,
+                        )
+
+                        # Pre-create full-image anchors for empty-scene
+                        # photos, and promote any legacy full-image
+                        # ``detector_runs`` row to the portable runtime
+                        # so imported full-image classifications
+                        # actually attach on materialize instead of
+                        # being deferred by the runtime-fingerprint
+                        # gate.
+                        full_runtime = full_image_runtime_fingerprint()
+                        empty_scene_ids = [
+                            photo["id"] for photo in photos
+                            if photo["id"] in processed_ids
+                            and not this_run_detections.get(photo["id"])
+                        ]
+                        for photo_id in empty_scene_ids:
+                            identity = thread_db.conn.execute(
+                                """SELECT file_hash, companion_path
+                                   FROM photos WHERE id = ?""",
+                                (photo_id,),
+                            ).fetchone()
+                            full_input = None
+                            if (
+                                identity is not None
+                                and not identity["companion_path"]
+                            ):
+                                try:
+                                    _block, full_input = source_input(
+                                        identity["file_hash"],
+                                        "vireo-detector-source-v1",
+                                    )
+                                except (ValueError, CacheFormatError):
+                                    # source_input raises CacheFormatError on
+                                    # NULL / non-canonical file_hash values.
+                                    # Falling through to the outer
+                                    # ``except Exception`` would abandon the
+                                    # post-detect reapply for the whole
+                                    # detect stage; keep full_input=None so
+                                    # the surrounding write still runs.
+                                    full_input = None
+                            existing_full = thread_db.get_detections(
+                                photo_id, detector_model="full-image",
+                                min_conf=0,
+                            )
+                            if not existing_full:
+                                thread_db.save_detections(
+                                    photo_id,
+                                    [{
+                                        "box": {"x": 0, "y": 0, "w": 1, "h": 1},
+                                        "confidence": 0,
+                                        "category": "animal",
+                                    }],
+                                    detector_model="full-image",
+                                    runtime_fingerprint=full_runtime,
+                                )
+                            else:
+                                # Promote a legacy full-image detection so
+                                # its runtime_fingerprint matches the run
+                                # we're about to record. exportable_artifacts
+                                # reads the detector runtime from
+                                # ``detections`` — leaving it at 'legacy'
+                                # makes future exports emit an empty
+                                # full-image detection artifact for this
+                                # photo, dropping the attached classifier
+                                # run.
+                                thread_db.conn.execute(
+                                    """UPDATE detections
+                                          SET runtime_fingerprint = ?
+                                        WHERE photo_id = ?
+                                          AND detector_model = 'full-image'
+                                          AND (runtime_fingerprint IS NULL
+                                               OR runtime_fingerprint != ?)""",
+                                    (full_runtime, photo_id, full_runtime),
+                                )
+                                thread_db.conn.commit()
+                            existing_run = thread_db.conn.execute(
+                                """SELECT runtime_fingerprint FROM detector_runs
+                                   WHERE photo_id = ?
+                                     AND detector_model = 'full-image'""",
+                                (photo_id,),
+                            ).fetchone()
+                            if (
+                                existing_run is None
+                                or existing_run["runtime_fingerprint"]
+                                != full_runtime
+                            ):
+                                thread_db.record_detector_run(
+                                    photo_id, "full-image", box_count=1,
+                                    runtime_fingerprint=full_runtime,
+                                    input_fingerprint=full_input,
+                                )
+
+                        known_runtimes = {full_runtime}
+                        if detector_runtime is not None:
+                            known_runtimes.add(detector_runtime)
+                        # Compute expected classifier runtimes for any
+                        # classifier the model_loader stage already
+                        # resolved. Without this the classifier-runtime
+                        # quarantine drops bundle classifications even
+                        # when this install carries the exact matching
+                        # classifier. Multi-classifier pipelines only
+                        # get the first classifier's runtime here;
+                        # later classifiers land during their own
+                        # classify_stage invocations of the cache.
+                        known_classifier_runtimes = set()
+                        pl_identity = loaded_models.get(
+                            "classifier_model_identity",
+                        )
+                        pl_fp_full = loaded_models.get(
+                            "labels_fingerprint_full",
+                        )
+                        if (
+                            pl_identity
+                            and isinstance(pl_fp_full, str)
+                            and len(pl_fp_full) == 64
+                        ):
+                            try:
+                                from computation_cache import (
+                                    classifier_runtime_fingerprint,
+                                )
+
+                                pl_tax_identity = loaded_models.get(
+                                    "taxonomy_identity", "no-tax",
+                                )
+                                for det_rt in (detector_runtime, full_runtime):
+                                    if not det_rt:
+                                        continue
+                                    crt = classifier_runtime_fingerprint(
+                                        pl_identity, pl_fp_full, det_rt,
+                                        taxonomy_identity=pl_tax_identity,
+                                    )
+                                    if crt:
+                                        known_classifier_runtimes.add(crt)
+                            except Exception:
+                                known_classifier_runtimes = set()
+                        from computation_cache import ArtifactStore
+
+                        reapply_store = (
+                            ArtifactStore(computation_cache_dir)
+                            if computation_cache_dir else None
+                        )
+                        post = materialize_local_store(
+                            thread_db, store=reapply_store,
+                            known_runtimes=known_runtimes,
+                            known_classifier_runtimes=(
+                                known_classifier_runtimes or None
+                            ),
+                        )
+                        if post.get("classifier_runs_applied"):
+                            prior = detect_state.get("portable_reused") or {}
+                            prior_applied = prior.get(
+                                "classifier_runs_applied", 0,
+                            )
+                            merged = dict(prior)
+                            merged["classifier_runs_applied"] = (
+                                prior_applied
+                                + post["classifier_runs_applied"]
+                            )
+                            detect_state["portable_reused"] = merged
+                    except Exception:
+                        log.warning(
+                            "Could not reapply local computation cache after detect",
+                            exc_info=True,
+                        )
 
                 stages["detect"]["status"] = "completed"
                 runner.update_step(
@@ -4394,6 +4682,7 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                     _BATCH_SIZE,
                     _flush_batch,
                     _prepare_image,
+                    _publish_classifier_runs_for_raw_results,
                     _record_batch_classifier_runs,
                     _store_grouped_predictions,
                 )
@@ -4892,6 +5181,12 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                         _record_batch_classifier_runs(
                             thread_db, pending, model_name, spec_fp, raw_results,
                             pre_len,
+                            labels_fingerprint_full=loaded_models.get(
+                                "labels_fingerprint_full"
+                            ),
+                            model_identity=loaded_models.get(
+                                "classifier_model_identity"
+                            ),
                         )
 
                         # Photo-scoped ``count`` bookkeeping: each distinct
@@ -5055,14 +5350,41 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                                 if existing_full and not params.reclassify:
                                     full_det_id = existing_full[0]["id"]
                                 else:
-                                    full_det_ids = thread_db.save_detections(
-                                        photo["id"],
+                                    from computation_cache import (
+                                        full_image_runtime_fingerprint,
+                                        source_input,
+                                    )
+
+                                    full_runtime = full_image_runtime_fingerprint()
+                                    identity = thread_db.conn.execute(
+                                        """SELECT file_hash, companion_path
+                                           FROM photos WHERE id = ?""",
+                                        (photo["id"],),
+                                    ).fetchone()
+                                    full_input = None
+                                    if identity is not None and not identity["companion_path"]:
+                                        try:
+                                            _block, full_input = source_input(
+                                                identity["file_hash"],
+                                                "vireo-detector-source-v1",
+                                            )
+                                        except ValueError:
+                                            full_input = None
+                                    # Combine save_detections + record_detector_run
+                                    # into one transaction via write_detection_batch
+                                    # so a crash between them can't leave a
+                                    # full-image detection row without its matching
+                                    # detector_runs row — mirroring the invariant
+                                    # documented for write_detection_batch.
+                                    full_det_ids = thread_db.write_detection_batch(
+                                        photo["id"], "full-image",
                                         [{
                                             "box": {"x": 0, "y": 0, "w": 1, "h": 1},
                                             "confidence": 0,
                                             "category": "animal",
                                         }],
-                                        detector_model="full-image",
+                                        runtime_fingerprint=full_runtime,
+                                        input_fingerprint=full_input,
                                     )
                                     full_det_id = full_det_ids[0]
                                 detections_to_classify = [{
@@ -5091,8 +5413,37 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                                 # it — otherwise the cached detection would silently
                                 # drop out of the grouping pipeline.
                                 if not params.reclassify:
+                                    expected_classifier_runtime = None
+                                    portable_labels_full = loaded_models.get(
+                                        "labels_fingerprint_full"
+                                    )
+                                    portable_model_identity = loaded_models.get(
+                                        "classifier_model_identity"
+                                    )
+                                    portable_tax_identity = loaded_models.get(
+                                        "taxonomy_identity", "no-tax",
+                                    )
+                                    if portable_labels_full and portable_model_identity:
+                                        from computation_cache import (
+                                            classifier_runtime_for_detection,
+                                        )
+
+                                        expected_classifier_runtime = (
+                                            classifier_runtime_for_detection(
+                                                thread_db,
+                                                detection["id"],
+                                                portable_model_identity,
+                                                portable_labels_full,
+                                                taxonomy_identity=(
+                                                    portable_tax_identity
+                                                ),
+                                            )
+                                        )
                                     run_keys = thread_db.get_classifier_run_keys(
-                                        detection["id"]
+                                        detection["id"],
+                                        runtime_fingerprint=(
+                                            expected_classifier_runtime
+                                        ),
                                     )
                                     if (model_name, spec_fp) in run_keys:
                                         cached = thread_db.get_predictions_for_detection(
@@ -5439,6 +5790,36 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                         raw_results, job["id"], model_name,
                         grouping_window, similarity_threshold, tax, thread_db,
                         labels_fingerprint=spec_fp,
+                    )
+                    # promote_and_publish reads persisted predictions written
+                    # by _store_grouped_predictions above; running it inside
+                    # _record_batch_classifier_runs would no-op because those
+                    # rows don't exist yet, leaving fresh classifier_runs
+                    # stranded on runtime_fingerprint = 'legacy' and out of
+                    # bundle exports.
+                    # Reconstruct the configured ArtifactStore from the
+                    # path stashed by ``run_pipeline_job`` so classifier
+                    # artifacts published here land in the same cache the
+                    # status / export / catalog-reapplication paths use
+                    # when ``COMPUTATION_CACHE_DIR`` is overridden.
+                    from computation_cache import ArtifactStore
+                    _publish_cache_dir = job.get("_computation_cache_dir")
+                    _publish_store = (
+                        ArtifactStore(_publish_cache_dir)
+                        if _publish_cache_dir else None
+                    )
+                    _publish_classifier_runs_for_raw_results(
+                        thread_db, raw_results, model_name, spec_fp,
+                        labels_fingerprint_full=loaded_models.get(
+                            "labels_fingerprint_full"
+                        ),
+                        model_identity=loaded_models.get(
+                            "classifier_model_identity"
+                        ),
+                        taxonomy_identity=loaded_models.get(
+                            "taxonomy_identity", "no-tax",
+                        ),
+                        store=_publish_store,
                     )
                     preds = group_result["predictions_stored"]
                     total_predictions_stored += preds

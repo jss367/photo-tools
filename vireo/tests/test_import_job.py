@@ -14462,3 +14462,143 @@ def test_symlinked_offcard_candidate_is_adopted(tmp_path):
     assert not (dest_dir / "IMG_0700_1.jpg").exists(), \
         sorted(os.listdir(str(dest_dir)))
     assert link.is_symlink()
+
+
+# --- PR 7b review round 6 (Codex P1): a zero-byte source that grows -----
+#
+# The zero-byte adopt branch matches on SIZE, using the src_size captured
+# by enqueue's opening stat. If the source gains bytes between that stat
+# and the branch — a file still being written to the card — the branch
+# adopts an EMPTY destination for a source that now has real bytes. The
+# destination then validates as empty (it IS empty), the file counts as
+# skipped_duplicate, and a verified run reports safe_to_format=True over
+# bytes that exist only on the card.
+#
+# Unlike the size-MATCHED branch, which re-reads the source through
+# src_hash_fn and would notice, this branch adopts without reading
+# anything at all — so it needs an explicit re-stat.
+
+def _grow_source_mid_walk(monkeypatch, src_path, cand_path,
+                          payload=b"late bytes"):
+    """Make ``src_path`` gain bytes DURING the collision walk.
+
+    Hooks ``os.path.lexists`` on the specific candidate path: that is the
+    walk's own first probe of a candidate, so it lands strictly inside the
+    window between ``enqueue``'s opening source stat and the adopt
+    decision.
+
+    Do NOT hook ``_is_source_backed_dest`` for this — it is also called by
+    ``_reject_source_backed_dest`` from the orchestrator BEFORE
+    ``enqueue`` runs, so the source would grow before its size is even
+    captured and the test would pass without exercising anything.
+    """
+    real = os.path.lexists
+    target = os.path.realpath(str(cand_path))
+    fired = []
+
+    def growing(path):
+        if (os.path.realpath(str(path)) == target
+                and os.path.getsize(str(src_path)) == 0):
+            Path(src_path).write_bytes(payload)
+            fired.append(str(path))
+        return real(path)
+
+    monkeypatch.setattr(os.path, "lexists", growing)
+    # Returned so every caller can ASSERT the injection actually
+    # happened. Without that, a path-spelling change (macOS realpaths
+    # /var -> /private/var, and the destination is normalized) would
+    # silently stop the source from ever growing, and the test would go
+    # green against the ordinary zero-byte adopt while proving nothing.
+    return fired
+
+
+def test_local_zero_byte_source_that_grows_is_not_adopted(
+        tmp_path, monkeypatch):
+    """A source that is empty at the opening stat but has bytes by the
+    time the walk decides must not adopt an empty candidate."""
+    from import_job import ImportParams
+
+    card, src = _make_zero_byte_card(tmp_path)
+    archive = tmp_path / "archive"
+    dest_dir = archive / "2026" / "2026-07-03"
+    dest_dir.mkdir(parents=True)
+    (dest_dir / "IMG_0001.jpg").touch()
+
+    fired = _grow_source_mid_walk(
+        monkeypatch, src, dest_dir / "IMG_0001.jpg")
+
+    db, ws_id, result = _run_import(tmp_path, ImportParams(
+        sources=[str(card)], destination=str(archive),
+    ))
+
+    assert fired, "the source never grew — the injection point missed"
+    assert src.stat().st_size > 0
+    assert result["skipped_duplicate"] == 0, result
+    assert result["failed"] == 0, result["unsafe_files"]
+    assert result["copied"] == 1, result
+    # The card's real bytes reached the archive at the next free slot;
+    # the pre-existing empty file is untouched.
+    landed = dest_dir / "IMG_0001_1.jpg"
+    assert landed.read_bytes() == b"late bytes"
+    assert (dest_dir / "IMG_0001.jpg").stat().st_size == 0
+
+
+def test_remote_zero_byte_source_that_grows_is_not_adopted(
+        tmp_path, monkeypatch):
+    """Remote half — one shared walk, so one fix covers both. The false
+    adoption is gone; the surviving outcome is an honest FAILURE, and
+    that difference from local is transport-inherent, not drift.
+
+    The rsync transport hashes the source eagerly, before any bytes move
+    (spec decision 7: a source that changes mid-transfer must not look
+    clean). So when the source grows during the walk, the identity this
+    run recorded is the empty one, the transferred bytes are the new
+    ones, and the post-scan stamping loop correctly refuses to reconcile
+    them — the file is failed and ``safe_to_format`` stays False. The
+    local transport instead verifies at copy time through
+    ``copy_and_hash_verify``, which reads the source fresh, so it lands
+    the file cleanly.
+
+    Both outcomes are safe; neither claims the card is formattable over
+    bytes it does not have. Only the adoption was unsafe, and that is
+    what this fix removes. (This remote outcome is also pre-existing:
+    before flip A the zero-byte source simply never matched an empty
+    candidate, advanced, and hit the same stale-hash refusal.)
+    """
+    from import_job import ImportParams, run_import_job
+
+    ra = _remote_archive_for(tmp_path)
+    calls = _remote_calls(ra)
+    _install_fake_remote_rsync(monkeypatch, calls, verify=None)
+
+    card, src = _make_zero_byte_card(tmp_path)
+    mount_dir = Path(ra["mount_base"]) / "2026" / "2026-07-03"
+    mount_dir.mkdir(parents=True)
+    (mount_dir / "IMG_0001.jpg").touch()
+
+    fired = _grow_source_mid_walk(
+        monkeypatch, src, mount_dir / "IMG_0001.jpg")
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    result = run_import_job(
+        _make_job(), FakeRunner(), db_path, db._active_workspace_id,
+        ImportParams(
+            sources=[str(card)], destination=ra["mount_base"],
+            remote_target=ra, verify_by_hash=True,
+        ),
+    )
+
+    assert fired, "the source never grew — the injection point missed"
+    assert src.stat().st_size > 0
+    # THE FIX: the empty mount file is not adopted for a source that now
+    # has bytes. That adoption was the data-loss shape.
+    assert result["skipped_duplicate"] == 0, result
+    # The honest remainder: identity was captured before transfer, so the
+    # run refuses to attest what it moved rather than guessing.
+    assert result["failed"] == 1, result
+    assert result["safe_to_format"] is False, result
+    # The real bytes did reach the mount at the next free slot, and the
+    # pre-existing empty file was left alone.
+    assert (mount_dir / "IMG_0001_1.jpg").read_bytes() == b"late bytes"
+    assert (mount_dir / "IMG_0001.jpg").stat().st_size == 0

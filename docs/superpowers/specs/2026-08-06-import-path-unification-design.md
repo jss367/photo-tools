@@ -290,7 +290,7 @@ Two further decisions recorded here:
   `_duplicate_gate` / `enqueue` / the walk, `_book_adoption` already carries
   the raw-vs-normalized hash split that motivated the deferral, and no third
   transport is on any horizon. YAGNI.
-- **Cancellation while advancing the walk (Codex review of PR #1450, P2 —
+- **Cancellation while advancing the walk (Codex review of PR #1450 —
   adopted after empirical confirmation).** Flip B removed the rsync walk's
   incidental cancellation poll: `_hash_dest_file` polls `cancel_check()` at
   entry, so hashing every existing candidate meant a Stop was observed
@@ -298,27 +298,56 @@ Two further decisions recorded here:
   which has always size-gated, never had the poll at all. Reproduced red on
   both transports with a chain of size-mismatched candidates — local
   *completed the copy* with `cancelled=False` despite Stop, remote probed
-  the whole chain. The shared walk now raises `DestReadCancelled` at the top
-  of any iteration reached by ADVANCING (`counter > 0`), which both
-  transports already book correctly. Deliberately gated on `counter`: the
-  no-collision fast path stays unpolled so a Stop racing the orchestrator's
-  loop-top check cannot flip an otherwise-clean copy into a cancellation.
-  Pinned by `test_{local,remote}_walk_observes_stop_while_advancing_candidates`.
-  **Second round (same review):** the first version of this poll raised
-  `DestReadCancelled`, which was wrong. That exception means a destination
-  *read* was interrupted, so its handlers set `dest_read_cancelled`, which
-  suppresses both the post-loop mount probe and the batch's catalog pass —
-  breaking the invariant the catalog block itself documents ("a plain user
-  Stop on a healthy mount leaves `dest_read_cancelled` False, so
-  partially-landed batches keep cataloging like before", PR #1423 review).
-  A Stop seen between probes is no evidence of a sick mount. The walk now
-  returns a distinct `_WALK_CANCELLED` verdict; both transports set
-  `state.cancelled` and return `_ENQ_CANCELLED` without touching
-  `dest_read_cancelled`. The two pins were rebuilt as two-file batches
-  where the earlier file lands (local: fresh copy; remote: adoption, since
-  a queued transfer is not in `landed` at the cancel point) and must still
-  be cataloged; neutralization confirms both go red under the raising
-  version.
+  the whole chain.
+
+  **Final contract.** At the top of any iteration reached by ADVANCING
+  (`counter > 0`), the shared walk returns the `_WALK_CANCELLED` verdict.
+  Both transports map it to: set `state.cancelled`, return
+  `_ENQ_CANCELLED`, and **leave `dest_read_cancelled` untouched**. The
+  no-collision fast path is deliberately unpolled (`counter > 0` gate), so
+  a Stop racing the orchestrator's loop-top check cannot flip an
+  otherwise-clean copy into a cancellation. `DestReadCancelled` still
+  propagates unchanged for genuine interrupted reads, and only that sets
+  `dest_read_cancelled`.
+
+  *Rejected alternative, recorded so it is not reintroduced:* the first
+  implementation raised `DestReadCancelled` for this poll. That is wrong —
+  the exception means a destination *read* was interrupted, so its handlers
+  set `dest_read_cancelled`, which suppresses both the post-loop mount
+  probe and the batch's catalog pass, breaking the invariant the catalog
+  block documents ("a plain user Stop on a healthy mount leaves
+  `dest_read_cancelled` False, so partially-landed batches keep cataloging
+  like before", PR #1423 review). A Stop seen between probes is no evidence
+  of a sick mount. Pinned by
+  `test_{local,remote}_walk_observes_stop_while_advancing_candidates`,
+  built as two-file batches where the earlier file lands (local: fresh
+  copy; remote: adoption, since a queued transfer is not in `landed` at the
+  cancel point) and must still be cataloged; neutralization confirms both
+  go red under the raising version.
+- **Zero-byte sources that grow mid-walk (Codex review of PR #1450, P1 —
+  adopted).** The zero-byte adopt branch matches on SIZE, using the
+  `src_size` captured by `enqueue`'s opening stat, and is the one adopt
+  branch that reads nothing (the size-matched branch re-reads the source
+  through `src_hash_fn` and would notice). A source still being written to
+  the card can be empty at that stat and have real bytes by the time the
+  branch fires, so it adopted an empty destination for a source that now
+  had bytes: the destination validates fine (it IS empty), the file counts
+  as `skipped_duplicate`, and a verified run reports `safe_to_format=True`
+  over bytes that exist only on the card. The branch now re-stats the
+  source immediately before booking and advances unless it is still empty
+  (an `OSError` also advances — inability to confirm emptiness is not
+  confirmation). The local primary-name case predates PR 7b; flip A
+  widened it to the suffix positions and to rsync. Pinned by
+  `test_{local,remote}_zero_byte_source_that_grows_is_not_adopted`, whose
+  injection helper **returns a fired-flag the tests assert**, because the
+  first version of it silently missed (it hooked
+  `_is_source_backed_dest`, which the orchestrator calls *before*
+  `enqueue` stats the source, so the file grew before the window opened
+  and the test passed against the ordinary zero-byte adopt). The two
+  transports then differ, inherently: local verifies at copy time and
+  lands the file cleanly, rsync captured identity before transfer
+  (decision 7) and so refuses to reconcile, failing the file with
+  `safe_to_format=False`. Both are safe; only the adoption was not.
 - **Non-regular collision candidates (CodeRabbit review of PR #1450,
   Major — adopted, severity corrected).** FIFOs, device nodes and sockets
   stat as size 0, so flip A's `src_size == 0 and cand_size == 0` branch

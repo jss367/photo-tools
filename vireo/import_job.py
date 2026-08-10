@@ -3377,6 +3377,32 @@ def _resolve_dest_collision(state, batch_st, ctx, *, source_file, rel,
                 # checker'd zero-byte source hashes to None by
                 # convention and could never match. Adopts at ANY
                 # candidate position on both transports (PR 7b flip A).
+                #
+                # Re-stat the SOURCE first. ``src_size`` was captured by
+                # ``enqueue``'s opening stat, and this is the one adopt
+                # branch that reads nothing — the size-matched branch
+                # below re-reads the source through ``src_hash_fn`` and
+                # would notice a change. A source still being written to
+                # the card can therefore be empty at that stat and have
+                # real bytes by now, and adopting an empty destination
+                # for it books ``skipped_duplicate`` over bytes that
+                # exist only on the card: the destination validates fine
+                # (it IS empty), and a verified run reports
+                # ``safe_to_format=True``. Formatting then loses them.
+                # If it is no longer empty, this candidate simply is not
+                # a match — advance, and the copy/transfer that follows
+                # moves the real bytes. An OSError here means we cannot
+                # confirm emptiness, so advance for the same reason (the
+                # copy then fails with the real error). Codex review of
+                # PR #1450 (P1); the local primary-name case predates
+                # PR 7b, flip A widened it to the other positions.
+                try:
+                    still_empty = source_file.stat().st_size == 0
+                except OSError:
+                    still_empty = False
+                if not still_empty:
+                    counter += 1
+                    continue
                 adopt = (cand_path, EMPTY_FILE_SHA256, EMPTY_FILE_SHA256)
             elif cand_size == src_size:
                 # Size pre-check: equal hashes imply equal sizes, so a

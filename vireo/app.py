@@ -19221,9 +19221,26 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     with os.scandir(folder) as it:
                         for entry in it:
                             try:
-                                if entry.is_file(follow_symlinks=False):
+                                # FOLLOW symlinks, because the import walk
+                                # does: it stats candidates with os.stat
+                                # and adopts one whose bytes match, so a
+                                # symlink to an off-card regular file IS a
+                                # recovery. Listing it as absent made the
+                                # preview promise a transfer the run would
+                                # not perform. A symlink back into the
+                                # card is still excluded from recovery —
+                                # by ``_is_source`` in ``_bytes_match``,
+                                # mirroring the walk's own source-backed
+                                # refusal — and a DANGLING symlink stays
+                                # out of the listing because is_file()
+                                # follows it and finds nothing, matching
+                                # the walk's ENOENT advance. Non-regular
+                                # entries (FIFOs, device nodes) also stay
+                                # out, mirroring the walk's S_ISREG guard.
+                                # Codex review of PR #1450.
+                                if entry.is_file(follow_symlinks=True):
                                     entries[entry.name] = entry.stat(
-                                        follow_symlinks=False).st_size
+                                        follow_symlinks=True).st_size
                             except OSError:
                                 continue
                 except OSError:

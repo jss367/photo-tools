@@ -373,6 +373,21 @@ Two further decisions recorded here:
   - *Flip C (advance past unreadable candidates)* — a candidate whose stat
     fails is dropped from `_planned_folder_listing`, so the preview
     already reached "not recovered", matching the run's new landing.
+  - *Symlinked candidates (Codex review of PR #1450, round 4 — fixed).*
+    `_planned_folder_listing` recorded only
+    `is_file(follow_symlinks=False)` entries, so a candidate that is a
+    symlink to an off-card regular file read as a free slot, while the walk
+    stats candidates with `os.stat` (which follows) and adopts on a byte
+    match. The listing now follows symlinks. Scope correction: the report
+    tied this to the newly-supported zero-byte cases, but it applies to
+    ordinary files too and predates PR 7b entirely — the RED test carries
+    real bytes for exactly that reason, and
+    `test_symlinked_offcard_candidate_is_adopted` pins the run side so the
+    preview's new answer is anchored to observed behavior rather than
+    inference. A symlink back into the card is still refused (by
+    `_is_source` in `_bytes_match`, mirroring the walk's source-backed
+    refusal), and dangling symlinks plus non-regular entries still stay out
+    of the listing, matching the walk's ENOENT advance and `S_ISREG` guard.
   - *Still divergent, pre-existing, PR 8's business:* the preview's suffix
     walk **stops** at the first slot absent from its listing
     (`cand_size is None → return False`), where the run advances. Symlinks
@@ -381,6 +396,15 @@ Two further decisions recorded here:
     `name_2.ext` is "not recovered" to the preview and an adoption to the
     run. That corner diverged before PR 7b too (in the opposite direction),
     and de-mirroring is what PR 8 is for.
+
+  **Scope line for PR 7b.** Rounds 3 and 4 of review each surfaced a
+  preview/ingest inconsistency, which is unsurprising — the preview is a
+  hand-mirror, and finding these one at a time is precisely the argument
+  for PR 8. The two fixed here were taken because PR 7b's own flips touch
+  the same geometry (zero-byte adoption) or because the divergence is
+  reachable from it. Any *further* preview-mirror divergence belongs to
+  PR 8, which deletes the mirror rather than patching it; the known
+  remaining one is the first-missing-slot difference recorded just above.
 - **Axis-3 test adaptation.** `test_remote_import_cancel_interrupts_stuck_collision_hash`
   simulates a wedged mount with FIFOs at the collision-candidate paths, and a
   FIFO stats as size 0 — so the new size pre-check would advance past it

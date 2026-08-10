@@ -14410,3 +14410,51 @@ def test_zero_byte_source_does_not_adopt_a_fifo_candidate(tmp_path):
     assert fifo.is_fifo()
     rows = [r["filename"] for r in _photo_rows(db)]
     assert rows == ["EMPTY_1.jpg"], rows
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="os.symlink usually requires elevation on Windows.",
+)
+def test_symlinked_offcard_candidate_is_adopted(tmp_path):
+    """The counterpart pin for the recovery preview: a candidate that is a
+    symlink to an OFF-CARD regular file holding this source's bytes IS
+    adopted.
+
+    The walk stats candidates with ``os.stat``, which follows symlinks, so
+    this has been true since long before PR 7b — and it is what makes
+    ``test_check_duplicates_recovery_follows_symlinked_candidate`` the
+    correct expectation for the preview rather than a guess. Contrast
+    ``test_local_source_backed_suffix_candidate_not_adopted``: a symlink
+    into the CARD is refused, because then the bytes are not really at the
+    destination. Here they are.
+    """
+    from import_job import ImportParams
+
+    card = _make_card(tmp_path, [
+        ("IMG_0700.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+    ])
+    # A real archive file elsewhere holding this source's exact bytes,
+    # reachable at the planned name only through a symlink.
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    real_target = elsewhere / "landed.jpg"
+    real_target.write_bytes((card / "IMG_0700.jpg").read_bytes())
+
+    archive = tmp_path / "archive"
+    dest_dir = archive / "2026" / "2026-07-03"
+    dest_dir.mkdir(parents=True)
+    link = dest_dir / "IMG_0700.jpg"
+    os.symlink(str(real_target), str(link))
+
+    db, ws_id, result = _run_import(tmp_path, ImportParams(
+        sources=[str(card)], destination=str(archive),
+    ))
+
+    assert result["failed"] == 0, result["unsafe_files"]
+    assert result["copied"] == 0, result
+    assert result["skipped_duplicate"] == 1, result
+    # No second copy landed beside it.
+    assert not (dest_dir / "IMG_0700_1.jpg").exists(), \
+        sorted(os.listdir(str(dest_dir)))
+    assert link.is_symlink()

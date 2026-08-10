@@ -671,6 +671,100 @@ def test_check_duplicates_zero_byte_source_not_recovered_from_fifo(
     assert _recovered_paths(events) == []
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="os.symlink usually requires elevation on Windows.",
+)
+def test_check_duplicates_recovery_follows_symlinked_candidate(
+    app_and_db, tmp_path
+):
+    """A candidate that is a SYMLINK to an off-card regular file with this
+    source's bytes is an adoption, so the preview must report recovery.
+
+    The import walk stats candidates with ``os.stat``, which follows
+    symlinks, and adopts on a byte match — that has been true since long
+    before PR 7b. The preview listed entries with
+    ``is_file(follow_symlinks=False)``, so it saw a free slot and promised
+    a transfer the run would not perform. Codex review of #1450; the
+    report scoped this to the zero-byte cases, but it applies to ordinary
+    files too, which is why this case carries real bytes.
+    """
+    from datetime import datetime
+
+    app, db, fid = app_and_db
+
+    source = tmp_path / "source"
+    source.mkdir(exist_ok=True)
+    src = source / "DSC_0001.NEF"
+    src.write_bytes(b"the real bytes")
+    ts = datetime(2026, 7, 3, 10, 0, 0).timestamp()
+    os.utime(str(src), (ts, ts))
+
+    # An off-card archive file holding the same bytes, reachable at the
+    # planned name only through a symlink.
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    real_target = elsewhere / "landed.NEF"
+    real_target.write_bytes(b"the real bytes")
+
+    dest = tmp_path / "archive"
+    planned = dest / "2026" / "2026-07-03"
+    planned.mkdir(parents=True)
+    os.symlink(str(real_target), str(planned / "DSC_0001.NEF"))
+
+    client = app.test_client()
+    resp = client.post("/api/import/check-duplicates", json={
+        "paths": [str(src)],
+        "destination": str(dest),
+    })
+    events = parse_sse_events(resp.data)
+    done = [e for e in events if e.get("done")]
+    assert done[0]["recovered_count"] == 1
+    assert str(src) in _recovered_paths(events)
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="os.symlink usually requires elevation on Windows.",
+)
+def test_check_duplicates_zero_byte_recovery_follows_symlinked_candidate(
+    app_and_db, tmp_path
+):
+    """The zero-byte half of the same rule, which is what the review
+    reported: an empty source whose candidate symlinks to an off-card
+    empty regular file is adopted by the run at every candidate position
+    since flip A."""
+    from datetime import datetime
+
+    app, db, fid = app_and_db
+
+    source = tmp_path / "source"
+    source.mkdir(exist_ok=True)
+    src = source / "DSC_0001.NEF"
+    src.write_bytes(b"")
+    ts = datetime(2026, 7, 3, 10, 0, 0).timestamp()
+    os.utime(str(src), (ts, ts))
+
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    real_target = elsewhere / "landed.NEF"
+    real_target.write_bytes(b"")
+
+    dest = tmp_path / "archive"
+    planned = dest / "2026" / "2026-07-03"
+    planned.mkdir(parents=True)
+    os.symlink(str(real_target), str(planned / "DSC_0001.NEF"))
+
+    client = app.test_client()
+    resp = client.post("/api/import/check-duplicates", json={
+        "paths": [str(src)],
+        "destination": str(dest),
+    })
+    events = parse_sse_events(resp.data)
+    done = [e for e in events if e.get("done")]
+    assert done[0]["recovered_count"] == 1
+
+
 def test_check_duplicates_rejects_relative_destination(app_and_db, tmp_path):
     app, db, fid = app_and_db
     src = _make_dated_source(tmp_path)

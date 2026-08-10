@@ -4918,6 +4918,63 @@ def test_trash_paths_rejects_missing_when_nested_inner_mount_unreachable(
     assert set(reachability_calls) == {str(outer), str(inner)}
 
 
+def test_trash_paths_probes_distinct_roots_concurrently(monkeypatch, tmp_path):
+    """Reachability probes for distinct network mounts in a single Finder
+    batch must run concurrently, not serially. Each probe is a bounded
+    ``_MOUNT_QUERY_TIMEOUT_SECS`` subprocess; serialising them would let
+    a batch spanning ``N`` unavailable roots add up to ``N × timeout``
+    seconds of hang time before the Finder recheck could run — a full
+    20-item batch across unreachable shares would burn ~100 seconds and
+    undermine the bounded-batch guarantee this code establishes.
+    """
+    import threading
+
+    import app as app_module
+
+    roots = [tmp_path / f"share-{i}" for i in range(6)]
+    photos = []
+    for i, root in enumerate(roots):
+        root.mkdir()
+        photos.append(str(root / f"bird-{i}.NEF"))
+
+    assert len(photos) <= app_module._FINDER_TRASH_BATCH_SIZE
+
+    root_set = {str(root) for root in roots}
+    monkeypatch.setattr(app_module.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        app_module, "_network_volume_roots", lambda: root_set,
+    )
+
+    # A ``Barrier`` sized to the number of distinct probes only releases
+    # when every probe thread has entered the function; if any probe ran
+    # after another returned (i.e. serially), the barrier would never
+    # meet its party count and the wait would raise ``BrokenBarrierError``
+    # once the timeout elapses.
+    barrier = threading.Barrier(len(roots), timeout=5)
+
+    def concurrent_reachable(root):
+        barrier.wait()
+        return True
+
+    monkeypatch.setattr(
+        app_module, "_network_root_reachable", concurrent_reachable,
+    )
+    monkeypatch.setattr(
+        app_module, "_trash_via_finder",
+        lambda paths: (set(), set(paths), []),
+    )
+    monkeypatch.setattr(
+        app_module, "_missing_paths_via_finder",
+        lambda paths: (set(paths), set(), []),
+    )
+
+    moved, successful, failures = app_module._trash_paths(photos)
+
+    assert moved == 0
+    assert successful == set(photos)
+    assert failures == []
+
+
 def test_network_root_reachable_uses_bounded_subprocess(monkeypatch):
     """The reachability probe must run out-of-process with a bounded
     timeout — an in-process ``os.stat`` on the mount root would still

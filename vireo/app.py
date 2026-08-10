@@ -5,6 +5,7 @@ Usage:
 """
 
 import argparse
+import concurrent.futures
 import contextlib
 import copy
 import csv
@@ -2399,7 +2400,13 @@ def _trash_paths(filepaths, progress_callback=None, already_missing_out=None,
             # Probe each still-relevant mount root with a bounded
             # out-of-process ``stat`` — a signal independent of Finder's
             # exists-cache — so a still-listed but unreachable SMB server
-            # cannot make ``missing`` outcomes look legitimate.
+            # cannot make ``missing`` outcomes look legitimate. Run the
+            # probes concurrently so a Finder batch spanning many
+            # unavailable shares completes within one probe timeout
+            # rather than accumulating ``len(distinct_roots)`` ×
+            # ``_MOUNT_QUERY_TIMEOUT_SECS`` serially — a full 20-item
+            # batch across unreachable roots would otherwise add up to
+            # ~100 seconds of hang time before the Finder recheck.
             reachable_network_roots = set()
             path_to_deepest_root = {}
             confirmed_network_missing = set()
@@ -2423,9 +2430,19 @@ def _trash_paths(filepaths, progress_callback=None, already_missing_out=None,
                     )
                     if root is not None:
                         path_to_deepest_root[path] = root
-                for root in set(path_to_deepest_root.values()):
-                    if _network_root_reachable(root):
-                        reachable_network_roots.add(root)
+                distinct_roots = list(set(path_to_deepest_root.values()))
+                if distinct_roots:
+                    with concurrent.futures.ThreadPoolExecutor(
+                        max_workers=len(distinct_roots),
+                    ) as executor:
+                        probe_results = executor.map(
+                            _network_root_reachable, distinct_roots,
+                        )
+                        for root, is_reachable in zip(
+                            distinct_roots, probe_results, strict=True,
+                        ):
+                            if is_reachable:
+                                reachable_network_roots.add(root)
                 if paths_still_on_network:
                     try:
                         (

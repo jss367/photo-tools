@@ -1735,8 +1735,60 @@ def _network_volume_roots(run=subprocess.run):
     }
 
 
+def _abandon_stuck_subprocess(proc):
+    """SIGKILL a stuck subprocess and reap it on a daemon thread.
+
+    ``proc.wait()`` after ``proc.kill()`` is *not* a hard deadline: when the
+    child is blocked in an uninterruptible kernel call (macOS SMB stat while
+    the server is unreachable is the canonical case) the wait will itself
+    block until the kernel call finally returns. Callers that must remain
+    responsive can therefore never reap synchronously — the reap has to be
+    delegated to a background thread whose blocking does not propagate back
+    into the request-serving path.
+
+    ``start_new_session=True`` gave the child its own process group so we can
+    SIGKILL the whole group here; if any pipes still have blocked reader/
+    writer threads inside ``proc`` they will unwind once the kernel releases
+    the process, which may be minutes later. The daemon reaper is fine with
+    that — the process is at worst a zombie until then.
+    """
+    try:
+        # ``os.killpg(0, sig)`` targets the CALLER's process group, so a
+        # Popen instance without a real pid (e.g. a test fake) must never
+        # take the killpg path. Fall back to ``proc.kill()`` there — it
+        # is a no-op on fakes and reaches the single process on real
+        # Popen instances whose child was spawned without a new session.
+        pid = getattr(proc, "pid", None)
+        if os.name == "posix" and isinstance(pid, int) and pid > 0:
+            import signal as _signal
+            try:
+                os.killpg(pid, _signal.SIGKILL)
+            except (OSError, AttributeError):
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
+        else:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+    except Exception:  # noqa: BLE001 - never raise from cleanup
+        pass
+
+    def _reap():
+        try:
+            proc.wait()
+        except Exception:  # noqa: BLE001 - never raise from cleanup thread
+            pass
+
+    threading.Thread(
+        target=_reap, name="vireo-abandon-reap", daemon=True,
+    ).start()
+
+
 def _network_root_reachable(root, timeout=_MOUNT_QUERY_TIMEOUT_SECS,
-                             run=subprocess.run):
+                             _popen=subprocess.Popen):
     """Bounded, out-of-process reachability probe for a mounted network root.
 
     ``mount`` listing a share and Finder reporting a file's absence are
@@ -1746,9 +1798,16 @@ def _network_root_reachable(root, timeout=_MOUNT_QUERY_TIMEOUT_SECS,
     cached parent metadata even though the photo will reappear on
     reconnect. Repeating the same Finder query does not detect this — it
     reuses the same cache. A ``stat`` on the mount root in a bounded
-    subprocess is an *independent* signal: it does not touch Finder, and
-    the subprocess is killed on timeout so an unresponsive share cannot
-    hang the caller.
+    subprocess is an *independent* signal: it does not touch Finder.
+
+    ``subprocess.run(..., timeout=...)`` looked sufficient at first glance
+    but is not — on timeout it calls ``proc.kill()`` and then
+    ``proc.wait()`` synchronously, and a ``/usr/bin/stat`` blocked in an
+    uninterruptible SMB kernel call would leave that ``wait()`` hung
+    indefinitely, reintroducing the exact hang this probe exists to
+    prevent. Instead we drive ``Popen`` directly, and on timeout hand the
+    child off to :func:`_abandon_stuck_subprocess` for background reaping
+    so this function always returns within ``timeout``.
 
     Returns ``True`` only when ``stat`` completed in time and reported the
     root as a directory. Any other outcome (timeout, non-zero exit, error)
@@ -1757,17 +1816,27 @@ def _network_root_reachable(root, timeout=_MOUNT_QUERY_TIMEOUT_SECS,
     if sys.platform != "darwin":
         return False
     try:
-        result = run(
+        proc = _popen(
             ["/usr/bin/stat", "-f", "%HT", root],
-            capture_output=True, text=True,
-            timeout=timeout,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=(os.name == "posix"),
             **no_window_kwargs(),
         )
-    except (OSError, subprocess.SubprocessError):
+    except OSError:
         return False
-    if result.returncode != 0:
+    try:
+        stdout, _stderr = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _abandon_stuck_subprocess(proc)
         return False
-    return (result.stdout or "").strip() == "Directory"
+    except (OSError, ValueError):
+        _abandon_stuck_subprocess(proc)
+        return False
+    if proc.returncode != 0:
+        return False
+    return (stdout or "").strip() == "Directory"
 
 
 def _expand_first_symlink_prefix(filepath):
@@ -1807,15 +1876,29 @@ def _expand_first_symlink_prefix(filepath):
 
 
 def _path_on_network_volume(filepath, network_roots):
-    """Whether ``filepath`` should avoid in-process mounted-volume I/O."""
+    """Whether ``filepath`` should avoid in-process mounted-volume I/O.
+
+    On macOS we fail closed in two additional cases beyond a direct root
+    match against ``network_roots``:
+
+    * A ``/Volumes/...`` path that does not appear in the current mount
+      table is still routed through Finder. A NAS that detached *before*
+      mount discovery ran leaves its ``/Volumes/<name>`` mount-point
+      directory in place on the underlying local FS, so ``mount`` reports
+      an empty match and treating the path as local would let
+      ``_snapshot_parent_device`` / ``os.path.isfile`` succeed against
+      the stub directory — the caller would then prune the catalog row
+      for a photo that reappears on remount.
+    * When mount discovery itself failed (``network_roots is None``) we
+      cannot tell a custom network mount such as ``/Users/me/mnt/photos``
+      apart from any other local path. Discovery failure is rare, so we
+      trade some Finder-path overhead for local files against the risk
+      of an unbounded stat on an unhealthy share and treat every macOS
+      candidate as network-backed.
+    """
     normalized = os.path.normpath(os.path.abspath(filepath))
     for _depth in range(16):
-        if network_roots is None:
-            # Mount discovery failed. Prefer bounded Finder handling for any
-            # /Volumes path, including one reached through a local symlink.
-            if _volume_root_for_path(normalized) is not None:
-                return True
-        else:
+        if network_roots is not None:
             for root in network_roots:
                 try:
                     if os.path.commonpath((normalized, root)) == root:
@@ -1824,6 +1907,18 @@ def _path_on_network_volume(filepath, network_roots):
                     continue
         if sys.platform != "darwin":
             return False
+        # /Volumes/... paths always fail closed on macOS even when the
+        # current mount table has no matching root: the reasonable
+        # explanation for that combination is a detached network share,
+        # not a genuinely local /Volumes subdirectory.
+        if _volume_root_for_path(normalized) is not None:
+            return True
+        # Mount discovery failure means we cannot distinguish a custom
+        # network mount from any other local path — fail closed for the
+        # whole macOS filesystem rather than let a stat hang on an
+        # unhealthy share we could not enumerate.
+        if network_roots is None:
+            return True
         expanded = _expand_first_symlink_prefix(normalized)
         if expanded is None:
             return False

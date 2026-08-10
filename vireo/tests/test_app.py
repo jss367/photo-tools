@@ -4099,9 +4099,17 @@ def test_trash_paths_routes_network_volume_directly_to_bounded_finder(
 def test_network_mount_discovery_failure_avoids_direct_volume_rename(
     monkeypatch,
 ):
-    """Fail closed when the kernel mount table cannot be queried."""
+    """Fail closed when the kernel mount table cannot be queried.
+
+    macOS is the only platform where the network-volume Finder fallback
+    exists, so this classification is deliberately gated on ``darwin``:
+    on Linux and Windows there is no bounded Finder to route through, so
+    treating an arbitrary path as network-backed would just make callers
+    fail the operation for no benefit.
+    """
     import app as app_module
 
+    monkeypatch.setattr(app_module.sys, "platform", "darwin")
     monkeypatch.setattr(
         app_module, "_volume_root_for_path", lambda _path: "/Volumes/X",
     )
@@ -4143,6 +4151,64 @@ def test_path_on_network_volume_expands_local_symlink_prefix(
     assert app_module._path_on_network_volume(
         str(photo), {str(network_root)},
     ) is True
+
+
+def test_path_on_network_volume_fails_closed_on_detached_volumes_mount(
+    monkeypatch,
+):
+    """A ``/Volumes/<name>`` path that isn't in the current mount table
+    is still routed through Finder. The most likely explanation for the
+    combination — ``mount`` succeeds but has no matching entry, yet the
+    path is under ``/Volumes`` — is a NAS that detached before mount
+    discovery ran and left its stub mount-point directory behind on the
+    underlying local filesystem. Accepting the path as local would then
+    let ``_snapshot_parent_device`` / ``os.path.isfile`` succeed against
+    that stub and callers would prune the catalog row for a photo that
+    reappears on remount.
+    """
+    import app as app_module
+
+    monkeypatch.setattr(app_module.sys, "platform", "darwin")
+
+    # Mount discovery succeeded but returned a set with no entry for the
+    # detached NAS. Under the previous behavior /Volumes/NAS/photo.jpg
+    # would fall through the ``for root in network_roots`` loop and be
+    # classified as local.
+    assert app_module._path_on_network_volume(
+        "/Volumes/NAS/photo.jpg", {"/Volumes/OtherDrive"},
+    ) is True
+    # And with an empty discovered set (the other observable form of the
+    # same problem — every network share has detached before discovery).
+    assert app_module._path_on_network_volume(
+        "/Volumes/NAS/photo.jpg", set(),
+    ) is True
+
+
+def test_path_on_network_volume_fails_closed_for_custom_mounts_when_discovery_fails(
+    monkeypatch,
+):
+    """When ``mount`` itself couldn't be read we cannot tell a custom
+    network mount (``/Users/me/mnt/photos``) apart from any other local
+    path, so treat every macOS candidate as network-backed. The prior
+    fallback only protected ``/Volumes/...`` and left custom mount
+    points free to hang the caller on an in-process stat.
+    """
+    import app as app_module
+
+    monkeypatch.setattr(app_module.sys, "platform", "darwin")
+
+    # Custom mount location — previously classified as local when
+    # ``network_roots is None``, which reintroduced the exact hang the
+    # network-volume routing exists to prevent.
+    assert app_module._path_on_network_volume(
+        "/Users/me/mnt/photos/bird.NEF", None,
+    ) is True
+    # Non-macOS platforms are unaffected: no bounded Finder fallback
+    # exists there, so callers still take their normal code path.
+    monkeypatch.setattr(app_module.sys, "platform", "linux")
+    assert app_module._path_on_network_volume(
+        "/home/me/mnt/photos/bird.NEF", None,
+    ) is False
 
 
 def test_trash_paths_batches_finder_fallback_and_retains_timeout_failures(
@@ -4981,20 +5047,26 @@ def test_network_root_reachable_uses_bounded_subprocess(monkeypatch):
     block indefinitely when the SMB server is unresponsive, which is the
     exact case the probe is supposed to detect.
     """
-    from types import SimpleNamespace
-
     import app as app_module
 
     monkeypatch.setattr(app_module.sys, "platform", "darwin")
 
     captured = {}
 
-    def fake_run(argv, **kwargs):
-        captured["argv"] = argv
-        captured["timeout"] = kwargs.get("timeout")
-        return SimpleNamespace(returncode=0, stdout="Directory\n", stderr="")
+    class FakeProc:
+        def __init__(self, argv, **kwargs):
+            captured["argv"] = argv
+            captured["kwargs"] = kwargs
+            self.returncode = 0
 
-    assert app_module._network_root_reachable("/Volumes/NAS", run=fake_run) is True
+        def communicate(self, timeout=None):
+            captured["timeout"] = timeout
+            return "Directory\n", ""
+
+    assert (
+        app_module._network_root_reachable("/Volumes/NAS", _popen=FakeProc)
+        is True
+    )
     assert captured["argv"][0] == "/usr/bin/stat"
     assert "/Volumes/NAS" in captured["argv"]
     assert captured["timeout"] == app_module._MOUNT_QUERY_TIMEOUT_SECS
@@ -5010,14 +5082,85 @@ def test_network_root_reachable_fails_closed_on_timeout(monkeypatch):
     import app as app_module
 
     monkeypatch.setattr(app_module.sys, "platform", "darwin")
+    abandoned = []
+    monkeypatch.setattr(
+        app_module, "_abandon_stuck_subprocess", abandoned.append,
+    )
 
-    def fake_run(argv, **kwargs):
-        raise subprocess.TimeoutExpired(argv, kwargs.get("timeout", 0))
+    class TimeoutProc:
+        def __init__(self, argv, **_kwargs):
+            self.argv = argv
+            self.returncode = None
+            self.pid = -1
+
+        def communicate(self, timeout=None):
+            raise subprocess.TimeoutExpired(self.argv, timeout or 0)
 
     assert (
-        app_module._network_root_reachable("/Volumes/NAS", run=fake_run)
+        app_module._network_root_reachable("/Volumes/NAS", _popen=TimeoutProc)
         is False
     )
+    # The probe MUST NOT synchronously wait on the timed-out child — an
+    # SMB stat can be uninterruptible in the kernel, so ``proc.wait()``
+    # after ``proc.kill()`` would block us here for as long as the kernel
+    # call is stuck. Handing the process off to the abandon helper (which
+    # reaps on a daemon thread) is how we keep the caller responsive.
+    assert len(abandoned) == 1
+
+
+def test_network_root_reachable_abandons_child_that_hangs_on_kill(
+    monkeypatch,
+):
+    """A child that hangs in ``wait()`` after ``kill()`` must not block
+    the reachability probe. This test simulates the pathological SMB
+    case: ``communicate`` raises ``TimeoutExpired`` and then any
+    ``wait()`` on the child would block forever. The probe must return
+    within its bounded timeout regardless.
+    """
+    import subprocess
+    import threading
+
+    import app as app_module
+
+    monkeypatch.setattr(app_module.sys, "platform", "darwin")
+
+    class HangOnWaitProc:
+        def __init__(self, argv, **_kwargs):
+            self.argv = argv
+            self.pid = 0
+            self.returncode = None
+            self._never_returns = threading.Event()
+
+        def communicate(self, timeout=None):
+            raise subprocess.TimeoutExpired(self.argv, timeout or 0)
+
+        def kill(self):
+            # SIGKILL is delivered but the kernel call is uninterruptible;
+            # the process stays stuck. Do nothing.
+            return None
+
+        def wait(self, timeout=None):
+            # If the main thread ever waited on us, it would deadlock.
+            # The daemon reap thread is fine because it's a daemon.
+            self._never_returns.wait()
+            return -9
+
+    completed = threading.Event()
+    result = {}
+
+    def run_probe():
+        result["value"] = app_module._network_root_reachable(
+            "/Volumes/NAS", timeout=0.1, _popen=HangOnWaitProc,
+        )
+        completed.set()
+
+    threading.Thread(target=run_probe, daemon=True).start()
+    assert completed.wait(timeout=5.0), (
+        "reachability probe did not return within 5s — the timed-out "
+        "child was reaped synchronously and would hang forever in "
+        "production against an unresponsive SMB mount"
+    )
+    assert result["value"] is False
 
 
 def test_network_root_reachable_returns_false_off_mac(monkeypatch):
@@ -5031,12 +5174,13 @@ def test_network_root_reachable_returns_false_off_mac(monkeypatch):
 
     called = []
 
-    def fake_run(*a, **k):
-        called.append(a)
-        raise AssertionError("subprocess must not run off macOS")
+    class ForbiddenProc:
+        def __init__(self, *a, **k):
+            called.append(a)
+            raise AssertionError("subprocess must not run off macOS")
 
     assert (
-        app_module._network_root_reachable("/mnt/nas", run=fake_run)
+        app_module._network_root_reachable("/mnt/nas", _popen=ForbiddenProc)
         is False
     )
     assert called == []

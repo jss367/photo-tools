@@ -12455,6 +12455,26 @@ def test_remote_import_cancel_interrupts_stuck_collision_hash(
     db = Database(db_path)
     ws_id = db._active_workspace_id
 
+    # FIXTURE ADAPTATION (PR 7b flip B). The walk now gates candidate
+    # hashing on a size match, and a FIFO stats as size 0 — so without
+    # this stub the wedged candidates would be advanced past without ever
+    # being read, and every assertion below would pass vacuously. A real
+    # wedged SMB candidate does not report size 0 (its stat blocks, or
+    # returns the real size); the FIFO's 0 is an artifact of how this
+    # test simulates a dead mount, so the fixture is what the gate
+    # invalidates, not the property under test. Report the source size
+    # for the two FIFOs and delegate everything else.
+    _card_size = os.path.getsize(str(card_file))
+    _fifo_paths = {str(collision), str(next_collision)}
+    _real_getsize = os.path.getsize
+
+    def _getsize_with_live_fifos(path):
+        if str(path) in _fifo_paths:
+            return _card_size
+        return _real_getsize(path)
+
+    monkeypatch.setattr(os.path, "getsize", _getsize_with_live_fifos)
+
     # Spy on the collision-candidate probe. ``os.path.exists`` gets called
     # once per candidate iteration, so without the inner break Codex asked
     # for, cancelling on the primary FIFO's hash would fall through to the
@@ -12508,9 +12528,12 @@ def test_remote_import_cancel_interrupts_stuck_collision_hash(
     # advance to ``IMG_0300_1.jpg`` and hash it too before observing
     # cancellation at the outer batch boundary.
     dest_hashes = [p for p in hashed_paths if str(dest_dir) in str(p)]
-    assert len(dest_hashes) <= 1, (
-        f"collision loop hashed multiple dead-mount candidates on cancel: "
-        f"{dest_hashes}"
+    assert len(dest_hashes) == 1, (
+        f"the collision loop must hash EXACTLY ONE dead-mount candidate "
+        f"on cancel: more than one means it advanced past the wedged "
+        f"primary instead of leaving the loop; zero means the walk never "
+        f"reached the read this test exists to interrupt (the flip-B size "
+        f"gate skipping the FIFO would look like that) — {dest_hashes}"
     )
 
 
@@ -13823,3 +13846,65 @@ def test_local_zero_byte_suffix_candidate_adopts_with_checker(tmp_path):
     adopted = [r for r in _photo_rows(db) if r["filename"] == "IMG_0001_1.jpg"]
     assert len(adopted) == 1, [dict(r) for r in _photo_rows(db)]
     assert adopted[0]["hash_status"] == "ok"
+
+
+# --- PR 7b flip B: the rsync walk gains local's size pre-check ----------
+
+def test_remote_size_mismatched_candidate_not_hashed(tmp_path, monkeypatch):
+    """The rsync walk must not hash a candidate whose size already rules
+    out a byte match.
+
+    Local has always gated candidate hashing on ``getsize(cand) ==
+    src_size``; remote hashed every existing candidate. The outcome is the
+    same either way (equal hashes imply equal sizes), so this is invisible
+    in the result dict — but the archive is a network mount, and a full
+    hash read of a file that cannot possibly match is pure wasted round
+    trips. Pinned by call counting, plus the unchanged landing.
+    """
+    import import_job as _ij
+    from import_job import ImportParams, run_import_job
+
+    ra = _remote_archive_for(tmp_path)
+    calls = _remote_calls(ra)
+    _install_fake_remote_rsync(monkeypatch, calls, verify=None)
+
+    card = _make_card(tmp_path, [
+        ("IMG_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+    ])
+    mount_dir = Path(ra["mount_base"]) / "2026" / "2026-07-03"
+    mount_dir.mkdir(parents=True)
+    collision = mount_dir / "IMG_0001.jpg"
+    # Different content AND a different length from the card file, so the
+    # size gate alone is enough to rule it out.
+    collision.write_bytes(
+        (card / "IMG_0001.jpg").read_bytes() + b"\x00" * 512)
+    assert collision.stat().st_size != (card / "IMG_0001.jpg").stat().st_size
+
+    real_hash = _ij._hash_dest_file
+    hashed = []
+
+    def counting_hash(path, cancel_check, **kw):
+        hashed.append(str(path))
+        return real_hash(path, cancel_check, **kw)
+
+    monkeypatch.setattr(_ij, "_hash_dest_file", counting_hash)
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws_id = db._active_workspace_id
+    result = run_import_job(
+        _make_job(), FakeRunner(), db_path, ws_id,
+        ImportParams(
+            sources=[str(card)], destination=ra["mount_base"],
+            remote_target=ra, verify_by_hash=True,
+        ),
+    )
+
+    assert str(collision) not in hashed, hashed
+    # Outcome unchanged: the file still advances past the collision and
+    # lands at the first free suffix.
+    assert result["failed"] == 0, result["unsafe_files"]
+    assert result["copied"] == 1, result
+    assert sorted(os.listdir(str(mount_dir))) == [
+        "IMG_0001.jpg", "IMG_0001_1.jpg",
+    ], sorted(os.listdir(str(mount_dir)))

@@ -3613,6 +3613,16 @@ class _RsyncTransport:
                     )
                     adopted = True
                     break
+                if cand_size != src_size:
+                    # Size pre-check, matching the local walk: equal
+                    # hashes imply equal sizes, so a size mismatch rules
+                    # out a byte match without reading the file. Outcome-
+                    # invisible; what it buys is round trips — the
+                    # archive is a network mount and a full hash read of
+                    # a candidate that cannot match is pure waste.
+                    # PR 7b flip B.
+                    counter += 1
+                    continue
                 try:
                     on_disk = _hash_dest_file(
                         cand_mount, _stop_requested)

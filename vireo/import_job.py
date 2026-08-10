@@ -3218,7 +3218,20 @@ class _LocalTransport:
             adopted_dest = None  # (path, hash) when byte-identical twin found
 
             if os.path.exists(dest_file):
-                dest_size = os.path.getsize(dest_file)
+                try:
+                    dest_size = os.path.getsize(dest_file)
+                except OSError:
+                    # An unreadable CANDIDATE is a destination artifact,
+                    # not a source problem: this OSError used to escape
+                    # to the handler below and fail a perfectly healthy
+                    # card file. Advance instead (the rsync walk always
+                    # has), which imports the photo at the next safe
+                    # slot; if the destination is genuinely broken rather
+                    # than just this one entry, the copy right below
+                    # fails with the real error anyway. -1 (not 0) so an
+                    # unreadable candidate can never be mistaken for an
+                    # empty one by the zero-byte branch. PR 7b flip C.
+                    dest_size = -1
                 if src_size == 0 and dest_size == 0:
                     # Zero-byte twin: identical by definition, but kept
                     # out of the duplicate-identity index (see ingest).
@@ -3229,8 +3242,21 @@ class _LocalTransport:
                     # case without walking the rest of the directory.
                     adopted_dest = (dest_file, EMPTY_FILE_SHA256)
                 elif src_size == dest_size:
-                    dest_hash = _hash_dest_file(
-                        dest_file, _stop_requested)
+                    try:
+                        dest_hash = _hash_dest_file(
+                            dest_file, _stop_requested)
+                    except DestReadCancelled:
+                        # MUST come first: DestReadCancelled subclasses
+                        # OSError, so the advance handler below would
+                        # otherwise swallow a Stop into "unreadable
+                        # candidate" and let the run keep touching the
+                        # wedged destination. Re-raise to the outer
+                        # cancel handler. PR 7b flip C.
+                        raise
+                    except OSError:
+                        # Advance rather than fail the source file — see
+                        # the getsize handler above.
+                        dest_hash = None
                     src_h = _src_hash_cached()
                     if src_h is not None and src_h == dest_hash:
                         # Byte-identical file already at the destination
@@ -3285,8 +3311,19 @@ class _LocalTransport:
                             adopted_dest = (candidate, EMPTY_FILE_SHA256)
                             break
                         if cand_size == src_size:
-                            cand_hash = _hash_dest_file(
-                                candidate, _stop_requested)
+                            try:
+                                cand_hash = _hash_dest_file(
+                                    candidate, _stop_requested)
+                            except DestReadCancelled:
+                                # First, for the same reason as the
+                                # primary-name handler above.
+                                raise
+                            except OSError:
+                                # Advance past the sick candidate; the
+                                # ``cand_hash is not None`` gate below
+                                # then falls through to counter += 1.
+                                # PR 7b flip C.
+                                cand_hash = None
                             src_h = _src_hash_cached()
                             if (
                                 cand_hash is not None

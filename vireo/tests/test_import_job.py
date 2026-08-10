@@ -13908,3 +13908,125 @@ def test_remote_size_mismatched_candidate_not_hashed(tmp_path, monkeypatch):
     assert sorted(os.listdir(str(mount_dir))) == [
         "IMG_0001.jpg", "IMG_0001_1.jpg",
     ], sorted(os.listdir(str(mount_dir)))
+
+
+# --- PR 7b flip C: local advances past unreadable candidates ------------
+#
+# An unreadable *candidate* is a destination artifact, not a source
+# problem. Remote has always advanced past one; local let the OSError
+# escape to ``enqueue``'s outer handler and failed the healthy source
+# file. Unified on advance: if the destination is genuinely broken, the
+# copy that follows fails with the real error anyway, and if only that one
+# entry is sick the photo still gets imported at a safe slot.
+#
+# DestReadCancelled subclasses OSError, so each new handler re-raises it
+# first; the two local cancel keep-pins above are what hold that.
+
+def _delegating_getsize_raiser(monkeypatch, bad_path, errno_msg="stale"):
+    """Make ``os.path.getsize`` raise OSError for exactly ``bad_path``."""
+    real = os.path.getsize
+
+    def fake(path):
+        if str(path) == str(bad_path):
+            raise OSError(errno_msg)
+        return real(path)
+
+    monkeypatch.setattr(os.path, "getsize", fake)
+
+
+def _delegating_hash_raiser(monkeypatch, bad_path):
+    """Make ``_hash_dest_file`` raise OSError for exactly ``bad_path``."""
+    import import_job as _ij
+    real = _ij._hash_dest_file
+
+    def fake(path, cancel_check, **kw):
+        if str(path) == str(bad_path):
+            raise OSError("unreadable destination candidate")
+        return real(path, cancel_check, **kw)
+
+    monkeypatch.setattr(_ij, "_hash_dest_file", fake)
+
+
+def test_local_unreadable_primary_candidate_advances(tmp_path, monkeypatch):
+    """A primary-name candidate whose ``getsize`` fails must not fail the
+    source file — the walk advances to the next suffix and imports it."""
+    from import_job import ImportParams
+
+    card = _make_card(tmp_path, [
+        ("IMG_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+    ])
+    archive = tmp_path / "archive"
+    dest_dir = archive / "2026" / "2026-07-03"
+    dest_dir.mkdir(parents=True)
+    collision = dest_dir / "IMG_0001.jpg"
+    Image.new("RGB", (16, 16), "blue").save(str(collision))
+
+    _delegating_getsize_raiser(monkeypatch, collision)
+
+    db, ws_id, result = _run_import(tmp_path, ImportParams(
+        sources=[str(card)], destination=str(archive),
+    ))
+
+    assert result["failed"] == 0, result["unsafe_files"]
+    assert result["copied"] == 1, result
+    landed = [r for r in _photo_rows(db) if r["filename"] == "IMG_0001_1.jpg"]
+    assert len(landed) == 1, [dict(r) for r in _photo_rows(db)]
+
+
+def test_local_unhashable_same_size_primary_candidate_advances(
+        tmp_path, monkeypatch):
+    """A primary-name candidate that stats fine but cannot be READ must
+    also advance rather than fail the source file."""
+    from import_job import ImportParams
+
+    card = _make_card(tmp_path, [
+        ("IMG_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+    ])
+    archive = tmp_path / "archive"
+    dest_dir = archive / "2026" / "2026-07-03"
+    dest_dir.mkdir(parents=True)
+    collision = dest_dir / "IMG_0001.jpg"
+    # Same size as the source so the walk gets past the size gate and
+    # actually attempts the read.
+    collision.write_bytes(_same_size_filler(card / "IMG_0001.jpg"))
+
+    _delegating_hash_raiser(monkeypatch, collision)
+
+    db, ws_id, result = _run_import(tmp_path, ImportParams(
+        sources=[str(card)], destination=str(archive),
+    ))
+
+    assert result["failed"] == 0, result["unsafe_files"]
+    assert result["copied"] == 1, result
+    landed = [r for r in _photo_rows(db) if r["filename"] == "IMG_0001_1.jpg"]
+    assert len(landed) == 1, [dict(r) for r in _photo_rows(db)]
+
+
+def test_local_unhashable_suffix_candidate_advances(tmp_path, monkeypatch):
+    """Same contract one candidate further into the walk: the suffix
+    loop's read failure advances to the next suffix, it does not fail the
+    file. (The suffix loop's ``getsize`` failure already advanced before
+    this flip — ``cand_size = -1`` — so only the read needed changing.)"""
+    from import_job import ImportParams
+
+    card = _make_card(tmp_path, [
+        ("IMG_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+    ])
+    archive = tmp_path / "archive"
+    dest_dir = archive / "2026" / "2026-07-03"
+    dest_dir.mkdir(parents=True)
+    filler = _same_size_filler(card / "IMG_0001.jpg")
+    (dest_dir / "IMG_0001.jpg").write_bytes(filler)
+    sick = dest_dir / "IMG_0001_1.jpg"
+    sick.write_bytes(filler)
+
+    _delegating_hash_raiser(monkeypatch, sick)
+
+    db, ws_id, result = _run_import(tmp_path, ImportParams(
+        sources=[str(card)], destination=str(archive),
+    ))
+
+    assert result["failed"] == 0, result["unsafe_files"]
+    assert result["copied"] == 1, result
+    landed = [r for r in _photo_rows(db) if r["filename"] == "IMG_0001_2.jpg"]
+    assert len(landed) == 1, [dict(r) for r in _photo_rows(db)]

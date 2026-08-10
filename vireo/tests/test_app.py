@@ -5097,6 +5097,7 @@ def test_network_root_reachable_reuses_abandoned_probe(monkeypatch):
         return HealthyProcess()
 
     root = "/Volumes/NAS"
+    root_key = app_module.os.path.normcase(app_module.os.path.normpath(root))
     try:
         assert app_module._network_root_reachable(root, popen=fake_popen) is False
         assert app_module._network_root_reachable(root, popen=fake_popen) is False
@@ -5107,7 +5108,7 @@ def test_network_root_reachable_reuses_abandoned_probe(monkeypatch):
     deadline = time.monotonic() + 1
     while time.monotonic() < deadline:
         with app_module._NETWORK_PROBE_LOCK:
-            if root not in app_module._NETWORK_PROBES:
+            if root_key not in app_module._NETWORK_PROBES:
                 break
         time.sleep(0.01)
 
@@ -5145,6 +5146,10 @@ def test_network_root_reachable_caps_abandoned_probes(monkeypatch):
         return WedgedProcess()
 
     roots = ["/Volumes/NAS-1", "/Volumes/NAS-2"]
+    root_keys = [
+        app_module.os.path.normcase(app_module.os.path.normpath(root))
+        for root in roots
+    ]
     try:
         for root in roots:
             assert (
@@ -5164,12 +5169,12 @@ def test_network_root_reachable_caps_abandoned_probes(monkeypatch):
     deadline = time.monotonic() + 1
     while time.monotonic() < deadline:
         with app_module._NETWORK_PROBE_LOCK:
-            if not any(root in app_module._NETWORK_PROBES for root in roots):
+            if not any(key in app_module._NETWORK_PROBES for key in root_keys):
                 break
         time.sleep(0.01)
 
     with app_module._NETWORK_PROBE_LOCK:
-        assert not any(root in app_module._NETWORK_PROBES for root in roots)
+        assert not any(key in app_module._NETWORK_PROBES for key in root_keys)
 
 
 def test_network_root_reachable_returns_false_off_mac(monkeypatch):

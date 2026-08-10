@@ -56,6 +56,29 @@ def test_parse_ignores_non_network_and_garbage():
     assert remote_setup.parse_mount_output(LOCAL + "\nnot a mount line\n") == []
 
 
+def test_parse_mount_table_preserves_unclassified_and_complex_mount_points():
+    unusual = (
+        "server:/archive on /Volumes/Photo on Film (Archive) "
+        "(sshfs, nodev)"
+    )
+
+    assert remote_setup.parse_mount_table(LOCAL + "\n" + unusual) == [
+        {"source": "/dev/disk3s1s1", "mount_point": "/", "fs_type": "apfs"},
+        {
+            "source": "server:/archive",
+            "mount_point": "/Volumes/Photo on Film (Archive)",
+            "fs_type": "sshfs",
+        },
+    ]
+
+
+def test_unknown_mount_types_fail_closed_as_possibly_network_backed():
+    assert remote_setup.mount_type_is_network_or_unknown("apfs") is False
+    assert remote_setup.mount_type_is_network_or_unknown("exfat") is False
+    assert remote_setup.mount_type_is_network_or_unknown("smbfs") is True
+    assert remote_setup.mount_type_is_network_or_unknown("sshfs") is True
+
+
 def test_parse_afpfs_and_ipv6_hosts():
     afp = "//julius@mynas._afpovertcp._tcp.local/Media on /Volumes/Media (afpfs, nodev, nosuid, mounted by julius)"
     v6 = "//admin@[fe80::1%25en0]/Backup on /Volumes/Backup (smbfs, nodev, nosuid, mounted by julius)"

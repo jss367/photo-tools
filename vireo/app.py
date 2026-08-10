@@ -1707,17 +1707,11 @@ class _NetworkVolumeRoots(set):
         self.mounted_volume_roots = frozenset(mounted_volume_roots)
 
 
-def _mounted_volume_roots_from_mount_output(text):
-    """Return live top-level ``/Volumes/<name>`` mount points."""
+def _mounted_volume_roots(mounts):
+    """Return live top-level ``/Volumes/<name>`` roots from parsed mounts."""
     roots = set()
-    for line in text.splitlines():
-        before_options, separator, _options = line.strip().rpartition(" (")
-        if not separator:
-            continue
-        _source, separator, mount_point = before_options.partition(" on ")
-        if not separator:
-            continue
-        normalized = posixpath.normpath(mount_point)
+    for mount in mounts:
+        normalized = posixpath.normpath(mount["mount_point"])
         parts = normalized.split("/")
         if len(parts) == 3 and parts[1] == "Volumes" and parts[2]:
             roots.add(normalized)
@@ -1757,14 +1751,18 @@ def _network_volume_roots(run=subprocess.run):
     if result.returncode != 0:
         return None
     output = result.stdout or ""
+    mounts = remote_setup.parse_mount_table(output)
     return _NetworkVolumeRoots(
         # ``mount`` always reports macOS/POSIX paths.  Keep parsing independent
         # of the host running the test suite (notably Windows' ``ntpath``).
         (
-            posixpath.normpath(row["mount_point"])
-            for row in remote_setup.parse_mount_output(output)
+            posixpath.normpath(mount["mount_point"])
+            for mount in mounts
+            if remote_setup.mount_type_is_network_or_unknown(
+                mount["fs_type"],
+            )
         ),
-        _mounted_volume_roots_from_mount_output(output),
+        _mounted_volume_roots(mounts),
     )
 
 

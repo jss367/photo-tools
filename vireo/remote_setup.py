@@ -36,6 +36,10 @@ _NFS_SRC_RE = re.compile(
 )
 
 _NETWORK_FS = ("smbfs", "nfs", "afpfs", "webdav")
+_LOCAL_FS = frozenset({
+    "apfs", "autofs", "cd9660", "devfs", "exfat", "fdesc", "hfs",
+    "msdos", "nullfs", "procfs", "tmpfs", "udf", "union",
+})
 
 
 def platform_supported():
@@ -51,17 +55,39 @@ def platform_supported():
     return sys.platform == "darwin"
 
 
+def parse_mount_table(text):
+    """Parse macOS ``mount`` output without classifying its filesystems."""
+    rows = []
+    for line in text.splitlines():
+        match = _MOUNT_RE.match(line.strip())
+        if not match:
+            continue
+        rows.append({
+            "source": match.group("src"),
+            "mount_point": match.group("mp"),
+            "fs_type": (match.group("opts").split(",")[0] or "").strip(),
+        })
+    return rows
+
+
+def mount_type_is_network_or_unknown(fs_type):
+    """Fail closed for mount types that are not explicitly known-local.
+
+    New network filesystem implementations must not silently gain local-file
+    semantics in safety-sensitive callers such as Trash routing. Unknown local
+    filesystems may take a slower Finder path until added to ``_LOCAL_FS``.
+    """
+    return (fs_type or "").strip().lower() not in _LOCAL_FS
+
+
 def parse_mount_output(text):
     """Parse ``mount`` output into network-share rows the wizard can offer."""
     rows = []
-    for line in text.splitlines():
-        m = _MOUNT_RE.match(line.strip())
-        if not m:
-            continue
-        fs_type = (m.group("opts").split(",")[0] or "").strip()
+    for mount in parse_mount_table(text):
+        fs_type = mount["fs_type"]
         if fs_type not in _NETWORK_FS:
             continue
-        src, mount_point = m.group("src"), m.group("mp")
+        src, mount_point = mount["source"], mount["mount_point"]
         if fs_type == "nfs":
             n = _NFS_SRC_RE.match(src)
             if not n:

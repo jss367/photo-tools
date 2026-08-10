@@ -4013,18 +4013,19 @@ def test_network_volume_roots_reads_mount_table_without_resolving_hosts(
                 "//user@nas/Photography on /Volumes/Photography "
                 "(smbfs, nodev, nosuid)\n"
                 "/dev/disk4s1 on /Volumes/CARD (exfat, local)\n"
+                "nas:/archive on /Volumes/Archive (sshfs, nodev)\n"
             ),
         )
 
     monkeypatch.setattr(app_module.sys, "platform", "darwin")
 
     assert app_module._network_volume_roots(run=fake_run) == {
-        "/Volumes/Photography",
+        "/Volumes/Photography", "/Volumes/Archive",
     }
     assert app_module._network_volume_roots(
         run=fake_run,
     ).mounted_volume_roots == {
-        "/Volumes/Photography", "/Volumes/CARD",
+        "/Volumes/Photography", "/Volumes/CARD", "/Volumes/Archive",
     }
     assert calls[0][0] == ["mount"]
     assert calls[0][1]["timeout"] == app_module._MOUNT_QUERY_TIMEOUT_SECS

@@ -4857,6 +4857,67 @@ def test_trash_paths_accepts_missing_through_symlinked_network_root(
     assert reachability_calls == [str(volume)]
 
 
+def test_trash_paths_rejects_missing_when_nested_inner_mount_unreachable(
+    monkeypatch, tmp_path,
+):
+    """A reachable outer network mount must not vouch for a detached inner
+    one that is nested beneath it.
+
+    When an SMB share is mounted at ``/Volumes/NAS/archive`` beneath a
+    separate, still-reachable share at ``/Volumes/NAS``, Finder can report
+    a photo on the inner mount as ``missing`` from cached parent metadata
+    while the inner server is silently unavailable. The reachability probe
+    must target the *deepest* matching root the path resolves into —
+    otherwise the outer mount's healthy ``stat`` response would validate
+    Finder's false negative and prune the catalog row for a photo that
+    reappears on reconnect.
+    """
+    import app as app_module
+
+    outer = tmp_path / "NAS"
+    outer.mkdir()
+    inner = outer / "archive"
+    inner.mkdir()
+    outer_photo = str(outer / "top.NEF")
+    inner_photo = str(inner / "buried.NEF")
+    reachability_calls = []
+
+    def fake_reachable(root):
+        reachability_calls.append(root)
+        # Outer mount responds; nested inner mount does not.
+        return root == str(outer)
+
+    monkeypatch.setattr(app_module.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        app_module, "_network_volume_roots",
+        lambda: {str(outer), str(inner)},
+    )
+    monkeypatch.setattr(
+        app_module, "_network_root_reachable", fake_reachable,
+    )
+    monkeypatch.setattr(
+        app_module, "_trash_via_finder",
+        lambda paths: (set(), set(paths), []),
+    )
+    monkeypatch.setattr(
+        app_module, "_missing_paths_via_finder",
+        lambda paths: (set(paths), set(), []),
+    )
+
+    moved, successful, failures = app_module._trash_paths(
+        [outer_photo, inner_photo],
+    )
+
+    # The path on the reachable outer mount is accepted as missing; the
+    # path on the detached inner mount is preserved for retry.
+    assert moved == 0
+    assert successful == {outer_photo}
+    assert [f["path"] for f in failures] == [inner_photo]
+    # Reachability was probed for each distinct deepest root — not just
+    # whichever the set iteration surfaced first for one path.
+    assert set(reachability_calls) == {str(outer), str(inner)}
+
+
 def test_network_root_reachable_uses_bounded_subprocess(monkeypatch):
     """The reachability probe must run out-of-process with a bounded
     timeout — an in-process ``os.stat`` on the mount root would still

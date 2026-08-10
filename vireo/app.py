@@ -1814,6 +1814,49 @@ def _path_on_network_volume(filepath, network_roots):
     return True
 
 
+def _deepest_network_root_for_path(filepath, network_roots):
+    """Return the *deepest* ``network_roots`` entry ``filepath`` resolves into.
+
+    ``_path_on_network_volume`` answers the yes/no membership question and
+    short-circuits on the first matching root, which is enough for routing
+    decisions but not for reachability probing.  When mounts are nested —
+    e.g. a still-reachable ``/Volumes/NAS`` share with a detached
+    ``/Volumes/NAS/archive`` share mounted underneath it — the caller must
+    probe reachability of the *exact* mount the path depends on rather than
+    any reachable ancestor; otherwise a healthy outer mount would vouch for
+    a nested inner mount that is actually gone, and Finder's false
+    ``missing`` result would prune catalog rows for photos that reappear on
+    reconnect.  Returns ``None`` when no root matches (either directly or
+    via symlink expansion, mirroring ``_path_on_network_volume``'s traversal).
+    """
+    if not network_roots:
+        return None
+    normalized = os.path.normpath(os.path.abspath(filepath))
+    for _depth in range(16):
+        best = None
+        best_len = -1
+        for root in network_roots:
+            try:
+                if os.path.commonpath((normalized, root)) == root:
+                    # Longest matching root wins so nested mounts probe the
+                    # inner share rather than an outer one that happens to
+                    # be iterated first from the roots set.
+                    if len(root) > best_len:
+                        best = root
+                        best_len = len(root)
+            except ValueError:
+                continue
+        if best is not None:
+            return best
+        if sys.platform != "darwin":
+            return None
+        expanded = _expand_first_symlink_prefix(normalized)
+        if expanded is None:
+            return None
+        normalized = expanded
+    return None
+
+
 def _missing_paths_via_finder(filepaths, timeout=_FINDER_TRASH_TIMEOUT_SECS):
     """Boundedly confirm which paths remain absent according to Finder."""
     filepaths = [os.fspath(path) for path in filepaths]
@@ -2261,7 +2304,7 @@ def _trash_paths(filepaths, progress_callback=None, already_missing_out=None,
 
     def _finder_missing_is_trustworthy(
         filepath, current_network_roots, reachable_network_roots,
-        confirmed_network_missing,
+        confirmed_network_missing, path_to_deepest_root,
     ):
         """Reject Finder's "missing" outcome when the underlying mount is gone.
 
@@ -2276,11 +2319,13 @@ def _trash_paths(filepaths, progress_callback=None, already_missing_out=None,
         (1) the mount table (already re-queried once per Finder batch by
         the caller and passed in via ``current_network_roots``) still
         lists a root the path resolves into; (2) an out-of-process
-        ``stat`` probe on that root — separate from Finder's cache —
-        actually responds within its bounded timeout, so a still-listed
-        but unreachable SMB server cannot masquerade as "empty"; and (3)
-        Finder's second-look ``exists`` query also confirmed the path as
-        missing. Doing the mount recheck and reachability probes per
+        ``stat`` probe on the *deepest* matching root the path resolves
+        into — separate from Finder's cache — responds within its bounded
+        timeout, so a still-listed but unreachable SMB server cannot
+        masquerade as "empty" and, crucially, a reachable ancestor mount
+        cannot vouch for a nested inner mount that is actually gone; and
+        (3) Finder's second-look ``exists`` query also confirmed the path
+        as missing. Doing the mount recheck and reachability probes per
         batch instead of per path keeps the worst-case cost bounded — a
         20-item retry of already-moved paths would otherwise spawn one
         ``mount`` (or ``stat``) subprocess per path. For local fallbacks
@@ -2297,12 +2342,16 @@ def _trash_paths(filepaths, progress_callback=None, already_missing_out=None,
                 return False
             if filepath not in confirmed_network_missing:
                 return False
-            # An independent reachability signal that does not share
-            # Finder's exists-cache: if the mount root itself does not
-            # respond to a bounded out-of-process stat, treat "missing"
-            # as a false negative from an unreachable server rather than
-            # as evidence the photo is gone.
-            return _path_on_network_volume(filepath, reachable_network_roots)
+            # Require the *exact* mount the path depends on — not just any
+            # reachable ancestor — to respond to the out-of-process stat
+            # probe. When a detached inner share is nested beneath a
+            # reachable outer share (e.g. ``/Volumes/NAS/archive`` under a
+            # still-live ``/Volumes/NAS``), only the deepest match tells us
+            # whether the photo could reappear on reconnect.
+            deepest_root = path_to_deepest_root.get(filepath)
+            if deepest_root is None:
+                return False
+            return deepest_root in reachable_network_roots
         return _path_confirmed_gone(filepath, parent_devs.get(filepath))
 
     for finder_batch in _chunked(
@@ -2332,6 +2381,7 @@ def _trash_paths(filepaths, progress_callback=None, already_missing_out=None,
             # exists-cache — so a still-listed but unreachable SMB server
             # cannot make ``missing`` outcomes look legitimate.
             reachable_network_roots = set()
+            path_to_deepest_root = {}
             confirmed_network_missing = set()
             finder_recheck_errors = set()
             if batch_network_missing and batch_network_roots is not None:
@@ -2340,13 +2390,20 @@ def _trash_paths(filepaths, progress_callback=None, already_missing_out=None,
                     if path in network_finder_candidates
                     and _path_on_network_volume(path, batch_network_roots)
                 }
-                relevant_roots = set()
+                # Associate each path with the *deepest* mount root it
+                # resolves into so nested mounts probe reachability of the
+                # inner share rather than an outer one that happens to be
+                # iterated first. Set iteration is order-independent, so
+                # picking the first match could otherwise validate a
+                # detached inner mount using a live outer one and prune
+                # rows for photos that reappear on reconnect.
                 for path in paths_still_on_network:
-                    for root in batch_network_roots:
-                        if _path_on_network_volume(path, {root}):
-                            relevant_roots.add(root)
-                            break
-                for root in relevant_roots:
+                    root = _deepest_network_root_for_path(
+                        path, batch_network_roots,
+                    )
+                    if root is not None:
+                        path_to_deepest_root[path] = root
+                for root in set(path_to_deepest_root.values()):
                     if _network_root_reachable(root):
                         reachable_network_roots.add(root)
                 if paths_still_on_network:
@@ -2381,6 +2438,7 @@ def _trash_paths(filepaths, progress_callback=None, already_missing_out=None,
                     missing_path, batch_network_roots,
                     reachable_network_roots,
                     confirmed_network_missing,
+                    path_to_deepest_root,
                 ):
                     successful.add(missing_path)
                     if already_missing_out is not None:

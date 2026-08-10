@@ -13935,16 +13935,23 @@ def test_remote_size_mismatched_candidate_not_hashed(tmp_path, monkeypatch):
 # DestReadCancelled subclasses OSError, so each new handler re-raises it
 # first; the two local cancel keep-pins above are what hold that.
 
-def _delegating_getsize_raiser(monkeypatch, bad_path, errno_msg="stale"):
-    """Make ``os.path.getsize`` raise OSError for exactly ``bad_path``."""
-    real = os.path.getsize
+def _delegating_stat_raiser(monkeypatch, bad_path, errno_msg="stale"):
+    """Make ``os.stat`` raise OSError for exactly ``bad_path``.
 
-    def fake(path):
+    Must patch ``os.stat`` and not ``os.path.getsize``: the walk reads
+    candidate metadata with a single ``os.stat`` that doubles as its
+    existence probe, so a ``getsize`` patch is never reached and the test
+    would pass through the ordinary collision path — green even with the
+    error handling deleted (Codex review of PR #1450, caught exactly that).
+    """
+    real = os.stat
+
+    def fake(path, *args, **kwargs):
         if str(path) == str(bad_path):
             raise OSError(errno_msg)
-        return real(path)
+        return real(path, *args, **kwargs)
 
-    monkeypatch.setattr(os.path, "getsize", fake)
+    monkeypatch.setattr(os, "stat", fake)
 
 
 def _delegating_hash_raiser(monkeypatch, bad_path):
@@ -13974,7 +13981,7 @@ def test_local_unreadable_primary_candidate_advances(tmp_path, monkeypatch):
     collision = dest_dir / "IMG_0001.jpg"
     Image.new("RGB", (16, 16), "blue").save(str(collision))
 
-    _delegating_getsize_raiser(monkeypatch, collision)
+    _delegating_stat_raiser(monkeypatch, collision)
 
     db, ws_id, result = _run_import(tmp_path, ImportParams(
         sources=[str(card)], destination=str(archive),

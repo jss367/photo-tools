@@ -3302,7 +3302,23 @@ def _resolve_dest_collision(state, batch_st, ctx, *, source_file, rel,
             # of which follows a symlink. Verified before the fix; see
             # spec row 13.) Nothing to adopt either — there are no bytes
             # behind it — so advance.
-            if not os.path.exists(cand_path):
+            #
+            # ONE stat serves as both the existence probe and the
+            # metadata read: a dangling symlink is ``lexists`` but raises
+            # ENOENT here, so the single ``except OSError`` covers the
+            # dangling case AND a candidate that cannot be stat'd, and
+            # both advance. Merged deliberately — a separate
+            # ``os.path.exists`` would be a second round trip per
+            # candidate on a network archive, and it made the
+            # unreadable-candidate branch untestable by hiding which call
+            # a test had to intercept (Codex review of PR #1450).
+            try:
+                cand_stat = os.stat(cand_path)
+            except OSError:
+                # Unreadable candidate (or a dangling symlink): advance
+                # rather than fail the source file (PR 7b flip C).
+                # Deliberately not folded into the zero-byte test below —
+                # a failed stat must never read as "empty".
                 counter += 1
                 continue
             # Never hash, and never adopt, a candidate that is really
@@ -3336,15 +3352,6 @@ def _resolve_dest_collision(state, batch_st, ctx, *, source_file, rel,
             # would re-copy identical bytes to ``name_2.ext`` and leave
             # two archive copies of one source photo. See PR #1107
             # review.
-            try:
-                cand_stat = os.stat(cand_path)
-            except OSError:
-                # Unreadable candidate: advance rather than fail the
-                # source file (PR 7b flip C). Deliberately not folded
-                # into the zero-byte test below — a failed stat must
-                # never read as "empty".
-                counter += 1
-                continue
             if not stat_mod.S_ISREG(cand_stat.st_mode):
                 # FIFOs, device nodes and sockets all stat as size 0, so
                 # the zero-byte branch below would adopt one as this

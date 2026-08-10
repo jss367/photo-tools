@@ -14119,7 +14119,11 @@ def test_local_source_backed_suffix_candidate_not_adopted(
     assert not os.path.samefile(str(landed), str(card_file))
     # The poisoned candidate is untouched.
     assert link.is_symlink()
-    assert os.readlink(str(link)) == str(card_file)
+    # Compare where the link RESOLVES, not the literal stored target:
+    # Windows returns the extended-length spelling (``\\?\C:\...``) from
+    # os.readlink while ``str(card_file)`` is the plain form, so a
+    # string comparison fails there on path spelling alone.
+    assert os.path.realpath(str(link)) == os.path.realpath(str(card_file))
     assert any(
         str(link) in r.getMessage() and "source media" in r.getMessage()
         for r in caplog.records

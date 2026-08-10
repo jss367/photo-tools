@@ -1850,11 +1850,15 @@ def _expand_first_symlink_prefix(filepath):
 def _path_on_network_volume(filepath, network_roots):
     """Whether ``filepath`` should avoid in-process mounted-volume I/O."""
     normalized = os.path.normpath(os.path.abspath(filepath))
-    if sys.platform == "darwin" and network_roots is None:
+    if network_roots is None:
         # Discovery failed, so there is no trustworthy evidence that any
         # candidate is local. Route every macOS path through bounded Finder
         # handling instead of risking an in-process stat on a custom mount.
-        return True
+        # Preserve the explicit /Volumes fallback on non-macOS test hosts.
+        return (
+            sys.platform == "darwin"
+            or _volume_root_for_path(normalized) is not None
+        )
     for _depth in range(16):
         # A detached network mount disappears from a successful mount-table
         # result but leaves its /Volumes directory behind. That absence cannot

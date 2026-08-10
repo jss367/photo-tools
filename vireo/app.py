@@ -1735,8 +1735,30 @@ def _network_volume_roots(run=subprocess.run):
     }
 
 
+def _reap_abandoned_network_probe(process):
+    """Reap a timed-out probe away from the request path."""
+    try:
+        process.communicate()
+    except (OSError, ValueError, subprocess.SubprocessError):
+        pass
+
+
+def _abandon_network_probe(process):
+    """Kill a timed-out probe without synchronously waiting for it."""
+    try:
+        process.kill()
+    except OSError:
+        pass
+    threading.Thread(
+        target=_reap_abandoned_network_probe,
+        args=(process,),
+        name="vireo-network-probe-reaper",
+        daemon=True,
+    ).start()
+
+
 def _network_root_reachable(root, timeout=_MOUNT_QUERY_TIMEOUT_SECS,
-                             run=subprocess.run):
+                             run=None, popen=subprocess.Popen):
     """Bounded, out-of-process reachability probe for a mounted network root.
 
     ``mount`` listing a share and Finder reporting a file's absence are
@@ -1746,9 +1768,10 @@ def _network_root_reachable(root, timeout=_MOUNT_QUERY_TIMEOUT_SECS,
     cached parent metadata even though the photo will reappear on
     reconnect. Repeating the same Finder query does not detect this — it
     reuses the same cache. A ``stat`` on the mount root in a bounded
-    subprocess is an *independent* signal: it does not touch Finder, and
-    the subprocess is killed on timeout so an unresponsive share cannot
-    hang the caller.
+    subprocess is an *independent* signal: it does not touch Finder. On
+    timeout the child is killed and reaped on a daemon thread so an
+    uninterruptible filesystem call cannot hold the request thread in
+    Python's usual synchronous kill-and-wait timeout cleanup.
 
     Returns ``True`` only when ``stat`` completed in time and reported the
     root as a directory. Any other outcome (timeout, non-zero exit, error)
@@ -1756,18 +1779,36 @@ def _network_root_reachable(root, timeout=_MOUNT_QUERY_TIMEOUT_SECS,
     """
     if sys.platform != "darwin":
         return False
+    argv = ["/usr/bin/stat", "-f", "%HT", root]
+    if run is not None:
+        try:
+            result = run(
+                argv, capture_output=True, text=True, timeout=timeout,
+                **no_window_kwargs(),
+            )
+        except (OSError, subprocess.SubprocessError):
+            return False
+        return (
+            result.returncode == 0
+            and (result.stdout or "").strip() == "Directory"
+        )
     try:
-        result = run(
-            ["/usr/bin/stat", "-f", "%HT", root],
-            capture_output=True, text=True,
-            timeout=timeout,
+        process = popen(
+            argv,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
             **no_window_kwargs(),
         )
+        stdout, _stderr = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _abandon_network_probe(process)
+        return False
     except (OSError, subprocess.SubprocessError):
+        if "process" in locals():
+            _abandon_network_probe(process)
         return False
-    if result.returncode != 0:
-        return False
-    return (result.stdout or "").strip() == "Directory"
+    return process.returncode == 0 and (stdout or "").strip() == "Directory"
 
 
 def _expand_first_symlink_prefix(filepath):
@@ -1809,19 +1850,27 @@ def _expand_first_symlink_prefix(filepath):
 def _path_on_network_volume(filepath, network_roots):
     """Whether ``filepath`` should avoid in-process mounted-volume I/O."""
     normalized = os.path.normpath(os.path.abspath(filepath))
+    if sys.platform == "darwin" and network_roots is None:
+        # Discovery failed, so there is no trustworthy evidence that any
+        # candidate is local. Route every macOS path through bounded Finder
+        # handling instead of risking an in-process stat on a custom mount.
+        return True
     for _depth in range(16):
-        if network_roots is None:
-            # Mount discovery failed. Prefer bounded Finder handling for any
-            # /Volumes path, including one reached through a local symlink.
-            if _volume_root_for_path(normalized) is not None:
-                return True
-        else:
-            for root in network_roots:
-                try:
-                    if os.path.commonpath((normalized, root)) == root:
-                        return True
-                except ValueError:
-                    continue
+        # A detached network mount disappears from a successful mount-table
+        # result but leaves its /Volumes directory behind. That absence cannot
+        # prove the catalog path is local, so keep all such paths off in-process
+        # filesystem calls even when no current network root matches.
+        if (
+            sys.platform == "darwin"
+            and _volume_root_for_path(normalized) is not None
+        ):
+            return True
+        for root in network_roots:
+            try:
+                if os.path.commonpath((normalized, root)) == root:
+                    return True
+            except ValueError:
+                continue
         if sys.platform != "darwin":
             return False
         expanded = _expand_first_symlink_prefix(normalized)

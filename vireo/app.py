@@ -1695,6 +1695,31 @@ _MOUNT_QUERY_TIMEOUT_SECS = 5
 _NETWORK_ROOTS_UNSET = object()
 
 
+class _NetworkVolumeRoots(set):
+    """Network roots plus the live /Volumes roots from one mount snapshot."""
+
+    def __init__(self, network_roots=(), mounted_volume_roots=()):
+        super().__init__(network_roots)
+        self.mounted_volume_roots = frozenset(mounted_volume_roots)
+
+
+def _mounted_volume_roots_from_mount_output(text):
+    """Return live top-level ``/Volumes/<name>`` mount points."""
+    roots = set()
+    for line in text.splitlines():
+        before_options, separator, _options = line.strip().rpartition(" (")
+        if not separator:
+            continue
+        _source, separator, mount_point = before_options.partition(" on ")
+        if not separator:
+            continue
+        normalized = posixpath.normpath(mount_point)
+        parts = normalized.split("/")
+        if len(parts) == 3 and parts[1] == "Volumes" and parts[2]:
+            roots.add(normalized)
+    return roots
+
+
 def _volume_root_for_path(filepath):
     """Return ``/Volumes/<name>`` for a path on a macOS mounted volume."""
     try:
@@ -1727,12 +1752,16 @@ def _network_volume_roots(run=subprocess.run):
         return None
     if result.returncode != 0:
         return None
-    return {
+    output = result.stdout or ""
+    return _NetworkVolumeRoots(
         # ``mount`` always reports macOS/POSIX paths.  Keep parsing independent
         # of the host running the test suite (notably Windows' ``ntpath``).
-        posixpath.normpath(row["mount_point"])
-        for row in remote_setup.parse_mount_output(result.stdout or "")
-    }
+        (
+            posixpath.normpath(row["mount_point"])
+            for row in remote_setup.parse_mount_output(output)
+        ),
+        _mounted_volume_roots_from_mount_output(output),
+    )
 
 
 def _reap_abandoned_network_probe(process):
@@ -1792,6 +1821,7 @@ def _network_root_reachable(root, timeout=_MOUNT_QUERY_TIMEOUT_SECS,
             result.returncode == 0
             and (result.stdout or "").strip() == "Directory"
         )
+    process = None
     try:
         process = popen(
             argv,
@@ -1805,7 +1835,7 @@ def _network_root_reachable(root, timeout=_MOUNT_QUERY_TIMEOUT_SECS,
         _abandon_network_probe(process)
         return False
     except (OSError, subprocess.SubprocessError):
-        if "process" in locals():
+        if process is not None:
             _abandon_network_probe(process)
         return False
     return process.returncode == 0 and (stdout or "").strip() == "Directory"
@@ -1860,21 +1890,25 @@ def _path_on_network_volume(filepath, network_roots):
             or _volume_root_for_path(normalized) is not None
         )
     for _depth in range(16):
-        # A detached network mount disappears from a successful mount-table
-        # result but leaves its /Volumes directory behind. That absence cannot
-        # prove the catalog path is local, so keep all such paths off in-process
-        # filesystem calls even when no current network root matches.
-        if (
-            sys.platform == "darwin"
-            and _volume_root_for_path(normalized) is not None
-        ):
-            return True
         for root in network_roots:
             try:
                 if os.path.commonpath((normalized, root)) == root:
                     return True
             except ValueError:
                 continue
+        if sys.platform == "darwin":
+            volume_root = _volume_root_for_path(normalized)
+            if volume_root is not None:
+                mounted_roots = getattr(
+                    network_roots, "mounted_volume_roots", None,
+                )
+                # A detached network mount disappears from the snapshot but
+                # leaves its /Volumes directory behind. Conversely, a live
+                # local USB/APFS root in the same snapshot must retain the
+                # local-trash path. Plain sets from older callers/tests carry
+                # no liveness evidence, so continue to fail closed for them.
+                if mounted_roots is None or volume_root not in mounted_roots:
+                    return True
         if sys.platform != "darwin":
             return False
         expanded = _expand_first_symlink_prefix(normalized)

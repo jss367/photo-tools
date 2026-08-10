@@ -4021,6 +4021,11 @@ def test_network_volume_roots_reads_mount_table_without_resolving_hosts(
     assert app_module._network_volume_roots(run=fake_run) == {
         "/Volumes/Photography",
     }
+    assert app_module._network_volume_roots(
+        run=fake_run,
+    ).mounted_volume_roots == {
+        "/Volumes/Photography", "/Volumes/CARD",
+    }
     assert calls[0][0] == ["mount"]
     assert calls[0][1]["timeout"] == app_module._MOUNT_QUERY_TIMEOUT_SECS
 
@@ -5049,6 +5054,7 @@ def test_network_root_reachable_does_not_wait_to_reap_timeout(monkeypatch):
     assert app_module._network_root_reachable(
         "/Volumes/NAS", popen=lambda *args, **kwargs: WedgedProcess(),
     ) is False
+    assert not reaper_finished.is_set()
     assert reaper_started.wait(timeout=1)
     release_reaper.set()
     assert reaper_finished.wait(timeout=1)
@@ -5088,6 +5094,57 @@ def test_path_on_network_volume_fails_closed_for_detached_volume(monkeypatch):
     assert app_module._path_on_network_volume(
         "/Volumes/NAS/bird.NEF", set(),
     ) is True
+
+
+def test_path_on_network_volume_preserves_live_local_volume(monkeypatch):
+    """A live USB/APFS volume keeps the direct local-trash route."""
+    import app as app_module
+
+    volume = "/Volumes/CARD"
+    roots = app_module._NetworkVolumeRoots((), {volume})
+    monkeypatch.setattr(app_module.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        app_module, "_volume_root_for_path", lambda _path: volume,
+    )
+
+    assert app_module._path_on_network_volume(
+        f"{volume}/bird.NEF", roots,
+    ) is False
+
+
+def test_trash_paths_preserves_live_local_volume_fast_path(monkeypatch, tmp_path):
+    """Healthy local volumes still use the direct mounted-volume Trash path."""
+    import app as app_module
+
+    volume = tmp_path / "CARD"
+    volume.mkdir()
+    photo = volume / "bird.NEF"
+    photo.write_bytes(b"raw")
+    roots = app_module._NetworkVolumeRoots((), {str(volume)})
+    direct_calls = []
+
+    monkeypatch.setattr(app_module.sys, "platform", "darwin")
+    monkeypatch.setattr(app_module, "_network_volume_roots", lambda: roots)
+    monkeypatch.setattr(
+        app_module, "_volume_root_for_path", lambda _path: str(volume),
+    )
+    monkeypatch.setattr(
+        app_module, "_move_to_volume_trash",
+        lambda path: direct_calls.append(path) or True,
+    )
+    monkeypatch.setattr(
+        app_module, "_trash_via_finder",
+        lambda _paths: (_ for _ in ()).throw(
+            AssertionError("live local volume reached Finder"),
+        ),
+    )
+
+    moved, successful, failures = app_module._trash_paths([str(photo)])
+
+    assert moved == 1
+    assert successful == {str(photo)}
+    assert failures == []
+    assert direct_calls == [str(photo)]
 
 
 def test_path_on_network_volume_fails_closed_when_discovery_fails(monkeypatch):

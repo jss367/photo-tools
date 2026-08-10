@@ -77,6 +77,11 @@ def test_unknown_mount_types_fail_closed_as_possibly_network_backed():
     assert remote_setup.mount_type_is_network_or_unknown("exfat") is False
     assert remote_setup.mount_type_is_network_or_unknown("smbfs") is True
     assert remote_setup.mount_type_is_network_or_unknown("sshfs") is True
+    # autofs is an automount trigger, not local storage: its target can be an
+    # unavailable network share, so callers must route through the bounded
+    # probe path rather than issuing in-process stat/isfile that would trip
+    # the automount and block.
+    assert remote_setup.mount_type_is_network_or_unknown("autofs") is True
 
 
 def test_parse_afpfs_and_ipv6_hosts():

@@ -14180,3 +14180,115 @@ def test_local_dangling_symlink_slot_is_not_a_free_slot(tmp_path):
     # through it onto the card.
     assert link.is_symlink()
     assert not target.exists()
+
+
+# --- PR 7b review follow-up: cancellation while ADVANCING the walk ------
+#
+# Codex review of #1450 (P2). Before flip B, the rsync walk hashed every
+# existing candidate, and ``_hash_dest_file`` polls ``cancel_check()`` at
+# entry — so a Stop that arrived after the orchestrator's per-file check
+# was observed within one candidate. With the size gate in place, a chain
+# of size-mismatched candidates is advanced past with no hash and no poll,
+# so a Stop goes unobserved until the walk finds a free slot. The local
+# walk never had the poll at all (it has always size-gated), so this
+# aligns both transports UP rather than restoring one of them.
+#
+# The walk now polls at the top of every iteration it reaches by
+# ADVANCING (counter > 0). The no-collision fast path — by far the common
+# case — is deliberately left unpolled so a Stop racing the loop-top check
+# cannot flip an otherwise-clean copy into a cancellation.
+
+def _mismatched_chain(dest_dir, card_file, names):
+    """Fill ``names`` in ``dest_dir`` with files that collide by name but
+    can never match by size, so the walk advances past every one."""
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    base = card_file.read_bytes()
+    for i, name in enumerate(names):
+        (dest_dir / name).write_bytes(base + b"\x00" * (17 * (i + 1)))
+
+
+def _dest_getsize_spy(monkeypatch, dest_dir):
+    """Count ``os.path.getsize`` probes inside ``dest_dir`` only."""
+    probed = []
+    real = os.path.getsize
+
+    def spy(path):
+        if os.path.dirname(str(path)) == str(dest_dir):
+            probed.append(str(path))
+        return real(path)
+
+    monkeypatch.setattr(os.path, "getsize", spy)
+    return probed
+
+
+def test_local_walk_observes_stop_while_advancing_candidates(
+        tmp_path, monkeypatch):
+    """Stop must be observed while advancing a size-mismatched collision
+    chain, not only when a candidate gets hashed."""
+    from import_job import ImportParams, run_import_job
+
+    card = _make_card(tmp_path, [
+        ("IMG_0400.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+    ])
+    archive = tmp_path / "archive"
+    dest_dir = archive / "2026" / "2026-07-03"
+    _mismatched_chain(dest_dir, card / "IMG_0400.jpg", [
+        "IMG_0400.jpg", "IMG_0400_1.jpg", "IMG_0400_2.jpg",
+    ])
+    probed = _dest_getsize_spy(monkeypatch, dest_dir)
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    result = run_import_job(
+        _make_job(), CancelOnImportingRunner(), db_path,
+        db._active_workspace_id,
+        ImportParams(sources=[str(card)], destination=str(archive)),
+    )
+
+    assert result["cancelled"] is True, result
+    assert result["copied"] == 0, result
+    assert result["failed"] == 0, result
+    # The walk stopped at the first advance instead of walking the chain
+    # to a free slot and copying there.
+    assert not (dest_dir / "IMG_0400_3.jpg").exists(), \
+        sorted(os.listdir(str(dest_dir)))
+    assert len(probed) == 1, probed
+
+
+def test_remote_walk_observes_stop_while_advancing_candidates(
+        tmp_path, monkeypatch):
+    """Remote half — the same shared-walk poll, so the same code satisfies
+    both."""
+    from import_job import ImportParams, run_import_job
+
+    ra = _remote_archive_for(tmp_path)
+    calls = _remote_calls(ra)
+    _install_fake_remote_rsync(monkeypatch, calls, verify=None)
+
+    card = _make_card(tmp_path, [
+        ("IMG_0400.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+    ])
+    mount_dir = Path(ra["mount_base"]) / "2026" / "2026-07-03"
+    _mismatched_chain(mount_dir, card / "IMG_0400.jpg", [
+        "IMG_0400.jpg", "IMG_0400_1.jpg", "IMG_0400_2.jpg",
+    ])
+    probed = _dest_getsize_spy(monkeypatch, mount_dir)
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    result = run_import_job(
+        _make_job(), CancelOnImportingRunner(), db_path,
+        db._active_workspace_id,
+        ImportParams(
+            sources=[str(card)], destination=ra["mount_base"],
+            remote_target=ra, verify_by_hash=True,
+        ),
+    )
+
+    assert result["cancelled"] is True, result
+    assert result["copied"] == 0, result
+    assert result["failed"] == 0, result
+    assert calls["rsync"] == [], calls["rsync"]
+    assert not (mount_dir / "IMG_0400_3.jpg").exists(), \
+        sorted(os.listdir(str(mount_dir)))
+    assert len(probed) == 1, probed

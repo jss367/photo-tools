@@ -290,6 +290,20 @@ Two further decisions recorded here:
   `_duplicate_gate` / `enqueue` / the walk, `_book_adoption` already carries
   the raw-vs-normalized hash split that motivated the deferral, and no third
   transport is on any horizon. YAGNI.
+- **Cancellation while advancing the walk (Codex review of PR #1450, P2 —
+  adopted after empirical confirmation).** Flip B removed the rsync walk's
+  incidental cancellation poll: `_hash_dest_file` polls `cancel_check()` at
+  entry, so hashing every existing candidate meant a Stop was observed
+  within one candidate, and the size gate skips that hash. The local walk,
+  which has always size-gated, never had the poll at all. Reproduced red on
+  both transports with a chain of size-mismatched candidates — local
+  *completed the copy* with `cancelled=False` despite Stop, remote probed
+  the whole chain. The shared walk now raises `DestReadCancelled` at the top
+  of any iteration reached by ADVANCING (`counter > 0`), which both
+  transports already book correctly. Deliberately gated on `counter`: the
+  no-collision fast path stays unpolled so a Stop racing the orchestrator's
+  loop-top check cannot flip an otherwise-clean copy into a cancellation.
+  Pinned by `test_{local,remote}_walk_observes_stop_while_advancing_candidates`.
 - **Preflight-mirror reconciliation (the PR 3 standing obligation).** Every
   change to the collision/adopt walk must be checked against the
   hand-mirrored copy in `app.py`'s recovery preview

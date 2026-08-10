@@ -3229,6 +3229,29 @@ def _resolve_dest_collision(state, batch_st, ctx, *, source_file, rel,
     stem, suffix = os.path.splitext(source_file.name)
     counter = 0
     while True:
+        if counter and stop_requested():
+            # This iteration was reached by ADVANCING past a candidate,
+            # and every advance path — claimed sibling, dangling entry,
+            # source-backed entry, unreadable candidate, size mismatch,
+            # hash mismatch — can run without calling _hash_dest_file,
+            # which is the walk's only other cancellation poll. Without
+            # this a Stop goes unobserved for the whole collision chain
+            # while the walk keeps probing a (possibly slow, possibly
+            # dying) network destination. Raise the same
+            # DestReadCancelled the hash raises so both transports book
+            # it through the handler they already have. Codex review of
+            # PR #1450; before flip B the rsync walk got this for free by
+            # hashing every existing candidate, and the local walk — which
+            # has always size-gated — never had it at all.
+            #
+            # Gated on ``counter`` deliberately: the no-collision fast
+            # path stays unpolled, so a Stop racing the orchestrator's
+            # loop-top check cannot flip an otherwise-clean copy into a
+            # cancellation.
+            raise DestReadCancelled(
+                f"import cancelled while resolving a destination name "
+                f"for {source_file}"
+            )
         candidate = (source_file.name if counter == 0
                      else f"{stem}_{counter}{suffix}")
         cand_path = os.path.join(batch_st.dest_folder, candidate)

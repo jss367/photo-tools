@@ -260,6 +260,45 @@ wrap the installed fake and re-call it with the same argument layout — and
 `remote_verify_files` must keep its
 `(rsync_bin, src_specs, rsync_target, remote, dest_is_dir=…)` shape.
 
+#### PR 7b as-built (2026-08-10)
+
+PR 7b unifies the last hand-mirrored import logic: the two collision/adopt
+walks PR 7 adaptation 2 deliberately left inside the transports. Shape:
+align-then-extract (the proven PR 6b sequence) — three behavior flips
+red-green'd per transport in place, then a provably behavior-neutral
+extraction into `_resolve_dest_collision`, then the safety flip
+(decision 13) written **once**, in the shared walk. That last commit is the
+project's thesis in miniature: the first fix in this file that lands on both
+transports by construction rather than by remembering to mirror it.
+
+Disposition of PR 7 adaptation 2's seven divergence axes:
+
+| # | Axis | Disposition |
+|---|------|-------------|
+| 1 | Loop shape (local: primary special-cased + suffix loop from 1; remote: uniform loop from 0) | Unified on the uniform loop at extraction. Behavior-neutral **after** the semantic flips below. |
+| 2 | Reservation map (remote `claimed_basenames`/`ctx.fold_basename`; local none) | Stays a per-transport parameter: `claims=None` on local (branch statically skipped), the batch map on remote. The local-vs-remote ledger difference for a same-basename identical sibling (local adopts the already-copied bytes; remote dup-skips via the claim) is **inherent to deferred transfer**, not a flip — documented, not changed. |
+| 3 | Size pre-check before hashing candidates (local yes, remote no) | Ported to remote. Outcome-invisible (same hash ⟹ same size); observable only as fewer `_hash_dest_file` calls — pinned by a call-count test. |
+| 4 | Zero-byte adopt (local: explicit primary-only branch; remote: reachable only checker-less) | Unified: `src_size == 0 and cand_size == 0` adopts at ANY candidate position on BOTH transports, red-green. |
+| 5 | Eager vs lazy source hashing | Stays per-transport via a `src_hash_fn` zero-arg callable: remote passes `lambda: src_hash` (eager hash already required by the pre-walk `queued_src_hashes` dedup), local passes its memoized lazy closure. Zero-flip. |
+| 6 | `DestReadCancelled` propagation (local: raises through to `enqueue`'s handler; remote: caught inline per-candidate) | Unified on propagate-out-of-the-walk; remote `enqueue` gains the same catch local already has. Observable behavior identical — the PR 1 geometry-B cancel pins stay green. |
+| 7 | Candidate stat/hash `OSError` (local: fails the file via the outer `except OSError`; remote: advances past the candidate) | Unified on **advance**, red-green on local. An unreadable *candidate* is a destination artifact, not a source problem; failing a healthy source file for it is wrong, and if the destination is genuinely broken the subsequent copy fails with the real error anyway. `DestReadCancelled` subclasses `OSError`, so every new advance-handler re-raises it first — otherwise the wedged-mount cancel pins would be silently swallowed into an advance. |
+
+Two further decisions recorded here:
+
+- **The pure-`_BatchResult` enqueue form (PR 7 adaptation 1's open option)
+  is DROPPED, not deferred.** The verdict idiom is now uniform across
+  `_duplicate_gate` / `enqueue` / the walk, `_book_adoption` already carries
+  the raw-vs-normalized hash split that motivated the deferral, and no third
+  transport is on any horizon. YAGNI.
+- **Axis-3 test adaptation.** `test_remote_import_cancel_interrupts_stuck_collision_hash`
+  simulates a wedged mount with FIFOs at the collision-candidate paths, and a
+  FIFO stats as size 0 — so the new size pre-check would advance past it
+  without ever reaching the wedged read the test exists to pin. A real wedged
+  SMB candidate does not report size 0 (its `stat` blocks or matches), so the
+  fixture, not the property, is what the gate invalidates: the test now stubs
+  `os.path.getsize` for the two FIFO paths to return the source size, and
+  otherwise asserts exactly what it did before.
+
 ### Entry point
 
 `run_import_job(job, runner, db_path, workspace_id, params)` keeps its exact
@@ -289,6 +328,7 @@ changes to match.
 | 10 | Adopted (crash-recovery) files get `hash_status='ok'` stamped locally but stay `NULL` remotely — found empirically by PR 1's parity net (2026-08-07): local adoption folds into `landed` and hits the verify stamp; remote adoption lives in `adopted_paths`, whose validation cross-checks bytes but never stamps | **Adopt local, via the PR 5 structural change.** Folding remote adoptions into `landed` with their verified hash makes the stamp fall out of the unified catalog pass; no separate fix PR. Pinned per-path by `test_{local,remote}_adoption_uncataloged_dest_twin_current_behavior`, which flip when PR 5 lands. |
 | 11 | Local stamping loop backfills `file_hash` on scan-NULL rows (`update_photo_hash_check(..., "ok", file_hash=verified_hash)`, ~L4511–4514 — NOT the non-backfilling stamp at L4480–4482 just above it, which handles the zero-byte case); remote stamps `"ok"` without backfilling — found by the 2026-08-08 extraction phase map (D4). Related, same loop: a zero-byte normalization-convention split (D2/D3) — remote normalizes `EMPTY_FILE_SHA256` → `None` at hash time with a `read_failed` flag; local compares raw hashes and its `verified_hash` is never `None`. | **RESOLVED 2026-08-09 (PR 6b): adopt local, with the zero-byte exclusion.** Remote backfills `file_hash` only on the scan-NULL re-read-agree path, and only with non-`EMPTY_FILE_SHA256` hashes: `file_hash=(src_hash if src_hash != EMPTY_FILE_SHA256 else None)`. Backfilling `EMPTY_FILE_SHA256` would recreate the collision the scanner's zero-byte NULL convention exists to prevent (scanner nulls empty-file hashes; `empty_hash_needs_repair` would churn repairs). The scan-hash-agrees path needs no backfill — the row already holds the hash (local doesn't backfill there either). For D2/D3, unify by normalizing at `_LandedFile` construction in 6b so both loops see the same convention. |
 | 12 | Local has a per-file dest-safety guard (`os.path.samefile` + realpath'd dest-under-source check) before copying; remote has only the folder-level `_batch_preflight` guard | **Port to remote (PR 7, red-green).** The per-file guard is NOT subsumed by the folder guard: it additionally catches `os.path.samefile` identity (hard-links/symlinks to the same inode) and a `dest_file` that is itself a symlink resolving back into the card — realpath'd at file level, where the folder guard only realpaths the folder. On remote, that geometry is exactly the safe_to_format-over-unbacked-bytes hazard the batch guard's own comment describes; today remote has no per-file defense (the collision walk would hash the symlink target — the card file itself — byte-match, and adopt). Porting is a pure tightening: it can only convert an accept into a failure in an already-unsafe geometry; expected existing-suite flips: zero. Red-green in PR 7: a remote import whose `dest_file` is symlinked into the card with `verify_by_hash=True` must yield `failed == 1`, `safe_to_format is False`. HONESTY CONSTRAINT: a source-backed SUFFIX candidate (e.g. a symlink at `name_1.ext` into the card with different bytes at the primary name) is caught by NEITHER guard on EITHER path — that per-candidate gap is pre-existing on local, and this port deliberately preserves parity rather than closing it (closing it is its own behavior change; PR 7b/follow-up). Guard comments must never claim suffix coverage that doesn't exist. |
+| 13 | Source-backed SUFFIX candidates (decision 12's KNOWN GAP): both walks hash a suffix candidate that is a symlink/hardlink back into the card, byte-match it against itself, and adopt — `safe_to_format` can go green over card-only bytes. Sibling hole: the free-slot check uses `os.path.exists`, so a DANGLING symlink at a candidate name reads as free and is chosen as the landing slot. | **Close both in PR 7b, once, in the shared walk (red-green per transport).** An existing candidate that is source-backed (`os.path.samefile(source_file, cand)` or realpath-under-any-source) is advanced past with a WARNING — never hashed, never adopted; unlike the primary-name decision-12 guard it does NOT fail the file, because one poisoned entry does not poison sibling slots (the primary guard's geometry — a template resolving into the card — does, and it keeps failing the file at the orchestrator). The free-slot check becomes `not os.path.lexists(cand)`; an `lexists`-but-not-`exists` (dangling) entry is advanced past. KNOWN-REMAINING (documented, out of scope): a candidate hardlinked to a *different* card file has no path- or inode-visible tie to this source (`samefile` false, realpath is its own path) — catching it needs `st_dev` checks against source roots. **Dangling-slot premise corrected (2026-08-10, verified before implementing):** the planning note claimed the local copy "writes through" the dangling link, landing archive bytes at the link target (possibly on the card). It does not. `copy_and_hash_verify` copies to a hidden sibling temp and promotes with a no-overwrite `os.link`, which raises `FileExistsError` on a dangling symlink (the directory entry exists), so today the file is **failed** with the misleading reason `"copy verification failed (destination bytes do not match the source)"`; the hardlinkless fallback's `os.rename` would replace the link itself, never write through it. So the defect is a spurious import failure with a wrong reason, not data loss — still worth closing, and `lexists` closes it, but the red assertion is `failed == 1`, not bytes-on-the-card. |
 
 Kept as deliberate (transport-required) differences, expressed through the
 protocol rather than duplicated code: transfer sub-progress
@@ -393,6 +433,12 @@ and goes through the normal PR-agent review cycle.
    only applies the batch-level dest-under-source guard. PR 7 must decide
    keep-both/port/drop deliberately rather than letting the merge pick a
    winner silently.*
+7b. **PR 7b — walk unification + suffix-gap closure.** *In flight
+   2026-08-10; plan at
+   `docs/superpowers/plans/2026-08-10-import-unify-pr7b-walk-unification.md`.*
+   Disposes of PR 7 adaptation 2's seven axes (table above), extracts
+   `_resolve_dest_collision`, and closes decision 13's source-backed
+   suffix-candidate and dangling-slot holes once, in the shared walk.
 8. **PR 8 (stretch) — preflight de-mirror.** Share the collision/adopt walk
    with `/api/import/check-duplicates` and friends (`app.py:18328–18522`),
    removing the third hand-mirrored copy. Only after PR 7 has soaked.

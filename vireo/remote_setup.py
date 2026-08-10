@@ -21,10 +21,17 @@ import time
 import urllib.parse
 
 # `mount` line: "<source> on <mount point> (<fstype>, opt, ...)".
-# The source is space-free for the network filesystems we accept (smbfs/afp
-# URL-encode spaces; nfs is host:/path), while the mount point may contain
-# spaces — so split at the FIRST " on " (non-greedy source).
-_MOUNT_RE = re.compile(r"^(?P<src>\S+?) on (?P<mp>.+) \((?P<opts>[^()]*)\)$")
+# Sources for the network filesystems we accept happen to be space-free
+# (smbfs/afp URL-encode spaces; nfs is host:/path), but macOS also emits
+# multi-word sources for automount triggers such as ``map auto_home on
+# /System/Volumes/Data/home (autofs, ...)``. Restricting the source to
+# ``\S+`` silently dropped those lines and let paths beneath the automount
+# be classified as local — the exact failure mode the fail-closed probe
+# path is designed to avoid. Anchor the split by requiring the mount point
+# to start with ``/`` instead: the non-greedy source stops at the FIRST
+# ``" on /"`` boundary, which unambiguously separates ``<src>`` from the
+# absolute mount path.
+_MOUNT_RE = re.compile(r"^(?P<src>.+?) on (?P<mp>/.*) \((?P<opts>[^()]*)\)$")
 # smbfs/afp source: //[user@]host/share  (URL-encoded)
 _SMB_SRC_RE = re.compile(r"^//(?:(?P<user>[^@/]+)@)?(?P<host>[^/]+)/(?P<share>.+)$")
 # nfs source: host:/export/path — host may be a hostname, IPv4, or a

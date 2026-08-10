@@ -13480,3 +13480,231 @@ def test_remote_import_dest_read_cancel_skips_catalog_scan_fresh_transfer(
         f"corner — nothing was landed or adopted, so scan() must not "
         f"run: {len(scan_calls)} calls"
     )
+
+
+# --------------------------------------------------------------------------
+# PR 7b — collision/adopt walk unification.
+#
+# Keep-pins first (Task 1): the walk behaviors that must survive the three
+# semantic alignments (Tasks 2-4) and the extraction into the shared
+# ``_resolve_dest_collision`` (Task 5) unchanged. Each pin below covers a
+# branch that had no dedicated test at the PR 7b branch point; the branches
+# that were already pinned are listed in the plan's audit step and are not
+# duplicated here.
+# --------------------------------------------------------------------------
+
+def test_remote_same_basename_identical_sibling_is_dup_skipped(
+        tmp_path, monkeypatch):
+    """KEEP-PIN (audit 2): the rsync walk's claimed-basename *match* arm.
+
+    Two card files with the SAME basename in one batch whose bytes are
+    also identical: the first claims ``DSC_0001.jpg`` in
+    ``claimed_basenames``; the second walks to counter 0, finds the name
+    claimed, sees the claim's hash equals its own, and books an
+    intra-batch duplicate skip instead of advancing to a suffix. Only the
+    different-bytes arm of that branch had a test
+    (``test_remote_import_same_basename_collision_parity``).
+
+    This is also the arm the PR 7b zero-byte flip reuses with a raw
+    ``src_hash`` of ``None``, so it must stay pinned across the flip.
+    """
+    from import_job import ImportParams, run_import_job
+
+    ra = _remote_archive_for(tmp_path)
+    calls = _remote_calls(ra)
+    _install_fake_remote_rsync(monkeypatch, calls, verify=None)
+
+    # Same basename AND same bytes, in two card subdirs, same date folder.
+    card = tmp_path / "card"
+    (card / "DCIM" / "100").mkdir(parents=True)
+    (card / "DCIM" / "101").mkdir(parents=True)
+    p1 = card / "DCIM" / "100" / "DSC_0001.jpg"
+    p2 = card / "DCIM" / "101" / "DSC_0001.jpg"
+    Image.new("RGB", (16, 16), "red").save(str(p1))
+    p2.write_bytes(p1.read_bytes())
+    ts = datetime(2026, 7, 3, 10, 0, 0).timestamp()
+    for p in (p1, p2):
+        os.utime(str(p), (ts, ts))
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws_id = db._active_workspace_id
+    result = run_import_job(
+        _make_job(), FakeRunner(), db_path, ws_id,
+        ImportParams(
+            sources=[str(card)], destination=ra["mount_base"],
+            remote_target=ra, verify_by_hash=True,
+        ),
+    )
+
+    assert result["failed"] == 0, result["unsafe_files"]
+    assert result["copied"] == 1, result
+    assert result["skipped_duplicate"] == 1, result
+    # No suffixed sibling: the second file never advanced past the
+    # claimed name.
+    mount_dir = os.path.join(ra["mount_base"], "2026", "2026-07-03")
+    assert sorted(os.listdir(mount_dir)) == ["DSC_0001.jpg"], \
+        sorted(os.listdir(mount_dir))
+    assert len(_photo_rows(db)) == 1
+
+
+def test_remote_intra_batch_content_dedup_skips_renamed_twin(
+        tmp_path, monkeypatch):
+    """KEEP-PIN (audit 3): the ``queued_src_hashes`` positive arm.
+
+    Two byte-identical card files with DIFFERENT basenames in one batch,
+    with duplicate skipping ON: the second is skipped against the first's
+    queued source hash, before the collision walk runs at all. Only the
+    negative contract (``skip_duplicates=False`` must queue both — PR
+    #1113) had a test; this pins the arm that populates the map, which
+    the PR 7b extraction leaves in ``enqueue`` rather than moving into the
+    shared walk.
+    """
+    import shutil as _shutil
+
+    from import_job import ImportParams, run_import_job
+
+    ra = _remote_archive_for(tmp_path)
+    calls = _remote_calls(ra)
+    _install_fake_remote_rsync(monkeypatch, calls, verify=None)
+
+    card = _make_card(tmp_path, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+    ])
+    _shutil.copy2(str(card / "DSC_0001.jpg"), str(card / "DSC_0002.jpg"))
+    ts = datetime(2026, 7, 3, 10, 0, 0).timestamp()
+    os.utime(str(card / "DSC_0002.jpg"), (ts, ts))
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws_id = db._active_workspace_id
+    result = run_import_job(
+        _make_job(), FakeRunner(), db_path, ws_id,
+        ImportParams(
+            sources=[str(card)], destination=ra["mount_base"],
+            remote_target=ra, verify_by_hash=True,
+        ),
+    )
+
+    assert result["failed"] == 0, result
+    assert result["copied"] == 1, result
+    assert result["skipped_duplicate"] == 1, result
+    # Exactly one file crossed the transport.
+    transferred = sorted({
+        os.path.basename(s)
+        for c in calls["rsync"] for s in c["src_specs"]
+    })
+    assert transferred == ["DSC_0001.jpg"], transferred
+
+
+def _same_size_filler(reference_path):
+    """Bytes that are NOT ``reference_path``'s but are exactly as long.
+
+    The local walk gates candidate hashing on a size match, so a
+    different-content collision that must still reach ``_hash_dest_file``
+    has to be built by length, not by saving another image.
+    """
+    data = Path(reference_path).read_bytes()
+    return bytes((b ^ 0xFF) for b in data)
+
+
+def test_local_cancel_during_primary_candidate_hash_is_a_cancel(
+        tmp_path, monkeypatch):
+    """KEEP-PIN (audit 4, local half): ``DestReadCancelled`` raised by the
+    collision walk's PRIMARY-name hash must cancel the run — never be
+    absorbed into "unreadable candidate" handling.
+
+    ``DestReadCancelled`` subclasses ``OSError``, so any ``except OSError``
+    the walk grows around ``_hash_dest_file`` (PR 7b flip C makes an
+    unreadable candidate advance instead of failing the file) would
+    silently swallow a Stop and let the run keep touching the wedged
+    destination. The remote half of this branch is pinned by
+    ``test_remote_import_cancel_interrupts_stuck_collision_hash``; the
+    local half had no pin.
+
+    The raise is injected rather than produced by a wedged FIFO because
+    the local walk's size pre-check never hashes a 0-sized FIFO — see the
+    ``_same_size_filler`` collision below, which is what gets the walk to
+    the hash at all.
+    """
+    import import_job as _ij
+    from import_job import DestReadCancelled, ImportParams
+
+    card = _make_card(tmp_path, [
+        ("IMG_0300.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+    ])
+    archive = tmp_path / "archive"
+    dest_dir = archive / "2026" / "2026-07-03"
+    dest_dir.mkdir(parents=True)
+    collision = dest_dir / "IMG_0300.jpg"
+    collision.write_bytes(_same_size_filler(card / "IMG_0300.jpg"))
+
+    real_hash = _ij._hash_dest_file
+    hashed = []
+
+    def cancelling_hash(path, cancel_check, **kw):
+        hashed.append(path)
+        if os.path.dirname(str(path)) == str(dest_dir):
+            raise DestReadCancelled(f"import cancelled reading {path}")
+        return real_hash(path, cancel_check, **kw)
+
+    monkeypatch.setattr(_ij, "_hash_dest_file", cancelling_hash)
+
+    db, ws_id, result = _run_import(tmp_path, ImportParams(
+        sources=[str(card)], destination=str(archive),
+    ))
+
+    assert result["cancelled"] is True, result
+    assert result["failed"] == 0, result
+    assert result["copied"] == 0, result
+    assert result["skipped_duplicate"] == 0, result
+    # Nothing landed, so nothing was cataloged.
+    assert _photo_rows(db) == []
+    # Only the primary candidate was read: the cancel left the walk
+    # rather than advancing to IMG_0300_1.jpg on the same sick mount.
+    assert hashed == [str(collision)], hashed
+
+
+def test_local_cancel_during_suffix_candidate_hash_is_a_cancel(
+        tmp_path, monkeypatch):
+    """KEEP-PIN (audit 4, local half, suffix position).
+
+    Same contract as the primary-name pin above, one candidate further
+    into the walk — flip C wraps BOTH hash sites, so both need a
+    ``DestReadCancelled`` pin.
+    """
+    import import_job as _ij
+    from import_job import DestReadCancelled, ImportParams
+
+    card = _make_card(tmp_path, [
+        ("IMG_0300.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+    ])
+    archive = tmp_path / "archive"
+    dest_dir = archive / "2026" / "2026-07-03"
+    dest_dir.mkdir(parents=True)
+    filler = _same_size_filler(card / "IMG_0300.jpg")
+    (dest_dir / "IMG_0300.jpg").write_bytes(filler)
+    suffix_cand = dest_dir / "IMG_0300_1.jpg"
+    suffix_cand.write_bytes(filler)
+
+    real_hash = _ij._hash_dest_file
+
+    def cancelling_hash(path, cancel_check, **kw):
+        if str(path) == str(suffix_cand):
+            raise DestReadCancelled(f"import cancelled reading {path}")
+        return real_hash(path, cancel_check, **kw)
+
+    monkeypatch.setattr(_ij, "_hash_dest_file", cancelling_hash)
+
+    db, ws_id, result = _run_import(tmp_path, ImportParams(
+        sources=[str(card)], destination=str(archive),
+    ))
+
+    assert result["cancelled"] is True, result
+    assert result["failed"] == 0, result
+    assert result["copied"] == 0, result
+    assert _photo_rows(db) == []
+    # The walk stopped at the suffix candidate — no IMG_0300_2.jpg.
+    assert sorted(os.listdir(str(dest_dir))) == [
+        "IMG_0300.jpg", "IMG_0300_1.jpg",
+    ], sorted(os.listdir(str(dest_dir)))

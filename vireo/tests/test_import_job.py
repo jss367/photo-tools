@@ -12455,6 +12455,38 @@ def test_remote_import_cancel_interrupts_stuck_collision_hash(
     db = Database(db_path)
     ws_id = db._active_workspace_id
 
+    # FIXTURE ADAPTATION (PR 7b). The walk screens candidates on their
+    # stat before reading them — a size match (flip B) and a regular-file
+    # check (CodeRabbit review of #1450) — and a FIFO fails BOTH: it
+    # reports size 0 and mode S_IFIFO. Without this stub the wedged
+    # candidates would be advanced past without ever being read and every
+    # assertion below would pass vacuously.
+    #
+    # A real wedged SMB candidate is a REGULAR file of the expected size
+    # whose READ blocks; that blocking read is the only property this
+    # test needs a FIFO for, and its mode and 0 size are artifacts of the
+    # simulation. So present the two FIFOs as regular files of the
+    # source's size and let the genuine blocking open() still happen —
+    # the fixture is what the screening invalidates, not the property
+    # under test.
+    import stat as _stat
+    _card_size = os.path.getsize(str(card_file))
+    _fifo_paths = {str(collision), str(next_collision)}
+    _real_stat = os.stat
+
+    def _stat_with_live_fifos(path, *args, **kwargs):
+        st = _real_stat(path, *args, **kwargs)
+        if str(path) in _fifo_paths:
+            return os.stat_result((
+                (st.st_mode & ~_stat.S_IFMT(st.st_mode)) | _stat.S_IFREG,
+                st.st_ino, st.st_dev, st.st_nlink, st.st_uid, st.st_gid,
+                _card_size,
+                int(st.st_atime), int(st.st_mtime), int(st.st_ctime),
+            ))
+        return st
+
+    monkeypatch.setattr(os, "stat", _stat_with_live_fifos)
+
     # Spy on the collision-candidate probe. ``os.path.exists`` gets called
     # once per candidate iteration, so without the inner break Codex asked
     # for, cancelling on the primary FIFO's hash would fall through to the
@@ -12508,9 +12540,13 @@ def test_remote_import_cancel_interrupts_stuck_collision_hash(
     # advance to ``IMG_0300_1.jpg`` and hash it too before observing
     # cancellation at the outer batch boundary.
     dest_hashes = [p for p in hashed_paths if str(dest_dir) in str(p)]
-    assert len(dest_hashes) <= 1, (
-        f"collision loop hashed multiple dead-mount candidates on cancel: "
-        f"{dest_hashes}"
+    assert len(dest_hashes) == 1, (
+        f"the collision loop must hash EXACTLY ONE dead-mount candidate "
+        f"on cancel: more than one means it advanced past the wedged "
+        f"primary instead of leaving the loop; zero means the walk never "
+        f"reached the read this test exists to interrupt (any candidate "
+        f"screening that filters the FIFO out before the read — the size "
+        f"gate, the regular-file check — looks like that) — {dest_hashes}"
     )
 
 
@@ -13480,3 +13516,1089 @@ def test_remote_import_dest_read_cancel_skips_catalog_scan_fresh_transfer(
         f"corner — nothing was landed or adopted, so scan() must not "
         f"run: {len(scan_calls)} calls"
     )
+
+
+# --------------------------------------------------------------------------
+# PR 7b — collision/adopt walk unification.
+#
+# Keep-pins first (Task 1): the walk behaviors that must survive the three
+# semantic alignments (Tasks 2-4) and the extraction into the shared
+# ``_resolve_dest_collision`` (Task 5) unchanged. Each pin below covers a
+# branch that had no dedicated test at the PR 7b branch point; the branches
+# that were already pinned are listed in the plan's audit step and are not
+# duplicated here.
+# --------------------------------------------------------------------------
+
+def test_remote_same_basename_identical_sibling_is_dup_skipped(
+        tmp_path, monkeypatch):
+    """KEEP-PIN (audit 2): the rsync walk's claimed-basename *match* arm.
+
+    Two card files with the SAME basename in one batch whose bytes are
+    also identical: the first claims ``DSC_0001.jpg`` in
+    ``claimed_basenames``; the second walks to counter 0, finds the name
+    claimed, sees the claim's hash equals its own, and books an
+    intra-batch duplicate skip instead of advancing to a suffix. Only the
+    different-bytes arm of that branch had a test
+    (``test_remote_import_same_basename_collision_parity``).
+
+    This is also the arm the PR 7b zero-byte flip reuses with a raw
+    ``src_hash`` of ``None``, so it must stay pinned across the flip.
+    """
+    from import_job import ImportParams, run_import_job
+
+    ra = _remote_archive_for(tmp_path)
+    calls = _remote_calls(ra)
+    _install_fake_remote_rsync(monkeypatch, calls, verify=None)
+
+    # Same basename AND same bytes, in two card subdirs, same date folder.
+    card = tmp_path / "card"
+    (card / "DCIM" / "100").mkdir(parents=True)
+    (card / "DCIM" / "101").mkdir(parents=True)
+    p1 = card / "DCIM" / "100" / "DSC_0001.jpg"
+    p2 = card / "DCIM" / "101" / "DSC_0001.jpg"
+    Image.new("RGB", (16, 16), "red").save(str(p1))
+    p2.write_bytes(p1.read_bytes())
+    ts = datetime(2026, 7, 3, 10, 0, 0).timestamp()
+    for p in (p1, p2):
+        os.utime(str(p), (ts, ts))
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws_id = db._active_workspace_id
+    result = run_import_job(
+        _make_job(), FakeRunner(), db_path, ws_id,
+        ImportParams(
+            sources=[str(card)], destination=ra["mount_base"],
+            remote_target=ra, verify_by_hash=True,
+        ),
+    )
+
+    assert result["failed"] == 0, result["unsafe_files"]
+    assert result["copied"] == 1, result
+    assert result["skipped_duplicate"] == 1, result
+    # No suffixed sibling: the second file never advanced past the
+    # claimed name.
+    mount_dir = os.path.join(ra["mount_base"], "2026", "2026-07-03")
+    assert sorted(os.listdir(mount_dir)) == ["DSC_0001.jpg"], \
+        sorted(os.listdir(mount_dir))
+    assert len(_photo_rows(db)) == 1
+
+
+def test_remote_intra_batch_content_dedup_skips_renamed_twin(
+        tmp_path, monkeypatch):
+    """KEEP-PIN (audit 3): the ``queued_src_hashes`` positive arm.
+
+    Two byte-identical card files with DIFFERENT basenames in one batch,
+    with duplicate skipping ON: the second is skipped against the first's
+    queued source hash, before the collision walk runs at all. Only the
+    negative contract (``skip_duplicates=False`` must queue both — PR
+    #1113) had a test; this pins the arm that populates the map, which
+    the PR 7b extraction leaves in ``enqueue`` rather than moving into the
+    shared walk.
+    """
+    import shutil as _shutil
+
+    from import_job import ImportParams, run_import_job
+
+    ra = _remote_archive_for(tmp_path)
+    calls = _remote_calls(ra)
+    _install_fake_remote_rsync(monkeypatch, calls, verify=None)
+
+    card = _make_card(tmp_path, [
+        ("DSC_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+    ])
+    _shutil.copy2(str(card / "DSC_0001.jpg"), str(card / "DSC_0002.jpg"))
+    ts = datetime(2026, 7, 3, 10, 0, 0).timestamp()
+    os.utime(str(card / "DSC_0002.jpg"), (ts, ts))
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws_id = db._active_workspace_id
+    result = run_import_job(
+        _make_job(), FakeRunner(), db_path, ws_id,
+        ImportParams(
+            sources=[str(card)], destination=ra["mount_base"],
+            remote_target=ra, verify_by_hash=True,
+        ),
+    )
+
+    assert result["failed"] == 0, result
+    assert result["copied"] == 1, result
+    assert result["skipped_duplicate"] == 1, result
+    # Exactly one file crossed the transport.
+    transferred = sorted({
+        os.path.basename(s)
+        for c in calls["rsync"] for s in c["src_specs"]
+    })
+    assert transferred == ["DSC_0001.jpg"], transferred
+
+
+def _same_size_filler(reference_path):
+    """Bytes that are NOT ``reference_path``'s but are exactly as long.
+
+    The local walk gates candidate hashing on a size match, so a
+    different-content collision that must still reach ``_hash_dest_file``
+    has to be built by length, not by saving another image.
+    """
+    data = Path(reference_path).read_bytes()
+    return bytes((b ^ 0xFF) for b in data)
+
+
+def test_local_cancel_during_primary_candidate_hash_is_a_cancel(
+        tmp_path, monkeypatch):
+    """KEEP-PIN (audit 4, local half): ``DestReadCancelled`` raised by the
+    collision walk's PRIMARY-name hash must cancel the run — never be
+    absorbed into "unreadable candidate" handling.
+
+    ``DestReadCancelled`` subclasses ``OSError``, so any ``except OSError``
+    the walk grows around ``_hash_dest_file`` (PR 7b flip C makes an
+    unreadable candidate advance instead of failing the file) would
+    silently swallow a Stop and let the run keep touching the wedged
+    destination. The remote half of this branch is pinned by
+    ``test_remote_import_cancel_interrupts_stuck_collision_hash``; the
+    local half had no pin.
+
+    The raise is injected rather than produced by a wedged FIFO because
+    the local walk's size pre-check never hashes a 0-sized FIFO — see the
+    ``_same_size_filler`` collision below, which is what gets the walk to
+    the hash at all.
+    """
+    import import_job as _ij
+    from import_job import DestReadCancelled, ImportParams
+
+    card = _make_card(tmp_path, [
+        ("IMG_0300.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+    ])
+    archive = tmp_path / "archive"
+    dest_dir = archive / "2026" / "2026-07-03"
+    dest_dir.mkdir(parents=True)
+    collision = dest_dir / "IMG_0300.jpg"
+    collision.write_bytes(_same_size_filler(card / "IMG_0300.jpg"))
+
+    real_hash = _ij._hash_dest_file
+    hashed = []
+
+    def cancelling_hash(path, cancel_check, **kw):
+        hashed.append(path)
+        if os.path.dirname(str(path)) == str(dest_dir):
+            raise DestReadCancelled(f"import cancelled reading {path}")
+        return real_hash(path, cancel_check, **kw)
+
+    monkeypatch.setattr(_ij, "_hash_dest_file", cancelling_hash)
+
+    db, ws_id, result = _run_import(tmp_path, ImportParams(
+        sources=[str(card)], destination=str(archive),
+    ))
+
+    assert result["cancelled"] is True, result
+    assert result["failed"] == 0, result
+    assert result["copied"] == 0, result
+    assert result["skipped_duplicate"] == 0, result
+    # Nothing landed, so nothing was cataloged.
+    assert _photo_rows(db) == []
+    # Only the primary candidate was read: the cancel left the walk
+    # rather than advancing to IMG_0300_1.jpg on the same sick mount.
+    assert hashed == [str(collision)], hashed
+
+
+def test_local_cancel_during_suffix_candidate_hash_is_a_cancel(
+        tmp_path, monkeypatch):
+    """KEEP-PIN (audit 4, local half, suffix position).
+
+    Same contract as the primary-name pin above, one candidate further
+    into the walk — flip C wraps BOTH hash sites, so both need a
+    ``DestReadCancelled`` pin.
+    """
+    import import_job as _ij
+    from import_job import DestReadCancelled, ImportParams
+
+    card = _make_card(tmp_path, [
+        ("IMG_0300.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+    ])
+    archive = tmp_path / "archive"
+    dest_dir = archive / "2026" / "2026-07-03"
+    dest_dir.mkdir(parents=True)
+    filler = _same_size_filler(card / "IMG_0300.jpg")
+    (dest_dir / "IMG_0300.jpg").write_bytes(filler)
+    suffix_cand = dest_dir / "IMG_0300_1.jpg"
+    suffix_cand.write_bytes(filler)
+
+    real_hash = _ij._hash_dest_file
+
+    def cancelling_hash(path, cancel_check, **kw):
+        if str(path) == str(suffix_cand):
+            raise DestReadCancelled(f"import cancelled reading {path}")
+        return real_hash(path, cancel_check, **kw)
+
+    monkeypatch.setattr(_ij, "_hash_dest_file", cancelling_hash)
+
+    db, ws_id, result = _run_import(tmp_path, ImportParams(
+        sources=[str(card)], destination=str(archive),
+    ))
+
+    assert result["cancelled"] is True, result
+    assert result["failed"] == 0, result
+    assert result["copied"] == 0, result
+    assert _photo_rows(db) == []
+    # The walk stopped at the suffix candidate — no IMG_0300_2.jpg.
+    assert sorted(os.listdir(str(dest_dir))) == [
+        "IMG_0300.jpg", "IMG_0300_1.jpg",
+    ], sorted(os.listdir(str(dest_dir)))
+
+
+# --- PR 7b flip A: zero-byte twins adopt at ANY candidate position -------
+#
+# Before the flip the two walks disagreed twice over zero-byte sources.
+# Local had an explicit zero-byte adopt branch, but only at the PRIMARY
+# name; at a suffix position a checker'd zero-byte source hashes to None
+# and can never match, so it landed a pointless extra empty copy. Remote
+# had no branch at all: with a checker its ``src_hash`` is None, so even
+# the primary-name empty twin never matched and got suffixed.
+#
+# Unified rule, both transports, every candidate position:
+# ``src_size == 0 and cand_size == 0`` adopts. All zero-byte files are
+# identical by definition, which is exactly why local shipped the branch;
+# ``DuplicateChecker.record()`` returns ``()`` for a zero-byte source, so
+# the raw-vs-normalized ``record_hash`` split is unobservable here.
+#
+# The checker-LESS halves of both branches (``skip_duplicates=False``,
+# where the source hash is a real EMPTY_FILE_SHA256 and matches on-disk)
+# already adopted before this flip and are pinned by
+# ``test_{local,remote}_zero_byte_adoption_revalidates_before_stamping``.
+
+def _make_zero_byte_card(tmp_path, name="IMG_0001.jpg",
+                         when=datetime(2026, 7, 3, 10, 0, 0)):
+    card = tmp_path / "card"
+    card.mkdir(exist_ok=True)
+    src = card / name
+    src.touch()
+    ts = when.timestamp()
+    os.utime(str(src), (ts, ts))
+    return card, src
+
+
+def test_remote_zero_byte_twin_at_primary_adopts_with_checker(
+        tmp_path, monkeypatch):
+    """Remote, duplicate skipping ON: an empty file already on the mount at
+    the primary name must be ADOPTED, not suffixed.
+
+    With a checker the source hash is None (the zero-byte convention), so
+    the on-disk hash comparison can never match and the walk used to
+    advance — transferring a second empty file to ``IMG_0001_1.jpg`` and
+    cataloging two rows for one card photo.
+    """
+    from import_job import EMPTY_FILE_SHA256, ImportParams, run_import_job
+
+    ra = _remote_archive_for(tmp_path)
+    calls = _remote_calls(ra)
+    _install_fake_remote_rsync(monkeypatch, calls, verify=None)
+
+    card, _src = _make_zero_byte_card(tmp_path)
+    mount_dir = Path(ra["mount_base"]) / "2026" / "2026-07-03"
+    mount_dir.mkdir(parents=True)
+    (mount_dir / "IMG_0001.jpg").touch()
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws_id = db._active_workspace_id
+    result = run_import_job(
+        _make_job(), FakeRunner(), db_path, ws_id,
+        ImportParams(
+            sources=[str(card)], destination=ra["mount_base"],
+            remote_target=ra, verify_by_hash=True,
+        ),
+    )
+
+    assert result["failed"] == 0, result["unsafe_files"]
+    assert result["copied"] == 0, result
+    assert result["skipped_duplicate"] == 1, result
+    # Nothing crossed the transport, and no suffixed empty twin exists.
+    assert calls["rsync"] == [], calls["rsync"]
+    assert sorted(os.listdir(str(mount_dir))) == ["IMG_0001.jpg"], \
+        sorted(os.listdir(str(mount_dir)))
+    # The adoption rides ``landed``, so it is cataloged and stamped like
+    # the local path's zero-byte adopt (spec decisions 10/11: the row's
+    # file_hash stays NULL under the scanner's zero-byte convention).
+    rows = _photo_rows(db)
+    assert len(rows) == 1, [dict(r) for r in rows]
+    assert rows[0]["filename"] == "IMG_0001.jpg"
+    assert rows[0]["hash_status"] == "ok"
+    assert rows[0]["file_hash"] in (None, EMPTY_FILE_SHA256)
+
+
+def test_local_zero_byte_suffix_candidate_adopts_with_checker(tmp_path):
+    """Local, duplicate skipping ON: an empty file already at a SUFFIX
+    candidate must be adopted, exactly as one at the primary name is.
+
+    Local's zero-byte branch only ever ran at the primary name; in the
+    suffix loop a checker'd zero-byte source hashes to None, never matched,
+    and the run copied a third empty file to ``IMG_0001_2.jpg``.
+    """
+    from import_job import ImportParams
+
+    card, src = _make_zero_byte_card(tmp_path)
+    archive = tmp_path / "archive"
+    dest_dir = archive / "2026" / "2026-07-03"
+    dest_dir.mkdir(parents=True)
+    # Primary name taken by an unrelated NON-empty file (so the primary
+    # zero-byte branch cannot fire), this source's empty twin parked at
+    # the first suffix by a prior run that died before its scan.
+    Image.new("RGB", (16, 16), "blue").save(str(dest_dir / "IMG_0001.jpg"))
+    (dest_dir / "IMG_0001_1.jpg").touch()
+
+    db, ws_id, result = _run_import(tmp_path, ImportParams(
+        sources=[str(card)], destination=str(archive),
+    ))
+
+    assert result["failed"] == 0, result["unsafe_files"]
+    assert result["copied"] == 0, result
+    assert result["skipped_duplicate"] == 1, result
+    assert sorted(os.listdir(str(dest_dir))) == [
+        "IMG_0001.jpg", "IMG_0001_1.jpg",
+    ], sorted(os.listdir(str(dest_dir)))
+    adopted = [r for r in _photo_rows(db) if r["filename"] == "IMG_0001_1.jpg"]
+    assert len(adopted) == 1, [dict(r) for r in _photo_rows(db)]
+    assert adopted[0]["hash_status"] == "ok"
+
+
+# --- PR 7b flip B: the rsync walk gains local's size pre-check ----------
+
+def test_remote_size_mismatched_candidate_not_hashed(tmp_path, monkeypatch):
+    """The rsync walk must not hash a candidate whose size already rules
+    out a byte match.
+
+    Local has always gated candidate hashing on ``getsize(cand) ==
+    src_size``; remote hashed every existing candidate. The outcome is the
+    same either way (equal hashes imply equal sizes), so this is invisible
+    in the result dict — but the archive is a network mount, and a full
+    hash read of a file that cannot possibly match is pure wasted round
+    trips. Pinned by call counting, plus the unchanged landing.
+    """
+    import import_job as _ij
+    from import_job import ImportParams, run_import_job
+
+    ra = _remote_archive_for(tmp_path)
+    calls = _remote_calls(ra)
+    _install_fake_remote_rsync(monkeypatch, calls, verify=None)
+
+    card = _make_card(tmp_path, [
+        ("IMG_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+    ])
+    mount_dir = Path(ra["mount_base"]) / "2026" / "2026-07-03"
+    mount_dir.mkdir(parents=True)
+    collision = mount_dir / "IMG_0001.jpg"
+    # Different content AND a different length from the card file, so the
+    # size gate alone is enough to rule it out.
+    collision.write_bytes(
+        (card / "IMG_0001.jpg").read_bytes() + b"\x00" * 512)
+    assert collision.stat().st_size != (card / "IMG_0001.jpg").stat().st_size
+
+    real_hash = _ij._hash_dest_file
+    hashed = []
+
+    def counting_hash(path, cancel_check, **kw):
+        hashed.append(str(path))
+        return real_hash(path, cancel_check, **kw)
+
+    monkeypatch.setattr(_ij, "_hash_dest_file", counting_hash)
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws_id = db._active_workspace_id
+    result = run_import_job(
+        _make_job(), FakeRunner(), db_path, ws_id,
+        ImportParams(
+            sources=[str(card)], destination=ra["mount_base"],
+            remote_target=ra, verify_by_hash=True,
+        ),
+    )
+
+    assert str(collision) not in hashed, hashed
+    # Outcome unchanged: the file still advances past the collision and
+    # lands at the first free suffix.
+    assert result["failed"] == 0, result["unsafe_files"]
+    assert result["copied"] == 1, result
+    assert sorted(os.listdir(str(mount_dir))) == [
+        "IMG_0001.jpg", "IMG_0001_1.jpg",
+    ], sorted(os.listdir(str(mount_dir)))
+
+
+# --- PR 7b flip C: local advances past unreadable candidates ------------
+#
+# An unreadable *candidate* is a destination artifact, not a source
+# problem. Remote has always advanced past one; local let the OSError
+# escape to ``enqueue``'s outer handler and failed the healthy source
+# file. Unified on advance: if the destination is genuinely broken, the
+# copy that follows fails with the real error anyway, and if only that one
+# entry is sick the photo still gets imported at a safe slot.
+#
+# DestReadCancelled subclasses OSError, so each new handler re-raises it
+# first; the two local cancel keep-pins above are what hold that.
+
+def _delegating_stat_raiser(monkeypatch, bad_path, errno_msg="stale"):
+    """Make ``os.stat`` raise OSError for exactly ``bad_path``.
+
+    Must patch ``os.stat`` and not ``os.path.getsize``: the walk reads
+    candidate metadata with a single ``os.stat`` that doubles as its
+    existence probe, so a ``getsize`` patch is never reached and the test
+    would pass through the ordinary collision path — green even with the
+    error handling deleted (Codex review of PR #1450, caught exactly that).
+    """
+    real = os.stat
+
+    def fake(path, *args, **kwargs):
+        if str(path) == str(bad_path):
+            raise OSError(errno_msg)
+        return real(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "stat", fake)
+
+
+def _delegating_hash_raiser(monkeypatch, bad_path):
+    """Make ``_hash_dest_file`` raise OSError for exactly ``bad_path``."""
+    import import_job as _ij
+    real = _ij._hash_dest_file
+
+    def fake(path, cancel_check, **kw):
+        if str(path) == str(bad_path):
+            raise OSError("unreadable destination candidate")
+        return real(path, cancel_check, **kw)
+
+    monkeypatch.setattr(_ij, "_hash_dest_file", fake)
+
+
+def test_local_unreadable_primary_candidate_advances(tmp_path, monkeypatch):
+    """A primary-name candidate whose ``getsize`` fails must not fail the
+    source file — the walk advances to the next suffix and imports it."""
+    from import_job import ImportParams
+
+    card = _make_card(tmp_path, [
+        ("IMG_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+    ])
+    archive = tmp_path / "archive"
+    dest_dir = archive / "2026" / "2026-07-03"
+    dest_dir.mkdir(parents=True)
+    collision = dest_dir / "IMG_0001.jpg"
+    Image.new("RGB", (16, 16), "blue").save(str(collision))
+
+    _delegating_stat_raiser(monkeypatch, collision)
+
+    db, ws_id, result = _run_import(tmp_path, ImportParams(
+        sources=[str(card)], destination=str(archive),
+    ))
+
+    assert result["failed"] == 0, result["unsafe_files"]
+    assert result["copied"] == 1, result
+    landed = [r for r in _photo_rows(db) if r["filename"] == "IMG_0001_1.jpg"]
+    assert len(landed) == 1, [dict(r) for r in _photo_rows(db)]
+
+
+def test_local_unhashable_same_size_primary_candidate_advances(
+        tmp_path, monkeypatch):
+    """A primary-name candidate that stats fine but cannot be READ must
+    also advance rather than fail the source file."""
+    from import_job import ImportParams
+
+    card = _make_card(tmp_path, [
+        ("IMG_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+    ])
+    archive = tmp_path / "archive"
+    dest_dir = archive / "2026" / "2026-07-03"
+    dest_dir.mkdir(parents=True)
+    collision = dest_dir / "IMG_0001.jpg"
+    # Same size as the source so the walk gets past the size gate and
+    # actually attempts the read.
+    collision.write_bytes(_same_size_filler(card / "IMG_0001.jpg"))
+
+    _delegating_hash_raiser(monkeypatch, collision)
+
+    db, ws_id, result = _run_import(tmp_path, ImportParams(
+        sources=[str(card)], destination=str(archive),
+    ))
+
+    assert result["failed"] == 0, result["unsafe_files"]
+    assert result["copied"] == 1, result
+    landed = [r for r in _photo_rows(db) if r["filename"] == "IMG_0001_1.jpg"]
+    assert len(landed) == 1, [dict(r) for r in _photo_rows(db)]
+
+
+def test_local_unhashable_suffix_candidate_advances(tmp_path, monkeypatch):
+    """Same contract one candidate further into the walk: the suffix
+    loop's read failure advances to the next suffix, it does not fail the
+    file. (The suffix loop's ``getsize`` failure already advanced before
+    this flip — ``cand_size = -1`` — so only the read needed changing.)"""
+    from import_job import ImportParams
+
+    card = _make_card(tmp_path, [
+        ("IMG_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+    ])
+    archive = tmp_path / "archive"
+    dest_dir = archive / "2026" / "2026-07-03"
+    dest_dir.mkdir(parents=True)
+    filler = _same_size_filler(card / "IMG_0001.jpg")
+    (dest_dir / "IMG_0001.jpg").write_bytes(filler)
+    sick = dest_dir / "IMG_0001_1.jpg"
+    sick.write_bytes(filler)
+
+    _delegating_hash_raiser(monkeypatch, sick)
+
+    db, ws_id, result = _run_import(tmp_path, ImportParams(
+        sources=[str(card)], destination=str(archive),
+    ))
+
+    assert result["failed"] == 0, result["unsafe_files"]
+    assert result["copied"] == 1, result
+    landed = [r for r in _photo_rows(db) if r["filename"] == "IMG_0001_2.jpg"]
+    assert len(landed) == 1, [dict(r) for r in _photo_rows(db)]
+
+
+# --- PR 7b flip D (spec decision 13): the walk refuses source-backed and
+# --- dangling candidates -------------------------------------------------
+#
+# Written ONCE, in the shared walk, and therefore true on both transports
+# by construction. That is the whole point of the extraction above: the
+# failure mode this project exists to end is a fix landing on one
+# hand-mirrored path while the other silently keeps the bug.
+#
+# Decision 12 gave the orchestrator a per-file guard for the PRIMARY dest
+# name, and its docstring was explicit that suffix candidates were NOT
+# covered on either path. This is that gap.
+
+def _card_symlink_geometry(root, *, dest_dir, dangling=False):
+    """Card with IMG_0001.jpg; ``dest_dir`` gets a different-bytes file at
+    the primary name and a symlink at the first suffix.
+
+    Returns ``(card, card_file, link, link_target)``. With
+    ``dangling=True`` the link points at a path inside the card that does
+    not exist.
+    """
+    card = _make_card(root, [
+        ("IMG_0001.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+    ])
+    card_file = card / "IMG_0001.jpg"
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    Image.new("RGB", (16, 16), "blue").save(str(dest_dir / "IMG_0001.jpg"))
+    link = dest_dir / "IMG_0001_1.jpg"
+    target = (card / "NOT_THERE.jpg") if dangling else card_file
+    os.symlink(str(target), str(link))
+    return card, card_file, link, target
+
+
+def test_local_source_backed_suffix_candidate_not_adopted(
+        tmp_path, caplog):
+    """A suffix candidate that is a symlink back into the card must never
+    be adopted.
+
+    The data-loss shape: the walk hashes the link, reads the CARD's own
+    bytes through it, matches them against themselves, books
+    ``skipped_duplicate``, and ``safe_to_format`` goes green — over bytes
+    that exist nowhere but the card. Format the card and the photo is gone.
+    Advance past it instead and import the file at a real slot.
+    """
+    import logging
+
+    from import_job import ImportParams
+
+    archive = tmp_path / "archive"
+    dest_dir = archive / "2026" / "2026-07-03"
+    card, card_file, link, _target = _card_symlink_geometry(
+        tmp_path, dest_dir=dest_dir)
+
+    with caplog.at_level(logging.WARNING, logger="import_job"):
+        db, ws_id, result = _run_import(tmp_path, ImportParams(
+            sources=[str(card)], destination=str(archive),
+        ))
+
+    assert result["failed"] == 0, result["unsafe_files"]
+    assert result["skipped_duplicate"] == 0, result
+    assert result["copied"] == 1, result
+    # Real bytes at a real slot — not a symlink, and not the card's inode.
+    landed = dest_dir / "IMG_0001_2.jpg"
+    assert landed.exists() and not landed.is_symlink()
+    assert landed.read_bytes() == card_file.read_bytes()
+    assert not os.path.samefile(str(landed), str(card_file))
+    # The poisoned candidate is untouched.
+    assert link.is_symlink()
+    # Compare where the link RESOLVES, not the literal stored target:
+    # Windows returns the extended-length spelling (``\\?\C:\...``) from
+    # os.readlink while ``str(card_file)`` is the plain form, so a
+    # string comparison fails there on path spelling alone.
+    assert os.path.realpath(str(link)) == os.path.realpath(str(card_file))
+    assert any(
+        str(link) in r.getMessage() and "source media" in r.getMessage()
+        for r in caplog.records
+    ), [r.getMessage() for r in caplog.records]
+
+
+def test_remote_source_backed_suffix_candidate_not_adopted(
+        tmp_path, monkeypatch):
+    """Remote half of the same rule — and, because the walk is shared, it
+    is satisfied by exactly the same code as the local half."""
+    from import_job import ImportParams, run_import_job
+
+    ra = _remote_archive_for(tmp_path)
+    calls = _remote_calls(ra)
+    _install_fake_remote_rsync(monkeypatch, calls, verify=None)
+
+    mount_dir = Path(ra["mount_base"]) / "2026" / "2026-07-03"
+    card, card_file, link, _target = _card_symlink_geometry(
+        tmp_path, dest_dir=mount_dir)
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws_id = db._active_workspace_id
+    result = run_import_job(
+        _make_job(), FakeRunner(), db_path, ws_id,
+        ImportParams(
+            sources=[str(card)], destination=ra["mount_base"],
+            remote_target=ra, verify_by_hash=True,
+        ),
+    )
+
+    assert result["failed"] == 0, result["unsafe_files"]
+    assert result["skipped_duplicate"] == 0, result
+    assert result["copied"] == 1, result
+    landed = mount_dir / "IMG_0001_2.jpg"
+    assert landed.exists() and not landed.is_symlink()
+    assert landed.read_bytes() == card_file.read_bytes()
+    assert link.is_symlink()
+    rows = [r["filename"] for r in _photo_rows(db)]
+    assert rows == ["IMG_0001_2.jpg"], rows
+
+
+def test_local_dangling_symlink_slot_is_not_a_free_slot(tmp_path):
+    """A dangling symlink at a candidate name must be advanced past, not
+    chosen as the landing slot.
+
+    ``os.path.exists`` follows the link and reports False, so the walk
+    picked the name — and then ``copy_and_hash_verify``'s no-overwrite
+    ``os.link`` promote hit the directory entry that does exist and raised
+    ``FileExistsError``, failing a healthy card file with the thoroughly
+    misleading reason "copy verification failed (destination bytes do not
+    match the source)". ``lexists`` closes it.
+
+    (The PR 7b plan predicted a write-THROUGH here — archive bytes landing
+    at the link target, possibly back on the card. That was checked before
+    implementing and is not what happens: the copy goes to a hidden
+    sibling temp and is promoted by link/rename, neither of which follows
+    the link. The hole is a spurious failure, not data loss. Recorded in
+    spec decision row 13.)
+    """
+    from import_job import ImportParams
+
+    archive = tmp_path / "archive"
+    dest_dir = archive / "2026" / "2026-07-03"
+    card, card_file, link, target = _card_symlink_geometry(
+        tmp_path, dest_dir=dest_dir, dangling=True)
+
+    db, ws_id, result = _run_import(tmp_path, ImportParams(
+        sources=[str(card)], destination=str(archive),
+    ))
+
+    assert result["failed"] == 0, result["unsafe_files"]
+    assert result["copied"] == 1, result
+    landed = dest_dir / "IMG_0001_2.jpg"
+    assert landed.exists() and not landed.is_symlink()
+    assert landed.read_bytes() == card_file.read_bytes()
+    # The link is untouched and still dangling — nothing was written
+    # through it onto the card.
+    assert link.is_symlink()
+    assert not target.exists()
+
+
+# --- PR 7b review follow-up: cancellation while ADVANCING the walk ------
+#
+# Codex review of #1450 (P2). Before flip B, the rsync walk hashed every
+# existing candidate, and ``_hash_dest_file`` polls ``cancel_check()`` at
+# entry — so a Stop that arrived after the orchestrator's per-file check
+# was observed within one candidate. With the size gate in place, a chain
+# of size-mismatched candidates is advanced past with no hash and no poll,
+# so a Stop goes unobserved until the walk finds a free slot. The local
+# walk never had the poll at all (it has always size-gated), so this
+# aligns both transports UP rather than restoring one of them.
+#
+# The walk now polls at the top of every iteration it reaches by
+# ADVANCING (counter > 0). The no-collision fast path — by far the common
+# case — is deliberately left unpolled so a Stop racing the loop-top check
+# cannot flip an otherwise-clean copy into a cancellation.
+
+def _mismatched_chain(dest_dir, card_file, names):
+    """Fill ``names`` in ``dest_dir`` with files that collide by name but
+    can never match by size, so the walk advances past every one."""
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    base = card_file.read_bytes()
+    for i, name in enumerate(names):
+        (dest_dir / name).write_bytes(base + b"\x00" * (17 * (i + 1)))
+
+
+def _candidate_probe_spy(monkeypatch, dest_dir, name_prefix):
+    """Count the walk's candidate probes for one source file.
+
+    Spies ``os.path.lexists``, which the walk calls exactly once per
+    candidate iteration (and which nothing else on this path calls for
+    files in ``dest_dir``), filtered to the candidates of a single source
+    basename. Counting the size probe instead would be fragile: whether
+    that is ``getsize`` or ``stat`` is an implementation detail, and it
+    is only reached for candidates that exist.
+    """
+    probed = []
+    real = os.path.lexists
+
+    def spy(path):
+        p = str(path)
+        if (os.path.dirname(p) == str(dest_dir)
+                and os.path.basename(p).startswith(name_prefix)):
+            probed.append(p)
+        return real(path)
+
+    monkeypatch.setattr(os.path, "lexists", spy)
+    return probed
+
+
+def test_local_walk_observes_stop_while_advancing_candidates(
+        tmp_path, monkeypatch):
+    """Stop must be observed while advancing a size-mismatched collision
+    chain, not only when a candidate gets hashed — AND it must stay an
+    ordinary cancellation.
+
+    The batch's earlier file lands cleanly before Stop arrives, so it has
+    to be cataloged: a plain Stop on a healthy mount leaves
+    ``dest_read_cancelled`` False, and the catalog block's own comment
+    promises partially-landed batches keep cataloging. Reporting this poll
+    as ``DestReadCancelled`` would break that promise (Codex review of
+    #1450) — it would also suppress the post-loop mount probe, which is
+    the last chance to notice a detach during the copy that just finished.
+    """
+    from import_job import ImportParams, run_import_job
+
+    card = tmp_path / "card"
+    card.mkdir()
+    for name, color in (("A_0400.jpg", "red"), ("B_0400.jpg", "blue")):
+        Image.new("RGB", (16, 16), color).save(str(card / name))
+        ts = datetime(2026, 7, 3, 10, 0, 0).timestamp()
+        os.utime(str(card / name), (ts, ts))
+
+    archive = tmp_path / "archive"
+    dest_dir = archive / "2026" / "2026-07-03"
+    # Only B collides — A fresh-copies and lands before the Stop.
+    _mismatched_chain(dest_dir, card / "B_0400.jpg", [
+        "B_0400.jpg", "B_0400_1.jpg", "B_0400_2.jpg",
+    ])
+    probed = _candidate_probe_spy(monkeypatch, dest_dir, "B_0400")
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    result = run_import_job(
+        _make_job(), CancelOnFileImportingRunner("B_0400.jpg"), db_path,
+        db._active_workspace_id,
+        ImportParams(sources=[str(card)], destination=str(archive)),
+    )
+
+    assert result["cancelled"] is True, result
+    assert result["failed"] == 0, result
+    # A landed before the Stop; B never did.
+    assert result["copied"] == 1, result
+    assert (dest_dir / "A_0400.jpg").exists()
+    assert not (dest_dir / "B_0400_3.jpg").exists(), \
+        sorted(os.listdir(str(dest_dir)))
+    # The walk stopped at the first advance instead of walking the chain
+    # to a free slot and copying there.
+    assert len(probed) == 1, probed
+    # THE REGRESSION GUARD: an ordinary Stop must not suppress the
+    # batch's catalog pass. A is on disk, so A must have a photo row.
+    rows = [r["filename"] for r in _photo_rows(db)]
+    assert rows == ["A_0400.jpg"], rows
+
+
+def test_remote_walk_observes_stop_while_advancing_candidates(
+        tmp_path, monkeypatch):
+    """Remote half — the same shared-walk verdict, so the same code
+    satisfies both.
+
+    The earlier file is a crash-recovery ADOPTION rather than a fresh
+    copy: remote transfers are queued and flushed per batch, so a fresh
+    file would not be in ``landed`` at the cancel point and the catalog
+    assertion would pass vacuously.
+    """
+    from import_job import ImportParams, run_import_job
+
+    ra = _remote_archive_for(tmp_path)
+    calls = _remote_calls(ra)
+    _install_fake_remote_rsync(monkeypatch, calls, verify=None)
+
+    card = tmp_path / "card"
+    card.mkdir()
+    for name, color in (("A_0400.jpg", "red"), ("B_0400.jpg", "blue")):
+        Image.new("RGB", (16, 16), color).save(str(card / name))
+        ts = datetime(2026, 7, 3, 10, 0, 0).timestamp()
+        os.utime(str(card / name), (ts, ts))
+
+    mount_dir = Path(ra["mount_base"]) / "2026" / "2026-07-03"
+    _mismatched_chain(mount_dir, card / "B_0400.jpg", [
+        "B_0400.jpg", "B_0400_1.jpg", "B_0400_2.jpg",
+    ])
+    # A is already on the mount byte-identical and uncataloged, so it is
+    # adopted into ``landed`` before B's Stop.
+    (mount_dir / "A_0400.jpg").write_bytes((card / "A_0400.jpg").read_bytes())
+    probed = _candidate_probe_spy(monkeypatch, mount_dir, "B_0400")
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    result = run_import_job(
+        _make_job(), CancelOnFileImportingRunner("B_0400.jpg"), db_path,
+        db._active_workspace_id,
+        ImportParams(
+            sources=[str(card)], destination=ra["mount_base"],
+            remote_target=ra, verify_by_hash=True,
+        ),
+    )
+
+    assert result["cancelled"] is True, result
+    assert result["failed"] == 0, result
+    assert result["copied"] == 0, result
+    assert result["skipped_duplicate"] == 1, result
+    assert calls["rsync"] == [], calls["rsync"]
+    assert not (mount_dir / "B_0400_3.jpg").exists(), \
+        sorted(os.listdir(str(mount_dir)))
+    # B's walk probed exactly one candidate before the Stop was
+    # observed, instead of chaining to the free slot past it.
+    assert len(probed) == 1, probed
+    # THE REGRESSION GUARD, remote half.
+    rows = [r["filename"] for r in _photo_rows(db)]
+    assert rows == ["A_0400.jpg"], rows
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="os.mkfifo is POSIX-only; FIFO stands in for a non-regular entry.",
+)
+def test_zero_byte_source_does_not_adopt_a_fifo_candidate(tmp_path):
+    """CodeRabbit review of #1450: a non-regular entry must never be
+    adopted as this source's archive copy.
+
+    FIFOs, device nodes and sockets all stat as size 0, so flip A's
+    ``src_size == 0 and cand_size == 0`` branch would adopt one for a
+    zero-byte source, without ever reading it. Observed pre-fix outcome:
+    the FIFO is adopted, the catalog scan produces no photo row for it,
+    and the post-scan validation reclassifies the file to FAILED with
+    "not cataloged after scan" — so a healthy card file is refused over a
+    stray FIFO. (The review predicted a silent ``skipped_duplicate`` with
+    ``safe_to_format`` going green; the rollback machinery prevents that,
+    so this is a spurious-failure bug of the same class as the
+    dangling-symlink hole, not a data-safety one.) The size-MATCHED branch is
+    protected by its read (hashing a FIFO blocks until the watchdog turns
+    it into an OSError advance); the zero-byte branch adopts without
+    reading anything, so it needs an explicit regular-file check.
+
+    The walk is shared, so this covers both transports.
+    """
+    from import_job import ImportParams
+
+    card, _src = _make_zero_byte_card(tmp_path, name="EMPTY.jpg")
+    archive = tmp_path / "archive"
+    dest_dir = archive / "2026" / "2026-07-03"
+    dest_dir.mkdir(parents=True)
+    fifo = dest_dir / "EMPTY.jpg"
+    os.mkfifo(str(fifo))
+
+    db, ws_id, result = _run_import(tmp_path, ImportParams(
+        sources=[str(card)], destination=str(archive),
+    ))
+
+    assert result["failed"] == 0, result["unsafe_files"]
+    assert result["skipped_duplicate"] == 0, result
+    assert result["copied"] == 1, result
+    # A real, regular archive file at the next slot; the FIFO untouched.
+    landed = dest_dir / "EMPTY_1.jpg"
+    assert landed.is_file() and not landed.is_fifo()
+    assert fifo.is_fifo()
+    rows = [r["filename"] for r in _photo_rows(db)]
+    assert rows == ["EMPTY_1.jpg"], rows
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="os.symlink usually requires elevation on Windows.",
+)
+def test_symlinked_offcard_candidate_is_adopted(tmp_path):
+    """The counterpart pin for the recovery preview: a candidate that is a
+    symlink to an OFF-CARD regular file holding this source's bytes IS
+    adopted.
+
+    The walk stats candidates with ``os.stat``, which follows symlinks, so
+    this has been true since long before PR 7b — and it is what makes
+    ``test_check_duplicates_recovery_follows_symlinked_candidate`` the
+    correct expectation for the preview rather than a guess. Contrast
+    ``test_local_source_backed_suffix_candidate_not_adopted``: a symlink
+    into the CARD is refused, because then the bytes are not really at the
+    destination. Here they are.
+    """
+    from import_job import ImportParams
+
+    card = _make_card(tmp_path, [
+        ("IMG_0700.jpg", datetime(2026, 7, 3, 10, 0, 0), "red"),
+    ])
+    # A real archive file elsewhere holding this source's exact bytes,
+    # reachable at the planned name only through a symlink.
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    real_target = elsewhere / "landed.jpg"
+    real_target.write_bytes((card / "IMG_0700.jpg").read_bytes())
+
+    archive = tmp_path / "archive"
+    dest_dir = archive / "2026" / "2026-07-03"
+    dest_dir.mkdir(parents=True)
+    link = dest_dir / "IMG_0700.jpg"
+    os.symlink(str(real_target), str(link))
+
+    db, ws_id, result = _run_import(tmp_path, ImportParams(
+        sources=[str(card)], destination=str(archive),
+    ))
+
+    assert result["failed"] == 0, result["unsafe_files"]
+    assert result["copied"] == 0, result
+    assert result["skipped_duplicate"] == 1, result
+    # No second copy landed beside it.
+    assert not (dest_dir / "IMG_0700_1.jpg").exists(), \
+        sorted(os.listdir(str(dest_dir)))
+    assert link.is_symlink()
+
+
+# --- PR 7b review round 6 (Codex P1): a zero-byte source that grows -----
+#
+# The zero-byte adopt branch matches on SIZE, using the src_size captured
+# by enqueue's opening stat. If the source gains bytes between that stat
+# and the branch — a file still being written to the card — the branch
+# adopts an EMPTY destination for a source that now has real bytes. The
+# destination then validates as empty (it IS empty), the file counts as
+# skipped_duplicate, and a verified run reports safe_to_format=True over
+# bytes that exist only on the card.
+#
+# Unlike the size-MATCHED branch, which re-reads the source through
+# src_hash_fn and would notice, this branch adopts without reading
+# anything at all — so it needs an explicit re-stat.
+
+def _grow_source_mid_walk(monkeypatch, src_path, cand_path,
+                          payload=b"late bytes"):
+    """Make ``src_path`` gain bytes DURING the collision walk.
+
+    Hooks ``os.path.lexists`` on the specific candidate path: that is the
+    walk's own first probe of a candidate, so it lands strictly inside the
+    window between ``enqueue``'s opening source stat and the adopt
+    decision.
+
+    Do NOT hook ``_is_source_backed_dest`` for this — it is also called by
+    ``_reject_source_backed_dest`` from the orchestrator BEFORE
+    ``enqueue`` runs, so the source would grow before its size is even
+    captured and the test would pass without exercising anything.
+    """
+    real = os.path.lexists
+    target = os.path.realpath(str(cand_path))
+    fired = []
+
+    def growing(path):
+        if (os.path.realpath(str(path)) == target
+                and os.path.getsize(str(src_path)) == 0):
+            Path(src_path).write_bytes(payload)
+            fired.append(str(path))
+        return real(path)
+
+    monkeypatch.setattr(os.path, "lexists", growing)
+    # Returned so every caller can ASSERT the injection actually
+    # happened. Without that, a path-spelling change (macOS realpaths
+    # /var -> /private/var, and the destination is normalized) would
+    # silently stop the source from ever growing, and the test would go
+    # green against the ordinary zero-byte adopt while proving nothing.
+    return fired
+
+
+def test_local_zero_byte_source_that_grows_is_not_adopted(
+        tmp_path, monkeypatch):
+    """A source that is empty at the opening stat but has bytes by the
+    time the walk decides must not adopt an empty candidate."""
+    from import_job import ImportParams
+
+    card, src = _make_zero_byte_card(tmp_path)
+    archive = tmp_path / "archive"
+    dest_dir = archive / "2026" / "2026-07-03"
+    dest_dir.mkdir(parents=True)
+    (dest_dir / "IMG_0001.jpg").touch()
+
+    fired = _grow_source_mid_walk(
+        monkeypatch, src, dest_dir / "IMG_0001.jpg")
+
+    db, ws_id, result = _run_import(tmp_path, ImportParams(
+        sources=[str(card)], destination=str(archive),
+    ))
+
+    assert fired, "the source never grew — the injection point missed"
+    assert src.stat().st_size > 0
+    assert result["skipped_duplicate"] == 0, result
+    assert result["failed"] == 0, result["unsafe_files"]
+    assert result["copied"] == 1, result
+    # The card's real bytes reached the archive at the next free slot;
+    # the pre-existing empty file is untouched.
+    landed = dest_dir / "IMG_0001_1.jpg"
+    assert landed.read_bytes() == b"late bytes"
+    assert (dest_dir / "IMG_0001.jpg").stat().st_size == 0
+
+
+def test_remote_zero_byte_source_that_grows_is_not_adopted(
+        tmp_path, monkeypatch):
+    """Remote half — one shared walk, so one fix covers both. The false
+    adoption is gone; the surviving outcome is an honest FAILURE, and
+    that difference from local is transport-inherent, not drift.
+
+    The rsync transport hashes the source eagerly, before any bytes move
+    (spec decision 7: a source that changes mid-transfer must not look
+    clean). So when the source grows during the walk, the identity this
+    run recorded is the empty one, the transferred bytes are the new
+    ones, and the post-scan stamping loop correctly refuses to reconcile
+    them — the file is failed and ``safe_to_format`` stays False. The
+    local transport instead verifies at copy time through
+    ``copy_and_hash_verify``, which reads the source fresh, so it lands
+    the file cleanly.
+
+    Both outcomes are safe; neither claims the card is formattable over
+    bytes it does not have. Only the adoption was unsafe, and that is
+    what this fix removes. (This remote outcome is also pre-existing:
+    before flip A the zero-byte source simply never matched an empty
+    candidate, advanced, and hit the same stale-hash refusal.)
+    """
+    from import_job import ImportParams, run_import_job
+
+    ra = _remote_archive_for(tmp_path)
+    calls = _remote_calls(ra)
+    _install_fake_remote_rsync(monkeypatch, calls, verify=None)
+
+    card, src = _make_zero_byte_card(tmp_path)
+    mount_dir = Path(ra["mount_base"]) / "2026" / "2026-07-03"
+    mount_dir.mkdir(parents=True)
+    (mount_dir / "IMG_0001.jpg").touch()
+
+    fired = _grow_source_mid_walk(
+        monkeypatch, src, mount_dir / "IMG_0001.jpg")
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    result = run_import_job(
+        _make_job(), FakeRunner(), db_path, db._active_workspace_id,
+        ImportParams(
+            sources=[str(card)], destination=ra["mount_base"],
+            remote_target=ra, verify_by_hash=True,
+        ),
+    )
+
+    assert fired, "the source never grew — the injection point missed"
+    assert src.stat().st_size > 0
+    # THE FIX: the empty mount file is not adopted for a source that now
+    # has bytes. That adoption was the data-loss shape.
+    assert result["skipped_duplicate"] == 0, result
+    # The honest remainder: identity was captured before transfer, so the
+    # run refuses to attest what it moved rather than guessing.
+    assert result["failed"] == 1, result
+    assert result["safe_to_format"] is False, result
+    # The real bytes did reach the mount at the next free slot, and the
+    # pre-existing empty file was left alone.
+    assert (mount_dir / "IMG_0001_1.jpg").read_bytes() == b"late bytes"
+    assert (mount_dir / "IMG_0001.jpg").stat().st_size == 0

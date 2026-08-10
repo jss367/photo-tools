@@ -19221,6 +19221,36 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     with os.scandir(folder) as it:
                         for entry in it:
                             try:
+                                # Symlinks are deliberately EXCLUDED, and
+                                # this is a considered trade, not an
+                                # oversight. The import walk follows them
+                                # (os.stat) and adopts a symlink to an
+                                # off-card regular file whose bytes match,
+                                # so excluding them makes the preview
+                                # UNDER-report recovery for that geometry
+                                # — it says "will copy" for a file the run
+                                # adopts. That is the safe direction to be
+                                # wrong in.
+                                #
+                                # Following them was tried (PR 7b) and
+                                # reverted: the walk refuses a candidate
+                                # resolving under ANY source root, while
+                                # this endpoint's ``_is_source`` can only
+                                # compare ``samefile`` against the CURRENT
+                                # source file. A symlink to a *different*
+                                # card file with identical bytes therefore
+                                # slipped through and was reported as
+                                # recovered — an OVER-claim, promising
+                                # "already safe at the destination" for
+                                # bytes that live only on the card. This
+                                # endpoint receives ``paths``, not the
+                                # import's source roots, so it cannot
+                                # reconstruct that guard; doing this right
+                                # needs the shared walk, i.e. the PR 8
+                                # de-mirror. Trading a safe under-report
+                                # for an unsafe over-report is not worth
+                                # it in the meantime.
+                                # Codex review of PR #1450, rounds 4-5.
                                 if entry.is_file(follow_symlinks=False):
                                     entries[entry.name] = entry.stat(
                                         follow_symlinks=False).st_size
@@ -19247,11 +19277,25 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 size = source_file.stat().st_size
             except OSError:
                 return False
-            if size == 0:
-                # Zero-byte placeholders match any empty file by size;
-                # don't claim adoption for them (the duplicate checker
-                # gives them no identity either).
-                return False
+            # NOTE: zero-byte sources are NOT special-cased here. They
+            # used to return False on the reasoning that "the duplicate
+            # checker gives them no identity either" — but that conflates
+            # duplicate identity with crash-recovery adoption, which is
+            # what this preview is about. ``_resolve_dest_collision``
+            # adopts an empty candidate for an empty source at every
+            # candidate position on both transports (spec PR 7b flip A;
+            # the local primary-name case predates it), so returning
+            # False here left the preview counting those files as
+            # transfers the run would never perform. The generic path
+            # below gets this right on its own: ``_src_hash`` uses
+            # ``compute_file_hash``, so an empty source hashes to
+            # EMPTY_FILE_SHA256 rather than the checker's None, and it
+            # matches an empty candidate. Non-regular entries (FIFOs,
+            # device nodes) stay excluded because
+            # ``_planned_folder_listing`` only records
+            # ``is_file(follow_symlinks=False)`` entries — which is also
+            # what the run's own S_ISREG guard does. Codex review of
+            # PR #1450.
             # Folder planning mirrors ingest._source_file_timestamps:
             # EXIF capture time falling back to file mtime. In the default
             # mode checker.prepare() already batched the EXIF reads and

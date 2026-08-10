@@ -260,6 +260,205 @@ wrap the installed fake and re-call it with the same argument layout — and
 `remote_verify_files` must keep its
 `(rsync_bin, src_specs, rsync_target, remote, dest_is_dir=…)` shape.
 
+#### PR 7b as-built (2026-08-10)
+
+PR 7b unifies the last hand-mirrored import logic: the two collision/adopt
+walks PR 7 adaptation 2 deliberately left inside the transports. Shape:
+align-then-extract (the proven PR 6b sequence) — three behavior flips
+red-green'd per transport in place, then a provably behavior-neutral
+extraction into `_resolve_dest_collision`, then the safety flip
+(decision 13) written **once**, in the shared walk. That last commit is the
+project's thesis in miniature: the first fix in this file that lands on both
+transports by construction rather than by remembering to mirror it.
+
+Disposition of PR 7 adaptation 2's seven divergence axes:
+
+| # | Axis | Disposition |
+|---|------|-------------|
+| 1 | Loop shape (local: primary special-cased + suffix loop from 1; remote: uniform loop from 0) | Unified on the uniform loop at extraction. Behavior-neutral **after** the semantic flips below. |
+| 2 | Reservation map (remote `claimed_basenames`/`ctx.fold_basename`; local none) | Stays a per-transport parameter: `claims=None` on local (branch statically skipped), the batch map on remote. The local-vs-remote ledger difference for a same-basename identical sibling (local adopts the already-copied bytes; remote dup-skips via the claim) is **inherent to deferred transfer**, not a flip — documented, not changed. |
+| 3 | Size pre-check before hashing candidates (local yes, remote no) | Ported to remote. Outcome-invisible (same hash ⟹ same size); observable only as fewer `_hash_dest_file` calls — pinned by a call-count test. |
+| 4 | Zero-byte adopt (local: explicit primary-only branch; remote: reachable only checker-less) | Unified: `src_size == 0 and cand_size == 0` adopts at ANY candidate position on BOTH transports, red-green. |
+| 5 | Eager vs lazy source hashing | Stays per-transport via a `src_hash_fn` zero-arg callable: remote passes `lambda: src_hash` (eager hash already required by the pre-walk `queued_src_hashes` dedup), local passes its memoized lazy closure. Zero-flip. |
+| 6 | `DestReadCancelled` propagation (local: raises through to `enqueue`'s handler; remote: caught inline per-candidate) | Unified on propagate-out-of-the-walk; remote `enqueue` gains the same catch local already has. Observable behavior identical — the PR 1 geometry-B cancel pins stay green. |
+| 7 | Candidate stat/hash `OSError` (local: fails the file via the outer `except OSError`; remote: advances past the candidate) | Unified on **advance**, red-green on local. An unreadable *candidate* is a destination artifact, not a source problem; failing a healthy source file for it is wrong, and if the destination is genuinely broken the subsequent copy fails with the real error anyway. `DestReadCancelled` subclasses `OSError`, so every new advance-handler re-raises it first — otherwise the wedged-mount cancel pins would be silently swallowed into an advance. |
+
+Two further decisions recorded here:
+
+- **The pure-`_BatchResult` enqueue form (PR 7 adaptation 1's open option)
+  is DROPPED, not deferred.** The verdict idiom is now uniform across
+  `_duplicate_gate` / `enqueue` / the walk, `_book_adoption` already carries
+  the raw-vs-normalized hash split that motivated the deferral, and no third
+  transport is on any horizon. YAGNI.
+- **Cancellation while advancing the walk (Codex review of PR #1450 —
+  adopted after empirical confirmation).** Flip B removed the rsync walk's
+  incidental cancellation poll: `_hash_dest_file` polls `cancel_check()` at
+  entry, so hashing every existing candidate meant a Stop was observed
+  within one candidate, and the size gate skips that hash. The local walk,
+  which has always size-gated, never had the poll at all. Reproduced red on
+  both transports with a chain of size-mismatched candidates — local
+  *completed the copy* with `cancelled=False` despite Stop, remote probed
+  the whole chain.
+
+  **Final contract.** At the top of any iteration reached by ADVANCING
+  (`counter > 0`), the shared walk returns the `_WALK_CANCELLED` verdict.
+  Both transports map it to: set `state.cancelled`, return
+  `_ENQ_CANCELLED`, and **leave `dest_read_cancelled` untouched**. The
+  no-collision fast path is deliberately unpolled (`counter > 0` gate), so
+  a Stop racing the orchestrator's loop-top check cannot flip an
+  otherwise-clean copy into a cancellation. `DestReadCancelled` still
+  propagates unchanged for genuine interrupted reads, and only that sets
+  `dest_read_cancelled`.
+
+  *Rejected alternative, recorded so it is not reintroduced:* the first
+  implementation raised `DestReadCancelled` for this poll. That is wrong —
+  the exception means a destination *read* was interrupted, so its handlers
+  set `dest_read_cancelled`, which suppresses both the post-loop mount
+  probe and the batch's catalog pass, breaking the invariant the catalog
+  block documents ("a plain user Stop on a healthy mount leaves
+  `dest_read_cancelled` False, so partially-landed batches keep cataloging
+  like before", PR #1423 review). A Stop seen between probes is no evidence
+  of a sick mount. Pinned by
+  `test_{local,remote}_walk_observes_stop_while_advancing_candidates`,
+  built as two-file batches where the earlier file lands (local: fresh
+  copy; remote: adoption, since a queued transfer is not in `landed` at the
+  cancel point) and must still be cataloged; neutralization confirms both
+  go red under the raising version.
+- **Zero-byte sources that grow mid-walk (Codex review of PR #1450, P1 —
+  adopted).** The zero-byte adopt branch matches on SIZE, using the
+  `src_size` captured by `enqueue`'s opening stat, and is the one adopt
+  branch that reads nothing (the size-matched branch re-reads the source
+  through `src_hash_fn` and would notice). A source still being written to
+  the card can be empty at that stat and have real bytes by the time the
+  branch fires, so it adopted an empty destination for a source that now
+  had bytes: the destination validates fine (it IS empty), the file counts
+  as `skipped_duplicate`, and a verified run reports `safe_to_format=True`
+  over bytes that exist only on the card. The branch now re-stats the
+  source immediately before booking and advances unless it is still empty
+  (an `OSError` also advances — inability to confirm emptiness is not
+  confirmation). The local primary-name case predates PR 7b; flip A
+  widened it to the suffix positions and to rsync. Pinned by
+  `test_{local,remote}_zero_byte_source_that_grows_is_not_adopted`, whose
+  injection helper **returns a fired-flag the tests assert**, because the
+  first version of it silently missed (it hooked
+  `_is_source_backed_dest`, which the orchestrator calls *before*
+  `enqueue` stats the source, so the file grew before the window opened
+  and the test passed against the ordinary zero-byte adopt). The two
+  transports then differ, inherently: local verifies at copy time and
+  lands the file cleanly, rsync captured identity before transfer
+  (decision 7) and so refuses to reconcile, failing the file with
+  `safe_to_format=False`. Both are safe; only the adoption was not.
+- **Non-regular collision candidates (CodeRabbit review of PR #1450,
+  Major — adopted, severity corrected).** FIFOs, device nodes and sockets
+  stat as size 0, so flip A's `src_size == 0 and cand_size == 0` branch
+  would adopt one for a zero-byte source *without reading it*. The walk now
+  takes one `os.stat` and advances unless `S_ISREG`. The size-matched
+  branch needs no guard — it reads the candidate, and a blocked FIFO read
+  becomes an `OSError` advance via `_hash_dest_file`'s watchdog. Severity
+  correction: the review predicted a silent `skipped_duplicate` with
+  `safe_to_format` going green; observed pre-fix behavior is that the
+  post-scan validation finds no photo row and reclassifies the file to
+  FAILED, so this is a spurious-failure bug of the same class as the
+  dangling-symlink hole, not a data-safety one. Pinned by
+  `test_zero_byte_source_does_not_adopt_a_fifo_candidate`. Note the
+  knock-on: this screening also filtered the FIFOs out of
+  `test_remote_import_cancel_interrupts_stuck_collision_hash` before its
+  wedged read — caught by the `== 1` assertion tightened earlier in this
+  PR — so that fixture now presents its FIFOs as regular files of the
+  source's size via an `os.stat` stub, keeping the genuine blocking
+  `open()` that is the only property it needs a FIFO for.
+- **Preflight-mirror reconciliation (the PR 3 standing obligation).** Every
+  change to the collision/adopt walk must be checked against the
+  hand-mirrored copy in `app.py`'s recovery preview
+  (`_recovery_candidate` / `_planned_folder_listing`, ~L19217–19366) and
+  either applied there or recorded as a deliberate difference. Checked for
+  all four PR 7b flips.
+  - *Flip A (zero-byte adopt at any position)* — **CORRECTED 2026-08-10
+    after the Codex review of PR #1450.** The first version of this
+    reconciliation claimed the preview already reported zero-byte twins as
+    recovered and that flip A closed a divergence. That was wrong: the
+    endpoint had an early `if size == 0: return False` (app.py ~L19250)
+    that short-circuits before any of the listing/hash logic the claim
+    relied on, pinned by `test_check_duplicates_zero_byte_source_never_recovered`.
+    The truth is the opposite — the divergence PRE-EXISTED (the local
+    primary-name zero-byte adopt is older than this PR) and flip A
+    WIDENED it to the local-suffix and both remote positions. Discharged
+    by applying the change rather than recording it: the early return is
+    removed, so the generic path answers correctly on its own
+    (`_src_hash` uses `compute_file_hash`, so an empty source hashes to
+    `EMPTY_FILE_SHA256` rather than the checker's `None`, and matches an
+    empty candidate). Non-regular entries stay excluded for free —
+    `_planned_folder_listing` records only
+    `is_file(follow_symlinks=False)` entries, which is exactly what the
+    run's new `S_ISREG` guard does. The old pin is flipped and renamed
+    `..._is_recovered`, with new suffix-slot and FIFO cases.
+  - *Flip D (source-backed candidates)* — the preview's `_bytes_match`
+    already begins with `_is_source(cand_path)` and advances, so it
+    modelled advance-past while the run adopted. Now they agree. (This
+    half of the original claim was re-checked when flip A's half turned
+    out to be wrong, and it holds.)
+  - *Flip B (size pre-check)* — the preview has always size-gated; it is
+    invisible to it anyway.
+  - *Flip C (advance past unreadable candidates)* — a candidate whose stat
+    fails is dropped from `_planned_folder_listing`, so the preview
+    already reached "not recovered", matching the run's new landing.
+  - *Symlinked candidates (Codex review of PR #1450, rounds 4-5 — TRIED,
+    REVERTED, deferred to PR 8).* Round 4 observed that
+    `_planned_folder_listing` records only
+    `is_file(follow_symlinks=False)` entries, so a candidate that is a
+    symlink to an off-card regular file reads as a free slot while the
+    walk stats candidates with `os.stat` (which follows) and adopts on a
+    byte match. True, and broader than reported — it applies to ordinary
+    files, not just the newly-supported zero-byte cases, and predates
+    PR 7b entirely. Fixed by following symlinks; round 5 then showed that
+    fix created a worse problem, and it was reverted. The walk refuses any
+    candidate resolving under ANY source root, whereas this endpoint's
+    `_is_source` can only compare `samefile` against the CURRENT source
+    file — so a symlink to a *different* card file with identical bytes
+    was reported as recovered. That is an OVER-claim: the preview would
+    promise "already safe at the destination" for bytes that live only on
+    the card, which is the direction that can talk a user into wiping it.
+    The endpoint receives `paths`, never the import's source roots, so it
+    cannot rebuild that guard; every version available here is an
+    approximation, and an approximation in a safety-relevant preview is
+    not worth trading a safe under-report for. Reverted to excluding
+    symlinks — the preview under-reports recovery for the off-card-match
+    geometry, which is the safe direction — and both halves are pinned:
+    `test_check_duplicates_symlinked_candidate_is_not_reported_recovered`
+    (the accepted under-report) and
+    `test_check_duplicates_never_reports_recovery_via_a_card_symlink`
+    (the over-report that must never come back; it goes red under the
+    reverted version). The run side is pinned by
+    `test_symlinked_offcard_candidate_is_adopted` so the divergence is
+    documented from both ends. **PR 8 resolves this properly** by giving
+    the preview the shared walk — and with it the real
+    `path_under_any_source` guard.
+  - *Still divergent, pre-existing, PR 8's business:* the preview's suffix
+    walk **stops** at the first slot absent from its listing
+    (`cand_size is None → return False`), where the run advances. Symlinks
+    are absent from the listing (`is_file(follow_symlinks=False)`), so a
+    poisoned or dangling entry at `name_1.ext` with this source's bytes at
+    `name_2.ext` is "not recovered" to the preview and an adoption to the
+    run. That corner diverged before PR 7b too (in the opposite direction),
+    and de-mirroring is what PR 8 is for.
+
+  **Scope line for PR 7b.** Rounds 3 and 4 of review each surfaced a
+  preview/ingest inconsistency, which is unsurprising — the preview is a
+  hand-mirror, and finding these one at a time is precisely the argument
+  for PR 8. The two fixed here were taken because PR 7b's own flips touch
+  the same geometry (zero-byte adoption) or because the divergence is
+  reachable from it. Any *further* preview-mirror divergence belongs to
+  PR 8, which deletes the mirror rather than patching it; the known
+  remaining one is the first-missing-slot difference recorded just above.
+- **Axis-3 test adaptation.** `test_remote_import_cancel_interrupts_stuck_collision_hash`
+  simulates a wedged mount with FIFOs at the collision-candidate paths, and a
+  FIFO stats as size 0 — so the new size pre-check would advance past it
+  without ever reaching the wedged read the test exists to pin. A real wedged
+  SMB candidate does not report size 0 (its `stat` blocks or matches), so the
+  fixture, not the property, is what the gate invalidates: the test now stubs
+  `os.path.getsize` for the two FIFO paths to return the source size, and
+  otherwise asserts exactly what it did before.
+
 ### Entry point
 
 `run_import_job(job, runner, db_path, workspace_id, params)` keeps its exact
@@ -289,6 +488,7 @@ changes to match.
 | 10 | Adopted (crash-recovery) files get `hash_status='ok'` stamped locally but stay `NULL` remotely — found empirically by PR 1's parity net (2026-08-07): local adoption folds into `landed` and hits the verify stamp; remote adoption lives in `adopted_paths`, whose validation cross-checks bytes but never stamps | **Adopt local, via the PR 5 structural change.** Folding remote adoptions into `landed` with their verified hash makes the stamp fall out of the unified catalog pass; no separate fix PR. Pinned per-path by `test_{local,remote}_adoption_uncataloged_dest_twin_current_behavior`, which flip when PR 5 lands. |
 | 11 | Local stamping loop backfills `file_hash` on scan-NULL rows (`update_photo_hash_check(..., "ok", file_hash=verified_hash)`, ~L4511–4514 — NOT the non-backfilling stamp at L4480–4482 just above it, which handles the zero-byte case); remote stamps `"ok"` without backfilling — found by the 2026-08-08 extraction phase map (D4). Related, same loop: a zero-byte normalization-convention split (D2/D3) — remote normalizes `EMPTY_FILE_SHA256` → `None` at hash time with a `read_failed` flag; local compares raw hashes and its `verified_hash` is never `None`. | **RESOLVED 2026-08-09 (PR 6b): adopt local, with the zero-byte exclusion.** Remote backfills `file_hash` only on the scan-NULL re-read-agree path, and only with non-`EMPTY_FILE_SHA256` hashes: `file_hash=(src_hash if src_hash != EMPTY_FILE_SHA256 else None)`. Backfilling `EMPTY_FILE_SHA256` would recreate the collision the scanner's zero-byte NULL convention exists to prevent (scanner nulls empty-file hashes; `empty_hash_needs_repair` would churn repairs). The scan-hash-agrees path needs no backfill — the row already holds the hash (local doesn't backfill there either). For D2/D3, unify by normalizing at `_LandedFile` construction in 6b so both loops see the same convention. |
 | 12 | Local has a per-file dest-safety guard (`os.path.samefile` + realpath'd dest-under-source check) before copying; remote has only the folder-level `_batch_preflight` guard | **Port to remote (PR 7, red-green).** The per-file guard is NOT subsumed by the folder guard: it additionally catches `os.path.samefile` identity (hard-links/symlinks to the same inode) and a `dest_file` that is itself a symlink resolving back into the card — realpath'd at file level, where the folder guard only realpaths the folder. On remote, that geometry is exactly the safe_to_format-over-unbacked-bytes hazard the batch guard's own comment describes; today remote has no per-file defense (the collision walk would hash the symlink target — the card file itself — byte-match, and adopt). Porting is a pure tightening: it can only convert an accept into a failure in an already-unsafe geometry; expected existing-suite flips: zero. Red-green in PR 7: a remote import whose `dest_file` is symlinked into the card with `verify_by_hash=True` must yield `failed == 1`, `safe_to_format is False`. HONESTY CONSTRAINT: a source-backed SUFFIX candidate (e.g. a symlink at `name_1.ext` into the card with different bytes at the primary name) is caught by NEITHER guard on EITHER path — that per-candidate gap is pre-existing on local, and this port deliberately preserves parity rather than closing it (closing it is its own behavior change; PR 7b/follow-up). Guard comments must never claim suffix coverage that doesn't exist. |
+| 13 | Source-backed SUFFIX candidates (decision 12's KNOWN GAP): both walks hash a suffix candidate that is a symlink/hardlink back into the card, byte-match it against itself, and adopt — `safe_to_format` can go green over card-only bytes. Sibling hole: the free-slot check uses `os.path.exists`, so a DANGLING symlink at a candidate name reads as free and is chosen as the landing slot. | **RESOLVED 2026-08-10 (PR 7b): closed both, once, in the shared walk.** Pinned by `test_local_source_backed_suffix_candidate_not_adopted`, `test_remote_source_backed_suffix_candidate_not_adopted` and `test_local_dangling_symlink_slot_is_not_a_free_slot` — all three red before the change. The local and remote source-backed tests are satisfied by the *same* code, which is the point: this is the first fix in this file that lands on both transports by construction rather than by remembering to mirror it. Design as planned: An existing candidate that is source-backed (`os.path.samefile(source_file, cand)` or realpath-under-any-source) is advanced past with a WARNING — never hashed, never adopted; unlike the primary-name decision-12 guard it does NOT fail the file, because one poisoned entry does not poison sibling slots (the primary guard's geometry — a template resolving into the card — does, and it keeps failing the file at the orchestrator). The free-slot check becomes `not os.path.lexists(cand)`; an `lexists`-but-not-`exists` (dangling) entry is advanced past. KNOWN-REMAINING (documented, out of scope): a candidate hardlinked to a *different* card file has no path- or inode-visible tie to this source (`samefile` false, realpath is its own path) — catching it needs `st_dev` checks against source roots. **Dangling-slot premise corrected (2026-08-10, verified before implementing):** the planning note claimed the local copy "writes through" the dangling link, landing archive bytes at the link target (possibly on the card). It does not. `copy_and_hash_verify` copies to a hidden sibling temp and promotes with a no-overwrite `os.link`, which raises `FileExistsError` on a dangling symlink (the directory entry exists), so today the file is **failed** with the misleading reason `"copy verification failed (destination bytes do not match the source)"`; the hardlinkless fallback's `os.rename` would replace the link itself, never write through it. So the defect is a spurious import failure with a wrong reason, not data loss — still worth closing, and `lexists` closes it, but the red assertion is `failed == 1`, not bytes-on-the-card. |
 
 Kept as deliberate (transport-required) differences, expressed through the
 protocol rather than duplicated code: transfer sub-progress
@@ -393,6 +593,12 @@ and goes through the normal PR-agent review cycle.
    only applies the batch-level dest-under-source guard. PR 7 must decide
    keep-both/port/drop deliberately rather than letting the merge pick a
    winner silently.*
+7b. **PR 7b — walk unification + suffix-gap closure.** *In flight
+   2026-08-10; plan at
+   `docs/superpowers/plans/2026-08-10-import-unify-pr7b-walk-unification.md`.*
+   Disposes of PR 7 adaptation 2's seven axes (table above), extracts
+   `_resolve_dest_collision`, and closes decision 13's source-backed
+   suffix-candidate and dangling-slot holes once, in the shared walk.
 8. **PR 8 (stretch) — preflight de-mirror.** Share the collision/adopt walk
    with `/api/import/check-duplicates` and friends (`app.py:18328–18522`),
    removing the third hand-mirrored copy. Only after PR 7 has soaked.

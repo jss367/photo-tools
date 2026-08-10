@@ -555,12 +555,21 @@ def test_check_duplicates_no_destination_reports_no_recovery(
     assert _recovered_paths(events) == []
 
 
-def test_check_duplicates_zero_byte_source_never_recovered(
+def test_check_duplicates_zero_byte_source_is_recovered(
     app_and_db, tmp_path
 ):
-    """Zero-byte placeholders match any empty destination file by size;
-    don't claim adoption for them (the checker gives them no identity
-    either)."""
+    """A zero-byte source with an empty file already at the planned
+    destination name IS a recovery — the preview must say so.
+
+    This flipped in PR 7b. The endpoint used to return False for every
+    zero-byte source, reasoning that "the checker gives them no identity
+    either" — but that conflates duplicate identity with crash-recovery
+    adoption. The import job adopts an empty candidate for an empty
+    source (at the primary name on the local path since long before PR
+    7b, and at every candidate position on both transports since flip
+    A), so the old answer left the preview counting a file as a transfer
+    the run would never perform.
+    """
     from datetime import datetime
 
     app, db, fid = app_and_db
@@ -584,7 +593,192 @@ def test_check_duplicates_zero_byte_source_never_recovered(
     })
     events = parse_sse_events(resp.data)
     done = [e for e in events if e.get("done")]
+    assert done[0]["recovered_count"] == 1
+    assert str(src) in _recovered_paths(events)
+
+
+def test_check_duplicates_zero_byte_source_recovered_at_suffix_slot(
+    app_and_db, tmp_path
+):
+    """Same rule one slot along: a non-empty file holds the primary name
+    and this source's empty twin sits at the first suffix. Mirrors
+    ``test_local_zero_byte_suffix_candidate_adopts_with_checker`` in the
+    import-job suite (PR 7b flip A)."""
+    from datetime import datetime
+
+    app, db, fid = app_and_db
+
+    source = tmp_path / "source"
+    source.mkdir(exist_ok=True)
+    src = source / "DSC_0001.NEF"
+    src.write_bytes(b"")
+    ts = datetime(2026, 7, 3, 10, 0, 0).timestamp()
+    os.utime(str(src), (ts, ts))
+
+    dest = tmp_path / "archive"
+    planned = dest / "2026" / "2026-07-03"
+    planned.mkdir(parents=True)
+    (planned / "DSC_0001.NEF").write_bytes(b"not empty")
+    (planned / "DSC_0001_1.NEF").write_bytes(b"")
+
+    client = app.test_client()
+    resp = client.post("/api/import/check-duplicates", json={
+        "paths": [str(src)],
+        "destination": str(dest),
+    })
+    events = parse_sse_events(resp.data)
+    done = [e for e in events if e.get("done")]
+    assert done[0]["recovered_count"] == 1
+    assert str(src) in _recovered_paths(events)
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="os.mkfifo is POSIX-only.",
+)
+def test_check_duplicates_zero_byte_source_not_recovered_from_fifo(
+    app_and_db, tmp_path
+):
+    """A FIFO at the planned name is not a recovery, matching the import
+    job's S_ISREG guard: it stats as size 0, so without the regular-file
+    rule both sides would treat it as this empty source's archive copy.
+    The preview gets this right for free — ``_planned_folder_listing``
+    only records ``is_file(follow_symlinks=False)`` entries."""
+    from datetime import datetime
+
+    app, db, fid = app_and_db
+
+    source = tmp_path / "source"
+    source.mkdir(exist_ok=True)
+    src = source / "DSC_0001.NEF"
+    src.write_bytes(b"")
+    ts = datetime(2026, 7, 3, 10, 0, 0).timestamp()
+    os.utime(str(src), (ts, ts))
+
+    dest = tmp_path / "archive"
+    planned = dest / "2026" / "2026-07-03"
+    planned.mkdir(parents=True)
+    os.mkfifo(str(planned / "DSC_0001.NEF"))
+
+    client = app.test_client()
+    resp = client.post("/api/import/check-duplicates", json={
+        "paths": [str(src)],
+        "destination": str(dest),
+    })
+    events = parse_sse_events(resp.data)
+    done = [e for e in events if e.get("done")]
     assert done[0]["recovered_count"] == 0
+    assert _recovered_paths(events) == []
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="os.symlink usually requires elevation on Windows.",
+)
+def test_check_duplicates_symlinked_candidate_is_not_reported_recovered(
+    app_and_db, tmp_path
+):
+    """KNOWN DIVERGENCE, deliberately deferred to PR 8 (the preflight
+    de-mirror): a candidate that is a symlink to an off-card regular file
+    with this source's bytes IS adopted by the run — pinned by
+    ``test_symlinked_offcard_candidate_is_adopted`` in the import-job
+    suite — but the preview reports it as still needing transfer.
+
+    ``_planned_folder_listing`` excludes symlinks, so the slot reads as
+    free. PR 7b tried following them and reverted: the walk refuses a
+    candidate resolving under ANY source root, whereas this endpoint's
+    ``_is_source`` can only compare ``samefile`` against the current
+    source file, so a symlink to a *different* card file with identical
+    bytes was reported as recovered — an OVER-claim promising "already
+    safe at the destination" for bytes that live only on the card. This
+    endpoint receives ``paths``, never the import's source roots, so it
+    cannot rebuild that guard; doing it right needs the shared walk.
+
+    So the preview under-reports here, which is the safe direction, and
+    this test pins that until PR 8. Codex review of #1450, rounds 4-5.
+    """
+    from datetime import datetime
+
+    app, db, fid = app_and_db
+
+    source = tmp_path / "source"
+    source.mkdir(exist_ok=True)
+    src = source / "DSC_0001.NEF"
+    src.write_bytes(b"the real bytes")
+    ts = datetime(2026, 7, 3, 10, 0, 0).timestamp()
+    os.utime(str(src), (ts, ts))
+
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    real_target = elsewhere / "landed.NEF"
+    real_target.write_bytes(b"the real bytes")
+
+    dest = tmp_path / "archive"
+    planned = dest / "2026" / "2026-07-03"
+    planned.mkdir(parents=True)
+    os.symlink(str(real_target), str(planned / "DSC_0001.NEF"))
+
+    client = app.test_client()
+    resp = client.post("/api/import/check-duplicates", json={
+        "paths": [str(src)],
+        "destination": str(dest),
+    })
+    events = parse_sse_events(resp.data)
+    done = [e for e in events if e.get("done")]
+    assert done[0]["recovered_count"] == 0
+    assert _recovered_paths(events) == []
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="os.symlink usually requires elevation on Windows.",
+)
+def test_check_duplicates_never_reports_recovery_via_a_card_symlink(
+    app_and_db, tmp_path
+):
+    """THE SAFETY DIRECTION, and the reason the symlink exclusion stays.
+
+    A candidate symlinked to a DIFFERENT file on the card with bytes
+    identical to this source must never be reported as recovered: the
+    bytes live only on the card, and claiming "already at the
+    destination" is the over-report that could talk a user into wiping
+    it. The import walk refuses this geometry via
+    ``_is_source_backed_dest``'s under-any-source-root check; this
+    endpoint has no equivalent, and excluding symlinks is what keeps it
+    honest until PR 8 lets both sides share one walk.
+    """
+    from datetime import datetime
+
+    app, db, fid = app_and_db
+
+    card = tmp_path / "card"
+    card.mkdir(exist_ok=True)
+    src = card / "DSC_0001.NEF"
+    src.write_bytes(b"the real bytes")
+    # A DIFFERENT card file with identical bytes — samefile against the
+    # current source is False, so only a source-root check catches it.
+    sibling = card / "DSC_0002.NEF"
+    sibling.write_bytes(b"the real bytes")
+    ts = datetime(2026, 7, 3, 10, 0, 0).timestamp()
+    for p in (src, sibling):
+        os.utime(str(p), (ts, ts))
+
+    dest = tmp_path / "archive"
+    planned = dest / "2026" / "2026-07-03"
+    planned.mkdir(parents=True)
+    os.symlink(str(sibling), str(planned / "DSC_0001.NEF"))
+
+    client = app.test_client()
+    resp = client.post("/api/import/check-duplicates", json={
+        "paths": [str(src)],
+        "destination": str(dest),
+    })
+    events = parse_sse_events(resp.data)
+    done = [e for e in events if e.get("done")]
+    assert done[0]["recovered_count"] == 0, (
+        "reported recovery for bytes that exist only on the card"
+    )
+    assert _recovered_paths(events) == []
 
 
 def test_check_duplicates_rejects_relative_destination(app_and_db, tmp_path):

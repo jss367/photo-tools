@@ -5060,6 +5060,118 @@ def test_network_root_reachable_does_not_wait_to_reap_timeout(monkeypatch):
     assert reaper_finished.wait(timeout=1)
 
 
+def test_network_root_reachable_reuses_abandoned_probe(monkeypatch):
+    """Retries for a wedged root must not spawn more children or reapers."""
+    import subprocess
+    import threading
+    import time
+
+    import app as app_module
+
+    monkeypatch.setattr(app_module.sys, "platform", "darwin")
+    release_reaper = threading.Event()
+    popen_calls = []
+
+    class WedgedProcess:
+        returncode = None
+
+        def communicate(self, timeout=None):
+            if timeout is not None:
+                raise subprocess.TimeoutExpired(["stat"], timeout)
+            release_reaper.wait(timeout=2)
+            return "", ""
+
+        def kill(self):
+            return None
+
+    class HealthyProcess:
+        returncode = 0
+
+        def communicate(self, timeout=None):
+            return "Directory\n", ""
+
+    def fake_popen(*args, **kwargs):
+        popen_calls.append(args)
+        if len(popen_calls) == 1:
+            return WedgedProcess()
+        return HealthyProcess()
+
+    root = "/Volumes/NAS"
+    try:
+        assert app_module._network_root_reachable(root, popen=fake_popen) is False
+        assert app_module._network_root_reachable(root, popen=fake_popen) is False
+        assert len(popen_calls) == 1
+    finally:
+        release_reaper.set()
+
+    deadline = time.monotonic() + 1
+    while time.monotonic() < deadline:
+        with app_module._NETWORK_PROBE_LOCK:
+            if root not in app_module._NETWORK_PROBES:
+                break
+        time.sleep(0.01)
+
+    assert app_module._network_root_reachable(root, popen=fake_popen) is True
+    assert len(popen_calls) == 2
+
+
+def test_network_root_reachable_caps_abandoned_probes(monkeypatch):
+    """Distinct wedged roots cannot grow the process/thread count forever."""
+    import subprocess
+    import threading
+    import time
+
+    import app as app_module
+
+    monkeypatch.setattr(app_module.sys, "platform", "darwin")
+    monkeypatch.setattr(app_module, "_MAX_NETWORK_PROBES", 2)
+    release_reapers = threading.Event()
+    popen_calls = []
+
+    class WedgedProcess:
+        returncode = None
+
+        def communicate(self, timeout=None):
+            if timeout is not None:
+                raise subprocess.TimeoutExpired(["stat"], timeout)
+            release_reapers.wait(timeout=2)
+            return "", ""
+
+        def kill(self):
+            return None
+
+    def fake_popen(*args, **kwargs):
+        popen_calls.append(args)
+        return WedgedProcess()
+
+    roots = ["/Volumes/NAS-1", "/Volumes/NAS-2"]
+    try:
+        for root in roots:
+            assert (
+                app_module._network_root_reachable(root, popen=fake_popen)
+                is False
+            )
+        assert (
+            app_module._network_root_reachable(
+                "/Volumes/NAS-3", popen=fake_popen,
+            )
+            is False
+        )
+        assert len(popen_calls) == 2
+    finally:
+        release_reapers.set()
+
+    deadline = time.monotonic() + 1
+    while time.monotonic() < deadline:
+        with app_module._NETWORK_PROBE_LOCK:
+            if not any(root in app_module._NETWORK_PROBES for root in roots):
+                break
+        time.sleep(0.01)
+
+    with app_module._NETWORK_PROBE_LOCK:
+        assert not any(root in app_module._NETWORK_PROBES for root in roots)
+
+
 def test_network_root_reachable_returns_false_off_mac(monkeypatch):
     """The probe only runs on macOS. On other platforms callers already
     do not route through Finder, so the probe never needs to answer

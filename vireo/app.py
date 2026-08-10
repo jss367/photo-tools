@@ -1684,6 +1684,10 @@ def _file_manager_labels():
 _FINDER_TRASH_TIMEOUT_SECS = 30
 _FINDER_TRASH_BATCH_SIZE = 20
 _MOUNT_QUERY_TIMEOUT_SECS = 5
+_MAX_NETWORK_PROBES = 8
+_NETWORK_PROBE_RESERVED = object()
+_NETWORK_PROBE_LOCK = threading.Lock()
+_NETWORK_PROBES = {}
 
 # Distinct from ``None`` so ``_trash_paths`` can tell "caller didn't pass
 # network_roots" (re-query is safe) apart from "caller's own mount query
@@ -1764,15 +1768,35 @@ def _network_volume_roots(run=subprocess.run):
     )
 
 
-def _reap_abandoned_network_probe(process):
+def _reserve_network_probe(root):
+    """Reserve a bounded probe slot, reusing one already active per root."""
+    with _NETWORK_PROBE_LOCK:
+        if root in _NETWORK_PROBES:
+            return False
+        if len(_NETWORK_PROBES) >= _MAX_NETWORK_PROBES:
+            return False
+        _NETWORK_PROBES[root] = _NETWORK_PROBE_RESERVED
+        return True
+
+
+def _release_network_probe(root, owner):
+    """Release ``root`` only when it is still owned by this probe."""
+    with _NETWORK_PROBE_LOCK:
+        if _NETWORK_PROBES.get(root) is owner:
+            _NETWORK_PROBES.pop(root, None)
+
+
+def _reap_abandoned_network_probe(root, process):
     """Reap a timed-out probe away from the request path."""
     try:
         process.communicate()
     except (OSError, ValueError, subprocess.SubprocessError):
         pass
+    finally:
+        _release_network_probe(root, process)
 
 
-def _abandon_network_probe(process):
+def _abandon_network_probe(root, process):
     """Kill a timed-out probe without synchronously waiting for it."""
     try:
         process.kill()
@@ -1780,7 +1804,7 @@ def _abandon_network_probe(process):
         pass
     threading.Thread(
         target=_reap_abandoned_network_probe,
-        args=(process,),
+        args=(root, process),
         name="vireo-network-probe-reaper",
         daemon=True,
     ).start()
@@ -1800,7 +1824,9 @@ def _network_root_reachable(root, timeout=_MOUNT_QUERY_TIMEOUT_SECS,
     subprocess is an *independent* signal: it does not touch Finder. On
     timeout the child is killed and reaped on a daemon thread so an
     uninterruptible filesystem call cannot hold the request thread in
-    Python's usual synchronous kill-and-wait timeout cleanup.
+    Python's usual synchronous kill-and-wait timeout cleanup. Active probes
+    are reused per root and globally capped so retries cannot accumulate an
+    unbounded number of stuck children and reaper threads.
 
     Returns ``True`` only when ``stat`` completed in time and reported the
     root as a directory. Any other outcome (timeout, non-zero exit, error)
@@ -1821,7 +1847,15 @@ def _network_root_reachable(root, timeout=_MOUNT_QUERY_TIMEOUT_SECS,
             result.returncode == 0
             and (result.stdout or "").strip() == "Directory"
         )
+    try:
+        root_key = os.path.normcase(os.path.normpath(os.fspath(root)))
+    except (TypeError, ValueError):
+        return False
+    if not _reserve_network_probe(root_key):
+        return False
+
     process = None
+    abandoned = False
     try:
         process = popen(
             argv,
@@ -1830,14 +1864,23 @@ def _network_root_reachable(root, timeout=_MOUNT_QUERY_TIMEOUT_SECS,
             text=True,
             **no_window_kwargs(),
         )
+        with _NETWORK_PROBE_LOCK:
+            _NETWORK_PROBES[root_key] = process
         stdout, _stderr = process.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
-        _abandon_network_probe(process)
+        abandoned = True
+        _abandon_network_probe(root_key, process)
         return False
     except (OSError, subprocess.SubprocessError):
         if process is not None:
-            _abandon_network_probe(process)
+            abandoned = True
+            _abandon_network_probe(root_key, process)
+        else:
+            _release_network_probe(root_key, _NETWORK_PROBE_RESERVED)
         return False
+    finally:
+        if process is not None and not abandoned:
+            _release_network_probe(root_key, process)
     return process.returncode == 0 and (stdout or "").strip() == "Directory"
 
 

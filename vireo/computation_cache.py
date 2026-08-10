@@ -515,6 +515,25 @@ def classification_input(
     return block, fingerprint(block)
 
 
+def _finite_unit_interval(value, label):
+    # Range-check the raw value before ``math.isfinite`` sees it. JSON allows
+    # unbounded integer literals (e.g. ``10 ** 1000``), which overflow when
+    # coerced to a C double inside ``isfinite`` and raise ``OverflowError``
+    # instead of returning ``False``. That escapes the import route as a
+    # 500. Rejecting the range up front keeps the failure inside
+    # ``CacheFormatError`` for every JSON-representable numeric.
+    if isinstance(value, int):
+        if not 0 <= value <= 1:
+            raise CacheFormatError(f"{label} must be finite and in [0, 1]")
+        return
+    try:
+        finite = math.isfinite(value)
+    except (OverflowError, ValueError) as exc:
+        raise CacheFormatError(f"{label} must be finite and in [0, 1]") from exc
+    if not finite or not 0 <= value <= 1:
+        raise CacheFormatError(f"{label} must be finite and in [0, 1]")
+
+
 def _validate_box(box):
     if not isinstance(box, dict) or set(box) != {"x", "y", "w", "h"}:
         raise CacheFormatError("box must contain exactly x, y, w, and h")
@@ -522,8 +541,7 @@ def _validate_box(box):
         value = box[key]
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             raise CacheFormatError(f"box.{key} must be numeric")
-        if not math.isfinite(value) or not 0 <= value <= 1:
-            raise CacheFormatError(f"box.{key} must be finite and in [0, 1]")
+        _finite_unit_interval(value, f"box.{key}")
     if box["w"] <= 0 or box["h"] <= 0:
         raise CacheFormatError("box width and height must be positive")
     if box["x"] + box["w"] > 1.000001 or box["y"] + box["h"] > 1.000001:
@@ -533,8 +551,7 @@ def _validate_box(box):
 def _validate_confidence(value):
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise CacheFormatError("confidence must be numeric")
-    if not math.isfinite(value) or not 0 <= value <= 1:
-        raise CacheFormatError("confidence must be finite and in [0, 1]")
+    _finite_unit_interval(value, "confidence")
 
 
 _TAXONOMY_SCALAR_FIELDS = frozenset({
@@ -1019,8 +1036,18 @@ def _safe_zip_members(archive):
     return {info.filename: info for info in infos}
 
 
-def read_bundle(source):
-    """Validate an entire bundle without extracting it."""
+def read_bundle(source, on_artifact=None):
+    """Validate an entire bundle without extracting it.
+
+    When ``on_artifact`` is provided, each validated artifact is passed to
+    it and immediately released so peak memory stays bounded regardless of
+    the bundle's declared size (a valid bundle near ``MAX_BUNDLE_BYTES``
+    can inflate into several gigabytes of Python objects if every parsed
+    artifact is retained).  In that streaming mode the returned artifact
+    list is empty.  Callers that only need to summarize a small test
+    bundle can still call this without a callback and get the full list
+    for convenience.
+    """
     try:
         archive = zipfile.ZipFile(source, "r")
     except (OSError, zipfile.BadZipFile) as exc:
@@ -1092,8 +1119,15 @@ def read_bundle(source):
                 raise CacheFormatError("bundle object is not valid JSON") from exc
             if canonical_bytes(artifact) != body:
                 raise CacheFormatError("bundle object JSON is not canonical")
-            artifacts.append(artifact)
             declared_total += size
+            if on_artifact is None:
+                artifacts.append(artifact)
+            else:
+                on_artifact(artifact)
+                # Drop the parsed body/dict before the next iteration so
+                # the loop's memory ceiling is the largest single artifact
+                # rather than the sum of every one in the bundle.
+                del artifact, body
         if set(members) != expected_names:
             raise CacheFormatError("bundle contains undeclared members")
         if manifest.get("uncompressed_bytes") != declared_total:
@@ -1102,21 +1136,42 @@ def read_bundle(source):
 
 
 def import_bundle(source, store):
-    """Validate the whole bundle, then immutably publish its objects."""
-    manifest, artifacts = read_bundle(source)
+    """Validate the whole bundle, then immutably publish its objects.
+
+    Streams each artifact through the store as soon as it validates, so
+    the whole bundle never sits in memory at once.  Only the runtime
+    fingerprint sets are retained across the walk (bounded by the count
+    of distinct runtimes, not by artifact size).  The returned artifact
+    list is intentionally empty in this streaming mode — callers that
+    need to plant these artifacts on a database should read them back
+    from ``store`` (e.g. via ``materialize_local_store``) after import.
+    """
     added = 0
     existing = 0
-    for artifact in artifacts:
+    detector_runtimes = set()
+    classifier_runtimes = set()
+
+    def _publish(artifact):
+        nonlocal added, existing
         _digest, created = store.put(artifact)
         if created:
             added += 1
         else:
             existing += 1
+        artifact_type = artifact.get("type")
+        if artifact_type == "detection":
+            detector_runtimes.add(artifact["runtime_fingerprint"])
+        elif artifact_type == "classification":
+            classifier_runtimes.add(artifact["runtime_fingerprint"])
+
+    manifest, _artifacts = read_bundle(source, on_artifact=_publish)
     return {
         "manifest": manifest,
-        "artifacts": artifacts,
+        "artifacts": [],
         "added": added,
         "already_present": existing,
+        "detector_runtimes": detector_runtimes,
+        "classifier_runtimes": classifier_runtimes,
     }
 
 
@@ -1527,6 +1582,44 @@ def materialize_artifacts(
     the built-in local check does not have to grow special cases.
     """
     normalized = [validate_artifact(artifact) for artifact in artifacts]
+    # Break same-lookup-identity ties by lexicographically lowest
+    # ``artifact_digest`` before any per-runtime dedup below runs.  Without
+    # this, when a bundle declares divergent artifacts for the same
+    # ``(photo_sha256, runtime_fingerprint, input_fingerprint)`` (e.g. the
+    # same detector run's subjects rewritten with different rounding), the
+    # downstream stable sort at end of this block preserves manifest order
+    # and different installs would surface different boxes/species solely
+    # because of manifest ordering.  Digest is canonical-bytes-derived so
+    # the winner is content-defined and identical across installs.
+    def _dedup_by_lookup_identity(items, key_fn):
+        best = {}
+        for item in items:
+            key = key_fn(item)
+            digest = artifact_digest(item)
+            prior = best.get(key)
+            if prior is None or digest < prior[0]:
+                best[key] = (digest, item)
+        return [entry[1] for entry in best.values()]
+
+    detection_items = [a for a in normalized if a["type"] == "detection"]
+    classification_items = [a for a in normalized if a["type"] == "classification"]
+    detection_items = _dedup_by_lookup_identity(
+        detection_items,
+        lambda a: (
+            a["photo_sha256"], a["detector_model"],
+            a["runtime_fingerprint"], a["input_fingerprint"],
+        ),
+    )
+    classification_items = _dedup_by_lookup_identity(
+        classification_items,
+        lambda a: (
+            a["photo_sha256"], a["classifier_model"], a["detector_model"],
+            a["labels"]["fingerprint"],
+            a["detector_runtime_fingerprint"],
+            a["runtime_fingerprint"], a["input_fingerprint"],
+        ),
+    )
+
     # Trusted detection artifacts for the same (photo, detector_model)
     # can carry multiple runtime_fingerprints -- e.g. the local store
     # was populated by successive imports from different weights.  Every
@@ -1538,13 +1631,10 @@ def materialize_artifacts(
     # per logical (photo, detector_model) run before the loop, preferring
     # whichever runtime the catalog already has installed so routine
     # cache reapplication is a no-op; ties fall back to a deterministic
-    # runtime_fingerprint sort so repeated calls stay stable.
+    # (runtime_fingerprint, artifact_digest) sort so repeated calls stay
+    # stable regardless of iteration order.
     detection_by_key = {}
-    other_artifacts = []
-    for artifact in normalized:
-        if artifact["type"] != "detection":
-            other_artifacts.append(artifact)
-            continue
+    for artifact in detection_items:
         key = (artifact["photo_sha256"], artifact["detector_model"])
         detection_by_key.setdefault(key, []).append(artifact)
     chosen_detections = []
@@ -1573,10 +1663,16 @@ def materialize_artifacts(
         )
         chosen_detections.append(
             match if match is not None
-            else min(candidates, key=lambda a: a["runtime_fingerprint"])
+            else min(
+                candidates,
+                key=lambda a: (a["runtime_fingerprint"], artifact_digest(a)),
+            )
         )
-    normalized = chosen_detections + other_artifacts
-    normalized.sort(key=lambda item: item["type"] != "detection")
+    # Sort each group by digest so classification order is also
+    # content-defined instead of manifest-defined.
+    chosen_detections.sort(key=artifact_digest)
+    classification_items.sort(key=artifact_digest)
+    normalized = chosen_detections + classification_items
     identity_cache = {}
     result = {
         "matched_photos": 0,

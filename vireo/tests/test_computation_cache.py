@@ -130,6 +130,70 @@ def test_input_fingerprint_and_numeric_bounds_are_verified():
         validate_artifact(artifact)
 
 
+def test_numeric_validators_reject_oversized_json_integers_cleanly():
+    # A JSON int outside the C-double range makes math.isfinite raise
+    # OverflowError; that used to escape the import route as a 500. Both
+    # validators must convert it into a CacheFormatError so the HTTP
+    # boundary returns a 400 with a readable message instead.
+    huge = 10 ** 400
+    artifact = detection_artifact()
+    artifact["subjects"][0]["confidence"] = huge
+    with pytest.raises(CacheFormatError, match=r"in \[0, 1\]"):
+        validate_artifact(artifact)
+
+    artifact = detection_artifact()
+    artifact["subjects"][0]["box"]["x"] = huge
+    with pytest.raises(CacheFormatError, match=r"in \[0, 1\]"):
+        validate_artifact(artifact)
+
+
+def test_materialize_picks_lowest_digest_when_lookup_identity_ties(tmp_path):
+    # Two divergent detection artifacts sharing the same lookup identity
+    # (photo × detector × runtime × input) must resolve to the same
+    # winner regardless of manifest order, or two installs importing the
+    # same object set would surface different boxes.  The tiebreak is
+    # the lexicographically lowest ``artifact_digest``.
+    destination, _folder_id, _photo_id = _database_with_photo(
+        tmp_path / "destination.db", "dst.jpg",
+    )
+    a = detection_artifact(subjects=[{
+        "key": "d0", "kind": "box",
+        "box": {"x": 0.10, "y": 0.20, "w": 0.30, "h": 0.40},
+        "confidence": 0.9, "category": "animal",
+    }])
+    b = detection_artifact(subjects=[{
+        "key": "d0", "kind": "box",
+        "box": {"x": 0.11, "y": 0.21, "w": 0.30, "h": 0.40},
+        "confidence": 0.8, "category": "animal",
+    }])
+    # Same lookup identity fields:
+    assert a["photo_sha256"] == b["photo_sha256"]
+    assert a["detector_model"] == b["detector_model"]
+    assert a["runtime_fingerprint"] == b["runtime_fingerprint"]
+    assert a["input_fingerprint"] == b["input_fingerprint"]
+    # Different content → different digest:
+    assert artifact_digest(a) != artifact_digest(b)
+    expected_box = (
+        a["subjects"][0]["box"] if artifact_digest(a) < artifact_digest(b)
+        else b["subjects"][0]["box"]
+    )
+    # Both orderings should install the same winner.
+    for order in ([a, b], [b, a]):
+        clean, _folder, _photo = _database_with_photo(
+            tmp_path / f"dst-{order.index(a)}.db", "dst.jpg",
+        )
+        result = materialize_artifacts(
+            clean, order, known_runtimes={RUNTIME},
+        )
+        assert result["detector_runs_applied"] == 1
+        row = clean.conn.execute(
+            "SELECT box_x, box_y FROM detections",
+        ).fetchone()
+        assert (row["box_x"], row["box_y"]) == (
+            expected_box["x"], expected_box["y"],
+        )
+
+
 def test_artifact_store_is_content_addressed_atomic_and_idempotent(tmp_path):
     store = ArtifactStore(tmp_path / "store")
     artifact = detection_artifact()
@@ -332,6 +396,13 @@ def test_database_export_bundle_import_and_duplicate_fanout(tmp_path):
     write_bundle(bundle, artifacts)
     store = ArtifactStore(tmp_path / "destination-store")
     imported = import_bundle(bundle, store)
+    # ``import_bundle`` now streams the bundle through the store instead
+    # of accumulating every artifact in Python, so it returns the trusted
+    # runtime fingerprint sets rather than the parsed artifacts.  The
+    # test still exercises the full plant pipeline by materializing from
+    # the on-disk store — which is what the HTTP import route does too.
+    assert imported["detector_runtimes"] == {RUNTIME}
+    assert imported["classifier_runtimes"] == {CLASSIFIER_RUNTIME}
 
     destination, folder_id, first_photo = _database_with_photo(
         tmp_path / "destination.db", "renamed.jpg",
@@ -351,8 +422,8 @@ def test_database_export_bundle_import_and_duplicate_fanout(tmp_path):
     )
     destination.conn.commit()
 
-    applied = materialize_artifacts(
-        destination, imported["artifacts"],
+    applied = materialize_local_store(
+        destination, store=store,
         known_runtimes={RUNTIME},
         known_classifier_runtimes={CLASSIFIER_RUNTIME},
     )
@@ -375,8 +446,8 @@ def test_database_export_bundle_import_and_duplicate_fanout(tmp_path):
         "SELECT COUNT(*) AS c FROM prediction_review",
     ).fetchone()["c"] == 0, "portable output must not transfer review state"
 
-    repeat = materialize_artifacts(
-        destination, imported["artifacts"],
+    repeat = materialize_local_store(
+        destination, store=store,
         known_runtimes={RUNTIME},
         known_classifier_runtimes={CLASSIFIER_RUNTIME},
     )

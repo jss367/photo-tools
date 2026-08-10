@@ -16668,7 +16668,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         from computation_cache import (
             CacheFormatError,
             import_bundle,
-            materialize_artifacts,
+            materialize_local_store,
         )
 
         upload = request.files.get("file")
@@ -16676,6 +16676,10 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             return json_error("a .vireo-cache file is required", status=400)
         try:
             store = _computation_store()
+            # Stream the upload through the store so a large bundle never
+            # accumulates every parsed artifact in Python at once — the
+            # returned "artifacts" field is intentionally empty and
+            # materialization reads back from the store's on-disk objects.
             imported = import_bundle(upload.stream, store)
             # An explicit user-initiated import is a trust action for the
             # runtimes this bundle carries: quarantine gates for unknown
@@ -16684,16 +16688,8 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             # here the user chose the source. Whitelist the artifact-
             # supplied fingerprints so the objects they just uploaded
             # actually plant instead of getting stranded in the store.
-            detector_rts = {
-                artifact["runtime_fingerprint"]
-                for artifact in imported["artifacts"]
-                if artifact.get("type") == "detection"
-            }
-            classifier_rts = {
-                artifact["runtime_fingerprint"]
-                for artifact in imported["artifacts"]
-                if artifact.get("type") == "classification"
-            }
+            detector_rts = imported["detector_runtimes"]
+            classifier_rts = imported["classifier_runtimes"]
             # Persist the trust so later materialize_local_store calls
             # from run_classify_job / the pipeline accept these runtimes
             # too. Without persistence, a bundle imported before its
@@ -16704,8 +16700,8 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 detector_runtimes=detector_rts,
                 classifier_runtimes=classifier_rts,
             )
-            applied = materialize_artifacts(
-                _get_db(), imported["artifacts"],
+            applied = materialize_local_store(
+                _get_db(), store=store,
                 known_runtimes=detector_rts,
                 known_classifier_runtimes=classifier_rts,
             )

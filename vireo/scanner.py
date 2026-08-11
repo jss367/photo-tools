@@ -114,6 +114,25 @@ def compute_file_hash(file_path, chunk_size=65536):
     return h.hexdigest()
 
 
+def compute_fd_hash(fd, chunk_size=65536):
+    """Compute SHA-256 hash of the object referred to by ``fd``.
+
+    Reading from the descriptor rather than re-opening the pathname keeps
+    a concurrent rename from substituting a FIFO or other blocking object
+    behind us — the caller pins the object with ``os.open`` + ``fstat``,
+    and this function only ever hashes whatever that descriptor already
+    refers to. Does NOT seek: pass a freshly-opened descriptor, or the
+    hash covers only the bytes past the current file offset.
+    """
+    h = hashlib.sha256()
+    while True:
+        chunk = os.read(fd, chunk_size)
+        if not chunk:
+            break
+        h.update(chunk)
+    return h.hexdigest()
+
+
 def _compute_file_features(path_str):
     """Compute (phash, file_hash) for one image.
 

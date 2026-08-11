@@ -173,9 +173,11 @@ verified files** button opens a confirmation dialog that states plainly:
 - Deletion is permanent — memory cards have no trash.
 - After deletion, the archive holds the only copy of these photos.
 - What "verified" means: each file's archive copy passed a checksum check
-  (at import, targeted cleanup verification, or integrity audit) and is
-  confirmed unchanged since by size and timestamp; the card copy itself is
-  re-checksummed at the moment of deletion. Archive bytes are not re-downloaded.
+  (at import, targeted cleanup verification, or integrity audit) and its
+  current size and modification time still match the `file_size` /
+  `file_mtime` baseline the catalog recorded when the checksum was
+  written; the card copy itself is re-checksummed at the moment of
+  deletion. Archive bytes are not re-downloaded.
 
 Confirming starts the **delete** job with live per-file progress. The final
 summary reports exact counts: deleted, kept, skipped-because-changed, and

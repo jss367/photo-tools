@@ -28,10 +28,15 @@ from image_loader import (
     safe_iter_dir,
     safe_scan_walk,
 )
-from scanner import compute_file_hash
+from scanner import compute_fd_hash, compute_file_hash
 
 MANIFEST_SCHEMA_VERSION = 1
 MANIFEST_MAX_AGE_DAYS = 7
+# Bumped whenever the manifest is rewritten (scan or verify). The delete
+# endpoint requires the client's confirmed revision to match — a verify
+# that runs between the confirmation and the delete POST would otherwise
+# let deletion sweep newly-promoted files the user never saw.
+INITIAL_MANIFEST_REVISION = 1
 
 
 class ManifestError(Exception):
@@ -293,9 +298,18 @@ def qualify_rows(rows, source_root_real, card_path, contains_check=None):
     # non-NULL, non-"ok" status (modified/corrupt/unreadable) have already
     # been verified; re-running verification reproduces the same verdict
     # and the remedy lives on the Audit page, so those rows fall back to
-    # KEEP_ARCHIVE_HASH_FAILED instead. A specific reason from an "ok"
-    # row that failed a later gate (unreachable / changed / inside source)
-    # still wins over both — that's the closest-to-success signal we have.
+    # KEEP_ARCHIVE_HASH_FAILED instead.
+    #
+    # Priority (also Codex P2): a specific reason from an "ok" row that
+    # failed a later gate USED TO win over KEEP_NOT_VERIFIED, but that hid
+    # entries whose unchecked sibling row could still be verified.
+    # KEEP_NOT_VERIFIED now takes precedence whenever we saw a
+    # never-checked row that verify could still try — the unchecked row
+    # might have a different archive path that clears the same gate.
+    # verify_manifest_archives itself does not persist a bad verdict when
+    # the archive fails a gate before hashing, so trying it is free of
+    # side effects; the ok-row's specific reason is only preferred when
+    # no unchecked row is available to give verify a fresh attempt.
     saw_never_checked = False
     saw_check_failed = False
     reason = None
@@ -363,15 +377,16 @@ def qualify_rows(rows, source_root_real, card_path, contains_check=None):
             reason = KEEP_INSIDE_SOURCE
             continue
         return archive_path, None
-    if reason is None:
-        # No "ok" row got as far as a specific rejection — fall back to
-        # the most accurate blame for what's on file. NULL wins the tie:
-        # a mix of never-checked and check-failed rows is still remediable
-        # by an audit (a never-checked row could turn "ok" and unlock the
-        # file), whereas the failed rows are just extra failed rows.
-        if saw_never_checked:
-            reason = KEEP_NOT_VERIFIED
-        elif saw_check_failed:
+    # NULL-hash-status wins over a specific ok-row reason (Codex P2): the
+    # unchecked row is verify's next lever, so the entry must land in the
+    # KEEP_NOT_VERIFIED bucket the callout keys off. Otherwise the reason
+    # already reflects the closest-to-success signal we have, and
+    # KEEP_ARCHIVE_HASH_FAILED only surfaces when no ok row spoke up and
+    # only check-failed rows remain.
+    if saw_never_checked:
+        reason = KEEP_NOT_VERIFIED
+    elif reason is None:
+        if saw_check_failed:
             reason = KEEP_ARCHIVE_HASH_FAILED
         else:
             # No non-ok rows and no ok row got a specific reason — the
@@ -472,44 +487,67 @@ def verify_manifest_archives(db, manifest, manifest_dir, progress_cb=None,
             if contains_check(archive_real):
                 outcome_reason = KEEP_INSIDE_SOURCE
                 continue
+            # CodeRabbit: pin the checked object via a descriptor rather
+            # than re-opening the pathname. A concurrent rename that swaps
+            # the archive for a FIFO between our S_ISREG check and the
+            # hash-open would leave compute_file_hash blocking forever
+            # inside open() — cancellation is checked only at file
+            # boundaries, so the verify worker would hang. Opening with
+            # O_NONBLOCK bypasses the FIFO-open block; fstat then rejects
+            # anything that is not a regular file, and every subsequent
+            # read/stat operates on this pinned fd so a later rename
+            # cannot slip a different object under us.
             try:
-                before = os.stat(archive_path)
+                archive_fd = os.open(
+                    archive_path, os.O_RDONLY | os.O_NONBLOCK)
             except (OSError, ValueError):
                 db.update_photo_hash_check(
                     row["id"], "unreadable", commit=False)
                 stats["unreadable"] += 1
                 continue
-            if not stat_mod.S_ISREG(before.st_mode):
-                db.update_photo_hash_check(
-                    row["id"], "unreadable", commit=False)
-                stats["unreadable"] += 1
-                continue
-
-            # An outside-path hardlink to a card file is not a second copy.
-            same_as_card = False
-            for entry in card_entries:
+            try:
                 try:
-                    card_st = os.stat(entry["path"])
+                    before = os.fstat(archive_fd)
                 except OSError:
+                    db.update_photo_hash_check(
+                        row["id"], "unreadable", commit=False)
+                    stats["unreadable"] += 1
                     continue
-                if ((before.st_dev, before.st_ino)
-                        == (card_st.st_dev, card_st.st_ino)):
-                    same_as_card = True
-                    break
-            if same_as_card:
-                outcome_reason = KEEP_INSIDE_SOURCE
-                continue
+                if not stat_mod.S_ISREG(before.st_mode):
+                    db.update_photo_hash_check(
+                        row["id"], "unreadable", commit=False)
+                    stats["unreadable"] += 1
+                    continue
 
-            try:
-                actual_hash = compute_file_hash(archive_path)
-                after = os.stat(archive_path)
-                after_real = os.path.realpath(archive_path)
-            except (OSError, ValueError):
-                db.update_photo_hash_check(
-                    row["id"], "unreadable", commit=False)
-                stats["unreadable"] += 1
-                continue
-            stats["archive_files_read"] += 1
+                # An outside-path hardlink to a card file is not a second
+                # copy.  Compare against the fd's dev/inode — the same
+                # object every later step here operates on.
+                same_as_card = False
+                for entry in card_entries:
+                    try:
+                        card_st = os.stat(entry["path"])
+                    except OSError:
+                        continue
+                    if ((before.st_dev, before.st_ino)
+                            == (card_st.st_dev, card_st.st_ino)):
+                        same_as_card = True
+                        break
+                if same_as_card:
+                    outcome_reason = KEEP_INSIDE_SOURCE
+                    continue
+
+                try:
+                    actual_hash = compute_fd_hash(archive_fd)
+                    after = os.fstat(archive_fd)
+                    after_real = os.path.realpath(archive_path)
+                except (OSError, ValueError):
+                    db.update_photo_hash_check(
+                        row["id"], "unreadable", commit=False)
+                    stats["unreadable"] += 1
+                    continue
+                stats["archive_files_read"] += 1
+            finally:
+                os.close(archive_fd)
 
             # Do not certify a pathname that moved or changed while it was
             # being read.  A later retry can verify the stable object.
@@ -580,6 +618,13 @@ def verify_manifest_archives(db, manifest, manifest_dir, progress_cb=None,
             totals[bucket]["count"] += 1
             totals[bucket]["bytes"] += entry.get("size", 0)
     manifest["totals"] = totals
+    # Bump before write: the delete endpoint's revision check compares
+    # against whatever is on disk, so the new manifest must carry a fresh
+    # number the moment it lands. Missing on old manifests (pre-revision
+    # schema) is treated as the initial revision — the next write is the
+    # first observable change.
+    manifest["revision"] = int(
+        manifest.get("revision", INITIAL_MANIFEST_REVISION)) + 1
     write_manifest(manifest_dir, manifest)
     return stats
 
@@ -656,6 +701,7 @@ def scan_card(db, source, recursive, manifest_dir, scan_job_id,
         "entries": entries,
         "walk_errors": walk_errors,
         "totals": totals,
+        "revision": INITIAL_MANIFEST_REVISION,
     }
     write_manifest(manifest_dir, manifest)
     # Job-result flag only — deliberately NOT part of the persisted
@@ -751,11 +797,47 @@ def delete_verified(db, manifest, progress_cb=None, should_cancel=None):
         # catches ordinary changes plus same-size/same-mtime replacements;
         # putting it here preserves that protection without reading every
         # card file twice.
+        #
+        # CodeRabbit: hash the descriptor we open here rather than
+        # re-opening the pathname. A rename that swaps the card file for
+        # a FIFO after the S_ISREG check on ``st`` but before
+        # compute_file_hash would leave the worker blocking inside
+        # open() — cancellation is checked at file boundaries only, so
+        # the delete job hangs. O_NONBLOCK survives the FIFO open;
+        # fstat then re-proves regular-file + dev/inode identity against
+        # the scanned baseline before any bytes are read.
         try:
-            current_hash = compute_file_hash(path)
+            card_fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+        except FileNotFoundError:
+            summary["skipped"].append(
+                {"path": path, "reason": SKIP_ALREADY_GONE})
+            continue
         except OSError as e:
             summary["failed"].append({"path": path, "error": str(e)})
             continue
+        try:
+            try:
+                fst = os.fstat(card_fd)
+            except OSError as e:
+                summary["failed"].append({"path": path, "error": str(e)})
+                continue
+            if not stat_mod.S_ISREG(fst.st_mode):
+                summary["skipped"].append(
+                    {"path": path, "reason": SKIP_NOT_REGULAR})
+                continue
+            if ((fst.st_dev, fst.st_ino) != (st.st_dev, st.st_ino)
+                    or fst.st_size != entry["size"]
+                    or fst.st_mtime_ns != entry["mtime_ns"]):
+                summary["skipped"].append(
+                    {"path": path, "reason": SKIP_CHANGED})
+                continue
+            try:
+                current_hash = compute_fd_hash(card_fd)
+            except OSError as e:
+                summary["failed"].append({"path": path, "error": str(e)})
+                continue
+        finally:
+            os.close(card_fd)
         if current_hash != entry["hash"]:
             summary["skipped"].append(
                 {"path": path, "reason": SKIP_CONTENT_CHANGED})

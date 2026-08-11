@@ -420,19 +420,22 @@ def test_scoped_verify_reads_only_matching_archive_and_refreshes_manifest(
 
     manifest_dir = str(tmp_path / "manifests")
     manifest = load_manifest(manifest_dir, "scan-1")
-    calls = []
-    real_hash = card_cleanup.compute_file_hash
+    # verify_manifest_archives hashes a pinned descriptor now (CodeRabbit
+    # TOCTOU fix), so callers no longer name the path. Correlate hashed
+    # descriptors back to files via fstat inode.
+    hashed_inodes = []
+    real_hash = card_cleanup.compute_fd_hash
 
-    def counting_hash(path, *args, **kwargs):
-        calls.append(str(path))
-        return real_hash(path, *args, **kwargs)
+    def track(fd, *a, **kw):
+        hashed_inodes.append(os.fstat(fd).st_ino)
+        return real_hash(fd, *a, **kw)
 
-    monkeypatch.setattr(card_cleanup, "compute_file_hash", counting_hash)
+    monkeypatch.setattr(card_cleanup, "compute_fd_hash", track)
     result = card_cleanup.verify_manifest_archives(
         db, manifest, manifest_dir)
 
-    assert calls == [str(archive_file)]
-    assert str(unrelated) not in calls
+    assert hashed_inodes == [os.stat(archive_file).st_ino]
+    assert os.stat(unrelated).st_ino not in hashed_inodes
     assert result["archive_files_read"] == 1
     assert result["unblocked_files"] == 1
     refreshed = load_manifest(manifest_dir, "scan-1")
@@ -639,6 +642,35 @@ def test_qualify_rows_null_archive_stat_baseline_keeps(db, tmp_path):
         rows, source_root_real, str(card))
     assert archive_path is None
     assert reason == card_cleanup.KEEP_ARCHIVE_CHANGED
+
+
+def test_qualify_rows_prefers_verify_remedy_over_ok_row_specific_reason(
+        db, tmp_path):
+    """Codex P2: an ok archive row that fails a later gate (missing
+    file, changed size/mtime, etc.) used to set the specific reason
+    verbatim, which then hid rows that still had an unchecked sibling
+    verify could try. Ensure the never-checked sibling wins so the
+    card-cleanup callout offers to verify it."""
+    archive_file, _ = _archive_photo(db, tmp_path)
+    source_root_real = os.path.realpath(str(tmp_path / "card"))
+    card = _card_file(tmp_path)
+    # Row A is 'ok' but its archive file is missing on disk — the row
+    # itself would raise KEEP_ARCHIVE_UNREACHABLE via the ok-path stat
+    # failure. Row B is a never-checked sibling that verify could still
+    # try; its presence must promote the reason to KEEP_NOT_VERIFIED.
+    rows = [
+        {"filename": "GONE.NEF",
+         "file_size": 7, "file_mtime": 0.0,
+         "hash_status": "ok",
+         "folder_path": str(tmp_path / "archive_missing")},
+        {"filename": os.path.basename(str(archive_file)),
+         "file_size": None, "file_mtime": None,
+         "hash_status": None,
+         "folder_path": os.path.dirname(str(archive_file))},
+    ]
+    _, reason = card_cleanup.qualify_rows(
+        rows, source_root_real, str(card))
+    assert reason == card_cleanup.KEEP_NOT_VERIFIED
 
 
 def test_qualify_rows_missing_card_file_unreadable(db, tmp_path):
@@ -1078,21 +1110,28 @@ def test_delete_skips_when_card_path_becomes_fifo_post_scan(
         pytest.skip("mkfifo unsupported on this filesystem")
     os.utime(card, ns=(entry["mtime_ns"], entry["mtime_ns"]))
 
-    # compute_file_hash on a FIFO would block on open indefinitely. Prove
-    # the gate rejects the replacement BEFORE any hash call happens.
+    # compute_file_hash / compute_fd_hash on a FIFO would block on read
+    # indefinitely. Prove the gate rejects the replacement BEFORE any
+    # hash call happens. Both hash entry points are patched — the delete
+    # path uses compute_fd_hash after the CodeRabbit TOCTOU fix, but
+    # guarding both keeps future regressions from silently slipping the
+    # bad object through.
     hash_calls = []
     real_hash = card_cleanup.compute_file_hash
+    real_fd_hash = card_cleanup.compute_fd_hash
 
-    def guarded_hash(path, *a, **kw):
-        hash_calls.append(path)
+    def guarded_hash(*a, **kw):
+        hash_calls.append(a)
         raise AssertionError(
-            "compute_file_hash must not be called on a non-regular replacement")
+            "hash function must not be called on a non-regular replacement")
 
     monkeypatch.setattr(card_cleanup, "compute_file_hash", guarded_hash)
+    monkeypatch.setattr(card_cleanup, "compute_fd_hash", guarded_hash)
     try:
         summary = card_cleanup.delete_verified(db, manifest)
     finally:
         monkeypatch.setattr(card_cleanup, "compute_file_hash", real_hash)
+        monkeypatch.setattr(card_cleanup, "compute_fd_hash", real_fd_hash)
 
     assert hash_calls == []
     assert summary["deleted"] == 0
@@ -1114,18 +1153,22 @@ def test_delete_skips_when_archive_dies_during_card_hash(db, tmp_path):
     scan = _scan(db, tmp_path)
     assert scan["totals"]["deletable"]["count"] == 1
     manifest = load_manifest(str(tmp_path / "manifests"), "scan-1")
-    real_hash = card_cleanup.compute_file_hash
+    # delete_verified reads the card via compute_fd_hash on a pinned
+    # descriptor (CodeRabbit TOCTOU fix), so intercept that instead of
+    # compute_file_hash. Kill the archive during the single card hash to
+    # prove gate 2 catches the death before os.remove.
+    real_hash = card_cleanup.compute_fd_hash
     hash_calls = []
 
-    def hash_kill_archive(path, *a, **kw):
-        hash_calls.append(str(path))
-        result = real_hash(path, *a, **kw)
+    def hash_kill_archive(fd, *a, **kw):
+        hash_calls.append(fd)
+        result = real_hash(fd, *a, **kw)
         if len(hash_calls) == 1:
             os.unlink(archive_file)
         return result
 
     with unittest.mock.patch.object(
-            card_cleanup, "compute_file_hash", hash_kill_archive):
+            card_cleanup, "compute_fd_hash", hash_kill_archive):
         summary = card_cleanup.delete_verified(db, manifest)
     assert summary["deleted"] == 0
     assert card.exists()
@@ -1152,12 +1195,15 @@ def test_delete_skips_when_parent_redirected_during_card_hash(db, tmp_path):
     decoy.write_bytes(b"raw-one")
     os.utime(decoy, ns=(entry["mtime_ns"], entry["mtime_ns"]))
 
-    real_hash = card_cleanup.compute_file_hash
+    # Same intent as above: delete_verified now reads the card via
+    # compute_fd_hash (CodeRabbit TOCTOU fix), so hook that entry point
+    # to run the parent-directory swap during the pinned-fd hash.
+    real_hash = card_cleanup.compute_fd_hash
     hash_calls = []
 
-    def hash_then_swap_parent(path, *a, **kw):
-        hash_calls.append(str(path))
-        result = real_hash(path, *a, **kw)
+    def hash_then_swap_parent(fd, *a, **kw):
+        hash_calls.append(fd)
+        result = real_hash(fd, *a, **kw)
         if len(hash_calls) == 1:
             # Swap the parent for a symlink after the single card read has
             # committed to bytes but before containment is re-verified.
@@ -1170,7 +1216,7 @@ def test_delete_skips_when_parent_redirected_during_card_hash(db, tmp_path):
         return result
 
     with unittest.mock.patch.object(
-            card_cleanup, "compute_file_hash", hash_then_swap_parent):
+            card_cleanup, "compute_fd_hash", hash_then_swap_parent):
         summary = card_cleanup.delete_verified(db, manifest)
     assert summary["deleted"] == 0
     assert len(summary["skipped"]) == 1
@@ -1182,19 +1228,23 @@ def test_delete_skips_when_parent_redirected_during_card_hash(db, tmp_path):
 def test_delete_hashes_each_card_file_once(db, tmp_path, monkeypatch):
     _archive_photo(db, tmp_path)
     card = _card_file(tmp_path)
+    card_inode = os.stat(card).st_ino
     _scan(db, tmp_path)
     manifest = load_manifest(str(tmp_path / "manifests"), "scan-1")
-    calls = []
-    real_hash = card_cleanup.compute_file_hash
+    # delete_verified hashes the card via compute_fd_hash on a pinned
+    # descriptor (CodeRabbit TOCTOU fix). Correlate fds back to the card
+    # by inode so this assertion still says "one read per card file".
+    hashed_inodes = []
+    real_hash = card_cleanup.compute_fd_hash
 
-    def counting_hash(path, *args, **kwargs):
-        calls.append(str(path))
-        return real_hash(path, *args, **kwargs)
+    def counting_hash(fd, *args, **kwargs):
+        hashed_inodes.append(os.fstat(fd).st_ino)
+        return real_hash(fd, *args, **kwargs)
 
-    monkeypatch.setattr(card_cleanup, "compute_file_hash", counting_hash)
+    monkeypatch.setattr(card_cleanup, "compute_fd_hash", counting_hash)
     summary = card_cleanup.delete_verified(db, manifest)
     assert summary["deleted"] == 1
-    assert calls == [str(card)]
+    assert hashed_inodes == [card_inode]
 
 
 def test_qualify_binds_containment_to_statted_object(db, tmp_path, monkeypatch):

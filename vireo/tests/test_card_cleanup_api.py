@@ -127,7 +127,9 @@ def test_scan_then_manifest_then_delete_end_to_end(app_and_db, tmp_path):
     assert manifest["totals"]["deletable"]["count"] == 1
 
     delete_resp = client.post(
-        "/api/card-cleanup/delete", json={"scan_job_id": scan_job_id})
+        "/api/card-cleanup/delete",
+        json={"scan_job_id": scan_job_id,
+              "manifest_revision": manifest["revision"]})
     assert delete_resp.status_code == 200
     delete_job_id = delete_resp.get_json()["job_id"]
     _wait_for_job(client, delete_job_id)
@@ -170,7 +172,8 @@ def test_scoped_verify_endpoint_promotes_preview_without_global_audit(
     after = client.get(
         f"/api/card-cleanup/{scan_job_id}/manifest").get_json()
     assert after["totals"]["deletable"]["count"] == 1
-    assert after["entries"][0]["archive_path"] == str(archive_file)
+    deletable = [e for e in after["entries"] if e["bucket"] == "deletable"]
+    assert [e["archive_path"] for e in deletable] == [str(archive_file)]
     assert unrelated.exists()
     unrelated_status = db.conn.execute(
         "SELECT hash_status FROM photos WHERE id = ?", (unrelated_pid,)
@@ -275,8 +278,12 @@ def test_delete_after_restart_uses_history_and_disk_manifest(
     )
     db.conn.commit()
 
+    manifest = client.get(
+        "/api/card-cleanup/scan-r/manifest").get_json()
     delete_resp = client.post(
-        "/api/card-cleanup/delete", json={"scan_job_id": "scan-r"})
+        "/api/card-cleanup/delete",
+        json={"scan_job_id": "scan-r",
+              "manifest_revision": manifest["revision"]})
     assert delete_resp.status_code == 200
     delete_job_id = delete_resp.get_json()["job_id"]
     _wait_for_job(client, delete_job_id)
@@ -307,7 +314,9 @@ def test_delete_expired_manifest_404(app_and_db, tmp_path):
         json.dump(manifest, f)
 
     delete_resp = client.post(
-        "/api/card-cleanup/delete", json={"scan_job_id": scan_job_id})
+        "/api/card-cleanup/delete",
+        json={"scan_job_id": scan_job_id,
+              "manifest_revision": manifest["revision"]})
     assert delete_resp.status_code == 404
     assert "re-scan" in delete_resp.get_json()["error"]
 
@@ -338,12 +347,16 @@ def test_delete_concurrent_delete_409(app_and_db, tmp_path, monkeypatch):
 
     monkeypatch.setattr(
         card_cleanup, "delete_verified", blocking_delete_verified)
+    manifest = client.get(
+        f"/api/card-cleanup/{scan_job_id}/manifest").get_json()
     # Bound before the try so a failure on the first POST surfaces as
     # itself, not as a NameError raised from the finally drain.
     job1_id = None
     try:
         resp1 = client.post(
-            "/api/card-cleanup/delete", json={"scan_job_id": scan_job_id})
+            "/api/card-cleanup/delete",
+            json={"scan_job_id": scan_job_id,
+                  "manifest_revision": manifest["revision"]})
         assert resp1.status_code == 200
         job1_id = resp1.get_json()["job_id"]
         assert started.wait(timeout=15)
@@ -360,7 +373,9 @@ def test_delete_concurrent_delete_409(app_and_db, tmp_path, monkeypatch):
         assert _running()
 
         resp2 = client.post(
-            "/api/card-cleanup/delete", json={"scan_job_id": scan_job_id})
+            "/api/card-cleanup/delete",
+            json={"scan_job_id": scan_job_id,
+                  "manifest_revision": manifest["revision"]})
         assert resp2.status_code == 409
     finally:
         release.set()
@@ -411,14 +426,109 @@ def test_delete_result_carries_exact_totals(app_and_db, tmp_path):
                        json={"source": str(tmp_path / "card")})
     scan_job_id = resp.get_json()["job_id"]
     _wait_for_job(client, scan_job_id)
+    manifest = client.get(
+        f"/api/card-cleanup/{scan_job_id}/manifest").get_json()
     resp = client.post("/api/card-cleanup/delete",
-                       json={"scan_job_id": scan_job_id})
+                       json={"scan_job_id": scan_job_id,
+                             "manifest_revision": manifest["revision"]})
     job_id = resp.get_json()["job_id"]
     _wait_for_job(client, job_id)
     result = client.get(f"/api/jobs/{job_id}").get_json()["result"]
     assert result["skipped_total"] == len(result["skipped"]) == 0
     assert result["failed_total"] == len(result["failed"]) == 0
     assert result["deleted"] == 1
+
+
+def test_scan_manifest_carries_initial_revision(app_and_db, tmp_path):
+    """Codex P1: the first manifest a scan writes must carry
+    INITIAL_MANIFEST_REVISION so the delete endpoint's revision check
+    has something concrete to compare against on the very first pass."""
+    app, db = app_and_db
+    client = app.test_client()
+    _make_verified_pair(db, tmp_path)
+    resp = client.post("/api/card-cleanup/scan",
+                       json={"source": str(tmp_path / "card")})
+    scan_job_id = resp.get_json()["job_id"]
+    _wait_for_job(client, scan_job_id)
+    manifest = client.get(
+        f"/api/card-cleanup/{scan_job_id}/manifest").get_json()
+    assert manifest["revision"] == card_cleanup.INITIAL_MANIFEST_REVISION
+
+
+def test_verify_bumps_manifest_revision(app_and_db, tmp_path):
+    """Codex P1: a completed verify must land a fresh revision so any
+    still-open confirmation from before the verify fails the delete-side
+    revision check instead of quietly deleting newly-promoted files."""
+    app, db = app_and_db
+    client = app.test_client()
+    _archive_photo(db, tmp_path)
+    db.conn.execute(
+        "UPDATE photos SET hash_status = NULL, hash_checked_at = NULL")
+    db.conn.commit()
+    _card_file(tmp_path)
+    scan_resp = client.post(
+        "/api/card-cleanup/scan", json={"source": str(tmp_path / "card")})
+    scan_job_id = scan_resp.get_json()["job_id"]
+    _wait_for_job(client, scan_job_id)
+
+    before = client.get(
+        f"/api/card-cleanup/{scan_job_id}/manifest").get_json()
+    verify_resp = client.post(
+        "/api/card-cleanup/verify", json={"scan_job_id": scan_job_id})
+    _wait_for_job(client, verify_resp.get_json()["job_id"])
+    after = client.get(
+        f"/api/card-cleanup/{scan_job_id}/manifest").get_json()
+    assert after["revision"] == before["revision"] + 1
+
+
+def test_delete_rejects_missing_manifest_revision(app_and_db, tmp_path):
+    """The revision check is required on any completed scan.  A body
+    that omits it must 400 rather than defaulting silently."""
+    app, db = app_and_db
+    client = app.test_client()
+    _make_verified_pair(db, tmp_path)
+    scan_resp = client.post(
+        "/api/card-cleanup/scan", json={"source": str(tmp_path / "card")})
+    scan_job_id = scan_resp.get_json()["job_id"]
+    _wait_for_job(client, scan_job_id)
+    resp = client.post(
+        "/api/card-cleanup/delete", json={"scan_job_id": scan_job_id})
+    assert resp.status_code == 400
+    assert "manifest_revision" in resp.get_json()["error"]
+
+
+def test_delete_rejects_stale_manifest_revision_after_verify(
+        app_and_db, tmp_path):
+    """Codex P1: a delete that confirms an older revision after verify
+    has rewritten the manifest must be rejected with a distinguishable
+    code so the UI can hand the user back to the refreshed preview."""
+    app, db = app_and_db
+    client = app.test_client()
+    _archive_photo(db, tmp_path)
+    db.conn.execute(
+        "UPDATE photos SET hash_status = NULL, hash_checked_at = NULL")
+    db.conn.commit()
+    _card_file(tmp_path)
+    scan_resp = client.post(
+        "/api/card-cleanup/scan", json={"source": str(tmp_path / "card")})
+    scan_job_id = scan_resp.get_json()["job_id"]
+    _wait_for_job(client, scan_job_id)
+    stale = client.get(
+        f"/api/card-cleanup/{scan_job_id}/manifest").get_json()
+    stale_revision = stale["revision"]
+
+    # Verify promotes the unchecked archive row and bumps the revision.
+    verify_resp = client.post(
+        "/api/card-cleanup/verify", json={"scan_job_id": scan_job_id})
+    _wait_for_job(client, verify_resp.get_json()["job_id"])
+
+    resp = client.post(
+        "/api/card-cleanup/delete",
+        json={"scan_job_id": scan_job_id,
+              "manifest_revision": stale_revision})
+    assert resp.status_code == 409
+    body = resp.get_json()
+    assert body["code"] == "manifest_revision_mismatch"
 
 
 def test_endpoints_reject_non_object_json_body(app_and_db):
@@ -533,7 +643,11 @@ def test_finish_scoped_verification_refreshes_preview_without_rescan(
     assert "await cardCleanupLoadManifest()" in section
     assert section.index("await cardCleanupLoadManifest()") < section.index(
         "cardCleanupSetBusy(false")
-    assert "keepDeleteState: refreshed" in section
+    # After the Codex P1 flicker fix, keepDeleteState is truthy for any
+    # completed/cancelled verification so cardCleanupSetBusy never
+    # restores the pre-verification Delete snapshot — success re-renders
+    # via cardCleanupLoadManifest, failure explicitly disables below.
+    assert "keepDeleteState: attemptedReload || refreshed" in section
     assert "re-scan the card before deleting" not in section
 
 

@@ -130,6 +130,15 @@ log = logging.getLogger(__name__)
 # and leave the process in the wrong mode mid-probe.
 _WIN_ERROR_MODE_LOCK = threading.Lock()
 
+# Serializes the "no other card-cleanup verify/delete is running for this
+# scan" check with the runner.start() that follows it. list_jobs() +
+# runner.start() are separately atomic, but the gap between them let two
+# concurrent verify or delete POSTs both see "nothing running" and both
+# launch a worker — a race Codex flagged on PR 1453. Holding this lock
+# across the check AND the registration collapses that gap; the second
+# request now sees the first's just-registered job and returns 409.
+_CARD_CLEANUP_JOB_LOCK = threading.Lock()
+
 # A Leaflet marker is substantially heavier than its JSON source row. Keep a
 # hard ceiling as a final safety net for very large libraries; the Map UI
 # clearly reports truncation and lets users narrow the shared filters.
@@ -20007,6 +20016,51 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             return json_error(str(e), status=e.http_status)
         return jsonify(manifest)
 
+    def _resolve_completed_card_cleanup_scan(db, runner, scan_job_id):
+        """Look up a card-cleanup-scan job, live runner first then
+        job_history, and return (scan_job, error_response). Either the
+        job is completed and the caller may proceed, or ``error_response``
+        is a ready-to-return :func:`json_error` for the bad states.
+
+        Shared by the verify and delete endpoints so their
+        scan-resolution rules can't drift.
+        """
+        scan_job = runner.get(scan_job_id)
+        if scan_job is None:
+            row = db.conn.execute(
+                "SELECT type, status FROM job_history WHERE id = ?",
+                (scan_job_id,)).fetchone()
+            scan_job = dict(row) if row is not None else None
+        if scan_job is None or scan_job.get("type") != "card-cleanup-scan":
+            return None, json_error("unknown scan job", status=404)
+        if scan_job.get("status") in ("queued", "running"):
+            # Mid-flight, not a dead end: telling the user to re-scan
+            # here would throw away a scan that is about to succeed.
+            return None, json_error(
+                "scan still running — wait for it to finish")
+        if scan_job.get("status") != "completed":
+            return None, json_error(
+                "scan did not complete — re-scan the card")
+        return scan_job, None
+
+    def _card_cleanup_job_conflict_response(runner, scan_job_id):
+        """Return a 409 :func:`json_error` when a verify or delete for
+        this scan is already queued or running, else ``None``. Callers
+        MUST hold ``_CARD_CLEANUP_JOB_LOCK`` across both this call and
+        the following ``runner.start()`` so a second POST cannot slip in
+        during the gap and register its own worker.
+        """
+        for j in runner.list_jobs():
+            if (j.get("type") in
+                    ("card-cleanup-verify", "card-cleanup-delete")
+                    and j.get("status") in ("queued", "running")
+                    and (j.get("config") or {}).get("scan_job_id")
+                    == scan_job_id):
+                return json_error(
+                    "verification or deletion for this scan is already "
+                    "running", status=409)
+        return None
+
     @app.route("/api/card-cleanup/verify", methods=["POST"])
     def api_card_cleanup_verify():
         """Verify only archive copies needed by a cleanup preview.
@@ -20025,28 +20079,10 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         db = _get_db()
         runner = app._job_runner
         active_ws = db._active_workspace_id
-        scan_job = runner.get(scan_job_id)
-        if scan_job is None:
-            row = db.conn.execute(
-                "SELECT type, status FROM job_history WHERE id = ?",
-                (scan_job_id,)).fetchone()
-            scan_job = dict(row) if row is not None else None
-        if scan_job is None or scan_job.get("type") != "card-cleanup-scan":
-            return json_error("unknown scan job", status=404)
-        if scan_job.get("status") in ("queued", "running"):
-            return json_error("scan still running — wait for it to finish")
-        if scan_job.get("status") != "completed":
-            return json_error("scan did not complete — re-scan the card")
-
-        for job in runner.list_jobs():
-            if (job.get("type") in
-                    ("card-cleanup-verify", "card-cleanup-delete")
-                    and job.get("status") in ("queued", "running")
-                    and (job.get("config") or {}).get("scan_job_id")
-                    == scan_job_id):
-                return json_error(
-                    "verification or deletion for this scan is already "
-                    "running", status=409)
+        _scan_job, err = _resolve_completed_card_cleanup_scan(
+            db, runner, scan_job_id)
+        if err is not None:
+            return err
 
         card_cleanup_dir = app.config["CARD_CLEANUP_DIR"]
         try:
@@ -20083,10 +20119,18 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             finally:
                 thread_db.close()
 
-        job_id = runner.start(
-            "card-cleanup-verify", work,
-            config={"scan_job_id": scan_job_id},
-            workspace_id=active_ws)
+        # Atomic conflict-check + start (Codex P1): without the lock,
+        # two concurrent verify POSTs can both pass the conflict check
+        # and both launch a worker that rewrites the same manifest.
+        with _CARD_CLEANUP_JOB_LOCK:
+            conflict = _card_cleanup_job_conflict_response(
+                runner, scan_job_id)
+            if conflict is not None:
+                return conflict
+            job_id = runner.start(
+                "card-cleanup-verify", work,
+                config={"scan_job_id": scan_job_id},
+                workspace_id=active_ws)
         return jsonify({"job_id": job_id})
 
     @app.route("/api/card-cleanup/delete", methods=["POST"])
@@ -20111,41 +20155,40 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         runner = app._job_runner
         active_ws = db._active_workspace_id
 
-        scan_job = runner.get(scan_job_id)
-        if scan_job is None:
-            row = db.conn.execute(
-                "SELECT type, status FROM job_history WHERE id = ?",
-                (scan_job_id,)).fetchone()
-            scan_job = dict(row) if row is not None else None
-        if scan_job is None or scan_job.get("type") != "card-cleanup-scan":
-            return json_error("unknown scan job", status=404)
-        if scan_job.get("status") in ("queued", "running"):
-            # Mid-flight, not a dead end: telling the user to re-scan here
-            # would throw away a scan that is about to succeed.
-            return json_error("scan still running — wait for it to finish")
-        if scan_job.get("status") != "completed":
-            return json_error("scan did not complete — re-scan the card")
-        # One delete AT A TIME per manifest — this guards concurrency,
-        # not repetition: after a delete finishes, the manifest still
-        # loads and a second delete may start (its per-file gates skip
-        # everything already gone). (A TOCTOU race between two
-        # simultaneous POSTs is likewise acceptable: the gates make a
-        # double-delete skip, not double-fire.)
-        for j in runner.list_jobs():
-            if (j.get("type") in
-                    ("card-cleanup-delete", "card-cleanup-verify")
-                    and j.get("status") in ("queued", "running")
-                    and (j.get("config") or {}).get("scan_job_id")
-                    == scan_job_id):
-                return json_error(
-                    "verification or deletion for this scan is already "
-                    "running", status=409)
+        _scan_job, err = _resolve_completed_card_cleanup_scan(
+            db, runner, scan_job_id)
+        if err is not None:
+            return err
+        # Codex P1: the client must send the manifest revision it
+        # confirmed. If a verify has run since that confirmation, the
+        # on-disk manifest carries a newer revision and its deletable
+        # set may include files the user never saw — reject rather than
+        # sweep them in silently. Checked AFTER the scan-job resolution
+        # so an unknown scan still surfaces as 404 rather than a body
+        # complaint.
+        manifest_revision = body.get("manifest_revision")
+        if (not isinstance(manifest_revision, int)
+                or isinstance(manifest_revision, bool)):
+            return json_error("manifest_revision required")
         card_cleanup_dir = app.config["CARD_CLEANUP_DIR"]
         try:
             manifest = card_cleanup.load_manifest(
                 card_cleanup_dir, scan_job_id)
         except card_cleanup.ManifestError as e:
             return json_error(str(e), status=e.http_status)
+        loaded_revision = int(manifest.get(
+            "revision", card_cleanup.INITIAL_MANIFEST_REVISION))
+        if loaded_revision != manifest_revision:
+            # Explicit code so the UI can distinguish this from generic
+            # 409s and drop the user back into a "reload the preview
+            # before deleting" state.
+            return json_error(
+                "the preview has changed since you confirmed it — "
+                "reload the page to review the updated totals before "
+                "deleting.",
+                status=409,
+                code="manifest_revision_mismatch",
+            )
         if not any(e.get("bucket") == "deletable"
                    for e in manifest["entries"]):
             return json_error("nothing to delete — no verified files")
@@ -20183,10 +20226,19 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             finally:
                 thread_db.close()
 
-        job_id = runner.start(
-            "card-cleanup-delete", work,
-            config={"scan_job_id": scan_job_id},
-            workspace_id=active_ws)
+        # Atomic conflict-check + start (Codex P1): pair with the same
+        # lock the verify endpoint uses so a verify POST can't slip in
+        # between our check and our registration and start writing a
+        # new manifest under this delete.
+        with _CARD_CLEANUP_JOB_LOCK:
+            conflict = _card_cleanup_job_conflict_response(
+                runner, scan_job_id)
+            if conflict is not None:
+                return conflict
+            job_id = runner.start(
+                "card-cleanup-delete", work,
+                config={"scan_job_id": scan_job_id},
+                workspace_id=active_ws)
         return jsonify({"job_id": job_id})
 
     @app.route("/api/audit/resolve", methods=["POST"])

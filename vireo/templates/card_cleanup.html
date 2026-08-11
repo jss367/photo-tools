@@ -528,7 +528,7 @@ async function cardCleanupLoadManifest() {
     const resp = await fetch('/api/card-cleanup/' +
       encodeURIComponent(requestedScanJobId) + '/manifest');
     const data = await resp.json();
-    if (cardCleanupState.scanJobId !== requestedScanJobId) return;
+    if (cardCleanupState.scanJobId !== requestedScanJobId) return false;
     if (resp.status === 404) {
       cardCleanupState.scanJobId = null;
       cardCleanupSetError('Preview expired — re-scan the card.', { rescan: true });
@@ -538,7 +538,11 @@ async function cardCleanupLoadManifest() {
     cardCleanupRenderManifest(data);
     return true;
   } catch (e) {
-    if (cardCleanupState.scanJobId !== requestedScanJobId) return;
+    // CodeRabbit: preserve the boolean return contract on the
+    // stale-scan ownership check too. Returning undefined here would be
+    // read as "not refreshed" by the caller, which happens to be
+    // correct — but only by accident. State it.
+    if (cardCleanupState.scanJobId !== requestedScanJobId) return false;
     cardCleanupSetError(String(e.message || e));
     return false;
   }
@@ -609,9 +613,14 @@ function cardCleanupRenderManifest(manifest) {
 
 /* ---------- Card-scoped archive verification ---------- */
 function cardCleanupVerificationPendingCount(manifest) {
+  // CodeRabbit: match verify_manifest_archives' filter — it groups
+  // pending work by entry.hash and silently drops hashless entries, so
+  // counting them here made the callout advertise a pending count
+  // while `reads only the matching archive 0 copies` sat below it.
   return (manifest.entries || []).filter(entry =>
     entry.bucket === 'kept'
     && entry.reason === CARD_CLEANUP_VERIFY_REASON
+    && entry.hash
   ).length;
 }
 
@@ -743,7 +752,15 @@ async function cardCleanupFinishVerification(job, status, jobError) {
   if (attemptedReload) {
     refreshed = await cardCleanupLoadManifest();
   }
-  cardCleanupSetBusy(false, {keepDeleteState: refreshed});
+  // Codex P1: any completed/cancelled verification renders the
+  // pre-verification Delete state stale. Do NOT let cardCleanupSetBusy
+  // restore that state — a successful reload has already re-rendered
+  // Delete via cardCleanupRenderManifest, and a failed reload needs it
+  // locked. Restoring the busyRestore snapshot in between would flicker
+  // Delete back to "enabled with old counts" for the microsecond
+  // between this call and the manual disable below, and Codex flagged
+  // the whole window as a P1 risk on this PR.
+  cardCleanupSetBusy(false, {keepDeleteState: attemptedReload || refreshed});
   if (attemptedReload && !refreshed) {
     // Verification finished but the manifest reload failed or returned
     // an unreadable response, so the on-disk deletable set may now
@@ -916,11 +933,21 @@ async function cardCleanupConfirmDelete() {
   cardCleanupSetBusy(true, {
     deleteHint: 'Deletion is starting…',
   });
+  // Codex P1: send the manifest revision we confirmed against. If a
+  // verify has landed since (and rewritten the manifest with a fresh
+  // revision), the server rejects this POST rather than deleting the
+  // newly-promoted files the user never saw. Missing revision on an old
+  // manifest is treated as INITIAL_MANIFEST_REVISION on the server side.
+  const confirmedRevision =
+    cardCleanupState.manifest && cardCleanupState.manifest.revision;
   try {
     const resp = await fetch('/api/card-cleanup/delete', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ scan_job_id: cardCleanupState.scanJobId }),
+      body: JSON.stringify({
+        scan_job_id: cardCleanupState.scanJobId,
+        manifest_revision: confirmedRevision,
+      }),
     });
     const data = await resp.json();
     cardCleanupCloseConfirm();
@@ -933,6 +960,14 @@ async function cardCleanupConfirmDelete() {
         cardCleanupState.scanJobId = null;
         cardCleanupResetPreview();
         cardCleanupSetError('Preview expired — re-scan the card.', { rescan: true });
+      } else if (data && data.code === 'manifest_revision_mismatch') {
+        // Reload the on-disk manifest so the preview and Delete button
+        // reflect what would actually be deleted next; the totals the
+        // user just confirmed no longer exist on the server.
+        cardCleanupSetError(data.error ||
+          'The preview changed since you confirmed it — review the ' +
+          'updated totals before deleting.');
+        cardCleanupLoadManifest();
       } else {
         cardCleanupSetError(data.error || 'deletion failed to start');
       }

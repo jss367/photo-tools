@@ -462,8 +462,6 @@ body { display: flex; flex-direction: column; height: 100vh; }
   </div>
 </div>
 
-{% set folder_browser_overlay_id = 'importFolderBrowser' %}
-{% set folder_browser_test_id = 'import-folder-browser' %}
 {% include '_folder_browser.html' %}
 
 <script src="/static/vireo-folder-browser.js"></script>
@@ -1330,7 +1328,7 @@ async function browseForDestination() {
 }
 
 const importFolderBrowser = new VireoFolderBrowser({
-  overlayId: 'importFolderBrowser',
+  overlayId: 'folderBrowser',
   defaultMode: 'source',
   onError: (message) => showError(message),
   modes: {

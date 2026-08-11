@@ -2142,7 +2142,7 @@ def test_import_browse_button_opens_folder_browser_fallback(live_server, page):
 
     page.locator("[data-testid='import-source-browse-btn']").click()
 
-    browser = page.locator("[data-testid='import-folder-browser']")
+    browser = page.locator("[data-testid='folder-browser']")
     expect(browser).to_have_class(re.compile(r"\bopen\b"))
     expect(page.locator("#folderBrowserTitle")).to_have_text("Select Source Folders")
     panel = browser.locator(".folder-browser-panel")
@@ -2431,7 +2431,7 @@ def test_import_menu_deep_link_opens_copy_mode_with_source_picker(live_server, p
 
     expect(page.locator("#modeCopy")).to_be_checked()
     expect(page.locator("#destCard")).to_be_visible()
-    expect(page.locator("[data-testid='import-folder-browser']")).to_have_class(
+    expect(page.locator("[data-testid='folder-browser']")).to_have_class(
         re.compile(r"\bopen\b"))
     expect(page.locator("#folderBrowserTitle")).to_have_text("Select Source Folders")
     # pick is a one-shot trigger: it must be stripped from the URL so a manual
@@ -2445,7 +2445,7 @@ def test_import_folder_browser_escape_closes_modal(live_server, page):
     page.evaluate("window.pickDirectory = async () => null")
 
     page.locator("[data-testid='import-source-browse-btn']").click()
-    browser = page.locator("[data-testid='import-folder-browser']")
+    browser = page.locator("[data-testid='folder-browser']")
     expect(browser).to_have_class(re.compile(r"\bopen\b"))
     expect(browser.locator(".folder-browser-close")).to_be_focused()
 
@@ -2524,7 +2524,7 @@ def test_import_destination_structure_hides_when_folder_browser_picks_destinatio
     expect(page.locator("#destStructure")).to_be_visible()
 
     page.locator("[data-testid='import-destination-browse-btn']").click()
-    expect(page.locator("[data-testid='import-folder-browser']")).to_have_class(
+    expect(page.locator("[data-testid='folder-browser']")).to_have_class(
         re.compile(r"\bopen\b"))
     page.locator("#folderBrowserSelectBtn").click()
 

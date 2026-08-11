@@ -47,7 +47,7 @@ def test_card_cleanup_folder_browser_shows_recursive_photo_counts(
 
     page.locator("[data-testid='card-cleanup-browse-btn']").click()
 
-    browser = page.locator("[data-testid='card-folder-browser']")
+    browser = page.locator("[data-testid='folder-browser']")
     expect(browser).to_have_class(re.compile(r"\bopen\b"))
     expect(page.locator("#folderBrowserTitle")).to_have_text(
         "Select Card Folder"

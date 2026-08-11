@@ -165,8 +165,6 @@ body { display: flex; flex-direction: column; height: 100vh; }
   </div>
 </div>
 
-{% set folder_browser_overlay_id = 'cardFolderBrowser' %}
-{% set folder_browser_test_id = 'card-folder-browser' %}
 {% include '_folder_browser.html' %}
 
 <!-- Delete confirmation. Reuses the folder browser's overlay/panel classes:
@@ -295,7 +293,7 @@ function cardCleanupSetError(msg, opts) {
 
 /* ---------- Shared single-select folder browser ---------- */
 const cardFolderBrowser = new VireoFolderBrowser({
-  overlayId: 'cardFolderBrowser',
+  overlayId: 'folderBrowser',
   defaultMode: 'card',
   onError: (message) => cardCleanupSetError(message),
   modes: {

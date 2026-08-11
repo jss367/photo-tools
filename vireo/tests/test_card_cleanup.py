@@ -493,6 +493,51 @@ def test_scoped_verify_mismatch_stays_kept_and_records_failed_verdict(
     assert status == "corrupt"
 
 
+def test_scoped_verify_unreachable_archive_keeps_row_unchecked(
+        db, tmp_path, monkeypatch):
+    # Codex P2: a transiently unreachable archive (NAS mount down) must
+    # not permanently downgrade the row from unchecked → unreadable, or
+    # a later re-scan would classify it as a prior integrity failure
+    # (KEEP_ARCHIVE_HASH_FAILED) and route the user to the workspace-wide
+    # Audit page instead of retrying targeted verification.
+    archive_file, pid = _archive_photo(db, tmp_path, hash_status=None)
+    _card_file(tmp_path)
+    _scan(db, tmp_path)
+
+    # verify_manifest_archives opens the archive fd first (CodeRabbit's
+    # descriptor-pinning fix), so a downed-mount symptom surfaces as an
+    # os.open failure on the archive path.
+    real_open = os.open
+    archive_str = str(archive_file)
+
+    def failing_open(path, *args, **kwargs):
+        if str(path) == archive_str:
+            raise OSError(2, "mount is down")
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(card_cleanup.os, "open", failing_open)
+
+    manifest_dir = str(tmp_path / "manifests")
+    result = card_cleanup.verify_manifest_archives(
+        db, load_manifest(manifest_dir, "scan-1"), manifest_dir)
+
+    assert result["unreadable"] == 1
+    assert result["verified"] == 0
+    assert result["unblocked_files"] == 0
+
+    # DB row must remain NULL so a later scan-after-remount re-issues
+    # KEEP_NOT_VERIFIED, not KEEP_ARCHIVE_HASH_FAILED.
+    status = db.conn.execute(
+        "SELECT hash_status FROM photos WHERE id = ?", (pid,)
+    ).fetchone()["hash_status"]
+    assert status is None
+
+    refreshed = load_manifest(manifest_dir, "scan-1")
+    kept = _entries(refreshed, "kept")
+    assert len(kept) == 1
+    assert kept[0]["reason"] == card_cleanup.KEEP_ARCHIVE_UNREACHABLE
+
+
 def test_scan_archive_file_missing_kept(db, tmp_path):
     archive_file, _ = _archive_photo(db, tmp_path)
     _card_file(tmp_path)

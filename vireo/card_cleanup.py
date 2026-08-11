@@ -480,9 +480,15 @@ def verify_manifest_archives(db, manifest, manifest_dir, progress_cb=None,
             try:
                 archive_real = os.path.realpath(archive_path)
             except (OSError, ValueError):
-                db.update_photo_hash_check(
-                    row["id"], "unreadable", commit=False)
+                # Codex P2: keep hash_status NULL when we can't even
+                # reach the archive path. Marking unreadable here is
+                # permanent — after a transiently-down mount comes
+                # back, a re-scan would classify the row as a prior
+                # integrity failure and route users to the
+                # workspace-wide Audit page instead of a targeted
+                # verify retry.
                 stats["unreadable"] += 1
+                outcome_reason = KEEP_ARCHIVE_UNREACHABLE
                 continue
             if contains_check(archive_real):
                 outcome_reason = KEEP_INSIDE_SOURCE
@@ -501,19 +507,35 @@ def verify_manifest_archives(db, manifest, manifest_dir, progress_cb=None,
                 archive_fd = os.open(
                     archive_path, os.O_RDONLY | os.O_NONBLOCK)
             except (OSError, ValueError):
-                db.update_photo_hash_check(
-                    row["id"], "unreadable", commit=False)
+                # Same rationale as the realpath branch above (Codex
+                # P2): a stat that can't see the file — the common
+                # symptom of a disconnected NAS mount — means the
+                # archive is unreachable, not corrupt. Leave the row
+                # unchecked so targeted verification can retry once
+                # the mount returns; reserve 'unreadable' for files
+                # we actually reached but could not read.
                 stats["unreadable"] += 1
+                outcome_reason = KEEP_ARCHIVE_UNREACHABLE
                 continue
             try:
                 try:
                     before = os.fstat(archive_fd)
                 except OSError:
+                    # We opened the object but immediately failed to
+                    # stat it (extremely rare — a race on the mount
+                    # itself). Treat as reached-but-unreadable rather
+                    # than unreachable; the fd itself would have
+                    # failed at open() in the mount-down case.
                     db.update_photo_hash_check(
                         row["id"], "unreadable", commit=False)
                     stats["unreadable"] += 1
                     continue
                 if not stat_mod.S_ISREG(before.st_mode):
+                    # The object is present but is a directory/FIFO/
+                    # device swapped in on top of the path — not
+                    # "unreachable" (we reached it), just not something
+                    # we can hash. Marking unreadable is intentional;
+                    # a subsequent audit is the right remedy.
                     db.update_photo_hash_check(
                         row["id"], "unreadable", commit=False)
                     stats["unreadable"] += 1

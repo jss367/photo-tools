@@ -656,6 +656,18 @@ def verify_manifest_archives(db, manifest, manifest_dir, progress_cb=None,
                 entry.pop("reason", None)
                 stats["unblocked_files"] += 1
                 stats["unblocked_bytes"] += entry.get("size", 0)
+            elif reason == KEEP_NOT_VERIFIED:
+                # Codex P2: qualify_rows saw a viable unchecked row
+                # after our attempt, so verify still has a lever here.
+                # Overwriting with this run's transient
+                # KEEP_ARCHIVE_UNREACHABLE/CHANGED would push the entry
+                # out of the KEEP_NOT_VERIFIED bucket that the verify
+                # endpoint's pending-reason filter and the UI callout
+                # key off; once the NAS mount returns or the file
+                # settles, targeted verification would then report
+                # "nothing needs checking" until the user re-scans the
+                # card. Keep the entry in the retry-eligible bucket.
+                entry["reason"] = KEEP_NOT_VERIFIED
             elif expected_hash in failure_reasons:
                 entry["reason"] = failure_reasons[expected_hash]
             else:

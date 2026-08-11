@@ -532,10 +532,53 @@ def test_scoped_verify_unreachable_archive_keeps_row_unchecked(
     ).fetchone()["hash_status"]
     assert status is None
 
+    # Codex P2: the manifest reason must ALSO stay in the
+    # KEEP_NOT_VERIFIED bucket the verify endpoint/UI's
+    # pending-reason filter keys off. Overwriting with this run's
+    # transient KEEP_ARCHIVE_UNREACHABLE would let a later verify report
+    # "nothing needs checking" once the mount returns, forcing the user
+    # to re-scan the card even though the DB row is still eligible.
     refreshed = load_manifest(manifest_dir, "scan-1")
     kept = _entries(refreshed, "kept")
     assert len(kept) == 1
-    assert kept[0]["reason"] == card_cleanup.KEEP_ARCHIVE_UNREACHABLE
+    assert kept[0]["reason"] == card_cleanup.KEEP_NOT_VERIFIED
+
+
+def test_scoped_verify_retry_after_transient_failure_unblocks(
+        db, tmp_path, monkeypatch):
+    # Codex P2 end-to-end: the first verify run hits a transient
+    # os.open failure (mount down); the row must remain retry-eligible
+    # so that a second verify run, once the mount is back, actually
+    # promotes the entry to deletable without a fresh card scan.
+    archive_file, pid = _archive_photo(db, tmp_path, hash_status=None)
+    _card_file(tmp_path)
+    _scan(db, tmp_path)
+    manifest_dir = str(tmp_path / "manifests")
+
+    real_open = os.open
+    archive_str = str(archive_file)
+    down = {"active": True}
+
+    def flaky_open(path, *args, **kwargs):
+        if down["active"] and str(path) == archive_str:
+            raise OSError(2, "mount is down")
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(card_cleanup.os, "open", flaky_open)
+    card_cleanup.verify_manifest_archives(
+        db, load_manifest(manifest_dir, "scan-1"), manifest_dir)
+    kept_first = _entries(load_manifest(manifest_dir, "scan-1"), "kept")
+    assert len(kept_first) == 1
+    assert kept_first[0]["reason"] == card_cleanup.KEEP_NOT_VERIFIED
+
+    down["active"] = False
+    retry = card_cleanup.verify_manifest_archives(
+        db, load_manifest(manifest_dir, "scan-1"), manifest_dir)
+
+    assert retry["verified"] == 1
+    assert retry["unblocked_files"] == 1
+    refreshed = load_manifest(manifest_dir, "scan-1")
+    assert refreshed["totals"]["deletable"]["count"] == 1
 
 
 def test_scoped_verify_rejects_atomic_replace_during_hash(
@@ -590,9 +633,13 @@ def test_scoped_verify_rejects_atomic_replace_during_hash(
     assert status is None
     refreshed = load_manifest(manifest_dir, "scan-1")
     assert refreshed["totals"]["deletable"]["count"] == 0
+    # Codex P2: the DB row is still unchecked (verify did not persist a
+    # verdict), so the manifest must stay in the KEEP_NOT_VERIFIED
+    # bucket — a targeted retry after the file settles is the correct
+    # next lever, not "archive changed" which would look terminal.
     assert (
         _entries(refreshed, "kept")[0]["reason"]
-        == card_cleanup.KEEP_ARCHIVE_CHANGED
+        == card_cleanup.KEEP_NOT_VERIFIED
     )
 
 

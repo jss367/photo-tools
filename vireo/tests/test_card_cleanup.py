@@ -1102,6 +1102,90 @@ def test_scoped_verify_terminal_alias_does_not_mask_persisted_external_failure(
     assert kept[0]["reason"] == card_cleanup.KEEP_ARCHIVE_HASH_FAILED
 
 
+def test_scoped_verify_surfaces_new_failed_archive_beside_unchecked_alias(
+        db, tmp_path):
+    """A failure persisted in this run also outranks a NULL alias."""
+    card = _card_file(tmp_path, name="IMG_0001.NEF", content=b"raw-one")
+    expected_hash = _sha(str(card))
+
+    alias_folder = tmp_path / "archive" / "alias-current"
+    alias_folder.mkdir(parents=True)
+    alias = alias_folder / "IMG_0001.NEF"
+    try:
+        os.link(card, alias)
+    except (OSError, NotImplementedError):
+        pytest.skip("hardlinks unsupported on this filesystem")
+    alias_st = os.stat(alias)
+    alias_fid = db.add_folder(str(alias_folder))
+    alias_pid = db.add_photo(
+        folder_id=alias_fid, filename=alias.name, extension=".NEF",
+        file_size=alias_st.st_size, file_mtime=alias_st.st_mtime,
+        file_hash=expected_hash,
+    )
+
+    failed_folder = tmp_path / "archive" / "independent"
+    failed_folder.mkdir(parents=True)
+    failed_archive = failed_folder / "IMG_0001.NEF"
+    failed_archive.write_bytes(b"bad-copy")
+    failed_st = os.stat(failed_archive)
+    failed_fid = db.add_folder(str(failed_folder))
+    failed_pid = db.add_photo(
+        folder_id=failed_fid, filename=failed_archive.name, extension=".NEF",
+        file_size=failed_st.st_size, file_mtime=failed_st.st_mtime,
+        file_hash=expected_hash,
+    )
+
+    _scan(db, tmp_path)
+    manifest_dir = str(tmp_path / "manifests")
+    result = card_cleanup.verify_manifest_archives(
+        db, load_manifest(manifest_dir, "scan-1"), manifest_dir)
+
+    assert result["corrupt"] == 1
+    statuses = {
+        row["id"]: row["hash_status"]
+        for row in db.conn.execute(
+            "SELECT id, hash_status FROM photos WHERE id IN (?, ?)",
+            (alias_pid, failed_pid),
+        )
+    }
+    assert statuses == {alias_pid: None, failed_pid: "corrupt"}
+    kept = _entries(load_manifest(manifest_dir, "scan-1"), "kept")
+    assert kept[0]["reason"] == card_cleanup.KEEP_ARCHIVE_HASH_FAILED
+
+
+def test_scoped_verify_does_not_certify_repurposed_catalog_row(
+        db, tmp_path, monkeypatch):
+    archive_file, pid = _archive_photo(db, tmp_path, hash_status=None)
+    _card_file(tmp_path)
+    _scan(db, tmp_path)
+    real_hash = card_cleanup.compute_fd_hash
+
+    def repurpose_row_while_hashing(fd, *args, **kwargs):
+        result = real_hash(fd, *args, **kwargs)
+        if os.fstat(fd).st_ino == os.stat(archive_file).st_ino:
+            db.conn.execute(
+                "UPDATE photos SET filename = ? WHERE id = ?",
+                ("REUSED.NEF", pid),
+            )
+        return result
+
+    monkeypatch.setattr(
+        card_cleanup, "compute_fd_hash", repurpose_row_while_hashing)
+    manifest_dir = str(tmp_path / "manifests")
+    result = card_cleanup.verify_manifest_archives(
+        db, load_manifest(manifest_dir, "scan-1"), manifest_dir)
+
+    row = db.conn.execute(
+        "SELECT filename, hash_status FROM photos WHERE id = ?", (pid,)
+    ).fetchone()
+    assert row["filename"] == "REUSED.NEF"
+    assert row["hash_status"] is None
+    assert result["verified"] == 0
+    assert result["unblocked_files"] == 0
+    refreshed = load_manifest(manifest_dir, "scan-1")
+    assert refreshed["totals"]["deletable"]["count"] == 0
+
+
 def test_scoped_verify_drops_pending_kept_entries_whose_card_files_are_gone(
         db, tmp_path):
     # Codex P2 (follow-up): the deletable pre-pass already drops

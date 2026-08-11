@@ -419,7 +419,8 @@ def qualify_rows(rows, source_root_real, card_path, contains_check=None):
 
 
 _ROWS_BY_HASH_SQL = """
-    SELECT p.id, p.filename, p.file_size, p.file_mtime, p.hash_status,
+    SELECT p.id, p.folder_id, p.filename, p.file_size, p.file_mtime,
+           p.hash_status,
            f.path AS folder_path
     FROM photos p LEFT JOIN folders f ON f.id = p.folder_id
     WHERE p.file_hash = ?
@@ -428,6 +429,35 @@ _ROWS_BY_HASH_SQL = """
 
 def fetch_rows_by_hash(db, file_hash):
     return db.conn.execute(_ROWS_BY_HASH_SQL, (file_hash,)).fetchall()
+
+
+def _record_unchecked_hash_verdict(db, row, expected_hash, status,
+                                   file_size=None, file_mtime=None):
+    """Persist a scoped-verification verdict only for the row we read.
+
+    Hashing can take long enough for a concurrent catalog refresh to replace
+    or repurpose the photo row.  Binding the update to its original identity,
+    baseline, hash, and unchecked state prevents the old descriptor's digest
+    from certifying (or flagging) that newer row.
+    """
+    now = datetime.now().isoformat()
+    assignments = "hash_status = ?, hash_checked_at = ?"
+    values = [status, now]
+    if file_size is not None and file_mtime is not None:
+        assignments += ", file_size = ?, file_mtime = ?"
+        values.extend([file_size, file_mtime])
+    values.extend([
+        row["id"], expected_hash, row["folder_id"], row["filename"],
+        row["file_size"], row["file_mtime"],
+    ])
+    cursor = db.conn.execute(
+        f"UPDATE photos SET {assignments} "
+        "WHERE id = ? AND file_hash = ? AND hash_status IS NULL "
+        "AND folder_id IS ? AND filename = ? "
+        "AND file_size IS ? AND file_mtime IS ?",
+        values,
+    )
+    return cursor.rowcount == 1
 
 
 def _load_catalog_by_hash(db):
@@ -570,18 +600,12 @@ def verify_manifest_archives(db, manifest, manifest_dir, progress_cb=None,
         "unblocked_files": 0, "unblocked_bytes": 0,
     }
     failure_reasons = {}
-    # Codex P2: hashes whose ONLY unchecked catalog rows turned out to be
-    # aliases/hardlinks of the card file itself, or whose cataloged
-    # archive path resolves inside the current source. Those rows stay
-    # NULL-status (they neither read as usable archives nor pass a
-    # persistable failure verdict), so qualify_rows' next pass would
-    # again see saw_never_checked=True and return KEEP_NOT_VERIFIED,
-    # trapping the entry in an infinite verify retry — every click reads
-    # nothing new and shows the same "audit hasn't run" callout. Track
-    # the terminal signal here and let reclassification adopt it below
-    # so the callout finally explains what is actually true: no
-    # independent archive copy exists.
-    terminal_inside_source_hashes = set()
+    # qualify_rows deliberately prioritizes any NULL-status row so a viable
+    # independent copy remains retryable. Once this run establishes that no
+    # such copy remains, however, a NULL same-file/source alias must not mask
+    # either the terminal "inside source" result or a failed independent
+    # archive. Record that final reason for the refresh below.
+    terminal_reasons = {}
 
     for i, (expected_hash, card_entries) in enumerate(pending):
         if should_cancel is not None and should_cancel():
@@ -598,23 +622,21 @@ def verify_manifest_archives(db, manifest, manifest_dir, progress_cb=None,
         unchecked = [row for row in rows if row["hash_status"] is None]
         outcome_reason = KEEP_ARCHIVE_UNREACHABLE
         verified = False
-        # Codex P2 (see terminal_inside_source_hashes above): stays True
-        # only if every unchecked row we processed ended with an inside-
-        # source verdict AND left the row NULL in the DB. A single row
-        # that was persisted (unreadable / modified / corrupt), came back
-        # transiently unreachable, or changed under us flips this off —
-        # qualify_rows' next pass will then have a real lever (either a
-        # persisted verdict it can surface, or a still-NULL row a retry
-        # can still try), so we must not overwrite its KEEP_NOT_VERIFIED
-        # verdict.
-        all_unchecked_inside_source = bool(unchecked)
+        saw_inside_source_alias = False
+        saw_terminal_failure = any(
+            row["hash_status"] not in (None, "ok") for row in rows
+        )
+        saw_retryable_external = False
         for row in unchecked:
             folder_path = row["folder_path"]
             if not folder_path:
-                db.update_photo_hash_check(
-                    row["id"], "unreadable", commit=False)
-                stats["unreadable"] += 1
-                all_unchecked_inside_source = False
+                if _record_unchecked_hash_verdict(
+                        db, row, expected_hash, "unreadable"):
+                    stats["unreadable"] += 1
+                    saw_terminal_failure = True
+                else:
+                    outcome_reason = KEEP_ARCHIVE_CHANGED
+                    saw_retryable_external = True
                 continue
             archive_path = os.path.join(folder_path, row["filename"])
             try:
@@ -629,10 +651,11 @@ def verify_manifest_archives(db, manifest, manifest_dir, progress_cb=None,
                 # verify retry.
                 stats["unreadable"] += 1
                 outcome_reason = KEEP_ARCHIVE_UNREACHABLE
-                all_unchecked_inside_source = False
+                saw_retryable_external = True
                 continue
             if contains_check(archive_real):
                 outcome_reason = KEEP_INSIDE_SOURCE
+                saw_inside_source_alias = True
                 continue
             # CodeRabbit: pin the checked object via a descriptor rather
             # than re-opening the pathname. A concurrent rename that swaps
@@ -657,7 +680,7 @@ def verify_manifest_archives(db, manifest, manifest_dir, progress_cb=None,
                 # we actually reached but could not read.
                 stats["unreadable"] += 1
                 outcome_reason = KEEP_ARCHIVE_UNREACHABLE
-                all_unchecked_inside_source = False
+                saw_retryable_external = True
                 continue
             try:
                 try:
@@ -678,11 +701,14 @@ def verify_manifest_archives(db, manifest, manifest_dir, progress_cb=None,
                     # verdict, hiding the failure and stripping the
                     # Audit-page guidance the UI shows for
                     # KEEP_ARCHIVE_HASH_FAILED.
-                    db.update_photo_hash_check(
-                        row["id"], "unreadable", commit=False)
-                    stats["unreadable"] += 1
-                    outcome_reason = KEEP_ARCHIVE_HASH_FAILED
-                    all_unchecked_inside_source = False
+                    if _record_unchecked_hash_verdict(
+                            db, row, expected_hash, "unreadable"):
+                        stats["unreadable"] += 1
+                        outcome_reason = KEEP_ARCHIVE_HASH_FAILED
+                        saw_terminal_failure = True
+                    else:
+                        outcome_reason = KEEP_ARCHIVE_CHANGED
+                        saw_retryable_external = True
                     continue
                 if not stat_mod.S_ISREG(before.st_mode):
                     # The object is present but is a directory/FIFO/
@@ -692,11 +718,14 @@ def verify_manifest_archives(db, manifest, manifest_dir, progress_cb=None,
                     # a subsequent audit is the right remedy.
                     #
                     # Codex P2 (follow-up): see the fstat branch above.
-                    db.update_photo_hash_check(
-                        row["id"], "unreadable", commit=False)
-                    stats["unreadable"] += 1
-                    outcome_reason = KEEP_ARCHIVE_HASH_FAILED
-                    all_unchecked_inside_source = False
+                    if _record_unchecked_hash_verdict(
+                            db, row, expected_hash, "unreadable"):
+                        stats["unreadable"] += 1
+                        outcome_reason = KEEP_ARCHIVE_HASH_FAILED
+                        saw_terminal_failure = True
+                    else:
+                        outcome_reason = KEEP_ARCHIVE_CHANGED
+                        saw_retryable_external = True
                     continue
 
                 # An outside-path hardlink to a card file is not a second
@@ -714,6 +743,7 @@ def verify_manifest_archives(db, manifest, manifest_dir, progress_cb=None,
                         break
                 if same_as_card:
                     outcome_reason = KEEP_INSIDE_SOURCE
+                    saw_inside_source_alias = True
                     continue
 
                 try:
@@ -727,11 +757,14 @@ def verify_manifest_archives(db, manifest, manifest_dir, progress_cb=None,
                     # promotion loop does not override qualify_rows'
                     # KEEP_ARCHIVE_HASH_FAILED with the initial
                     # KEEP_ARCHIVE_UNREACHABLE.
-                    db.update_photo_hash_check(
-                        row["id"], "unreadable", commit=False)
-                    stats["unreadable"] += 1
-                    outcome_reason = KEEP_ARCHIVE_HASH_FAILED
-                    all_unchecked_inside_source = False
+                    if _record_unchecked_hash_verdict(
+                            db, row, expected_hash, "unreadable"):
+                        stats["unreadable"] += 1
+                        outcome_reason = KEEP_ARCHIVE_HASH_FAILED
+                        saw_terminal_failure = True
+                    else:
+                        outcome_reason = KEEP_ARCHIVE_CHANGED
+                        saw_retryable_external = True
                     continue
                 stats["archive_files_read"] += 1
             finally:
@@ -765,20 +798,19 @@ def verify_manifest_archives(db, manifest, manifest_dir, progress_cb=None,
                     != (after.st_dev, after.st_ino, after.st_size,
                         after.st_mtime_ns)):
                 outcome_reason = KEEP_ARCHIVE_CHANGED
-                all_unchecked_inside_source = False
+                saw_retryable_external = True
                 continue
 
             if actual_hash == expected_hash:
-                now = datetime.now().isoformat()
-                db.conn.execute(
-                    "UPDATE photos SET hash_status = 'ok', "
-                    "hash_checked_at = ?, file_size = ?, file_mtime = ? "
-                    "WHERE id = ?",
-                    (now, after.st_size, after.st_mtime, row["id"]),
-                )
-                stats["verified"] += 1
-                verified = True
-                break
+                if _record_unchecked_hash_verdict(
+                        db, row, expected_hash, "ok",
+                        file_size=after.st_size, file_mtime=after.st_mtime):
+                    stats["verified"] += 1
+                    verified = True
+                    break
+                outcome_reason = KEEP_ARCHIVE_CHANGED
+                saw_retryable_external = True
+                continue
 
             db_mtime = row["file_mtime"]
             if (db_mtime is not None
@@ -786,17 +818,25 @@ def verify_manifest_archives(db, manifest, manifest_dir, progress_cb=None,
                 status = "modified"
             else:
                 status = "corrupt"
-            db.update_photo_hash_check(row["id"], status, commit=False)
-            stats[status] += 1
-            outcome_reason = KEEP_ARCHIVE_HASH_FAILED
-            all_unchecked_inside_source = False
+            if _record_unchecked_hash_verdict(
+                    db, row, expected_hash, status):
+                stats[status] += 1
+                outcome_reason = KEEP_ARCHIVE_HASH_FAILED
+                saw_terminal_failure = True
+            else:
+                outcome_reason = KEEP_ARCHIVE_CHANGED
+                saw_retryable_external = True
 
         db.conn.commit()
         stats["hashes_processed"] += 1
         if not verified:
             failure_reasons[expected_hash] = outcome_reason
-            if all_unchecked_inside_source:
-                terminal_inside_source_hashes.add(expected_hash)
+            if not saw_retryable_external:
+                if saw_terminal_failure:
+                    terminal_reasons[expected_hash] = (
+                        KEEP_ARCHIVE_HASH_FAILED)
+                elif saw_inside_source_alias:
+                    terminal_reasons[expected_hash] = KEEP_INSIDE_SOURCE
 
     # Only previously-unverified entries can change here.  Existing
     # deletable rows are not re-audited or invalidated by this scoped job.
@@ -857,37 +897,8 @@ def verify_manifest_archives(db, manifest, manifest_dir, progress_cb=None,
                 # infinite verify loop (qualify_rows keeps returning
                 # KEEP_NOT_VERIFIED off the still-NULL alias rows).
                 # Adopt the terminal inside-source reason instead.
-                #
-                # Codex P2 (follow-up 2): the inside-source override
-                # must not mask a persisted external integrity failure.
-                # When a hash has one same-source alias row (still NULL,
-                # inside-source terminal) AND at least one external row
-                # that was hashed and persisted as corrupt/modified/
-                # unreadable in a prior pass, qualify_rows still returns
-                # KEEP_NOT_VERIFIED (the alias remains NULL and wins
-                # priority), and this hash lands in
-                # terminal_inside_source_hashes on the run that only
-                # sees the alias. Surfacing KEEP_INSIDE_SOURCE here
-                # would tell the user "no independent archive exists"
-                # even though the catalog has one — one that failed —
-                # and hide the Audit-page remedy the failed row needs.
-                # Persisted check-failed statuses only ever belong to
-                # external rows: every inside-source / same-as-card gate
-                # in the verify loop short-circuits with continue and
-                # never calls update_photo_hash_check, so any non-None,
-                # non-"ok" hash_status here is definitionally external.
-                if expected_hash in terminal_inside_source_hashes:
-                    has_persisted_external_failure = any(
-                        row["hash_status"] in (
-                            "corrupt", "modified", "unreadable")
-                        for row in rows
-                    )
-                    if has_persisted_external_failure:
-                        entry["reason"] = KEEP_ARCHIVE_HASH_FAILED
-                    else:
-                        entry["reason"] = KEEP_INSIDE_SOURCE
-                else:
-                    entry["reason"] = KEEP_NOT_VERIFIED
+                entry["reason"] = terminal_reasons.get(
+                    expected_hash, KEEP_NOT_VERIFIED)
             elif reason == KEEP_ARCHIVE_HASH_FAILED:
                 # A reached row whose fstat/read failed was persisted as
                 # unreadable. That terminal catalog verdict must win over a

@@ -1027,6 +1027,81 @@ def test_scoped_verify_keeps_pending_when_alias_and_transient_row_coexist(
     assert kept[0]["reason"] == card_cleanup.KEEP_NOT_VERIFIED
 
 
+def test_scoped_verify_terminal_alias_does_not_mask_persisted_external_failure(
+        db, tmp_path):
+    # Codex P2: a hash with one same-source alias row (still NULL) and
+    # one external row already persisted as corrupt (from an earlier
+    # verify pass) hits an edge case in the terminal-alias override.
+    # This run only processes the alias — the external row is no longer
+    # unchecked — so scoped verify records the alias as terminally
+    # inside-source and adds the hash to terminal_inside_source_hashes.
+    # qualify_rows then still returns KEEP_NOT_VERIFIED (the alias's
+    # NULL row wins priority over the corrupt row's KEEP_ARCHIVE_HASH_
+    # FAILED). Without this fix, the reclassification pass would
+    # overwrite that to KEEP_INSIDE_SOURCE and tell the user "no
+    # independent archive copy exists", hiding the corrupt external
+    # archive and the Audit-page remedy it needs. The refreshed
+    # manifest must surface KEEP_ARCHIVE_HASH_FAILED instead: the
+    # external failure was cataloged, and the Audit page — not
+    # another verify click — is the remedy.
+    card = _card_file(tmp_path, name="IMG_0001.NEF", content=b"raw-one")
+
+    # External archive row that was hashed as corrupt in an earlier
+    # pass. Store the row without a real file on disk so this run's
+    # verify loop cannot revisit it; hash_status = "corrupt" makes it
+    # non-unchecked so it never enters the scoped verify's unchecked
+    # list. The row remains visible to qualify_rows and to the
+    # reclassification's row scan.
+    external_folder = tmp_path / "archive" / "2026"
+    external_folder.mkdir(parents=True)
+    external_fid = db.add_folder(str(external_folder))
+    external_pid = db.add_photo(
+        folder_id=external_fid, filename="IMG_0001.NEF", extension=".NEF",
+        file_size=len(b"raw-one"), file_mtime=1000.0,
+        file_hash=_sha(str(card)),
+    )
+    db.update_photo_hash_check(external_pid, "corrupt")
+
+    # Alias row: a hardlink into the card file itself. Still NULL —
+    # never audited. Scoped verify will detect it as same-as-card via
+    # the fd's dev/inode and leave it NULL.
+    alias_folder = tmp_path / "archive" / "alias"
+    alias_folder.mkdir(parents=True)
+    alias = alias_folder / "IMG_0001.NEF"
+    try:
+        os.link(card, alias)
+    except (OSError, NotImplementedError):
+        pytest.skip("hardlinks unsupported on this filesystem")
+    alias_st = os.stat(alias)
+    alias_fid = db.add_folder(str(alias_folder))
+    db.add_photo(
+        folder_id=alias_fid, filename="IMG_0001.NEF", extension=".NEF",
+        file_size=alias_st.st_size, file_mtime=alias_st.st_mtime,
+        file_hash=_sha(str(alias)),
+    )
+
+    scan = _scan(db, tmp_path)
+    kept = _entries(scan, "kept")
+    assert len(kept) == 1
+    # Initial scan: the alias's NULL status makes KEEP_NOT_VERIFIED the
+    # winning reason via qualify_rows' priority order.
+    assert kept[0]["reason"] == card_cleanup.KEEP_NOT_VERIFIED
+
+    manifest_dir = str(tmp_path / "manifests")
+    card_cleanup.verify_manifest_archives(
+        db, load_manifest(manifest_dir, "scan-1"), manifest_dir)
+
+    refreshed = load_manifest(manifest_dir, "scan-1")
+    kept = _entries(refreshed, "kept")
+    assert len(kept) == 1
+    # Not KEEP_INSIDE_SOURCE (which would tell the user no independent
+    # archive exists — false; one is cataloged) and not
+    # KEEP_NOT_VERIFIED (another verify click would find nothing new to
+    # do since the only remaining NULL row is a same-source alias).
+    # The correct surface is the terminal external verdict.
+    assert kept[0]["reason"] == card_cleanup.KEEP_ARCHIVE_HASH_FAILED
+
+
 def test_scoped_verify_drops_pending_kept_entries_whose_card_files_are_gone(
         db, tmp_path):
     # Codex P2 (follow-up): the deletable pre-pass already drops

@@ -857,8 +857,35 @@ def verify_manifest_archives(db, manifest, manifest_dir, progress_cb=None,
                 # infinite verify loop (qualify_rows keeps returning
                 # KEEP_NOT_VERIFIED off the still-NULL alias rows).
                 # Adopt the terminal inside-source reason instead.
+                #
+                # Codex P2 (follow-up 2): the inside-source override
+                # must not mask a persisted external integrity failure.
+                # When a hash has one same-source alias row (still NULL,
+                # inside-source terminal) AND at least one external row
+                # that was hashed and persisted as corrupt/modified/
+                # unreadable in a prior pass, qualify_rows still returns
+                # KEEP_NOT_VERIFIED (the alias remains NULL and wins
+                # priority), and this hash lands in
+                # terminal_inside_source_hashes on the run that only
+                # sees the alias. Surfacing KEEP_INSIDE_SOURCE here
+                # would tell the user "no independent archive exists"
+                # even though the catalog has one — one that failed —
+                # and hide the Audit-page remedy the failed row needs.
+                # Persisted check-failed statuses only ever belong to
+                # external rows: every inside-source / same-as-card gate
+                # in the verify loop short-circuits with continue and
+                # never calls update_photo_hash_check, so any non-None,
+                # non-"ok" hash_status here is definitionally external.
                 if expected_hash in terminal_inside_source_hashes:
-                    entry["reason"] = KEEP_INSIDE_SOURCE
+                    has_persisted_external_failure = any(
+                        row["hash_status"] in (
+                            "corrupt", "modified", "unreadable")
+                        for row in rows
+                    )
+                    if has_persisted_external_failure:
+                        entry["reason"] = KEEP_ARCHIVE_HASH_FAILED
+                    else:
+                        entry["reason"] = KEEP_INSIDE_SOURCE
                 else:
                     entry["reason"] = KEEP_NOT_VERIFIED
             elif reason == KEEP_ARCHIVE_HASH_FAILED:

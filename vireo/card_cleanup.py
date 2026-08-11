@@ -514,9 +514,23 @@ def verify_manifest_archives(db, manifest, manifest_dir, progress_cb=None,
     # deletion. Reclassify those entries into the kept bucket with
     # the corresponding SKIP_* reason instead; only a confirmed-
     # absent path (FileNotFoundError above) leaves the manifest.
+    #
+    # Codex P2 (follow-up 3): pending KEEP_NOT_VERIFIED entries were
+    # never revalidated here, so a pending card file removed after
+    # the scan stayed in the refreshed manifest with its original
+    # byte count credited to the kept bucket — the preview then
+    # claimed a nonexistent file would remain on the card. Handle
+    # confirmed-absent card paths the same way for pending entries;
+    # transient OSErrors still preserve the entry so a mount blip
+    # cannot shrink the preview, and still-present pending entries
+    # keep flowing through the promotion loop below (which applies
+    # the delete-time gates via _card_gate_promotion_block).
     surviving = []
     for entry in manifest["entries"]:
-        if entry.get("bucket") != "deletable":
+        bucket = entry.get("bucket")
+        is_pending = (bucket == "kept"
+                      and entry.get("reason") == KEEP_NOT_VERIFIED)
+        if bucket != "deletable" and not is_pending:
             surviving.append(entry)
             continue
         path = entry.get("path")
@@ -528,6 +542,13 @@ def verify_manifest_archives(db, manifest, manifest_dir, progress_cb=None,
         except FileNotFoundError:
             continue
         except OSError:
+            surviving.append(entry)
+            continue
+        if bucket != "deletable":
+            # Pending entry is still present. Leave changed/type-
+            # mismatch reclassification to the promotion loop's
+            # _card_gate_promotion_block so the gate decision stays
+            # in one place.
             surviving.append(entry)
             continue
         if stat_mod.S_ISLNK(st.st_mode):
@@ -660,9 +681,20 @@ def verify_manifest_archives(db, manifest, manifest_dir, progress_cb=None,
                     # itself). Treat as reached-but-unreadable rather
                     # than unreachable; the fd itself would have
                     # failed at open() in the mount-down case.
+                    #
+                    # Codex P2 (follow-up): outcome_reason must match
+                    # what qualify_rows will return for the row we
+                    # just persisted as 'unreadable' — KEEP_ARCHIVE_
+                    # HASH_FAILED. Leaving it at the initial KEEP_
+                    # ARCHIVE_UNREACHABLE lets the promotion-loop
+                    # override downgrade qualify_rows' terminal
+                    # verdict, hiding the failure and stripping the
+                    # Audit-page guidance the UI shows for
+                    # KEEP_ARCHIVE_HASH_FAILED.
                     db.update_photo_hash_check(
                         row["id"], "unreadable", commit=False)
                     stats["unreadable"] += 1
+                    outcome_reason = KEEP_ARCHIVE_HASH_FAILED
                     all_unchecked_inside_source = False
                     continue
                 if not stat_mod.S_ISREG(before.st_mode):
@@ -671,9 +703,12 @@ def verify_manifest_archives(db, manifest, manifest_dir, progress_cb=None,
                     # "unreachable" (we reached it), just not something
                     # we can hash. Marking unreadable is intentional;
                     # a subsequent audit is the right remedy.
+                    #
+                    # Codex P2 (follow-up): see the fstat branch above.
                     db.update_photo_hash_check(
                         row["id"], "unreadable", commit=False)
                     stats["unreadable"] += 1
+                    outcome_reason = KEEP_ARCHIVE_HASH_FAILED
                     all_unchecked_inside_source = False
                     continue
 
@@ -699,9 +734,16 @@ def verify_manifest_archives(db, manifest, manifest_dir, progress_cb=None,
                     after = os.fstat(archive_fd)
                     after_real = os.path.realpath(archive_path)
                 except (OSError, ValueError):
+                    # Codex P2 (follow-up): see the earlier fstat
+                    # branch — outcome_reason must reflect the
+                    # persisted 'unreadable' verdict so the
+                    # promotion loop does not override qualify_rows'
+                    # KEEP_ARCHIVE_HASH_FAILED with the initial
+                    # KEEP_ARCHIVE_UNREACHABLE.
                     db.update_photo_hash_check(
                         row["id"], "unreadable", commit=False)
                     stats["unreadable"] += 1
+                    outcome_reason = KEEP_ARCHIVE_HASH_FAILED
                     all_unchecked_inside_source = False
                     continue
                 stats["archive_files_read"] += 1

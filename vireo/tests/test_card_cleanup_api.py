@@ -403,6 +403,24 @@ def test_card_cleanup_page_renders(app_and_db):
     assert "card-cleanup-audit-btn" in body
 
 
+def test_import_and_card_cleanup_share_folder_browser(app_and_db):
+    """Both pages use one browser implementation, partial, and stylesheet.
+
+    This pins the architectural reason for the refactor: count rendering and
+    navigation fixes must land once rather than drift between template copies.
+    """
+    app, _ = app_and_db
+    client = app.test_client()
+    import_body = client.get("/import").get_data(as_text=True)
+    cleanup_body = client.get("/card-cleanup").get_data(as_text=True)
+    for body in (import_body, cleanup_body):
+        assert '/static/vireo-folder-browser.js' in body
+        assert '/static/vireo-folder-browser.css' in body
+        assert 'data-folder-browser-action="select"' in body
+    assert client.get("/static/vireo-folder-browser.js").status_code == 200
+    assert client.get("/static/vireo-folder-browser.css").status_code == 200
+
+
 def test_import_page_links_to_card_cleanup_instead_of_hosting_it(app_and_db):
     app, _ = app_and_db
     resp = app.test_client().get("/import")

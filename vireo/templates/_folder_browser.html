@@ -1,0 +1,26 @@
+<div class="folder-browser-overlay" id="{{ folder_browser_overlay_id }}"
+     data-testid="{{ folder_browser_test_id }}">
+  <div class="folder-browser-panel" role="dialog" aria-modal="true"
+       aria-labelledby="folderBrowserTitle">
+    <div class="folder-browser-header">
+      <h3 id="folderBrowserTitle">Select Folder</h3>
+      <button class="folder-browser-close" type="button"
+              data-folder-browser-action="close">&times;</button>
+    </div>
+    <div class="folder-browser-body">
+      <div class="folder-browser-shortcuts">
+        <button class="btn" type="button" data-folder-browser-path="home">Home</button>
+        <button class="btn" type="button" data-folder-browser-path="pictures">Pictures</button>
+        <button class="btn" type="button" data-folder-browser-path="volumes">Volumes</button>
+      </div>
+      <div class="folder-browser-path" id="folderBrowserPath"></div>
+      <div class="folder-browser-list" id="folderBrowserList"></div>
+      <div class="folder-browser-path" id="folderBrowserSelection"></div>
+    </div>
+    <div class="folder-browser-actions">
+      <button class="btn" type="button" data-folder-browser-action="close">Cancel</button>
+      <button class="btn btn-primary" type="button" id="folderBrowserSelectBtn"
+              data-folder-browser-action="select">Select This Folder</button>
+    </div>
+  </div>
+</div>

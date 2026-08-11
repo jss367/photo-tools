@@ -1,0 +1,57 @@
+.folder-browser-overlay {
+  display: none; position: fixed; inset: 0; z-index: 1001;
+  background: rgba(0, 0, 0, 0.45); align-items: center; justify-content: center;
+}
+.folder-browser-overlay.open { display: flex; }
+.folder-browser-panel {
+  width: min(720px, calc(100vw - 32px)); max-height: calc(100vh - 64px);
+  background: var(--bg-secondary); border: 1px solid var(--border-primary);
+  border-radius: 8px; box-shadow: 0 18px 60px rgba(0,0,0,0.35);
+  display: flex; flex-direction: column; overflow: hidden;
+}
+.folder-browser-header {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 14px 16px; border-bottom: 1px solid var(--border-primary);
+}
+.folder-browser-header h3 { margin: 0; }
+.folder-browser-close {
+  background: none; border: none; color: var(--text-secondary);
+  font-size: 22px; cursor: pointer;
+}
+.folder-browser-body {
+  padding: 12px 16px; display: flex; flex-direction: column;
+  gap: 10px; min-height: 0;
+}
+.folder-browser-shortcuts { display: flex; gap: 8px; flex-wrap: wrap; }
+.folder-browser-path {
+  font-size: 12px; color: var(--text-secondary); overflow-wrap: anywhere;
+}
+.folder-browser-list {
+  height: 320px; overflow: auto; border: 1px solid var(--border-primary);
+  border-radius: 6px; background: var(--bg-tertiary);
+}
+.folder-browser-item {
+  padding: 8px 10px; font-size: 12px; color: var(--text-primary);
+  cursor: pointer;
+  border-bottom: 1px solid color-mix(in srgb, var(--border-primary) 60%, transparent);
+  display: flex; align-items: center; gap: 8px;
+}
+.folder-browser-item:hover { background: var(--bg-hover, rgba(255,255,255,0.05)); }
+.folder-browser-item.selected {
+  background: color-mix(in srgb, var(--accent) 15%, transparent);
+}
+.folder-browser-item-name {
+  flex: 1; min-width: 0; overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap;
+}
+.folder-browser-count {
+  color: var(--text-secondary); font-size: 11px;
+  font-variant-numeric: tabular-nums; flex-shrink: 0; white-space: nowrap;
+}
+.folder-browser-empty {
+  padding: 14px; font-size: 12px; color: var(--text-secondary);
+}
+.folder-browser-actions {
+  display: flex; gap: 8px; justify-content: flex-end;
+  padding: 12px 16px; border-top: 1px solid var(--border-primary);
+}

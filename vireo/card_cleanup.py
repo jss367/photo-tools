@@ -38,6 +38,12 @@ MANIFEST_MAX_AGE_DAYS = 7
 # let deletion sweep newly-promoted files the user never saw.
 INITIAL_MANIFEST_REVISION = 1
 
+# O_NONBLOCK doesn't exist on Windows; fall back to 0 (a no-op flag) so
+# the open call succeeds. The FIFO-open block this flag defends against
+# is a POSIX concern — Windows can't be tricked into open() blocking on
+# a FIFO the same way, so a plain O_RDONLY there is safe.
+O_NONBLOCK = getattr(os, "O_NONBLOCK", 0)
+
 
 class ManifestError(Exception):
     """Manifest missing, expired, or failing validation.
@@ -505,7 +511,7 @@ def verify_manifest_archives(db, manifest, manifest_dir, progress_cb=None,
             # cannot slip a different object under us.
             try:
                 archive_fd = os.open(
-                    archive_path, os.O_RDONLY | os.O_NONBLOCK)
+                    archive_path, os.O_RDONLY | O_NONBLOCK)
             except (OSError, ValueError):
                 # Same rationale as the realpath branch above (Codex
                 # P2): a stat that can't see the file — the common
@@ -829,7 +835,7 @@ def delete_verified(db, manifest, progress_cb=None, should_cancel=None):
         # fstat then re-proves regular-file + dev/inode identity against
         # the scanned baseline before any bytes are read.
         try:
-            card_fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+            card_fd = os.open(path, os.O_RDONLY | O_NONBLOCK)
         except FileNotFoundError:
             summary["skipped"].append(
                 {"path": path, "reason": SKIP_ALREADY_GONE})

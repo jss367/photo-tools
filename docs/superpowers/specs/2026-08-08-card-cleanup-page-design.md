@@ -2,12 +2,13 @@
 
 **Date:** 2026-08-08
 **Status:** Approved in discussion with maintainer (relocation follow-up to
-PR #1436); lightweight spec — the feature's behavior is unchanged and
-governed by `2026-08-07-card-cleanup-design.md`.
+PR #1436); amended 2026-08-11 to replace the workspace-wide audit affordance
+with targeted matching-copy verification. Runtime behavior is governed by
+`2026-08-07-card-cleanup-design.md`.
 **Scope:** Move the "Free up card space" UI from a collapsed section on the
 import page to a dedicated page with a navbar entry; add an inline
-integrity-audit affordance; keep the post-import entry point as a link.
-No backend behavior changes to scan/delete.
+targeted-verification affordance; keep the post-import entry point as a link.
+Scan/delete behavior remains governed by the parent design.
 
 ## Problem
 
@@ -40,17 +41,13 @@ this reason).
    refactor of import.html: the parent PR's reviewers accepted mirrored
    code at this scale, and un-inlining import.html's browser is exactly
    the kind of unrelated refactor the parent spec declined.
-3. **Inline audit affordance.** When the rendered preview's kept bucket
-   contains the `KEEP_NOT_VERIFIED` reason ("not verified by a checksummed
-   import — run the integrity audit"), show a callout above the buckets:
-   how many kept files carry that reason, one sentence explaining that
-   the archive copies must be checksum-verified before deletion is
-   allowed, a **Verify archive hashes** button that starts the existing
-   `verify-hashes` job (`POST /api/jobs/verify-hashes`) with the page's
-   standard progress rendering, and — on completion — a **Re-scan card**
-   affordance. Include the SMB cost warning: verification re-reads
-   archive files; on a VPN'd mount this is slow, best run close to the
-   NAS. No new backend endpoints.
+3. **Inline targeted-verification affordance.** When the rendered preview's
+   kept bucket contains `KEEP_NOT_VERIFIED`, show how many card files and
+   unique hashes need verification. **Verify matching archive copies** calls
+   `POST /api/card-cleanup/verify` for this scan. It reads at most one viable
+   archive copy per unique pending hash, never unrelated workspace files,
+   then reloads the atomically refreshed manifest. No second card scan is
+   required.
 4. **Navbar**: add "Card cleanup" to `_navbar.html` in the tools/pages
    list (match existing nav idiom and ordering conventions).
 5. **Import page**: remove the moved section and its JS; keep the
@@ -59,8 +56,9 @@ this reason).
    its source input from the `source` query parameter. Multi-source
    imports pass the first source; the new page keeps the existing
    "remaining sources" hint behavior.
-6. **No API changes.** Scan/delete/manifest endpoints, job types, and
-   manifest format are untouched.
+6. **Scoped API addition.** The verify endpoint and `card-cleanup-verify`
+   job are tied to a completed scan manifest and cannot overlap verification
+   or deletion for that manifest.
 
 ## Testing
 

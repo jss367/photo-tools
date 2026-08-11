@@ -5,6 +5,7 @@ docs/superpowers/specs/2026-08-07-card-cleanup-design.md
 import os
 import shutil
 import stat
+import sys
 import unittest.mock
 from datetime import UTC, datetime, timedelta
 
@@ -42,6 +43,16 @@ def test_write_then_load_roundtrip(tmp_path):
     write_manifest(mdir, _manifest(tmp_path))
     loaded = load_manifest(mdir, "scan-1")
     assert loaded["scan_job_id"] == "scan-1"
+    assert loaded["revision"] == card_cleanup.INITIAL_MANIFEST_REVISION
+
+
+@pytest.mark.parametrize("revision", [True, False, 0, -1, "1", 1.5])
+def test_load_rejects_invalid_manifest_revision(tmp_path, revision):
+    (tmp_path / "card").mkdir()
+    mdir = str(tmp_path / "manifests")
+    write_manifest(mdir, _manifest(tmp_path, revision=revision))
+    with pytest.raises(ManifestError, match="revision invalid"):
+        load_manifest(mdir, "scan-1")
 
 
 def test_write_is_atomic_no_leftover_tmp(tmp_path):
@@ -348,7 +359,7 @@ def test_scan_uncataloged_file_kept(db, tmp_path):
     assert len(kept) == 1 and "not in catalog" in kept[0]["reason"]
 
 
-def test_scan_null_hash_status_kept_with_audit_remedy(db, tmp_path):
+def test_scan_null_hash_status_kept_with_scoped_verify_remedy(db, tmp_path):
     # Scan-cataloged archives: file_hash set, hash_status NULL. Kept —
     # and the reason must point at the remedy, or the tool reads broken.
     _archive_photo(db, tmp_path, hash_status=None)
@@ -356,7 +367,7 @@ def test_scan_null_hash_status_kept_with_audit_remedy(db, tmp_path):
     result = _scan(db, tmp_path)
     kept = _entries(result, "kept")
     assert len(kept) == 1
-    assert "integrity audit" in kept[0]["reason"]
+    assert kept[0]["reason"] == card_cleanup.KEEP_NOT_VERIFIED
 
 
 def test_scan_failed_hash_status_kept_but_not_audit_remedy(db, tmp_path):
@@ -391,7 +402,7 @@ def test_scan_specific_failed_hash_statuses_all_kept_with_failed_reason(
     assert kept[0]["reason"] == card_cleanup.KEEP_ARCHIVE_HASH_FAILED
 
 
-def test_scan_mixed_null_and_failed_prefers_audit_remedy(db, tmp_path):
+def test_scan_mixed_null_and_failed_prefers_verify_remedy(db, tmp_path):
     # Two archive rows share a card file's hash — one never checked, one
     # already flagged. The NULL row is remediable by a verify run (its
     # verdict could turn "ok"), so the reason must stay on the audit
@@ -405,7 +416,940 @@ def test_scan_mixed_null_and_failed_prefers_audit_remedy(db, tmp_path):
     result = _scan(db, tmp_path)
     kept = _entries(result, "kept")
     assert len(kept) == 1
-    assert "integrity audit" in kept[0]["reason"]
+    assert kept[0]["reason"] == card_cleanup.KEEP_NOT_VERIFIED
+
+
+def test_scoped_verify_reads_only_matching_archive_and_refreshes_manifest(
+        db, tmp_path, monkeypatch):
+    archive_file, pid = _archive_photo(db, tmp_path, hash_status=None)
+    unrelated, unrelated_pid = _archive_photo(
+        db, tmp_path, name="OTHER.NEF", content=b"other",
+        hash_status=None, folder="archive/other")
+    _card_file(tmp_path)
+    scan = _scan(db, tmp_path)
+    assert scan["totals"]["deletable"]["count"] == 0
+
+    manifest_dir = str(tmp_path / "manifests")
+    manifest = load_manifest(manifest_dir, "scan-1")
+    # verify_manifest_archives hashes a pinned descriptor now (CodeRabbit
+    # TOCTOU fix), so callers no longer name the path. Correlate hashed
+    # descriptors back to files via fstat inode.
+    hashed_inodes = []
+    real_hash = card_cleanup.compute_fd_hash
+
+    def track(fd, *a, **kw):
+        hashed_inodes.append(os.fstat(fd).st_ino)
+        return real_hash(fd, *a, **kw)
+
+    monkeypatch.setattr(card_cleanup, "compute_fd_hash", track)
+    result = card_cleanup.verify_manifest_archives(
+        db, manifest, manifest_dir)
+
+    assert hashed_inodes == [os.stat(archive_file).st_ino]
+    assert os.stat(unrelated).st_ino not in hashed_inodes
+    assert result["archive_files_read"] == 1
+    assert result["unblocked_files"] == 1
+    refreshed = load_manifest(manifest_dir, "scan-1")
+    assert refreshed["totals"]["deletable"]["count"] == 1
+    assert _entries(refreshed, "deletable")[0]["archive_path"] == str(
+        archive_file)
+    statuses = {
+        row["id"]: row["hash_status"]
+        for row in db.conn.execute(
+            "SELECT id, hash_status FROM photos WHERE id IN (?, ?)",
+            (pid, unrelated_pid),
+        )
+    }
+    assert statuses == {pid: "ok", unrelated_pid: None}
+
+
+def test_scoped_verify_hashes_duplicate_card_content_once(db, tmp_path):
+    _archive_photo(db, tmp_path, hash_status=None)
+    _card_file(tmp_path, name="IMG_0001.NEF")
+    _card_file(tmp_path, name="IMG_0002.NEF")
+    _scan(db, tmp_path)
+    manifest_dir = str(tmp_path / "manifests")
+    result = card_cleanup.verify_manifest_archives(
+        db, load_manifest(manifest_dir, "scan-1"), manifest_dir)
+    assert result["hashes_total"] == 1
+    assert result["archive_files_read"] == 1
+    assert result["unblocked_files"] == 2
+    refreshed = load_manifest(manifest_dir, "scan-1")
+    assert refreshed["totals"]["deletable"]["count"] == 2
+
+
+def test_scoped_verify_mismatch_stays_kept_and_records_failed_verdict(
+        db, tmp_path):
+    archive_file, pid = _archive_photo(db, tmp_path, hash_status=None)
+    _card_file(tmp_path)
+    _scan(db, tmp_path)
+    original_mtime = os.stat(archive_file).st_mtime_ns
+    archive_file.write_bytes(b"NEW-ONE")  # same size as b"raw-one"
+    os.utime(archive_file, ns=(original_mtime, original_mtime))
+
+    manifest_dir = str(tmp_path / "manifests")
+    result = card_cleanup.verify_manifest_archives(
+        db, load_manifest(manifest_dir, "scan-1"), manifest_dir)
+
+    assert result["verified"] == 0
+    assert result["corrupt"] == 1
+    assert result["unblocked_files"] == 0
+    refreshed = load_manifest(manifest_dir, "scan-1")
+    assert refreshed["totals"]["deletable"]["count"] == 0
+    assert _entries(refreshed, "kept")[0]["reason"] == (
+        card_cleanup.KEEP_ARCHIVE_HASH_FAILED)
+    status = db.conn.execute(
+        "SELECT hash_status FROM photos WHERE id = ?", (pid,)
+    ).fetchone()["hash_status"]
+    assert status == "corrupt"
+
+
+def test_scoped_verify_unreachable_archive_keeps_row_unchecked(
+        db, tmp_path, monkeypatch):
+    # Codex P2: a transiently unreachable archive (NAS mount down) must
+    # not permanently downgrade the row from unchecked → unreadable, or
+    # a later re-scan would classify it as a prior integrity failure
+    # (KEEP_ARCHIVE_HASH_FAILED) and route the user to the workspace-wide
+    # Audit page instead of retrying targeted verification.
+    archive_file, pid = _archive_photo(db, tmp_path, hash_status=None)
+    _card_file(tmp_path)
+    _scan(db, tmp_path)
+
+    # verify_manifest_archives opens the archive fd first (CodeRabbit's
+    # descriptor-pinning fix), so a downed-mount symptom surfaces as an
+    # os.open failure on the archive path.
+    real_open = os.open
+    archive_str = str(archive_file)
+
+    def failing_open(path, *args, **kwargs):
+        if str(path) == archive_str:
+            raise OSError(2, "mount is down")
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(card_cleanup.os, "open", failing_open)
+
+    manifest_dir = str(tmp_path / "manifests")
+    result = card_cleanup.verify_manifest_archives(
+        db, load_manifest(manifest_dir, "scan-1"), manifest_dir)
+
+    assert result["unreadable"] == 1
+    assert result["verified"] == 0
+    assert result["unblocked_files"] == 0
+
+    # DB row must remain NULL so a later scan-after-remount re-issues
+    # KEEP_NOT_VERIFIED, not KEEP_ARCHIVE_HASH_FAILED.
+    status = db.conn.execute(
+        "SELECT hash_status FROM photos WHERE id = ?", (pid,)
+    ).fetchone()["hash_status"]
+    assert status is None
+
+    # Codex P2: the manifest reason must ALSO stay in the
+    # KEEP_NOT_VERIFIED bucket the verify endpoint/UI's
+    # pending-reason filter keys off. Overwriting with this run's
+    # transient KEEP_ARCHIVE_UNREACHABLE would let a later verify report
+    # "nothing needs checking" once the mount returns, forcing the user
+    # to re-scan the card even though the DB row is still eligible.
+    refreshed = load_manifest(manifest_dir, "scan-1")
+    kept = _entries(refreshed, "kept")
+    assert len(kept) == 1
+    assert kept[0]["reason"] == card_cleanup.KEEP_NOT_VERIFIED
+
+
+def test_scoped_verify_retry_after_transient_failure_unblocks(
+        db, tmp_path, monkeypatch):
+    # Codex P2 end-to-end: the first verify run hits a transient
+    # os.open failure (mount down); the row must remain retry-eligible
+    # so that a second verify run, once the mount is back, actually
+    # promotes the entry to deletable without a fresh card scan.
+    archive_file, pid = _archive_photo(db, tmp_path, hash_status=None)
+    _card_file(tmp_path)
+    _scan(db, tmp_path)
+    manifest_dir = str(tmp_path / "manifests")
+
+    real_open = os.open
+    archive_str = str(archive_file)
+    down = {"active": True}
+
+    def flaky_open(path, *args, **kwargs):
+        if down["active"] and str(path) == archive_str:
+            raise OSError(2, "mount is down")
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(card_cleanup.os, "open", flaky_open)
+    card_cleanup.verify_manifest_archives(
+        db, load_manifest(manifest_dir, "scan-1"), manifest_dir)
+    kept_first = _entries(load_manifest(manifest_dir, "scan-1"), "kept")
+    assert len(kept_first) == 1
+    assert kept_first[0]["reason"] == card_cleanup.KEEP_NOT_VERIFIED
+
+    down["active"] = False
+    retry = card_cleanup.verify_manifest_archives(
+        db, load_manifest(manifest_dir, "scan-1"), manifest_dir)
+
+    assert retry["verified"] == 1
+    assert retry["unblocked_files"] == 1
+    refreshed = load_manifest(manifest_dir, "scan-1")
+    assert refreshed["totals"]["deletable"]["count"] == 1
+
+
+def test_scoped_verify_preserves_persisted_unreadable_reason(
+        db, tmp_path, monkeypatch):
+    archive_file, pid = _archive_photo(db, tmp_path, hash_status=None)
+    _card_file(tmp_path)
+    _scan(db, tmp_path)
+    real_hash = card_cleanup.compute_fd_hash
+
+    def fail_archive_read(fd, *args, **kwargs):
+        if os.fstat(fd).st_ino == os.stat(archive_file).st_ino:
+            raise OSError("archive read failed")
+        return real_hash(fd, *args, **kwargs)
+
+    monkeypatch.setattr(card_cleanup, "compute_fd_hash", fail_archive_read)
+    manifest_dir = str(tmp_path / "manifests")
+    result = card_cleanup.verify_manifest_archives(
+        db, load_manifest(manifest_dir, "scan-1"), manifest_dir)
+
+    assert result["unreadable"] == 1
+    status = db.conn.execute(
+        "SELECT hash_status FROM photos WHERE id = ?", (pid,)
+    ).fetchone()["hash_status"]
+    assert status == "unreadable"
+    kept = _entries(load_manifest(manifest_dir, "scan-1"), "kept")
+    assert kept[0]["reason"] == card_cleanup.KEEP_ARCHIVE_HASH_FAILED
+
+
+def test_scoped_verify_nonblocking_open_rejects_fifo_swap(
+        db, tmp_path, monkeypatch):
+    if not hasattr(os, "mkfifo") or not card_cleanup.O_NONBLOCK:
+        pytest.skip("non-blocking FIFOs unsupported on this platform")
+    archive_file, _ = _archive_photo(db, tmp_path, hash_status=None)
+    _card_file(tmp_path)
+    _scan(db, tmp_path)
+    real_open = os.open
+    opened_flags = []
+
+    def swap_then_open(path, flags, *args, **kwargs):
+        if str(path) == str(archive_file) and not opened_flags:
+            opened_flags.append(flags)
+            os.unlink(archive_file)
+            os.mkfifo(archive_file)
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(card_cleanup.os, "open", swap_then_open)
+    manifest_dir = str(tmp_path / "manifests")
+    result = card_cleanup.verify_manifest_archives(
+        db, load_manifest(manifest_dir, "scan-1"), manifest_dir)
+
+    assert opened_flags[0] & card_cleanup.O_NONBLOCK
+    assert result["archive_files_read"] == 0
+    assert result["unreadable"] == 1
+    assert stat.S_ISFIFO(os.lstat(archive_file).st_mode)
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="POSIX-only race: Windows locks files opened via os.open, so "
+    "os.replace() against the archive path fails inside the wrapper "
+    "before the swap can complete. The race this test simulates cannot "
+    "occur on Windows in the first place.",
+)
+def test_scoped_verify_rejects_atomic_replace_during_hash(
+        db, tmp_path, monkeypatch):
+    # Codex P1: while compute_fd_hash reads the pinned archive fd, a
+    # sync/backup tool can atomically replace archive_path with a
+    # different file under the same name. The fd's fstat still describes
+    # the old (now unlinked) inode, so before/after fstat match — but the
+    # bytes we then trust as authoritative for the archive no longer live
+    # at that name. Certifying the row would let qualify_rows accept the
+    # replacement later (same size+mtime is enough) and delete the card
+    # copy against an archive we never actually saw. Row must stay
+    # unchecked so a targeted re-verify can settle it once the file is
+    # stable.
+    archive_file, pid = _archive_photo(db, tmp_path, hash_status=None)
+    _card_file(tmp_path)
+    _scan(db, tmp_path)
+
+    archive_str = str(archive_file)
+    real_hash = card_cleanup.compute_fd_hash
+    swapped = {"done": False}
+
+    def swap_then_hash(fd, *a, **kw):
+        result = real_hash(fd, *a, **kw)
+        if not swapped["done"] and os.fstat(fd).st_ino == os.stat(
+                archive_str).st_ino:
+            replacement = tmp_path / "replacement.NEF"
+            # Same size + mtime as the original — a naïve later
+            # qualify_rows stat would otherwise accept it.
+            replacement.write_bytes(b"raw-one")
+            original_st = os.stat(archive_str)
+            os.utime(
+                replacement,
+                ns=(original_st.st_atime_ns, original_st.st_mtime_ns),
+            )
+            os.replace(str(replacement), archive_str)
+            swapped["done"] = True
+        return result
+
+    monkeypatch.setattr(card_cleanup, "compute_fd_hash", swap_then_hash)
+
+    manifest_dir = str(tmp_path / "manifests")
+    result = card_cleanup.verify_manifest_archives(
+        db, load_manifest(manifest_dir, "scan-1"), manifest_dir)
+
+    assert swapped["done"]
+    assert result["verified"] == 0
+    assert result["unblocked_files"] == 0
+    status = db.conn.execute(
+        "SELECT hash_status FROM photos WHERE id = ?", (pid,)
+    ).fetchone()["hash_status"]
+    assert status is None
+    refreshed = load_manifest(manifest_dir, "scan-1")
+    assert refreshed["totals"]["deletable"]["count"] == 0
+    # Codex P2: the DB row is still unchecked (verify did not persist a
+    # verdict), so the manifest must stay in the KEEP_NOT_VERIFIED
+    # bucket — a targeted retry after the file settles is the correct
+    # next lever, not "archive changed" which would look terminal.
+    assert (
+        _entries(refreshed, "kept")[0]["reason"]
+        == card_cleanup.KEEP_NOT_VERIFIED
+    )
+
+
+def test_scoped_verify_drops_deletable_entries_whose_card_files_are_gone(
+        db, tmp_path):
+    # Codex P2: delete_verified unlinks card files but never rewrites the
+    # manifest, so a subsequent scoped-verify run sees stale deletable
+    # entries whose card paths no longer exist. The recomputed totals
+    # must not credit those bytes to the deletable bucket — otherwise
+    # the refreshed UI re-enables Delete asking the user to confirm
+    # counts that include files already gone from the card, and the
+    # revision bump would let a delete request sweep past the freshness
+    # guard.
+    already_deleted, _ = _archive_photo(
+        db, tmp_path, name="IMG_0001.NEF", content=b"raw-one",
+        hash_status="ok")
+    _archive_photo(
+        db, tmp_path, name="IMG_0002.NEF", content=b"raw-two",
+        hash_status=None, folder="archive/2026/2026-08-02")
+    gone_card = _card_file(tmp_path, name="IMG_0001.NEF", content=b"raw-one")
+    _card_file(tmp_path, name="IMG_0002.NEF", content=b"raw-two")
+    scan = _scan(db, tmp_path)
+    assert scan["totals"]["deletable"]["count"] == 1
+    assert scan["totals"]["kept"]["count"] == 1
+
+    # Simulate a prior delete_verified run: the card file was unlinked
+    # but the manifest still lists it as deletable.
+    os.unlink(gone_card)
+
+    manifest_dir = str(tmp_path / "manifests")
+    manifest_before = load_manifest(manifest_dir, "scan-1")
+    revision_before = int(manifest_before.get(
+        "revision", card_cleanup.INITIAL_MANIFEST_REVISION))
+
+    card_cleanup.verify_manifest_archives(
+        db, manifest_before, manifest_dir)
+
+    refreshed = load_manifest(manifest_dir, "scan-1")
+    deletable = _entries(refreshed, "deletable")
+    # Only the newly-verified file is deletable; the already-gone one
+    # was dropped rather than counted.
+    assert [e["path"] for e in deletable] == [
+        str(tmp_path / "card" / "DCIM" / "IMG_0002.NEF")]
+    assert refreshed["totals"]["deletable"]["count"] == 1
+    assert refreshed["totals"]["deletable"]["bytes"] == len(b"raw-two")
+    # The revision still bumps so a stale confirmation for the pre-verify
+    # manifest is rejected by the delete endpoint's freshness gate.
+    assert int(refreshed["revision"]) == revision_before + 1
+
+
+def test_scoped_verify_keeps_deletable_entry_when_lstat_error_is_transient(
+        db, tmp_path, monkeypatch):
+    # Companion to the drop test: a transient lstat error (mount blip,
+    # EACCES) is NOT proof the card file is gone. Dropping the entry on
+    # any OSError would shrink the preview during an ordinary hiccup.
+    # Preserve the entry so the next scoped verify — or the next delete
+    # gate — gets the real answer.
+    archive_file, _ = _archive_photo(
+        db, tmp_path, name="IMG_0001.NEF", content=b"raw-one",
+        hash_status="ok")
+    card_file = _card_file(tmp_path, name="IMG_0001.NEF", content=b"raw-one")
+    scan = _scan(db, tmp_path)
+    assert scan["totals"]["deletable"]["count"] == 1
+
+    real_lstat = os.lstat
+    card_str = str(card_file)
+
+    def flaky_lstat(path, *args, **kwargs):
+        if str(path) == card_str:
+            raise OSError(13, "permission denied")
+        return real_lstat(path, *args, **kwargs)
+
+    monkeypatch.setattr(card_cleanup.os, "lstat", flaky_lstat)
+
+    manifest_dir = str(tmp_path / "manifests")
+    card_cleanup.verify_manifest_archives(
+        db, load_manifest(manifest_dir, "scan-1"), manifest_dir)
+
+    refreshed = load_manifest(manifest_dir, "scan-1")
+    assert refreshed["totals"]["deletable"]["count"] == 1
+    assert [e["path"] for e in _entries(refreshed, "deletable")] == [card_str]
+
+
+def test_scoped_verify_reclassifies_changed_deletable_entry_as_kept(
+        db, tmp_path):
+    # Codex P2: a prior delete_verified run skipped the file because its
+    # type (or size, or mtime) no longer matched the scanned baseline —
+    # SKIP_NOT_REGULAR / SKIP_SYMLINK / SKIP_CHANGED. lstat still
+    # succeeds, so the FileNotFoundError-only gone-file check retained
+    # the entry, inflating the refreshed deletable totals with bytes the
+    # delete gates will refuse. Mirror the delete-time gates here so
+    # scoped verify's revised preview matches what delete would accept.
+    #
+    # Codex P2 (follow-up 2): the file is still on the card, so dropping
+    # the entry entirely undercounted the kept list and the totals hid a
+    # file that will remain after deletion. Reclassify into the kept
+    # bucket with SKIP_CHANGED instead; only confirmed-absent paths
+    # should leave the manifest.
+    archive_file, _ = _archive_photo(
+        db, tmp_path, name="IMG_0001.NEF", content=b"raw-one",
+        hash_status="ok")
+    _archive_photo(
+        db, tmp_path, name="IMG_0002.NEF", content=b"raw-two",
+        hash_status=None, folder="archive/2026/2026-08-02")
+    swapped_card = _card_file(
+        tmp_path, name="IMG_0001.NEF", content=b"raw-one")
+    _card_file(tmp_path, name="IMG_0002.NEF", content=b"raw-two")
+    scan = _scan(db, tmp_path)
+    assert scan["totals"]["deletable"]["count"] == 1
+    assert scan["totals"]["kept"]["count"] == 1
+
+    # Simulate the SKIP_CHANGED delete-time skip: same size, different
+    # mtime_ns. delete_verified would refuse to unlink; scoped verify
+    # must not re-enable Delete for these bytes.
+    os.utime(swapped_card, ns=(0, 0))
+
+    manifest_dir = str(tmp_path / "manifests")
+    card_cleanup.verify_manifest_archives(
+        db, load_manifest(manifest_dir, "scan-1"), manifest_dir)
+
+    refreshed = load_manifest(manifest_dir, "scan-1")
+    deletable = _entries(refreshed, "deletable")
+    assert [e["path"] for e in deletable] == [
+        str(tmp_path / "card" / "DCIM" / "IMG_0002.NEF")]
+    assert refreshed["totals"]["deletable"]["count"] == 1
+    assert refreshed["totals"]["deletable"]["bytes"] == len(b"raw-two")
+    # Changed card file is now kept (reclassified, not dropped).
+    # IMG_0002.NEF, originally kept with KEEP_NOT_VERIFIED, is
+    # promoted to deletable by the verify pass, so IMG_0001.NEF is the
+    # sole kept entry after verify.
+    kept = _entries(refreshed, "kept")
+    assert [e["path"] for e in kept] == [str(swapped_card)]
+    assert kept[0]["reason"] == card_cleanup.SKIP_CHANGED
+    assert "archive_path" not in kept[0]
+    assert refreshed["totals"]["kept"]["count"] == 1
+    assert refreshed["totals"]["kept"]["bytes"] == len(b"raw-one")
+
+
+def test_scoped_verify_gates_pending_entry_before_promotion(
+        db, tmp_path):
+    # Codex P2 (follow-up 3): the deletable-entry pre-pass revalidates
+    # the card file against the manifest baseline before the promotion
+    # loop, but pending kept entries (KEEP_NOT_VERIFIED) went straight
+    # into qualify_rows — which only inspects catalog rows and cannot
+    # see that the card file has been replaced/resized/turned into a
+    # symlink since the scan. delete_verified would reject the changed
+    # file (SKIP_CHANGED / SKIP_SYMLINK / SKIP_NOT_REGULAR), so the
+    # refreshed preview must not credit its bytes to the deletable
+    # totals or re-enable Delete for it. Applying the same gates to
+    # KEEP_NOT_VERIFIED entries reclassifies the changed file as kept
+    # with the appropriate SKIP_* reason before qualify_rows sees it.
+    archive_file, _ = _archive_photo(
+        db, tmp_path, name="IMG_0001.NEF", content=b"raw-one",
+        hash_status=None)
+    card = _card_file(tmp_path, name="IMG_0001.NEF", content=b"raw-one")
+
+    scan = _scan(db, tmp_path)
+    # The unchecked archive row keeps the card entry pending.
+    assert scan["totals"]["deletable"]["count"] == 0
+    kept = _entries(scan, "kept")
+    assert len(kept) == 1
+    assert kept[0]["reason"] == card_cleanup.KEEP_NOT_VERIFIED
+    assert kept[0]["path"] == str(card)
+
+    # Simulate the SKIP_CHANGED delete-time skip: same size, different
+    # mtime_ns. Archive hash still verifies fine, so qualify_rows would
+    # happily promote — but delete_verified would refuse to unlink.
+    os.utime(card, ns=(0, 0))
+
+    manifest_dir = str(tmp_path / "manifests")
+    result = card_cleanup.verify_manifest_archives(
+        db, load_manifest(manifest_dir, "scan-1"), manifest_dir)
+    # The archive still verified successfully; the pending entry just
+    # did not get promoted.
+    assert result["verified"] == 1
+    assert result["unblocked_files"] == 0
+    assert result["unblocked_bytes"] == 0
+
+    refreshed = load_manifest(manifest_dir, "scan-1")
+    assert refreshed["totals"]["deletable"]["count"] == 0
+    assert refreshed["totals"]["deletable"]["bytes"] == 0
+    kept = _entries(refreshed, "kept")
+    assert [e["path"] for e in kept] == [str(card)]
+    assert kept[0]["reason"] == card_cleanup.SKIP_CHANGED
+    assert "archive_path" not in kept[0]
+    assert refreshed["totals"]["kept"]["count"] == 1
+    assert refreshed["totals"]["kept"]["bytes"] == len(b"raw-one")
+
+
+def test_scoped_verify_drops_missing_pending_entry(db, tmp_path):
+    _archive_photo(db, tmp_path, hash_status=None)
+    card = _card_file(tmp_path)
+    scan = _scan(db, tmp_path)
+    assert _entries(scan, "kept")[0]["reason"] == (
+        card_cleanup.KEEP_NOT_VERIFIED)
+    os.unlink(card)
+
+    manifest_dir = str(tmp_path / "manifests")
+    result = card_cleanup.verify_manifest_archives(
+        db, load_manifest(manifest_dir, "scan-1"), manifest_dir)
+
+    assert result["verified"] == 1
+    refreshed = load_manifest(manifest_dir, "scan-1")
+    assert refreshed["entries"] == []
+    assert refreshed["totals"]["deletable"] == {"count": 0, "bytes": 0}
+    assert refreshed["totals"]["kept"] == {"count": 0, "bytes": 0}
+
+
+def test_scoped_verify_terminal_alias_promotes_to_inside_source(
+        db, tmp_path):
+    # Codex P2: the only unchecked catalog row for a card file is a
+    # hardlink (or alt-mount alias) of the card file itself. The initial
+    # scan classifies the entry as KEEP_NOT_VERIFIED because
+    # qualify_rows skips NULL-status rows before the same-file check.
+    # Scoped verify then detects the alias via the fd's dev+inode and
+    # sets its outcome_reason to KEEP_INSIDE_SOURCE, but does not
+    # persist a verdict on the DB row — the row stays NULL. Without a
+    # terminal override, qualify_rows would return KEEP_NOT_VERIFIED
+    # again on the next click, trapping the entry in an infinite retry
+    # loop with the "audit hasn't run" callout. The refreshed manifest
+    # must adopt KEEP_INSIDE_SOURCE so the user sees the real story:
+    # no independent archive copy exists.
+    card = _card_file(tmp_path, name="IMG_0001.NEF", content=b"raw-one")
+    folder_path = tmp_path / "archive" / "2026"
+    folder_path.mkdir(parents=True)
+    alias = folder_path / "IMG_0001.NEF"
+    try:
+        os.link(card, alias)
+    except (OSError, NotImplementedError):
+        pytest.skip("hardlinks unsupported on this filesystem")
+    st = os.stat(alias)
+    fid = db.add_folder(str(folder_path))
+    db.add_photo(
+        folder_id=fid, filename="IMG_0001.NEF", extension=".NEF",
+        file_size=st.st_size, file_mtime=st.st_mtime,
+        file_hash=_sha(str(alias)),
+    )
+    # NULL hash_status: the alias row was cataloged but never audited.
+
+    scan = _scan(db, tmp_path)
+    kept = _entries(scan, "kept")
+    assert len(kept) == 1
+    assert kept[0]["reason"] == card_cleanup.KEEP_NOT_VERIFIED
+
+    manifest_dir = str(tmp_path / "manifests")
+    result = card_cleanup.verify_manifest_archives(
+        db, load_manifest(manifest_dir, "scan-1"), manifest_dir)
+    assert result["verified"] == 0
+    assert result["unblocked_files"] == 0
+
+    refreshed = load_manifest(manifest_dir, "scan-1")
+    kept = _entries(refreshed, "kept")
+    assert [e["path"] for e in kept] == [str(card)]
+    assert kept[0]["reason"] == card_cleanup.KEEP_INSIDE_SOURCE
+    # And the retry-eligible bucket is empty — the verify endpoint
+    # would tell the user "nothing needs checking" without the loop.
+    pending = [e for e in refreshed["entries"]
+               if e.get("reason") == card_cleanup.KEEP_NOT_VERIFIED]
+    assert pending == []
+
+
+def test_scoped_verify_keeps_pending_when_alias_and_transient_row_coexist(
+        db, tmp_path):
+    # Guard the terminal-alias override against overreach: when a hash
+    # has one unchecked alias row AND one unchecked transient-failure
+    # row (e.g. the real archive's mount is momentarily down), the
+    # entry must stay retry-eligible. A future click after the mount
+    # returns has a real lever — the transient row can still succeed.
+    card = _card_file(tmp_path, name="IMG_0001.NEF", content=b"raw-one")
+    # Alias row (hardlink into the card, NULL hash_status).
+    alias_folder = tmp_path / "archive" / "alias"
+    alias_folder.mkdir(parents=True)
+    alias = alias_folder / "IMG_0001.NEF"
+    try:
+        os.link(card, alias)
+    except (OSError, NotImplementedError):
+        pytest.skip("hardlinks unsupported on this filesystem")
+    alias_st = os.stat(alias)
+    alias_fid = db.add_folder(str(alias_folder))
+    db.add_photo(
+        folder_id=alias_fid, filename="IMG_0001.NEF", extension=".NEF",
+        file_size=alias_st.st_size, file_mtime=alias_st.st_mtime,
+        file_hash=_sha(str(alias)),
+    )
+    # Real independent archive row (NULL hash_status), but the file is
+    # deleted so scoped verify sees KEEP_ARCHIVE_UNREACHABLE — the same
+    # shape as a mount that comes back later.
+    real_folder = tmp_path / "archive" / "2026"
+    real_folder.mkdir(parents=True)
+    real_archive = real_folder / "IMG_0001.NEF"
+    real_archive.write_bytes(b"raw-one")
+    real_st = os.stat(real_archive)
+    real_fid = db.add_folder(str(real_folder))
+    db.add_photo(
+        folder_id=real_fid, filename="IMG_0001.NEF", extension=".NEF",
+        file_size=real_st.st_size, file_mtime=real_st.st_mtime,
+        file_hash=_sha(str(real_archive)),
+    )
+    os.unlink(real_archive)
+
+    scan = _scan(db, tmp_path)
+    assert _entries(scan, "kept")[0]["reason"] == \
+        card_cleanup.KEEP_NOT_VERIFIED
+
+    manifest_dir = str(tmp_path / "manifests")
+    card_cleanup.verify_manifest_archives(
+        db, load_manifest(manifest_dir, "scan-1"), manifest_dir)
+
+    refreshed = load_manifest(manifest_dir, "scan-1")
+    kept = _entries(refreshed, "kept")
+    # Retry-eligible: KEEP_NOT_VERIFIED wins because the real row still
+    # gives verify a lever once its mount returns.
+    assert kept[0]["reason"] == card_cleanup.KEEP_NOT_VERIFIED
+
+
+def test_scoped_verify_terminal_alias_does_not_mask_persisted_external_failure(
+        db, tmp_path):
+    # Codex P2: a hash with one same-source alias row (still NULL) and
+    # one external row already persisted as corrupt (from an earlier
+    # verify pass) hits an edge case in the terminal-alias override.
+    # This run only processes the alias — the external row is no longer
+    # unchecked — so scoped verify records the alias as terminally
+    # inside-source and adds the hash to terminal_inside_source_hashes.
+    # qualify_rows then still returns KEEP_NOT_VERIFIED (the alias's
+    # NULL row wins priority over the corrupt row's KEEP_ARCHIVE_HASH_
+    # FAILED). Without this fix, the reclassification pass would
+    # overwrite that to KEEP_INSIDE_SOURCE and tell the user "no
+    # independent archive copy exists", hiding the corrupt external
+    # archive and the Audit-page remedy it needs. The refreshed
+    # manifest must surface KEEP_ARCHIVE_HASH_FAILED instead: the
+    # external failure was cataloged, and the Audit page — not
+    # another verify click — is the remedy.
+    card = _card_file(tmp_path, name="IMG_0001.NEF", content=b"raw-one")
+
+    # External archive row that was hashed as corrupt in an earlier
+    # pass. Store the row without a real file on disk so this run's
+    # verify loop cannot revisit it; hash_status = "corrupt" makes it
+    # non-unchecked so it never enters the scoped verify's unchecked
+    # list. The row remains visible to qualify_rows and to the
+    # reclassification's row scan.
+    external_folder = tmp_path / "archive" / "2026"
+    external_folder.mkdir(parents=True)
+    external_fid = db.add_folder(str(external_folder))
+    external_pid = db.add_photo(
+        folder_id=external_fid, filename="IMG_0001.NEF", extension=".NEF",
+        file_size=len(b"raw-one"), file_mtime=1000.0,
+        file_hash=_sha(str(card)),
+    )
+    db.update_photo_hash_check(external_pid, "corrupt")
+
+    # Alias row: a hardlink into the card file itself. Still NULL —
+    # never audited. Scoped verify will detect it as same-as-card via
+    # the fd's dev/inode and leave it NULL.
+    alias_folder = tmp_path / "archive" / "alias"
+    alias_folder.mkdir(parents=True)
+    alias = alias_folder / "IMG_0001.NEF"
+    try:
+        os.link(card, alias)
+    except (OSError, NotImplementedError):
+        pytest.skip("hardlinks unsupported on this filesystem")
+    alias_st = os.stat(alias)
+    alias_fid = db.add_folder(str(alias_folder))
+    db.add_photo(
+        folder_id=alias_fid, filename="IMG_0001.NEF", extension=".NEF",
+        file_size=alias_st.st_size, file_mtime=alias_st.st_mtime,
+        file_hash=_sha(str(alias)),
+    )
+
+    scan = _scan(db, tmp_path)
+    kept = _entries(scan, "kept")
+    assert len(kept) == 1
+    # Initial scan: the alias's NULL status makes KEEP_NOT_VERIFIED the
+    # winning reason via qualify_rows' priority order.
+    assert kept[0]["reason"] == card_cleanup.KEEP_NOT_VERIFIED
+
+    manifest_dir = str(tmp_path / "manifests")
+    card_cleanup.verify_manifest_archives(
+        db, load_manifest(manifest_dir, "scan-1"), manifest_dir)
+
+    refreshed = load_manifest(manifest_dir, "scan-1")
+    kept = _entries(refreshed, "kept")
+    assert len(kept) == 1
+    # Not KEEP_INSIDE_SOURCE (which would tell the user no independent
+    # archive exists — false; one is cataloged) and not
+    # KEEP_NOT_VERIFIED (another verify click would find nothing new to
+    # do since the only remaining NULL row is a same-source alias).
+    # The correct surface is the terminal external verdict.
+    assert kept[0]["reason"] == card_cleanup.KEEP_ARCHIVE_HASH_FAILED
+
+
+def test_scoped_verify_surfaces_new_failed_archive_beside_unchecked_alias(
+        db, tmp_path):
+    """A failure persisted in this run also outranks a NULL alias."""
+    card = _card_file(tmp_path, name="IMG_0001.NEF", content=b"raw-one")
+    expected_hash = _sha(str(card))
+
+    alias_folder = tmp_path / "archive" / "alias-current"
+    alias_folder.mkdir(parents=True)
+    alias = alias_folder / "IMG_0001.NEF"
+    try:
+        os.link(card, alias)
+    except (OSError, NotImplementedError):
+        pytest.skip("hardlinks unsupported on this filesystem")
+    alias_st = os.stat(alias)
+    alias_fid = db.add_folder(str(alias_folder))
+    alias_pid = db.add_photo(
+        folder_id=alias_fid, filename=alias.name, extension=".NEF",
+        file_size=alias_st.st_size, file_mtime=alias_st.st_mtime,
+        file_hash=expected_hash,
+    )
+
+    failed_folder = tmp_path / "archive" / "independent"
+    failed_folder.mkdir(parents=True)
+    failed_archive = failed_folder / "IMG_0001.NEF"
+    failed_archive.write_bytes(b"bad-copy")
+    failed_st = os.stat(failed_archive)
+    failed_fid = db.add_folder(str(failed_folder))
+    failed_pid = db.add_photo(
+        folder_id=failed_fid, filename=failed_archive.name, extension=".NEF",
+        file_size=failed_st.st_size, file_mtime=failed_st.st_mtime,
+        file_hash=expected_hash,
+    )
+
+    _scan(db, tmp_path)
+    manifest_dir = str(tmp_path / "manifests")
+    result = card_cleanup.verify_manifest_archives(
+        db, load_manifest(manifest_dir, "scan-1"), manifest_dir)
+
+    assert result["corrupt"] == 1
+    statuses = {
+        row["id"]: row["hash_status"]
+        for row in db.conn.execute(
+            "SELECT id, hash_status FROM photos WHERE id IN (?, ?)",
+            (alias_pid, failed_pid),
+        )
+    }
+    assert statuses == {alias_pid: None, failed_pid: "corrupt"}
+    kept = _entries(load_manifest(manifest_dir, "scan-1"), "kept")
+    assert kept[0]["reason"] == card_cleanup.KEEP_ARCHIVE_HASH_FAILED
+
+
+def test_scoped_verify_does_not_certify_repurposed_catalog_row(
+        db, tmp_path, monkeypatch):
+    archive_file, pid = _archive_photo(db, tmp_path, hash_status=None)
+    _card_file(tmp_path)
+    _scan(db, tmp_path)
+    real_hash = card_cleanup.compute_fd_hash
+
+    def repurpose_row_while_hashing(fd, *args, **kwargs):
+        result = real_hash(fd, *args, **kwargs)
+        if os.fstat(fd).st_ino == os.stat(archive_file).st_ino:
+            db.conn.execute(
+                "UPDATE photos SET filename = ? WHERE id = ?",
+                ("REUSED.NEF", pid),
+            )
+        return result
+
+    monkeypatch.setattr(
+        card_cleanup, "compute_fd_hash", repurpose_row_while_hashing)
+    manifest_dir = str(tmp_path / "manifests")
+    result = card_cleanup.verify_manifest_archives(
+        db, load_manifest(manifest_dir, "scan-1"), manifest_dir)
+
+    row = db.conn.execute(
+        "SELECT filename, hash_status FROM photos WHERE id = ?", (pid,)
+    ).fetchone()
+    assert row["filename"] == "REUSED.NEF"
+    assert row["hash_status"] is None
+    assert result["verified"] == 0
+    assert result["unblocked_files"] == 0
+    refreshed = load_manifest(manifest_dir, "scan-1")
+    assert refreshed["totals"]["deletable"]["count"] == 0
+
+
+def test_scoped_verify_drops_pending_kept_entries_whose_card_files_are_gone(
+        db, tmp_path):
+    # Codex P2 (follow-up): the deletable pre-pass already drops
+    # confirmed-absent card files, but pending KEEP_NOT_VERIFIED
+    # entries were never revalidated the same way. If a pending card
+    # file is removed after the scan, the previous code kept the
+    # entry with its original byte count credited to the "kept"
+    # bucket; the refreshed preview then claimed a nonexistent file
+    # would remain on the card. The absent entry must be dropped so
+    # the totals match what is actually on disk.
+    #
+    # Pair with a second pending file that has a viable archive so
+    # verify actually does something and the missing entry is the
+    # only kept survivor difference we're measuring.
+    archive_gone, _ = _archive_photo(
+        db, tmp_path, name="IMG_0001.NEF", content=b"raw-one",
+        hash_status=None)
+    archive_kept, _ = _archive_photo(
+        db, tmp_path, name="IMG_0002.NEF", content=b"raw-two",
+        hash_status=None, folder="archive/2026/2026-08-02")
+    gone_card = _card_file(
+        tmp_path, name="IMG_0001.NEF", content=b"raw-one")
+    _card_file(tmp_path, name="IMG_0002.NEF", content=b"raw-two")
+
+    scan = _scan(db, tmp_path)
+    kept = _entries(scan, "kept")
+    assert sorted(e["path"] for e in kept) == sorted([
+        str(gone_card),
+        str(tmp_path / "card" / "DCIM" / "IMG_0002.NEF"),
+    ])
+    assert all(e["reason"] == card_cleanup.KEEP_NOT_VERIFIED for e in kept)
+
+    # Simulate the card file getting removed after the scan (for
+    # example, ejected and re-inserted, or the user deleted it
+    # directly from the card in another tool).
+    os.unlink(gone_card)
+
+    manifest_dir = str(tmp_path / "manifests")
+    manifest_before = load_manifest(manifest_dir, "scan-1")
+    revision_before = int(manifest_before.get(
+        "revision", card_cleanup.INITIAL_MANIFEST_REVISION))
+
+    card_cleanup.verify_manifest_archives(
+        db, manifest_before, manifest_dir)
+
+    refreshed = load_manifest(manifest_dir, "scan-1")
+    # The IMG_0002 pending entry promoted to deletable. The gone-card
+    # entry did NOT survive as a kept-with-original-bytes row.
+    kept = _entries(refreshed, "kept")
+    assert kept == [], (
+        "Confirmed-absent pending entries must leave the manifest so "
+        "the refreshed totals do not claim a nonexistent file will "
+        "remain on the card."
+    )
+    deletable = _entries(refreshed, "deletable")
+    assert [e["path"] for e in deletable] == [
+        str(tmp_path / "card" / "DCIM" / "IMG_0002.NEF")]
+    assert refreshed["totals"]["kept"]["count"] == 0
+    assert refreshed["totals"]["kept"]["bytes"] == 0
+    assert refreshed["totals"]["deletable"]["count"] == 1
+    assert refreshed["totals"]["deletable"]["bytes"] == len(b"raw-two")
+    # Revision still bumps so any confirmation against the pre-verify
+    # manifest is rejected by the delete endpoint's freshness gate.
+    assert int(refreshed["revision"]) == revision_before + 1
+
+
+def test_scoped_verify_keeps_pending_entry_when_lstat_error_is_transient(
+        db, tmp_path, monkeypatch):
+    # Companion to the drop test: a transient lstat error on a
+    # pending card file (mount blip, EACCES) is NOT proof the file is
+    # gone. Dropping the entry would shrink the preview during an
+    # ordinary hiccup and — worse — make a still-eligible file
+    # invisible until the next scan. Pair the transient lstat with a
+    # transient archive-open failure so the archive-side verify keeps
+    # the entry in the KEEP_NOT_VERIFIED bucket (rather than
+    # promoting it via qualify_rows, which uses os.stat and is not
+    # affected by an os.lstat monkeypatch); this isolates that the
+    # pre-pass itself preserves the entry.
+    archive_file, _ = _archive_photo(db, tmp_path, hash_status=None)
+    card_file = _card_file(tmp_path)
+    _scan(db, tmp_path)
+
+    real_lstat = os.lstat
+    real_open = os.open
+    card_str = str(card_file)
+    archive_str = str(archive_file)
+
+    def flaky_lstat(path, *args, **kwargs):
+        if str(path) == card_str:
+            raise OSError(13, "permission denied")
+        return real_lstat(path, *args, **kwargs)
+
+    def flaky_open(path, *args, **kwargs):
+        if str(path) == archive_str:
+            raise OSError(2, "mount is down")
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(card_cleanup.os, "lstat", flaky_lstat)
+    monkeypatch.setattr(card_cleanup.os, "open", flaky_open)
+
+    manifest_dir = str(tmp_path / "manifests")
+    card_cleanup.verify_manifest_archives(
+        db, load_manifest(manifest_dir, "scan-1"), manifest_dir)
+
+    refreshed = load_manifest(manifest_dir, "scan-1")
+    kept = _entries(refreshed, "kept")
+    # The transient lstat did NOT drop the pending entry from the
+    # manifest — it survived the pre-pass, and with the archive
+    # transiently unreachable it stays retry-eligible.
+    assert [e["path"] for e in kept] == [card_str]
+    assert kept[0]["reason"] == card_cleanup.KEEP_NOT_VERIFIED
+
+
+def test_scoped_verify_records_hash_failed_when_open_fd_hash_fails(
+        db, tmp_path, monkeypatch):
+    # Codex P2: when os.open on the archive path succeeds but the
+    # subsequent fd read (compute_fd_hash / fstat / realpath) fails,
+    # the DB row is persisted as hash_status='unreadable' — a
+    # permanent verdict. qualify_rows returns KEEP_ARCHIVE_HASH_FAILED
+    # for that persisted row on the next pass. The scoped-verify
+    # promotion-loop override used to replace that verdict with the
+    # run's outcome_reason, still initialized to
+    # KEEP_ARCHIVE_UNREACHABLE, hiding the failure from the refreshed
+    # preview. The UI shows the retry affordance for
+    # KEEP_ARCHIVE_UNREACHABLE and the Audit-page guidance only for
+    # KEEP_ARCHIVE_HASH_FAILED, so the mismatched reason misroutes
+    # the user. outcome_reason must match the persisted verdict.
+    _, pid = _archive_photo(db, tmp_path, hash_status=None)
+    _card_file(tmp_path)
+    _scan(db, tmp_path)
+
+    def failing_compute(fd, *args, **kwargs):
+        # Simulate a mid-read failure on the pinned archive fd.
+        raise OSError(5, "input/output error")
+
+    monkeypatch.setattr(card_cleanup, "compute_fd_hash", failing_compute)
+
+    manifest_dir = str(tmp_path / "manifests")
+    result = card_cleanup.verify_manifest_archives(
+        db, load_manifest(manifest_dir, "scan-1"), manifest_dir)
+
+    # The row was reached (os.open succeeded), so this counts as
+    # unreadable, not verified.
+    assert result["unreadable"] == 1
+    assert result["verified"] == 0
+    assert result["unblocked_files"] == 0
+
+    # The DB row must be persisted as 'unreadable' — permanent.
+    status = db.conn.execute(
+        "SELECT hash_status FROM photos WHERE id = ?", (pid,)
+    ).fetchone()["hash_status"]
+    assert status == "unreadable"
+
+    # The manifest reason must match qualify_rows' terminal verdict
+    # for a persisted-unreadable row: KEEP_ARCHIVE_HASH_FAILED, NOT
+    # the run's initial KEEP_ARCHIVE_UNREACHABLE. This is the signal
+    # the UI keys off to point users at the Audit page.
+    refreshed = load_manifest(manifest_dir, "scan-1")
+    kept = _entries(refreshed, "kept")
+    assert len(kept) == 1
+    assert kept[0]["reason"] == card_cleanup.KEEP_ARCHIVE_HASH_FAILED
+    # And it must not have been overridden back to unreachable
+    # (which would incorrectly offer a retry).
+    assert kept[0]["reason"] != card_cleanup.KEEP_ARCHIVE_UNREACHABLE
 
 
 def test_scan_archive_file_missing_kept(db, tmp_path):
@@ -557,6 +1501,35 @@ def test_qualify_rows_null_archive_stat_baseline_keeps(db, tmp_path):
         rows, source_root_real, str(card))
     assert archive_path is None
     assert reason == card_cleanup.KEEP_ARCHIVE_CHANGED
+
+
+def test_qualify_rows_prefers_verify_remedy_over_ok_row_specific_reason(
+        db, tmp_path):
+    """Codex P2: an ok archive row that fails a later gate (missing
+    file, changed size/mtime, etc.) used to set the specific reason
+    verbatim, which then hid rows that still had an unchecked sibling
+    verify could try. Ensure the never-checked sibling wins so the
+    card-cleanup callout offers to verify it."""
+    archive_file, _ = _archive_photo(db, tmp_path)
+    source_root_real = os.path.realpath(str(tmp_path / "card"))
+    card = _card_file(tmp_path)
+    # Row A is 'ok' but its archive file is missing on disk — the row
+    # itself would raise KEEP_ARCHIVE_UNREACHABLE via the ok-path stat
+    # failure. Row B is a never-checked sibling that verify could still
+    # try; its presence must promote the reason to KEEP_NOT_VERIFIED.
+    rows = [
+        {"filename": "GONE.NEF",
+         "file_size": 7, "file_mtime": 0.0,
+         "hash_status": "ok",
+         "folder_path": str(tmp_path / "archive_missing")},
+        {"filename": os.path.basename(str(archive_file)),
+         "file_size": None, "file_mtime": None,
+         "hash_status": None,
+         "folder_path": os.path.dirname(str(archive_file))},
+    ]
+    _, reason = card_cleanup.qualify_rows(
+        rows, source_root_real, str(card))
+    assert reason == card_cleanup.KEEP_NOT_VERIFIED
 
 
 def test_qualify_rows_missing_card_file_unreadable(db, tmp_path):
@@ -828,14 +1801,9 @@ def test_delete_skips_file_replaced_during_archive_gate(db, tmp_path):
 
 
 def test_delete_skips_inplace_rewrite_during_archive_gate(db, tmp_path):
-    # Final-rehash gate (Codex P1 follow-up): the initial delete-time hash
-    # runs BEFORE the potentially slow archive gate. If the file is
-    # rewritten in place during the archive gate — same inode (open/write
-    # preserves it), same size, mtime forced back to the manifest value
-    # (FAT is 2s-granular; a camera reusing a filename in that window is
-    # the realistic case) — every metadata gate passes but the bytes at
-    # unlink time are not the ones we authorized. Only a rehash right
-    # before os.remove can catch this.
+    # The card hash runs after archive gate 1. If the file is rewritten in
+    # place during that potentially slow gate — same inode, size, and mtime
+    # — the single content read still catches it.
     _archive_photo(db, tmp_path)
     card = _card_file(tmp_path)  # content b"raw-one", 7 bytes
     scan = _scan(db, tmp_path)
@@ -859,8 +1827,8 @@ def test_delete_skips_inplace_rewrite_during_archive_gate(db, tmp_path):
     with unittest.mock.patch.object(
             card_cleanup, "fetch_rows_by_hash", fetch_then_inplace_rewrite):
         summary = card_cleanup.delete_verified(db, manifest)
-    # Inode preserved: metadata gates would have passed. Only the final
-    # rehash can catch the swap — assert both the outcome and the reason.
+    # Inode preserved: metadata gates would have passed. The content hash
+    # catches the swap — assert both the outcome and the reason.
     assert os.stat(card).st_ino == original_ino
     assert summary["deleted"] == 0
     assert len(summary["skipped"]) == 1
@@ -1001,21 +1969,28 @@ def test_delete_skips_when_card_path_becomes_fifo_post_scan(
         pytest.skip("mkfifo unsupported on this filesystem")
     os.utime(card, ns=(entry["mtime_ns"], entry["mtime_ns"]))
 
-    # compute_file_hash on a FIFO would block on open indefinitely. Prove
-    # the gate rejects the replacement BEFORE any hash call happens.
+    # compute_file_hash / compute_fd_hash on a FIFO would block on read
+    # indefinitely. Prove the gate rejects the replacement BEFORE any
+    # hash call happens. Both hash entry points are patched — the delete
+    # path uses compute_fd_hash after the CodeRabbit TOCTOU fix, but
+    # guarding both keeps future regressions from silently slipping the
+    # bad object through.
     hash_calls = []
     real_hash = card_cleanup.compute_file_hash
+    real_fd_hash = card_cleanup.compute_fd_hash
 
-    def guarded_hash(path, *a, **kw):
-        hash_calls.append(path)
+    def guarded_hash(*a, **kw):
+        hash_calls.append(a)
         raise AssertionError(
-            "compute_file_hash must not be called on a non-regular replacement")
+            "hash function must not be called on a non-regular replacement")
 
     monkeypatch.setattr(card_cleanup, "compute_file_hash", guarded_hash)
+    monkeypatch.setattr(card_cleanup, "compute_fd_hash", guarded_hash)
     try:
         summary = card_cleanup.delete_verified(db, manifest)
     finally:
         monkeypatch.setattr(card_cleanup, "compute_file_hash", real_hash)
+        monkeypatch.setattr(card_cleanup, "compute_fd_hash", real_fd_hash)
 
     assert hash_calls == []
     assert summary["deleted"] == 0
@@ -1026,8 +2001,37 @@ def test_delete_skips_when_card_path_becomes_fifo_post_scan(
     assert stat.S_ISFIFO(os.lstat(card).st_mode)
 
 
-def test_delete_skips_when_archive_dies_during_final_hash(db, tmp_path):
-    # Codex P1: gate 1 authorizes, then the final card re-hash reads the
+def test_delete_nonblocking_open_rejects_fifo_swap_after_lstat(
+        db, tmp_path, monkeypatch):
+    if not hasattr(os, "mkfifo") or not card_cleanup.O_NONBLOCK:
+        pytest.skip("non-blocking FIFOs unsupported on this platform")
+    _archive_photo(db, tmp_path)
+    card = _card_file(tmp_path)
+    _scan(db, tmp_path)
+    manifest = load_manifest(str(tmp_path / "manifests"), "scan-1")
+    real_open = os.open
+    opened_flags = []
+
+    def swap_then_open(path, flags, *args, **kwargs):
+        if str(path) == str(card) and not opened_flags:
+            opened_flags.append(flags)
+            os.unlink(card)
+            os.mkfifo(card)
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(card_cleanup.os, "open", swap_then_open)
+    summary = card_cleanup.delete_verified(db, manifest)
+
+    assert opened_flags[0] & card_cleanup.O_NONBLOCK
+    assert summary["deleted"] == 0
+    assert summary["skipped"] == [{
+        "path": str(card), "reason": card_cleanup.SKIP_NOT_REGULAR,
+    }]
+    assert stat.S_ISFIFO(os.lstat(card).st_mode)
+
+
+def test_delete_skips_when_archive_dies_during_card_hash(db, tmp_path):
+    # Gate 1 authorizes, then the single card hash reads the
     # whole file (seconds on real photos). If the archive vanishes during
     # that hash, gate 1's authorization is stale. A second archive gate
     # immediately before os.remove must catch the death — otherwise the
@@ -1037,22 +2041,22 @@ def test_delete_skips_when_archive_dies_during_final_hash(db, tmp_path):
     scan = _scan(db, tmp_path)
     assert scan["totals"]["deletable"]["count"] == 1
     manifest = load_manifest(str(tmp_path / "manifests"), "scan-1")
-    real_hash = card_cleanup.compute_file_hash
+    # delete_verified reads the card via compute_fd_hash on a pinned
+    # descriptor (CodeRabbit TOCTOU fix), so intercept that instead of
+    # compute_file_hash. Kill the archive during the single card hash to
+    # prove gate 2 catches the death before os.remove.
+    real_hash = card_cleanup.compute_fd_hash
     hash_calls = []
 
-    def hash_kill_archive_before_final(path, *a, **kw):
-        # Two hash calls per candidate in delete_verified: initial (fast
-        # reject) and final (right before unlink). Simulate the archive
-        # dying during the final call by unlinking it just before this
-        # invocation returns.
-        hash_calls.append(str(path))
-        result = real_hash(path, *a, **kw)
-        if len(hash_calls) == 2:
+    def hash_kill_archive(fd, *a, **kw):
+        hash_calls.append(fd)
+        result = real_hash(fd, *a, **kw)
+        if len(hash_calls) == 1:
             os.unlink(archive_file)
         return result
 
     with unittest.mock.patch.object(
-            card_cleanup, "compute_file_hash", hash_kill_archive_before_final):
+            card_cleanup, "compute_fd_hash", hash_kill_archive):
         summary = card_cleanup.delete_verified(db, manifest)
     assert summary["deleted"] == 0
     assert card.exists()
@@ -1060,7 +2064,14 @@ def test_delete_skips_when_archive_dies_during_final_hash(db, tmp_path):
     assert "archive" in summary["skipped"][0]["reason"]
 
 
-def test_delete_skips_when_parent_redirected_during_final_hash(db, tmp_path):
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="POSIX-only race: Windows cannot rmtree a directory that "
+    "contains an open file, so the parent-directory swap inside the "
+    "wrapper fails before the containment recheck runs. The race this "
+    "test simulates cannot occur on Windows in the first place.",
+)
+def test_delete_skips_when_parent_redirected_during_card_hash(db, tmp_path):
     # Codex P1: after both archive gate 1 and gate 2 authorize, if the
     # parent directory is swapped for a symlink to a byte-identical
     # external copy during the final hash, every content gate still
@@ -1079,17 +2090,18 @@ def test_delete_skips_when_parent_redirected_during_final_hash(db, tmp_path):
     decoy.write_bytes(b"raw-one")
     os.utime(decoy, ns=(entry["mtime_ns"], entry["mtime_ns"]))
 
-    real_hash = card_cleanup.compute_file_hash
+    # Same intent as above: delete_verified now reads the card via
+    # compute_fd_hash (CodeRabbit TOCTOU fix), so hook that entry point
+    # to run the parent-directory swap during the pinned-fd hash.
+    real_hash = card_cleanup.compute_fd_hash
     hash_calls = []
 
-    def hash_then_swap_parent(path, *a, **kw):
-        hash_calls.append(str(path))
-        result = real_hash(path, *a, **kw)
-        if len(hash_calls) == 2:
-            # Second hash call is the FINAL rehash. Swap the parent
-            # directory for a symlink to `outside` after the read has
-            # already committed to card bytes but before containment
-            # is re-verified.
+    def hash_then_swap_parent(fd, *a, **kw):
+        hash_calls.append(fd)
+        result = real_hash(fd, *a, **kw)
+        if len(hash_calls) == 1:
+            # Swap the parent for a symlink after the single card read has
+            # committed to bytes but before containment is re-verified.
             dcim = tmp_path / "card" / "DCIM"
             shutil.rmtree(dcim)
             try:
@@ -1099,13 +2111,35 @@ def test_delete_skips_when_parent_redirected_during_final_hash(db, tmp_path):
         return result
 
     with unittest.mock.patch.object(
-            card_cleanup, "compute_file_hash", hash_then_swap_parent):
+            card_cleanup, "compute_fd_hash", hash_then_swap_parent):
         summary = card_cleanup.delete_verified(db, manifest)
     assert summary["deleted"] == 0
     assert len(summary["skipped"]) == 1
     assert "no longer resolves inside" in summary["skipped"][0]["reason"]
     # The decoy — the only file behind the redirected path — must survive.
     assert decoy.exists() and decoy.read_bytes() == b"raw-one"
+
+
+def test_delete_hashes_each_card_file_once(db, tmp_path, monkeypatch):
+    _archive_photo(db, tmp_path)
+    card = _card_file(tmp_path)
+    card_inode = os.stat(card).st_ino
+    _scan(db, tmp_path)
+    manifest = load_manifest(str(tmp_path / "manifests"), "scan-1")
+    # delete_verified hashes the card via compute_fd_hash on a pinned
+    # descriptor (CodeRabbit TOCTOU fix). Correlate fds back to the card
+    # by inode so this assertion still says "one read per card file".
+    hashed_inodes = []
+    real_hash = card_cleanup.compute_fd_hash
+
+    def counting_hash(fd, *args, **kwargs):
+        hashed_inodes.append(os.fstat(fd).st_ino)
+        return real_hash(fd, *args, **kwargs)
+
+    monkeypatch.setattr(card_cleanup, "compute_fd_hash", counting_hash)
+    summary = card_cleanup.delete_verified(db, manifest)
+    assert summary["deleted"] == 1
+    assert hashed_inodes == [card_inode]
 
 
 def test_qualify_binds_containment_to_statted_object(db, tmp_path, monkeypatch):

@@ -127,13 +127,58 @@ def test_scan_then_manifest_then_delete_end_to_end(app_and_db, tmp_path):
     assert manifest["totals"]["deletable"]["count"] == 1
 
     delete_resp = client.post(
-        "/api/card-cleanup/delete", json={"scan_job_id": scan_job_id})
+        "/api/card-cleanup/delete",
+        json={"scan_job_id": scan_job_id,
+              "manifest_revision": manifest["revision"]})
     assert delete_resp.status_code == 200
     delete_job_id = delete_resp.get_json()["job_id"]
     _wait_for_job(client, delete_job_id)
 
     assert not card_file.exists()
     assert archive_file.exists()
+
+
+def test_scoped_verify_endpoint_promotes_preview_without_global_audit(
+        app_and_db, tmp_path):
+    app, db = app_and_db
+    client = app.test_client()
+    archive_file, pid = _archive_photo(db, tmp_path)
+    unrelated, unrelated_pid = _archive_photo(
+        db, tmp_path, name="OTHER.NEF", content=b"other",
+        folder="archive/other")
+    db.conn.execute(
+        "UPDATE photos SET hash_status = NULL, hash_checked_at = NULL "
+        "WHERE id IN (?, ?)", (pid, unrelated_pid))
+    db.conn.commit()
+    _card_file(tmp_path)
+
+    scan_resp = client.post(
+        "/api/card-cleanup/scan", json={"source": str(tmp_path / "card")})
+    scan_job_id = scan_resp.get_json()["job_id"]
+    _wait_for_job(client, scan_job_id)
+    before = client.get(
+        f"/api/card-cleanup/{scan_job_id}/manifest").get_json()
+    assert before["totals"]["deletable"]["count"] == 0
+
+    verify_resp = client.post(
+        "/api/card-cleanup/verify", json={"scan_job_id": scan_job_id})
+    assert verify_resp.status_code == 200
+    verify_job_id = verify_resp.get_json()["job_id"]
+    job = _wait_for_job(client, verify_job_id)
+    assert job["type"] == "card-cleanup-verify"
+    assert job["result"]["archive_files_read"] == 1
+    assert job["result"]["unblocked_files"] == 1
+
+    after = client.get(
+        f"/api/card-cleanup/{scan_job_id}/manifest").get_json()
+    assert after["totals"]["deletable"]["count"] == 1
+    deletable = [e for e in after["entries"] if e["bucket"] == "deletable"]
+    assert [e["archive_path"] for e in deletable] == [str(archive_file)]
+    assert unrelated.exists()
+    unrelated_status = db.conn.execute(
+        "SELECT hash_status FROM photos WHERE id = ?", (unrelated_pid,)
+    ).fetchone()["hash_status"]
+    assert unrelated_status is None
 
 
 def test_scan_job_result_carries_totals_not_entries(app_and_db, tmp_path):
@@ -233,8 +278,12 @@ def test_delete_after_restart_uses_history_and_disk_manifest(
     )
     db.conn.commit()
 
+    manifest = client.get(
+        "/api/card-cleanup/scan-r/manifest").get_json()
     delete_resp = client.post(
-        "/api/card-cleanup/delete", json={"scan_job_id": "scan-r"})
+        "/api/card-cleanup/delete",
+        json={"scan_job_id": "scan-r",
+              "manifest_revision": manifest["revision"]})
     assert delete_resp.status_code == 200
     delete_job_id = delete_resp.get_json()["job_id"]
     _wait_for_job(client, delete_job_id)
@@ -265,7 +314,9 @@ def test_delete_expired_manifest_404(app_and_db, tmp_path):
         json.dump(manifest, f)
 
     delete_resp = client.post(
-        "/api/card-cleanup/delete", json={"scan_job_id": scan_job_id})
+        "/api/card-cleanup/delete",
+        json={"scan_job_id": scan_job_id,
+              "manifest_revision": manifest["revision"]})
     assert delete_resp.status_code == 404
     assert "re-scan" in delete_resp.get_json()["error"]
 
@@ -296,12 +347,16 @@ def test_delete_concurrent_delete_409(app_and_db, tmp_path, monkeypatch):
 
     monkeypatch.setattr(
         card_cleanup, "delete_verified", blocking_delete_verified)
+    manifest = client.get(
+        f"/api/card-cleanup/{scan_job_id}/manifest").get_json()
     # Bound before the try so a failure on the first POST surfaces as
     # itself, not as a NameError raised from the finally drain.
     job1_id = None
     try:
         resp1 = client.post(
-            "/api/card-cleanup/delete", json={"scan_job_id": scan_job_id})
+            "/api/card-cleanup/delete",
+            json={"scan_job_id": scan_job_id,
+                  "manifest_revision": manifest["revision"]})
         assert resp1.status_code == 200
         job1_id = resp1.get_json()["job_id"]
         assert started.wait(timeout=15)
@@ -318,7 +373,9 @@ def test_delete_concurrent_delete_409(app_and_db, tmp_path, monkeypatch):
         assert _running()
 
         resp2 = client.post(
-            "/api/card-cleanup/delete", json={"scan_job_id": scan_job_id})
+            "/api/card-cleanup/delete",
+            json={"scan_job_id": scan_job_id,
+                  "manifest_revision": manifest["revision"]})
         assert resp2.status_code == 409
     finally:
         release.set()
@@ -369,8 +426,11 @@ def test_delete_result_carries_exact_totals(app_and_db, tmp_path):
                        json={"source": str(tmp_path / "card")})
     scan_job_id = resp.get_json()["job_id"]
     _wait_for_job(client, scan_job_id)
+    manifest = client.get(
+        f"/api/card-cleanup/{scan_job_id}/manifest").get_json()
     resp = client.post("/api/card-cleanup/delete",
-                       json={"scan_job_id": scan_job_id})
+                       json={"scan_job_id": scan_job_id,
+                             "manifest_revision": manifest["revision"]})
     job_id = resp.get_json()["job_id"]
     _wait_for_job(client, job_id)
     result = client.get(f"/api/jobs/{job_id}").get_json()["result"]
@@ -379,12 +439,155 @@ def test_delete_result_carries_exact_totals(app_and_db, tmp_path):
     assert result["deleted"] == 1
 
 
+def test_scan_manifest_carries_initial_revision(app_and_db, tmp_path):
+    """Codex P1: the first manifest a scan writes must carry
+    INITIAL_MANIFEST_REVISION so the delete endpoint's revision check
+    has something concrete to compare against on the very first pass."""
+    app, db = app_and_db
+    client = app.test_client()
+    _make_verified_pair(db, tmp_path)
+    resp = client.post("/api/card-cleanup/scan",
+                       json={"source": str(tmp_path / "card")})
+    scan_job_id = resp.get_json()["job_id"]
+    _wait_for_job(client, scan_job_id)
+    manifest = client.get(
+        f"/api/card-cleanup/{scan_job_id}/manifest").get_json()
+    assert manifest["revision"] == card_cleanup.INITIAL_MANIFEST_REVISION
+
+
+def test_verify_bumps_manifest_revision(app_and_db, tmp_path):
+    """Codex P1: a completed verify must land a fresh revision so any
+    still-open confirmation from before the verify fails the delete-side
+    revision check instead of quietly deleting newly-promoted files."""
+    app, db = app_and_db
+    client = app.test_client()
+    _archive_photo(db, tmp_path)
+    db.conn.execute(
+        "UPDATE photos SET hash_status = NULL, hash_checked_at = NULL")
+    db.conn.commit()
+    _card_file(tmp_path)
+    scan_resp = client.post(
+        "/api/card-cleanup/scan", json={"source": str(tmp_path / "card")})
+    scan_job_id = scan_resp.get_json()["job_id"]
+    _wait_for_job(client, scan_job_id)
+
+    before = client.get(
+        f"/api/card-cleanup/{scan_job_id}/manifest").get_json()
+    verify_resp = client.post(
+        "/api/card-cleanup/verify", json={"scan_job_id": scan_job_id})
+    _wait_for_job(client, verify_resp.get_json()["job_id"])
+    after = client.get(
+        f"/api/card-cleanup/{scan_job_id}/manifest").get_json()
+    assert after["revision"] == before["revision"] + 1
+
+
+def test_verify_endpoint_loads_manifest_inside_cleanup_job_lock():
+    """Codex P1 (commit ad9375db): the verify endpoint must load the
+    manifest INSIDE the ``_CARD_CLEANUP_JOB_LOCK`` critical section, not
+    before it.
+
+    Race: request A loads revision N, releases before taking the lock,
+    then request B runs to completion and writes revision N+1. If A
+    then enters the lock (B is no longer registered as running), passes
+    the conflict check, and hands its stale revision-N manifest to
+    verify_manifest_archives, the worker bumps to N+1 and writes it —
+    silently clobbering B's promotions with entries the user never saw
+    promoted. The conflict check alone does NOT close this window
+    because the check catches only queued/running jobs, and A can enter
+    the lock after B has finished.
+
+    Load-inside-lock closes the window: every verify starts from the
+    manifest that the previous verify's write landed. Pinning this via
+    source inspection because reproducing the race in a functional test
+    would need scheduler hooks we do not have; a future refactor that
+    quietly hoists load_manifest above the ``with`` block would
+    reintroduce the exact bug this commit fixed.
+    """
+    import inspect
+
+    import app as app_module
+
+    src = inspect.getsource(app_module.create_app)
+    start = src.index("def api_card_cleanup_verify(")
+    end = src.index("def api_card_cleanup_delete(", start)
+    verify_src = src[start:end]
+
+    lock_idx = verify_src.index("with _CARD_CLEANUP_JOB_LOCK")
+    load_idx = verify_src.index("card_cleanup.load_manifest(")
+    conflict_idx = verify_src.index(
+        "_card_cleanup_job_conflict_response(")
+    start_idx = verify_src.index("runner.start(")
+
+    assert lock_idx < conflict_idx < load_idx < start_idx, (
+        "api_card_cleanup_verify must run these steps IN ORDER inside "
+        "the _CARD_CLEANUP_JOB_LOCK critical section: (1) take the "
+        "lock, (2) call _card_cleanup_job_conflict_response, (3) load "
+        "the manifest, (4) runner.start. Hoisting load_manifest above "
+        "the `with` block reopens the load-before-lock window Codex "
+        "P1 called out at commit ad9375db: a verify can enter after "
+        "another verify has completed, see no conflict, and hand a "
+        "stale snapshot to verify_manifest_archives that clobbers the "
+        "just-landed revision."
+    )
+
+
+def test_delete_rejects_missing_manifest_revision(app_and_db, tmp_path):
+    """The revision check is required on any completed scan.  A body
+    that omits it must 400 rather than defaulting silently."""
+    app, db = app_and_db
+    client = app.test_client()
+    _make_verified_pair(db, tmp_path)
+    scan_resp = client.post(
+        "/api/card-cleanup/scan", json={"source": str(tmp_path / "card")})
+    scan_job_id = scan_resp.get_json()["job_id"]
+    _wait_for_job(client, scan_job_id)
+    resp = client.post(
+        "/api/card-cleanup/delete", json={"scan_job_id": scan_job_id})
+    assert resp.status_code == 400
+    assert "manifest_revision" in resp.get_json()["error"]
+
+
+def test_delete_rejects_stale_manifest_revision_after_verify(
+        app_and_db, tmp_path):
+    """Codex P1: a delete that confirms an older revision after verify
+    has rewritten the manifest must be rejected with a distinguishable
+    code so the UI can hand the user back to the refreshed preview."""
+    app, db = app_and_db
+    client = app.test_client()
+    _archive_photo(db, tmp_path)
+    db.conn.execute(
+        "UPDATE photos SET hash_status = NULL, hash_checked_at = NULL")
+    db.conn.commit()
+    _card_file(tmp_path)
+    scan_resp = client.post(
+        "/api/card-cleanup/scan", json={"source": str(tmp_path / "card")})
+    scan_job_id = scan_resp.get_json()["job_id"]
+    _wait_for_job(client, scan_job_id)
+    stale = client.get(
+        f"/api/card-cleanup/{scan_job_id}/manifest").get_json()
+    stale_revision = stale["revision"]
+
+    # Verify promotes the unchecked archive row and bumps the revision.
+    verify_resp = client.post(
+        "/api/card-cleanup/verify", json={"scan_job_id": scan_job_id})
+    _wait_for_job(client, verify_resp.get_json()["job_id"])
+
+    resp = client.post(
+        "/api/card-cleanup/delete",
+        json={"scan_job_id": scan_job_id,
+              "manifest_revision": stale_revision})
+    assert resp.status_code == 409
+    body = resp.get_json()
+    assert body["code"] == "manifest_revision_mismatch"
+
+
 def test_endpoints_reject_non_object_json_body(app_and_db):
     # get_json returns 5 for a valid non-object JSON document; the
     # endpoints must 400, not 500 on body.get.
     app, _ = app_and_db
     client = app.test_client()
-    for url in ("/api/card-cleanup/scan", "/api/card-cleanup/delete"):
+    for url in ("/api/card-cleanup/scan", "/api/card-cleanup/verify",
+                "/api/card-cleanup/delete"):
         resp = client.post(url, json=5)
         assert resp.status_code == 400, url
         assert "JSON object" in resp.get_json()["error"]
@@ -399,8 +602,7 @@ def test_card_cleanup_page_renders(app_and_db):
     body = resp.get_data(as_text=True)
     assert "card-cleanup-section" in body
     assert "card-cleanup-scan-btn" in body
-    # The integrity-audit affordance is part of the page, not the import page.
-    assert "card-cleanup-audit-btn" in body
+    assert "card-cleanup-verify-btn" in body
 
 
 def test_import_and_card_cleanup_share_folder_browser(app_and_db):
@@ -432,16 +634,14 @@ def test_import_page_links_to_card_cleanup_instead_of_hosting_it(app_and_db):
     assert "/card-cleanup" in body
 
 
-def test_audit_callout_reason_stays_in_sync(app_and_db):
-    """The page's audit callout counts kept entries by matching a tail of
-    KEEP_NOT_VERIFIED. That coupling is invisible from either side, so pin
-    both ends: the served page must carry the literal it matches on, and
-    the reason it matches must still contain it."""
+def test_verification_callout_reason_stays_in_sync(app_and_db):
+    """The scoped verification callout and backend reason stay coupled."""
     app, _ = app_and_db
-    matched = "run the integrity audit"
-    assert matched in card_cleanup.KEEP_NOT_VERIFIED
+    matched = card_cleanup.KEEP_NOT_VERIFIED
     body = app.test_client().get("/card-cleanup").get_data(as_text=True)
-    assert f"CARD_CLEANUP_AUDIT_REASON = '{matched}'" in body
+    assert f"CARD_CLEANUP_VERIFY_REASON = '{matched}'" in body
+    assert "/api/card-cleanup/verify" in body
+    assert "/api/jobs/verify-hashes" not in body
 
 
 def test_hash_failed_callout_reason_stays_in_sync(app_and_db):
@@ -481,35 +681,88 @@ def test_hash_failed_callout_states_audit_workspace_scope(app_and_db):
     assert "switch to that workspace to find it there" in body
 
 
-def test_finish_audit_disables_delete_until_rescan(app_and_db):
-    """Codex P2 review (commit 1213fec): finishing or cancelling the
-    verify-hashes run must invalidate the preview's Delete affordance,
-    because verification can flip previously-ok rows to modified/corrupt/
-    unreadable — the confirmation dialog would then advertise stale file
-    and byte totals against a subset the user never agreed to. The audit
-    handler must both disable the Delete button and swap in a hint that
-    tells the user to re-scan (the button surfaced next to the audit
-    status). Pin the literal here so the guardrail can't be silently
-    reworded away."""
+def test_finish_scoped_verification_refreshes_preview_without_rescan(
+        app_and_db):
+    """Scoped verification only promotes pending rows, so it can atomically
+    refresh the existing manifest instead of forcing another card scan."""
     app, _ = app_and_db
     body = app.test_client().get("/card-cleanup").get_data(as_text=True)
-    finish = body.index("function cardCleanupFinishAudit(")
-    # Snap out a window around the handler body. The next function in the
-    # file is cardCleanupBindBucket; slice up to whichever declaration
-    # follows so this test does not accidentally match code elsewhere.
+    finish = body.index("async function cardCleanupFinishVerification(")
     end = body.index("function cardCleanupBindBucket(", finish)
     section = body[finish:end]
-    # The Delete button is disabled inside the handler, not just via the
-    # separate cardCleanupSetBusy(false) that ran first (which restores
-    # the pre-verify enabled state).
-    assert "deleteBtn.disabled = true" in section
-    # The user-facing hint that replaces whatever cardCleanupSetBusy
-    # restored — pinned verbatim so a reword can't drop the "re-scan
-    # first" instruction the Codex P2 asked for.
-    assert (
-        "Verification may have changed which files count as verified — "
-        "re-scan the card before deleting."
-    ) in section
+    assert "await cardCleanupLoadManifest()" in section
+    assert section.index("await cardCleanupLoadManifest()") < section.index(
+        "cardCleanupSetBusy(false")
+    # After the Codex P1 flicker fix, keepDeleteState is truthy for any
+    # completed/cancelled verification so cardCleanupSetBusy never
+    # restores the pre-verification Delete snapshot — success re-renders
+    # via cardCleanupLoadManifest, failure explicitly disables below.
+    assert "keepDeleteState: attemptedReload || refreshed" in section
+    assert "re-scan the card before deleting" not in section
+
+
+def test_finish_scoped_verification_locks_delete_when_manifest_reload_fails(
+        app_and_db):
+    """Codex P1 review: if verification finishes but the refreshed manifest
+    cannot be loaded, keep Delete disabled and require a reload or re-scan.
+
+    Verification can promote kept rows to deletable. When it does, the
+    pre-verification Delete state understates what is now on disk: a
+    click would confirm the old totals while /api/card-cleanup/delete
+    operates on the freshly-promoted set too. The prior implementation
+    called cardCleanupSetBusy(false, {keepDeleteState: false}) on reload
+    failure, which restored the pre-verification busyRestore snapshot —
+    including Delete enabled with the old count. It also unconditionally
+    told the user "Preview updated" on a completed status even when the
+    updated preview never rendered.
+
+    Pin the recovered behaviour so a future refactor cannot silently
+    re-open the gap: on the failure branch the Delete button must be
+    explicitly disabled with a hint that directs the user to reload or
+    scan again, and the "Preview updated" copy must be gated on the
+    reload succeeding.
+    """
+    app, _ = app_and_db
+    body = app.test_client().get("/card-cleanup").get_data(as_text=True)
+    finish = body.index("async function cardCleanupFinishVerification(")
+    end = body.index("function cardCleanupBindBucket(", finish)
+    section = body[finish:end]
+    # The failure branch must explicitly force Delete off — a plain
+    # setBusy(false) restore is not enough because busyRestore holds the
+    # pre-verification Delete state (possibly enabled with stale counts).
+    assert "deleteBtn.disabled = true" in section, (
+        "cardCleanupFinishVerification must explicitly disable Delete "
+        "when the post-verification manifest reload fails; otherwise the "
+        "pre-verification Delete state (possibly enabled with stale "
+        "counts) is what the user sees"
+    )
+    # The delete-hint must tell the user why Delete is off and how to
+    # recover (reload / re-scan). Match the actionable phrase.
+    assert "reload the page or scan again before deleting" in section, (
+        "the delete hint must direct the user to reload or scan again "
+        "before deletion is possible after a failed manifest reload"
+    )
+    # The "Preview updated" copy must only appear on the refreshed
+    # branch — pin the conditional so a rewrite cannot drop back to the
+    # unconditional message that was misleading before this fix.
+    completed_start = section.index("if (status === 'completed'")
+    completed_end = section.index("else if (status === 'cancelled')", completed_start)
+    completed_block = section[completed_start:completed_end]
+    assert "refreshed" in completed_block and "Preview updated" in completed_block, (
+        "the completed-status branch must gate 'Preview updated' on the "
+        "refreshed flag so the message is only shown after the reload "
+        "actually rendered the new manifest"
+    )
+    # The cancelled branch must also gate its "preview was updated" copy
+    # on the same flag.
+    cancelled_start = section.index("else if (status === 'cancelled')")
+    cancelled_end = section.index("else if (status)", cancelled_start)
+    cancelled_block = section[cancelled_start:cancelled_end]
+    assert "refreshed" in cancelled_block, (
+        "the cancelled-status branch must gate its 'preview was updated' "
+        "copy on the refreshed flag so a failed reload after cancel does "
+        "not still claim the preview reflects the completed checks"
+    )
 
 
 def test_confirm_delete_locks_page_before_post(app_and_db):
@@ -579,24 +832,127 @@ def test_confirm_delete_locks_page_before_post(app_and_db):
     )
 
 
-def test_start_audit_keeps_page_locked_on_ambiguous_start(app_and_db):
-    """Codex P1 review (commit 5afcb0ba): cardCleanupStartAudit must not
-    release the page-wide busy lock on outcomes that don't prove whether the
-    server queued the verify-hashes job.
+def test_confirm_delete_defaults_manifest_revision_for_pre_upgrade_manifests(
+        app_and_db):
+    """Codex P2 (commit ad9375db): cardCleanupConfirmDelete must send a
+    concrete manifest_revision even when the loaded manifest has no
+    revision key.
 
-    If the audit is silently running while Scan/Verify/Delete come back live,
-    a subsequent delete can race it. delete_verified() trusts the currently
-    committed hash_status plus archive size/mtime rather than re-hashing
-    archive bytes, so a row the audit is about to flip from `ok` to
-    modified/corrupt/unreadable could still qualify for deletion — removing
-    the good card copy of a file whose archive copy is silently rotting. Same
-    guarantee the delete-start path pins in test_confirm_delete_locks_page_
-    before_post; pinning both invariants here so a refactor can't quietly
-    re-open the gap."""
+    A manifest saved before the revision schema landed has no ``revision``
+    property. If the client reads it as ``undefined``, JSON.stringify
+    drops the key from the request body, and the server rejects a missing
+    manifest_revision with 400 required — making every carried-over
+    preview undeletable. The server treats a missing on-disk revision as
+    ``INITIAL_MANIFEST_REVISION`` (1), so the client must default to the
+    same value to keep the two sides in sync.
+    """
     app, _ = app_and_db
     body = app.test_client().get("/card-cleanup").get_data(as_text=True)
-    start = body.index("async function cardCleanupStartAudit(")
-    end = body.index("function cardCleanupFinishAudit(", start)
+    start = body.index("async function cardCleanupConfirmDelete(")
+    end = body.index("function cardCleanupRenderDeleteResult(", start)
+    section = body[start:end]
+    # Locate the confirmedRevision assignment and require a truthy
+    # fallback to 1 so an undefined/absent manifest.revision does not
+    # silently drop the key from the request body.
+    rev_idx = section.index("const confirmedRevision")
+    body_idx = section.index("manifest_revision:", rev_idx)
+    rev_expr = section[rev_idx:body_idx]
+    assert "|| 1" in rev_expr, (
+        "cardCleanupConfirmDelete must default confirmedRevision to 1 "
+        "(INITIAL_MANIFEST_REVISION) when cardCleanupState.manifest.revision "
+        "is undefined — sending undefined here would omit manifest_revision "
+        "from JSON.stringify and the delete endpoint would reject a "
+        "pre-upgrade manifest that has no revision key with 400 required, "
+        "even though the server treats a missing on-disk revision as the "
+        "initial revision on load"
+    )
+
+
+def test_confirm_delete_awaits_manifest_reload_on_revision_mismatch(
+        app_and_db):
+    """Codex P1 review: cardCleanupConfirmDelete must keep the page locked
+    until the post-mismatch manifest reload finishes.
+
+    When /api/card-cleanup/delete returns 409 manifest_revision_mismatch
+    the on-disk manifest has already moved past the revision the user
+    just confirmed against — a concurrent verify (from another tab or
+    another client) promoted new files. The page must reload the fresh
+    manifest so the preview and Delete button describe what would
+    actually be deleted next.
+
+    The prior flow ran cardCleanupSetBusy(false) first (re-enabling
+    Delete against the pre-mismatch cardCleanupState.manifest), then
+    kicked cardCleanupLoadManifest() off as fire-and-forget. In the
+    gap before the reload landed a user could reopen the confirm
+    dialog with the old totals; once the reload swapped the manifest,
+    confirming would send the new revision and the server would accept
+    deletion of the newly promoted files that never appeared in the
+    dialog.
+
+    Pin the closed gap: the mismatch branch must await
+    cardCleanupLoadManifest, keep the busy state during the await,
+    unlock with keepDeleteState so the freshly rendered Delete state
+    survives, and explicitly disable Delete on reload failure so a
+    stale preview cannot authorize a deletion.
+    """
+    app, _ = app_and_db
+    body = app.test_client().get("/card-cleanup").get_data(as_text=True)
+    start = body.index("async function cardCleanupConfirmDelete(")
+    end = body.index("function cardCleanupRenderDeleteResult(", start)
+    section = body[start:end]
+    # Locate the mismatch branch.
+    branch_start = section.index("manifest_revision_mismatch")
+    branch_end = section.index("} else {", branch_start)
+    branch = section[branch_start:branch_end]
+    # The reload must be awaited, not fire-and-forget.
+    assert "await cardCleanupLoadManifest()" in branch, (
+        "the manifest_revision_mismatch branch must await "
+        "cardCleanupLoadManifest — a fire-and-forget reload lets the "
+        "user reopen the confirm dialog against the pre-mismatch "
+        "manifest in the gap before the response lands, and the "
+        "next confirmation sends the new revision the server will "
+        "accept for the newly promoted set"
+    )
+    # The unlock must run AFTER the await and must use keepDeleteState
+    # so the freshly rendered Delete state is not overwritten by
+    # busyRestore.
+    reload_idx = branch.index("await cardCleanupLoadManifest()")
+    unlock_idx = branch.index("cardCleanupSetBusy(false", reload_idx)
+    assert unlock_idx > reload_idx, (
+        "cardCleanupSetBusy(false, …) must run after awaiting the "
+        "reload — otherwise the page unlocks before the fresh manifest "
+        "has replaced the pre-mismatch state and the race the P1 fix "
+        "closes reopens"
+    )
+    assert "keepDeleteState: true" in branch[unlock_idx:], (
+        "the post-reload cardCleanupSetBusy(false, …) must pass "
+        "keepDeleteState so busyRestore does not overwrite the "
+        "Delete-button state that cardCleanupRenderManifest just set "
+        "from the fresh totals"
+    )
+    # The failure path must explicitly disable Delete — busyRestore
+    # was skipped and the render never ran, so Delete would still
+    # carry setBusy(true)'s disabled=true; pinning the explicit disable
+    # here so a future refactor cannot leave it dangling.
+    assert "deleteBtn.disabled = true" in branch, (
+        "the reload-failure branch must explicitly disable the Delete "
+        "button — a stale preview must not be able to authorize a "
+        "deletion when the fresh manifest could not be loaded"
+    )
+    # And it must tell the user why Delete is off and how to recover.
+    assert "Reload the page or scan again before deleting" in branch, (
+        "the reload-failure hint must direct the user to reload or "
+        "scan again before deletion is possible"
+    )
+
+
+def test_start_verification_keeps_page_locked_on_ambiguous_start(app_and_db):
+    """An ambiguous POST outcome must not unlock deletion while the scoped
+    verification job may be refreshing the manifest."""
+    app, _ = app_and_db
+    body = app.test_client().get("/card-cleanup").get_data(as_text=True)
+    start = body.index("async function cardCleanupStartVerification(")
+    end = body.index("async function cardCleanupFinishVerification(", start)
     section = body[start:end]
     # An HTTP response that proves nothing was queued (!resp.ok) must
     # release the lock so the user isn't stranded with a dead page.
@@ -607,31 +963,23 @@ def test_start_audit_keeps_page_locked_on_ambiguous_start(app_and_db):
     ok_branch = section[ok_branch_start:ok_branch_end]
     assert "cardCleanupSetBusy(false)" in ok_branch, (
         "the !resp.ok branch must call cardCleanupSetBusy(false) — the "
-        "server said the verify-hashes job was not queued, so the page can "
+        "server said the verification job was not queued, so the page can "
         "safely hand the buttons back"
     )
-    # The network-error catch on the fetch itself must NOT unlock — the
-    # POST may have reached the server and started api_job_verify_hashes()
-    # before the connection dropped, and the delete path trusts hash_status
-    # in the DB rather than re-hashing archive bytes, so a concurrent delete
-    # could remove the good card copy of a file the audit is silently
-    # detecting as corrupt.
     fetch_catch_start = section.index("resp = await fetch(")
     fetch_catch_start = section.index("} catch (e) {", fetch_catch_start)
     fetch_catch_end = section.index("if (!resp.ok)", fetch_catch_start)
     fetch_catch_body = section[fetch_catch_start:fetch_catch_end]
     assert "cardCleanupSetBusy(false)" not in fetch_catch_body, (
-        "the fetch-rejection catch on cardCleanupStartAudit must NOT release "
-        "the page lock — the POST may have reached the server and queued the "
-        "verify-hashes job before the connection dropped, and unlocking "
-        "would let a concurrent delete race the audit"
+        "the fetch-rejection catch must not unlock a possibly running "
+        "verification job"
     )
     assert "Jobs page" in fetch_catch_body, (
         "the fetch-rejection catch must direct the user to the Jobs page so "
-        "they can find out whether the server queued the verify-hashes job"
+        "they can find out whether verification was queued"
     )
     # The JSON-parse catch on the OK response is the second ambiguous
-    # outcome: a 2xx status means api_job_verify_hashes() returned, but if
+    # outcome: a 2xx status means the endpoint returned, but if
     # the body couldn't be decoded we can't be sure the job wasn't queued.
     # Same reasoning — keep the lock, route to Jobs.
     json_catch_start = section.index("data = await resp.json()")
@@ -640,8 +988,7 @@ def test_start_audit_keeps_page_locked_on_ambiguous_start(app_and_db):
     json_catch_body = section[json_catch_start:json_catch_end]
     assert "cardCleanupSetBusy(false)" not in json_catch_body, (
         "the JSON-parse catch on a 2xx response must NOT release the page "
-        "lock — the server returned OK, so api_job_verify_hashes() may have "
-        "queued the audit even though we can't read the response body"
+        "lock — the server returned OK, so verification may be running"
     )
     assert "Jobs page" in json_catch_body, (
         "the JSON-parse catch on a 2xx response must direct the user to the "

@@ -439,6 +439,31 @@ def _load_catalog_by_hash(db):
     return by_hash
 
 
+def _card_gate_promotion_block(entry):
+    """Return a SKIP_* reason if the card file no longer matches the
+    manifest baseline in a way delete_verified would refuse; return
+    ``None`` when promotion is safe to attempt or the check cannot make
+    a firm judgment (missing path / transient OSError). Deliberately
+    parallels the cheap card-side gates at the top of
+    ``delete_verified``.
+    """
+    path = entry.get("path")
+    if not path:
+        return None
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return None
+    if stat_mod.S_ISLNK(st.st_mode):
+        return SKIP_SYMLINK
+    if not stat_mod.S_ISREG(st.st_mode):
+        return SKIP_NOT_REGULAR
+    if (st.st_size != entry.get("size")
+            or st.st_mtime_ns != entry.get("mtime_ns")):
+        return SKIP_CHANGED
+    return None
+
+
 def verify_manifest_archives(db, manifest, manifest_dir, progress_cb=None,
                              should_cancel=None):
     """Verify only archive copies needed by one card-cleanup preview.
@@ -740,6 +765,24 @@ def verify_manifest_archives(db, manifest, manifest_dir, progress_cb=None,
     for expected_hash, card_entries in pending_by_hash.items():
         rows = fetch_rows_by_hash(db, expected_hash)
         for entry in card_entries:
+            # Codex P2 (follow-up 3): qualify_rows only inspects catalog
+            # rows — it cannot see that this card file has been replaced,
+            # resized, or turned into a symlink since the scan. Promoting
+            # a changed pending entry to the deletable bucket would let
+            # its bytes land in the refreshed totals the user confirms,
+            # even though delete_verified would later skip it
+            # (SKIP_CHANGED / SKIP_SYMLINK / SKIP_NOT_REGULAR) and
+            # actually unlink nothing. Reproduce the delete-time card
+            # gates here so promotion honors the same baseline. Content
+            # drift (bytes changed with size + mtime intact) still lands
+            # in delete_verified's full-hash pass — repeating that here
+            # would defeat the point of scoped verification.
+            promote_block = _card_gate_promotion_block(entry)
+            if promote_block is not None:
+                entry["bucket"] = "kept"
+                entry["reason"] = promote_block
+                entry.pop("archive_path", None)
+                continue
             archive_path, reason = qualify_rows(
                 rows, source_root, entry["path"], contains_check)
             if archive_path is not None:

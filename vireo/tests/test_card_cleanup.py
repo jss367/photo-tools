@@ -786,6 +786,57 @@ def test_scoped_verify_reclassifies_changed_deletable_entry_as_kept(
     assert refreshed["totals"]["kept"]["bytes"] == len(b"raw-one")
 
 
+def test_scoped_verify_gates_pending_entry_before_promotion(
+        db, tmp_path):
+    # Codex P2 (follow-up 3): the deletable-entry pre-pass revalidates
+    # the card file against the manifest baseline before the promotion
+    # loop, but pending kept entries (KEEP_NOT_VERIFIED) went straight
+    # into qualify_rows — which only inspects catalog rows and cannot
+    # see that the card file has been replaced/resized/turned into a
+    # symlink since the scan. delete_verified would reject the changed
+    # file (SKIP_CHANGED / SKIP_SYMLINK / SKIP_NOT_REGULAR), so the
+    # refreshed preview must not credit its bytes to the deletable
+    # totals or re-enable Delete for it. Applying the same gates to
+    # KEEP_NOT_VERIFIED entries reclassifies the changed file as kept
+    # with the appropriate SKIP_* reason before qualify_rows sees it.
+    archive_file, _ = _archive_photo(
+        db, tmp_path, name="IMG_0001.NEF", content=b"raw-one",
+        hash_status=None)
+    card = _card_file(tmp_path, name="IMG_0001.NEF", content=b"raw-one")
+
+    scan = _scan(db, tmp_path)
+    # The unchecked archive row keeps the card entry pending.
+    assert scan["totals"]["deletable"]["count"] == 0
+    kept = _entries(scan, "kept")
+    assert len(kept) == 1
+    assert kept[0]["reason"] == card_cleanup.KEEP_NOT_VERIFIED
+    assert kept[0]["path"] == str(card)
+
+    # Simulate the SKIP_CHANGED delete-time skip: same size, different
+    # mtime_ns. Archive hash still verifies fine, so qualify_rows would
+    # happily promote — but delete_verified would refuse to unlink.
+    os.utime(card, ns=(0, 0))
+
+    manifest_dir = str(tmp_path / "manifests")
+    result = card_cleanup.verify_manifest_archives(
+        db, load_manifest(manifest_dir, "scan-1"), manifest_dir)
+    # The archive still verified successfully; the pending entry just
+    # did not get promoted.
+    assert result["verified"] == 1
+    assert result["unblocked_files"] == 0
+    assert result["unblocked_bytes"] == 0
+
+    refreshed = load_manifest(manifest_dir, "scan-1")
+    assert refreshed["totals"]["deletable"]["count"] == 0
+    assert refreshed["totals"]["deletable"]["bytes"] == 0
+    kept = _entries(refreshed, "kept")
+    assert [e["path"] for e in kept] == [str(card)]
+    assert kept[0]["reason"] == card_cleanup.SKIP_CHANGED
+    assert "archive_path" not in kept[0]
+    assert refreshed["totals"]["kept"]["count"] == 1
+    assert refreshed["totals"]["kept"]["bytes"] == len(b"raw-one")
+
+
 def test_scoped_verify_terminal_alias_promotes_to_inside_source(
         db, tmp_path):
     # Codex P2: the only unchecked catalog row for a card file is a

@@ -452,6 +452,35 @@ def verify_manifest_archives(db, manifest, manifest_dir, progress_cb=None,
     """
     source_root = manifest["source_root"]
     contains_check = path_guard.make_case_folded_check(source_root)
+
+    # Codex P2: a prior delete_verified run on this scan unlinks card
+    # files but never rewrites the manifest, so its deletable entries
+    # sit here even though their card paths are gone. If we left them
+    # in, the totals recomputed below would still credit their bytes
+    # to the deletable bucket and the refreshed UI would re-enable
+    # Delete asking the user to confirm counts that include files
+    # already deleted from the card. Drop entries whose card path is
+    # gone; a transient stat error (mount hiccup, EACCES) preserves
+    # the entry so a NAS blip cannot shrink the preview.
+    surviving = []
+    for entry in manifest["entries"]:
+        if entry.get("bucket") != "deletable":
+            surviving.append(entry)
+            continue
+        path = entry.get("path")
+        if not path:
+            surviving.append(entry)
+            continue
+        try:
+            os.lstat(path)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            surviving.append(entry)
+        else:
+            surviving.append(entry)
+    manifest["entries"] = surviving
+
     pending_by_hash = {}
     for entry in manifest["entries"]:
         if (entry.get("bucket") == "kept"

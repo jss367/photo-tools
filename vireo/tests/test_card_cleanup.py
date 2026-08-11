@@ -643,6 +643,86 @@ def test_scoped_verify_rejects_atomic_replace_during_hash(
     )
 
 
+def test_scoped_verify_drops_deletable_entries_whose_card_files_are_gone(
+        db, tmp_path):
+    # Codex P2: delete_verified unlinks card files but never rewrites the
+    # manifest, so a subsequent scoped-verify run sees stale deletable
+    # entries whose card paths no longer exist. The recomputed totals
+    # must not credit those bytes to the deletable bucket — otherwise
+    # the refreshed UI re-enables Delete asking the user to confirm
+    # counts that include files already gone from the card, and the
+    # revision bump would let a delete request sweep past the freshness
+    # guard.
+    already_deleted, _ = _archive_photo(
+        db, tmp_path, name="IMG_0001.NEF", content=b"raw-one",
+        hash_status="ok")
+    _archive_photo(
+        db, tmp_path, name="IMG_0002.NEF", content=b"raw-two",
+        hash_status=None, folder="archive/2026/2026-08-02")
+    gone_card = _card_file(tmp_path, name="IMG_0001.NEF", content=b"raw-one")
+    _card_file(tmp_path, name="IMG_0002.NEF", content=b"raw-two")
+    scan = _scan(db, tmp_path)
+    assert scan["totals"]["deletable"]["count"] == 1
+    assert scan["totals"]["kept"]["count"] == 1
+
+    # Simulate a prior delete_verified run: the card file was unlinked
+    # but the manifest still lists it as deletable.
+    os.unlink(gone_card)
+
+    manifest_dir = str(tmp_path / "manifests")
+    manifest_before = load_manifest(manifest_dir, "scan-1")
+    revision_before = int(manifest_before.get(
+        "revision", card_cleanup.INITIAL_MANIFEST_REVISION))
+
+    card_cleanup.verify_manifest_archives(
+        db, manifest_before, manifest_dir)
+
+    refreshed = load_manifest(manifest_dir, "scan-1")
+    deletable = _entries(refreshed, "deletable")
+    # Only the newly-verified file is deletable; the already-gone one
+    # was dropped rather than counted.
+    assert [e["path"] for e in deletable] == [
+        str(tmp_path / "card" / "DCIM" / "IMG_0002.NEF")]
+    assert refreshed["totals"]["deletable"]["count"] == 1
+    assert refreshed["totals"]["deletable"]["bytes"] == len(b"raw-two")
+    # The revision still bumps so a stale confirmation for the pre-verify
+    # manifest is rejected by the delete endpoint's freshness gate.
+    assert int(refreshed["revision"]) == revision_before + 1
+
+
+def test_scoped_verify_keeps_deletable_entry_when_lstat_error_is_transient(
+        db, tmp_path, monkeypatch):
+    # Companion to the drop test: a transient lstat error (mount blip,
+    # EACCES) is NOT proof the card file is gone. Dropping the entry on
+    # any OSError would shrink the preview during an ordinary hiccup.
+    # Preserve the entry so the next scoped verify — or the next delete
+    # gate — gets the real answer.
+    archive_file, _ = _archive_photo(
+        db, tmp_path, name="IMG_0001.NEF", content=b"raw-one",
+        hash_status="ok")
+    card_file = _card_file(tmp_path, name="IMG_0001.NEF", content=b"raw-one")
+    scan = _scan(db, tmp_path)
+    assert scan["totals"]["deletable"]["count"] == 1
+
+    real_lstat = os.lstat
+    card_str = str(card_file)
+
+    def flaky_lstat(path, *args, **kwargs):
+        if str(path) == card_str:
+            raise OSError(13, "permission denied")
+        return real_lstat(path, *args, **kwargs)
+
+    monkeypatch.setattr(card_cleanup.os, "lstat", flaky_lstat)
+
+    manifest_dir = str(tmp_path / "manifests")
+    card_cleanup.verify_manifest_archives(
+        db, load_manifest(manifest_dir, "scan-1"), manifest_dir)
+
+    refreshed = load_manifest(manifest_dir, "scan-1")
+    assert refreshed["totals"]["deletable"]["count"] == 1
+    assert [e["path"] for e in _entries(refreshed, "deletable")] == [card_str]
+
+
 def test_scan_archive_file_missing_kept(db, tmp_path):
     archive_file, _ = _archive_photo(db, tmp_path)
     _card_file(tmp_path)

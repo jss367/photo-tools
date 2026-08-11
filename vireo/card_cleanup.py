@@ -462,6 +462,17 @@ def verify_manifest_archives(db, manifest, manifest_dir, progress_cb=None,
     # already deleted from the card. Drop entries whose card path is
     # gone; a transient stat error (mount hiccup, EACCES) preserves
     # the entry so a NAS blip cannot shrink the preview.
+    #
+    # Codex P2 (follow-up): the FileNotFoundError-only check misses
+    # files delete_verified skipped for size/mtime/type mismatches
+    # (SKIP_CHANGED / SKIP_NOT_REGULAR / SKIP_SYMLINK). lstat still
+    # succeeds for those files, so the stale entry would stay in the
+    # deletable bucket, inflate totals, and re-enable Delete for a
+    # count the delete-time gates will refuse. Mirror the cheap gates
+    # here so the refreshed preview matches what delete would accept.
+    # Content-changed-but-metadata-matching is still caught by
+    # delete_verified's own hash pass — expensive re-hashing here
+    # would defeat the point of scoped verification.
     surviving = []
     for entry in manifest["entries"]:
         if entry.get("bucket") != "deletable":
@@ -472,13 +483,18 @@ def verify_manifest_archives(db, manifest, manifest_dir, progress_cb=None,
             surviving.append(entry)
             continue
         try:
-            os.lstat(path)
+            st = os.lstat(path)
         except FileNotFoundError:
             continue
         except OSError:
             surviving.append(entry)
-        else:
-            surviving.append(entry)
+            continue
+        if (stat_mod.S_ISLNK(st.st_mode)
+                or not stat_mod.S_ISREG(st.st_mode)
+                or st.st_size != entry.get("size")
+                or st.st_mtime_ns != entry.get("mtime_ns")):
+            continue
+        surviving.append(entry)
     manifest["entries"] = surviving
 
     pending_by_hash = {}
@@ -497,6 +513,18 @@ def verify_manifest_archives(db, manifest, manifest_dir, progress_cb=None,
         "unblocked_files": 0, "unblocked_bytes": 0,
     }
     failure_reasons = {}
+    # Codex P2: hashes whose ONLY unchecked catalog rows turned out to be
+    # aliases/hardlinks of the card file itself, or whose cataloged
+    # archive path resolves inside the current source. Those rows stay
+    # NULL-status (they neither read as usable archives nor pass a
+    # persistable failure verdict), so qualify_rows' next pass would
+    # again see saw_never_checked=True and return KEEP_NOT_VERIFIED,
+    # trapping the entry in an infinite verify retry — every click reads
+    # nothing new and shows the same "audit hasn't run" callout. Track
+    # the terminal signal here and let reclassification adopt it below
+    # so the callout finally explains what is actually true: no
+    # independent archive copy exists.
+    terminal_inside_source_hashes = set()
 
     for i, (expected_hash, card_entries) in enumerate(pending):
         if should_cancel is not None and should_cancel():
@@ -513,12 +541,23 @@ def verify_manifest_archives(db, manifest, manifest_dir, progress_cb=None,
         unchecked = [row for row in rows if row["hash_status"] is None]
         outcome_reason = KEEP_ARCHIVE_UNREACHABLE
         verified = False
+        # Codex P2 (see terminal_inside_source_hashes above): stays True
+        # only if every unchecked row we processed ended with an inside-
+        # source verdict AND left the row NULL in the DB. A single row
+        # that was persisted (unreadable / modified / corrupt), came back
+        # transiently unreachable, or changed under us flips this off —
+        # qualify_rows' next pass will then have a real lever (either a
+        # persisted verdict it can surface, or a still-NULL row a retry
+        # can still try), so we must not overwrite its KEEP_NOT_VERIFIED
+        # verdict.
+        all_unchecked_inside_source = bool(unchecked)
         for row in unchecked:
             folder_path = row["folder_path"]
             if not folder_path:
                 db.update_photo_hash_check(
                     row["id"], "unreadable", commit=False)
                 stats["unreadable"] += 1
+                all_unchecked_inside_source = False
                 continue
             archive_path = os.path.join(folder_path, row["filename"])
             try:
@@ -533,6 +572,7 @@ def verify_manifest_archives(db, manifest, manifest_dir, progress_cb=None,
                 # verify retry.
                 stats["unreadable"] += 1
                 outcome_reason = KEEP_ARCHIVE_UNREACHABLE
+                all_unchecked_inside_source = False
                 continue
             if contains_check(archive_real):
                 outcome_reason = KEEP_INSIDE_SOURCE
@@ -560,6 +600,7 @@ def verify_manifest_archives(db, manifest, manifest_dir, progress_cb=None,
                 # we actually reached but could not read.
                 stats["unreadable"] += 1
                 outcome_reason = KEEP_ARCHIVE_UNREACHABLE
+                all_unchecked_inside_source = False
                 continue
             try:
                 try:
@@ -573,6 +614,7 @@ def verify_manifest_archives(db, manifest, manifest_dir, progress_cb=None,
                     db.update_photo_hash_check(
                         row["id"], "unreadable", commit=False)
                     stats["unreadable"] += 1
+                    all_unchecked_inside_source = False
                     continue
                 if not stat_mod.S_ISREG(before.st_mode):
                     # The object is present but is a directory/FIFO/
@@ -583,6 +625,7 @@ def verify_manifest_archives(db, manifest, manifest_dir, progress_cb=None,
                     db.update_photo_hash_check(
                         row["id"], "unreadable", commit=False)
                     stats["unreadable"] += 1
+                    all_unchecked_inside_source = False
                     continue
 
                 # An outside-path hardlink to a card file is not a second
@@ -610,6 +653,7 @@ def verify_manifest_archives(db, manifest, manifest_dir, progress_cb=None,
                     db.update_photo_hash_check(
                         row["id"], "unreadable", commit=False)
                     stats["unreadable"] += 1
+                    all_unchecked_inside_source = False
                     continue
                 stats["archive_files_read"] += 1
             finally:
@@ -643,6 +687,7 @@ def verify_manifest_archives(db, manifest, manifest_dir, progress_cb=None,
                     != (after.st_dev, after.st_ino, after.st_size,
                         after.st_mtime_ns)):
                 outcome_reason = KEEP_ARCHIVE_CHANGED
+                all_unchecked_inside_source = False
                 continue
 
             if actual_hash == expected_hash:
@@ -666,11 +711,14 @@ def verify_manifest_archives(db, manifest, manifest_dir, progress_cb=None,
             db.update_photo_hash_check(row["id"], status, commit=False)
             stats[status] += 1
             outcome_reason = KEEP_ARCHIVE_HASH_FAILED
+            all_unchecked_inside_source = False
 
         db.conn.commit()
         stats["hashes_processed"] += 1
         if not verified:
             failure_reasons[expected_hash] = outcome_reason
+            if all_unchecked_inside_source:
+                terminal_inside_source_hashes.add(expected_hash)
 
     # Only previously-unverified entries can change here.  Existing
     # deletable rows are not re-audited or invalidated by this scoped job.
@@ -696,7 +744,20 @@ def verify_manifest_archives(db, manifest, manifest_dir, progress_cb=None,
                 # settles, targeted verification would then report
                 # "nothing needs checking" until the user re-scans the
                 # card. Keep the entry in the retry-eligible bucket.
-                entry["reason"] = KEEP_NOT_VERIFIED
+                #
+                # Codex P2 (follow-up): the exception is when this
+                # run proved every unchecked row for the hash is a
+                # same-source alias / hardlink of the card file — no
+                # independent archive copy exists, so there IS no
+                # future retry that can change the outcome. Preserving
+                # KEEP_NOT_VERIFIED there traps the entry in an
+                # infinite verify loop (qualify_rows keeps returning
+                # KEEP_NOT_VERIFIED off the still-NULL alias rows).
+                # Adopt the terminal inside-source reason instead.
+                if expected_hash in terminal_inside_source_hashes:
+                    entry["reason"] = KEEP_INSIDE_SOURCE
+                else:
+                    entry["reason"] = KEEP_NOT_VERIFIED
             elif expected_hash in failure_reasons:
                 entry["reason"] = failure_reasons[expected_hash]
             else:

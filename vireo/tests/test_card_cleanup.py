@@ -731,6 +731,152 @@ def test_scoped_verify_keeps_deletable_entry_when_lstat_error_is_transient(
     assert [e["path"] for e in _entries(refreshed, "deletable")] == [card_str]
 
 
+def test_scoped_verify_drops_deletable_entry_when_card_file_type_changed(
+        db, tmp_path):
+    # Codex P2: a prior delete_verified run skipped the file because its
+    # type (or size, or mtime) no longer matched the scanned baseline —
+    # SKIP_NOT_REGULAR / SKIP_SYMLINK / SKIP_CHANGED. lstat still
+    # succeeds, so the FileNotFoundError-only gone-file check retained
+    # the entry, inflating the refreshed deletable totals with bytes the
+    # delete gates will refuse. Mirror the delete-time gates here so
+    # scoped verify's revised preview matches what delete would accept.
+    archive_file, _ = _archive_photo(
+        db, tmp_path, name="IMG_0001.NEF", content=b"raw-one",
+        hash_status="ok")
+    _archive_photo(
+        db, tmp_path, name="IMG_0002.NEF", content=b"raw-two",
+        hash_status=None, folder="archive/2026/2026-08-02")
+    swapped_card = _card_file(
+        tmp_path, name="IMG_0001.NEF", content=b"raw-one")
+    _card_file(tmp_path, name="IMG_0002.NEF", content=b"raw-two")
+    scan = _scan(db, tmp_path)
+    assert scan["totals"]["deletable"]["count"] == 1
+    assert scan["totals"]["kept"]["count"] == 1
+
+    # Simulate the SKIP_CHANGED delete-time skip: same size, different
+    # mtime_ns. delete_verified would refuse to unlink; scoped verify
+    # must not re-enable Delete for these bytes.
+    os.utime(swapped_card, ns=(0, 0))
+
+    manifest_dir = str(tmp_path / "manifests")
+    card_cleanup.verify_manifest_archives(
+        db, load_manifest(manifest_dir, "scan-1"), manifest_dir)
+
+    refreshed = load_manifest(manifest_dir, "scan-1")
+    deletable = _entries(refreshed, "deletable")
+    assert [e["path"] for e in deletable] == [
+        str(tmp_path / "card" / "DCIM" / "IMG_0002.NEF")]
+    assert refreshed["totals"]["deletable"]["count"] == 1
+    assert refreshed["totals"]["deletable"]["bytes"] == len(b"raw-two")
+
+
+def test_scoped_verify_terminal_alias_promotes_to_inside_source(
+        db, tmp_path):
+    # Codex P2: the only unchecked catalog row for a card file is a
+    # hardlink (or alt-mount alias) of the card file itself. The initial
+    # scan classifies the entry as KEEP_NOT_VERIFIED because
+    # qualify_rows skips NULL-status rows before the same-file check.
+    # Scoped verify then detects the alias via the fd's dev+inode and
+    # sets its outcome_reason to KEEP_INSIDE_SOURCE, but does not
+    # persist a verdict on the DB row — the row stays NULL. Without a
+    # terminal override, qualify_rows would return KEEP_NOT_VERIFIED
+    # again on the next click, trapping the entry in an infinite retry
+    # loop with the "audit hasn't run" callout. The refreshed manifest
+    # must adopt KEEP_INSIDE_SOURCE so the user sees the real story:
+    # no independent archive copy exists.
+    card = _card_file(tmp_path, name="IMG_0001.NEF", content=b"raw-one")
+    folder_path = tmp_path / "archive" / "2026"
+    folder_path.mkdir(parents=True)
+    alias = folder_path / "IMG_0001.NEF"
+    try:
+        os.link(card, alias)
+    except (OSError, NotImplementedError):
+        pytest.skip("hardlinks unsupported on this filesystem")
+    st = os.stat(alias)
+    fid = db.add_folder(str(folder_path))
+    db.add_photo(
+        folder_id=fid, filename="IMG_0001.NEF", extension=".NEF",
+        file_size=st.st_size, file_mtime=st.st_mtime,
+        file_hash=_sha(str(alias)),
+    )
+    # NULL hash_status: the alias row was cataloged but never audited.
+
+    scan = _scan(db, tmp_path)
+    kept = _entries(scan, "kept")
+    assert len(kept) == 1
+    assert kept[0]["reason"] == card_cleanup.KEEP_NOT_VERIFIED
+
+    manifest_dir = str(tmp_path / "manifests")
+    result = card_cleanup.verify_manifest_archives(
+        db, load_manifest(manifest_dir, "scan-1"), manifest_dir)
+    assert result["verified"] == 0
+    assert result["unblocked_files"] == 0
+
+    refreshed = load_manifest(manifest_dir, "scan-1")
+    kept = _entries(refreshed, "kept")
+    assert [e["path"] for e in kept] == [str(card)]
+    assert kept[0]["reason"] == card_cleanup.KEEP_INSIDE_SOURCE
+    # And the retry-eligible bucket is empty — the verify endpoint
+    # would tell the user "nothing needs checking" without the loop.
+    pending = [e for e in refreshed["entries"]
+               if e.get("reason") == card_cleanup.KEEP_NOT_VERIFIED]
+    assert pending == []
+
+
+def test_scoped_verify_keeps_pending_when_alias_and_transient_row_coexist(
+        db, tmp_path):
+    # Guard the terminal-alias override against overreach: when a hash
+    # has one unchecked alias row AND one unchecked transient-failure
+    # row (e.g. the real archive's mount is momentarily down), the
+    # entry must stay retry-eligible. A future click after the mount
+    # returns has a real lever — the transient row can still succeed.
+    card = _card_file(tmp_path, name="IMG_0001.NEF", content=b"raw-one")
+    # Alias row (hardlink into the card, NULL hash_status).
+    alias_folder = tmp_path / "archive" / "alias"
+    alias_folder.mkdir(parents=True)
+    alias = alias_folder / "IMG_0001.NEF"
+    try:
+        os.link(card, alias)
+    except (OSError, NotImplementedError):
+        pytest.skip("hardlinks unsupported on this filesystem")
+    alias_st = os.stat(alias)
+    alias_fid = db.add_folder(str(alias_folder))
+    db.add_photo(
+        folder_id=alias_fid, filename="IMG_0001.NEF", extension=".NEF",
+        file_size=alias_st.st_size, file_mtime=alias_st.st_mtime,
+        file_hash=_sha(str(alias)),
+    )
+    # Real independent archive row (NULL hash_status), but the file is
+    # deleted so scoped verify sees KEEP_ARCHIVE_UNREACHABLE — the same
+    # shape as a mount that comes back later.
+    real_folder = tmp_path / "archive" / "2026"
+    real_folder.mkdir(parents=True)
+    real_archive = real_folder / "IMG_0001.NEF"
+    real_archive.write_bytes(b"raw-one")
+    real_st = os.stat(real_archive)
+    real_fid = db.add_folder(str(real_folder))
+    db.add_photo(
+        folder_id=real_fid, filename="IMG_0001.NEF", extension=".NEF",
+        file_size=real_st.st_size, file_mtime=real_st.st_mtime,
+        file_hash=_sha(str(real_archive)),
+    )
+    os.unlink(real_archive)
+
+    scan = _scan(db, tmp_path)
+    assert _entries(scan, "kept")[0]["reason"] == \
+        card_cleanup.KEEP_NOT_VERIFIED
+
+    manifest_dir = str(tmp_path / "manifests")
+    card_cleanup.verify_manifest_archives(
+        db, load_manifest(manifest_dir, "scan-1"), manifest_dir)
+
+    refreshed = load_manifest(manifest_dir, "scan-1")
+    kept = _entries(refreshed, "kept")
+    # Retry-eligible: KEEP_NOT_VERIFIED wins because the real row still
+    # gives verify a lever once its mount returns.
+    assert kept[0]["reason"] == card_cleanup.KEEP_NOT_VERIFIED
+
+
 def test_scan_archive_file_missing_kept(db, tmp_path):
     archive_file, _ = _archive_photo(db, tmp_path)
     _card_file(tmp_path)

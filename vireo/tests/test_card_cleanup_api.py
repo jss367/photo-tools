@@ -537,6 +537,70 @@ def test_finish_scoped_verification_refreshes_preview_without_rescan(
     assert "re-scan the card before deleting" not in section
 
 
+def test_finish_scoped_verification_locks_delete_when_manifest_reload_fails(
+        app_and_db):
+    """Codex P1 review: if verification finishes but the refreshed manifest
+    cannot be loaded, keep Delete disabled and require a reload or re-scan.
+
+    Verification can promote kept rows to deletable. When it does, the
+    pre-verification Delete state understates what is now on disk: a
+    click would confirm the old totals while /api/card-cleanup/delete
+    operates on the freshly-promoted set too. The prior implementation
+    called cardCleanupSetBusy(false, {keepDeleteState: false}) on reload
+    failure, which restored the pre-verification busyRestore snapshot —
+    including Delete enabled with the old count. It also unconditionally
+    told the user "Preview updated" on a completed status even when the
+    updated preview never rendered.
+
+    Pin the recovered behaviour so a future refactor cannot silently
+    re-open the gap: on the failure branch the Delete button must be
+    explicitly disabled with a hint that directs the user to reload or
+    scan again, and the "Preview updated" copy must be gated on the
+    reload succeeding.
+    """
+    app, _ = app_and_db
+    body = app.test_client().get("/card-cleanup").get_data(as_text=True)
+    finish = body.index("async function cardCleanupFinishVerification(")
+    end = body.index("function cardCleanupBindBucket(", finish)
+    section = body[finish:end]
+    # The failure branch must explicitly force Delete off — a plain
+    # setBusy(false) restore is not enough because busyRestore holds the
+    # pre-verification Delete state (possibly enabled with stale counts).
+    assert "deleteBtn.disabled = true" in section, (
+        "cardCleanupFinishVerification must explicitly disable Delete "
+        "when the post-verification manifest reload fails; otherwise the "
+        "pre-verification Delete state (possibly enabled with stale "
+        "counts) is what the user sees"
+    )
+    # The delete-hint must tell the user why Delete is off and how to
+    # recover (reload / re-scan). Match the actionable phrase.
+    assert "reload the page or scan again before deleting" in section, (
+        "the delete hint must direct the user to reload or scan again "
+        "before deletion is possible after a failed manifest reload"
+    )
+    # The "Preview updated" copy must only appear on the refreshed
+    # branch — pin the conditional so a rewrite cannot drop back to the
+    # unconditional message that was misleading before this fix.
+    completed_start = section.index("if (status === 'completed'")
+    completed_end = section.index("else if (status === 'cancelled')", completed_start)
+    completed_block = section[completed_start:completed_end]
+    assert "refreshed" in completed_block and "Preview updated" in completed_block, (
+        "the completed-status branch must gate 'Preview updated' on the "
+        "refreshed flag so the message is only shown after the reload "
+        "actually rendered the new manifest"
+    )
+    # The cancelled branch must also gate its "preview was updated" copy
+    # on the same flag.
+    cancelled_start = section.index("else if (status === 'cancelled')")
+    cancelled_end = section.index("else if (status)", cancelled_start)
+    cancelled_block = section[cancelled_start:cancelled_end]
+    assert "refreshed" in cancelled_block, (
+        "the cancelled-status branch must gate its 'preview was updated' "
+        "copy on the refreshed flag so a failed reload after cancel does "
+        "not still claim the preview reflects the completed checks"
+    )
+
+
 def test_confirm_delete_locks_page_before_post(app_and_db):
     """Codex P2 reviews (commits 96137e3 and 012aec2c): cardCleanupConfirmDelete
     must set the page-wide busy state *before* the POST /api/card-cleanup/delete

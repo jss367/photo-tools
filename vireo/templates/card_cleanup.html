@@ -731,12 +731,32 @@ async function cardCleanupStartVerification() {
 
 async function cardCleanupFinishVerification(job, status, jobError) {
   const resultEl = document.getElementById('card-cleanup-verify-result');
+  // Codex P1 (this commit): a completed or cancelled verification may
+  // have promoted files, so the pre-verification Delete state is stale
+  // until the refreshed manifest lands. Track both whether we tried to
+  // reload and whether it succeeded; the "Preview updated" copy and
+  // the Delete lock both depend on that success.
+  const attemptedReload =
+    (status === 'completed' || status === 'cancelled')
+    && !!cardCleanupState.scanJobId;
   let refreshed = false;
-  if ((status === 'completed' || status === 'cancelled')
-      && cardCleanupState.scanJobId) {
+  if (attemptedReload) {
     refreshed = await cardCleanupLoadManifest();
   }
   cardCleanupSetBusy(false, {keepDeleteState: refreshed});
+  if (attemptedReload && !refreshed) {
+    // Verification finished but the manifest reload failed or returned
+    // an unreadable response, so the on-disk deletable set may now
+    // exceed what the pre-verification preview advertises. Keep Delete
+    // locked and require a successful reload or re-scan before it can
+    // fire — the user would otherwise confirm the old totals while the
+    // server deletes the freshly-promoted files too.
+    const deleteBtn = document.getElementById('card-cleanup-delete-btn');
+    deleteBtn.disabled = true;
+    document.getElementById('card-cleanup-delete-hint').textContent =
+      'Verification finished but the updated preview could not be loaded ' +
+      '— reload the page or scan again before deleting.';
+  }
   resultEl.style.display = '';
   if (status === 'completed' && job && job.result) {
     const r = job.result;
@@ -746,10 +766,20 @@ async function cardCleanupFinishVerification(job, status, jobError) {
       ' read'];
     parts.push(cardCleanupFileCount(r.unblocked_files || 0) + ' now ready to delete');
     if (problems) parts.push(problems.toLocaleString() + ' could not be verified');
-    resultEl.textContent = parts.join(' · ') + '. Preview updated.';
+    // Only claim the preview was updated once the refreshed manifest
+    // has actually rendered — the counts above come from the job result,
+    // not from the preview, so a failed reload would leave a stale
+    // preview under a "Preview updated" line.
+    resultEl.textContent = parts.join(' · ') +
+      (refreshed
+        ? '. Preview updated.'
+        : '. The updated preview could not be loaded — reload the page ' +
+          'or scan again before deleting.');
   } else if (status === 'cancelled') {
-    resultEl.textContent =
-      'Verification cancelled — completed checks were kept and the preview was updated.';
+    resultEl.textContent = refreshed
+      ? 'Verification cancelled — completed checks were kept and the preview was updated.'
+      : 'Verification cancelled but the updated preview could not be loaded ' +
+        '— reload the page or scan again before deleting.';
   } else if (status) {
     resultEl.textContent = 'Verification ' + status +
       (jobError ? ': ' + jobError : '.') +

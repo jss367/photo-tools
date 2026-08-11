@@ -293,13 +293,20 @@ photo) are both deletable — the rule is content-based, not one-to-one.
 
 ### Delete job
 
-`POST /api/card-cleanup/delete` with `{scan_job_id}` starts
-`card_cleanup_delete`. It loads the manifest file written by the scan and
-refuses to start if the scan job is missing, unfinished, or cancelled, if
-the manifest file is gone (expired), or if its deletable bucket is empty.
-Only one delete job per scan manifest may run at a time. Because the
-manifest lives on disk, delete-after-restart works: the endpoint validates
-the scan job against `job_history` when it is no longer in memory.
+`POST /api/card-cleanup/delete` with `{scan_job_id, manifest_revision}`
+starts `card_cleanup_delete`. `manifest_revision` is the integer revision
+the client last rendered (from the manifest's `revision` field); a
+targeted verify job atomically bumps this after each run, so a mismatch
+means the on-disk preview no longer matches what the user confirmed.
+The endpoint responds `409 manifest_revision_mismatch` in that case so
+the UI can drop the user back into a "reload the preview" state rather
+than sweep in newly-promoted files the user never saw. It otherwise
+loads the manifest file written by the scan and refuses to start if the
+scan job is missing, unfinished, or cancelled, if the manifest file is
+gone (expired), or if its deletable bucket is empty. Only one delete
+job per scan manifest may run at a time. Because the manifest lives on
+disk, delete-after-restart works: the endpoint validates the scan job
+against `job_history` when it is no longer in memory.
 
 For each **deletable** manifest entry, immediately before deletion:
 
@@ -352,11 +359,18 @@ they exist only for the preview.
   matching, previously-unchecked archive copies and atomically refreshes the
   scan manifest. Returns the job id; 409 if verification or deletion for the
   same manifest is already running.
-- `POST /api/card-cleanup/delete` — body `{scan_job_id}`. Returns the job
-  id. 409 if a delete for that manifest is already running; 400 for an
-  unfinished/cancelled scan or a manifest that fails load-time validation
-  (corrupt, wrong schema, entries outside the source root); 404 for an
-  unknown scan job, a pruned manifest file, or a manifest older than 7
+- `POST /api/card-cleanup/delete` — body
+  `{scan_job_id, manifest_revision: int}`. Returns the job id. 400 if
+  `manifest_revision` is missing or not an integer (bools are rejected
+  explicitly — `isinstance(True, int)` is truthy). 409
+  `manifest_revision_mismatch` when the on-disk manifest carries a
+  different revision than the client confirmed (a verify run has since
+  refreshed the preview); the UI reloads and asks the user to
+  re-confirm. Otherwise 409 if a delete for that manifest is already
+  running; 400 for an unfinished/cancelled scan or a manifest that
+  fails load-time validation (corrupt, wrong schema, entries outside
+  the source root); 404 for an unknown scan job, a pruned manifest
+  file, or a manifest older than 7
   days (age is checked at request time, not only at prune time), with
   "re-scan the card" copy.
 - Progress and results ride the existing job endpoints (stream, status,

@@ -44,6 +44,15 @@ INITIAL_MANIFEST_REVISION = 1
 # a FIFO the same way, so a plain O_RDONLY there is safe.
 O_NONBLOCK = getattr(os, "O_NONBLOCK", 0)
 
+# Codex P1: os.open on Windows defaults to text mode. compute_fd_hash
+# reads through os.read, and the CRT would translate CRLF↔LF and treat
+# Ctrl-Z (0x1A) as EOF in text mode — producing a different digest from
+# compute_file_hash's "rb" open for any RAW/JPEG file containing those
+# bytes. Scoped verification would then flag valid archives as corrupt,
+# and delete_verified's identical card-file open would skip valid
+# deletions. O_BINARY is a POSIX no-op (getattr fallback).
+O_BINARY = getattr(os, "O_BINARY", 0)
+
 
 class ManifestError(Exception):
     """Manifest missing, expired, or failing validation.
@@ -511,7 +520,7 @@ def verify_manifest_archives(db, manifest, manifest_dir, progress_cb=None,
             # cannot slip a different object under us.
             try:
                 archive_fd = os.open(
-                    archive_path, os.O_RDONLY | O_NONBLOCK)
+                    archive_path, os.O_RDONLY | O_NONBLOCK | O_BINARY)
             except (OSError, ValueError):
                 # Same rationale as the realpath branch above (Codex
                 # P2): a stat that can't see the file — the common
@@ -854,7 +863,7 @@ def delete_verified(db, manifest, progress_cb=None, should_cancel=None):
         # fstat then re-proves regular-file + dev/inode identity against
         # the scanned baseline before any bytes are read.
         try:
-            card_fd = os.open(path, os.O_RDONLY | O_NONBLOCK)
+            card_fd = os.open(path, os.O_RDONLY | O_NONBLOCK | O_BINARY)
         except FileNotFoundError:
             summary["skipped"].append(
                 {"path": path, "reason": SKIP_ALREADY_GONE})

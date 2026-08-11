@@ -5,6 +5,7 @@ docs/superpowers/specs/2026-08-07-card-cleanup-design.md
 import os
 import shutil
 import stat
+import sys
 import unittest.mock
 from datetime import UTC, datetime, timedelta
 
@@ -581,6 +582,13 @@ def test_scoped_verify_retry_after_transient_failure_unblocks(
     assert refreshed["totals"]["deletable"]["count"] == 1
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="POSIX-only race: Windows locks files opened via os.open, so "
+    "os.replace() against the archive path fails inside the wrapper "
+    "before the swap can complete. The race this test simulates cannot "
+    "occur on Windows in the first place.",
+)
 def test_scoped_verify_rejects_atomic_replace_during_hash(
         db, tmp_path, monkeypatch):
     # Codex P1: while compute_fd_hash reads the pinned archive fd, a
@@ -1406,6 +1414,13 @@ def test_delete_skips_when_archive_dies_during_card_hash(db, tmp_path):
     assert "archive" in summary["skipped"][0]["reason"]
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="POSIX-only race: Windows cannot rmtree a directory that "
+    "contains an open file, so the parent-directory swap inside the "
+    "wrapper fails before the containment recheck runs. The race this "
+    "test simulates cannot occur on Windows in the first place.",
+)
 def test_delete_skips_when_parent_redirected_during_card_hash(db, tmp_path):
     # Codex P1: after both archive gate 1 and gate 2 authorize, if the
     # parent directory is swapped for a symlink to a byte-identical

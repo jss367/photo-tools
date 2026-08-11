@@ -180,6 +180,13 @@ def load_manifest(manifest_dir, scan_job_id,
     if (not isinstance(manifest, dict)
             or manifest.get("schema_version") != MANIFEST_SCHEMA_VERSION):
         raise ManifestError("manifest schema not recognized — re-scan the card")
+    revision = manifest.get("revision", INITIAL_MANIFEST_REVISION)
+    if (isinstance(revision, bool) or not isinstance(revision, int)
+            or revision < INITIAL_MANIFEST_REVISION):
+        raise ManifestError("manifest revision invalid — re-scan the card")
+    # Normalize pre-revision manifests at the read boundary so every caller
+    # sees the same initial value, including the API response and verify job.
+    manifest["revision"] = revision
     source_root = manifest.get("source_root")
     if not source_root or not os.path.isabs(str(source_root)):
         raise ManifestError("manifest missing source root — re-scan the card")
@@ -452,6 +459,8 @@ def _card_gate_promotion_block(entry):
         return None
     try:
         st = os.lstat(path)
+    except FileNotFoundError:
+        return SKIP_ALREADY_GONE
     except OSError:
         return None
     if stat_mod.S_ISLNK(st.st_mode):
@@ -762,6 +771,7 @@ def verify_manifest_archives(db, manifest, manifest_dir, progress_cb=None,
 
     # Only previously-unverified entries can change here.  Existing
     # deletable rows are not re-audited or invalidated by this scoped job.
+    missing_pending_entry_ids = set()
     for expected_hash, card_entries in pending_by_hash.items():
         rows = fetch_rows_by_hash(db, expected_hash)
         for entry in card_entries:
@@ -778,6 +788,12 @@ def verify_manifest_archives(db, manifest, manifest_dir, progress_cb=None,
             # in delete_verified's full-hash pass — repeating that here
             # would defeat the point of scoped verification.
             promote_block = _card_gate_promotion_block(entry)
+            if promote_block == SKIP_ALREADY_GONE:
+                # A prior delete or external removal means this file no
+                # longer exists on the card. Do not retain its historical
+                # bytes in the refreshed kept totals.
+                missing_pending_entry_ids.add(id(entry))
+                continue
             if promote_block is not None:
                 entry["bucket"] = "kept"
                 entry["reason"] = promote_block
@@ -816,10 +832,22 @@ def verify_manifest_archives(db, manifest, manifest_dir, progress_cb=None,
                     entry["reason"] = KEEP_INSIDE_SOURCE
                 else:
                     entry["reason"] = KEEP_NOT_VERIFIED
+            elif reason == KEEP_ARCHIVE_HASH_FAILED:
+                # A reached row whose fstat/read failed was persisted as
+                # unreadable. That terminal catalog verdict must win over a
+                # transient run-local fallback so the preview offers the
+                # Audit remedy instead of neither retry nor repair guidance.
+                entry["reason"] = reason
             elif expected_hash in failure_reasons:
                 entry["reason"] = failure_reasons[expected_hash]
             else:
                 entry["reason"] = reason
+
+    if missing_pending_entry_ids:
+        manifest["entries"] = [
+            entry for entry in manifest["entries"]
+            if id(entry) not in missing_pending_entry_ids
+        ]
 
     totals = {
         "deletable": {"count": 0, "bytes": 0},

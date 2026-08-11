@@ -43,6 +43,16 @@ def test_write_then_load_roundtrip(tmp_path):
     write_manifest(mdir, _manifest(tmp_path))
     loaded = load_manifest(mdir, "scan-1")
     assert loaded["scan_job_id"] == "scan-1"
+    assert loaded["revision"] == card_cleanup.INITIAL_MANIFEST_REVISION
+
+
+@pytest.mark.parametrize("revision", [True, False, 0, -1, "1", 1.5])
+def test_load_rejects_invalid_manifest_revision(tmp_path, revision):
+    (tmp_path / "card").mkdir()
+    mdir = str(tmp_path / "manifests")
+    write_manifest(mdir, _manifest(tmp_path, revision=revision))
+    with pytest.raises(ManifestError, match="revision invalid"):
+        load_manifest(mdir, "scan-1")
 
 
 def test_write_is_atomic_no_leftover_tmp(tmp_path):
@@ -582,6 +592,60 @@ def test_scoped_verify_retry_after_transient_failure_unblocks(
     assert refreshed["totals"]["deletable"]["count"] == 1
 
 
+def test_scoped_verify_preserves_persisted_unreadable_reason(
+        db, tmp_path, monkeypatch):
+    archive_file, pid = _archive_photo(db, tmp_path, hash_status=None)
+    _card_file(tmp_path)
+    _scan(db, tmp_path)
+    real_hash = card_cleanup.compute_fd_hash
+
+    def fail_archive_read(fd, *args, **kwargs):
+        if os.fstat(fd).st_ino == os.stat(archive_file).st_ino:
+            raise OSError("archive read failed")
+        return real_hash(fd, *args, **kwargs)
+
+    monkeypatch.setattr(card_cleanup, "compute_fd_hash", fail_archive_read)
+    manifest_dir = str(tmp_path / "manifests")
+    result = card_cleanup.verify_manifest_archives(
+        db, load_manifest(manifest_dir, "scan-1"), manifest_dir)
+
+    assert result["unreadable"] == 1
+    status = db.conn.execute(
+        "SELECT hash_status FROM photos WHERE id = ?", (pid,)
+    ).fetchone()["hash_status"]
+    assert status == "unreadable"
+    kept = _entries(load_manifest(manifest_dir, "scan-1"), "kept")
+    assert kept[0]["reason"] == card_cleanup.KEEP_ARCHIVE_HASH_FAILED
+
+
+def test_scoped_verify_nonblocking_open_rejects_fifo_swap(
+        db, tmp_path, monkeypatch):
+    if not hasattr(os, "mkfifo") or not card_cleanup.O_NONBLOCK:
+        pytest.skip("non-blocking FIFOs unsupported on this platform")
+    archive_file, _ = _archive_photo(db, tmp_path, hash_status=None)
+    _card_file(tmp_path)
+    _scan(db, tmp_path)
+    real_open = os.open
+    opened_flags = []
+
+    def swap_then_open(path, flags, *args, **kwargs):
+        if str(path) == str(archive_file) and not opened_flags:
+            opened_flags.append(flags)
+            os.unlink(archive_file)
+            os.mkfifo(archive_file)
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(card_cleanup.os, "open", swap_then_open)
+    manifest_dir = str(tmp_path / "manifests")
+    result = card_cleanup.verify_manifest_archives(
+        db, load_manifest(manifest_dir, "scan-1"), manifest_dir)
+
+    assert opened_flags[0] & card_cleanup.O_NONBLOCK
+    assert result["archive_files_read"] == 0
+    assert result["unreadable"] == 1
+    assert stat.S_ISFIFO(os.lstat(archive_file).st_mode)
+
+
 @pytest.mark.skipif(
     sys.platform == "win32",
     reason="POSIX-only race: Windows locks files opened via os.open, so "
@@ -835,6 +899,25 @@ def test_scoped_verify_gates_pending_entry_before_promotion(
     assert "archive_path" not in kept[0]
     assert refreshed["totals"]["kept"]["count"] == 1
     assert refreshed["totals"]["kept"]["bytes"] == len(b"raw-one")
+
+
+def test_scoped_verify_drops_missing_pending_entry(db, tmp_path):
+    _archive_photo(db, tmp_path, hash_status=None)
+    card = _card_file(tmp_path)
+    scan = _scan(db, tmp_path)
+    assert _entries(scan, "kept")[0]["reason"] == (
+        card_cleanup.KEEP_NOT_VERIFIED)
+    os.unlink(card)
+
+    manifest_dir = str(tmp_path / "manifests")
+    result = card_cleanup.verify_manifest_archives(
+        db, load_manifest(manifest_dir, "scan-1"), manifest_dir)
+
+    assert result["verified"] == 1
+    refreshed = load_manifest(manifest_dir, "scan-1")
+    assert refreshed["entries"] == []
+    assert refreshed["totals"]["deletable"] == {"count": 0, "bytes": 0}
+    assert refreshed["totals"]["kept"] == {"count": 0, "bytes": 0}
 
 
 def test_scoped_verify_terminal_alias_promotes_to_inside_source(
@@ -1590,6 +1673,35 @@ def test_delete_skips_when_card_path_becomes_fifo_post_scan(
     assert len(summary["skipped"]) == 1
     assert summary["skipped"][0]["reason"] == card_cleanup.SKIP_NOT_REGULAR
     # The FIFO is left untouched — the tool refused to operate on it.
+    assert stat.S_ISFIFO(os.lstat(card).st_mode)
+
+
+def test_delete_nonblocking_open_rejects_fifo_swap_after_lstat(
+        db, tmp_path, monkeypatch):
+    if not hasattr(os, "mkfifo") or not card_cleanup.O_NONBLOCK:
+        pytest.skip("non-blocking FIFOs unsupported on this platform")
+    _archive_photo(db, tmp_path)
+    card = _card_file(tmp_path)
+    _scan(db, tmp_path)
+    manifest = load_manifest(str(tmp_path / "manifests"), "scan-1")
+    real_open = os.open
+    opened_flags = []
+
+    def swap_then_open(path, flags, *args, **kwargs):
+        if str(path) == str(card) and not opened_flags:
+            opened_flags.append(flags)
+            os.unlink(card)
+            os.mkfifo(card)
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(card_cleanup.os, "open", swap_then_open)
+    summary = card_cleanup.delete_verified(db, manifest)
+
+    assert opened_flags[0] & card_cleanup.O_NONBLOCK
+    assert summary["deleted"] == 0
+    assert summary["skipped"] == [{
+        "path": str(card), "reason": card_cleanup.SKIP_NOT_REGULAR,
+    }]
     assert stat.S_ISFIFO(os.lstat(card).st_mode)
 
 

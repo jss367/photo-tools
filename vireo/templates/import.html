@@ -6,6 +6,7 @@
 <link rel="icon" type="image/png" href="/favicon.ico">
 <link rel="apple-touch-icon" href="/static/apple-touch-icon.png">
 <link rel="stylesheet" href="/static/vireo-base.css">
+<link rel="stylesheet" href="/static/vireo-folder-browser.css">
 <title>Vireo - Import</title>
 <style>
 body { display: flex; flex-direction: column; height: 100vh; }
@@ -164,49 +165,6 @@ body { display: flex; flex-direction: column; height: 100vh; }
 .staging-meta { font-size: 11px; color: var(--text-secondary); margin-top: 3px; }
 .staging-actions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
 .staging-details { margin: 8px 0 0 0; padding-left: 18px; font-size: 11px; color: var(--text-secondary); max-height: 120px; overflow: auto; }
-.folder-browser-overlay {
-  display: none; position: fixed; inset: 0; z-index: 1001;
-  background: rgba(0, 0, 0, 0.45); align-items: center; justify-content: center;
-}
-.folder-browser-overlay.open { display: flex; }
-.folder-browser-panel {
-  width: min(720px, calc(100vw - 32px)); max-height: calc(100vh - 64px);
-  background: var(--bg-secondary); border: 1px solid var(--border-primary);
-  border-radius: 8px; box-shadow: 0 18px 60px rgba(0,0,0,0.35);
-  display: flex; flex-direction: column; overflow: hidden;
-}
-.folder-browser-header {
-  display: flex; align-items: center; justify-content: space-between;
-  padding: 14px 16px; border-bottom: 1px solid var(--border-primary);
-}
-.folder-browser-header h3 { margin: 0; }
-.folder-browser-close { background: none; border: none; color: var(--text-secondary); font-size: 22px; cursor: pointer; }
-.folder-browser-body { padding: 12px 16px; display: flex; flex-direction: column; gap: 10px; min-height: 0; }
-.folder-browser-shortcuts { display: flex; gap: 8px; flex-wrap: wrap; }
-.folder-browser-path { font-size: 12px; color: var(--text-secondary); overflow-wrap: anywhere; }
-.folder-browser-list {
-  height: 320px; overflow: auto; border: 1px solid var(--border-primary);
-  border-radius: 6px; background: var(--bg-tertiary);
-}
-.folder-browser-item {
-  padding: 8px 10px; font-size: 12px; color: var(--text-primary);
-  cursor: pointer; border-bottom: 1px solid color-mix(in srgb, var(--border-primary) 60%, transparent);
-  display: flex; align-items: center; gap: 8px;
-}
-.folder-browser-item:hover { background: var(--bg-hover, rgba(255,255,255,0.05)); }
-.folder-browser-item.selected { background: color-mix(in srgb, var(--accent) 15%, transparent); }
-.folder-browser-item-name {
-  flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-}
-.folder-browser-count {
-  color: var(--text-secondary); font-size: 11px; font-variant-numeric: tabular-nums;
-  flex-shrink: 0; white-space: nowrap;
-}
-.folder-browser-empty { padding: 14px; font-size: 12px; color: var(--text-secondary); }
-.folder-browser-actions {
-  display: flex; gap: 8px; justify-content: flex-end;
-  padding: 12px 16px; border-top: 1px solid var(--border-primary);
-}
 .import-tag-list { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
 .import-tag-chip {
   display: inline-flex; align-items: center; gap: 5px;
@@ -504,29 +462,9 @@ body { display: flex; flex-direction: column; height: 100vh; }
   </div>
 </div>
 
-<div class="folder-browser-overlay" id="importFolderBrowser" data-testid="import-folder-browser">
-  <div class="folder-browser-panel" role="dialog" aria-modal="true" aria-labelledby="folderBrowserTitle">
-    <div class="folder-browser-header">
-      <h3 id="folderBrowserTitle">Select Folder</h3>
-      <button class="folder-browser-close" type="button" onclick="closeImportFolderBrowser()">&times;</button>
-    </div>
-    <div class="folder-browser-body">
-      <div class="folder-browser-shortcuts">
-        <button class="btn" type="button" onclick="browseImportFolderTo(null)">Home</button>
-        <button class="btn" type="button" onclick="browseImportFolderTo('__pictures__')">Pictures</button>
-        <button class="btn" type="button" onclick="browseImportFolderTo('__volumes__')">Volumes</button>
-      </div>
-      <div class="folder-browser-path" id="folderBrowserPath"></div>
-      <div class="folder-browser-list" id="folderBrowserList"></div>
-      <div class="folder-browser-path" id="folderBrowserSelection"></div>
-    </div>
-    <div class="folder-browser-actions">
-      <button class="btn" type="button" onclick="closeImportFolderBrowser()">Cancel</button>
-      <button class="btn btn-primary" type="button" id="folderBrowserSelectBtn" onclick="selectImportBrowserFolder()">Select This Folder</button>
-    </div>
-  </div>
-</div>
+{% include '_folder_browser.html' %}
 
+<script src="/static/vireo-folder-browser.js"></script>
 <script>
 /* Import page: adds folders in place or copies them to an archive, renders
    live progress from the job's SSE stream, and only shows safe-to-format
@@ -540,15 +478,6 @@ let cardCleanupImportSources = [];
 let stagingResultsByPath = {};
 let sourceCounts = {};
 let sourceCountRequestSeq = 0;
-let browserMode = 'source';
-let browserPath = '';
-let browserHomePath = '';
-let browserSeq = 0;
-let browserCountsAbort = null;
-let browserCountCache = {};
-let browserEscHandler = null;
-let browserSelectedPaths = [];
-let browserSelectAnchorPath = '';
 let activeImportMode = 'in_place';
 let importRemoteTargets = [];
 let importRsyncAvailable = false;
@@ -1215,16 +1144,6 @@ async function loadImportRemoteTargets() {
   updateAfterMoveUI();
 }
 
-function importEscapeHtml(s) {
-  return String(s).replace(/[&<>"']/g, (ch) => ({
-    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
-  }[ch]));
-}
-
-function importEscapeAttr(s) {
-  return importEscapeHtml(s);
-}
-
 function renderSources() {
   const list = document.getElementById('sourceList');
   list.innerHTML = '';
@@ -1367,7 +1286,7 @@ function addSource() {
 
 async function browseForSource() {
   if (typeof pickDirectory === 'function') {
-    const seqBeforePicker = browserSeq;
+    const seqBeforePicker = importFolderBrowser.sequence;
     const result = await pickDirectory('Select source folders', { multiple: true });
     if (result) {
       const paths = Array.isArray(result) ? result : [result];
@@ -1375,7 +1294,7 @@ async function browseForSource() {
       return;
     }
     if (typeof isTauri === 'function' && isTauri()) return;
-    if (browserSeq !== seqBeforePicker) {
+    if (importFolderBrowser.sequence !== seqBeforePicker) {
       openImportFolderBrowser('source', { skipInitialBrowse: true });
       return;
     }
@@ -1385,7 +1304,7 @@ async function browseForSource() {
 
 async function browseForDestination() {
   if (typeof pickDirectory === 'function') {
-    const seqBeforePicker = browserSeq;
+    const seqBeforePicker = importFolderBrowser.sequence;
     const result = await pickDirectory('Select archive folder');
     if (result) {
       const path = Array.isArray(result) ? result[0] : result;
@@ -1400,7 +1319,7 @@ async function browseForDestination() {
       return;
     }
     if (typeof isTauri === 'function' && isTauri()) return;
-    if (browserSeq !== seqBeforePicker) {
+    if (importFolderBrowser.sequence !== seqBeforePicker) {
       openImportFolderBrowser('destination', { skipInitialBrowse: true });
       return;
     }
@@ -1408,290 +1327,50 @@ async function browseForDestination() {
   openImportFolderBrowser('destination');
 }
 
+const importFolderBrowser = new VireoFolderBrowser({
+  overlayId: 'folderBrowser',
+  defaultMode: 'source',
+  onError: (message) => showError(message),
+  modes: {
+    source: {
+      title: 'Select Source Folders',
+      multiple: true,
+      showCounts: true,
+      fileTypes: () => selectedSourceCountOptions().file_types,
+      startPath: '',
+      onSelect: (paths) => paths.forEach(addSourcePath),
+    },
+    destination: {
+      title: 'Select Destination Folder',
+      multiple: false,
+      showCounts: false,
+      startPath: () => (document.getElementById('destInput').value || '').trim(),
+      onSelect: (path) => {
+        const destination = document.getElementById('destInput');
+        destination.value = path;
+        // Notify destination-preview listeners exactly like a manual edit.
+        destination.dispatchEvent(new Event('input', { bubbles: true }));
+      },
+    },
+  },
+});
+
+// Compatibility wrappers keep existing inline callers, deep-link behavior,
+// and browser-level tests stable while all behavior lives in the shared module.
 function openImportFolderBrowser(mode, opts = {}) {
-  browserMode = mode === 'destination' ? 'destination' : 'source';
-  const overlay = document.getElementById('importFolderBrowser');
-  document.getElementById('folderBrowserTitle').textContent =
-    browserMode === 'source' ? 'Select Source Folders' : 'Select Destination Folder';
-  browserSelectedPaths = [];
-  browserSelectAnchorPath = '';
-  updateImportBrowserSelection();
-  overlay.classList.add('open');
-  overlay.onclick = (e) => {
-    if (e.target === overlay) closeImportFolderBrowser();
-  };
-  if (browserEscHandler) document.removeEventListener('keydown', browserEscHandler);
-  browserEscHandler = (e) => {
-    if (e.key === 'Escape') closeImportFolderBrowser();
-  };
-  document.addEventListener('keydown', browserEscHandler);
-  document.body.style.overflow = 'hidden';
-  const firstAction = overlay.querySelector('button');
-  if (firstAction) firstAction.focus();
-  const startPath = browserMode === 'destination'
-    ? (document.getElementById('destInput').value || '').trim()
-    : '';
-  if (!opts.skipInitialBrowse) browseImportFolderTo(startPath || null);
+  importFolderBrowser.open(mode === 'destination' ? 'destination' : 'source', opts);
 }
 
 function closeImportFolderBrowser() {
-  document.getElementById('importFolderBrowser').classList.remove('open');
-  if (browserCountsAbort) {
-    browserCountsAbort.abort();
-    browserCountsAbort = null;
-  }
-  if (browserEscHandler) {
-    document.removeEventListener('keydown', browserEscHandler);
-    browserEscHandler = null;
-  }
-  document.body.style.overflow = '';
+  importFolderBrowser.close();
 }
 
-async function browseImportFolderTo(path) {
-  const seq = ++browserSeq;
-  if (browserCountsAbort) {
-    browserCountsAbort.abort();
-    browserCountsAbort = null;
-  }
-  // Clear stale selection while this async navigation is pending. Without
-  // this, clicking "Select This Folder" during a slow or failing fetch
-  // submits the previous folder instead of the one the user requested —
-  // both on modal open and mid-session navigation.
-  browserPath = '';
-  browserSelectedPaths = [];
-  browserSelectAnchorPath = '';
-  updateImportBrowserSelection();
-  const selectBtn = document.getElementById('folderBrowserSelectBtn');
-  if (selectBtn) selectBtn.disabled = true;
-  document.getElementById('folderBrowserPath').textContent = 'Loading…';
-  document.getElementById('folderBrowserList').innerHTML =
-    '<div class="folder-browser-empty">Loading…</div>';
-  let url = '/api/browse';
-  if (path === '__pictures__') {
-    if (!browserHomePath) {
-      try {
-        const homeResp = await fetch('/api/browse');
-        if (seq !== browserSeq || !homeResp.ok) return;
-        const home = await homeResp.json();
-        browserHomePath = home.path || '';
-      } catch (e) {
-        return;
-      }
-    }
-    url = '/api/browse?path=' + encodeURIComponent(browserHomePath + '/Pictures');
-  } else if (path === '__volumes__') {
-    if (navigator.userAgent.indexOf('Mac') < 0) {
-      try {
-        const resp = await fetch('/api/volumes');
-        if (seq !== browserSeq || !resp.ok) return;
-        const volumes = await resp.json();
-        browserPath = '';
-        renderImportFolderBrowser({ path: '', dirs: volumes || [] }, { syntheticRoot: true });
-      } catch (e) { /* ignore */ }
-      return;
-    }
-    url = '/api/browse?path=' + encodeURIComponent('/Volumes');
-  } else if (path) {
-    url = '/api/browse?path=' + encodeURIComponent(path);
-  }
-
-  try {
-    const resp = await fetch(url);
-    if (seq !== browserSeq) return;
-    if (!resp.ok) {
-      const data = await resp.json().catch(() => ({}));
-      showError(data.error || 'Could not open folder.');
-      return;
-    }
-    const data = await resp.json();
-    browserPath = data.path || '';
-    browserSelectedPaths = [];
-    browserSelectAnchorPath = '';
-    if (!path) browserHomePath = browserPath;
-    renderImportFolderBrowser(data);
-  } catch (e) {
-    showError(String(e.message || e));
-  }
-}
-
-function renderImportFolderBrowser(data, opts) {
-  document.getElementById('folderBrowserPath').textContent = data.path || 'Volumes';
-  const list = document.getElementById('folderBrowserList');
-  const dirs = data.dirs || [];
-  let html = '';
-  const syntheticRoot = opts && opts.syntheticRoot;
-  let parent = '';
-  if (data.path && data.path.indexOf('\\') !== -1) {
-    parent = data.path.replace(/[\\\/]?[^\\\/]+[\\\/]?$/, '') || data.path;
-    if (/^[A-Za-z]:$/.test(parent)) parent += '\\';
-  } else if (data.path) {
-    parent = data.path.substring(0, data.path.lastIndexOf('/')) || '/';
-  }
-  if (data.path && data.path !== '/' && parent && parent !== data.path) {
-    html += '<div class="folder-browser-item" data-browse-path="' + importEscapeAttr(parent) + '" data-parent-link="1">' +
-      '<span class="folder-browser-item-name">&#128193; ..</span></div>';
-  }
-  dirs.forEach((d) => {
-    html += '<div class="folder-browser-item" data-browse-path="' + importEscapeAttr(d.path) + '" data-folder-path="' + importEscapeAttr(d.path) + '">' +
-      '<span class="folder-browser-item-name">&#128193; ' + importEscapeHtml(d.name || d.path) + '</span>' +
-      '<span class="folder-browser-count" data-count-path="' + importEscapeAttr(d.path) + '"></span></div>';
-  });
-  if (!html) {
-    html = '<div class="folder-browser-empty">' +
-      (syntheticRoot ? 'No volumes found.' : 'No subfolders.') + '</div>';
-  }
-  list.innerHTML = html;
-  list.onclick = (e) => {
-    const item = e.target.closest('.folder-browser-item[data-browse-path]');
-    if (!item) return;
-    if (item.getAttribute('data-parent-link') === '1' || browserMode === 'destination') {
-      browseImportFolderTo(item.getAttribute('data-browse-path'));
-      return;
-    }
-    selectImportBrowserListItem(item, e);
-  };
-  list.ondblclick = (e) => {
-    const item = e.target.closest('.folder-browser-item[data-browse-path]');
-    if (item && item.getAttribute('data-parent-link') !== '1') {
-      browseImportFolderTo(item.getAttribute('data-browse-path'));
-    }
-  };
-  updateImportBrowserSelection();
-  if (browserMode === 'source') refreshImportBrowserCounts(dirs, browserSeq);
-}
-
-function importBrowserCountKey(path, fileTypes) {
-  const normalized = Array.isArray(fileTypes)
-    ? fileTypes.slice().sort().join(',')
-    : String(fileTypes || 'both');
-  return path + '\n' + normalized;
-}
-
-function applyImportBrowserCount(path, count) {
-  if (!count) return;
-  document.querySelectorAll('#folderBrowserList .folder-browser-count').forEach((badge) => {
-    if (badge.getAttribute('data-count-path') === path) {
-      badge.textContent = formatPhotoCount(count);
-    }
-  });
-}
-
-async function refreshImportBrowserCounts(dirs, seq) {
-  if (!dirs.length || seq !== browserSeq) return;
-  const fileTypes = selectedSourceCountOptions().file_types;
-  const uncached = [];
-  dirs.forEach((dir) => {
-    const key = importBrowserCountKey(dir.path, fileTypes);
-    if (Object.prototype.hasOwnProperty.call(browserCountCache, key)) {
-      applyImportBrowserCount(dir.path, browserCountCache[key]);
-    } else {
-      uncached.push(dir.path);
-    }
-  });
-  if (!uncached.length) return;
-
-  browserCountsAbort = new AbortController();
-  try {
-    const resp = await fetch('/api/browse/photo-counts', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ paths: uncached, file_types: fileTypes }),
-      signal: browserCountsAbort.signal,
-    });
-    if (!resp.ok || seq !== browserSeq) return;
-    const data = await resp.json();
-    if (seq !== browserSeq) return;
-    const counts = data.counts || {};
-    Object.keys(counts).forEach((path) => {
-      browserCountCache[importBrowserCountKey(path, fileTypes)] = counts[path];
-      applyImportBrowserCount(path, counts[path]);
-    });
-  } catch (e) {
-    if (e.name !== 'AbortError') { /* Counts are helpful but non-blocking. */ }
-  } finally {
-    if (seq === browserSeq) browserCountsAbort = null;
-  }
-}
-
-function selectImportBrowserListItem(item, event) {
-  const path = item.getAttribute('data-folder-path') || item.getAttribute('data-browse-path');
-  if (!path) return;
-  const items = Array.from(document.querySelectorAll('#folderBrowserList .folder-browser-item[data-folder-path]'));
-  const shift = event && event.shiftKey;
-  const toggle = event && (event.metaKey || event.ctrlKey);
-
-  if (shift && browserSelectAnchorPath) {
-    let anchorIdx = items.findIndex((el) => el.getAttribute('data-folder-path') === browserSelectAnchorPath);
-    const clickIdx = items.findIndex((el) => el.getAttribute('data-folder-path') === path);
-    if (clickIdx === -1) return;
-    if (anchorIdx === -1) anchorIdx = clickIdx;
-    const lo = Math.min(anchorIdx, clickIdx);
-    const hi = Math.max(anchorIdx, clickIdx);
-    browserSelectedPaths = items.slice(lo, hi + 1).map((el) => el.getAttribute('data-folder-path'));
-  } else if (toggle) {
-    const idx = browserSelectedPaths.indexOf(path);
-    if (idx === -1) browserSelectedPaths.push(path);
-    else browserSelectedPaths.splice(idx, 1);
-    browserSelectAnchorPath = path;
-  } else {
-    browserSelectedPaths = [path];
-    browserSelectAnchorPath = path;
-  }
-  updateImportBrowserSelection();
-}
-
-function updateImportBrowserSelection() {
-  const selected = {};
-  browserSelectedPaths.forEach((path) => { selected[path] = true; });
-  document.querySelectorAll('#folderBrowserList .folder-browser-item[data-folder-path]').forEach((item) => {
-    item.classList.toggle('selected', !!selected[item.getAttribute('data-folder-path')]);
-  });
-
-  const selection = document.getElementById('folderBrowserSelection');
-  if (selection) {
-    if (browserMode === 'source' && browserSelectedPaths.length > 1) {
-      selection.textContent = browserSelectedPaths.length + ' folders selected';
-    } else if (browserMode === 'source' && browserSelectedPaths.length === 1) {
-      selection.textContent = browserSelectedPaths[0];
-    } else {
-      selection.textContent = '';
-    }
-  }
-
-  const selectBtn = document.getElementById('folderBrowserSelectBtn');
-  if (selectBtn) {
-    if (browserMode === 'source') {
-      selectBtn.textContent = browserSelectedPaths.length > 1
-        ? 'Add ' + browserSelectedPaths.length + ' Folders'
-        : 'Add This Folder';
-      // Volumes root renders with browserPath = '' but selectable drive rows.
-      // Enable submission whenever the user has picked at least one, so
-      // multi-select from the Volumes shortcut is reachable.
-      selectBtn.disabled = !browserPath && browserSelectedPaths.length === 0;
-    } else {
-      selectBtn.textContent = 'Select This Folder';
-      selectBtn.disabled = !browserPath;
-    }
-  }
+function browseImportFolderTo(path) {
+  return importFolderBrowser.browse(path);
 }
 
 function selectImportBrowserFolder() {
-  if (browserMode === 'destination') {
-    if (!browserPath) return;
-    const destination = document.getElementById('destInput');
-    destination.value = browserPath;
-    // Notify destInput listeners (dest-structure invalidation, NAS-move
-    // row) exactly like a manual edit would — matches
-    // selectRecentDestination().
-    destination.dispatchEvent(new Event('input', { bubbles: true }));
-  } else {
-    const paths = browserSelectedPaths.length
-      ? browserSelectedPaths
-      : (browserPath ? [browserPath] : []);
-    if (!paths.length) return;
-    paths.forEach(addSourcePath);
-  }
-  closeImportFolderBrowser();
+  importFolderBrowser.confirm();
 }
 
 // Populate the After Import dropdown from the saved-process library. Keeps

@@ -6,11 +6,11 @@
 <link rel="icon" type="image/png" href="/favicon.ico">
 <link rel="apple-touch-icon" href="/static/apple-touch-icon.png">
 <link rel="stylesheet" href="/static/vireo-base.css">
+<link rel="stylesheet" href="/static/vireo-folder-browser.css">
 <title>Vireo - Card Cleanup</title>
 <style>
-/* Page CSS is a deliberate minimal copy of the import page's: this flow
-   moved off that page and has to keep looking like itself. Only the
-   classes this page actually uses were brought over. */
+/* Page-specific Card Cleanup layout. Shared folder-browser chrome lives in
+   vireo-folder-browser.css so Import and Cleanup cannot drift. */
 body { display: flex; flex-direction: column; height: 100vh; }
 .content { flex: 1; overflow-y: auto; padding: 20px; }
 .card-cleanup-wrap { max-width: 760px; margin: 0 auto; display: flex; flex-direction: column; gap: 16px; }
@@ -40,44 +40,6 @@ body { display: flex; flex-direction: column; height: 100vh; }
 .progress-bar { height: 8px; background: var(--bg-tertiary); border-radius: 4px; overflow: hidden; }
 .progress-bar > div { height: 100%; background: var(--accent); width: 0; transition: width 0.2s; }
 .staging-details { margin: 8px 0 0 0; padding-left: 18px; font-size: 11px; color: var(--text-secondary); max-height: 120px; overflow: auto; }
-.folder-browser-overlay {
-  display: none; position: fixed; inset: 0; z-index: 1001;
-  background: rgba(0, 0, 0, 0.45); align-items: center; justify-content: center;
-}
-.folder-browser-overlay.open { display: flex; }
-.folder-browser-panel {
-  width: min(720px, calc(100vw - 32px)); max-height: calc(100vh - 64px);
-  background: var(--bg-secondary); border: 1px solid var(--border-primary);
-  border-radius: 8px; box-shadow: 0 18px 60px rgba(0,0,0,0.35);
-  display: flex; flex-direction: column; overflow: hidden;
-}
-.folder-browser-header {
-  display: flex; align-items: center; justify-content: space-between;
-  padding: 14px 16px; border-bottom: 1px solid var(--border-primary);
-}
-.folder-browser-header h3 { margin: 0; }
-.folder-browser-close { background: none; border: none; color: var(--text-secondary); font-size: 22px; cursor: pointer; }
-.folder-browser-body { padding: 12px 16px; display: flex; flex-direction: column; gap: 10px; min-height: 0; }
-.folder-browser-shortcuts { display: flex; gap: 8px; flex-wrap: wrap; }
-.folder-browser-path { font-size: 12px; color: var(--text-secondary); overflow-wrap: anywhere; }
-.folder-browser-list {
-  height: 320px; overflow: auto; border: 1px solid var(--border-primary);
-  border-radius: 6px; background: var(--bg-tertiary);
-}
-.folder-browser-item {
-  padding: 8px 10px; font-size: 12px; color: var(--text-primary);
-  cursor: pointer; border-bottom: 1px solid color-mix(in srgb, var(--border-primary) 60%, transparent);
-  display: flex; align-items: center; gap: 8px;
-}
-.folder-browser-item:hover { background: var(--bg-hover, rgba(255,255,255,0.05)); }
-.folder-browser-item-name {
-  flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-}
-.folder-browser-empty { padding: 14px; font-size: 12px; color: var(--text-secondary); }
-.folder-browser-actions {
-  display: flex; gap: 8px; justify-content: flex-end;
-  padding: 12px 16px; border-top: 1px solid var(--border-primary);
-}
 .card-cleanup-bucket { margin-top: 6px; }
 .card-cleanup-bucket > summary { cursor: pointer; font-size: 12px; color: var(--text-primary); }
 /* Same callout shape as the import page's .managed-archive-callout, in
@@ -203,29 +165,7 @@ body { display: flex; flex-direction: column; height: 100vh; }
   </div>
 </div>
 
-<!-- Single-select folder browser: a minimal copy of the import page's,
-     kept to the one mode this page needs (pick one card folder). -->
-<div class="folder-browser-overlay" id="cardFolderBrowser" data-testid="card-folder-browser">
-  <div class="folder-browser-panel" role="dialog" aria-modal="true" aria-labelledby="folderBrowserTitle">
-    <div class="folder-browser-header">
-      <h3 id="folderBrowserTitle">Select Card Folder</h3>
-      <button class="folder-browser-close" type="button" onclick="closeCardFolderBrowser()">&times;</button>
-    </div>
-    <div class="folder-browser-body">
-      <div class="folder-browser-shortcuts">
-        <button class="btn" type="button" onclick="browseCardFolderTo(null)">Home</button>
-        <button class="btn" type="button" onclick="browseCardFolderTo('__pictures__')">Pictures</button>
-        <button class="btn" type="button" onclick="browseCardFolderTo('__volumes__')">Volumes</button>
-      </div>
-      <div class="folder-browser-path" id="folderBrowserPath"></div>
-      <div class="folder-browser-list" id="folderBrowserList"></div>
-    </div>
-    <div class="folder-browser-actions">
-      <button class="btn" type="button" onclick="closeCardFolderBrowser()">Cancel</button>
-      <button class="btn btn-primary" type="button" id="folderBrowserSelectBtn" onclick="selectCardBrowserFolder()">Select This Folder</button>
-    </div>
-  </div>
-</div>
+{% include '_folder_browser.html' %}
 
 <!-- Delete confirmation. Reuses the folder browser's overlay/panel classes:
      they are this page's only modal chrome, named after their first user. -->
@@ -254,6 +194,7 @@ body { display: flex; flex-direction: column; height: 100vh; }
   </div>
 </div>
 
+<script src="/static/vireo-folder-browser.js"></script>
 <script>
 /* ---------- Free up card space ----------
    Deletes card files only where the archive copy is verified. Every count
@@ -329,12 +270,6 @@ function formatBytes(n) {
   return (i === 0 ? String(n) : n.toFixed(n >= 10 ? 1 : 2)) + ' ' + units[i];
 }
 
-function cardEscapeHtml(s) {
-  return String(s).replace(/[&<>"']/g, (ch) => ({
-    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
-  }[ch]));
-}
-
 function cardCleanupFileCount(n) {
   const count = Number(n || 0);
   return count.toLocaleString() + (count === 1 ? ' file' : ' files');
@@ -356,19 +291,33 @@ function cardCleanupSetError(msg, opts) {
   }
 }
 
-/* ---------- Single-select folder browser ----------
-   Minimal copy of the import page's browser: same /api/browse and
-   /api/volumes endpoints, one folder at a time, no photo counts. */
-let cardBrowserPath = '';
-let cardBrowserHomePath = '';
-let cardBrowserSeq = 0;
-let cardBrowserEscHandler = null;
+/* ---------- Shared single-select folder browser ---------- */
+const cardFolderBrowser = new VireoFolderBrowser({
+  overlayId: 'folderBrowser',
+  defaultMode: 'card',
+  onError: (message) => cardCleanupSetError(message),
+  modes: {
+    card: {
+      title: 'Select Card Folder',
+      multiple: false,
+      showCounts: true,
+      // Cleanup considers every photo format Vireo imports, independent of
+      // the Import page's last RAW/JPEG filter selection.
+      fileTypes: 'both',
+      startPath: () =>
+        (document.getElementById('card-cleanup-source').value || '').trim(),
+      onSelect: (path) => {
+        document.getElementById('card-cleanup-source').value = path;
+      },
+    },
+  },
+});
 
 async function cardCleanupBrowse() {
   // Same shape as the import page's browseForSource(): native picker
   // when the desktop shell offers one, in-page browser otherwise.
   if (typeof pickDirectory === 'function') {
-    const seqBeforePicker = cardBrowserSeq;
+    const seqBeforePicker = cardFolderBrowser.sequence;
     const result = await pickDirectory('Select the card folder');
     if (result) {
       const path = Array.isArray(result) ? result[0] : result;
@@ -376,7 +325,7 @@ async function cardCleanupBrowse() {
       return;
     }
     if (typeof isTauri === 'function' && isTauri()) return;
-    if (cardBrowserSeq !== seqBeforePicker) {
+    if (cardFolderBrowser.sequence !== seqBeforePicker) {
       openCardFolderBrowser({ skipInitialBrowse: true });
       return;
     }
@@ -385,137 +334,19 @@ async function cardCleanupBrowse() {
 }
 
 function openCardFolderBrowser(opts = {}) {
-  const overlay = document.getElementById('cardFolderBrowser');
-  overlay.classList.add('open');
-  overlay.onclick = (e) => {
-    if (e.target === overlay) closeCardFolderBrowser();
-  };
-  if (cardBrowserEscHandler) {
-    document.removeEventListener('keydown', cardBrowserEscHandler);
-  }
-  cardBrowserEscHandler = (e) => {
-    if (e.key === 'Escape') closeCardFolderBrowser();
-  };
-  document.addEventListener('keydown', cardBrowserEscHandler);
-  document.body.style.overflow = 'hidden';
-  const firstAction = overlay.querySelector('button');
-  if (firstAction) firstAction.focus();
-  const startPath = (document.getElementById('card-cleanup-source').value || '').trim();
-  if (!opts.skipInitialBrowse) browseCardFolderTo(startPath || null);
+  cardFolderBrowser.open('card', opts);
 }
 
 function closeCardFolderBrowser() {
-  document.getElementById('cardFolderBrowser').classList.remove('open');
-  if (cardBrowserEscHandler) {
-    document.removeEventListener('keydown', cardBrowserEscHandler);
-    cardBrowserEscHandler = null;
-  }
-  document.body.style.overflow = '';
+  cardFolderBrowser.close();
 }
 
-async function browseCardFolderTo(path) {
-  const seq = ++cardBrowserSeq;
-  // Clear the stale selection while this async navigation is pending.
-  // Without this, clicking "Select This Folder" during a slow or failing
-  // fetch submits the previous folder instead of the one requested.
-  cardBrowserPath = '';
-  const selectBtn = document.getElementById('folderBrowserSelectBtn');
-  if (selectBtn) selectBtn.disabled = true;
-  document.getElementById('folderBrowserPath').textContent = 'Loading…';
-  document.getElementById('folderBrowserList').innerHTML =
-    '<div class="folder-browser-empty">Loading…</div>';
-  let url = '/api/browse';
-  if (path === '__pictures__') {
-    if (!cardBrowserHomePath) {
-      try {
-        const homeResp = await fetch('/api/browse');
-        if (seq !== cardBrowserSeq || !homeResp.ok) return;
-        const home = await homeResp.json();
-        cardBrowserHomePath = home.path || '';
-      } catch (e) {
-        return;
-      }
-    }
-    url = '/api/browse?path=' + encodeURIComponent(cardBrowserHomePath + '/Pictures');
-  } else if (path === '__volumes__') {
-    if (navigator.userAgent.indexOf('Mac') < 0) {
-      try {
-        const resp = await fetch('/api/volumes');
-        if (seq !== cardBrowserSeq || !resp.ok) return;
-        const volumes = await resp.json();
-        cardBrowserPath = '';
-        renderCardFolderBrowser({ path: '', dirs: volumes || [] }, { syntheticRoot: true });
-      } catch (e) { /* ignore */ }
-      return;
-    }
-    url = '/api/browse?path=' + encodeURIComponent('/Volumes');
-  } else if (path) {
-    url = '/api/browse?path=' + encodeURIComponent(path);
-  }
-
-  try {
-    const resp = await fetch(url);
-    if (seq !== cardBrowserSeq) return;
-    if (!resp.ok) {
-      const data = await resp.json().catch(() => ({}));
-      document.getElementById('folderBrowserPath').textContent =
-        data.error || 'Could not open folder.';
-      document.getElementById('folderBrowserList').innerHTML =
-        '<div class="folder-browser-empty">Could not open folder.</div>';
-      return;
-    }
-    const data = await resp.json();
-    cardBrowserPath = data.path || '';
-    if (!path) cardBrowserHomePath = cardBrowserPath;
-    renderCardFolderBrowser(data);
-  } catch (e) {
-    document.getElementById('folderBrowserPath').textContent = String(e.message || e);
-    document.getElementById('folderBrowserList').innerHTML =
-      '<div class="folder-browser-empty">Could not open folder.</div>';
-  }
-}
-
-function renderCardFolderBrowser(data, opts) {
-  document.getElementById('folderBrowserPath').textContent = data.path || 'Volumes';
-  const list = document.getElementById('folderBrowserList');
-  const dirs = data.dirs || [];
-  let html = '';
-  const syntheticRoot = opts && opts.syntheticRoot;
-  let parent = '';
-  if (data.path && data.path.indexOf('\\') !== -1) {
-    parent = data.path.replace(/[\\\/]?[^\\\/]+[\\\/]?$/, '') || data.path;
-    if (/^[A-Za-z]:$/.test(parent)) parent += '\\';
-  } else if (data.path) {
-    parent = data.path.substring(0, data.path.lastIndexOf('/')) || '/';
-  }
-  if (data.path && data.path !== '/' && parent && parent !== data.path) {
-    html += '<div class="folder-browser-item" data-browse-path="' + cardEscapeHtml(parent) + '" data-parent-link="1">' +
-      '<span class="folder-browser-item-name">&#128193; ..</span></div>';
-  }
-  dirs.forEach((d) => {
-    html += '<div class="folder-browser-item" data-browse-path="' + cardEscapeHtml(d.path) + '">' +
-      '<span class="folder-browser-item-name">&#128193; ' + cardEscapeHtml(d.name || d.path) + '</span></div>';
-  });
-  if (!html) {
-    html = '<div class="folder-browser-empty">' +
-      (syntheticRoot ? 'No volumes found.' : 'No subfolders.') + '</div>';
-  }
-  list.innerHTML = html;
-  // Single-select: a click navigates into the folder, and the actions bar
-  // selects wherever you are standing.
-  list.onclick = (e) => {
-    const item = e.target.closest('.folder-browser-item[data-browse-path]');
-    if (!item) return;
-    browseCardFolderTo(item.getAttribute('data-browse-path'));
-  };
-  const selectBtn = document.getElementById('folderBrowserSelectBtn');
-  if (selectBtn) selectBtn.disabled = !cardBrowserPath;
+function browseCardFolderTo(path) {
+  return cardFolderBrowser.browse(path);
 }
 
 function selectCardBrowserFolder() {
-  if (!cardBrowserPath) return;
-  document.getElementById('card-cleanup-source').value = cardBrowserPath;
-  closeCardFolderBrowser();
+  cardFolderBrowser.confirm();
 }
 
 async function cardCleanupStartScan() {

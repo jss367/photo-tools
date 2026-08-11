@@ -20085,48 +20085,55 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             return err
 
         card_cleanup_dir = app.config["CARD_CLEANUP_DIR"]
-        try:
-            manifest = card_cleanup.load_manifest(
-                card_cleanup_dir, scan_job_id)
-        except card_cleanup.ManifestError as e:
-            return json_error(str(e), status=e.http_status)
-        if not any(
-            entry.get("bucket") == "kept"
-            and entry.get("reason") == card_cleanup.KEEP_NOT_VERIFIED
-            and entry.get("hash")
-            for entry in manifest["entries"]
-        ):
-            return json_error("nothing needs archive verification")
 
-        def work(job):
-            thread_db = Database(db_path)
-            try:
-                if active_ws is not None:
-                    thread_db.set_active_workspace(active_ws)
-
-                def progress_cb(current, total, filename):
-                    runner.push_event(job["id"], "progress", {
-                        "current": current, "total": total,
-                        "current_file": filename,
-                        "phase": "Verifying matching archive copies",
-                    })
-
-                return card_cleanup.verify_manifest_archives(
-                    thread_db, manifest, card_cleanup_dir,
-                    progress_cb=progress_cb,
-                    should_cancel=lambda: runner.is_cancelled(job["id"]),
-                )
-            finally:
-                thread_db.close()
-
-        # Atomic conflict-check + start (Codex P1): without the lock,
-        # two concurrent verify POSTs can both pass the conflict check
-        # and both launch a worker that rewrites the same manifest.
+        # Codex P1: load the manifest INSIDE the lock, after the conflict
+        # check passes. Loading it before we hold the lock captures a
+        # snapshot that a concurrent verify can outdate before our worker
+        # starts: if request A loads revision N, releases, then request B
+        # runs to completion and writes revision N+1, A can still enter
+        # the lock (B is no longer registered), pass the conflict check,
+        # and hand its stale revision-N manifest to verify_manifest_
+        # archives — which bumps to N+1 and writes it, clobbering B's
+        # promotions with entries the user never saw promoted.
         with _CARD_CLEANUP_JOB_LOCK:
             conflict = _card_cleanup_job_conflict_response(
                 runner, scan_job_id)
             if conflict is not None:
                 return conflict
+            try:
+                manifest = card_cleanup.load_manifest(
+                    card_cleanup_dir, scan_job_id)
+            except card_cleanup.ManifestError as e:
+                return json_error(str(e), status=e.http_status)
+            if not any(
+                entry.get("bucket") == "kept"
+                and entry.get("reason") == card_cleanup.KEEP_NOT_VERIFIED
+                and entry.get("hash")
+                for entry in manifest["entries"]
+            ):
+                return json_error("nothing needs archive verification")
+
+            def work(job):
+                thread_db = Database(db_path)
+                try:
+                    if active_ws is not None:
+                        thread_db.set_active_workspace(active_ws)
+
+                    def progress_cb(current, total, filename):
+                        runner.push_event(job["id"], "progress", {
+                            "current": current, "total": total,
+                            "current_file": filename,
+                            "phase": "Verifying matching archive copies",
+                        })
+
+                    return card_cleanup.verify_manifest_archives(
+                        thread_db, manifest, card_cleanup_dir,
+                        progress_cb=progress_cb,
+                        should_cancel=lambda: runner.is_cancelled(job["id"]),
+                    )
+                finally:
+                    thread_db.close()
+
             job_id = runner.start(
                 "card-cleanup-verify", work,
                 config={"scan_job_id": scan_job_id},

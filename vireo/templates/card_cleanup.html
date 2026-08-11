@@ -936,10 +936,17 @@ async function cardCleanupConfirmDelete() {
   // Codex P1: send the manifest revision we confirmed against. If a
   // verify has landed since (and rewritten the manifest with a fresh
   // revision), the server rejects this POST rather than deleting the
-  // newly-promoted files the user never saw. Missing revision on an old
-  // manifest is treated as INITIAL_MANIFEST_REVISION on the server side.
+  // newly-promoted files the user never saw.
+  //
+  // Codex P2: pre-revision manifests (saved before this branch landed)
+  // have no `revision` key. Sending undefined would make JSON.stringify
+  // drop `manifest_revision` from the body, and the endpoint rejects a
+  // missing key with 400 rather than treating it as the initial
+  // revision — leaving every carried-over preview undeletable. Match
+  // what the server already does when it loads a manifest without a
+  // revision: default to INITIAL_MANIFEST_REVISION (1).
   const confirmedRevision =
-    cardCleanupState.manifest && cardCleanupState.manifest.revision;
+    (cardCleanupState.manifest && cardCleanupState.manifest.revision) || 1;
   try {
     const resp = await fetch('/api/card-cleanup/delete', {
       method: 'POST',

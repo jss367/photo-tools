@@ -481,6 +481,56 @@ def test_verify_bumps_manifest_revision(app_and_db, tmp_path):
     assert after["revision"] == before["revision"] + 1
 
 
+def test_verify_endpoint_loads_manifest_inside_cleanup_job_lock():
+    """Codex P1 (commit ad9375db): the verify endpoint must load the
+    manifest INSIDE the ``_CARD_CLEANUP_JOB_LOCK`` critical section, not
+    before it.
+
+    Race: request A loads revision N, releases before taking the lock,
+    then request B runs to completion and writes revision N+1. If A
+    then enters the lock (B is no longer registered as running), passes
+    the conflict check, and hands its stale revision-N manifest to
+    verify_manifest_archives, the worker bumps to N+1 and writes it —
+    silently clobbering B's promotions with entries the user never saw
+    promoted. The conflict check alone does NOT close this window
+    because the check catches only queued/running jobs, and A can enter
+    the lock after B has finished.
+
+    Load-inside-lock closes the window: every verify starts from the
+    manifest that the previous verify's write landed. Pinning this via
+    source inspection because reproducing the race in a functional test
+    would need scheduler hooks we do not have; a future refactor that
+    quietly hoists load_manifest above the ``with`` block would
+    reintroduce the exact bug this commit fixed.
+    """
+    import inspect
+
+    import app as app_module
+
+    src = inspect.getsource(app_module.create_app)
+    start = src.index("def api_card_cleanup_verify(")
+    end = src.index("def api_card_cleanup_delete(", start)
+    verify_src = src[start:end]
+
+    lock_idx = verify_src.index("with _CARD_CLEANUP_JOB_LOCK")
+    load_idx = verify_src.index("card_cleanup.load_manifest(")
+    conflict_idx = verify_src.index(
+        "_card_cleanup_job_conflict_response(")
+    start_idx = verify_src.index("runner.start(")
+
+    assert lock_idx < conflict_idx < load_idx < start_idx, (
+        "api_card_cleanup_verify must run these steps IN ORDER inside "
+        "the _CARD_CLEANUP_JOB_LOCK critical section: (1) take the "
+        "lock, (2) call _card_cleanup_job_conflict_response, (3) load "
+        "the manifest, (4) runner.start. Hoisting load_manifest above "
+        "the `with` block reopens the load-before-lock window Codex "
+        "P1 called out at commit ad9375db: a verify can enter after "
+        "another verify has completed, see no conflict, and hand a "
+        "stale snapshot to verify_manifest_archives that clobbers the "
+        "just-landed revision."
+    )
+
+
 def test_delete_rejects_missing_manifest_revision(app_and_db, tmp_path):
     """The revision check is required on any completed scan.  A body
     that omits it must 400 rather than defaulting silently."""
@@ -779,6 +829,42 @@ def test_confirm_delete_locks_page_before_post(app_and_db):
         "the network-error catch must direct the user to the Jobs page so "
         "they can find out whether the server queued the delete before the "
         "connection dropped"
+    )
+
+
+def test_confirm_delete_defaults_manifest_revision_for_pre_upgrade_manifests(
+        app_and_db):
+    """Codex P2 (commit ad9375db): cardCleanupConfirmDelete must send a
+    concrete manifest_revision even when the loaded manifest has no
+    revision key.
+
+    A manifest saved before the revision schema landed has no ``revision``
+    property. If the client reads it as ``undefined``, JSON.stringify
+    drops the key from the request body, and the server rejects a missing
+    manifest_revision with 400 required — making every carried-over
+    preview undeletable. The server treats a missing on-disk revision as
+    ``INITIAL_MANIFEST_REVISION`` (1), so the client must default to the
+    same value to keep the two sides in sync.
+    """
+    app, _ = app_and_db
+    body = app.test_client().get("/card-cleanup").get_data(as_text=True)
+    start = body.index("async function cardCleanupConfirmDelete(")
+    end = body.index("function cardCleanupRenderDeleteResult(", start)
+    section = body[start:end]
+    # Locate the confirmedRevision assignment and require a truthy
+    # fallback to 1 so an undefined/absent manifest.revision does not
+    # silently drop the key from the request body.
+    rev_idx = section.index("const confirmedRevision")
+    body_idx = section.index("manifest_revision:", rev_idx)
+    rev_expr = section[rev_idx:body_idx]
+    assert "|| 1" in rev_expr, (
+        "cardCleanupConfirmDelete must default confirmedRevision to 1 "
+        "(INITIAL_MANIFEST_REVISION) when cardCleanupState.manifest.revision "
+        "is undefined — sending undefined here would omit manifest_revision "
+        "from JSON.stringify and the delete endpoint would reject a "
+        "pre-upgrade manifest that has no revision key with 400 required, "
+        "even though the server treats a missing on-disk revision as the "
+        "initial revision on load"
     )
 
 

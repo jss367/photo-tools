@@ -114,21 +114,18 @@ body { display: flex; flex-direction: column; height: 100vh; }
           </details>
         </div>
         <div class="hint" id="card-cleanup-scanned-root" style="margin-bottom:6px;"></div>
-        <!-- Shown only when the scan's own kept reasons say the integrity
-             audit is what is missing. -->
-        <div class="card-cleanup-audit" id="card-cleanup-audit" style="display:none;">
-          <div id="card-cleanup-audit-text"></div>
-          <span class="hint" id="card-cleanup-audit-cost"></span>
-          <span class="hint" id="card-cleanup-audit-scope-note"
-                style="display:none;"></span>
+        <!-- Shown only when matching archive rows have never had their
+             bytes verified.  This check is scoped to the current card. -->
+        <div class="card-cleanup-audit" id="card-cleanup-verify" style="display:none;">
+          <div id="card-cleanup-verify-text"></div>
+          <span class="hint" id="card-cleanup-verify-cost"></span>
           <div class="row" style="margin-top:8px;margin-bottom:0;">
-            <button class="btn btn-primary" type="button" id="card-cleanup-audit-btn"
-                    onclick="cardCleanupStartAudit()">Verify archive hashes</button>
-            <button class="btn" type="button" id="card-cleanup-audit-rescan-btn"
-                    style="display:none;" onclick="cardCleanupStartScan()">Re-scan card</button>
+            <button class="btn btn-primary" type="button" id="card-cleanup-verify-btn"
+                    onclick="cardCleanupStartVerification()">Verify matching archive copies</button>
           </div>
-          <div class="hint" id="card-cleanup-audit-status" style="margin-top:6px;"></div>
         </div>
+        <div class="hint" id="card-cleanup-verify-result"
+             style="display:none;margin:8px 0;"></div>
         <!-- Shown when kept entries are held back because their archive
              copies failed a prior integrity check. Distinct from the
              audit callout above: re-running verify would just reproduce
@@ -183,7 +180,7 @@ body { display: flex; flex-direction: column; height: 100vh; }
       <ul class="card-cleanup-confirm-list">
         <li>Deletion is permanent — memory cards have no trash.</li>
         <li>After deletion, the archive holds the only copy of these photos.</li>
-        <li>What "verified" means: each file's archive copy passed a checksum check (at import or integrity audit) and is confirmed unchanged since by size and timestamp; the card copy itself is re-checksummed at the moment of deletion. Archive bytes are not re-downloaded.</li>
+        <li>What "verified" means: each file's archive copy passed a checksum check (at import, here, or in the integrity audit) and is confirmed unchanged since by size and timestamp; the card copy itself is re-checksummed at the moment of deletion. Archive bytes are not re-downloaded.</li>
       </ul>
     </div>
     <div class="folder-browser-actions">
@@ -210,7 +207,6 @@ const cardCleanupState = {
   listsRendered: {},    // bucket -> true once its <li>s are in the DOM
   confirmEscHandler: null,
   busyRestore: null,    // delete button/hint state saved while a job runs
-  auditCompleted: false, // a verify-hashes run finished during this page visit
 };
 
 /* Exactly one job at a time. Starting a second one while this page is
@@ -223,7 +219,7 @@ const cardCleanupState = {
 function cardCleanupSetBusy(running, opts) {
   const scanBtn = document.getElementById('card-cleanup-scan-btn');
   const deleteBtn = document.getElementById('card-cleanup-delete-btn');
-  const auditBtn = document.getElementById('card-cleanup-audit-btn');
+  const verifyBtn = document.getElementById('card-cleanup-verify-btn');
   const deleteHint = document.getElementById('card-cleanup-delete-hint');
   if (running) {
     // Whether Delete may be pressed depends on the manifest (and on
@@ -236,7 +232,7 @@ function cardCleanupSetBusy(running, opts) {
       };
     }
     scanBtn.disabled = true;
-    auditBtn.disabled = true;
+    verifyBtn.disabled = true;
     deleteBtn.disabled = true;
     if (opts && opts.deleteHint) deleteHint.textContent = opts.deleteHint;
     return;
@@ -244,20 +240,20 @@ function cardCleanupSetBusy(running, opts) {
   const restore = cardCleanupState.busyRestore;
   cardCleanupState.busyRestore = null;
   scanBtn.disabled = false;
-  auditBtn.disabled = false;
+  verifyBtn.disabled = false;
+  if (opts && opts.keepDeleteState) return;
   if (restore) {
     deleteBtn.disabled = restore.deleteDisabled;
     deleteHint.textContent = restore.deleteHint;
   }
 }
 
-// The manifest reason that this page's audit callout answers. Mirrors
-// card_cleanup.KEEP_NOT_VERIFIED — matched on the distinctive tail so a
-// reason with extra detail appended still counts.
-const CARD_CLEANUP_AUDIT_REASON = 'run the integrity audit';
+// Mirrors card_cleanup.KEEP_NOT_VERIFIED exactly.  Exact matching avoids
+// offering verification for rows that already failed a previous check.
+const CARD_CLEANUP_VERIFY_REASON = 'archive copy has not been checksum-verified';
 // The manifest reason that this page's hash-failed callout answers.
 // Mirrors card_cleanup.KEEP_ARCHIVE_HASH_FAILED — kept distinct from
-// CARD_CLEANUP_AUDIT_REASON so a check-failed row cannot pretend to be a
+// CARD_CLEANUP_VERIFY_REASON so a check-failed row cannot pretend to be a
 // never-checked one and get double-counted (or vice versa). Same tail
 // match as above; test_hash_failed_callout_reason_stays_in_sync pins it.
 const CARD_CLEANUP_HASH_FAILED_REASON = 'see the Audit page';
@@ -474,11 +470,11 @@ async function cardCleanupFinishJob(jobId, kind) {
   cardCleanupState.jobId = null;
   document.getElementById('card-cleanup-cancel-btn').style.display = 'none';
   document.getElementById('card-cleanup-progress').style.display = 'none';
-  // Buttons come back first; the per-kind branches below then overwrite
-  // the Delete button and its hint with what this run's outcome means.
-  cardCleanupSetBusy(false);
   const status = job && job.status;
   const jobError = job && (job.errors || [])[0];
+  // A verification completion owns the page until its refreshed manifest
+  // is rendered; otherwise Delete could briefly advertise the old totals.
+  if (kind !== 'verify') cardCleanupSetBusy(false);
   if (kind === 'scan') {
     if (status === 'completed') {
       await cardCleanupLoadManifest();
@@ -496,8 +492,8 @@ async function cardCleanupFinishJob(jobId, kind) {
     }
     return;
   }
-  if (kind === 'audit') {
-    cardCleanupFinishAudit(job, status, jobError);
+  if (kind === 'verify') {
+    await cardCleanupFinishVerification(job, status, jobError);
     return;
   }
   // Delete: the per-file outcome lives in the job result, so a job that
@@ -536,13 +532,15 @@ async function cardCleanupLoadManifest() {
     if (resp.status === 404) {
       cardCleanupState.scanJobId = null;
       cardCleanupSetError('Preview expired — re-scan the card.', { rescan: true });
-      return;
+      return false;
     }
     if (!resp.ok) throw new Error(data.error || 'the preview could not be loaded');
     cardCleanupRenderManifest(data);
+    return true;
   } catch (e) {
     if (cardCleanupState.scanJobId !== requestedScanJobId) return;
     cardCleanupSetError(String(e.message || e));
+    return false;
   }
 }
 
@@ -588,7 +586,7 @@ function cardCleanupRenderManifest(manifest) {
     cardCleanupFileCount(ignored.count) +
     ' ignored (not photo files Vireo imports)';
 
-  cardCleanupRenderAuditCallout(manifest);
+  cardCleanupRenderVerificationCallout(manifest);
   cardCleanupRenderHashFailedCallout(manifest);
 
   cardCleanupBindBucket('deletable', 'card-cleanup-deletable-details',
@@ -609,48 +607,36 @@ function cardCleanupRenderManifest(manifest) {
   document.getElementById('card-cleanup-preview').style.display = '';
 }
 
-/* ---------- Integrity-audit affordance ----------
-   The scan itself tells us when the archive audit is the missing step:
-   every kept entry whose reason is KEEP_NOT_VERIFIED. The count below is
-   those entries, not an estimate. */
-function cardCleanupAuditPendingCount(manifest) {
+/* ---------- Card-scoped archive verification ---------- */
+function cardCleanupVerificationPendingCount(manifest) {
   return (manifest.entries || []).filter(entry =>
     entry.bucket === 'kept'
-    && String(entry.reason || '').indexOf(CARD_CLEANUP_AUDIT_REASON) !== -1
+    && entry.reason === CARD_CLEANUP_VERIFY_REASON
   ).length;
 }
 
-function cardCleanupRenderAuditCallout(manifest) {
-  const callout = document.getElementById('card-cleanup-audit');
-  const pending = cardCleanupAuditPendingCount(manifest);
+function cardCleanupRenderVerificationCallout(manifest) {
+  const callout = document.getElementById('card-cleanup-verify');
+  const pending = cardCleanupVerificationPendingCount(manifest);
   if (!pending) {
     callout.style.display = 'none';
     return;
   }
-  document.getElementById('card-cleanup-audit-text').textContent =
+  const uniqueHashes = new Set((manifest.entries || [])
+    .filter(entry => entry.bucket === 'kept'
+      && entry.reason === CARD_CLEANUP_VERIFY_REASON && entry.hash)
+    .map(entry => entry.hash)).size;
+  document.getElementById('card-cleanup-verify-text').textContent =
     cardCleanupFileCount(pending) +
     (pending === 1 ? ' is' : ' are') +
-    ' kept only because the archive ' +
-    'copy has never been checksum-verified. Vireo will not delete a card ' +
-    'file until its archive copy passes a checksum check, and the ' +
-    'integrity audit is what performs that check.';
-  // Scope honesty (Codex P2 review): the card scan matches photos across
-  // ALL workspaces, but the verify-hashes job covers only the folders in
-  // the CURRENT workspace. If some of these files' archive copies live
-  // in another workspace's folders, verifying here will not touch them —
-  // say so up front, and cardCleanupRenderStillUnverifiedHint says it
-  // again, specifically, when a post-audit re-scan proves it happened.
-  document.getElementById('card-cleanup-audit-cost').textContent =
-    'Verifying re-reads and re-checksums every archive file in the ' +
-    'current workspace, not just these — over a VPN’d network mount ' +
-    'that is slow, so it is best run on a machine close to the NAS. ' +
-    'Archive copies that belong to a different workspace are not ' +
-    'covered; switch to that workspace to verify them.';
-  cardCleanupRenderStillUnverifiedHint(pending);
-  document.getElementById('card-cleanup-audit-btn').style.display = '';
-  document.getElementById('card-cleanup-audit-btn').disabled = false;
-  document.getElementById('card-cleanup-audit-rescan-btn').style.display = 'none';
-  document.getElementById('card-cleanup-audit-status').textContent = '';
+    ' kept only because the matching archive copy has never been ' +
+    'checksum-verified.';
+  document.getElementById('card-cleanup-verify-cost').textContent =
+    'This reads only the matching archive ' +
+    (uniqueHashes === 1 ? 'copy' : uniqueHashes.toLocaleString() + ' copies') +
+    ' needed by this card. Unrelated archive files are not touched, and ' +
+    'duplicate files on the card share one check.';
+  document.getElementById('card-cleanup-verify-btn').disabled = false;
   callout.style.display = '';
 }
 
@@ -693,63 +679,28 @@ function cardCleanupRenderHashFailedCallout(manifest) {
   callout.style.display = '';
 }
 
-/* After a verification has run, files still pending on the next scan are
-   exactly the ones verification could not reach — most likely archive
-   copies in folders that belong to a different workspace (the scan
-   matches globally; verify-hashes covers only the current workspace's
-   folders). Say that specifically instead of letting the callout loop. */
-function cardCleanupRenderStillUnverifiedHint(pending) {
-  const note = document.getElementById('card-cleanup-audit-scope-note');
-  if (!cardCleanupState.auditCompleted || !pending) {
-    note.style.display = 'none';
-    note.textContent = '';
-    return;
-  }
-  note.textContent =
-    'Still unverified after the last verification run: these files’ ' +
-    'archive copies were not covered by it — most likely they belong to ' +
-    'folders in a different workspace (or the run was cancelled before ' +
-    'reaching them). Switch to the workspace that holds those folders ' +
-    'and verify there, then re-scan here.';
-  note.style.display = 'block';
-}
-
-async function cardCleanupStartAudit() {
+async function cardCleanupStartVerification() {
   if (cardCleanupState.jobId) return;  // a run is already streaming
-  // Verification changes what counts as verified, so the preview's Delete
-  // button describes a state that is being rewritten underneath it. Say
-  // that where the Delete button is, not only up here.
   cardCleanupSetBusy(true, {
     deleteHint: 'Verification is running — deletion is available when it ' +
       'finishes.',
   });
-  document.getElementById('card-cleanup-audit-rescan-btn').style.display = 'none';
-  document.getElementById('card-cleanup-audit-status').textContent = '';
+  const resultEl = document.getElementById('card-cleanup-verify-result');
+  resultEl.style.display = 'none';
+  resultEl.textContent = '';
   cardCleanupSetError('');
-  // Failure handling here mirrors cardCleanupConfirmDelete (Codex P1 review
-  // on commit 5afcb0ba). Only a definitive HTTP response proves whether the
-  // server queued the audit — an fetch rejection or an unreadable body
-  // could mean api_job_verify_hashes() is already running. If the page
-  // unlocked in that gap, delete_verified() would trust the currently
-  // committed hash_status plus archive size/mtime rather than re-hashing
-  // archive bytes, so a concurrent delete could qualify a row on its old
-  // `ok` verdict while the audit is flipping it to modified/corrupt/
-  // unreadable — and remove the good card copy. Keep Scan/Verify/Delete
-  // disabled on any ambiguous outcome and send the user to Jobs, only
-  // unlocking when the server proves nothing was queued.
   let resp;
   try {
-    resp = await fetch('/api/jobs/verify-hashes', {
+    resp = await fetch('/api/card-cleanup/verify', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: '{}',
+      body: JSON.stringify({scan_job_id: cardCleanupState.scanJobId}),
     });
   } catch (e) {
     cardCleanupSetError(
       'The verify request never got a response, so we cannot tell whether ' +
-      'the server queued the audit. Check the Jobs page for a verify-hashes ' +
-      'job that started around now, then reload this page to work with the ' +
-      'card again. (' + String(e.message || e) + ')');
+      'the server queued it. Check the Jobs page for a card-cleanup-verify ' +
+      'job, then reload this page. (' + String(e.message || e) + ')');
     return;
   }
   if (!resp.ok) {
@@ -768,71 +719,46 @@ async function cardCleanupStartAudit() {
   try {
     data = await resp.json();
   } catch (e) {
-    // 2xx response, unreadable body: the audit may already be running.
-    // Same reasoning as the network catch above — keep the page locked and
-    // route the user to Jobs rather than freeing the destructive path.
     cardCleanupSetError(
       'The verify request returned OK but its response could not be read, ' +
-      'so the audit may already be running. Check the Jobs page for a ' +
-      'verify-hashes job that started around now, then reload this page to ' +
-      'work with the card again. (' + String(e.message || e) + ')');
+      'so verification may already be running. Check the Jobs page for a ' +
+      'card-cleanup-verify job, then reload this page. (' +
+      String(e.message || e) + ')');
     return;
   }
-  cardCleanupWatchJob(data.job_id, 'audit', 'Starting hash verification…');
+  cardCleanupWatchJob(data.job_id, 'verify', 'Starting matching-copy verification…');
 }
 
-// The buttons are already re-enabled by cardCleanupSetBusy(false) in
-// cardCleanupFinishJob's cleanup; this only reports what the run found.
-// Verification can flip previously-ok rows to modified/corrupt/unreadable,
-// so the preview's deletable count/bytes may no longer describe what a
-// deletion would actually touch. Disable Delete until the user takes the
-// re-scan surfaced below — the backend re-checks and skips invalid rows,
-// but the confirmation dialog would still show stale totals against a
-// valid subset the user never agreed to.
-function cardCleanupFinishAudit(job, status, jobError) {
-  const statusEl = document.getElementById('card-cleanup-audit-status');
-  if (status === 'completed' || status === 'cancelled') {
-    // Lets the next re-scan's callout explain files that verification
-    // could not have covered (other workspaces' folders).
-    cardCleanupState.auditCompleted = true;
+async function cardCleanupFinishVerification(job, status, jobError) {
+  const resultEl = document.getElementById('card-cleanup-verify-result');
+  let refreshed = false;
+  if ((status === 'completed' || status === 'cancelled')
+      && cardCleanupState.scanJobId) {
+    refreshed = await cardCleanupLoadManifest();
   }
-  const deleteBtn = document.getElementById('card-cleanup-delete-btn');
-  deleteBtn.disabled = true;
-  document.getElementById('card-cleanup-delete-hint').textContent
-    = 'Verification may have changed which files count as verified — re-scan the card before deleting.';
+  cardCleanupSetBusy(false, {keepDeleteState: refreshed});
+  resultEl.style.display = '';
   if (status === 'completed' && job && job.result) {
     const r = job.result;
     const problems = (r.modified || 0) + (r.corrupt || 0) + (r.unreadable || 0);
-    const parts = [cardCleanupFileCount(r.checked) + ' checked'];
-    if (r.baselined) {
-      parts.push(Number(r.baselined).toLocaleString() +
-        ' baselined (no prior hash)');
-    }
-    if (r.missing) {
-      parts.push(Number(r.missing).toLocaleString() +
-        ' missing (see the Audit page)');
-    }
-    parts.push(problems
-      ? problems.toLocaleString() + ' problems found (see the Audit page)'
-      : 'no problems');
-    if (r.cancelled) parts.push('cancelled before the whole archive was read');
-    statusEl.textContent = parts.join(' · ') +
-      '. The preview above is from the earlier scan — re-scan the card to ' +
-      'see what is verified now.';
+    const parts = [Number(r.archive_files_read || 0).toLocaleString() +
+      ' matching archive ' + ((r.archive_files_read || 0) === 1 ? 'file' : 'files') +
+      ' read'];
+    parts.push(cardCleanupFileCount(r.unblocked_files || 0) + ' now ready to delete');
+    if (problems) parts.push(problems.toLocaleString() + ' could not be verified');
+    resultEl.textContent = parts.join(' · ') + '. Preview updated.';
   } else if (status === 'cancelled') {
-    statusEl.textContent =
-      'Verification cancelled — the files it had already checked keep ' +
-      'their new verdicts; the rest are unchanged.';
+    resultEl.textContent =
+      'Verification cancelled — completed checks were kept and the preview was updated.';
   } else if (status) {
-    statusEl.textContent = 'Verification ' + status +
+    resultEl.textContent = 'Verification ' + status +
       (jobError ? ': ' + jobError : '.') +
       ' Check the Jobs page for what it managed to check.';
   } else {
-    statusEl.textContent =
+    resultEl.textContent =
       'The verification is still running but this page lost track of it — ' +
       'check the Jobs page.';
   }
-  document.getElementById('card-cleanup-audit-rescan-btn').style.display = '';
 }
 
 // Bucket lists run to thousands of rows, so build them the first time the
@@ -887,7 +813,8 @@ function cardCleanupResetPreview() {
   cardCleanupState.listsRendered = {};
   document.getElementById('card-cleanup-preview').style.display = 'none';
   document.getElementById('card-cleanup-incomplete').style.display = 'none';
-  document.getElementById('card-cleanup-audit').style.display = 'none';
+  document.getElementById('card-cleanup-verify').style.display = 'none';
+  document.getElementById('card-cleanup-verify-result').style.display = 'none';
   document.getElementById('card-cleanup-hash-failed').style.display = 'none';
   const deleteBtn = document.getElementById('card-cleanup-delete-btn');
   deleteBtn.disabled = true;

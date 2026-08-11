@@ -24,6 +24,9 @@ All notable changes to Vireo are documented in this file.
   updater, and uninstall-preservation gates before publication.
 
 ### Fixed
+- Freeing card space now verifies only archive copies that match the selected
+  card instead of re-hashing the entire workspace, refreshes the preview
+  automatically, and reads each card file only once at deletion.
 - Opening a catalog that was already migrated by a newer Vireo (for example
   after reinstalling an older build) now shows clear "update Vireo to open
   this catalog" guidance instead of a crash — and no longer suggests moving

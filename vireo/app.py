@@ -6335,6 +6335,9 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         # missing-originals timer fire during verification would
         # double the I/O on those slow volumes.
         "verify-hashes",
+        # Card cleanup reads only archive copies that match one card, but
+        # those reads still hit the same NAS/SMB trees.
+        "card-cleanup-verify",
         # The startup working-copy backfill job walks the same source
         # trees and additionally performs RAW decode + JPEG encode
         # work per file, so overlapping it with an automatic Missing
@@ -20004,6 +20007,88 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             return json_error(str(e), status=e.http_status)
         return jsonify(manifest)
 
+    @app.route("/api/card-cleanup/verify", methods=["POST"])
+    def api_card_cleanup_verify():
+        """Verify only archive copies needed by a cleanup preview.
+
+        Unlike the workspace-wide integrity audit, this reads at most one
+        viable archive copy per distinct pending card hash and refreshes the
+        existing manifest when it finishes.
+        """
+        body = request.get_json(silent=True) or {}
+        if not isinstance(body, dict):
+            return json_error("request body must be a JSON object")
+        scan_job_id = body.get("scan_job_id")
+        if not scan_job_id or not isinstance(scan_job_id, str):
+            return json_error("scan_job_id required")
+
+        db = _get_db()
+        runner = app._job_runner
+        active_ws = db._active_workspace_id
+        scan_job = runner.get(scan_job_id)
+        if scan_job is None:
+            row = db.conn.execute(
+                "SELECT type, status FROM job_history WHERE id = ?",
+                (scan_job_id,)).fetchone()
+            scan_job = dict(row) if row is not None else None
+        if scan_job is None or scan_job.get("type") != "card-cleanup-scan":
+            return json_error("unknown scan job", status=404)
+        if scan_job.get("status") in ("queued", "running"):
+            return json_error("scan still running — wait for it to finish")
+        if scan_job.get("status") != "completed":
+            return json_error("scan did not complete — re-scan the card")
+
+        for job in runner.list_jobs():
+            if (job.get("type") in
+                    ("card-cleanup-verify", "card-cleanup-delete")
+                    and job.get("status") in ("queued", "running")
+                    and (job.get("config") or {}).get("scan_job_id")
+                    == scan_job_id):
+                return json_error(
+                    "verification or deletion for this scan is already "
+                    "running", status=409)
+
+        card_cleanup_dir = app.config["CARD_CLEANUP_DIR"]
+        try:
+            manifest = card_cleanup.load_manifest(
+                card_cleanup_dir, scan_job_id)
+        except card_cleanup.ManifestError as e:
+            return json_error(str(e), status=e.http_status)
+        if not any(
+            entry.get("bucket") == "kept"
+            and entry.get("reason") == card_cleanup.KEEP_NOT_VERIFIED
+            and entry.get("hash")
+            for entry in manifest["entries"]
+        ):
+            return json_error("nothing needs archive verification")
+
+        def work(job):
+            thread_db = Database(db_path)
+            try:
+                if active_ws is not None:
+                    thread_db.set_active_workspace(active_ws)
+
+                def progress_cb(current, total, filename):
+                    runner.push_event(job["id"], "progress", {
+                        "current": current, "total": total,
+                        "current_file": filename,
+                        "phase": "Verifying matching archive copies",
+                    })
+
+                return card_cleanup.verify_manifest_archives(
+                    thread_db, manifest, card_cleanup_dir,
+                    progress_cb=progress_cb,
+                    should_cancel=lambda: runner.is_cancelled(job["id"]),
+                )
+            finally:
+                thread_db.close()
+
+        job_id = runner.start(
+            "card-cleanup-verify", work,
+            config={"scan_job_id": scan_job_id},
+            workspace_id=active_ws)
+        return jsonify({"job_id": job_id})
+
     @app.route("/api/card-cleanup/delete", methods=["POST"])
     def api_card_cleanup_delete():
         """Delete the deletable bucket of a scan's manifest.
@@ -20047,12 +20132,14 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         # simultaneous POSTs is likewise acceptable: the gates make a
         # double-delete skip, not double-fire.)
         for j in runner.list_jobs():
-            if (j.get("type") == "card-cleanup-delete"
+            if (j.get("type") in
+                    ("card-cleanup-delete", "card-cleanup-verify")
                     and j.get("status") in ("queued", "running")
                     and (j.get("config") or {}).get("scan_job_id")
                     == scan_job_id):
                 return json_error(
-                    "a delete for this scan is already running", status=409)
+                    "verification or deletion for this scan is already "
+                    "running", status=409)
         card_cleanup_dir = app.config["CARD_CLEANUP_DIR"]
         try:
             manifest = card_cleanup.load_manifest(

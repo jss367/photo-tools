@@ -136,6 +136,48 @@ def test_scan_then_manifest_then_delete_end_to_end(app_and_db, tmp_path):
     assert archive_file.exists()
 
 
+def test_scoped_verify_endpoint_promotes_preview_without_global_audit(
+        app_and_db, tmp_path):
+    app, db = app_and_db
+    client = app.test_client()
+    archive_file, pid = _archive_photo(db, tmp_path)
+    unrelated, unrelated_pid = _archive_photo(
+        db, tmp_path, name="OTHER.NEF", content=b"other",
+        folder="archive/other")
+    db.conn.execute(
+        "UPDATE photos SET hash_status = NULL, hash_checked_at = NULL "
+        "WHERE id IN (?, ?)", (pid, unrelated_pid))
+    db.conn.commit()
+    _card_file(tmp_path)
+
+    scan_resp = client.post(
+        "/api/card-cleanup/scan", json={"source": str(tmp_path / "card")})
+    scan_job_id = scan_resp.get_json()["job_id"]
+    _wait_for_job(client, scan_job_id)
+    before = client.get(
+        f"/api/card-cleanup/{scan_job_id}/manifest").get_json()
+    assert before["totals"]["deletable"]["count"] == 0
+
+    verify_resp = client.post(
+        "/api/card-cleanup/verify", json={"scan_job_id": scan_job_id})
+    assert verify_resp.status_code == 200
+    verify_job_id = verify_resp.get_json()["job_id"]
+    job = _wait_for_job(client, verify_job_id)
+    assert job["type"] == "card-cleanup-verify"
+    assert job["result"]["archive_files_read"] == 1
+    assert job["result"]["unblocked_files"] == 1
+
+    after = client.get(
+        f"/api/card-cleanup/{scan_job_id}/manifest").get_json()
+    assert after["totals"]["deletable"]["count"] == 1
+    assert after["entries"][0]["archive_path"] == str(archive_file)
+    assert unrelated.exists()
+    unrelated_status = db.conn.execute(
+        "SELECT hash_status FROM photos WHERE id = ?", (unrelated_pid,)
+    ).fetchone()["hash_status"]
+    assert unrelated_status is None
+
+
 def test_scan_job_result_carries_totals_not_entries(app_and_db, tmp_path):
     """Spec: the scan job's RESULT carries only bucket totals, resolved
     source root, and the manifest path — never the (potentially
@@ -384,7 +426,8 @@ def test_endpoints_reject_non_object_json_body(app_and_db):
     # endpoints must 400, not 500 on body.get.
     app, _ = app_and_db
     client = app.test_client()
-    for url in ("/api/card-cleanup/scan", "/api/card-cleanup/delete"):
+    for url in ("/api/card-cleanup/scan", "/api/card-cleanup/verify",
+                "/api/card-cleanup/delete"):
         resp = client.post(url, json=5)
         assert resp.status_code == 400, url
         assert "JSON object" in resp.get_json()["error"]
@@ -399,8 +442,7 @@ def test_card_cleanup_page_renders(app_and_db):
     body = resp.get_data(as_text=True)
     assert "card-cleanup-section" in body
     assert "card-cleanup-scan-btn" in body
-    # The integrity-audit affordance is part of the page, not the import page.
-    assert "card-cleanup-audit-btn" in body
+    assert "card-cleanup-verify-btn" in body
 
 
 def test_import_and_card_cleanup_share_folder_browser(app_and_db):
@@ -432,16 +474,14 @@ def test_import_page_links_to_card_cleanup_instead_of_hosting_it(app_and_db):
     assert "/card-cleanup" in body
 
 
-def test_audit_callout_reason_stays_in_sync(app_and_db):
-    """The page's audit callout counts kept entries by matching a tail of
-    KEEP_NOT_VERIFIED. That coupling is invisible from either side, so pin
-    both ends: the served page must carry the literal it matches on, and
-    the reason it matches must still contain it."""
+def test_verification_callout_reason_stays_in_sync(app_and_db):
+    """The scoped verification callout and backend reason stay coupled."""
     app, _ = app_and_db
-    matched = "run the integrity audit"
-    assert matched in card_cleanup.KEEP_NOT_VERIFIED
+    matched = card_cleanup.KEEP_NOT_VERIFIED
     body = app.test_client().get("/card-cleanup").get_data(as_text=True)
-    assert f"CARD_CLEANUP_AUDIT_REASON = '{matched}'" in body
+    assert f"CARD_CLEANUP_VERIFY_REASON = '{matched}'" in body
+    assert "/api/card-cleanup/verify" in body
+    assert "/api/jobs/verify-hashes" not in body
 
 
 def test_hash_failed_callout_reason_stays_in_sync(app_and_db):
@@ -481,35 +521,20 @@ def test_hash_failed_callout_states_audit_workspace_scope(app_and_db):
     assert "switch to that workspace to find it there" in body
 
 
-def test_finish_audit_disables_delete_until_rescan(app_and_db):
-    """Codex P2 review (commit 1213fec): finishing or cancelling the
-    verify-hashes run must invalidate the preview's Delete affordance,
-    because verification can flip previously-ok rows to modified/corrupt/
-    unreadable — the confirmation dialog would then advertise stale file
-    and byte totals against a subset the user never agreed to. The audit
-    handler must both disable the Delete button and swap in a hint that
-    tells the user to re-scan (the button surfaced next to the audit
-    status). Pin the literal here so the guardrail can't be silently
-    reworded away."""
+def test_finish_scoped_verification_refreshes_preview_without_rescan(
+        app_and_db):
+    """Scoped verification only promotes pending rows, so it can atomically
+    refresh the existing manifest instead of forcing another card scan."""
     app, _ = app_and_db
     body = app.test_client().get("/card-cleanup").get_data(as_text=True)
-    finish = body.index("function cardCleanupFinishAudit(")
-    # Snap out a window around the handler body. The next function in the
-    # file is cardCleanupBindBucket; slice up to whichever declaration
-    # follows so this test does not accidentally match code elsewhere.
+    finish = body.index("async function cardCleanupFinishVerification(")
     end = body.index("function cardCleanupBindBucket(", finish)
     section = body[finish:end]
-    # The Delete button is disabled inside the handler, not just via the
-    # separate cardCleanupSetBusy(false) that ran first (which restores
-    # the pre-verify enabled state).
-    assert "deleteBtn.disabled = true" in section
-    # The user-facing hint that replaces whatever cardCleanupSetBusy
-    # restored — pinned verbatim so a reword can't drop the "re-scan
-    # first" instruction the Codex P2 asked for.
-    assert (
-        "Verification may have changed which files count as verified — "
-        "re-scan the card before deleting."
-    ) in section
+    assert "await cardCleanupLoadManifest()" in section
+    assert section.index("await cardCleanupLoadManifest()") < section.index(
+        "cardCleanupSetBusy(false")
+    assert "keepDeleteState: refreshed" in section
+    assert "re-scan the card before deleting" not in section
 
 
 def test_confirm_delete_locks_page_before_post(app_and_db):
@@ -579,24 +604,13 @@ def test_confirm_delete_locks_page_before_post(app_and_db):
     )
 
 
-def test_start_audit_keeps_page_locked_on_ambiguous_start(app_and_db):
-    """Codex P1 review (commit 5afcb0ba): cardCleanupStartAudit must not
-    release the page-wide busy lock on outcomes that don't prove whether the
-    server queued the verify-hashes job.
-
-    If the audit is silently running while Scan/Verify/Delete come back live,
-    a subsequent delete can race it. delete_verified() trusts the currently
-    committed hash_status plus archive size/mtime rather than re-hashing
-    archive bytes, so a row the audit is about to flip from `ok` to
-    modified/corrupt/unreadable could still qualify for deletion — removing
-    the good card copy of a file whose archive copy is silently rotting. Same
-    guarantee the delete-start path pins in test_confirm_delete_locks_page_
-    before_post; pinning both invariants here so a refactor can't quietly
-    re-open the gap."""
+def test_start_verification_keeps_page_locked_on_ambiguous_start(app_and_db):
+    """An ambiguous POST outcome must not unlock deletion while the scoped
+    verification job may be refreshing the manifest."""
     app, _ = app_and_db
     body = app.test_client().get("/card-cleanup").get_data(as_text=True)
-    start = body.index("async function cardCleanupStartAudit(")
-    end = body.index("function cardCleanupFinishAudit(", start)
+    start = body.index("async function cardCleanupStartVerification(")
+    end = body.index("async function cardCleanupFinishVerification(", start)
     section = body[start:end]
     # An HTTP response that proves nothing was queued (!resp.ok) must
     # release the lock so the user isn't stranded with a dead page.
@@ -607,31 +621,23 @@ def test_start_audit_keeps_page_locked_on_ambiguous_start(app_and_db):
     ok_branch = section[ok_branch_start:ok_branch_end]
     assert "cardCleanupSetBusy(false)" in ok_branch, (
         "the !resp.ok branch must call cardCleanupSetBusy(false) — the "
-        "server said the verify-hashes job was not queued, so the page can "
+        "server said the verification job was not queued, so the page can "
         "safely hand the buttons back"
     )
-    # The network-error catch on the fetch itself must NOT unlock — the
-    # POST may have reached the server and started api_job_verify_hashes()
-    # before the connection dropped, and the delete path trusts hash_status
-    # in the DB rather than re-hashing archive bytes, so a concurrent delete
-    # could remove the good card copy of a file the audit is silently
-    # detecting as corrupt.
     fetch_catch_start = section.index("resp = await fetch(")
     fetch_catch_start = section.index("} catch (e) {", fetch_catch_start)
     fetch_catch_end = section.index("if (!resp.ok)", fetch_catch_start)
     fetch_catch_body = section[fetch_catch_start:fetch_catch_end]
     assert "cardCleanupSetBusy(false)" not in fetch_catch_body, (
-        "the fetch-rejection catch on cardCleanupStartAudit must NOT release "
-        "the page lock — the POST may have reached the server and queued the "
-        "verify-hashes job before the connection dropped, and unlocking "
-        "would let a concurrent delete race the audit"
+        "the fetch-rejection catch must not unlock a possibly running "
+        "verification job"
     )
     assert "Jobs page" in fetch_catch_body, (
         "the fetch-rejection catch must direct the user to the Jobs page so "
-        "they can find out whether the server queued the verify-hashes job"
+        "they can find out whether verification was queued"
     )
     # The JSON-parse catch on the OK response is the second ambiguous
-    # outcome: a 2xx status means api_job_verify_hashes() returned, but if
+    # outcome: a 2xx status means the endpoint returned, but if
     # the body couldn't be decoded we can't be sure the job wasn't queued.
     # Same reasoning — keep the lock, route to Jobs.
     json_catch_start = section.index("data = await resp.json()")
@@ -640,8 +646,7 @@ def test_start_audit_keeps_page_locked_on_ambiguous_start(app_and_db):
     json_catch_body = section[json_catch_start:json_catch_end]
     assert "cardCleanupSetBusy(false)" not in json_catch_body, (
         "the JSON-parse catch on a 2xx response must NOT release the page "
-        "lock — the server returned OK, so api_job_verify_hashes() may have "
-        "queued the audit even though we can't read the response body"
+        "lock — the server returned OK, so verification may be running"
     )
     assert "Jobs page" in json_catch_body, (
         "the JSON-parse catch on a 2xx response must direct the user to the "

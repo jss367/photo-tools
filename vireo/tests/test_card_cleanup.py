@@ -348,7 +348,7 @@ def test_scan_uncataloged_file_kept(db, tmp_path):
     assert len(kept) == 1 and "not in catalog" in kept[0]["reason"]
 
 
-def test_scan_null_hash_status_kept_with_audit_remedy(db, tmp_path):
+def test_scan_null_hash_status_kept_with_scoped_verify_remedy(db, tmp_path):
     # Scan-cataloged archives: file_hash set, hash_status NULL. Kept —
     # and the reason must point at the remedy, or the tool reads broken.
     _archive_photo(db, tmp_path, hash_status=None)
@@ -356,7 +356,7 @@ def test_scan_null_hash_status_kept_with_audit_remedy(db, tmp_path):
     result = _scan(db, tmp_path)
     kept = _entries(result, "kept")
     assert len(kept) == 1
-    assert "integrity audit" in kept[0]["reason"]
+    assert kept[0]["reason"] == card_cleanup.KEEP_NOT_VERIFIED
 
 
 def test_scan_failed_hash_status_kept_but_not_audit_remedy(db, tmp_path):
@@ -391,7 +391,7 @@ def test_scan_specific_failed_hash_statuses_all_kept_with_failed_reason(
     assert kept[0]["reason"] == card_cleanup.KEEP_ARCHIVE_HASH_FAILED
 
 
-def test_scan_mixed_null_and_failed_prefers_audit_remedy(db, tmp_path):
+def test_scan_mixed_null_and_failed_prefers_verify_remedy(db, tmp_path):
     # Two archive rows share a card file's hash — one never checked, one
     # already flagged. The NULL row is remediable by a verify run (its
     # verdict could turn "ok"), so the reason must stay on the audit
@@ -405,7 +405,89 @@ def test_scan_mixed_null_and_failed_prefers_audit_remedy(db, tmp_path):
     result = _scan(db, tmp_path)
     kept = _entries(result, "kept")
     assert len(kept) == 1
-    assert "integrity audit" in kept[0]["reason"]
+    assert kept[0]["reason"] == card_cleanup.KEEP_NOT_VERIFIED
+
+
+def test_scoped_verify_reads_only_matching_archive_and_refreshes_manifest(
+        db, tmp_path, monkeypatch):
+    archive_file, pid = _archive_photo(db, tmp_path, hash_status=None)
+    unrelated, unrelated_pid = _archive_photo(
+        db, tmp_path, name="OTHER.NEF", content=b"other",
+        hash_status=None, folder="archive/other")
+    _card_file(tmp_path)
+    scan = _scan(db, tmp_path)
+    assert scan["totals"]["deletable"]["count"] == 0
+
+    manifest_dir = str(tmp_path / "manifests")
+    manifest = load_manifest(manifest_dir, "scan-1")
+    calls = []
+    real_hash = card_cleanup.compute_file_hash
+
+    def counting_hash(path, *args, **kwargs):
+        calls.append(str(path))
+        return real_hash(path, *args, **kwargs)
+
+    monkeypatch.setattr(card_cleanup, "compute_file_hash", counting_hash)
+    result = card_cleanup.verify_manifest_archives(
+        db, manifest, manifest_dir)
+
+    assert calls == [str(archive_file)]
+    assert str(unrelated) not in calls
+    assert result["archive_files_read"] == 1
+    assert result["unblocked_files"] == 1
+    refreshed = load_manifest(manifest_dir, "scan-1")
+    assert refreshed["totals"]["deletable"]["count"] == 1
+    assert _entries(refreshed, "deletable")[0]["archive_path"] == str(
+        archive_file)
+    statuses = {
+        row["id"]: row["hash_status"]
+        for row in db.conn.execute(
+            "SELECT id, hash_status FROM photos WHERE id IN (?, ?)",
+            (pid, unrelated_pid),
+        )
+    }
+    assert statuses == {pid: "ok", unrelated_pid: None}
+
+
+def test_scoped_verify_hashes_duplicate_card_content_once(db, tmp_path):
+    _archive_photo(db, tmp_path, hash_status=None)
+    _card_file(tmp_path, name="IMG_0001.NEF")
+    _card_file(tmp_path, name="IMG_0002.NEF")
+    _scan(db, tmp_path)
+    manifest_dir = str(tmp_path / "manifests")
+    result = card_cleanup.verify_manifest_archives(
+        db, load_manifest(manifest_dir, "scan-1"), manifest_dir)
+    assert result["hashes_total"] == 1
+    assert result["archive_files_read"] == 1
+    assert result["unblocked_files"] == 2
+    refreshed = load_manifest(manifest_dir, "scan-1")
+    assert refreshed["totals"]["deletable"]["count"] == 2
+
+
+def test_scoped_verify_mismatch_stays_kept_and_records_failed_verdict(
+        db, tmp_path):
+    archive_file, pid = _archive_photo(db, tmp_path, hash_status=None)
+    _card_file(tmp_path)
+    _scan(db, tmp_path)
+    original_mtime = os.stat(archive_file).st_mtime_ns
+    archive_file.write_bytes(b"NEW-ONE")  # same size as b"raw-one"
+    os.utime(archive_file, ns=(original_mtime, original_mtime))
+
+    manifest_dir = str(tmp_path / "manifests")
+    result = card_cleanup.verify_manifest_archives(
+        db, load_manifest(manifest_dir, "scan-1"), manifest_dir)
+
+    assert result["verified"] == 0
+    assert result["corrupt"] == 1
+    assert result["unblocked_files"] == 0
+    refreshed = load_manifest(manifest_dir, "scan-1")
+    assert refreshed["totals"]["deletable"]["count"] == 0
+    assert _entries(refreshed, "kept")[0]["reason"] == (
+        card_cleanup.KEEP_ARCHIVE_HASH_FAILED)
+    status = db.conn.execute(
+        "SELECT hash_status FROM photos WHERE id = ?", (pid,)
+    ).fetchone()["hash_status"]
+    assert status == "corrupt"
 
 
 def test_scan_archive_file_missing_kept(db, tmp_path):
@@ -828,14 +910,9 @@ def test_delete_skips_file_replaced_during_archive_gate(db, tmp_path):
 
 
 def test_delete_skips_inplace_rewrite_during_archive_gate(db, tmp_path):
-    # Final-rehash gate (Codex P1 follow-up): the initial delete-time hash
-    # runs BEFORE the potentially slow archive gate. If the file is
-    # rewritten in place during the archive gate — same inode (open/write
-    # preserves it), same size, mtime forced back to the manifest value
-    # (FAT is 2s-granular; a camera reusing a filename in that window is
-    # the realistic case) — every metadata gate passes but the bytes at
-    # unlink time are not the ones we authorized. Only a rehash right
-    # before os.remove can catch this.
+    # The card hash runs after archive gate 1. If the file is rewritten in
+    # place during that potentially slow gate — same inode, size, and mtime
+    # — the single content read still catches it.
     _archive_photo(db, tmp_path)
     card = _card_file(tmp_path)  # content b"raw-one", 7 bytes
     scan = _scan(db, tmp_path)
@@ -859,8 +936,8 @@ def test_delete_skips_inplace_rewrite_during_archive_gate(db, tmp_path):
     with unittest.mock.patch.object(
             card_cleanup, "fetch_rows_by_hash", fetch_then_inplace_rewrite):
         summary = card_cleanup.delete_verified(db, manifest)
-    # Inode preserved: metadata gates would have passed. Only the final
-    # rehash can catch the swap — assert both the outcome and the reason.
+    # Inode preserved: metadata gates would have passed. The content hash
+    # catches the swap — assert both the outcome and the reason.
     assert os.stat(card).st_ino == original_ino
     assert summary["deleted"] == 0
     assert len(summary["skipped"]) == 1
@@ -1026,8 +1103,8 @@ def test_delete_skips_when_card_path_becomes_fifo_post_scan(
     assert stat.S_ISFIFO(os.lstat(card).st_mode)
 
 
-def test_delete_skips_when_archive_dies_during_final_hash(db, tmp_path):
-    # Codex P1: gate 1 authorizes, then the final card re-hash reads the
+def test_delete_skips_when_archive_dies_during_card_hash(db, tmp_path):
+    # Gate 1 authorizes, then the single card hash reads the
     # whole file (seconds on real photos). If the archive vanishes during
     # that hash, gate 1's authorization is stale. A second archive gate
     # immediately before os.remove must catch the death — otherwise the
@@ -1040,19 +1117,15 @@ def test_delete_skips_when_archive_dies_during_final_hash(db, tmp_path):
     real_hash = card_cleanup.compute_file_hash
     hash_calls = []
 
-    def hash_kill_archive_before_final(path, *a, **kw):
-        # Two hash calls per candidate in delete_verified: initial (fast
-        # reject) and final (right before unlink). Simulate the archive
-        # dying during the final call by unlinking it just before this
-        # invocation returns.
+    def hash_kill_archive(path, *a, **kw):
         hash_calls.append(str(path))
         result = real_hash(path, *a, **kw)
-        if len(hash_calls) == 2:
+        if len(hash_calls) == 1:
             os.unlink(archive_file)
         return result
 
     with unittest.mock.patch.object(
-            card_cleanup, "compute_file_hash", hash_kill_archive_before_final):
+            card_cleanup, "compute_file_hash", hash_kill_archive):
         summary = card_cleanup.delete_verified(db, manifest)
     assert summary["deleted"] == 0
     assert card.exists()
@@ -1060,7 +1133,7 @@ def test_delete_skips_when_archive_dies_during_final_hash(db, tmp_path):
     assert "archive" in summary["skipped"][0]["reason"]
 
 
-def test_delete_skips_when_parent_redirected_during_final_hash(db, tmp_path):
+def test_delete_skips_when_parent_redirected_during_card_hash(db, tmp_path):
     # Codex P1: after both archive gate 1 and gate 2 authorize, if the
     # parent directory is swapped for a symlink to a byte-identical
     # external copy during the final hash, every content gate still
@@ -1085,11 +1158,9 @@ def test_delete_skips_when_parent_redirected_during_final_hash(db, tmp_path):
     def hash_then_swap_parent(path, *a, **kw):
         hash_calls.append(str(path))
         result = real_hash(path, *a, **kw)
-        if len(hash_calls) == 2:
-            # Second hash call is the FINAL rehash. Swap the parent
-            # directory for a symlink to `outside` after the read has
-            # already committed to card bytes but before containment
-            # is re-verified.
+        if len(hash_calls) == 1:
+            # Swap the parent for a symlink after the single card read has
+            # committed to bytes but before containment is re-verified.
             dcim = tmp_path / "card" / "DCIM"
             shutil.rmtree(dcim)
             try:
@@ -1106,6 +1177,24 @@ def test_delete_skips_when_parent_redirected_during_final_hash(db, tmp_path):
     assert "no longer resolves inside" in summary["skipped"][0]["reason"]
     # The decoy — the only file behind the redirected path — must survive.
     assert decoy.exists() and decoy.read_bytes() == b"raw-one"
+
+
+def test_delete_hashes_each_card_file_once(db, tmp_path, monkeypatch):
+    _archive_photo(db, tmp_path)
+    card = _card_file(tmp_path)
+    _scan(db, tmp_path)
+    manifest = load_manifest(str(tmp_path / "manifests"), "scan-1")
+    calls = []
+    real_hash = card_cleanup.compute_file_hash
+
+    def counting_hash(path, *args, **kwargs):
+        calls.append(str(path))
+        return real_hash(path, *args, **kwargs)
+
+    monkeypatch.setattr(card_cleanup, "compute_file_hash", counting_hash)
+    summary = card_cleanup.delete_verified(db, manifest)
+    assert summary["deleted"] == 1
+    assert calls == [str(card)]
 
 
 def test_qualify_binds_containment_to_statted_object(db, tmp_path, monkeypatch):

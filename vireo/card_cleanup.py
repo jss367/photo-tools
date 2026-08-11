@@ -577,10 +577,29 @@ def verify_manifest_archives(db, manifest, manifest_dir, progress_cb=None,
             finally:
                 os.close(archive_fd)
 
+            # Codex P1: the pinned fd's fstat describes the object we
+            # actually hashed, but an atomic replace under the same
+            # name during compute_fd_hash would leave that fd pointing
+            # at the old (now-unlinked) inode. before/after fstat then
+            # still match, and after_real == archive_real, but the
+            # pathname now resolves to a fresh object. A replacement
+            # that preserves size+mtime could then pass qualify_rows
+            # later and let the card copy be deleted against an
+            # archive whose bytes we never read. Re-stat the pathname
+            # and require its dev/inode still match the fd's — a
+            # mismatch means the successor is a different file.
+            try:
+                after_path_st = os.stat(archive_path)
+            except (OSError, ValueError):
+                after_path_st = None
+
             # Do not certify a pathname that moved or changed while it was
             # being read.  A later retry can verify the stable object.
             if (after_real != archive_real
                     or contains_check(after_real)
+                    or after_path_st is None
+                    or (after_path_st.st_dev, after_path_st.st_ino)
+                    != (after.st_dev, after.st_ino)
                     or (before.st_dev, before.st_ino, before.st_size,
                         before.st_mtime_ns)
                     != (after.st_dev, after.st_ino, after.st_size,

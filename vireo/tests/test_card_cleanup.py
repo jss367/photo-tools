@@ -538,6 +538,64 @@ def test_scoped_verify_unreachable_archive_keeps_row_unchecked(
     assert kept[0]["reason"] == card_cleanup.KEEP_ARCHIVE_UNREACHABLE
 
 
+def test_scoped_verify_rejects_atomic_replace_during_hash(
+        db, tmp_path, monkeypatch):
+    # Codex P1: while compute_fd_hash reads the pinned archive fd, a
+    # sync/backup tool can atomically replace archive_path with a
+    # different file under the same name. The fd's fstat still describes
+    # the old (now unlinked) inode, so before/after fstat match — but the
+    # bytes we then trust as authoritative for the archive no longer live
+    # at that name. Certifying the row would let qualify_rows accept the
+    # replacement later (same size+mtime is enough) and delete the card
+    # copy against an archive we never actually saw. Row must stay
+    # unchecked so a targeted re-verify can settle it once the file is
+    # stable.
+    archive_file, pid = _archive_photo(db, tmp_path, hash_status=None)
+    _card_file(tmp_path)
+    _scan(db, tmp_path)
+
+    archive_str = str(archive_file)
+    real_hash = card_cleanup.compute_fd_hash
+    swapped = {"done": False}
+
+    def swap_then_hash(fd, *a, **kw):
+        result = real_hash(fd, *a, **kw)
+        if not swapped["done"] and os.fstat(fd).st_ino == os.stat(
+                archive_str).st_ino:
+            replacement = tmp_path / "replacement.NEF"
+            # Same size + mtime as the original — a naïve later
+            # qualify_rows stat would otherwise accept it.
+            replacement.write_bytes(b"raw-one")
+            original_st = os.stat(archive_str)
+            os.utime(
+                replacement,
+                ns=(original_st.st_atime_ns, original_st.st_mtime_ns),
+            )
+            os.replace(str(replacement), archive_str)
+            swapped["done"] = True
+        return result
+
+    monkeypatch.setattr(card_cleanup, "compute_fd_hash", swap_then_hash)
+
+    manifest_dir = str(tmp_path / "manifests")
+    result = card_cleanup.verify_manifest_archives(
+        db, load_manifest(manifest_dir, "scan-1"), manifest_dir)
+
+    assert swapped["done"]
+    assert result["verified"] == 0
+    assert result["unblocked_files"] == 0
+    status = db.conn.execute(
+        "SELECT hash_status FROM photos WHERE id = ?", (pid,)
+    ).fetchone()["hash_status"]
+    assert status is None
+    refreshed = load_manifest(manifest_dir, "scan-1")
+    assert refreshed["totals"]["deletable"]["count"] == 0
+    assert (
+        _entries(refreshed, "kept")[0]["reason"]
+        == card_cleanup.KEEP_ARCHIVE_CHANGED
+    )
+
+
 def test_scan_archive_file_missing_kept(db, tmp_path):
     archive_file, _ = _archive_photo(db, tmp_path)
     _card_file(tmp_path)

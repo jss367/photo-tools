@@ -868,6 +868,84 @@ def test_confirm_delete_defaults_manifest_revision_for_pre_upgrade_manifests(
     )
 
 
+def test_confirm_delete_awaits_manifest_reload_on_revision_mismatch(
+        app_and_db):
+    """Codex P1 review: cardCleanupConfirmDelete must keep the page locked
+    until the post-mismatch manifest reload finishes.
+
+    When /api/card-cleanup/delete returns 409 manifest_revision_mismatch
+    the on-disk manifest has already moved past the revision the user
+    just confirmed against — a concurrent verify (from another tab or
+    another client) promoted new files. The page must reload the fresh
+    manifest so the preview and Delete button describe what would
+    actually be deleted next.
+
+    The prior flow ran cardCleanupSetBusy(false) first (re-enabling
+    Delete against the pre-mismatch cardCleanupState.manifest), then
+    kicked cardCleanupLoadManifest() off as fire-and-forget. In the
+    gap before the reload landed a user could reopen the confirm
+    dialog with the old totals; once the reload swapped the manifest,
+    confirming would send the new revision and the server would accept
+    deletion of the newly promoted files that never appeared in the
+    dialog.
+
+    Pin the closed gap: the mismatch branch must await
+    cardCleanupLoadManifest, keep the busy state during the await,
+    unlock with keepDeleteState so the freshly rendered Delete state
+    survives, and explicitly disable Delete on reload failure so a
+    stale preview cannot authorize a deletion.
+    """
+    app, _ = app_and_db
+    body = app.test_client().get("/card-cleanup").get_data(as_text=True)
+    start = body.index("async function cardCleanupConfirmDelete(")
+    end = body.index("function cardCleanupRenderDeleteResult(", start)
+    section = body[start:end]
+    # Locate the mismatch branch.
+    branch_start = section.index("manifest_revision_mismatch")
+    branch_end = section.index("} else {", branch_start)
+    branch = section[branch_start:branch_end]
+    # The reload must be awaited, not fire-and-forget.
+    assert "await cardCleanupLoadManifest()" in branch, (
+        "the manifest_revision_mismatch branch must await "
+        "cardCleanupLoadManifest — a fire-and-forget reload lets the "
+        "user reopen the confirm dialog against the pre-mismatch "
+        "manifest in the gap before the response lands, and the "
+        "next confirmation sends the new revision the server will "
+        "accept for the newly promoted set"
+    )
+    # The unlock must run AFTER the await and must use keepDeleteState
+    # so the freshly rendered Delete state is not overwritten by
+    # busyRestore.
+    reload_idx = branch.index("await cardCleanupLoadManifest()")
+    unlock_idx = branch.index("cardCleanupSetBusy(false", reload_idx)
+    assert unlock_idx > reload_idx, (
+        "cardCleanupSetBusy(false, …) must run after awaiting the "
+        "reload — otherwise the page unlocks before the fresh manifest "
+        "has replaced the pre-mismatch state and the race the P1 fix "
+        "closes reopens"
+    )
+    assert "keepDeleteState: true" in branch[unlock_idx:], (
+        "the post-reload cardCleanupSetBusy(false, …) must pass "
+        "keepDeleteState so busyRestore does not overwrite the "
+        "Delete-button state that cardCleanupRenderManifest just set "
+        "from the fresh totals"
+    )
+    # The failure path must explicitly disable Delete — busyRestore
+    # was skipped and the render never ran, so Delete would still
+    # carry setBusy(true)'s disabled=true; pinning the explicit disable
+    # here so a future refactor cannot leave it dangling.
+    assert "deleteBtn.disabled = true" in branch, (
+        "the reload-failure branch must explicitly disable the Delete "
+        "button — a stale preview must not be able to authorize a "
+        "deletion when the fresh manifest could not be loaded"
+    )
+    # And it must tell the user why Delete is off and how to recover.
+    assert "Reload the page or scan again before deleting" in branch, (
+        "the reload-failure hint must direct the user to reload or "
+        "scan again before deletion is possible"
+    )
+
+
 def test_start_verification_keeps_page_locked_on_ambiguous_start(app_and_db):
     """An ambiguous POST outcome must not unlock deletion while the scoped
     verification job may be refreshing the manifest."""

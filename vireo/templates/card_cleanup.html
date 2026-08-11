@@ -959,11 +959,10 @@ async function cardCleanupConfirmDelete() {
     const data = await resp.json();
     cardCleanupCloseConfirm();
     if (!resp.ok) {
-      // Nothing was queued — hand the buttons back before showing the error.
-      cardCleanupSetBusy(false);
       if (resp.status === 404) {
         // The manifest is gone, so the preview above no longer describes
         // anything that can be deleted — take it down with the error.
+        cardCleanupSetBusy(false);
         cardCleanupState.scanJobId = null;
         cardCleanupResetPreview();
         cardCleanupSetError('Preview expired — re-scan the card.', { rescan: true });
@@ -974,8 +973,34 @@ async function cardCleanupConfirmDelete() {
         cardCleanupSetError(data.error ||
           'The preview changed since you confirmed it — review the ' +
           'updated totals before deleting.');
-        cardCleanupLoadManifest();
+        // Codex P1 review: await the reload before releasing the busy
+        // state. The previous flow called cardCleanupSetBusy(false)
+        // first and then kicked cardCleanupLoadManifest() off as
+        // fire-and-forget, so Scan/Verify/Delete were re-enabled in
+        // the gap before the response landed. A user who reopened
+        // the confirm dialog during that gap saw the pre-mismatch
+        // totals; once the reload swapped cardCleanupState.manifest
+        // for the fresh one, confirming would send the new revision
+        // and the server would accept deletion of the newly promoted
+        // set that never appeared in the dialog. Awaiting the reload
+        // with the page still locked closes the window. On success,
+        // cardCleanupRenderManifest has already set Delete's disabled
+        // state and hint from the fresh totals, so keepDeleteState
+        // preserves them across the unlock. On failure the render
+        // never ran, so explicitly disable Delete and clear the
+        // stale "Deletion is starting…" hint — a stale preview must
+        // not be able to authorize a deletion.
+        const reloaded = await cardCleanupLoadManifest();
+        cardCleanupSetBusy(false, { keepDeleteState: true });
+        if (!reloaded) {
+          const deleteBtn = document.getElementById('card-cleanup-delete-btn');
+          deleteBtn.disabled = true;
+          document.getElementById('card-cleanup-delete-hint').textContent =
+            'Reload the page or scan again before deleting — the ' +
+            'preview could not be refreshed after the revision changed.';
+        }
       } else {
+        cardCleanupSetBusy(false);
         cardCleanupSetError(data.error || 'deletion failed to start');
       }
       return;

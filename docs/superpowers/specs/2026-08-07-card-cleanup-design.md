@@ -366,8 +366,8 @@ they exist only for the preview.
   `manifest_revision_mismatch` when the on-disk manifest carries a
   different revision than the client confirmed (a verify run has since
   refreshed the preview); the UI reloads and asks the user to
-  re-confirm. Otherwise 409 if a delete for that manifest is already
-  running; 400 for an unfinished/cancelled scan or a manifest that
+  re-confirm. Otherwise 409 if verification or deletion for that manifest
+  is already running; 400 for an unfinished/cancelled scan or a manifest that
   fails load-time validation (corrupt, wrong schema, entries outside
   the source root); 404 for an unknown scan job, a pruned manifest
   file, or a manifest older than 7

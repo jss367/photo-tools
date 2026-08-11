@@ -515,22 +515,16 @@ def verify_manifest_archives(db, manifest, manifest_dir, progress_cb=None,
     # the corresponding SKIP_* reason instead; only a confirmed-
     # absent path (FileNotFoundError above) leaves the manifest.
     #
-    # Codex P2 (follow-up 3): pending KEEP_NOT_VERIFIED entries were
-    # never revalidated here, so a pending card file removed after
-    # the scan stayed in the refreshed manifest with its original
-    # byte count credited to the kept bucket — the preview then
-    # claimed a nonexistent file would remain on the card. Handle
-    # confirmed-absent card paths the same way for pending entries;
-    # transient OSErrors still preserve the entry so a mount blip
-    # cannot shrink the preview, and still-present pending entries
-    # keep flowing through the promotion loop below (which applies
-    # the delete-time gates via _card_gate_promotion_block).
+    # Pending entries with a removed card file are handled in the
+    # promotion loop below via _card_gate_promotion_block's
+    # SKIP_ALREADY_GONE path, which lets scoped verify still hash
+    # the archive and refresh the catalog row before dropping the
+    # entry from the manifest. Keeping that dispatch in one place
+    # (rather than short-circuiting here) preserves the DB-refresh
+    # side effect other card scans keyed off the same hash rely on.
     surviving = []
     for entry in manifest["entries"]:
-        bucket = entry.get("bucket")
-        is_pending = (bucket == "kept"
-                      and entry.get("reason") == KEEP_NOT_VERIFIED)
-        if bucket != "deletable" and not is_pending:
+        if entry.get("bucket") != "deletable":
             surviving.append(entry)
             continue
         path = entry.get("path")
@@ -542,13 +536,6 @@ def verify_manifest_archives(db, manifest, manifest_dir, progress_cb=None,
         except FileNotFoundError:
             continue
         except OSError:
-            surviving.append(entry)
-            continue
-        if bucket != "deletable":
-            # Pending entry is still present. Leave changed/type-
-            # mismatch reclassification to the promotion loop's
-            # _card_gate_promotion_block so the gate decision stays
-            # in one place.
             surviving.append(entry)
             continue
         if stat_mod.S_ISLNK(st.st_mode):

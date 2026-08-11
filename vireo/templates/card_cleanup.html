@@ -616,7 +616,7 @@ function cardCleanupVerificationPendingCount(manifest) {
   // CodeRabbit: match verify_manifest_archives' filter — it groups
   // pending work by entry.hash and silently drops hashless entries, so
   // counting them here made the callout advertise a pending count
-  // while `reads only the matching archive 0 copies` sat below it.
+  // while the cost message below said zero archives would be read.
   return (manifest.entries || []).filter(entry =>
     entry.bucket === 'kept'
     && entry.reason === CARD_CLEANUP_VERIFY_REASON
@@ -640,11 +640,23 @@ function cardCleanupRenderVerificationCallout(manifest) {
     (pending === 1 ? ' is' : ' are') +
     ' kept only because the matching archive copy has never been ' +
     'checksum-verified.';
+  // Codex P2 (r3761960414): the cost message used to promise "reads N
+  // matching copies" where N = number of unique pending hashes. But
+  // verify_manifest_archives iterates every unchecked archive row for a
+  // hash until one hashes cleanly, so a hash with several corrupt or
+  // stale candidates can drive multiple full-file reads even though the
+  // unique-hash count is one. Say "at least one per pending hash" and
+  // name the retry condition explicitly, so the wording matches what
+  // the verify job may actually do.
   document.getElementById('card-cleanup-verify-cost').textContent =
-    'This reads only the matching archive ' +
-    (uniqueHashes === 1 ? 'copy' : uniqueHashes.toLocaleString() + ' copies') +
-    ' needed by this card. Unrelated archive files are not touched, and ' +
-    'duplicate files on the card share one check.';
+    'This reads matching archive files this card needs — at least one ' +
+    'per ' +
+    (uniqueHashes === 1
+      ? 'pending hash'
+      : uniqueHashes.toLocaleString() + ' pending hashes') +
+    ', with additional reads if a candidate turns out to be corrupt or ' +
+    'stale. Unrelated archive files are not touched, and duplicate ' +
+    'files on the card share one check.';
   document.getElementById('card-cleanup-verify-btn').disabled = false;
   callout.style.display = '';
 }

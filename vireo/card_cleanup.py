@@ -473,6 +473,13 @@ def verify_manifest_archives(db, manifest, manifest_dir, progress_cb=None,
     # Content-changed-but-metadata-matching is still caught by
     # delete_verified's own hash pass — expensive re-hashing here
     # would defeat the point of scoped verification.
+    #
+    # Codex P2 (follow-up 2): dropping a changed-but-still-present
+    # card entry hid a file that still exists on the card, so the
+    # kept-list and totals undercounted what would remain after
+    # deletion. Reclassify those entries into the kept bucket with
+    # the corresponding SKIP_* reason instead; only a confirmed-
+    # absent path (FileNotFoundError above) leaves the manifest.
     surviving = []
     for entry in manifest["entries"]:
         if entry.get("bucket") != "deletable":
@@ -489,11 +496,19 @@ def verify_manifest_archives(db, manifest, manifest_dir, progress_cb=None,
         except OSError:
             surviving.append(entry)
             continue
-        if (stat_mod.S_ISLNK(st.st_mode)
-                or not stat_mod.S_ISREG(st.st_mode)
-                or st.st_size != entry.get("size")
+        if stat_mod.S_ISLNK(st.st_mode):
+            reclassify_reason = SKIP_SYMLINK
+        elif not stat_mod.S_ISREG(st.st_mode):
+            reclassify_reason = SKIP_NOT_REGULAR
+        elif (st.st_size != entry.get("size")
                 or st.st_mtime_ns != entry.get("mtime_ns")):
+            reclassify_reason = SKIP_CHANGED
+        else:
+            surviving.append(entry)
             continue
+        entry["bucket"] = "kept"
+        entry["reason"] = reclassify_reason
+        entry.pop("archive_path", None)
         surviving.append(entry)
     manifest["entries"] = surviving
 

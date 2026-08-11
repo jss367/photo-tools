@@ -731,7 +731,7 @@ def test_scoped_verify_keeps_deletable_entry_when_lstat_error_is_transient(
     assert [e["path"] for e in _entries(refreshed, "deletable")] == [card_str]
 
 
-def test_scoped_verify_drops_deletable_entry_when_card_file_type_changed(
+def test_scoped_verify_reclassifies_changed_deletable_entry_as_kept(
         db, tmp_path):
     # Codex P2: a prior delete_verified run skipped the file because its
     # type (or size, or mtime) no longer matched the scanned baseline —
@@ -740,6 +740,12 @@ def test_scoped_verify_drops_deletable_entry_when_card_file_type_changed(
     # the entry, inflating the refreshed deletable totals with bytes the
     # delete gates will refuse. Mirror the delete-time gates here so
     # scoped verify's revised preview matches what delete would accept.
+    #
+    # Codex P2 (follow-up 2): the file is still on the card, so dropping
+    # the entry entirely undercounted the kept list and the totals hid a
+    # file that will remain after deletion. Reclassify into the kept
+    # bucket with SKIP_CHANGED instead; only confirmed-absent paths
+    # should leave the manifest.
     archive_file, _ = _archive_photo(
         db, tmp_path, name="IMG_0001.NEF", content=b"raw-one",
         hash_status="ok")
@@ -768,6 +774,16 @@ def test_scoped_verify_drops_deletable_entry_when_card_file_type_changed(
         str(tmp_path / "card" / "DCIM" / "IMG_0002.NEF")]
     assert refreshed["totals"]["deletable"]["count"] == 1
     assert refreshed["totals"]["deletable"]["bytes"] == len(b"raw-two")
+    # Changed card file is now kept (reclassified, not dropped).
+    # IMG_0002.NEF, originally kept with KEEP_NOT_VERIFIED, is
+    # promoted to deletable by the verify pass, so IMG_0001.NEF is the
+    # sole kept entry after verify.
+    kept = _entries(refreshed, "kept")
+    assert [e["path"] for e in kept] == [str(swapped_card)]
+    assert kept[0]["reason"] == card_cleanup.SKIP_CHANGED
+    assert "archive_path" not in kept[0]
+    assert refreshed["totals"]["kept"]["count"] == 1
+    assert refreshed["totals"]["kept"]["bytes"] == len(b"raw-one")
 
 
 def test_scoped_verify_terminal_alias_promotes_to_inside_source(

@@ -9278,6 +9278,26 @@ def test_staged_mask_syncs_bytes_and_name_before_database_commit(
     staged.restore()
 
 
+def test_mask_file_fsync_opens_writable_for_windows(tmp_path, monkeypatch):
+    """CRT _commit requires a writable descriptor on Windows."""
+    import pipeline_job as pj
+
+    mask_path = tmp_path / "mask.png"
+    mask_path.write_bytes(b"mask")
+    opened_modes = []
+    real_open = open
+
+    def tracked_open(path, mode):
+        opened_modes.append(mode)
+        return real_open(path, mode)
+
+    monkeypatch.setattr(pj, "open", tracked_open, raising=False)
+
+    pj._fsync_mask_file(str(mask_path))
+
+    assert opened_modes == ["rb+"]
+
+
 def test_staged_mask_removes_previous_file_only_after_commit(tmp_path):
     """The old committed path stays valid until finish follows DB commit."""
     import pipeline_job as pj

@@ -78,7 +78,9 @@ def _rollback_failed_mask_photo(thread_db, photo_id):
 
 def _fsync_mask_file(path):
     """Make a completed staged PNG durable before publishing its name."""
-    with open(path, "rb") as handle:
+    # Windows' CRT _commit backend rejects a read-only descriptor with EBADF.
+    # Request write access even though the bytes are already complete.
+    with open(path, "rb+") as handle:
         os.fsync(handle.fileno())
 
 

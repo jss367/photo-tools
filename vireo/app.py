@@ -9070,6 +9070,45 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
 
     # -- Edit API routes --
 
+    def _create_current_local_mask_snapshot(
+        db, photo_id, *, vireo_dir, native_size,
+    ):
+        """Snapshot the active immutable mask, retrying cleanup races."""
+        import local_masks
+
+        for attempt in range(3):
+            variant_row = db.conn.execute(
+                "SELECT active_mask_variant FROM photos WHERE id=?",
+                (photo_id,),
+            ).fetchone()
+            variant = (
+                variant_row["active_mask_variant"] if variant_row else None
+            )
+            mask_row = (
+                db.get_photo_mask(photo_id, variant) if variant else None
+            )
+            try:
+                return local_masks.create_snapshot(
+                    photo_id=photo_id,
+                    mask_row=mask_row,
+                    vireo_dir=vireo_dir,
+                    native_size=native_size,
+                )
+            except FileNotFoundError:
+                if attempt == 2:
+                    raise ValueError(
+                        "active subject mask changed during snapshot; retry"
+                    ) from None
+            except ValueError as exc:
+                # ``create_snapshot`` can observe a predecessor after the DB
+                # lookup but after cleanup at its existence check. Retry only
+                # that missing-file result; validation errors are stable.
+                if (
+                    str(exc) != "active subject mask file is missing"
+                    or attempt == 2
+                ):
+                    raise
+
     @app.route("/api/photos/<int:photo_id>/wildlife_excluded", methods=["POST"])
     def api_set_wildlife_excluded(photo_id):
         db = _get_db()
@@ -9131,17 +9170,10 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         photo = db.get_photo(photo_id, verify_workspace=True)
         if not photo:
             return _photo_not_found_error(legacy_error="not found")
-        import local_masks
-        variant_row = db.conn.execute(
-            "SELECT active_mask_variant FROM photos WHERE id=?",
-            (photo_id,),
-        ).fetchone()
-        variant = variant_row["active_mask_variant"] if variant_row else None
-        mask_row = db.get_photo_mask(photo_id, variant) if variant else None
         try:
-            mask = local_masks.create_snapshot(
-                photo_id=photo_id,
-                mask_row=mask_row,
+            mask = _create_current_local_mask_snapshot(
+                db,
+                photo_id,
                 vireo_dir=os.path.dirname(app.config["THUMB_CACHE_DIR"]),
                 native_size=_recipe_source_dimensions(photo),
             )
@@ -9287,21 +9319,10 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 # the slider values copy, the mask does not. Photos without a
                 # usable mask are skipped and reported, not silently given a
                 # wrong mask.
-                import local_masks
-                variant_row = db.conn.execute(
-                    "SELECT active_mask_variant FROM photos WHERE id=?",
-                    (pid,),
-                ).fetchone()
-                variant = (
-                    variant_row["active_mask_variant"] if variant_row else None
-                )
-                mask_row = (
-                    db.get_photo_mask(pid, variant) if variant else None
-                )
                 try:
-                    target_mask = local_masks.create_snapshot(
-                        photo_id=pid,
-                        mask_row=mask_row,
+                    target_mask = _create_current_local_mask_snapshot(
+                        db,
+                        pid,
                         vireo_dir=vireo_dir,
                         native_size=_recipe_source_dimensions(photo),
                     )

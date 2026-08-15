@@ -9582,6 +9582,52 @@ def test_local_mask_snapshot_and_recipe_roundtrip(client_with_photo):
     assert got["local_mask_stale"] is False
 
 
+def test_local_mask_snapshot_retries_predecessor_cleanup(
+    client_with_photo, monkeypatch,
+):
+    """Snapshot re-resolves the mask if cleanup wins before its open."""
+    import shutil
+
+    import local_masks
+
+    app, db, photo_id = client_with_photo
+    client = app.test_client()
+    folder = db.conn.execute("SELECT path FROM folders").fetchone()
+    old_path = _register_active_mask(db, photo_id, folder["path"])
+    new_path = old_path + ".next.png"
+    shutil.copyfile(old_path, new_path)
+    real_create_snapshot = local_masks.create_snapshot
+    raced = False
+
+    def racing_create_snapshot(**kwargs):
+        nonlocal raced
+        if not raced:
+            raced = True
+            db.upsert_photo_mask(
+                photo_id,
+                "sam2-small",
+                new_path,
+                "megadetector-v6",
+                0.0,
+                0.0,
+                0.5,
+                1.0,
+            )
+            os.unlink(old_path)
+            raise FileNotFoundError(old_path)
+        return real_create_snapshot(**kwargs)
+
+    monkeypatch.setattr(
+        local_masks, "create_snapshot", racing_create_snapshot,
+    )
+
+    resp = client.post(f"/api/photos/{photo_id}/local-mask/snapshot")
+
+    assert raced
+    assert resp.status_code == 200, resp.get_json()
+    assert set(resp.get_json()["mask"]) == {"ref", "source_digest"}
+
+
 def test_local_recipe_stale_flag_tracks_live_mask(client_with_photo):
     import numpy as np
     from PIL import Image as PILImage

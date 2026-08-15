@@ -31879,36 +31879,55 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         back to the photo's active mask via ``photo_masks`` so the inspect
         panel keeps working without a round-trip API call.
         """
+        from pipeline_locks import acquire_photo_mask
+
         masks_dir = os.path.join(os.path.dirname(db_path), "masks")
         mask_path = os.path.join(masks_dir, filename)
-        if os.path.exists(mask_path) and _mask_file_is_db_backed(
-            filename, mask_path,
-        ):
-            return send_from_directory(masks_dir, filename)
+        id_match = re.match(r"^(\d+)[._]", filename)
+        if not id_match:
+            if os.path.exists(mask_path) and _mask_file_is_db_backed(
+                filename, mask_path,
+            ):
+                return send_from_directory(masks_dir, filename)
+            return "", 404
 
-        m = re.match(r"^(\d+)\.png$", filename)
-        if m:
-            pid = int(m.group(1))
-            db = _get_db()
-            row = db.conn.execute(
-                "SELECT active_mask_variant FROM photos WHERE id=?", (pid,)
-            ).fetchone()
-            active = row["active_mask_variant"] if row else None
-            if active:
-                mask = db.get_photo_mask(pid, active)
-                if mask and mask.get("path"):
-                    masks_dir_real = os.path.realpath(masks_dir)
-                    abs_path = os.path.realpath(mask["path"])
-                    if (
-                        (abs_path == masks_dir_real
-                            or abs_path.startswith(masks_dir_real + os.sep))
-                        and os.path.isfile(abs_path)
-                    ):
-                        return send_from_directory(
-                            masks_dir_real,
-                            os.path.relpath(abs_path, masks_dir_real),
-                        )
-        return "", 404
+        pid = int(id_match.group(1))
+        with acquire_photo_mask(pid):
+            selected_path = None
+            if os.path.exists(mask_path) and _mask_file_is_db_backed(
+                filename, mask_path,
+            ):
+                selected_path = mask_path
+
+            m = re.match(r"^(\d+)\.png$", filename)
+            if selected_path is None and m:
+                db = _get_db()
+                row = db.conn.execute(
+                    "SELECT active_mask_variant FROM photos WHERE id=?", (pid,)
+                ).fetchone()
+                active = row["active_mask_variant"] if row else None
+                if active:
+                    mask = db.get_photo_mask(pid, active)
+                    if mask and mask.get("path"):
+                        masks_dir_real = os.path.realpath(masks_dir)
+                        abs_path = os.path.realpath(mask["path"])
+                        if (
+                            abs_path == masks_dir_real
+                            or abs_path.startswith(masks_dir_real + os.sep)
+                        ):
+                            selected_path = abs_path
+
+            if selected_path is None:
+                return "", 404
+            try:
+                with open(selected_path, "rb") as handle:
+                    mask_bytes = handle.read()
+            except OSError:
+                return "", 404
+
+        # Buffer while holding the per-photo lock. Cleanup may unlink an
+        # immutable predecessor as soon as the lock is released.
+        return Response(mask_bytes, mimetype="image/png")
 
     @app.route("/api/photos/<int:pid>/masks")
     def api_photo_masks(pid):

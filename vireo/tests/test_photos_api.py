@@ -9160,7 +9160,9 @@ def test_api_serve_mask_uses_stored_db_path_for_legacy_filename(app_and_db):
     assert resp.data == b"LEGACYPNG"
 
 
-def test_legacy_serve_mask_falls_back_to_active_variant(app_and_db):
+def test_legacy_serve_mask_falls_back_to_active_variant(
+    app_and_db, monkeypatch,
+):
     """``/masks/{pid}.png`` must keep working after variant-aware extraction.
 
     Callers like ``openInspect`` in pipeline_review.html still request
@@ -9170,11 +9172,27 @@ def test_legacy_serve_mask_falls_back_to_active_variant(app_and_db):
     when the literal ``{pid}.png`` file no longer exists.
     """
     import os as _os
+
+    import pipeline_locks
+
     app, db = app_and_db
     pid = db.get_photos()[0]["id"]
     masks_dir = _os.path.join(_os.path.dirname(db._db_path), "masks")
     _seed_mask(db, masks_dir, pid, "sam2-small", body=b"ACTIVEPNG")
     db.set_active_mask_variant(pid, "sam2-small")
+    lock_events = []
+
+    class TrackingLock:
+        def __enter__(self):
+            lock_events.append(("enter", pid))
+
+        def __exit__(self, exc_type, exc, tb):
+            lock_events.append(("exit", pid))
+
+    monkeypatch.setattr(
+        pipeline_locks, "acquire_photo_mask",
+        lambda photo_id: TrackingLock(),
+    )
     # No literal `{pid}.png` on disk.
     assert not _os.path.exists(_os.path.join(masks_dir, f"{pid}.png"))
 
@@ -9182,6 +9200,7 @@ def test_legacy_serve_mask_falls_back_to_active_variant(app_and_db):
     resp = client.get(f"/masks/{pid}.png")
     assert resp.status_code == 200
     assert resp.data == b"ACTIVEPNG"
+    assert lock_events == [("enter", pid), ("exit", pid)]
 
 
 def test_legacy_serve_mask_404_when_no_active_variant(app_and_db):

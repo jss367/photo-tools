@@ -6189,6 +6189,56 @@ def test_import_in_place_rejects_detached_then_remounted_source(
     assert extractor_calls == []
 
 
+def test_import_in_place_rejects_replaced_local_source(
+    app_and_db, tmp_path, monkeypatch,
+):
+    """A local source replaced after scan is not used for extraction."""
+    import pipeline_job
+    import scanner
+
+    app, _ = app_and_db
+    source = tmp_path / "local-source"
+    source.mkdir()
+    extractor_calls = []
+    identities = iter([
+        ("stat", 1, 100),
+        ("stat", 1, 200),
+    ])
+
+    monkeypatch.setattr(
+        pipeline_job, "_load_known_mount_roots", lambda _db: set(),
+    )
+    monkeypatch.setattr(
+        pipeline_job, "_archive_mount_baseline", lambda path, known: {},
+    )
+    monkeypatch.setattr(
+        pipeline_job, "_record_known_mount_roots",
+        lambda _db, _baseline: None,
+    )
+    monkeypatch.setattr(
+        pipeline_job, "_mount_identity", lambda _path: next(identities),
+    )
+    monkeypatch.setattr(
+        scanner, "scan",
+        lambda *_args, **_kwargs: {"discovered": 0, "indexed": 0},
+    )
+    monkeypatch.setattr(
+        scanner, "_extract_working_copies",
+        lambda *args, **kwargs: extractor_calls.append((args, kwargs)),
+    )
+
+    client = app.test_client()
+    resp = client.post("/api/jobs/import-in-place", json={
+        "sources": [str(source)],
+        "after_import": None,
+    })
+    assert resp.status_code == 200, resp.get_json()
+    job = wait_for_job_via_client(client, resp.get_json()["job_id"])
+
+    assert job["status"] == "completed", job
+    assert extractor_calls == []
+
+
 def test_import_in_place_normalizes_deferred_scope_spelling(
     app_and_db, tmp_path, monkeypatch,
 ):

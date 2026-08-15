@@ -26422,6 +26422,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 _archive_mount_baseline,
                 _changed_mount_since_baseline,
                 _load_known_mount_roots,
+                _mount_identity,
                 _mount_identity_baseline,
                 _record_known_mount_roots,
                 _unmounted_since_baseline,
@@ -26465,9 +26466,12 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     source, known_mount_roots,
                 )
                 source_mount_baselines[source_key] = baseline
-                source_mount_identities[source_key] = (
-                    _mount_identity_baseline(baseline)
-                )
+                identities = _mount_identity_baseline(baseline)
+                # Mount roots catch detach/remount; the source directory's
+                # own inode also catches a local root renamed and replaced
+                # while later sources are still scanning.
+                identities[source_key] = _mount_identity(source_key)
+                source_mount_identities[source_key] = identities
                 _record_known_mount_roots(thread_db, baseline)
 
             snapshot_requested = len(snapshot_paths or [])

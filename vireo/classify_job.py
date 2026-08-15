@@ -3055,6 +3055,13 @@ def run_classify_job(
                 labels=None if use_tol else labels,
                 factory=_construct_classifier,
                 files=active_model.get("files"),
+                # Optional-artifact presence must flip the fingerprint too.
+                # timm declares label_descriptions.json as optional and
+                # TimmClassifier reads it to translate to common names, so
+                # after a Repair downloads it we must not reuse the
+                # pre-repair classifier still emitting scientific names.
+                # bioclip-2.5's ToL artifacts are declared the same way.
+                optional_files=active_model.get("optional_files"),
                 taxonomy_fingerprint=(
                     taxonomy_identity(tax) if model_type == "timm" else None
                 ),

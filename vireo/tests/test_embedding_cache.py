@@ -3,6 +3,7 @@
 import json
 import os
 import sys
+import tempfile
 import threading
 from concurrent.futures import ThreadPoolExecutor
 
@@ -366,6 +367,81 @@ def test_manifest_failure_does_not_invalidate_published_payload(
 
     assert np.array_equal(value, _payload())
     assert cache.is_cached(identity, 2)
+
+
+def test_load_failure_does_not_unlink_a_concurrently_repaired_file(
+    tmp_path, monkeypatch,
+):
+    """Regression: two callers hit the same malformed cache file. Caller A's
+    np.load raises. Between that failure and A's cleanup unlink, caller B
+    atomically publishes a valid replacement via os.replace onto the same
+    name. A must not delete B's freshly published payload — otherwise a
+    joining waiter's hand-off ``_load`` raises FileNotFoundError, failing
+    an otherwise successful equal-key job. Only the exact inode A validated
+    is safe to remove.
+    """
+    import embedding_cache as ec
+
+    cache = EmbeddingCache(tmp_path / "cache")
+    identity = _identity()
+    digest = identity_digest(identity)
+    path = cache.path_for(identity)
+
+    os.makedirs(cache.cache_dir, exist_ok=True)
+    # Write a malformed (rank-1) payload that _validate_payload rejects.
+    np.save(path, np.ones(4, dtype=np.float32), allow_pickle=False)
+
+    real_load = ec.np.load
+
+    def race_replace_then_fail(load_path, *args, **kwargs):
+        result = real_load(load_path, *args, **kwargs)
+        if str(load_path) == path:
+            # Simulate another caller winning os.replace between our
+            # np.load and the cleanup unlink. This yields a different
+            # inode at the same name.
+            fd, tmp = tempfile.mkstemp(
+                prefix=".repair.", suffix=".npy", dir=cache.cache_dir,
+            )
+            os.close(fd)
+            np.save(tmp, np.full((4, 2), 3, dtype=np.float32),
+                    allow_pickle=False)
+            os.replace(tmp, load_path)
+        return result
+
+    monkeypatch.setattr(ec.np, "load", race_replace_then_fail)
+
+    with pytest.raises(ValueError):
+        cache._load(digest, 2)
+
+    # The valid replacement must still be on disk — our cleanup detected
+    # the inode change and skipped the unlink.
+    assert os.path.exists(path), (
+        "concurrently repaired payload was deleted by the failing loader's "
+        "cleanup"
+    )
+    fresh = np.load(path)
+    assert fresh.shape == (4, 2)
+    assert np.array_equal(fresh, np.full((4, 2), 3, dtype=np.float32))
+
+
+def test_load_failure_still_removes_its_own_invalid_file(tmp_path):
+    """The narrowed unlink must still drop a file that nobody replaced —
+    otherwise a malformed payload would persist and every caller would
+    keep re-validating + re-failing without single-flight ever kicking in
+    (since ``is_cached`` reaches ``_load`` without registering a flight).
+    """
+    cache = EmbeddingCache(tmp_path / "cache")
+    identity = _identity()
+    digest = identity_digest(identity)
+    path = cache.path_for(identity)
+
+    os.makedirs(cache.cache_dir, exist_ok=True)
+    np.save(path, np.ones(4, dtype=np.float32), allow_pickle=False)
+
+    with pytest.raises(ValueError):
+        cache._load(digest, 2)
+
+    assert not os.path.exists(path)
 
 
 def test_concurrent_manifest_updates_do_not_lose_entries(tmp_path):

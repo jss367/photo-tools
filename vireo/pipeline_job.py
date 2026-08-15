@@ -3878,6 +3878,13 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                     labels=None if use_tol else labels,
                     factory=_construct_classifier,
                     files=files,
+                    # Fold in optional-artifact presence: without this a
+                    # Repair that downloads timm's label_descriptions.json
+                    # (or bioclip-2.5's ToL files) would not invalidate the
+                    # entry already loaded from the pre-repair install, and
+                    # subsequent pipeline runs would keep using a stale
+                    # classifier constructed without those artifacts.
+                    optional_files=active_model.get("optional_files"),
                     taxonomy_fingerprint=tax_fp,
                     cancel_check=lambda: (
                         _should_abort(abort) or _cancellation_requested()

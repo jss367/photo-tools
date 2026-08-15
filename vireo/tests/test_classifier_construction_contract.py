@@ -3,7 +3,11 @@
 import ast
 from pathlib import Path
 
-from classifier_cache import acquire_cached_classifier
+from classifier_cache import (
+    acquire_cached_classifier,
+    classifier_cache_key,
+    model_files_fingerprint,
+)
 from model_cache import reset_default_cache_for_tests
 
 
@@ -114,6 +118,82 @@ acquire_cached_classifier(model_str="m", factory=lambda: Classifier(labels=[]))
     assert isinstance(factories[0], ast.Name)
     assert factories[0].id == "_construct_classifier"
     assert isinstance(factories[1], ast.Lambda)
+
+
+def test_optional_files_flip_fingerprint_when_they_appear_on_disk(tmp_path):
+    """Regression: a Repair that downloads a declared-optional artifact
+    (e.g. timm's ``label_descriptions.json``, or bioclip-2.5's ToL files)
+    must invalidate any pre-repair cache entry. Without folding the
+    optional artifacts into ``files=`` — the two production sites pass
+    only the *required* manifest — the fingerprint would not change and
+    the pre-repair classifier (constructed without the artifact and
+    therefore emitting different labels) would keep being reused."""
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    (model_dir / "text_encoder.onnx").write_bytes(b"weights")
+    (model_dir / "config.json").write_bytes(b"config")
+
+    required = ["text_encoder.onnx", "config.json"]
+    optional = ["label_descriptions.json"]
+
+    before = model_files_fingerprint(
+        str(model_dir), files=required, optional_files=optional,
+    )
+    key_before = classifier_cache_key(
+        model_type="timm",
+        model_str="timm-a",
+        weights_path=str(model_dir),
+        labels=["bird"],
+        files=required,
+        optional_files=optional,
+    )
+
+    # Repair lands the optional artifact.
+    (model_dir / "label_descriptions.json").write_bytes(b"descriptions")
+
+    after = model_files_fingerprint(
+        str(model_dir), files=required, optional_files=optional,
+    )
+    key_after = classifier_cache_key(
+        model_type="timm",
+        model_str="timm-a",
+        weights_path=str(model_dir),
+        labels=["bird"],
+        files=required,
+        optional_files=optional,
+    )
+
+    assert before != after, (
+        "optional artifact appearing on disk must flip the fingerprint"
+    )
+    assert key_before != key_after, (
+        "optional artifact appearing on disk must flip the cache key so a "
+        "post-Repair caller does not reuse the pre-Repair classifier"
+    )
+    assert any(name == "label_descriptions.json" for name, *_ in after)
+
+
+def test_absent_optional_files_do_not_bloat_the_fingerprint(tmp_path):
+    """An optional artifact never present on disk must not appear in the
+    fingerprint at all — otherwise every fresh install would produce a
+    fingerprint distinguishable only by a phantom entry, and existing
+    tests that build a fingerprint from just the required manifest would
+    stop matching production."""
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    (model_dir / "text_encoder.onnx").write_bytes(b"weights")
+    (model_dir / "config.json").write_bytes(b"config")
+
+    required = ["text_encoder.onnx", "config.json"]
+
+    baseline = model_files_fingerprint(str(model_dir), files=required)
+    with_optional = model_files_fingerprint(
+        str(model_dir),
+        files=required,
+        optional_files=["label_descriptions.json"],
+    )
+
+    assert baseline == with_optional
 
 
 def test_shared_classifier_cache_preserves_authoritative_label_order(tmp_path):

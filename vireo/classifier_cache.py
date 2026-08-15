@@ -18,12 +18,29 @@ def _ordered_labels_identity(labels):
     return hashlib.sha256(body).hexdigest()
 
 
-def model_files_fingerprint(weights_path, files=None):
-    """Cheap identity for in-process invalidation after model replacement."""
+def model_files_fingerprint(weights_path, files=None, optional_files=None):
+    """Cheap identity for in-process invalidation after model replacement.
+
+    ``optional_files`` — filenames declared as ``optional_files`` in the
+    model's KNOWN_MODELS entry (best-effort downloads, e.g. timm's
+    ``label_descriptions.json`` or bioclip-2.5's ToL artifacts). Only
+    those optional files present on disk right now are folded into the
+    fingerprint. That way a Repair that lands a previously absent
+    optional file flips the fingerprint and prevents the pre-repair
+    cached classifier — which was constructed without that artifact and
+    therefore emits different labels — from being reused.
+    """
     if not weights_path:
         return None
     if files:
-        names = sorted(files)
+        names = set(files)
+        if optional_files and os.path.isdir(weights_path):
+            for name in optional_files:
+                if name in names:
+                    continue
+                if os.path.isfile(os.path.join(weights_path, name)):
+                    names.add(name)
+        names = sorted(names)
     elif os.path.isdir(weights_path):
         names = sorted(
             name for name in os.listdir(weights_path)
@@ -54,6 +71,7 @@ def classifier_cache_key(
     weights_path,
     labels,
     files=None,
+    optional_files=None,
     taxonomy_fingerprint=None,
 ):
     return (
@@ -63,7 +81,7 @@ def classifier_cache_key(
         os.path.abspath(weights_path) if weights_path else None,
         _ordered_labels_identity(labels),
         taxonomy_fingerprint,
-        model_files_fingerprint(weights_path, files),
+        model_files_fingerprint(weights_path, files, optional_files),
     )
 
 
@@ -75,6 +93,7 @@ def acquire_cached_classifier(
     labels,
     factory,
     files=None,
+    optional_files=None,
     taxonomy_fingerprint=None,
     cancel_check=None,
 ):
@@ -84,6 +103,12 @@ def acquire_cached_classifier(
     shared-cache waiter loop so a job blocked here while another caller's
     factory is loading a text encoder or computing label embeddings can
     still cancel promptly.
+
+    ``optional_files`` — best-effort declared artifacts (see
+    ``model_files_fingerprint``). Callers that pass an explicit ``files=``
+    list (which typically covers only the required manifest) should also
+    pass ``optional_files=`` so a Repair that fills in a previously absent
+    optional artifact invalidates the pre-repair classifier entry.
     """
 
     def _key():
@@ -93,6 +118,7 @@ def acquire_cached_classifier(
             weights_path=weights_path,
             labels=labels,
             files=files,
+            optional_files=optional_files,
             taxonomy_fingerprint=taxonomy_fingerprint,
         )
 

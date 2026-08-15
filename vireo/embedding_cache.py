@@ -361,6 +361,16 @@ class EmbeddingCache:
 
     def _load(self, digest, label_count, embedding_dim=None):
         path = os.path.join(self.cache_dir, f"{digest}.npy")
+        # Snapshot the inode we are about to validate so a concurrent
+        # producer that atomically replaces this path between np.load and
+        # unlink cannot make us delete their freshly published payload.
+        # Single-flight is in-process only, and validation happens before
+        # _flights registration, so an equal-key producer in another
+        # process (or a racing in-process caller) can win os.replace here.
+        try:
+            loaded_ino = os.stat(path).st_ino
+        except OSError:
+            loaded_ino = None
         try:
             value = np.load(path, allow_pickle=False)
             return _validate_payload(
@@ -368,9 +378,14 @@ class EmbeddingCache:
             )
         except (EOFError, ValueError):
             # A truncated or otherwise invalid final file cannot satisfy later
-            # callers.  Removal is best-effort; a racing repair can replace it.
-            with contextlib.suppress(OSError):
-                os.unlink(path)
+            # callers.  Removal is best-effort — but only remove the exact
+            # inode we validated, so a valid payload published under this
+            # name after our load failed is not deleted (which would cause a
+            # joining waiter's hand-off _load to raise FileNotFoundError).
+            if loaded_ino is not None:
+                with contextlib.suppress(OSError):
+                    if os.stat(path).st_ino == loaded_ino:
+                        os.unlink(path)
             raise
 
     def _publish(self, digest, value, label_count):

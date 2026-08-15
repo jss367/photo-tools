@@ -339,6 +339,49 @@ def test_discover_source_files_recursive_streams_candidates(
     )
 
 
+def test_discover_source_files_skips_stat_for_non_matching_extensions(
+    tmp_path, monkeypatch
+):
+    """Non-image entries must be rejected by the extension/hidden-name
+    check before ``Path.is_file()`` runs. Sources like a home directory or
+    a network mount can contain millions of non-image files; statting each
+    one adds a filesystem round-trip per entry and, on remote mounts, can
+    turn discovery into a multi-hour operation. The cheap name/suffix
+    checks have to filter first.
+    """
+    from pathlib import Path
+
+    real_is_file = Path.is_file
+    is_file_names = []
+
+    def tracking_is_file(self):
+        is_file_names.append(self.name)
+        return real_is_file(self)
+
+    monkeypatch.setattr(Path, "is_file", tracking_is_file)
+
+    src = tmp_path / "src"
+    _create_test_files(
+        str(src),
+        [
+            "keep.jpg",
+            "skip.txt",
+            "skip.log",
+            ".hidden.jpg",
+            "another.raw.bak",
+        ],
+    )
+
+    files = discover_source_files(str(src), file_types="both")
+    assert {f.name for f in files} == {"keep.jpg"}
+
+    # Only entries that passed the cheap filters are worth statting.
+    assert "skip.txt" not in is_file_names
+    assert "skip.log" not in is_file_names
+    assert ".hidden.jpg" not in is_file_names
+    assert "another.raw.bak" not in is_file_names
+
+
 def test_discover_source_files_rejects_excluded_source_before_statting(
     tmp_path, monkeypatch
 ):

@@ -407,10 +407,14 @@ def discover_source_files(
         checked += 1
         if cancel_check is not None and cancel_check():
             raise ScanCancelled("file discovery cancelled")
+        # Cheap name/suffix filters run before is_file() so that a source
+        # dominated by non-image files (a home directory, a network mount)
+        # doesn't cost one filesystem stat per irrelevant entry — that's
+        # millions of remote metadata ops on the wrong kind of tree.
         if (
-            f.is_file()
+            not f.name.startswith(".")
             and f.suffix.lower() in allowed
-            and not f.name.startswith(".")
+            and f.is_file()
         ):
             files.append(f)
         if progress_callback is not None and checked % 500 == 0:

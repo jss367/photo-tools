@@ -220,6 +220,49 @@ def test_mismatched_embedding_dim_rejects_cache_hit(tmp_path):
     assert cache.is_cached(identity, 2, embedding_dim=512)
 
 
+def test_cancel_triggered_retry_still_enforces_embedding_dim(tmp_path):
+    """Regression: the recursive retry a waiter runs after an equal-key
+    producer is cancelled must carry ``embedding_dim`` forward. Dropping
+    it lets the replacement computation publish a mismatched payload that
+    would only fail at inference on ``img_features @ txt_embeddings``."""
+    class ClassificationCancelled(RuntimeError):
+        pass
+
+    cache = EmbeddingCache(tmp_path / "cache")
+    identity = _identity()
+    producer_started = threading.Event()
+    cancel_producer = threading.Event()
+
+    def cancelled_compute():
+        producer_started.set()
+        assert cancel_producer.wait(2)
+        raise ClassificationCancelled("cancelled")
+
+    def wrong_dim_compute():
+        # A 512-dim model receiving a 256-dim payload — the exact scenario
+        # the fresh-computation validator catches on the primary path.
+        return np.ones((256, 2), dtype=np.float32)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        producer = pool.submit(
+            cache.get_or_compute, identity, cancelled_compute,
+        )
+        assert producer_started.wait(2)
+        waiter = pool.submit(
+            cache.get_or_compute,
+            identity,
+            wrong_dim_compute,
+            embedding_dim=512,
+        )
+        cancel_producer.set()
+        with pytest.raises(ClassificationCancelled):
+            producer.result(timeout=2)
+        with pytest.raises(ValueError, match=r"expected \(512, 2\)"):
+            waiter.result(timeout=2)
+
+    assert not os.path.exists(cache.path_for(identity))
+
+
 def test_mismatched_embedding_dim_rejects_freshly_computed_payload(tmp_path):
     """A producer whose factory returns a wrong-dim ndarray must fail up
     front rather than publish a payload that later callers must eventually

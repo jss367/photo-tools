@@ -298,12 +298,18 @@ class EmbeddingCache:
                 }:
                     # Cancellation belongs to the producer, not the key. A
                     # healthy waiter retries and one of the waiters becomes
-                    # the replacement producer.
+                    # the replacement producer. ``embedding_dim`` must ride
+                    # the retry so the replacement computation is checked
+                    # against this caller's image encoder; dropping it would
+                    # bypass the new dimension validation on this branch and
+                    # let a mismatched payload publish and later crash at
+                    # ``img_features @ txt_embeddings``.
                     return self.get_or_compute(
                         identity,
                         compute,
                         identity_after=identity_after,
                         cancel_check=cancel_check,
+                        embedding_dim=embedding_dim,
                     )
                 raise EmbeddingComputationError(
                     "label embedding producer failed"

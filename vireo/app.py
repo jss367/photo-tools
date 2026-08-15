@@ -31933,24 +31933,30 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         and (3) the stored path must resolve inside the masks directory
         (so an attacker-controlled or corrupted DB row can't escape).
         """
+        from pipeline_locks import acquire_photo_mask
+
         if not _MASK_VARIANT_RE.match(variant):
             return "", 404
-        db = _get_db()
-        mask = db.get_photo_mask(pid, variant)
-        if mask is None or not mask.get("path"):
-            return "", 404
-        masks_dir = os.path.realpath(
-            os.path.join(os.path.dirname(db_path), "masks")
-        )
-        abs_path = os.path.realpath(mask["path"])
-        if not (abs_path == masks_dir
-                or abs_path.startswith(masks_dir + os.sep)):
-            return "", 404
-        if not os.path.isfile(abs_path):
-            return "", 404
-        return send_from_directory(
-            masks_dir, os.path.relpath(abs_path, masks_dir)
-        )
+        with acquire_photo_mask(pid):
+            db = _get_db()
+            mask = db.get_photo_mask(pid, variant)
+            if mask is None or not mask.get("path"):
+                return "", 404
+            masks_dir = os.path.realpath(
+                os.path.join(os.path.dirname(db_path), "masks")
+            )
+            abs_path = os.path.realpath(mask["path"])
+            if not (abs_path == masks_dir
+                    or abs_path.startswith(masks_dir + os.sep)):
+                return "", 404
+            try:
+                with open(abs_path, "rb") as handle:
+                    mask_bytes = handle.read()
+            except OSError:
+                return "", 404
+        # Response owns the bytes, so predecessor cleanup after lock release
+        # cannot turn this request into a transient 404 or truncated stream.
+        return Response(mask_bytes, mimetype="image/png")
 
     @app.route("/api/pipeline/reflow", methods=["POST"])
     def api_pipeline_reflow():

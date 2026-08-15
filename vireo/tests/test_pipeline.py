@@ -2884,6 +2884,46 @@ def test_eye_stage_all_gates_pass_writes_eye_fields(tmp_path, monkeypatch):
     assert eye_teng is not None and eye_teng > 0.0
 
 
+def test_eye_stage_refreshes_mask_path_under_photo_lock(tmp_path, monkeypatch):
+    """A cached predecessor path cannot race concurrent mask replacement."""
+    import keypoints as kp
+    import pipeline_locks
+    from pipeline import detect_eye_keypoints_stage
+
+    db, pid, models_dir = _setup_eligible_mammal_with_files(tmp_path)
+    monkeypatch.setattr(kp, "MODELS_DIR", models_dir)
+    eligible = [dict(row) for row in db.list_photos_for_eye_keypoint_stage()]
+    eligible[0]["mask_path"] = str(tmp_path / "removed-predecessor.png")
+    monkeypatch.setattr(
+        db, "list_photos_for_eye_keypoint_stage",
+        lambda **_kwargs: eligible,
+    )
+    lock_events = []
+
+    class TrackingLock:
+        def __enter__(self):
+            lock_events.append(("enter", pid))
+
+        def __exit__(self, exc_type, exc, tb):
+            lock_events.append(("exit", pid))
+
+    monkeypatch.setattr(
+        pipeline_locks, "acquire_photo_mask",
+        lambda photo_id: TrackingLock(),
+    )
+    monkeypatch.setattr(
+        kp, "detect_keypoints",
+        lambda *_args, **_kwargs: [
+            {"name": "left_eye", "x": 300.0, "y": 300.0, "conf": 0.88},
+        ],
+    )
+
+    detect_eye_keypoints_stage(db, config={"eye_detect_enabled": True})
+
+    assert _read_eye_fields(db, pid)[0] is not None
+    assert lock_events == [("enter", pid), ("exit", pid)]
+
+
 def test_eye_stage_uses_image_loader_and_tolerates_none(tmp_path, monkeypatch):
     """Stage calls image_loader.load_image (which handles RAW + EXIF
     orientation) rather than plain PIL.Image.open. If the loader returns

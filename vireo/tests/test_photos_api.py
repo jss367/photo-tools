@@ -9050,18 +9050,35 @@ def test_api_photo_masks_empty_when_no_masks(app_and_db):
     assert data["active"] is None
 
 
-def test_api_serve_mask_png(app_and_db):
+def test_api_serve_mask_png(app_and_db, monkeypatch):
     """GET /api/masks/<pid>/<variant>.png serves the on-disk mask."""
     import os as _os
+
+    import pipeline_locks
+
     app, db = app_and_db
     pid = db.get_photos()[0]["id"]
     masks_dir = _os.path.join(_os.path.dirname(db._db_path), "masks")
     _seed_mask(db, masks_dir, pid, "sam2-small", body=b"\x89PNGFAKE")
+    lock_events = []
+
+    class TrackingLock:
+        def __enter__(self):
+            lock_events.append(("enter", pid))
+
+        def __exit__(self, exc_type, exc, tb):
+            lock_events.append(("exit", pid))
+
+    monkeypatch.setattr(
+        pipeline_locks, "acquire_photo_mask",
+        lambda photo_id: TrackingLock(),
+    )
 
     client = app.test_client()
     resp = client.get(f"/api/masks/{pid}/sam2-small.png")
     assert resp.status_code == 200
     assert resp.data == b"\x89PNGFAKE"
+    assert lock_events == [("enter", pid), ("exit", pid)]
 
 
 def test_api_serve_mask_404_when_no_db_row(app_and_db):

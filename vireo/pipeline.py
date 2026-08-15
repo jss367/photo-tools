@@ -1738,6 +1738,7 @@ def _process_photo_for_eye(db, row, folders, *, C, T, k_window):
 
     import keypoints as kp
     from image_loader import load_image
+    from pipeline_locks import acquire_photo_mask
     from quality import compute_eye_tenengrad
 
     def mark_attempted_without_eye():
@@ -1801,9 +1802,19 @@ def _process_photo_for_eye(db, row, folders, *, C, T, k_window):
 
     kps = kp.detect_keypoints(image, bbox, model_name)
 
+    # The stage worklist can outlive a concurrent mask regeneration and still
+    # carry its predecessor path. Re-read and fully load the current active
+    # mask under the same photo lock writers hold through predecessor cleanup.
+    with acquire_photo_mask(row["id"]):
+        current_mask = db.conn.execute(
+            "SELECT mask_path FROM photos WHERE id = ?", (row["id"],),
+        ).fetchone()
+        if current_mask is None or not current_mask["mask_path"]:
+            return
+        mask = _load_mask_array(current_mask["mask_path"])
+
     # Resize mask to image dims if needed (masks are typically saved at
     # proxy resolution and must be compared to full-image keypoint coords).
-    mask = _load_mask_array(row["mask_path"])
     if mask.shape != (ih, iw):
         from PIL import Image as _PIL
         mask_img = _PIL.fromarray(mask.astype(np.uint8) * 255).resize(

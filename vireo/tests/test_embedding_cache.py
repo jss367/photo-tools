@@ -225,6 +225,70 @@ def test_mismatched_embedding_dim_rejects_cache_hit(tmp_path):
     assert cache.is_cached(identity, 2, embedding_dim=512)
 
 
+def test_healed_producer_handoff_skips_waiter_embedding_dim(tmp_path):
+    """Regression: when a shared producer self-heals to a different embedding
+    width, the waiter's stale ``embedding_dim`` used to be applied to the
+    healed payload's hand-off ``_load``. That raised ``ValueError`` before
+    the waiter could return the healed identity — so the caller (Classifier)
+    never reached ``identity_before != identity_after`` and could not rebuild
+    its image side. Worse, ``_load``'s cleanup then unlinked the freshly
+    published valid payload because its inode still matched.
+
+    The waiter must detect the identity change (``published_digest !=
+    initial_digest``) and skip the waiter-specific dim validation on the
+    hand-off — the caller rebuilds its image side to match the healed width.
+    """
+    cache = EmbeddingCache(tmp_path / "cache")
+    pre_heal_identity = _identity()
+    healed_identity = _identity(suffix="healed")
+    healed_digest = identity_digest(healed_identity)
+
+    producer_started = threading.Event()
+    release_producer = threading.Event()
+
+    def self_healing_compute():
+        producer_started.set()
+        assert release_producer.wait(2)
+        # Producer publishes a wider payload than the waiter's pre-heal
+        # image encoder expects (e.g. text encoder was healed to a 768-wide
+        # revision while the waiter still holds a 512-wide image session).
+        return np.ones((768, 2), dtype=np.float32)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        producer = pool.submit(
+            cache.get_or_compute,
+            pre_heal_identity,
+            self_healing_compute,
+            identity_after=lambda: healed_identity,
+        )
+        assert producer_started.wait(2)
+        # Waiter joins on the pre-heal identity and carries the pre-heal
+        # image-encoder width. If we validated the healed payload against
+        # this stale dim we would raise and unlink the valid payload.
+        waiter = pool.submit(
+            cache.get_or_compute,
+            pre_heal_identity,
+            lambda: pytest.fail("waiter must not compute"),
+            identity_after=lambda: healed_identity,
+            embedding_dim=512,
+        )
+        release_producer.set()
+        producer_value, producer_identity = producer.result(timeout=2)
+        waiter_value, waiter_identity = waiter.result(timeout=2)
+
+    assert producer_value.shape == (768, 2)
+    assert producer_identity == healed_identity
+    # The hand-off must return the healed payload and the healed identity so
+    # the caller can detect the change and rebuild its image side.
+    assert waiter_value.shape == (768, 2)
+    assert waiter_identity == healed_identity
+    # And the freshly published payload must still be on disk — the waiter's
+    # stale dim must not have tripped ``_load``'s inode-matched unlink.
+    assert os.path.exists(
+        os.path.join(cache.cache_dir, f"{healed_digest}.npy")
+    )
+
+
 def test_cancel_triggered_retry_still_enforces_embedding_dim(tmp_path):
     """Regression: the recursive retry a waiter runs after an equal-key
     producer is cancelled must carry ``embedding_dim`` forward. Dropping

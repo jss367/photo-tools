@@ -324,8 +324,26 @@ class EmbeddingCache:
             published_digest = flight.published_digest or initial_digest
             # Durable publication is the hand-off contract.  Do not reuse the
             # producer's mutable ndarray in memory.
+            #
+            # A shared producer (e.g. an equal-key precompute job) may
+            # self-heal the whole model snapshot mid-flight to a revision
+            # whose text encoder emits a different feature width.  The
+            # producer publishes under the healed identity, so
+            # ``published_digest != initial_digest`` is the durable signal
+            # that this waiter's pre-flight image encoder is now stale.
+            # In that case, validating the healed payload against this
+            # waiter's stale ``embedding_dim`` would (a) raise before we can
+            # return the healed identity, so the caller never reaches its
+            # ``identity_before != identity_after`` image-side rebuild, and
+            # (b) trip ``_load``'s inode-matched unlink on the freshly
+            # published valid payload.  Skip the waiter-specific dimension
+            # check on the hand-off; the caller detects the identity change
+            # and rebuilds its image side against the healed snapshot.
+            waiter_dim = (
+                None if published_digest != initial_digest else embedding_dim
+            )
             value = self._load(
-                published_digest, label_count, embedding_dim=embedding_dim,
+                published_digest, label_count, embedding_dim=waiter_dim,
             )
             actual_identity = identity_after() if identity_after else identity
             return value, actual_identity

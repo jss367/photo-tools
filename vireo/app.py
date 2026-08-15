@@ -26418,6 +26418,12 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
 
         def _run_import_in_place(job):
             import config as cfg
+            from pipeline_job import (
+                _archive_mount_baseline,
+                _load_known_mount_roots,
+                _record_known_mount_roots,
+                _unmounted_since_baseline,
+            )
             from scanner import (
                 ScanCancelled,
                 _extract_working_copies,
@@ -26446,6 +26452,16 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             root_errors = []
             scan_acc = {"prior": 0, "last_current": 0, "last_total": 0}
             working_copy_scope = []
+            working_copy_scope_baselines = {}
+            known_mount_roots = _load_known_mount_roots(thread_db)
+            source_mount_baselines = {}
+            for source in sources:
+                source_key = str(Path(source))
+                baseline = _archive_mount_baseline(
+                    source, known_mount_roots,
+                )
+                source_mount_baselines[source_key] = baseline
+                _record_known_mount_roots(thread_db, baseline)
 
             snapshot_requested = len(snapshot_paths or [])
             snapshot_missing = []
@@ -26632,14 +26648,18 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     # stale scope to the deferred extractor would mark every
                     # pre-existing RAW row as failed for 24 hours.
                     if restricted_dirs is not None:
-                        working_copy_scope.extend(
-                            (directory, "exact")
-                            for directory in restricted_dirs
+                        for directory in restricted_dirs:
                             if (
                                 not is_excluded_scan_path(Path(directory))
                                 and os.path.isdir(directory)
-                            )
-                        )
+                            ):
+                                entry = (directory, "exact")
+                                working_copy_scope.append(entry)
+                                working_copy_scope_baselines[entry] = (
+                                    source_mount_baselines.get(
+                                        str(Path(source)), {},
+                                    )
+                                )
                     elif (
                         not is_excluded_scan_path(Path(source))
                         and os.path.isdir(source)
@@ -26649,9 +26669,13 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                         # trailing separators and ``.`` components. Use that
                         # exact spelling for the deferred SQL scope too.
                         normalized_source = str(Path(source))
-                        working_copy_scope.append(
+                        entry = (
                             (normalized_source, "exact")
                             if not recursive else normalized_source
+                        )
+                        working_copy_scope.append(entry)
+                        working_copy_scope_baselines[entry] = (
+                            source_mount_baselines.get(normalized_source, {})
                         )
                 except Exception as exc:
                     if isinstance(exc, ScanCancelled) and cancel_check():
@@ -26707,19 +26731,25 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     else:
                         path = entry
                     try:
+                        detached_mount = _unmounted_since_baseline(
+                            working_copy_scope_baselines.get(entry, {}),
+                        )
                         still_available = (
                             not is_excluded_scan_path(Path(path))
+                            and detached_mount is None
                             and os.path.isdir(path)
                         )
                     except OSError:
                         still_available = False
+                        detached_mount = None
                     if still_available:
                         revalidated_scope.append(entry)
                     else:
                         log.info(
                             "Skipping deferred working-copy scope %s: no "
-                            "longer present or excluded",
+                            "longer present, excluded, or mount detached%s",
                             path,
+                            f" ({detached_mount})" if detached_mount else "",
                         )
                 if revalidated_scope:
                     try:

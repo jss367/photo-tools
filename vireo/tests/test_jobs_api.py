@@ -6076,6 +6076,55 @@ def test_import_in_place_revalidates_scope_after_all_scans(
     assert str(source_b) in passed
 
 
+def test_import_in_place_rejects_detached_persistent_mount_stub(
+    app_and_db, tmp_path, monkeypatch,
+):
+    """An empty directory left by an unmounted source is not extractable."""
+    import pipeline_job
+    import scanner
+
+    app, _ = app_and_db
+    source = tmp_path / "persistent-mountpoint"
+    source.mkdir()
+    extractor_calls = []
+
+    monkeypatch.setattr(
+        pipeline_job, "_load_known_mount_roots", lambda _db: set(),
+    )
+    monkeypatch.setattr(
+        pipeline_job, "_archive_mount_baseline",
+        lambda path, known: {"/mnt/card": True},
+    )
+    monkeypatch.setattr(
+        pipeline_job, "_record_known_mount_roots",
+        lambda _db, _baseline: None,
+    )
+    monkeypatch.setattr(
+        pipeline_job, "_unmounted_since_baseline",
+        lambda baseline: "/mnt/card" if baseline else None,
+    )
+    monkeypatch.setattr(
+        scanner, "scan",
+        lambda *_args, **_kwargs: {"discovered": 0, "indexed": 0},
+    )
+    monkeypatch.setattr(
+        scanner, "_extract_working_copies",
+        lambda *args, **kwargs: extractor_calls.append((args, kwargs)),
+    )
+
+    client = app.test_client()
+    resp = client.post("/api/jobs/import-in-place", json={
+        "sources": [str(source)],
+        "after_import": None,
+    })
+    assert resp.status_code == 200, resp.get_json()
+    job = wait_for_job_via_client(client, resp.get_json()["job_id"])
+
+    assert job["status"] == "completed", job
+    assert source.is_dir(), "the detached mount stub still exists"
+    assert extractor_calls == []
+
+
 def test_import_in_place_normalizes_deferred_scope_spelling(
     app_and_db, tmp_path, monkeypatch,
 ):

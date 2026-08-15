@@ -212,6 +212,30 @@ def test_api_job_batch_delete_vireo_mode(app_and_db):
     assert db.get_photo(pid) is None
 
 
+def test_delete_modal_has_persistent_stage_progress(app_and_db):
+    """Disk deletes show stable bars instead of reusing one resetting bar."""
+    app, _ = app_and_db
+    html = app.test_client().get("/browse").data.decode()
+
+    stage_ids = [
+        "deleteProgressFilesStage",
+        "deleteProgressCatalogStage",
+        "deleteProgressCacheStage",
+    ]
+    positions = [html.index(f'id="{stage_id}"') for stage_id in stage_ids]
+    assert positions == sorted(positions)
+    assert "Move files to Trash" in html
+    assert "Remove photos from Vireo" in html
+    assert "Clean up previews and cached files" in html
+    assert "? ['files', 'catalog', 'cache']" in html
+    assert ": ['catalog', 'cache'];" in html
+    assert (
+        "phase === 'Pruning pipeline cache' || "
+        "phase === 'Cleaning cached files'"
+    ) in html
+    assert "'Updating review cache\\u2026'" in html
+
+
 def test_api_batch_delete_tolerates_pipeline_prune_system_exit(app_and_db, monkeypatch):
     """A packaged-app lazy import failure must not strand the delete request."""
     from db import Database

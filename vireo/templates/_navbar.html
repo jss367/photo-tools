@@ -1314,6 +1314,16 @@ input[type=text], input[type=date], select, .path-input, .text-input, .model-sel
   height: 100%; background: var(--accent); width: 0%; transition: width 0.3s;
 }
 .inat-progress-text { font-size: 11px; color: var(--text-muted); margin-top: 4px; }
+.delete-progress-stage + .delete-progress-stage { margin-top: 10px; }
+.delete-progress-stage-head {
+  display: flex; align-items: baseline; justify-content: space-between; gap: 12px;
+  font-size: 12px; color: var(--text-primary); margin-bottom: 5px;
+}
+.delete-progress-stage-status {
+  color: var(--text-muted); font-size: 11px; white-space: nowrap;
+}
+.delete-progress-stage.waiting { opacity: 0.55; }
+.delete-progress-stage.complete .delete-progress-stage-status { color: var(--accent); }
 
 /* ---------- Workspace switcher ---------- */
 .ws-dropdown { position: relative; }
@@ -3614,8 +3624,36 @@ async function createWorkspace() {
       </label>
     </div>
     <div id="deleteProgress" class="inat-progress" style="display:none;margin-bottom:12px;">
-      <div id="deleteProgressText" style="font-size:12px;color:var(--text-primary);margin-bottom:6px;">Starting...</div>
-      <div class="inat-progress-bar"><div class="inat-progress-fill" id="deleteProgressFill"></div></div>
+      <div class="delete-progress-stage waiting" id="deleteProgressFilesStage">
+        <div class="delete-progress-stage-head">
+          <span id="deleteProgressFilesLabel">Move files to Trash</span>
+          <span class="delete-progress-stage-status" id="deleteProgressFilesStatus">Waiting</span>
+        </div>
+        <div class="inat-progress-bar" role="progressbar" aria-labelledby="deleteProgressFilesLabel"
+             aria-valuemin="0" aria-valuemax="1" aria-valuenow="0">
+          <div class="inat-progress-fill"></div>
+        </div>
+      </div>
+      <div class="delete-progress-stage waiting" id="deleteProgressCatalogStage">
+        <div class="delete-progress-stage-head">
+          <span id="deleteProgressCatalogLabel">Remove photos from Vireo</span>
+          <span class="delete-progress-stage-status" id="deleteProgressCatalogStatus">Waiting</span>
+        </div>
+        <div class="inat-progress-bar" role="progressbar" aria-labelledby="deleteProgressCatalogLabel"
+             aria-valuemin="0" aria-valuemax="1" aria-valuenow="0">
+          <div class="inat-progress-fill"></div>
+        </div>
+      </div>
+      <div class="delete-progress-stage waiting" id="deleteProgressCacheStage">
+        <div class="delete-progress-stage-head">
+          <span id="deleteProgressCacheLabel">Clean up previews and cached files</span>
+          <span class="delete-progress-stage-status" id="deleteProgressCacheStatus">Waiting</span>
+        </div>
+        <div class="inat-progress-bar" role="progressbar" aria-labelledby="deleteProgressCacheLabel"
+             aria-valuemin="0" aria-valuemax="1" aria-valuenow="0">
+          <div class="inat-progress-fill"></div>
+        </div>
+      </div>
       <div id="deleteProgressDetail" class="inat-progress-text"></div>
     </div>
     <div class="modal-actions">
@@ -7907,6 +7945,7 @@ function revealLightboxPhoto(pid) {
 var _deletePhotoIds = [];
 var _deleteCallback = null;
 var _deleteJobSource = null;
+var _deleteProgressStageOrder = [];
 
 function showDeleteDialog(photoIds, companionCount, callback) {
   _deletePhotoIds = photoIds;
@@ -7942,31 +7981,133 @@ function hideDeleteModal() {
 
 function resetDeleteProgress() {
   var box = document.getElementById('deleteProgress');
-  var text = document.getElementById('deleteProgressText');
-  var fill = document.getElementById('deleteProgressFill');
   var detail = document.getElementById('deleteProgressDetail');
   if (box) box.style.display = 'none';
-  if (text) text.textContent = 'Starting...';
-  if (fill) fill.style.width = '0%';
   if (detail) detail.textContent = '';
+  _deleteProgressStageOrder = [];
+  ['Files', 'Catalog', 'Cache'].forEach(function(name) {
+    var row = document.getElementById('deleteProgress' + name + 'Stage');
+    var status = document.getElementById('deleteProgress' + name + 'Status');
+    if (!row) return;
+    row.hidden = false;
+    row.classList.add('waiting');
+    row.classList.remove('active', 'complete');
+    if (status) status.textContent = 'Waiting';
+    var bar = row.querySelector('[role="progressbar"]');
+    var fill = row.querySelector('.inat-progress-fill');
+    if (bar) {
+      bar.setAttribute('aria-valuemax', '1');
+      bar.setAttribute('aria-valuenow', '0');
+      bar.setAttribute('aria-valuetext', 'Waiting');
+    }
+    if (fill) fill.style.width = '0%';
+  });
+}
+
+function setDeleteProgressStage(stage, state, current, total, statusText) {
+  var name = stage.charAt(0).toUpperCase() + stage.slice(1);
+  var row = document.getElementById('deleteProgress' + name + 'Stage');
+  if (!row) return;
+  var status = document.getElementById('deleteProgress' + name + 'Status');
+  var bar = row.querySelector('[role="progressbar"]');
+  var fill = row.querySelector('.inat-progress-fill');
+  current = Math.max(0, Number(current || 0));
+  total = Math.max(0, Number(total || 0));
+  var pct = state === 'complete'
+    ? 100
+    : (total > 0 ? Math.max(0, Math.min(100, Math.round(100 * current / total))) : 0);
+
+  row.classList.toggle('waiting', state === 'waiting');
+  row.classList.toggle('active', state === 'active');
+  row.classList.toggle('complete', state === 'complete');
+  if (fill) fill.style.width = pct + '%';
+  if (bar) {
+    bar.setAttribute('aria-valuemax', String(total || 1));
+    bar.setAttribute('aria-valuenow', String(state === 'complete' ? (total || 1) : current));
+  }
+
+  var displayStatus = statusText;
+  if (!displayStatus) {
+    if (state === 'waiting') displayStatus = 'Waiting';
+    else if (state === 'complete') displayStatus = '\u2713 Complete';
+    else if (total > 0) displayStatus = current + '/' + total;
+    else displayStatus = 'Working\u2026';
+  }
+  if (status) status.textContent = displayStatus;
+  if (bar) bar.setAttribute('aria-valuetext', displayStatus);
+}
+
+function startDeleteProgress(mode, count) {
+  var filesRow = document.getElementById('deleteProgressFilesStage');
+  var filesLabel = document.getElementById('deleteProgressFilesLabel');
+  var diskMode = mode !== 'vireo';
+  _deleteProgressStageOrder = diskMode
+    ? ['files', 'catalog', 'cache']
+    : ['catalog', 'cache'];
+  if (filesRow) filesRow.hidden = !diskMode;
+  if (filesLabel) {
+    filesLabel.textContent = mode === 'disk_permanent'
+      ? 'Delete files permanently'
+      : 'Move files to Trash';
+  }
+  _deleteProgressStageOrder.forEach(function(stage) {
+    setDeleteProgressStage(stage, 'waiting', 0, count);
+  });
+  var box = document.getElementById('deleteProgress');
+  if (box) box.style.display = '';
+}
+
+function deleteProgressStageForPhase(phase) {
+  if (phase === 'Moving files to Trash' || phase === 'Deleting files permanently') {
+    return 'files';
+  }
+  if (phase === 'Removing from Vireo' || phase === 'Removed from Vireo') {
+    return 'catalog';
+  }
+  if (phase === 'Pruning pipeline cache' || phase === 'Cleaning cached files') {
+    return 'cache';
+  }
+  if (phase === 'Starting delete') return _deleteProgressStageOrder[0];
+  return null;
 }
 
 function updateDeleteProgress(data) {
   data = data || {};
   var box = document.getElementById('deleteProgress');
-  var text = document.getElementById('deleteProgressText');
-  var fill = document.getElementById('deleteProgressFill');
   var detail = document.getElementById('deleteProgressDetail');
   if (box) box.style.display = '';
   var phase = data.phase || 'Working';
   var total = Number(data.total || 0);
   var current = Number(data.current || 0);
-  var countText = total > 0 ? ' ' + current + '/' + total : '';
-  if (text) text.textContent = phase + countText;
-  if (fill) {
-    var pct = total > 0 ? Math.max(0, Math.min(100, Math.round(100 * current / total))) : 15;
-    fill.style.width = pct + '%';
+
+  if (phase === 'Finishing') {
+    _deleteProgressStageOrder.forEach(function(stage) {
+      setDeleteProgressStage(stage, 'complete');
+    });
+    if (detail) detail.textContent = '';
+    return;
   }
+
+  var stage = deleteProgressStageForPhase(phase);
+  var stageIndex = _deleteProgressStageOrder.indexOf(stage);
+  if (stageIndex >= 0) {
+    _deleteProgressStageOrder.slice(0, stageIndex).forEach(function(previous) {
+      setDeleteProgressStage(previous, 'complete');
+    });
+    if (phase === 'Pruning pipeline cache') {
+      // This usually completes too quickly to deserve its own bar. Keep the
+      // cleanup bar monotonic at zero until per-photo cache cleanup begins.
+      setDeleteProgressStage(stage, 'active', 0, 0, 'Updating review cache\u2026');
+    } else if (phase === 'Removed from Vireo') {
+      setDeleteProgressStage(stage, 'complete', current, total);
+    } else {
+      setDeleteProgressStage(
+        stage, 'active', current, total,
+        phase === 'Starting delete' ? 'Starting\u2026' : ''
+      );
+    }
+  }
+
   var parts = [];
   if (data.current_file) parts.push(data.current_file);
   if (data.detail) parts.push(data.detail);
@@ -8077,6 +8218,7 @@ async function confirmDelete() {
   var savedIds = _deletePhotoIds.slice();
   var savedCallback = _deleteCallback;
   setDeleteModalBusy(true, savedIds.length, mode);
+  startDeleteProgress(mode, savedIds.length);
   updateDeleteProgress({
     phase: 'Starting delete',
     current: 0,

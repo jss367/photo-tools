@@ -547,6 +547,11 @@ def test_jobs_page_returns_200(app_and_db):
     assert b'data-resume-job' in resp.data
     assert b'data-retry-import-job' in resp.data
     assert b'importRetryBody' in resp.data
+    # Import-in-place's overall counter pauses during discovery/metadata.
+    # The jobs page must not turn that pause into a growing ETA or keep
+    # rendering the previous source's filenames under the new phase.
+    assert b'step.started_at && !importInPlacePhaseActive' in resp.data
+    assert b'isRunning && !importInPlacePhaseActive' in resp.data
 
 
 def test_navbar_has_jobs_link(app_and_db):
@@ -5872,6 +5877,61 @@ def test_import_in_place_no_destination_required(app_and_db, tmp_path):
         result["collection_id"], per_page=999999,
     )
     assert [p["id"] for p in photos] == result["photo_ids"]
+
+
+def test_import_in_place_overall_total_is_stable_across_sources(
+    app_and_db, tmp_path,
+):
+    """Overall must not move backward when the next source is discovered.
+
+    Regression: source 1 published 1/1, then source 2 changed the same bar to
+    1/3. Discovery is now a separate phase and every processing event uses the
+    final all-source denominator.
+    """
+    app, _db = app_and_db
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    Image.new("RGB", (16, 16), "red").save(first / "one.jpg")
+    Image.new("RGB", (16, 16), "green").save(second / "two.jpg")
+    Image.new("RGB", (16, 16), "blue").save(second / "three.jpg")
+
+    with app.test_client() as client:
+        resp = client.post("/api/jobs/import-in-place", json={
+            "sources": [str(first), str(second)],
+            "after_import": None,
+        })
+        assert resp.status_code == 200, resp.get_json()
+        job_id = resp.get_json()["job_id"]
+        job = wait_for_job_via_client(client, job_id)
+
+    assert job["status"] == "completed", job
+    assert job["result"]["indexed"] == 3
+    progress = [
+        event["data"]
+        for event in app._job_runner.get_events(job_id)
+        if event["type"] == "progress"
+    ]
+    discovery = [
+        data for data in progress
+        if data.get("phase_label") == "Discovering sources"
+    ]
+    assert discovery
+    assert discovery[0]["phase_total"] == 2
+    assert discovery[-1]["phase_current"] == 2
+    assert all(data.get("total", 0) == 0 for data in discovery)
+
+    overall = [
+        data for data in progress
+        if data.get("total", 0) > 0
+        and data.get("phase_current") is None
+    ]
+    assert overall
+    assert {data["total"] for data in overall} == {3}
+    currents = [data["current"] for data in overall]
+    assert currents == sorted(currents)
+    assert currents[-1] == 3
 
 
 def test_import_in_place_snapshot_admits_only_frozen_files(

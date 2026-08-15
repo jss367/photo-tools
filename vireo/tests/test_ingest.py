@@ -118,6 +118,26 @@ def test_discover_source_files_recursive(tmp_path):
     assert files[0].name == "IMG_001.jpg"
 
 
+def test_discover_source_files_reports_progress_and_honors_cancel(tmp_path):
+    from scanner import ScanCancelled
+
+    src = tmp_path / "sd_card"
+    _create_test_files(str(src), ["one.jpg", "two.jpg"])
+    progress = []
+
+    files = discover_source_files(
+        str(src),
+        progress_callback=lambda checked, found: progress.append(
+            (checked, found)
+        ),
+    )
+    assert len(files) == 2
+    assert progress[-1] == (2, 2)
+
+    with pytest.raises(ScanCancelled):
+        discover_source_files(str(src), cancel_check=lambda: True)
+
+
 def test_discover_source_files_non_recursive(tmp_path):
     src = tmp_path / "sd_card"
     _create_test_files(str(src), ["top.jpg"])

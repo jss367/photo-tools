@@ -54,6 +54,38 @@ def test_scan_discovers_folders(tmp_path):
     assert os.path.join(root, '2024', 'January') in paths
 
 
+def test_scan_uses_frozen_discovered_files_manifest(tmp_path):
+    """A pre-discovered import manifest fixes both scope and denominator.
+
+    Files that appear after the all-source discovery pass belong to a later
+    import; re-walking here would both admit them and make Overall move.
+    """
+    from db import Database
+    from scanner import scan
+
+    root = str(tmp_path / "photos")
+    _create_test_images(root, {"": ["selected.jpg", "late.jpg"]})
+    selected = os.path.join(root, "selected.jpg")
+    progress = []
+
+    db = Database(str(tmp_path / "test.db"))
+    result = scan(
+        root,
+        db,
+        discovered_files=[selected],
+        progress_callback=lambda current, total: progress.append(
+            (current, total)
+        ),
+    )
+
+    assert result["discovered"] == 1
+    assert {photo["filename"] for photo in db.get_photos(per_page=100)} == {
+        "selected.jpg",
+    }
+    assert progress
+    assert {total for _current, total in progress} == {1}
+
+
 def test_scan_skips_app_managed_library_bundles(tmp_path):
     """scan() must not descend into macOS app-managed library bundles.
 

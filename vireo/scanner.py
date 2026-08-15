@@ -1498,7 +1498,7 @@ _EMPTY_SCAN_COUNTS = {
 }
 
 
-def scan(root, db, progress_callback=None, incremental=False, extract_full_metadata=True, photo_callback=None, skip_paths=None, status_callback=None, recursive=True, restrict_dirs=None, restrict_files=None, vireo_dir=None, thumb_cache_dir=None, permission_error_callback=None, cancel_check=None, skip_working_copies=False, repair_missing_metadata=False, register_restrict_dirs_as_roots=True, allow_photo_inserts=True, counts=None):
+def scan(root, db, progress_callback=None, incremental=False, extract_full_metadata=True, photo_callback=None, skip_paths=None, status_callback=None, recursive=True, restrict_dirs=None, restrict_files=None, vireo_dir=None, thumb_cache_dir=None, permission_error_callback=None, cancel_check=None, skip_working_copies=False, repair_missing_metadata=False, register_restrict_dirs_as_roots=True, allow_photo_inserts=True, counts=None, discovered_files=None):
     """Walk a folder tree, discover photos, read metadata, populate database.
 
     Args:
@@ -1573,6 +1573,10 @@ def scan(root, db, progress_callback=None, incremental=False, extract_full_metad
             pass, a DB error), the return value alone would force callers
             to report zero for a run that really did catalog thousands.
             Pass a dict here to read accurate counts on any exit path.
+        discovered_files: optional frozen iterable of paths from a preceding
+            discovery pass. When supplied, scan skips its filesystem walk and
+            processes exactly this manifest. Import-in-place uses this to
+            establish a stable all-source progress denominator before work.
 
     Returns:
         dict with ``discovered`` (files the walk turned up), ``indexed``
@@ -1640,11 +1644,16 @@ def scan(root, db, progress_callback=None, incremental=False, extract_full_metad
             status_callback(message)
 
     # Discover all image files (incremental enumeration for progress reporting)
+    # unless the caller already froze an all-source manifest. Copy the input:
+    # scan sorts its work queue and callers may retain their source mapping.
     log.info("Discovering files in %s ...", root)
     _check_cancelled()
-    if status_callback:
+    if discovered_files is None and status_callback:
         _emit_status("Discovering files...")
-    image_files = []
+    image_files = (
+        [Path(path) for path in discovered_files]
+        if discovered_files is not None else []
+    )
 
     # os.walk + onerror, not Path.rglob: rglob silently skips any
     # subdir that raises during enumeration, so a TCC-denied folder
@@ -1689,7 +1698,15 @@ def scan(root, db, progress_callback=None, incremental=False, extract_full_metad
     # ``folder_path/filename`` — re-tripping the macOS TCC prompt this guard
     # exists to avoid.
     effective_restrict_dirs = []
-    if restrict_dirs is not None:
+    if discovered_files is not None:
+        # The manifest already applied the file filters. Retain only the
+        # directory scope used by the later working-copy extraction pass;
+        # do not enumerate those directories a second time.
+        effective_restrict_dirs = [
+            d for d in (restrict_dirs or [])
+            if not is_excluded_scan_path(Path(d))
+        ]
+    elif restrict_dirs is not None:
         # Only enumerate files in the specified directories (non-recursive).
         # root is still used as the folder hierarchy root for _ensure_folder.
         restrict_files_set = set(restrict_files) if restrict_files is not None else None

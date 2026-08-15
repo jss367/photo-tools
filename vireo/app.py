@@ -26417,7 +26417,10 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 )
 
         def _run_import_in_place(job):
+            import errno as errno_mod
+
             import config as cfg
+            from ingest import discover_source_files
             from scanner import ScanCancelled
             from scanner import scan as do_scan
 
@@ -26438,7 +26441,13 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             seen_photo_ids = set()
             indexed_paths = set()
             root_errors = []
-            scan_acc = {"prior": 0, "last_current": 0, "last_total": 0}
+            scan_acc = {
+                "prior": 0,
+                "last_current": 0,
+                "last_total": 0,
+                "overall_total": 0,
+                "source_index": 0,
+            }
 
             snapshot_requested = len(snapshot_paths or [])
             snapshot_missing = []
@@ -26510,7 +26519,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 scan_acc["last_current"] = current
                 scan_acc["last_total"] = total
                 cum_current = scan_acc["prior"] + current
-                cum_total = scan_acc["prior"] + total
+                cum_total = scan_acc["overall_total"]
                 job["progress"]["current"] = cum_current
                 job["progress"]["total"] = cum_total
                 runner.update_step(
@@ -26522,19 +26531,31 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     "total": cum_total,
                     "current_file": job["progress"].get("current_file", ""),
                     "phase": "Importing in place",
+                    # Explicitly clear a completed discovery/metadata phase.
+                    # JobRunner mirrors progress by merging keys, so omitting
+                    # these would leave the old phase active for poll clients.
+                    "phase_current": None,
+                    "phase_total": None,
+                    "phase_label": None,
                 })
 
             def status_cb(message, phase_current=None, phase_total=None, phase_label=None):
+                visible_phase_label = phase_label
+                if phase_label and len(sources) > 1:
+                    visible_phase_label = (
+                        f"{phase_label} — source "
+                        f"{scan_acc['source_index']} of {len(sources)}"
+                    )
                 job["progress"]["current_file"] = message
                 runner.update_step(job["id"], "scan", current_file=message)
                 runner.push_event(job["id"], "progress", {
                     "current": job["progress"].get("current", 0),
                     "total": job["progress"].get("total", 0),
                     "current_file": message,
-                    "phase": phase_label or message,
+                    "phase": visible_phase_label or message,
                     "phase_current": phase_current,
                     "phase_total": phase_total,
-                    "phase_label": phase_label,
+                    "phase_label": visible_phase_label,
                 })
 
             def advance_scan_acc():
@@ -26545,11 +26566,123 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             def cancel_check():
                 return runner.is_cancelled(job["id"])
 
+            # Discover every source before processing any of them. Previously
+            # each scan discovered its source just-in-time, so the UI called a
+            # partial denominator "Overall" and then moved backward when the
+            # next source added more files. Freezing these manifests makes the
+            # total stable and also excludes files that arrive mid-import.
+            source_manifests = {}
+            source_discovery_failures = set()
             cancelled = False
+
+            def emit_discovery(source_index, source, checked=0, found=0):
+                source_name = os.path.basename(os.path.normpath(source)) or source
+                message = (
+                    f"Discovering source {source_index} of {len(sources)}: "
+                    f"{source_name}"
+                )
+                if checked:
+                    message += f" ({found:,} files found)"
+                runner.update_step(job["id"], "scan", current_file=message)
+                runner.push_event(job["id"], "progress", {
+                    "current": 0,
+                    "total": 0,
+                    "current_file": message,
+                    "phase": message,
+                    "phase_current": source_index - 1,
+                    "phase_total": len(sources),
+                    "phase_label": "Discovering sources",
+                })
+
+            for source_index, source in enumerate(sources, 1):
+                if cancel_check():
+                    cancelled = True
+                    break
+                emit_discovery(source_index, source)
+                try:
+                    if snapshot_paths_by_root is not None:
+                        manifest = sorted(
+                            Path(path)
+                            for path in snapshot_paths_by_root[source]
+                            if path in snapshot_eligible
+                        )
+                    else:
+                        def discovery_onerror(exc):
+                            if exc.errno in (errno_mod.EPERM, errno_mod.EACCES):
+                                raise exc
+                            log.warning(
+                                "Import-in-place discovery error at %s: %s",
+                                exc.filename, exc,
+                            )
+
+                        manifest = discover_source_files(
+                            source,
+                            file_types="both",
+                            recursive=recursive,
+                            onerror=discovery_onerror,
+                            cancel_check=cancel_check,
+                            progress_callback=lambda checked, found, i=source_index,
+                            s=source: emit_discovery(i, s, checked, found),
+                        )
+                except ScanCancelled:
+                    cancelled = True
+                    break
+                except Exception as exc:
+                    log.exception(
+                        "In-place import discovery failed for source %s", source,
+                    )
+                    msg = f"[{source}] discovery failed: {exc}"
+                    root_errors.append(msg)
+                    if msg not in job["errors"]:
+                        job["errors"].append(msg)
+                    source_discovery_failures.add(source)
+                    manifest = []
+                source_manifests[source] = manifest
+                scan_acc["overall_total"] += len(manifest)
+                runner.push_event(job["id"], "progress", {
+                    "current": 0,
+                    "total": 0,
+                    "current_file": (
+                        f"Discovered {len(manifest):,} files in source "
+                        f"{source_index} of {len(sources)}"
+                    ),
+                    "phase": "Discovering sources",
+                    "phase_current": source_index,
+                    "phase_total": len(sources),
+                    "phase_label": "Discovering sources",
+                })
+
+            # Publish the overall denominator only after every source has
+            # contributed. From this event onward it never changes.
+            job["progress"]["current"] = 0
+            job["progress"]["total"] = scan_acc["overall_total"]
+            runner.update_step(
+                job["id"], "scan",
+                progress={
+                    "current": 0,
+                    "total": scan_acc["overall_total"],
+                },
+                current_file="",
+            )
+            runner.push_event(job["id"], "progress", {
+                "current": 0,
+                "total": scan_acc["overall_total"],
+                "current_file": "",
+                "phase": "Importing in place",
+                "phase_current": None,
+                "phase_total": None,
+                "phase_label": None,
+            })
+
             for idx, source in enumerate(sources, 1):
                 if cancel_check():
                     cancelled = True
                     break
+                if source in source_discovery_failures:
+                    continue
+                scan_acc["source_index"] = idx
+                scan_acc["last_current"] = 0
+                scan_acc["last_total"] = len(source_manifests[source])
                 restricted_files = None
                 restricted_dirs = None
                 if snapshot_paths_by_root is not None:
@@ -26576,11 +26709,15 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     f"Importing source {idx} of {len(sources)}: {source}"
                     if len(sources) > 1 else "Importing in place"
                 )
+                runner.update_step(job["id"], "scan", current_file=phase)
                 runner.push_event(job["id"], "progress", {
                     "current": job["progress"].get("current", 0),
                     "total": job["progress"].get("total", 0),
                     "current_file": phase,
                     "phase": phase,
+                    "phase_current": None,
+                    "phase_total": None,
+                    "phase_label": None,
                 })
                 try:
                     do_scan(
@@ -26600,6 +26737,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                         register_restrict_dirs_as_roots=(
                             snapshot_paths_by_root is None
                         ),
+                        discovered_files=source_manifests[source],
                     )
                 except Exception as exc:
                     if isinstance(exc, ScanCancelled) and cancel_check():

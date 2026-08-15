@@ -24,7 +24,7 @@ from import_dedup import (
     source_capture_timestamps,
     stored_metadata_key,
 )
-from scanner import compute_file_hash
+from scanner import ScanCancelled, compute_file_hash
 
 log = logging.getLogger(__name__)
 
@@ -285,6 +285,7 @@ def preview_destination(sources, destination, folder_template="%Y/%Y-%m-%d",
 
 def discover_source_files(
     source_dir, file_types="both", recursive=True, onerror=None,
+    cancel_check=None, progress_callback=None,
 ):
     """Discover image files in source directory.
 
@@ -300,6 +301,10 @@ def discover_source_files(
             and lets ``safe_to_format`` go green over a card whose files
             were never seen; the import job passes a collector that flips
             the ledger unsafe.
+        cancel_check: optional callable returning truthy when discovery should
+            stop. Checked while walking so large sources remain cancellable.
+        progress_callback: optional ``callback(checked, found)`` invoked every
+            500 directory entries and once at completion.
 
     Returns:
         Sorted list of Path objects for matching files
@@ -386,13 +391,23 @@ def discover_source_files(
         # a generator — pass it straight through to the filter so we
         # don't materialize the directory listing twice.
         candidates = safe_iter_dir(str(source_path), onerror=onerror)
-    return sorted(
-        f
-        for f in candidates
-        if f.is_file()
-        and f.suffix.lower() in allowed
-        and not f.name.startswith(".")
-    )
+    files = []
+    checked = 0
+    for f in candidates:
+        checked += 1
+        if cancel_check is not None and cancel_check():
+            raise ScanCancelled("file discovery cancelled")
+        if (
+            f.is_file()
+            and f.suffix.lower() in allowed
+            and not f.name.startswith(".")
+        ):
+            files.append(f)
+        if progress_callback is not None and checked % 500 == 0:
+            progress_callback(checked, len(files))
+    if progress_callback is not None:
+        progress_callback(checked, len(files))
+    return sorted(files)
 
 
 def ingest(

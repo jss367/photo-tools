@@ -698,8 +698,18 @@
 
     // Expanded content
     if (isExpanded) {
+      // Import-in-place publishes explicit discovery and metadata sub-phases.
+      // Its overall file counter intentionally pauses during those phases, so
+      // extrapolating current / whole-step elapsed produces a fake ETA that
+      // grows while useful work is happening. The phase counter in the card
+      // header is the truthful progress signal until file processing resumes.
+      var importInPlacePhaseActive = job.type === 'import-in-place' &&
+        job.progress && typeof job.progress.phase_current === 'number' &&
+        job.progress.phase_total > 0;
+
       // 8: Throughput + ETA for running steps
-      if (isRunning && step.progress && step.progress.current > 0 && step.started_at) {
+      if (isRunning && step.progress && step.progress.current > 0 &&
+          step.started_at && !importInPlacePhaseActive) {
         if (job.type === 'import') {
           // Import's visible counter advances while a batch is prepared,
           // before its transfer and restricted catalog scan finish. Use the
@@ -779,8 +789,11 @@
         html += '</div>';
       }
 
-      // Leaf buffer (files processed)
-      if (isRunning) {
+      // Leaf buffer (files processed). Hide stale filenames while an in-place
+      // import is in a non-file sub-phase; the current status line above then
+      // stands alone instead of looking like it applies to the previous
+      // source's leaves.
+      if (isRunning && !importInPlacePhaseActive) {
         var leaves = leafBuffers[step.id] || [];
         if (step.current_file) {
           var found = leaves.find(function(l) { return l.name === step.current_file; });

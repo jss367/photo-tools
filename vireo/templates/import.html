@@ -3499,8 +3499,12 @@ function renderProgress(data) {
   // Once indexing finishes, working-copy generation becomes the active phase.
   // Drive the visible bar from that phase instead of leaving it pinned at the
   // indexing counter's 100% while thousands of files are still being rendered.
-  const visibleCurrent = data.phase_total > 0 ? (data.phase_current || 0) : data.current;
-  const visibleTotal = data.phase_total > 0 ? data.phase_total : data.total;
+  // Other sub-phases, notably remote transfer batches, are intentionally local
+  // to one batch and must not replace the import's overall progress bar.
+  const workingCopyPhase =
+    data.phase_label === 'Generating working copies' && data.phase_total > 0;
+  const visibleCurrent = workingCopyPhase ? (data.phase_current || 0) : data.current;
+  const visibleTotal = workingCopyPhase ? data.phase_total : data.total;
   const pct = visibleTotal ? Math.round(100 * visibleCurrent / visibleTotal) : 0;
   document.getElementById('progressFill').style.width = pct + '%';
   if (data.folders && Object.keys(data.folders).length) {

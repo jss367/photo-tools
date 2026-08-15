@@ -1324,6 +1324,8 @@ input[type=text], input[type=date], select, .path-input, .text-input, .model-sel
 }
 .delete-progress-stage.waiting { opacity: 0.55; }
 .delete-progress-stage.complete .delete-progress-stage-status { color: var(--accent); }
+.delete-progress-stage.partial .delete-progress-stage-status { color: var(--danger); }
+.delete-progress-stage.partial .inat-progress-fill { background: var(--danger); }
 
 /* ---------- Workspace switcher ---------- */
 .ws-dropdown { position: relative; }
@@ -7991,7 +7993,8 @@ function resetDeleteProgress() {
     if (!row) return;
     row.hidden = false;
     row.classList.add('waiting');
-    row.classList.remove('active', 'complete');
+    row.classList.remove('active', 'complete', 'partial');
+    delete row.dataset.failed;
     if (status) status.textContent = 'Waiting';
     var bar = row.querySelector('[role="progressbar"]');
     var fill = row.querySelector('.inat-progress-fill');
@@ -8008,28 +8011,40 @@ function setDeleteProgressStage(stage, state, current, total, statusText) {
   var name = stage.charAt(0).toUpperCase() + stage.slice(1);
   var row = document.getElementById('deleteProgress' + name + 'Stage');
   if (!row) return;
+  // A stage that has already recorded failures must not be silently
+  // "completed" by a later phase transition \u2014 that would let the UI report
+  // e.g. "Move files to Trash \u2713 Complete" while files were actually
+  // retained. Keep the failure state visible until the modal is reset.
+  if (state === 'complete' && row.dataset.failed) {
+    return;
+  }
   var status = document.getElementById('deleteProgress' + name + 'Status');
   var bar = row.querySelector('[role="progressbar"]');
   var fill = row.querySelector('.inat-progress-fill');
   current = Math.max(0, Number(current || 0));
   total = Math.max(0, Number(total || 0));
-  var pct = state === 'complete'
+  var pct = (state === 'complete' || state === 'partial')
     ? 100
     : (total > 0 ? Math.max(0, Math.min(100, Math.round(100 * current / total))) : 0);
 
   row.classList.toggle('waiting', state === 'waiting');
   row.classList.toggle('active', state === 'active');
   row.classList.toggle('complete', state === 'complete');
+  row.classList.toggle('partial', state === 'partial');
   if (fill) fill.style.width = pct + '%';
   if (bar) {
     bar.setAttribute('aria-valuemax', String(total || 1));
-    bar.setAttribute('aria-valuenow', String(state === 'complete' ? (total || 1) : current));
+    bar.setAttribute(
+      'aria-valuenow',
+      String((state === 'complete' || state === 'partial') ? (total || 1) : current),
+    );
   }
 
   var displayStatus = statusText;
   if (!displayStatus) {
     if (state === 'waiting') displayStatus = 'Waiting';
     else if (state === 'complete') displayStatus = '\u2713 Complete';
+    else if (state === 'partial') displayStatus = 'Processed with errors';
     else if (total > 0) displayStatus = current + '/' + total;
     else displayStatus = 'Working\u2026';
   }
@@ -8071,6 +8086,17 @@ function deleteProgressStageForPhase(phase) {
   return null;
 }
 
+function markDeleteStageFailed(stage, failed, current, total) {
+  var name = stage.charAt(0).toUpperCase() + stage.slice(1);
+  var row = document.getElementById('deleteProgress' + name + 'Stage');
+  if (!row) return;
+  row.dataset.failed = String(failed);
+  var statusText = failed === 1
+    ? '1 file retained'
+    : failed + ' files retained';
+  setDeleteProgressStage(stage, 'partial', current, total, statusText);
+}
+
 function updateDeleteProgress(data) {
   data = data || {};
   var box = document.getElementById('deleteProgress');
@@ -8079,9 +8105,14 @@ function updateDeleteProgress(data) {
   var phase = data.phase || 'Working';
   var total = Number(data.total || 0);
   var current = Number(data.current || 0);
+  var failed = Number(data.failed || 0);
 
   if (phase === 'Finishing') {
     _deleteProgressStageOrder.forEach(function(stage) {
+      // setDeleteProgressStage refuses to overwrite a stage that already
+      // recorded a failure, so this only completes stages whose work
+      // actually succeeded -- the files stage stays partial when Trash
+      // failures were reported earlier.
       setDeleteProgressStage(stage, 'complete');
     });
     if (detail) detail.textContent = '';
@@ -8094,7 +8125,15 @@ function updateDeleteProgress(data) {
     _deleteProgressStageOrder.slice(0, stageIndex).forEach(function(previous) {
       setDeleteProgressStage(previous, 'complete');
     });
-    if (phase === 'Pruning pipeline cache') {
+    var isDiskPhase = (
+      phase === 'Moving files to Trash' ||
+      phase === 'Deleting files permanently'
+    );
+    if (isDiskPhase && failed > 0 && total > 0 && current >= total) {
+      // Filesystem step finished with retained files -- surface the failure
+      // now rather than letting a later phase mark this stage green.
+      markDeleteStageFailed(stage, failed, current, total);
+    } else if (phase === 'Pruning pipeline cache') {
       // This usually completes too quickly to deserve its own bar. Keep the
       // cleanup bar monotonic at zero until per-photo cache cleanup begins.
       setDeleteProgressStage(stage, 'active', 0, 0, 'Updating review cache\u2026');

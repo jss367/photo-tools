@@ -236,6 +236,104 @@ def test_delete_modal_has_persistent_stage_progress(app_and_db):
     assert "'Updating review cache\\u2026'" in html
 
 
+def test_delete_modal_marks_files_stage_partial_on_trash_failure(app_and_db):
+    """When Trash fails, the files stage must render a failure state.
+
+    Without this, the 'Finishing' phase blindly marks every stage complete
+    (green check) even though files were retained on disk and the user is
+    about to be prompted about permanent deletion. Guard both directions:
+    the partial state must exist in the DOM/CSS and script, and the
+    'complete' write path must refuse to overwrite a stage flagged as
+    failed via ``dataset.failed``.
+    """
+    app, _ = app_and_db
+    html = app.test_client().get("/browse").data.decode()
+
+    # A partial CSS state (styled distinctly from complete) must exist so
+    # the row can convey "processed with errors" instead of green complete.
+    assert ".delete-progress-stage.partial" in html
+    # The set-stage helper must know about the partial state.
+    assert "state === 'partial'" in html
+    # The updateDeleteProgress function must honour a backend-reported
+    # failure count so the Files stage transitions to partial instead of
+    # active-at-100% when the disk phase finishes with retained files.
+    assert "markDeleteStageFailed" in html
+    assert "var failed = Number(data.failed || 0);" in html
+    # The complete-write path must respect an already-failed stage so a
+    # later 'Finishing' or subsequent phase can't erase the failure.
+    assert "state === 'complete' && row.dataset.failed" in html
+
+
+def test_batch_delete_progress_reports_failed_count_on_trash_failure(
+    app_and_db, tmp_path, monkeypatch,
+):
+    """The disk-phase completion emit must carry ``failed`` so the UI can
+    keep the Files stage in a failure state instead of showing it green.
+
+    Without a ``failed`` field on the payload, the frontend has no way to
+    tell that files were retained and reports 'Move files to Trash ✓
+    Complete' during subsequent cleanup phases.
+    """
+    import app as appmod
+
+    app, db = app_and_db
+    client = app.test_client()
+    photo = db.get_photos()[0]
+    folder_path = str(tmp_path / "trash_fail_progress")
+    db.conn.execute(
+        "UPDATE folders SET path = ? WHERE id = ?",
+        (folder_path, photo["folder_id"]),
+    )
+    db.conn.commit()
+    os.makedirs(folder_path, exist_ok=True)
+    Image.new("RGB", (10, 10)).save(
+        os.path.join(folder_path, photo["filename"]),
+    )
+
+    def fail_trash(paths, progress_callback=None):
+        paths = list(paths)
+        return 0, set(), [
+            {"path": path, "error": "SMB Trash unavailable"} for path in paths
+        ]
+
+    monkeypatch.setattr(appmod, "_trash_paths", fail_trash)
+
+    resp = client.post("/api/jobs/batch-delete", json={
+        "photo_ids": [photo["id"]],
+        "mode": "disk",
+    })
+    assert resp.status_code == 200
+    job_id = resp.get_json()["job_id"]
+
+    job = wait_for_job_via_client(client, job_id)
+    assert job["status"] == "completed"
+    assert job["result"]["failed_photo_ids"] == [photo["id"]]
+
+    # Inspect emitted progress events for the disk-phase completion and
+    # the Finishing emit. Both must carry ``failed`` so the UI can hold
+    # the Files stage in a partial (not green ✓) state.
+    events = app._job_runner.get_events(job_id)
+    disk_progress = [
+        e for e in events
+        if e.get("type") == "progress"
+        and e.get("data", {}).get("phase") == "Moving files to Trash"
+    ]
+    assert disk_progress, "expected at least one Moving files to Trash event"
+    last_disk = disk_progress[-1]["data"]
+    assert last_disk.get("failed") == 1, (
+        "disk-phase completion must report the failed count so the UI can "
+        f"render a partial state instead of green complete: {last_disk!r}"
+    )
+
+    finishing = [
+        e for e in events
+        if e.get("type") == "progress"
+        and e.get("data", {}).get("phase") == "Finishing"
+    ]
+    assert finishing, "expected a Finishing progress event"
+    assert finishing[-1]["data"].get("failed") == 1
+
+
 def test_api_batch_delete_tolerates_pipeline_prune_system_exit(app_and_db, monkeypatch):
     """A packaged-app lazy import failure must not strand the delete request."""
     from db import Database

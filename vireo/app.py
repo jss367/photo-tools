@@ -10943,7 +10943,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         """Delete photos using the same phases for sync and job endpoints."""
         paths = paths or []
 
-        def emit(phase, current=0, total=0, current_file="", detail=""):
+        def emit(phase, current=0, total=0, current_file="", detail="", failed=0):
             if progress_callback:
                 progress_callback({
                     "phase": phase,
@@ -10951,6 +10951,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     "total": total,
                     "current_file": current_file,
                     "detail": detail,
+                    "failed": failed,
                 })
 
         if mode == "disk_permanent" and paths:
@@ -11333,6 +11334,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 f"{len(successful_ids)} photo(s) ready for catalog removal; "
                 f"{len(failed_ids)} retained after filesystem errors."
             ),
+            failed=len(failed_ids),
         )
         result = remove_catalog_rows(
             successful_ids,
@@ -11358,7 +11360,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 photo_id for photo_id in skipped_ids
                 if photo_id not in already_failed
             ]
-        emit("Finishing", 1, 1)
+        emit("Finishing", 1, 1, failed=len(failed_ids))
         return {
             "ok": True,
             "deleted": result["deleted"],

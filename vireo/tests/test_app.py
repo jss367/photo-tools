@@ -16179,6 +16179,74 @@ def _seed_mammal_taxon(db):
     return cur.lastrowid
 
 
+def test_explorer_uncounted_identifications_are_class_aware_and_reasoned(db):
+    from app import _build_explorer_payload
+
+    ids = _seed_bird_taxonomy(db)
+    mammalia_id = _seed_mammal_taxon(db)
+    ovis_id = db.conn.execute(
+        "INSERT INTO taxa (name, common_name, rank, parent_id, kingdom) "
+        "VALUES ('Ovis', 'Sheep', 'genus', ?, 'Animalia')",
+        (mammalia_id,),
+    ).lastrowid
+    plants_id = db.conn.execute(
+        "INSERT INTO taxa (name, common_name, rank, kingdom) "
+        "VALUES ('Tracheophyta', 'tracheophytes', 'phylum', 'Plantae')"
+    ).lastrowid
+    ws = db.ensure_default_workspace()
+    db.set_active_workspace(ws)
+    fid = db.add_folder('/p', name='p')
+
+    tags = [
+        ('New World sparrows', ids['Passerellidae']),
+        ('Sheep', ovis_id),
+        ('Trees', plants_id),
+        ('Mallard × hawaiian duck', None),
+    ]
+    for index, (name, taxon_id) in enumerate(tags, start=1):
+        photo_id = db.add_photo(
+            folder_id=fid, filename=f'{index}.jpg', extension='.jpg',
+            file_size=1, file_mtime=float(index),
+        )
+        keyword_id = db.add_keyword(name, kw_type='taxonomy')
+        db.conn.execute(
+            "UPDATE keywords SET type='taxonomy', is_species=1, taxon_id=? "
+            "WHERE id=?",
+            (taxon_id, keyword_id),
+        )
+        db.tag_photo(photo_id, keyword_id)
+    db.conn.commit()
+
+    birds = _build_explorer_payload(db)
+    bird_uncounted = birds['uncounted_identifications']
+    assert [row['name'] for row in bird_uncounted['scoped']] == [
+        'New World sparrows'
+    ]
+    assert {row['name'] for row in bird_uncounted['workspace']} == {
+        'Mallard × Hawaiian Duck', 'Trees'
+    }
+    assert all(row['name'] != 'Sheep' for row in (
+        bird_uncounted['scoped'] + bird_uncounted['workspace']
+    ))
+    reasons = {
+        row['name']: (row['reason'], row['taxon_rank'], row['photo_count'])
+        for row in bird_uncounted['scoped'] + bird_uncounted['workspace']
+    }
+    assert reasons == {
+        'New World sparrows': ('higher_rank', 'family', 1),
+        'Trees': ('higher_rank', 'phylum', 1),
+        'Mallard × Hawaiian Duck': ('unmatched', None, 1),
+    }
+    assert 'Mammalia' in {row['name'] for row in birds['classes']}
+
+    mammals = _build_explorer_payload(db, root_id=mammalia_id)
+    mammal_uncounted = mammals['uncounted_identifications']
+    assert [row['name'] for row in mammal_uncounted['scoped']] == ['Sheep']
+    assert all(row['name'] != 'New World sparrows' for row in (
+        mammal_uncounted['scoped'] + mammal_uncounted['workspace']
+    ))
+
+
 def test_build_explorer_payload_always_includes_default_aves_class(db):
     # Codex P2: after switching away from Aves, the default Birds class must
     # stay in the selector so the user has an in-page way back to it. Recomputing

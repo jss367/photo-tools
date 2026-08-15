@@ -20291,6 +20291,56 @@ def test_life_list_taxon_ids_excludes_non_species_matches(db):
     assert 'Melospiza sp.' in unmatched
 
 
+def test_life_list_uncounted_suppresses_redundant_ancestor_per_photo(db):
+    """Imported family/order parents are noise when a descendant is present,
+    but the same broad label must remain actionable on a broad-only photo."""
+    ids = _seed_bird_taxonomy(db)
+    ws = db.ensure_default_workspace()
+    db.set_active_workspace(ws)
+    fid = db.add_folder('/p', name='p')
+    species_photo = db.add_photo(
+        folder_id=fid, filename='species.jpg', extension='.jpg',
+        file_size=1, file_mtime=1.0,
+    )
+    broad_photo = db.add_photo(
+        folder_id=fid, filename='broad.jpg', extension='.jpg',
+        file_size=1, file_mtime=2.0,
+    )
+    family_kw = db.add_keyword('New World sparrows', kw_type='taxonomy')
+    species_kw = db.add_keyword('Song Sparrow', kw_type='taxonomy')
+    db.conn.execute(
+        "UPDATE keywords SET is_species=1, taxon_id=? WHERE id=?",
+        (ids['Passerellidae'], family_kw),
+    )
+    db.conn.execute(
+        "UPDATE keywords SET is_species=1, taxon_id=? WHERE id=?",
+        (ids['Melospiza melodia'], species_kw),
+    )
+    db.tag_photo(species_photo, family_kw)
+    db.tag_photo(species_photo, species_kw)
+    db.conn.commit()
+
+    # The family tag is redundant on its only photo and disappears entirely.
+    assert db.get_life_list_uncounted_identifications() == []
+
+    db.tag_photo(broad_photo, family_kw)
+    db.conn.commit()
+    rows = db.get_life_list_uncounted_identifications()
+    assert len(rows) == 1
+    assert rows[0] == {
+        'name': 'New World sparrows',
+        'taxon_id': ids['Passerellidae'],
+        'taxon_rank': 'family',
+        'class': {
+            'id': ids['Aves'],
+            'name': 'Aves',
+            'common_name': 'Birds',
+        },
+        'reason': 'higher_rank',
+        'photo_count': 1,
+    }
+
+
 def test_life_list_taxon_ids_excludes_rejected(db):
     ids = _seed_bird_taxonomy(db)
     ws = db.ensure_default_workspace()
@@ -20868,6 +20918,54 @@ def test_mark_species_keywords_rebinds_higher_rank_taxonomy_link(tmp_path):
     assert row["type"] == "taxonomy"
     assert row["is_species"] == 1
     assert row["taxon_id"] == species_taxon
+
+
+def test_mark_species_keywords_links_subspecies_to_species_ancestor(tmp_path):
+    """A precise subspecies label should credit its containing species even
+    though the structured Explorer taxonomy intentionally stops at species."""
+    from db import Database
+
+    db = Database(str(tmp_path / "test.db"))
+    species_taxon = db.conn.execute(
+        "INSERT INTO taxa (inat_id, name, common_name, rank, kingdom) "
+        "VALUES (?, ?, ?, 'species', 'Animalia')",
+        (46020, "Sciurus niger", "Fox Squirrel"),
+    ).lastrowid
+    keyword_id = db.conn.execute(
+        "INSERT INTO keywords (name, type, is_species, taxon_id) "
+        "VALUES ('Eastern fox squirrel', 'taxonomy', 1, NULL)"
+    ).lastrowid
+    db.conn.commit()
+
+    class FakeTaxonomy:
+        def lookup(self, name):
+            if name.lower() == "eastern fox squirrel":
+                return {
+                    "taxon_id": 132755,
+                    "rank": "subspecies",
+                    "lineage_names": [
+                        "Animalia", "Mammalia", "Sciurus",
+                        "Sciurus niger", "Sciurus niger vulpinus",
+                    ],
+                    "lineage_ranks": [
+                        "kingdom", "class", "genus", "species", "subspecies",
+                    ],
+                }
+            return None
+
+        def is_taxon(self, name):
+            return self.lookup(name) is not None
+
+    assert db.mark_species_keywords(FakeTaxonomy()) == 1
+    row = db.conn.execute(
+        "SELECT type, is_species, taxon_id FROM keywords WHERE id = ?",
+        (keyword_id,),
+    ).fetchone()
+    assert dict(row) == {
+        "type": "taxonomy",
+        "is_species": 1,
+        "taxon_id": species_taxon,
+    }
 
 
 def test_mark_species_keywords_leaves_taxon_null_when_only_higher_rank_available(tmp_path):

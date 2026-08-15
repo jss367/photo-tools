@@ -1,5 +1,8 @@
 """End-to-end coverage for the zoomable Life List explorer sunburst."""
 
+import json
+from urllib.parse import parse_qs, urlparse
+
 from playwright.sync_api import expect
 
 
@@ -29,6 +32,7 @@ def _seed_hummingbird_tree(db):
         (ids["Archilochus colubris"], "Red-tailed Hawk"),
     )
     db.conn.commit()
+    return ids
 
 
 def test_sunburst_expands_selected_taxon(live_server, page):
@@ -64,3 +68,72 @@ def test_sunburst_expands_selected_taxon(live_server, page):
     expect(page.locator(".ll-sb-arc")).to_have_attribute(
         "data-name", "Unplaced hummingbird"
     )
+
+
+def test_uncounted_identifications_are_reasoned_and_actionable(live_server, page):
+    db = live_server["db"]
+    ids = _seed_hummingbird_tree(db)
+    existing_photo = db.conn.execute(
+        "SELECT pk.photo_id FROM photo_keywords pk "
+        "JOIN keywords k ON k.id=pk.keyword_id "
+        "WHERE k.name='Red-tailed Hawk' LIMIT 1"
+    ).fetchone()["photo_id"]
+    folder_id = db.conn.execute(
+        "SELECT folder_id FROM photos WHERE id=?", (existing_photo,)
+    ).fetchone()["folder_id"]
+
+    # A family keyword on a photo that also has a descendant species is
+    # redundant and must not appear in the disclosure.
+    redundant_id = db.add_keyword("Hummingbirds", kw_type="taxonomy")
+    db.conn.execute(
+        "UPDATE keywords SET taxon_id=?, is_species=1 WHERE id=?",
+        (ids["Trochilidae"], redundant_id),
+    )
+    db.tag_photo(existing_photo, redundant_id)
+
+    broad_photo = db.add_photo(
+        folder_id=folder_id, filename="broad-only.jpg", extension=".jpg",
+        file_size=1, file_mtime=10.0,
+    )
+    broad_id = db.add_keyword("Reference gap", kw_type="taxonomy")
+    db.conn.execute(
+        "UPDATE keywords SET taxon_id=?, is_species=1 WHERE id=?",
+        (ids["Incertae sedis"], broad_id),
+    )
+    db.tag_photo(broad_photo, broad_id)
+
+    unmatched_photo = db.add_photo(
+        folder_id=folder_id, filename="hybrid.jpg", extension=".jpg",
+        file_size=1, file_mtime=11.0,
+    )
+    unmatched_id = db.add_keyword("Mystery hybrid", kw_type="taxonomy")
+    db.tag_photo(unmatched_photo, unmatched_id)
+    db.conn.commit()
+
+    page.goto(f"{live_server['url']}/life-list?view=explorer")
+    disclosures = page.locator(".ll-unmatched")
+    expect(disclosures).to_have_count(2)
+    expect(disclosures.nth(0)).to_contain_text(
+        "1 identification label in Birds isn't included in species totals."
+    )
+    expect(disclosures.nth(1)).to_contain_text(
+        "identification labels elsewhere in this workspace"
+    )
+    expect(disclosures.nth(1)).to_contain_text("Mystery Hybrid")
+    assert "Hummingbirds" not in " ".join(disclosures.all_inner_texts())
+
+    disclosures.nth(0).locator("summary").click()
+    expect(disclosures.nth(0)).to_contain_text("Reference Gap")
+    expect(disclosures.nth(0)).to_contain_text("Identified at family rank")
+    expect(disclosures.nth(0)).to_contain_text("1 photo")
+
+    href = disclosures.nth(0).get_by_role("link", name="View photos").get_attribute("href")
+    filters = json.loads(parse_qs(urlparse(href).query)["filters"][0])
+    assert filters == {
+        "root": {
+            "mode": "all",
+            "rules": [
+                {"field": "keyword", "op": "is", "value": "Reference Gap"}
+            ],
+        }
+    }

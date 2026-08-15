@@ -3375,14 +3375,24 @@ def _build_explorer_payload(db, root_id=None):
         # Taxonomy absent (default lookup found no Aves class) -> not ready.
         return {"taxonomy_ready": False, "valid_root": False, "root": None,
                 "summary": {}, "nodes": [],
-                "unmatched_species": {"count": 0, "names": []}, "classes": []}
+                "unmatched_species": {"count": 0, "names": []},
+                "uncounted_identifications": {
+                    "count": 0, "scoped_count": 0, "workspace_count": 0,
+                    "scoped": [], "workspace": [],
+                },
+                "classes": []}
     if root["rank"] != "class":
         # Explorer roots must be class-rank; an order/family/etc. root produces a
         # semantically confusing summary (e.g. an order counting itself). The
         # taxonomy exists, but this root is not valid.
         return {"taxonomy_ready": True, "valid_root": False, "root": None,
                 "summary": {}, "nodes": [],
-                "unmatched_species": {"count": 0, "names": []}, "classes": []}
+                "unmatched_species": {"count": 0, "names": []},
+                "uncounted_identifications": {
+                    "count": 0, "scoped_count": 0, "workspace_count": 0,
+                    "scoped": [], "workspace": [],
+                },
+                "classes": []}
 
     rows = db.get_taxon_subtree(root["id"])
     found = db.get_life_list_taxon_ids()
@@ -3442,8 +3452,29 @@ def _build_explorer_payload(db, root_id=None):
         key=lambda c: (c["found_species"] == 0,
                        (c["common_name"] or c["name"]).lower()))]
 
-    unmatched = db.get_life_list_unmatched_species()
-    classes = db.get_classes_for_taxa(found)
+    uncounted = db.get_life_list_uncounted_identifications()
+    scoped_uncounted = [
+        entry for entry in uncounted
+        if entry["class"] is not None and entry["class"]["id"] == root["id"]
+    ]
+    # An unlinked label (or a taxon broader than class, such as the plant
+    # phylum behind "Trees") cannot honestly be assigned to the selected
+    # class. Surface it separately as workspace-wide taxonomy cleanup instead
+    # of making mammals/reptiles/plants look like missing Birds entries.
+    workspace_uncounted = [
+        entry for entry in uncounted if entry["class"] is None
+    ]
+    visible_uncounted = scoped_uncounted + workspace_uncounted
+
+    # A class represented only by a broad identification still belongs in the
+    # selector. Otherwise (for example) a workspace containing only the genus
+    # "Sheep" would have no Mammals option in which to review that label.
+    class_seed_taxa = set(found)
+    class_seed_taxa.update(
+        entry["taxon_id"] for entry in uncounted
+        if entry["taxon_id"] is not None
+    )
+    classes = db.get_classes_for_taxa(class_seed_taxa)
     # Always include the default Aves class in the selector, regardless of the
     # currently selected root. `get_classes_for_taxa(found)` only returns classes
     # the user has actually tagged in, so a user who tags only non-bird species
@@ -3463,7 +3494,19 @@ def _build_explorer_payload(db, root_id=None):
                  "common_name": root.get("common_name"), "rank": root["rank"]},
         "summary": summary,
         "nodes": top,
-        "unmatched_species": {"count": len(unmatched), "names": unmatched[:200]},
+        # Retain the old name-only field for API compatibility. New clients use
+        # the structured, reasoned field below.
+        "unmatched_species": {
+            "count": len(visible_uncounted),
+            "names": [entry["name"] for entry in visible_uncounted[:200]],
+        },
+        "uncounted_identifications": {
+            "count": len(visible_uncounted),
+            "scoped_count": len(scoped_uncounted),
+            "workspace_count": len(workspace_uncounted),
+            "scoped": scoped_uncounted[:200],
+            "workspace": workspace_uncounted[:200],
+        },
         "classes": classes,
     }
 

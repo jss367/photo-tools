@@ -76,6 +76,27 @@ def _rollback_failed_mask_photo(thread_db, photo_id):
         ) from exc
 
 
+def _fsync_mask_file(path):
+    """Make a completed staged PNG durable before publishing its name."""
+    with open(path, "rb") as handle:
+        os.fsync(handle.fileno())
+
+
+def _fsync_mask_directory(path):
+    """Persist a published mask directory entry where Python supports it."""
+    # Python cannot open directory handles for fsync on Windows. The staged
+    # file itself is still flushed there before os.replace; POSIX platforms
+    # additionally flush the directory entry before SQLite may commit it.
+    if os.name == "nt":
+        return
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    directory_fd = os.open(path, flags)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
 class _StagedMaskFile:
     """Publish a new immutable mask generation around a database commit.
 
@@ -124,8 +145,10 @@ class _StagedMaskFile:
 
     def install(self):
         """Atomically publish the new generation at its unique path."""
+        _fsync_mask_file(self.staged_path)
         os.replace(self.staged_path, self.final_path)
         self.installed = True
+        _fsync_mask_directory(os.path.dirname(self.final_path))
 
     def restore(self):
         """Discard a generation whose database transaction did not commit."""

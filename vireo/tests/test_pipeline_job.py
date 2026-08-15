@@ -9234,6 +9234,50 @@ def test_staged_mask_restores_previous_file_on_failure(tmp_path, monkeypatch):
     assert not list(masks_dir.glob(".mask-stage-*"))
 
 
+def test_staged_mask_syncs_bytes_and_name_before_database_commit(
+    tmp_path, monkeypatch,
+):
+    """install() durably orders file, rename, then directory publication."""
+    import pipeline_job as pj
+
+    masks_dir = tmp_path / "masks"
+
+    def fake_save(_mask, stage_dir, photo_id, variant):
+        staged_path = os.path.join(stage_dir, f"{photo_id}.{variant}.png")
+        with open(staged_path, "wb") as handle:
+            handle.write(b"new mask")
+        return staged_path
+
+    staged = pj._StagedMaskFile.create(
+        None, str(masks_dir), 42, "tiny", fake_save,
+    )
+    calls = []
+    real_replace = pj.os.replace
+    monkeypatch.setattr(
+        pj, "_fsync_mask_file",
+        lambda path: calls.append(("file", path)),
+    )
+    monkeypatch.setattr(
+        pj, "_fsync_mask_directory",
+        lambda path: calls.append(("directory", path)),
+    )
+
+    def tracked_replace(source, destination):
+        calls.append(("replace", source, destination))
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(pj.os, "replace", tracked_replace)
+
+    staged.install()
+
+    assert calls == [
+        ("file", staged.staged_path),
+        ("replace", staged.staged_path, staged.final_path),
+        ("directory", str(masks_dir)),
+    ]
+    staged.restore()
+
+
 def test_staged_mask_removes_previous_file_only_after_commit(tmp_path):
     """The old committed path stays valid until finish follows DB commit."""
     import pipeline_job as pj

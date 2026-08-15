@@ -12,6 +12,7 @@ from resource_ledger import (
     ResourceLedger,
     ResourceRequest,
     ResourceWaitCancelled,
+    bind_resource_cancel_check,
     bind_resource_owner,
 )
 
@@ -172,3 +173,78 @@ def test_raising_cancel_check_releases_waiter_accounting():
 def test_invalid_cpu_request_rejected(values):
     with pytest.raises(ValueError):
         CpuRequest(*values)
+
+
+def test_bound_cancel_check_wakes_waiter_without_explicit_argument():
+    """A job that binds its cancel probe cancels downstream ledger waits.
+
+    Downstream inference sites (CPU classify/detect/mask/embed) claim the
+    ``cpu_ml`` lane through ``acquire_inference_resources`` without seeing
+    the job's cancellation callable. Binding the probe via
+    ``bind_resource_cancel_check`` at the top of a job means those waits
+    still wake when the job is cancelled.
+    """
+    ledger = ResourceLedger(cpu_capacity=1)
+    holder = ledger.acquire(ResourceRequest(cpu=CpuRequest(1, 1, 1)))
+    waiting = threading.Event()
+    cancelled = threading.Event()
+    outcome = []
+
+    def waiter():
+        with bind_resource_cancel_check(cancelled.is_set):
+            try:
+                ledger.acquire(
+                    ResourceRequest(cpu=CpuRequest(1, 1, 1)),
+                    on_wait=lambda _request: waiting.set(),
+                )
+            except ResourceWaitCancelled:
+                outcome.append("cancelled")
+
+    thread = threading.Thread(target=waiter)
+    thread.start()
+    assert waiting.wait(timeout=1.0)
+    cancelled.set()
+    holder.release()
+    thread.join(timeout=1.0)
+    assert not thread.is_alive()
+    assert outcome == ["cancelled"]
+    assert ledger.snapshot()["waiters"] == 0
+
+
+def test_explicit_cancel_check_overrides_bound_probe():
+    """A caller that passes cancel_check explicitly is trusted verbatim.
+
+    Scanner hashing already threads its own probe and would otherwise be
+    surprised by a bound probe silently taking over — the explicit
+    argument must win, and ``None`` means "no cancellation" for callers
+    that opted out on purpose.
+    """
+    ledger = ResourceLedger(cpu_capacity=1)
+    holder = ledger.acquire(ResourceRequest(cpu=CpuRequest(1, 1, 1)))
+    waiting = threading.Event()
+    bound_cancelled = threading.Event()
+    explicit_cancelled = threading.Event()
+    outcome = []
+
+    def waiter():
+        with bind_resource_cancel_check(bound_cancelled.is_set):
+            try:
+                ledger.acquire(
+                    ResourceRequest(cpu=CpuRequest(1, 1, 1)),
+                    cancel_check=explicit_cancelled.is_set,
+                    on_wait=lambda _request: waiting.set(),
+                )
+            except ResourceWaitCancelled:
+                outcome.append("cancelled")
+
+    thread = threading.Thread(target=waiter)
+    thread.start()
+    assert waiting.wait(timeout=1.0)
+    # Flip the bound probe first. If bind took precedence, this would
+    # cancel the waiter; the assertions below prove it did not.
+    bound_cancelled.set()
+    explicit_cancelled.set()
+    holder.release()
+    thread.join(timeout=1.0)
+    assert not thread.is_alive()
+    assert outcome == ["cancelled"]

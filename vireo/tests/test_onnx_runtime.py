@@ -150,6 +150,54 @@ def test_create_session_configures_threads_from_cpu_grant(tmp_path):
     assert ledger.snapshot()["lanes"]["model_construction"]["allocated"] == 0
 
 
+def test_create_session_uses_inference_profile_not_construction_grant(tmp_path):
+    """Session threads must reflect the intended inference profile.
+
+    When construction runs under contention (e.g. a scan holding most
+    permits) the construction lease may receive only its minimum grant.
+    Sizing ``intra_op_num_threads`` from that transient number would cap
+    the cached session at the reduced count forever, throttling every
+    subsequent CPU inference until process restart. Verify that the
+    session is instead sized from the inference profile, which is
+    independent of construction-time contention.
+    """
+    from unittest.mock import MagicMock, patch
+
+    import resource_ledger
+
+    from vireo.onnx_runtime import create_session, session_cpu_threads
+
+    model_file = tmp_path / "model.onnx"
+    model_file.write_bytes(b"fake")
+    mock_session = MagicMock()
+    mock_session.get_providers.return_value = ["CPUExecutionProvider"]
+    ledger = resource_ledger.ResourceLedger(cpu_capacity=12)
+    previous = resource_ledger._set_resource_ledger_for_tests(ledger)
+    # Reserve 10 permits so construction can only receive its 2-permit
+    # minimum. Pre-fix this would cap the session at 2 inference threads.
+    holder = ledger.acquire(resource_ledger.ResourceRequest(
+        cpu=resource_ledger.CpuRequest(10, 10, 10),
+    ))
+    try:
+        with patch(
+            "vireo.onnx_runtime.get_providers",
+            return_value=["CPUExecutionProvider"],
+        ), patch(
+            "onnxruntime.InferenceSession", return_value=mock_session,
+        ) as mock_cls:
+            session = create_session(str(model_file))
+    finally:
+        holder.release()
+        resource_ledger._set_resource_ledger_for_tests(previous)
+
+    options = mock_cls.call_args.kwargs["sess_options"]
+    # The session must be sized from the inference profile (preferred=8),
+    # not from the transient 2-permit construction grant.
+    assert options.intra_op_num_threads == 8
+    assert options.inter_op_num_threads == 1
+    assert session_cpu_threads(session) == 8
+
+
 def test_production_onnx_sessions_use_budgeted_factory():
     """Direct session construction would bypass thread and load budgets."""
     import ast

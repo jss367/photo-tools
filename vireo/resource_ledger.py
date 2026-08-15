@@ -18,6 +18,9 @@ import time
 from dataclasses import dataclass
 
 _RESOURCE_OWNER = contextvars.ContextVar("vireo_resource_owner", default=None)
+_RESOURCE_CANCEL_CHECK = contextvars.ContextVar(
+    "vireo_resource_cancel_check", default=None,
+)
 
 
 class ResourceWaitCancelled(RuntimeError):
@@ -232,11 +235,19 @@ class ResourceLedger:
 
         Cancellation callbacks run outside the ledger mutex.  They may call
         JobRunner or stage code without creating a lock-order cycle.
+
+        When ``cancel_check`` is not supplied, the current execution
+        context's bound probe (see :func:`bind_resource_cancel_check`) is
+        used instead so background jobs that establish one at their top
+        level can cancel waits from any downstream inference site without
+        threading a callable through every helper.
         """
         if not isinstance(request, ResourceRequest):
             raise TypeError("request must be a ResourceRequest")
         self._validate_request(request)
         owner_id = owner_id if owner_id is not None else _RESOURCE_OWNER.get()
+        if cancel_check is None:
+            cancel_check = _RESOURCE_CANCEL_CHECK.get()
         wait_started = None
         announce_wait = False
 
@@ -355,6 +366,28 @@ def bind_resource_owner(owner_id):
         yield
     finally:
         _RESOURCE_OWNER.reset(token)
+
+
+@contextlib.contextmanager
+def bind_resource_cancel_check(cancel_check):
+    """Route ledger waits in the current context through ``cancel_check``.
+
+    Downstream inference sites (classifier, detector, mask, embedding, text
+    encoder, keypoints, timm) claim ``cpu_ml`` without seeing the owning
+    job's cancellation probe directly. Binding the probe here lets those
+    waits wake promptly on Cancel — the same guarantee scanner hashing
+    already gets by threading ``cancel_check`` through function arguments —
+    so a cancelled worker cannot outlive ``JobRunner.shutdown()``.
+
+    Callers that pass ``cancel_check`` explicitly to :meth:`ResourceLedger.acquire`
+    always take precedence; the bound probe is only consulted when the
+    argument is omitted or None.
+    """
+    token = _RESOURCE_CANCEL_CHECK.set(cancel_check)
+    try:
+        yield
+    finally:
+        _RESOURCE_CANCEL_CHECK.reset(token)
 
 
 def _set_resource_ledger_for_tests(ledger):

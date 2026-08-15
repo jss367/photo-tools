@@ -67,6 +67,60 @@ def test_acquire_gpu_if_session_uses_it_skips_lock_for_cpu_only_session():
     assert ledger.snapshot()["cpu"]["allocated"] == 0
 
 
+def test_acquire_inference_resources_wakes_on_bound_cancel_check():
+    """A queued CPU-inference claim wakes when the bound job probe fires.
+
+    Without this, a cancelled classify/detect/mask/embed worker would
+    block on ``cpu_ml`` until the current holder released — and if the
+    native inference stalls, the cancelled worker could outlive
+    ``JobRunner.shutdown()``.
+    """
+    import resource_ledger
+    from pipeline_locks import acquire_inference_resources
+    from resource_ledger import (
+        CpuRequest,
+        ResourceLedger,
+        ResourceRequest,
+        ResourceWaitCancelled,
+        bind_resource_cancel_check,
+    )
+
+    sess = _FakeSession(["CPUExecutionProvider"])
+    ledger = ResourceLedger(cpu_capacity=1)
+    previous = resource_ledger._set_resource_ledger_for_tests(ledger)
+    holder = ledger.acquire(ResourceRequest(
+        cpu=CpuRequest(1, 1, 1), lanes=("cpu_ml",),
+    ))
+    cancelled_flag = threading.Event()
+    finished = threading.Event()
+    outcome = []
+    try:
+        def waiter():
+            with bind_resource_cancel_check(cancelled_flag.is_set):
+                try:
+                    with acquire_inference_resources(sess):
+                        pass
+                except ResourceWaitCancelled:
+                    outcome.append("cancelled")
+                finally:
+                    finished.set()
+
+        thread = threading.Thread(target=waiter)
+        thread.start()
+        # Give the waiter time to enter the ledger wait loop.
+        time.sleep(0.05)
+        cancelled_flag.set()
+        # The ledger uses a bounded 200ms poll so the waiter observes the
+        # flag on the next tick; no need to release the holder.
+        assert finished.wait(timeout=1.0), "waiter never observed cancel"
+        thread.join(timeout=1.0)
+        assert not thread.is_alive()
+        assert outcome == ["cancelled"]
+    finally:
+        holder.release()
+        resource_ledger._set_resource_ledger_for_tests(previous)
+
+
 def test_acquire_gpu_if_session_uses_it_defaults_to_lock_when_providers_missing():
     """A session that doesn't expose get_providers (or raises) must
     conservatively take the lock — same behavior as before this check existed.

@@ -10,7 +10,11 @@ from datetime import datetime
 
 import power
 from job_contract import failure_event
-from resource_ledger import bind_resource_owner, get_resource_ledger
+from resource_ledger import (
+    bind_resource_cancel_check,
+    bind_resource_owner,
+    get_resource_ledger,
+)
 
 log = logging.getLogger(__name__)
 
@@ -817,7 +821,19 @@ class JobRunner:
             # the inhibitor and hold the machine awake indefinitely.
             self.sleep_blocker.acquire()
         try:
-            with bind_resource_owner(job["id"]):
+            job_id = job["id"]
+            # Bind the job's cancellation probe so resource-ledger waits
+            # (including CPU inference acquisitions on the ``cpu_ml`` lane)
+            # wake promptly when the job is cancelled instead of blocking
+            # until the current holder releases. Without this a cancel
+            # request could not preempt a queued classify/detect/mask/embed
+            # worker, and if the current native inference stalled the
+            # cancelled worker could outlive ``JobRunner.shutdown()``.
+            def _job_cancel_probe(_job_id=job_id):
+                return self.cancellation_requested(_job_id)
+            with bind_resource_owner(job_id), bind_resource_cancel_check(
+                _job_cancel_probe,
+            ):
                 result = work_fn(job)
             # Atomically check cancellation and set final status under the
             # same lock acquisition to prevent a race where cancel_job()

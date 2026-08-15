@@ -243,6 +243,18 @@ def create_session(model_path, providers=None):
     )
 
     ledger = get_resource_ledger()
+    # The session's ONNX native pool is sized ONCE at construction and reused
+    # for every subsequent inference call, so its thread count must reflect
+    # the intended inference profile — not the transient construction-time
+    # grant. If we instead used ``lease.cpu_permits`` here, a construction
+    # request that landed while another CPU phase (e.g. a scan) held most of
+    # the budget would receive only its minimum grant, and the cached session
+    # would then be capped at that reduced count forever, throttling every
+    # inference call until the process restarts.
+    inference_profile = cpu_phase_request(
+        ledger.cpu_capacity, minimum=1, preferred=8, maximum=8,
+    )
+    session_thread_count = inference_profile.preferred
     cpu_request = cpu_phase_request(
         ledger.cpu_capacity, minimum=2, preferred=8, maximum=8,
     )
@@ -251,23 +263,23 @@ def create_session(model_path, providers=None):
         lanes=("model_construction",),
         label="ONNX model construction",
     )
-    with ledger.acquire(request) as lease:
+    with ledger.acquire(request):
         session_options = ort.SessionOptions()
-        session_options.intra_op_num_threads = lease.cpu_permits
+        session_options.intra_op_num_threads = session_thread_count
         # Keep inter-op parallelism at one so ONNX cannot multiply the CPU
         # grant by running several graph branches, each with its own intra-op
         # pool.
         session_options.inter_op_num_threads = 1
         log.info(
             "Loading ONNX model: %s (providers: %s, CPU threads: %d)",
-            model_path, providers, lease.cpu_permits,
+            model_path, providers, session_thread_count,
         )
         session = ort.InferenceSession(
             model_path,
             sess_options=session_options,
             providers=providers,
         )
-        _remember_session_cpu_threads(session, lease.cpu_permits)
+        _remember_session_cpu_threads(session, session_thread_count)
     actual = session.get_providers()
     log.info("ONNX session using: %s", actual)
     return session

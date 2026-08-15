@@ -53,7 +53,7 @@ from render_source import (
 from render_source import (
     working_copy_path_if_satisfies as _working_copy_path_if_satisfies,
 )
-from resource_ledger import bind_resource_owner
+from resource_ledger import bind_resource_cancel_check, bind_resource_owner
 
 log = logging.getLogger(__name__)
 
@@ -1410,8 +1410,13 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
         try:
             # Context variables do not propagate into Python threads. Bind
             # each pipeline participant explicitly so scanner/model waits are
-            # attributed to the parent job's diagnostics.
-            with bind_resource_owner(job["id"]):
+            # attributed to the parent job's diagnostics, and so ledger waits
+            # (including CPU inference on the ``cpu_ml`` lane) wake promptly
+            # on cancellation instead of blocking until the current holder
+            # releases.
+            with bind_resource_owner(job["id"]), bind_resource_cancel_check(
+                _cancellation_requested,
+            ):
                 _pause_checkpoint()
                 return work_fn()
         finally:

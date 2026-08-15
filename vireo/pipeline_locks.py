@@ -79,13 +79,21 @@ def _session_uses_gpu(session):
     return any(p in _GPU_PROVIDERS for p in providers)
 
 
-def acquire_inference_resources(session):
+def acquire_inference_resources(session, *, cancel_check=None):
     """Return the enforceable inference lease for an ONNX session.
 
     CPU-only sessions claim the exact CPU thread count configured when the
     session was constructed and the initial exclusive ``cpu_ml`` lane.
     Accelerator sessions keep the existing per-batch GPU serialization.
     Unknown providers take the conservative accelerator path.
+
+    ``cancel_check`` is threaded into the CPU claim so a cancelled
+    classify, detection, mask, or embedding worker wakes promptly while
+    another inference call owns the ``cpu_ml`` lane or the required
+    permits — the same guarantee scanner hashing already gets. When
+    omitted, the ledger falls back to whatever probe the current job
+    established via :func:`resource_ledger.bind_resource_cancel_check`
+    at its top level.
 
     Usage::
 
@@ -116,16 +124,19 @@ def acquire_inference_resources(session):
     # Production uses one immutable startup capacity, but clamping here keeps
     # the request valid without weakening the configured production budget.
     threads = max(1, min(int(threads), ledger.cpu_capacity))
-    return ledger.acquire(ResourceRequest(
-        cpu=CpuRequest(threads, threads, threads),
-        lanes=("cpu_ml",),
-        label="CPU ONNX inference",
-    ))
+    return ledger.acquire(
+        ResourceRequest(
+            cpu=CpuRequest(threads, threads, threads),
+            lanes=("cpu_ml",),
+            label="CPU ONNX inference",
+        ),
+        cancel_check=cancel_check,
+    )
 
 
-def acquire_gpu_if_session_uses_it(session):
+def acquire_gpu_if_session_uses_it(session, *, cancel_check=None):
     """Backward-compatible name for provider-aware inference coordination."""
-    return acquire_inference_resources(session)
+    return acquire_inference_resources(session, cancel_check=cancel_check)
 
 
 # Per-workspace regroup locks. Created lazily on first request. Entries

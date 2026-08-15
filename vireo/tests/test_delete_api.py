@@ -332,6 +332,126 @@ def test_batch_delete_progress_reports_failed_count_on_trash_failure(
     ]
     assert finishing, "expected a Finishing progress event"
     assert finishing[-1]["data"].get("failed") == 1
+    # Finishing must also carry a per-stage failure map so a single event is
+    # enough for the frontend to render the correct state -- otherwise a
+    # dropped or reordered intermediate emit would let the disk stage revert
+    # to green complete under Finishing's blanket "mark all complete" branch.
+    finishing_stage_failures = finishing[-1]["data"].get("stage_failures")
+    assert finishing_stage_failures == {"files": 1, "catalog": 0}, (
+        f"Finishing must attribute failures per-stage: "
+        f"{finishing_stage_failures!r}"
+    )
+    # The disk-phase completion must also attribute its failure to the files
+    # stage so the frontend can render partial without waiting for Finishing.
+    assert last_disk.get("stage_failures") == {"files": 1}
+
+
+def test_batch_delete_progress_marks_catalog_stage_partial_on_revalidation_skip(
+    app_and_db, tmp_path, monkeypatch,
+):
+    """A concurrent move mid-delete leaves the catalog row and the UI must
+    surface it -- Finishing.failed alone isn't enough; the frontend also
+    needs a per-stage attribution so the catalog bar shows partial rather
+    than green ✓ complete."""
+    import app as appmod
+
+    app, db = app_and_db
+    client = app.test_client()
+    source_folder = str(tmp_path / "source")
+    dest_folder = str(tmp_path / "dest")
+    src_fid = db.add_folder(source_folder, name="source")
+    dst_fid = db.add_folder(dest_folder, name="dest")
+    pid = db.add_photo(
+        folder_id=src_fid, filename="bird.jpg", extension=".jpg",
+        file_size=10, file_mtime=1.0,
+    )
+    os.makedirs(source_folder, exist_ok=True)
+    os.makedirs(dest_folder, exist_ok=True)
+    Image.new("RGB", (10, 10)).save(os.path.join(dest_folder, "bird.jpg"))
+
+    def concurrent_move_then_trash(paths, progress_callback=None):
+        db.conn.execute(
+            "UPDATE photos SET folder_id = ? WHERE id = ?",
+            (dst_fid, pid),
+        )
+        db.conn.commit()
+        return 0, set(paths), []
+
+    monkeypatch.setattr(appmod, "_trash_paths", concurrent_move_then_trash)
+    resp = client.post("/api/jobs/batch-delete", json={
+        "photo_ids": [pid],
+        "mode": "disk",
+    })
+    assert resp.status_code == 200
+    job_id = resp.get_json()["job_id"]
+    job = wait_for_job_via_client(client, job_id)
+    assert job["status"] == "completed"
+
+    events = app._job_runner.get_events(job_id)
+
+    # The last "Removed from Vireo" emit must carry ``failed`` (and its
+    # per-stage attribution) so the frontend transitions the catalog stage
+    # from complete → partial. Without this, only the Finishing event
+    # would carry the retained count, and by then the frontend has
+    # already blindly promoted every stage to green complete.
+    catalog_progress = [
+        e for e in events
+        if e.get("type") == "progress"
+        and e.get("data", {}).get("phase") == "Removed from Vireo"
+    ]
+    assert catalog_progress, (
+        "expected a Removed from Vireo emit that reports the skipped count"
+    )
+    last_catalog = catalog_progress[-1]["data"]
+    assert last_catalog.get("failed") == 1, (
+        f"catalog stage completion must report skipped rows: {last_catalog!r}"
+    )
+    assert last_catalog.get("stage_failures") == {"catalog": 1}
+
+    # Finishing must combine both stages' failure counts so a single event
+    # can rebuild the full partial state on the frontend even if per-stage
+    # emits were dropped.
+    finishing = [
+        e for e in events
+        if e.get("type") == "progress"
+        and e.get("data", {}).get("phase") == "Finishing"
+    ]
+    assert finishing, "expected a Finishing progress event"
+    assert finishing[-1]["data"].get("failed") == 1
+    assert finishing[-1]["data"].get("stage_failures") == {
+        "files": 0, "catalog": 1,
+    }
+
+
+def test_delete_modal_marks_catalog_stage_partial_from_finishing_map(
+    app_and_db,
+):
+    """The frontend must consume ``Finishing.stage_failures`` so a single
+    Finishing event is enough to render partial per stage, even if a
+    per-stage emit was dropped or reordered. Without the map, the
+    Finishing branch would fall through to ``setDeleteProgressStage(stage,
+    'complete')`` on every stage and quietly turn a retained catalog into
+    a green ✓ complete row."""
+    app, _ = app_and_db
+    html = app.test_client().get("/browse").data.decode()
+
+    # The Finishing branch must read the per-stage map and route each stage
+    # with recorded failures through markDeleteStageFailed instead of
+    # unconditionally marking complete.
+    assert "data.stage_failures" in html
+    assert (
+        "stageFailures[stage]" in html or "stage_failures[stage]" in html
+    ), "Finishing must look up per-stage failure counts"
+    # A "Removed from Vireo" event that carries a failed count must also
+    # route through markDeleteStageFailed so the catalog stage transitions
+    # from complete → partial mid-run.
+    assert "phase === 'Removed from Vireo'" in html
+    # The relabelled count reflects the per-photo semantics of failed_ids:
+    # one retained photo can leave more than one file on disk (a companion
+    # plus its unattempted primary), so "photo" is accurate where "file"
+    # would silently underreport.
+    assert "'1 photo retained'" in html
+    assert "' photos retained'" in html
 
 
 def test_api_batch_delete_tolerates_pipeline_prune_system_exit(app_and_db, monkeypatch):

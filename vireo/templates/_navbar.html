@@ -8091,9 +8091,14 @@ function markDeleteStageFailed(stage, failed, current, total) {
   var row = document.getElementById('deleteProgress' + name + 'Stage');
   if (!row) return;
   row.dataset.failed = String(failed);
+  // ``failed`` is a per-photo count (len(failed_ids)) rather than a
+  // per-path count. A single retained photo may leave both a companion and
+  // its unattempted primary on disk, so labelling the number as "files"
+  // would understate what remains -- label as photos to match the count's
+  // real semantics.
   var statusText = failed === 1
-    ? '1 file retained'
-    : failed + ' files retained';
+    ? '1 photo retained'
+    : failed + ' photos retained';
   setDeleteProgressStage(stage, 'partial', current, total, statusText);
 }
 
@@ -8106,14 +8111,21 @@ function updateDeleteProgress(data) {
   var total = Number(data.total || 0);
   var current = Number(data.current || 0);
   var failed = Number(data.failed || 0);
+  var stageFailures = data.stage_failures || {};
 
   if (phase === 'Finishing') {
     _deleteProgressStageOrder.forEach(function(stage) {
-      // setDeleteProgressStage refuses to overwrite a stage that already
-      // recorded a failure, so this only completes stages whose work
-      // actually succeeded -- the files stage stays partial when Trash
-      // failures were reported earlier.
-      setDeleteProgressStage(stage, 'complete');
+      // Prefer the per-stage failure map so a single Finishing event is
+      // enough to render the correct state even if an intermediate
+      // per-stage emit never arrived. ``setDeleteProgressStage`` still
+      // refuses to overwrite a stage flagged failed, so a stage already
+      // marked partial by an earlier emit stays partial.
+      var stageFailed = Number(stageFailures[stage] || 0);
+      if (stageFailed > 0) {
+        markDeleteStageFailed(stage, stageFailed, 0, 0);
+      } else {
+        setDeleteProgressStage(stage, 'complete');
+      }
     });
     if (detail) detail.textContent = '';
     return;
@@ -8138,7 +8150,14 @@ function updateDeleteProgress(data) {
       // cleanup bar monotonic at zero until per-photo cache cleanup begins.
       setDeleteProgressStage(stage, 'active', 0, 0, 'Updating review cache\u2026');
     } else if (phase === 'Removed from Vireo') {
-      setDeleteProgressStage(stage, 'complete', current, total);
+      if (failed > 0) {
+        // Catalog revalidation preserved rows whose identity changed mid-
+        // delete -- keep the stage from turning green and let the user see
+        // that the catalog work was only partially applied.
+        markDeleteStageFailed(stage, failed, current, total);
+      } else {
+        setDeleteProgressStage(stage, 'complete', current, total);
+      }
     } else {
       setDeleteProgressStage(
         stage, 'active', current, total,

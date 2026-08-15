@@ -10943,15 +10943,28 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         """Delete photos using the same phases for sync and job endpoints."""
         paths = paths or []
 
-        def emit(phase, current=0, total=0, current_file="", detail=""):
+        def emit(
+            phase, current=0, total=0, current_file="", detail="", failed=0,
+            stage_failures=None,
+        ):
             if progress_callback:
-                progress_callback({
+                payload = {
                     "phase": phase,
                     "current": current,
                     "total": total,
                     "current_file": current_file,
                     "detail": detail,
-                })
+                    "failed": failed,
+                }
+                # ``stage_failures`` lets a single emit attribute failure counts
+                # to specific stages so the frontend does not have to rely on
+                # a specific per-stage emit having arrived first. The disk and
+                # catalog phases each report their own count while Finishing
+                # sends the merged map, so a dropped intermediate event cannot
+                # silently promote a partial stage to green complete.
+                if stage_failures:
+                    payload["stage_failures"] = dict(stage_failures)
+                progress_callback(payload)
 
         if mode == "disk_permanent" and paths:
             # Retry path: DB rows were already deleted by the initial
@@ -11327,12 +11340,15 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 detail["photo_id"] = photo_id
                 trash_failed.append(detail)
 
+        disk_failed_photos = len(failed_ids)
         emit(
             disk_phase, len(all_disk_paths), len(all_disk_paths),
             detail=(
                 f"{len(successful_ids)} photo(s) ready for catalog removal; "
-                f"{len(failed_ids)} retained after filesystem errors."
+                f"{disk_failed_photos} retained after filesystem errors."
             ),
+            failed=disk_failed_photos,
+            stage_failures={"files": disk_failed_photos},
         )
         result = remove_catalog_rows(
             successful_ids,
@@ -11343,6 +11359,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         # weren't deleted — surface them alongside filesystem failures so
         # the client keeps them visible and doesn't report them as trashed.
         skipped_ids = result.get("skipped_ids", []) or []
+        catalog_failed_photos = len(skipped_ids)
         if skipped_ids:
             already_failed = set(failed_ids)
             for photo_id in skipped_ids:
@@ -11358,7 +11375,29 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 photo_id for photo_id in skipped_ids
                 if photo_id not in already_failed
             ]
-        emit("Finishing", 1, 1)
+            # Re-emit the catalog stage with the retained count so the frontend
+            # transitions it from complete → partial. Without this, the initial
+            # "Removed from Vireo" event marks the stage green and Finishing
+            # later carries a higher failed count that the frontend can't
+            # attribute to any stage.
+            emit(
+                "Removed from Vireo",
+                result["deleted"], result["deleted"] + catalog_failed_photos,
+                detail=(
+                    f"{catalog_failed_photos} photo(s) retained "
+                    "due to concurrent moves."
+                ),
+                failed=catalog_failed_photos,
+                stage_failures={"catalog": catalog_failed_photos},
+            )
+        emit(
+            "Finishing", 1, 1,
+            failed=len(failed_ids),
+            stage_failures={
+                "files": disk_failed_photos,
+                "catalog": catalog_failed_photos,
+            },
+        )
         return {
             "ok": True,
             "deleted": result["deleted"],

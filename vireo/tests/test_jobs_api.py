@@ -1972,7 +1972,22 @@ def test_extract_masks_route_writes_photo_masks_row(
         db, tmp_path, "bird.jpg", (10, 20, 100, 200), "MegaDetector",
     )
 
+    import pipeline_locks
+
     calls = []
+    lock_events = []
+
+    class TrackingLock:
+        def acquire(self):
+            lock_events.append(("acquire", pid))
+
+        def release(self):
+            lock_events.append(("release", pid))
+
+    monkeypatch.setattr(
+        pipeline_locks, "acquire_photo_mask",
+        lambda photo_id: TrackingLock(),
+    )
     _patch_extract_masks_deps(monkeypatch, calls)
 
     col_id = db.add_collection(
@@ -1991,6 +2006,7 @@ def test_extract_masks_route_writes_photo_masks_row(
 
     # SAM was invoked exactly once.
     assert len(calls) == 1, calls
+    assert lock_events == [("acquire", pid), ("release", pid)]
 
     # photo_masks row exists with the right variant + prompt.
     row = db.conn.execute(
@@ -6035,6 +6051,40 @@ def test_import_in_place_revalidates_scope_after_all_scans(
     }
     assert str(source_a) not in passed
     assert str(source_b) in passed
+
+
+def test_import_in_place_normalizes_deferred_scope_spelling(
+    app_and_db, tmp_path, monkeypatch,
+):
+    """Deferred scope uses the same Path spelling scanner catalogs."""
+    import scanner
+
+    app, _ = app_and_db
+    source = tmp_path / "raw-card"
+    source.mkdir()
+    supplied_source = str(source) + os.sep
+    captured_scopes = []
+
+    monkeypatch.setattr(
+        scanner, "scan",
+        lambda *_args, **_kwargs: {"discovered": 0, "indexed": 0},
+    )
+    monkeypatch.setattr(
+        scanner, "_extract_working_copies",
+        lambda *_args, **kwargs: captured_scopes.append(kwargs["scope"]),
+    )
+
+    client = app.test_client()
+    resp = client.post("/api/jobs/import-in-place", json={
+        "sources": [supplied_source],
+        "recursive": False,
+        "after_import": None,
+    })
+    assert resp.status_code == 200, resp.get_json()
+    job = wait_for_job_via_client(client, resp.get_json()["job_id"])
+
+    assert job["status"] == "completed", job
+    assert captured_scopes == [[(str(source), "exact")]]
 
 
 def test_import_in_place_metadata_phase_does_not_override_step_progress(

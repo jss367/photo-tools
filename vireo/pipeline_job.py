@@ -157,16 +157,9 @@ class _StagedMaskFile:
         if self.previous_path:
             masks_dir = os.path.realpath(os.path.dirname(self.final_path))
             previous_real = os.path.realpath(self.previous_path)
-            previous_name = os.path.basename(previous_real)
-            previous_stem = os.path.splitext(previous_name)[0]
             if (
                 previous_real != os.path.realpath(self.final_path)
                 and os.path.dirname(previous_real) == masks_dir
-                # The standalone extract-masks job publishes the deterministic
-                # ``{photo}.{variant}.png`` path without this class. Never
-                # unlink that path: it may have been republished concurrently.
-                # Only immutable generations are owned by this cleanup path.
-                and ".generation-" in previous_stem
             ):
                 # The database already committed the new generation, so an
                 # old-file cleanup error must not turn a successful photo into

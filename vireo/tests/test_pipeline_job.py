@@ -9271,8 +9271,8 @@ def test_staged_mask_removes_previous_file_only_after_commit(tmp_path):
     assert not list(masks_dir.glob(".mask-stage-*"))
 
 
-def test_staged_mask_never_removes_deterministic_standalone_path(tmp_path):
-    """Concurrent standalone publication cannot be deleted after commit."""
+def test_staged_mask_reclaims_deterministic_standalone_path(tmp_path):
+    """The shared photo lock makes deterministic predecessor cleanup safe."""
     import pipeline_job as pj
 
     masks_dir = tmp_path / "masks"
@@ -9293,7 +9293,7 @@ def test_staged_mask_never_removes_deterministic_standalone_path(tmp_path):
     staged.install()
     staged.finish()
 
-    assert standalone_path.read_bytes() == b"standalone mask"
+    assert not standalone_path.exists()
     with open(staged.final_path, "rb") as handle:
         assert handle.read() == b"pipeline mask"
 

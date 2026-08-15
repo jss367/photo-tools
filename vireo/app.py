@@ -26644,8 +26644,14 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                         not is_excluded_scan_path(Path(source))
                         and os.path.isdir(source)
                     ):
+                        # scanner.scan converts its root to Path before it
+                        # catalogs folder strings, which removes lexical
+                        # trailing separators and ``.`` components. Use that
+                        # exact spelling for the deferred SQL scope too.
+                        normalized_source = str(Path(source))
                         working_copy_scope.append(
-                            (source, "exact") if not recursive else source
+                            (normalized_source, "exact")
+                            if not recursive else normalized_source
                         )
                 except Exception as exc:
                     if isinstance(exc, ScanCancelled) and cancel_check():
@@ -29529,6 +29535,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 render_proxy,
                 save_mask,
             )
+            from pipeline_locks import acquire_photo_mask
             from quality import compute_all_quality_features
 
             thread_db = Database(db_path)
@@ -29641,6 +29648,12 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 folder_path = folders.get(photo["folder_id"], "")
                 image_path = os.path.join(folder_path, photo["filename"])
 
+                # Share the same photo-wide critical section as Process jobs.
+                # This standalone route writes the deterministic predecessor
+                # filename, so serializing its full cache-check/write sequence
+                # lets Process safely reclaim that predecessor after commit.
+                photo_mask_lock = acquire_photo_mask(photo_id)
+                photo_mask_lock.acquire()
                 try:
                     # Cache hit: photo_masks already has a row for
                     # (photo, configured variant) AND its stored prompt
@@ -29786,6 +29799,8 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     job["errors"].append(
                         f"Photo {photo_id}: mask extraction failed"
                     )
+                finally:
+                    photo_mask_lock.release()
 
                 runner.push_event(
                     job["id"],

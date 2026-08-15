@@ -8174,12 +8174,14 @@ def _stub_extract_masks_heavy_ops(monkeypatch):
         masking, "generate_mask",
         lambda *a, **k: np.ones((16, 16), dtype=np.uint8),
     )
-    monkeypatch.setattr(
-        masking, "save_mask",
-        lambda mask, dir_, pid_, variant: os.path.join(
-            dir_, f"{pid_}.{variant}.png",
-        ),
-    )
+    def fake_save_mask(mask, dir_, pid_, variant):
+        path = os.path.join(dir_, f"{pid_}.{variant}.png")
+        os.makedirs(dir_, exist_ok=True)
+        with open(path, "wb") as handle:
+            handle.write(b"mask")
+        return path
+
+    monkeypatch.setattr(masking, "save_mask", fake_save_mask)
     monkeypatch.setattr(masking, "crop_completeness", lambda m: 1.0)
     monkeypatch.setattr(masking, "crop_subject", lambda p, m, margin=0.15: None)
     monkeypatch.setattr(masking, "ensure_sam2_weights", lambda **k: None)
@@ -9187,8 +9189,36 @@ def test_extract_masks_rolls_back_all_photo_writes_when_embeddings_fail(
     assert rows[0]["photo_id"] is None
     assert rows[0]["mask_path"] is None
     assert rows[0]["active_mask_variant"] is None
+    assert not (tmp_path / "masks" / f"{rows[0]['id']}.tiny.png").exists()
     assert rows[1]["photo_id"] == rows[1]["id"]
     assert rows[1]["mask_path"] is not None
+
+
+def test_staged_mask_restores_previous_file_on_failure(tmp_path):
+    """A failed rerun cannot leave old DB metadata pointing at a new PNG."""
+    import pipeline_job as pj
+
+    masks_dir = tmp_path / "masks"
+    masks_dir.mkdir()
+    final_path = masks_dir / "42.tiny.png"
+    final_path.write_bytes(b"old mask")
+
+    def fake_save(_mask, stage_dir, photo_id, variant):
+        staged = os.path.join(stage_dir, f"{photo_id}.{variant}.png")
+        with open(staged, "wb") as handle:
+            handle.write(b"new mask")
+        return staged
+
+    staged = pj._StagedMaskFile.create(
+        None, str(masks_dir), 42, "tiny", fake_save,
+    )
+    staged.install()
+    assert final_path.read_bytes() == b"new mask"
+
+    staged.restore()
+
+    assert final_path.read_bytes() == b"old mask"
+    assert not list(masks_dir.glob(".mask-stage-*"))
 
 
 def test_extract_masks_aborts_when_rollback_fails():

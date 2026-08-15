@@ -75,6 +75,74 @@ def _rollback_failed_mask_photo(thread_db, photo_id):
         ) from exc
 
 
+class _StagedMaskFile:
+    """Stage a deterministic mask PNG and restore its predecessor on failure."""
+
+    def __init__(self, stage_dir, staged_path, final_path):
+        self.stage_dir = stage_dir
+        self.staged_path = staged_path
+        self.final_path = final_path
+        self.backup_path = None
+        self.installed = False
+
+    @classmethod
+    def create(cls, mask, masks_dir, photo_id, variant, save_mask):
+        os.makedirs(masks_dir, exist_ok=True)
+        stage_dir = tempfile.mkdtemp(prefix=".mask-stage-", dir=masks_dir)
+        staged_path = None
+        try:
+            staged_path = save_mask(mask, stage_dir, photo_id, variant)
+            final_path = os.path.join(
+                masks_dir, os.path.basename(staged_path),
+            )
+            return cls(stage_dir, staged_path, final_path)
+        except Exception:
+            if staged_path:
+                with contextlib.suppress(OSError):
+                    os.unlink(staged_path)
+            with contextlib.suppress(OSError):
+                os.rmdir(stage_dir)
+            raise
+
+    def install(self):
+        """Atomically place the staged PNG while retaining any old version."""
+        if os.path.exists(self.final_path):
+            self.backup_path = os.path.join(self.stage_dir, "previous.png")
+            os.replace(self.final_path, self.backup_path)
+        try:
+            os.replace(self.staged_path, self.final_path)
+        except Exception:
+            if self.backup_path and os.path.exists(self.backup_path):
+                os.replace(self.backup_path, self.final_path)
+                self.backup_path = None
+            raise
+        self.installed = True
+
+    def restore(self):
+        """Restore the prior PNG, or remove a newly installed first version."""
+        if self.backup_path and os.path.exists(self.backup_path):
+            os.replace(self.backup_path, self.final_path)
+            self.backup_path = None
+        elif self.installed:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(self.final_path)
+        self.installed = False
+        self._cleanup()
+
+    def finish(self):
+        """Keep the installed PNG and discard staging artifacts after commit."""
+        self.installed = False
+        self._cleanup()
+
+    def _cleanup(self):
+        for path in (self.staged_path, self.backup_path):
+            if path:
+                with contextlib.suppress(OSError):
+                    os.unlink(path)
+        with contextlib.suppress(OSError):
+            os.rmdir(self.stage_dir)
+
+
 def _archive_mount_root_candidates(path: str) -> list[str]:
     """Return the plausible mount-root prefix(es) for ``path``, if any.
 
@@ -6701,6 +6769,7 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                     photo_id = photo["id"]
                     folder_path = folders.get(photo["folder_id"], "")
                     image_path = os.path.join(folder_path, photo["filename"])
+                    mask_file_stage = None
 
                     try:
                         # Per-photo serialisation. Two pipelines whose
@@ -6864,9 +6933,6 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                             if _should_abort_without_pause(abort):
                                 break
 
-                            mask_path = save_mask(
-                                mask, masks_dir, photo_id, sam2_variant,
-                            )
                             completeness = crop_completeness(mask)
                             features = compute_all_quality_features(proxy, mask)
                             if _should_abort_without_pause(abort):
@@ -6907,6 +6973,14 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                                     embed(proxy, variant=dinov2_variant),
                                 )
 
+                            mask_file_stage = _StagedMaskFile.create(
+                                mask,
+                                masks_dir,
+                                photo_id,
+                                sam2_variant,
+                                save_mask,
+                            )
+                            mask_path = mask_file_stage.final_path
                             thread_db.upsert_photo_mask(
                                 photo_id=photo_id,
                                 variant=sam2_variant,
@@ -6945,7 +7019,10 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                             # quality features, and embeddings as one unit. A
                             # later failure must not leave a cache-valid mask
                             # paired with stale or absent feature data.
+                            mask_file_stage.install()
                             commit_with_retry(thread_db.conn)
+                            mask_file_stage.finish()
+                            mask_file_stage = None
                             masked += 1
                     except Exception:
                         em_failed += 1
@@ -6955,7 +7032,11 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                         # photo fails immediately with the same ``database is
                         # locked`` error even after the competing writer has
                         # moved on.
-                        _rollback_failed_mask_photo(thread_db, photo_id)
+                        try:
+                            _rollback_failed_mask_photo(thread_db, photo_id)
+                        finally:
+                            if mask_file_stage is not None:
+                                mask_file_stage.restore()
 
                     processed = i + 1
                     stages["extract_masks"]["count"] = processed

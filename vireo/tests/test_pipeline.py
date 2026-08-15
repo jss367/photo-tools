@@ -1944,6 +1944,60 @@ def test_load_photo_features_collection_scoped(tmp_path):
     assert scoped[0]["id"] == p1
 
 
+def test_load_photo_features_scoped_read_allows_later_concurrent_writes(tmp_path):
+    """Temp scope DML must not pin a stale main-database WAL snapshot."""
+    from db import Database
+    from pipeline import load_photo_features
+
+    db_path = str(tmp_path / "test.db")
+    reader = Database(db_path)
+    fid = reader.add_folder(str(tmp_path), name="photos")
+    photo_id = reader.add_photo(fid, "a.jpg", ".jpg", 1000, 1.0)
+    writer = Database(db_path)
+    writer.set_active_workspace(reader._active_workspace_id)
+    reader.conn.execute("PRAGMA busy_timeout=50")
+    writer.conn.execute("PRAGMA busy_timeout=50")
+
+    photos = load_photo_features(reader, photo_ids={photo_id})
+    assert [photo["id"] for photo in photos] == [photo_id]
+    assert reader.conn.in_transaction is False
+
+    # Advance the WAL from another connection, then write from the feature
+    # loader's connection. Before the fix, the latter raises immediately with
+    # ``database is locked`` because its TEMP-table transaction owns a stale
+    # snapshot of the main database.
+    writer.conn.execute("UPDATE photos SET rating = 1 WHERE id = ?", (photo_id,))
+    writer.conn.commit()
+    reader.conn.execute("UPDATE photos SET flag = 'picked' WHERE id = ?", (photo_id,))
+    reader.conn.commit()
+
+    row = reader.conn.execute(
+        "SELECT rating, flag FROM photos WHERE id = ?", (photo_id,),
+    ).fetchone()
+    assert (row["rating"], row["flag"]) == (1, "picked")
+
+
+def test_load_photo_features_preserves_callers_transaction(tmp_path):
+    """A caller-owned transaction must not be committed by temp scope setup."""
+    from db import Database
+    from pipeline import load_photo_features
+
+    db = Database(str(tmp_path / "test.db"))
+    fid = db.add_folder(str(tmp_path), name="photos")
+    photo_id = db.add_photo(fid, "a.jpg", ".jpg", 1000, 1.0)
+    db.conn.execute("UPDATE photos SET rating = 4 WHERE id = ?", (photo_id,))
+    assert db.conn.in_transaction is True
+
+    load_photo_features(db, photo_ids={photo_id})
+
+    assert db.conn.in_transaction is True
+    db.conn.rollback()
+    rating = db.conn.execute(
+        "SELECT rating FROM photos WHERE id = ?", (photo_id,),
+    ).fetchone()["rating"]
+    assert rating == 0
+
+
 def test_serialize_results_has_species_predictions(tmp_path):
     """Serialized encounters include species_predictions with model info."""
     from pipeline import load_photo_features, run_full_pipeline, serialize_results

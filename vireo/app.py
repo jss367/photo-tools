@@ -26526,7 +26526,17 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
 
             def status_cb(message, phase_current=None, phase_total=None, phase_label=None):
                 job["progress"]["current_file"] = message
-                runner.update_step(job["id"], "scan", current_file=message)
+                step_update = {"current_file": message}
+                if phase_total:
+                    # The scan counter can already be complete while working
+                    # copies are still being generated. Put the active phase
+                    # on the expanded Jobs-page step too, rather than leaving
+                    # that row pinned at a misleading 100%.
+                    step_update["progress"] = {
+                        "current": phase_current or 0,
+                        "total": phase_total,
+                    }
+                runner.update_step(job["id"], "scan", **step_update)
                 runner.push_event(job["id"], "progress", {
                     "current": job["progress"].get("current", 0),
                     "total": job["progress"].get("total", 0),

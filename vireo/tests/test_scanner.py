@@ -1946,6 +1946,46 @@ def test_scan_extracts_working_copy_for_raw(tmp_path, monkeypatch):
     assert os.path.exists(os.path.join(str(vireo_dir), photos[0]["working_copy_path"]))
 
 
+def test_scan_reports_working_copy_as_counted_subphase(tmp_path, monkeypatch):
+    """Working-copy generation must not leave import progress pinned at 100%."""
+    import config as cfg
+    import scanner
+    from db import Database
+
+    monkeypatch.setattr(cfg, "CONFIG_PATH", str(tmp_path / "config.json"))
+    vireo_dir = tmp_path / "vireo"
+    vireo_dir.mkdir()
+    photo_dir = tmp_path / "photos"
+    photo_dir.mkdir()
+    (photo_dir / "IMG_001.nef").write_bytes(b"fake raw data")
+    monkeypatch.setattr(scanner, "extract_metadata", lambda paths, **_kwargs: {})
+
+    def fake_extract(_source, output, **_kwargs):
+        os.makedirs(os.path.dirname(output), exist_ok=True)
+        Image.new("RGB", (4096, 2731)).save(output, "JPEG")
+        return True
+
+    monkeypatch.setattr(scanner, "extract_working_copy", fake_extract)
+    statuses = []
+
+    def status_cb(message, **phase):
+        statuses.append((message, phase))
+
+    db = Database(str(vireo_dir / "test.db"))
+    scanner.scan(
+        str(photo_dir), db, vireo_dir=str(vireo_dir),
+        status_callback=status_cb,
+    )
+
+    working_copy_events = [
+        event for event in statuses
+        if event[1].get("phase_label") == "Generating working copies"
+    ]
+    assert [event[1]["phase_current"] for event in working_copy_events] == [0, 1]
+    assert all(event[1]["phase_total"] == 1 for event in working_copy_events)
+    assert working_copy_events[-1][0] == "Generating working copies: 1 of 1"
+
+
 def test_scan_skips_working_copy_for_jpeg(tmp_path, monkeypatch):
     """Scanning a JPEG file does not create a working copy."""
     import config as cfg

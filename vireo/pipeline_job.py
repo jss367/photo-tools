@@ -6932,6 +6932,13 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                     except Exception:
                         em_failed += 1
                         log.warning("Mask extraction failed for photo %s", photo_id, exc_info=True)
+                        # A failed write can leave this connection inside a
+                        # stale WAL snapshot. Without a rollback, every later
+                        # photo fails immediately with the same ``database is
+                        # locked`` error even after the competing writer has
+                        # moved on.
+                        with contextlib.suppress(Exception):
+                            thread_db.conn.rollback()
 
                     processed = i + 1
                     stages["extract_masks"]["count"] = processed

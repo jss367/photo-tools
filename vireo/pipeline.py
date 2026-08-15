@@ -139,6 +139,35 @@ def _resolve_collection_photo_ids(db, collection_id):
     return {r["id"] for r in rows} if rows else set()
 
 
+def _replace_temp_id_scope(conn, table_name, ids):
+    """Replace a connection-local temp ID table without leaking a transaction.
+
+    SQLite DML against a TEMP table opens a transaction on the connection. If
+    that transaction remains open while the caller reads the main WAL database,
+    a concurrent writer can advance the main database and make a later write on
+    this connection fail immediately with ``SQLITE_BUSY_SNAPSHOT`` (surfaced by
+    Python as ``database is locked``). Commit only when this helper opened the
+    transaction; an outer transaction still belongs entirely to the caller.
+    """
+    started_in_transaction = conn.in_transaction
+    try:
+        conn.execute(
+            f"CREATE TEMP TABLE IF NOT EXISTS {table_name} "
+            "(id INTEGER PRIMARY KEY)"
+        )
+        conn.execute(f"DELETE FROM {table_name}")
+        conn.executemany(
+            f"INSERT OR IGNORE INTO {table_name} (id) VALUES (?)",
+            [(photo_id,) for photo_id in ids],
+        )
+        if not started_in_transaction and conn.in_transaction:
+            conn.commit()
+    except Exception:
+        if not started_in_transaction and conn.in_transaction:
+            conn.rollback()
+        raise
+
+
 def load_photo_features(db, collection_id=None, config=None,
                         labels_fingerprint=None, photo_ids=None):
     """Load all pipeline-relevant features for workspace photos from the database.
@@ -193,14 +222,8 @@ def load_photo_features(db, collection_id=None, config=None,
         # placeholders — a large collection exceeds SQLite's bound-parameter
         # cap (999 on legacy builds), and this scope is interpolated into
         # three queries below.
-        db.conn.execute(
-            "CREATE TEMP TABLE IF NOT EXISTS pipeline_scope_ids "
-            "(id INTEGER PRIMARY KEY)"
-        )
-        db.conn.execute("DELETE FROM pipeline_scope_ids")
-        db.conn.executemany(
-            "INSERT OR IGNORE INTO pipeline_scope_ids (id) VALUES (?)",
-            [(i,) for i in scoped_photo_ids],
+        _replace_temp_id_scope(
+            db.conn, "pipeline_scope_ids", scoped_photo_ids,
         )
         rows = db.conn.execute(
             f"""SELECT {_PIPELINE_PHOTO_COLS}
@@ -272,14 +295,8 @@ def load_photo_features(db, collection_id=None, config=None,
     detection_floor_sql = "AND d.detector_confidence >= ?"
     detection_floor_params = (min_conf,)
     if weak_candidate_ids:
-        db.conn.execute(
-            "CREATE TEMP TABLE IF NOT EXISTS pipeline_weak_detection_ids "
-            "(id INTEGER PRIMARY KEY)"
-        )
-        db.conn.execute("DELETE FROM pipeline_weak_detection_ids")
-        db.conn.executemany(
-            "INSERT OR IGNORE INTO pipeline_weak_detection_ids (id) VALUES (?)",
-            [(photo_id,) for photo_id in weak_candidate_ids],
+        _replace_temp_id_scope(
+            db.conn, "pipeline_weak_detection_ids", weak_candidate_ids,
         )
         detection_floor_sql = """AND (
               d.detector_confidence >= ?

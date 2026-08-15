@@ -1187,8 +1187,30 @@ def _extract_working_copies(db, vireo_dir, progress_callback=None,
         return
 
     total = len(rows)
-    if status_callback:
-        status_callback(f"Extracting {total} working copies...")
+
+    def _emit_working_copy_progress(current):
+        """Publish the secondary working-copy phase without replacing scan progress."""
+        message = (
+            f"Generating working copies: {current:,} of {total:,}"
+            if current
+            else f"Generating {total:,} working copies..."
+        )
+        if status_callback:
+            try:
+                status_callback(
+                    message,
+                    phase_current=current,
+                    phase_total=total,
+                    phase_label="Generating working copies",
+                )
+            except TypeError:
+                # Utility callers and older tests may still provide the
+                # original one-argument status callback.
+                status_callback(message)
+        if progress_callback is not None and current:
+            progress_callback(current, total)
+
+    _emit_working_copy_progress(0)
 
     # Commit per row so the writer lock is released between iterations.
     # Otherwise the first UPDATE in a batch auto-opens a transaction and
@@ -1450,8 +1472,7 @@ def _extract_working_copies(db, vireo_dir, progress_callback=None,
             )
         commit_with_retry(db.conn)
 
-        if progress_callback is not None:
-            progress_callback(i, total)
+        _emit_working_copy_progress(i)
 
 
 def backfill_working_copies(db, vireo_dir, progress_callback=None,

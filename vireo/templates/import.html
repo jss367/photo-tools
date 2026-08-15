@@ -3496,7 +3496,12 @@ function renderProgress(data) {
       (data.phase_current || 0) + ' / ' + data.phase_total;
   }
   document.getElementById('progressPhase').textContent = phaseText;
-  const pct = data.total ? Math.round(100 * data.current / data.total) : 0;
+  // Once indexing finishes, working-copy generation becomes the active phase.
+  // Drive the visible bar from that phase instead of leaving it pinned at the
+  // indexing counter's 100% while thousands of files are still being rendered.
+  const visibleCurrent = data.phase_total > 0 ? (data.phase_current || 0) : data.current;
+  const visibleTotal = data.phase_total > 0 ? data.phase_total : data.total;
+  const pct = visibleTotal ? Math.round(100 * visibleCurrent / visibleTotal) : 0;
   document.getElementById('progressFill').style.width = pct + '%';
   if (data.folders && Object.keys(data.folders).length) {
     renderFolderTable(document.getElementById('folderProgress'), data.folders);

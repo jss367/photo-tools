@@ -3,6 +3,7 @@
 import contextlib
 import json
 import os
+import sqlite3
 import sys
 import threading
 
@@ -9080,6 +9081,67 @@ def _run_extract_masks_for_test(
     run_pipeline_job(job, runner, db_path, ws_id, params)
 
     return db, runner, generate_mask_calls, photo_ids
+
+
+def test_extract_masks_rolls_back_failed_photo_before_continuing(
+    tmp_path, monkeypatch,
+):
+    """One failed persistence attempt must not poison the thread connection."""
+    from db import Database
+
+    real_upsert = Database.upsert_photo_mask
+    attempts = 0
+
+    def fail_first_upsert(self, *args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            # Reproduce a failed write after sqlite has opened a transaction.
+            # The stage's exception handler must roll this back before moving
+            # to the next photo.
+            self.conn.execute(
+                "UPDATE photos SET rating = rating WHERE id = ?",
+                (kwargs["photo_id"],),
+            )
+            raise sqlite3.OperationalError("database is locked")
+        if self.conn.in_transaction:
+            raise sqlite3.OperationalError("previous transaction still open")
+        return real_upsert(self, *args, **kwargs)
+
+    monkeypatch.setattr(Database, "upsert_photo_mask", fail_first_upsert)
+    runner = FakeRunner()
+    with pytest.raises(RuntimeError, match="1 of 2 photos failed"):
+        _run_extract_masks_for_test(
+            tmp_path,
+            monkeypatch,
+            "tiny",
+            [
+                {"filename": "first.jpg", "box": (0.1, 0.1, 0.5, 0.5),
+                 "model": "MegaDetector"},
+                {"filename": "second.jpg", "box": (0.1, 0.1, 0.5, 0.5),
+                 "model": "MegaDetector"},
+            ],
+            runner=runner,
+        )
+
+    db = Database(str(tmp_path / "test.db"))
+    photo_ids = [
+        row["id"] for row in db.conn.execute(
+            "SELECT id FROM photos ORDER BY id",
+        ).fetchall()
+    ]
+
+    saved_ids = [
+        row["photo_id"] for row in db.conn.execute(
+            "SELECT photo_id FROM photo_masks ORDER BY photo_id",
+        ).fetchall()
+    ]
+    assert saved_ids == [photo_ids[1]]
+    final = _extract_masks_final_update(runner)
+    assert final["status"] == "failed"
+    assert final["error_count"] == 1
+    assert "1 masked" in final["summary"]
+    assert "1 failed" in final["summary"]
 
 
 def test_extract_masks_pause_waits_outside_photo_lock(tmp_path, monkeypatch):

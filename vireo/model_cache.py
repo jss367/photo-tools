@@ -17,14 +17,31 @@ acquirers of the same key block until the first load returns and then
 all receive the same object.
 """
 
+import contextlib
 import logging
 import threading
 
 log = logging.getLogger(__name__)
 
+# Polling interval used by acquire() when a waiter passes cancel_check and is
+# blocked on another caller's factory load. Short enough that a cancel takes
+# effect within a fraction of a second; long enough that idle contention is
+# negligible even with many concurrent waiters on the same key.
+_WAITER_POLL_SECS = 0.1
+
 
 def _is_caller_cancelled_error(exc):
     return exc.__class__.__name__ == "ClassificationCancelled"
+
+
+def _make_cancellation_error():
+    """Build a caller-visible cancellation exception without importing at load."""
+    try:
+        from classifier import ClassificationCancelled
+    except Exception:
+        class ClassificationCancelled(RuntimeError):
+            pass
+    return ClassificationCancelled("classification cancelled")
 
 
 class _Entry:
@@ -73,6 +90,13 @@ class _Handle:
     def __exit__(self, exc_type, exc, tb):
         self.release()
 
+    def __del__(self):
+        # Safety net for legacy/script callers that unwind before their normal
+        # explicit release. ``release`` is idempotent and does only in-memory
+        # bookkeeping plus timer creation.
+        with contextlib.suppress(Exception):
+            self.release()
+
     def release(self):
         if self._released:
             return
@@ -94,7 +118,7 @@ class ModelCache:
         self._entries = {}
         self._idle_secs = idle_secs
 
-    def acquire(self, key, factory, post_load_key=None):
+    def acquire(self, key, factory, post_load_key=None, cancel_check=None):
         """Acquire a refcounted handle to the value for ``key``.
 
         On cache miss, ``factory()`` is called to produce the value. On a
@@ -108,6 +132,15 @@ class ModelCache:
         mutates on-disk state in ways that change a fingerprint baked into
         the key (e.g. ONNX self-heal redownload replaces corrupt weights
         and the post-load file stats no longer match the pre-load ones).
+
+        ``cancel_check`` is an optional zero-arg callable returning ``True``
+        when this caller wants to abandon its wait. When another caller is
+        already producing the value, ``acquire`` polls the load lock with a
+        short timeout so a cancel here takes effect within a fraction of a
+        second instead of blocking for the full duration of the shared
+        factory (which for BioCLIP embedding computation can be minutes and
+        would otherwise also stall ``JobRunner.shutdown``). The shared
+        producer keeps running for other waiters; only this waiter unwinds.
         """
         while True:
             with self._global_lock:
@@ -123,7 +156,19 @@ class ModelCache:
                 # the race with the timer thread firing.
                 entry.evict_token = None
 
-            with entry.load_lock:
+            if cancel_check is not None:
+                # Waiter-local cancellation: poll the load_lock instead of
+                # blocking indefinitely so this caller can abandon its wait
+                # while another caller's factory is still running. The other
+                # caller is unaffected and their factory continues.
+                while not entry.load_lock.acquire(timeout=_WAITER_POLL_SECS):
+                    if cancel_check():
+                        self._release_entry(entry)
+                        raise _make_cancellation_error()
+            else:
+                entry.load_lock.acquire()
+
+            try:
                 if entry.value is None and entry.load_error is None:
                     try:
                         value = factory()
@@ -157,6 +202,8 @@ class ModelCache:
                         continue
                     raise load_error
                 return _Handle(self, entry, entry.value)
+            finally:
+                entry.load_lock.release()
 
     def _release_entry(self, entry):
         """Decrement refcount on the specific entry the caller acquired.

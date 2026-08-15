@@ -391,8 +391,15 @@ def _load_or_compute_label_embeddings(
     redownload=None,
     progress_callback=None,
     cancel_check=None,
+    embedding_dim=None,
 ):
-    """Resolve custom-label embeddings through the shared cache service."""
+    """Resolve custom-label embeddings through the shared cache service.
+
+    ``embedding_dim`` is the image encoder's feature width for this model;
+    when supplied, cached payloads with a mismatched first axis are rejected
+    so a malformed file cannot slip past to fail at inference time on
+    ``img_features @ txt_embeddings``.
+    """
     from embedding_cache import (
         EmbeddingWaitCancelled,
         canonicalize_labels,
@@ -443,10 +450,32 @@ def _load_or_compute_label_embeddings(
                 classes, model_str, model_dir
             ),
             cancel_check=cancel_check,
+            embedding_dim=embedding_dim,
         )
     except EmbeddingWaitCancelled as exc:
         raise ClassificationCancelled("classification cancelled") from exc
     return classes, embeddings, initial_identity, actual_identity
+
+
+def _image_encoder_embedding_dim(image_session):
+    """Extract the image encoder's feature width from its ONNX outputs.
+
+    The image session's output is ``(batch, embedding_dim)`` — the second
+    axis is what the label embeddings must match to satisfy the matmul in
+    ``classify_with_embedding``.  Returns ``None`` when the dimension is
+    symbolic (rare for exported CLIP heads) so the caller can skip the
+    stricter check rather than reject valid caches.
+    """
+    try:
+        shape = image_session.get_outputs()[0].shape
+    except Exception:
+        return None
+    if not shape:
+        return None
+    dim = shape[-1]
+    if isinstance(dim, int) and dim > 0:
+        return dim
+    return None
 
 
 def precompute_label_embeddings(
@@ -575,6 +604,9 @@ class Classifier:
             else:
                 text_redownload = None
 
+            expected_embedding_dim = _image_encoder_embedding_dim(
+                self._image_session
+            )
             (
                 self._classes,
                 self._txt_embeddings,
@@ -587,6 +619,7 @@ class Classifier:
                 redownload=text_redownload,
                 progress_callback=embedding_progress_callback,
                 cancel_check=cancel_check,
+                embedding_dim=expected_embedding_dim,
             )
 
             # A producer shared with this caller may self-heal the entire

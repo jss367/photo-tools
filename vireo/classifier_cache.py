@@ -76,8 +76,15 @@ def acquire_cached_classifier(
     factory,
     files=None,
     taxonomy_fingerprint=None,
+    cancel_check=None,
 ):
-    """Acquire a refcounted classifier, rekeying after in-place self-heal."""
+    """Acquire a refcounted classifier, rekeying after in-place self-heal.
+
+    ``cancel_check`` propagates the caller's cancellation signal down to the
+    shared-cache waiter loop so a job blocked here while another caller's
+    factory is loading a text encoder or computing label embeddings can
+    still cancel promptly.
+    """
 
     def _key():
         return classifier_cache_key(
@@ -90,5 +97,8 @@ def acquire_cached_classifier(
         )
 
     return get_default_cache().acquire(
-        _key(), factory, post_load_key=lambda _value: _key()
+        _key(),
+        factory,
+        post_load_key=lambda _value: _key(),
+        cancel_check=cancel_check,
     )

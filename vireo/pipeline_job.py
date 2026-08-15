@@ -3879,6 +3879,9 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                     factory=_construct_classifier,
                     files=files,
                     taxonomy_fingerprint=tax_fp,
+                    cancel_check=lambda: (
+                        _should_abort(abort) or _cancellation_requested()
+                    ),
                 )
                 clf = cache_handle.__enter__()
             except Exception as load_err:

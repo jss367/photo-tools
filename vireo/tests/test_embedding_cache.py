@@ -195,6 +195,48 @@ def test_cancelled_waiter_does_not_cancel_shared_producer(tmp_path):
     assert np.array_equal(value, _payload())
 
 
+def test_mismatched_embedding_dim_rejects_cache_hit(tmp_path):
+    """Regression: a malformed cache file whose feature axis does not match
+    the model's expected embedding dim used to pass rank + label-axis
+    validation and load, then blow up at inference on
+    ``img_features @ txt_embeddings``. Passing ``embedding_dim`` must
+    reject that file so the caller falls back to recomputing."""
+    cache = EmbeddingCache(tmp_path / "cache")
+    identity = _identity()
+
+    # Publish a malformed payload — shape (1, 2) instead of (512, 2).
+    malformed = np.ones((1, 2), dtype=np.float32)
+    cache.get_or_compute(identity, lambda: malformed)
+
+    # A cache-hit check that knows the expected dim must reject it.
+    assert not cache.is_cached(identity, 2, embedding_dim=512)
+    # And a fresh get_or_compute with the right dim must recompute rather
+    # than serve the malformed file.
+    computed = np.ones((512, 2), dtype=np.float32)
+    value, _ = cache.get_or_compute(
+        identity, lambda: computed, embedding_dim=512,
+    )
+    assert value.shape == (512, 2)
+    assert cache.is_cached(identity, 2, embedding_dim=512)
+
+
+def test_mismatched_embedding_dim_rejects_freshly_computed_payload(tmp_path):
+    """A producer whose factory returns a wrong-dim ndarray must fail up
+    front rather than publish a payload that later callers must eventually
+    reject."""
+    cache = EmbeddingCache(tmp_path / "cache")
+    identity = _identity()
+
+    with pytest.raises(ValueError, match=r"expected \(512, 2\)"):
+        cache.get_or_compute(
+            identity,
+            lambda: np.ones((256, 2), dtype=np.float32),
+            embedding_dim=512,
+        )
+
+    assert not os.path.exists(cache.path_for(identity))
+
+
 def test_invalid_payload_never_replaces_final_path(tmp_path):
     cache = EmbeddingCache(tmp_path / "cache")
     identity = _identity()

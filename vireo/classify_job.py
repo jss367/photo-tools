@@ -3058,6 +3058,7 @@ def run_classify_job(
                 taxonomy_fingerprint=(
                     taxonomy_identity(tax) if model_type == "timm" else None
                 ),
+                cancel_check=lambda: runner.is_cancelled(job["id"]),
             )
             clf = classifier_cache_handle.__enter__()
         except ClassificationCancelled:

@@ -194,13 +194,22 @@ def _payload_digest(path):
     return digest.hexdigest()
 
 
-def _validate_payload(value, label_count):
+def _validate_payload(value, label_count, embedding_dim=None):
     if not isinstance(value, np.ndarray):
         raise ValueError("embedding payload is not a NumPy array")
     if value.ndim != 2 or value.shape[1] != label_count:
         raise ValueError(
             "embedding payload has shape "
             f"{value.shape}; expected (embedding_dim, {label_count})"
+        )
+    if embedding_dim is not None and value.shape[0] != embedding_dim:
+        # A cache file whose first axis is any positive int passes rank +
+        # label-axis checks, so ``Classifier`` would then load it and only
+        # blow up at inference time on ``img_features @ txt_embeddings``.
+        # Reject it here so the caller falls back to recomputing.
+        raise ValueError(
+            "embedding payload has shape "
+            f"{value.shape}; expected ({embedding_dim}, {label_count})"
         )
     if value.dtype != np.float32:
         raise ValueError(
@@ -226,9 +235,12 @@ class EmbeddingCache:
     def path_for(self, identity):
         return cache_path(self.cache_dir, identity)
 
-    def is_cached(self, identity, label_count):
+    def is_cached(self, identity, label_count, embedding_dim=None):
         try:
-            self._load(identity_digest(identity), label_count)
+            self._load(
+                identity_digest(identity), label_count,
+                embedding_dim=embedding_dim,
+            )
             return True
         except (EOFError, OSError, ValueError):
             return False
@@ -240,6 +252,7 @@ class EmbeddingCache:
         *,
         identity_after=None,
         cancel_check=None,
+        embedding_dim=None,
     ):
         """Load or compute one embedding payload.
 
@@ -248,6 +261,12 @@ class EmbeddingCache:
         loading the text encoder.  In that case the payload is published under
         the healed identity and waiters follow the producer to that durable
         path.
+
+        ``embedding_dim``, when supplied, rejects any cached or freshly
+        computed payload whose first axis does not match the model's
+        expected image-feature dimension.  Rank and label-axis checks alone
+        would accept a malformed ``(1, N)`` file and only surface the
+        mismatch at inference time on ``img_features @ txt_embeddings``.
         """
         label_count = len(identity["labels"])
         initial_digest = identity_digest(identity)
@@ -255,7 +274,9 @@ class EmbeddingCache:
         if cancel_check and cancel_check():
             raise EmbeddingWaitCancelled("classification cancelled")
         try:
-            value = self._load(initial_digest, label_count)
+            value = self._load(
+                initial_digest, label_count, embedding_dim=embedding_dim,
+            )
             if cancel_check and cancel_check():
                 raise EmbeddingWaitCancelled("classification cancelled")
             return value, identity
@@ -298,7 +319,9 @@ class EmbeddingCache:
             published_digest = flight.published_digest or initial_digest
             # Durable publication is the hand-off contract.  Do not reuse the
             # producer's mutable ndarray in memory.
-            value = self._load(published_digest, label_count)
+            value = self._load(
+                published_digest, label_count, embedding_dim=embedding_dim,
+            )
             actual_identity = identity_after() if identity_after else identity
             return value, actual_identity
 
@@ -306,7 +329,9 @@ class EmbeddingCache:
             if cancel_check and cancel_check():
                 raise EmbeddingWaitCancelled("classification cancelled")
             log.info("EmbeddingCache: producing key=%s", initial_digest[:12])
-            value = _validate_payload(compute(), label_count)
+            value = _validate_payload(
+                compute(), label_count, embedding_dim=embedding_dim,
+            )
             if cancel_check and cancel_check():
                 raise EmbeddingWaitCancelled("classification cancelled")
             actual_identity = identity_after() if identity_after else identity
@@ -336,11 +361,13 @@ class EmbeddingCache:
                     del _flights[flight_key]
             flight.event.set()
 
-    def _load(self, digest, label_count):
+    def _load(self, digest, label_count, embedding_dim=None):
         path = os.path.join(self.cache_dir, f"{digest}.npy")
         try:
             value = np.load(path, allow_pickle=False)
-            return _validate_payload(value, label_count)
+            return _validate_payload(
+                value, label_count, embedding_dim=embedding_dim,
+            )
         except (EOFError, ValueError):
             # A truncated or otherwise invalid final file cannot satisfy later
             # callers.  Removal is best-effort; a racing repair can replace it.

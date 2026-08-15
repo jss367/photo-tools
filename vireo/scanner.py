@@ -1274,6 +1274,16 @@ def _extract_working_copies(db, vireo_dir, progress_callback=None,
         params,
     ).fetchall()
 
+    # Revalidate cataloged paths at execution time. A user-selected source can
+    # be replaced with a symlink into a protected macOS library after the API
+    # request was validated but before this deferred extraction pass begins.
+    # Filtering here keeps every caller from following stale folder rows into
+    # another app's managed bundle.
+    rows = [
+        row for row in rows
+        if not is_excluded_scan_path(row["folder_path"])
+    ]
+
     if not rows:
         return
 
@@ -1312,6 +1322,16 @@ def _extract_working_copies(db, vireo_dir, progress_callback=None,
         if cancel_check is not None and cancel_check():
             log.info("Working-copy extraction cancelled after %d/%d rows", i - 1, total)
             break
+
+        # Close the remaining gap between candidate selection and this file
+        # read in case an alias is swapped while earlier rows are processed.
+        if is_excluded_scan_path(row["folder_path"]):
+            log.warning(
+                "Skipping working-copy extraction inside excluded bundle: %s",
+                row["folder_path"],
+            )
+            _emit_working_copy_progress(i)
+            continue
 
         wc_rel = f"working/{row['id']}.jpg"
         wc_abs = os.path.join(vireo_dir, "working", f"{row['id']}.jpg")

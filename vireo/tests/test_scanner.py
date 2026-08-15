@@ -2035,6 +2035,61 @@ def test_working_copy_scope_supports_more_than_sqlite_expression_limit(
     assert row["working_copy_path"] == f"working/{photo_id}.jpg"
 
 
+def test_working_copy_extractor_rechecks_excluded_path_before_read(
+    tmp_path, monkeypatch,
+):
+    """A source alias swapped after candidate selection is never opened."""
+    import config as cfg
+    import scanner
+    from db import Database
+
+    monkeypatch.setattr(cfg, "CONFIG_PATH", str(tmp_path / "config.json"))
+    vireo_dir = tmp_path / "vireo"
+    vireo_dir.mkdir()
+    target_dir = tmp_path / "selected-source"
+    target_dir.mkdir()
+    raw_path = target_dir / "IMG_0001.nef"
+    raw_path.write_bytes(b"fake raw data")
+
+    db = Database(str(vireo_dir / "test.db"))
+    folder_id = db.add_folder(str(target_dir))
+    photo_id = db.add_photo(
+        folder_id,
+        raw_path.name,
+        ".nef",
+        raw_path.stat().st_size,
+        raw_path.stat().st_mtime,
+    )
+
+    exclusion_checks = []
+
+    def source_becomes_excluded(path):
+        exclusion_checks.append(str(path))
+        # Candidate filtering sees the original directory; the per-row guard
+        # models it becoming a protected-library symlink before file access.
+        return len(exclusion_checks) > 1
+
+    extract_calls = []
+    monkeypatch.setattr(
+        scanner, "is_excluded_scan_path", source_becomes_excluded,
+    )
+    monkeypatch.setattr(
+        scanner, "extract_working_copy",
+        lambda *args, **kwargs: extract_calls.append(args) or True,
+    )
+
+    scanner._extract_working_copies(
+        db, str(vireo_dir), scope=[str(target_dir)],
+    )
+
+    assert len(exclusion_checks) == 2
+    assert extract_calls == []
+    row = db.conn.execute(
+        "SELECT working_copy_path FROM photos WHERE id = ?", (photo_id,),
+    ).fetchone()
+    assert row["working_copy_path"] is None
+
+
 def test_phase_status_callback_internal_typeerror_is_not_retried():
     """A callback implementation error is not a legacy-signature signal."""
     import scanner

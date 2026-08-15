@@ -26840,24 +26840,29 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     "phase_label": None,
                 })
                 try:
-                    # Discovery freezes pathnames, not the storage instance
-                    # behind them. A removable card or network mount can be
+                    # Revalidate the source's mount identity before replaying
+                    # its frozen manifest. Between discovery and scan a
+                    # removable/network source (or a local directory) can be
                     # detached and replaced at the same path while later
-                    # sources are still being discovered; replaying the old
-                    # manifest against that replacement could catalog the
-                    # wrong card's same-named files. Revalidate the source
-                    # mount and directory identity immediately before scan.
-                    source_key = str(Path(source))
-                    detached_source = _unmounted_since_baseline(
-                        source_mount_baselines.get(source_key, {}),
+                    # sources are still being discovered; ``root_path.is_dir()``
+                    # inside scanner.scan would still be true, so common camera
+                    # filenames such as ``DCIM/.../IMG_0001.JPG`` would be
+                    # cataloged from the wrong volume. The post-scan check that
+                    # already gates working-copy extraction runs too late to
+                    # prevent that catalog contamination — do the check here.
+                    changed_source_mount = _changed_mount_since_baseline(
+                        source_mount_identities.get(str(Path(source)), {}),
                     )
-                    changed_source = _changed_mount_since_baseline(
-                        source_mount_identities.get(source_key, {}),
-                    )
-                    if detached_source or changed_source:
-                        changed_path = detached_source or changed_source
-                        raise OSError(
-                            f"source changed after discovery: {changed_path}"
+                    if changed_source_mount is not None:
+                        raise FileNotFoundError(
+                            errno_mod.ENOENT,
+                            (
+                                "source mount changed since discovery "
+                                f"({changed_source_mount}); refusing to "
+                                "replay frozen manifest against replacement "
+                                "filesystem"
+                            ),
+                            source,
                         )
                     do_scan(
                         source, thread_db,

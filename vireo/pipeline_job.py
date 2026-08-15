@@ -17,6 +17,7 @@ import queue
 import tempfile
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 
 import numpy as np
@@ -62,6 +63,143 @@ _SENTINEL = object()  # unique end-of-stream marker
 # stops asking. Resuming without actually remounting the share would otherwise
 # pause again on the very next photo, forever.
 _MAX_SOURCE_OFFLINE_PAUSES = 3
+
+
+def _rollback_failed_mask_photo(thread_db, photo_id):
+    """Reset the reused mask-stage connection or abort if it cannot recover."""
+    try:
+        thread_db.conn.rollback()
+    except Exception as exc:
+        log.exception("Mask extraction rollback failed for photo %s", photo_id)
+        raise RuntimeError(
+            f"Mask extraction rollback failed for photo {photo_id}"
+        ) from exc
+
+
+def _fsync_mask_file(path):
+    """Make a completed staged PNG durable before publishing its name."""
+    # Windows' CRT _commit backend rejects a read-only descriptor with EBADF.
+    # Request write access even though the bytes are already complete.
+    with open(path, "rb+") as handle:
+        os.fsync(handle.fileno())
+
+
+def _fsync_mask_directory(path):
+    """Persist a published mask directory entry where Python supports it."""
+    # Python cannot open directory handles for fsync on Windows. The staged
+    # file itself is still flushed there before os.replace; POSIX platforms
+    # additionally flush the directory entry before SQLite may commit it.
+    if os.name == "nt":
+        return
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    directory_fd = os.open(path, flags)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
+class _StagedMaskFile:
+    """Publish a new immutable mask generation around a database commit.
+
+    The predecessor remains at its database-referenced path until the new
+    path has committed.  A process interruption can therefore leave an
+    unreferenced generation behind, but can never change the bytes behind a
+    committed path.
+    """
+
+    def __init__(self, stage_dir, staged_path, final_path, previous_path=None):
+        self.stage_dir = stage_dir
+        self.staged_path = staged_path
+        self.final_path = final_path
+        self.previous_path = previous_path
+        self.installed = False
+
+    @classmethod
+    def create(
+        cls, mask, masks_dir, photo_id, variant, save_mask,
+        previous_path=None,
+    ):
+        os.makedirs(masks_dir, exist_ok=True)
+        stage_dir = tempfile.mkdtemp(prefix=".mask-stage-", dir=masks_dir)
+        staged_path = None
+        try:
+            staged_path = save_mask(mask, stage_dir, photo_id, variant)
+            stem, extension = os.path.splitext(os.path.basename(staged_path))
+            # Never overwrite the path referenced by the currently committed
+            # photo_masks row. SQLite can atomically switch that row to this
+            # immutable generation after the file is fully published.
+            final_path = os.path.join(
+                masks_dir,
+                f"{stem}.generation-{uuid.uuid4().hex}{extension}",
+            )
+            return cls(
+                stage_dir, staged_path, final_path,
+                previous_path=previous_path,
+            )
+        except Exception:
+            if staged_path:
+                with contextlib.suppress(OSError):
+                    os.unlink(staged_path)
+            with contextlib.suppress(OSError):
+                os.rmdir(stage_dir)
+            raise
+
+    def install(self):
+        """Atomically publish the new generation at its unique path."""
+        _fsync_mask_file(self.staged_path)
+        os.replace(self.staged_path, self.final_path)
+        self.installed = True
+        _fsync_mask_directory(os.path.dirname(self.final_path))
+
+    def restore(self):
+        """Discard a generation whose database transaction did not commit."""
+        if self.installed:
+            # The published path is uniquely suffixed (.generation-<uuid>.png)
+            # and no committed row references it, so an unlink failure here —
+            # e.g. an antivirus scanner holding the fresh PNG open on Windows —
+            # is equivalent to a mid-write process interruption: the file is
+            # left as unreferenced disk garbage rather than propagating and
+            # marking the entire extract-masks stage fatal for every remaining
+            # photo. Log so the leftover is discoverable.
+            try:
+                os.unlink(self.final_path)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                log.warning(
+                    "Failed to unlink rolled-back mask generation %s; "
+                    "leaving unreferenced file in place",
+                    self.final_path,
+                    exc_info=True,
+                )
+        self.installed = False
+        self._cleanup()
+
+    def finish(self):
+        """Keep the committed generation and discard its predecessor."""
+        self.installed = False
+        if self.previous_path:
+            masks_dir = os.path.realpath(os.path.dirname(self.final_path))
+            previous_real = os.path.realpath(self.previous_path)
+            if (
+                previous_real != os.path.realpath(self.final_path)
+                and os.path.dirname(previous_real) == masks_dir
+            ):
+                # The database already committed the new generation, so an
+                # old-file cleanup error must not turn a successful photo into
+                # a reported extraction failure.
+                with contextlib.suppress(OSError):
+                    os.unlink(self.previous_path)
+        self._cleanup()
+
+    def _cleanup(self):
+        for path in (self.staged_path,):
+            if path:
+                with contextlib.suppress(OSError):
+                    os.unlink(path)
+        with contextlib.suppress(OSError):
+            os.rmdir(self.stage_dir)
 
 
 def _archive_mount_root_candidates(path: str) -> list[str]:
@@ -268,6 +406,51 @@ def _unmounted_since_baseline(baseline: dict[str, bool]) -> str | None:
     """
     for root, was_mounted in baseline.items():
         if was_mounted and not os.path.ismount(root):
+            return root
+    return None
+
+
+def _mount_identity(root: str):
+    """Return a mount-instance identity, preferring Linux's mount ID."""
+    normalized = os.path.normpath(root)
+    try:
+        with open("/proc/self/mountinfo", encoding="utf-8") as mountinfo:
+            for line in mountinfo:
+                fields = line.split(" - ", 1)[0].split()
+                if len(fields) < 5:
+                    continue
+                mount_point = fields[4]
+                for escaped, literal in (
+                    ("\\040", " "), ("\\011", "\t"),
+                    ("\\012", "\n"), ("\\134", "\\"),
+                ):
+                    mount_point = mount_point.replace(escaped, literal)
+                if os.path.normpath(mount_point) == normalized:
+                    # This ID changes even when the same filesystem is
+                    # detached and remounted; device/inode may not.
+                    return ("mountinfo", fields[0], fields[2], fields[3])
+    except OSError:
+        pass
+    try:
+        stat_result = os.stat(root)
+    except OSError:
+        return None
+    return ("stat", stat_result.st_dev, stat_result.st_ino)
+
+
+def _mount_identity_baseline(baseline: dict[str, bool]) -> dict[str, object]:
+    """Snapshot live mount instances represented by a mounted baseline."""
+    return {
+        root: _mount_identity(root)
+        for root, was_mounted in baseline.items()
+        if was_mounted
+    }
+
+
+def _changed_mount_since_baseline(identities: dict[str, object]) -> str | None:
+    """Return a mount whose instance disappeared or was replaced."""
+    for root, prior_identity in identities.items():
+        if prior_identity is None or _mount_identity(root) != prior_identity:
             return root
     return None
 
@@ -6647,6 +6830,7 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                     photo_id = photo["id"]
                     folder_path = folders.get(photo["folder_id"], "")
                     image_path = os.path.join(folder_path, photo["filename"])
+                    mask_file_stage = None
 
                     try:
                         # Per-photo serialisation. Two pipelines whose
@@ -6810,9 +6994,6 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                             if _should_abort_without_pause(abort):
                                 break
 
-                            mask_path = save_mask(
-                                mask, masks_dir, photo_id, sam2_variant,
-                            )
                             completeness = crop_completeness(mask)
                             features = compute_all_quality_features(proxy, mask)
                             if _should_abort_without_pause(abort):
@@ -6853,6 +7034,17 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                                     embed(proxy, variant=dinov2_variant),
                                 )
 
+                            mask_file_stage = _StagedMaskFile.create(
+                                mask,
+                                masks_dir,
+                                photo_id,
+                                sam2_variant,
+                                save_mask,
+                                previous_path=(
+                                    existing["path"] if existing else None
+                                ),
+                            )
+                            mask_path = mask_file_stage.final_path
                             thread_db.upsert_photo_mask(
                                 photo_id=photo_id,
                                 variant=sam2_variant,
@@ -6866,9 +7058,10 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                                 subject_tenengrad=mask_subject_tenengrad,
                                 bg_tenengrad=mask_bg_tenengrad,
                                 crop_complete=completeness,
+                                _commit=False,
                             )
                             thread_db.set_active_mask_variant(
-                                photo_id, sam2_variant,
+                                photo_id, sam2_variant, _commit=False,
                             )
                             # Remaining (non-mask) per-photo features still land
                             # on the photos row.  mask_path / crop_complete /
@@ -6877,18 +7070,39 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                             # intentionally NOT passed here.
                             if features:
                                 thread_db.update_photo_pipeline_features(
-                                    photo_id, **features,
+                                    photo_id, **features, _commit=False,
                                 )
                             thread_db.update_photo_embeddings(
                                 photo_id,
                                 dino_subject_embedding=subj_emb_blob,
                                 dino_global_embedding=global_emb_blob,
                                 variant=dinov2_variant,
+                                _commit=False,
                             )
+                            # Publish a new immutable PNG, then atomically move
+                            # the mask row, active denormalized fields, quality
+                            # features, and embeddings to that generation. The
+                            # predecessor remains readable until the commit;
+                            # finish removes it only after the database points
+                            # at the new path.
+                            mask_file_stage.install()
+                            commit_with_retry(thread_db.conn)
+                            mask_file_stage.finish()
+                            mask_file_stage = None
                             masked += 1
                     except Exception:
                         em_failed += 1
                         log.warning("Mask extraction failed for photo %s", photo_id, exc_info=True)
+                        # A failed write can leave this connection inside a
+                        # stale WAL snapshot. Without a rollback, every later
+                        # photo fails immediately with the same ``database is
+                        # locked`` error even after the competing writer has
+                        # moved on.
+                        try:
+                            _rollback_failed_mask_photo(thread_db, photo_id)
+                        finally:
+                            if mask_file_stage is not None:
+                                mask_file_stage.restore()
 
                     processed = i + 1
                     stages["extract_masks"]["count"] = processed

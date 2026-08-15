@@ -139,6 +139,35 @@ def _resolve_collection_photo_ids(db, collection_id):
     return {r["id"] for r in rows} if rows else set()
 
 
+def _replace_temp_id_scope(conn, table_name, ids):
+    """Replace a connection-local temp ID table without leaking a transaction.
+
+    SQLite DML against a TEMP table opens a transaction on the connection. If
+    that transaction remains open while the caller reads the main WAL database,
+    a concurrent writer can advance the main database and make a later write on
+    this connection fail immediately with ``SQLITE_BUSY_SNAPSHOT`` (surfaced by
+    Python as ``database is locked``). Commit only when this helper opened the
+    transaction; an outer transaction still belongs entirely to the caller.
+    """
+    started_in_transaction = conn.in_transaction
+    try:
+        conn.execute(
+            f"CREATE TEMP TABLE IF NOT EXISTS {table_name} "
+            "(id INTEGER PRIMARY KEY)"
+        )
+        conn.execute(f"DELETE FROM {table_name}")
+        conn.executemany(
+            f"INSERT OR IGNORE INTO {table_name} (id) VALUES (?)",
+            [(photo_id,) for photo_id in ids],
+        )
+        if not started_in_transaction and conn.in_transaction:
+            conn.commit()
+    except Exception:
+        if not started_in_transaction and conn.in_transaction:
+            conn.rollback()
+        raise
+
+
 def load_photo_features(db, collection_id=None, config=None,
                         labels_fingerprint=None, photo_ids=None):
     """Load all pipeline-relevant features for workspace photos from the database.
@@ -193,14 +222,8 @@ def load_photo_features(db, collection_id=None, config=None,
         # placeholders — a large collection exceeds SQLite's bound-parameter
         # cap (999 on legacy builds), and this scope is interpolated into
         # three queries below.
-        db.conn.execute(
-            "CREATE TEMP TABLE IF NOT EXISTS pipeline_scope_ids "
-            "(id INTEGER PRIMARY KEY)"
-        )
-        db.conn.execute("DELETE FROM pipeline_scope_ids")
-        db.conn.executemany(
-            "INSERT OR IGNORE INTO pipeline_scope_ids (id) VALUES (?)",
-            [(i,) for i in scoped_photo_ids],
+        _replace_temp_id_scope(
+            db.conn, "pipeline_scope_ids", scoped_photo_ids,
         )
         rows = db.conn.execute(
             f"""SELECT {_PIPELINE_PHOTO_COLS}
@@ -272,14 +295,8 @@ def load_photo_features(db, collection_id=None, config=None,
     detection_floor_sql = "AND d.detector_confidence >= ?"
     detection_floor_params = (min_conf,)
     if weak_candidate_ids:
-        db.conn.execute(
-            "CREATE TEMP TABLE IF NOT EXISTS pipeline_weak_detection_ids "
-            "(id INTEGER PRIMARY KEY)"
-        )
-        db.conn.execute("DELETE FROM pipeline_weak_detection_ids")
-        db.conn.executemany(
-            "INSERT OR IGNORE INTO pipeline_weak_detection_ids (id) VALUES (?)",
-            [(photo_id,) for photo_id in weak_candidate_ids],
+        _replace_temp_id_scope(
+            db.conn, "pipeline_weak_detection_ids", weak_candidate_ids,
         )
         detection_floor_sql = """AND (
               d.detector_confidence >= ?
@@ -1721,6 +1738,7 @@ def _process_photo_for_eye(db, row, folders, *, C, T, k_window):
 
     import keypoints as kp
     from image_loader import load_image
+    from pipeline_locks import acquire_photo_mask
     from quality import compute_eye_tenengrad
 
     def mark_attempted_without_eye():
@@ -1784,9 +1802,19 @@ def _process_photo_for_eye(db, row, folders, *, C, T, k_window):
 
     kps = kp.detect_keypoints(image, bbox, model_name)
 
+    # The stage worklist can outlive a concurrent mask regeneration and still
+    # carry its predecessor path. Re-read and fully load the current active
+    # mask under the same photo lock writers hold through predecessor cleanup.
+    with acquire_photo_mask(row["id"]):
+        current_mask = db.conn.execute(
+            "SELECT mask_path FROM photos WHERE id = ?", (row["id"],),
+        ).fetchone()
+        if current_mask is None or not current_mask["mask_path"]:
+            return
+        mask = _load_mask_array(current_mask["mask_path"])
+
     # Resize mask to image dims if needed (masks are typically saved at
     # proxy resolution and must be compared to full-image keypoint coords).
-    mask = _load_mask_array(row["mask_path"])
     if mask.shape != (ih, iw):
         from PIL import Image as _PIL
         mask_img = _PIL.fromarray(mask.astype(np.uint8) * 255).resize(

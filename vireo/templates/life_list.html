@@ -77,9 +77,14 @@
   .ll-exp-controls select { font-size:13px; padding:4px 8px; background:var(--bg-input); color:var(--text-primary); border:1px solid var(--border-secondary); border-radius:4px; }
 
   .ll-unmatched { font-size:12px; color:var(--text-muted); margin-bottom:14px; }
+  .ll-unmatched + .ll-unmatched { margin-top:-8px; }
   .ll-unmatched details { margin-top:4px; }
   .ll-unmatched summary { cursor:pointer; color:var(--text-secondary); }
-  .ll-unmatched ul { margin:6px 0 0 16px; padding:0; columns:2; font-size:12px; }
+  .ll-unmatched ul { margin:7px 0 0; padding:0; list-style:none; font-size:12px; }
+  .ll-unmatched li { display:flex; align-items:baseline; gap:7px; padding:3px 0; }
+  .ll-unmatched-name { color:var(--text-secondary); }
+  .ll-unmatched-reason { color:var(--text-faint); }
+  .ll-unmatched a { margin-left:auto; color:var(--accent); white-space:nowrap; }
 
   .ll-summary { display:flex; flex-wrap:wrap; gap:8px; margin-bottom:14px; }
   .ll-sumchip { padding:6px 12px; border-radius:8px; background:var(--bg-secondary); border:1px solid var(--border-primary); font-size:13px; color:var(--text-secondary); font-variant-numeric:tabular-nums; cursor:pointer; transition:border-color 0.15s, color 0.15s; }
@@ -982,22 +987,62 @@ function wireBreadcrumb(container) {
   });
 }
 
-// Muted footnote for tagged species that aren't matched to the taxonomy and so
-// aren't counted here. If the name list is truncated, say so plainly.
-function renderUnmatched(d) {
-  var u = d.unmatched_species || { count: 0, names: [] };
-  if (!u.count) return '';
-  var names = u.names || [];
-  var truncated = u.count > names.length;
-  var html = '<div class="ll-unmatched">';
-  html += u.count + " tagged species aren't counted here (unmatched, or matched above species rank).";
+function uncountedBrowseHref(entry) {
+  // The compact token is expanded by Browse into the same server-side
+  // ancestor-suppression predicate that produced ``photo_count``. Embedding
+  // every matching photo ID here would exceed browser/server URL limits for
+  // large catalogs, while a bare keyword rule would include redundant tags.
+  var filters = { root: { mode: 'all', rules: [
+    { field: 'life_list_uncounted', op: 'is', value: entry.filter_token }
+  ] } };
+  return '/browse?filters=' + encodeURIComponent(JSON.stringify(filters));
+}
+
+function renderUncountedGroup(entries, count, message) {
+  if (!count) return '';
+  var shown = entries || [];
+  var truncated = count > shown.length;
+  var html = '<div class="ll-unmatched">' + escapeHtml(message);
   html += '<details><summary>'
-    + (truncated ? ('Show the first ' + names.length + ' of ' + u.count) : 'Show them')
+    + (truncated ? ('Review the first ' + shown.length + ' of ' + count) : 'Review them')
     + '</summary><ul>';
-  names.forEach(function(n) { html += '<li>' + escapeHtml(n) + '</li>'; });
+  shown.forEach(function(entry) {
+    var reason = entry.reason === 'higher_rank' && entry.taxon_rank
+      ? ('Identified at ' + entry.taxon_rank + ' rank')
+      : 'No species-level taxonomy match';
+    var photos = entry.photo_count + ' photo' + (entry.photo_count === 1 ? '' : 's');
+    html += '<li><span class="ll-unmatched-name">' + escapeHtml(entry.name) + '</span>'
+      + '<span class="ll-unmatched-reason">&mdash; ' + escapeHtml(reason)
+      + ' &middot; ' + photos + '</span>'
+      + '<a href="' + escapeAttr(uncountedBrowseHref(entry)) + '">View photos</a></li>';
+  });
   html += '</ul>';
-  if (truncated) html += '<div style="margin-top:4px;">…and ' + (u.count - names.length) + ' more not shown.</div>';
+  if (truncated) html += '<div style="margin-top:4px;">…and ' + (count - shown.length) + ' more not shown.</div>';
   html += '</details></div>';
+  return html;
+}
+
+// Reasoned, class-aware disclosure for accepted identification labels that
+// cannot contribute to exact species completeness.
+function renderUnmatched(d) {
+  var u = d.uncounted_identifications;
+  if (!u) return '';
+  var root = d.root || {};
+  var className = root.common_name || root.name || 'this class';
+  var scopedCount = u.scoped_count || 0;
+  var workspaceCount = u.workspace_count || 0;
+  var html = '';
+  html += renderUncountedGroup(
+    u.scoped, scopedCount,
+    scopedCount + ' identification label' + (scopedCount === 1 ? '' : 's')
+      + ' in ' + className + (scopedCount === 1 ? " isn't" : " aren't")
+      + ' included in species totals.'
+  );
+  html += renderUncountedGroup(
+    u.workspace, workspaceCount,
+    workspaceCount + ' identification label' + (workspaceCount === 1 ? '' : 's')
+      + " elsewhere in this workspace can't be assigned to one taxonomic class."
+  );
   return html;
 }
 

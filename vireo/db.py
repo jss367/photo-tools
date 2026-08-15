@@ -1129,6 +1129,7 @@ class Database:
 
             CREATE INDEX IF NOT EXISTS idx_keywords_name ON keywords(name);
             CREATE INDEX IF NOT EXISTS idx_keywords_parent_id ON keywords(parent_id);
+            CREATE INDEX IF NOT EXISTS idx_keywords_taxon_id ON keywords(taxon_id);
             -- type is low-cardinality (5-value enum) but heavily filtered:
             -- has_subject rule, filter_out_subject_tagged, backfill_wildlife,
             -- and the warm-path migration probes all do WHERE type [IN/=] ...
@@ -14267,14 +14268,23 @@ class Database:
         ).fetchall()
         return {r["tid"] for r in rows}
 
-    def get_life_list_unmatched_species(self):
-        """Names of workspace-scoped tagged species keywords that can't be counted
-        at species rank — either no linked taxon at all, or a link that lands on
-        a taxon above species (genus/family/etc.). Surfaced honestly in the
-        explorer as 'not counted' so higher-rank matches aren't silently dropped."""
+    def get_life_list_uncounted_identifications(self):
+        """Workspace identifications that cannot contribute a species count.
+
+        Return dictionaries with the stored label, linked rank/taxon (when
+        available), class ancestor, reason, and affected-photo count. The same
+        per-photo ancestor suppression used by the Life List itself is applied
+        here: an imported family/order keyword is not reported when that photo
+        also carries a descendant identification. If at least one photo carries
+        only the broader label, that label remains in the result with a count of
+        the photos for which it is genuinely the most specific identification.
+        """
         ws = self._ws_id()
         rows = self.conn.execute(
-            """SELECT DISTINCT k.name AS name
+            f"""SELECT k.name AS name,
+                      k.taxon_id AS taxon_id,
+                      t.rank AS taxon_rank,
+                      COUNT(DISTINCT p.id) AS photo_count
                FROM photo_keywords pk
                JOIN keywords k ON k.id = pk.keyword_id
                 AND (k.is_species = 1 OR k.type = 'taxonomy')
@@ -14286,10 +14296,45 @@ class Database:
                 AND f.status IN ('ok', 'partial')
                WHERE COALESCE(p.flag, 'none') != 'rejected'
                  AND (k.taxon_id IS NULL OR t.rank IS NULL OR t.rank != 'species')
+                 {_LIFE_LIST_ANCESTOR_SUPPRESSION_CLAUSE}
+               GROUP BY k.name, k.taxon_id, t.rank
                ORDER BY k.name""",
             (ws,),
         ).fetchall()
-        return [r["name"] for r in rows]
+        class_by_taxon = self.get_class_ancestors_for_taxa(
+            [row["taxon_id"] for row in rows]
+        )
+
+        return [
+            {
+                "name": row["name"],
+                "taxon_id": row["taxon_id"],
+                "taxon_rank": row["taxon_rank"],
+                "class": class_by_taxon.get(row["taxon_id"]),
+                "reason": (
+                    "higher_rank" if row["taxon_id"] is not None
+                    and row["taxon_rank"] is not None else "unmatched"
+                ),
+                "photo_count": row["photo_count"],
+                # Keep Browse handoffs compact even when this label affects
+                # thousands of photos. The universal-filter engine expands
+                # this token into the same server-side ancestor-suppression
+                # predicate used by the count above.
+                "filter_token": json.dumps(
+                    {"name": row["name"], "taxon_id": row["taxon_id"]},
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
+            }
+            for row in rows
+        ]
+
+    def get_life_list_unmatched_species(self):
+        """Backward-compatible list of uncounted identification names."""
+        return [
+            row["name"]
+            for row in self.get_life_list_uncounted_identifications()
+        ]
 
     def get_taxon_subtree(self, root_id, max_depth=12):
         """All taxa in the subtree rooted at root_id (inclusive), as dict rows
@@ -19977,6 +20022,51 @@ class Database:
                 if len(parts) == 1:
                     return parts[0], params
                 return "(" + " OR ".join(parts) + ")", params
+            if field == "life_list_uncounted":
+                if op not in ("equals", "is") or not isinstance(value, str):
+                    raise ValueError("invalid Life List identification filter")
+                try:
+                    token = json.loads(value)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(
+                        "invalid Life List identification filter"
+                    ) from exc
+                if not isinstance(token, dict) or set(token) != {"name", "taxon_id"}:
+                    raise ValueError("invalid Life List identification filter")
+                name = token["name"]
+                taxon_id = token["taxon_id"]
+                if not isinstance(name, str) or not name:
+                    raise ValueError("invalid Life List identification filter")
+                if taxon_id is not None and (
+                    not isinstance(taxon_id, int) or isinstance(taxon_id, bool)
+                ):
+                    raise ValueError("invalid Life List identification filter")
+
+                predicate = (
+                    "(k.is_species = 1 OR k.type = 'taxonomy') "
+                    "AND k.name = ? "
+                )
+                predicate_params = [name]
+                if taxon_id is None:
+                    predicate += "AND k.taxon_id IS NULL "
+                else:
+                    predicate += (
+                        "AND k.taxon_id = ? "
+                        "AND NOT EXISTS (SELECT 1 FROM taxa t_unc "
+                        "WHERE t_unc.id = k.taxon_id "
+                        "AND t_unc.rank = 'species') "
+                    )
+                    predicate_params.append(taxon_id)
+                predicate += _LIFE_LIST_ANCESTOR_SUPPRESSION_CLAUSE
+                condition, predicate_params = _keyword_exists(
+                    predicate, predicate_params
+                )
+                # The Life List excludes rejected photos from both its count
+                # and disclosure. Preserve that exact scope in Browse.
+                return (
+                    f"(COALESCE(p.flag, 'none') != 'rejected' AND {condition})",
+                    predicate_params,
+                )
             if field in ("rating", "quality_score", "sharpness",
                          "subject_sharpness", "noise_estimate",
                          "crop_complete"):
@@ -21033,6 +21123,51 @@ class Database:
         )
         self.conn.commit()
 
+    def _resolve_species_by_lineage(self, species_name, expected_ancestors):
+        """Pick the species-rank taxon matching ``species_name`` and lineage.
+
+        Every candidate, including a sole local row, must contain every name
+        in ``expected_ancestors``. A taxonomy name index can retain only the
+        wrong side of a homonym, so candidate count alone is not evidence that
+        the local row belongs to the lookup's lineage. Missing lineage context,
+        zero matches, or multiple matches all return ``None`` rather than
+        permanently crediting the wrong Life List species/class.
+        """
+        candidates = self.conn.execute(
+            "SELECT id, rank, parent_id FROM taxa "
+            "WHERE name = ? AND rank = 'species'",
+            (species_name,),
+        ).fetchall()
+        if not candidates:
+            return None
+        expected = set(expected_ancestors)
+        if not expected:
+            # With no lineage context, even a sole local row may be the wrong
+            # side of a homonym whose intended row is absent from ``taxa``.
+            return None
+        matches = []
+        for candidate in candidates:
+            ancestors = set()
+            cursor = candidate["parent_id"]
+            # Depth cap mirrors ``get_class_ancestors_for_taxa`` and guards
+            # against pathological cyclic parent_id data.
+            for _ in range(12):
+                if cursor is None:
+                    break
+                row = self.conn.execute(
+                    "SELECT name, parent_id FROM taxa WHERE id = ?",
+                    (cursor,),
+                ).fetchone()
+                if row is None:
+                    break
+                ancestors.add(row["name"])
+                cursor = row["parent_id"]
+            if expected.issubset(ancestors):
+                matches.append(candidate)
+        if len(matches) == 1:
+            return matches[0]
+        return None
+
     def mark_species_keywords(self, taxonomy):
         """Mark keywords that are recognized species in the taxonomy.
 
@@ -21045,7 +21180,11 @@ class Database:
 
         Matching rows get ``is_species=1``, ``type='taxonomy'``, and (if the
         local taxa table is populated and the lookup resolves to a
-        species-rank taxon) a ``taxon_id`` link by iNaturalist id.
+        species-rank taxon) a ``taxon_id`` link by iNaturalist id. Lookup
+        results below species rank (for example Eastern Fox Squirrel or
+        Red-eared Slider subspecies) link to their species ancestor: the Life
+        List keeps the precise stored label while the Explorer credits the
+        containing species once.
         ``taxon_id`` is left NULL when the row had no prior link and only
         a higher-rank (genus/family) match exists — binding an unlinked
         row to a non-species-rank taxon would auto-promote it in a way the
@@ -21099,6 +21238,53 @@ class Database:
                 if row:
                     lookup_local_id = row["id"]
                     lookup_rank = row["rank"]
+            # The structured taxa table intentionally keeps major ranks only
+            # (kingdom through species), while taxonomy.json can resolve a
+            # label to a subspecies or another infraspecific rank. Walk that
+            # result's scientific lineage back to its species ancestor rather
+            # than leaving a valid, more-precise identification unlinked and
+            # absent from Explorer completeness. Higher-rank lookups have no
+            # species member in their lineage and therefore remain unchanged.
+            if lookup_rank != "species":
+                lineage_names = taxon.get("lineage_names") or []
+                lineage_ranks = taxon.get("lineage_ranks") or []
+                species_index = next(
+                    (
+                        i for i, rank in enumerate(lineage_ranks)
+                        if rank == "species"
+                    ),
+                    None,
+                )
+                if species_index is not None:
+                    species_name = lineage_names[species_index]
+                    # Ancestor scientific names above the species rank, used
+                    # to disambiguate homonyms. Two taxa with the same
+                    # species-rank scientific name can legitimately coexist
+                    # in the local ``taxa`` table (see the taxonomy loader
+                    # around ``_build_lineage`` — the schema keys on
+                    # ``inat_id``, not on ``(name, rank)`` — and iNat itself
+                    # allows homonyms across kingdoms). A name-only
+                    # ``LIMIT 1`` binding an infraspecific label to an
+                    # arbitrary row could permanently credit the wrong Life
+                    # List species/class; verify each candidate's parent
+                    # chain matches the taxonomy lookup's lineage instead.
+                    expected_ancestors = [
+                        name for name, rank in zip(
+                            lineage_names[:species_index],
+                            lineage_ranks[:species_index],
+                            strict=False,
+                        )
+                        if rank in (
+                            "genus", "family", "order",
+                            "class", "phylum", "kingdom",
+                        )
+                    ]
+                    species_row = self._resolve_species_by_lineage(
+                        species_name, expected_ancestors
+                    )
+                    if species_row:
+                        lookup_local_id = species_row["id"]
+                        lookup_rank = species_row["rank"]
             if local_taxon_id is None and lookup_rank == "species":
                 local_taxon_id = lookup_local_id
             # Only bind ``taxon_id`` to a species-rank local taxon. Binding a

@@ -277,6 +277,15 @@
       const n = Array.isArray(rule.value) ? rule.value.length : 0;
       return `${n} hand-picked photo${n === 1 ? '' : 's'}`;
     }
+    if (rule.field === 'life_list_uncounted') {
+      try {
+        const token = JSON.parse(rule.value);
+        if (token && typeof token.name === 'string' && token.name) {
+          return `Uncounted identification · ${token.name}`;
+        }
+      } catch (e) { /* Invalid tokens fail closed on the server. */ }
+      return 'Uncounted identification';
+    }
     const spec = state.fields[rule.field] || { label: rule.field, type: 'text' };
     const opLabel = OP_LABELS[rule.op] || rule.op;
     return `${spec.label} ${opLabel} ${valueLabel(spec, rule)}`;

@@ -26840,6 +26840,30 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     "phase_label": None,
                 })
                 try:
+                    # Revalidate the source's mount identity before replaying
+                    # its frozen manifest. Between discovery and scan a
+                    # removable/network source (or a local directory) can be
+                    # detached and replaced at the same path while later
+                    # sources are still being discovered; ``root_path.is_dir()``
+                    # inside scanner.scan would still be true, so common camera
+                    # filenames such as ``DCIM/.../IMG_0001.JPG`` would be
+                    # cataloged from the wrong volume. The post-scan check that
+                    # already gates working-copy extraction runs too late to
+                    # prevent that catalog contamination — do the check here.
+                    changed_source_mount = _changed_mount_since_baseline(
+                        source_mount_identities.get(str(Path(source)), {}),
+                    )
+                    if changed_source_mount is not None:
+                        raise FileNotFoundError(
+                            errno_mod.ENOENT,
+                            (
+                                "source mount changed since discovery "
+                                f"({changed_source_mount}); refusing to "
+                                "replay frozen manifest against replacement "
+                                "filesystem"
+                            ),
+                            source,
+                        )
                     do_scan(
                         source, thread_db,
                         progress_callback=progress_cb,

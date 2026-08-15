@@ -6314,9 +6314,19 @@ def test_import_in_place_rejects_detached_then_remounted_source(
     monkeypatch.setattr(
         pipeline_job, "_unmounted_since_baseline", lambda _baseline: None,
     )
+    # First call is the per-source pre-scan revalidation (must pass so scan
+    # runs and the deferred scope is populated); the subsequent call is the
+    # post-scan revalidation the test is exercising.
+    changed_calls = {"count": 0}
+
+    def fake_changed(identities):
+        changed_calls["count"] += 1
+        if changed_calls["count"] == 1:
+            return None
+        return "/mnt/card" if identities else None
+
     monkeypatch.setattr(
-        pipeline_job, "_changed_mount_since_baseline",
-        lambda identities: "/mnt/card" if identities else None,
+        pipeline_job, "_changed_mount_since_baseline", fake_changed,
     )
     monkeypatch.setattr(
         scanner, "scan",
@@ -6351,7 +6361,11 @@ def test_import_in_place_rejects_replaced_local_source(
     source = tmp_path / "local-source"
     source.mkdir()
     extractor_calls = []
+    # baseline, pre-scan (unchanged so scan runs), post-scan (changed so the
+    # deferred scope is dropped). The test focuses on the post-scan check;
+    # the separate pre-scan check has its own coverage below.
     identities = iter([
+        ("stat", 1, 100),
         ("stat", 1, 100),
         ("stat", 1, 200),
     ])
@@ -6388,6 +6402,80 @@ def test_import_in_place_rejects_replaced_local_source(
 
     assert job["status"] == "completed", job
     assert extractor_calls == []
+
+
+def test_import_in_place_rejects_replaced_source_before_scan(
+    app_and_db, tmp_path, monkeypatch,
+):
+    """A source replaced between discovery and its scan must not be scanned.
+
+    Import-in-place freezes each source's manifest before scanning any of
+    them so the "Overall" denominator is stable. If a removable or network
+    source is detached and replaced at the same path while later sources
+    are still being discovered, ``root_path.is_dir()`` inside scanner.scan
+    would still be True, so the frozen list of common camera filenames
+    (``DCIM/.../IMG_0001.JPG``) would replay against the replacement
+    filesystem and catalog photos from the wrong volume. The per-source
+    mount identity captured at discovery is meant to catch exactly this;
+    it has to be checked immediately before ``do_scan`` runs, not only in
+    the post-scan working-copy revalidation.
+    """
+    import pipeline_job
+    import scanner
+
+    app, _ = app_and_db
+    source = tmp_path / "swapped-source"
+    source.mkdir()
+    scan_calls = []
+    extractor_calls = []
+    # baseline discovery captures identity 100; by the time the per-source
+    # scan is about to start, the same path resolves to a different volume.
+    identities = iter([
+        ("stat", 1, 100),
+        ("stat", 1, 200),
+    ])
+
+    monkeypatch.setattr(
+        pipeline_job, "_load_known_mount_roots", lambda _db: set(),
+    )
+    monkeypatch.setattr(
+        pipeline_job, "_archive_mount_baseline", lambda path, known: {},
+    )
+    monkeypatch.setattr(
+        pipeline_job, "_record_known_mount_roots",
+        lambda _db, _baseline: None,
+    )
+    monkeypatch.setattr(
+        pipeline_job, "_mount_identity", lambda _path: next(identities),
+    )
+
+    def fake_scan(*_args, **_kwargs):
+        scan_calls.append(True)
+        return {"discovered": 0, "indexed": 0}
+
+    monkeypatch.setattr(scanner, "scan", fake_scan)
+    monkeypatch.setattr(
+        scanner, "_extract_working_copies",
+        lambda *args, **kwargs: extractor_calls.append((args, kwargs)),
+    )
+
+    client = app.test_client()
+    resp = client.post("/api/jobs/import-in-place", json={
+        "sources": [str(source)],
+        "after_import": None,
+    })
+    assert resp.status_code == 200, resp.get_json()
+    job = wait_for_job_via_client(client, resp.get_json()["job_id"])
+
+    # A replaced source is a source-level failure, not a silently successful
+    # import against the wrong filesystem.
+    assert job["status"] == "failed", job
+    assert scan_calls == [], "scanner must not run against the replacement"
+    assert extractor_calls == []
+    assert any(
+        "source mount changed since discovery" in err
+        for err in job.get("errors", [])
+    ), job.get("errors")
 
 
 def test_import_in_place_snapshot_rejects_replaced_restricted_directory(

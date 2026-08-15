@@ -1946,6 +1946,191 @@ def test_scan_extracts_working_copy_for_raw(tmp_path, monkeypatch):
     assert os.path.exists(os.path.join(str(vireo_dir), photos[0]["working_copy_path"]))
 
 
+def test_scan_reports_working_copy_as_counted_subphase(tmp_path, monkeypatch):
+    """Working-copy generation must not leave import progress pinned at 100%."""
+    import config as cfg
+    import scanner
+    from db import Database
+
+    monkeypatch.setattr(cfg, "CONFIG_PATH", str(tmp_path / "config.json"))
+    vireo_dir = tmp_path / "vireo"
+    vireo_dir.mkdir()
+    photo_dir = tmp_path / "photos"
+    photo_dir.mkdir()
+    (photo_dir / "IMG_001.nef").write_bytes(b"fake raw data")
+    monkeypatch.setattr(scanner, "extract_metadata", lambda paths, **_kwargs: {})
+
+    def fake_extract(_source, output, **_kwargs):
+        os.makedirs(os.path.dirname(output), exist_ok=True)
+        Image.new("RGB", (4096, 2731)).save(output, "JPEG")
+        return True
+
+    monkeypatch.setattr(scanner, "extract_working_copy", fake_extract)
+    statuses = []
+
+    def status_cb(message, **phase):
+        statuses.append((message, phase))
+
+    db = Database(str(vireo_dir / "test.db"))
+    scanner.scan(
+        str(photo_dir), db, vireo_dir=str(vireo_dir),
+        status_callback=status_cb,
+    )
+
+    working_copy_events = [
+        event for event in statuses
+        if event[1].get("phase_label") == "Generating working copies"
+    ]
+    assert [event[1]["phase_current"] for event in working_copy_events] == [0, 1]
+    assert all(event[1]["phase_total"] == 1 for event in working_copy_events)
+    assert working_copy_events[0][0] == "Generating 1 working copy..."
+    assert working_copy_events[-1][0] == "Generating working copies: 1 of 1"
+
+
+def test_working_copy_scope_supports_more_than_sqlite_expression_limit(
+    tmp_path, monkeypatch,
+):
+    """Large snapshot directory sets use a temp table, not an OR expression."""
+    import config as cfg
+    import scanner
+    from db import Database
+
+    monkeypatch.setattr(cfg, "CONFIG_PATH", str(tmp_path / "config.json"))
+    vireo_dir = tmp_path / "vireo"
+    vireo_dir.mkdir()
+    target_dir = tmp_path / "target"
+    target_dir.mkdir()
+    raw_path = target_dir / "IMG_0001.nef"
+    raw_path.write_bytes(b"fake raw data")
+
+    db = Database(str(vireo_dir / "test.db"))
+    folder_id = db.add_folder(str(target_dir))
+    photo_id = db.add_photo(
+        folder_id,
+        raw_path.name,
+        ".nef",
+        raw_path.stat().st_size,
+        raw_path.stat().st_mtime,
+    )
+
+    def fake_extract(_source, output, **_kwargs):
+        os.makedirs(os.path.dirname(output), exist_ok=True)
+        Image.new("RGB", (64, 48)).save(output, "JPEG")
+        return True
+
+    monkeypatch.setattr(scanner, "extract_working_copy", fake_extract)
+    scope = [
+        (str(tmp_path / f"unused-{index}"), "exact")
+        for index in range(1_100)
+    ]
+    scope.append((str(target_dir), "exact"))
+
+    scanner._extract_working_copies(
+        db, str(vireo_dir), scope=scope,
+    )
+
+    row = db.conn.execute(
+        "SELECT working_copy_path FROM photos WHERE id = ?", (photo_id,),
+    ).fetchone()
+    assert row["working_copy_path"] == f"working/{photo_id}.jpg"
+
+
+def test_working_copy_extractor_rechecks_excluded_path_before_read(
+    tmp_path, monkeypatch,
+):
+    """A source alias swapped after candidate selection is never opened."""
+    import config as cfg
+    import scanner
+    from db import Database
+
+    monkeypatch.setattr(cfg, "CONFIG_PATH", str(tmp_path / "config.json"))
+    vireo_dir = tmp_path / "vireo"
+    vireo_dir.mkdir()
+    target_dir = tmp_path / "selected-source"
+    target_dir.mkdir()
+    raw_path = target_dir / "IMG_0001.nef"
+    raw_path.write_bytes(b"fake raw data")
+
+    db = Database(str(vireo_dir / "test.db"))
+    folder_id = db.add_folder(str(target_dir))
+    photo_id = db.add_photo(
+        folder_id,
+        raw_path.name,
+        ".nef",
+        raw_path.stat().st_size,
+        raw_path.stat().st_mtime,
+    )
+
+    exclusion_checks = []
+
+    def source_becomes_excluded(path):
+        exclusion_checks.append(str(path))
+        # Candidate filtering sees the original directory; the per-row guard
+        # models it becoming a protected-library symlink before file access.
+        return len(exclusion_checks) > 1
+
+    extract_calls = []
+    monkeypatch.setattr(
+        scanner, "is_excluded_scan_path", source_becomes_excluded,
+    )
+    monkeypatch.setattr(
+        scanner, "extract_working_copy",
+        lambda *args, **kwargs: extract_calls.append(args) or True,
+    )
+
+    scanner._extract_working_copies(
+        db, str(vireo_dir), scope=[str(target_dir)],
+    )
+
+    assert len(exclusion_checks) == 2
+    assert extract_calls == []
+    row = db.conn.execute(
+        "SELECT working_copy_path FROM photos WHERE id = ?", (photo_id,),
+    ).fetchone()
+    assert row["working_copy_path"] is None
+
+
+def test_phase_status_callback_internal_typeerror_is_not_retried():
+    """A callback implementation error is not a legacy-signature signal."""
+    import scanner
+
+    calls = []
+
+    def failing_callback(message, **phase):
+        calls.append((message, phase))
+        raise TypeError("callback implementation failed")
+
+    with pytest.raises(TypeError, match="callback implementation failed"):
+        scanner._call_status_callback(
+            failing_callback,
+            "Generating",
+            phase_current=0,
+            phase_total=1,
+            phase_label="Generating working copies",
+        )
+    assert len(calls) == 1
+
+
+def test_phase_status_callback_detects_legacy_one_argument_shape():
+    """Legacy scanner callbacks remain supported without exception probing."""
+    import scanner
+
+    calls = []
+
+    def legacy_callback(message):
+        calls.append(message)
+
+    assert scanner._status_callback_supports_phase(legacy_callback) is False
+    scanner._call_status_callback(
+        legacy_callback,
+        "Generating",
+        phase_current=0,
+        phase_total=1,
+        phase_label="Generating working copies",
+    )
+    assert calls == ["Generating"]
+
+
 def test_scan_skips_working_copy_for_jpeg(tmp_path, monkeypatch):
     """Scanning a JPEG file does not create a working copy."""
     import config as cfg
@@ -2850,6 +3035,29 @@ def test_scanner_worker_count_obeys_process_cpu_grant(monkeypatch):
         resource_ledger._set_resource_ledger_for_tests(previous)
 
 
+def test_scanner_reserves_capacity_for_exact_inference_claim(monkeypatch):
+    """Flexible hashing must leave room for the configured ONNX pool."""
+    import config as cfg
+    import resource_ledger
+    import scanner
+
+    monkeypatch.setattr(cfg, "get", lambda _k: 16)
+    monkeypatch.setattr(scanner.os, "cpu_count", lambda: 16)
+    ledger = resource_ledger.ResourceLedger(cpu_capacity=12)
+    previous = resource_ledger._set_resource_ledger_for_tests(ledger)
+    try:
+        with scanner._claim_worker_count(list(range(100))) as workers:
+            assert workers == 4
+            with ledger.acquire(resource_ledger.ResourceRequest(
+                cpu=resource_ledger.cpu_inference_request(ledger.cpu_capacity),
+                lanes=("cpu_ml",),
+            )) as inference:
+                assert inference.cpu_permits == 8
+                assert ledger.snapshot()["cpu"]["allocated"] == 12
+    finally:
+        resource_ledger._set_resource_ledger_for_tests(previous)
+
+
 def test_scan_releases_cpu_permits_while_paused(tmp_path, monkeypatch):
     """When ``pause_check`` reports a pending pause during hashing, the
     scanner must drop its CPU lease before parking at ``cancel_check``.
@@ -2969,6 +3177,63 @@ def test_scan_pause_check_none_preserves_existing_behavior(tmp_path):
 
     photos = db.get_photos(per_page=100)
     assert len(photos) == 2
+
+
+def test_scan_pause_requeues_item_waiting_for_worker_result(tmp_path, monkeypatch):
+    """A pause while awaiting a popped future must not drop that photo."""
+    import resource_ledger
+    import scanner
+    from db import Database
+
+    root = str(tmp_path / "photos")
+    filenames = [f"{letter}.jpg" for letter in "abcdefghi"]
+    _create_test_images(root, {'': filenames})
+    db = Database(str(tmp_path / "test.db"))
+
+    pause_state = {"active": False, "triggered": False}
+
+    class PendingFuture:
+        def __init__(self, function, path):
+            self.function = function
+            self.path = path
+
+        def result(self, timeout=None):
+            if not pause_state["triggered"]:
+                pause_state["triggered"] = True
+                pause_state["active"] = True
+                raise scanner.TimeoutError()
+            return self.function(self.path)
+
+    class FakeProcessPool:
+        def __init__(self, *args, **kwargs):
+            self._processes = {}
+
+        def submit(self, function, path):
+            return PendingFuture(function, path)
+
+        def shutdown(self, wait=True, cancel_futures=False):
+            return None
+
+    def cancel_check():
+        pause_state["active"] = False
+        return False
+
+    monkeypatch.setattr(scanner, "ProcessPoolExecutor", FakeProcessPool)
+    ledger = resource_ledger.ResourceLedger(cpu_capacity=2)
+    previous = resource_ledger._set_resource_ledger_for_tests(ledger)
+    try:
+        scanner.scan(
+            root,
+            db,
+            cancel_check=cancel_check,
+            pause_check=lambda: pause_state["active"],
+        )
+    finally:
+        resource_ledger._set_resource_ledger_for_tests(previous)
+
+    assert pause_state["triggered"]
+    photos = db.get_photos(per_page=100)
+    assert {os.path.basename(photo["filename"]) for photo in photos} == set(filenames)
 
 
 # -- scan resilience: retry on locked DB, mark folder partial on abort --

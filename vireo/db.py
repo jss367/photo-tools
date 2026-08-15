@@ -9407,9 +9407,13 @@ class Database:
         self, photo_id, variant, path,
         detector_model, prompt_x, prompt_y, prompt_w, prompt_h,
         subject_size=None, subject_tenengrad=None,
-        bg_tenengrad=None, crop_complete=None,
+        bg_tenengrad=None, crop_complete=None, _commit=True,
     ):
-        """Insert or replace a mask row for (photo_id, variant)."""
+        """Insert or replace a mask row for (photo_id, variant).
+
+        ``_commit=False`` lets a caller include the row in a larger atomic
+        per-photo persistence transaction.
+        """
         self.conn.execute(
             """
             INSERT INTO photo_masks (
@@ -9435,7 +9439,8 @@ class Database:
              detector_model, prompt_x, prompt_y, prompt_w, prompt_h,
              subject_size, subject_tenengrad, bg_tenengrad, crop_complete),
         )
-        commit_with_retry(self.conn)
+        if _commit:
+            commit_with_retry(self.conn)
 
     def update_photo_pipeline_features(
         self,
@@ -9455,10 +9460,13 @@ class Database:
         eye_conf=_UNSET,
         eye_tenengrad=_UNSET,
         eye_kp_fingerprint=_UNSET,
+        _commit=True,
     ):
         """Update pipeline feature columns for a photo.
 
         Only updates columns whose values are explicitly provided (not _UNSET).
+        ``_commit=False`` lets a caller include the update in a larger atomic
+        per-photo persistence transaction.
         """
         cols = {
             "mask_path": mask_path,
@@ -9486,7 +9494,8 @@ class Database:
         self.conn.execute(
             f"UPDATE photos SET {set_clause} WHERE id=?", values
         )
-        commit_with_retry(self.conn)
+        if _commit:
+            commit_with_retry(self.conn)
 
     def get_photos_missing_masks(self, folder_ids=None):
         """Get photos that have detections but no masks yet.
@@ -9665,7 +9674,7 @@ class Database:
 
     def update_photo_embeddings(
         self, photo_id, dino_subject_embedding=None, dino_global_embedding=None,
-        variant=None,
+        variant=None, _commit=True,
     ):
         """Store DINOv2 embedding BLOBs for a photo.
 
@@ -9677,13 +9686,16 @@ class Database:
                 (e.g. "vit-b14"). Stored so the pipeline can detect stale
                 embeddings after a variant switch and drop them instead of
                 feeding mismatched-dim vectors to cosine similarity.
+            _commit: commit immediately by default. Set False only when the
+                caller owns a larger transaction and will commit it.
         """
         self.conn.execute(
             "UPDATE photos SET dino_subject_embedding=?, dino_global_embedding=?, "
             "dino_embedding_variant=? WHERE id=?",
             (dino_subject_embedding, dino_global_embedding, variant, photo_id),
         )
-        commit_with_retry(self.conn)
+        if _commit:
+            commit_with_retry(self.conn)
 
     # -- Keywords --
 

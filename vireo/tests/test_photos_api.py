@@ -9053,6 +9053,7 @@ def test_api_photo_masks_empty_when_no_masks(app_and_db):
 def test_api_serve_mask_png(app_and_db):
     """GET /api/masks/<pid>/<variant>.png serves the on-disk mask."""
     import os as _os
+
     app, db = app_and_db
     pid = db.get_photos()[0]["id"]
     masks_dir = _os.path.join(_os.path.dirname(db._db_path), "masks")
@@ -9153,6 +9154,7 @@ def test_legacy_serve_mask_falls_back_to_active_variant(app_and_db):
     when the literal ``{pid}.png`` file no longer exists.
     """
     import os as _os
+
     app, db = app_and_db
     pid = db.get_photos()[0]["id"]
     masks_dir = _os.path.join(_os.path.dirname(db._db_path), "masks")
@@ -9165,6 +9167,55 @@ def test_legacy_serve_mask_falls_back_to_active_variant(app_and_db):
     resp = client.get(f"/masks/{pid}.png")
     assert resp.status_code == 200
     assert resp.data == b"ACTIVEPNG"
+
+
+def test_legacy_serve_mask_retries_after_predecessor_cleanup(
+    app_and_db, monkeypatch,
+):
+    """A cleanup that wins before open is recovered without writer lock."""
+    import builtins
+    import os as _os
+
+    app, db = app_and_db
+    pid = db.get_photos()[0]["id"]
+    masks_dir = _os.path.join(_os.path.dirname(db._db_path), "masks")
+    old_path = _seed_mask(
+        db, masks_dir, pid, "sam2-small", body=b"PREDECESSOR",
+    )
+    db.set_active_mask_variant(pid, "sam2-small")
+    new_path = _os.path.join(masks_dir, f"{pid}.sam2-small.next.png")
+    with open(new_path, "wb") as handle:
+        handle.write(b"CURRENT")
+
+    real_open = builtins.open
+    raced = False
+
+    def racing_open(path, *args, **kwargs):
+        nonlocal raced
+        if not raced and _os.fspath(path) == old_path and args[:1] == ("rb",):
+            raced = True
+            db.upsert_photo_mask(
+                photo_id=pid,
+                variant="sam2-small",
+                path=new_path,
+                detector_model="md",
+                prompt_x=0,
+                prompt_y=0,
+                prompt_w=0,
+                prompt_h=0,
+            )
+            _os.unlink(old_path)
+            raise FileNotFoundError(old_path)
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", racing_open)
+
+    client = app.test_client()
+    resp = client.get(f"/masks/{pid}.png")
+
+    assert raced
+    assert resp.status_code == 200
+    assert resp.data == b"CURRENT"
 
 
 def test_legacy_serve_mask_404_when_no_active_variant(app_and_db):
@@ -9529,6 +9580,52 @@ def test_local_mask_snapshot_and_recipe_roundtrip(client_with_photo):
     got = client.get(f"/api/photos/{photo_id}/edit-recipe").get_json()
     assert got["recipe"]["local"]["mask"]["ref"] == mask["ref"]
     assert got["local_mask_stale"] is False
+
+
+def test_local_mask_snapshot_retries_predecessor_cleanup(
+    client_with_photo, monkeypatch,
+):
+    """Snapshot re-resolves the mask if cleanup wins before its open."""
+    import shutil
+
+    import local_masks
+
+    app, db, photo_id = client_with_photo
+    client = app.test_client()
+    folder = db.conn.execute("SELECT path FROM folders").fetchone()
+    old_path = _register_active_mask(db, photo_id, folder["path"])
+    new_path = old_path + ".next.png"
+    shutil.copyfile(old_path, new_path)
+    real_create_snapshot = local_masks.create_snapshot
+    raced = False
+
+    def racing_create_snapshot(**kwargs):
+        nonlocal raced
+        if not raced:
+            raced = True
+            db.upsert_photo_mask(
+                photo_id,
+                "sam2-small",
+                new_path,
+                "megadetector-v6",
+                0.0,
+                0.0,
+                0.5,
+                1.0,
+            )
+            os.unlink(old_path)
+            raise FileNotFoundError(old_path)
+        return real_create_snapshot(**kwargs)
+
+    monkeypatch.setattr(
+        local_masks, "create_snapshot", racing_create_snapshot,
+    )
+
+    resp = client.post(f"/api/photos/{photo_id}/local-mask/snapshot")
+
+    assert raced
+    assert resp.status_code == 200, resp.get_json()
+    assert set(resp.get_json()["mask"]) == {"ref", "source_digest"}
 
 
 def test_local_recipe_stale_flag_tracks_live_mask(client_with_photo):

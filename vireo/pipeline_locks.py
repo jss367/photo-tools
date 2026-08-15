@@ -113,12 +113,13 @@ def acquire_inference_resources(session, *, cancel_check=None):
     from resource_ledger import (
         CpuRequest,
         ResourceRequest,
+        cpu_inference_request,
         get_resource_ledger,
     )
 
     ledger = get_resource_ledger()
     threads = session_cpu_threads(
-        session, default=min(8, ledger.cpu_capacity),
+        session, default=cpu_inference_request(ledger.cpu_capacity).preferred,
     )
     # A test may replace the process ledger after constructing a session.
     # Production uses one immutable startup capacity, but clamping here keeps
@@ -208,8 +209,9 @@ def acquire_photo_mask(photo_id):
 
     Held across the get_photo_mask → generate_mask → save_mask →
     upsert_photo_mask → set_active_mask_variant → update_photo_embeddings
-    sequence in ``extract_masks_stage`` so two pipelines hitting the
-    same photo serialise. Pipelines on different photos don't contend.
+    sequence in ``extract_masks_stage`` and the standalone extract-masks
+    route so concurrent writers hitting the same photo serialise. Pipelines
+    on different photos don't contend.
     """
     with _PHOTO_MASK_LOCKS_GUARD:
         lock = _PHOTO_MASK_LOCKS.get(photo_id)

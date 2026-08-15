@@ -3,6 +3,7 @@
 import contextlib
 import json
 import os
+import sqlite3
 import sys
 import threading
 
@@ -8173,12 +8174,14 @@ def _stub_extract_masks_heavy_ops(monkeypatch):
         masking, "generate_mask",
         lambda *a, **k: np.ones((16, 16), dtype=np.uint8),
     )
-    monkeypatch.setattr(
-        masking, "save_mask",
-        lambda mask, dir_, pid_, variant: os.path.join(
-            dir_, f"{pid_}.{variant}.png",
-        ),
-    )
+    def fake_save_mask(mask, dir_, pid_, variant):
+        path = os.path.join(dir_, f"{pid_}.{variant}.png")
+        os.makedirs(dir_, exist_ok=True)
+        with open(path, "wb") as handle:
+            handle.write(b"mask")
+        return path
+
+    monkeypatch.setattr(masking, "save_mask", fake_save_mask)
     monkeypatch.setattr(masking, "crop_completeness", lambda m: 1.0)
     monkeypatch.setattr(masking, "crop_subject", lambda p, m, margin=0.15: None)
     monkeypatch.setattr(masking, "ensure_sam2_weights", lambda **k: None)
@@ -9080,6 +9083,345 @@ def _run_extract_masks_for_test(
     run_pipeline_job(job, runner, db_path, ws_id, params)
 
     return db, runner, generate_mask_calls, photo_ids
+
+
+def test_extract_masks_rolls_back_failed_photo_before_continuing(
+    tmp_path, monkeypatch,
+):
+    """One failed persistence attempt must not poison the thread connection."""
+    from db import Database
+
+    real_upsert = Database.upsert_photo_mask
+    attempts = 0
+
+    def fail_first_upsert(self, *args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            # Reproduce a failed write after sqlite has opened a transaction.
+            # The stage's exception handler must roll this back before moving
+            # to the next photo.
+            self.conn.execute(
+                "UPDATE photos SET rating = rating WHERE id = ?",
+                (kwargs["photo_id"],),
+            )
+            raise sqlite3.OperationalError("database is locked")
+        if self.conn.in_transaction:
+            raise sqlite3.OperationalError("previous transaction still open")
+        return real_upsert(self, *args, **kwargs)
+
+    monkeypatch.setattr(Database, "upsert_photo_mask", fail_first_upsert)
+    runner = FakeRunner()
+    with pytest.raises(RuntimeError, match="1 of 2 photos failed"):
+        _run_extract_masks_for_test(
+            tmp_path,
+            monkeypatch,
+            "tiny",
+            [
+                {"filename": "first.jpg", "box": (0.1, 0.1, 0.5, 0.5),
+                 "model": "MegaDetector"},
+                {"filename": "second.jpg", "box": (0.1, 0.1, 0.5, 0.5),
+                 "model": "MegaDetector"},
+            ],
+            runner=runner,
+        )
+
+    db = Database(str(tmp_path / "test.db"))
+    photo_ids = [
+        row["id"] for row in db.conn.execute(
+            "SELECT id FROM photos ORDER BY id",
+        ).fetchall()
+    ]
+
+    saved_ids = [
+        row["photo_id"] for row in db.conn.execute(
+            "SELECT photo_id FROM photo_masks ORDER BY photo_id",
+        ).fetchall()
+    ]
+    assert saved_ids == [photo_ids[1]]
+    final = _extract_masks_final_update(runner)
+    assert final["status"] == "failed"
+    assert final["error_count"] == 1
+    assert "1 masked" in final["summary"]
+    assert "1 failed" in final["summary"]
+
+
+def test_extract_masks_rolls_back_all_photo_writes_when_embeddings_fail(
+    tmp_path, monkeypatch,
+):
+    """Mask rows and derived fields commit atomically with embeddings."""
+    from db import Database
+
+    real_update = Database.update_photo_embeddings
+    attempts = 0
+
+    def fail_first_embedding_update(self, *args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise sqlite3.OperationalError("embedding write failed")
+        return real_update(self, *args, **kwargs)
+
+    monkeypatch.setattr(
+        Database, "update_photo_embeddings", fail_first_embedding_update,
+    )
+    runner = FakeRunner()
+    with pytest.raises(RuntimeError, match="1 of 2 photos failed"):
+        _run_extract_masks_for_test(
+            tmp_path,
+            monkeypatch,
+            "tiny",
+            [
+                {"filename": "first.jpg", "box": (0.1, 0.1, 0.5, 0.5),
+                 "model": "MegaDetector"},
+                {"filename": "second.jpg", "box": (0.1, 0.1, 0.5, 0.5),
+                 "model": "MegaDetector"},
+            ],
+            runner=runner,
+        )
+
+    db = Database(str(tmp_path / "test.db"))
+    rows = db.conn.execute(
+        "SELECT p.id, p.mask_path, p.active_mask_variant, pm.photo_id "
+        "FROM photos p LEFT JOIN photo_masks pm ON pm.photo_id = p.id "
+        "ORDER BY p.id",
+    ).fetchall()
+    assert rows[0]["photo_id"] is None
+    assert rows[0]["mask_path"] is None
+    assert rows[0]["active_mask_variant"] is None
+    assert not (tmp_path / "masks" / f"{rows[0]['id']}.tiny.png").exists()
+    assert rows[1]["photo_id"] == rows[1]["id"]
+    assert rows[1]["mask_path"] is not None
+
+
+def test_staged_mask_restores_previous_file_on_failure(tmp_path, monkeypatch):
+    """A failed rerun cannot leave old DB metadata pointing at a new PNG."""
+    import pipeline_job as pj
+
+    masks_dir = tmp_path / "masks"
+    masks_dir.mkdir()
+    final_path = masks_dir / "42.tiny.png"
+    final_path.write_bytes(b"old mask")
+
+    def fake_save(_mask, stage_dir, photo_id, variant):
+        staged = os.path.join(stage_dir, f"{photo_id}.{variant}.png")
+        with open(staged, "wb") as handle:
+            handle.write(b"new mask")
+        return staged
+
+    staged = pj._StagedMaskFile.create(
+        None, str(masks_dir), 42, "tiny", fake_save,
+        previous_path=str(final_path),
+    )
+    real_replace = pj.os.replace
+
+    def assert_final_exists_before_replace(source, destination):
+        if source == staged.staged_path and destination == staged.final_path:
+            assert final_path.read_bytes() == b"old mask"
+            assert destination != str(final_path)
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(pj.os, "replace", assert_final_exists_before_replace)
+    staged.install()
+    assert final_path.read_bytes() == b"old mask"
+    with open(staged.final_path, "rb") as handle:
+        assert handle.read() == b"new mask"
+
+    staged.restore()
+
+    assert final_path.read_bytes() == b"old mask"
+    assert not os.path.exists(staged.final_path)
+    assert not list(masks_dir.glob(".mask-stage-*"))
+
+
+def test_staged_mask_syncs_bytes_and_name_before_database_commit(
+    tmp_path, monkeypatch,
+):
+    """install() durably orders file, rename, then directory publication."""
+    import pipeline_job as pj
+
+    masks_dir = tmp_path / "masks"
+
+    def fake_save(_mask, stage_dir, photo_id, variant):
+        staged_path = os.path.join(stage_dir, f"{photo_id}.{variant}.png")
+        with open(staged_path, "wb") as handle:
+            handle.write(b"new mask")
+        return staged_path
+
+    staged = pj._StagedMaskFile.create(
+        None, str(masks_dir), 42, "tiny", fake_save,
+    )
+    calls = []
+    real_replace = pj.os.replace
+    monkeypatch.setattr(
+        pj, "_fsync_mask_file",
+        lambda path: calls.append(("file", path)),
+    )
+    monkeypatch.setattr(
+        pj, "_fsync_mask_directory",
+        lambda path: calls.append(("directory", path)),
+    )
+
+    def tracked_replace(source, destination):
+        calls.append(("replace", source, destination))
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(pj.os, "replace", tracked_replace)
+
+    staged.install()
+
+    assert calls == [
+        ("file", staged.staged_path),
+        ("replace", staged.staged_path, staged.final_path),
+        ("directory", str(masks_dir)),
+    ]
+    staged.restore()
+
+
+def test_mask_file_fsync_opens_writable_for_windows(tmp_path, monkeypatch):
+    """CRT _commit requires a writable descriptor on Windows."""
+    import pipeline_job as pj
+
+    mask_path = tmp_path / "mask.png"
+    mask_path.write_bytes(b"mask")
+    opened_modes = []
+    real_open = open
+
+    def tracked_open(path, mode):
+        opened_modes.append(mode)
+        return real_open(path, mode)
+
+    monkeypatch.setattr(pj, "open", tracked_open, raising=False)
+
+    pj._fsync_mask_file(str(mask_path))
+
+    assert opened_modes == ["rb+"]
+
+
+def test_staged_mask_removes_previous_file_only_after_commit(tmp_path):
+    """The old committed path stays valid until finish follows DB commit."""
+    import pipeline_job as pj
+
+    masks_dir = tmp_path / "masks"
+    masks_dir.mkdir()
+    previous_path = (
+        masks_dir / "42.tiny.generation-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.png"
+    )
+    previous_path.write_bytes(b"old mask")
+
+    def fake_save(_mask, stage_dir, photo_id, variant):
+        staged_path = os.path.join(stage_dir, f"{photo_id}.{variant}.png")
+        with open(staged_path, "wb") as handle:
+            handle.write(b"new mask")
+        return staged_path
+
+    staged = pj._StagedMaskFile.create(
+        None, str(masks_dir), 42, "tiny", fake_save,
+        previous_path=str(previous_path),
+    )
+    staged.install()
+
+    # This is the interruption window before the database commit: both files
+    # are complete, and the database's old path still serves the old bytes.
+    assert previous_path.read_bytes() == b"old mask"
+    with open(staged.final_path, "rb") as handle:
+        assert handle.read() == b"new mask"
+
+    staged.finish()
+
+    assert not previous_path.exists()
+    with open(staged.final_path, "rb") as handle:
+        assert handle.read() == b"new mask"
+    assert not list(masks_dir.glob(".mask-stage-*"))
+
+
+def test_staged_mask_reclaims_deterministic_standalone_path(tmp_path):
+    """The shared photo lock makes deterministic predecessor cleanup safe."""
+    import pipeline_job as pj
+
+    masks_dir = tmp_path / "masks"
+    masks_dir.mkdir()
+    standalone_path = masks_dir / "42.tiny.png"
+    standalone_path.write_bytes(b"standalone mask")
+
+    def fake_save(_mask, stage_dir, photo_id, variant):
+        staged_path = os.path.join(stage_dir, f"{photo_id}.{variant}.png")
+        with open(staged_path, "wb") as handle:
+            handle.write(b"pipeline mask")
+        return staged_path
+
+    staged = pj._StagedMaskFile.create(
+        None, str(masks_dir), 42, "tiny", fake_save,
+        previous_path=str(standalone_path),
+    )
+    staged.install()
+    staged.finish()
+
+    assert not standalone_path.exists()
+    with open(staged.final_path, "rb") as handle:
+        assert handle.read() == b"pipeline mask"
+
+
+def test_staged_mask_restore_swallows_unlink_oserror(tmp_path, monkeypatch):
+    """restore()'s cleanup unlink cannot abort the whole extract-masks stage.
+
+    The published path is uniquely suffixed and no committed row references it
+    once the transaction rolled back, so an ``OSError`` here — e.g. an
+    antivirus scanner briefly holding the fresh PNG open on Windows — must be
+    swallowed. If it escaped through the per-photo ``finally``, the outer
+    exception handler would mark the entire stage fatal and skip every
+    remaining photo even though the database was rolled back cleanly.
+    """
+    import pipeline_job as pj
+
+    masks_dir = tmp_path / "masks"
+    masks_dir.mkdir()
+
+    def fake_save(_mask, stage_dir, photo_id, variant):
+        staged_path = os.path.join(stage_dir, f"{photo_id}.{variant}.png")
+        with open(staged_path, "wb") as handle:
+            handle.write(b"new mask")
+        return staged_path
+
+    staged = pj._StagedMaskFile.create(
+        None, str(masks_dir), 42, "tiny", fake_save,
+    )
+    staged.install()
+    assert os.path.exists(staged.final_path)
+
+    real_unlink = pj.os.unlink
+
+    def refuse_final_unlink(path):
+        if path == staged.final_path:
+            raise PermissionError(
+                "simulated antivirus lock on rolled-back mask generation"
+            )
+        return real_unlink(path)
+
+    monkeypatch.setattr(pj.os, "unlink", refuse_final_unlink)
+
+    staged.restore()
+
+    # Rollback survived the cleanup failure; the unreferenced generation is
+    # left behind (same outcome as a mid-write process interruption).
+    assert os.path.exists(staged.final_path)
+    assert not staged.installed
+    assert not list(masks_dir.glob(".mask-stage-*"))
+
+
+def test_extract_masks_aborts_when_rollback_fails():
+    """A broken reused connection must not be carried to later photos."""
+    import pipeline_job as pj
+
+    class BrokenConnection:
+        def rollback(self):
+            raise sqlite3.OperationalError("cannot roll back")
+
+    class BrokenDatabase:
+        conn = BrokenConnection()
+
+    with pytest.raises(RuntimeError, match="rollback failed for photo 42"):
+        pj._rollback_failed_mask_photo(BrokenDatabase(), 42)
 
 
 def test_extract_masks_pause_waits_outside_photo_lock(tmp_path, monkeypatch):

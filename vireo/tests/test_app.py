@@ -15708,6 +15708,16 @@ def test_import_page_returns_200(app_and_db):
     assert "/api/jobs/import-in-place" in html
 
 
+def test_import_page_uses_only_working_copy_subphase_for_main_progress(app_and_db):
+    """Per-batch remote transfer progress must not reset the overall bar."""
+    app, _ = app_and_db
+    html = app.test_client().get("/import").data.decode()
+
+    assert "data.phase_label === 'Generating working copies'" in html
+    assert "const visibleCurrent = workingCopyPhase" in html
+    assert "const visibleTotal = workingCopyPhase" in html
+
+
 def test_import_page_surfaces_remote_target_load_failure(app_and_db):
     """The Archive Destination dropdown must never lose its SSH options
     silently: when /api/remote-targets fails or hangs, the page shows a

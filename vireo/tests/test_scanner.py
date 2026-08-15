@@ -147,6 +147,21 @@ def test_scan_with_empty_frozen_manifest_tolerates_missing_root(tmp_path):
     assert result["indexed"] == 0
 
 
+def test_scan_with_empty_frozen_manifest_iterator_tolerates_missing_root(tmp_path):
+    """An empty manifest iterator has the same semantics as an empty list."""
+    from db import Database
+    from scanner import scan
+
+    db = Database(str(tmp_path / "test.db"))
+    result = scan(
+        str(tmp_path / "vanished_card"),
+        db,
+        discovered_files=iter(()),
+    )
+    assert result["discovered"] == 0
+    assert result["indexed"] == 0
+
+
 def test_scan_skips_app_managed_library_bundles(tmp_path):
     """scan() must not descend into macOS app-managed library bundles.
 

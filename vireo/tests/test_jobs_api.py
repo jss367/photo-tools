@@ -552,6 +552,8 @@ def test_jobs_page_returns_200(app_and_db):
     # rendering the previous source's filenames under the new phase.
     assert b'step.started_at && !importInPlacePhaseActive' in resp.data
     assert b'isRunning && !importInPlacePhaseActive' in resp.data
+    assert b'delete leafBuffers[step.id]' in resp.data
+    assert b'leafBufferSources[step.id] !== step.source_index' in resp.data
 
 
 def test_navbar_has_jobs_link(app_and_db):
@@ -5947,6 +5949,7 @@ def test_import_in_place_overall_total_is_stable_across_sources(
 
     assert job["status"] == "completed", job
     assert job["result"]["indexed"] == 3
+    assert job["steps"][0]["source_index"] == 2
     progress = [
         event["data"]
         for event in app._job_runner.get_events(job_id)
@@ -6064,6 +6067,42 @@ def test_import_in_place_reports_error_when_source_vanishes_after_discovery(
     currents = [data["current"] for data in overall]
     assert currents == sorted(currents)
     assert currents[-1] == 3, currents
+
+
+def test_import_in_place_stops_after_interrupted_discovery(
+    app_and_db, tmp_path, monkeypatch,
+):
+    """A transient discovery cancellation cannot feed partial manifests to scan."""
+    import ingest
+    import scanner
+
+    app, _ = app_and_db
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    scan_calls = []
+
+    def interrupt_discovery(*_args, **_kwargs):
+        raise scanner.ScanCancelled("discovery interrupted")
+
+    monkeypatch.setattr(ingest, "discover_source_files", interrupt_discovery)
+    monkeypatch.setattr(
+        scanner,
+        "scan",
+        lambda *_args, **_kwargs: scan_calls.append(True),
+    )
+
+    with app.test_client() as client:
+        resp = client.post("/api/jobs/import-in-place", json={
+            "sources": [str(first), str(second)],
+            "after_import": None,
+        })
+        assert resp.status_code == 200, resp.get_json()
+        job = wait_for_job_via_client(client, resp.get_json()["job_id"])
+
+    assert job["result"]["cancelled"] is True, job
+    assert scan_calls == []
 def test_import_in_place_reports_working_copy_phase(app_and_db, tmp_path, monkeypatch):
     """A completed file scan must not hide ongoing RAW working-copy work."""
     import scanner
@@ -6472,10 +6511,11 @@ def test_import_in_place_rejects_replaced_source_before_scan(
     assert job["status"] == "failed", job
     assert scan_calls == [], "scanner must not run against the replacement"
     assert extractor_calls == []
+    errors = list(job.get("errors") or [])
     assert any(
         "source mount changed since discovery" in err
-        for err in job.get("errors", [])
-    ), job.get("errors")
+        for err in errors
+    ), errors
 
 
 def test_import_in_place_snapshot_rejects_replaced_restricted_directory(

@@ -313,6 +313,7 @@
   var pollTimer = null;
   var sseSource = null;
   var leafBuffers = {};
+  var leafBufferSources = {};
   var LEAF_MAX = 20;
   // Job ids the user has clicked Cancel on but the server hasn't yet
   // moved out of the active list. Tracked here so subsequent renders
@@ -644,6 +645,15 @@
     var isExpanded = isRunning || step.status === 'failed' || (step.status === 'completed' && warningCount > 0);
     if (collapsedSteps[step.id] === true) isExpanded = false;
     if (collapsedSteps[step.id] === false) isExpanded = true;
+    // Import-in-place reuses one scan step across every source. Clear the
+    // prior source's filenames as soon as the backend advances that source
+    // index, even if the step is currently collapsed.
+    if (job.type === 'import-in-place' &&
+        typeof step.source_index === 'number' &&
+        leafBufferSources[step.id] !== step.source_index) {
+      delete leafBuffers[step.id];
+      leafBufferSources[step.id] = step.source_index;
+    }
 
     var html = '<div class="tree-step" data-step-id="' + esc(step.id) + '">';
     html += '<div class="tree-step-header" data-toggle-step="' + esc(step.id) + '">';
@@ -1016,6 +1026,7 @@
     selectedJobId = jobId;
     selectedSource = source;
     leafBuffers = {};
+    leafBufferSources = {};
     collapsedSteps = {};
     if (sseSource) { sseSource.close(); sseSource = null; }
     if (source === 'active') {

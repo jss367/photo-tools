@@ -1751,6 +1751,12 @@ def scan(root, db, progress_callback=None, incremental=False, extract_full_metad
             "Skipping other-app data bundle as scan root: %s", root_path,
         )
         return counts
+    # A frozen manifest may be any iterable, including a generator. Consume
+    # it exactly once so the missing-root guard can distinguish an empty
+    # manifest from promised work without exhausting the later work queue.
+    frozen_files = (
+        None if discovered_files is None else list(discovered_files)
+    )
     if not root_path.is_dir():
         # A frozen manifest promised these files exist; the missing root
         # is a source-level failure the caller must see (an SD card
@@ -1761,7 +1767,7 @@ def scan(root, db, progress_callback=None, incremental=False, extract_full_metad
         # source and mark the import successful on an incomplete set.
         # Without a manifest, missing roots stay a benign no-op — an
         # empty-manifest run wants the same shape a completed one has.
-        if discovered_files:
+        if frozen_files:
             raise FileNotFoundError(
                 errno.ENOENT,
                 "scan root disappeared between discovery and scan",
@@ -1791,11 +1797,11 @@ def scan(root, db, progress_callback=None, incremental=False, extract_full_metad
     # scan sorts its work queue and callers may retain their source mapping.
     log.info("Discovering files in %s ...", root)
     _check_cancelled()
-    if discovered_files is None and status_callback:
+    if frozen_files is None and status_callback:
         _emit_status("Discovering files...")
     image_files = (
-        [Path(path) for path in discovered_files]
-        if discovered_files is not None else []
+        [Path(path) for path in frozen_files]
+        if frozen_files is not None else []
     )
 
     # os.walk + onerror, not Path.rglob: rglob silently skips any
@@ -1841,7 +1847,7 @@ def scan(root, db, progress_callback=None, incremental=False, extract_full_metad
     # ``folder_path/filename`` — re-tripping the macOS TCC prompt this guard
     # exists to avoid.
     effective_restrict_dirs = []
-    if discovered_files is not None:
+    if frozen_files is not None:
         # The manifest already applied the file filters. Retain only the
         # directory scope used by the later working-copy extraction pass;
         # do not enumerate those directories a second time.

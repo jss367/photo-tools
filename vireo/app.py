@@ -26790,7 +26790,12 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             })
 
             for idx, source in enumerate(sources, 1):
-                if cancel_check():
+                # Discovery can observe a transient pause request and raise
+                # ScanCancelled before the runner settles into its paused
+                # state. Keep the local outcome authoritative even if the
+                # runner is resumed before this loop checks again; later
+                # sources do not have frozen manifests in that case.
+                if cancelled or cancel_check():
                     cancelled = True
                     break
                 if source in source_discovery_failures:
@@ -26829,7 +26834,11 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     f"Importing source {idx} of {len(sources)}: {source}"
                     if len(sources) > 1 else "Importing in place"
                 )
-                runner.update_step(job["id"], "scan", current_file=phase)
+                runner.update_step(
+                    job["id"], "scan",
+                    current_file=phase,
+                    source_index=idx,
+                )
                 runner.push_event(job["id"], "progress", {
                     "current": job["progress"].get("current", 0),
                     "total": job["progress"].get("total", 0),

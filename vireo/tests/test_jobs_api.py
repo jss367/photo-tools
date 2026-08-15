@@ -5908,6 +5908,45 @@ def test_import_in_place_reports_working_copy_phase(app_and_db, tmp_path, monkey
     assert scan_step["progress"] == {"current": 1, "total": 1}
 
 
+def test_import_in_place_aggregates_working_copy_phase_across_sources(
+    app_and_db, tmp_path, monkeypatch,
+):
+    """Multiple sources share one working-copy denominator and progress run."""
+    import scanner
+
+    app, _ = app_and_db
+    sources = []
+    for index in (1, 2):
+        source = tmp_path / f"raw-card-{index}"
+        source.mkdir()
+        (source / f"IMG_{index:04d}.nef").write_bytes(b"fake raw data")
+        sources.append(str(source))
+
+    monkeypatch.setattr(scanner, "extract_metadata", lambda paths, **kwargs: {})
+
+    def fake_extract(_source, output, **_kwargs):
+        os.makedirs(os.path.dirname(output), exist_ok=True)
+        Image.new("RGB", (64, 48), "green").save(output, "JPEG")
+        return True
+
+    monkeypatch.setattr(scanner, "extract_working_copy", fake_extract)
+
+    client = app.test_client()
+    resp = client.post("/api/jobs/import-in-place", json={
+        "sources": sources,
+        "after_import": None,
+    })
+    assert resp.status_code == 200, resp.get_json()
+    job = wait_for_job_via_client(client, resp.get_json()["job_id"])
+
+    assert job["status"] == "completed", job
+    assert job["progress"]["phase_label"] == "Generating working copies"
+    assert job["progress"]["phase_current"] == 2
+    assert job["progress"]["phase_total"] == 2
+    scan_step = next(step for step in job["steps"] if step["id"] == "scan")
+    assert scan_step["progress"] == {"current": 2, "total": 2}
+
+
 def test_import_in_place_snapshot_admits_only_frozen_files(
     app_and_db, tmp_path,
 ):

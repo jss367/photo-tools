@@ -26418,8 +26418,14 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
 
         def _run_import_in_place(job):
             import config as cfg
-            from scanner import ScanCancelled
-            from scanner import scan as do_scan
+            from scanner import (
+                ScanCancelled,
+                _extract_working_copies,
+                is_excluded_scan_path,
+            )
+            from scanner import (
+                scan as do_scan,
+            )
 
             thread_db = Database(db_path)
             thread_db.set_active_workspace(active_ws)
@@ -26439,6 +26445,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             indexed_paths = set()
             root_errors = []
             scan_acc = {"prior": 0, "last_current": 0, "last_total": 0}
+            working_copy_scope = []
 
             snapshot_requested = len(snapshot_paths or [])
             snapshot_missing = []
@@ -26593,6 +26600,16 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     "phase": phase,
                 })
                 try:
+                    if restricted_dirs is not None:
+                        working_copy_scope.extend(
+                            (directory, "exact")
+                            for directory in restricted_dirs
+                            if not is_excluded_scan_path(Path(directory))
+                        )
+                    elif not recursive:
+                        working_copy_scope.append((source, "exact"))
+                    else:
+                        working_copy_scope.append(source)
                     do_scan(
                         source, thread_db,
                         progress_callback=progress_cb,
@@ -26607,6 +26624,11 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                         vireo_dir=vireo_dir,
                         thumb_cache_dir=thumb_cache_dir,
                         cancel_check=cancel_check,
+                        # Pair companions during each scan, but defer RAW
+                        # working-copy generation until every source has been
+                        # cataloged. One combined pass gives the UI a truthful
+                        # total instead of restarting a 0..N phase per source.
+                        skip_working_copies=True,
                         register_restrict_dirs_as_roots=(
                             snapshot_paths_by_root is None
                         ),
@@ -26649,6 +26671,24 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                             source,
                         )
                     advance_scan_acc()
+
+            if not cancelled and working_copy_scope:
+                try:
+                    _extract_working_copies(
+                        thread_db,
+                        vireo_dir,
+                        status_callback=status_cb,
+                        scope=working_copy_scope,
+                        cancel_check=cancel_check,
+                    )
+                except Exception as exc:
+                    log.exception(
+                        "In-place import working-copy generation failed",
+                    )
+                    msg = f"[working copies] {exc}"
+                    root_errors.append(msg)
+                    if msg not in job["errors"]:
+                        job["errors"].append(msg)
 
             if snapshot_paths is not None:
                 # Pairing can fold a newly scanned JPEG into an existing RAW

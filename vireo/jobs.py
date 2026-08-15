@@ -303,9 +303,9 @@ class JobRunner:
         Unlike ``start`` (which spawns a worker thread synchronously),
         ``enqueue_pipeline`` persists the job to ``job_history`` with
         ``status='queued'``, stashes the work closure in-process, and
-        then asks the scheduler to promote it. With ``SLOT_CAP=1`` and
-        no other pipelines active, promotion happens before this method
-        returns and the work thread is already running.
+        then asks the scheduler to promote it. With capacity available under
+        the configured slot cap, promotion happens before this method returns
+        and the work thread is already running.
 
         Returns the job id.
         """

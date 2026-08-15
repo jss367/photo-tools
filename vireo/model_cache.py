@@ -17,6 +17,7 @@ acquirers of the same key block until the first load returns and then
 all receive the same object.
 """
 
+import contextlib
 import logging
 import threading
 
@@ -72,6 +73,13 @@ class _Handle:
 
     def __exit__(self, exc_type, exc, tb):
         self.release()
+
+    def __del__(self):
+        # Safety net for legacy/script callers that unwind before their normal
+        # explicit release. ``release`` is idempotent and does only in-memory
+        # bookkeeping plus timer creation.
+        with contextlib.suppress(Exception):
+            self.release()
 
     def release(self):
         if self._released:

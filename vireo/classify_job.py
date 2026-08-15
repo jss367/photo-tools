@@ -2496,6 +2496,7 @@ def run_classify_job(
             plant on the next classify run outside the default location.
     """
     thread_db = Database(db_path)
+    classifier_cache_handle = None
     try:
         thread_db.set_active_workspace(workspace_id)
         job["_start_time"] = time.time()
@@ -3012,7 +3013,10 @@ def run_classify_job(
                     "detected": 0,
                     "failed": 0,
                 }
-            clf = TimmClassifier(model_str, taxonomy=tax)
+            def _construct_classifier():
+                if runner.is_cancelled(job["id"]):
+                    raise ClassificationCancelled("classification cancelled")
+                return TimmClassifier(model_str, taxonomy=tax)
         else:
             def _emb_progress(current, emb_total):
                 runner.update_step(
@@ -3031,32 +3035,49 @@ def run_classify_job(
                     },
                 )
 
-            try:
-                clf = Classifier(
+            def _construct_classifier():
+                return Classifier(
                     labels=None if use_tol else labels,
                     model_str=model_str,
                     pretrained_str=weights_path,
                     embedding_progress_callback=_emb_progress,
                     cancel_check=lambda: runner.is_cancelled(job["id"]),
                 )
-            except ClassificationCancelled:
-                runner.update_step(
-                    job["id"], "load_model",
-                    status="cancelled", summary="Cancelled",
-                )
-                _finalize_remaining_steps(
-                    runner, job["id"], ["detect", "classify", "finalize"],
-                    status="cancelled", summary="Cancelled before start",
-                )
-                return {
-                    "total": total,
-                    "predictions_stored": 0,
-                    "burst_groups": 0,
-                    "already_classified": 0,
-                    "already_labeled": 0,
-                    "detected": 0,
-                    "failed": 0,
-                }
+
+        try:
+            from classifier_cache import acquire_cached_classifier
+            from computation_cache import taxonomy_identity
+
+            classifier_cache_handle = acquire_cached_classifier(
+                model_type=model_type,
+                model_str=model_str,
+                weights_path=weights_path,
+                labels=None if use_tol else labels,
+                factory=_construct_classifier,
+                files=active_model.get("files"),
+                taxonomy_fingerprint=(
+                    taxonomy_identity(tax) if model_type == "timm" else None
+                ),
+            )
+            clf = classifier_cache_handle.__enter__()
+        except ClassificationCancelled:
+            runner.update_step(
+                job["id"], "load_model",
+                status="cancelled", summary="Cancelled",
+            )
+            _finalize_remaining_steps(
+                runner, job["id"], ["detect", "classify", "finalize"],
+                status="cancelled", summary="Cancelled before start",
+            )
+            return {
+                "total": total,
+                "predictions_stored": 0,
+                "burst_groups": 0,
+                "already_classified": 0,
+                "already_labeled": 0,
+                "detected": 0,
+                "failed": 0,
+            }
         runner.update_step(
             job["id"], "load_model", status="completed",
             summary=effective_name,
@@ -3477,4 +3498,6 @@ def run_classify_job(
             "failed": failed,
         }
     finally:
+        if classifier_cache_handle is not None:
+            classifier_cache_handle.release()
         thread_db.conn.close()

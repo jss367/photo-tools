@@ -20,9 +20,9 @@ import time
 from dataclasses import dataclass
 
 import numpy as np
+from classifier_cache import acquire_cached_classifier
 from db import Database, commit_with_retry
 from job_contract import progress_event
-from model_cache import get_default_cache
 from pipeline_locks import (
     acquire_photo_mask,
     acquire_workspace_regroup,
@@ -1057,52 +1057,10 @@ def _taxonomy_fingerprint(tax):
 
 
 def _weights_fingerprint(weights_path, files):
-    """Stable key component reflecting the on-disk state of the weights.
+    """Compatibility wrapper for the shared classifier cache identity."""
+    from classifier_cache import model_files_fingerprint
 
-    A cached ONNX session is keyed by ``weights_path`` plus this
-    fingerprint. Without it, a Repair (download in place) or a custom-
-    model re-registration overwrites the file at the same path but the
-    classifier cache reuses the previously-loaded session built from the
-    old bytes — silently classifying with stale or corrupt weights.
-    Stat-only (size + mtime_ns) so the lookup stays cheap; in-place
-    replacement reliably bumps mtime even for byte-identical files.
-    Missing files map to a sentinel so a partial repair still misses.
-
-    Custom models have no declared ``files`` list, so fall back to
-    listing the directory (or stat'ing the single file if
-    ``weights_path`` points at one). Without this fallback a user who
-    re-registers a custom model at the same path would reuse the stale
-    session until the idle window expires.
-    """
-    if not weights_path:
-        return None
-    if files:
-        parts = []
-        for rel in files:
-            path = os.path.join(weights_path, rel)
-            try:
-                st = os.stat(path)
-                parts.append((rel, st.st_size, int(st.st_mtime_ns)))
-            except OSError:
-                parts.append((rel, None, None))
-        return tuple(parts)
-    try:
-        if os.path.isdir(weights_path):
-            parts = []
-            for name in sorted(os.listdir(weights_path)):
-                path = os.path.join(weights_path, name)
-                try:
-                    st = os.stat(path)
-                    parts.append((name, st.st_size, int(st.st_mtime_ns)))
-                except OSError:
-                    parts.append((name, None, None))
-            return tuple(parts)
-        if os.path.isfile(weights_path):
-            st = os.stat(weights_path)
-            return (("__file__", st.st_size, int(st.st_mtime_ns)),)
-    except OSError:
-        pass
-    return None
+    return model_files_fingerprint(weights_path, files)
 
 
 def _release_classifier_cache_handle(loaded_models):
@@ -3881,12 +3839,11 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                     cancel_check=cancel_check,
                 )
 
-            # Cache key includes the labels fingerprint when use_tol=False because
-            # the Classifier pre-computes text embeddings for the provided labels
-            # at construction time. Two pipelines with the same model but
-            # different labels must NOT share a session. Tree-of-Life mode
-            # (use_tol=True) reads precomputed embeddings from disk and is
-            # label-independent, so the key collapses to a constant.
+            # The shared cache key includes an ordered, canonical label identity
+            # when use_tol=False because Classifier captures embeddings in that
+            # exact column order. Two pipelines with different labels or order
+            # must not share a session. Tree-of-Life mode reads precomputed
+            # embeddings and is label-independent, so its key is constant.
             #
             # The timm key also varies by taxonomy fingerprint: TimmClassifier
             # captures the taxonomy at construction and resolves common names /
@@ -3900,38 +3857,28 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
             # (Repair, custom re-register). Without it, a pipeline started
             # before the old session's idle timer fires would reuse the
             # stale ONNX session on the new bytes.
-            tax_fp = _taxonomy_fingerprint(tax) if model_type == "timm" else None
+            if model_type == "timm":
+                from computation_cache import taxonomy_identity
+
+                tax_fp = taxonomy_identity(tax)
+            else:
+                tax_fp = None
             files = active_model.get("files")
-
-            def _build_cache_key(weights_fp):
-                return (
-                    "timm" if model_type == "timm" else "bioclip",
-                    active_model["id"],
-                    model_str,
-                    weights_path,
-                    "__tol__" if use_tol else fp,
-                    tax_fp,
-                    weights_fp,
-                )
-
-            cache_key = _build_cache_key(_weights_fingerprint(weights_path, files))
 
             # _construct_classifier may trigger the ONNX self-heal path
             # (create_session_with_self_heal) which deletes corrupt weights
-            # and redownloads them inside the factory. That bumps the file
-            # mtime/size, so the pre-load fingerprint baked into ``cache_key``
-            # no longer matches what the *next* pipeline will compute. Rekey
-            # to the post-load fingerprint so the second pipeline hits this
-            # entry instead of loading a duplicate session against the freshly
-            # written bytes.
-            def _post_load_key(_value):
-                return _build_cache_key(_weights_fingerprint(weights_path, files))
-
+            # and redownloads them inside the factory. The shared acquisition
+            # helper rekeys the entry to the post-load file fingerprint.
             cache_handle = None
             try:
-                cache_handle = get_default_cache().acquire(
-                    cache_key, _construct_classifier,
-                    post_load_key=_post_load_key,
+                cache_handle = acquire_cached_classifier(
+                    model_type=model_type,
+                    model_str=model_str,
+                    weights_path=weights_path,
+                    labels=None if use_tol else labels,
+                    factory=_construct_classifier,
+                    files=files,
+                    taxonomy_fingerprint=tax_fp,
                 )
                 clf = cache_handle.__enter__()
             except Exception as load_err:

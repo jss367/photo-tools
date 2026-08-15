@@ -658,6 +658,38 @@ class TestEmbeddingCache:
         assert p1 != p2
 
 
+class TestEmbeddingPrecompute:
+    def test_precompute_loads_only_text_encoder(self, tmp_path):
+        from classifier import precompute_label_embeddings
+
+        model_dir = _make_model_dir(tmp_path)
+        text_session = _make_fake_text_session()
+        tokenizer = _make_fake_tokenizer()
+
+        with (
+            patch("classifier.CACHE_DIR", str(tmp_path / "cache")),
+            patch(
+                "classifier._MANIFEST_PATH",
+                str(tmp_path / "cache" / "manifest.json"),
+            ),
+            patch(
+                "classifier.onnx_runtime.create_session_with_self_heal",
+                return_value=text_session,
+            ) as create_session,
+            patch("classifier._load_tokenizer", return_value=tokenizer),
+            patch("models.build_self_heal_redownloader", return_value=None),
+        ):
+            count = precompute_label_embeddings(
+                ["bird", "cat"],
+                model_str="ViT-B-16",
+                pretrained_str=str(model_dir),
+            )
+
+        assert count == 2
+        assert create_session.call_count == 1
+        assert create_session.call_args.args[0].endswith("text_encoder.onnx")
+
+
 class TestGpuLockScope:
     """Regression: the GPU semaphore must wrap only the image-encoder
     ``session.run`` call inside ``_get_image_embedding`` — not the

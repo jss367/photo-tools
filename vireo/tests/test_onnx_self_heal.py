@@ -497,7 +497,7 @@ def test_text_heal_rebuilds_image_session(tmp_path):
         patch("classifier._load_tokenizer", return_value=fake_tokenizer),
         patch(
             "classifier._compute_embeddings_with_progress",
-            return_value=np.zeros((1, 512), dtype=np.float32),
+            return_value=np.zeros((512, 1), dtype=np.float32),
         ),
         patch(
             "models.build_self_heal_redownloader",
@@ -529,10 +529,9 @@ def test_text_heal_rebuilds_image_session(tmp_path):
 def test_image_heal_invalidates_stale_text_embedding_cache(tmp_path, monkeypatch):
     """When image-encoder self-heal refreshes the model dir, the
     on-disk text_encoder bytes change too. Any cached label embeddings
-    (keyed only by labels+model_str+model_dir) were computed against
-    the OLD text weights, so loading them would pair old-derived text
-    features with new image features — silent score drift. The cache
-    must be invalidated before the cache-lookup branch."""
+    computed against the old identity must not be loaded with the healed
+    image encoder. The complete key should miss and publish fresh text
+    features under the healed weights identity."""
     import json
 
     import classifier
@@ -559,7 +558,7 @@ def test_image_heal_invalidates_stale_text_embedding_cache(tmp_path, monkeypatch
     cache_path = classifier._embedding_cache_path(
         labels, "ViT-B-16", str(model_dir),
     )
-    stale_embeddings = np.ones((1, 512), dtype=np.float32) * 999.0
+    stale_embeddings = np.ones((512, 1), dtype=np.float32) * 999.0
     np.save(cache_path, stale_embeddings)
     assert os.path.exists(cache_path)
 
@@ -591,7 +590,7 @@ def test_image_heal_invalidates_stale_text_embedding_cache(tmp_path, monkeypatch
         (model_dir / "image_encoder.onnx").write_bytes(b"fresh img")
         (model_dir / "text_encoder.onnx").write_bytes(b"fresh txt")
 
-    fresh_embeddings = np.zeros((1, 512), dtype=np.float32)
+    fresh_embeddings = np.zeros((512, 1), dtype=np.float32)
     fake_tokenizer = MagicMock()
 
     class FakeEncoding:

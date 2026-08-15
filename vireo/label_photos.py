@@ -10,7 +10,8 @@ import os
 import tempfile
 from pathlib import Path
 
-from classifier import Classifier
+from classifier import Classifier, _resolve_model_dir
+from classifier_cache import acquire_cached_classifier
 from image_loader import SUPPORTED_EXTENSIONS, load_image
 from xmp import write_sidecar
 
@@ -44,7 +45,19 @@ def run(
     Returns:
         dict with stats
     """
-    clf = Classifier(labels=labels, model_str=model_str, pretrained_str=pretrained_str)
+    resolved_model_dir = _resolve_model_dir(model_str, pretrained_str)
+    classifier_handle = acquire_cached_classifier(
+        model_type="bioclip",
+        model_str=model_str,
+        weights_path=resolved_model_dir,
+        labels=labels,
+        factory=lambda: Classifier(
+            labels=labels,
+            model_str=model_str,
+            pretrained_str=pretrained_str,
+        ),
+    )
+    clf = classifier_handle.__enter__()
 
     folder_path = Path(folder)
     if recursive:
@@ -134,6 +147,7 @@ def run(
     log.info("Images failed:     %d", stats["images_failed"])
     log.info("Sidecars written:  %d", stats["sidecars_written"])
 
+    classifier_handle.release()
     return stats
 
 

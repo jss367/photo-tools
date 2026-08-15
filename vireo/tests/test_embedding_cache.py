@@ -1,0 +1,245 @@
+"""Concurrency and correctness tests for the label embedding cache."""
+
+import json
+import os
+import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor
+
+import numpy as np
+import pytest
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+from embedding_cache import (
+    EmbeddingCache,
+    EmbeddingWaitCancelled,
+    build_embedding_identity,
+    canonicalize_labels,
+    identity_digest,
+)
+
+
+def _identity(labels=("bird", "cat"), suffix="a"):
+    return {
+        "embedding_schema": 2,
+        "model_runtime": {
+            "family": "test",
+            "model_str": f"model-{suffix}",
+        },
+        "labels": list(labels),
+    }
+
+
+def _payload(label_count=2, value=1):
+    return np.full((4, label_count), value, dtype=np.float32)
+
+
+def test_canonical_labels_match_the_values_sent_to_encoder():
+    assert canonicalize_labels([" bird ", "Cat"]) == ["bird", "Cat"]
+    with pytest.raises(ValueError, match="empty"):
+        canonicalize_labels(["bird", "  "])
+
+
+def test_complete_identity_changes_with_each_text_side_input(tmp_path):
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    (model_dir / "text_encoder.onnx").write_bytes(b"weights-a")
+    (model_dir / "text_encoder.onnx.data").write_bytes(b"external-a")
+    (model_dir / "tokenizer.json").write_bytes(b"tokenizer-a")
+
+    def build(**overrides):
+        args = {
+            "labels": [" bird ", "Cat"],
+            "model_str": "model-a",
+            "model_dir": str(model_dir),
+            "prompt_template_identity": "prompts-a",
+            "tokenizer_context_length": 77,
+        }
+        args.update(overrides)
+        return build_embedding_identity(**args)
+
+    baseline = identity_digest(build())
+    assert baseline == identity_digest(build(labels=["bird", "Cat"]))
+    assert baseline != identity_digest(build(labels=["Cat", "bird"]))
+    assert baseline != identity_digest(build(prompt_template_identity="prompts-b"))
+    assert baseline != identity_digest(build(tokenizer_context_length=76))
+
+    (model_dir / "tokenizer.json").write_bytes(b"tokenizer-b")
+    assert baseline != identity_digest(build())
+    (model_dir / "tokenizer.json").write_bytes(b"tokenizer-a")
+    (model_dir / "text_encoder.onnx.data").write_bytes(b"external-b")
+    assert baseline != identity_digest(build())
+
+
+def test_pinned_install_does_not_rehash_large_encoder_files(
+    tmp_path, monkeypatch,
+):
+    import embedding_cache
+
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    (model_dir / ".hf_revision").write_text("immutable-commit")
+    (model_dir / "text_encoder.onnx").write_bytes(b"onnx")
+    (model_dir / "text_encoder.onnx.data").write_bytes(b"external")
+    (model_dir / "tokenizer.json").write_bytes(b"tokenizer")
+    hashed = []
+    original = embedding_cache._sha256_file
+
+    def record(path):
+        hashed.append(os.path.basename(path))
+        return original(path)
+
+    monkeypatch.setattr(embedding_cache, "_sha256_file", record)
+    build_embedding_identity(
+        ["bird"],
+        "model-a",
+        str(model_dir),
+        prompt_template_identity="prompts-a",
+        tokenizer_context_length=77,
+    )
+
+    assert hashed == ["tokenizer.json"]
+
+
+def test_equal_key_callers_compute_once_and_waiter_rereads_disk(tmp_path):
+    cache = EmbeddingCache(tmp_path / "cache")
+    identity = _identity()
+    producer_started = threading.Event()
+    release_producer = threading.Event()
+    calls = 0
+    calls_lock = threading.Lock()
+
+    def compute():
+        nonlocal calls
+        with calls_lock:
+            calls += 1
+        producer_started.set()
+        assert release_producer.wait(2)
+        return _payload()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(cache.get_or_compute, identity, compute)
+        assert producer_started.wait(2)
+        second = pool.submit(cache.get_or_compute, identity, compute)
+        release_producer.set()
+        first_value, _ = first.result(timeout=2)
+        second_value, _ = second.result(timeout=2)
+
+    assert calls == 1
+    assert np.array_equal(first_value, second_value)
+    assert first_value is not second_value
+
+
+def test_producer_cancellation_wakes_waiter_and_waiter_takes_over(tmp_path):
+    class ClassificationCancelled(RuntimeError):
+        pass
+
+    cache = EmbeddingCache(tmp_path / "cache")
+    identity = _identity()
+    producer_started = threading.Event()
+    cancel_producer = threading.Event()
+    waiter_computed = threading.Event()
+
+    def cancelled_compute():
+        producer_started.set()
+        assert cancel_producer.wait(2)
+        raise ClassificationCancelled("cancelled")
+
+    def healthy_compute():
+        waiter_computed.set()
+        return _payload(value=2)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        producer = pool.submit(
+            cache.get_or_compute, identity, cancelled_compute
+        )
+        assert producer_started.wait(2)
+        waiter = pool.submit(cache.get_or_compute, identity, healthy_compute)
+        cancel_producer.set()
+        with pytest.raises(ClassificationCancelled):
+            producer.result(timeout=2)
+        value, _ = waiter.result(timeout=2)
+
+    assert waiter_computed.is_set()
+    assert np.array_equal(value, _payload(value=2))
+
+
+def test_cancelled_waiter_does_not_cancel_shared_producer(tmp_path):
+    cache = EmbeddingCache(tmp_path / "cache")
+    identity = _identity()
+    producer_started = threading.Event()
+    release_producer = threading.Event()
+    cancel_waiter = threading.Event()
+
+    def compute():
+        producer_started.set()
+        assert release_producer.wait(2)
+        return _payload()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        producer = pool.submit(cache.get_or_compute, identity, compute)
+        assert producer_started.wait(2)
+        waiter = pool.submit(
+            cache.get_or_compute,
+            identity,
+            lambda: pytest.fail("waiter must not compute"),
+            cancel_check=cancel_waiter.is_set,
+        )
+        cancel_waiter.set()
+        with pytest.raises(EmbeddingWaitCancelled):
+            waiter.result(timeout=2)
+        release_producer.set()
+        value, _ = producer.result(timeout=2)
+
+    assert np.array_equal(value, _payload())
+
+
+def test_invalid_payload_never_replaces_final_path(tmp_path):
+    cache = EmbeddingCache(tmp_path / "cache")
+    identity = _identity()
+
+    with pytest.raises(ValueError, match="dtype"):
+        cache.get_or_compute(
+            identity,
+            lambda: np.ones((4, 2), dtype=np.float64),
+        )
+
+    assert not os.path.exists(cache.path_for(identity))
+    assert not list((tmp_path / "cache").glob("*.tmp"))
+
+
+def test_manifest_failure_does_not_invalidate_published_payload(
+    tmp_path, monkeypatch,
+):
+    cache = EmbeddingCache(tmp_path / "cache")
+    identity = _identity()
+    monkeypatch.setattr(
+        cache,
+        "_update_manifest",
+        lambda *_args: (_ for _ in ()).throw(OSError("read-only manifest")),
+    )
+
+    value, _ = cache.get_or_compute(identity, _payload)
+
+    assert np.array_equal(value, _payload())
+    assert cache.is_cached(identity, 2)
+
+
+def test_concurrent_manifest_updates_do_not_lose_entries(tmp_path):
+    cache = EmbeddingCache(tmp_path / "cache")
+    identities = [_identity(suffix=str(i)) for i in range(8)]
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = [
+            pool.submit(cache.get_or_compute, identity, _payload)
+            for identity in identities
+        ]
+        for future in futures:
+            future.result(timeout=3)
+
+    with open(tmp_path / "cache" / "manifest.json", encoding="utf-8") as handle:
+        manifest = json.load(handle)
+    assert set(manifest) == {
+        f"{identity_digest(identity)}.npy" for identity in identities
+    }

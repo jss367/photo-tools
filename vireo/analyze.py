@@ -12,7 +12,8 @@ import tempfile
 from datetime import date
 from pathlib import Path
 
-from classifier import Classifier
+from classifier import Classifier, _resolve_model_dir
+from classifier_cache import acquire_cached_classifier
 from compare import categorize
 from grouping import consensus_prediction, group_by_timestamp, read_exif_timestamp
 from image_loader import SUPPORTED_EXTENSIONS, load_image
@@ -66,7 +67,19 @@ def analyze(
     os.makedirs(thumb_dir, exist_ok=True)
 
     tax = Taxonomy(taxonomy_path)
-    clf = Classifier(labels=labels, model_str=model_str, pretrained_str=pretrained_str)
+    resolved_model_dir = _resolve_model_dir(model_str, pretrained_str)
+    classifier_handle = acquire_cached_classifier(
+        model_type="bioclip",
+        model_str=model_str,
+        weights_path=resolved_model_dir,
+        labels=labels,
+        factory=lambda: Classifier(
+            labels=labels,
+            model_str=model_str,
+            pretrained_str=pretrained_str,
+        ),
+    )
+    clf = classifier_handle.__enter__()
     slug = _model_slug(model_name, model_str)
 
     folder_path = Path(folder)
@@ -341,6 +354,7 @@ def analyze(
     log.info("Groups:         %d", group_counter)
     log.info("Results saved to %s", results_path)
 
+    classifier_handle.release()
     return results
 
 

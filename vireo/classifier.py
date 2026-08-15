@@ -604,23 +604,74 @@ class Classifier:
             else:
                 text_redownload = None
 
+            def _rebuild_image_side():
+                """Reload the image session and preprocessing from disk.
+
+                A text-side self-heal replaces the whole model snapshot, so
+                both the in-memory image session and the config values read
+                from the pre-heal files are stale.
+                """
+                self._image_session = onnx_runtime.create_session(
+                    image_encoder_path,
+                )
+                self._image_input_name = self._image_session.get_inputs()[0].name
+                with open(config_path) as handle:
+                    healed = json.load(handle)
+                self._input_size = tuple(healed["input_size"][-2:])
+                self._mean = healed["mean"]
+                self._std = healed["std"]
+
+            def _load_embeddings(expected_dim):
+                return _load_or_compute_label_embeddings(
+                    labels,
+                    model_str,
+                    self._model_dir,
+                    redownload=text_redownload,
+                    progress_callback=embedding_progress_callback,
+                    cancel_check=cancel_check,
+                    embedding_dim=expected_dim,
+                )
+
             expected_embedding_dim = _image_encoder_embedding_dim(
                 self._image_session
             )
-            (
-                self._classes,
-                self._txt_embeddings,
-                identity_before,
-                identity_after,
-            ) = _load_or_compute_label_embeddings(
-                labels,
-                model_str,
-                self._model_dir,
-                redownload=text_redownload,
-                progress_callback=embedding_progress_callback,
-                cancel_check=cancel_check,
-                embedding_dim=expected_embedding_dim,
-            )
+            try:
+                (
+                    self._classes,
+                    self._txt_embeddings,
+                    identity_before,
+                    identity_after,
+                ) = _load_embeddings(expected_embedding_dim)
+            except ValueError:
+                # The expected width came from the image session loaded
+                # *before* the text side had a chance to self-heal, and a
+                # heal replaces the whole snapshot at HuggingFace's current
+                # revision (download_model pins to the latest SHA, not to
+                # the one already installed). The healed text encoder can
+                # therefore emit a different feature width than the stale
+                # session reports, and validating against the pre-heal
+                # width would fail the very classification the heal just
+                # repaired. Rebuild the image side from the healed files
+                # and re-validate against it. Only ever one retry: a second
+                # failure is a genuinely bad payload.
+                if not text_heal_state["triggered"]:
+                    raise
+                log.info(
+                    "Text-encoder self-heal replaced the model snapshot; "
+                    "rebuilding the image encoder and re-validating label "
+                    "embeddings against the healed feature width."
+                )
+                _rebuild_image_side()
+                text_heal_state["triggered"] = False
+                expected_embedding_dim = _image_encoder_embedding_dim(
+                    self._image_session
+                )
+                (
+                    self._classes,
+                    self._txt_embeddings,
+                    identity_before,
+                    identity_after,
+                ) = _load_embeddings(expected_embedding_dim)
 
             # A producer shared with this caller may self-heal the entire
             # model directory while we wait. Rebuild the already-loaded image
@@ -630,15 +681,7 @@ class Classifier:
                     "Text-encoder self-heal refreshed model dir; rebuilding "
                     "image encoder and preprocessing from the healed snapshot."
                 )
-                self._image_session = onnx_runtime.create_session(
-                    image_encoder_path,
-                )
-                self._image_input_name = self._image_session.get_inputs()[0].name
-                with open(config_path) as f:
-                    preproc = json.load(f)
-                self._input_size = tuple(preproc["input_size"][-2:])
-                self._mean = preproc["mean"]
-                self._std = preproc["std"]
+                _rebuild_image_side()
 
             self._mode = "custom"
         else:

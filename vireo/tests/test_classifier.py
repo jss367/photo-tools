@@ -102,6 +102,12 @@ def _make_fake_image_session(embedding_dim=512):
     mock_input = MagicMock()
     mock_input.name = "pixel_values"
     session.get_inputs.return_value = [mock_input]
+    # Real exported CLIP image heads report a static feature width on the
+    # last output axis; _image_encoder_embedding_dim reads it to validate
+    # label-embedding payloads.
+    mock_output = MagicMock()
+    mock_output.shape = ["batch", embedding_dim]
+    session.get_outputs.return_value = [mock_output]
 
     def fake_run(output_names, input_dict):
         batch_size = list(input_dict.values())[0].shape[0]
@@ -391,6 +397,70 @@ class TestCustomLabelsMode:
             clf2 = Classifier(labels=["bird", "cat"], model_str="ViT-B-16")
 
         np.testing.assert_array_equal(clf2._txt_embeddings, emb1)
+
+    def test_text_self_heal_revalidates_against_healed_image_encoder(
+        self, tmp_path
+    ):
+        """A text-encoder self-heal must not fail the run that triggered it.
+
+        The expected embedding width comes from the image session loaded
+        *before* the text side self-heals, and a heal redownloads the whole
+        snapshot at HuggingFace's current revision. If that revision exports
+        a different feature width, validating the freshly computed payload
+        against the pre-heal width would reject embeddings the heal just
+        repaired, so the repairing run fails and only a manual retry works.
+        The image side must be rebuilt and the payload re-validated instead.
+        """
+        from classifier import Classifier
+
+        model_dir = _make_model_dir(tmp_path)
+        fake_tokenizer = _make_fake_tokenizer()
+        calls = {"image": 0, "text": 0}
+
+        def _redownload():
+            # A real redownload restores the purged file from the current
+            # upstream revision — here, a wider export than what was on disk.
+            (model_dir / "text_encoder.onnx").write_text("healed-wider")
+
+        def _fake_create_session(path):
+            if path.endswith("image_encoder.onnx"):
+                calls["image"] += 1
+                return _make_fake_image_session(
+                    512 if calls["image"] == 1 else 768
+                )
+            calls["text"] += 1
+            if calls["text"] == 1:
+                # Corruption signature that trips create_session_with_self_heal.
+                raise RuntimeError("Protobuf parsing failed")
+            return _make_fake_text_session(768)
+
+        with (
+            patch("classifier._MODELS_ROOT", str(tmp_path)),
+            patch("classifier.CACHE_DIR", str(tmp_path / "cache")),
+            patch(
+                "classifier._MANIFEST_PATH",
+                str(tmp_path / "cache" / "manifest.json"),
+            ),
+            patch(
+                "classifier.onnx_runtime.create_session",
+                side_effect=_fake_create_session,
+            ),
+            patch(
+                "models.build_self_heal_redownloader",
+                return_value=_redownload,
+            ),
+            patch("classifier._load_tokenizer", return_value=fake_tokenizer),
+        ):
+            clf = Classifier(labels=["bird", "cat"], model_str="ViT-B-16")
+
+        assert clf._txt_embeddings.shape == (768, 2), (
+            "the healed snapshot's embeddings must be accepted, not rejected "
+            f"against the pre-heal width; got {clf._txt_embeddings.shape}"
+        )
+        assert calls["image"] == 2, (
+            "the image encoder must be rebuilt from the healed snapshot so "
+            "inference matmuls against the new width"
+        )
 
 
 class TestTreeOfLifeMode:

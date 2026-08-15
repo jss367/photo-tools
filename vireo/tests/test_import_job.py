@@ -1247,6 +1247,61 @@ def _stub_extractor(monkeypatch, outcome):
     return calls
 
 
+def test_deferred_working_copy_progress_preserves_import_total(
+    tmp_path, monkeypatch,
+):
+    """Archive imports expose WC progress after their file total is complete."""
+    from types import SimpleNamespace
+
+    import scanner
+    from import_job import _extract_deferred_working_copies, _ImportRunState
+
+    captured = {}
+
+    def fake_extract(_db, _vireo_dir, **kwargs):
+        captured.update(kwargs)
+        kwargs["status_callback"](
+            "Generating working copies: 2 of 5",
+            phase_current=2,
+            phase_total=5,
+            phase_label="Generating working copies",
+        )
+
+    monkeypatch.setattr(scanner, "_extract_working_copies", fake_extract)
+    state = _ImportRunState(
+        "local",
+        folder_counts={"card": {"copied": 5}},
+        wc_dest_folders={str(tmp_path / "archive")},
+    )
+    job = _make_job()
+    job["progress"].update({"current": 5, "total": 5})
+    runner = FakeRunner()
+
+    _extract_deferred_working_copies(
+        state,
+        SimpleNamespace(vireo_dir=str(tmp_path / "vireo")),
+        runner,
+        job,
+        object(),
+    )
+
+    assert captured["status_callback"] is not None
+    step = runner.step_updates[-1][2]
+    assert step["progress"] == {
+        "current": 5,
+        "total": 5,
+        "phase_current": 2,
+        "phase_total": 5,
+        "phase_label": "Generating working copies",
+    }
+    event = runner.events[-1][2]
+    assert event["current"] == 5
+    assert event["total"] == 5
+    assert event["phase_current"] == 2
+    assert event["phase_total"] == 5
+    assert event["phase_label"] == "Generating working copies"
+
+
 def test_working_copy_extracted_from_card_path(tmp_path, monkeypatch):
     """The working copy reads the CARD copy of a RAW file, not the archive
     copy — after import, no processing stage re-reads originals from the

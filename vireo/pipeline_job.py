@@ -17,12 +17,13 @@ import queue
 import tempfile
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 
 import numpy as np
+from classifier_cache import acquire_cached_classifier
 from db import Database, commit_with_retry
 from job_contract import progress_event
-from model_cache import get_default_cache
 from pipeline_locks import (
     acquire_photo_mask,
     acquire_workspace_regroup,
@@ -62,6 +63,143 @@ _SENTINEL = object()  # unique end-of-stream marker
 # stops asking. Resuming without actually remounting the share would otherwise
 # pause again on the very next photo, forever.
 _MAX_SOURCE_OFFLINE_PAUSES = 3
+
+
+def _rollback_failed_mask_photo(thread_db, photo_id):
+    """Reset the reused mask-stage connection or abort if it cannot recover."""
+    try:
+        thread_db.conn.rollback()
+    except Exception as exc:
+        log.exception("Mask extraction rollback failed for photo %s", photo_id)
+        raise RuntimeError(
+            f"Mask extraction rollback failed for photo {photo_id}"
+        ) from exc
+
+
+def _fsync_mask_file(path):
+    """Make a completed staged PNG durable before publishing its name."""
+    # Windows' CRT _commit backend rejects a read-only descriptor with EBADF.
+    # Request write access even though the bytes are already complete.
+    with open(path, "rb+") as handle:
+        os.fsync(handle.fileno())
+
+
+def _fsync_mask_directory(path):
+    """Persist a published mask directory entry where Python supports it."""
+    # Python cannot open directory handles for fsync on Windows. The staged
+    # file itself is still flushed there before os.replace; POSIX platforms
+    # additionally flush the directory entry before SQLite may commit it.
+    if os.name == "nt":
+        return
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    directory_fd = os.open(path, flags)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
+class _StagedMaskFile:
+    """Publish a new immutable mask generation around a database commit.
+
+    The predecessor remains at its database-referenced path until the new
+    path has committed.  A process interruption can therefore leave an
+    unreferenced generation behind, but can never change the bytes behind a
+    committed path.
+    """
+
+    def __init__(self, stage_dir, staged_path, final_path, previous_path=None):
+        self.stage_dir = stage_dir
+        self.staged_path = staged_path
+        self.final_path = final_path
+        self.previous_path = previous_path
+        self.installed = False
+
+    @classmethod
+    def create(
+        cls, mask, masks_dir, photo_id, variant, save_mask,
+        previous_path=None,
+    ):
+        os.makedirs(masks_dir, exist_ok=True)
+        stage_dir = tempfile.mkdtemp(prefix=".mask-stage-", dir=masks_dir)
+        staged_path = None
+        try:
+            staged_path = save_mask(mask, stage_dir, photo_id, variant)
+            stem, extension = os.path.splitext(os.path.basename(staged_path))
+            # Never overwrite the path referenced by the currently committed
+            # photo_masks row. SQLite can atomically switch that row to this
+            # immutable generation after the file is fully published.
+            final_path = os.path.join(
+                masks_dir,
+                f"{stem}.generation-{uuid.uuid4().hex}{extension}",
+            )
+            return cls(
+                stage_dir, staged_path, final_path,
+                previous_path=previous_path,
+            )
+        except Exception:
+            if staged_path:
+                with contextlib.suppress(OSError):
+                    os.unlink(staged_path)
+            with contextlib.suppress(OSError):
+                os.rmdir(stage_dir)
+            raise
+
+    def install(self):
+        """Atomically publish the new generation at its unique path."""
+        _fsync_mask_file(self.staged_path)
+        os.replace(self.staged_path, self.final_path)
+        self.installed = True
+        _fsync_mask_directory(os.path.dirname(self.final_path))
+
+    def restore(self):
+        """Discard a generation whose database transaction did not commit."""
+        if self.installed:
+            # The published path is uniquely suffixed (.generation-<uuid>.png)
+            # and no committed row references it, so an unlink failure here —
+            # e.g. an antivirus scanner holding the fresh PNG open on Windows —
+            # is equivalent to a mid-write process interruption: the file is
+            # left as unreferenced disk garbage rather than propagating and
+            # marking the entire extract-masks stage fatal for every remaining
+            # photo. Log so the leftover is discoverable.
+            try:
+                os.unlink(self.final_path)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                log.warning(
+                    "Failed to unlink rolled-back mask generation %s; "
+                    "leaving unreferenced file in place",
+                    self.final_path,
+                    exc_info=True,
+                )
+        self.installed = False
+        self._cleanup()
+
+    def finish(self):
+        """Keep the committed generation and discard its predecessor."""
+        self.installed = False
+        if self.previous_path:
+            masks_dir = os.path.realpath(os.path.dirname(self.final_path))
+            previous_real = os.path.realpath(self.previous_path)
+            if (
+                previous_real != os.path.realpath(self.final_path)
+                and os.path.dirname(previous_real) == masks_dir
+            ):
+                # The database already committed the new generation, so an
+                # old-file cleanup error must not turn a successful photo into
+                # a reported extraction failure.
+                with contextlib.suppress(OSError):
+                    os.unlink(self.previous_path)
+        self._cleanup()
+
+    def _cleanup(self):
+        for path in (self.staged_path,):
+            if path:
+                with contextlib.suppress(OSError):
+                    os.unlink(path)
+        with contextlib.suppress(OSError):
+            os.rmdir(self.stage_dir)
 
 
 def _archive_mount_root_candidates(path: str) -> list[str]:
@@ -268,6 +406,51 @@ def _unmounted_since_baseline(baseline: dict[str, bool]) -> str | None:
     """
     for root, was_mounted in baseline.items():
         if was_mounted and not os.path.ismount(root):
+            return root
+    return None
+
+
+def _mount_identity(root: str):
+    """Return a mount-instance identity, preferring Linux's mount ID."""
+    normalized = os.path.normpath(root)
+    try:
+        with open("/proc/self/mountinfo", encoding="utf-8") as mountinfo:
+            for line in mountinfo:
+                fields = line.split(" - ", 1)[0].split()
+                if len(fields) < 5:
+                    continue
+                mount_point = fields[4]
+                for escaped, literal in (
+                    ("\\040", " "), ("\\011", "\t"),
+                    ("\\012", "\n"), ("\\134", "\\"),
+                ):
+                    mount_point = mount_point.replace(escaped, literal)
+                if os.path.normpath(mount_point) == normalized:
+                    # This ID changes even when the same filesystem is
+                    # detached and remounted; device/inode may not.
+                    return ("mountinfo", fields[0], fields[2], fields[3])
+    except OSError:
+        pass
+    try:
+        stat_result = os.stat(root)
+    except OSError:
+        return None
+    return ("stat", stat_result.st_dev, stat_result.st_ino)
+
+
+def _mount_identity_baseline(baseline: dict[str, bool]) -> dict[str, object]:
+    """Snapshot live mount instances represented by a mounted baseline."""
+    return {
+        root: _mount_identity(root)
+        for root, was_mounted in baseline.items()
+        if was_mounted
+    }
+
+
+def _changed_mount_since_baseline(identities: dict[str, object]) -> str | None:
+    """Return a mount whose instance disappeared or was replaced."""
+    for root, prior_identity in identities.items():
+        if prior_identity is None or _mount_identity(root) != prior_identity:
             return root
     return None
 
@@ -1057,52 +1240,10 @@ def _taxonomy_fingerprint(tax):
 
 
 def _weights_fingerprint(weights_path, files):
-    """Stable key component reflecting the on-disk state of the weights.
+    """Compatibility wrapper for the shared classifier cache identity."""
+    from classifier_cache import model_files_fingerprint
 
-    A cached ONNX session is keyed by ``weights_path`` plus this
-    fingerprint. Without it, a Repair (download in place) or a custom-
-    model re-registration overwrites the file at the same path but the
-    classifier cache reuses the previously-loaded session built from the
-    old bytes — silently classifying with stale or corrupt weights.
-    Stat-only (size + mtime_ns) so the lookup stays cheap; in-place
-    replacement reliably bumps mtime even for byte-identical files.
-    Missing files map to a sentinel so a partial repair still misses.
-
-    Custom models have no declared ``files`` list, so fall back to
-    listing the directory (or stat'ing the single file if
-    ``weights_path`` points at one). Without this fallback a user who
-    re-registers a custom model at the same path would reuse the stale
-    session until the idle window expires.
-    """
-    if not weights_path:
-        return None
-    if files:
-        parts = []
-        for rel in files:
-            path = os.path.join(weights_path, rel)
-            try:
-                st = os.stat(path)
-                parts.append((rel, st.st_size, int(st.st_mtime_ns)))
-            except OSError:
-                parts.append((rel, None, None))
-        return tuple(parts)
-    try:
-        if os.path.isdir(weights_path):
-            parts = []
-            for name in sorted(os.listdir(weights_path)):
-                path = os.path.join(weights_path, name)
-                try:
-                    st = os.stat(path)
-                    parts.append((name, st.st_size, int(st.st_mtime_ns)))
-                except OSError:
-                    parts.append((name, None, None))
-            return tuple(parts)
-        if os.path.isfile(weights_path):
-            st = os.stat(weights_path)
-            return (("__file__", st.st_size, int(st.st_mtime_ns)),)
-    except OSError:
-        pass
-    return None
+    return model_files_fingerprint(weights_path, files)
 
 
 def _release_classifier_cache_handle(loaded_models):
@@ -3881,12 +4022,11 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                     cancel_check=cancel_check,
                 )
 
-            # Cache key includes the labels fingerprint when use_tol=False because
-            # the Classifier pre-computes text embeddings for the provided labels
-            # at construction time. Two pipelines with the same model but
-            # different labels must NOT share a session. Tree-of-Life mode
-            # (use_tol=True) reads precomputed embeddings from disk and is
-            # label-independent, so the key collapses to a constant.
+            # The shared cache key includes an ordered, canonical label identity
+            # when use_tol=False because Classifier captures embeddings in that
+            # exact column order. Two pipelines with different labels or order
+            # must not share a session. Tree-of-Life mode reads precomputed
+            # embeddings and is label-independent, so its key is constant.
             #
             # The timm key also varies by taxonomy fingerprint: TimmClassifier
             # captures the taxonomy at construction and resolves common names /
@@ -3900,38 +4040,38 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
             # (Repair, custom re-register). Without it, a pipeline started
             # before the old session's idle timer fires would reuse the
             # stale ONNX session on the new bytes.
-            tax_fp = _taxonomy_fingerprint(tax) if model_type == "timm" else None
+            if model_type == "timm":
+                from computation_cache import taxonomy_identity
+
+                tax_fp = taxonomy_identity(tax)
+            else:
+                tax_fp = None
             files = active_model.get("files")
-
-            def _build_cache_key(weights_fp):
-                return (
-                    "timm" if model_type == "timm" else "bioclip",
-                    active_model["id"],
-                    model_str,
-                    weights_path,
-                    "__tol__" if use_tol else fp,
-                    tax_fp,
-                    weights_fp,
-                )
-
-            cache_key = _build_cache_key(_weights_fingerprint(weights_path, files))
 
             # _construct_classifier may trigger the ONNX self-heal path
             # (create_session_with_self_heal) which deletes corrupt weights
-            # and redownloads them inside the factory. That bumps the file
-            # mtime/size, so the pre-load fingerprint baked into ``cache_key``
-            # no longer matches what the *next* pipeline will compute. Rekey
-            # to the post-load fingerprint so the second pipeline hits this
-            # entry instead of loading a duplicate session against the freshly
-            # written bytes.
-            def _post_load_key(_value):
-                return _build_cache_key(_weights_fingerprint(weights_path, files))
-
+            # and redownloads them inside the factory. The shared acquisition
+            # helper rekeys the entry to the post-load file fingerprint.
             cache_handle = None
             try:
-                cache_handle = get_default_cache().acquire(
-                    cache_key, _construct_classifier,
-                    post_load_key=_post_load_key,
+                cache_handle = acquire_cached_classifier(
+                    model_type=model_type,
+                    model_str=model_str,
+                    weights_path=weights_path,
+                    labels=None if use_tol else labels,
+                    factory=_construct_classifier,
+                    files=files,
+                    # Fold in optional-artifact presence: without this a
+                    # Repair that downloads timm's label_descriptions.json
+                    # (or bioclip-2.5's ToL files) would not invalidate the
+                    # entry already loaded from the pre-repair install, and
+                    # subsequent pipeline runs would keep using a stale
+                    # classifier constructed without those artifacts.
+                    optional_files=active_model.get("optional_files"),
+                    taxonomy_fingerprint=tax_fp,
+                    cancel_check=lambda: (
+                        _should_abort(abort) or _cancellation_requested()
+                    ),
                 )
                 clf = cache_handle.__enter__()
             except Exception as load_err:
@@ -6690,6 +6830,7 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                     photo_id = photo["id"]
                     folder_path = folders.get(photo["folder_id"], "")
                     image_path = os.path.join(folder_path, photo["filename"])
+                    mask_file_stage = None
 
                     try:
                         # Per-photo serialisation. Two pipelines whose
@@ -6853,9 +6994,6 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                             if _should_abort_without_pause(abort):
                                 break
 
-                            mask_path = save_mask(
-                                mask, masks_dir, photo_id, sam2_variant,
-                            )
                             completeness = crop_completeness(mask)
                             features = compute_all_quality_features(proxy, mask)
                             if _should_abort_without_pause(abort):
@@ -6896,6 +7034,17 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                                     embed(proxy, variant=dinov2_variant),
                                 )
 
+                            mask_file_stage = _StagedMaskFile.create(
+                                mask,
+                                masks_dir,
+                                photo_id,
+                                sam2_variant,
+                                save_mask,
+                                previous_path=(
+                                    existing["path"] if existing else None
+                                ),
+                            )
+                            mask_path = mask_file_stage.final_path
                             thread_db.upsert_photo_mask(
                                 photo_id=photo_id,
                                 variant=sam2_variant,
@@ -6909,9 +7058,10 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                                 subject_tenengrad=mask_subject_tenengrad,
                                 bg_tenengrad=mask_bg_tenengrad,
                                 crop_complete=completeness,
+                                _commit=False,
                             )
                             thread_db.set_active_mask_variant(
-                                photo_id, sam2_variant,
+                                photo_id, sam2_variant, _commit=False,
                             )
                             # Remaining (non-mask) per-photo features still land
                             # on the photos row.  mask_path / crop_complete /
@@ -6920,18 +7070,39 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                             # intentionally NOT passed here.
                             if features:
                                 thread_db.update_photo_pipeline_features(
-                                    photo_id, **features,
+                                    photo_id, **features, _commit=False,
                                 )
                             thread_db.update_photo_embeddings(
                                 photo_id,
                                 dino_subject_embedding=subj_emb_blob,
                                 dino_global_embedding=global_emb_blob,
                                 variant=dinov2_variant,
+                                _commit=False,
                             )
+                            # Publish a new immutable PNG, then atomically move
+                            # the mask row, active denormalized fields, quality
+                            # features, and embeddings to that generation. The
+                            # predecessor remains readable until the commit;
+                            # finish removes it only after the database points
+                            # at the new path.
+                            mask_file_stage.install()
+                            commit_with_retry(thread_db.conn)
+                            mask_file_stage.finish()
+                            mask_file_stage = None
                             masked += 1
                     except Exception:
                         em_failed += 1
                         log.warning("Mask extraction failed for photo %s", photo_id, exc_info=True)
+                        # A failed write can leave this connection inside a
+                        # stale WAL snapshot. Without a rollback, every later
+                        # photo fails immediately with the same ``database is
+                        # locked`` error even after the competing writer has
+                        # moved on.
+                        try:
+                            _rollback_failed_mask_photo(thread_db, photo_id)
+                        finally:
+                            if mask_file_stage is not None:
+                                mask_file_stage.restore()
 
                     processed = i + 1
                     stages["extract_masks"]["count"] = processed

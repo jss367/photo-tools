@@ -217,6 +217,71 @@ def test_cancelled_load_waiter_retries_instead_of_inheriting_cancel():
     assert values == ["ok"]
 
 
+def test_waiter_cancel_check_unblocks_while_producer_still_loading():
+    """Regression: without a waiter-local cancellation check, a waiter blocked
+    on another caller's load_lock only observes its own cancellation after
+    the producing factory finishes. For a BioCLIP embedding job that can be
+    minutes long, and one that also blocks JobRunner.shutdown, that delay
+    is unacceptable. cancel_check must let the waiter unwind promptly while
+    the producer keeps loading for its own callers."""
+    from classifier import ClassificationCancelled
+
+    cache = ModelCache(idle_secs=60)
+    producer_started = threading.Event()
+    release_producer = threading.Event()
+    cancel_waiter = threading.Event()
+    values = []
+
+    def slow_factory():
+        producer_started.set()
+        release_producer.wait(timeout=2.0)
+        return "loaded"
+
+    def producer():
+        with cache.acquire("k", slow_factory) as v:
+            values.append(v)
+
+    waiter_error = []
+
+    def waiter():
+        try:
+            with cache.acquire(
+                "k",
+                lambda: pytest.fail("waiter must not run the factory"),
+                cancel_check=cancel_waiter.is_set,
+            ):
+                pytest.fail("waiter must have raised")
+        except ClassificationCancelled as e:
+            waiter_error.append(e)
+
+    tp = threading.Thread(target=producer)
+    tp.start()
+    assert producer_started.wait(timeout=1.0)
+
+    tw = threading.Thread(target=waiter)
+    tw.start()
+    time.sleep(0.05)  # let waiter enter its poll loop
+
+    cancel_waiter.set()
+    tw.join(timeout=2.0)
+    assert not tw.is_alive(), "waiter did not unwind after cancel"
+    assert len(waiter_error) == 1
+
+    # The producer must be untouched — cancellation belonged to the waiter
+    # alone, and the shared load must finish for its own caller.
+    assert tp.is_alive(), "producer must still be loading"
+    release_producer.set()
+    tp.join(timeout=2.0)
+    assert not tp.is_alive()
+    assert values == ["loaded"]
+
+    # Waiter's cancellation must not have leaked a refcount on the entry
+    # that would prevent idle eviction later.
+    entry = cache._entries.get("k")
+    assert entry is not None
+    assert entry.refcount == 0
+
+
 def test_failed_load_waiter_does_not_evict_recreated_entry():
     """Regression: when factory fails while another thread is queued on the
     same key, the waiter must not decrement the refcount of a fresh entry

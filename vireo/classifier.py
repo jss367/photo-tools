@@ -4,7 +4,6 @@ Uses ONNX Runtime for inference with separate image encoder and text encoder
 sessions. Model files are stored in ~/.vireo/models/{model-id}/.
 """
 
-import hashlib
 import json
 import logging
 import os
@@ -121,22 +120,42 @@ OPENAI_IMAGENET_TEMPLATE = [
 ]
 
 
-def _load_manifest():
-    """Load the embedding cache manifest."""
-    if os.path.exists(_MANIFEST_PATH):
-        try:
-            with open(_MANIFEST_PATH) as f:
-                return json.load(f)
-        except Exception:
-            return {}
-    return {}
+def _prompt_template_identity():
+    """Content identity for the prompts that produce cached embeddings."""
+    from embedding_cache import identity_digest
+
+    sentinel = "__VIREO_LABEL__"
+    return {
+        "name": "openai-imagenet-80",
+        "sha256": identity_digest({
+            "prompts": [template(sentinel) for template in OPENAI_IMAGENET_TEMPLATE]
+        }),
+    }
 
 
-def _save_manifest(manifest):
-    """Save the embedding cache manifest."""
-    os.makedirs(CACHE_DIR, exist_ok=True)
-    with open(_MANIFEST_PATH, "w") as f:
-        json.dump(manifest, f, indent=2)
+def _embedding_identity(labels, model_str, model_dir, *, allow_missing=False):
+    from embedding_cache import build_embedding_identity
+
+    return build_embedding_identity(
+        labels,
+        model_str,
+        model_dir,
+        prompt_template_identity=_prompt_template_identity(),
+        tokenizer_context_length=_CONTEXT_LENGTH,
+        allow_missing=allow_missing,
+    )
+
+
+def _embedding_cache_service():
+    from embedding_cache import EmbeddingCache
+
+    manifest_path = _MANIFEST_PATH
+    if os.path.abspath(os.path.dirname(manifest_path)) != os.path.abspath(CACHE_DIR):
+        # Tests and embedded callers sometimes redirect CACHE_DIR. Keep every
+        # cache artifact together even if the legacy manifest constant was not
+        # patched separately.
+        manifest_path = os.path.join(CACHE_DIR, "manifest.json")
+    return EmbeddingCache(CACHE_DIR, manifest_path)
 
 
 def _resolve_model_dir(model_str, pretrained_str=None):
@@ -167,16 +186,28 @@ def _resolve_model_dir(model_str, pretrained_str=None):
 
 
 def _embedding_cache_path(labels, model_str, model_dir=None):
-    """Build a cache file path based on a hash of the labels, model, and weights path.
+    """Return the complete-identity cache path used by ``EmbeddingCache``."""
+    model_dir = model_dir or _resolve_model_dir(model_str)
+    if model_dir is None:
+        # Preserve a deterministic diagnostic path for unknown models while
+        # keeping real cache access strict about resolving exact files.
+        model_dir = os.path.join(_MODELS_ROOT, f"unknown-{model_str}")
+    identity = _embedding_identity(
+        labels, model_str, model_dir, allow_missing=True
+    )
+    return _embedding_cache_service().path_for(identity)
 
-    ``model_dir`` is included so that two models sharing the same ``model_str``
-    but loaded from different directories (e.g. a default install vs. a custom
-    ``weights_path``) produce distinct cache entries and never share embeddings
-    computed with different encoder weights.
-    """
-    key = model_str + "\n" + (model_dir or "") + "\n" + "\n".join(labels)
-    digest = hashlib.sha256(key.encode()).hexdigest()[:16]
-    return os.path.join(CACHE_DIR, f"{digest}.npy")
+
+def _embedding_is_cached(labels, model_str, model_dir=None):
+    """Return whether a complete and shape-valid embedding payload exists."""
+    model_dir = model_dir or _resolve_model_dir(model_str)
+    if model_dir is None:
+        return False
+    try:
+        identity = _embedding_identity(labels, model_str, model_dir)
+    except (OSError, ValueError):
+        return False
+    return _embedding_cache_service().is_cached(identity, len(identity["labels"]))
 
 
 def _load_tokenizer(tokenizer_path):
@@ -352,6 +383,130 @@ def _compute_embeddings_with_progress(
     return stacked.T  # (embedding_dim, num_labels)
 
 
+def _load_or_compute_label_embeddings(
+    labels,
+    model_str,
+    model_dir,
+    *,
+    redownload=None,
+    progress_callback=None,
+    cancel_check=None,
+    embedding_dim=None,
+):
+    """Resolve custom-label embeddings through the shared cache service.
+
+    ``embedding_dim`` is the image encoder's feature width for this model;
+    when supplied, cached payloads with a mismatched first axis are rejected
+    so a malformed file cannot slip past to fail at inference time on
+    ``img_features @ txt_embeddings``.
+    """
+    from embedding_cache import (
+        EmbeddingWaitCancelled,
+        canonicalize_labels,
+    )
+
+    classes = canonicalize_labels(labels)
+    text_encoder_path = os.path.join(model_dir, "text_encoder.onnx")
+    tokenizer_path = os.path.join(model_dir, "tokenizer.json")
+    for path, desc in [
+        (text_encoder_path, "text encoder ONNX model"),
+        (tokenizer_path, "tokenizer"),
+    ]:
+        if not os.path.isfile(path):
+            raise FileNotFoundError(
+                f"{desc} not found at {path}. "
+                "Download the model from the Models page in Settings."
+            )
+
+    initial_identity = _embedding_identity(classes, model_str, model_dir)
+    cache = _embedding_cache_service()
+
+    def _compute():
+        if cancel_check and cancel_check():
+            raise ClassificationCancelled("classification cancelled")
+        text_session = onnx_runtime.create_session_with_self_heal(
+            text_encoder_path, redownload=redownload,
+        )
+        try:
+            text_input_name = text_session.get_inputs()[0].name
+            tokenizer = _load_tokenizer(tokenizer_path)
+            return _compute_embeddings_with_progress(
+                text_session,
+                text_input_name,
+                tokenizer,
+                classes,
+                progress_callback=progress_callback,
+                cancel_check=cancel_check,
+                model_dir=model_dir,
+            )
+        finally:
+            del text_session
+
+    try:
+        embeddings, actual_identity = cache.get_or_compute(
+            initial_identity,
+            _compute,
+            identity_after=lambda: _embedding_identity(
+                classes, model_str, model_dir
+            ),
+            cancel_check=cancel_check,
+            embedding_dim=embedding_dim,
+        )
+    except EmbeddingWaitCancelled as exc:
+        raise ClassificationCancelled("classification cancelled") from exc
+    return classes, embeddings, initial_identity, actual_identity
+
+
+def _image_encoder_embedding_dim(image_session):
+    """Extract the image encoder's feature width from its ONNX outputs.
+
+    The image session's output is ``(batch, embedding_dim)`` — the second
+    axis is what the label embeddings must match to satisfy the matmul in
+    ``classify_with_embedding``.  Returns ``None`` when the dimension is
+    symbolic (rare for exported CLIP heads) so the caller can skip the
+    stricter check rather than reject valid caches.
+    """
+    try:
+        shape = image_session.get_outputs()[0].shape
+    except Exception:
+        return None
+    if not shape:
+        return None
+    dim = shape[-1]
+    if isinstance(dim, int) and dim > 0:
+        return dim
+    return None
+
+
+def precompute_label_embeddings(
+    labels,
+    model_str="ViT-B-16",
+    pretrained_str=None,
+    *,
+    progress_callback=None,
+    cancel_check=None,
+):
+    """Populate custom-label embeddings without loading the image encoder."""
+    model_dir = _resolve_model_dir(model_str, pretrained_str)
+    if model_dir is None:
+        raise ValueError(
+            f"Unknown BioCLIP model: {model_str}. "
+            f"Known models: {list(_MODEL_DIR_MAP.keys())}"
+        )
+    import models as _models_mod
+
+    redownload = _models_mod.build_self_heal_redownloader(model_dir)
+    classes, _embeddings, _before, _after = _load_or_compute_label_embeddings(
+        labels,
+        model_str,
+        model_dir,
+        redownload=redownload,
+        progress_callback=progress_callback,
+        cancel_check=cancel_check,
+    )
+    return len(classes)
+
+
 class Classifier:
     """Wraps BioCLIP ONNX models for species classification.
 
@@ -399,8 +554,6 @@ class Classifier:
                 )
             self._model_dir = os.path.join(_MODELS_ROOT, dir_name)
         image_encoder_path = os.path.join(self._model_dir, "image_encoder.onnx")
-        text_encoder_path = os.path.join(self._model_dir, "text_encoder.onnx")
-        tokenizer_path = os.path.join(self._model_dir, "tokenizer.json")
         config_path = os.path.join(self._model_dir, "config.json")
 
         # Validate required files
@@ -423,25 +576,9 @@ class Classifier:
 
         redownload = _models_mod.build_self_heal_redownloader(self._model_dir)
 
-        # Track whether image-side self-heal fires. If it does, the
-        # refreshed model dir may have new text_encoder bytes, making
-        # any cached label embeddings (computed against old text
-        # weights) produce silent score drift. We invalidate the
-        # cache before the cache-lookup branch below.
-        image_heal_state = {"triggered": False}
-
-        if redownload is not None:
-            def _image_redownload():
-                image_heal_state["triggered"] = True
-                redownload()
-
-            _image_redownload_cb = _image_redownload
-        else:
-            _image_redownload_cb = None
-
         log.info("Loading BioCLIP image encoder: %s", image_encoder_path)
         self._image_session = onnx_runtime.create_session_with_self_heal(
-            image_encoder_path, redownload=_image_redownload_cb,
+            image_encoder_path, redownload=redownload,
         )
         self._image_input_name = self._image_session.get_inputs()[0].name
 
@@ -456,133 +593,95 @@ class Classifier:
         self._std = preproc["std"]
 
         if labels is not None:
-            if not labels:
-                raise ValueError("labels list must not be empty")
+            text_heal_state = {"triggered": False}
 
-            # Custom labels mode: need text encoder + tokenizer
-            for path, desc in [
-                (text_encoder_path, "text encoder ONNX model"),
-                (tokenizer_path, "tokenizer"),
-            ]:
-                if not os.path.isfile(path):
-                    raise FileNotFoundError(
-                        f"{desc} not found at {path}. "
-                        "Download the model from the Models page in Settings."
-                    )
+            if redownload is not None:
+                def _tracked_redownload():
+                    text_heal_state["triggered"] = True
+                    redownload()
 
-            self._classes = [cls.strip() for cls in labels]
-
-            cache_path = _embedding_cache_path(labels, model_str, self._model_dir)
-
-            # If image self-heal refreshed the model dir, the on-disk
-            # text_encoder bytes are different from what any previously-
-            # cached embeddings were computed against. Invalidate the
-            # cache so we re-compute embeddings from the healed weights.
-            if image_heal_state["triggered"] and os.path.exists(cache_path):
-                log.info(
-                    "Image self-heal refreshed model dir; invalidating "
-                    "stale text embedding cache at %s",
-                    cache_path,
-                )
-                try:
-                    os.unlink(cache_path)
-                except OSError:
-                    log.exception(
-                        "Failed to invalidate text embedding cache %s",
-                        cache_path,
-                    )
-
-            if os.path.exists(cache_path):
-                if cancel_check and cancel_check():
-                    raise ClassificationCancelled("classification cancelled")
-                log.info(
-                    "Loading cached label embeddings for %d labels...", len(labels)
-                )
-                self._txt_embeddings = np.load(cache_path)
-                log.info("Label embeddings loaded from cache")
+                text_redownload = _tracked_redownload
             else:
-                if cancel_check and cancel_check():
-                    raise ClassificationCancelled("classification cancelled")
+                text_redownload = None
+
+            def _rebuild_image_side():
+                """Reload the image session and preprocessing from disk.
+
+                A text-side self-heal replaces the whole model snapshot, so
+                both the in-memory image session and the config values read
+                from the pre-heal files are stale.
+                """
+                self._image_session = onnx_runtime.create_session(
+                    image_encoder_path,
+                )
+                self._image_input_name = self._image_session.get_inputs()[0].name
+                with open(config_path) as handle:
+                    healed = json.load(handle)
+                self._input_size = tuple(healed["input_size"][-2:])
+                self._mean = healed["mean"]
+                self._std = healed["std"]
+
+            def _load_embeddings(expected_dim):
+                return _load_or_compute_label_embeddings(
+                    labels,
+                    model_str,
+                    self._model_dir,
+                    redownload=text_redownload,
+                    progress_callback=embedding_progress_callback,
+                    cancel_check=cancel_check,
+                    embedding_dim=expected_dim,
+                )
+
+            expected_embedding_dim = _image_encoder_embedding_dim(
+                self._image_session
+            )
+            try:
+                (
+                    self._classes,
+                    self._txt_embeddings,
+                    identity_before,
+                    identity_after,
+                ) = _load_embeddings(expected_embedding_dim)
+            except ValueError:
+                # The expected width came from the image session loaded
+                # *before* the text side had a chance to self-heal, and a
+                # heal replaces the whole snapshot at HuggingFace's current
+                # revision (download_model pins to the latest SHA, not to
+                # the one already installed). The healed text encoder can
+                # therefore emit a different feature width than the stale
+                # session reports, and validating against the pre-heal
+                # width would fail the very classification the heal just
+                # repaired. Rebuild the image side from the healed files
+                # and re-validate against it. Only ever one retry: a second
+                # failure is a genuinely bad payload.
+                if not text_heal_state["triggered"]:
+                    raise
                 log.info(
-                    "Computing label embeddings for %d labels "
-                    "(first run -- will be cached for next time)...",
-                    len(labels),
+                    "Text-encoder self-heal replaced the model snapshot; "
+                    "rebuilding the image encoder and re-validating label "
+                    "embeddings against the healed feature width."
                 )
-                # Load text encoder session (self-healing on corruption).
-                # A text-side heal invokes download_model which refreshes
-                # the ENTIRE model directory (image_encoder, text_encoder,
-                # config.json, tokenizer). If that happens, the already-
-                # loaded image session is stale — a version bump between
-                # the original install and the heal could leave us with
-                # an old image encoder paired with new text embeddings,
-                # producing silently incompatible features. Wrap the
-                # redownloader in a tracker and rebuild the image side
-                # if we see it fire.
-                text_heal_state = {"triggered": False}
-
-                if redownload is not None:
-                    def _tracked_redownload():
-                        text_heal_state["triggered"] = True
-                        redownload()
-
-                    text_redownload = _tracked_redownload
-                else:
-                    text_redownload = None
-
-                text_session = onnx_runtime.create_session_with_self_heal(
-                    text_encoder_path, redownload=text_redownload,
+                _rebuild_image_side()
+                text_heal_state["triggered"] = False
+                expected_embedding_dim = _image_encoder_embedding_dim(
+                    self._image_session
                 )
-                try:
-                    text_input_name = text_session.get_inputs()[0].name
-                    tokenizer = _load_tokenizer(tokenizer_path)
+                (
+                    self._classes,
+                    self._txt_embeddings,
+                    identity_before,
+                    identity_after,
+                ) = _load_embeddings(expected_embedding_dim)
 
-                    if text_heal_state["triggered"]:
-                        log.info(
-                            "Text-encoder self-heal refreshed model dir; "
-                            "rebuilding image encoder and preprocessing "
-                            "config from the healed snapshot."
-                        )
-                        self._image_session = onnx_runtime.create_session(
-                            image_encoder_path,
-                        )
-                        self._image_input_name = (
-                            self._image_session.get_inputs()[0].name
-                        )
-                        with open(config_path) as f:
-                            preproc = json.load(f)
-                        self._input_size = tuple(preproc["input_size"][-2:])
-                        self._mean = preproc["mean"]
-                        self._std = preproc["std"]
-
-                    if cancel_check and cancel_check():
-                        raise ClassificationCancelled("classification cancelled")
-                    self._txt_embeddings = _compute_embeddings_with_progress(
-                        text_session,
-                        text_input_name,
-                        tokenizer,
-                        self._classes,
-                        progress_callback=embedding_progress_callback,
-                        cancel_check=cancel_check,
-                        model_dir=self._model_dir,
-                    )
-                finally:
-                    del text_session
-                if cancel_check and cancel_check():
-                    raise ClassificationCancelled("classification cancelled")
-                os.makedirs(CACHE_DIR, exist_ok=True)
-                np.save(cache_path, self._txt_embeddings)
-                # Update manifest with human-readable metadata
-                from datetime import datetime
-
-                manifest = _load_manifest()
-                manifest[os.path.basename(cache_path)] = {
-                    "model": model_str,
-                    "model_dir": self._model_dir,
-                    "label_count": len(labels),
-                    "created": datetime.now().isoformat(timespec="seconds"),
-                }
-                _save_manifest(manifest)
-                log.info("Label embeddings computed and cached to disk")
+            # A producer shared with this caller may self-heal the entire
+            # model directory while we wait. Rebuild the already-loaded image
+            # side whenever the durable embedding identity shows that change.
+            if text_heal_state["triggered"] or identity_before != identity_after:
+                log.info(
+                    "Text-encoder self-heal refreshed model dir; rebuilding "
+                    "image encoder and preprocessing from the healed snapshot."
+                )
+                _rebuild_image_side()
 
             self._mode = "custom"
         else:

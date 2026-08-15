@@ -1977,7 +1977,22 @@ def test_extract_masks_route_writes_photo_masks_row(
         db, tmp_path, "bird.jpg", (10, 20, 100, 200), "MegaDetector",
     )
 
+    import pipeline_locks
+
     calls = []
+    lock_events = []
+
+    class TrackingLock:
+        def acquire(self):
+            lock_events.append(("acquire", pid))
+
+        def release(self):
+            lock_events.append(("release", pid))
+
+    monkeypatch.setattr(
+        pipeline_locks, "acquire_photo_mask",
+        lambda photo_id: TrackingLock(),
+    )
     _patch_extract_masks_deps(monkeypatch, calls)
 
     col_id = db.add_collection(
@@ -1996,6 +2011,7 @@ def test_extract_masks_route_writes_photo_masks_row(
 
     # SAM was invoked exactly once.
     assert len(calls) == 1, calls
+    assert lock_events == [("acquire", pid), ("release", pid)]
 
     # photo_masks row exists with the right variant + prompt.
     row = db.conn.execute(
@@ -2021,6 +2037,29 @@ def test_extract_masks_route_writes_photo_masks_row(
     ).fetchone()
     assert pr["active_mask_variant"] == "sam2-small"
     assert pr["mask_path"] == row["path"]
+
+    # A stale rerun publishes a new immutable generation and reclaims the
+    # previously committed one after the atomic database switch.
+    previous_path = row["path"]
+    db.conn.execute(
+        "UPDATE detections SET box_x = 11 WHERE photo_id = ?", (pid,),
+    )
+    db.conn.commit()
+    rerun = client.post(
+        "/api/jobs/extract-masks", json={"collection_id": col_id},
+    )
+    assert rerun.status_code == 200
+    rerun_job = wait_for_job_via_client(
+        client, rerun.get_json()["job_id"],
+    )
+    assert rerun_job["status"] == "completed", rerun_job
+    replacement = db.conn.execute(
+        "SELECT path, prompt_x FROM photo_masks WHERE photo_id = ?", (pid,),
+    ).fetchone()
+    assert replacement["prompt_x"] == 11
+    assert replacement["path"] != previous_path
+    assert os.path.isfile(replacement["path"])
+    assert not os.path.exists(previous_path)
 
 
 def test_extract_masks_route_skips_sam_when_cached(
@@ -6025,6 +6064,464 @@ def test_import_in_place_reports_error_when_source_vanishes_after_discovery(
     currents = [data["current"] for data in overall]
     assert currents == sorted(currents)
     assert currents[-1] == 3, currents
+def test_import_in_place_reports_working_copy_phase(app_and_db, tmp_path, monkeypatch):
+    """A completed file scan must not hide ongoing RAW working-copy work."""
+    import scanner
+
+    app, _ = app_and_db
+    source = tmp_path / "raw-card"
+    source.mkdir()
+    (source / "IMG_0001.nef").write_bytes(b"fake raw data")
+
+    monkeypatch.setattr(scanner, "extract_metadata", lambda paths, **kwargs: {})
+
+    def fake_extract(_source, output, **_kwargs):
+        os.makedirs(os.path.dirname(output), exist_ok=True)
+        Image.new("RGB", (64, 48), "green").save(output, "JPEG")
+        return True
+
+    monkeypatch.setattr(scanner, "extract_working_copy", fake_extract)
+
+    client = app.test_client()
+    resp = client.post("/api/jobs/import-in-place", json={
+        "sources": [str(source)],
+        "after_import": None,
+    })
+    assert resp.status_code == 200, resp.get_json()
+    job = wait_for_job_via_client(client, resp.get_json()["job_id"])
+
+    assert job["status"] == "completed", job
+    assert job["progress"]["phase_label"] == "Generating working copies"
+    assert job["progress"]["phase_current"] == 1
+    assert job["progress"]["phase_total"] == 1
+    scan_step = next(step for step in job["steps"] if step["id"] == "scan")
+    assert scan_step["progress"] == {"current": 1, "total": 1}
+
+
+def test_import_in_place_aggregates_working_copy_phase_across_sources(
+    app_and_db, tmp_path, monkeypatch,
+):
+    """Multiple sources share one working-copy denominator and progress run."""
+    import scanner
+
+    app, _ = app_and_db
+    sources = []
+    for index in (1, 2):
+        source = tmp_path / f"raw-card-{index}"
+        source.mkdir()
+        (source / f"IMG_{index:04d}.nef").write_bytes(b"fake raw data")
+        sources.append(str(source))
+
+    monkeypatch.setattr(scanner, "extract_metadata", lambda paths, **kwargs: {})
+
+    def fake_extract(_source, output, **_kwargs):
+        os.makedirs(os.path.dirname(output), exist_ok=True)
+        Image.new("RGB", (64, 48), "green").save(output, "JPEG")
+        return True
+
+    monkeypatch.setattr(scanner, "extract_working_copy", fake_extract)
+
+    client = app.test_client()
+    resp = client.post("/api/jobs/import-in-place", json={
+        "sources": sources,
+        "after_import": None,
+    })
+    assert resp.status_code == 200, resp.get_json()
+    job = wait_for_job_via_client(client, resp.get_json()["job_id"])
+
+    assert job["status"] == "completed", job
+    assert job["progress"]["phase_label"] == "Generating working copies"
+    assert job["progress"]["phase_current"] == 2
+    assert job["progress"]["phase_total"] == 2
+    scan_step = next(step for step in job["steps"] if step["id"] == "scan")
+    assert scan_step["progress"] == {"current": 2, "total": 2}
+
+
+def test_import_in_place_omits_source_that_vanishes_during_scan(
+    app_and_db, tmp_path, monkeypatch,
+):
+    """A disappeared root cannot poison deferred working-copy retries."""
+    import scanner
+
+    app, _ = app_and_db
+    source = tmp_path / "vanishing-card"
+    source.mkdir()
+    extractor_calls = []
+
+    def fake_scan(_root, _db, **_kwargs):
+        source.rmdir()
+        return {"discovered": 0, "indexed": 0}
+
+    monkeypatch.setattr(scanner, "scan", fake_scan)
+    monkeypatch.setattr(
+        scanner,
+        "_extract_working_copies",
+        lambda *args, **kwargs: extractor_calls.append((args, kwargs)),
+    )
+
+    client = app.test_client()
+    resp = client.post("/api/jobs/import-in-place", json={
+        "sources": [str(source)],
+        "after_import": None,
+    })
+    assert resp.status_code == 200, resp.get_json()
+    job = wait_for_job_via_client(client, resp.get_json()["job_id"])
+
+    assert job["status"] == "completed", job
+    assert extractor_calls == []
+
+
+def test_import_in_place_revalidates_scope_after_all_scans(
+    app_and_db, tmp_path, monkeypatch,
+):
+    """A source removed between its scan and the deferred extract is dropped.
+
+    The per-source guard only fires immediately after each scan returns, but
+    the aggregate ``_extract_working_copies`` pass runs after every source
+    scans. A removable source (card, network share) can therefore vanish AFTER
+    its own scan succeeded and before extraction begins; without a
+    revalidation pass the extractor would follow the stale scope, fail every
+    pre-existing RAW row's read, and stamp ``working_copy_failed_at`` markers
+    that suppress retries for 24 hours after the volume is remounted.
+    """
+    from pathlib import Path
+
+    import scanner
+
+    app, _ = app_and_db
+    source_a = tmp_path / "vanishing-card"
+    source_a.mkdir()
+    source_b = tmp_path / "still-here"
+    source_b.mkdir()
+
+    def fake_scan(root, _db, **_kwargs):
+        # Source A stays present through its own scan (so it clears the
+        # per-source guard) and only disappears while source B is scanning.
+        if Path(root) == source_b and source_a.exists():
+            source_a.rmdir()
+        return {"discovered": 0, "indexed": 0}
+
+    captured_scopes = []
+
+    def fake_extract(_db, _vireo_dir, *, scope=None, **_kwargs):
+        captured_scopes.append(list(scope))
+
+    monkeypatch.setattr(scanner, "scan", fake_scan)
+    monkeypatch.setattr(scanner, "_extract_working_copies", fake_extract)
+
+    client = app.test_client()
+    resp = client.post("/api/jobs/import-in-place", json={
+        "sources": [str(source_a), str(source_b)],
+        "after_import": None,
+    })
+    assert resp.status_code == 200, resp.get_json()
+    job = wait_for_job_via_client(client, resp.get_json()["job_id"])
+
+    assert job["status"] == "completed", job
+    assert len(captured_scopes) == 1, captured_scopes
+    passed = {
+        entry if isinstance(entry, str) else entry[0]
+        for entry in captured_scopes[0]
+    }
+    assert str(source_a) not in passed
+    assert str(source_b) in passed
+
+
+def test_import_in_place_rejects_detached_persistent_mount_stub(
+    app_and_db, tmp_path, monkeypatch,
+):
+    """An empty directory left by an unmounted source is not extractable."""
+    import pipeline_job
+    import scanner
+
+    app, _ = app_and_db
+    source = tmp_path / "persistent-mountpoint"
+    source.mkdir()
+    extractor_calls = []
+
+    monkeypatch.setattr(
+        pipeline_job, "_load_known_mount_roots", lambda _db: set(),
+    )
+    monkeypatch.setattr(
+        pipeline_job, "_archive_mount_baseline",
+        lambda path, known: {"/mnt/card": True},
+    )
+    monkeypatch.setattr(
+        pipeline_job, "_record_known_mount_roots",
+        lambda _db, _baseline: None,
+    )
+    monkeypatch.setattr(
+        pipeline_job, "_mount_identity_baseline",
+        lambda _baseline: {"/mnt/card": ("mountinfo", "old")},
+    )
+    monkeypatch.setattr(
+        pipeline_job, "_unmounted_since_baseline",
+        lambda baseline: "/mnt/card" if baseline else None,
+    )
+    monkeypatch.setattr(
+        pipeline_job, "_changed_mount_since_baseline",
+        lambda _identities: None,
+    )
+    monkeypatch.setattr(
+        scanner, "scan",
+        lambda *_args, **_kwargs: {"discovered": 0, "indexed": 0},
+    )
+    monkeypatch.setattr(
+        scanner, "_extract_working_copies",
+        lambda *args, **kwargs: extractor_calls.append((args, kwargs)),
+    )
+
+    client = app.test_client()
+    resp = client.post("/api/jobs/import-in-place", json={
+        "sources": [str(source)],
+        "after_import": None,
+    })
+    assert resp.status_code == 200, resp.get_json()
+    job = wait_for_job_via_client(client, resp.get_json()["job_id"])
+
+    assert job["status"] == "completed", job
+    assert source.is_dir(), "the detached mount stub still exists"
+    assert extractor_calls == []
+
+
+def test_import_in_place_rejects_detached_then_remounted_source(
+    app_and_db, tmp_path, monkeypatch,
+):
+    """A replacement mount cannot pass the final availability probe."""
+    import pipeline_job
+    import scanner
+
+    app, _ = app_and_db
+    source = tmp_path / "remounted-source"
+    source.mkdir()
+    extractor_calls = []
+
+    monkeypatch.setattr(
+        pipeline_job, "_load_known_mount_roots", lambda _db: set(),
+    )
+    monkeypatch.setattr(
+        pipeline_job, "_archive_mount_baseline",
+        lambda path, known: {"/mnt/card": True},
+    )
+    monkeypatch.setattr(
+        pipeline_job, "_record_known_mount_roots",
+        lambda _db, _baseline: None,
+    )
+    monkeypatch.setattr(
+        pipeline_job, "_mount_identity_baseline",
+        lambda _baseline: {"/mnt/card": ("mountinfo", "old")},
+    )
+    monkeypatch.setattr(
+        pipeline_job, "_unmounted_since_baseline", lambda _baseline: None,
+    )
+    monkeypatch.setattr(
+        pipeline_job, "_changed_mount_since_baseline",
+        lambda identities: "/mnt/card" if identities else None,
+    )
+    monkeypatch.setattr(
+        scanner, "scan",
+        lambda *_args, **_kwargs: {"discovered": 0, "indexed": 0},
+    )
+    monkeypatch.setattr(
+        scanner, "_extract_working_copies",
+        lambda *args, **kwargs: extractor_calls.append((args, kwargs)),
+    )
+
+    client = app.test_client()
+    resp = client.post("/api/jobs/import-in-place", json={
+        "sources": [str(source)],
+        "after_import": None,
+    })
+    assert resp.status_code == 200, resp.get_json()
+    job = wait_for_job_via_client(client, resp.get_json()["job_id"])
+
+    assert job["status"] == "completed", job
+    assert source.is_dir(), "the replacement mount is live at final probe"
+    assert extractor_calls == []
+
+
+def test_import_in_place_rejects_replaced_local_source(
+    app_and_db, tmp_path, monkeypatch,
+):
+    """A local source replaced after scan is not used for extraction."""
+    import pipeline_job
+    import scanner
+
+    app, _ = app_and_db
+    source = tmp_path / "local-source"
+    source.mkdir()
+    extractor_calls = []
+    identities = iter([
+        ("stat", 1, 100),
+        ("stat", 1, 200),
+    ])
+
+    monkeypatch.setattr(
+        pipeline_job, "_load_known_mount_roots", lambda _db: set(),
+    )
+    monkeypatch.setattr(
+        pipeline_job, "_archive_mount_baseline", lambda path, known: {},
+    )
+    monkeypatch.setattr(
+        pipeline_job, "_record_known_mount_roots",
+        lambda _db, _baseline: None,
+    )
+    monkeypatch.setattr(
+        pipeline_job, "_mount_identity", lambda _path: next(identities),
+    )
+    monkeypatch.setattr(
+        scanner, "scan",
+        lambda *_args, **_kwargs: {"discovered": 0, "indexed": 0},
+    )
+    monkeypatch.setattr(
+        scanner, "_extract_working_copies",
+        lambda *args, **kwargs: extractor_calls.append((args, kwargs)),
+    )
+
+    client = app.test_client()
+    resp = client.post("/api/jobs/import-in-place", json={
+        "sources": [str(source)],
+        "after_import": None,
+    })
+    assert resp.status_code == 200, resp.get_json()
+    job = wait_for_job_via_client(client, resp.get_json()["job_id"])
+
+    assert job["status"] == "completed", job
+    assert extractor_calls == []
+
+
+def test_import_in_place_snapshot_rejects_replaced_restricted_directory(
+    app_and_db, tmp_path, monkeypatch,
+):
+    """Each exact snapshot directory retains its own filesystem identity."""
+    from pathlib import Path
+
+    import pipeline_job
+    import scanner
+
+    app, db = app_and_db
+    root = tmp_path / "registered"
+    first = root / "first"
+    second = root / "second"
+    first.mkdir(parents=True)
+    second.mkdir()
+    first_raw = first / "IMG_0001.nef"
+    second_raw = second / "IMG_0002.nef"
+    first_raw.write_bytes(b"first")
+    second_raw.write_bytes(b"second")
+    db.add_folder(str(root), name="registered")
+    snap_id = db.create_new_images_snapshot([
+        str(first_raw), str(second_raw),
+    ])
+    first_identity_calls = 0
+
+    def changing_identity(path):
+        nonlocal first_identity_calls
+        normalized = str(Path(path))
+        if normalized == str(first):
+            first_identity_calls += 1
+            inode = 100 if first_identity_calls == 1 else 200
+            return ("stat", 1, inode)
+        return ("stat", 1, hash(normalized))
+
+    captured_scopes = []
+    monkeypatch.setattr(
+        pipeline_job, "_mount_identity", changing_identity,
+    )
+    monkeypatch.setattr(
+        scanner, "scan",
+        lambda *_args, **_kwargs: {"discovered": 0, "indexed": 0},
+    )
+    monkeypatch.setattr(
+        scanner, "_extract_working_copies",
+        lambda _db, _vireo_dir, *, scope=None, **_kwargs: (
+            captured_scopes.append(list(scope))
+        ),
+    )
+
+    client = app.test_client()
+    resp = client.post("/api/jobs/import-in-place", json={
+        "source_snapshot_id": snap_id,
+        "after_import": None,
+    })
+    assert resp.status_code == 200, resp.get_json()
+    job = wait_for_job_via_client(client, resp.get_json()["job_id"])
+
+    # The fake scanner intentionally indexes none of the frozen files, so
+    # the snapshot contract reports failure after deferred-scope handling.
+    assert job["status"] == "failed", job
+    assert first_identity_calls == 2
+    assert len(captured_scopes) == 1
+    passed = {entry[0] for entry in captured_scopes[0]}
+    assert str(first) not in passed
+    assert str(second) in passed
+
+
+def test_import_in_place_normalizes_deferred_scope_spelling(
+    app_and_db, tmp_path, monkeypatch,
+):
+    """Deferred scope uses the same Path spelling scanner catalogs."""
+    import scanner
+
+    app, _ = app_and_db
+    source = tmp_path / "raw-card"
+    source.mkdir()
+    supplied_source = str(source) + os.sep
+    captured_scopes = []
+
+    monkeypatch.setattr(
+        scanner, "scan",
+        lambda *_args, **_kwargs: {"discovered": 0, "indexed": 0},
+    )
+    monkeypatch.setattr(
+        scanner, "_extract_working_copies",
+        lambda *_args, **kwargs: captured_scopes.append(kwargs["scope"]),
+    )
+
+    client = app.test_client()
+    resp = client.post("/api/jobs/import-in-place", json={
+        "sources": [supplied_source],
+        "recursive": False,
+        "after_import": None,
+    })
+    assert resp.status_code == 200, resp.get_json()
+    job = wait_for_job_via_client(client, resp.get_json()["job_id"])
+
+    assert job["status"] == "completed", job
+    assert captured_scopes == [[(str(source), "exact")]]
+
+
+def test_import_in_place_metadata_phase_does_not_override_step_progress(
+    app_and_db, tmp_path, monkeypatch,
+):
+    """Metadata sub-progress stays descriptive rather than resetting the bar."""
+    import scanner
+
+    app, _ = app_and_db
+    source = tmp_path / "card"
+    source.mkdir()
+
+    def fake_scan(_root, _db, *, status_callback=None, **_kwargs):
+        status_callback(
+            "Extracting metadata: 1 of 1",
+            phase_current=1,
+            phase_total=1,
+            phase_label="Extracting metadata",
+        )
+        return {"discovered": 0, "indexed": 0}
+
+    monkeypatch.setattr(scanner, "scan", fake_scan)
+    client = app.test_client()
+    resp = client.post("/api/jobs/import-in-place", json={
+        "sources": [str(source)],
+        "after_import": None,
+    })
+    assert resp.status_code == 200, resp.get_json()
+    job = wait_for_job_via_client(client, resp.get_json()["job_id"])
+
+    assert job["status"] == "completed", job
+    scan_step = next(step for step in job["steps"] if step["id"] == "scan")
+    assert scan_step["progress"] == {"current": 0, "total": 0}
 
 
 def test_import_in_place_snapshot_admits_only_frozen_files(

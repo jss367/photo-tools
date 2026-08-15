@@ -9070,6 +9070,45 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
 
     # -- Edit API routes --
 
+    def _create_current_local_mask_snapshot(
+        db, photo_id, *, vireo_dir, native_size,
+    ):
+        """Snapshot the active immutable mask, retrying cleanup races."""
+        import local_masks
+
+        for attempt in range(3):
+            variant_row = db.conn.execute(
+                "SELECT active_mask_variant FROM photos WHERE id=?",
+                (photo_id,),
+            ).fetchone()
+            variant = (
+                variant_row["active_mask_variant"] if variant_row else None
+            )
+            mask_row = (
+                db.get_photo_mask(photo_id, variant) if variant else None
+            )
+            try:
+                return local_masks.create_snapshot(
+                    photo_id=photo_id,
+                    mask_row=mask_row,
+                    vireo_dir=vireo_dir,
+                    native_size=native_size,
+                )
+            except FileNotFoundError:
+                if attempt == 2:
+                    raise ValueError(
+                        "active subject mask changed during snapshot; retry"
+                    ) from None
+            except ValueError as exc:
+                # ``create_snapshot`` can observe a predecessor after the DB
+                # lookup but after cleanup at its existence check. Retry only
+                # that missing-file result; validation errors are stable.
+                if (
+                    str(exc) != "active subject mask file is missing"
+                    or attempt == 2
+                ):
+                    raise
+
     @app.route("/api/photos/<int:photo_id>/wildlife_excluded", methods=["POST"])
     def api_set_wildlife_excluded(photo_id):
         db = _get_db()
@@ -9131,17 +9170,10 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         photo = db.get_photo(photo_id, verify_workspace=True)
         if not photo:
             return _photo_not_found_error(legacy_error="not found")
-        import local_masks
-        variant_row = db.conn.execute(
-            "SELECT active_mask_variant FROM photos WHERE id=?",
-            (photo_id,),
-        ).fetchone()
-        variant = variant_row["active_mask_variant"] if variant_row else None
-        mask_row = db.get_photo_mask(photo_id, variant) if variant else None
         try:
-            mask = local_masks.create_snapshot(
-                photo_id=photo_id,
-                mask_row=mask_row,
+            mask = _create_current_local_mask_snapshot(
+                db,
+                photo_id,
                 vireo_dir=os.path.dirname(app.config["THUMB_CACHE_DIR"]),
                 native_size=_recipe_source_dimensions(photo),
             )
@@ -9287,21 +9319,10 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 # the slider values copy, the mask does not. Photos without a
                 # usable mask are skipped and reported, not silently given a
                 # wrong mask.
-                import local_masks
-                variant_row = db.conn.execute(
-                    "SELECT active_mask_variant FROM photos WHERE id=?",
-                    (pid,),
-                ).fetchone()
-                variant = (
-                    variant_row["active_mask_variant"] if variant_row else None
-                )
-                mask_row = (
-                    db.get_photo_mask(pid, variant) if variant else None
-                )
                 try:
-                    target_mask = local_masks.create_snapshot(
-                        photo_id=pid,
-                        mask_row=mask_row,
+                    target_mask = _create_current_local_mask_snapshot(
+                        db,
+                        pid,
                         vireo_dir=vireo_dir,
                         native_size=_recipe_source_dimensions(photo),
                     )
@@ -10943,15 +10964,28 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         """Delete photos using the same phases for sync and job endpoints."""
         paths = paths or []
 
-        def emit(phase, current=0, total=0, current_file="", detail=""):
+        def emit(
+            phase, current=0, total=0, current_file="", detail="", failed=0,
+            stage_failures=None,
+        ):
             if progress_callback:
-                progress_callback({
+                payload = {
                     "phase": phase,
                     "current": current,
                     "total": total,
                     "current_file": current_file,
                     "detail": detail,
-                })
+                    "failed": failed,
+                }
+                # ``stage_failures`` lets a single emit attribute failure counts
+                # to specific stages so the frontend does not have to rely on
+                # a specific per-stage emit having arrived first. The disk and
+                # catalog phases each report their own count while Finishing
+                # sends the merged map, so a dropped intermediate event cannot
+                # silently promote a partial stage to green complete.
+                if stage_failures:
+                    payload["stage_failures"] = dict(stage_failures)
+                progress_callback(payload)
 
         if mode == "disk_permanent" and paths:
             # Retry path: DB rows were already deleted by the initial
@@ -11327,12 +11361,15 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 detail["photo_id"] = photo_id
                 trash_failed.append(detail)
 
+        disk_failed_photos = len(failed_ids)
         emit(
             disk_phase, len(all_disk_paths), len(all_disk_paths),
             detail=(
                 f"{len(successful_ids)} photo(s) ready for catalog removal; "
-                f"{len(failed_ids)} retained after filesystem errors."
+                f"{disk_failed_photos} retained after filesystem errors."
             ),
+            failed=disk_failed_photos,
+            stage_failures={"files": disk_failed_photos},
         )
         result = remove_catalog_rows(
             successful_ids,
@@ -11343,6 +11380,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         # weren't deleted — surface them alongside filesystem failures so
         # the client keeps them visible and doesn't report them as trashed.
         skipped_ids = result.get("skipped_ids", []) or []
+        catalog_failed_photos = len(skipped_ids)
         if skipped_ids:
             already_failed = set(failed_ids)
             for photo_id in skipped_ids:
@@ -11358,7 +11396,29 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 photo_id for photo_id in skipped_ids
                 if photo_id not in already_failed
             ]
-        emit("Finishing", 1, 1)
+            # Re-emit the catalog stage with the retained count so the frontend
+            # transitions it from complete → partial. Without this, the initial
+            # "Removed from Vireo" event marks the stage green and Finishing
+            # later carries a higher failed count that the frontend can't
+            # attribute to any stage.
+            emit(
+                "Removed from Vireo",
+                result["deleted"], result["deleted"] + catalog_failed_photos,
+                detail=(
+                    f"{catalog_failed_photos} photo(s) retained "
+                    "due to concurrent moves."
+                ),
+                failed=catalog_failed_photos,
+                stage_failures={"catalog": catalog_failed_photos},
+            )
+        emit(
+            "Finishing", 1, 1,
+            failed=len(failed_ids),
+            stage_failures={
+                "files": disk_failed_photos,
+                "catalog": catalog_failed_photos,
+            },
+        )
         return {
             "ok": True,
             "deleted": result["deleted"],
@@ -16364,7 +16424,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
     @app.route("/api/classify/readiness")
     def api_classify_readiness():
         """Check what's ready for classification and what will need work."""
-        from classifier import _embedding_cache_path, _resolve_model_dir
+        from classifier import _embedding_is_cached, _resolve_model_dir
         from labels import get_active_labels, get_saved_labels, load_merged_labels, read_label_file
         from models import get_active_model, get_models
 
@@ -16483,10 +16543,9 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             model_dir = _resolve_model_dir(
                 model.get("model_str", ""), model.get("weights_path")
             )
-            cache_path = _embedding_cache_path(
+            embeddings_cached = _embedding_is_cached(
                 labels, model.get("model_str", ""), model_dir
             )
-            embeddings_cached = os.path.exists(cache_path)
 
         return jsonify(
             {
@@ -18606,7 +18665,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
     @app.route("/api/embedding-matrix")
     def api_embedding_matrix():
         """Return which model+labels combinations have cached embeddings."""
-        from classifier import _embedding_cache_path, _resolve_model_dir
+        from classifier import _embedding_is_cached, _resolve_model_dir
         from labels import get_saved_labels, read_label_file
         from models import get_models
 
@@ -18634,9 +18693,10 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             }
             for m in models:
                 model_dir = _resolve_model_dir(m["model_str"], m.get("weights_path"))
-                cache_path = _embedding_cache_path(labels, m["model_str"], model_dir)
                 row["models"][m["id"]] = {
-                    "cached": os.path.exists(cache_path),
+                    "cached": _embedding_is_cached(
+                        labels, m["model_str"], model_dir
+                    ),
                     "model_name": m["name"],
                 }
             matrix.append(row)
@@ -18660,7 +18720,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         active_ws = _get_db()._active_workspace_id
 
         def work(job):
-            from classifier import Classifier
+            from classifier import precompute_label_embeddings
             from labels import read_label_file
             from models import get_models
 
@@ -18710,12 +18770,13 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     },
                 )
 
-            # This will compute and cache the embeddings
-            Classifier(
+            # The shared service loads only the text side and joins an
+            # equal-key pipeline/precompute already doing this work.
+            precompute_label_embeddings(
                 labels=labels,
                 model_str=model["model_str"],
                 pretrained_str=model["weights_path"],
-                embedding_progress_callback=_progress,
+                progress_callback=_progress,
                 cancel_check=lambda: runner.is_cancelled(job["id"]),
             )
 
@@ -21059,16 +21120,19 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 and active_model.get("model_type", "bioclip") != "timm"
             ):
                 try:
-                    from classifier import _embedding_cache_path, _resolve_model_dir
+                    from classifier import _embedding_is_cached, _resolve_model_dir
 
                     labels = read_label_file(labels_path)
                     model_dir = _resolve_model_dir(
                         active_model["model_str"], active_model.get("weights_path")
                     )
-                    cache_path = _embedding_cache_path(
+                    # Use the shared helper: it validates payload shape and
+                    # dtype rather than accepting any file at the identity
+                    # path, so a truncated or wrong-shape cache no longer
+                    # reports as ready here.
+                    if not _embedding_is_cached(
                         labels, active_model["model_str"], model_dir
-                    )
-                    if not os.path.exists(cache_path):
+                    ):
                         precompute = {
                             "model_id": active_model["id"],
                             "model_name": active_model["name"],
@@ -26421,8 +26485,23 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
 
             import config as cfg
             from ingest import discover_source_files
-            from scanner import ScanCancelled
-            from scanner import scan as do_scan
+            from pipeline_job import (
+                _archive_mount_baseline,
+                _changed_mount_since_baseline,
+                _load_known_mount_roots,
+                _mount_identity,
+                _mount_identity_baseline,
+                _record_known_mount_roots,
+                _unmounted_since_baseline,
+            )
+            from scanner import (
+                ScanCancelled,
+                _extract_working_copies,
+                is_excluded_scan_path,
+            )
+            from scanner import (
+                scan as do_scan,
+            )
 
             thread_db = Database(db_path)
             thread_db.set_active_workspace(active_ws)
@@ -26448,6 +26527,25 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 "overall_total": 0,
                 "source_index": 0,
             }
+            working_copy_scope = []
+            working_copy_scope_baselines = {}
+            working_copy_scope_identities = {}
+            known_mount_roots = _load_known_mount_roots(thread_db)
+            source_mount_baselines = {}
+            source_mount_identities = {}
+            for source in sources:
+                source_key = str(Path(source))
+                baseline = _archive_mount_baseline(
+                    source, known_mount_roots,
+                )
+                source_mount_baselines[source_key] = baseline
+                identities = _mount_identity_baseline(baseline)
+                # Mount roots catch detach/remount; the source directory's
+                # own inode also catches a local root renamed and replaced
+                # while later sources are still scanning.
+                identities[source_key] = _mount_identity(source_key)
+                source_mount_identities[source_key] = identities
+                _record_known_mount_roots(thread_db, baseline)
 
             snapshot_requested = len(snapshot_paths or [])
             snapshot_missing = []
@@ -26541,13 +26639,30 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
 
             def status_cb(message, phase_current=None, phase_total=None, phase_label=None):
                 visible_phase_label = phase_label
-                if phase_label and len(sources) > 1:
+                if (
+                    phase_label
+                    and phase_label != "Generating working copies"
+                    and len(sources) > 1
+                ):
                     visible_phase_label = (
                         f"{phase_label} — source "
                         f"{scan_acc['source_index']} of {len(sources)}"
                     )
                 job["progress"]["current_file"] = message
-                runner.update_step(job["id"], "scan", current_file=message)
+                step_update = {"current_file": message}
+                if (
+                    phase_total
+                    and phase_label == "Generating working copies"
+                ):
+                    # The scan counter can already be complete while working
+                    # copies are still being generated. Put the active phase
+                    # on the expanded Jobs-page step too, rather than leaving
+                    # that row pinned at a misleading 100%.
+                    step_update["progress"] = {
+                        "current": phase_current or 0,
+                        "total": phase_total,
+                    }
+                runner.update_step(job["id"], "scan", **step_update)
                 runner.push_event(job["id"], "progress", {
                     "current": job["progress"].get("current", 0),
                     "total": job["progress"].get("total", 0),
@@ -26685,6 +26800,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 scan_acc["last_total"] = len(source_manifests[source])
                 restricted_files = None
                 restricted_dirs = None
+                restricted_dir_identities = {}
                 if snapshot_paths_by_root is not None:
                     restricted_files = {
                         path for path in snapshot_paths_by_root[source]
@@ -26705,6 +26821,10 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     restricted_dirs = sorted(
                         {os.path.dirname(path) for path in restricted_files}
                     )
+                    restricted_dir_identities = {
+                        str(Path(directory)): _mount_identity(directory)
+                        for directory in restricted_dirs
+                    }
                 phase = (
                     f"Importing source {idx} of {len(sources)}: {source}"
                     if len(sources) > 1 else "Importing in place"
@@ -26734,11 +26854,64 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                         vireo_dir=vireo_dir,
                         thumb_cache_dir=thumb_cache_dir,
                         cancel_check=cancel_check,
+                        # Pair companions during each scan, but defer RAW
+                        # working-copy generation until every source has been
+                        # cataloged. One combined pass gives the UI a truthful
+                        # total instead of restarting a 0..N phase per source.
+                        skip_working_copies=True,
                         register_restrict_dirs_as_roots=(
                             snapshot_paths_by_root is None
                         ),
                         discovered_files=source_manifests[source],
                     )
+                    # Retain extraction scope only after the scan returns and
+                    # only while its paths are still valid. A selected volume
+                    # can disappear after request validation; handing that
+                    # stale scope to the deferred extractor would mark every
+                    # pre-existing RAW row as failed for 24 hours.
+                    if restricted_dirs is not None:
+                        for directory in restricted_dirs:
+                            if (
+                                not is_excluded_scan_path(Path(directory))
+                                and os.path.isdir(directory)
+                            ):
+                                entry = (directory, "exact")
+                                working_copy_scope.append(entry)
+                                working_copy_scope_baselines[entry] = (
+                                    source_mount_baselines.get(
+                                        str(Path(source)), {},
+                                    )
+                                )
+                                entry_identities = dict(
+                                    source_mount_identities.get(
+                                        str(Path(source)), {},
+                                    )
+                                )
+                                directory_key = str(Path(directory))
+                                entry_identities[directory_key] = (
+                                    restricted_dir_identities.get(directory_key)
+                                )
+                                working_copy_scope_identities[entry] = entry_identities
+                    elif (
+                        not is_excluded_scan_path(Path(source))
+                        and os.path.isdir(source)
+                    ):
+                        # scanner.scan converts its root to Path before it
+                        # catalogs folder strings, which removes lexical
+                        # trailing separators and ``.`` components. Use that
+                        # exact spelling for the deferred SQL scope too.
+                        normalized_source = str(Path(source))
+                        entry = (
+                            (normalized_source, "exact")
+                            if not recursive else normalized_source
+                        )
+                        working_copy_scope.append(entry)
+                        working_copy_scope_baselines[entry] = (
+                            source_mount_baselines.get(normalized_source, {})
+                        )
+                        working_copy_scope_identities[entry] = (
+                            source_mount_identities.get(normalized_source, {})
+                        )
                 except Exception as exc:
                     if isinstance(exc, ScanCancelled) and cancel_check():
                         cancelled = True
@@ -26812,6 +26985,68 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                             source,
                         )
                     advance_scan_acc()
+
+            if not cancelled and working_copy_scope:
+                # A removable source can disappear after its scan succeeded
+                # but before the aggregate extract pass runs (later sources
+                # were still scanning, or a card was pulled between the loop
+                # ending and this call). Revalidate every retained scope
+                # entry now so the extractor never reads a vanished volume
+                # and stamps 24h ``working_copy_failed_at`` markers on its
+                # pre-existing catalog rows.
+                revalidated_scope = []
+                for entry in working_copy_scope:
+                    if isinstance(entry, tuple):
+                        path = entry[0]
+                    else:
+                        path = entry
+                    try:
+                        detached_mount = _unmounted_since_baseline(
+                            working_copy_scope_baselines.get(entry, {}),
+                        )
+                        changed_mount = _changed_mount_since_baseline(
+                            working_copy_scope_identities.get(entry, {}),
+                        )
+                        still_available = (
+                            not is_excluded_scan_path(Path(path))
+                            and detached_mount is None
+                            and changed_mount is None
+                            and os.path.isdir(path)
+                        )
+                    except OSError:
+                        still_available = False
+                        detached_mount = None
+                        changed_mount = None
+                    if still_available:
+                        revalidated_scope.append(entry)
+                    else:
+                        log.info(
+                            "Skipping deferred working-copy scope %s: no "
+                            "longer present, excluded, or mount changed%s",
+                            path,
+                            (
+                                f" ({detached_mount or changed_mount})"
+                                if detached_mount or changed_mount
+                                else ""
+                            ),
+                        )
+                if revalidated_scope:
+                    try:
+                        _extract_working_copies(
+                            thread_db,
+                            vireo_dir,
+                            status_callback=status_cb,
+                            scope=revalidated_scope,
+                            cancel_check=cancel_check,
+                        )
+                    except Exception as exc:
+                        log.exception(
+                            "In-place import working-copy generation failed",
+                        )
+                        msg = f"[working copies] {exc}"
+                        root_errors.append(msg)
+                        if msg not in job["errors"]:
+                            job["errors"].append(msg)
 
             if snapshot_paths is not None:
                 # Pairing can fold a newly scanned JPEG into an existing RAW
@@ -29609,6 +29844,11 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 render_proxy,
                 save_mask,
             )
+            from pipeline_job import (
+                _rollback_failed_mask_photo,
+                _StagedMaskFile,
+            )
+            from pipeline_locks import acquire_photo_mask
             from quality import compute_all_quality_features
 
             thread_db = Database(db_path)
@@ -29721,6 +29961,13 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 folder_path = folders.get(photo["folder_id"], "")
                 image_path = os.path.join(folder_path, photo["filename"])
 
+                # Share the same photo-wide critical section as Process jobs.
+                # This standalone route writes the deterministic predecessor
+                # filename, so serializing its full cache-check/write sequence
+                # lets Process safely reclaim that predecessor after commit.
+                photo_mask_lock = acquire_photo_mask(photo_id)
+                photo_mask_lock.acquire()
+                mask_file_stage = None
                 try:
                     # Cache hit: photo_masks already has a row for
                     # (photo, configured variant) AND its stored prompt
@@ -29779,11 +30026,6 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                         skipped += 1
                         continue
 
-                    # Save mask PNG (per SAM variant; one file per variant)
-                    mask_path = save_mask(
-                        mask, masks_dir, photo_id, sam2_variant,
-                    )
-
                     # Compute crop completeness + all quality features
                     completeness = crop_completeness(mask)
                     features = compute_all_quality_features(proxy, mask)
@@ -29804,6 +30046,18 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                         global_emb_blob = embedding_to_blob(
                             embed(proxy, variant=dinov2_variant),
                         )
+
+                    mask_file_stage = _StagedMaskFile.create(
+                        mask,
+                        masks_dir,
+                        photo_id,
+                        sam2_variant,
+                        save_mask,
+                        previous_path=(
+                            existing["path"] if existing else None
+                        ),
+                    )
+                    mask_path = mask_file_stage.final_path
 
                     # Per-mask features: pop them out of `features` so
                     # they land on the photo_masks row and not on the
@@ -29837,9 +30091,10 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                         subject_tenengrad=mask_subject_tenengrad,
                         bg_tenengrad=mask_bg_tenengrad,
                         crop_complete=completeness,
+                        _commit=False,
                     )
                     thread_db.set_active_mask_variant(
-                        photo_id, sam2_variant,
+                        photo_id, sam2_variant, _commit=False,
                     )
                     # Remaining (non-mask) per-photo features still land
                     # on the photos row. mask_path / crop_complete /
@@ -29848,14 +30103,19 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     # intentionally NOT passed here.
                     if features:
                         thread_db.update_photo_pipeline_features(
-                            photo_id, **features,
+                            photo_id, **features, _commit=False,
                         )
                     thread_db.update_photo_embeddings(
                         photo_id,
                         dino_subject_embedding=subj_emb_blob,
                         dino_global_embedding=global_emb_blob,
                         variant=dinov2_variant,
+                        _commit=False,
                     )
+                    mask_file_stage.install()
+                    commit_with_retry(thread_db.conn)
+                    mask_file_stage.finish()
+                    mask_file_stage = None
                     masked += 1
 
                 except Exception:
@@ -29866,6 +30126,13 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     job["errors"].append(
                         f"Photo {photo_id}: mask extraction failed"
                     )
+                    try:
+                        _rollback_failed_mask_photo(thread_db, photo_id)
+                    finally:
+                        if mask_file_stage is not None:
+                            mask_file_stage.restore()
+                finally:
+                    photo_mask_lock.release()
 
                 runner.push_event(
                     job["id"],
@@ -31105,8 +31372,8 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 computation_cache_dir=app.config["COMPUTATION_CACHE_DIR"],
             )
 
-        # Enqueue rather than start directly: when SLOT_CAP is 1 and
-        # nothing else is active, ``enqueue_pipeline`` promotes inline
+        # Enqueue rather than start directly: when pipeline slots are available,
+        # ``enqueue_pipeline`` promotes inline
         # before returning, so this looks identical to the old ``start``
         # call. When a pipeline is already running, the new run waits in
         # ``status='queued'`` until the slot opens. Callers receive the
@@ -31856,6 +32123,20 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             and os.path.realpath(row["mask_path"]) == real
         )
 
+    def _read_mask_bytes(mask_path):
+        """Read an immutable mask generation, or lose a cleanup race.
+
+        POSIX keeps an already-open unlinked file readable, while Windows
+        refuses to unlink an open handle. The only race to recover from is
+        cleanup winning before ``open``; callers then re-resolve the current
+        database path and retry without waiting for a long-running writer.
+        """
+        try:
+            with open(mask_path, "rb") as handle:
+                return handle.read()
+        except OSError:
+            return None
+
     @app.route("/masks/<filename>")
     def serve_mask(filename):
         """Serve mask PNG files.
@@ -31869,33 +32150,46 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         """
         masks_dir = os.path.join(os.path.dirname(db_path), "masks")
         mask_path = os.path.join(masks_dir, filename)
+        id_match = re.match(r"^(\d+)[._]", filename)
+        if not id_match:
+            if os.path.exists(mask_path) and _mask_file_is_db_backed(
+                filename, mask_path,
+            ):
+                return send_from_directory(masks_dir, filename)
+            return "", 404
+
+        pid = int(id_match.group(1))
         if os.path.exists(mask_path) and _mask_file_is_db_backed(
             filename, mask_path,
         ):
-            return send_from_directory(masks_dir, filename)
+            mask_bytes = _read_mask_bytes(mask_path)
+            if mask_bytes is not None:
+                return Response(mask_bytes, mimetype="image/png")
 
-        m = re.match(r"^(\d+)\.png$", filename)
-        if m:
-            pid = int(m.group(1))
+        if re.match(r"^(\d+)\.png$", filename):
             db = _get_db()
-            row = db.conn.execute(
-                "SELECT active_mask_variant FROM photos WHERE id=?", (pid,)
-            ).fetchone()
-            active = row["active_mask_variant"] if row else None
-            if active:
-                mask = db.get_photo_mask(pid, active)
-                if mask and mask.get("path"):
-                    masks_dir_real = os.path.realpath(masks_dir)
-                    abs_path = os.path.realpath(mask["path"])
-                    if (
-                        (abs_path == masks_dir_real
-                            or abs_path.startswith(masks_dir_real + os.sep))
-                        and os.path.isfile(abs_path)
-                    ):
-                        return send_from_directory(
-                            masks_dir_real,
-                            os.path.relpath(abs_path, masks_dir_real),
-                        )
+            # A committed immutable generation can be unlinked after the DB
+            # lookup but before open. Re-resolve after that narrow race; do
+            # not block this HTTP request on full model regeneration.
+            for _attempt in range(3):
+                row = db.conn.execute(
+                    "SELECT active_mask_variant FROM photos WHERE id=?", (pid,)
+                ).fetchone()
+                active = row["active_mask_variant"] if row else None
+                if active:
+                    mask = db.get_photo_mask(pid, active)
+                    if mask and mask.get("path"):
+                        masks_dir_real = os.path.realpath(masks_dir)
+                        abs_path = os.path.realpath(mask["path"])
+                        if (
+                            abs_path == masks_dir_real
+                            or abs_path.startswith(masks_dir_real + os.sep)
+                        ):
+                            mask_bytes = _read_mask_bytes(abs_path)
+                            if mask_bytes is not None:
+                                return Response(
+                                    mask_bytes, mimetype="image/png",
+                                )
         return "", 404
 
     @app.route("/api/photos/<int:pid>/masks")
@@ -31947,22 +32241,24 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         """
         if not _MASK_VARIANT_RE.match(variant):
             return "", 404
-        db = _get_db()
-        mask = db.get_photo_mask(pid, variant)
-        if mask is None or not mask.get("path"):
-            return "", 404
-        masks_dir = os.path.realpath(
-            os.path.join(os.path.dirname(db_path), "masks")
-        )
-        abs_path = os.path.realpath(mask["path"])
-        if not (abs_path == masks_dir
-                or abs_path.startswith(masks_dir + os.sep)):
-            return "", 404
-        if not os.path.isfile(abs_path):
-            return "", 404
-        return send_from_directory(
-            masks_dir, os.path.relpath(abs_path, masks_dir)
-        )
+        for _attempt in range(3):
+            db = _get_db()
+            mask = db.get_photo_mask(pid, variant)
+            if mask is None or not mask.get("path"):
+                return "", 404
+            masks_dir = os.path.realpath(
+                os.path.join(os.path.dirname(db_path), "masks")
+            )
+            abs_path = os.path.realpath(mask["path"])
+            if not (abs_path == masks_dir
+                    or abs_path.startswith(masks_dir + os.sep)):
+                return "", 404
+            mask_bytes = _read_mask_bytes(abs_path)
+            if mask_bytes is not None:
+                # Response owns the bytes, so cleanup after open cannot turn
+                # this request into a transient 404 or truncated stream.
+                return Response(mask_bytes, mimetype="image/png")
+        return "", 404
 
     @app.route("/api/pipeline/reflow", methods=["POST"])
     def api_pipeline_reflow():

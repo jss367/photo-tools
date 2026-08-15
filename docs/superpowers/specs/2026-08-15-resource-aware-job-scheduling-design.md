@@ -282,9 +282,17 @@ interactive reserve. The initial policy is:
 
 ```text
 physical_cores = platform physical-core count, falling back to os.cpu_count()
+# Both detections can report nothing (os.cpu_count() returns None on some
+# platforms), so normalize to a positive value before the arithmetic below —
+# otherwise ceil(None * 0.20) raises at startup.
+physical_cores = max(1, physical_cores or 1)
 interactive_reserve = max(2, ceil(physical_cores * 0.20))
 cpu_capacity = max(1, physical_cores - interactive_reserve)
 ```
+
+The unavailable-core-count path is a required test case: with both detections
+returning nothing, capacity must resolve to the single-permit floor rather than
+raising.
 
 On the observed 16-core system, the background capacity would be 12 permits.
 This is a starting policy to benchmark, not a promise that every permit has
@@ -854,8 +862,11 @@ local-SSD and SMB/NAS fixtures:
    reserve.
 3. Cached API requests used by navigation and the Jobs panel have p95 latency
    below 500 ms during sustained processing on the reference 16-core system.
-4. Identical label-embedding requests execute the encoder once and publish one
-   valid cache entry under forced races and cancellation.
+4. Identical label-embedding requests keep at most one active encoder producer
+   per request key and converge on exactly one valid durable cache entry under
+   forced races and cancellation. A retry after producer cancellation or
+   failure may run the encoder again — that is the deliberate consequence of
+   the failure contract above, not a violation of this criterion.
 5. Two overlapping pipelines execute each identical detector/runtime/photo
    computation at most once while still running distinct classifier identities.
 6. Peak resident memory for the observed overlapping BioCLIP scenario is

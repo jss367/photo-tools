@@ -7,6 +7,36 @@ from classifier_cache import acquire_cached_classifier
 from model_cache import reset_default_cache_for_tests
 
 
+def _callee_name(node):
+    """Return the called name for ``f(...)`` and ``mod.f(...)`` alike."""
+    func = node.func
+    if isinstance(func, ast.Name):
+        return func.id
+    if isinstance(func, ast.Attribute):
+        return func.attr
+    return None
+
+
+def _factory_arguments(tree):
+    """Collect every AST node passed as ``factory=`` to the cache acquirer.
+
+    Only calls whose callee is ``acquire_cached_classifier`` count. A
+    ``factory=`` keyword on some unrelated call does not satisfy the
+    contract, so an inline ``Classifier(...)`` cannot be laundered through a
+    lookalike helper.
+    """
+    factories = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        if _callee_name(node) != "acquire_cached_classifier":
+            continue
+        for keyword in node.keywords:
+            if keyword.arg == "factory":
+                factories.append(keyword.value)
+    return factories
+
+
 def test_production_classifier_calls_are_cache_factories():
     vireo_dir = Path(__file__).resolve().parents[1]
     violations = []
@@ -18,6 +48,16 @@ def test_production_classifier_calls_are_cache_factories():
             for child in ast.iter_child_nodes(node):
                 parents[child] = node
 
+        factories = _factory_arguments(tree)
+        # Lambdas are matched by identity; named functions by the name the
+        # acquirer was actually handed.
+        factory_lambdas = {
+            id(value) for value in factories if isinstance(value, ast.Lambda)
+        }
+        factory_names = {
+            value.id for value in factories if isinstance(value, ast.Name)
+        }
+
         for node in ast.walk(tree):
             if not (
                 isinstance(node, ast.Call)
@@ -28,18 +68,13 @@ def test_production_classifier_calls_are_cache_factories():
             current = parents.get(node)
             routed = False
             while current is not None:
-                if (
-                    isinstance(current, ast.FunctionDef)
-                    and current.name == "_construct_classifier"
-                ):
-                    routed = True
+                if isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    # A def only counts when this module hands that exact name
+                    # to acquire_cached_classifier as its factory.
+                    routed = current.name in factory_names
                     break
                 if isinstance(current, ast.Lambda):
-                    parent = parents.get(current)
-                    routed = (
-                        isinstance(parent, ast.keyword)
-                        and parent.arg == "factory"
-                    )
+                    routed = id(current) in factory_lambdas
                     break
                 current = parents.get(current)
             if not routed:
@@ -49,6 +84,36 @@ def test_production_classifier_calls_are_cache_factories():
         "Classifier construction must be a factory passed to "
         f"acquire_cached_classifier: {', '.join(violations)}"
     )
+
+
+def test_contract_rejects_a_factory_keyword_on_an_unrelated_call():
+    """The scan must not accept any function merely named
+    ``_construct_classifier``, nor any ``factory=`` keyword on some other
+    call. Both were previously enough to pass."""
+    source = """
+def _construct_classifier():
+    return Classifier(labels=[])
+
+some_other_helper(factory=lambda: Classifier(labels=[]))
+"""
+    tree = ast.parse(source)
+    assert _factory_arguments(tree) == []
+
+
+def test_contract_accepts_named_and_lambda_factories_on_the_acquirer():
+    source = """
+def _construct_classifier():
+    return Classifier(labels=[])
+
+acquire_cached_classifier(model_str="m", factory=_construct_classifier)
+acquire_cached_classifier(model_str="m", factory=lambda: Classifier(labels=[]))
+"""
+    tree = ast.parse(source)
+    factories = _factory_arguments(tree)
+    assert len(factories) == 2
+    assert isinstance(factories[0], ast.Name)
+    assert factories[0].id == "_construct_classifier"
+    assert isinstance(factories[1], ast.Lambda)
 
 
 def test_shared_classifier_cache_preserves_authoritative_label_order(tmp_path):

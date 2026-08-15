@@ -9144,6 +9144,68 @@ def test_extract_masks_rolls_back_failed_photo_before_continuing(
     assert "1 failed" in final["summary"]
 
 
+def test_extract_masks_rolls_back_all_photo_writes_when_embeddings_fail(
+    tmp_path, monkeypatch,
+):
+    """Mask rows and derived fields commit atomically with embeddings."""
+    from db import Database
+
+    real_update = Database.update_photo_embeddings
+    attempts = 0
+
+    def fail_first_embedding_update(self, *args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise sqlite3.OperationalError("embedding write failed")
+        return real_update(self, *args, **kwargs)
+
+    monkeypatch.setattr(
+        Database, "update_photo_embeddings", fail_first_embedding_update,
+    )
+    runner = FakeRunner()
+    with pytest.raises(RuntimeError, match="1 of 2 photos failed"):
+        _run_extract_masks_for_test(
+            tmp_path,
+            monkeypatch,
+            "tiny",
+            [
+                {"filename": "first.jpg", "box": (0.1, 0.1, 0.5, 0.5),
+                 "model": "MegaDetector"},
+                {"filename": "second.jpg", "box": (0.1, 0.1, 0.5, 0.5),
+                 "model": "MegaDetector"},
+            ],
+            runner=runner,
+        )
+
+    db = Database(str(tmp_path / "test.db"))
+    rows = db.conn.execute(
+        "SELECT p.id, p.mask_path, p.active_mask_variant, pm.photo_id "
+        "FROM photos p LEFT JOIN photo_masks pm ON pm.photo_id = p.id "
+        "ORDER BY p.id",
+    ).fetchall()
+    assert rows[0]["photo_id"] is None
+    assert rows[0]["mask_path"] is None
+    assert rows[0]["active_mask_variant"] is None
+    assert rows[1]["photo_id"] == rows[1]["id"]
+    assert rows[1]["mask_path"] is not None
+
+
+def test_extract_masks_aborts_when_rollback_fails():
+    """A broken reused connection must not be carried to later photos."""
+    import pipeline_job as pj
+
+    class BrokenConnection:
+        def rollback(self):
+            raise sqlite3.OperationalError("cannot roll back")
+
+    class BrokenDatabase:
+        conn = BrokenConnection()
+
+    with pytest.raises(RuntimeError, match="rollback failed for photo 42"):
+        pj._rollback_failed_mask_photo(BrokenDatabase(), 42)
+
+
 def test_extract_masks_pause_waits_outside_photo_lock(tmp_path, monkeypatch):
     """Pause may be requested under a photo lock but must wait after release."""
     import pipeline_job as pj

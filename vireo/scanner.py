@@ -3,6 +3,7 @@
 import contextlib
 import errno
 import hashlib
+import inspect
 import json
 import logging
 import multiprocessing
@@ -42,6 +43,55 @@ EMPTY_FILE_SHA256 = hashlib.sha256(b"").hexdigest()
 
 class ScanCancelled(RuntimeError):
     """Raised when a caller cancels scanner.scan via cancel_check."""
+
+
+def _status_callback_supports_phase(status_callback):
+    """Return whether a callback binds the scanner's phase keyword fields."""
+    if status_callback is None:
+        return False
+    try:
+        signature = inspect.signature(status_callback)
+    except (TypeError, ValueError):
+        # Opaque extension callables cannot be checked without invoking them.
+        # Prefer the current rich contract; any callback error must propagate
+        # rather than being mistaken for a legacy signature and retried.
+        return True
+    try:
+        signature.bind(
+            "",
+            phase_current=0,
+            phase_total=1,
+            phase_label="phase",
+        )
+    except TypeError:
+        return False
+    return True
+
+
+def _call_status_callback(
+    status_callback, message, *, phase_current=None, phase_total=None,
+    phase_label=None, supports_phase=None,
+):
+    """Invoke a status callback once using its prevalidated argument shape."""
+    has_phase = (
+        phase_current is not None
+        or phase_total is not None
+        or phase_label is not None
+    )
+    if not has_phase:
+        status_callback(message)
+        return
+    if supports_phase is None:
+        supports_phase = _status_callback_supports_phase(status_callback)
+    if supports_phase:
+        status_callback(
+            message,
+            phase_current=phase_current,
+            phase_total=phase_total,
+            phase_label=phase_label,
+        )
+    else:
+        status_callback(message)
 
 
 # scan() runs inside JobRunner/pipeline_job background threads, so the
@@ -1187,26 +1237,25 @@ def _extract_working_copies(db, vireo_dir, progress_callback=None,
         return
 
     total = len(rows)
+    status_supports_phase = _status_callback_supports_phase(status_callback)
 
     def _emit_working_copy_progress(current):
         """Publish the secondary working-copy phase without replacing scan progress."""
+        unit = "working copy" if total == 1 else "working copies"
         message = (
             f"Generating working copies: {current:,} of {total:,}"
             if current
-            else f"Generating {total:,} working copies..."
+            else f"Generating {total:,} {unit}..."
         )
         if status_callback:
-            try:
-                status_callback(
-                    message,
-                    phase_current=current,
-                    phase_total=total,
-                    phase_label="Generating working copies",
-                )
-            except TypeError:
-                # Utility callers and older tests may still provide the
-                # original one-argument status callback.
-                status_callback(message)
+            _call_status_callback(
+                status_callback,
+                message,
+                phase_current=current,
+                phase_total=total,
+                phase_label="Generating working copies",
+                supports_phase=status_supports_phase,
+            )
         if progress_callback is not None and current:
             progress_callback(current, total)
 
@@ -1613,6 +1662,7 @@ def scan(root, db, progress_callback=None, incremental=False, extract_full_metad
     # exception) or a fresh one; either way start from a known shape.
     counts = {} if counts is None else counts
     counts.update(_EMPTY_SCAN_COUNTS)
+    status_supports_phase = _status_callback_supports_phase(status_callback)
     root_path = Path(root)
     # Don't open the root at all if the root is, or sits inside, an
     # other-app data bundle. prune_scan_dirs below only filters
@@ -1645,20 +1695,14 @@ def scan(root, db, progress_callback=None, incremental=False, extract_full_metad
     def _emit_status(message, phase_current=None, phase_total=None, phase_label=None):
         if not status_callback:
             return
-        if phase_current is None and phase_total is None and phase_label is None:
-            status_callback(message)
-            return
-        try:
-            status_callback(
-                message,
-                phase_current=phase_current,
-                phase_total=phase_total,
-                phase_label=phase_label,
-            )
-        except TypeError:
-            # Keep compatibility with older one-argument callbacks in tests and
-            # utility callers.
-            status_callback(message)
+        _call_status_callback(
+            status_callback,
+            message,
+            phase_current=phase_current,
+            phase_total=phase_total,
+            phase_label=phase_label,
+            supports_phase=status_supports_phase,
+        )
 
     # Discover all image files (incremental enumeration for progress reporting)
     log.info("Discovering files in %s ...", root)

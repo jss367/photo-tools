@@ -1983,7 +1983,49 @@ def test_scan_reports_working_copy_as_counted_subphase(tmp_path, monkeypatch):
     ]
     assert [event[1]["phase_current"] for event in working_copy_events] == [0, 1]
     assert all(event[1]["phase_total"] == 1 for event in working_copy_events)
+    assert working_copy_events[0][0] == "Generating 1 working copy..."
     assert working_copy_events[-1][0] == "Generating working copies: 1 of 1"
+
+
+def test_phase_status_callback_internal_typeerror_is_not_retried():
+    """A callback implementation error is not a legacy-signature signal."""
+    import scanner
+
+    calls = []
+
+    def failing_callback(message, **phase):
+        calls.append((message, phase))
+        raise TypeError("callback implementation failed")
+
+    with pytest.raises(TypeError, match="callback implementation failed"):
+        scanner._call_status_callback(
+            failing_callback,
+            "Generating",
+            phase_current=0,
+            phase_total=1,
+            phase_label="Generating working copies",
+        )
+    assert len(calls) == 1
+
+
+def test_phase_status_callback_detects_legacy_one_argument_shape():
+    """Legacy scanner callbacks remain supported without exception probing."""
+    import scanner
+
+    calls = []
+
+    def legacy_callback(message):
+        calls.append(message)
+
+    assert scanner._status_callback_supports_phase(legacy_callback) is False
+    scanner._call_status_callback(
+        legacy_callback,
+        "Generating",
+        phase_current=0,
+        phase_total=1,
+        phase_label="Generating working copies",
+    )
+    assert calls == ["Generating"]
 
 
 def test_scan_skips_working_copy_for_jpeg(tmp_path, monkeypatch):

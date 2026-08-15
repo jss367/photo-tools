@@ -64,6 +64,17 @@ _SENTINEL = object()  # unique end-of-stream marker
 _MAX_SOURCE_OFFLINE_PAUSES = 3
 
 
+def _rollback_failed_mask_photo(thread_db, photo_id):
+    """Reset the reused mask-stage connection or abort if it cannot recover."""
+    try:
+        thread_db.conn.rollback()
+    except Exception as exc:
+        log.exception("Mask extraction rollback failed for photo %s", photo_id)
+        raise RuntimeError(
+            f"Mask extraction rollback failed for photo {photo_id}"
+        ) from exc
+
+
 def _archive_mount_root_candidates(path: str) -> list[str]:
     """Return the plausible mount-root prefix(es) for ``path``, if any.
 
@@ -6909,9 +6920,10 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                                 subject_tenengrad=mask_subject_tenengrad,
                                 bg_tenengrad=mask_bg_tenengrad,
                                 crop_complete=completeness,
+                                _commit=False,
                             )
                             thread_db.set_active_mask_variant(
-                                photo_id, sam2_variant,
+                                photo_id, sam2_variant, _commit=False,
                             )
                             # Remaining (non-mask) per-photo features still land
                             # on the photos row.  mask_path / crop_complete /
@@ -6920,14 +6932,20 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                             # intentionally NOT passed here.
                             if features:
                                 thread_db.update_photo_pipeline_features(
-                                    photo_id, **features,
+                                    photo_id, **features, _commit=False,
                                 )
                             thread_db.update_photo_embeddings(
                                 photo_id,
                                 dino_subject_embedding=subj_emb_blob,
                                 dino_global_embedding=global_emb_blob,
                                 variant=dinov2_variant,
+                                _commit=False,
                             )
+                            # Publish the mask row, active denormalized fields,
+                            # quality features, and embeddings as one unit. A
+                            # later failure must not leave a cache-valid mask
+                            # paired with stale or absent feature data.
+                            commit_with_retry(thread_db.conn)
                             masked += 1
                     except Exception:
                         em_failed += 1
@@ -6937,8 +6955,7 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                         # photo fails immediately with the same ``database is
                         # locked`` error even after the competing writer has
                         # moved on.
-                        with contextlib.suppress(Exception):
-                            thread_db.conn.rollback()
+                        _rollback_failed_mask_photo(thread_db, photo_id)
 
                     processed = i + 1
                     stages["extract_masks"]["count"] = processed

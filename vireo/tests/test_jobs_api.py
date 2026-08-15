@@ -5947,6 +5947,40 @@ def test_import_in_place_aggregates_working_copy_phase_across_sources(
     assert scan_step["progress"] == {"current": 2, "total": 2}
 
 
+def test_import_in_place_omits_source_that_vanishes_during_scan(
+    app_and_db, tmp_path, monkeypatch,
+):
+    """A disappeared root cannot poison deferred working-copy retries."""
+    import scanner
+
+    app, _ = app_and_db
+    source = tmp_path / "vanishing-card"
+    source.mkdir()
+    extractor_calls = []
+
+    def fake_scan(_root, _db, **_kwargs):
+        source.rmdir()
+        return {"discovered": 0, "indexed": 0}
+
+    monkeypatch.setattr(scanner, "scan", fake_scan)
+    monkeypatch.setattr(
+        scanner,
+        "_extract_working_copies",
+        lambda *args, **kwargs: extractor_calls.append((args, kwargs)),
+    )
+
+    client = app.test_client()
+    resp = client.post("/api/jobs/import-in-place", json={
+        "sources": [str(source)],
+        "after_import": None,
+    })
+    assert resp.status_code == 200, resp.get_json()
+    job = wait_for_job_via_client(client, resp.get_json()["job_id"])
+
+    assert job["status"] == "completed", job
+    assert extractor_calls == []
+
+
 def test_import_in_place_metadata_phase_does_not_override_step_progress(
     app_and_db, tmp_path, monkeypatch,
 ):

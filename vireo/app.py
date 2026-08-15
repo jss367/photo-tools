@@ -26603,16 +26603,6 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     "phase": phase,
                 })
                 try:
-                    if restricted_dirs is not None:
-                        working_copy_scope.extend(
-                            (directory, "exact")
-                            for directory in restricted_dirs
-                            if not is_excluded_scan_path(Path(directory))
-                        )
-                    elif not recursive:
-                        working_copy_scope.append((source, "exact"))
-                    else:
-                        working_copy_scope.append(source)
                     do_scan(
                         source, thread_db,
                         progress_callback=progress_cb,
@@ -26636,6 +26626,27 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                             snapshot_paths_by_root is None
                         ),
                     )
+                    # Retain extraction scope only after the scan returns and
+                    # only while its paths are still valid. A selected volume
+                    # can disappear after request validation; handing that
+                    # stale scope to the deferred extractor would mark every
+                    # pre-existing RAW row as failed for 24 hours.
+                    if restricted_dirs is not None:
+                        working_copy_scope.extend(
+                            (directory, "exact")
+                            for directory in restricted_dirs
+                            if (
+                                not is_excluded_scan_path(Path(directory))
+                                and os.path.isdir(directory)
+                            )
+                        )
+                    elif (
+                        not is_excluded_scan_path(Path(source))
+                        and os.path.isdir(source)
+                    ):
+                        working_copy_scope.append(
+                            (source, "exact") if not recursive else source
+                        )
                 except Exception as exc:
                     if isinstance(exc, ScanCancelled) and cancel_check():
                         cancelled = True

@@ -130,8 +130,24 @@ class _StagedMaskFile:
     def restore(self):
         """Discard a generation whose database transaction did not commit."""
         if self.installed:
-            with contextlib.suppress(FileNotFoundError):
+            # The published path is uniquely suffixed (.generation-<uuid>.png)
+            # and no committed row references it, so an unlink failure here —
+            # e.g. an antivirus scanner holding the fresh PNG open on Windows —
+            # is equivalent to a mid-write process interruption: the file is
+            # left as unreferenced disk garbage rather than propagating and
+            # marking the entire extract-masks stage fatal for every remaining
+            # photo. Log so the leftover is discoverable.
+            try:
                 os.unlink(self.final_path)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                log.warning(
+                    "Failed to unlink rolled-back mask generation %s; "
+                    "leaving unreferenced file in place",
+                    self.final_path,
+                    exc_info=True,
+                )
         self.installed = False
         self._cleanup()
 

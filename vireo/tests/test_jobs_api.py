@@ -5981,6 +5981,62 @@ def test_import_in_place_omits_source_that_vanishes_during_scan(
     assert extractor_calls == []
 
 
+def test_import_in_place_revalidates_scope_after_all_scans(
+    app_and_db, tmp_path, monkeypatch,
+):
+    """A source removed between its scan and the deferred extract is dropped.
+
+    The per-source guard only fires immediately after each scan returns, but
+    the aggregate ``_extract_working_copies`` pass runs after every source
+    scans. A removable source (card, network share) can therefore vanish AFTER
+    its own scan succeeded and before extraction begins; without a
+    revalidation pass the extractor would follow the stale scope, fail every
+    pre-existing RAW row's read, and stamp ``working_copy_failed_at`` markers
+    that suppress retries for 24 hours after the volume is remounted.
+    """
+    from pathlib import Path
+
+    import scanner
+
+    app, _ = app_and_db
+    source_a = tmp_path / "vanishing-card"
+    source_a.mkdir()
+    source_b = tmp_path / "still-here"
+    source_b.mkdir()
+
+    def fake_scan(root, _db, **_kwargs):
+        # Source A stays present through its own scan (so it clears the
+        # per-source guard) and only disappears while source B is scanning.
+        if Path(root) == source_b and source_a.exists():
+            source_a.rmdir()
+        return {"discovered": 0, "indexed": 0}
+
+    captured_scopes = []
+
+    def fake_extract(_db, _vireo_dir, *, scope=None, **_kwargs):
+        captured_scopes.append(list(scope))
+
+    monkeypatch.setattr(scanner, "scan", fake_scan)
+    monkeypatch.setattr(scanner, "_extract_working_copies", fake_extract)
+
+    client = app.test_client()
+    resp = client.post("/api/jobs/import-in-place", json={
+        "sources": [str(source_a), str(source_b)],
+        "after_import": None,
+    })
+    assert resp.status_code == 200, resp.get_json()
+    job = wait_for_job_via_client(client, resp.get_json()["job_id"])
+
+    assert job["status"] == "completed", job
+    assert len(captured_scopes) == 1, captured_scopes
+    passed = {
+        entry if isinstance(entry, str) else entry[0]
+        for entry in captured_scopes[0]
+    }
+    assert str(source_a) not in passed
+    assert str(source_b) in passed
+
+
 def test_import_in_place_metadata_phase_does_not_override_step_progress(
     app_and_db, tmp_path, monkeypatch,
 ):

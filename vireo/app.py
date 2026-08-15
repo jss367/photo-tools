@@ -26687,22 +26687,51 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     advance_scan_acc()
 
             if not cancelled and working_copy_scope:
-                try:
-                    _extract_working_copies(
-                        thread_db,
-                        vireo_dir,
-                        status_callback=status_cb,
-                        scope=working_copy_scope,
-                        cancel_check=cancel_check,
-                    )
-                except Exception as exc:
-                    log.exception(
-                        "In-place import working-copy generation failed",
-                    )
-                    msg = f"[working copies] {exc}"
-                    root_errors.append(msg)
-                    if msg not in job["errors"]:
-                        job["errors"].append(msg)
+                # A removable source can disappear after its scan succeeded
+                # but before the aggregate extract pass runs (later sources
+                # were still scanning, or a card was pulled between the loop
+                # ending and this call). Revalidate every retained scope
+                # entry now so the extractor never reads a vanished volume
+                # and stamps 24h ``working_copy_failed_at`` markers on its
+                # pre-existing catalog rows.
+                revalidated_scope = []
+                for entry in working_copy_scope:
+                    if isinstance(entry, tuple):
+                        path = entry[0]
+                    else:
+                        path = entry
+                    try:
+                        still_available = (
+                            not is_excluded_scan_path(Path(path))
+                            and os.path.isdir(path)
+                        )
+                    except OSError:
+                        still_available = False
+                    if still_available:
+                        revalidated_scope.append(entry)
+                    else:
+                        log.info(
+                            "Skipping deferred working-copy scope %s: no "
+                            "longer present or excluded",
+                            path,
+                        )
+                if revalidated_scope:
+                    try:
+                        _extract_working_copies(
+                            thread_db,
+                            vireo_dir,
+                            status_callback=status_cb,
+                            scope=revalidated_scope,
+                            cancel_check=cancel_check,
+                        )
+                    except Exception as exc:
+                        log.exception(
+                            "In-place import working-copy generation failed",
+                        )
+                        msg = f"[working copies] {exc}"
+                        root_errors.append(msg)
+                        if msg not in job["errors"]:
+                            job["errors"].append(msg)
 
             if snapshot_paths is not None:
                 # Pairing can fold a newly scanned JPEG into an existing RAW

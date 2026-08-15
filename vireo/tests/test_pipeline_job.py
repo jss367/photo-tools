@@ -9298,6 +9298,53 @@ def test_staged_mask_never_removes_deterministic_standalone_path(tmp_path):
         assert handle.read() == b"pipeline mask"
 
 
+def test_staged_mask_restore_swallows_unlink_oserror(tmp_path, monkeypatch):
+    """restore()'s cleanup unlink cannot abort the whole extract-masks stage.
+
+    The published path is uniquely suffixed and no committed row references it
+    once the transaction rolled back, so an ``OSError`` here — e.g. an
+    antivirus scanner briefly holding the fresh PNG open on Windows — must be
+    swallowed. If it escaped through the per-photo ``finally``, the outer
+    exception handler would mark the entire stage fatal and skip every
+    remaining photo even though the database was rolled back cleanly.
+    """
+    import pipeline_job as pj
+
+    masks_dir = tmp_path / "masks"
+    masks_dir.mkdir()
+
+    def fake_save(_mask, stage_dir, photo_id, variant):
+        staged_path = os.path.join(stage_dir, f"{photo_id}.{variant}.png")
+        with open(staged_path, "wb") as handle:
+            handle.write(b"new mask")
+        return staged_path
+
+    staged = pj._StagedMaskFile.create(
+        None, str(masks_dir), 42, "tiny", fake_save,
+    )
+    staged.install()
+    assert os.path.exists(staged.final_path)
+
+    real_unlink = pj.os.unlink
+
+    def refuse_final_unlink(path):
+        if path == staged.final_path:
+            raise PermissionError(
+                "simulated antivirus lock on rolled-back mask generation"
+            )
+        return real_unlink(path)
+
+    monkeypatch.setattr(pj.os, "unlink", refuse_final_unlink)
+
+    staged.restore()
+
+    # Rollback survived the cleanup failure; the unreferenced generation is
+    # left behind (same outcome as a mid-write process interruption).
+    assert os.path.exists(staged.final_path)
+    assert not staged.installed
+    assert not list(masks_dir.glob(".mask-stage-*"))
+
+
 def test_extract_masks_aborts_when_rollback_fails():
     """A broken reused connection must not be carried to later photos."""
     import pipeline_job as pj

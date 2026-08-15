@@ -26840,6 +26840,25 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     "phase_label": None,
                 })
                 try:
+                    # Discovery freezes pathnames, not the storage instance
+                    # behind them. A removable card or network mount can be
+                    # detached and replaced at the same path while later
+                    # sources are still being discovered; replaying the old
+                    # manifest against that replacement could catalog the
+                    # wrong card's same-named files. Revalidate the source
+                    # mount and directory identity immediately before scan.
+                    source_key = str(Path(source))
+                    detached_source = _unmounted_since_baseline(
+                        source_mount_baselines.get(source_key, {}),
+                    )
+                    changed_source = _changed_mount_since_baseline(
+                        source_mount_identities.get(source_key, {}),
+                    )
+                    if detached_source or changed_source:
+                        changed_path = detached_source or changed_source
+                        raise OSError(
+                            f"source changed after discovery: {changed_path}"
+                        )
                     do_scan(
                         source, thread_db,
                         progress_callback=progress_cb,

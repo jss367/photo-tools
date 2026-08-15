@@ -6064,6 +6064,58 @@ def test_import_in_place_reports_error_when_source_vanishes_after_discovery(
     currents = [data["current"] for data in overall]
     assert currents == sorted(currents)
     assert currents[-1] == 3, currents
+
+
+def test_import_in_place_rejects_replaced_source_before_manifest_replay(
+    app_and_db, tmp_path, monkeypatch,
+):
+    """A frozen manifest must stay bound to the discovered storage instance."""
+    import pipeline_job
+    import scanner
+
+    app, db = app_and_db
+    first = tmp_path / "first"
+    replaced = tmp_path / "replaced"
+    first.mkdir()
+    replaced.mkdir()
+    Image.new("RGB", (16, 16), "red").save(first / "one.jpg")
+    Image.new("RGB", (16, 16), "blue").save(replaced / "same-name.jpg")
+    scanned = []
+    real_scan = scanner.scan
+
+    def recording_scan(root, *args, **kwargs):
+        scanned.append(root)
+        return real_scan(root, *args, **kwargs)
+
+    monkeypatch.setattr(scanner, "scan", recording_scan)
+    monkeypatch.setattr(
+        pipeline_job,
+        "_changed_mount_since_baseline",
+        lambda identities: str(replaced) if str(replaced) in identities else None,
+    )
+
+    with app.test_client() as client:
+        resp = client.post("/api/jobs/import-in-place", json={
+            "sources": [str(first), str(replaced)],
+            "after_import": None,
+        })
+        assert resp.status_code == 200, resp.get_json()
+        job = wait_for_job_via_client(client, resp.get_json()["job_id"])
+
+    assert job["status"] == "failed", job
+    assert scanned == [str(first)]
+    assert any(
+        "source changed after discovery" in error
+        for error in job["result"]["errors"]
+    )
+    filenames = {
+        row["filename"]
+        for row in db.conn.execute("SELECT filename FROM photos")
+    }
+    assert "one.jpg" in filenames
+    assert "same-name.jpg" not in filenames
+
+
 def test_import_in_place_reports_working_copy_phase(app_and_db, tmp_path, monkeypatch):
     """A completed file scan must not hide ongoing RAW working-copy work."""
     import scanner
@@ -6238,6 +6290,14 @@ def test_import_in_place_rejects_detached_persistent_mount_stub(
     source = tmp_path / "persistent-mountpoint"
     source.mkdir()
     extractor_calls = []
+    unmounted_calls = 0
+
+    def detach_after_scan(baseline):
+        nonlocal unmounted_calls
+        if not baseline:
+            return None
+        unmounted_calls += 1
+        return "/mnt/card" if unmounted_calls > 1 else None
 
     monkeypatch.setattr(
         pipeline_job, "_load_known_mount_roots", lambda _db: set(),
@@ -6256,7 +6316,7 @@ def test_import_in_place_rejects_detached_persistent_mount_stub(
     )
     monkeypatch.setattr(
         pipeline_job, "_unmounted_since_baseline",
-        lambda baseline: "/mnt/card" if baseline else None,
+        detach_after_scan,
     )
     monkeypatch.setattr(
         pipeline_job, "_changed_mount_since_baseline",
@@ -6295,6 +6355,14 @@ def test_import_in_place_rejects_detached_then_remounted_source(
     source = tmp_path / "remounted-source"
     source.mkdir()
     extractor_calls = []
+    identity_checks = 0
+
+    def remount_after_scan(identities):
+        nonlocal identity_checks
+        if not identities:
+            return None
+        identity_checks += 1
+        return "/mnt/card" if identity_checks > 1 else None
 
     monkeypatch.setattr(
         pipeline_job, "_load_known_mount_roots", lambda _db: set(),
@@ -6316,7 +6384,7 @@ def test_import_in_place_rejects_detached_then_remounted_source(
     )
     monkeypatch.setattr(
         pipeline_job, "_changed_mount_since_baseline",
-        lambda identities: "/mnt/card" if identities else None,
+        remount_after_scan,
     )
     monkeypatch.setattr(
         scanner, "scan",
@@ -6352,6 +6420,7 @@ def test_import_in_place_rejects_replaced_local_source(
     source.mkdir()
     extractor_calls = []
     identities = iter([
+        ("stat", 1, 100),
         ("stat", 1, 100),
         ("stat", 1, 200),
     ])

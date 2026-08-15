@@ -1643,7 +1643,7 @@ def test_unreadable_source_subtree_flips_safe_to_format_off(
     import image_loader
     real_walk = image_loader.safe_scan_walk
 
-    def broken_walk(top, onerror=None):
+    def broken_walk(top, onerror=None, cancel_check=None):
         # Simulate a PermissionError bubbling up from os.scandir on the
         # source root; safe_scan_walk's OSError branch would forward it
         # via onerror and yield nothing further.
@@ -1651,7 +1651,11 @@ def test_unreadable_source_subtree_flips_safe_to_format_off(
             onerror(PermissionError(13, "Operation not permitted", str(top)))
         # Still yield everything real_walk would have produced so we can
         # verify the ledger is unsafe even when copies still landed.
-        yield from real_walk(top, onerror=onerror)
+        yield from real_walk(
+            top,
+            onerror=onerror,
+            cancel_check=cancel_check,
+        )
 
     monkeypatch.setattr("ingest.safe_scan_walk", broken_walk)
 

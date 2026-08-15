@@ -21060,16 +21060,19 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 and active_model.get("model_type", "bioclip") != "timm"
             ):
                 try:
-                    from classifier import _embedding_cache_path, _resolve_model_dir
+                    from classifier import _embedding_is_cached, _resolve_model_dir
 
                     labels = read_label_file(labels_path)
                     model_dir = _resolve_model_dir(
                         active_model["model_str"], active_model.get("weights_path")
                     )
-                    cache_path = _embedding_cache_path(
+                    # Use the shared helper: it validates payload shape and
+                    # dtype rather than accepting any file at the identity
+                    # path, so a truncated or wrong-shape cache no longer
+                    # reports as ready here.
+                    if not _embedding_is_cached(
                         labels, active_model["model_str"], model_dir
-                    )
-                    if not os.path.exists(cache_path):
+                    ):
                         precompute = {
                             "model_id": active_model["id"],
                             "model_name": active_model["name"],

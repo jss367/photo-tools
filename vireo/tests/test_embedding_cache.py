@@ -65,10 +65,14 @@ def test_complete_identity_changes_with_each_text_side_input(tmp_path):
     assert baseline != identity_digest(build(labels=["Cat", "bird"]))
     assert baseline != identity_digest(build(prompt_template_identity="prompts-b"))
     assert baseline != identity_digest(build(tokenizer_context_length=76))
+    assert baseline != identity_digest(build(model_str="model-b"))
 
     (model_dir / "tokenizer.json").write_bytes(b"tokenizer-b")
     assert baseline != identity_digest(build())
     (model_dir / "tokenizer.json").write_bytes(b"tokenizer-a")
+    (model_dir / "text_encoder.onnx").write_bytes(b"weights-b")
+    assert baseline != identity_digest(build())
+    (model_dir / "text_encoder.onnx").write_bytes(b"weights-a")
     (model_dir / "text_encoder.onnx.data").write_bytes(b"external-b")
     assert baseline != identity_digest(build())
 

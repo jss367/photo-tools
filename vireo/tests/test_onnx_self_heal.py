@@ -590,7 +590,11 @@ def test_image_heal_invalidates_stale_text_embedding_cache(tmp_path, monkeypatch
         (model_dir / "image_encoder.onnx").write_bytes(b"fresh img")
         (model_dir / "text_encoder.onnx").write_bytes(b"fresh txt")
 
-    fresh_embeddings = np.zeros((512, 1), dtype=np.float32)
+    # A distinctive value distinguishes the recomputed payload from an
+    # uninitialised buffer.  The embedding cache round-trips through disk,
+    # so ``clf._txt_embeddings`` is a newly loaded array — not the exact
+    # fixture object — but its values must equal what compute returned.
+    fresh_embeddings = np.full((512, 1), 0.25, dtype=np.float32)
     fake_tokenizer = MagicMock()
 
     class FakeEncoding:
@@ -619,8 +623,7 @@ def test_image_heal_invalidates_stale_text_embedding_cache(tmp_path, monkeypatch
         )
 
     # Cache was invalidated and re-computed; the classifier must hold
-    # the fresh embeddings, not the pre-seeded stale ones.
-    assert clf._txt_embeddings is fresh_embeddings or (
-        clf._txt_embeddings.shape == fresh_embeddings.shape
-        and not np.allclose(clf._txt_embeddings, stale_embeddings)
-    ), "stale cached embeddings must not survive an image-side self-heal"
+    # the fresh embeddings exactly, not the pre-seeded stale ones.
+    assert np.array_equal(clf._txt_embeddings, fresh_embeddings), (
+        "classifier must hold the recomputed embeddings, not the stale cache"
+    )

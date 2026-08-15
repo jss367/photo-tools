@@ -228,6 +228,13 @@ class EmbeddingCache:
         return cache_path(self.cache_dir, identity)
 
     def is_cached(self, identity, label_count, embedding_dim=None):
+        """Return whether a valid payload for ``identity`` is on disk.
+
+        Side effect: an unreadable or malformed payload is unlinked as part
+        of the underlying ``_load`` call so subsequent producers do not keep
+        re-hitting the same corrupt file.  Callers on the readiness path
+        therefore repair the cache on the fly.
+        """
         try:
             self._load(
                 identity_digest(identity), label_count,

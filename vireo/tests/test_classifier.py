@@ -660,17 +660,32 @@ class TestEmbeddingCache:
 
 class TestEmbeddingPrecompute:
     def test_precompute_loads_only_text_encoder(self, tmp_path):
-        from classifier import precompute_label_embeddings
+        from classifier import _embedding_cache_path, precompute_label_embeddings
 
         model_dir = _make_model_dir(tmp_path)
         text_session = _make_fake_text_session()
-        tokenizer = _make_fake_tokenizer()
+        # One encoding per input label exercises the intended (num_labels,
+        # context_length) batch shape rather than the tokenizer's default
+        # 5-row fixture — which would leave 75 rows zero-filled in the
+        # 80-row _tokenize() batch used by _compute_embeddings_with_progress.
+        tokenizer = MagicMock()
+
+        class FakeEncoding:
+            def __init__(self):
+                self.ids = list(range(10))
+
+        tokenizer.encode.return_value = FakeEncoding()
+        tokenizer.encode_batch.side_effect = lambda texts: [
+            FakeEncoding() for _ in texts
+        ]
+        labels = ["bird", "cat"]
+        cache_dir = tmp_path / "cache"
 
         with (
-            patch("classifier.CACHE_DIR", str(tmp_path / "cache")),
+            patch("classifier.CACHE_DIR", str(cache_dir)),
             patch(
                 "classifier._MANIFEST_PATH",
-                str(tmp_path / "cache" / "manifest.json"),
+                str(cache_dir / "manifest.json"),
             ),
             patch(
                 "classifier.onnx_runtime.create_session_with_self_heal",
@@ -680,14 +695,32 @@ class TestEmbeddingPrecompute:
             patch("models.build_self_heal_redownloader", return_value=None),
         ):
             count = precompute_label_embeddings(
-                ["bird", "cat"],
+                labels,
                 model_str="ViT-B-16",
                 pretrained_str=str(model_dir),
             )
 
-        assert count == 2
-        assert create_session.call_count == 1
-        assert create_session.call_args.args[0].endswith("text_encoder.onnx")
+            assert count == 2
+            assert create_session.call_count == 1
+            assert create_session.call_args.args[0].endswith("text_encoder.onnx")
+
+            cache_path = _embedding_cache_path(
+                labels, "ViT-B-16", str(model_dir),
+            )
+            payload = np.load(cache_path)
+            assert payload.shape == (512, 2)
+            assert payload.dtype == np.float32
+
+            # A second precompute for the same labels must hit the cache: no
+            # additional text encoder is loaded.
+            count_again = precompute_label_embeddings(
+                labels,
+                model_str="ViT-B-16",
+                pretrained_str=str(model_dir),
+            )
+
+            assert count_again == 2
+            assert create_session.call_count == 1
 
 
 class TestGpuLockScope:

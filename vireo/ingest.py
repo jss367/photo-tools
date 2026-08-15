@@ -358,6 +358,9 @@ def discover_source_files(
     else:
         allowed = SUPPORTED_EXTENSIONS
 
+    files = []
+    checked = 0
+
     if recursive:
         # safe_scan_walk skips other-app data bundles (e.g.
         # "Photos Library.photoslibrary") without stat-following any
@@ -382,11 +385,26 @@ def discover_source_files(
             # entry has been classified. The outer per-directory check
             # below still guards the interval between yield resumption
             # and the next scandir call.
-            for dirpath, _dirnames, filenames in safe_scan_walk(
+            walked = enumerate(safe_scan_walk(
                 str(source_path), onerror=onerror, cancel_check=cancel_check,
-            ):
+            ), start=1)
+            for dirs_walked, (dirpath, _dirnames, filenames) in walked:
                 if cancel_check is not None and cancel_check():
                     raise ScanCancelled("file discovery cancelled")
+                # A source dominated by empty (or all-filtered) subtrees
+                # would otherwise never advance the outer per-candidate
+                # loop, so a discovery pass could walk thousands of
+                # directories without emitting a single heartbeat. Fire
+                # the callback periodically here so the UI stays alive
+                # during long directory-only traversals — the counts
+                # don't change (no new candidate was seen) but the
+                # heartbeat proves the walk is still making progress.
+                if (
+                    progress_callback is not None
+                    and not filenames
+                    and (dirs_walked % 64) == 0
+                ):
+                    progress_callback(checked, len(files))
                 for name in filenames:
                     yield Path(dirpath) / name
         candidates = _candidate_paths()
@@ -402,8 +420,6 @@ def discover_source_files(
         # a generator — pass it straight through to the filter so we
         # don't materialize the directory listing twice.
         candidates = safe_iter_dir(str(source_path), onerror=onerror)
-    files = []
-    checked = 0
     for f in candidates:
         checked += 1
         if cancel_check is not None and cancel_check():

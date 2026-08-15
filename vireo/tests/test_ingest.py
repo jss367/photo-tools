@@ -166,6 +166,46 @@ def test_discover_source_files_cancels_during_empty_directory_walk(tmp_path):
     assert calls["n"] >= 2
 
 
+def test_discover_source_files_reports_progress_during_empty_directory_walk(
+    tmp_path,
+):
+    """A source dominated by empty (or all-filtered) directories must
+    still emit discovery heartbeats while the walk is in progress. The
+    outer per-candidate loop only advances when the walker yields a
+    filename, so without a heartbeat inside the walk itself the caller
+    would see a single completion callback with no way to know the
+    traversal is alive during long empty-hierarchy passes.
+    """
+    src = tmp_path / "sd_card"
+    # 200 top-level subdirectories, each with a nested "deeper" child.
+    # ``safe_scan_walk`` will visit ~401 directories without yielding a
+    # single filename, so the per-candidate loop never advances. The
+    # in-generator heartbeat is the only signal the walk is progressing.
+    for i in range(200):
+        (src / f"empty_{i}" / "deeper").mkdir(parents=True)
+
+    calls = []
+
+    files = discover_source_files(
+        str(src),
+        progress_callback=lambda checked, found: calls.append(
+            (checked, found)
+        ),
+    )
+    assert files == []
+    # Every heartbeat during the walk reports (0, 0) — no candidate
+    # files have been seen yet. The final completion callback is also
+    # (0, 0). We need at least one intermediate heartbeat *before* the
+    # completion call so the caller sees the traversal is alive.
+    assert len(calls) >= 2, (
+        "discover_source_files did not emit any progress heartbeat "
+        "while walking an empty-directory hierarchy; the per-candidate "
+        "loop never ticks in this shape, so the caller would appear "
+        "stalled until completion. calls=" + repr(calls)
+    )
+    assert all(call == (0, 0) for call in calls), calls
+
+
 def test_discover_source_files_non_recursive(tmp_path):
     src = tmp_path / "sd_card"
     _create_test_files(str(src), ["top.jpg"])

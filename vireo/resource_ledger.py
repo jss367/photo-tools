@@ -187,6 +187,14 @@ class ResourceLedger:
         self._wait_count = 0
         self._waiters = 0
         self._owner_timing = {}
+        # Wait start times for owners currently blocked in acquire().
+        # Snapshot readers add the elapsed active wait to the reported
+        # totals so ``/api/jobs`` shows accurate diagnostics for the job
+        # that is right now waiting on resources — not just after the
+        # wait ends. A single owner may hold multiple entries if several
+        # of its threads are waiting concurrently, so this is a list per
+        # owner, not a single timestamp.
+        self._active_owner_waits = {}
 
     def _validate_request(self, request):
         if request.cpu is not None and request.cpu.minimum > self.cpu_capacity:
@@ -220,6 +228,7 @@ class ResourceLedger:
         self._total_wait_seconds += wait_seconds
         self._wait_count += 1
         self._waiters -= 1
+        self._drop_active_owner_wait_locked(owner_id, wait_started)
         if owner_id is not None:
             timing = self._owner_timing.setdefault(
                 owner_id, {"wait_seconds": 0.0, "wait_count": 0}
@@ -227,6 +236,24 @@ class ResourceLedger:
             timing["wait_seconds"] += wait_seconds
             timing["wait_count"] += 1
         return wait_seconds
+
+    def _track_active_owner_wait_locked(self, owner_id, wait_started):
+        if owner_id is None:
+            return
+        self._active_owner_waits.setdefault(owner_id, []).append(wait_started)
+
+    def _drop_active_owner_wait_locked(self, owner_id, wait_started):
+        if owner_id is None:
+            return
+        starts = self._active_owner_waits.get(owner_id)
+        if not starts:
+            return
+        try:
+            starts.remove(wait_started)
+        except ValueError:
+            return
+        if not starts:
+            self._active_owner_waits.pop(owner_id, None)
 
     def acquire(
         self, request, *, cancel_check=None, owner_id=None, on_wait=None,
@@ -301,6 +328,9 @@ class ResourceLedger:
                 if wait_started is None:
                     wait_started = self._clock()
                     self._waiters += 1
+                    self._track_active_owner_wait_locked(
+                        owner_id, wait_started,
+                    )
                     announce_wait = True
                     # Run the callback outside the ledger mutex before
                     # sleeping. The next loop rechecks availability first.
@@ -315,9 +345,28 @@ class ResourceLedger:
             self._condition.notify_all()
 
     def owner_timing(self, owner_id, *, remove=False):
+        """Return recorded wait totals for ``owner_id`` including active waits.
+
+        A wait is recorded only when it ends (grant, cancellation, or a
+        raising probe). Snapshots taken while an owner is still blocked
+        in :meth:`acquire` would therefore report zero — precisely for
+        the job that most needs the diagnostic. Fold in any currently
+        active wait so ``/api/jobs`` shows accurate ``resource_wait_*``
+        while a job is stuck in contention. When called with
+        ``remove=True`` (once per job at finalization), the currently
+        active waits are left untouched — an active wait entry belongs
+        to the still-running :meth:`acquire` call and its final total
+        will be recorded when that call ends.
+        """
         with self._condition:
             timing = self._owner_timing.get(owner_id)
             result = dict(timing or {"wait_seconds": 0.0, "wait_count": 0})
+            active_starts = self._active_owner_waits.get(owner_id)
+            if active_starts:
+                now = self._clock()
+                for start in active_starts:
+                    result["wait_seconds"] += max(0.0, now - start)
+                result["wait_count"] += len(active_starts)
             if remove:
                 self._owner_timing.pop(owner_id, None)
         result["wait_seconds"] = round(result["wait_seconds"], 3)

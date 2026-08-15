@@ -100,6 +100,53 @@ def test_owner_wait_timing_uses_injected_clock():
     assert ledger.snapshot()["wait_seconds"] == 2.5
 
 
+def test_owner_timing_includes_active_wait_before_grant():
+    """A blocked owner shows its live wait in owner_timing snapshots.
+
+    ``/api/jobs`` reads ``resource_wait_*`` from ``owner_timing`` while a
+    job is running. Waits are otherwise only recorded once the acquire
+    call returns, so a job currently blocked on ``cpu_ml`` or the CPU
+    budget would report zero wait — precisely for the job that most
+    needs the diagnostic.
+    """
+    now = [10.0]
+    ledger = ResourceLedger(cpu_capacity=1, clock=lambda: now[0])
+    holder = ledger.acquire(ResourceRequest(cpu=CpuRequest(1, 1, 1)))
+    waiting = threading.Event()
+    acquired = threading.Event()
+
+    def waiter():
+        with bind_resource_owner("job-2"):
+            with ledger.acquire(
+                ResourceRequest(cpu=CpuRequest(1, 1, 1)),
+                on_wait=lambda _request: waiting.set(),
+            ):
+                acquired.set()
+
+    thread = threading.Thread(target=waiter)
+    thread.start()
+    try:
+        assert waiting.wait(timeout=1.0)
+        now[0] = 13.5
+        # Wait has not returned yet, but owner_timing must already reflect
+        # the 3.5s the job has been blocked.
+        active = ledger.owner_timing("job-2")
+        assert active == {"wait_seconds": 3.5, "wait_count": 1}
+        # remove=True on an active wait clears the recorded totals but
+        # leaves the in-flight wait entry alone; the running acquire()
+        # will record its own totals when it eventually returns.
+        active_remove = ledger.owner_timing("job-2", remove=True)
+        assert active_remove == {"wait_seconds": 3.5, "wait_count": 1}
+    finally:
+        now[0] = 15.0
+        holder.release()
+        assert acquired.wait(timeout=1.0)
+        thread.join(timeout=1.0)
+
+    final = ledger.owner_timing("job-2")
+    assert final == {"wait_seconds": 5.0, "wait_count": 1}
+
+
 def test_cancelled_wait_releases_waiter_accounting():
     ledger = ResourceLedger(cpu_capacity=1)
     holder = ledger.acquire(ResourceRequest(cpu=CpuRequest(1, 1, 1)))

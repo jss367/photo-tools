@@ -2288,7 +2288,19 @@ def scan(root, db, progress_callback=None, incremental=False, extract_full_metad
                         _check_cancelled()
                         yield done_path, _feature_result(done_fut)
                 except BaseException:
-                    pool.shutdown(wait=False, cancel_futures=True)
+                    # Actively terminate the worker processes so their CPU
+                    # work stops now, then wait for them to actually exit
+                    # before letting ``_claim_worker_count`` release its
+                    # CPU permits. ``shutdown(wait=False)`` alone would
+                    # unwind the lease while old workers were still
+                    # hashing — a replacement scan or CPU inference could
+                    # then receive the same permits and defeat the
+                    # process-wide budget, and ``JobRunner.shutdown()``
+                    # could report completion while hashing continued.
+                    for proc in list(getattr(pool, "_processes", {}).values()):
+                        with contextlib.suppress(Exception):
+                            proc.terminate()
+                    pool.shutdown(wait=True, cancel_futures=True)
                     raise
                 else:
                     pool.shutdown(wait=True)

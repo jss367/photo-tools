@@ -376,6 +376,16 @@ def discover_source_files(
             for dirpath, _dirnames, filenames in safe_scan_walk(
                 str(source_path), onerror=onerror,
             ):
+                # Cancellation checkpoint per walked directory. A
+                # per-candidate check alone (see the outer loop below)
+                # never fires while safe_scan_walk grinds through a
+                # subtree that yields no filenames — deeply nested empty
+                # directories, or a tree whose files are all
+                # extension-filtered out — so pause and cancel both
+                # appear stuck until the whole walk finishes. Mirrors
+                # scanner.scan()'s per-directory poll.
+                if cancel_check is not None and cancel_check():
+                    raise ScanCancelled("file discovery cancelled")
                 for name in filenames:
                     yield Path(dirpath) / name
         candidates = _candidate_paths()

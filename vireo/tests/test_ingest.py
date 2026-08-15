@@ -138,6 +138,34 @@ def test_discover_source_files_reports_progress_and_honors_cancel(tmp_path):
         discover_source_files(str(src), cancel_check=lambda: True)
 
 
+def test_discover_source_files_cancels_during_empty_directory_walk(tmp_path):
+    """Cancellation must fire during the directory walk itself, not just
+    after a candidate file is yielded. A large hierarchy of empty (or
+    all-filtered) directories yields no filenames, so a per-candidate
+    check alone would leave pause/cancel stuck until the entire walk
+    finishes on giant sources like a home directory.
+    """
+    from scanner import ScanCancelled
+
+    src = tmp_path / "sd_card"
+    # Empty directories only — no filenames will be yielded, and no
+    # file candidate will ever reach the per-candidate cancel check.
+    for i in range(10):
+        (src / f"empty_{i}" / "deeper").mkdir(parents=True)
+
+    calls = {"n": 0}
+
+    def cancel_after_first_dir():
+        calls["n"] += 1
+        return calls["n"] >= 2
+
+    with pytest.raises(ScanCancelled):
+        discover_source_files(str(src), cancel_check=cancel_after_first_dir)
+    # cancel_check was polled while walking directories even though the
+    # tree contained no matching files.
+    assert calls["n"] >= 2
+
+
 def test_discover_source_files_non_recursive(tmp_path):
     src = tmp_path / "sd_card"
     _create_test_files(str(src), ["top.jpg"])

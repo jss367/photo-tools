@@ -14,10 +14,10 @@ import logging
 import math
 import os
 import queue
-import shutil
 import tempfile
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 
 import numpy as np
@@ -77,26 +77,42 @@ def _rollback_failed_mask_photo(thread_db, photo_id):
 
 
 class _StagedMaskFile:
-    """Stage a deterministic mask PNG and restore its predecessor on failure."""
+    """Publish a new immutable mask generation around a database commit.
 
-    def __init__(self, stage_dir, staged_path, final_path):
+    The predecessor remains at its database-referenced path until the new
+    path has committed.  A process interruption can therefore leave an
+    unreferenced generation behind, but can never change the bytes behind a
+    committed path.
+    """
+
+    def __init__(self, stage_dir, staged_path, final_path, previous_path=None):
         self.stage_dir = stage_dir
         self.staged_path = staged_path
         self.final_path = final_path
-        self.backup_path = None
+        self.previous_path = previous_path
         self.installed = False
 
     @classmethod
-    def create(cls, mask, masks_dir, photo_id, variant, save_mask):
+    def create(
+        cls, mask, masks_dir, photo_id, variant, save_mask,
+        previous_path=None,
+    ):
         os.makedirs(masks_dir, exist_ok=True)
         stage_dir = tempfile.mkdtemp(prefix=".mask-stage-", dir=masks_dir)
         staged_path = None
         try:
             staged_path = save_mask(mask, stage_dir, photo_id, variant)
+            stem, extension = os.path.splitext(os.path.basename(staged_path))
+            # Never overwrite the path referenced by the currently committed
+            # photo_masks row. SQLite can atomically switch that row to this
+            # immutable generation after the file is fully published.
             final_path = os.path.join(
-                masks_dir, os.path.basename(staged_path),
+                masks_dir, f"{stem}.{uuid.uuid4().hex}{extension}",
             )
-            return cls(stage_dir, staged_path, final_path)
+            return cls(
+                stage_dir, staged_path, final_path,
+                previous_path=previous_path,
+            )
         except Exception:
             if staged_path:
                 with contextlib.suppress(OSError):
@@ -106,46 +122,37 @@ class _StagedMaskFile:
             raise
 
     def install(self):
-        """Atomically place the staged PNG while retaining any old version."""
-        if os.path.exists(self.final_path):
-            self.backup_path = os.path.join(self.stage_dir, "previous.png")
-            try:
-                # Same-filesystem hard link is cheap and, unlike moving the
-                # predecessor aside, keeps the committed path continuously
-                # readable until the single atomic replacement below.
-                os.link(self.final_path, self.backup_path)
-            except OSError:
-                # Some filesystems do not support hard links. Copying retains
-                # the same crash-safe ordering at the cost of one mask-sized
-                # write on reruns.
-                shutil.copy2(self.final_path, self.backup_path)
-        try:
-            os.replace(self.staged_path, self.final_path)
-        except Exception:
-            if self.backup_path and os.path.exists(self.backup_path):
-                os.replace(self.backup_path, self.final_path)
-                self.backup_path = None
-            raise
+        """Atomically publish the new generation at its unique path."""
+        os.replace(self.staged_path, self.final_path)
         self.installed = True
 
     def restore(self):
-        """Restore the prior PNG, or remove a newly installed first version."""
-        if self.backup_path and os.path.exists(self.backup_path):
-            os.replace(self.backup_path, self.final_path)
-            self.backup_path = None
-        elif self.installed:
+        """Discard a generation whose database transaction did not commit."""
+        if self.installed:
             with contextlib.suppress(FileNotFoundError):
                 os.unlink(self.final_path)
         self.installed = False
         self._cleanup()
 
     def finish(self):
-        """Keep the installed PNG and discard staging artifacts after commit."""
+        """Keep the committed generation and discard its predecessor."""
         self.installed = False
+        if self.previous_path:
+            masks_dir = os.path.realpath(os.path.dirname(self.final_path))
+            previous_real = os.path.realpath(self.previous_path)
+            if (
+                previous_real != os.path.realpath(self.final_path)
+                and os.path.dirname(previous_real) == masks_dir
+            ):
+                # The database already committed the new generation, so an
+                # old-file cleanup error must not turn a successful photo into
+                # a reported extraction failure.
+                with contextlib.suppress(OSError):
+                    os.unlink(self.previous_path)
         self._cleanup()
 
     def _cleanup(self):
-        for path in (self.staged_path, self.backup_path):
+        for path in (self.staged_path,):
             if path:
                 with contextlib.suppress(OSError):
                     os.unlink(path)
@@ -6989,6 +6996,9 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                                 photo_id,
                                 sam2_variant,
                                 save_mask,
+                                previous_path=(
+                                    existing["path"] if existing else None
+                                ),
                             )
                             mask_path = mask_file_stage.final_path
                             thread_db.upsert_photo_mask(
@@ -7025,10 +7035,12 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                                 variant=dinov2_variant,
                                 _commit=False,
                             )
-                            # Publish the mask row, active denormalized fields,
-                            # quality features, and embeddings as one unit. A
-                            # later failure must not leave a cache-valid mask
-                            # paired with stale or absent feature data.
+                            # Publish a new immutable PNG, then atomically move
+                            # the mask row, active denormalized fields, quality
+                            # features, and embeddings to that generation. The
+                            # predecessor remains readable until the commit;
+                            # finish removes it only after the database points
+                            # at the new path.
                             mask_file_stage.install()
                             commit_with_retry(thread_db.conn)
                             mask_file_stage.finish()

@@ -9211,21 +9211,61 @@ def test_staged_mask_restores_previous_file_on_failure(tmp_path, monkeypatch):
 
     staged = pj._StagedMaskFile.create(
         None, str(masks_dir), 42, "tiny", fake_save,
+        previous_path=str(final_path),
     )
     real_replace = pj.os.replace
 
     def assert_final_exists_before_replace(source, destination):
         if source == staged.staged_path and destination == staged.final_path:
             assert final_path.read_bytes() == b"old mask"
+            assert destination != str(final_path)
         return real_replace(source, destination)
 
     monkeypatch.setattr(pj.os, "replace", assert_final_exists_before_replace)
     staged.install()
-    assert final_path.read_bytes() == b"new mask"
+    assert final_path.read_bytes() == b"old mask"
+    with open(staged.final_path, "rb") as handle:
+        assert handle.read() == b"new mask"
 
     staged.restore()
 
     assert final_path.read_bytes() == b"old mask"
+    assert not os.path.exists(staged.final_path)
+    assert not list(masks_dir.glob(".mask-stage-*"))
+
+
+def test_staged_mask_removes_previous_file_only_after_commit(tmp_path):
+    """The old committed path stays valid until finish follows DB commit."""
+    import pipeline_job as pj
+
+    masks_dir = tmp_path / "masks"
+    masks_dir.mkdir()
+    previous_path = masks_dir / "42.tiny.png"
+    previous_path.write_bytes(b"old mask")
+
+    def fake_save(_mask, stage_dir, photo_id, variant):
+        staged_path = os.path.join(stage_dir, f"{photo_id}.{variant}.png")
+        with open(staged_path, "wb") as handle:
+            handle.write(b"new mask")
+        return staged_path
+
+    staged = pj._StagedMaskFile.create(
+        None, str(masks_dir), 42, "tiny", fake_save,
+        previous_path=str(previous_path),
+    )
+    staged.install()
+
+    # This is the interruption window before the database commit: both files
+    # are complete, and the database's old path still serves the old bytes.
+    assert previous_path.read_bytes() == b"old mask"
+    with open(staged.final_path, "rb") as handle:
+        assert handle.read() == b"new mask"
+
+    staged.finish()
+
+    assert not previous_path.exists()
+    with open(staged.final_path, "rb") as handle:
+        assert handle.read() == b"new mask"
     assert not list(masks_dir.glob(".mask-stage-*"))
 
 

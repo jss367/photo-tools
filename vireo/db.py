@@ -14283,7 +14283,8 @@ class Database:
             f"""SELECT k.name AS name,
                       k.taxon_id AS taxon_id,
                       t.rank AS taxon_rank,
-                      COUNT(DISTINCT p.id) AS photo_count
+                      COUNT(DISTINCT p.id) AS photo_count,
+                      GROUP_CONCAT(DISTINCT p.id) AS photo_ids
                FROM photo_keywords pk
                JOIN keywords k ON k.id = pk.keyword_id
                 AND (k.is_species = 1 OR k.type = 'taxonomy')
@@ -14303,6 +14304,25 @@ class Database:
         class_by_taxon = self.get_class_ancestors_for_taxa(
             [row["taxon_id"] for row in rows]
         )
+
+        def _parse_ids(raw):
+            # SQLite's GROUP_CONCAT returns NULL for an empty group, but the
+            # rows here always match at least one photo (that's what made
+            # them a row). Guard against NULL/empty anyway so a schema drift
+            # never renders a Browse link that opens every photo.
+            if not raw:
+                return []
+            out = []
+            for chunk in raw.split(","):
+                chunk = chunk.strip()
+                if not chunk:
+                    continue
+                try:
+                    out.append(int(chunk))
+                except ValueError:
+                    continue
+            return sorted(out)
+
         return [
             {
                 "name": row["name"],
@@ -14314,6 +14334,14 @@ class Database:
                     and row["taxon_rank"] is not None else "unmatched"
                 ),
                 "photo_count": row["photo_count"],
+                # Expose the affected photo IDs so the "View photos" link
+                # in the Life List UI can target exactly the uncounted
+                # photos. A plain ``keyword is <name>`` filter would open
+                # every photo carrying the keyword — including ones where
+                # the label is redundant (an ancestor of a more specific
+                # identification on the same photo) and therefore not
+                # counted here. See ``_LIFE_LIST_ANCESTOR_SUPPRESSION_CLAUSE``.
+                "photo_ids": _parse_ids(row["photo_ids"]),
             }
             for row in rows
         ]
@@ -21067,6 +21095,55 @@ class Database:
         )
         self.conn.commit()
 
+    def _resolve_species_by_lineage(self, species_name, expected_ancestors):
+        """Pick the species-rank taxon matching ``species_name``. When only one
+        row has that scientific name at species rank, return it — there is no
+        homonym to disambiguate. When multiple rows share the name (scientific
+        homonyms are permitted across kingdoms and the ``taxa`` schema keys on
+        ``inat_id``, not on ``(name, rank)``), require the candidate's parent
+        chain to contain every name in ``expected_ancestors`` (scientific
+        names for genus/family/order/class/phylum/kingdom) before returning
+        it. Ambiguity — zero or multiple lineage matches — returns ``None``;
+        silently binding to an arbitrary homonym would permanently credit the
+        wrong Life List species/class.
+        """
+        candidates = self.conn.execute(
+            "SELECT id, rank, parent_id FROM taxa "
+            "WHERE name = ? AND rank = 'species'",
+            (species_name,),
+        ).fetchall()
+        if not candidates:
+            return None
+        if len(candidates) == 1:
+            return candidates[0]
+        expected = set(expected_ancestors)
+        if not expected:
+            # Homonyms with no lineage context to arbitrate between them:
+            # decline to bind rather than credit the wrong species.
+            return None
+        matches = []
+        for candidate in candidates:
+            ancestors = set()
+            cursor = candidate["parent_id"]
+            # Depth cap mirrors ``get_class_ancestors_for_taxa`` and guards
+            # against pathological cyclic parent_id data.
+            for _ in range(12):
+                if cursor is None:
+                    break
+                row = self.conn.execute(
+                    "SELECT name, parent_id FROM taxa WHERE id = ?",
+                    (cursor,),
+                ).fetchone()
+                if row is None:
+                    break
+                ancestors.add(row["name"])
+                cursor = row["parent_id"]
+            if expected.issubset(ancestors):
+                matches.append(candidate)
+        if len(matches) == 1:
+            return matches[0]
+        return None
+
     def mark_species_keywords(self, taxonomy):
         """Mark keywords that are recognized species in the taxonomy.
 
@@ -21147,21 +21224,40 @@ class Database:
             if lookup_rank != "species":
                 lineage_names = taxon.get("lineage_names") or []
                 lineage_ranks = taxon.get("lineage_ranks") or []
-                species_name = next(
+                species_index = next(
                     (
-                        name for name, rank in zip(
-                            lineage_names, lineage_ranks, strict=False
-                        )
+                        i for i, rank in enumerate(lineage_ranks)
                         if rank == "species"
                     ),
                     None,
                 )
-                if species_name:
-                    species_row = self.conn.execute(
-                        "SELECT id, rank FROM taxa "
-                        "WHERE name = ? AND rank = 'species' LIMIT 1",
-                        (species_name,),
-                    ).fetchone()
+                if species_index is not None:
+                    species_name = lineage_names[species_index]
+                    # Ancestor scientific names above the species rank, used
+                    # to disambiguate homonyms. Two taxa with the same
+                    # species-rank scientific name can legitimately coexist
+                    # in the local ``taxa`` table (see the taxonomy loader
+                    # around ``_build_lineage`` — the schema keys on
+                    # ``inat_id``, not on ``(name, rank)`` — and iNat itself
+                    # allows homonyms across kingdoms). A name-only
+                    # ``LIMIT 1`` binding an infraspecific label to an
+                    # arbitrary row could permanently credit the wrong Life
+                    # List species/class; verify each candidate's parent
+                    # chain matches the taxonomy lookup's lineage instead.
+                    expected_ancestors = [
+                        name for name, rank in zip(
+                            lineage_names[:species_index],
+                            lineage_ranks[:species_index],
+                            strict=False,
+                        )
+                        if rank in (
+                            "genus", "family", "order",
+                            "class", "phylum", "kingdom",
+                        )
+                    ]
+                    species_row = self._resolve_species_by_lineage(
+                        species_name, expected_ancestors
+                    )
                     if species_row:
                         lookup_local_id = species_row["id"]
                         lookup_rank = species_row["rank"]

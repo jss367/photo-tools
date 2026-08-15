@@ -20327,6 +20327,10 @@ def test_life_list_uncounted_suppresses_redundant_ancestor_per_photo(db):
     db.conn.commit()
     rows = db.get_life_list_uncounted_identifications()
     assert len(rows) == 1
+    # ``photo_ids`` targets only the broad-only photo — species_photo carries
+    # a descendant identification and is intentionally excluded by the
+    # ancestor-suppression clause, so the Life List "View photos" link would
+    # otherwise open two photos for a count-of-one row.
     assert rows[0] == {
         'name': 'New World sparrows',
         'taxon_id': ids['Passerellidae'],
@@ -20338,7 +20342,50 @@ def test_life_list_uncounted_suppresses_redundant_ancestor_per_photo(db):
         },
         'reason': 'higher_rank',
         'photo_count': 1,
+        'photo_ids': [broad_photo],
     }
+
+
+def test_life_list_uncounted_photo_ids_exclude_suppressed_photos(db):
+    """The Life List "View photos" link must target only the uncounted photos.
+    A family label present on both a broad-only photo and a species-tagged
+    photo counts as one (the species-tagged one is suppressed), so the
+    returned ``photo_ids`` must exclude that suppressed photo."""
+    ids = _seed_bird_taxonomy(db)
+    ws = db.ensure_default_workspace()
+    db.set_active_workspace(ws)
+    fid = db.add_folder('/p', name='p')
+    broad_photo = db.add_photo(
+        folder_id=fid, filename='broad.jpg', extension='.jpg',
+        file_size=1, file_mtime=1.0,
+    )
+    species_photo = db.add_photo(
+        folder_id=fid, filename='species.jpg', extension='.jpg',
+        file_size=1, file_mtime=2.0,
+    )
+    family_kw = db.add_keyword('New World sparrows', kw_type='taxonomy')
+    species_kw = db.add_keyword('Song Sparrow', kw_type='taxonomy')
+    db.conn.execute(
+        "UPDATE keywords SET is_species=1, taxon_id=? WHERE id=?",
+        (ids['Passerellidae'], family_kw),
+    )
+    db.conn.execute(
+        "UPDATE keywords SET is_species=1, taxon_id=? WHERE id=?",
+        (ids['Melospiza melodia'], species_kw),
+    )
+    # Both photos carry the family label; only ``species_photo`` also
+    # carries the species descendant. The family label is redundant on
+    # ``species_photo`` and counted on ``broad_photo``.
+    db.tag_photo(broad_photo, family_kw)
+    db.tag_photo(species_photo, family_kw)
+    db.tag_photo(species_photo, species_kw)
+    db.conn.commit()
+
+    rows = db.get_life_list_uncounted_identifications()
+    assert len(rows) == 1
+    assert rows[0]['name'] == 'New World sparrows'
+    assert rows[0]['photo_count'] == 1
+    assert rows[0]['photo_ids'] == [broad_photo]
 
 
 def test_life_list_taxon_ids_excludes_rejected(db):
@@ -20966,6 +21013,93 @@ def test_mark_species_keywords_links_subspecies_to_species_ancestor(tmp_path):
         "is_species": 1,
         "taxon_id": species_taxon,
     }
+
+
+def test_mark_species_keywords_disambiguates_homonym_species_by_lineage(tmp_path):
+    """When two species-rank taxa share a scientific name (a legitimate
+    scenario — the ``taxa`` schema keys on ``inat_id`` and homonyms are
+    permitted across kingdoms), an infraspecific keyword must NOT bind to
+    an arbitrary same-name row. The taxonomy lookup's lineage identifies
+    which species is meant; the wrong bind would permanently credit the
+    wrong Life List species/class.
+    """
+    from db import Database
+
+    db = Database(str(tmp_path / "test.db"))
+    # Correct branch: Kingdom Animalia → class Mammalia → genus Alces →
+    # species "Alces alces" (moose).
+    animalia_id = db.conn.execute(
+        "INSERT INTO taxa (inat_id, name, common_name, rank, kingdom) "
+        "VALUES (?, ?, ?, 'kingdom', 'Animalia')",
+        (1, "Animalia", "Animals"),
+    ).lastrowid
+    mammalia_id = db.conn.execute(
+        "INSERT INTO taxa (inat_id, name, common_name, rank, parent_id, kingdom) "
+        "VALUES (?, ?, ?, 'class', ?, 'Animalia')",
+        (40151, "Mammalia", "Mammals", animalia_id),
+    ).lastrowid
+    correct_genus_id = db.conn.execute(
+        "INSERT INTO taxa (inat_id, name, common_name, rank, parent_id, kingdom) "
+        "VALUES (?, ?, ?, 'genus', ?, 'Animalia')",
+        (42159, "Alces", None, mammalia_id),
+    ).lastrowid
+    correct_species_id = db.conn.execute(
+        "INSERT INTO taxa (inat_id, name, common_name, rank, parent_id, kingdom) "
+        "VALUES (?, ?, ?, 'species', ?, 'Animalia')",
+        (42160, "Alces alces", "Moose", correct_genus_id),
+    ).lastrowid
+    # Homonym branch: unrelated kingdom, same scientific name "Alces alces".
+    other_kingdom_id = db.conn.execute(
+        "INSERT INTO taxa (inat_id, name, common_name, rank, kingdom) "
+        "VALUES (?, ?, ?, 'kingdom', 'Plantae')",
+        (47126, "Plantae", "Plants"),
+    ).lastrowid
+    other_genus_id = db.conn.execute(
+        "INSERT INTO taxa (inat_id, name, common_name, rank, parent_id, kingdom) "
+        "VALUES (?, ?, ?, 'genus', ?, 'Plantae')",
+        (999900, "Alces", None, other_kingdom_id),
+    ).lastrowid
+    wrong_species_id = db.conn.execute(
+        "INSERT INTO taxa (inat_id, name, common_name, rank, parent_id, kingdom) "
+        "VALUES (?, ?, ?, 'species', ?, 'Plantae')",
+        (999901, "Alces alces", "not a real moose", other_genus_id),
+    ).lastrowid
+    kid = db.conn.execute(
+        "INSERT INTO keywords (name, type, is_species, taxon_id) "
+        "VALUES ('Alaskan moose', 'taxonomy', 1, NULL)",
+    ).lastrowid
+    db.conn.commit()
+
+    class FakeTaxonomy:
+        def lookup(self, name):
+            if name.lower() == "alaskan moose":
+                # Subspecies of the *animal* Alces alces. Lineage names
+                # unambiguously identify the correct species branch.
+                return {
+                    "taxon_id": 132760,
+                    "rank": "subspecies",
+                    "lineage_names": [
+                        "Animalia", "Mammalia",
+                        "Alces", "Alces alces", "Alces alces gigas",
+                    ],
+                    "lineage_ranks": [
+                        "kingdom", "class",
+                        "genus", "species", "subspecies",
+                    ],
+                }
+            return None
+
+        def is_taxon(self, name):
+            return self.lookup(name) is not None
+
+    assert db.mark_species_keywords(FakeTaxonomy()) == 1
+    row = db.conn.execute(
+        "SELECT taxon_id FROM keywords WHERE id = ?", (kid,),
+    ).fetchone()
+    # Must bind to the moose species under Mammalia, not the same-named
+    # row under Plantae.
+    assert row["taxon_id"] == correct_species_id
+    assert row["taxon_id"] != wrong_species_id
 
 
 def test_mark_species_keywords_leaves_taxon_null_when_only_higher_rank_available(tmp_path):

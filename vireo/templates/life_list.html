@@ -987,14 +987,20 @@ function wireBreadcrumb(container) {
   });
 }
 
-function uncountedBrowseHref(name) {
-  // Use an exact universal-filter rule rather than the legacy quick-search
-  // parameter, which can also match filenames and partial keyword names.
-  var filters = {
-    root: { mode: 'all', rules: [
-      { field: 'keyword', op: 'is', value: name }
-    ] }
-  };
+function uncountedBrowseHref(entry) {
+  // Prefer the affected photo IDs — a bare "keyword is <name>" filter would
+  // open every photo carrying the keyword, including the ones where the
+  // ancestor tag is redundant (a more specific identification is also
+  // present) and therefore NOT part of ``photo_count`` here. That would
+  // report "1 photo" and hand the user two.
+  var ids = entry && Array.isArray(entry.photo_ids) ? entry.photo_ids : [];
+  var filters = ids.length
+    ? { root: { mode: 'all', rules: [
+        { field: 'photo_ids', op: 'in', value: ids }
+      ] } }
+    : { root: { mode: 'all', rules: [
+        { field: 'keyword', op: 'is', value: entry.name }
+      ] } };
   return '/browse?filters=' + encodeURIComponent(JSON.stringify(filters));
 }
 
@@ -1014,7 +1020,7 @@ function renderUncountedGroup(entries, count, message) {
     html += '<li><span class="ll-unmatched-name">' + escapeHtml(entry.name) + '</span>'
       + '<span class="ll-unmatched-reason">&mdash; ' + escapeHtml(reason)
       + ' &middot; ' + photos + '</span>'
-      + '<a href="' + escapeAttr(uncountedBrowseHref(entry.name)) + '">View photos</a></li>';
+      + '<a href="' + escapeAttr(uncountedBrowseHref(entry)) + '">View photos</a></li>';
   });
   html += '</ul>';
   if (truncated) html += '<div style="margin-top:4px;">…and ' + (count - shown.length) + ' more not shown.</div>';

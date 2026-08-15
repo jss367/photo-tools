@@ -28,6 +28,12 @@ def test_automatic_capacity_survives_unavailable_core_counts(monkeypatch):
     assert resource_ledger.automatic_cpu_capacity() == 1
 
 
+@pytest.mark.parametrize("value", [True, False, 1.5, "2", None])
+def test_cpu_request_rejects_non_integer_permits(value):
+    with pytest.raises(TypeError):
+        CpuRequest(value, value, value)
+
+
 def test_cpu_grants_preferred_then_available_above_minimum():
     ledger = ResourceLedger(cpu_capacity=6)
     outer_request = ResourceRequest(cpu=CpuRequest(2, 4, 6))
@@ -271,14 +277,19 @@ def test_explicit_cancel_check_overrides_bound_probe():
     waiting = threading.Event()
     bound_cancelled = threading.Event()
     explicit_cancelled = threading.Event()
+    explicit_polled = threading.Event()
     outcome = []
+
+    def explicit_probe():
+        explicit_polled.set()
+        return explicit_cancelled.is_set()
 
     def waiter():
         with bind_resource_cancel_check(bound_cancelled.is_set):
             try:
                 ledger.acquire(
                     ResourceRequest(cpu=CpuRequest(1, 1, 1)),
-                    cancel_check=explicit_cancelled.is_set,
+                    cancel_check=explicit_probe,
                     on_wait=lambda _request: waiting.set(),
                 )
             except ResourceWaitCancelled:
@@ -289,9 +300,13 @@ def test_explicit_cancel_check_overrides_bound_probe():
     assert waiting.wait(timeout=1.0)
     # Flip the bound probe first. If bind took precedence, this would
     # cancel the waiter; the assertions below prove it did not.
+    explicit_polled.clear()
     bound_cancelled.set()
+    assert explicit_polled.wait(timeout=1.0)
+    assert thread.is_alive()
+    assert outcome == []
     explicit_cancelled.set()
-    holder.release()
     thread.join(timeout=1.0)
     assert not thread.is_alive()
     assert outcome == ["cancelled"]
+    holder.release()

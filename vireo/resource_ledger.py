@@ -21,6 +21,7 @@ _RESOURCE_OWNER = contextvars.ContextVar("vireo_resource_owner", default=None)
 _RESOURCE_CANCEL_CHECK = contextvars.ContextVar(
     "vireo_resource_cancel_check", default=None,
 )
+DEFAULT_CPU_INFERENCE_THREADS = 8
 
 
 class ResourceWaitCancelled(RuntimeError):
@@ -40,6 +41,13 @@ class CpuRequest:
     maximum: int
 
     def __post_init__(self):
+        for name, value in (
+            ("minimum", self.minimum),
+            ("preferred", self.preferred),
+            ("maximum", self.maximum),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise TypeError(f"CPU {name} must be an integer")
         if self.minimum < 1:
             raise ValueError("CPU minimum must be at least 1")
         if not self.minimum <= self.preferred <= self.maximum:
@@ -134,6 +142,16 @@ def cpu_phase_request(capacity, *, minimum=1, preferred=8, maximum=8):
     minimum = max(1, min(int(minimum), maximum))
     preferred = max(minimum, min(int(preferred), maximum))
     return CpuRequest(minimum=minimum, preferred=preferred, maximum=maximum)
+
+
+def cpu_inference_request(capacity):
+    """Return the exact CPU grant matching Vireo's ONNX thread pool."""
+    return cpu_phase_request(
+        capacity,
+        minimum=DEFAULT_CPU_INFERENCE_THREADS,
+        preferred=DEFAULT_CPU_INFERENCE_THREADS,
+        maximum=DEFAULT_CPU_INFERENCE_THREADS,
+    )
 
 
 class ResourceLease:

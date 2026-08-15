@@ -7,6 +7,7 @@ Uses ONNX Runtime for inference with text encoder models stored in
 import logging
 import os
 import threading
+import time
 
 import numpy as np
 import onnx_runtime
@@ -31,6 +32,7 @@ _MODELS_ROOT = os.path.expanduser("~/.vireo/models")
 
 # Context length for CLIP-style tokenizers
 _CONTEXT_LENGTH = 77
+_INTERACTIVE_RESOURCE_WAIT_SECONDS = 5.0
 
 
 def _get_text_session(model_str, pretrained_str=None):
@@ -123,7 +125,11 @@ def encode_text(query, model_str, pretrained_str=None):
 
     # Run text encoder
     from pipeline_locks import acquire_inference_resources
-    with acquire_inference_resources(session):
+    deadline = time.monotonic() + _INTERACTIVE_RESOURCE_WAIT_SECONDS
+    with acquire_inference_resources(
+        session,
+        cancel_check=lambda: time.monotonic() >= deadline,
+    ):
         txt_features = session.run(None, {input_name: tokens})[0]
     txt_features = txt_features.astype(np.float32)
 

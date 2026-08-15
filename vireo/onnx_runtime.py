@@ -9,6 +9,7 @@ import logging
 import os
 import threading
 import weakref
+from collections import OrderedDict
 
 import numpy as np
 from PIL import Image
@@ -17,7 +18,8 @@ log = logging.getLogger(__name__)
 
 _SESSION_THREADS_LOCK = threading.Lock()
 _SESSION_CPU_THREADS = weakref.WeakKeyDictionary()
-_SESSION_CPU_THREADS_FALLBACK = {}
+_SESSION_CPU_THREADS_FALLBACK = OrderedDict()
+_SESSION_CPU_THREADS_FALLBACK_LIMIT = 64
 
 
 # Substrings that identify onnxruntime load failures rooted in the file
@@ -186,8 +188,17 @@ def _remember_session_cpu_threads(session, threads):
             _SESSION_CPU_THREADS[session] = threads
         except TypeError:
             # Some extension-backed test doubles are not weak-referenceable.
-            # Production InferenceSession objects use the weak map.
-            _SESSION_CPU_THREADS_FALLBACK[id(session)] = threads
+            # Retain the object with the value so an id reused after eviction
+            # can never inherit another session's budget. Keep this uncommon
+            # compatibility path bounded; production sessions use the weak map.
+            key = id(session)
+            _SESSION_CPU_THREADS_FALLBACK[key] = (session, threads)
+            _SESSION_CPU_THREADS_FALLBACK.move_to_end(key)
+            while (
+                len(_SESSION_CPU_THREADS_FALLBACK)
+                > _SESSION_CPU_THREADS_FALLBACK_LIMIT
+            ):
+                _SESSION_CPU_THREADS_FALLBACK.popitem(last=False)
 
 
 def session_cpu_threads(session, default=None):
@@ -202,7 +213,14 @@ def session_cpu_threads(session, default=None):
         except TypeError:
             threads = None
         if threads is None:
-            threads = _SESSION_CPU_THREADS_FALLBACK.get(id(session))
+            key = id(session)
+            fallback = _SESSION_CPU_THREADS_FALLBACK.get(key)
+            if fallback is not None and fallback[0] is session:
+                _SESSION_CPU_THREADS_FALLBACK.move_to_end(key)
+                threads = fallback[1]
+            elif fallback is not None:
+                # Treat an id-keyed hit as advisory until identity is proven.
+                _SESSION_CPU_THREADS_FALLBACK.pop(key, None)
     return threads if threads is not None else default
 
 
@@ -238,7 +256,7 @@ def create_session(model_path, providers=None):
 
     from resource_ledger import (
         ResourceRequest,
-        cpu_phase_request,
+        cpu_inference_request,
         get_resource_ledger,
     )
 
@@ -251,9 +269,7 @@ def create_session(model_path, providers=None):
     # the budget would receive only its minimum grant, and the cached session
     # would then be capped at that reduced count forever, throttling every
     # inference call until the process restarts.
-    inference_profile = cpu_phase_request(
-        ledger.cpu_capacity, minimum=1, preferred=8, maximum=8,
-    )
+    inference_profile = cpu_inference_request(ledger.cpu_capacity)
     session_thread_count = inference_profile.preferred
     # Require the construction lease to hold ``session_thread_count`` permits
     # too. ONNX exercises its ``intra_op_num_threads`` pool during graph
@@ -263,12 +279,7 @@ def create_session(model_path, providers=None):
     # Waiting for the full inference budget is the right trade: model loads
     # are rare and one-time, while oversubscribing the CPU during a
     # contentious construction hurts every concurrent job.
-    cpu_request = cpu_phase_request(
-        ledger.cpu_capacity,
-        minimum=session_thread_count,
-        preferred=session_thread_count,
-        maximum=session_thread_count,
-    )
+    cpu_request = inference_profile
     request = ResourceRequest(
         cpu=cpu_request,
         lanes=("model_construction",),

@@ -10,7 +10,7 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 sys.path.insert(0, os.path.dirname(__file__))
 
-from wait import wait_for_job_via_runner
+from wait import wait_for_job, wait_for_job_via_runner
 
 
 def test_job_runner_starts_and_completes(tmp_path):
@@ -872,7 +872,13 @@ def test_job_records_resource_wait_timing_in_snapshot_and_history(tmp_path):
 
     try:
         job_id = runner.start("test", work, workspace_id=workspace_id)
-        assert waiting.wait(timeout=1.0)
+        active_job = wait_for_job(
+            lambda: runner.get(job_id) if waiting.is_set() else None,
+            terminal=("running",),
+            description=f"job {job_id} resource wait",
+        )
+        assert active_job["resource_wait_count"] == 1
+        assert active_job["resource_wait_seconds"] >= 0
         holder.release()
         job = wait_for_job_via_runner(
             runner, job_id, wait_for_history=True,

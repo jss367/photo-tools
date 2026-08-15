@@ -236,6 +236,36 @@ def test_create_session_waits_for_full_inference_budget(tmp_path):
     assert session_cpu_threads(result["session"]) == 8
 
 
+def test_nonweak_session_thread_registry_is_identity_safe_and_bounded(monkeypatch):
+    """The compatibility registry cannot leak stale id-based budgets."""
+    from collections import OrderedDict
+
+    import vireo.onnx_runtime as runtime
+
+    class NonWeakSession:
+        __slots__ = ()
+
+    registry = OrderedDict()
+    monkeypatch.setattr(runtime, "_SESSION_CPU_THREADS_FALLBACK", registry)
+
+    target = NonWeakSession()
+    runtime._remember_session_cpu_threads(target, 4)
+    assert runtime.session_cpu_threads(target) == 4
+
+    impostor = NonWeakSession()
+    registry[id(target)] = (impostor, 7)
+    assert runtime.session_cpu_threads(target, default=2) == 2
+    assert id(target) not in registry
+
+    sessions = [
+        NonWeakSession()
+        for _ in range(runtime._SESSION_CPU_THREADS_FALLBACK_LIMIT + 5)
+    ]
+    for session in sessions:
+        runtime._remember_session_cpu_threads(session, 3)
+    assert len(registry) == runtime._SESSION_CPU_THREADS_FALLBACK_LIMIT
+
+
 def test_production_onnx_sessions_use_budgeted_factory():
     """Direct session construction would bypass thread and load budgets."""
     import ast

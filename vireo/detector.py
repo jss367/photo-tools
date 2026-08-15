@@ -8,6 +8,7 @@ import os
 import threading
 
 import numpy as np
+from resource_ledger import ResourceWaitCancelled
 
 log = logging.getLogger(__name__)
 
@@ -344,6 +345,8 @@ def detect_animals(image_path):
             outputs = session.run(None, {input_name: input_tensor})
 
         return _postprocess(outputs, preprocess_info, RAW_CONF_FLOOR)
+    except ResourceWaitCancelled:
+        raise
     except Exception:
         log.warning("Detection failed for %s", image_path, exc_info=True)
         return None

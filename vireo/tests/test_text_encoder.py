@@ -89,6 +89,41 @@ def test_encode_text_zero_vector(monkeypatch):
     assert np.linalg.norm(result) == 0.0
 
 
+def test_encode_text_bounds_interactive_resource_wait(monkeypatch):
+    """Interactive text search passes a deadline-aware cancel probe."""
+    import contextlib
+
+    import pipeline_locks
+    import text_encoder
+
+    fake_features = np.ones((1, 512), dtype=np.float32)
+    fake_session = _make_fake_text_session(fake_features)
+    fake_tokenizer = _make_fake_tokenizer()
+    monkeypatch.setattr(
+        text_encoder,
+        "_get_text_session",
+        lambda *_args: (fake_session, "input_ids", fake_tokenizer),
+    )
+    now = [10.0]
+    monkeypatch.setattr(text_encoder.time, "monotonic", lambda: now[0])
+    observed = []
+
+    @contextlib.contextmanager
+    def capture_lease(_session, *, cancel_check=None):
+        assert cancel_check is not None
+        observed.append(cancel_check())
+        now[0] += text_encoder._INTERACTIVE_RESOURCE_WAIT_SECONDS
+        observed.append(cancel_check())
+        yield
+
+    monkeypatch.setattr(
+        pipeline_locks, "acquire_inference_resources", capture_lease,
+    )
+
+    text_encoder.encode_text("bird", model_str="ViT-B-16")
+    assert observed == [False, True]
+
+
 def test_encode_text_caching(monkeypatch, tmp_path):
     """_get_text_session caches by model directory."""
     from text_encoder import _get_text_session

@@ -5934,6 +5934,99 @@ def test_import_in_place_overall_total_is_stable_across_sources(
     assert currents[-1] == 3
 
 
+def test_import_in_place_reports_error_when_source_vanishes_after_discovery(
+    app_and_db, tmp_path,
+):
+    """A source that disappears after its manifest is frozen but before
+    ``scan()`` processes it must surface as a source failure — and the
+    Overall counter must still reach the frozen denominator so the
+    progress bar doesn't stall permanently below its promised total.
+
+    Previously ``scan()`` silently returned zero counts on a vanished
+    root, so nothing was appended to ``root_errors``, no per-source
+    error was reported, and the counter was left short of the frozen
+    total. The import was reported successful on an incomplete set.
+    """
+    import shutil
+
+    import scanner
+
+    app, _db = app_and_db
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    Image.new("RGB", (16, 16), "red").save(first / "one.jpg")
+    Image.new("RGB", (16, 16), "green").save(second / "two.jpg")
+    Image.new("RGB", (16, 16), "blue").save(second / "three.jpg")
+
+    real_scan = scanner.scan
+    removed = {"done": False}
+
+    def scan_removing_second(*args, **kwargs):
+        # After the first source's scan completes but before the second
+        # source's scan runs, unlink the second source. Its manifest was
+        # already frozen during the earlier discovery pass, so the scan
+        # call sees ``root_path.is_dir() == False`` with a non-empty
+        # discovered_files.
+        root = args[0] if args else kwargs.get("root")
+        if not removed["done"] and root == str(first):
+            result = real_scan(*args, **kwargs)
+            shutil.rmtree(second)
+            removed["done"] = True
+            return result
+        return real_scan(*args, **kwargs)
+
+    # ``scan`` is imported inside ``_run_import_in_place`` via ``from
+    # scanner import scan as do_scan`` at job-run time, so patching
+    # scanner.scan is sufficient to intercept it.
+    scanner.scan = scan_removing_second
+    try:
+        with app.test_client() as client:
+            resp = client.post("/api/jobs/import-in-place", json={
+                "sources": [str(first), str(second)],
+                "after_import": None,
+            })
+            assert resp.status_code == 200, resp.get_json()
+            job = wait_for_job_via_client(client, resp.get_json()["job_id"])
+    finally:
+        scanner.scan = real_scan
+
+    # The job terminates as ``failed`` (ok=False propagates from the
+    # scan step's aggregated errors) but the first source's photos still
+    # made it into the catalog — it is a partial import, not a total
+    # abort.
+    assert job["status"] == "failed", job
+    assert removed["done"] is True
+
+    # The second source's disappearance appears in the job's error list
+    # instead of being silently swallowed.
+    errors = list(job.get("errors") or [])
+    result_errors = list((job.get("result") or {}).get("errors") or [])
+    combined = errors + result_errors
+    assert any(str(second) in msg for msg in combined), combined
+
+    # And the overall progress counter still reaches the frozen
+    # denominator (1 file from `first` + 2 from `second` = 3) so the
+    # progress bar is not stuck at 1/3 forever. `current` is monotone
+    # non-decreasing across processing events.
+    progress = [
+        event["data"]
+        for event in app._job_runner.get_events(job["id"])
+        if event["type"] == "progress"
+    ]
+    overall = [
+        data for data in progress
+        if data.get("total", 0) > 0
+        and data.get("phase_current") is None
+    ]
+    assert overall
+    assert {data["total"] for data in overall} == {3}
+    currents = [data["current"] for data in overall]
+    assert currents == sorted(currents)
+    assert currents[-1] == 3, currents
+
+
 def test_import_in_place_snapshot_admits_only_frozen_files(
     app_and_db, tmp_path,
 ):

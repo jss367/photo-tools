@@ -26748,6 +26748,41 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     root_errors.append(msg)
                     if msg not in job["errors"]:
                         job["errors"].append(msg)
+                    # Advance the counter past this source's frozen
+                    # manifest so the overall denominator is still
+                    # reached even when the scan failed — a source that
+                    # disconnected after discovery (scanner raises
+                    # FileNotFoundError on the missing root) would
+                    # otherwise leave the progress bar permanently below
+                    # its promised total. scan_acc["last_total"] holds
+                    # this source's frozen size; the ``finally`` block
+                    # below rolls it into ``prior`` via advance_scan_acc.
+                    if scan_acc["last_current"] < scan_acc["last_total"]:
+                        scan_acc["last_current"] = scan_acc["last_total"]
+                        # Emit a progress event now so the bar visibly
+                        # moves past this source instead of only jumping
+                        # once a later source's photo_cb re-publishes.
+                        # The frozen denominator is preserved; ``current``
+                        # advances by the failed source's manifest size.
+                        cum_current = (
+                            scan_acc["prior"] + scan_acc["last_current"]
+                        )
+                        cum_total = scan_acc["overall_total"]
+                        job["progress"]["current"] = cum_current
+                        job["progress"]["total"] = cum_total
+                        runner.update_step(
+                            job["id"], "scan",
+                            progress={"current": cum_current, "total": cum_total},
+                        )
+                        runner.push_event(job["id"], "progress", {
+                            "current": cum_current,
+                            "total": cum_total,
+                            "current_file": job["progress"].get("current_file", ""),
+                            "phase": "Importing in place",
+                            "phase_current": None,
+                            "phase_total": None,
+                            "phase_label": None,
+                        })
                 finally:
                     try:
                         _invalidate_new_images_after_scan(thread_db, source)

@@ -1239,3 +1239,81 @@ def test_safe_scan_walk_surfaces_permission_errors_via_onerror(tmp_path):
         )
     finally:
         os.chmod(str(forbidden), 0o755)
+
+
+def test_safe_scan_walk_cancels_while_enumerating_single_large_directory(
+    tmp_path, monkeypatch,
+):
+    """A cancel request must fire while ``safe_scan_walk`` is still
+    consuming a single directory's ``os.scandir`` iterator, not only
+    between yields. ``os.walk``-style semantics collect every child's
+    classification stat into ``dirs``/``nondirs`` lists before the tuple
+    is yielded — for a directory with millions of entries that means a
+    per-yield check by the caller cannot pause or cancel until the whole
+    enumeration finishes. Emulate the pathology with a fake ``os.scandir``
+    that streams many entries into a single directory tuple.
+    """
+    import image_loader
+    import pytest
+    from image_loader import ScanCancelled, safe_scan_walk
+
+    root = tmp_path / "photos"
+    root.mkdir()
+
+    real_scandir = image_loader.os.scandir
+
+    class LongScandir:
+        def __init__(self, entries):
+            self.entries = entries
+
+        def __iter__(self):
+            return iter(self.entries)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    # 1024 fake entries — enough to cross several 256-entry cancel poll
+    # boundaries. A caller-side per-yield check would not fire until the
+    # whole list was buffered.
+    fake_entries = [
+        SimpleNamespace(
+            name=f"file_{i:04d}.dat",
+            path=str(root / f"file_{i:04d}.dat"),
+            is_symlink=lambda: False,
+            is_dir=lambda follow_symlinks=True: False,
+        )
+        for i in range(1024)
+    ]
+
+    def fake_scandir(path):
+        if path == str(root):
+            return LongScandir(fake_entries)
+        return real_scandir(path)
+
+    monkeypatch.setattr(image_loader.os, "scandir", fake_scandir)
+
+    calls = {"n": 0}
+
+    def cancel_after_top_level_check():
+        calls["n"] += 1
+        # Let the pre-loop guard pass (call #1) so the test actually
+        # exercises the in-scandir poll rather than the entry check.
+        return calls["n"] > 1
+
+    with pytest.raises(ScanCancelled):
+        for _row in safe_scan_walk(
+            str(root), cancel_check=cancel_after_top_level_check,
+        ):
+            pytest.fail("safe_scan_walk yielded before honoring cancel")
+
+    # Cancel fired via the in-scandir poll, not via a per-yield check.
+    # A single-directory tree only yields after the scandir loop
+    # finishes, so if the cancel had to wait for a yield we would have
+    # classified all 1024 fake entries first. Any n between 2 and 5 is a
+    # cancel that landed while the walker was still filling the buffer;
+    # the walker checks the callback every 256 entries starting at
+    # i=256.
+    assert 2 <= calls["n"] <= 6, calls

@@ -19,6 +19,7 @@ from exif_orientation import orientation_swaps_axes as _orientation_swaps_axes
 from image_loader import (
     RAW_EXTENSIONS,
     SUPPORTED_EXTENSIONS,
+    ScanCancelled,
     extract_working_copy,
     is_excluded_scan_path,
     safe_iter_dir,
@@ -40,8 +41,9 @@ log = logging.getLogger(__name__)
 EMPTY_FILE_SHA256 = hashlib.sha256(b"").hexdigest()
 
 
-class ScanCancelled(RuntimeError):
-    """Raised when a caller cancels scanner.scan via cancel_check."""
+# ``ScanCancelled`` is defined in ``image_loader`` (where the low-level
+# walkers raise it) and re-exported here for callers that use
+# ``from scanner import ScanCancelled``.
 
 
 # scan() runs inside JobRunner/pipeline_job background threads, so the
@@ -1618,6 +1620,21 @@ def scan(root, db, progress_callback=None, incremental=False, extract_full_metad
         )
         return counts
     if not root_path.is_dir():
+        # A frozen manifest promised these files exist; the missing root
+        # is a source-level failure the caller must see (an SD card
+        # ejected between discovery and scan, or a network mount that
+        # dropped). Silently returning zero counts would hide the loss
+        # from ``root_errors``, so the multi-source coordinator would
+        # advance its "Overall" denominator without ever processing this
+        # source and mark the import successful on an incomplete set.
+        # Without a manifest, missing roots stay a benign no-op — an
+        # empty-manifest run wants the same shape a completed one has.
+        if discovered_files:
+            raise FileNotFoundError(
+                errno.ENOENT,
+                "scan root disappeared between discovery and scan",
+                str(root_path),
+            )
         log.warning("Root path does not exist or is not a directory: %s", root)
         return counts
 
@@ -1783,8 +1800,14 @@ def scan(root, db, progress_callback=None, incremental=False, extract_full_metad
             # would re-trip the macOS "access data from other apps" TCC
             # prompt for a child like ``LibraryAlias -> Photos
             # Library.photoslibrary`` before prune_scan_dirs could reject it.
+            # Pass cancel_check into safe_scan_walk so it polls between
+            # scandir entries as well: a single very large directory (a
+            # media dump with 1M+ files) can otherwise consume the whole
+            # ``os.scandir`` loop before yielding, leaving the per-yield
+            # ``_check_cancelled()`` below unreachable until the walker
+            # finishes filling its dirs/nondirs lists.
             for dirpath, _dirnames, filenames in safe_scan_walk(
-                str(root_path), onerror=_on_walk_error,
+                str(root_path), onerror=_on_walk_error, cancel_check=cancel_check,
             ):
                 _check_cancelled()
                 for name in filenames:

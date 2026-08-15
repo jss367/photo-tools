@@ -306,10 +306,12 @@ def test_discover_source_files_recursive_streams_candidates(
 
     events = []
 
-    def tracking_walk(top, onerror=None):
+    def tracking_walk(top, onerror=None, cancel_check=None):
         # Yield one filename per tuple so each name's emission is its own
         # observable event in `events`.
-        for dirpath, _dirnames, filenames in real_walk(top, onerror=onerror):
+        for dirpath, _dirnames, filenames in real_walk(
+            top, onerror=onerror, cancel_check=cancel_check,
+        ):
             for name in filenames:
                 events.append(("yield", name))
                 yield dirpath, [], [name]

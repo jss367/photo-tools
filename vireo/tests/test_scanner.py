@@ -86,6 +86,67 @@ def test_scan_uses_frozen_discovered_files_manifest(tmp_path):
     assert {total for _current, total in progress} == {1}
 
 
+def test_scan_raises_when_frozen_manifest_source_vanishes(tmp_path):
+    """A source that disconnects between discovery and scan must surface
+    as an error — not a silent all-zero return.
+
+    Import-in-place freezes a per-source manifest before scanning any
+    source so ``Overall`` has a stable denominator. When a removable or
+    network source drops after its manifest is captured but before
+    ``scan()`` runs, ``root_path.is_dir()`` is False. Previously that
+    branch logged a warning and returned zero counts, so the multi-source
+    coordinator saw no error, advanced past the source, and reported the
+    import successful on an incomplete set. With a frozen manifest in
+    hand, that state has to raise so the caller records the failure and
+    accounts for the promised files.
+    """
+    from db import Database
+    from scanner import scan
+
+    missing_root = str(tmp_path / "vanished_card")
+    frozen = [os.path.join(missing_root, "IMG_001.jpg")]
+    db = Database(str(tmp_path / "test.db"))
+
+    with pytest.raises(FileNotFoundError) as excinfo:
+        scan(missing_root, db, discovered_files=frozen)
+
+    assert missing_root in str(excinfo.value)
+
+
+def test_scan_without_manifest_still_tolerates_missing_root(tmp_path):
+    """Callers that don't pass a frozen manifest still get the benign
+    zero-count return when the root doesn't exist. This is the shape
+    audit/repair paths and health checks rely on: a missing root there
+    is expected state, not a hard error.
+    """
+    from db import Database
+    from scanner import scan
+
+    db = Database(str(tmp_path / "test.db"))
+    result = scan(str(tmp_path / "vanished_card"), db)
+    assert result["discovered"] == 0
+    assert result["indexed"] == 0
+
+
+def test_scan_with_empty_frozen_manifest_tolerates_missing_root(tmp_path):
+    """An empty manifest on a missing root is also benign. The vanished-
+    source guard only trips when the manifest holds work the caller
+    expected to happen; an empty list represents a source that had
+    nothing to scan in the first place.
+    """
+    from db import Database
+    from scanner import scan
+
+    db = Database(str(tmp_path / "test.db"))
+    result = scan(
+        str(tmp_path / "vanished_card"),
+        db,
+        discovered_files=[],
+    )
+    assert result["discovered"] == 0
+    assert result["indexed"] == 0
+
+
 def test_scan_skips_app_managed_library_bundles(tmp_path):
     """scan() must not descend into macOS app-managed library bundles.
 

@@ -30,6 +30,15 @@ from PIL import Image, ImageOps
 
 log = logging.getLogger(__name__)
 
+
+class ScanCancelled(RuntimeError):
+    """Raised when a directory walker's ``cancel_check`` callable returns
+    truthy. Defined here (not in scanner) so lower-level walkers like
+    :func:`safe_scan_walk` can raise cancellation without importing
+    scanner and creating a cycle. ``scanner.ScanCancelled`` is an alias
+    for this class."""
+
+
 RAW_EXTENSIONS = {".nef", ".cr2", ".cr3", ".arw", ".raf", ".dng", ".rw2", ".orf"}
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".tiff", ".tif", ".bmp", ".webp"}
 SUPPORTED_EXTENSIONS = IMAGE_EXTENSIONS | RAW_EXTENSIONS
@@ -285,7 +294,7 @@ def safe_iter_dir(top, onerror=None):
         )
 
 
-def safe_scan_walk(top, onerror=None):
+def safe_scan_walk(top, onerror=None, cancel_check=None):
     """Yield ``(dirpath, dirnames, filenames)`` like ``os.walk(top,
     followlinks=False)``, but never stat-following a symlinked excluded
     bundle.
@@ -310,7 +319,19 @@ def safe_scan_walk(top, onerror=None):
     ``filenames`` with ``os.path.isfile`` (which returns False for
     directories, including symlinked dirs) discard those entries
     automatically.
+
+    ``cancel_check`` is polled at the start of each visited directory and
+    again every ~256 scandir entries within a directory. A single
+    extremely large directory (a media dump with 1M+ files) can otherwise
+    keep this loop consuming the whole ``os.scandir`` iterator before
+    yielding, so a caller that only checks between yields cannot pause
+    or cancel until the enumeration finishes. When the check returns
+    truthy the walker raises :class:`ScanCancelled` from the current
+    ``next()``; callers do not need a separate per-yield poll for that
+    case.
     """
+    if cancel_check is not None and cancel_check():
+        raise ScanCancelled("directory walk cancelled")
     try:
         scandir_it = os.scandir(top)
     except OSError as exc:
@@ -322,7 +343,16 @@ def safe_scan_walk(top, onerror=None):
     skipped = []
     seen = set()
     with scandir_it:
-        for entry in scandir_it:
+        for i, entry in enumerate(scandir_it):
+            # Poll cancellation while we're still filling the buffer.
+            # A directory with millions of entries would otherwise finish
+            # the whole ``scandir`` loop before yielding, leaving pause
+            # and cancel stuck for the full enumeration. 256 is small
+            # enough that a big-mount stat batch still gets checked
+            # promptly, cheap enough that the check adds no measurable
+            # overhead to normal folders.
+            if cancel_check is not None and i and (i & 0xFF) == 0 and cancel_check():
+                raise ScanCancelled("directory walk cancelled")
             name = entry.name
             if name in seen:
                 continue
@@ -355,7 +385,9 @@ def safe_scan_walk(top, onerror=None):
         )
     yield top, dirs, nondirs
     for subdir in dirs:
-        yield from safe_scan_walk(os.path.join(top, subdir), onerror=onerror)
+        yield from safe_scan_walk(
+            os.path.join(top, subdir), onerror=onerror, cancel_check=cancel_check,
+        )
 
 
 def load_image(file_path, max_size=1024, raw_decode=RAW_DECODE_JPEG_FIRST):

@@ -373,17 +373,18 @@ def discover_source_files(
         # previous Path.rglob path was likewise consumed lazily by
         # ``sorted()``.
         def _candidate_paths():
+            # cancel_check is threaded into safe_scan_walk itself so pause
+            # and cancel fire not just between directories but between
+            # scandir entries too. A single very large directory (a media
+            # dump with 1M+ files) would otherwise keep the walker inside
+            # its ``os.scandir`` loop for the full enumeration, so
+            # per-yield checks here can't see the cancel until every
+            # entry has been classified. The outer per-directory check
+            # below still guards the interval between yield resumption
+            # and the next scandir call.
             for dirpath, _dirnames, filenames in safe_scan_walk(
-                str(source_path), onerror=onerror,
+                str(source_path), onerror=onerror, cancel_check=cancel_check,
             ):
-                # Cancellation checkpoint per walked directory. A
-                # per-candidate check alone (see the outer loop below)
-                # never fires while safe_scan_walk grinds through a
-                # subtree that yields no filenames — deeply nested empty
-                # directories, or a tree whose files are all
-                # extension-filtered out — so pause and cancel both
-                # appear stuck until the whole walk finishes. Mirrors
-                # scanner.scan()'s per-directory poll.
                 if cancel_check is not None and cancel_check():
                     raise ScanCancelled("file discovery cancelled")
                 for name in filenames:

@@ -53,7 +53,11 @@ from render_source import (
 from render_source import (
     working_copy_path_if_satisfies as _working_copy_path_if_satisfies,
 )
-from resource_ledger import bind_resource_cancel_check, bind_resource_owner
+from resource_ledger import (
+    ResourceWaitCancelled,
+    bind_resource_cancel_check,
+    bind_resource_owner,
+)
 
 log = logging.getLogger(__name__)
 
@@ -1782,6 +1786,17 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                 def cancel_check():
                     return _should_abort(abort) or _cancellation_requested()
 
+                def scan_pause_check():
+                    # Non-blocking pause probe for scanner.scan. When the
+                    # pipeline is about to pause, this returns True *before*
+                    # ``cancel_check`` parks — giving the scanner a chance to
+                    # terminate its worker processes and release its CPU
+                    # permits back to the ledger, so replacement scans,
+                    # model loads, and CPU inference aren't starved for the
+                    # duration of the pause.
+                    probe = getattr(runner, "pause_requested", None)
+                    return bool(probe and probe(job["id"]))
+
                 # Accumulator so multi-folder scans (repair loop, scan-in-place
                 # with sources=[...]) don't rewind the overall progress at each
                 # folder boundary. scan() reports (current, total) local to the
@@ -1900,6 +1915,7 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                                 vireo_dir=effective_vireo_dir,
                                 thumb_cache_dir=effective_thumb_cache_dir,
                                 cancel_check=cancel_check,
+                                pause_check=scan_pause_check,
                                 register_restrict_dirs_as_roots=False,
                                 allow_photo_inserts=False,
                             )
@@ -2775,6 +2791,7 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                         thumb_cache_dir=effective_thumb_cache_dir,
                         permission_error_callback=_on_denied,
                         cancel_check=cancel_check,
+                        pause_check=scan_pause_check,
                     )
                 else:
                     # Scan-in-place: scan each source folder independently.
@@ -2844,6 +2861,7 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                                 thumb_cache_dir=effective_thumb_cache_dir,
                                 permission_error_callback=_on_denied,
                                 cancel_check=cancel_check,
+                                pause_check=scan_pause_check,
                             )
                         finally:
                             advance_scan_acc()
@@ -6896,6 +6914,13 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                                 variant=dinov2_variant,
                             )
                             masked += 1
+                    except ResourceWaitCancelled:
+                        # Cooperative cancellation during a CPU inference
+                        # lease wait is not a per-photo mask failure. Let
+                        # it propagate so extract_masks_stage exits its
+                        # per-photo loop promptly instead of iterating
+                        # every remaining candidate.
+                        raise
                     except Exception:
                         em_failed += 1
                         log.warning("Mask extraction failed for photo %s", photo_id, exc_info=True)

@@ -2850,6 +2850,127 @@ def test_scanner_worker_count_obeys_process_cpu_grant(monkeypatch):
         resource_ledger._set_resource_ledger_for_tests(previous)
 
 
+def test_scan_releases_cpu_permits_while_paused(tmp_path, monkeypatch):
+    """When ``pause_check`` reports a pending pause during hashing, the
+    scanner must drop its CPU lease before parking at ``cancel_check``.
+
+    Codex flagged that the pause-aware ``cancel_check`` parked inside
+    ``_iter_features`` while the ``_claim_worker_count`` context was
+    still open — so a paused scan retained every CPU permit and left
+    submitted futures running. Other scans, model loads, and CPU
+    inference were blocked for the entire pause even though the user
+    intended this job to stop competing for resources.
+
+    Assertion contract: on the FIRST parking-shaped call to
+    ``cancel_check`` (the one that would block in the pipeline), the
+    ledger's CPU allocation must already be zero. After the pause
+    clears, the scanner must reacquire and finish. Every file must
+    still land in the DB.
+    """
+    import threading
+
+    import resource_ledger
+    import scanner
+    from db import Database
+
+    root = str(tmp_path / "photos")
+    _create_test_images(root, {'': ['a.jpg', 'b.jpg', 'c.jpg']})
+    db = Database(str(tmp_path / "test.db"))
+
+    ledger = resource_ledger.ResourceLedger(cpu_capacity=2)
+    previous = resource_ledger._set_resource_ledger_for_tests(ledger)
+
+    pause_state = {"active": False}
+    parking_alloc = []
+    resume_event = threading.Event()
+
+    def pause_check():
+        return pause_state["active"]
+
+    def cancel_check():
+        # Faithful emulation of the pipeline's pause-aware cancel_check:
+        # when a pause is pending, this call would enter
+        # ``pause_gate.checkpoint`` and block until resume. Capture the
+        # ledger allocation right at that moment — the fix's contract is
+        # that the scanner has already released its lease by the time it
+        # gets here. Resume once, so the retry loop can complete.
+        if pause_state["active"]:
+            parking_alloc.append(ledger.snapshot()["cpu"]["allocated"])
+            # In the real pipeline, ``pause_gate.wait_if_paused`` blocks
+            # here. Use a short wait so the test still fails obviously if
+            # the fix regresses (the resume_event will be set by the
+            # background thread below), rather than hanging forever.
+            resume_event.wait(timeout=5.0)
+            pause_state["active"] = False
+        return False
+
+    # Flip the pause on as soon as hashing announces itself (the status
+    # callback fires from inside ``_iter_features`` right after the lease
+    # is granted), then arm resume after a short delay so the ``cancel_
+    # check`` parking call has real breathing room to run under the
+    # unheld lease.
+    triggered = {"done": False}
+
+    def resume_after_delay():
+        time.sleep(0.1)
+        resume_event.set()
+
+    def status_callback(message, phase_current=None, phase_total=None, phase_label=None):
+        if not triggered["done"] and "Hashing" in message:
+            triggered["done"] = True
+            pause_state["active"] = True
+            threading.Thread(target=resume_after_delay, daemon=True).start()
+
+    try:
+        scanner.scan(
+            root,
+            db,
+            cancel_check=cancel_check,
+            pause_check=pause_check,
+            status_callback=status_callback,
+        )
+    finally:
+        resource_ledger._set_resource_ledger_for_tests(previous)
+
+    # The scanner must have parked at cancel_check with the ledger
+    # showing zero CPU allocation — proving the lease was released
+    # before parking rather than being held across the whole pause.
+    assert parking_alloc, (
+        "cancel_check was never called with the pause pending — the "
+        "scanner did not detect the pause request during hashing"
+    )
+    assert parking_alloc[0] == 0, (
+        f"CPU permits were still held while the scanner parked "
+        f"(observed: {parking_alloc[0]}); the pause must drain the "
+        f"pool and release the lease first"
+    )
+    # Post-resume, the ledger must be idle again and every discovered
+    # photo must be recorded — the pause path is not allowed to drop
+    # work on the floor.
+    assert ledger.snapshot()["cpu"]["allocated"] == 0
+    photos = db.get_photos(per_page=100)
+    assert {os.path.basename(p["filename"]) for p in photos} == {
+        "a.jpg", "b.jpg", "c.jpg",
+    }
+
+
+def test_scan_pause_check_none_preserves_existing_behavior(tmp_path):
+    """Callers that don't supply ``pause_check`` see the historical
+    single-lease hashing path — the new keyword is fully opt-in."""
+    import scanner
+    from db import Database
+
+    root = str(tmp_path / "photos")
+    _create_test_images(root, {'': ['a.jpg', 'b.jpg']})
+    db = Database(str(tmp_path / "test.db"))
+
+    # Should not raise and must catalog every file.
+    scanner.scan(root, db)
+
+    photos = db.get_photos(per_page=100)
+    assert len(photos) == 2
+
+
 # -- scan resilience: retry on locked DB, mark folder partial on abort --
 
 

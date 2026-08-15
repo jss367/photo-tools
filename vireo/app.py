@@ -29483,6 +29483,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 save_mask,
             )
             from quality import compute_all_quality_features
+            from resource_ledger import ResourceWaitCancelled
 
             thread_db = Database(db_path)
             thread_db.set_active_workspace(active_ws)
@@ -29731,6 +29732,16 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     )
                     masked += 1
 
+                except ResourceWaitCancelled:
+                    # Job cancelled while waiting for the CPU inference
+                    # lease. Bail out of the loop immediately instead of
+                    # marking every remaining photo as a mask failure
+                    # (which would then reopen the source, preprocess it,
+                    # and hit the same cancellation on the next iteration).
+                    log.info(
+                        "extract-masks cancelled while waiting for inference resources",
+                    )
+                    break
                 except Exception:
                     failed += 1
                     log.warning(

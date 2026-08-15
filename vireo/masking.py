@@ -13,6 +13,7 @@ import threading
 import numpy as np
 import onnx_runtime
 from PIL import Image, ImageFilter
+from resource_ledger import ResourceWaitCancelled
 
 log = logging.getLogger(__name__)
 
@@ -338,6 +339,13 @@ def generate_mask(image, detection_box, variant="sam2-small"):
             best_mask = np.array(mask_img) > 127
 
         return best_mask.astype(bool)
+    except ResourceWaitCancelled:
+        # Cooperative cancellation while waiting for the CPU inference
+        # lease is not a mask failure — swallowing it would let the
+        # extract-masks loop keep loading and preprocessing every
+        # remaining image before the next cancellation checkpoint,
+        # substantially delaying JobRunner.shutdown().
+        raise
     except Exception:
         log.warning("SAM2 mask generation failed", exc_info=True)
         return None

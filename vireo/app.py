@@ -26420,7 +26420,9 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             import config as cfg
             from pipeline_job import (
                 _archive_mount_baseline,
+                _changed_mount_since_baseline,
                 _load_known_mount_roots,
+                _mount_identity_baseline,
                 _record_known_mount_roots,
                 _unmounted_since_baseline,
             )
@@ -26453,14 +26455,19 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             scan_acc = {"prior": 0, "last_current": 0, "last_total": 0}
             working_copy_scope = []
             working_copy_scope_baselines = {}
+            working_copy_scope_identities = {}
             known_mount_roots = _load_known_mount_roots(thread_db)
             source_mount_baselines = {}
+            source_mount_identities = {}
             for source in sources:
                 source_key = str(Path(source))
                 baseline = _archive_mount_baseline(
                     source, known_mount_roots,
                 )
                 source_mount_baselines[source_key] = baseline
+                source_mount_identities[source_key] = (
+                    _mount_identity_baseline(baseline)
+                )
                 _record_known_mount_roots(thread_db, baseline)
 
             snapshot_requested = len(snapshot_paths or [])
@@ -26660,6 +26667,11 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                                         str(Path(source)), {},
                                     )
                                 )
+                                working_copy_scope_identities[entry] = (
+                                    source_mount_identities.get(
+                                        str(Path(source)), {},
+                                    )
+                                )
                     elif (
                         not is_excluded_scan_path(Path(source))
                         and os.path.isdir(source)
@@ -26676,6 +26688,9 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                         working_copy_scope.append(entry)
                         working_copy_scope_baselines[entry] = (
                             source_mount_baselines.get(normalized_source, {})
+                        )
+                        working_copy_scope_identities[entry] = (
+                            source_mount_identities.get(normalized_source, {})
                         )
                 except Exception as exc:
                     if isinstance(exc, ScanCancelled) and cancel_check():
@@ -26734,22 +26749,31 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                         detached_mount = _unmounted_since_baseline(
                             working_copy_scope_baselines.get(entry, {}),
                         )
+                        changed_mount = _changed_mount_since_baseline(
+                            working_copy_scope_identities.get(entry, {}),
+                        )
                         still_available = (
                             not is_excluded_scan_path(Path(path))
                             and detached_mount is None
+                            and changed_mount is None
                             and os.path.isdir(path)
                         )
                     except OSError:
                         still_available = False
                         detached_mount = None
+                        changed_mount = None
                     if still_available:
                         revalidated_scope.append(entry)
                     else:
                         log.info(
                             "Skipping deferred working-copy scope %s: no "
-                            "longer present, excluded, or mount detached%s",
+                            "longer present, excluded, or mount changed%s",
                             path,
-                            f" ({detached_mount})" if detached_mount else "",
+                            (
+                                f" ({detached_mount or changed_mount})"
+                                if detached_mount or changed_mount
+                                else ""
+                            ),
                         )
                 if revalidated_scope:
                     try:

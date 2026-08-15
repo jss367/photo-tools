@@ -410,6 +410,51 @@ def _unmounted_since_baseline(baseline: dict[str, bool]) -> str | None:
     return None
 
 
+def _mount_identity(root: str):
+    """Return a mount-instance identity, preferring Linux's mount ID."""
+    normalized = os.path.normpath(root)
+    try:
+        with open("/proc/self/mountinfo", encoding="utf-8") as mountinfo:
+            for line in mountinfo:
+                fields = line.split(" - ", 1)[0].split()
+                if len(fields) < 5:
+                    continue
+                mount_point = fields[4]
+                for escaped, literal in (
+                    ("\\040", " "), ("\\011", "\t"),
+                    ("\\012", "\n"), ("\\134", "\\"),
+                ):
+                    mount_point = mount_point.replace(escaped, literal)
+                if os.path.normpath(mount_point) == normalized:
+                    # This ID changes even when the same filesystem is
+                    # detached and remounted; device/inode may not.
+                    return ("mountinfo", fields[0], fields[2], fields[3])
+    except OSError:
+        pass
+    try:
+        stat_result = os.stat(root)
+    except OSError:
+        return None
+    return ("stat", stat_result.st_dev, stat_result.st_ino)
+
+
+def _mount_identity_baseline(baseline: dict[str, bool]) -> dict[str, object]:
+    """Snapshot live mount instances represented by a mounted baseline."""
+    return {
+        root: _mount_identity(root)
+        for root, was_mounted in baseline.items()
+        if was_mounted
+    }
+
+
+def _changed_mount_since_baseline(identities: dict[str, object]) -> str | None:
+    """Return a mount whose instance disappeared or was replaced."""
+    for root, prior_identity in identities.items():
+        if prior_identity is None or _mount_identity(root) != prior_identity:
+            return root
+    return None
+
+
 def _missing_archive_mount_root(path: str) -> str | None:
     """Return a likely missing mount root that must not be auto-created.
 

@@ -6100,8 +6100,16 @@ def test_import_in_place_rejects_detached_persistent_mount_stub(
         lambda _db, _baseline: None,
     )
     monkeypatch.setattr(
+        pipeline_job, "_mount_identity_baseline",
+        lambda _baseline: {"/mnt/card": ("mountinfo", "old")},
+    )
+    monkeypatch.setattr(
         pipeline_job, "_unmounted_since_baseline",
         lambda baseline: "/mnt/card" if baseline else None,
+    )
+    monkeypatch.setattr(
+        pipeline_job, "_changed_mount_since_baseline",
+        lambda _identities: None,
     )
     monkeypatch.setattr(
         scanner, "scan",
@@ -6122,6 +6130,62 @@ def test_import_in_place_rejects_detached_persistent_mount_stub(
 
     assert job["status"] == "completed", job
     assert source.is_dir(), "the detached mount stub still exists"
+    assert extractor_calls == []
+
+
+def test_import_in_place_rejects_detached_then_remounted_source(
+    app_and_db, tmp_path, monkeypatch,
+):
+    """A replacement mount cannot pass the final availability probe."""
+    import pipeline_job
+    import scanner
+
+    app, _ = app_and_db
+    source = tmp_path / "remounted-source"
+    source.mkdir()
+    extractor_calls = []
+
+    monkeypatch.setattr(
+        pipeline_job, "_load_known_mount_roots", lambda _db: set(),
+    )
+    monkeypatch.setattr(
+        pipeline_job, "_archive_mount_baseline",
+        lambda path, known: {"/mnt/card": True},
+    )
+    monkeypatch.setattr(
+        pipeline_job, "_record_known_mount_roots",
+        lambda _db, _baseline: None,
+    )
+    monkeypatch.setattr(
+        pipeline_job, "_mount_identity_baseline",
+        lambda _baseline: {"/mnt/card": ("mountinfo", "old")},
+    )
+    monkeypatch.setattr(
+        pipeline_job, "_unmounted_since_baseline", lambda _baseline: None,
+    )
+    monkeypatch.setattr(
+        pipeline_job, "_changed_mount_since_baseline",
+        lambda identities: "/mnt/card" if identities else None,
+    )
+    monkeypatch.setattr(
+        scanner, "scan",
+        lambda *_args, **_kwargs: {"discovered": 0, "indexed": 0},
+    )
+    monkeypatch.setattr(
+        scanner, "_extract_working_copies",
+        lambda *args, **kwargs: extractor_calls.append((args, kwargs)),
+    )
+
+    client = app.test_client()
+    resp = client.post("/api/jobs/import-in-place", json={
+        "sources": [str(source)],
+        "after_import": None,
+    })
+    assert resp.status_code == 200, resp.get_json()
+    job = wait_for_job_via_client(client, resp.get_json()["job_id"])
+
+    assert job["status"] == "completed", job
+    assert source.is_dir(), "the replacement mount is live at final probe"
     assert extractor_calls == []
 
 

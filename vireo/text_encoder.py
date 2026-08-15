@@ -122,7 +122,9 @@ def encode_text(query, model_str, pretrained_str=None):
     tokens[0, : len(ids)] = ids
 
     # Run text encoder
-    txt_features = session.run(None, {input_name: tokens})[0]
+    from pipeline_locks import acquire_inference_resources
+    with acquire_inference_resources(session):
+        txt_features = session.run(None, {input_name: tokens})[0]
     txt_features = txt_features.astype(np.float32)
 
     # Normalize to unit length

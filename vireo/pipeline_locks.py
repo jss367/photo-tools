@@ -2,11 +2,11 @@
 
 Two primitives:
 
-* ``acquire_gpu()`` — a single-holder semaphore that every GPU-using stage
-  (classify, detect, extract_masks, eye_keypoints) wraps around its
-  per-batch inference call. Must be released between batches so a long
-  classify doesn't completely starve a second pipeline that just wants
-  one quick GPU op.
+* ``acquire_inference_resources()`` — a provider-aware inference lease.
+  GPU sessions take the single-holder accelerator semaphore. CPU-only
+  sessions atomically claim their configured CPU permits plus the exclusive
+  ``cpu_ml`` lane, preventing independent native ONNX pools from
+  oversubscribing the process budget.
 
 * ``acquire_workspace_regroup(workspace_id)`` — a per-workspace lock
   held across BOTH ``regroup_stage`` and ``miss_stage`` so two pipelines
@@ -16,12 +16,13 @@ Two primitives:
   Pipelines on different workspaces never contend.
 
 Lock order (acquire outermost first): ``_progress_lock`` →
-``acquire_workspace_regroup`` → ``JobRunner._lock`` → ``acquire_gpu``.
+``acquire_workspace_regroup`` → ``JobRunner._lock`` → inference lease.
 ``JobRunner._lock`` is a brief leaf lock taken by ``runner.update_step``
 inside the workspace critical section; this is safe because no code
 path under ``JobRunner._lock`` acquires ``acquire_workspace_regroup``,
-so there is no cycle. ``acquire_gpu`` is the innermost: nothing else
-may be acquired while it is held.
+so there is no cycle. Resource-ledger accounting is completed before a
+lease is returned; its mutex is never held during inference. The accelerator
+semaphore remains innermost: nothing else may be acquired while it is held.
 """
 
 import threading
@@ -78,29 +79,53 @@ def _session_uses_gpu(session):
     return any(p in _GPU_PROVIDERS for p in providers)
 
 
-def acquire_gpu_if_session_uses_it(session):
-    """Context manager: take the GPU semaphore only for GPU-running sessions.
+def acquire_inference_resources(session):
+    """Return the enforceable inference lease for an ONNX session.
 
-    CPU-only ONNX sessions (Apple Silicon with external-data models,
-    CPU-only installs) skip the lock so they don't block concurrent
-    pipelines' real GPU work. GPU-running sessions still serialise.
+    CPU-only sessions claim the exact CPU thread count configured when the
+    session was constructed and the initial exclusive ``cpu_ml`` lane.
+    Accelerator sessions keep the existing per-batch GPU serialization.
+    Unknown providers take the conservative accelerator path.
 
     Usage::
 
-        with acquire_gpu_if_session_uses_it(session):
+        with acquire_inference_resources(session):
             outputs = session.run(None, feeds)
     """
     if _session_uses_gpu(session):
         return _GpuLockContext()
-    return _NoOpContext()
+    try:
+        providers = set(session.get_providers())
+    except Exception:
+        return _GpuLockContext()
+    if providers != {"CPUExecutionProvider"}:
+        return _GpuLockContext()
+
+    from onnx_runtime import session_cpu_threads
+    from resource_ledger import (
+        CpuRequest,
+        ResourceRequest,
+        get_resource_ledger,
+    )
+
+    ledger = get_resource_ledger()
+    threads = session_cpu_threads(
+        session, default=min(8, ledger.cpu_capacity),
+    )
+    # A test may replace the process ledger after constructing a session.
+    # Production uses one immutable startup capacity, but clamping here keeps
+    # the request valid without weakening the configured production budget.
+    threads = max(1, min(int(threads), ledger.cpu_capacity))
+    return ledger.acquire(ResourceRequest(
+        cpu=CpuRequest(threads, threads, threads),
+        lanes=("cpu_ml",),
+        label="CPU ONNX inference",
+    ))
 
 
-class _NoOpContext:
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc, tb):
-        return False
+def acquire_gpu_if_session_uses_it(session):
+    """Backward-compatible name for provider-aware inference coordination."""
+    return acquire_inference_resources(session)
 
 
 # Per-workspace regroup locks. Created lazily on first request. Entries

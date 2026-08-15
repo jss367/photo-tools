@@ -46,14 +46,25 @@ def test_acquire_gpu_if_session_uses_it_takes_lock_for_coreml_session():
 
 
 def test_acquire_gpu_if_session_uses_it_skips_lock_for_cpu_only_session():
+    import resource_ledger
+
     sess = _FakeSession(["CPUExecutionProvider"])
+    ledger = resource_ledger.ResourceLedger(cpu_capacity=2)
+    previous = resource_ledger._set_resource_ledger_for_tests(ledger)
     before = _GPU_SEMAPHORE._value
-    with acquire_gpu_if_session_uses_it(sess):
-        held = _GPU_SEMAPHORE._value
-    after = _GPU_SEMAPHORE._value
+    try:
+        with acquire_gpu_if_session_uses_it(sess):
+            held = _GPU_SEMAPHORE._value
+            snapshot = ledger.snapshot()
+            assert snapshot["cpu"]["allocated"] == 2
+            assert snapshot["lanes"]["cpu_ml"]["allocated"] == 1
+        after = _GPU_SEMAPHORE._value
+    finally:
+        resource_ledger._set_resource_ledger_for_tests(previous)
     assert before == 1
     assert held == 1, "CPU-only session must not take the GPU semaphore"
     assert after == 1
+    assert ledger.snapshot()["cpu"]["allocated"] == 0
 
 
 def test_acquire_gpu_if_session_uses_it_defaults_to_lock_when_providers_missing():

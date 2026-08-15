@@ -259,13 +259,12 @@ def generate_mask(image, detection_box, variant="sam2-small"):
             std=_IMAGENET_STD,
         )
 
-        # GPU serialisation across concurrent pipelines, scoped tightly
-        # to the encoder forward pass — preprocessing above and
-        # postprocessing/decoder setup below run without holding the
-        # semaphore so another pipeline's GPU op can interleave.
-        from pipeline_locks import acquire_gpu
+        # Provider-aware inference coordination is scoped tightly to the
+        # encoder forward pass. Preprocessing above and decoder setup below
+        # run without holding CPU or accelerator inference resources.
+        from pipeline_locks import acquire_inference_resources
         enc_input_name = encoder_session.get_inputs()[0].name
-        with acquire_gpu():
+        with acquire_inference_resources(encoder_session):
             enc_outputs = encoder_session.run(None, {enc_input_name: input_tensor})
         image_embeddings = enc_outputs[0]  # (1, C, H', W')
         # Encoder also outputs high-res FPN features for the mask decoder
@@ -316,7 +315,7 @@ def generate_mask(image, detection_box, variant="sam2-small"):
             if name in input_map:
                 decoder_inputs[name] = input_map[name]
 
-        with acquire_gpu():
+        with acquire_inference_resources(decoder_session):
             dec_outputs = decoder_session.run(None, decoder_inputs)
         # Outputs: masks (1, N, H, W) and scores (1, N)
         masks = dec_outputs[0]  # (1, N, H, W)

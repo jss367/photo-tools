@@ -53,6 +53,7 @@ from render_source import (
 from render_source import (
     working_copy_path_if_satisfies as _working_copy_path_if_satisfies,
 )
+from resource_ledger import bind_resource_owner
 
 log = logging.getLogger(__name__)
 
@@ -1407,8 +1408,12 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
             pause_gate.register(participant)
         pause_context.participant = participant
         try:
-            _pause_checkpoint()
-            return work_fn()
+            # Context variables do not propagate into Python threads. Bind
+            # each pipeline participant explicitly so scanner/model waits are
+            # attributed to the parent job's diagnostics.
+            with bind_resource_owner(job["id"]):
+                _pause_checkpoint()
+                return work_fn()
         finally:
             pause_context.participant = None
             pause_gate.unregister(participant)

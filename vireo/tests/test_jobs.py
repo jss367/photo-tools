@@ -845,6 +845,53 @@ def test_job_history_persistence(tmp_path):
     assert rows[0]['status'] == 'completed'
 
 
+def test_job_records_resource_wait_timing_in_snapshot_and_history(tmp_path):
+    import resource_ledger
+    from db import Database
+    from jobs import JobRunner
+
+    db = Database(str(tmp_path / "test.db"))
+    workspace_id = db.ensure_default_workspace()
+    db.set_active_workspace(workspace_id)
+    runner = JobRunner(db=db)
+    ledger = resource_ledger.ResourceLedger(cpu_capacity=1)
+    previous = resource_ledger._set_resource_ledger_for_tests(ledger)
+    holder = ledger.acquire(resource_ledger.ResourceRequest(
+        cpu=resource_ledger.CpuRequest(1, 1, 1),
+    ))
+    waiting = threading.Event()
+
+    def work(_job):
+        with ledger.acquire(
+            resource_ledger.ResourceRequest(
+                cpu=resource_ledger.CpuRequest(1, 1, 1),
+            ),
+            on_wait=lambda _request: waiting.set(),
+        ):
+            return {"ok": True}
+
+    try:
+        job_id = runner.start("test", work, workspace_id=workspace_id)
+        assert waiting.wait(timeout=1.0)
+        holder.release()
+        job = wait_for_job_via_runner(
+            runner, job_id, wait_for_history=True,
+        )
+    finally:
+        holder.release()
+        resource_ledger._set_resource_ledger_for_tests(previous)
+
+    assert job["resource_wait_count"] == 1
+    assert job["resource_wait_seconds"] >= 0
+    row = db.conn.execute(
+        "SELECT resource_wait_seconds, resource_wait_count "
+        "FROM job_history WHERE id = ?",
+        (job_id,),
+    ).fetchone()
+    assert row["resource_wait_count"] == 1
+    assert row["resource_wait_seconds"] >= 0
+
+
 def test_ephemeral_job_skips_history_persistence(tmp_path):
     """Ephemeral jobs run normally but never write a row to job_history."""
     from db import Database

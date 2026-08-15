@@ -626,6 +626,17 @@ def test_jobs_list_includes_active_workspace_id(app_and_db):
     assert data['active_workspace_id'] == db._active_workspace_id
 
 
+def test_jobs_list_includes_resource_budget_snapshot(app_and_db):
+    app, _db = app_and_db
+    data = app.test_client().get("/api/jobs").get_json()
+
+    budget = data["resource_budget"]
+    assert budget["cpu"]["capacity"] >= 1
+    assert budget["cpu"]["available"] <= budget["cpu"]["capacity"]
+    assert budget["lanes"]["cpu_ml"]["capacity"] == 1
+    assert budget["lanes"]["model_construction"]["capacity"] == 1
+
+
 def test_jobs_list_includes_workspace_names(app_and_db):
     """GET /api/jobs includes workspace_names mapping."""
     app, _ = app_and_db

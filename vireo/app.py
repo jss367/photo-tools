@@ -28168,6 +28168,8 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
 
     @app.route("/api/jobs")
     def api_jobs_list():
+        from resource_ledger import get_resource_ledger
+
         runner = app._job_runner
         db = _get_db()
         active = [_strip_heavy_for_list(j) for j in runner.list_jobs()]
@@ -28181,6 +28183,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             # job runs (issue #1397). Surfacing it keeps that visible
             # rather than silent — see CORE_PHILOSOPHY "no black boxes".
             "keeping_awake": app._job_runner.sleep_blocker.active,
+            "resource_budget": get_resource_ledger().snapshot(),
             "active_workspace_id": db._active_workspace_id,
             "workspace_names": ws_names,
         })

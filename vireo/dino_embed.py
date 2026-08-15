@@ -353,46 +353,18 @@ def embed_batch(images, variant="vit-b14"):
     ]
     batch = np.concatenate(tensors, axis=0)
 
-    # GPU serialisation across concurrent pipelines, scoped tightly to
-    # the forward pass. Preprocessing above (resize/normalize per image)
-    # runs without the lock so concurrent pipelines aren't blocked on
-    # CPU work.
+    # Provider-aware coordination is scoped tightly to the forward pass.
+    # Preprocessing above (resize/normalize per image) runs without a lease.
     #
-    # Skip the GPU semaphore when the session is CPU-only — on Apple
-    # Silicon with external-data models (CoreML excluded — see
-    # ``onnx_runtime.create_session``) and on CPU-only installs, DINO
-    # runs on the CPU. Taking the process-wide GPU lock there would
-    # needlessly block concurrent detector/classifier/SAM batches that
-    # *do* use the GPU, defeating the concurrency this design enables.
+    # CPU-only sessions skip the GPU semaphore and instead take their
+    # configured CPU permits plus the exclusive cpu_ml lane. Accelerator
+    # sessions retain the process-wide per-batch semaphore.
     input_name = session.get_inputs()[0].name
-    if _session_uses_gpu(session):
-        from pipeline_locks import acquire_gpu
-        with acquire_gpu():
-            outputs = session.run(None, {input_name: batch})
-    else:
+    from pipeline_locks import acquire_inference_resources
+    with acquire_inference_resources(session):
         outputs = session.run(None, {input_name: batch})
 
     return outputs[0].astype(np.float32)
-
-
-_GPU_PROVIDERS = ("CUDAExecutionProvider", "CoreMLExecutionProvider")
-
-
-def _session_uses_gpu(session):
-    """Return True if ``session`` is actually executing on a GPU provider.
-
-    ``InferenceSession.get_providers()`` returns the providers ONNX
-    Runtime decided to use after construction, so this reflects reality
-    even when CoreML was requested but excluded (e.g. for external-data
-    models). Falls back to ``True`` if the session doesn't expose
-    ``get_providers`` — the conservative default that matches prior
-    behavior.
-    """
-    try:
-        providers = session.get_providers()
-    except Exception:
-        return True
-    return any(p in _GPU_PROVIDERS for p in providers)
 
 
 def embed_subject(crop_image, variant="vit-b14"):

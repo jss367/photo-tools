@@ -2831,6 +2831,25 @@ def test_resolve_worker_count_no_windows_cap_on_posix(monkeypatch):
     assert scanner._resolve_worker_count(list(range(200))) == 128
 
 
+def test_scanner_worker_count_obeys_process_cpu_grant(monkeypatch):
+    """scan_workers is a maximum request, not an entitlement."""
+    import config as cfg
+    import resource_ledger
+    import scanner
+
+    monkeypatch.setattr(cfg, "get", lambda _k: 16)
+    monkeypatch.setattr(scanner.os, "cpu_count", lambda: 16)
+    ledger = resource_ledger.ResourceLedger(cpu_capacity=3)
+    previous = resource_ledger._set_resource_ledger_for_tests(ledger)
+    try:
+        with scanner._claim_worker_count(list(range(100))) as workers:
+            assert workers == 3
+            assert ledger.snapshot()["cpu"]["allocated"] == 3
+        assert ledger.snapshot()["cpu"]["allocated"] == 0
+    finally:
+        resource_ledger._set_resource_ledger_for_tests(previous)
+
+
 # -- scan resilience: retry on locked DB, mark folder partial on abort --
 
 

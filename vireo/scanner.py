@@ -34,6 +34,11 @@ from preview_cache import (
 )
 from render_source import exif_orientation as _exif_orientation_from_data
 from render_source import is_undersized
+from resource_ledger import (
+    ResourceRequest,
+    cpu_phase_request,
+    get_resource_ledger,
+)
 from xmp import read_hierarchical_keywords, read_keywords
 
 log = logging.getLogger(__name__)
@@ -174,6 +179,24 @@ def _resolve_worker_count(files_to_process):
     if sys.platform == "win32":
         workers = min(workers, _WINDOWS_MAX_WORKERS)
     return max(1, min(workers, n))
+
+
+@contextlib.contextmanager
+def _claim_worker_count(files_to_process, cancel_check=None):
+    """Yield the scanner worker grant from the process-wide CPU budget."""
+    desired = _resolve_worker_count(files_to_process)
+    ledger = get_resource_ledger()
+    request = ResourceRequest(
+        cpu=cpu_phase_request(
+            ledger.cpu_capacity,
+            minimum=1,
+            preferred=desired,
+            maximum=desired,
+        ),
+        label="scanner hashing",
+    )
+    with ledger.acquire(request, cancel_check=cancel_check) as lease:
+        yield lease.cpu_permits
 
 
 def _import_keywords_for_photo(db, photo_id, xmp_path_str):
@@ -2218,53 +2241,61 @@ def scan(root, db, progress_callback=None, incremental=False, extract_full_metad
     # every byte of the image; everything else in the loop is cheap DB or
     # dict work. Results stream in order, so workers keep computing the tail
     # while the main thread commits the head — no O(n) buffer of features.
-    workers = _resolve_worker_count(files_to_process)
-    if paths_to_extract and status_callback:
-        _emit_status(
-            f"Hashing {len(paths_to_extract)} files ({workers} worker{'s' if workers != 1 else ''})..."
-        )
-
     def _iter_features():
-        if workers > 1:
-            mp_ctx = multiprocessing.get_context(_SCAN_MP_METHOD)
-            pool = ProcessPoolExecutor(max_workers=workers, mp_context=mp_ctx)
-            try:
-                # Bounded in-flight window instead of pool.map(): on Python
-                # 3.11 Executor.map eagerly submits every input, so on a
-                # 200k-file scan we would hold 200k queued futures in RAM.
-                # A few submissions per worker is enough to keep them fed
-                # while the main thread drains results in order.
-                def _feature_result(fut):
-                    while True:
-                        _check_cancelled()
-                        try:
-                            return fut.result(timeout=0.2)
-                        except TimeoutError:
-                            continue
+        if not files_to_process:
+            return
+        with _claim_worker_count(
+            files_to_process, cancel_check=_check_cancelled,
+        ) as workers:
+            if status_callback:
+                _emit_status(
+                    f"Hashing {len(paths_to_extract)} files "
+                    f"({workers} worker{'s' if workers != 1 else ''})..."
+                )
+            log.info(
+                "Scanner hashing granted %d worker(s) for %d files",
+                workers, len(paths_to_extract),
+            )
+            if workers > 1:
+                mp_ctx = multiprocessing.get_context(_SCAN_MP_METHOD)
+                pool = ProcessPoolExecutor(max_workers=workers, mp_context=mp_ctx)
+                try:
+                    # Bounded in-flight window instead of pool.map(): on Python
+                    # 3.11 Executor.map eagerly submits every input, so on a
+                    # 200k-file scan we would hold 200k queued futures in RAM.
+                    # A few submissions per worker is enough to keep them fed
+                    # while the main thread drains results in order.
+                    def _feature_result(fut):
+                        while True:
+                            _check_cancelled()
+                            try:
+                                return fut.result(timeout=0.2)
+                            except TimeoutError:
+                                continue
 
-                max_in_flight = workers * 4
-                pending = deque()
-                inputs = zip(files_to_process, paths_to_extract, strict=True)
-                for image_path, path_str in inputs:
-                    _check_cancelled()
-                    pending.append((image_path, pool.submit(_compute_file_features, path_str)))
-                    if len(pending) >= max_in_flight:
+                    max_in_flight = workers * 4
+                    pending = deque()
+                    inputs = zip(files_to_process, paths_to_extract, strict=True)
+                    for image_path, path_str in inputs:
+                        _check_cancelled()
+                        pending.append((image_path, pool.submit(_compute_file_features, path_str)))
+                        if len(pending) >= max_in_flight:
+                            done_path, done_fut = pending.popleft()
+                            _check_cancelled()
+                            yield done_path, _feature_result(done_fut)
+                    while pending:
                         done_path, done_fut = pending.popleft()
                         _check_cancelled()
                         yield done_path, _feature_result(done_fut)
-                while pending:
-                    done_path, done_fut = pending.popleft()
-                    _check_cancelled()
-                    yield done_path, _feature_result(done_fut)
-            except BaseException:
-                pool.shutdown(wait=False, cancel_futures=True)
-                raise
+                except BaseException:
+                    pool.shutdown(wait=False, cancel_futures=True)
+                    raise
+                else:
+                    pool.shutdown(wait=True)
             else:
-                pool.shutdown(wait=True)
-        else:
-            for image_path, path_str in zip(files_to_process, paths_to_extract, strict=True):
-                _check_cancelled()
-                yield image_path, _compute_file_features(path_str)
+                for image_path, path_str in zip(files_to_process, paths_to_extract, strict=True):
+                    _check_cancelled()
+                    yield image_path, _compute_file_features(path_str)
 
     try:
         for image_path, (phash, file_hash) in _iter_features():

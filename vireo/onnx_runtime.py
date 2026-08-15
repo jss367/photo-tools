@@ -7,11 +7,17 @@ image preprocessing, and common post-processing operations.
 import contextlib
 import logging
 import os
+import threading
+import weakref
 
 import numpy as np
 from PIL import Image
 
 log = logging.getLogger(__name__)
+
+_SESSION_THREADS_LOCK = threading.Lock()
+_SESSION_CPU_THREADS = weakref.WeakKeyDictionary()
+_SESSION_CPU_THREADS_FALLBACK = {}
 
 
 # Substrings that identify onnxruntime load failures rooted in the file
@@ -167,11 +173,46 @@ def get_providers():
     return providers
 
 
-def create_session(model_path):
+def _remember_session_cpu_threads(session, threads):
+    """Associate an ONNX session with its enforceable CPU thread budget."""
+    threads = max(1, int(threads))
+    with contextlib.suppress(Exception):
+        # The Python InferenceSession wrapper normally accepts attributes.
+        # Keeping the value on the object lets top-level and package-qualified
+        # imports observe the same budget in mixed test/tooling environments.
+        session._vireo_cpu_threads = threads
+    with _SESSION_THREADS_LOCK:
+        try:
+            _SESSION_CPU_THREADS[session] = threads
+        except TypeError:
+            # Some extension-backed test doubles are not weak-referenceable.
+            # Production InferenceSession objects use the weak map.
+            _SESSION_CPU_THREADS_FALLBACK[id(session)] = threads
+
+
+def session_cpu_threads(session, default=None):
+    """Return the configured CPU threads for ``session`` when known."""
+    with contextlib.suppress(Exception):
+        threads = int(session._vireo_cpu_threads)
+        if threads >= 1:
+            return threads
+    with _SESSION_THREADS_LOCK:
+        try:
+            threads = _SESSION_CPU_THREADS.get(session)
+        except TypeError:
+            threads = None
+        if threads is None:
+            threads = _SESSION_CPU_THREADS_FALLBACK.get(id(session))
+    return threads if threads is not None else default
+
+
+def create_session(model_path, providers=None):
     """Create an ONNX Runtime InferenceSession with best available provider.
 
     Args:
         model_path: path to .onnx file
+        providers: optional explicit provider order. The default uses Vireo's
+            hardware selection; CPU-only models can force CPU execution.
 
     Returns:
         ort.InferenceSession
@@ -180,7 +221,7 @@ def create_session(model_path):
 
     import onnxruntime as ort
 
-    providers = get_providers()
+    providers = list(providers) if providers is not None else get_providers()
 
     # onnxruntime 1.24+ CoreMLExecutionProvider crashes when loading models
     # that use external data (.onnx.data sidecar files).  Fall back to the
@@ -195,8 +236,38 @@ def create_session(model_path):
                 model_path,
             )
 
-    log.info("Loading ONNX model: %s (providers: %s)", model_path, providers)
-    session = ort.InferenceSession(model_path, providers=providers)
+    from resource_ledger import (
+        ResourceRequest,
+        cpu_phase_request,
+        get_resource_ledger,
+    )
+
+    ledger = get_resource_ledger()
+    cpu_request = cpu_phase_request(
+        ledger.cpu_capacity, minimum=2, preferred=8, maximum=8,
+    )
+    request = ResourceRequest(
+        cpu=cpu_request,
+        lanes=("model_construction",),
+        label="ONNX model construction",
+    )
+    with ledger.acquire(request) as lease:
+        session_options = ort.SessionOptions()
+        session_options.intra_op_num_threads = lease.cpu_permits
+        # Keep inter-op parallelism at one so ONNX cannot multiply the CPU
+        # grant by running several graph branches, each with its own intra-op
+        # pool.
+        session_options.inter_op_num_threads = 1
+        log.info(
+            "Loading ONNX model: %s (providers: %s, CPU threads: %d)",
+            model_path, providers, lease.cpu_permits,
+        )
+        session = ort.InferenceSession(
+            model_path,
+            sess_options=session_options,
+            providers=providers,
+        )
+        _remember_session_cpu_threads(session, lease.cpu_permits)
     actual = session.get_providers()
     log.info("ONNX session using: %s", actual)
     return session

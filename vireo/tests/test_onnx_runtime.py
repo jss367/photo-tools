@@ -115,3 +115,67 @@ def test_create_session_keeps_coreml_without_sidecar(tmp_path):
     providers_used = kwargs.get("providers", _args[1] if len(_args) > 1 else [])
     assert "CoreMLExecutionProvider" in providers_used
     assert "CPUExecutionProvider" in providers_used
+
+
+def test_create_session_configures_threads_from_cpu_grant(tmp_path):
+    """ONNX native pools must match the enforceable process grant."""
+    from unittest.mock import MagicMock, patch
+
+    import resource_ledger
+
+    from vireo.onnx_runtime import create_session, session_cpu_threads
+
+    model_file = tmp_path / "model.onnx"
+    model_file.write_bytes(b"fake")
+    mock_session = MagicMock()
+    mock_session.get_providers.return_value = ["CPUExecutionProvider"]
+    ledger = resource_ledger.ResourceLedger(cpu_capacity=3)
+    previous = resource_ledger._set_resource_ledger_for_tests(ledger)
+    try:
+        with patch(
+            "vireo.onnx_runtime.get_providers",
+            return_value=["CPUExecutionProvider"],
+        ), patch(
+            "onnxruntime.InferenceSession", return_value=mock_session,
+        ) as mock_cls:
+            session = create_session(str(model_file))
+    finally:
+        resource_ledger._set_resource_ledger_for_tests(previous)
+
+    options = mock_cls.call_args.kwargs["sess_options"]
+    assert options.intra_op_num_threads == 3
+    assert options.inter_op_num_threads == 1
+    assert session_cpu_threads(session) == 3
+    assert ledger.snapshot()["cpu"]["allocated"] == 0
+    assert ledger.snapshot()["lanes"]["model_construction"]["allocated"] == 0
+
+
+def test_production_onnx_sessions_use_budgeted_factory():
+    """Direct session construction would bypass thread and load budgets."""
+    import ast
+    from pathlib import Path
+
+    package_root = Path(__file__).resolve().parents[1]
+    violations = []
+    for path in package_root.rglob("*.py"):
+        if "tests" in path.parts or path.name == "onnx_runtime.py":
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            function = node.func
+            is_constructor = (
+                isinstance(function, ast.Attribute)
+                and function.attr == "InferenceSession"
+            ) or (
+                isinstance(function, ast.Name)
+                and function.id == "InferenceSession"
+            )
+            if is_constructor:
+                violations.append(f"{path.relative_to(package_root)}:{node.lineno}")
+
+    assert violations == [], (
+        "Production ONNX sessions must use onnx_runtime.create_session: "
+        + ", ".join(violations)
+    )

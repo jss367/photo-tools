@@ -9240,7 +9240,9 @@ def test_staged_mask_removes_previous_file_only_after_commit(tmp_path):
 
     masks_dir = tmp_path / "masks"
     masks_dir.mkdir()
-    previous_path = masks_dir / "42.tiny.png"
+    previous_path = (
+        masks_dir / "42.tiny.generation-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.png"
+    )
     previous_path.write_bytes(b"old mask")
 
     def fake_save(_mask, stage_dir, photo_id, variant):
@@ -9267,6 +9269,33 @@ def test_staged_mask_removes_previous_file_only_after_commit(tmp_path):
     with open(staged.final_path, "rb") as handle:
         assert handle.read() == b"new mask"
     assert not list(masks_dir.glob(".mask-stage-*"))
+
+
+def test_staged_mask_never_removes_deterministic_standalone_path(tmp_path):
+    """Concurrent standalone publication cannot be deleted after commit."""
+    import pipeline_job as pj
+
+    masks_dir = tmp_path / "masks"
+    masks_dir.mkdir()
+    standalone_path = masks_dir / "42.tiny.png"
+    standalone_path.write_bytes(b"standalone mask")
+
+    def fake_save(_mask, stage_dir, photo_id, variant):
+        staged_path = os.path.join(stage_dir, f"{photo_id}.{variant}.png")
+        with open(staged_path, "wb") as handle:
+            handle.write(b"pipeline mask")
+        return staged_path
+
+    staged = pj._StagedMaskFile.create(
+        None, str(masks_dir), 42, "tiny", fake_save,
+        previous_path=str(standalone_path),
+    )
+    staged.install()
+    staged.finish()
+
+    assert standalone_path.read_bytes() == b"standalone mask"
+    with open(staged.final_path, "rb") as handle:
+        assert handle.read() == b"pipeline mask"
 
 
 def test_extract_masks_aborts_when_rollback_fails():

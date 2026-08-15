@@ -298,14 +298,16 @@ class JobRunner:
 
     def enqueue_pipeline(self, work_fn, config=None, workspace_id=None,
                          runtime_warning=None):
-        """Enqueue a pipeline job. Promotes immediately when a slot is free.
+        """Enqueue a pipeline job and attempt promotion before returning.
 
         Unlike ``start`` (which spawns a worker thread synchronously),
         ``enqueue_pipeline`` persists the job to ``job_history`` with
         ``status='queued'``, stashes the work closure in-process, and
-        then asks the scheduler to promote it. With capacity available under
-        the configured slot cap, promotion happens before this method returns
-        and the work thread is already running.
+        then asks the scheduler to promote it. Promotion is attempted, not
+        guaranteed: the job stays queued when no slot is free, when queue
+        ordering promotes an older candidate first, or when the SQLite
+        ``queued -> running`` flip fails and a retry is scheduled. Callers
+        must not assume the work thread is running on return.
 
         Returns the job id.
         """

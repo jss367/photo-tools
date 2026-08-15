@@ -5947,6 +5947,39 @@ def test_import_in_place_aggregates_working_copy_phase_across_sources(
     assert scan_step["progress"] == {"current": 2, "total": 2}
 
 
+def test_import_in_place_metadata_phase_does_not_override_step_progress(
+    app_and_db, tmp_path, monkeypatch,
+):
+    """Metadata sub-progress stays descriptive rather than resetting the bar."""
+    import scanner
+
+    app, _ = app_and_db
+    source = tmp_path / "card"
+    source.mkdir()
+
+    def fake_scan(_root, _db, *, status_callback=None, **_kwargs):
+        status_callback(
+            "Extracting metadata: 1 of 1",
+            phase_current=1,
+            phase_total=1,
+            phase_label="Extracting metadata",
+        )
+        return {"discovered": 0, "indexed": 0}
+
+    monkeypatch.setattr(scanner, "scan", fake_scan)
+    client = app.test_client()
+    resp = client.post("/api/jobs/import-in-place", json={
+        "sources": [str(source)],
+        "after_import": None,
+    })
+    assert resp.status_code == 200, resp.get_json()
+    job = wait_for_job_via_client(client, resp.get_json()["job_id"])
+
+    assert job["status"] == "completed", job
+    scan_step = next(step for step in job["steps"] if step["id"] == "scan")
+    assert scan_step["progress"] == {"current": 0, "total": 0}
+
+
 def test_import_in_place_snapshot_admits_only_frozen_files(
     app_and_db, tmp_path,
 ):

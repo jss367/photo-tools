@@ -14,6 +14,7 @@ import logging
 import math
 import os
 import queue
+import shutil
 import tempfile
 import threading
 import time
@@ -108,7 +109,16 @@ class _StagedMaskFile:
         """Atomically place the staged PNG while retaining any old version."""
         if os.path.exists(self.final_path):
             self.backup_path = os.path.join(self.stage_dir, "previous.png")
-            os.replace(self.final_path, self.backup_path)
+            try:
+                # Same-filesystem hard link is cheap and, unlike moving the
+                # predecessor aside, keeps the committed path continuously
+                # readable until the single atomic replacement below.
+                os.link(self.final_path, self.backup_path)
+            except OSError:
+                # Some filesystems do not support hard links. Copying retains
+                # the same crash-safe ordering at the cost of one mask-sized
+                # write on reruns.
+                shutil.copy2(self.final_path, self.backup_path)
         try:
             os.replace(self.staged_path, self.final_path)
         except Exception:

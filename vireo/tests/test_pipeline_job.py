@@ -9194,7 +9194,7 @@ def test_extract_masks_rolls_back_all_photo_writes_when_embeddings_fail(
     assert rows[1]["mask_path"] is not None
 
 
-def test_staged_mask_restores_previous_file_on_failure(tmp_path):
+def test_staged_mask_restores_previous_file_on_failure(tmp_path, monkeypatch):
     """A failed rerun cannot leave old DB metadata pointing at a new PNG."""
     import pipeline_job as pj
 
@@ -9212,6 +9212,14 @@ def test_staged_mask_restores_previous_file_on_failure(tmp_path):
     staged = pj._StagedMaskFile.create(
         None, str(masks_dir), 42, "tiny", fake_save,
     )
+    real_replace = pj.os.replace
+
+    def assert_final_exists_before_replace(source, destination):
+        if source == staged.staged_path and destination == staged.final_path:
+            assert final_path.read_bytes() == b"old mask"
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(pj.os, "replace", assert_final_exists_before_replace)
     staged.install()
     assert final_path.read_bytes() == b"new mask"
 

@@ -26534,7 +26534,10 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             def status_cb(message, phase_current=None, phase_total=None, phase_label=None):
                 job["progress"]["current_file"] = message
                 step_update = {"current_file": message}
-                if phase_total:
+                if (
+                    phase_total
+                    and phase_label == "Generating working copies"
+                ):
                     # The scan counter can already be complete while working
                     # copies are still being generated. Put the active phase
                     # on the expanded Jobs-page step too, rather than leaving

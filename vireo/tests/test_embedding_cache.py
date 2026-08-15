@@ -251,6 +251,63 @@ def test_invalid_payload_never_replaces_final_path(tmp_path):
     assert not list((tmp_path / "cache").glob("*.tmp"))
 
 
+def test_competing_publisher_does_not_fail_our_publish(tmp_path, monkeypatch):
+    """Regression: publish used to digest the temp file, os.replace, then
+    re-read the *final* path and compare. Single-flight is in-process only,
+    so a second process publishing the same identity can land its replace in
+    that window. Its payload is equally valid but not bit-identical (the
+    encoder is not bitwise reproducible), so we raised a hard
+    ValueError over a perfectly good cache entry. Integrity must be checked
+    on the temp file before the rename instead."""
+    import embedding_cache as ec
+
+    cache = EmbeddingCache(tmp_path / "cache")
+    identity = _identity()
+    competitor = _payload(value=7)
+    real_replace = os.replace
+
+    def replace_then_race(src, dst):
+        real_replace(src, dst)
+        if str(dst).endswith(".npy"):
+            # Stand in for another process winning the same rename just after
+            # us. Leave the manifest's own os.replace alone.
+            np.save(dst, competitor, allow_pickle=False)
+
+    monkeypatch.setattr(ec.os, "replace", replace_then_race)
+
+    value, _ = cache.get_or_compute(identity, _payload)
+
+    # Our own call returns without raising, and the durable entry is the
+    # competitor's valid payload rather than a deleted/corrupt file.
+    assert np.array_equal(value, _payload())
+    assert np.array_equal(np.load(cache.path_for(identity)), competitor)
+
+
+def test_publish_rejects_bytes_that_do_not_round_trip(tmp_path, monkeypatch):
+    """The pre-rename check must still catch a write that did not persist
+    what we serialized — and must not leave a partial file behind."""
+    import embedding_cache as ec
+
+    cache = EmbeddingCache(tmp_path / "cache")
+    identity = _identity()
+
+    real_load = np.load
+
+    def corrupt_load(path, *args, **kwargs):
+        if str(path).endswith(".npy.tmp"):
+            # Serialized fine, came back as something else.
+            return _payload(value=99)
+        return real_load(path, *args, **kwargs)
+
+    monkeypatch.setattr(ec.np, "load", corrupt_load)
+
+    with pytest.raises(ValueError, match="changed during write"):
+        cache.get_or_compute(identity, _payload)
+
+    assert not os.path.exists(cache.path_for(identity))
+    assert not list((tmp_path / "cache").glob("*.tmp"))
+
+
 def test_manifest_failure_does_not_invalidate_published_payload(
     tmp_path, monkeypatch,
 ):

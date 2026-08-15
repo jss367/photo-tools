@@ -186,14 +186,6 @@ def cache_path(cache_dir, identity):
     return os.path.join(cache_dir, f"{identity_digest(identity)}.npy")
 
 
-def _payload_digest(path):
-    digest = hashlib.sha256()
-    with open(path, "rb") as handle:
-        for chunk in iter(lambda: handle.read(4 * 1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
 def _validate_payload(value, label_count, embedding_dim=None):
     if not isinstance(value, np.ndarray):
         raise ValueError("embedding payload is not a NumPy array")
@@ -385,13 +377,22 @@ class EmbeddingCache:
                 np.save(handle, value, allow_pickle=False)
                 handle.flush()
                 os.fsync(handle.fileno())
+            # Verify the durable bytes *before* they become visible.  Reading
+            # the final path back after os.replace cannot prove anything about
+            # our own write: single-flight is in-process only, so another
+            # process publishing the same identity can land its os.replace
+            # between ours and the read-back, and its (equally valid, but not
+            # bit-identical — the encoder is not bitwise reproducible across
+            # runs) payload would look like corruption to us.  Round-tripping
+            # the temp file against the in-memory value is a strictly stronger
+            # check than the old digest comparison, and it costs one pass
+            # instead of three.
             loaded = np.load(temporary, allow_pickle=False)
             _validate_payload(loaded, label_count)
-            before = _payload_digest(temporary)
+            if not np.array_equal(loaded, value):
+                raise ValueError("embedding payload changed during write")
+            del loaded
             os.replace(temporary, os.path.join(self.cache_dir, f"{digest}.npy"))
-            final_path = os.path.join(self.cache_dir, f"{digest}.npy")
-            if _payload_digest(final_path) != before:
-                raise ValueError("embedding payload digest changed during publish")
         finally:
             with contextlib.suppress(FileNotFoundError):
                 os.unlink(temporary)

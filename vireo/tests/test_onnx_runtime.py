@@ -150,17 +150,21 @@ def test_create_session_configures_threads_from_cpu_grant(tmp_path):
     assert ledger.snapshot()["lanes"]["model_construction"]["allocated"] == 0
 
 
-def test_create_session_uses_inference_profile_not_construction_grant(tmp_path):
-    """Session threads must reflect the intended inference profile.
+def test_create_session_waits_for_full_inference_budget(tmp_path):
+    """Construction must hold the full inference-thread budget in permits.
 
-    When construction runs under contention (e.g. a scan holding most
-    permits) the construction lease may receive only its minimum grant.
-    Sizing ``intra_op_num_threads`` from that transient number would cap
-    the cached session at the reduced count forever, throttling every
-    subsequent CPU inference until process restart. Verify that the
-    session is instead sized from the inference profile, which is
-    independent of construction-time contention.
+    ``intra_op_num_threads`` is fixed at ``session_thread_count`` (8 on a
+    12-permit machine) so subsequent CPU inference calls run at the
+    intended profile. ONNX exercises that pool during graph optimization
+    and kernel prepacking, so accepting a smaller construction grant
+    would let those native threads exceed the process budget for the
+    duration of the load. Verify that construction blocks until the full
+    inference budget is free, and that the session is then sized from
+    the inference profile — independent of the state of contention at
+    construction time.
     """
+    import contextlib
+    import threading
     from unittest.mock import MagicMock, patch
 
     import resource_ledger
@@ -173,29 +177,63 @@ def test_create_session_uses_inference_profile_not_construction_grant(tmp_path):
     mock_session.get_providers.return_value = ["CPUExecutionProvider"]
     ledger = resource_ledger.ResourceLedger(cpu_capacity=12)
     previous = resource_ledger._set_resource_ledger_for_tests(ledger)
-    # Reserve 10 permits so construction can only receive its 2-permit
-    # minimum. Pre-fix this would cap the session at 2 inference threads.
+    # Reserve 10 permits so only 2 are free — less than the 8-thread
+    # inference budget the session will run at.
     holder = ledger.acquire(resource_ledger.ResourceRequest(
         cpu=resource_ledger.CpuRequest(10, 10, 10),
     ))
+    result = {}
+    ready_to_construct = threading.Event()
+
+    def _create():
+        try:
+            with patch(
+                "vireo.onnx_runtime.get_providers",
+                return_value=["CPUExecutionProvider"],
+            ), patch(
+                "onnxruntime.InferenceSession", return_value=mock_session,
+            ) as mock_cls:
+                # ``mock_cls`` is captured so the assertions after the join
+                # can inspect the ``SessionOptions`` create_session built.
+                result["mock_cls"] = mock_cls
+                ready_to_construct.set()
+                result["session"] = create_session(str(model_file))
+        except BaseException as exc:  # pragma: no cover - defensive
+            result["error"] = exc
+
+    thread = threading.Thread(target=_create)
+    thread.start()
     try:
-        with patch(
-            "vireo.onnx_runtime.get_providers",
-            return_value=["CPUExecutionProvider"],
-        ), patch(
-            "onnxruntime.InferenceSession", return_value=mock_session,
-        ) as mock_cls:
-            session = create_session(str(model_file))
-    finally:
+        # Construction should be blocked waiting on CPU permits.
+        assert ready_to_construct.wait(timeout=1.0)
+        thread.join(timeout=0.5)
+        assert thread.is_alive(), (
+            "create_session must wait until the full inference budget "
+            "is free, but it completed with only 2 permits available"
+        )
+        assert "session" not in result
+
+        # Release the reservation; construction now completes with the
+        # full 8-permit grant.
         holder.release()
+        thread.join(timeout=5.0)
+        assert not thread.is_alive()
+    finally:
+        # Belt-and-braces: if anything went wrong above, don't leave the
+        # holder retained or the thread running.
+        with contextlib.suppress(Exception):
+            holder.release()
+        if thread.is_alive():
+            thread.join(timeout=5.0)
         resource_ledger._set_resource_ledger_for_tests(previous)
 
-    options = mock_cls.call_args.kwargs["sess_options"]
+    assert result.get("error") is None
+    options = result["mock_cls"].call_args.kwargs["sess_options"]
     # The session must be sized from the inference profile (preferred=8),
-    # not from the transient 2-permit construction grant.
+    # and the construction lease that granted it must also have held 8.
     assert options.intra_op_num_threads == 8
     assert options.inter_op_num_threads == 1
-    assert session_cpu_threads(session) == 8
+    assert session_cpu_threads(result["session"]) == 8
 
 
 def test_production_onnx_sessions_use_budgeted_factory():

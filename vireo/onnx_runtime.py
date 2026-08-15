@@ -255,8 +255,19 @@ def create_session(model_path, providers=None):
         ledger.cpu_capacity, minimum=1, preferred=8, maximum=8,
     )
     session_thread_count = inference_profile.preferred
+    # Require the construction lease to hold ``session_thread_count`` permits
+    # too. ONNX exercises its ``intra_op_num_threads`` pool during graph
+    # optimization and kernel prepacking, so a smaller construction grant
+    # would let those native threads exceed the process CPU budget for the
+    # duration of the load — precisely when the ledger is already tight.
+    # Waiting for the full inference budget is the right trade: model loads
+    # are rare and one-time, while oversubscribing the CPU during a
+    # contentious construction hurts every concurrent job.
     cpu_request = cpu_phase_request(
-        ledger.cpu_capacity, minimum=2, preferred=8, maximum=8,
+        ledger.cpu_capacity,
+        minimum=session_thread_count,
+        preferred=session_thread_count,
+        maximum=session_thread_count,
     )
     request = ResourceRequest(
         cpu=cpu_request,

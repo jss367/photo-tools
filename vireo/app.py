@@ -31868,6 +31868,20 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             and os.path.realpath(row["mask_path"]) == real
         )
 
+    def _read_mask_bytes(mask_path):
+        """Read an immutable mask generation, or lose a cleanup race.
+
+        POSIX keeps an already-open unlinked file readable, while Windows
+        refuses to unlink an open handle. The only race to recover from is
+        cleanup winning before ``open``; callers then re-resolve the current
+        database path and retry without waiting for a long-running writer.
+        """
+        try:
+            with open(mask_path, "rb") as handle:
+                return handle.read()
+        except OSError:
+            return None
+
     @app.route("/masks/<filename>")
     def serve_mask(filename):
         """Serve mask PNG files.
@@ -31879,8 +31893,6 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         back to the photo's active mask via ``photo_masks`` so the inspect
         panel keeps working without a round-trip API call.
         """
-        from pipeline_locks import acquire_photo_mask
-
         masks_dir = os.path.join(os.path.dirname(db_path), "masks")
         mask_path = os.path.join(masks_dir, filename)
         id_match = re.match(r"^(\d+)[._]", filename)
@@ -31892,16 +31904,19 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             return "", 404
 
         pid = int(id_match.group(1))
-        with acquire_photo_mask(pid):
-            selected_path = None
-            if os.path.exists(mask_path) and _mask_file_is_db_backed(
-                filename, mask_path,
-            ):
-                selected_path = mask_path
+        if os.path.exists(mask_path) and _mask_file_is_db_backed(
+            filename, mask_path,
+        ):
+            mask_bytes = _read_mask_bytes(mask_path)
+            if mask_bytes is not None:
+                return Response(mask_bytes, mimetype="image/png")
 
-            m = re.match(r"^(\d+)\.png$", filename)
-            if selected_path is None and m:
-                db = _get_db()
+        if re.match(r"^(\d+)\.png$", filename):
+            db = _get_db()
+            # A committed immutable generation can be unlinked after the DB
+            # lookup but before open. Re-resolve after that narrow race; do
+            # not block this HTTP request on full model regeneration.
+            for _attempt in range(3):
                 row = db.conn.execute(
                     "SELECT active_mask_variant FROM photos WHERE id=?", (pid,)
                 ).fetchone()
@@ -31915,19 +31930,12 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                             abs_path == masks_dir_real
                             or abs_path.startswith(masks_dir_real + os.sep)
                         ):
-                            selected_path = abs_path
-
-            if selected_path is None:
-                return "", 404
-            try:
-                with open(selected_path, "rb") as handle:
-                    mask_bytes = handle.read()
-            except OSError:
-                return "", 404
-
-        # Buffer while holding the per-photo lock. Cleanup may unlink an
-        # immutable predecessor as soon as the lock is released.
-        return Response(mask_bytes, mimetype="image/png")
+                            mask_bytes = _read_mask_bytes(abs_path)
+                            if mask_bytes is not None:
+                                return Response(
+                                    mask_bytes, mimetype="image/png",
+                                )
+        return "", 404
 
     @app.route("/api/photos/<int:pid>/masks")
     def api_photo_masks(pid):
@@ -31976,11 +31984,9 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         and (3) the stored path must resolve inside the masks directory
         (so an attacker-controlled or corrupted DB row can't escape).
         """
-        from pipeline_locks import acquire_photo_mask
-
         if not _MASK_VARIANT_RE.match(variant):
             return "", 404
-        with acquire_photo_mask(pid):
+        for _attempt in range(3):
             db = _get_db()
             mask = db.get_photo_mask(pid, variant)
             if mask is None or not mask.get("path"):
@@ -31992,14 +31998,12 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             if not (abs_path == masks_dir
                     or abs_path.startswith(masks_dir + os.sep)):
                 return "", 404
-            try:
-                with open(abs_path, "rb") as handle:
-                    mask_bytes = handle.read()
-            except OSError:
-                return "", 404
-        # Response owns the bytes, so predecessor cleanup after lock release
-        # cannot turn this request into a transient 404 or truncated stream.
-        return Response(mask_bytes, mimetype="image/png")
+            mask_bytes = _read_mask_bytes(abs_path)
+            if mask_bytes is not None:
+                # Response owns the bytes, so cleanup after open cannot turn
+                # this request into a transient 404 or truncated stream.
+                return Response(mask_bytes, mimetype="image/png")
+        return "", 404
 
     @app.route("/api/pipeline/reflow", methods=["POST"])
     def api_pipeline_reflow():

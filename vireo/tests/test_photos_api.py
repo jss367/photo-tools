@@ -9050,35 +9050,19 @@ def test_api_photo_masks_empty_when_no_masks(app_and_db):
     assert data["active"] is None
 
 
-def test_api_serve_mask_png(app_and_db, monkeypatch):
+def test_api_serve_mask_png(app_and_db):
     """GET /api/masks/<pid>/<variant>.png serves the on-disk mask."""
     import os as _os
-
-    import pipeline_locks
 
     app, db = app_and_db
     pid = db.get_photos()[0]["id"]
     masks_dir = _os.path.join(_os.path.dirname(db._db_path), "masks")
     _seed_mask(db, masks_dir, pid, "sam2-small", body=b"\x89PNGFAKE")
-    lock_events = []
-
-    class TrackingLock:
-        def __enter__(self):
-            lock_events.append(("enter", pid))
-
-        def __exit__(self, exc_type, exc, tb):
-            lock_events.append(("exit", pid))
-
-    monkeypatch.setattr(
-        pipeline_locks, "acquire_photo_mask",
-        lambda photo_id: TrackingLock(),
-    )
 
     client = app.test_client()
     resp = client.get(f"/api/masks/{pid}/sam2-small.png")
     assert resp.status_code == 200
     assert resp.data == b"\x89PNGFAKE"
-    assert lock_events == [("enter", pid), ("exit", pid)]
 
 
 def test_api_serve_mask_404_when_no_db_row(app_and_db):
@@ -9160,9 +9144,7 @@ def test_api_serve_mask_uses_stored_db_path_for_legacy_filename(app_and_db):
     assert resp.data == b"LEGACYPNG"
 
 
-def test_legacy_serve_mask_falls_back_to_active_variant(
-    app_and_db, monkeypatch,
-):
+def test_legacy_serve_mask_falls_back_to_active_variant(app_and_db):
     """``/masks/{pid}.png`` must keep working after variant-aware extraction.
 
     Callers like ``openInspect`` in pipeline_review.html still request
@@ -9173,26 +9155,11 @@ def test_legacy_serve_mask_falls_back_to_active_variant(
     """
     import os as _os
 
-    import pipeline_locks
-
     app, db = app_and_db
     pid = db.get_photos()[0]["id"]
     masks_dir = _os.path.join(_os.path.dirname(db._db_path), "masks")
     _seed_mask(db, masks_dir, pid, "sam2-small", body=b"ACTIVEPNG")
     db.set_active_mask_variant(pid, "sam2-small")
-    lock_events = []
-
-    class TrackingLock:
-        def __enter__(self):
-            lock_events.append(("enter", pid))
-
-        def __exit__(self, exc_type, exc, tb):
-            lock_events.append(("exit", pid))
-
-    monkeypatch.setattr(
-        pipeline_locks, "acquire_photo_mask",
-        lambda photo_id: TrackingLock(),
-    )
     # No literal `{pid}.png` on disk.
     assert not _os.path.exists(_os.path.join(masks_dir, f"{pid}.png"))
 
@@ -9200,7 +9167,55 @@ def test_legacy_serve_mask_falls_back_to_active_variant(
     resp = client.get(f"/masks/{pid}.png")
     assert resp.status_code == 200
     assert resp.data == b"ACTIVEPNG"
-    assert lock_events == [("enter", pid), ("exit", pid)]
+
+
+def test_legacy_serve_mask_retries_after_predecessor_cleanup(
+    app_and_db, monkeypatch,
+):
+    """A cleanup that wins before open is recovered without writer lock."""
+    import builtins
+    import os as _os
+
+    app, db = app_and_db
+    pid = db.get_photos()[0]["id"]
+    masks_dir = _os.path.join(_os.path.dirname(db._db_path), "masks")
+    old_path = _seed_mask(
+        db, masks_dir, pid, "sam2-small", body=b"PREDECESSOR",
+    )
+    db.set_active_mask_variant(pid, "sam2-small")
+    new_path = _os.path.join(masks_dir, f"{pid}.sam2-small.next.png")
+    with open(new_path, "wb") as handle:
+        handle.write(b"CURRENT")
+
+    real_open = builtins.open
+    raced = False
+
+    def racing_open(path, *args, **kwargs):
+        nonlocal raced
+        if not raced and _os.fspath(path) == old_path and args[:1] == ("rb",):
+            raced = True
+            db.upsert_photo_mask(
+                photo_id=pid,
+                variant="sam2-small",
+                path=new_path,
+                detector_model="md",
+                prompt_x=0,
+                prompt_y=0,
+                prompt_w=0,
+                prompt_h=0,
+            )
+            _os.unlink(old_path)
+            raise FileNotFoundError(old_path)
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", racing_open)
+
+    client = app.test_client()
+    resp = client.get(f"/masks/{pid}.png")
+
+    assert raced
+    assert resp.status_code == 200
+    assert resp.data == b"CURRENT"
 
 
 def test_legacy_serve_mask_404_when_no_active_variant(app_and_db):

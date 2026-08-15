@@ -6137,6 +6137,7 @@ def test_finalize_cached_only_respects_workspace_detector_threshold(
     )
 
     import classify_job as classify_job_mod
+    monkeypatch.setattr(classify_job_mod, "get_active_labels", lambda: [])
     monkeypatch.setattr(classify_job_mod, "get_active_model", lambda: None)
     monkeypatch.setattr(classify_job_mod, "get_models", lambda: [])
 
@@ -6191,6 +6192,7 @@ def test_finalize_cached_only_includes_zero_confidence_full_image_anchor(
         "empty", json.dumps([{"field": "photo_ids", "value": [pid]}]),
     )
 
+    monkeypatch.setattr(classify_job_mod, "get_active_labels", lambda: [])
     monkeypatch.setattr(classify_job_mod, "get_active_model", lambda: None)
     monkeypatch.setattr(classify_job_mod, "get_models", lambda: [])
     result = run_classify_job(
@@ -6247,6 +6249,7 @@ def test_finalize_cached_only_treats_null_category_as_animal(
         "legacy", json.dumps([{"field": "photo_ids", "value": [photo_id]}]),
     )
 
+    monkeypatch.setattr(classify_job_mod, "get_active_labels", lambda: [])
     monkeypatch.setattr(classify_job_mod, "get_active_model", lambda: None)
     monkeypatch.setattr(classify_job_mod, "get_models", lambda: [])
     result = run_classify_job(
@@ -6301,6 +6304,7 @@ def test_run_classify_job_short_circuits_when_cache_covers_every_photo(
     # Model resolution WOULD fail here — no active model exists. The
     # short-circuit must run before this raises.
     import classify_job as classify_job_mod
+    monkeypatch.setattr(classify_job_mod, "get_active_labels", lambda: [])
     monkeypatch.setattr(classify_job_mod, "get_active_model", lambda: None)
     monkeypatch.setattr(classify_job_mod, "get_models", lambda: [])
 
@@ -6445,6 +6449,7 @@ def test_run_classify_job_reconciles_group_metadata_on_reuse(
     )
 
     import classify_job as classify_job_mod
+    monkeypatch.setattr(classify_job_mod, "get_active_labels", lambda: [])
     monkeypatch.setattr(classify_job_mod, "get_active_model", lambda: None)
     monkeypatch.setattr(classify_job_mod, "get_models", lambda: [])
 

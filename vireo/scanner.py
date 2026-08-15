@@ -1198,7 +1198,7 @@ def _extract_working_copies(db, vireo_dir, progress_callback=None,
 
     scope_clause = ""
     if scope is not None:
-        scope_terms = []
+        scope_rows = []
         for entry in scope:
             if isinstance(entry, tuple):
                 path, mode = entry
@@ -1206,18 +1206,59 @@ def _extract_working_copies(db, vireo_dir, progress_callback=None,
                 path, mode = entry, "subtree"
             path = str(path)
             if mode == "exact":
-                scope_terms.append("f.path = ?")
-                params.append(path)
+                scope_rows.append((path, mode, None))
             else:
                 # Subtree match. The LIKE pattern needs to escape `_`, `%`,
                 # and the escape char itself — both in the path and in the
-                # separator — so (a) literal wildcards in folder names don't
-                # leak into siblings (`2024_06` matching `2024A06`) and
-                # (b) the Windows `\` separator doesn't turn the trailing
-                # `%` into a literal under ESCAPE '\\'.
-                scope_terms.append("(f.path = ? OR f.path LIKE ? ESCAPE '\\')")
-                params.extend([path, _subtree_like_pattern(path)])
-        scope_clause = " AND (" + " OR ".join(scope_terms) + ")"
+                # separator — so literal wildcards in folder names cannot
+                # leak into siblings.
+                scope_rows.append(
+                    (path, "subtree", _subtree_like_pattern(path)),
+                )
+
+        # A snapshot can span thousands of exact directories. Expanding one
+        # OR term per directory hits SQLite's default MAX_EXPR_DEPTH=1000.
+        # Keep the scope connection-local in a TEMP table instead; executemany
+        # also avoids the bound-parameter limit. Commit only the transaction
+        # opened here so the subsequent main-WAL read cannot retain a stale
+        # snapshot if another job writes before this extractor does.
+        started_in_transaction = db.conn.in_transaction
+        try:
+            db.conn.execute(
+                """CREATE TEMP TABLE IF NOT EXISTS working_copy_scope (
+                       path TEXT NOT NULL,
+                       mode TEXT NOT NULL,
+                       like_pattern TEXT,
+                       PRIMARY KEY (path, mode)
+                   )"""
+            )
+            db.conn.execute(
+                "CREATE INDEX IF NOT EXISTS working_copy_scope_mode "
+                "ON working_copy_scope (mode)"
+            )
+            db.conn.execute("DELETE FROM working_copy_scope")
+            db.conn.executemany(
+                "INSERT OR IGNORE INTO working_copy_scope "
+                "(path, mode, like_pattern) VALUES (?, ?, ?)",
+                scope_rows,
+            )
+            if not started_in_transaction and db.conn.in_transaction:
+                commit_with_retry(db.conn)
+        except Exception:
+            if not started_in_transaction and db.conn.in_transaction:
+                db.conn.rollback()
+            raise
+        scope_clause = """AND (
+              EXISTS (
+                  SELECT 1 FROM working_copy_scope wcs
+                   WHERE wcs.path = f.path
+              )
+              OR EXISTS (
+                  SELECT 1 FROM working_copy_scope wcs
+                   WHERE wcs.mode = 'subtree'
+                     AND f.path LIKE wcs.like_pattern ESCAPE '\\'
+              )
+           )"""
 
     rows = db.conn.execute(
         f"""

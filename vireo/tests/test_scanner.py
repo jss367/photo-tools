@@ -1987,6 +1987,54 @@ def test_scan_reports_working_copy_as_counted_subphase(tmp_path, monkeypatch):
     assert working_copy_events[-1][0] == "Generating working copies: 1 of 1"
 
 
+def test_working_copy_scope_supports_more_than_sqlite_expression_limit(
+    tmp_path, monkeypatch,
+):
+    """Large snapshot directory sets use a temp table, not an OR expression."""
+    import config as cfg
+    import scanner
+    from db import Database
+
+    monkeypatch.setattr(cfg, "CONFIG_PATH", str(tmp_path / "config.json"))
+    vireo_dir = tmp_path / "vireo"
+    vireo_dir.mkdir()
+    target_dir = tmp_path / "target"
+    target_dir.mkdir()
+    raw_path = target_dir / "IMG_0001.nef"
+    raw_path.write_bytes(b"fake raw data")
+
+    db = Database(str(vireo_dir / "test.db"))
+    folder_id = db.add_folder(str(target_dir))
+    photo_id = db.add_photo(
+        folder_id,
+        raw_path.name,
+        ".nef",
+        raw_path.stat().st_size,
+        raw_path.stat().st_mtime,
+    )
+
+    def fake_extract(_source, output, **_kwargs):
+        os.makedirs(os.path.dirname(output), exist_ok=True)
+        Image.new("RGB", (64, 48)).save(output, "JPEG")
+        return True
+
+    monkeypatch.setattr(scanner, "extract_working_copy", fake_extract)
+    scope = [
+        (str(tmp_path / f"unused-{index}"), "exact")
+        for index in range(1_100)
+    ]
+    scope.append((str(target_dir), "exact"))
+
+    scanner._extract_working_copies(
+        db, str(vireo_dir), scope=scope,
+    )
+
+    row = db.conn.execute(
+        "SELECT working_copy_path FROM photos WHERE id = ?", (photo_id,),
+    ).fetchone()
+    assert row["working_copy_path"] == f"working/{photo_id}.jpg"
+
+
 def test_phase_status_callback_internal_typeerror_is_not_retried():
     """A callback implementation error is not a legacy-signature signal."""
     import scanner

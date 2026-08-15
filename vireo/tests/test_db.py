@@ -22,6 +22,10 @@ def test_create_tables(tmp_path):
     assert 'photo_keywords' in table_names
     assert 'collections' in table_names
     assert 'pending_changes' in table_names
+    keyword_indexes = {
+        row['name'] for row in db.conn.execute("PRAGMA index_list(keywords)")
+    }
+    assert 'idx_keywords_taxon_id' in keyword_indexes
 
 
 def test_edit_history_tables_exist(tmp_path):
@@ -20327,10 +20331,8 @@ def test_life_list_uncounted_suppresses_redundant_ancestor_per_photo(db):
     db.conn.commit()
     rows = db.get_life_list_uncounted_identifications()
     assert len(rows) == 1
-    # ``photo_ids`` targets only the broad-only photo — species_photo carries
-    # a descendant identification and is intentionally excluded by the
-    # ancestor-suppression clause, so the Life List "View photos" link would
-    # otherwise open two photos for a count-of-one row.
+    import json
+
     assert rows[0] == {
         'name': 'New World sparrows',
         'taxon_id': ids['Passerellidae'],
@@ -20342,15 +20344,20 @@ def test_life_list_uncounted_suppresses_redundant_ancestor_per_photo(db):
         },
         'reason': 'higher_rank',
         'photo_count': 1,
-        'photo_ids': [broad_photo],
+        'filter_token': json.dumps(
+            {'name': 'New World sparrows', 'taxon_id': ids['Passerellidae']},
+            separators=(',', ':'),
+        ),
     }
 
 
-def test_life_list_uncounted_photo_ids_exclude_suppressed_photos(db):
-    """The Life List "View photos" link must target only the uncounted photos.
+def test_life_list_uncounted_filter_targets_only_unsuppressed_photos(db):
+    """The compact Browse filter must target only the uncounted photos.
+
     A family label present on both a broad-only photo and a species-tagged
-    photo counts as one (the species-tagged one is suppressed), so the
-    returned ``photo_ids`` must exclude that suppressed photo."""
+    photo counts as one because the species-tagged occurrence is suppressed.
+    The server-side token must preserve that scope without serializing IDs.
+    """
     ids = _seed_bird_taxonomy(db)
     ws = db.ensure_default_workspace()
     db.set_active_workspace(ws)
@@ -20362,6 +20369,10 @@ def test_life_list_uncounted_photo_ids_exclude_suppressed_photos(db):
     species_photo = db.add_photo(
         folder_id=fid, filename='species.jpg', extension='.jpg',
         file_size=1, file_mtime=2.0,
+    )
+    rejected_photo = db.add_photo(
+        folder_id=fid, filename='rejected.jpg', extension='.jpg',
+        file_size=1, file_mtime=3.0,
     )
     family_kw = db.add_keyword('New World sparrows', kw_type='taxonomy')
     species_kw = db.add_keyword('Song Sparrow', kw_type='taxonomy')
@@ -20379,13 +20390,22 @@ def test_life_list_uncounted_photo_ids_exclude_suppressed_photos(db):
     db.tag_photo(broad_photo, family_kw)
     db.tag_photo(species_photo, family_kw)
     db.tag_photo(species_photo, species_kw)
+    db.tag_photo(rejected_photo, family_kw)
+    db.update_photo_flag(rejected_photo, 'rejected')
     db.conn.commit()
 
     rows = db.get_life_list_uncounted_identifications()
     assert len(rows) == 1
     assert rows[0]['name'] == 'New World sparrows'
     assert rows[0]['photo_count'] == 1
-    assert rows[0]['photo_ids'] == [broad_photo]
+    assert 'photo_ids' not in rows[0]
+    assert len(rows[0]['filter_token']) < 100
+    rules = [{
+        'field': 'life_list_uncounted',
+        'op': 'is',
+        'value': rows[0]['filter_token'],
+    }]
+    assert db.query_photo_ids(rules) == [broad_photo]
 
 
 def test_life_list_taxon_ids_excludes_rejected(db):
@@ -20973,10 +20993,25 @@ def test_mark_species_keywords_links_subspecies_to_species_ancestor(tmp_path):
     from db import Database
 
     db = Database(str(tmp_path / "test.db"))
-    species_taxon = db.conn.execute(
+    animalia_id = db.conn.execute(
         "INSERT INTO taxa (inat_id, name, common_name, rank, kingdom) "
-        "VALUES (?, ?, ?, 'species', 'Animalia')",
-        (46020, "Sciurus niger", "Fox Squirrel"),
+        "VALUES (?, ?, ?, 'kingdom', 'Animalia')",
+        (1, "Animalia", "Animals"),
+    ).lastrowid
+    mammalia_id = db.conn.execute(
+        "INSERT INTO taxa (inat_id, name, common_name, rank, parent_id, kingdom) "
+        "VALUES (?, ?, ?, 'class', ?, 'Animalia')",
+        (40151, "Mammalia", "Mammals", animalia_id),
+    ).lastrowid
+    genus_id = db.conn.execute(
+        "INSERT INTO taxa (inat_id, name, rank, parent_id, kingdom) "
+        "VALUES (?, ?, 'genus', ?, 'Animalia')",
+        (46019, "Sciurus", mammalia_id),
+    ).lastrowid
+    species_taxon = db.conn.execute(
+        "INSERT INTO taxa (inat_id, name, common_name, rank, parent_id, kingdom) "
+        "VALUES (?, ?, ?, 'species', ?, 'Animalia')",
+        (46020, "Sciurus niger", "Fox Squirrel", genus_id),
     ).lastrowid
     keyword_id = db.conn.execute(
         "INSERT INTO keywords (name, type, is_species, taxon_id) "
@@ -21013,6 +21048,63 @@ def test_mark_species_keywords_links_subspecies_to_species_ancestor(tmp_path):
         "is_species": 1,
         "taxon_id": species_taxon,
     }
+
+
+def test_mark_species_keywords_rejects_sole_wrong_lineage_candidate(tmp_path):
+    """A sole local same-name species is not necessarily the intended one.
+
+    If the correct side of a homonym is absent from ``taxa``, the remaining
+    candidate must still match the lookup lineage before it can be linked.
+    """
+    from db import Database
+
+    db = Database(str(tmp_path / "test.db"))
+    plantae_id = db.conn.execute(
+        "INSERT INTO taxa (inat_id, name, common_name, rank, kingdom) "
+        "VALUES (?, ?, ?, 'kingdom', 'Plantae')",
+        (47126, "Plantae", "Plants"),
+    ).lastrowid
+    wrong_genus_id = db.conn.execute(
+        "INSERT INTO taxa (inat_id, name, rank, parent_id, kingdom) "
+        "VALUES (?, ?, 'genus', ?, 'Plantae')",
+        (999900, "Alces", plantae_id),
+    ).lastrowid
+    wrong_species_id = db.conn.execute(
+        "INSERT INTO taxa (inat_id, name, common_name, rank, parent_id, kingdom) "
+        "VALUES (?, ?, ?, 'species', ?, 'Plantae')",
+        (999901, "Alces alces", "not a real moose", wrong_genus_id),
+    ).lastrowid
+    kid = db.conn.execute(
+        "INSERT INTO keywords (name, type, is_species, taxon_id) "
+        "VALUES ('Alaskan moose', 'taxonomy', 1, NULL)",
+    ).lastrowid
+    db.conn.commit()
+
+    class FakeTaxonomy:
+        def lookup(self, name):
+            if name.lower() == "alaskan moose":
+                return {
+                    "taxon_id": 132760,
+                    "rank": "subspecies",
+                    "lineage_names": [
+                        "Animalia", "Mammalia", "Alces",
+                        "Alces alces", "Alces alces gigas",
+                    ],
+                    "lineage_ranks": [
+                        "kingdom", "class", "genus", "species", "subspecies",
+                    ],
+                }
+            return None
+
+        def is_taxon(self, name):
+            return self.lookup(name) is not None
+
+    assert db.mark_species_keywords(FakeTaxonomy()) == 0
+    row = db.conn.execute(
+        "SELECT taxon_id FROM keywords WHERE id = ?", (kid,),
+    ).fetchone()
+    assert row["taxon_id"] is None
+    assert row["taxon_id"] != wrong_species_id
 
 
 def test_mark_species_keywords_disambiguates_homonym_species_by_lineage(tmp_path):
@@ -22581,6 +22673,8 @@ def test_registry_ops_all_compile(tmp_path):
     for key, spec in FILTER_FIELDS.items():
         for op in spec["ops"]:
             value = sample_values[spec["type"]]
+            if key == "life_list_uncounted":
+                value = '{"name":"x","taxon_id":null}'
             if spec["type"] == "enum":
                 value = (spec.get("values") or [".jpg"])[0]
             if op in ("in", "not_in"):

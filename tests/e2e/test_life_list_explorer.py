@@ -133,7 +133,17 @@ def test_uncounted_identifications_are_reasoned_and_actionable(live_server, page
         "root": {
             "mode": "all",
             "rules": [
-                {"field": "keyword", "op": "is", "value": "Reference Gap"}
+                {
+                    "field": "life_list_uncounted",
+                    "op": "is",
+                    "value": json.dumps(
+                        {
+                            "name": "Reference Gap",
+                            "taxon_id": ids["Incertae sedis"],
+                        },
+                        separators=(",", ":"),
+                    ),
+                }
             ],
         }
     }

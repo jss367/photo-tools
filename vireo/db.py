@@ -1129,6 +1129,7 @@ class Database:
 
             CREATE INDEX IF NOT EXISTS idx_keywords_name ON keywords(name);
             CREATE INDEX IF NOT EXISTS idx_keywords_parent_id ON keywords(parent_id);
+            CREATE INDEX IF NOT EXISTS idx_keywords_taxon_id ON keywords(taxon_id);
             -- type is low-cardinality (5-value enum) but heavily filtered:
             -- has_subject rule, filter_out_subject_tagged, backfill_wildlife,
             -- and the warm-path migration probes all do WHERE type [IN/=] ...
@@ -14283,8 +14284,7 @@ class Database:
             f"""SELECT k.name AS name,
                       k.taxon_id AS taxon_id,
                       t.rank AS taxon_rank,
-                      COUNT(DISTINCT p.id) AS photo_count,
-                      GROUP_CONCAT(DISTINCT p.id) AS photo_ids
+                      COUNT(DISTINCT p.id) AS photo_count
                FROM photo_keywords pk
                JOIN keywords k ON k.id = pk.keyword_id
                 AND (k.is_species = 1 OR k.type = 'taxonomy')
@@ -14305,24 +14305,6 @@ class Database:
             [row["taxon_id"] for row in rows]
         )
 
-        def _parse_ids(raw):
-            # SQLite's GROUP_CONCAT returns NULL for an empty group, but the
-            # rows here always match at least one photo (that's what made
-            # them a row). Guard against NULL/empty anyway so a schema drift
-            # never renders a Browse link that opens every photo.
-            if not raw:
-                return []
-            out = []
-            for chunk in raw.split(","):
-                chunk = chunk.strip()
-                if not chunk:
-                    continue
-                try:
-                    out.append(int(chunk))
-                except ValueError:
-                    continue
-            return sorted(out)
-
         return [
             {
                 "name": row["name"],
@@ -14334,14 +14316,15 @@ class Database:
                     and row["taxon_rank"] is not None else "unmatched"
                 ),
                 "photo_count": row["photo_count"],
-                # Expose the affected photo IDs so the "View photos" link
-                # in the Life List UI can target exactly the uncounted
-                # photos. A plain ``keyword is <name>`` filter would open
-                # every photo carrying the keyword — including ones where
-                # the label is redundant (an ancestor of a more specific
-                # identification on the same photo) and therefore not
-                # counted here. See ``_LIFE_LIST_ANCESTOR_SUPPRESSION_CLAUSE``.
-                "photo_ids": _parse_ids(row["photo_ids"]),
+                # Keep Browse handoffs compact even when this label affects
+                # thousands of photos. The universal-filter engine expands
+                # this token into the same server-side ancestor-suppression
+                # predicate used by the count above.
+                "filter_token": json.dumps(
+                    {"name": row["name"], "taxon_id": row["taxon_id"]},
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
             }
             for row in rows
         ]
@@ -20039,6 +20022,51 @@ class Database:
                 if len(parts) == 1:
                     return parts[0], params
                 return "(" + " OR ".join(parts) + ")", params
+            if field == "life_list_uncounted":
+                if op not in ("equals", "is") or not isinstance(value, str):
+                    raise ValueError("invalid Life List identification filter")
+                try:
+                    token = json.loads(value)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(
+                        "invalid Life List identification filter"
+                    ) from exc
+                if not isinstance(token, dict) or set(token) != {"name", "taxon_id"}:
+                    raise ValueError("invalid Life List identification filter")
+                name = token["name"]
+                taxon_id = token["taxon_id"]
+                if not isinstance(name, str) or not name:
+                    raise ValueError("invalid Life List identification filter")
+                if taxon_id is not None and (
+                    not isinstance(taxon_id, int) or isinstance(taxon_id, bool)
+                ):
+                    raise ValueError("invalid Life List identification filter")
+
+                predicate = (
+                    "(k.is_species = 1 OR k.type = 'taxonomy') "
+                    "AND k.name = ? "
+                )
+                predicate_params = [name]
+                if taxon_id is None:
+                    predicate += "AND k.taxon_id IS NULL "
+                else:
+                    predicate += (
+                        "AND k.taxon_id = ? "
+                        "AND NOT EXISTS (SELECT 1 FROM taxa t_unc "
+                        "WHERE t_unc.id = k.taxon_id "
+                        "AND t_unc.rank = 'species') "
+                    )
+                    predicate_params.append(taxon_id)
+                predicate += _LIFE_LIST_ANCESTOR_SUPPRESSION_CLAUSE
+                condition, predicate_params = _keyword_exists(
+                    predicate, predicate_params
+                )
+                # The Life List excludes rejected photos from both its count
+                # and disclosure. Preserve that exact scope in Browse.
+                return (
+                    f"(COALESCE(p.flag, 'none') != 'rejected' AND {condition})",
+                    predicate_params,
+                )
             if field in ("rating", "quality_score", "sharpness",
                          "subject_sharpness", "noise_estimate",
                          "crop_complete"):
@@ -21096,16 +21124,14 @@ class Database:
         self.conn.commit()
 
     def _resolve_species_by_lineage(self, species_name, expected_ancestors):
-        """Pick the species-rank taxon matching ``species_name``. When only one
-        row has that scientific name at species rank, return it — there is no
-        homonym to disambiguate. When multiple rows share the name (scientific
-        homonyms are permitted across kingdoms and the ``taxa`` schema keys on
-        ``inat_id``, not on ``(name, rank)``), require the candidate's parent
-        chain to contain every name in ``expected_ancestors`` (scientific
-        names for genus/family/order/class/phylum/kingdom) before returning
-        it. Ambiguity — zero or multiple lineage matches — returns ``None``;
-        silently binding to an arbitrary homonym would permanently credit the
-        wrong Life List species/class.
+        """Pick the species-rank taxon matching ``species_name`` and lineage.
+
+        Every candidate, including a sole local row, must contain every name
+        in ``expected_ancestors``. A taxonomy name index can retain only the
+        wrong side of a homonym, so candidate count alone is not evidence that
+        the local row belongs to the lookup's lineage. Missing lineage context,
+        zero matches, or multiple matches all return ``None`` rather than
+        permanently crediting the wrong Life List species/class.
         """
         candidates = self.conn.execute(
             "SELECT id, rank, parent_id FROM taxa "
@@ -21114,12 +21140,10 @@ class Database:
         ).fetchall()
         if not candidates:
             return None
-        if len(candidates) == 1:
-            return candidates[0]
         expected = set(expected_ancestors)
         if not expected:
-            # Homonyms with no lineage context to arbitrate between them:
-            # decline to bind rather than credit the wrong species.
+            # With no lineage context, even a sole local row may be the wrong
+            # side of a homonym whose intended row is absent from ``taxa``.
             return None
         matches = []
         for candidate in candidates:

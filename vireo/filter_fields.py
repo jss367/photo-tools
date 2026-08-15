@@ -54,6 +54,12 @@ FILTER_FIELDS = {
                           values=COLOR_VALUES),
     "keyword": _field("Keyword", "Organization", "text",
                       ["contains", "not_contains", "is", "is not"], suggest=True),
+    # Internal deep-link predicate used by Life List "View photos" actions.
+    # ``pages=[]`` keeps it out of the normal field picker while still giving
+    # an incoming Browse rule a readable label and a stable registry entry.
+    "life_list_uncounted": _field(
+        "Uncounted identification", "Organization", "text", ["is"], pages=[]
+    ),
     "species": _field("Species", "Organization", "text",
                       ["contains", "not_contains", "is", "is not"], suggest=True),
     "keyword_count": _field("Keyword count", "Organization", "number", NUMBER_OPS),

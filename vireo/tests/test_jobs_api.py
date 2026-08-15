@@ -6239,6 +6239,73 @@ def test_import_in_place_rejects_replaced_local_source(
     assert extractor_calls == []
 
 
+def test_import_in_place_snapshot_rejects_replaced_restricted_directory(
+    app_and_db, tmp_path, monkeypatch,
+):
+    """Each exact snapshot directory retains its own filesystem identity."""
+    from pathlib import Path
+
+    import pipeline_job
+    import scanner
+
+    app, db = app_and_db
+    root = tmp_path / "registered"
+    first = root / "first"
+    second = root / "second"
+    first.mkdir(parents=True)
+    second.mkdir()
+    first_raw = first / "IMG_0001.nef"
+    second_raw = second / "IMG_0002.nef"
+    first_raw.write_bytes(b"first")
+    second_raw.write_bytes(b"second")
+    db.add_folder(str(root), name="registered")
+    snap_id = db.create_new_images_snapshot([
+        str(first_raw), str(second_raw),
+    ])
+    first_identity_calls = 0
+
+    def changing_identity(path):
+        nonlocal first_identity_calls
+        normalized = str(Path(path))
+        if normalized == str(first):
+            first_identity_calls += 1
+            inode = 100 if first_identity_calls == 1 else 200
+            return ("stat", 1, inode)
+        return ("stat", 1, hash(normalized))
+
+    captured_scopes = []
+    monkeypatch.setattr(
+        pipeline_job, "_mount_identity", changing_identity,
+    )
+    monkeypatch.setattr(
+        scanner, "scan",
+        lambda *_args, **_kwargs: {"discovered": 0, "indexed": 0},
+    )
+    monkeypatch.setattr(
+        scanner, "_extract_working_copies",
+        lambda _db, _vireo_dir, *, scope=None, **_kwargs: (
+            captured_scopes.append(list(scope))
+        ),
+    )
+
+    client = app.test_client()
+    resp = client.post("/api/jobs/import-in-place", json={
+        "source_snapshot_id": snap_id,
+        "after_import": None,
+    })
+    assert resp.status_code == 200, resp.get_json()
+    job = wait_for_job_via_client(client, resp.get_json()["job_id"])
+
+    # The fake scanner intentionally indexes none of the frozen files, so
+    # the snapshot contract reports failure after deferred-scope handling.
+    assert job["status"] == "failed", job
+    assert first_identity_calls == 2
+    assert len(captured_scopes) == 1
+    passed = {entry[0] for entry in captured_scopes[0]}
+    assert str(first) not in passed
+    assert str(second) in passed
+
+
 def test_import_in_place_normalizes_deferred_scope_spelling(
     app_and_db, tmp_path, monkeypatch,
 ):

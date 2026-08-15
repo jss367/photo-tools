@@ -26620,6 +26620,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     break
                 restricted_files = None
                 restricted_dirs = None
+                restricted_dir_identities = {}
                 if snapshot_paths_by_root is not None:
                     restricted_files = {
                         path for path in snapshot_paths_by_root[source]
@@ -26640,6 +26641,10 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     restricted_dirs = sorted(
                         {os.path.dirname(path) for path in restricted_files}
                     )
+                    restricted_dir_identities = {
+                        str(Path(directory)): _mount_identity(directory)
+                        for directory in restricted_dirs
+                    }
                 phase = (
                     f"Importing source {idx} of {len(sources)}: {source}"
                     if len(sources) > 1 else "Importing in place"
@@ -26692,11 +26697,16 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                                         str(Path(source)), {},
                                     )
                                 )
-                                working_copy_scope_identities[entry] = (
+                                entry_identities = dict(
                                     source_mount_identities.get(
                                         str(Path(source)), {},
                                     )
                                 )
+                                directory_key = str(Path(directory))
+                                entry_identities[directory_key] = (
+                                    restricted_dir_identities.get(directory_key)
+                                )
+                                working_copy_scope_identities[entry] = entry_identities
                     elif (
                         not is_excluded_scan_path(Path(source))
                         and os.path.isdir(source)

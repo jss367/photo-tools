@@ -2033,6 +2033,29 @@ def test_extract_masks_route_writes_photo_masks_row(
     assert pr["active_mask_variant"] == "sam2-small"
     assert pr["mask_path"] == row["path"]
 
+    # A stale rerun publishes a new immutable generation and reclaims the
+    # previously committed one after the atomic database switch.
+    previous_path = row["path"]
+    db.conn.execute(
+        "UPDATE detections SET box_x = 11 WHERE photo_id = ?", (pid,),
+    )
+    db.conn.commit()
+    rerun = client.post(
+        "/api/jobs/extract-masks", json={"collection_id": col_id},
+    )
+    assert rerun.status_code == 200
+    rerun_job = wait_for_job_via_client(
+        client, rerun.get_json()["job_id"],
+    )
+    assert rerun_job["status"] == "completed", rerun_job
+    replacement = db.conn.execute(
+        "SELECT path, prompt_x FROM photo_masks WHERE photo_id = ?", (pid,),
+    ).fetchone()
+    assert replacement["prompt_x"] == 11
+    assert replacement["path"] != previous_path
+    assert os.path.isfile(replacement["path"])
+    assert not os.path.exists(previous_path)
+
 
 def test_extract_masks_route_skips_sam_when_cached(
     app_and_db, tmp_path, monkeypatch,

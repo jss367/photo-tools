@@ -29535,6 +29535,10 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 render_proxy,
                 save_mask,
             )
+            from pipeline_job import (
+                _rollback_failed_mask_photo,
+                _StagedMaskFile,
+            )
             from pipeline_locks import acquire_photo_mask
             from quality import compute_all_quality_features
 
@@ -29654,6 +29658,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 # lets Process safely reclaim that predecessor after commit.
                 photo_mask_lock = acquire_photo_mask(photo_id)
                 photo_mask_lock.acquire()
+                mask_file_stage = None
                 try:
                     # Cache hit: photo_masks already has a row for
                     # (photo, configured variant) AND its stored prompt
@@ -29712,11 +29717,6 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                         skipped += 1
                         continue
 
-                    # Save mask PNG (per SAM variant; one file per variant)
-                    mask_path = save_mask(
-                        mask, masks_dir, photo_id, sam2_variant,
-                    )
-
                     # Compute crop completeness + all quality features
                     completeness = crop_completeness(mask)
                     features = compute_all_quality_features(proxy, mask)
@@ -29737,6 +29737,18 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                         global_emb_blob = embedding_to_blob(
                             embed(proxy, variant=dinov2_variant),
                         )
+
+                    mask_file_stage = _StagedMaskFile.create(
+                        mask,
+                        masks_dir,
+                        photo_id,
+                        sam2_variant,
+                        save_mask,
+                        previous_path=(
+                            existing["path"] if existing else None
+                        ),
+                    )
+                    mask_path = mask_file_stage.final_path
 
                     # Per-mask features: pop them out of `features` so
                     # they land on the photo_masks row and not on the
@@ -29770,9 +29782,10 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                         subject_tenengrad=mask_subject_tenengrad,
                         bg_tenengrad=mask_bg_tenengrad,
                         crop_complete=completeness,
+                        _commit=False,
                     )
                     thread_db.set_active_mask_variant(
-                        photo_id, sam2_variant,
+                        photo_id, sam2_variant, _commit=False,
                     )
                     # Remaining (non-mask) per-photo features still land
                     # on the photos row. mask_path / crop_complete /
@@ -29781,14 +29794,19 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     # intentionally NOT passed here.
                     if features:
                         thread_db.update_photo_pipeline_features(
-                            photo_id, **features,
+                            photo_id, **features, _commit=False,
                         )
                     thread_db.update_photo_embeddings(
                         photo_id,
                         dino_subject_embedding=subj_emb_blob,
                         dino_global_embedding=global_emb_blob,
                         variant=dinov2_variant,
+                        _commit=False,
                     )
+                    mask_file_stage.install()
+                    commit_with_retry(thread_db.conn)
+                    mask_file_stage.finish()
+                    mask_file_stage = None
                     masked += 1
 
                 except Exception:
@@ -29799,6 +29817,11 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     job["errors"].append(
                         f"Photo {photo_id}: mask extraction failed"
                     )
+                    try:
+                        _rollback_failed_mask_photo(thread_db, photo_id)
+                    finally:
+                        if mask_file_stage is not None:
+                            mask_file_stage.restore()
                 finally:
                     photo_mask_lock.release()
 

@@ -206,6 +206,89 @@ def test_discover_source_files_reports_progress_during_empty_directory_walk(
     assert all(call == (0, 0) for call in calls), calls
 
 
+def test_discover_source_files_reports_progress_during_single_large_directory(
+    tmp_path, monkeypatch,
+):
+    """A source dominated by ONE extremely large directory must still emit
+    discovery heartbeats while ``safe_scan_walk`` is buffering that
+    directory's ``os.scandir`` iterator. ``os.walk``-style semantics
+    classify every child into the ``dirs``/``nondirs`` lists before
+    yielding the tuple, so the outer per-candidate loop cannot tick until
+    the whole enumeration finishes. Without an in-scandir heartbeat the
+    Jobs UI would emit one initial phase event and then look stalled for
+    the entire directory scan.
+    """
+    from types import SimpleNamespace
+
+    import image_loader
+
+    root = tmp_path / "sd_card"
+    root.mkdir()
+
+    real_scandir = image_loader.os.scandir
+
+    class LongScandir:
+        def __init__(self, entries):
+            self.entries = entries
+
+        def __iter__(self):
+            return iter(self.entries)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    # 1024 fake non-image entries — enough to cross several 256-entry
+    # in-scandir checkpoints. The safe_scan_walk loop only yields the
+    # (dirpath, dirs, nondirs) tuple after enumerating all of them, so a
+    # caller-side per-yield heartbeat would fire exactly once.
+    fake_entries = [
+        SimpleNamespace(
+            name=f"blob_{i:04d}.dat",
+            path=str(root / f"blob_{i:04d}.dat"),
+            is_symlink=lambda: False,
+            is_dir=lambda follow_symlinks=True: False,
+        )
+        for i in range(1024)
+    ]
+
+    def fake_scandir(path):
+        if path == str(root):
+            return LongScandir(fake_entries)
+        return real_scandir(path)
+
+    monkeypatch.setattr(image_loader.os, "scandir", fake_scandir)
+
+    calls = []
+
+    files = discover_source_files(
+        str(root),
+        progress_callback=lambda checked, found: calls.append(
+            (checked, found)
+        ),
+    )
+    # None of the fake entries have image suffixes, so the file list stays
+    # empty; what matters is the heartbeat cadence during the walk.
+    assert files == []
+    # A single non-empty directory never triggers the outer empty-directory
+    # heartbeat (that guard only fires when the yielded ``filenames`` list
+    # is empty), so any (0, 0) call MUST have come from the in-scandir
+    # heartbeat riding the 256-entry checkpoint. Without that hook the
+    # walker would buffer all 1024 entries into a single yielded tuple and
+    # the caller would see nothing until the outer per-candidate loop
+    # started incrementing ``checked``.
+    zero_progress_calls = [call for call in calls if call == (0, 0)]
+    assert zero_progress_calls, (
+        "discover_source_files did not emit any (checked=0, found=0) "
+        "heartbeat while safe_scan_walk was still buffering a single "
+        "large directory; the outer per-candidate loop cannot advance "
+        "in this shape, so the caller would appear stalled for the "
+        "whole enumeration. calls=" + repr(calls)
+    )
+
+
 def test_discover_source_files_non_recursive(tmp_path):
     src = tmp_path / "sd_card"
     _create_test_files(str(src), ["top.jpg"])
@@ -346,11 +429,12 @@ def test_discover_source_files_recursive_streams_candidates(
 
     events = []
 
-    def tracking_walk(top, onerror=None, cancel_check=None):
+    def tracking_walk(top, onerror=None, cancel_check=None, on_scandir_batch=None):
         # Yield one filename per tuple so each name's emission is its own
         # observable event in `events`.
         for dirpath, _dirnames, filenames in real_walk(
             top, onerror=onerror, cancel_check=cancel_check,
+            on_scandir_batch=on_scandir_batch,
         ):
             for name in filenames:
                 events.append(("yield", name))

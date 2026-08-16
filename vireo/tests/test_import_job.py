@@ -1643,7 +1643,7 @@ def test_unreadable_source_subtree_flips_safe_to_format_off(
     import image_loader
     real_walk = image_loader.safe_scan_walk
 
-    def broken_walk(top, onerror=None, cancel_check=None):
+    def broken_walk(top, onerror=None, cancel_check=None, on_scandir_batch=None):
         # Simulate a PermissionError bubbling up from os.scandir on the
         # source root; safe_scan_walk's OSError branch would forward it
         # via onerror and yield nothing further.
@@ -1655,6 +1655,7 @@ def test_unreadable_source_subtree_flips_safe_to_format_off(
             top,
             onerror=onerror,
             cancel_check=cancel_check,
+            on_scandir_batch=on_scandir_batch,
         )
 
     monkeypatch.setattr("ingest.safe_scan_walk", broken_walk)

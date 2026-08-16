@@ -385,8 +385,20 @@ def discover_source_files(
             # entry has been classified. The outer per-directory check
             # below still guards the interval between yield resumption
             # and the next scandir call.
+            #
+            # ``on_scandir_batch`` rides the same 256-entry checkpoint so
+            # a directory that streams millions of entries still emits
+            # discovery heartbeats before it finally yields. Without this
+            # the Jobs UI would show one initial phase event and then
+            # nothing until the whole enumeration finished — looking
+            # stalled during the largest single-directory case.
+            def _scandir_heartbeat():
+                if progress_callback is not None:
+                    progress_callback(checked, len(files))
+
             walked = enumerate(safe_scan_walk(
                 str(source_path), onerror=onerror, cancel_check=cancel_check,
+                on_scandir_batch=_scandir_heartbeat,
             ), start=1)
             for dirs_walked, (dirpath, _dirnames, filenames) in walked:
                 if cancel_check is not None and cancel_check():

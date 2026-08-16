@@ -294,7 +294,7 @@ def safe_iter_dir(top, onerror=None):
         )
 
 
-def safe_scan_walk(top, onerror=None, cancel_check=None):
+def safe_scan_walk(top, onerror=None, cancel_check=None, on_scandir_batch=None):
     """Yield ``(dirpath, dirnames, filenames)`` like ``os.walk(top,
     followlinks=False)``, but never stat-following a symlinked excluded
     bundle.
@@ -329,6 +329,13 @@ def safe_scan_walk(top, onerror=None, cancel_check=None):
     truthy the walker raises :class:`ScanCancelled` from the current
     ``next()``; callers do not need a separate per-yield poll for that
     case.
+
+    ``on_scandir_batch`` is invoked (with no arguments) at the same
+    per-256-entry checkpoint. The Jobs UI's discovery heartbeat piggybacks
+    on the outer per-yield loop, which cannot advance while the walker is
+    still filling one directory's buffer; without this hook a single very
+    large directory would appear stalled after the initial discovery event
+    until the whole enumeration finishes.
     """
     if cancel_check is not None and cancel_check():
         raise ScanCancelled("directory walk cancelled")
@@ -351,8 +358,15 @@ def safe_scan_walk(top, onerror=None, cancel_check=None):
             # enough that a big-mount stat batch still gets checked
             # promptly, cheap enough that the check adds no measurable
             # overhead to normal folders.
-            if cancel_check is not None and i and (i & 0xFF) == 0 and cancel_check():
-                raise ScanCancelled("directory walk cancelled")
+            if i and (i & 0xFF) == 0:
+                if cancel_check is not None and cancel_check():
+                    raise ScanCancelled("directory walk cancelled")
+                # Same checkpoint fires a heartbeat: the outer per-yield
+                # progress loop can't advance while this scandir call is
+                # still buffering, so a single huge directory would look
+                # stalled to the Jobs UI without this.
+                if on_scandir_batch is not None:
+                    on_scandir_batch()
             name = entry.name
             if name in seen:
                 continue
@@ -387,6 +401,7 @@ def safe_scan_walk(top, onerror=None, cancel_check=None):
     for subdir in dirs:
         yield from safe_scan_walk(
             os.path.join(top, subdir), onerror=onerror, cancel_check=cancel_check,
+            on_scandir_batch=on_scandir_batch,
         )
 
 

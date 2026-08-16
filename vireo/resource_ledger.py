@@ -165,54 +165,161 @@ def detect_physical_core_count():
     return None
 
 
+def _read_cgroup_v2_max(path):
+    """Parse a cgroup v2 ``cpu.max`` file into a CPU count or ``None``.
+
+    Returns ``None`` for missing files, malformed content, or an
+    unlimited ``max <period>`` line. Rounds fractional quotas up so
+    ``--cpus=1.5`` yields ``2`` for whole-CPU decisions rather than
+    silently truncating to 1.
+    """
+    try:
+        with open(path, encoding="utf-8") as f:
+            raw = f.read().strip()
+    except OSError:
+        return None
+    parts = raw.split()
+    if len(parts) != 2:
+        return None
+    quota_str, period_str = parts
+    if quota_str == "max":
+        return None
+    try:
+        quota = int(quota_str)
+        period = int(period_str)
+    except ValueError:
+        return None
+    if quota <= 0 or period <= 0:
+        return None
+    return max(1, math.ceil(quota / period))
+
+
+def _read_cgroup_v1_pair(quota_path, period_path):
+    """Parse a cgroup v1 quota/period pair into a CPU count or ``None``."""
+    try:
+        with open(quota_path, encoding="utf-8") as f:
+            quota = int(f.read().strip())
+        with open(period_path, encoding="utf-8") as f:
+            period = int(f.read().strip())
+    except (OSError, ValueError):
+        return None
+    if quota <= 0 or period <= 0:
+        return None
+    return max(1, math.ceil(quota / period))
+
+
+def _process_cgroup_paths():
+    """Return ``(v2_relative_path, v1_cpu_relative_path)`` for this process.
+
+    ``/proc/self/cgroup`` has one line per hierarchy. On cgroup v2 the
+    line is ``0::<path>`` (single unified hierarchy). On cgroup v1 there
+    is one line per controller; the ``cpu`` (or ``cpu,cpuacct``)
+    controller row holds the process-specific subpath. Missing values
+    surface as ``None`` so callers fall back to the root cgroup file.
+    """
+    v2_path = None
+    v1_cpu_path = None
+    try:
+        with open("/proc/self/cgroup", encoding="utf-8") as f:
+            for line in f:
+                line = line.rstrip("\n")
+                fields = line.split(":", 2)
+                if len(fields) != 3:
+                    continue
+                hier_id, controllers, subpath = fields
+                if hier_id == "0" and controllers == "":
+                    v2_path = subpath or "/"
+                elif "cpu" in controllers.split(","):
+                    v1_cpu_path = subpath or "/"
+    except OSError:
+        pass
+    return v2_path, v1_cpu_path
+
+
+def _ancestor_dirs(path):
+    """Yield ``path`` and each parent directory down to ``/``.
+
+    ``"/system.slice/vireo.service"`` → ``["/system.slice/vireo.service",
+    "/system.slice", "/"]``. Ancestor quotas below the leaf can also
+    apply — cgroup enforces the tightest along the chain — so walking
+    every ancestor and taking the ``min`` matches kernel semantics.
+    """
+    if not path:
+        return
+    normalized = path.rstrip("/") or "/"
+    yield normalized
+    while normalized != "/":
+        parent = normalized.rsplit("/", 1)[0] or "/"
+        yield parent
+        if parent == "/":
+            break
+        normalized = parent
+
+
 def _cgroup_cpu_quota_cpus():
     """Return the effective CPU count from the cgroup CFS quota, or ``None``.
 
-    Docker ``--cpus=2`` (and equivalent Kubernetes CPU limits) impose a
-    CFS bandwidth quota WITHOUT narrowing the process's CPU affinity —
-    ``os.sched_getaffinity`` and ``os.process_cpu_count`` therefore still
-    report the host's full affinity set, missing this ceiling. Read the
-    quota interfaces directly.
+    Docker ``--cpus=2``, Kubernetes CPU limits, and systemd
+    ``CPUQuota=`` impose a CFS bandwidth quota WITHOUT narrowing the
+    process's CPU affinity — ``os.sched_getaffinity`` and
+    ``os.process_cpu_count`` therefore still report the host's full
+    affinity set, missing this ceiling.
 
-    Prefer cgroup v2's unified ``/sys/fs/cgroup/cpu.max`` (``"<quota>
-    <period>"`` or ``"max <period>"`` for unlimited). Fall back to
-    cgroup v1's ``cpu.cfs_quota_us`` / ``cpu.cfs_period_us`` split
-    (``-1`` = unlimited). CPUs = quota / period, rounded up so a
-    fractional quota (e.g. ``--cpus=1.5``) still yields at least the
-    integer floor for whole-CPU decisions. Returns ``None`` when
-    neither interface is readable or when the quota is unlimited so the
-    caller falls back to affinity-based counts.
+    Nested cgroup hierarchies (systemd services, containers running
+    under a slice) store the effective quota under the process's own
+    cgroup path, not the hierarchy root — reading only
+    ``/sys/fs/cgroup/cpu.max`` at the root would silently fall back to
+    the affinity count for a ``vireo.service`` with a ``CPUQuota=200%``
+    directive. Resolve the process's cgroup path from
+    ``/proc/self/cgroup`` and check every ancestor, taking the ``min``
+    quota — cgroup enforces the tightest along the chain, and this
+    matches that semantics for capacity sizing.
+
+    Prefers cgroup v2's unified ``cpu.max``. Falls back to cgroup v1's
+    ``cpu.cfs_quota_us`` / ``cpu.cfs_period_us`` split (``-1`` =
+    unlimited). Returns ``None`` when no readable quota is set anywhere
+    on the process's cgroup chain so the caller falls back to
+    affinity-based counts.
     """
-    try:
-        with open("/sys/fs/cgroup/cpu.max", encoding="utf-8") as f:
-            raw = f.read().strip()
-        parts = raw.split()
-        if len(parts) == 2:
-            quota_str, period_str = parts
-            if quota_str == "max":
-                return None
-            quota = int(quota_str)
-            period = int(period_str)
-            if quota > 0 and period > 0:
-                return max(1, math.ceil(quota / period))
-    except (OSError, ValueError):
-        pass
+    v2_path, v1_cpu_path = _process_cgroup_paths()
 
-    try:
-        with open(
-            "/sys/fs/cgroup/cpu/cpu.cfs_quota_us", encoding="utf-8",
-        ) as f:
-            quota = int(f.read().strip())
-        with open(
-            "/sys/fs/cgroup/cpu/cpu.cfs_period_us", encoding="utf-8",
-        ) as f:
-            period = int(f.read().strip())
-        if quota > 0 and period > 0:
-            return max(1, math.ceil(quota / period))
-    except (OSError, ValueError):
-        pass
+    candidates = []
 
-    return None
+    # cgroup v2: /sys/fs/cgroup{path}/cpu.max, walking ancestors.
+    if v2_path is not None:
+        for ancestor in _ancestor_dirs(v2_path):
+            mount = "/sys/fs/cgroup" + ("" if ancestor == "/" else ancestor)
+            value = _read_cgroup_v2_max(mount + "/cpu.max")
+            if value is not None:
+                candidates.append(value)
+    else:
+        # No /proc/self/cgroup — fall back to the root file so at least
+        # a non-nested container is still detected.
+        value = _read_cgroup_v2_max("/sys/fs/cgroup/cpu.max")
+        if value is not None:
+            candidates.append(value)
+
+    # cgroup v1: /sys/fs/cgroup/cpu{path}/cpu.cfs_quota_us, walking ancestors.
+    if v1_cpu_path is not None:
+        for ancestor in _ancestor_dirs(v1_cpu_path):
+            mount = "/sys/fs/cgroup/cpu" + (
+                "" if ancestor == "/" else ancestor
+            )
+            value = _read_cgroup_v1_pair(
+                mount + "/cpu.cfs_quota_us",
+                mount + "/cpu.cfs_period_us",
+            )
+            if value is not None:
+                candidates.append(value)
+    else:
+        value = _read_cgroup_v1_pair(
+            "/sys/fs/cgroup/cpu/cpu.cfs_quota_us",
+            "/sys/fs/cgroup/cpu/cpu.cfs_period_us",
+        )
+        if value is not None:
+            candidates.append(value)
+
+    return min(candidates) if candidates else None
 
 
 def process_usable_cpu_count():

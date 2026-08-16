@@ -88,10 +88,17 @@ def _make_open_stub(files):
 
 
 def test_cgroup_cpu_quota_reads_v2_unified_interface(monkeypatch):
-    """cgroup v2 exposes ``<quota> <period>`` in ``/sys/fs/cgroup/cpu.max``."""
+    """cgroup v2 exposes ``<quota> <period>`` in ``/sys/fs/cgroup/cpu.max``.
+
+    Simulate a root-level cgroup (no /proc/self/cgroup subpath), so the
+    quota lookup falls through to the root ``cpu.max``.
+    """
     monkeypatch.setattr(
         "builtins.open",
-        _make_open_stub({"/sys/fs/cgroup/cpu.max": "200000 100000\n"}),
+        _make_open_stub({
+            "/proc/self/cgroup": "0::/\n",
+            "/sys/fs/cgroup/cpu.max": "200000 100000\n",
+        }),
     )
     # 200000 / 100000 = 2 CPUs (Docker --cpus=2 equivalent).
     assert resource_ledger._cgroup_cpu_quota_cpus() == 2
@@ -101,7 +108,10 @@ def test_cgroup_cpu_quota_v2_unlimited_returns_none(monkeypatch):
     """``max <period>`` means unlimited — no CPU ceiling, return ``None``."""
     monkeypatch.setattr(
         "builtins.open",
-        _make_open_stub({"/sys/fs/cgroup/cpu.max": "max 100000\n"}),
+        _make_open_stub({
+            "/proc/self/cgroup": "0::/\n",
+            "/sys/fs/cgroup/cpu.max": "max 100000\n",
+        }),
     )
     assert resource_ledger._cgroup_cpu_quota_cpus() is None
 
@@ -112,9 +122,59 @@ def test_cgroup_cpu_quota_v2_fractional_rounds_up(monkeypatch):
     """
     monkeypatch.setattr(
         "builtins.open",
-        _make_open_stub({"/sys/fs/cgroup/cpu.max": "150000 100000\n"}),
+        _make_open_stub({
+            "/proc/self/cgroup": "0::/\n",
+            "/sys/fs/cgroup/cpu.max": "150000 100000\n",
+        }),
     )
     assert resource_ledger._cgroup_cpu_quota_cpus() == 2
+
+
+def test_cgroup_cpu_quota_v2_uses_process_cgroup_path_not_root(monkeypatch):
+    """Regression: nested cgroup v2 (systemd service, containerd) stores
+    the effective quota under the process's own cgroup path, not the
+    hierarchy root. A ``vireo.service`` with ``CPUQuota=200%`` has
+    ``/sys/fs/cgroup/system.slice/vireo.service/cpu.max`` = ``200000
+    100000`` while ``/sys/fs/cgroup/cpu.max`` reads ``max <period>``.
+    Reading only the root would silently fall back to the affinity
+    count and derive a much larger CPU budget than the service is
+    allowed. Resolve the current cgroup path from ``/proc/self/cgroup``.
+    """
+    monkeypatch.setattr(
+        "builtins.open",
+        _make_open_stub({
+            "/proc/self/cgroup": "0::/system.slice/vireo.service\n",
+            "/sys/fs/cgroup/cpu.max": "max 100000\n",
+            "/sys/fs/cgroup/system.slice/cpu.max": "max 100000\n",
+            "/sys/fs/cgroup/system.slice/vireo.service/cpu.max": (
+                "200000 100000\n"
+            ),
+        }),
+    )
+    assert resource_ledger._cgroup_cpu_quota_cpus() == 2
+
+
+def test_cgroup_cpu_quota_v2_takes_min_of_ancestor_chain(monkeypatch):
+    """cgroup enforces the tightest quota along the ancestor chain. A
+    slice with ``CPUQuota=400%`` containing a service with
+    ``CPUQuota=200%`` gives an effective 2 CPUs, but a service with
+    ``CPUQuota=800%`` under the same 400%-slice gives an effective
+    4 CPUs. Walk every ancestor and take the ``min`` so ancestor caps
+    apply even when the leaf's own quota is looser.
+    """
+    monkeypatch.setattr(
+        "builtins.open",
+        _make_open_stub({
+            "/proc/self/cgroup": "0::/system.slice/vireo.service\n",
+            "/sys/fs/cgroup/cpu.max": "max 100000\n",
+            "/sys/fs/cgroup/system.slice/cpu.max": "400000 100000\n",
+            "/sys/fs/cgroup/system.slice/vireo.service/cpu.max": (
+                "800000 100000\n"
+            ),
+        }),
+    )
+    # Leaf allows 8, ancestor slice caps at 4 — min wins.
+    assert resource_ledger._cgroup_cpu_quota_cpus() == 4
 
 
 def test_cgroup_cpu_quota_falls_back_to_v1_split(monkeypatch):
@@ -125,6 +185,10 @@ def test_cgroup_cpu_quota_falls_back_to_v1_split(monkeypatch):
     monkeypatch.setattr(
         "builtins.open",
         _make_open_stub({
+            # v1 process cgroup identification.
+            "/proc/self/cgroup": (
+                "9:cpu,cpuacct:/\n"
+            ),
             "/sys/fs/cgroup/cpu/cpu.cfs_quota_us": "400000\n",
             "/sys/fs/cgroup/cpu/cpu.cfs_period_us": "100000\n",
         }),
@@ -134,11 +198,37 @@ def test_cgroup_cpu_quota_falls_back_to_v1_split(monkeypatch):
     monkeypatch.setattr(
         "builtins.open",
         _make_open_stub({
+            "/proc/self/cgroup": "9:cpu,cpuacct:/\n",
             "/sys/fs/cgroup/cpu/cpu.cfs_quota_us": "-1\n",
             "/sys/fs/cgroup/cpu/cpu.cfs_period_us": "100000\n",
         }),
     )
     assert resource_ledger._cgroup_cpu_quota_cpus() is None
+
+
+def test_cgroup_cpu_quota_v1_nested_walks_ancestors(monkeypatch):
+    """v1 nested hierarchies work the same as v2 — ``vireo.service``
+    under ``system.slice`` looks up the tightest quota along the chain.
+    """
+    monkeypatch.setattr(
+        "builtins.open",
+        _make_open_stub({
+            "/proc/self/cgroup": (
+                "9:cpu,cpuacct:/system.slice/vireo.service\n"
+            ),
+            "/sys/fs/cgroup/cpu/cpu.cfs_quota_us": "-1\n",
+            "/sys/fs/cgroup/cpu/cpu.cfs_period_us": "100000\n",
+            "/sys/fs/cgroup/cpu/system.slice/cpu.cfs_quota_us": "-1\n",
+            "/sys/fs/cgroup/cpu/system.slice/cpu.cfs_period_us": (
+                "100000\n"
+            ),
+            "/sys/fs/cgroup/cpu/system.slice/vireo.service"
+            "/cpu.cfs_quota_us": "200000\n",
+            "/sys/fs/cgroup/cpu/system.slice/vireo.service"
+            "/cpu.cfs_period_us": "100000\n",
+        }),
+    )
+    assert resource_ledger._cgroup_cpu_quota_cpus() == 2
 
 
 def test_cgroup_cpu_quota_missing_files_returns_none(monkeypatch):
@@ -167,7 +257,10 @@ def test_process_usable_cpu_count_takes_minimum_of_affinity_and_cgroup(
     monkeypatch.setattr(resource_ledger.os, "process_cpu_count", lambda: 16)
     monkeypatch.setattr(
         "builtins.open",
-        _make_open_stub({"/sys/fs/cgroup/cpu.max": "200000 100000\n"}),
+        _make_open_stub({
+            "/proc/self/cgroup": "0::/\n",
+            "/sys/fs/cgroup/cpu.max": "200000 100000\n",
+        }),
     )
     assert resource_ledger.process_usable_cpu_count() == 2
 
@@ -175,7 +268,10 @@ def test_process_usable_cpu_count_takes_minimum_of_affinity_and_cgroup(
     monkeypatch.setattr(resource_ledger.os, "process_cpu_count", lambda: 4)
     monkeypatch.setattr(
         "builtins.open",
-        _make_open_stub({"/sys/fs/cgroup/cpu.max": "800000 100000\n"}),
+        _make_open_stub({
+            "/proc/self/cgroup": "0::/\n",
+            "/sys/fs/cgroup/cpu.max": "800000 100000\n",
+        }),
     )
     assert resource_ledger.process_usable_cpu_count() == 4
 

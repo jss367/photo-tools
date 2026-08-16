@@ -29,6 +29,7 @@ import threading
 import time
 import uuid
 import webbrowser
+from collections import OrderedDict
 from datetime import UTC, datetime
 from pathlib import Path
 from urllib.parse import quote, urlsplit
@@ -621,6 +622,131 @@ def _sync_preview_presentation(
         "before": "Current XMP value",
         "after": value or "Cleared",
     }
+
+
+# Server-side snapshot cache for /api/sync/preview. Progressive page loads
+# request the same pending-changes revision many times in a row; without a
+# cache each request re-scans the full queue and re-hashes every change,
+# making preview preparation quadratic in the queue size. Keyed by
+# (workspace_id, revision); bounded by count with LRU eviction.
+_SYNC_PREVIEW_SNAPSHOTS = OrderedDict()
+_SYNC_PREVIEW_SNAPSHOTS_LOCK = threading.Lock()
+_SYNC_PREVIEW_SNAPSHOTS_MAX = 8
+
+
+def _sync_preview_pending_fingerprint(db, ws_id):
+    """Cheap SUM/COUNT/MAX aggregate to detect INSERT/DELETE on pending_changes.
+
+    Value-only UPDATEs (see ``db.py`` line ~12942) slip past this check;
+    a stale snapshot is caught at apply time by the revision compared
+    against the sync operation, so we accept the small mismatch window
+    to avoid re-scanning the whole queue on every page request.
+    """
+    row = db.conn.execute(
+        "SELECT COUNT(*), COALESCE(MAX(id), 0), COALESCE(SUM(id), 0) "
+        "FROM pending_changes WHERE workspace_id = ?",
+        (ws_id,),
+    ).fetchone()
+    return (row[0], row[1], row[2])
+
+
+def _sync_preview_build_snapshot(db, ws_id):
+    """Load pending changes, group by photo, and compute the revision hash."""
+    changes = db.conn.execute(
+        """
+        SELECT pc.*, p.filename, p.folder_id, f.path AS folder_path
+        FROM pending_changes pc
+        JOIN photos p ON p.id = pc.photo_id
+        LEFT JOIN folders f ON f.id = p.folder_id
+        WHERE pc.workspace_id = ?
+        ORDER BY pc.created_at, pc.id
+        """,
+        (ws_id,),
+    ).fetchall()
+
+    revision_hash = hashlib.sha256()
+    change_type_counts = {}
+    fp_count = 0
+    fp_max_id = 0
+    fp_sum_id = 0
+    by_photo = {}
+    for change in changes:
+        revision_hash.update(
+            (
+                f"{change['id']}\0{change['change_token'] or ''}\0"
+                f"{change['photo_id']}\0{change['change_type']}\0"
+                f"{change['value'] or ''}\n"
+            ).encode()
+        )
+        change_type = change["change_type"]
+        change_type_counts[change_type] = (
+            change_type_counts.get(change_type, 0) + 1
+        )
+        fp_count += 1
+        cid = change["id"]
+        if cid > fp_max_id:
+            fp_max_id = cid
+        fp_sum_id += cid
+        pid = change["photo_id"]
+        photo = by_photo.get(pid)
+        if photo is None:
+            photo = {
+                "photo_id": pid,
+                "filename": change["filename"],
+                "folder": change["folder_path"] or "",
+                "changes": [],
+            }
+            by_photo[pid] = photo
+        photo["changes"].append({
+            "id": cid,
+            "type": change_type,
+            # ``_sync_preview_change_creates_sidecar`` and
+            # ``_sync_preview_presentation`` both read ``change_type`` and
+            # ``value`` off the row they're passed; storing them under both
+            # names lets the enrichment loop use these dicts directly
+            # without a per-request lookup back into the DB row.
+            "change_type": change_type,
+            "value": change["value"],
+        })
+
+    return {
+        "revision": revision_hash.hexdigest()[:24],
+        "all_photos": list(by_photo.values()),
+        "total_changes": len(changes),
+        "change_type_counts": change_type_counts,
+        "fingerprint": (fp_count, fp_max_id, fp_sum_id),
+    }
+
+
+def _sync_preview_get_snapshot(db, ws_id, requested_revision):
+    """Return a cached or freshly computed snapshot of pending changes.
+
+    Progressive page loads normally arrive back-to-back with the same
+    ``requested_revision``; on cache hit a lightweight aggregate check
+    verifies the pending queue hasn't shifted since the snapshot was
+    stored. On miss (or when the queue has shifted) the full snapshot is
+    rebuilt and cached under its computed revision.
+    """
+    if requested_revision:
+        key = (ws_id, requested_revision)
+        with _SYNC_PREVIEW_SNAPSHOTS_LOCK:
+            snapshot = _SYNC_PREVIEW_SNAPSHOTS.get(key)
+            if snapshot is not None:
+                _SYNC_PREVIEW_SNAPSHOTS.move_to_end(key)
+        if snapshot is not None:
+            if _sync_preview_pending_fingerprint(db, ws_id) == snapshot["fingerprint"]:
+                return snapshot
+            with _SYNC_PREVIEW_SNAPSHOTS_LOCK:
+                _SYNC_PREVIEW_SNAPSHOTS.pop(key, None)
+
+    snapshot = _sync_preview_build_snapshot(db, ws_id)
+    key = (ws_id, snapshot["revision"])
+    with _SYNC_PREVIEW_SNAPSHOTS_LOCK:
+        _SYNC_PREVIEW_SNAPSHOTS[key] = snapshot
+        _SYNC_PREVIEW_SNAPSHOTS.move_to_end(key)
+        while len(_SYNC_PREVIEW_SNAPSHOTS) > _SYNC_PREVIEW_SNAPSHOTS_MAX:
+            _SYNC_PREVIEW_SNAPSHOTS.popitem(last=False)
+    return snapshot
 
 
 def _sync_preview_change_creates_sidecar(
@@ -12092,34 +12218,11 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             if offset < 0:
                 return json_error("offset must be non-negative")
 
-        changes = db.conn.execute(
-            """
-            SELECT pc.*, p.filename, p.folder_id, f.path AS folder_path
-            FROM pending_changes pc
-            JOIN photos p ON p.id = pc.photo_id
-            LEFT JOIN folders f ON f.id = p.folder_id
-            WHERE pc.workspace_id = ?
-            ORDER BY pc.created_at, pc.id
-            """,
-            (db._ws_id(),),
-        ).fetchall()
-
-        revision_hash = hashlib.sha256()
-        change_type_counts = {}
-        for change in changes:
-            revision_hash.update(
-                (
-                    f"{change['id']}\0{change['change_token'] or ''}\0"
-                    f"{change['photo_id']}\0{change['change_type']}\0"
-                    f"{change['value'] or ''}\n"
-                ).encode()
-            )
-            change_type = change["change_type"]
-            change_type_counts[change_type] = (
-                change_type_counts.get(change_type, 0) + 1
-            )
-        revision = revision_hash.hexdigest()[:24]
         requested_revision = request.args.get("revision")
+        snapshot = _sync_preview_get_snapshot(
+            db, db._ws_id(), requested_revision,
+        )
+        revision = snapshot["revision"]
         if requested_revision and requested_revision != revision:
             return json_error(
                 "pending changes changed while the review was loading",
@@ -12128,26 +12231,11 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 message="Pending changes changed. Restarting the review.",
             )
 
-        # Group by photo
-        by_photo = {}
-        for c in changes:
-            pid = c["photo_id"]
-            if pid not in by_photo:
-                by_photo[pid] = {
-                    "photo_id": pid,
-                    "filename": c["filename"],
-                    "folder": c["folder_path"] or "",
-                    "changes": [],
-                }
-            by_photo[pid]["changes"].append({
-                "id": c["id"],
-                "type": c["change_type"],
-                "value": c["value"],
-            })
-
-        all_photos = list(by_photo.values())
+        all_photos = snapshot["all_photos"]
         total_photos = len(all_photos)
-        if not changes:
+        total_changes = snapshot["total_changes"]
+        change_type_counts = snapshot["change_type_counts"]
+        if total_changes == 0:
             return jsonify({
                 "photos": [],
                 "total_changes": 0,
@@ -12159,11 +12247,24 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 "revision": revision,
             })
 
-        page_photos = (
+        # Enrichment below mutates the per-change dicts (``creates_xmp_sidecar``,
+        # ``presentation``, …), so copy the slice before touching it — the
+        # underlying photos/changes lists live inside the cached snapshot and
+        # are re-served across page requests for the same revision.
+        page_slice = (
             all_photos
             if limit is None
             else all_photos[offset:offset + limit]
         )
+        page_photos = [
+            {
+                "photo_id": photo["photo_id"],
+                "filename": photo["filename"],
+                "folder": photo["folder"],
+                "changes": [dict(change) for change in photo["changes"]],
+            }
+            for photo in page_slice
+        ]
 
         import config as cfg
 
@@ -12172,7 +12273,6 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             effective_config.get("write_assigned_location_to_xmp", False)
         )
         sync_flags = bool(effective_config.get("sync_flags_to_xmp", False))
-        changes_by_id = {change["id"]: change for change in changes}
         location_photo_ids = [
             photo["photo_id"]
             for photo in page_photos
@@ -12233,7 +12333,6 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                         )
             keyword_add_keys = set(keyword_add_values_by_key.keys())
             for change in photo["changes"]:
-                pending = changes_by_id[change["id"]]
                 auto_includes_keyword_add = bool(
                     change["type"] in {"keyword_remove", "keyword_remove_flat"}
                     and keyword_match_key(change["value"]) in keyword_add_keys
@@ -12252,7 +12351,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     and (
                         auto_includes_keyword_add
                         or _sync_preview_change_creates_sidecar(
-                            pending,
+                            change,
                             sync_flags=sync_flags,
                             write_locations=write_locations,
                             assigned_location=assigned_location,
@@ -12264,7 +12363,6 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 change["creates_xmp_sidecar"] for change in photo["changes"]
             )
             for change in photo["changes"]:
-                pending = changes_by_id[change["id"]]
                 paired_add_value = None
                 if change["type"] == "keyword_remove" and change[
                     "paired_keyword_rename"
@@ -12273,14 +12371,14 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                         keyword_match_key(change["value"])
                     )
                 if (
-                    pending["change_type"] == "rating"
+                    change["change_type"] == "rating"
                     and not folder_offline
                     and not metadata.get("rating_writable")
                 ):
                     change["rating_requires_sidecar"] = True
                     change["presentation_without_sidecar"] = (
                         _sync_preview_presentation(
-                            pending,
+                            change,
                             metadata,
                             assigned_location=assigned_location,
                             write_locations=write_locations,
@@ -12294,7 +12392,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     )
                     change["presentation_with_sidecar"] = (
                         _sync_preview_presentation(
-                            pending,
+                            change,
                             metadata,
                             assigned_location=assigned_location,
                             write_locations=write_locations,
@@ -12313,7 +12411,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     ]
                     continue
                 change["presentation"] = _sync_preview_presentation(
-                    pending,
+                    change,
                     metadata,
                     assigned_location=assigned_location,
                     write_locations=write_locations,
@@ -12327,7 +12425,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         has_more = page_end < total_photos
         result = {
             "photos": page_photos,
-            "total_changes": len(changes),
+            "total_changes": total_changes,
             "total_photos": total_photos,
             "change_type_counts": change_type_counts,
             "offset": offset,

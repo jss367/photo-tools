@@ -454,6 +454,49 @@ def test_sync_preview_rejects_stale_progressive_revision(app_and_db):
     assert stale.get_json()["code"] == "sync_preview_changed"
 
 
+def test_sync_preview_reuses_snapshot_across_page_requests(app_and_db):
+    """Subsequent page requests skip the full pending-changes scan.
+
+    Progressive loading otherwise re-fetches and re-hashes every pending
+    change on every page request, making preview preparation quadratic in
+    queue size (Codex review, PR #1483). Once the snapshot for a revision
+    is cached, later pages must not re-query ``pending_changes``.
+    """
+    app, db = app_and_db
+    photo_ids = [photo["id"] for photo in db.get_photos()[:3]]
+    assert len(photo_ids) == 3
+    for index, photo_id in enumerate(photo_ids, start=1):
+        db.queue_change(photo_id, "rating", str(index))
+
+    client = app.test_client()
+    first = client.get("/api/sync/preview?limit=2&offset=0").get_json()
+    assert first["total_photos"] == 3
+    assert first["revision"]
+    revision = first["revision"]
+
+    import app as vireo_app
+
+    call_count = {"n": 0}
+    original_build = vireo_app._sync_preview_build_snapshot
+
+    def counting_build(*args, **kwargs):
+        call_count["n"] += 1
+        return original_build(*args, **kwargs)
+
+    vireo_app._sync_preview_build_snapshot = counting_build
+    try:
+        second = client.get(
+            f"/api/sync/preview?limit=2&offset=2&revision={revision}"
+        ).get_json()
+    finally:
+        vireo_app._sync_preview_build_snapshot = original_build
+
+    assert second["revision"] == revision
+    assert len(second["photos"]) == 1
+    # The cached snapshot serves page 2 — no re-scan of pending_changes.
+    assert call_count["n"] == 0
+
+
 def test_sync_preview_describes_location_keyword_as_xmp_delta(
     client_with_photo,
 ):

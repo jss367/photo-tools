@@ -16865,6 +16865,93 @@ def test_prediction_states_distinguish_empty_reasons(app_and_db):
     assert states[detected_only]["classifier_ran"] is False
 
 
+def test_prediction_states_ignore_fallback_and_noise_detections(app_and_db):
+    """"Detections exist" must mean detections the classifier could act on.
+
+    The whole-frame ``full-image`` row is written *because* the detector found
+    nothing, and rows under the workspace ``detector_confidence`` floor are
+    noise. Counting either would render "detections found, but no classifier
+    has run yet" for a photo whose detector plainly found no animal.
+    """
+    app, db = app_and_db
+    assert app is not None
+    folder_id = db.get_folder_tree()[0]["id"]
+
+    fallback_only = db.add_photo(
+        folder_id=folder_id, filename="state-fallback.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+    )
+    db.record_detector_run(fallback_only, "MDV6", box_count=0)
+    db.save_detections(
+        fallback_only,
+        [{"box": {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0},
+          "confidence": 1.0, "category": "animal"}],
+        detector_model="full-image",
+    )
+
+    noise_only = db.add_photo(
+        folder_id=folder_id, filename="state-noise.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+    )
+    db.record_detector_run(noise_only, "MDV6", box_count=1)
+    db.save_detections(
+        noise_only,
+        [{"box": {"x": 0.1, "y": 0.1, "w": 0.2, "h": 0.2},
+          "confidence": 0.01, "category": "animal"}],
+        detector_model="MDV6",
+    )
+
+    states = db.get_prediction_states([fallback_only, noise_only])
+    assert states[fallback_only]["detector_ran"] is True
+    assert states[fallback_only]["detection_count"] == 0
+    assert states[noise_only]["detector_ran"] is True
+    assert states[noise_only]["detection_count"] == 0
+
+
+def test_batch_accept_skips_already_accepted_predictions(app_and_db):
+    """A double-clicked Accept must not record a second accept.
+
+    The keyword already exists by then, so the second pass would log a
+    status-only edit claiming the prediction was previously pending. Undoing
+    it would knock a long-accepted prediction back to pending.
+    """
+    app, db = app_and_db
+    client = app.test_client()
+    photo_id, _ = _seed_prediction_photo(db, "dupe-accept.jpg", "Bald Eagle", 0.9)
+    pred_id = _prediction_id(db, photo_id, "Bald Eagle")
+
+    first = client.post(
+        "/api/predictions/batch-accept", json={"prediction_ids": [pred_id]},
+    )
+    assert first.status_code == 200, first.get_data(as_text=True)
+    assert first.get_json()["accepted"] == 1
+    edits_after_first = len(db.get_edit_history(limit=50))
+
+    second = client.post(
+        "/api/predictions/batch-accept", json={"prediction_ids": [pred_id]},
+    )
+    assert second.status_code == 200, second.get_data(as_text=True)
+    body = second.get_json()
+    assert body["accepted"] == 0
+    assert body["already_accepted"] == 1
+    # No second edit row: the resubmission changed nothing, so it must not
+    # sit at the top of the undo stack pretending to be reversible work.
+    assert len(db.get_edit_history(limit=50)) == edits_after_first
+    assert app is not None
+
+
+def test_predictions_api_rejects_oversized_photo_ids(app_and_db):
+    """The GET filter runs one workspace check per id, so it is capped like
+    the selection endpoints rather than accepting an unbounded list."""
+    app, _ = app_and_db
+    client = app.test_client()
+    ids = ",".join(str(i) for i in range(1, 1002))
+    resp = client.get(f"/api/predictions?photo_ids={ids}")
+    assert resp.status_code == 400
+    assert "too many photo_ids" in resp.get_data(as_text=True)
+    assert app is not None
+
+
 def test_review_supports_photo_id_deep_link(app_and_db):
     """Browse routes ambiguous predictions to Review filtered to one photo."""
     app, _ = app_and_db

@@ -5733,6 +5733,10 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         Returns None when absent so callers keep their unscoped behaviour, and
         raises ValueError on a malformed value so a typo surfaces as a 400
         rather than silently widening the query to the whole workspace.
+
+        Capped at the same 1000 ids ``_parse_selection_photo_ids`` allows:
+        ``/api/predictions`` runs one ``_photo_in_workspace`` query per id, so
+        an unbounded list turns a single GET into unbounded database work.
         """
         raw = request.args.get("photo_ids")
         if raw is None or raw.strip() == "":
@@ -5752,6 +5756,8 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 seen.add(pid)
         if not ids:
             raise ValueError("photo_ids must contain at least one id")
+        if len(ids) > 1000:
+            raise ValueError("too many photo_ids")
         return ids
 
     _VISUAL_STRENGTH_THRESHOLDS = {"broad": 0.10, "balanced": 0.15, "strict": 0.22}
@@ -16329,6 +16335,25 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         # Browse. ``accept_prediction`` already honours ``photo_ids`` when
         # limiting a grouped accept.
         submitted_photo_ids = list({int(pid) for pid in photo_by_pred.values()})
+
+        # Make a repeat submission a no-op rather than a second accept. A
+        # double-clicked Accept button or a stale panel would otherwise
+        # re-accept rows that are already accepted: the keyword now exists, so
+        # the second pass records a status-only ``no_tag`` item whose
+        # "previous" status is a fiction — undoing it would knock a
+        # long-accepted prediction back to pending while keeping the keyword.
+        ws = db._ws_id()
+        placeholders = ",".join("?" for _ in pred_ids)
+        already_accepted = {
+            row["prediction_id"] for row in db.conn.execute(
+                f"""SELECT prediction_id FROM prediction_review
+                    WHERE workspace_id = ? AND status = 'accepted'
+                      AND prediction_id IN ({placeholders})""",
+                (ws, *pred_ids),
+            )
+        }
+        pred_ids = [pid for pid in pred_ids if pid not in already_accepted]
+
         replace_species = bool(body.get("replace_species"))
         items = []
         keyword_id = None
@@ -16384,6 +16409,10 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         return jsonify({
             "ok": True,
             "accepted": len({item["photo_id"] for item in items}),
+            # Reported rather than folded into ``accepted``: a caller that
+            # resubmits should be able to tell "nothing to do, already
+            # accepted" from "nothing matched".
+            "already_accepted": len(already_accepted),
             "species": species,
         })
 

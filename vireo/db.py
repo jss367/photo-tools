@@ -16293,13 +16293,22 @@ class Database:
         ``threshold`` travels with the state so the panel can split the rows
         it already has into visible and below-the-floor, and say the hidden
         count out loud rather than dropping those rows silently.
+
+        ``detection_count`` counts only what the rest of this file calls a
+        real detection: ``detector_model = 'full-image'`` rows are the
+        synthetic whole-frame anchor written *because* the detector found
+        nothing, and rows under the workspace's ``detector_confidence`` floor
+        are the noise the classifier never acts on. Counting either would
+        report "detections exist but were never classified" for a photo whose
+        detector plainly found no animal — the exact conflation this method
+        exists to prevent. Same rule as ``count_real_detections_in_scope``.
         """
         if not photo_ids:
             return {}
         import config as cfg
-        threshold = self.get_effective_config(cfg.load()).get(
-            "classifier_confidence", 0.0
-        ) or 0.0
+        effective = self.get_effective_config(cfg.load())
+        threshold = effective.get("classifier_confidence", 0.0) or 0.0
+        detector_floor = effective.get("detector_confidence", 0.2)
         ids = list(dict.fromkeys(int(pid) for pid in photo_ids))
         states = {
             pid: {
@@ -16320,8 +16329,11 @@ class Database:
                 states[row["photo_id"]]["detector_ran"] = row["n"] > 0
             for row in self.conn.execute(
                 f"""SELECT photo_id, COUNT(*) AS n FROM detections
-                    WHERE photo_id IN ({placeholders}) GROUP BY photo_id""",
-                chunk,
+                    WHERE photo_id IN ({placeholders})
+                      AND detector_model != 'full-image'
+                      AND detector_confidence >= ?
+                    GROUP BY photo_id""",
+                [*chunk, detector_floor],
             ):
                 states[row["photo_id"]]["detection_count"] = row["n"]
             for row in self.conn.execute(

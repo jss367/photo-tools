@@ -99,11 +99,30 @@ Row: `Bald Eagle · 87% · SpeciesNet`, in one of three states:
 | Pending, ambiguous | No bare Accept. States why — "3 alternatives", "conflicts with keyworded Bald Eagle" — and offers **Open in Review** |
 | Already decided | Muted, marked Accepted or Rejected |
 
-Two empty states, which are different facts and must not collapse into one
-blank panel:
+An empty list has five different meanings and a blank panel implies only the
+first, so `/api/predictions?photo_ids=…` returns a `photo_states` entry per
+photo (`detector_ran`, `detection_count`, `classifier_ran`, `threshold`) and
+the panel names the real cause:
 
-- **Not yet classified** — no classifier has run on this photo.
-- **Classified, nothing above threshold** — it ran and found nothing.
+| Condition | Rendering |
+|---|---|
+| `detector_ran = false` | Not yet classified — no detector has run on this photo. |
+| `classifier_ran = false`, `detection_count = 0` | Nothing detected — the detector ran and found no animals. |
+| `classifier_ran = false`, `detection_count > 0` | Not yet classified — detections found, but no classifier has run yet. |
+| `classifier_ran = true`, rows exist but all below `threshold` | No species above threshold — every prediction is below your confidence floor. |
+| `classifier_ran = true`, no rows at all | Classification ran and produced no species for this photo. |
+
+The last two must stay apart: blaming the threshold when the classifier
+emitted nothing names a cause that never fired. `classifier_ran` is therefore
+tested *before* `detection_count` — once the classifier has run, the reason
+is a classifier fact.
+
+`detection_count` counts only real detections — `detector_model =
+'full-image'` synthetic anchors and rows below the workspace
+`detector_confidence` floor are excluded, matching
+`count_real_detections_in_scope`. A photo whose only row is the whole-frame
+fallback the detector writes *because* it found nothing must read as
+"nothing detected", not "detections found".
 
 Predictions below the workspace `classifier_confidence` are not silently
 dropped. A collapsed line — `2 below threshold (0.35)` — keeps them
@@ -114,14 +133,14 @@ visible without cluttering.
 A **Predictions** section above the existing Keywords section in
 `selectionPanel`, reading like the keyword rows already there:
 
-```
+```text
 Bald Eagle — predicted on 38 of 40, keyworded on 0     [Accept on 38]
 ```
 
 Where some predictions are ambiguous, the button covers only the clean
 subset and the row says so:
 
-```
+```text
 Bald Eagle — predicted on 38 of 40     [Accept on 35 · 3 need review]
 ```
 
@@ -131,24 +150,46 @@ the UI-transparency rule forbids.
 ## Data flow
 
 **Loading.** Single-photo predictions fetch inside the existing
-`loadDetail(photoId)` path. Multi-select reuses the
-`selectionKeywordKey` / `selectionKeywordRequestSeq` guard pattern
-(`browse.html:6053`) — same cache key, same stale-response drop. That
-pattern exists because a fast selection change previously rendered results
-for the prior selection (see the review note at `browse.html:2034`); an
-independently-invented guard would reintroduce it. One seq counter per
-panel, responses dropped on mismatch.
+`loadDetail(photoId)` path. Multi-select reuses the *pattern* of the
+`selectionKeywordKey` / seq guard (`browse.html:6053`) — same cache key
+shape, same stale-response drop — but with its own `selectionPredictionKey`
+and `selectionPredictionSeq`. Sharing the keyword panel's key would let one
+panel's response invalidate the other's, or make a valid response look
+stale. That guard exists because a fast selection change previously rendered
+results for the prior selection (see the review note at `browse.html:2034`);
+an independently-invented guard would reintroduce it. One seq counter per
+panel, responses dropped on mismatch. A failed load clears its key so the
+same selection can retry instead of sticking on the error text.
 
-**After accept/reject.** An accept mutates keywords, so it runs the same
-fan-out `applySelectionKeyword` already performs:
+**After accept.** An accept mutates keywords, so it runs the same fan-out
+`applySelectionKeyword` already performs:
 
 - `_refreshBrowseKeywordState(ids)`
 - `loadKeywords()`
 - `scheduleCollectionCountsRefresh()`
 - `refreshActiveCollectionAfterMembershipChange()`
 - `refreshPendingSyncBanner()` — accepting writes pending XMP changes
-- `showUndoToast()`
+- `showUndoToast()` — the batch is one `prediction_accept` edit, so one
+  Cmd-Z reverses the whole thing
 - invalidate the prediction cache key so row state re-renders
+
+**After reject.** A rejection touches no keywords, so it refreshes only the
+prediction rows plus the membership-dependent surfaces:
+
+- repaint the detail/selection prediction panels (cache key invalidated)
+- `scheduleCollectionCountsRefresh()` and
+  `refreshActiveCollectionAfterMembershipChange()` — a reject changes
+  membership in prediction-status collections such as "pending predictions"
+- **no** `showUndoToast()`. `prediction_reject` is in the database's
+  `_NON_UNDOABLE` set (`_apply_undo` has no handler), so a toast would
+  advertise some *earlier* edit as reversible and Cmd-Z would silently undo
+  that unrelated action instead of the rejection.
+
+**Repeat accepts.** `/api/predictions/batch-accept` skips prediction ids
+already marked accepted and reports them as `already_accepted`. A
+double-clicked button would otherwise record a status-only edit whose
+"previous" status is a fiction, and undoing it would knock a
+long-accepted prediction back to pending.
 
 ## Testing
 

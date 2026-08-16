@@ -6285,15 +6285,24 @@ function predictionAmbiguityReason(p) {
   return reasons.join(' · ');
 }
 
-// An empty list has four different meanings. Collapsing them into one blank
+// An empty list has five different meanings. Collapsing them into one blank
 // panel would tell the user "no prediction" when the truth might be "nothing
 // has run yet" — see CORE_PHILOSOPHY.md, no black boxes.
-function predictionEmptyMessage(state) {
+//
+// `classifier_ran` is checked before `detection_count` on purpose: once the
+// classifier has run, the reason the panel is empty is a classifier fact, and
+// "nothing detected" would be a stale explanation. `hiddenCount` splits the
+// last case in two — blaming the threshold when the classifier produced no
+// species at all would name a cause that never fired.
+function predictionEmptyMessage(state, hiddenCount) {
   if (!state) return 'No predictions for this photo.';
   if (!state.detector_ran) return 'Not yet classified — no detector has run on this photo.';
+  if (state.classifier_ran) {
+    if (hiddenCount) return 'No species above threshold — every prediction is below your confidence floor.';
+    return 'Classification ran and produced no species for this photo.';
+  }
   if (!state.detection_count) return 'Nothing detected — the detector ran and found no animals.';
-  if (!state.classifier_ran) return 'Not yet classified — detections found, but no classifier has run yet.';
-  return 'No species above threshold — classification ran and produced nothing to review.';
+  return 'Not yet classified — detections found, but no classifier has run yet.';
 }
 
 function formatPredictionConfidence(conf) {
@@ -6342,7 +6351,7 @@ function renderDetailPredictions(data, photoId) {
 
   if (!visible.length) {
     list.innerHTML = '<div class="selection-empty">' +
-      escapeHtml(predictionEmptyMessage(state)) + '</div>' +
+      escapeHtml(predictionEmptyMessage(state, hidden)) + '</div>' +
       (hidden ? '<div class="prediction-below-threshold">' + hidden +
         (hidden === 1 ? ' prediction' : ' predictions') + ' below your confidence threshold (' +
         formatPredictionConfidence(threshold) + ').</div>' : '');
@@ -6522,6 +6531,10 @@ async function loadSelectionPredictions(ids) {
     );
   } catch(e) {
     if (seq === selectionPredictionSeq) {
+      // Drop the cache key: it was stored before the request ran, so leaving
+      // it set would make the next call for this same selection early-return
+      // and strand the panel on the error text until the selection changes.
+      selectionPredictionKey = '';
       list.innerHTML = '<div class="selection-empty">Could not load predictions.</div>';
     }
   }

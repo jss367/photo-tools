@@ -150,9 +150,11 @@ available, and where the accept path needs the same key anyway.
 predictions (no group). Connect two nodes when they have the **same
 `taxon_key`** and their **photo memberships intersect**. Each connected
 component is one card; `card_id` is derived from the lexicographically
-smallest member's stable node key (see below) prefixed with the taxon key
-so distinct taxa can never collide, then URL-safe encoded (see "Card ID
-encoding" below).
+smallest member's stable node key alone (see "Card ID encoding" below).
+The taxon key is *not* baked into `card_id` — it is recomputed from the
+anchor node's rows on the mutation POST, so cards survive taxonomy-cache
+transitions between the GET and the click (see "Anchor lookup and
+cache-transition safety" below).
 
 **Node identity.** The graph keys each burst-group node as
 `(classifier_model, labels_fingerprint, group_id)`. That tuple is
@@ -247,23 +249,44 @@ time is not:
    groups of one never get a `group_id`. The partition therefore never
    has to invent an ordering for `NULL`.
 
-Capture time is also *immutable and independent of write history*: it
-comes from the photo's EXIF, so re-inserting a cached prediction row,
-an `INSERT OR IGNORE` no-op, a re-run, or a backfill cannot move it.
+Capture time is *independent of write history* — it comes from EXIF, so
+re-inserting a cached prediction row, an `INSERT OR IGNORE` no-op, a
+re-run, or a backfill cannot move it. That is exactly the property
+`created_at` lacked. Capture time is however **not fully immutable at the
+row level**: `_refresh_photo_metadata` (`vireo/capture_time.py:265-283`)
+and scanner refreshes both re-read EXIF and update `photos.timestamp`,
+so a correction between the GET and the POST of a single Review
+interaction can, in principle, shift a row's subset assignment.
+The narrowness of this residual — and its safe failure mode — is
+addressed under "Timestamp-mutation residual" below, after `subset_pid`
+is defined.
 
 The read path therefore partitions the rows sharing each
 `(classifier_model, labels_fingerprint, group_id)` bucket into
 **capture-time-connected subsets** — join `photos.timestamp`, sort the
 bucket's rows ascending by `(timestamp, photo_id)`, and break the
 sequence whenever the gap between two consecutive rows exceeds
-`W_read`. `W_read` is `max(effective grouping_window_seconds, 300)`.
-The `max` matters: the partition must never split a burst that was
-grouped under a *larger* window than the config currently holds, and
-over-wide is the safe direction (it can only under-split, i.e. leave
-a legacy collision unresolved, never shatter a real burst). 300s is a
-floor, not a tuned constant — the partition only ever runs *within* a
-single colliding `group_id` bucket, so a generous window costs
-nothing.
+`W_read`. `W_read` is the **schema maximum** of `grouping_window_seconds`
+(`vireo/config_schema.py`, currently `3600`), *not* the current effective
+setting. This is deliberately independent of both the workspace's current
+value and the global setting: the current value is a *lower bound on the
+truthful width* and can only under-split legitimately, but the *historical*
+value that was in force when a legacy bucket was written is not
+recoverable — the schema `min`/`max` bounds (`0`..`3600`,
+`vireo/config_schema.py:89-93`) are the tightest fact still available at
+read time about what window that burst could legally have used. A rule
+that used the current setting would split a legacy burst whenever the
+user has since lowered the config below the historical value (e.g. a
+600s burst with a 400s inter-frame gap, seen with the config now at 10s
+so `W_read = 300`). Keying `W_read` on the schema `max` removes the
+setting from the partition entirely, so the partition is a pure function
+of stored rows plus the fixed schema, and the failure mode disappears.
+The tradeoff is a slightly wider legacy-collision residual: two
+disjoint bursts whose photo capture times fall within the schema max of
+each other collapse into one subset (previously `max(setting, 300)`).
+That is the safe direction — under-splitting leaves a rare legacy
+collision as one card; over-splitting shatters a real burst into many
+cards — and the surface shrinks to zero as pre-Phase-0 rows age out.
 
 **Subsets are identified by an intrinsic anchor, not a position.**
 The subset's identifier is `subset_pid` — the **minimum
@@ -301,8 +324,11 @@ in the common case. Two colliding bursts from different runs fall
 into two subsets with two different anchors and become two distinct
 nodes; the same-taxon overlap edge test then correctly leaves them
 separate when their photos do not intersect (and correctly merges
-them when they do). The partition is a pure read-time transform — no
-schema change, no new column, no backfill.
+them when they do). The partition as specified is a pure read-time
+transform — no schema change, no new column, no backfill in this
+phase. (An additive nullable column is discussed as an explicit
+escape hatch under "Timestamp-mutation residual" below; it is not
+part of the current design.)
 
 The partition is deliberately conservative: it can only *split* rows
 apart, never combine them. The one case it cannot disentangle is the
@@ -318,6 +344,60 @@ time (if they were, and they were classified in one job, the grouper
 would have made them one burst in the first place). This surface
 predates the feature and shrinks to zero for new rows once Phase 0
 ships; it is documented rather than mitigated.
+
+**Timestamp-mutation residual.** `photos.timestamp` is not fully
+immutable — `_refresh_photo_metadata` (`vireo/capture_time.py:265-283`)
+and scanner refreshes both re-read EXIF and update the column — so in
+principle a correction between a Review GET and the mutation POST that
+follows it can shift a row's subset assignment. The surface is narrow
+by construction and the failure mode is safe, but it deserves an
+explicit accounting because the partition's identity guarantee (§2,
+"The partition is always computed over the unfiltered bucket") is a
+guarantee against *filter state*, not against concurrent writes to
+`photos.timestamp`:
+
+1. **Non-colliding buckets are unaffected.** A bucket whose
+   `group_id` is unique across (model, fingerprint) — every Phase 0
+   row, and every legacy row whose short suffix + counter did not
+   happen to collide — contains exactly one real burst, so the
+   partition puts the whole bucket in one subset regardless of any
+   inter-row capture-time gap. `subset_pid` is `min(id)` over the
+   bucket, which is a function of stored ids and cannot move when a
+   timestamp is corrected. The only way a Phase 0 bucket's identity
+   could shift is if a correction *widened* the maximum inter-row gap
+   beyond `W_read` (i.e., beyond an hour), which would require moving
+   a timestamp by more than the schema-max window — a full-hour drift
+   that is not what capture-time corrections usually do (they fix
+   camera-clock offsets in seconds-to-minutes, not hours). Even then,
+   the failure is captured by (3) below.
+2. **Legacy colliding buckets are affected only in narrow windows.**
+   Only pre-Phase-0 buckets that both collided *and* had a
+   timestamp correction land during a live Review interaction are
+   exposed. That is the intersection of two rare surfaces (a legacy
+   short-suffix collision and a concurrent EXIF refresh on one of the
+   colliding bursts' photos) and shrinks to zero as legacy rows age
+   out.
+3. **The failure mode is a 400, never a silent mismerge.** If a
+   correction moves a row across a subset boundary between GET and
+   POST, the client's `node_id` names a `subset_pid` that no longer
+   anchors any subset in the current partition. The server returns
+   400 (the same response §2 "Mutation ID from the fallback view"
+   already specifies for a stale `node_id` after a re-run rewrote
+   group IDs), and the next Review refresh rebuilds the card from
+   the current partition. No hidden row is mutated; no cross-bucket
+   accept fires.
+
+Full closure would require persisting the partition anchor at
+grouping time — a nullable additive column
+(`prediction_review.group_pid`) populated by `_store_grouped_predictions`
+with the burst's `min(prediction.id)`, read in preference to the
+timestamp partition when non-`NULL`. That is an **additive** column,
+not a destructive migration, so it does not violate the goals; it is
+documented as the explicit escape hatch and deferred because (1)+(2)+(3)
+already leave the exposure well under any observable-in-practice
+threshold, and shipping the column now would tie Phase 0 to a Phase
+that has to touch the write path and a backfill without a demonstrated
+need.
 
 The write-path fix stays. **Phase 0 (new,
 prerequisite of §2)** widens `_store_grouped_predictions` to mint
@@ -393,11 +473,13 @@ instead of `group_id`, so per-model detail remains available for rendering.
   is what the card endpoint composes.
 
 **Card ID encoding.** `card_id` is treated as opaque bytes on the wire.
-For `name:`-keyed cards the folded label is embedded in the id, and
-folded labels come from arbitrary user-supplied label files that may
-contain `/`, `?`, `#`, `%`, or other URL-significant characters — and
-may also contain the delimiter characters (`|`, `:`) that appear inside
-taxon keys and node keys themselves. Two-part rule:
+For `name:`-keyed cards the folded label appears in some fields (via
+node keys that carry model or fingerprint strings, though not the label
+itself under the encoding below), and those fields come from arbitrary
+user-supplied inputs that may contain `/`, `?`, `#`, `%`, or other
+URL-significant characters — and may contain the delimiter characters
+(`|`, `:`) that appear inside taxon keys and node keys themselves.
+Two-part rule:
 
 1. The card endpoint takes the id as a **query parameter**
    (`/api/predictions/card?id=<card_id>`), not as a path segment, so any
@@ -408,22 +490,86 @@ taxon keys and node keys themselves. Two-part rule:
 2. The server-emitted `card_id` string is base64url-encoded (RFC 4648
    §5, unpadded — alphabet `[A-Za-z0-9_-]`) over a **structured**
    payload, not a delimiter-joined string. Concretely, the payload is
-   the UTF-8 encoding of `json.dumps([taxon_key, smallest_member_key],
-   separators=(",", ":"), ensure_ascii=False)`. JSON string escaping
-   makes any byte inside either field unambiguous — including `|`, `:`,
-   `"`, `\`, `/`, and control chars — so the server can decode with
-   `json.loads` and recover exactly `(taxon_key, member_key)` regardless
-   of what the user's label file contains or what a classifier model
-   name looks like. Base64url over the JSON keeps the id safe to embed
-   anywhere (DOM attributes, path segments if some future route wants
-   them, log lines) without further escaping, and keeps it opaque to
-   the client. Where the client persists an id (e.g. in URL hash for
-   deep links), it stores the already-encoded form verbatim.
-   *Alternative implementation, same guarantee:* an opaque digest (e.g.
-   SHA-256 of the canonical JSON) with a server-side lookup table from
-   digest → `(taxon_key, member_key)`; equivalent correctness, one extra
-   table lookup per card open. Rejected as unnecessary — the structured
-   base64url form is round-trip decodable without state.
+   the UTF-8 encoding of `json.dumps([smallest_member_key],
+   separators=(",", ":"), ensure_ascii=False)` — a single-element JSON
+   array wrapping the anchor node key. JSON string escaping makes any
+   byte inside the anchor unambiguous — including `|`, `:`, `"`, `\`,
+   `/`, and control chars — so the server can decode with `json.loads`
+   and recover exactly `smallest_member_key` regardless of what a
+   classifier model name looks like. Base64url over the JSON keeps
+   the id safe to embed anywhere (DOM attributes, path segments if
+   some future route wants them, log lines) without further escaping,
+   and keeps it opaque to the client. Where the client persists an id
+   (e.g. in URL hash for deep links), it stores the already-encoded
+   form verbatim. *Alternative implementation, same guarantee:* an
+   opaque digest (e.g. SHA-256 of the canonical JSON) with a
+   server-side lookup table from digest → `member_key`; equivalent
+   correctness, one extra table lookup per card open. Rejected as
+   unnecessary — the structured base64url form is round-trip decodable
+   without state.
+
+*Why the anchor alone, and not `(taxon_key, anchor)`.* An earlier draft
+prefixed the id with the card's `taxon_key` "so distinct taxa cannot
+collide". That prefix is redundant, because a node belongs to at most
+one component per Review payload: the merge graph builds components on
+`(same taxon_key, overlapping photos)` and a node has exactly one
+`taxon_key` at a given time, so no two distinct-taxon components can
+share the same anchor node. Worse, embedding `taxon_key` made the id
+brittle across taxonomy-cache transitions: §1's background resolver
+opportunistically enqueues any `name:`-fallback label the GET emits,
+and the resolver can persist a hit *between* the GET that stamped a
+`name:`-keyed `card_id` and the POST that submits it. Rebuilding the
+graph from stored rows then produces a `taxon:`-keyed `card_id` for
+those same rows and the client's submitted id decodes to a `taxon_key`
+that no current component carries — so a card still on screen would
+return 400 or, worse, resolve to nothing at all. Encoding only the
+anchor eliminates the dependency: the anchor node's stored rows are
+untouched by the cache transition, `smallest_member_key` decodes to
+the same tuple, and "Anchor lookup and cache-transition safety" below
+covers how the server rebuilds the card under the *current* taxon
+key.
+
+**Anchor lookup and cache-transition safety.** On a `card_id` mutation
+POST the server:
+
+1. Decodes `card_id` to recover `smallest_member_key`.
+2. Locates that node's stored rows (join `prediction_review` with
+   `predictions` under the active workspace, filtered by the node's
+   `(classifier_model, labels_fingerprint, group_id, subset_pid)`
+   tuple for grouped rows, or `prediction_id` for singletons). A node
+   whose rows have all been deleted or a bucket a re-run rewrote
+   returns 400 — the same stale-handle response the design already
+   specifies elsewhere.
+3. Computes the taxon key for that anchor node's rows *now* using §1's
+   `taxon_key_for` (which reads the current cache — a hit that landed
+   between the GET and the POST resolves to `taxon:...`, a miss stays
+   `name:...`).
+4. Runs the same card-building graph the GET runs and returns the
+   connected component that contains the anchor node. That component
+   is the card the mutation resolves against, filtered by the scope
+   tuple as §3 already specifies.
+
+The intended cache-transition sequence is: GET emits `name:blue tit`
+card with anchor `A`, `card_id` = base64url(JSON([`A`])). Background
+resolver populates the cache for "blue tit" → *Cyanistes caeruleus*
+(iNat 13094). User clicks Accept. POST sends `card_id`. Server decodes
+to `A`, computes taxon key from `A`'s rows now — `taxon:13094` — builds
+the graph, finds `A`'s component (which may have grown to include
+groups from another model that already resolved to `taxon:13094`
+directly), and mutates it. No 400, no lost click; the merge just
+*works*, and if the component grew during the transition the user's
+accept correctly resolves the enlarged card. The symmetric case where
+the anchor's own `taxon:`-keyed component *shrank* because a hit made
+it merge with a previously-separate group under a different anchor
+also resolves correctly: the shrunk component still contains `A`, so
+`A`'s component is still findable, and the mutation still names the
+right card.
+
+The one transition this cannot silently paper over is when the anchor
+node's rows are gone entirely (bucket rewrite, deletion) — that
+returns 400 as before. Cache resolution does not delete rows; it just
+changes what taxon they resolve to, so the `name:`→`taxon:` case
+never triggers this failure.
 
 **Filter semantics.** When **any** filter that removes rows is active —
 server-applied *or* client-applied, the full five-predicate list below,
@@ -608,10 +754,18 @@ union**, not just the clicked group's photos:
    carried `rules` would re-expose it because `rules` does not
    subsume the visual clause. All three are excluded from the resolved
    component by forwarding the same predicates. For a `card_id`
-   request, the server re-runs the same card-building graph over the
-   same scoped row set the GET used, then intersects the resolved
-   component with the returned rows so mutation membership can never
-   exceed the displayed membership. For a `node_id` request, the
+   request, the server decodes to the anchor node key, computes the
+   anchor's *current* taxon key from its stored rows (§2, "Anchor
+   lookup and cache-transition safety"), re-runs the same
+   card-building graph over the same scoped row set the GET used
+   under that current taxon key, and returns the component containing
+   the anchor; it then intersects that resolved component with the
+   returned rows so mutation membership can never exceed the displayed
+   membership. Recomputing the taxon key at mutation time is what
+   makes a click safe when the background taxonomy resolver populated
+   a hit between the GET and the POST — the anchor is still findable
+   and the (possibly-grown, possibly-shrunk) component still resolves
+   correctly under the new key. For a `node_id` request, the
    server resolves exactly the named single node under the scope
    tuple, without any component expansion — matching the per-node
    fallback the filtered view rendered. Where the client sends only a
@@ -945,7 +1099,40 @@ Each phase lands as its own PR and is independently useful.
    taxon/member key syntax) round-trips through the JSON-structured
    base64url-encoded id and the card endpoint's query parameter
    without a 404, and the server decodes back to the exact
-   `(taxon_key, member_key)` pair; **filtered-view mutation-ID
+   `smallest_member_key`; a **cache-transition card-id fixture** —
+   a `name:blue tit` card is emitted with
+   `card_id = base64url(JSON([A]))` where `A` is the anchor node
+   key, the background resolver then persists `blue tit` →
+   *Cyanistes caeruleus* (iNat 13094), and a subsequent mutation
+   POST that carries the *original* `card_id` resolves to the
+   anchor's rows, computes their current taxon key as `taxon:13094`,
+   and finds the anchor's component under that key without returning
+   400 — including the sub-case where a previously-separate
+   BioCLIP-2.5 group `B` that already carried `taxon:13094` is now
+   in the same component (the resolved component grew) and the
+   sub-case where the same-taxon merge shifted the component's
+   smallest-member anchor to a different node than `A` (the component
+   still contains `A`, so `A`'s component is still findable and
+   `A`'s `card_id` still resolves); a
+   **cache-transition-anchor-deleted fixture** — the same setup
+   but with the anchor's rows deleted between the GET and the POST
+   (e.g. a re-run rewrote the bucket) returns 400, the documented
+   stale-handle failure mode (§2, "Anchor lookup and cache-transition
+   safety"); a **historical-window fixture** — a legacy burst
+   captured under `grouping_window_seconds = 600` with a 400s gap
+   between consecutive frames is *not* split by the read-side
+   partition even when the workspace's current effective
+   `grouping_window_seconds` is `10`, because `W_read` is the
+   schema max `3600` (§2, `W_read` definition), not the current
+   setting; a **timestamp-mutation residual fixture** — two
+   pre-Phase-0 colliding legacy bursts captured 90 minutes apart
+   (so distinct subsets under the schema-max `W_read` of 3600s)
+   render as two nodes and two cards; then
+   `_refresh_photo_metadata` moves the anchor row's
+   `photos.timestamp` into the other subset's window between GET
+   and POST, and the mutation POST for the first subset's `node_id`
+   returns 400 rather than silently mutating the wrong subset (§2,
+   "Timestamp-mutation residual"); **filtered-view mutation-ID
    fixture** — with any of the five active filters (including a
    non-null visual clause), the client's mutation POST carries
    `node_id` (not `card_id`), and a fixture POST that names a

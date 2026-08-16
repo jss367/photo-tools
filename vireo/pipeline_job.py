@@ -5767,12 +5767,39 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                                                 ),
                                             )
                                         )
-                                    run_keys = thread_db.get_classifier_run_keys(
-                                        detection["id"],
-                                        runtime_fingerprint=(
-                                            expected_classifier_runtime
-                                        ),
-                                    )
+                                    # Fetch both accepted and gate-rejected
+                                    # keys in one query. ``rejected_keys`` is
+                                    # the "existed but the runtime_fingerprint
+                                    # rule rejected it" set — the preflight
+                                    # ``count_classifier_runs`` ignores that
+                                    # rule, so without recording these as
+                                    # overcounts below, a photo whose only key
+                                    # is gate-rejected sits in ``cached_est``
+                                    # forever and ETA prematurely reads
+                                    # "finishing…" on runs where the detector
+                                    # fingerprint has rolled since the prior
+                                    # classifier pass (Codex #1468 P2).
+                                    if expected_classifier_runtime is not None:
+                                        run_keys, rejected_keys = (
+                                            thread_db
+                                            .get_classifier_run_key_gate(
+                                                detection["id"],
+                                                expected_classifier_runtime,
+                                            )
+                                        )
+                                    else:
+                                        # No expected runtime fingerprint means
+                                        # portable identity isn't wired up
+                                        # (legacy path); fall back to the
+                                        # unfiltered gate. Nothing to reconcile
+                                        # because the preflight and the gate
+                                        # then agree on which rows count.
+                                        run_keys = (
+                                            thread_db.get_classifier_run_keys(
+                                                detection["id"],
+                                            )
+                                        )
+                                        rejected_keys = set()
                                     if (model_name, spec_fp) in run_keys:
                                         cached = thread_db.get_predictions_for_detection(
                                             detection["id"],
@@ -5863,6 +5890,28 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                                         # estimate: it counted this photo based
                                         # solely on the run key existing, but
                                         # runtime will actually infer.
+                                        photos_cache_overcounted_in_spec.add(
+                                            photo["id"],
+                                        )
+                                    elif (
+                                        model_name, spec_fp,
+                                    ) in rejected_keys:
+                                        # A classifier_runs row exists but its
+                                        # ``runtime_fingerprint`` no longer
+                                        # matches (typically the detector was
+                                        # re-run since the prior classify).
+                                        # Preflight counted this photo as
+                                        # cached; runtime will infer. Record
+                                        # the overcount so
+                                        # ``_classification_eta_progress`` can
+                                        # deflate its projected future cache
+                                        # hits — otherwise a collection made
+                                        # entirely of these rows sees
+                                        # ``remaining_uncached`` collapse to
+                                        # zero after the first uncached batch
+                                        # and the UI reports "finishing…"
+                                        # while most photos still need
+                                        # inference (Codex #1468 P2).
                                         photos_cache_overcounted_in_spec.add(
                                             photo["id"],
                                         )

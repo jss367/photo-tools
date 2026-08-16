@@ -8521,6 +8521,98 @@ def test_pairing_redirects_classifier_runs_so_cache_gate_still_hits(tmp_path):
     assert stale is None, "stale classifier_runs row must not survive"
 
 
+def test_get_classifier_run_key_gate_splits_accepted_and_rejected(tmp_path):
+    """Regression for Codex P2 on PR #1468: the classify preflight
+    (``count_classifier_runs``) counts every existing classifier_runs
+    row for a photo, but the runtime gate
+    (``get_classifier_run_keys(..., runtime_fingerprint=X)``) filters
+    out rows whose runtime_fingerprint no longer matches. Without
+    ``get_classifier_run_key_gate`` surfacing the rejected-by-gate rows,
+    the pipeline can't reconcile the two views and ``_classification_eta_progress``
+    prematurely collapses ``remaining_uncached`` to zero.
+    """
+    from db import Database
+    db, pids = _make_workspace_with_photos(tmp_path, [{}])
+    det_id = db.save_detections(pids[0], [
+        {"box": {"x": 0, "y": 0, "w": 1, "h": 1},
+         "confidence": 0.9, "category": "animal"},
+    ], detector_model="MDV6")[0]
+
+    # Three rows on the same detection, varying only in
+    # runtime_fingerprint. One matches the expected runtime, one is the
+    # legacy sentinel (grandfathered), one is stale.
+    db.record_classifier_run(
+        det_id, "bioclip", "fp-fresh", prediction_count=1,
+        runtime_fingerprint="rt-current",
+    )
+    db.record_classifier_run(
+        det_id, "bioclip", "fp-legacy", prediction_count=1,
+        runtime_fingerprint="legacy",
+    )
+    db.record_classifier_run(
+        det_id, "bioclip", "fp-stale", prediction_count=1,
+        runtime_fingerprint="rt-old",
+    )
+
+    accepted, rejected = db.get_classifier_run_key_gate(
+        det_id, "rt-current",
+    )
+    assert accepted == {("bioclip", "fp-fresh"), ("bioclip", "fp-legacy")}
+    assert rejected == {("bioclip", "fp-stale")}, (
+        "Rows whose runtime_fingerprint the gate rejects must surface as "
+        "``rejected`` so the pipeline can decrement its cache_est projection."
+    )
+
+    # None argument short-circuits: the reclassify path bypasses the gate
+    # entirely, so returning two empty sets is the safe no-op.
+    accepted_none, rejected_none = db.get_classifier_run_key_gate(
+        det_id, None,
+    )
+    assert accepted_none == set() and rejected_none == set()
+
+
+def test_get_classifier_run_key_gate_honors_individual_review_override(tmp_path):
+    """A stale runtime_fingerprint must still be ``accepted`` when the
+    prediction carries a real (non-auto-match) review — that mirrors
+    ``get_classifier_run_keys``'s EXISTS clause and prevents the fix
+    from re-running inference on reviewed rows the operator has
+    already blessed.
+    """
+    db, pids = _make_workspace_with_photos(tmp_path, [{}])
+    ws_id = db._ws_id()
+    det_id = db.save_detections(pids[0], [
+        {"box": {"x": 0, "y": 0, "w": 1, "h": 1},
+         "confidence": 0.9, "category": "animal"},
+    ], detector_model="MDV6")[0]
+
+    db.record_classifier_run(
+        det_id, "bioclip", "fp-reviewed", prediction_count=1,
+        runtime_fingerprint="rt-old",
+    )
+    db.add_prediction(
+        det_id, species="Robin", confidence=0.9,
+        model="bioclip", labels_fingerprint="fp-reviewed",
+    )
+    pred_id = db.conn.execute(
+        """SELECT id FROM predictions
+            WHERE detection_id = ? AND classifier_model = ?
+              AND labels_fingerprint = ?""",
+        (det_id, "bioclip", "fp-reviewed"),
+    ).fetchone()["id"]
+    db.set_review_status(
+        pred_id, ws_id, "accepted", individual="Robin the First",
+    )
+
+    accepted, rejected = db.get_classifier_run_key_gate(
+        det_id, "rt-current",
+    )
+    assert accepted == {("bioclip", "fp-reviewed")}, (
+        "A reviewed prediction should keep its classifier_runs row in "
+        "``accepted`` even when runtime_fingerprint has drifted."
+    )
+    assert rejected == set()
+
+
 def test_pairing_preserves_review_when_duplicate_prediction_collapses(tmp_path):
     """When a companion prediction loses the duplicate collapse, its manual
     review state must move to the surviving primary prediction.

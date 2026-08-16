@@ -17783,6 +17783,61 @@ class Database:
         ).fetchall()
         return {(r["classifier_model"], r["labels_fingerprint"]) for r in rows}
 
+    def get_classifier_run_key_gate(self, detection_id, runtime_fingerprint):
+        """Return ``(accepted, rejected)`` classifier-run key sets for a detection.
+
+        ``accepted`` mirrors what ``get_classifier_run_keys(detection_id,
+        runtime_fingerprint=runtime_fingerprint)`` returns — keys whose row
+        the runtime cache gate would honor for this detection.
+
+        ``rejected`` are keys that DO have a classifier_runs row for the
+        detection but whose row would be filtered out by the fingerprint
+        rule (fingerprint mismatch, not ``'legacy'``, and no per-
+        prediction ``prediction_review`` override marks them as still
+        valid). The pipeline uses this set to reconcile the cache-hit
+        preflight — ``count_classifier_runs`` counts every existing row
+        regardless of runtime_fingerprint, so a photo whose only row is
+        rejected here would otherwise sit in ``cached_est`` yet never
+        register as a cache hit or as a fall-through miss, leaving
+        ``_classification_eta_progress`` believing a phantom future cache
+        hit is still coming.
+
+        ``runtime_fingerprint`` must be provided; passing ``None`` would
+        make every row look mismatched, which is not a useful signal
+        (that's the reclassify path, where the gate is bypassed anyway).
+        """
+        if runtime_fingerprint is None:
+            return set(), set()
+        rows = self.conn.execute(
+            """SELECT cr.classifier_model,
+                      cr.labels_fingerprint,
+                      cr.runtime_fingerprint,
+                      EXISTS (
+                          SELECT 1 FROM predictions p
+                          JOIN prediction_review pr ON pr.prediction_id = p.id
+                          WHERE p.detection_id = cr.detection_id
+                            AND p.classifier_model = cr.classifier_model
+                            AND p.labels_fingerprint = cr.labels_fingerprint
+                            AND pr.status IN ('accepted', 'rejected')
+                            AND COALESCE(pr.individual, '') != ?
+                      ) AS has_individual_override
+                 FROM classifier_runs cr
+                WHERE cr.detection_id = ?""",
+            (AUTO_MATCH_REVIEW_MARKER, detection_id),
+        ).fetchall()
+        accepted, rejected = set(), set()
+        for row in rows:
+            key = (row["classifier_model"], row["labels_fingerprint"])
+            if (
+                row["runtime_fingerprint"] == runtime_fingerprint
+                or row["runtime_fingerprint"] == "legacy"
+                or row["has_individual_override"]
+            ):
+                accepted.add(key)
+            else:
+                rejected.add(key)
+        return accepted, rejected
+
     def count_classifier_runs(self, photo_ids, classifier_model, labels_fingerprint):
         """Count distinct photos in `photo_ids` where EVERY runtime-classifiable
         target has a classifier_runs row matching the given

@@ -2691,12 +2691,11 @@ class Database:
     def get_folder_workspaces(self, folder_id):
         """Return every workspace in which ``folder_id`` is visible.
 
-        Workspace roots are recursive. Materialize newly discovered
-        descendants before reading the reverse mapping so a folder inherited
-        from an ancestor root is reported just like a directly linked root.
+        ``workspace_folders`` is the canonical visibility mapping. Read it
+        without materializing descendants: some import and repair paths create
+        deliberately restricted exact links that must not expand merely
+        because the user inspected a folder's memberships.
         """
-        for workspace in self.get_workspaces():
-            self._materialize_workspace_descendants(workspace["id"])
         return self.conn.execute(
             """SELECT w.id, w.name, wf.is_root
                FROM workspaces w

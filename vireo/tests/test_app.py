@@ -596,6 +596,29 @@ def test_api_folder_workspaces_rejects_folder_hidden_from_active_workspace(
     assert resp.status_code == 404
 
 
+def test_api_folder_workspaces_does_not_expand_restricted_exact_links(app_and_db):
+    """Reading memberships must not turn an exact link into a recursive one."""
+    app, db = app_and_db
+    root = db.conn.execute(
+        "SELECT id FROM folders WHERE path = '/photos/2024'"
+    ).fetchone()
+    child = db.conn.execute(
+        "SELECT id FROM folders WHERE path = '/photos/2024/January'"
+    ).fetchone()
+    restricted_ws = db.create_workspace("Restricted Import")
+    db.add_workspace_folder_exact(restricted_ws, root["id"], is_root=False)
+
+    resp = app.test_client().get(f'/api/folders/{root["id"]}/workspaces')
+    assert resp.status_code == 200
+    assert "Restricted Import" in {
+        workspace["name"] for workspace in resp.get_json()["workspaces"]
+    }
+    assert db.conn.execute(
+        "SELECT 1 FROM workspace_folders WHERE workspace_id = ? AND folder_id = ?",
+        (restricted_ws, child["id"]),
+    ).fetchone() is None
+
+
 def test_api_keywords(app_and_db):
     """GET /api/keywords returns keyword tree."""
     app, _ = app_and_db

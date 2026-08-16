@@ -7176,7 +7176,6 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         # Match the folder-detail endpoint's active-workspace boundary. This
         # prevents callers from using folder IDs to enumerate workspace names
         # for folders that the current workspace cannot see.
-        db._materialize_workspace_descendants(db._active_workspace_id)
         linked = db.conn.execute(
             "SELECT 1 FROM workspace_folders WHERE workspace_id = ? AND folder_id = ?",
             (db._active_workspace_id, folder_id),

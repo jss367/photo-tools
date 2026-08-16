@@ -423,8 +423,18 @@ def _classify_plan(
                     "fingerprint_reason": fingerprint_reason,
                 },
             }
-        detected_photo_ids = db.get_detector_run_photo_ids(
-            "megadetector-v6",
+        try:
+            from computation_cache import megadetector_runtime_fingerprint
+
+            detector_runtime = megadetector_runtime_fingerprint()
+        except (OSError, ValueError):
+            detector_runtime = None
+        detected_photo_ids = (
+            db.get_detector_run_photo_ids(
+                "megadetector-v6",
+                runtime_fingerprint=detector_runtime,
+            )
+            if detector_runtime is not None else set()
         )
         if (
             scope_ids

@@ -6418,10 +6418,15 @@ class Database:
                   FROM photos p
                   JOIN workspace_folders wf
                     ON wf.folder_id = p.folder_id AND wf.workspace_id = ?
-                  JOIN detector_runs dr
+                 JOIN detector_runs dr
                     ON dr.photo_id = p.id
                    AND dr.detector_model = ?
-                 WHERE NOT EXISTS (
+                 WHERE (dr.box_count = 0 OR EXISTS (
+                         SELECT 1 FROM detections consistent
+                          WHERE consistent.photo_id = p.id
+                            AND consistent.detector_model = dr.detector_model
+                       ))
+                   AND NOT EXISTS (
                          SELECT 1 FROM detections d
                           WHERE d.photo_id = p.id
                             AND d.detector_model != 'full-image'
@@ -6461,7 +6466,12 @@ class Database:
                         ON dr.photo_id = p.id
                        AND dr.detector_model = ?
                       LEFT JOIN full_anchor fa ON fa.photo_id = p.id
-                     WHERE NOT EXISTS (
+                     WHERE (dr.box_count = 0 OR EXISTS (
+                             SELECT 1 FROM detections consistent
+                              WHERE consistent.photo_id = p.id
+                                AND consistent.detector_model = dr.detector_model
+                           ))
+                       AND NOT EXISTS (
                              SELECT 1 FROM detections d
                               WHERE d.photo_id = p.id
                                 AND d.detector_model != 'full-image'
@@ -6512,7 +6522,12 @@ class Database:
                         ON dr.photo_id = p.id
                        AND dr.detector_model = ?
                       JOIN full_anchor fa ON fa.photo_id = p.id
-                     WHERE NOT EXISTS (
+                     WHERE (dr.box_count = 0 OR EXISTS (
+                             SELECT 1 FROM detections consistent
+                              WHERE consistent.photo_id = p.id
+                                AND consistent.detector_model = dr.detector_model
+                           ))
+                       AND NOT EXISTS (
                              SELECT 1 FROM detections d
                               WHERE d.photo_id = p.id
                                 AND d.detector_model != 'full-image'

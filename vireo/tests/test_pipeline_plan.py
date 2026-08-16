@@ -272,6 +272,23 @@ def test_full_image_fallback_counts_noise_only_boxes_at_workspace_floor(
     ) == 2
 
 
+def test_full_image_fallback_counts_reject_torn_detector_run(tmp_path):
+    db, folder_id = _make_db(tmp_path)
+    photo_id = db.add_photo(
+        folder_id=folder_id, filename="torn.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+    )
+    db.record_detector_run(photo_id, "megadetector-v6", box_count=1)
+
+    assert db.count_full_image_fallback_photos(min_conf=0.2) == 0
+    assert db.count_full_image_classify_pending_pairs(
+        "BioCLIP-2", "fp1", min_conf=0.2,
+    ) == 0
+    assert db.count_full_image_classify_stale(
+        "BioCLIP-2", "fp1", min_conf=0.2,
+    ) == 0
+
+
 def test_count_classify_pending_excludes_recorded_runs(tmp_path):
     """The pending-pair count must mirror the classify gate exactly: a
     detection with a classifier_runs row for (model, fp) is done.
@@ -387,6 +404,10 @@ def test_primary_classify_counts_ignore_confident_non_animal_boxes(
     ])
     monkeypatch.setattr(labels_mod, "get_active_labels", lambda: [])
     monkeypatch.setattr(labels_mod, "get_saved_labels", lambda: [])
+    monkeypatch.setattr(
+        "computation_cache.megadetector_runtime_fingerprint",
+        lambda: "current-runtime",
+    )
 
     plan = compute_plan(db, _params(model_ids=["m1"]), str(tmp_path / "test.db"))
     classify = plan["stages"]["Classify"]

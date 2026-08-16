@@ -8415,6 +8415,10 @@ async function grmApply() {
 document.addEventListener('lightbox:photodeleted', function(e) {
   var photoId = Number(e && e.detail && e.detail.photoId);
   if (!Number.isFinite(photoId) || !pipelineResults) return;
+  var groupOverlay = document.getElementById('grmOverlay');
+  var groupWasOpen = !!(
+    groupOverlay && groupOverlay.classList.contains('open') && grmState
+  );
 
   pipelineReviewContextPhotoIds = pipelineReviewContextPhotoIds.filter(function(id) {
     return id !== photoId;
@@ -8478,10 +8482,39 @@ document.addEventListener('lightbox:photodeleted', function(e) {
     }
   }
 
+  // Pruning an empty encounter or burst shifts later array indices. Group
+  // Review keeps those indices for Apply, so remap its surviving group by
+  // member identity before rendering or persisting another change.
+  if (groupWasOpen && grmState.items.length) {
+    var memberIds = grmState.items.map(function(photo) { return photo.id; });
+    var nextEncIdx = -1;
+    var nextBurstIdx = -1;
+    for (var encIdx = 0;
+         encIdx < pipelineResults.encounters.length && nextEncIdx < 0;
+         encIdx++) {
+      var bursts = pipelineResults.encounters[encIdx].bursts || [];
+      for (var burstIdx = 0; burstIdx < bursts.length; burstIdx++) {
+        var burstIds = bursts[burstIdx].photo_ids || bursts[burstIdx];
+        if (Array.isArray(burstIds) && memberIds.every(function(id) {
+          return burstIds.indexOf(id) !== -1;
+        })) {
+          nextEncIdx = encIdx;
+          nextBurstIdx = burstIdx;
+          break;
+        }
+      }
+    }
+    if (nextEncIdx >= 0) {
+      grmState.encIdx = nextEncIdx;
+      grmState.burstIdx = nextBurstIdx;
+    } else {
+      closeGroupReview(true);
+    }
+  }
+
   renderResults();
   updateSummaryBar(refreshLocalSummaryCounts());
   refreshLatestScopeSnapshotIfCurrent();
-  var groupOverlay = document.getElementById('grmOverlay');
   if (groupOverlay && groupOverlay.classList.contains('open')) {
     if (grmState.items.length) renderGroupModal();
     else closeGroupReview();

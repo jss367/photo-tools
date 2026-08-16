@@ -1408,6 +1408,7 @@ def test_similar_result_lightbox_preserves_scoped_read_only_mode(live_server, pa
         re.compile(r"\bactive\b")
     )
     assert page.evaluate("_lightboxCurrentId") == result_id
+    assert page.evaluate("_lightboxPhotoList.map(photo => photo.id)") == [result_id]
     assert page.evaluate("_lbReadOnly") is True
     expect(page.locator("#lightboxDeleteBtn")).to_be_disabled()
 
@@ -1424,6 +1425,7 @@ def test_similar_result_lightbox_preserves_scoped_read_only_mode(live_server, pa
         re.compile(r"\bactive\b")
     )
     assert page.evaluate("_lbReadOnly") is True
+    assert page.evaluate("_lightboxPhotoList.map(photo => photo.id)") == [result_id]
     assert page.evaluate("_lbReadOnlyMessage") == (
         "Group Review is applying changes. Wait for it to finish."
     )
@@ -2146,6 +2148,104 @@ def test_lightbox_deletion_updates_process_and_open_group_state(live_server, pag
     assert state["rejectDiff"] == 0
     expect(page.locator(f'.photo-card[data-photo-id="{deleted_id}"]')).to_have_count(0)
     expect(page.locator(f'.grm-card[data-photo-id="{deleted_id}"]')).to_have_count(0)
+
+
+def test_lightbox_deletion_remaps_open_group_after_pruning_earlier_units(
+    live_server, page
+):
+    photo_ids = live_server["data"]["photos"][:4]
+    _write_grouped_pipeline_cache(live_server, photo_ids)
+
+    page.goto(f"{live_server['url']}/pipeline/review")
+    expect(page.locator(".photo-card[data-photo-id]")).to_have_count(4)
+    page.evaluate(
+        """ids => {
+          pipelineResults.encounters = [{
+            photo_ids: [ids[0]],
+            photo_count: 1,
+            burst_count: 1,
+            species: [],
+            species_predictions: [],
+            species_confirmed: false,
+            confirmed_species: null,
+            bursts: [{
+              photo_ids: [ids[0]],
+              species_predictions: [],
+              species_override: null,
+            }],
+          }, {
+            photo_ids: [ids[1], ids[2], ids[3]],
+            photo_count: 3,
+            burst_count: 2,
+            species: [],
+            species_predictions: [],
+            species_confirmed: false,
+            confirmed_species: null,
+            bursts: [{
+              photo_ids: [ids[1]],
+              species_predictions: [],
+              species_override: null,
+            }, {
+              photo_ids: [ids[2], ids[3]],
+              species_predictions: [],
+              species_override: null,
+            }],
+          }];
+          renderResults();
+          openGroupReview(1, 1);
+        }""",
+        photo_ids,
+    )
+    page.wait_for_function("grmState && grmState.seeded === true")
+    group_ids = photo_ids[2:4]
+
+    first_shift = page.evaluate(
+        """photoId => {
+          document.dispatchEvent(new CustomEvent('lightbox:photodeleted', {
+            detail: {photoId: photoId, result: {deleted: 1}},
+          }));
+          const burst = pipelineResults.encounters[grmState.encIdx]
+            .bursts[grmState.burstIdx];
+          return {
+            encIdx: grmState.encIdx,
+            burstIdx: grmState.burstIdx,
+            groupIds: grmState.items.map(photo => photo.id),
+            burstIds: (burst.photo_ids || burst).slice(),
+          };
+        }""",
+        photo_ids[0],
+    )
+    assert first_shift == {
+        "encIdx": 0,
+        "burstIdx": 1,
+        "groupIds": group_ids,
+        "burstIds": group_ids,
+    }
+
+    second_shift = page.evaluate(
+        """photoId => {
+          document.dispatchEvent(new CustomEvent('lightbox:photodeleted', {
+            detail: {photoId: photoId, result: {deleted: 1}},
+          }));
+          const burst = pipelineResults.encounters[grmState.encIdx]
+            .bursts[grmState.burstIdx];
+          return {
+            encIdx: grmState.encIdx,
+            burstIdx: grmState.burstIdx,
+            groupIds: grmState.items.map(photo => photo.id),
+            burstIds: (burst.photo_ids || burst).slice(),
+            open: document.getElementById('grmOverlay').classList.contains('open'),
+          };
+        }""",
+        photo_ids[1],
+    )
+    assert second_shift == {
+        "encIdx": 0,
+        "burstIdx": 0,
+        "groupIds": group_ids,
+        "burstIds": group_ids,
+        "open": True,
+    }
 
 
 def test_lightbox_deletion_prunes_empty_encounter_from_summary(live_server, page):

@@ -10184,6 +10184,9 @@ function findSimilar(photoId) {
       } else {
         var grid = document.createElement('div');
         grid.className = 'similar-grid';
+        var similarPhotoList = data.similar.map(function(item) {
+          return item.photo;
+        });
         data.similar.forEach(function(item) {
           var p = item.photo;
           var pct = Math.round(item.similarity * 100);
@@ -10194,7 +10197,7 @@ function findSimilar(photoId) {
             var lightboxOptions = typeof window.getLightboxOpenOptions === 'function'
               ? window.getLightboxOpenOptions(p.id)
               : undefined;
-            openLightbox(p.id, p.filename || '', null, lightboxOptions);
+            openLightbox(p.id, p.filename || '', similarPhotoList, lightboxOptions);
           });
           var img = document.createElement('img');
           img.src = window.vireoThumbnailUrl

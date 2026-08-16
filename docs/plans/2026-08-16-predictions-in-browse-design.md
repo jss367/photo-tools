@@ -353,20 +353,30 @@ under a pill reading "Showing one photo from Browse". The payload has to be
 well-formed (`{"root":{"mode":"all","rules":[]},"visual":null}`), not a bare
 `?filters=`, which `init()` treats as a corrupt handoff and throws on.
 
-**Repeat and contradictory decisions.** Both batch endpoints share
-`_prediction_ids_with_status(db, pred_ids, statuses)` and skip rows whose
-decision is already made:
+**Repeat and contradictory decisions.** Both batch endpoints skip rows whose
+decision is already made, through one helper that owns the status list:
+`_decided_prediction_ids(db, pred_ids)` returns the `accepted` and `rejected`
+rows. Neither endpoint passes its own statuses, so the two cannot drift apart
+on what "still actionable" means. `alternative` rows stay actionable on both
+paths — they are the runners-up an accept promotes and a reject sweeps up.
 
-- `batch-accept` skips `accepted` ids and reports `already_accepted`.
-- `batch-reject` skips `accepted` *and* `rejected` ids and reports
-  `already_decided`. Overwriting an `accepted` row would leave the species
-  keyword the accept added attached to a prediction now marked `rejected`.
-  `alternative` rows stay actionable — they are the runners-up a reject
-  sweeps up.
+Both report the skipped count as `already_decided` (the accept side's earlier
+`already_accepted` was renamed once it also covered rejected rows — a field
+name narrower than its contents is exactly the quiet mis-description
+`CORE_PHILOSOPHY.md` rules out).
 
-Without this, a double-clicked button or a stale panel records a status-only
-edit whose "previous" status is a fiction, and undoing it would knock a
-long-accepted prediction back to pending.
+The two directions fail in mirrored ways without the filter:
+
+- A stale **reject** of an `accepted` row leaves the species keyword the
+  accept added attached to a prediction now marked `rejected`.
+- A stale **accept** of a `rejected` row tags the photo with the loser the
+  user just rejected by accepting its sibling in Review or a second tab, and
+  the batch's undo entry then resets the whole sibling scope to
+  pending/alternative instead of restoring the winner's accepted state.
+
+In both directions a re-submitted row also records a status-only edit whose
+"previous" status is a fiction, so undoing it would knock a long-decided
+prediction back to pending.
 
 ## Testing
 

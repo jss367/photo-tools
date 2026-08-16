@@ -16560,14 +16560,21 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         if err is not None:
             return err
 
-        # Make a repeat submission a no-op rather than a second accept. A
-        # double-clicked Accept button or a stale panel would otherwise
-        # re-accept rows that are already accepted: the keyword now exists, so
-        # the second pass records a status-only ``no_tag`` item whose
-        # "previous" status is a fiction — undoing it would knock a
+        # Make a submission of an already-decided row a no-op rather than a
+        # second accept. A double-clicked Accept button or a stale panel would
+        # otherwise re-accept rows that are already accepted: the keyword now
+        # exists, so the second pass records a status-only ``no_tag`` item
+        # whose "previous" status is a fiction — undoing it would knock a
         # long-accepted prediction back to pending while keeping the keyword.
-        already_accepted = _prediction_ids_with_status(db, pred_ids, ("accepted",))
-        pred_ids = [pid for pid in pred_ids if pid not in already_accepted]
+        # ``rejected`` rows are skipped for a sharper reason: when the user
+        # accepts an alternative in Review or another tab, this row's sibling
+        # wins and this row becomes the rejected loser. Accepting it from a
+        # payload Browse rendered before that happened would tag the photo
+        # with the species the user just rejected, and the batch's undo entry
+        # would then reset the whole sibling scope to pending/alternative
+        # instead of restoring the winner's accepted state.
+        already_decided = _decided_prediction_ids(db, pred_ids)
+        pred_ids = [pid for pid in pred_ids if pid not in already_decided]
 
         # Confine the whole batch to the rows the caller actually submitted.
         # ``accept_prediction`` otherwise expands a grouped (burst) accept to
@@ -16582,9 +16589,9 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         # a row the panel deliberately omitted (below threshold, ambiguous, or
         # already accepted). Row identity has no such projection to get wrong,
         # whatever column next distinguishes two rows on one photo. Note this
-        # set is built *after* the already-accepted filter, so a resubmitted
-        # row cannot be re-accepted through a sibling's group expansion
-        # either.
+        # set is built *after* the already-decided filter, so a row that was
+        # accepted or rejected elsewhere cannot be re-accepted through a
+        # sibling's group expansion either.
         submitted_pred_ids = set(pred_ids)
         # A grouped accept resolves every submitted sibling in its group in
         # one call — including each one's losing alternatives, which
@@ -16653,29 +16660,43 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             "accepted": len({item["photo_id"] for item in items}),
             # Reported rather than folded into ``accepted``: a caller that
             # resubmits should be able to tell "nothing to do, already
-            # accepted" from "nothing matched".
-            "already_accepted": len(already_accepted),
+            # decided" from "nothing matched". Named ``already_decided``
+            # rather than ``already_accepted`` because it counts rejected
+            # rows too — a field whose name implies a narrower set than it
+            # holds is the kind of quiet mis-description CORE_PHILOSOPHY.md
+            # rules out, and this count is the only signal a caller gets for
+            # rows the batch deliberately left alone.
+            "already_decided": len(already_decided),
             "species": species,
         })
 
-    def _prediction_ids_with_status(db, pred_ids, statuses):
-        """Which of ``pred_ids`` already sit in one of ``statuses``.
+    # The one definition of "no longer actionable" for both batch prediction
+    # endpoints. ``pending`` rows are the normal case; ``alternative`` rows
+    # stay actionable on purpose — they are the runners-up an accept promotes
+    # and a reject sweeps up.
+    _DECIDED_PREDICTION_STATUSES = ("accepted", "rejected")
 
-        Both batch endpoints need the same precondition: the panel that
-        produced this payload listed the rows as pending, but a decision may
-        have landed since — from a double-clicked button, a second tab, or
-        Review. Accepting or rejecting a row whose decision is already made
-        writes a history item whose recorded "previous" status is a fiction,
-        and in the accept-then-reject case leaves the accepted species keyword
-        attached to a row now marked ``rejected``. One helper so the two
-        endpoints cannot drift apart on what "still actionable" means.
+    def _decided_prediction_ids(db, pred_ids):
+        """Which of ``pred_ids`` already have a decision recorded.
+
+        Both batch endpoints need the same precondition, so neither gets to
+        pick its own status list: the panel that produced this payload listed
+        the rows as pending, but a decision may have landed since — from a
+        double-clicked button, a second tab, or Review. Acting on a row whose
+        decision is already made writes a history item whose recorded
+        "previous" status is a fiction, and the two directions fail in
+        mirrored ways: a stale reject leaves an accepted row's species keyword
+        attached to a row now marked ``rejected``, and a stale accept tags a
+        photo with the loser the user just rejected by accepting its sibling.
+        The statuses live here, not at the call sites, so the pair cannot
+        drift apart again on what "still actionable" means.
 
         Chunked: a legal payload runs well past the 999-variable limit older
         SQLite builds enforce (see ``_SQL_PARAM_CHUNK``).
         """
         ws = db._ws_id()
-        statuses = tuple(statuses)
-        if not pred_ids or not statuses:
+        statuses = _DECIDED_PREDICTION_STATUSES
+        if not pred_ids:
             return set()
         status_ph = ",".join("?" for _ in statuses)
         found = set()
@@ -16770,19 +16791,16 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         if err is not None:
             return err
 
-        # Symmetric with ``batch-accept``'s already-accepted filter. Without
+        # The same filter ``batch-accept`` applies, through the same helper —
+        # not a parallel copy that can be tightened on one side only. Without
         # it, a stale panel — or an Accept then Reject before the panel
         # reloads — overwrites an ``accepted`` row with ``rejected`` while the
         # species keyword the accept added stays on the photo: keyword state
         # and review state then contradict each other, and nothing in the UI
-        # points at the contradiction. Rows already ``rejected`` are skipped
-        # for the same reason the accept side skips accepted ones: re-writing
-        # them appends a history item whose ``old_value`` of "pending" never
-        # happened. ``alternative`` rows stay actionable — they are the
-        # runners-up a reject is meant to sweep up.
-        already_decided = _prediction_ids_with_status(
-            db, pred_ids, ("accepted", "rejected"),
-        )
+        # points at the contradiction. Re-rejecting an already ``rejected``
+        # row is skipped for the matching reason: it appends a history item
+        # whose ``old_value`` of "pending" never happened.
+        already_decided = _decided_prediction_ids(db, pred_ids)
         pred_ids = [pid for pid in pred_ids if pid not in already_decided]
 
         ws = db._ws_id()
@@ -16840,10 +16858,9 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         return jsonify({
             "ok": True,
             "rejected": len(items),
-            # Reported rather than folded into ``rejected``, matching
-            # batch-accept's ``already_accepted``: a caller that resubmits
-            # should be able to tell "nothing to do, already decided" from
-            # "nothing matched".
+            # Reported rather than folded into ``rejected``, under the same
+            # name batch-accept uses: a caller that resubmits should be able
+            # to tell "nothing to do, already decided" from "nothing matched".
             "already_decided": len(already_decided),
         })
 

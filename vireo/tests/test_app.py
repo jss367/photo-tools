@@ -16673,7 +16673,7 @@ def test_batch_accept_chunks_oversized_id_payloads(app_and_db):
         "/api/predictions/batch-accept", json={"prediction_ids": pred_ids},
     )
     assert resp.status_code == 200, resp.get_data(as_text=True)
-    assert resp.get_json()["already_accepted"] == len(pred_ids)
+    assert resp.get_json()["already_decided"] == len(pred_ids)
 
 
 def test_batch_accept_rejects_foreign_prediction(app_and_db):
@@ -17043,10 +17043,83 @@ def test_batch_accept_skips_already_accepted_predictions(app_and_db):
     assert second.status_code == 200, second.get_data(as_text=True)
     body = second.get_json()
     assert body["accepted"] == 0
-    assert body["already_accepted"] == 1
+    assert body["already_decided"] == 1
     # No second edit row: the resubmission changed nothing, so it must not
     # sit at the top of the undo stack pretending to be reversible work.
     assert len(db.get_edit_history(limit=50)) == edits_after_first
+    assert app is not None
+
+
+def test_batch_accept_skips_rejected_predictions(app_and_db):
+    """A row rejected elsewhere must not be accepted by a stale Browse payload.
+
+    The race: Browse renders a panel listing the top-1 row as pending. In
+    Review (or a second tab) the user then accepts that row's *alternative*,
+    which promotes the runner-up and rejects the top-1. Clicking Accept in
+    the still-open Browse panel submits the now-rejected loser. Accepting it
+    would tag the photo with the species the user just rejected — and because
+    the batch's undo entry knows only "this prediction was accepted", undoing
+    it would reset the whole sibling scope to pending/alternative rather than
+    restoring the winner's accepted state.
+
+    ``batch-reject`` has skipped decided rows since e4855edd; both endpoints
+    now read the same ``_decided_prediction_ids`` set, so the pair cannot
+    disagree about which statuses are still actionable.
+    """
+    app, db = app_and_db
+    client = app.test_client()
+    photo_id, det_id = _seed_prediction_photo(
+        db, "alt-race.jpg", "Bald Eagle", 0.7,
+    )
+    db.add_prediction(
+        det_id, "Golden Eagle", 0.3, "bioclip",
+        status="alternative", labels_fingerprint="fp1",
+    )
+    stale_pred = _prediction_id(db, photo_id, "Bald Eagle")
+    winner_pred = _prediction_id(db, photo_id, "Golden Eagle")
+
+    def _status_by_species():
+        return {
+            row["species"]: row["status"] for row in db.conn.execute(
+                """SELECT pr.species,
+                          COALESCE(pr_rev.status, 'pending') AS status
+                   FROM predictions pr
+                   LEFT JOIN prediction_review pr_rev
+                     ON pr_rev.prediction_id = pr.id
+                    AND pr_rev.workspace_id = ?
+                   WHERE pr.detection_id = ?""",
+                (db._ws_id(), det_id),
+            ).fetchall()
+        }
+
+    # Elsewhere: the alternative wins, so the row Browse still shows as
+    # pending becomes the rejected loser.
+    promoted = client.post(f"/api/predictions/{winner_pred}/accept")
+    assert promoted.status_code == 200, promoted.get_data(as_text=True)
+    assert _status_by_species() == {
+        "Bald Eagle": "rejected", "Golden Eagle": "accepted",
+    }
+    keywords_after_promotion = db.get_photo_keywords(photo_id)
+    edits_after_promotion = len(db.get_edit_history(limit=50))
+
+    # The stale panel submits the loser.
+    stale = client.post(
+        "/api/predictions/batch-accept", json={"prediction_ids": [stale_pred]},
+    )
+    assert stale.status_code == 200, stale.get_data(as_text=True)
+    body = stale.get_json()
+    assert body["accepted"] == 0
+    assert body["already_decided"] == 1
+
+    assert _status_by_species() == {
+        "Bald Eagle": "rejected", "Golden Eagle": "accepted",
+    }, "a stale accept re-decided a row the user had already rejected"
+    assert db.get_photo_keywords(photo_id) == keywords_after_promotion, (
+        "the rejected loser's species was tagged onto the photo"
+    )
+    # And nothing was recorded: a no-op must not sit on the undo stack, where
+    # reversing it would reset the winner's accepted state too.
+    assert len(db.get_edit_history(limit=50)) == edits_after_promotion
     assert app is not None
 
 
@@ -18271,7 +18344,7 @@ def test_batch_accept_leaves_earlier_accept_untouched_when_resubmitted(app_and_d
     assert second.status_code == 200, second.get_data(as_text=True)
     body = second.get_json()
     assert body["accepted"] == 1
-    assert body["already_accepted"] == 1
+    assert body["already_decided"] == 1
 
     # One new edit entry — a phantom re-accept would leave a second
     # ``no_tag`` item on this entry that undo would happily walk.
@@ -18339,8 +18412,10 @@ def test_batch_reject_skips_already_accepted_predictions(app_and_db):
     Overwriting the status leaves the species keyword the accept added
     attached to a photo whose prediction now reads ``rejected`` — keyword
     state and review state contradicting each other with nothing in the UI
-    admitting it. ``batch-accept`` has skipped already-accepted rows since
-    f031e077; this is the missing symmetric guard.
+    admitting it. The mirror case — a stale accept of a row rejected
+    elsewhere — is covered by
+    ``test_batch_accept_skips_rejected_predictions``; both endpoints read the
+    same ``_decided_prediction_ids`` set.
     """
     app, db = app_and_db
     client = app.test_client()

@@ -10177,7 +10177,10 @@ function findSimilar(photoId) {
           card.className = 'similar-card';
           card.addEventListener('click', function() {
             closeSimilar();
-            openLightbox(p.id, p.filename || '');
+            var lightboxOptions = typeof window.getLightboxOpenOptions === 'function'
+              ? window.getLightboxOpenOptions(p.id)
+              : undefined;
+            openLightbox(p.id, p.filename || '', null, lightboxOptions);
           });
           var img = document.createElement('img');
           img.src = window.vireoThumbnailUrl

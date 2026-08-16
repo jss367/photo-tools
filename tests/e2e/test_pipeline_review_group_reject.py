@@ -1298,6 +1298,40 @@ def test_similar_photos_overlay_suppresses_group_shortcuts(live_server, page):
     assert zones == {"picks": [], "rejects": [], "removed": [], "touched": []}
 
 
+def test_similar_result_lightbox_preserves_scoped_read_only_mode(live_server, page):
+    photo_ids = live_server["data"]["photos"][:4]
+    _write_grouped_pipeline_cache(live_server, photo_ids)
+    result_id = photo_ids[1]
+    page.route(
+        "**/api/photos/*/similar?limit=40",
+        lambda route: route.fulfill(
+            json={
+                "total_compared": 1,
+                "similar": [
+                    {
+                        "similarity": 0.91,
+                        "photo": {"id": result_id, "filename": "similar.jpg"},
+                    }
+                ],
+            }
+        ),
+    )
+
+    page.goto(f"{live_server['url']}/pipeline/review")
+    expect(page.locator(".photo-card[data-photo-id]")).to_have_count(4)
+    page.evaluate(
+        "pid => { reviewScopeMode = 'workspace'; findSimilar(pid); }", photo_ids[0]
+    )
+    page.locator(".similar-card").click()
+
+    expect(page.locator("#lightboxOverlay")).to_have_class(
+        re.compile(r"\bactive\b")
+    )
+    assert page.evaluate("_lightboxCurrentId") == result_id
+    assert page.evaluate("_lbReadOnly") is True
+    expect(page.locator("#lightboxDeleteBtn")).to_be_disabled()
+
+
 def test_lightbox_flag_over_group_review_updates_pending_zones(live_server, page):
     """A flag set from the lightbox above Group Review must route through the
     burst's pending zones, not write the database directly — otherwise the
@@ -1699,6 +1733,45 @@ def test_lightbox_deletion_updates_process_and_open_group_state(live_server, pag
     assert state["rejectDiff"] == 0
     expect(page.locator(f'.photo-card[data-photo-id="{deleted_id}"]')).to_have_count(0)
     expect(page.locator(f'.grm-card[data-photo-id="{deleted_id}"]')).to_have_count(0)
+
+
+def test_lightbox_deletion_prunes_empty_encounter_from_summary(live_server, page):
+    photo_ids = live_server["data"]["photos"][:4]
+    _write_grouped_pipeline_cache(live_server, photo_ids)
+
+    page.goto(f"{live_server['url']}/pipeline/review")
+    expect(page.locator(".photo-card[data-photo-id]")).to_have_count(4)
+    state = page.evaluate(
+        """photoId => {
+          const photo = pipelineResults.photos.find(item => item.id === photoId);
+          pipelineResults.photos = [photo];
+          pipelineResults.encounters = [{
+            photo_ids: [photoId],
+            photo_count: 1,
+            burst_count: 1,
+            bursts: [{photo_ids: [photoId]}],
+          }];
+          pipelineResults.summary = {total_photos: 1, encounter_count: 1, burst_count: 1};
+          document.dispatchEvent(new CustomEvent('lightbox:photodeleted', {
+            detail: {photoId: photoId, result: {deleted: 1}},
+          }));
+          return {
+            photos: pipelineResults.photos.length,
+            encounters: pipelineResults.encounters.length,
+            totalPhotos: pipelineResults.summary.total_photos,
+            encounterCount: pipelineResults.summary.encounter_count,
+            burstCount: pipelineResults.summary.burst_count,
+          };
+        }""",
+        photo_ids[0],
+    )
+    assert state == {
+        "photos": 0,
+        "encounters": 0,
+        "totalPhotos": 0,
+        "encounterCount": 0,
+        "burstCount": 0,
+    }
 
 
 def test_tauri_disables_navigation_when_group_review_is_dirty(live_server, page):

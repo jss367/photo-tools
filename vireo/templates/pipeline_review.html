@@ -7472,18 +7472,23 @@ function pipelineReviewVisiblePhotoList(photoId) {
   return list;
 }
 
-function openPipelineLightbox(photoId) {
-  var photo = findPhotoInResults(photoId);
-  if (!photo || typeof openLightbox !== 'function') return;
-  var list = pipelineReviewVisiblePhotoList(photoId);
+function pipelineReviewLightboxOptions() {
   var readOnly = isScopedReviewView();
-  openLightbox(photoId, photo.filename || '', list, {
+  return {
     readOnly: readOnly,
     readOnlyMessage: readOnly
       ? (reviewScopeMode === 'collection' ? 'Collection' : 'Workspace') +
         ' scope is view-only. Switch to Latest review to make changes.'
       : undefined,
-  });
+  };
+}
+window.getLightboxOpenOptions = pipelineReviewLightboxOptions;
+
+function openPipelineLightbox(photoId) {
+  var photo = findPhotoInResults(photoId);
+  if (!photo || typeof openLightbox !== 'function') return;
+  var list = pipelineReviewVisiblePhotoList(photoId);
+  openLightbox(photoId, photo.filename || '', list, pipelineReviewLightboxOptions());
 }
 
 async function setWildlifeExcludedFor(photoId, excluded) {
@@ -8299,7 +8304,16 @@ document.addEventListener('lightbox:photodeleted', function(e) {
         Array.prototype.push.apply(burst, filtered);
       }
     });
+    encounter.bursts = (encounter.bursts || []).filter(function(burst) {
+      var ids = burst.photo_ids || burst;
+      return Array.isArray(ids) && ids.length > 0;
+    });
+    encounter.burst_count = encounter.bursts.length;
   });
+  pipelineResults.encounters = (pipelineResults.encounters || []).filter(function(encounter) {
+    return encounter.photo_ids && encounter.photo_ids.length > 0;
+  });
+  _focusedEncounterIdx = null;
 
   if (grmState && Array.isArray(grmState.items)) {
     grmState.items = grmState.items.filter(function(photo) { return photo.id !== photoId; });

@@ -14131,6 +14131,47 @@ def test_retire_builtin_wildlife_preserves_synced_manual_add_history(tmp_path):
     ).fetchone() is None
 
 
+def test_retire_builtin_wildlife_preserves_imported_xmp_term(tmp_path):
+    """A flat Wildlife sidecar term is durable evidence of user metadata."""
+    from db import Database
+    from xmp import write_sidecar
+
+    photo_dir = tmp_path / "photos"
+    photo_dir.mkdir()
+    xmp_path = photo_dir / "p1.xmp"
+    write_sidecar(
+        str(xmp_path),
+        flat_keywords={"Wildlife"},
+        hierarchical_keywords=set(),
+    )
+    db = Database(str(tmp_path / "test.db"))
+    ws = db.create_workspace("ws")
+    db.set_active_workspace(ws)
+    fid = db.add_folder(str(photo_dir), name="photos")
+    db.add_workspace_folder(ws, fid)
+    p1 = db.add_photo(
+        folder_id=fid, filename="p1.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+        xmp_mtime=xmp_path.stat().st_mtime,
+    )
+    wildlife_id = db.conn.execute(
+        "INSERT INTO keywords (name, type) VALUES ('Wildlife', 'genre')"
+    ).lastrowid
+    species_id = db.add_keyword("House Sparrow", is_species=True)
+    db.tag_photo(p1, species_id)
+    db.tag_photo(p1, wildlife_id)
+    db.set_meta(Database._RETIRED_WILDLIFE_GENRE_KEY, "0")
+
+    assert db.retire_builtin_wildlife_genre() == 0
+    assert db.conn.execute(
+        "SELECT 1 FROM photo_keywords WHERE photo_id = ? AND keyword_id = ?",
+        (p1, wildlife_id),
+    ).fetchone() is not None
+    assert db.conn.execute(
+        "SELECT 1 FROM pending_changes WHERE photo_id = ?", (p1,),
+    ).fetchone() is None
+
+
 def test_retire_builtin_wildlife_queues_removal_in_every_owning_workspace(tmp_path):
     """A folder shared across workspaces must have the cleanup queued in each.
 

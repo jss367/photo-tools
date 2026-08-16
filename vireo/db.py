@@ -3151,7 +3151,9 @@ class Database:
         real hierarchy such as ``Wildlife|Birds|House Sparrow``; retiring the
         generated flat term must not delete that hierarchy. A not-yet-synced
         pending add proves the association was explicitly user-authored and is
-        preserved. When a same-name top-level keyword of another type (e.g.
+        preserved, as does a retained manual-add edit or a flat ``Wildlife``
+        term in the photo's XMP sidecar. When a same-name top-level keyword of
+        another type (e.g.
         an ``individual`` ``Wildlife`` alongside the generated ``genre`` row)
         still survives on the photo, the flat XMP subject represents both
         associations, so the removal is skipped to avoid silently stripping
@@ -3184,6 +3186,7 @@ class Database:
             fallback_workspace = fallback_row["id"] if fallback_row else None
         rows = self.conn.execute(
             f"""SELECT DISTINCT pk.photo_id, wf.workspace_id,
+                       p.filename, p.xmp_mtime, f.path AS folder_path,
                        EXISTS (
                            SELECT 1
                            FROM photo_keywords survivor_pk
@@ -3196,6 +3199,7 @@ class Database:
                        ) AS has_same_name_survivor
                 FROM photo_keywords pk
                 JOIN photos p ON p.id = pk.photo_id
+                JOIN folders f ON f.id = p.folder_id
                 LEFT JOIN workspace_folders wf ON wf.folder_id = p.folder_id
                 WHERE pk.keyword_id IN ({placeholders})
                   AND NOT EXISTS (
@@ -3237,8 +3241,35 @@ class Database:
         # sidecar removal while their generated genre association is still
         # detached from the DB.
         photo_workspaces = {}
+        sidecar_wildlife_by_photo = {}
         for row in rows:
             pid = row["photo_id"]
+            if pid not in sidecar_wildlife_by_photo:
+                base = os.path.splitext(row["filename"])[0]
+                xmp_path = os.path.join(row["folder_path"], base + ".xmp")
+                if not os.path.exists(xmp_path):
+                    # A non-null mtime means a sidecar was imported earlier but
+                    # is currently unavailable (for example, an offline NAS).
+                    # Preserve rather than destroy metadata without being able
+                    # to inspect its provenance.
+                    sidecar_wildlife_by_photo[pid] = row["xmp_mtime"] is not None
+                else:
+                    try:
+                        from xmp import read_keywords
+
+                        sidecar_wildlife_by_photo[pid] = any(
+                            keyword_match_key(value) == "wildlife"
+                            for value in read_keywords(xmp_path)
+                        )
+                    except Exception:
+                        log.warning(
+                            "Could not inspect Wildlife provenance in %s; preserving association",
+                            xmp_path,
+                            exc_info=True,
+                        )
+                        sidecar_wildlife_by_photo[pid] = True
+            if sidecar_wildlife_by_photo[pid]:
+                continue
             ws = row["workspace_id"]
             entry = photo_workspaces.setdefault(
                 pid,

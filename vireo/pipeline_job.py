@@ -1357,6 +1357,203 @@ STAGE_WEIGHTS = {
 }
 
 
+_CLASSIFICATION_ETA_MIN_ATTEMPTS = 16
+
+
+def _cached_classify_detections(detections, floor, *, contextual_weak=False):
+    """Filter cached detector rows to the classify runtime's candidates.
+
+    Contextual-weak rescues are defined exclusively from MegaDetector V6
+    evidence.  Keep that restriction on the initial cached-detection path as
+    well as the later DB fallback so runtime selection matches the cache ETA
+    preflight and a stale foreign-detector row cannot displace the cached
+    MegaDetector crop.
+    """
+    return [
+        detection for detection in detections
+        if detection.get("detector_model") != "full-image"
+        and detection.get("category", "animal") == "animal"
+        and (
+            not contextual_weak
+            or detection.get("detector_model") == "megadetector-v6"
+        )
+        and detection.get(
+            "confidence", detection.get("detector_confidence", 0),
+        ) >= floor
+    ]
+
+
+def _remove_attempted_cache_hits(attempted_photo_ids, cache_hit_ids):
+    """Remove photos with any inference attempt from the cache-hit bucket.
+
+    A multi-detection photo can produce one real cache hit and still require
+    inference for another detection. Once that inference is attempted, the
+    photo is not wholly cached even if inference fails and produces no result
+    to trigger the ordinary successful-promotion path. This is independent of
+    whether the cache preflight counted the photo in its estimate.
+    """
+    attempted_cache_hits = set(attempted_photo_ids) & set(cache_hit_ids)
+    cache_hit_ids.difference_update(attempted_cache_hits)
+    return len(attempted_cache_hits)
+
+
+def _record_unattempted_cache_hit(
+    photo_id, inferred_photo_ids, attempted_photo_ids, cache_hit_ids,
+):
+    """Record a cache-hit photo only while it remains wholly cached.
+
+    A failed inference can be flushed before a later detection on the same
+    photo reaches its cache hit.  In that ordering the photo is already an
+    observed inference attempt, so restoring it to the cache-hit bucket would
+    make the ETA treat the same photo as both cached and uncached work.
+    """
+    if (
+        photo_id in inferred_photo_ids
+        or photo_id in attempted_photo_ids
+        or photo_id in cache_hit_ids
+    ):
+        return False
+    cache_hit_ids.add(photo_id)
+    return True
+
+
+def _classification_eta_progress(
+    *, total, seen, cached_estimate, cache_hits, inference_attempts,
+    classified, elapsed, cache_overcount=0,
+    unclassifiable_estimate=0, unclassifiable_seen=0,
+):
+    """Return step-progress fields for a cache-aware classification ETA.
+
+    ``seen / elapsed`` is not a useful inference rate: a cache-heavy prefix
+    can be walked hundreds of times faster than uncached photos are decoded
+    and sent through the model.  Estimate only from photos that actually
+    entered an inference batch, while using the preflight cache count to
+    subtract cache hits that are still expected later in the collection.
+
+    ``elapsed`` must be inference-active seconds only — the wall time
+    spent preparing images (open/decode/crop/resize) plus the wall time
+    inside ``_flush_batch`` — not the wall time since the per-spec
+    start. Passing walltime here would let the cache-traversal prefix
+    bleed into the denominator: on a spec that spends thirty seconds
+    walking a cached prefix before ever hitting inference, ``elapsed``
+    would be ~30s while ``inference_attempts`` is still zero, and by the
+    time the first inference lands the effective rate is derated by that
+    entire prefix. The runtime tracks an ``inference_seconds`` accumulator
+    that only ticks around ``_prepare_image`` calls for photos entering
+    the batch and around ``_flush_batch`` itself, and passes it here.
+    Excluding ``_prepare_image`` cost would understate the ETA on
+    RAW/JPEG-heavy or slow-storage runs where preparation dominates
+    per-photo latency (Codex #1468 P2).
+
+    ``cache_overcount`` is the count of photos where the preflight assumed
+    a cache hit (a classifier_runs row existed) but runtime found no cached
+    predictions and fell through to fresh inference. Subtracting it from
+    ``cached_estimate`` keeps ``remaining_uncached`` from collapsing to zero
+    on collections dominated by run-key-without-predictions rows, where the
+    preflight overcounts because it can't see the empty-predictions case
+    (e.g. a prior pass wrote ``category == 'match'`` with no predictions).
+
+    ``unclassifiable_estimate`` / ``unclassifiable_seen`` count photos the
+    runtime skips at the ``raw_real_dets`` continue branch (has real
+    detections but none above the classify floor and not a contextual-weak
+    rescue). Runtime never enters an inference batch for them, so the
+    unvisited share of them is subtracted from ``remaining_uncached`` —
+    otherwise a tail of below-threshold photos inflates a numeric ETA
+    that the runtime will actually traverse without work (Codex #1468 P2).
+
+    The first classifier call is deliberately flushed as a one-photo batch
+    for cancellation responsiveness and includes model warm-up.  Wait for a
+    normal batch's worth of attempts before publishing a numeric ETA.
+    """
+    total = max(int(total or 0), 0)
+    seen = min(max(int(seen or 0), 0), total)
+    cached_estimate = min(max(int(cached_estimate or 0), 0), total)
+    cache_hits = min(max(int(cache_hits or 0), 0), seen)
+    inference_attempts = max(int(inference_attempts or 0), 0)
+    classified = max(int(classified or 0), 0)
+    elapsed = max(float(elapsed or 0), 0.0)
+    cache_overcount = max(int(cache_overcount or 0), 0)
+    unclassifiable_estimate = min(
+        max(int(unclassifiable_estimate or 0), 0), total,
+    )
+    unclassifiable_seen = min(
+        max(int(unclassifiable_seen or 0), 0), unclassifiable_estimate,
+    )
+
+    # Project future cache hits from the observed success rate of preflight
+    # cache predictions. ``cache_hits + cache_overcount`` is the count of
+    # preflight-expected cache attempts we've observed; ``cache_hits`` is
+    # the subset where the runtime cache-hit predicate actually fired.
+    # Scaling ``cached_estimate`` by this rate corrects the preflight for
+    # the run-key-without-predictions case without waiting for the whole
+    # collection to be visited — a collection dominated by these rows
+    # converges to zero projected cache hits within a single batch.
+    observed_cache_attempts = cache_hits + cache_overcount
+    if observed_cache_attempts > 0:
+        hit_success_rate = cache_hits / observed_cache_attempts
+    else:
+        # No preflight-expected cache observations yet — trust preflight
+        # so early ETAs don't collapse before any evidence has arrived.
+        hit_success_rate = 1.0
+    corrected_cached_estimate = int(cached_estimate * hit_success_rate)
+    remaining_photos = max(total - seen, 0)
+    expected_future_cache_hits = max(
+        corrected_cached_estimate - cache_hits, 0,
+    )
+    expected_future_unclassifiable = max(
+        unclassifiable_estimate - unclassifiable_seen, 0,
+    )
+    remaining_uncached = max(
+        remaining_photos
+        - expected_future_cache_hits
+        - expected_future_unclassifiable,
+        0,
+    )
+    expected_uncached = max(
+        total - corrected_cached_estimate - unclassifiable_estimate, 0,
+    )
+    min_attempts = min(
+        _CLASSIFICATION_ETA_MIN_ATTEMPTS,
+        max(expected_uncached, 1),
+    )
+
+    fields = {
+        "eta_kind": "classification",
+        "eta_state": "estimating",
+        "eta_seconds": None,
+        "eta_rate_per_min": None,
+        "cache_hits": cache_hits,
+        "classified": classified,
+        "inference_attempts": inference_attempts,
+        "remaining_uncached": remaining_uncached,
+    }
+    if seen >= total:
+        fields["eta_state"] = "finishing"
+        fields["eta_seconds"] = 0
+        return fields
+    # When preflight determines every remaining photo is cached or
+    # unclassifiable (expected_uncached collapses to zero), no inference
+    # batch will ever fire — the "Estimating after the first uncached
+    # batch…" state below would then never resolve and the Jobs page
+    # would linger on that message throughout a fully cached or fully
+    # skipped traversal. Return the finishing signal directly instead
+    # (Codex #1468 P2).
+    if expected_uncached <= 0:
+        fields["eta_state"] = "finishing"
+        fields["eta_seconds"] = 0
+        return fields
+    if inference_attempts < min_attempts or elapsed <= 0:
+        return fields
+
+    rate_per_sec = inference_attempts / elapsed
+    if rate_per_sec <= 0:
+        return fields
+    fields["eta_state"] = "ready"
+    fields["eta_rate_per_min"] = round(rate_per_sec * 60, 1)
+    fields["eta_seconds"] = round(remaining_uncached / rate_per_sec)
+    return fields
+
+
 def _stage_fraction(info):
     """Return a 0..1 completion fraction for one stage entry.
 
@@ -5334,27 +5531,168 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                     # Pre-flight cache estimate. One indexed query so the UI
                     # can display "~M cached, ~K to classify" before the first
                     # inference runs and ETAs are honest from the start. The
-                    # estimate may overcount if a run-key exists but no cached
-                    # predictions do (see lines ~2000-2004); the live `cached`
-                    # counter reflects actual skips.
+                    # estimate may overcount if a run key exists but no cached
+                    # predictions do (e.g. a prior pass wrote
+                    # ``category == 'match'`` with no predictions); the live
+                    # ``cached`` counter reflects actual skips, and
+                    # ``photos_cache_overcounted_in_spec`` (populated in the
+                    # fall-through branch below) lets ``_classification_eta_progress``
+                    # reconcile the estimate from observed misses so
+                    # ``remaining_uncached`` doesn't collapse to zero on
+                    # collections dominated by these rows.
                     #
-                    # Skipped on reclassify runs (the gate below is bypassed
-                    # so every photo is re-inferred regardless of cache state)
-                    # and on multi-spec runs (the estimate would only cover
-                    # the current spec while ``total`` already spans every
-                    # spec, producing a banner that undercounts cache and
-                    # overstates remaining work — and since the UI hides the
-                    # banner once any photo lands, there's no correction
-                    # window). The single-spec case is the common one.
-                    if (
-                        not params.reclassify
-                        and len(resolved_specs_local) == 1
-                    ):
-                        cached_est = thread_db.count_classifier_runs(
+                    # We keep the full preflight-cached photo id set (not
+                    # just its count) so overcount attribution can be
+                    # scoped: recording an overcount for a photo the
+                    # preflight never counted would deflate the projected
+                    # cache-hit rate for unrelated photos and prematurely
+                    # inflate ``remaining_uncached`` (Codex #1468 P2).
+                    # Contextual-weak photos use the lower
+                    # ``weak_detection_confidence`` floor to match the
+                    # runtime cache-hit predicate; otherwise the cached
+                    # weak tail is omitted from ``cached_est`` and the
+                    # ETA overstates remaining time (Codex #1468 P2).
+                    #
+                    # Skipped on reclassify runs because the cache gate below
+                    # is bypassed and every photo is re-inferred. In a
+                    # multi-model run each model owns its own Jobs step, so
+                    # accumulate the per-spec estimates for the stage while
+                    # retaining this spec's value for its ETA.
+                    cached_est = 0
+                    preflight_cached_ids: set = set()
+                    # Photos whose runtime path deterministically skips
+                    # inference because they have no eligible animal target
+                    # but do have a confident non-animal box. Without
+                    # subtracting them, a person/vehicle tail inflates the ETA
+                    # even though runtime traverses it without model work.
+                    #
+                    # Whenever detection ran, pass its in-memory map so both
+                    # this skip estimate and the cache estimate below use the
+                    # exact candidates the classify loop will consume. Rows
+                    # from another detector model can remain in the DB after
+                    # either a reclassify or an ordinary runtime-fingerprint
+                    # miss; letting those stale rows into preflight can invent
+                    # work or hide a fresh cache hit (Codex #1468 P2).
+                    preflight_unclassifiable_ids: set = (
+                        thread_db.get_unclassifiable_photos(
                             [p["id"] for p in photos],
-                            model_name,
-                            spec_fp,
+                            contextual_weak_photo_ids=contextual_weak_ids,
+                            weak_confidence=(
+                                weak_detection_confidence
+                                if contextual_weak_ids
+                                else None
+                            ),
+                            fresh_detections_by_photo=(
+                                detect_state["detections"]
+                                if detect_state.get("ran")
+                                else None
+                            ),
+                            # ``processed_ids`` is what ``_detect_batch``
+                            # actually completed this run. Photos absent
+                            # from it are ones the detector raised on and
+                            # runtime will DB-fallback for (see
+                            # ``photo_dets`` else branch below), so they
+                            # must be evaluated against DB rows here too
+                            # instead of treated as "no fresh animal"
+                            # (Codex #1468 P2).
+                            fresh_processed_photo_ids=(
+                                detect_state["processed_ids"]
+                                if detect_state.get("ran")
+                                else None
+                            ),
                         )
+                    )
+                    if not params.reclassify:
+                        # Precompute the classifier runtime_fingerprint the
+                        # runtime gate will accept for each distinct
+                        # ``detections.runtime_fingerprint`` present in this
+                        # batch. Passing this map lets the preflight reject
+                        # obsolete-runtime classifier_runs rows the same way
+                        # the per-detection ``get_classifier_run_key_gate``
+                        # does at runtime; without it, the preflight
+                        # overcounts rows whose runtime rolled since the
+                        # prior classify pass, and no observation can correct
+                        # the estimate until those rows are visited — so the
+                        # UI reads "finishing…" while inference is still
+                        # pending (Codex #1468 P2).
+                        preflight_expected_rt_map = None
+                        portable_labels_full = loaded_models.get(
+                            "labels_fingerprint_full"
+                        )
+                        portable_model_identity = loaded_models.get(
+                            "classifier_model_identity"
+                        )
+                        portable_tax_identity = loaded_models.get(
+                            "taxonomy_identity", "no-tax",
+                        )
+                        if portable_labels_full and portable_model_identity:
+                            from computation_cache import (
+                                classifier_runtime_fingerprint,
+                            )
+                            detector_runtimes: set = set()
+                            photo_id_list = [p["id"] for p in photos]
+                            det_chunk = 500
+                            for i in range(0, len(photo_id_list), det_chunk):
+                                chunk = photo_id_list[i:i + det_chunk]
+                                placeholders = ",".join("?" * len(chunk))
+                                rows = thread_db.conn.execute(
+                                    f"SELECT DISTINCT runtime_fingerprint "
+                                    f"FROM detections "
+                                    f"WHERE photo_id IN ({placeholders})",
+                                    chunk,
+                                ).fetchall()
+                                for row in rows:
+                                    detector_runtimes.add(
+                                        row["runtime_fingerprint"]
+                                    )
+                            preflight_expected_rt_map = {}
+                            for det_rt in detector_runtimes:
+                                if det_rt is None:
+                                    # Detector runtime not recorded — matches
+                                    # ``classifier_runtime_for_detection``'s
+                                    # None return; permissive entry preserves
+                                    # the unfiltered fallback.
+                                    preflight_expected_rt_map[det_rt] = None
+                                else:
+                                    preflight_expected_rt_map[det_rt] = (
+                                        classifier_runtime_fingerprint(
+                                            portable_model_identity,
+                                            portable_labels_full,
+                                            det_rt,
+                                            taxonomy_identity=(
+                                                portable_tax_identity
+                                            ),
+                                        )
+                                    )
+                        preflight_cached_ids = (
+                            thread_db.get_classifier_run_cache_hits(
+                                [p["id"] for p in photos],
+                                model_name,
+                                spec_fp,
+                                contextual_weak_photo_ids=(
+                                    contextual_weak_ids
+                                ),
+                                weak_confidence=(
+                                    weak_detection_confidence
+                                    if contextual_weak_ids
+                                    else None
+                                ),
+                                fresh_detections_by_photo=(
+                                    detect_state["detections"]
+                                    if detect_state.get("ran")
+                                    else None
+                                ),
+                                fresh_processed_photo_ids=(
+                                    detect_state["processed_ids"]
+                                    if detect_state.get("ran")
+                                    else None
+                                ),
+                                expected_classifier_runtime_by_detector_runtime=(
+                                    preflight_expected_rt_map
+                                ),
+                            )
+                        )
+                        cached_est = len(preflight_cached_ids)
                         stages["classify"]["cached_estimate"] = (
                             stages["classify"].get("cached_estimate", 0) + cached_est
                         )
@@ -5394,6 +5732,28 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                     # counted once per (photo × spec) — matching ``total``.
                     photos_cached_in_spec: set = set()
                     photos_inferred_in_spec: set = set()
+                    # Includes failed inference attempts as well as successful
+                    # ones. ETA throughput is about completed model work, not
+                    # only predictions that happened to persist successfully.
+                    photos_attempted_in_spec: set = set()
+                    # Preflight's ``cached_est`` counts any photo whose
+                    # qualifying detections all have classifier_runs rows,
+                    # but the runtime cache-hit predicate additionally
+                    # requires actual predictions to exist. When we hit the
+                    # fall-through case (run key present, predictions
+                    # missing — see the classify loop below) the photo will
+                    # end up in ``photos_inferred_in_spec``, so subtract it
+                    # from the preflight estimate in the ETA calculation
+                    # instead of leaving a phantom future cache hit that
+                    # collapses ``remaining_uncached`` to zero.
+                    photos_cache_overcounted_in_spec: set = set()
+                    # Photos observed to hit the confident-non-animal skip
+                    # branch this spec. Paired with
+                    # ``preflight_unclassifiable_ids`` so the ETA can
+                    # subtract the unvisited share from remaining work
+                    # instead of treating a fast tail as inference work
+                    # (Codex #1468 P2).
+                    photos_unclassifiable_in_spec: set = set()
                     # Per-spec tracking of photos whose per-photo iteration
                     # was actually entered in THIS spec. Used by the
                     # reclassify clear below so it never wipes predictions
@@ -5429,6 +5789,15 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                     # the end of the spec regardless of outcome mix.
                     processed_in_spec = 0
                     start_time = time.time()
+                    # Wall time since ``start_time`` includes cache-lookup and
+                    # result-building for the cache-hit prefix, which can dwarf
+                    # actual model work on cache-heavy collections. Dividing
+                    # ``inference_attempts`` by that walltime yields an
+                    # artificially low rate and inflates the ETA for the
+                    # uncached tail. Accumulate the seconds spent inside
+                    # ``_flush_batch`` here so the ETA rate reflects
+                    # inference throughput only (Codex #1468 P2).
+                    inference_seconds = 0.0
                     batch_size = 32  # classification batch granularity
                     inference_batch_size = _BATCH_SIZE
                     inference_batch: list = []
@@ -5449,21 +5818,43 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                         spec_fp=spec_fp,
                         photos_cached_in_spec=photos_cached_in_spec,
                         photos_inferred_in_spec=photos_inferred_in_spec,
+                        photos_attempted_in_spec=photos_attempted_in_spec,
+                        photos_cache_overcounted_in_spec=(
+                            photos_cache_overcounted_in_spec
+                        ),
                     ):
-                        nonlocal failed, has_flushed_in_spec
+                        nonlocal failed, has_flushed_in_spec, inference_seconds
                         if not inference_batch:
                             return
 
                         pending = list(inference_batch)
                         inference_batch.clear()
                         has_flushed_in_spec = True
+                        attempted_photo_ids = {
+                            entry["photo"]["id"] for entry in pending
+                        }
+                        photos_attempted_in_spec.update(attempted_photo_ids)
+                        removed_cache_hits = _remove_attempted_cache_hits(
+                            attempted_photo_ids,
+                            photos_cached_in_spec,
+                        )
+                        if removed_cache_hits:
+                            stages["classify"]["cached"] = max(
+                                0,
+                                stages["classify"].get("cached", 0)
+                                - removed_cache_hits,
+                            )
                         pre_len = len(raw_results)
                         # GPU serialisation lives inside _flush_batch around the
                         # inference call so the DB upserts/result-building afterward
                         # don't hold the semaphore while the GPU is idle.
+                        _flush_started = time.time()
                         n_batch_failed = _flush_batch(
                             pending, clf, model_type, model_name,
                             thread_db, raw_results,
+                        )
+                        inference_seconds += max(
+                            time.time() - _flush_started, 0.0,
                         )
                         failed += n_batch_failed
 
@@ -5570,15 +5961,11 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                                 # see real, qualifying animal boxes. _detect_batch's
                                 # fresh cache contains raw low-confidence boxes too,
                                 # while DB reads normally apply this threshold.
-                                photo_dets = [
-                                    d for d in cached_detections[photo["id"]]
-                                    if d.get("detector_model") != "full-image"
-                                    and d.get("category", "animal") == "animal"
-                                    and d.get(
-                                        "confidence",
-                                        d.get("detector_confidence", 0),
-                                    ) >= detection_floor
-                                ]
+                                photo_dets = _cached_classify_detections(
+                                    cached_detections[photo["id"]],
+                                    detection_floor,
+                                    contextual_weak=is_contextual_weak,
+                                )
                             else:
                                 photo_dets = [
                                     {
@@ -5592,6 +5979,18 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                                     }
                                     for d in thread_db.get_detections(
                                         photo["id"], min_conf=detection_floor,
+                                        # Contextual rescue is defined only
+                                        # from MegaDetector V6 evidence. Keep
+                                        # the detector-failure DB fallback on
+                                        # that same candidate set so a stale,
+                                        # higher-confidence foreign row cannot
+                                        # diverge from the cache preflight's
+                                        # selected crop (Codex #1468 P2).
+                                        detector_model=(
+                                            "megadetector-v6"
+                                            if is_contextual_weak
+                                            else None
+                                        ),
                                     )
                                     if d["detector_model"] != "full-image"
                                     and d["category"] == "animal"
@@ -5622,7 +6021,34 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                                 # One best weak crop is enough to validate the
                                 # bridge. Classifying every low-confidence box
                                 # would multiply work and false-positive risk.
-                                photo_dets = photo_dets[:1]
+                                #
+                                # Explicit ``detector_confidence DESC, id ASC``
+                                # tie-break so the runtime picks the same
+                                # detection the preflight's cache-hit query
+                                # picks. ``cached_detections`` comes back from
+                                # ``_detect_batch`` in raw detector/NMS output
+                                # order — no ID tie-break — while
+                                # ``get_classifier_run_cache_hits`` ranks by
+                                # ``detector_confidence DESC, id ASC``. Without
+                                # this sort, two equal-confidence weak boxes
+                                # can leave runtime inferring the higher-ID box
+                                # while the preflight marked the photo cached
+                                # via a portable-cache run on the lower-ID box;
+                                # the overcount tracker then can't correct it
+                                # because the runtime-selected detection has
+                                # no run key of its own (Codex #1468 P2).
+                                photo_dets = sorted(
+                                    photo_dets,
+                                    key=lambda d: (
+                                        -float(
+                                            d.get(
+                                                "confidence",
+                                                d.get("detector_confidence", 0),
+                                            ) or 0
+                                        ),
+                                        d.get("id", 0),
+                                    ),
+                                )[:1]
                             detections_to_classify = photo_dets
                             if not detections_to_classify:
                                 # No animal box is usable at either the
@@ -5666,6 +6092,13 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                                         )
                                     )
                                 if confident_non_animal:
+                                    # This is the only no-target path that
+                                    # skips inference. Track it so the ETA
+                                    # does not project confident person/
+                                    # vehicle tails as pending model work.
+                                    photos_unclassifiable_in_spec.add(
+                                        photo["id"],
+                                    )
                                     continue
 
                                 existing_full = thread_db.get_detections(
@@ -5765,12 +6198,39 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                                                 ),
                                             )
                                         )
-                                    run_keys = thread_db.get_classifier_run_keys(
-                                        detection["id"],
-                                        runtime_fingerprint=(
-                                            expected_classifier_runtime
-                                        ),
-                                    )
+                                    # Fetch both accepted and gate-rejected
+                                    # keys in one query. ``rejected_keys`` is
+                                    # the "existed but the runtime_fingerprint
+                                    # rule rejected it" set — the preflight
+                                    # ``count_classifier_runs`` ignores that
+                                    # rule, so without recording these as
+                                    # overcounts below, a photo whose only key
+                                    # is gate-rejected sits in ``cached_est``
+                                    # forever and ETA prematurely reads
+                                    # "finishing…" on runs where the detector
+                                    # fingerprint has rolled since the prior
+                                    # classifier pass (Codex #1468 P2).
+                                    if expected_classifier_runtime is not None:
+                                        run_keys, rejected_keys = (
+                                            thread_db
+                                            .get_classifier_run_key_gate(
+                                                detection["id"],
+                                                expected_classifier_runtime,
+                                            )
+                                        )
+                                    else:
+                                        # No expected runtime fingerprint means
+                                        # portable identity isn't wired up
+                                        # (legacy path); fall back to the
+                                        # unfiltered gate. Nothing to reconcile
+                                        # because the preflight and the gate
+                                        # then agree on which rows count.
+                                        run_keys = (
+                                            thread_db.get_classifier_run_keys(
+                                                detection["id"],
+                                            )
+                                        )
+                                        rejected_keys = set()
                                     if (model_name, spec_fp) in run_keys:
                                         cached = thread_db.get_predictions_for_detection(
                                             detection["id"],
@@ -5787,15 +6247,12 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                                             # detection on the same photo will
                                             # promote it into ``count`` in the
                                             # flush path above.
-                                            if (
-                                                photo["id"]
-                                                not in photos_inferred_in_spec
-                                                and photo["id"]
-                                                not in photos_cached_in_spec
+                                            if _record_unattempted_cache_hit(
+                                                photo["id"],
+                                                photos_inferred_in_spec,
+                                                photos_attempted_in_spec,
+                                                photos_cached_in_spec,
                                             ):
-                                                photos_cached_in_spec.add(
-                                                    photo["id"],
-                                                )
                                                 stages["classify"]["cached"] += 1
                                             top = cached[0]
                                             folder_path = folders.get(photo["folder_id"], "")
@@ -5857,10 +6314,79 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                                         # so the prediction was intentionally not
                                         # written). Fall through to re-classify
                                         # instead of stranding the detection.
+                                        # Reconcile the preflight's cache
+                                        # estimate: it counted this photo based
+                                        # solely on the run key existing, but
+                                        # runtime will actually infer. Only
+                                        # record the overcount when the
+                                        # preflight actually counted this
+                                        # photo — otherwise a multi-detection
+                                        # photo whose other detection lacked
+                                        # any run key was never in
+                                        # ``cached_est`` to begin with, and
+                                        # treating this fall-through as a
+                                        # failed preflight prediction would
+                                        # deflate the projection for
+                                        # unrelated cache-heavy tails
+                                        # (Codex #1468 P2).
+                                        if (
+                                            photo["id"] in preflight_cached_ids
+                                        ):
+                                            photos_cache_overcounted_in_spec.add(
+                                                photo["id"],
+                                            )
+                                    elif (
+                                        model_name, spec_fp,
+                                    ) in rejected_keys:
+                                        # A classifier_runs row exists but its
+                                        # ``runtime_fingerprint`` no longer
+                                        # matches (typically the detector was
+                                        # re-run since the prior classify).
+                                        # Preflight counted this photo as
+                                        # cached; runtime will infer. Record
+                                        # the overcount so
+                                        # ``_classification_eta_progress`` can
+                                        # deflate its projected future cache
+                                        # hits — otherwise a collection made
+                                        # entirely of these rows sees
+                                        # ``remaining_uncached`` collapse to
+                                        # zero after the first uncached batch
+                                        # and the UI reports "finishing…"
+                                        # while most photos still need
+                                        # inference (Codex #1468 P2). Same
+                                        # preflight-membership guard: an
+                                        # unrelated detection without any
+                                        # run key on this photo means the
+                                        # preflight never counted it, so
+                                        # this branch isn't a preflight
+                                        # miss to reconcile.
+                                        if (
+                                            photo["id"] in preflight_cached_ids
+                                        ):
+                                            photos_cache_overcounted_in_spec.add(
+                                                photo["id"],
+                                            )
 
+                                # Track image preparation time separately from
+                                # the offline pause loop below so it can be
+                                # folded into ``inference_seconds`` only when
+                                # the photo actually enters the inference
+                                # batch. Cache-hit and image-decode-fail paths
+                                # exit the loop above without contributing to
+                                # ``inference_attempts``, so their prep time
+                                # (if any) must not count toward the rate;
+                                # a photo whose retries eventually succeed
+                                # DOES count, so accumulate across every
+                                # ``_prepare_image`` call for this detection
+                                # (Codex #1468 P2).
+                                _det_prep_seconds = 0.0
+                                _prep_started = time.time()
                                 img, folder_path, image_path = _prepare_image(
                                     photo, folders,
                                     None if full_image_fallback else detection,
+                                )
+                                _det_prep_seconds += max(
+                                    time.time() - _prep_started, 0.0,
                                 )
                                 # Before blaming the photo, check whether the
                                 # source itself vanished. A dropped share
@@ -5960,12 +6486,16 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                                     # fails, the loop re-probes and either
                                     # pauses again (bounded), degrades to
                                     # folder-scope, or gives up.
+                                    _prep_started = time.time()
                                     img, folder_path, image_path = (
                                         _prepare_image(
                                             photo, folders,
                                             None if full_image_fallback
                                             else detection,
                                         )
+                                    )
+                                    _det_prep_seconds += max(
+                                        time.time() - _prep_started, 0.0,
                                     )
                                     if img is not None:
                                         # Successful recovery: refund the
@@ -5993,6 +6523,15 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                                     break
                                 if img is None:
                                     continue
+                                # This detection is about to enter the flush
+                                # batch — attribute its full preparation cost
+                                # to the rate denominator so ``_prepare_image``
+                                # time (open + decode + crop + resize) shows
+                                # up alongside ``_flush_batch`` time. Without
+                                # this, RAW/JPEG-heavy or slow-storage runs
+                                # publish a rate that only reflects GPU work
+                                # and understate the ETA (Codex #1468 P2).
+                                inference_seconds += _det_prep_seconds
                                 inference_batch.append({
                                     "photo": photo,
                                     "detection_id": detection["id"],
@@ -6035,6 +6574,31 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                             progress={
                                 "current": processed_in_spec,
                                 "total": total,
+                                **_classification_eta_progress(
+                                    total=total,
+                                    seen=processed_in_spec,
+                                    cached_estimate=cached_est,
+                                    cache_hits=len(photos_cached_in_spec),
+                                    inference_attempts=len(
+                                        photos_attempted_in_spec
+                                    ),
+                                    classified=len(photos_inferred_in_spec),
+                                    # Inference-active seconds only. Wall time
+                                    # since ``start_time`` includes the cache-
+                                    # traversal prefix and would deflate the
+                                    # per-attempt rate on cache-heavy runs
+                                    # (Codex #1468 P2).
+                                    elapsed=inference_seconds,
+                                    cache_overcount=len(
+                                        photos_cache_overcounted_in_spec
+                                    ),
+                                    unclassifiable_estimate=len(
+                                        preflight_unclassifiable_ids
+                                    ),
+                                    unclassifiable_seen=len(
+                                        photos_unclassifiable_in_spec
+                                    ),
+                                ),
                             },
                         )
 

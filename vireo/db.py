@@ -17922,42 +17922,368 @@ class Database:
         ).fetchall()
         return {(r["classifier_model"], r["labels_fingerprint"]) for r in rows}
 
-    def count_classifier_runs(self, photo_ids, classifier_model, labels_fingerprint):
-        """Count distinct photos in `photo_ids` where EVERY runtime-classifiable
-        target has a classifier_runs row matching the given
+    def get_classifier_run_key_gate(self, detection_id, runtime_fingerprint):
+        """Return ``(accepted, rejected)`` classifier-run key sets for a detection.
+
+        ``accepted`` mirrors what ``get_classifier_run_keys(detection_id,
+        runtime_fingerprint=runtime_fingerprint)`` returns — keys whose row
+        the runtime cache gate would honor for this detection.
+
+        ``rejected`` are keys that DO have a classifier_runs row for the
+        detection but whose row would be filtered out by the fingerprint
+        rule (fingerprint mismatch, not ``'legacy'``, and no per-
+        prediction ``prediction_review`` override marks them as still
+        valid). The pipeline uses this set to reconcile the cache-hit
+        preflight — ``count_classifier_runs`` counts every existing row
+        regardless of runtime_fingerprint, so a photo whose only row is
+        rejected here would otherwise sit in ``cached_est`` yet never
+        register as a cache hit or as a fall-through miss, leaving
+        ``_classification_eta_progress`` believing a phantom future cache
+        hit is still coming.
+
+        ``runtime_fingerprint`` must be provided; passing ``None`` would
+        make every row look mismatched, which is not a useful signal
+        (that's the reclassify path, where the gate is bypassed anyway).
+        """
+        if runtime_fingerprint is None:
+            return set(), set()
+        rows = self.conn.execute(
+            """SELECT cr.classifier_model,
+                      cr.labels_fingerprint,
+                      cr.runtime_fingerprint,
+                      EXISTS (
+                          SELECT 1 FROM predictions p
+                          JOIN prediction_review pr ON pr.prediction_id = p.id
+                          WHERE p.detection_id = cr.detection_id
+                            AND p.classifier_model = cr.classifier_model
+                            AND p.labels_fingerprint = cr.labels_fingerprint
+                            AND pr.status IN ('accepted', 'rejected')
+                            AND COALESCE(pr.individual, '') != ?
+                      ) AS has_individual_override
+                 FROM classifier_runs cr
+                WHERE cr.detection_id = ?""",
+            (AUTO_MATCH_REVIEW_MARKER, detection_id),
+        ).fetchall()
+        accepted, rejected = set(), set()
+        for row in rows:
+            key = (row["classifier_model"], row["labels_fingerprint"])
+            if (
+                row["runtime_fingerprint"] == runtime_fingerprint
+                or row["runtime_fingerprint"] == "legacy"
+                or row["has_individual_override"]
+            ):
+                accepted.add(key)
+            else:
+                rejected.add(key)
+        return accepted, rejected
+
+    def get_classifier_run_cache_hits(
+        self,
+        photo_ids,
+        classifier_model,
+        labels_fingerprint,
+        *,
+        contextual_weak_photo_ids=None,
+        weak_confidence=None,
+        fresh_detections_by_photo=None,
+        fresh_processed_photo_ids=None,
+        expected_classifier_runtime_by_detector_runtime=None,
+    ):
+        """Return the SET of photo IDs from ``photo_ids`` that the classify
+        preflight would consider fully cached under
         (classifier_model, labels_fingerprint).
 
         Used by the streaming pipeline's classify stage to pre-flight how
-        many photos will hit the cache vs. require fresh inference.
+        many photos will hit the cache vs. require fresh inference — and,
+        because ``_classification_eta_progress`` reconciles the estimate
+        from observed misses, also to know WHICH photos the preflight
+        expected to be cached. Only observed misses on preflight-expected
+        photos deflate the projected cache hits; misses on photos the
+        preflight never counted are unrelated to the estimate and must
+        not scale it down (Codex #1468 P2).
 
-        Photo-scoped to match runtime accounting: the classify loop keeps its
-        ``cached`` bucket photo-scoped (see pipeline_job.py — a photo lands
-        there only if every processed detection is a cache hit; the moment
-        any detection runs fresh inference it is promoted to ``count``).
-        So the preflight only counts a photo as cached when NO qualifying
-        detection would need fresh inference — otherwise a multi-subject
-        photo with one cached and one uncached detection would inflate
-        ``cached_estimate`` up to ``total`` and the banner would misread as
-        "no work to classify" when there is real work remaining.
+        Photo-scoped to match runtime accounting: the classify loop keeps
+        its ``cached`` bucket photo-scoped (see pipeline_job.py — a photo
+        lands there only if every processed detection is a cache hit; the
+        moment any detection runs fresh inference it is promoted to
+        ``count``). So the preflight only counts a photo as cached when
+        NO qualifying detection would need fresh inference — otherwise a
+        multi-subject photo with one cached and one uncached detection
+        would inflate ``cached_estimate`` up to ``total`` and the banner
+        would misread as "no work to classify" when there is real work
+        remaining.
 
-        Above-threshold real detections must all have matching run keys,
-        and photos where MegaDetector ran with ``box_count=0`` still count
-        through their synthetic full-image anchor. Below-threshold real
-        detections are ignored because the pipeline still skips them
-        instead of falling back.
+        Above-threshold animal detections must all have matching run keys.
+        Photos with no usable animal target and no confident non-animal box
+        count through their synthetic full-image anchor, including photos
+        whose only animal detections are below the workspace floor.
+
+        ``contextual_weak_photo_ids`` marks photos the classify loop will
+        rescue with a lowered ``weak_confidence`` floor. For those photos
+        the runtime picks one qualifying weak-threshold detection to
+        classify, so the preflight counts the photo when at least one of
+        its weak-threshold animal detections carries a matching run key.
+        Without this, a rerun over a cached weak tail is scored as pure
+        uncached work and the ETA can substantially overstate the time
+        remaining (Codex #1468 P2).
+
+        When the detector stage ran, ``fresh_detections_by_photo`` and
+        ``fresh_processed_photo_ids`` scope processed photos to the exact
+        in-memory candidates the classify runtime will consume. This avoids
+        stale rows from another detector either adding uncached work or hiding
+        a fresh uncached target. Photos the detector failed to process retain
+        the DB fallback, matching the classify loop.
+
+        ``expected_classifier_runtime_by_detector_runtime`` maps each
+        ``detections.runtime_fingerprint`` value present in this batch to the
+        classifier_runtime_fingerprint the runtime gate will accept for
+        classifier_runs rows anchored on that detection. When provided, the
+        preflight matches the runtime's per-detection gate: a
+        ``classifier_runs`` row counts only when its ``runtime_fingerprint``
+        equals the expected value for its detection's detector runtime, or is
+        the ``'legacy'`` sentinel, or the prediction carries a real
+        prediction_review override. Without this predicate the preflight
+        overcounts obsolete-runtime rows the runtime will reject and the
+        observation-based correction cannot deflate the estimate until those
+        rejected rows are actually visited — leading
+        ``_classification_eta_progress`` to report "finishing…" while
+        substantial inference work still remains (Codex #1468 P2). Passing
+        ``None`` retains the pre-Codex behaviour (no runtime filter); this
+        is the correct choice on reclassify runs, where the runtime gate is
+        bypassed anyway. Values may be ``None`` when the caller cannot
+        compute an expected fingerprint (e.g. portable identity not wired
+        up): matching detections then skip the runtime filter, mirroring
+        the unfiltered ``get_classifier_run_keys`` fallback the runtime
+        applies.
         """
         if not photo_ids:
-            return 0
+            return set()
         import config as cfg
         min_conf = self.get_effective_config(cfg.load()).get(
             "detector_confidence", 0.2,
         )
+        weak_photo_ids = set(contextual_weak_photo_ids or ())
+        weak_conf = (
+            float(weak_confidence) if weak_confidence is not None else min_conf
+        )
+        normal_ids = [pid for pid in photo_ids if pid not in weak_photo_ids]
+        weak_ids = [pid for pid in photo_ids if pid in weak_photo_ids]
+        fresh_processed = (
+            set(fresh_processed_photo_ids or ())
+            if fresh_detections_by_photo is not None
+            and fresh_processed_photo_ids is not None
+            else set()
+        )
+        normal_db_ids = [pid for pid in normal_ids if pid not in fresh_processed]
+        weak_db_ids = [pid for pid in weak_ids if pid not in fresh_processed]
         # Chunk to stay under SQLITE_MAX_VARIABLE_NUMBER (default 999).
         # Match the 500-element chunks used elsewhere in this file.
         CHUNK = 500
         matched = set()
-        for i in range(0, len(photo_ids), CHUNK):
-            chunk = photo_ids[i:i + CHUNK]
+
+        # Runtime-fingerprint gate for classifier_runs, mirroring what
+        # ``get_classifier_run_key_gate`` accepts at runtime. Without this
+        # predicate the preflight would count rows whose ``runtime_fingerprint``
+        # the runtime rejects (typically stale after a detector fingerprint
+        # roll), and no observation could correct the estimate until those
+        # rows were visited — collapsing ``remaining_uncached`` to zero
+        # prematurely (Codex #1468 P2).
+        rt_map = expected_classifier_runtime_by_detector_runtime
+        rt_predicate_sql = ""
+        rt_predicate_params: list = []
+        if rt_map is not None and rt_map:
+            strict_pairs = [
+                (det_rt, cls_rt)
+                for det_rt, cls_rt in rt_map.items()
+                if cls_rt is not None
+            ]
+            permissive_det_rts = [
+                det_rt
+                for det_rt, cls_rt in rt_map.items()
+                if cls_rt is None
+            ]
+            # Assemble a predicate that, given a classifier_runs alias
+            # ``{cr}``, requires at least one of:
+            #   1. ``{cr}.runtime_fingerprint`` matches the expected value for
+            #      the anchor detection's ``detections.runtime_fingerprint``.
+            #   2. ``{cr}.runtime_fingerprint`` is ``'legacy'`` (grandfathered).
+            #   3. A prediction on the same row carries a real
+            #      prediction_review override (mirrors ``get_classifier_run_keys``).
+            # A permissive detector-runtime entry (expected value ``None``)
+            # accepts any classifier_runs.runtime_fingerprint for its
+            # detections, matching the pipeline's unfiltered fallback when
+            # portable identity is not wired up.
+            def _runtime_predicate(alias):
+                pair_terms = " OR ".join(
+                    f"(d_src.runtime_fingerprint IS ? AND {alias}.runtime_fingerprint IS ?)"
+                    for _ in strict_pairs
+                )
+                permissive_terms = " OR ".join(
+                    "d_src.runtime_fingerprint IS ?"
+                    for _ in permissive_det_rts
+                )
+                detector_match_terms = " OR ".join(
+                    part for part in (pair_terms, permissive_terms) if part
+                )
+                pred_sql = (
+                    f" AND ({alias}.runtime_fingerprint = 'legacy'"
+                    f" OR EXISTS (SELECT 1 FROM detections d_src"
+                    f"             WHERE d_src.id = {alias}.detection_id"
+                    f"               AND ({detector_match_terms}))"
+                    f" OR EXISTS (SELECT 1 FROM predictions p_ov"
+                    f"             JOIN prediction_review pr_ov"
+                    f"               ON pr_ov.prediction_id = p_ov.id"
+                    f"            WHERE p_ov.detection_id = {alias}.detection_id"
+                    f"              AND p_ov.classifier_model = {alias}.classifier_model"
+                    f"              AND p_ov.labels_fingerprint = {alias}.labels_fingerprint"
+                    f"              AND pr_ov.status IN ('accepted', 'rejected')"
+                    f"              AND COALESCE(pr_ov.individual, '') != ?))"
+                )
+                params: list = []
+                for det_rt, cls_rt in strict_pairs:
+                    params.extend([det_rt, cls_rt])
+                params.extend(permissive_det_rts)
+                params.append(AUTO_MATCH_REVIEW_MARKER)
+                return pred_sql, params
+
+            rt_predicate_sql_cr, rt_predicate_params = _runtime_predicate("cr")
+            rt_predicate_sql = rt_predicate_sql_cr
+
+        # For photos whose detector iteration completed, mirror the runtime's
+        # in-memory target selection rather than querying every detection row
+        # still present in the DB. Old rows can legitimately survive until a
+        # later purge and are not runtime candidates for this pass.
+        fresh_candidates: dict = {}
+        for photo_id in fresh_processed:
+            is_weak = photo_id in weak_photo_ids
+            floor = weak_conf if is_weak else min_conf
+            candidates = []
+            for detection in fresh_detections_by_photo.get(photo_id) or ():
+                if detection.get("detector_model") == "full-image":
+                    continue
+                if detection.get("category", "animal") != "animal":
+                    continue
+                if (
+                    is_weak
+                    and detection.get("detector_model") != "megadetector-v6"
+                ):
+                    continue
+                confidence = detection.get(
+                    "confidence", detection.get("detector_confidence", 0),
+                )
+                try:
+                    if float(confidence or 0) < floor:
+                        continue
+                except (TypeError, ValueError):
+                    continue
+                if detection.get("id") is not None:
+                    candidates.append(detection)
+            if is_weak and candidates:
+                candidates = sorted(
+                    candidates,
+                    key=lambda detection: (
+                        -float(
+                            detection.get(
+                                "confidence",
+                                detection.get("detector_confidence", 0),
+                            ) or 0
+                        ),
+                        detection.get("id", 0),
+                    ),
+                )[:1]
+            if candidates:
+                fresh_candidates[photo_id] = {
+                    detection["id"] for detection in candidates
+                }
+
+        # Cached detector reuse loads rows at the ordinary workspace floor.
+        # A contextual-weak target can therefore be absent from the in-memory
+        # map even though the classify loop will explicitly reload its MDv6
+        # weak row from the DB. Route those omitted weak photos through the
+        # same DB fallback here (Codex #1468 P2).
+        weak_db_ids.extend(
+            photo_id for photo_id in weak_ids
+            if photo_id in fresh_processed
+            and photo_id not in fresh_candidates
+        )
+
+        # Ordinary processed photos with no usable animal crop now take the
+        # full-image fallback unless a confident person/vehicle box blocks it.
+        # The detect stage pre-creates those anchors before this preflight, so
+        # add the anchor ID to the same candidate map used for fresh crops.
+        fresh_full_image_ids = []
+        for photo_id in normal_ids:
+            if photo_id not in fresh_processed or photo_id in fresh_candidates:
+                continue
+            confident_non_animal = False
+            for detection in fresh_detections_by_photo.get(photo_id) or ():
+                if detection.get("detector_model") == "full-image":
+                    continue
+                if detection.get("category", "animal") == "animal":
+                    continue
+                confidence = detection.get(
+                    "confidence", detection.get("detector_confidence", 0),
+                )
+                try:
+                    if float(confidence or 0) >= min_conf:
+                        confident_non_animal = True
+                        break
+                except (TypeError, ValueError):
+                    continue
+            if not confident_non_animal:
+                fresh_full_image_ids.append(photo_id)
+        for i in range(0, len(fresh_full_image_ids), CHUNK):
+            chunk = fresh_full_image_ids[i:i + CHUNK]
+            placeholders = ",".join("?" * len(chunk))
+            rows = self.conn.execute(
+                f"""SELECT photo_id, MIN(id) AS detection_id
+                      FROM detections
+                     WHERE detector_model = 'full-image'
+                       AND photo_id IN ({placeholders})
+                     GROUP BY photo_id""",
+                chunk,
+            ).fetchall()
+            for row in rows:
+                fresh_candidates[row["photo_id"]] = {row["detection_id"]}
+
+        fresh_detection_ids = {
+            detection_id
+            for candidate_ids in fresh_candidates.values()
+            for detection_id in candidate_ids
+        }
+        cached_fresh_detection_ids: set = set()
+        fresh_detection_ids_list = list(fresh_detection_ids)
+        for i in range(0, len(fresh_detection_ids_list), CHUNK):
+            chunk = fresh_detection_ids_list[i:i + CHUNK]
+            placeholders = ",".join("?" * len(chunk))
+            rows = self.conn.execute(
+                f"""SELECT DISTINCT cr.detection_id
+                      FROM classifier_runs cr
+                     WHERE cr.detection_id IN ({placeholders})
+                       AND cr.classifier_model = ?
+                       AND cr.labels_fingerprint = ?
+                       AND EXISTS (
+                             SELECT 1 FROM predictions p
+                              WHERE p.detection_id = cr.detection_id
+                                AND p.classifier_model = cr.classifier_model
+                                AND p.labels_fingerprint
+                                    = cr.labels_fingerprint
+                                AND p.confidence >= 0
+                           )""" + rt_predicate_sql,
+                [*chunk, classifier_model, labels_fingerprint,
+                 *rt_predicate_params],
+            ).fetchall()
+            cached_fresh_detection_ids.update(
+                row["detection_id"] for row in rows
+            )
+        for photo_id, candidate_ids in fresh_candidates.items():
+            if candidate_ids <= cached_fresh_detection_ids:
+                matched.add(photo_id)
+
+        for i in range(0, len(normal_db_ids), CHUNK):
+            chunk = normal_db_ids[i:i + CHUNK]
+            if not chunk:
+                continue
             placeholders = ",".join("?" * len(chunk))
             # A photo counts as fully cached iff it has at least one
             # above-threshold real detection AND every above-threshold real
@@ -17995,13 +18321,94 @@ class Database:
                 f"        WHERE cr.detection_id = d2.id "
                 f"          AND cr.classifier_model = ? "
                 f"          AND cr.labels_fingerprint = ? "
-                f"      ) "
-                f"  )",
+                f"          AND EXISTS ( "
+                f"              SELECT 1 FROM predictions p "
+                f"              WHERE p.detection_id = cr.detection_id "
+                f"                AND p.classifier_model "
+                f"                    = cr.classifier_model "
+                f"                AND p.labels_fingerprint "
+                f"                    = cr.labels_fingerprint "
+                f"                AND p.confidence >= 0 "
+                f"          ) "
+                + rt_predicate_sql +
+                "      ) "
+                "  )",
                 [min_conf, *chunk, min_conf, classifier_model,
-                 labels_fingerprint],
+                 labels_fingerprint, *rt_predicate_params],
             ).fetchall()
             for r in rows:
                 matched.add(r["photo_id"])
+        # Contextual-weak photos: the runtime classifies a SINGLE
+        # weak-threshold detection per photo (``photo_dets[:1]`` in the
+        # classify loop, after ordering by ``detector_confidence DESC,
+        # id ASC`` in ``get_detections``). Mirror that by counting the
+        # photo only when THAT top detection carries a matching run
+        # key. An earlier revision accepted any qualifying weak
+        # detection with a run key, which meant a photo whose only
+        # cached row was a lower-ranked box was marked cached even
+        # though the runtime would infer the uncached top box; that
+        # miss never registered as a fall-through overcount either
+        # (the top detection has no run key at all), leaving a phantom
+        # cache hit in the ETA (Codex #1468 P2).
+        #
+        # Restrict the CTE to ``detector_model = 'megadetector-v6'`` to
+        # mirror the runtime weak fallback at ``pipeline_job.py``, which
+        # calls ``get_detections(..., detector_model='megadetector-v6')``
+        # for contextual-weak photos. Foreign-detector weak rows (e.g. a
+        # stale detection from another detector model still in the
+        # database) can otherwise rank first in the ROW_NUMBER window and
+        # carry the matching run key while the megadetector-v6 top box
+        # does not; that used to mark the photo cached, but the runtime
+        # would still infer the uncached megadetector-v6 box, leaving a
+        # phantom cache hit the overcount tracker cannot correct because
+        # the runtime-selected detection has no run key of its own
+        # (Codex #1468 P2).
+        for i in range(0, len(weak_db_ids), CHUNK):
+            chunk = weak_db_ids[i:i + CHUNK]
+            if not chunk:
+                continue
+            placeholders = ",".join("?" * len(chunk))
+            rows = self.conn.execute(
+                f"""WITH top_weak_det AS (
+                        SELECT photo_id, id AS detection_id,
+                               ROW_NUMBER() OVER (
+                                   PARTITION BY photo_id
+                                   ORDER BY detector_confidence DESC,
+                                            id ASC
+                               ) AS rn
+                          FROM detections
+                         WHERE detector_model = 'megadetector-v6'
+                           AND category = 'animal'
+                           AND detector_confidence >= ?
+                           AND photo_id IN ({placeholders})
+                      )
+                    SELECT DISTINCT td.photo_id
+                      FROM top_weak_det td
+                      JOIN classifier_runs cr
+                        ON cr.detection_id = td.detection_id
+                       AND cr.classifier_model = ?
+                       AND cr.labels_fingerprint = ?
+                     WHERE td.rn = 1
+                       AND EXISTS (
+                             SELECT 1 FROM predictions p
+                              WHERE p.detection_id = cr.detection_id
+                                AND p.classifier_model = cr.classifier_model
+                                AND p.labels_fingerprint
+                                    = cr.labels_fingerprint
+                                AND p.confidence >= 0
+                           )""" + rt_predicate_sql,
+                [weak_conf, *chunk, classifier_model, labels_fingerprint,
+                 *rt_predicate_params],
+            ).fetchall()
+            for r in rows:
+                matched.add(r["photo_id"])
+        # DB-fallback ordinary photos use a full-image anchor when no real box
+        # at the workspace floor remains. Any confident animal or non-animal
+        # box blocks the fallback; contextual-weak photos use their selected
+        # weak crop instead and are intentionally excluded here.
+        for i in range(0, len(normal_db_ids), CHUNK):
+            chunk = normal_db_ids[i:i + CHUNK]
+            placeholders = ",".join("?" * len(chunk))
             rows = self.conn.execute(
                 f"""WITH full_anchor AS (
                         SELECT photo_id, MIN(id) AS detection_id
@@ -18012,24 +18419,263 @@ class Database:
                       )
                     SELECT DISTINCT fa.photo_id
                       FROM full_anchor fa
-                      JOIN detector_runs dr
+                      LEFT JOIN detector_runs dr
                         ON dr.photo_id = fa.photo_id
                        AND dr.detector_model = 'megadetector-v6'
-                       AND dr.box_count = 0
                       JOIN classifier_runs cr
                         ON cr.detection_id = fa.detection_id
                        AND cr.classifier_model = ?
                        AND cr.labels_fingerprint = ?
-                     WHERE NOT EXISTS (
+                     WHERE (dr.photo_id IS NULL
+                            OR dr.box_count = 0 OR EXISTS (
+                             SELECT 1 FROM detections consistent
+                              WHERE consistent.photo_id = fa.photo_id
+                                AND consistent.detector_model
+                                    = dr.detector_model
+                           ))
+                       AND NOT EXISTS (
                              SELECT 1 FROM detections d
                               WHERE d.photo_id = fa.photo_id
                                 AND d.detector_model != 'full-image'
-                           )""",
-                [*chunk, classifier_model, labels_fingerprint],
+                                AND d.detector_confidence >= ?
+                           )
+                       AND EXISTS (
+                             SELECT 1 FROM predictions p
+                              WHERE p.detection_id = cr.detection_id
+                                AND p.classifier_model = cr.classifier_model
+                                AND p.labels_fingerprint
+                                    = cr.labels_fingerprint
+                                AND p.confidence >= 0
+                           )""" + rt_predicate_sql,
+                [*chunk, classifier_model, labels_fingerprint, min_conf,
+                 *rt_predicate_params],
             ).fetchall()
             for r in rows:
                 matched.add(r["photo_id"])
-        return len(matched)
+        return matched
+
+    def count_classifier_runs(
+        self,
+        photo_ids,
+        classifier_model,
+        labels_fingerprint,
+        *,
+        contextual_weak_photo_ids=None,
+        weak_confidence=None,
+        fresh_detections_by_photo=None,
+        fresh_processed_photo_ids=None,
+        expected_classifier_runtime_by_detector_runtime=None,
+    ):
+        """Return ``len(get_classifier_run_cache_hits(...))``.
+
+        Retained as a thin count-only shim so callers that don't need the
+        photo-id set (or preexisting tests) keep working; the id set is
+        the newer surface the pipeline uses to scope its overcount
+        tracker.
+        """
+        return len(self.get_classifier_run_cache_hits(
+            photo_ids,
+            classifier_model,
+            labels_fingerprint,
+            contextual_weak_photo_ids=contextual_weak_photo_ids,
+            weak_confidence=weak_confidence,
+            fresh_detections_by_photo=fresh_detections_by_photo,
+            fresh_processed_photo_ids=fresh_processed_photo_ids,
+            expected_classifier_runtime_by_detector_runtime=(
+                expected_classifier_runtime_by_detector_runtime
+            ),
+        ))
+
+    def get_unclassifiable_photos(
+        self,
+        photo_ids,
+        *,
+        contextual_weak_photo_ids=None,
+        weak_confidence=None,
+        fresh_detections_by_photo=None,
+        fresh_processed_photo_ids=None,
+    ):
+        """Return photo IDs the classify runtime skips without inference.
+
+        Photos with no usable animal crop normally receive full-image
+        classification. The remaining deterministic skip is a photo with no
+        eligible animal target but a confident non-animal (person/vehicle)
+        detection. Excluding that tail keeps it out of the ETA's projected
+        inference work.
+
+        ``fresh_detections_by_photo`` is an in-memory ``{photo_id:
+        [detection_dict, ...]}`` map (the ``detect_state["detections"]``
+        that ``_detect_batch`` populated). When provided, the "any
+        animal detection >= floor?" predicate is answered from this
+        fresh set instead of the DB — mirroring what the runtime's
+        ``photo_dets`` filter actually sees. This matters whenever the
+        current detector pass replaces the runtime candidates while older
+        rows from another detector model remain in the DB. Without this
+        override, stale rows can make the preflight choose a different crop
+        or skip outcome than runtime (Codex #1468 P2).
+        Each detection dict must expose ``confidence`` (or
+        ``detector_confidence``) and ``category`` (defaulting to
+        ``"animal"`` when absent, matching ``_detect_batch``'s output).
+
+        ``fresh_processed_photo_ids`` is the ``detect_state["processed_ids"]``
+        set — the photos ``_detect_batch`` actually completed. When a
+        MegaDetector pass raises for a single image, ``_detect_batch``
+        leaves that photo out of both ``detections`` and
+        ``processed_ids`` and the runtime's per-photo classify body
+        falls back to ``db.get_detections()`` (see
+        ``pipeline_job.py`` ``photo_dets`` else branch). Treating a
+        missing entry in ``fresh_detections_by_photo`` as "no fresh
+        animal above the floor" would mark such a photo unclassifiable
+        even though runtime will infer, subtracting real work from the
+        ETA's ``remaining_uncached`` and reporting "finishing…"
+        prematurely. When both this set and ``fresh_detections_by_photo``
+        are provided, photos NOT in the processed set defer to the DB
+        predicate for that photo, matching what the runtime actually
+        sees (Codex #1468 P2).
+        """
+        if not photo_ids:
+            return set()
+        import config as cfg
+        min_conf = self.get_effective_config(cfg.load()).get(
+            "detector_confidence", 0.2,
+        )
+        weak_photo_ids = set(contextual_weak_photo_ids or ())
+        weak_conf = (
+            float(weak_confidence) if weak_confidence is not None else min_conf
+        )
+        # Chunk to stay under SQLITE_MAX_VARIABLE_NUMBER (default 999).
+        CHUNK = 500
+
+        def _fresh_has_animal_above(photo_id, floor, *, contextual_weak=False):
+            dets = fresh_detections_by_photo.get(photo_id) or ()
+            for d in dets:
+                if d.get("category", "animal") != "animal":
+                    continue
+                if (
+                    contextual_weak
+                    and d.get("detector_model") != "megadetector-v6"
+                ):
+                    continue
+                conf = d.get("confidence", d.get("detector_confidence", 0))
+                try:
+                    if float(conf or 0) >= floor:
+                        return True
+                except (TypeError, ValueError):
+                    continue
+            return False
+
+        def _fresh_has_confident_non_animal(photo_id):
+            for detection in fresh_detections_by_photo.get(photo_id) or ():
+                if detection.get("detector_model") == "full-image":
+                    continue
+                if detection.get("category", "animal") == "animal":
+                    continue
+                confidence = detection.get(
+                    "confidence", detection.get("detector_confidence", 0),
+                )
+                try:
+                    if float(confidence or 0) >= min_conf:
+                        return True
+                except (TypeError, ValueError):
+                    continue
+            return False
+
+        def _db_unclassifiable(pool, floor, out, *, contextual_weak=False):
+            animal_model_predicate = (
+                "d2.detector_model = 'megadetector-v6'"
+                if contextual_weak
+                else "d2.detector_model != 'full-image'"
+            )
+            for i in range(0, len(pool), CHUNK):
+                chunk = pool[i:i + CHUNK]
+                if not chunk:
+                    continue
+                placeholders = ",".join("?" * len(chunk))
+                rows = self.conn.execute(
+                    f"""SELECT DISTINCT d.photo_id
+                          FROM detections d
+                         WHERE d.detector_model != 'full-image'
+                           AND d.category != 'animal'
+                           AND d.detector_confidence >= ?
+                           AND d.photo_id IN ({placeholders})
+                           AND NOT EXISTS (
+                                 SELECT 1 FROM detections d2
+                                  WHERE d2.photo_id = d.photo_id
+                                    AND {animal_model_predicate}
+                                    AND d2.category = 'animal'
+                                    AND d2.detector_confidence >= ?
+                               )""",
+                    [min_conf, *chunk, floor],
+                ).fetchall()
+                for r in rows:
+                    out.add(r["photo_id"])
+
+        unclassifiable: set = set()
+        normal_ids = [pid for pid in photo_ids if pid not in weak_photo_ids]
+        weak_ids = [pid for pid in photo_ids if pid in weak_photo_ids]
+
+        if fresh_detections_by_photo is None:
+            for pool, floor, is_weak in (
+                (normal_ids, min_conf, False),
+                (weak_ids, weak_conf, True),
+            ):
+                _db_unclassifiable(
+                    pool, floor, unclassifiable, contextual_weak=is_weak,
+                )
+            return unclassifiable
+
+        # Fresh-detection path: the "photo has an animal detection >= floor?"
+        # test uses the fresh in-memory map (matching the runtime's
+        # ``photo_dets`` filter), while "photo has any real detection?"
+        # still reads the DB — that mirrors the runtime's ``raw_real_dets``
+        # branch, which also reads the DB and would enter the skip path
+        # even if a pre-run row is the only real detection recorded.
+        #
+        # Photos absent from ``fresh_processed_photo_ids`` are ones the
+        # detector failed on this run; runtime falls back to DB rows for
+        # them, so evaluate them against the DB predicate too (otherwise
+        # the missing entry looks like "no fresh animal" and we'd
+        # misclassify them as unclassifiable — Codex #1468 P2).
+        processed = (
+            set(fresh_processed_photo_ids)
+            if fresh_processed_photo_ids is not None else None
+        )
+        for pool, floor, is_weak in (
+            (normal_ids, min_conf, False),
+            (weak_ids, weak_conf, True),
+        ):
+            if processed is None:
+                fresh_pool = pool
+                db_pool: list = []
+            else:
+                # Runtime reloads a contextual-weak row from the DB when the
+                # ordinary-threshold detector map omitted it. Keep that same
+                # fallback instead of treating an empty fresh entry as a skip.
+                fresh_pool = [
+                    pid for pid in pool
+                    if pid in processed
+                    and (
+                        not is_weak
+                        or _fresh_has_animal_above(
+                            pid, floor, contextual_weak=True,
+                        )
+                    )
+                ]
+                db_pool = [pid for pid in pool if pid not in fresh_pool]
+            for pid in fresh_pool:
+                if (
+                    not _fresh_has_animal_above(
+                        pid, floor, contextual_weak=is_weak,
+                    )
+                    and _fresh_has_confident_non_animal(pid)
+                ):
+                    unclassifiable.add(pid)
+            if db_pool:
+                _db_unclassifiable(
+                    db_pool, floor, unclassifiable,
+                    contextual_weak=is_weak,
+                )
+        return unclassifiable
 
     def get_labels_fingerprints(self):
         """Return all rows from the labels_fingerprints sidecar.

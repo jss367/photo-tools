@@ -230,6 +230,18 @@ def test_full_image_fallback_classify_counts_track_run_keys(tmp_path):
     assert db.count_full_image_classify_pending_pairs("BioCLIP-2", "fp1") == 1
 
     db.record_classifier_run(full_det_id, "BioCLIP-2", "fp1", prediction_count=1)
+    # ``count_classifier_runs`` (via ``get_classifier_run_cache_hits``)
+    # requires a real prediction alongside the run row so it matches what
+    # the classify runtime actually cache-serves; a bare
+    # ``classifier_runs`` row with no prediction is a stale marker the
+    # runtime would rerun.
+    db.add_prediction(
+        full_det_id,
+        species="Robin",
+        confidence=0.9,
+        model="BioCLIP-2",
+        labels_fingerprint="fp1",
+    )
     assert db.count_full_image_classify_pending_pairs("BioCLIP-2", "fp1") == 0
     assert db.count_classifier_runs([pid_empty, pid_weak], "BioCLIP-2", "fp1") == 1
 

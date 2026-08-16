@@ -14,6 +14,10 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from pipeline_job import (
     STAGE_WEIGHTS,
     PipelineParams,
+    _cached_classify_detections,
+    _classification_eta_progress,
+    _record_unattempted_cache_hit,
+    _remove_attempted_cache_hits,
     _stage_fraction,
     _weighted_progress,
     run_pipeline_job,
@@ -62,6 +66,334 @@ class FakeRunner:
 
     def is_cancelled(self, job_id):
         return job_id in self.cancelled_ids
+
+
+def test_contextual_weak_cached_candidates_ignore_foreign_detectors():
+    detections = [
+        {
+            "id": 1,
+            "detector_model": "other-detector",
+            "category": "animal",
+            "confidence": 0.9,
+        },
+        {
+            "id": 2,
+            "detector_model": "megadetector-v6",
+            "category": "animal",
+            "confidence": 0.3,
+        },
+    ]
+
+    ordinary = _cached_classify_detections(detections, 0.2)
+    contextual = _cached_classify_detections(
+        detections, 0.2, contextual_weak=True,
+    )
+
+    assert [d["id"] for d in ordinary] == [1, 2]
+    assert [d["id"] for d in contextual] == [2]
+
+
+def test_attempted_photo_is_not_still_reported_as_cached():
+    cache_hits = {10, 20}
+
+    removed = _remove_attempted_cache_hits(
+        attempted_photo_ids={10, 30},
+        cache_hit_ids=cache_hits,
+    )
+
+    assert removed == 1
+    assert cache_hits == {20}
+
+
+def test_later_cache_hit_does_not_restore_attempted_photo():
+    cache_hits = set()
+
+    recorded = _record_unattempted_cache_hit(
+        photo_id=10,
+        inferred_photo_ids=set(),
+        attempted_photo_ids={10},
+        cache_hit_ids=cache_hits,
+    )
+
+    assert recorded is False
+    assert cache_hits == set()
+
+
+def test_classification_eta_excludes_fast_cache_hits_from_rate():
+    """A cache-heavy prefix must not masquerade as model throughput."""
+    fields = _classification_eta_progress(
+        total=15_418,
+        seen=6_112,
+        cached_estimate=4_062,
+        cache_hits=4_157,
+        inference_attempts=913,
+        classified=913,
+        elapsed=1_480,
+    )
+
+    assert fields["eta_state"] == "ready"
+    assert fields["eta_rate_per_min"] == pytest.approx(37.0, abs=0.1)
+    assert fields["remaining_uncached"] == 9_306
+    assert fields["eta_seconds"] == pytest.approx(15_085, abs=1)
+    # The broken UI used seen / elapsed: roughly 248/min and a 37-minute ETA.
+    assert fields["eta_seconds"] > 4 * 60 * 60
+
+
+def test_classification_eta_waits_for_a_representative_uncached_batch():
+    fields = _classification_eta_progress(
+        total=1_000,
+        seen=700,
+        cached_estimate=650,
+        cache_hits=650,
+        inference_attempts=15,
+        classified=15,
+        elapsed=60,
+    )
+
+    assert fields["eta_state"] == "estimating"
+    assert fields["eta_seconds"] is None
+    assert fields["eta_rate_per_min"] is None
+
+
+def test_classification_eta_subtracts_expected_future_cache_hits():
+    fields = _classification_eta_progress(
+        total=100,
+        seen=36,
+        cached_estimate=60,
+        cache_hits=20,
+        inference_attempts=16,
+        classified=16,
+        elapsed=120,
+    )
+
+    assert fields["remaining_uncached"] == 24
+    assert fields["eta_rate_per_min"] == 8.0
+    assert fields["eta_seconds"] == 180
+
+
+def test_classification_eta_reconciles_overcounted_cache_estimate():
+    """The preflight counts a photo as cached whenever every qualifying
+    detection has a classifier_runs row, but the runtime cache-hit
+    predicate additionally requires cached predictions to exist. On a
+    collection dominated by run-key-without-predictions rows, the
+    preflight overcounts; without reconciliation ``remaining_uncached``
+    collapses to zero after the first inference batch and the UI would
+    report "finishing…" while most photos still need inference.
+    """
+    # 100 photos: preflight said all 100 are cached, but every single one
+    # falls through at runtime (run key present, predictions missing).
+    # After 20 photos we have 20 observed overcounts and 20 inferred; the
+    # remaining 80 photos are ALL uncached work.
+    fields = _classification_eta_progress(
+        total=100,
+        seen=20,
+        cached_estimate=100,
+        cache_hits=0,
+        inference_attempts=20,
+        classified=20,
+        elapsed=120,
+        cache_overcount=20,
+    )
+
+    assert fields["remaining_uncached"] == 80
+    assert fields["eta_state"] == "ready"
+    assert fields["eta_rate_per_min"] == 10.0
+    assert fields["eta_seconds"] == 480
+
+
+def test_classification_eta_overcount_floors_at_observed_cache_hits():
+    """``cache_overcount`` must never push corrected cached_estimate
+    below the cache hits we've already observed — otherwise a burst of
+    overcounts on later photos could retroactively erase legitimate
+    cache hits from the projection.
+    """
+    fields = _classification_eta_progress(
+        total=100,
+        seen=40,
+        cached_estimate=50,
+        cache_hits=30,
+        inference_attempts=10,
+        classified=10,
+        elapsed=60,
+        # Absurdly large overcount that would drive corrected estimate
+        # negative if not floored.
+        cache_overcount=1000,
+    )
+
+    # remaining_photos = 60; corrected_cached_estimate floors at
+    # cache_hits (30) so future expected hits = 0.
+    assert fields["remaining_uncached"] == 60
+
+
+def test_classification_eta_subtracts_future_unclassifiable_photos():
+    """Photos the runtime deterministically skips at the ``raw_real_dets``
+    continue branch (real detections but none above the classify floor,
+    not contextual-weak) must not inflate ``remaining_uncached`` — the
+    runtime never enters an inference batch for them, so the ETA
+    otherwise reports a large numeric estimate for a tail that will be
+    traversed almost immediately (Codex #1468 P2).
+    """
+    # 100 photos total; preflight identified 60 as unclassifiable. After
+    # 20 seen (0 skipped so far — the prefix happens to be all
+    # classifiable), we have 20 real inference attempts. The remaining
+    # 80 photos include 60 unclassifiable — only 20 are real work.
+    fields = _classification_eta_progress(
+        total=100,
+        seen=20,
+        cached_estimate=0,
+        cache_hits=0,
+        inference_attempts=20,
+        classified=20,
+        elapsed=120,
+        unclassifiable_estimate=60,
+        unclassifiable_seen=0,
+    )
+
+    assert fields["remaining_uncached"] == 20
+    assert fields["eta_state"] == "ready"
+    assert fields["eta_rate_per_min"] == 10.0
+    assert fields["eta_seconds"] == 120
+
+
+def test_classification_eta_elapsed_is_inference_active_seconds_only():
+    """``elapsed`` is the accumulated inference-active seconds (time
+    spent inside ``_flush_batch``), not walltime since the spec started.
+    Passing walltime would bleed the cache-traversal prefix into the
+    rate: on a spec that walked a cached prefix for 500s before hitting
+    inference, walltime-based ``elapsed`` would derate the inferred
+    rate by that entire prefix, inflating the ETA for the uncached
+    tail (Codex #1468 P2).
+
+    Same 20 inference attempts, same 100-photo total. With walltime-
+    based elapsed (600s including a 500s cache prefix), the rate reads
+    2/min and the 60-photo tail projects to ~30 minutes. With
+    inference-active elapsed (100s of pure model work), the rate reads
+    12/min and the tail projects to 5 minutes.
+    """
+    walltime_fields = _classification_eta_progress(
+        total=100,
+        seen=40,
+        cached_estimate=0,
+        cache_hits=0,
+        inference_attempts=20,
+        classified=20,
+        elapsed=600,  # walltime — includes cache-traversal prefix
+    )
+    inference_only_fields = _classification_eta_progress(
+        total=100,
+        seen=40,
+        cached_estimate=0,
+        cache_hits=0,
+        inference_attempts=20,
+        classified=20,
+        elapsed=100,  # inference-active seconds only
+    )
+
+    # The fix is at the caller (pass inference_seconds, not walltime).
+    # This test pins the contract by demonstrating that the ETA
+    # function relies on the caller to hand it the right denominator —
+    # so a future regression that reverts to walltime here would be
+    # caught immediately by the walltime ETA being ~6x too large.
+    assert walltime_fields["eta_rate_per_min"] == 2.0
+    assert walltime_fields["eta_seconds"] == 1800
+    assert inference_only_fields["eta_rate_per_min"] == 12.0
+    assert inference_only_fields["eta_seconds"] == 300
+
+
+def test_classification_eta_finishing_when_preflight_leaves_no_uncached_work():
+    """When preflight determines the entire remaining collection is either
+    cached or unclassifiable, ``expected_uncached`` collapses to zero and
+    the runtime will never enter an inference batch. In that state the
+    "Estimating after the first uncached batch…" placeholder can never
+    resolve, so the Jobs page would linger on it throughout the traversal.
+    ``_classification_eta_progress`` must instead return ``eta_state ==
+    "finishing"`` so the UI shows the correct signal from tick zero
+    (Codex #1468 P2).
+    """
+    # Fully cached: 100 photos, preflight said all 100 are cached, no
+    # inference has run yet.
+    fully_cached = _classification_eta_progress(
+        total=100,
+        seen=0,
+        cached_estimate=100,
+        cache_hits=0,
+        inference_attempts=0,
+        classified=0,
+        elapsed=0.0,
+    )
+    assert fully_cached["eta_state"] == "finishing"
+    assert fully_cached["eta_seconds"] == 0
+
+    # Fully unclassifiable: 100 photos, preflight said all 100 will be
+    # skipped at the raw_real_dets branch, no inference will run.
+    fully_unclassifiable = _classification_eta_progress(
+        total=100,
+        seen=0,
+        cached_estimate=0,
+        cache_hits=0,
+        inference_attempts=0,
+        classified=0,
+        elapsed=0.0,
+        unclassifiable_estimate=100,
+        unclassifiable_seen=0,
+    )
+    assert fully_unclassifiable["eta_state"] == "finishing"
+    assert fully_unclassifiable["eta_seconds"] == 0
+
+    # Mix that leaves no uncached work: 40 cached + 60 unclassifiable.
+    fully_covered = _classification_eta_progress(
+        total=100,
+        seen=10,
+        cached_estimate=40,
+        cache_hits=10,
+        inference_attempts=0,
+        classified=0,
+        elapsed=0.0,
+        unclassifiable_estimate=60,
+        unclassifiable_seen=0,
+    )
+    assert fully_covered["eta_state"] == "finishing"
+    assert fully_covered["eta_seconds"] == 0
+
+    # A genuinely uncached tail still waits for the first representative
+    # batch — the finishing early-return must not swallow the estimating
+    # state when there is real inference work ahead.
+    uncached_tail = _classification_eta_progress(
+        total=100,
+        seen=0,
+        cached_estimate=50,
+        cache_hits=0,
+        inference_attempts=0,
+        classified=0,
+        elapsed=0.0,
+        unclassifiable_estimate=10,
+        unclassifiable_seen=0,
+    )
+    assert uncached_tail["eta_state"] == "estimating"
+    assert uncached_tail["eta_seconds"] is None
+
+
+def test_classification_eta_unclassifiable_seen_capped_at_estimate():
+    """The seen count for unclassifiable photos should not exceed the
+    preflight estimate — an unexpected extra skip cannot make future
+    unclassifiable count go negative and cancel out real work.
+    """
+    fields = _classification_eta_progress(
+        total=100,
+        seen=40,
+        cached_estimate=0,
+        cache_hits=0,
+        inference_attempts=20,
+        classified=20,
+        elapsed=60,
+        unclassifiable_estimate=10,
+        unclassifiable_seen=15,  # runtime skipped more than preflight said
+    )
+
+    # remaining_photos = 60; expected_future_unclassifiable clamps at 0
+    # (all 10 preflight-predicted skips accounted for by seen), so all
+    # 60 remaining photos count as work.
+    assert fields["remaining_uncached"] == 60
 
 
 def test_pipeline_params_has_skip_classify():
@@ -13757,9 +14089,10 @@ def test_collection_rerun_redoes_only_missing_work(tmp_path, monkeypatch):
         )
         runner = FakeRunner()
         job = _make_job()
-        return run_pipeline_job(job, runner, db_path, ws_id, params)
+        result = run_pipeline_job(job, runner, db_path, ws_id, params)
+        return result, runner
 
-    first = run_once()
+    first, _first_runner = run_once()
     n = len(photo_ids)
     assert first["stages"]["thumbnails"]["generated"] == n, first["stages"]
     assert first["stages"]["previews"]["generated"] == n, first["stages"]
@@ -13769,7 +14102,7 @@ def test_collection_rerun_redoes_only_missing_work(tmp_path, monkeypatch):
     assert inference_calls, "first run never invoked the classifier"
 
     inference_calls.clear()
-    second = run_once()
+    second, second_runner = run_once()
     assert second["stages"]["thumbnails"] == {
         "generated": 0, "skipped": n, "failed": 0,
     }, second["stages"]
@@ -13787,6 +14120,17 @@ def test_collection_rerun_redoes_only_missing_work(tmp_path, monkeypatch):
     assert inference_calls == [], (
         f"rerun invoked the classifier: {inference_calls}"
     )
+    eta_updates = [
+        kw["progress"]
+        for _, step_id, kw in second_runner.step_updates
+        if step_id.startswith("classify:")
+        and isinstance(kw.get("progress"), dict)
+        and kw["progress"].get("eta_kind") == "classification"
+    ]
+    assert eta_updates, "classify step never published cache-aware ETA fields"
+    assert eta_updates[-1]["cache_hits"] == n
+    assert eta_updates[-1]["classified"] == 0
+    assert eta_updates[-1]["eta_state"] == "finishing"
 
 
 # ---------------------------------------------------------------------------

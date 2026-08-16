@@ -311,7 +311,36 @@ body {
   letter-spacing: .025em;
   text-transform: uppercase;
 }
-.location-review-candidate-meta { display: block; color: var(--text-dim); font-size: 10px; margin-top: 3px; line-height: 1.35; }
+.location-review-candidate-meta {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 4px 6px;
+  color: var(--text-dim);
+  font-size: 10px;
+  margin-top: 4px;
+  line-height: 1.35;
+}
+.location-review-candidate-type {
+  --location-type-color: #66717d;
+  display: inline-flex;
+  align-items: center;
+  flex: none;
+  border: 1px solid color-mix(in srgb, var(--location-type-color) 42%, var(--border-primary));
+  border-radius: 999px;
+  padding: 1px 6px;
+  background: color-mix(in srgb, var(--location-type-color) 10%, var(--bg-primary));
+  color: color-mix(in srgb, var(--location-type-color) 70%, var(--text-primary));
+  font-size: 9px;
+  font-weight: 650;
+  line-height: 1.4;
+}
+.location-review-candidate-type--nature { --location-type-color: #218a50; }
+.location-review-candidate-type--locality { --location-type-color: #2674c5; }
+.location-review-candidate-type--region { --location-type-color: #8053b5; }
+.location-review-candidate-type--country { --location-type-color: #b5661b; }
+.location-review-candidate-type--custom { --location-type-color: #66717d; }
+.location-review-candidate-detail { min-width: 0; }
 .location-review-candidate-coordinates {
   display: block;
   color: var(--text-secondary);
@@ -801,19 +830,30 @@ body {
     return 'custom:' + choice.name;
   }
 
+  function candidateType(choice) {
+    if (choice.kind === 'custom') {
+      return {label: 'Custom friendly name', category: 'custom'};
+    }
+    if (choice.kind !== 'google') return null;
+    var naturalLabel = '';
+    (choice.types || []).some(function(type) {
+      if (NATURAL_TYPES[type]) { naturalLabel = NATURAL_TYPES[type]; return true; }
+      return false;
+    });
+    if (naturalLabel) return {label: naturalLabel, category: 'nature'};
+    var category = {
+      'City or town': 'locality',
+      'County or region': 'region',
+      'State or province': 'region',
+      'Country': 'country',
+    }[choice.type_label] || 'place';
+    return {label: choice.type_label || 'Google place', category: category};
+  }
+
   function candidateMeta(choice) {
     var parts = [];
     if (choice.kind === 'keyword') {
       parts.push(formatNumber(choice.photo_count) + (choice.photo_count === 1 ? ' photo' : ' photos'));
-    } else if (choice.kind === 'custom') {
-      parts.push('Custom friendly name');
-    } else {
-      var typeLabel = '';
-      (choice.types || []).some(function(type) {
-        if (NATURAL_TYPES[type]) { typeLabel = NATURAL_TYPES[type]; return true; }
-        return false;
-      });
-      parts.push(typeLabel || choice.type_label || 'Google place');
     }
     if (choice.distance_m != null) parts.push(formatDistance(choice.distance_m) + ' from photo center');
     if (choice.context) parts.push(choice.context);
@@ -917,12 +957,18 @@ body {
       var selected = candidateKey(choice) === candidateKey(state.selectedChoice) ? ' selected' : '';
       var badge = choice.kind === 'keyword'
         ? '<span class="location-review-candidate-badge">Previously used</span>' : '';
+      var type = candidateType(choice);
+      var typeBadge = type
+        ? '<span class="location-review-candidate-type location-review-candidate-type--' + type.category + '">' +
+          escapeHtml(type.label) + '</span>' : '';
+      var meta = candidateMeta(choice);
       var coordinates = state.includeCoordinates ? candidateCoordinates(choice) : '';
       return '<button class="location-review-candidate' + selected + '" type="button" data-candidate-index="' + index + '">' +
         '<span class="location-review-radio"></span><span>' +
         '<span class="location-review-candidate-heading">' +
         '<span class="location-review-candidate-name">' + escapeHtml(choice.name) + '</span>' + badge + '</span>' +
-        '<span class="location-review-candidate-meta">' + escapeHtml(candidateMeta(choice)) + '</span>' +
+        '<span class="location-review-candidate-meta">' + typeBadge +
+        (meta ? '<span class="location-review-candidate-detail">' + escapeHtml(meta) + '</span>' : '') + '</span>' +
         (coordinates ? '<span class="location-review-candidate-coordinates">' + escapeHtml(coordinates) + '</span>' : '') +
         '</span></button>';
     }).join('');

@@ -91,7 +91,38 @@ GOOGLE_MAPS_STUB = """
     };
   }
   function Geocoder() {
-    this.geocode = function(request, callback) { callback([], 'ZERO_RESULTS'); };
+    this.geocode = function(request, callback) {
+      if (!window.__locationReviewIncludeRegions) {
+        callback([], 'ZERO_RESULTS');
+        return;
+      }
+      callback([
+        {
+          place_id: 'san-diego',
+          name: 'San Diego, CA, USA',
+          types: ['locality'],
+          address_components: [{long_name: 'San Diego', types: ['locality']}],
+          formatted_address: 'San Diego, CA, USA',
+          geometry: {location: request.location}
+        },
+        {
+          place_id: 'california',
+          name: 'California, USA',
+          types: ['administrative_area_level_1'],
+          address_components: [{long_name: 'California', types: ['administrative_area_level_1']}],
+          formatted_address: 'California, USA',
+          geometry: {location: request.location}
+        },
+        {
+          place_id: 'united-states',
+          name: 'United States',
+          types: ['country'],
+          address_components: [{long_name: 'United States', types: ['country']}],
+          formatted_address: 'United States',
+          geometry: {location: request.location}
+        }
+      ], 'OK');
+    };
   }
   function Autocomplete() {
     this.bindTo = function() {};
@@ -384,6 +415,54 @@ def test_location_review_suggests_campgrounds_and_can_show_all_nearby_places(
     )
     assert "campground" in requested_types
     assert None in requested_types
+
+
+def test_location_review_color_codes_place_types(live_server, page):
+    """Type pills make natural places and geographic levels easy to scan."""
+    photo_id = live_server["data"]["photos"][0]
+    with live_server["db"].conn:
+        live_server["db"].conn.execute(
+            "UPDATE photos SET latitude = ?, longitude = ? WHERE id = ?",
+            (32.750, -117.000, photo_id),
+        )
+
+    page.add_init_script("window.__locationReviewIncludeRegions = true")
+    page.route(
+        "**/api/config",
+        lambda route: route.fulfill(json={"google_maps_api_key": "test-key"}),
+    )
+    page.route(
+        "https://maps.googleapis.com/maps/api/js**",
+        lambda route: route.fulfill(
+            status=200,
+            content_type="application/javascript",
+            body=GOOGLE_MAPS_STUB,
+        ),
+    )
+    page.goto(f"{live_server['url']}/browse")
+    page.evaluate(
+        "photoId => sessionStorage.setItem('vireoLocationReviewSource', "
+        "JSON.stringify({photo_ids: [photoId]}))",
+        photo_id,
+    )
+    page.goto(f"{live_server['url']}/locations/review?source=selection")
+
+    expected_types = {
+        "Nearby Park": ("Park", "nature"),
+        "San Diego": ("City or town", "locality"),
+        "California": ("State or province", "region"),
+        "United States": ("Country", "country"),
+    }
+    for candidate_name, (type_label, category) in expected_types.items():
+        candidate = page.locator(
+            ".location-review-candidate", has_text=candidate_name
+        )
+        type_badge = candidate.locator(".location-review-candidate-type")
+        expect(type_badge).to_have_text(type_label)
+        expect(type_badge).to_have_class(
+            f"location-review-candidate-type "
+            f"location-review-candidate-type--{category}"
+        )
 
 
 def test_location_review_photo_marker_opens_the_photo_preview(live_server, page):

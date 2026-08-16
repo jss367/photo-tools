@@ -1287,6 +1287,144 @@ def test_browse_photo_id_deep_link_invalidates_older_workspace_load(live_server,
     assert -999 not in result["ids"]
 
 
+# Gate two requests inside the page so the deep-link race is deterministic:
+# hold /api/photos/<id> (the deep link's first await) and the first
+# /api/photos/query POST (the workspace-scoped load a sort change starts while
+# that await is pending). Patching window.fetch in an init script is enough —
+# vireo-api.js captures window.fetch at load, which is after init scripts run.
+_DEEP_LINK_REQUEST_GATE = """
+(() => {
+  const gate = { photoRelease: null, queryRelease: null, queryLanded: false };
+  window.__vireoGate = gate;
+  const targetPath = '/api/photos/__TARGET_ID__';
+  const origFetch = window.fetch;
+  window.fetch = function(input, init) {
+    const self = this;
+    const args = arguments;
+    const url = String((input && input.url) || input || '');
+    const method = String((init && init.method) || 'GET').toUpperCase();
+    if (!gate.photoRelease && method === 'GET' && url.endsWith(targetPath)) {
+      return new Promise(resolve => {
+        gate.photoRelease = () => resolve(origFetch.apply(self, args));
+      });
+    }
+    if (!gate.queryRelease && method === 'POST' && url.indexOf('/api/photos/query') !== -1) {
+      return new Promise(resolve => {
+        gate.queryRelease = () => resolve(
+          origFetch.apply(self, args).then(async response => {
+            // Body is buffered by the time a clone reads it, so this flips
+            // once the app's own .text() is about to resolve too.
+            try { await response.clone().text(); } catch (e) {}
+            gate.queryLanded = true;
+            return response;
+          })
+        );
+      });
+    }
+    return origFetch.apply(self, args);
+  };
+})();
+"""
+
+
+def test_browse_photo_id_deep_link_discards_loads_started_before_folder_switch(
+    live_server, page
+):
+    """A load started before the deep link claimed the folder must be dropped.
+
+    Changing the sort while /api/photos/<id> is still pending runs
+    applyFilters() -> resetAndLoad(), which starts a *workspace-scoped* page-1
+    load. The deep link then takes over the grid for the target's folder. If it
+    only snapshots the epoch that reset installed, that older load still passes
+    its own guard and appends unscoped workspace rows into the folder-scoped
+    window -- and the "N earlier photos aren't loaded" banner ends up counting
+    against a dataset that is no longer on screen (Codex review r3792769108).
+    """
+    db = live_server["db"]
+    folder_a, folder_b = live_server["data"]["folders"]
+    target_id = live_server["data"]["photos"][4]  # robin2 in folder_b
+
+    folder_b_ids = {live_server["data"]["photos"][3], target_id}
+    for idx in range(560):
+        folder_b_ids.add(
+            db.add_photo(
+                folder_id=folder_b,
+                filename=f"yard-before-{idx:02d}.jpg",
+                extension=".jpg",
+                file_size=1000,
+                file_mtime=10 + idx,
+                timestamp=f"2024-01-{(idx % 28) + 1:02d}T00:00:00",
+            )
+        )
+    # Photos outside the target folder that sort ahead of everything under
+    # name_desc, so the workspace-scoped page 1 we hold is made entirely of
+    # foreign rows: a leak is unmistakable in the grid.
+    for idx in range(60):
+        db.add_photo(
+            folder_id=folder_a,
+            filename=f"zz-park-extra-{idx:02d}.jpg",
+            extension=".jpg",
+            file_size=1000,
+            file_mtime=900 + idx,
+            timestamp=f"2025-02-{(idx % 28) + 1:02d}T00:00:00",
+        )
+
+    page.add_init_script(
+        _DEEP_LINK_REQUEST_GATE.replace("__TARGET_ID__", str(target_id))
+    )
+    page.goto(f"{live_server['url']}/browse?photo_id={target_id}")
+
+    # The deep link is parked on /api/photos/<id>.
+    page.wait_for_function("!!(window.__vireoGate && window.__vireoGate.photoRelease)")
+
+    # User changes the sort. activeFolderId is still null, so this reset loads
+    # the unscoped workspace grid -- and we hold its response.
+    # name_desc puts the 560 "yard-before-*" rows ahead of robin2, so the
+    # target lands well past page 1 and the truncated-window banner applies.
+    page.select_option("#sortSelect", "name_desc")
+    page.wait_for_function("!!window.__vireoGate.queryRelease")
+
+    # Let the deep link finish claiming and painting the target folder.
+    page.evaluate("window.__vireoGate.photoRelease()")
+    expect(page.locator(f'.grid-card[data-id="{target_id}"]')).to_be_visible(
+        timeout=5000
+    )
+    page.wait_for_function("browseDatasetReady === true")
+
+    # Now deliver the abandoned workspace load.
+    page.evaluate("window.__vireoGate.queryRelease()")
+    page.wait_for_function("window.__vireoGate.queryLanded === true")
+    # Two frames: any continuation the stale response schedules has run.
+    page.evaluate(
+        "() => new Promise(r => requestAnimationFrame("
+        "() => requestAnimationFrame(r)))"
+    )
+
+    assert page.evaluate("window.activeFolderId") == folder_b
+    loaded_ids = page.evaluate("photos.map(function(p) { return p.id; })")
+    assert loaded_ids
+    assert len(loaded_ids) == len(set(loaded_ids))
+    assert set(loaded_ids) <= folder_b_ids
+    card_ids = page.evaluate(
+        "Array.from(document.querySelectorAll('#grid .grid-card'))"
+        ".map(function(c) { return parseInt(c.dataset.id, 10); })"
+    )
+    assert set(card_ids) <= folder_b_ids
+    assert len(card_ids) == len(loaded_ids)
+
+    # Transparency invariant: the banner's count must describe the window that
+    # is actually on screen, not the abandoned one.
+    offset = page.evaluate("loadedWindowOffset()")
+    assert offset == page.evaluate("(earliestPage - 1) * perPage")
+    assert offset > 0
+    expect(page.locator("#loadPreviousPhotosBanner")).to_be_visible()
+    expect(page.locator("#loadPreviousPhotosText")).to_contain_text(
+        f"{offset:,} earlier photos"
+    )
+    expect(page.locator("#loadPreviousPhotosText")).to_contain_text(f"#{offset + 1:,}")
+    assert page.evaluate("totalPhotos") == len(folder_b_ids)
+
+
 def test_browse_lightbox_arrows_preserve_one_to_one_zoom(live_server, page):
     """Navigating from a 1:1 lightbox view keeps the next photo at 1:1."""
     url = live_server["url"]

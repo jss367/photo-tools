@@ -1799,10 +1799,33 @@ def scan(root, db, progress_callback=None, incremental=False, extract_full_metad
     _check_cancelled()
     if frozen_files is None and status_callback:
         _emit_status("Discovering files...")
-    image_files = (
-        [Path(path) for path in frozen_files]
-        if frozen_files is not None else []
-    )
+    if frozen_files is not None:
+        # A frozen manifest was captured before any per-source scan began, so
+        # a later source can wait minutes behind earlier ones. In that window
+        # a nested child dir, mount, or symlink under this source may be
+        # replaced with (or into) a macOS app-managed library — a swap the
+        # app-level pre-scan mount-identity check cannot see, because it
+        # only revalidates the source root. Rerun the bundle guard on every
+        # frozen path here so the later ``image_path.stat()`` cannot follow
+        # a replacement into ``Photos Library.photoslibrary`` (or a sibling
+        # excluded bundle) and re-trip the TCC prompt this guard exists to
+        # avoid — or catalog files from a substituted subtree.
+        image_files = []
+        excluded_frozen = 0
+        for path in frozen_files:
+            candidate = Path(path)
+            if is_excluded_scan_path(candidate):
+                excluded_frozen += 1
+                continue
+            image_files.append(candidate)
+        if excluded_frozen:
+            log.warning(
+                "Frozen manifest for %s: %d path(s) now resolve into an "
+                "excluded app-managed bundle and were skipped",
+                root, excluded_frozen,
+            )
+    else:
+        image_files = []
 
     # os.walk + onerror, not Path.rglob: rglob silently skips any
     # subdir that raises during enumeration, so a TCC-denied folder

@@ -162,6 +162,96 @@ def test_scan_with_empty_frozen_manifest_iterator_tolerates_missing_root(tmp_pat
     assert result["indexed"] == 0
 
 
+def test_scan_frozen_manifest_rejects_paths_in_excluded_bundle(tmp_path):
+    """Frozen paths that now resolve into an excluded bundle must be skipped.
+
+    Import-in-place freezes a per-source manifest before scanning any source
+    so ``Overall`` stays stable across multi-source imports; a later source
+    can wait minutes behind earlier ones. In that window a child dir or
+    symlink under this source may be swapped so its literal path components
+    (or a component's textual symlink target) now name an app-managed
+    library — ``Photos Library.photoslibrary`` / ``Music Library.musiclibrary``.
+    The app-level pre-scan mount-identity check only revalidates the source
+    root, so without a per-file guard the frozen path passes straight into
+    ``image_path.stat()``, which follows the replacement into the protected
+    bundle and re-trips the macOS TCC "access data from other apps" prompt
+    this repository's excluded-bundle guards exist to avoid.
+    """
+    from db import Database
+    from scanner import scan
+
+    root = str(tmp_path / "photos")
+    _create_test_images(root, {'': ['real.jpg']})
+    bundle_file = str(
+        tmp_path
+        / "photos"
+        / "Photos Library.photoslibrary"
+        / "originals"
+        / "managed.jpg"
+    )
+    os.makedirs(os.path.dirname(bundle_file), exist_ok=True)
+    Image.new('RGB', (200, 100), color='blue').save(bundle_file)
+
+    db = Database(str(tmp_path / "test.db"))
+    result = scan(
+        root,
+        db,
+        discovered_files=[os.path.join(root, "real.jpg"), bundle_file],
+    )
+
+    assert result["discovered"] == 1
+    assert {p['filename'] for p in db.get_photos(per_page=100)} == {'real.jpg'}
+
+
+def test_scan_frozen_manifest_rejects_paths_under_symlinked_bundle(tmp_path):
+    """A subdir replaced with a symlink into an excluded bundle after
+    discovery must not be scanned when the frozen manifest still names it.
+
+    Between discovery and scan a nested child dir can be replaced with a
+    symlink whose textual target points into ``Photos Library.photoslibrary``.
+    The frozen path's literal components do not name a bundle, but a
+    component-by-component symlink walk textually resolves into one, and
+    the later ``image_path.stat()`` would follow it and re-trip the macOS
+    TCC prompt. The per-frozen-path guard walks components textually so it
+    catches the replacement without following the symlink.
+    """
+    from db import Database
+    from scanner import scan
+
+    root = tmp_path / "photos"
+    root.mkdir()
+    (root / "Ordinary").mkdir()
+    Image.new('RGB', (200, 100), color='green').save(
+        root / "Ordinary" / "real.jpg"
+    )
+    frozen_photo = root / "Camera" / "IMG_0001.jpg"
+    frozen_photo.parent.mkdir()
+    Image.new('RGB', (200, 100), color='red').save(frozen_photo)
+
+    # Simulate the replacement: the Camera subdir is removed and replaced
+    # with a symlink pointing into an excluded bundle. os.readlink follows
+    # the textual target during is_excluded_scan_path's per-component walk;
+    # the bundle target does not need to exist for the guard to trip.
+    bundle_dir = tmp_path / "Elsewhere.photoslibrary" / "originals" / "Camera"
+    bundle_dir.mkdir(parents=True)
+    Image.new('RGB', (200, 100), color='blue').save(
+        bundle_dir / "IMG_0001.jpg"
+    )
+    shutil.rmtree(root / "Camera")
+    os.symlink(str(bundle_dir), str(root / "Camera"))
+
+    db = Database(str(tmp_path / "test.db"))
+    frozen = [
+        str(root / "Ordinary" / "real.jpg"),
+        str(root / "Camera" / "IMG_0001.jpg"),
+    ]
+    result = scan(str(root), db, discovered_files=frozen)
+
+    assert result["discovered"] == 1
+    filenames = {p['filename'] for p in db.get_photos(per_page=100)}
+    assert filenames == {'real.jpg'}
+
+
 def test_scan_skips_app_managed_library_bundles(tmp_path):
     """scan() must not descend into macOS app-managed library bundles.
 

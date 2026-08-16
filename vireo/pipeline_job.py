@@ -2105,6 +2105,7 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                                 thumb_cache_dir=effective_thumb_cache_dir,
                                 cancel_check=cancel_check,
                                 pause_check=scan_pause_check,
+                                cancel_only_check=_cancellation_requested,
                                 register_restrict_dirs_as_roots=False,
                                 allow_photo_inserts=False,
                             )
@@ -2981,6 +2982,7 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                         permission_error_callback=_on_denied,
                         cancel_check=cancel_check,
                         pause_check=scan_pause_check,
+                        cancel_only_check=_cancellation_requested,
                     )
                 else:
                     # Scan-in-place: scan each source folder independently.
@@ -3051,6 +3053,7 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                                 permission_error_callback=_on_denied,
                                 cancel_check=cancel_check,
                                 pause_check=scan_pause_check,
+                                cancel_only_check=_cancellation_requested,
                             )
                         finally:
                             advance_scan_acc()

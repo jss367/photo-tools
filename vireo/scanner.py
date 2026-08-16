@@ -1677,7 +1677,7 @@ _EMPTY_SCAN_COUNTS = {
 }
 
 
-def scan(root, db, progress_callback=None, incremental=False, extract_full_metadata=True, photo_callback=None, skip_paths=None, status_callback=None, recursive=True, restrict_dirs=None, restrict_files=None, vireo_dir=None, thumb_cache_dir=None, permission_error_callback=None, cancel_check=None, pause_check=None, skip_working_copies=False, repair_missing_metadata=False, register_restrict_dirs_as_roots=True, allow_photo_inserts=True, counts=None, discovered_files=None):
+def scan(root, db, progress_callback=None, incremental=False, extract_full_metadata=True, photo_callback=None, skip_paths=None, status_callback=None, recursive=True, restrict_dirs=None, restrict_files=None, vireo_dir=None, thumb_cache_dir=None, permission_error_callback=None, cancel_check=None, pause_check=None, cancel_only_check=None, skip_working_copies=False, repair_missing_metadata=False, register_restrict_dirs_as_roots=True, allow_photo_inserts=True, counts=None, discovered_files=None):
     """Walk a folder tree, discover photos, read metadata, populate database.
 
     Args:
@@ -1722,7 +1722,28 @@ def scan(root, db, progress_callback=None, incremental=False, extract_full_metad
             — a "Found 0 images" black box from the user's perspective.
         cancel_check: optional callable returning truthy when the caller
             wants scanning to stop promptly. When set, scan raises
-            ScanCancelled at cancellation checkpoints.
+            ScanCancelled at cancellation checkpoints. This probe MAY
+            park (pipeline callers wire it to ``_pause_checkpoint``
+            which blocks on Pause); it is only called between leases,
+            never inside ``_claim_worker_count``.
+        pause_check: optional NON-parking probe returning truthy when a
+            pause is pending. Checked at every inside-lease boundary so
+            the scanner can raise ``_ScanPauseRequested`` and unwind
+            the lease before the caller's parking ``cancel_check`` runs.
+        cancel_only_check: optional NON-parking probe returning truthy
+            when the job is cancelled (but NOT for pause — that is
+            ``pause_check``'s job). Used inside the lease to detect
+            cancellation without triggering the parking cancel path.
+            Without this, the pause_check/cancel_check ordering has a
+            race window: pause set between the pause probe and the
+            (parking) cancel probe would park the job while still
+            holding CPU permits and the process pool. Callers should
+            pass ``runner.cancellation_requested`` when they have a
+            runner. When omitted, the inside-lease boundaries still
+            call the parking ``cancel_check`` — the race window
+            described in that Codex finding remains open in that
+            fallback path, but nothing regresses vs. the pre-fix
+            behavior.
         skip_working_copies: if True, suppress the end-of-scan
             ``_extract_working_copies`` pass while still running
             ``_pair_raw_jpeg_companions`` (with cache context) and
@@ -2484,6 +2505,31 @@ def scan(root, db, progress_callback=None, incremental=False, extract_full_metad
     def _pause_pending():
         return pause_check is not None and pause_check()
 
+    def _check_cancelled_no_park():
+        """Cancel probe safe to call INSIDE ``_claim_worker_count``.
+
+        Never parks. When ``cancel_only_check`` was supplied the
+        pause/cancel probes are strictly non-parking, so a Pause
+        arriving between the two calls raises ``_ScanPauseRequested``
+        instead of triggering the caller's parking ``cancel_check``.
+        That lets the enclosing frame drain workers and release CPU
+        permits before parking on the outer ``_check_cancelled`` call.
+
+        When ``cancel_only_check`` is not supplied this falls back to
+        the pause-then-parking-cancel sequence with the race window
+        Codex flagged — pause set between the two calls parks the job
+        while it still holds the lease. Not worse than the pre-fix
+        behavior, and every pipeline caller now wires the non-parking
+        probe.
+        """
+        if _pause_pending():
+            raise _ScanPauseRequested()
+        if cancel_only_check is not None:
+            if cancel_only_check():
+                raise ScanCancelled("scan cancelled")
+            return
+        _check_cancelled()
+
     def _iter_features():
         if not files_to_process:
             return
@@ -2541,9 +2587,16 @@ def scan(root, db, progress_callback=None, incremental=False, extract_full_metad
                         # release CPU permits before we park.
                         def _feature_result(fut):
                             while True:
-                                if _pause_pending():
-                                    raise _ScanPauseRequested()
-                                _check_cancelled()
+                                # ``_check_cancelled_no_park`` raises
+                                # ``_ScanPauseRequested`` on pending pause
+                                # and only calls the parking probe if it
+                                # cannot be avoided (no ``cancel_only_check``
+                                # supplied). Closes the race Codex flagged
+                                # where ``_pause_pending`` returns False,
+                                # Pause fires, and the previously-called
+                                # ``_check_cancelled`` parked while still
+                                # inside the lease and pool.
+                                _check_cancelled_no_park()
                                 try:
                                     return fut.result(timeout=0.2)
                                 except TimeoutError:
@@ -2552,9 +2605,7 @@ def scan(root, db, progress_callback=None, incremental=False, extract_full_metad
                         max_in_flight = workers * 4
                         pending = deque()
                         while remaining:
-                            if _pause_pending():
-                                raise _ScanPauseRequested()
-                            _check_cancelled()
+                            _check_cancelled_no_park()
                             image_path, path_str = remaining[0]
                             pending.append((
                                 image_path, path_str,
@@ -2563,9 +2614,7 @@ def scan(root, db, progress_callback=None, incremental=False, extract_full_metad
                             remaining.popleft()
                             if len(pending) >= max_in_flight:
                                 done_path, _done_str, done_fut = pending[0]
-                                if _pause_pending():
-                                    raise _ScanPauseRequested()
-                                _check_cancelled()
+                                _check_cancelled_no_park()
                                 result = _feature_result(done_fut)
                                 if _pause_pending():
                                     raise _ScanPauseRequested()
@@ -2573,9 +2622,7 @@ def scan(root, db, progress_callback=None, incremental=False, extract_full_metad
                                 yield done_path, result
                         while pending:
                             done_path, _done_str, done_fut = pending[0]
-                            if _pause_pending():
-                                raise _ScanPauseRequested()
-                            _check_cancelled()
+                            _check_cancelled_no_park()
                             result = _feature_result(done_fut)
                             if _pause_pending():
                                 raise _ScanPauseRequested()
@@ -2615,14 +2662,18 @@ def scan(root, db, progress_callback=None, incremental=False, extract_full_metad
                 else:
                     paused = False
                     while remaining:
-                        # Pause detection precedes the cancel probe for the
-                        # same reason as the pool branch above: the caller's
-                        # ``cancel_check`` parks on pause, so calling it
-                        # first would keep the lease held for the full pause.
-                        if _pause_pending():
+                        # ``_check_cancelled_no_park`` raises
+                        # ``_ScanPauseRequested`` on pending pause and
+                        # only invokes the parking probe if no
+                        # ``cancel_only_check`` was supplied. Caught and
+                        # translated to ``paused = True`` so this branch
+                        # keeps its "drop the lease, then park outside"
+                        # symmetry with the pool branch above.
+                        try:
+                            _check_cancelled_no_park()
+                        except _ScanPauseRequested:
                             paused = True
                             break
-                        _check_cancelled()
                         image_path, path_str = remaining[0]
                         result = _compute_file_features(path_str)
                         if _pause_pending():

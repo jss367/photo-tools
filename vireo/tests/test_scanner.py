@@ -3576,6 +3576,104 @@ def test_scan_does_not_construct_worker_pool_while_pause_remains_pending(
     assert {os.path.basename(photo["filename"]) for photo in photos} == set(filenames)
 
 
+def test_scan_cancel_only_check_prevents_parking_inside_lease(tmp_path):
+    """Regression: without a non-parking cancel probe, the scanner had
+    a race window inside ``_claim_worker_count``. ``_pause_pending()``
+    returned False, Pause was requested externally, then
+    ``_check_cancelled()`` invoked the parking ``cancel_check`` and
+    parked — while the lease and worker pool were still open. The job
+    reported ``paused`` while retaining every CPU permit, blocking
+    replacement scans and CPU inference for the full pause duration.
+
+    With ``cancel_only_check`` supplied, the inside-lease boundaries
+    use it (non-parking) so a Pause arriving in the race window makes
+    ``_check_cancelled_no_park`` raise ``_ScanPauseRequested``; the
+    enclosing frame drains the pool, releases the lease, and only
+    then parks at the outer ``_check_cancelled``. The parking
+    ``cancel_check`` must NEVER be called while the lease is held —
+    that is the deterministic guarantee.
+
+    Contract: with the fix, ``cancel_check`` is called ONLY after the
+    lease has been released (allocated == 0). The test triggers pause
+    exactly in the race window (between ``pause_check`` and the next
+    boundary) by having ``pause_check`` flip True on its second call
+    from inside the lease.
+    """
+    import threading
+
+    import resource_ledger
+    import scanner
+    from db import Database
+
+    root = str(tmp_path / "photos")
+    _create_test_images(root, {'': [f"{i:02d}.jpg" for i in range(6)]})
+    db = Database(str(tmp_path / "test.db"))
+
+    ledger = resource_ledger.ResourceLedger(cpu_capacity=2)
+    previous = resource_ledger._set_resource_ledger_for_tests(ledger)
+
+    parking_call_allocs = []
+    pause_pending = threading.Event()
+    resume_event = threading.Event()
+    cancel_only_calls = {"n": 0}
+
+    def pause_check():
+        return pause_pending.is_set()
+
+    def cancel_only_check():
+        cancel_only_calls["n"] += 1
+        # Emulate the race: on the third inside-lease probe, flip the
+        # pause pending flag so that IF the code fell back to the
+        # parking cancel_check, it would observe the race window and
+        # park. With the fix, this is the branch that raises
+        # _ScanPauseRequested and unwinds the lease.
+        if cancel_only_calls["n"] == 3 and not pause_pending.is_set():
+            pause_pending.set()
+            threading.Thread(
+                target=lambda: (time.sleep(0.1), resume_event.set()),
+                daemon=True,
+            ).start()
+        return False
+
+    def cancel_check():
+        # This MUST only fire after the lease is released. Capture the
+        # ledger allocation at every call. The parking behavior is
+        # emulated by waiting on resume_event when pause is pending.
+        parking_call_allocs.append(ledger.snapshot()["cpu"]["allocated"])
+        if pause_pending.is_set():
+            resume_event.wait(timeout=5.0)
+            pause_pending.clear()
+        return False
+
+    try:
+        scanner.scan(
+            root,
+            db,
+            cancel_check=cancel_check,
+            pause_check=pause_check,
+            cancel_only_check=cancel_only_check,
+        )
+    finally:
+        resource_ledger._set_resource_ledger_for_tests(previous)
+
+    # Every parking cancel_check call must have observed the lease as
+    # released. Under the pre-fix behavior at least one call would have
+    # fired while the lease was still held (allocated > 0).
+    assert parking_call_allocs, (
+        "cancel_check was never called — the pause path did not park"
+    )
+    assert all(a == 0 for a in parking_call_allocs), (
+        f"Parking cancel_check must never run while the scanner lease "
+        f"is held. Observed CPU allocations at parking calls: "
+        f"{parking_call_allocs!r}. If any is non-zero, the race window "
+        f"where a Pause arriving between pause_check and cancel_check "
+        f"parked the job while retaining CPU permits is still open."
+    )
+    # Every file must still land: pause+resume is not allowed to drop work.
+    photos = db.get_photos(per_page=100)
+    assert len(photos) == 6, f"expected 6 photos indexed, got {len(photos)}"
+
+
 def test_scan_pause_check_none_preserves_existing_behavior(tmp_path):
     """Callers that don't supply ``pause_check`` see the historical
     single-lease hashing path — the new keyword is fully opt-in."""

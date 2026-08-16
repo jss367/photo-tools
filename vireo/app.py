@@ -22149,6 +22149,9 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             def pause_check():
                 return runner.pause_requested(job["id"])
 
+            def cancel_only_check():
+                return runner.cancellation_requested(job["id"])
+
             vireo_dir = os.path.dirname(app.config["THUMB_CACHE_DIR"])
 
             # Per-root failures are caught and recorded rather than
@@ -22200,6 +22203,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                         thumb_cache_dir=app.config["THUMB_CACHE_DIR"],
                         cancel_check=cancel_check,
                         pause_check=pause_check,
+                        cancel_only_check=cancel_only_check,
                         repair_missing_metadata=repair_missing_metadata,
                         counts=root_counts,
                     )
@@ -25357,6 +25361,9 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             def scan_pause_check():
                 return runner.pause_requested(job["id"])
 
+            def scan_cancel_only_check():
+                return runner.cancellation_requested(job["id"])
+
             vireo_dir = os.path.dirname(app.config["THUMB_CACHE_DIR"])
             try:
                 # copy=false: scan_target is the source and restrict_dirs is
@@ -25375,6 +25382,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     restrict_dirs=restrict_dirs,
                     cancel_check=scan_cancel_check,
                     pause_check=scan_pause_check,
+                    cancel_only_check=scan_cancel_only_check,
                 )
             finally:
                 # scanner.scan commits photo rows incrementally, so even a mid-scan
@@ -26715,6 +26723,9 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             def pause_check():
                 return runner.pause_requested(job["id"])
 
+            def cancel_only_check():
+                return runner.cancellation_requested(job["id"])
+
             # Discover every source before processing any of them. Previously
             # each scan discovered its source just-in-time, so the UI called a
             # partial denominator "Overall" and then moved backward when the
@@ -26984,6 +26995,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                         thumb_cache_dir=thumb_cache_dir,
                         cancel_check=cancel_check,
                         pause_check=pause_check,
+                        cancel_only_check=cancel_only_check,
                         # Pair companions during each scan, but defer RAW
                         # working-copy generation until every source has been
                         # cataloged. One combined pass gives the UI a truthful

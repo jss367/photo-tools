@@ -3425,9 +3425,21 @@ function folderLocalStatuses(folders, byParent) {
 
   (localData.folders || []).forEach(function(item) {
     if (!item) return;
-    var visibleId = Number(item.requested_folder_id || item.root_folder_id);
-    if (!rowsById[visibleId]) return;
-    var rootId = Number(item.root_folder_id || item.requested_folder_id);
+    var requestedId = Number(item.requested_folder_id || item.root_folder_id);
+    var visibleId = requestedId;
+    if (!rowsById[visibleId]) {
+      // The requested folder isn't in the tree — commonly because
+      // check_folder_health flipped its rebased folders.path to 'missing'
+      // when the managed local directory was unmounted or deleted, so
+      // /api/folders now excludes it. Dropping the item here loses the
+      // LOCAL ISSUE / SYNCING badge exactly when the local copy needs
+      // attention. Fall back to the nearest visible ancestor so the
+      // status surfaces on the enclosing folder instead.
+      var ancestorId = Number(item.visible_ancestor_folder_id || 0);
+      if (!ancestorId || !rowsById[ancestorId]) return;
+      visibleId = ancestorId;
+    }
+    var rootId = Number(item.root_folder_id || requestedId);
     if (rootId) {
       if (!visibleIdsByRoot[rootId]) visibleIdsByRoot[rootId] = [];
       if (visibleIdsByRoot[rootId].indexOf(visibleId) === -1) {

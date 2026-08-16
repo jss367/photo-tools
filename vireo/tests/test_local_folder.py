@@ -1746,6 +1746,82 @@ def test_ancestor_workspace_materialized_before_stage_rebase(tmp_path):
         db.close()
 
 
+def test_workspace_status_exposes_visible_ancestor_for_missing_local_root(tmp_path):
+    """When a local session's rebased folders.path goes missing (managed local
+    directory unmounted or deleted, so check_folder_health marks it 'missing'
+    and /api/folders drops it), workspace_status must still hand the Browse
+    folder tree an anchor to render the LOCAL ISSUE badge on. The nearest
+    visible ancestor is that anchor; without it the badge disappears exactly
+    when the local copy needs recovery (Codex review r3791982618)."""
+    db = Database(str(tmp_path / "vireo.db"))
+    ws = db.create_workspace("Reviewer")
+    parent = tmp_path / "nas" / "parent"
+    child = parent / "child"
+    child.mkdir(parents=True)
+    (child / "bird.jpg").write_bytes(b"original")
+    parent_id = db.add_folder(str(parent), name="parent", link_to_workspace=False)
+    child_id = db.add_folder(str(child), name="child", parent_id=parent_id, link_to_workspace=False)
+    db.add_workspace_folder(ws, parent_id)
+    db.add_workspace_folder(ws, child_id)
+    try:
+        stage_folder(db, child_id, str(tmp_path / "vireo"))
+
+        # Simulate check_folder_health flipping the rebased child's status to
+        # 'missing' after its managed local dir disappears — get_folder_tree
+        # then excludes the row (/api/folders no longer lists it).
+        db.conn.execute(
+            "UPDATE folders SET status='missing' WHERE id=?", (child_id,)
+        )
+        db.conn.commit()
+
+        db.set_active_workspace(ws)
+        visible_ids = {row["id"] for row in db.get_folder_tree()}
+        assert child_id not in visible_ids, "test premise: missing row is dropped"
+        assert parent_id in visible_ids, "test premise: ancestor still visible"
+
+        status = workspace_status(db, ws, str(tmp_path / "vireo"))
+        descendant = next(
+            item for item in status["folders"]
+            if item["requested_folder_id"] == child_id
+        )
+        assert descendant["visible_ancestor_folder_id"] == parent_id
+        # folder_name gives the frontend something to render if it ever needs
+        # to synthesize a tree entry for a top-level missing root.
+        assert descendant["folder_name"] == "child"
+    finally:
+        db.close()
+
+
+def test_workspace_status_ancestor_is_none_for_top_level_missing_root(tmp_path):
+    """A workspace root that goes missing has no ancestor linked to the
+    workspace. workspace_status must expose visible_ancestor_folder_id=None
+    in that case so the frontend knows the badge can't attach to an ancestor
+    and can fall back to whatever it likes (global banner, workspace panel)."""
+    db = Database(str(tmp_path / "vireo.db"))
+    ws = db.create_workspace("Reviewer")
+    source = tmp_path / "nas" / "photos"
+    source.mkdir(parents=True)
+    (source / "bird.jpg").write_bytes(b"original")
+    folder_id = db.add_folder(str(source), name="photos", link_to_workspace=False)
+    db.add_workspace_folder(ws, folder_id)
+    try:
+        stage_folder(db, folder_id, str(tmp_path / "vireo"))
+        db.conn.execute(
+            "UPDATE folders SET status='missing' WHERE id=?", (folder_id,)
+        )
+        db.conn.commit()
+
+        status = workspace_status(db, ws, str(tmp_path / "vireo"))
+        item = next(
+            entry for entry in status["folders"]
+            if entry["requested_folder_id"] == folder_id
+        )
+        assert item["visible_ancestor_folder_id"] is None
+        assert item["folder_name"] == "photos"
+    finally:
+        db.close()
+
+
 def test_future_ancestor_link_materializes_local_descendants(tmp_path):
     """Linking an ancestor root AFTER a descendant has been staged must still
     discover the rebased descendant. Once staging moves the child's

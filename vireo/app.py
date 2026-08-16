@@ -5909,7 +5909,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         """Combined endpoint for browse page initial load — one request instead of five."""
         import config as cfg
         db = _get_db()
-        page = request.args.get("page", 1, type=int)
+        page = max(1, request.args.get("page", 1, type=int))
         default_per_page = cfg.load().get("photos_per_page", 50)
         per_page = max(1, min(request.args.get("per_page", default_per_page, type=int), _MAX_PER_PAGE))
         sort = request.args.get("sort", "date")
@@ -5974,6 +5974,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             photos = []
             total = 0
             focus_index = None
+            focus_page = page
         else:
             try:
                 photos = db.get_photos(
@@ -5998,11 +5999,11 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     db.conn.rollback()
                     return json_error(str(exc), 400)
             # Photo deep links need the target's position in the exact sort
-            # order used by this first paint.  Returning the zero-based index
-            # lets Browse fetch the contiguous prefix in a handful of large,
-            # bounded requests instead of probing serial 50-photo pages until
-            # the target happens to appear.  Keep the extra ordered-id query
-            # opt-in so ordinary Browse loads retain their existing cost.
+            # order used by this first paint. Returning the zero-based index
+            # and its contiguous prefix from this read snapshot avoids probing
+            # serial 50-photo pages until the target happens to appear. Keep
+            # the extra ordered-id query opt-in so ordinary Browse loads retain
+            # their existing cost.
             #
             # When the target is already in the first-page ``photos`` fetched
             # above (the common case — Highlights and most native actions open
@@ -6012,6 +6013,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             # paint on the documented 100K- and 1M-photo libraries, even when
             # a lookup was never necessary (Codex review r3792637103).
             focus_index = None
+            focus_page = page
             if focus_photo_id is not None:
                 local_index = None
                 for offset, row in enumerate(photos):
@@ -6034,6 +6036,27 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                         focus_index = ordered_ids.index(focus_photo_id)
                     except ValueError:
                         pass
+                # Keep every row through the target on the same SQLite read
+                # snapshot as the position and total above. Splitting this
+                # prefix across parallel offset requests lets concurrent
+                # ingestion/deletion create overlaps, gaps, and stale totals.
+                # A single transaction-consistent response also removes the
+                # serial round-trip cost that made deep links slow while
+                # preserving the contiguous grid/lightbox navigation set.
+                if focus_index is not None:
+                    focus_page = focus_index // per_page + 1
+                    if page != 1 or focus_page > 1:
+                        try:
+                            photos = db.get_photos(
+                                folder_id=folder_id,
+                                collection_id=collection_id,
+                                page=1,
+                                per_page=focus_page * per_page,
+                                sort=sort,
+                            )
+                        except ValueError as exc:
+                            db.conn.rollback()
+                            return json_error(str(exc), 400)
         folders = db.get_folder_tree()
         keywords = db.get_keyword_tree()
         collections = db.get_collections()
@@ -6094,6 +6117,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 "missing_folder_ids": missing_folder_ids,
                 "folder_health_version": folder_health_version,
                 "focus_index": focus_index,
+                "focus_page": focus_page,
             }
         )
         # End the read transaction after every value in the response has been

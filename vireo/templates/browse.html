@@ -9475,99 +9475,6 @@ document.addEventListener('contextmenu', function(e) {
 // interruptions, fall through to whatever refreshBrowseAfterFolderHealthChange
 // last rendered rather than deep-link forever (Codex review r3686778061).
 var _DEEP_LINK_MAX_RETRIES = 5;
-// The photo APIs cap a response at 500 rows.  Deep links use that full budget
-// (rounded down to a whole number of configured Browse pages) and a small
-// worker pool so a target deep in a folder does not require dozens of serial
-// round trips.  The prefix is still loaded contiguously, preserving the
-// existing grid order, scroll range, and lightbox navigation set.
-var _DEEP_LINK_MAX_BATCH_SIZE = 500;
-var _DEEP_LINK_BATCH_CONCURRENCY = 4;
-
-async function _loadDeepLinkPrefix(photoId, focusIndex, shouldContinue) {
-  if (!Number.isInteger(focusIndex) || focusIndex < photos.length) {
-    return null;
-  }
-
-  var pagesPerBatch = Math.max(1, Math.floor(_DEEP_LINK_MAX_BATCH_SIZE / perPage));
-  var batchSize = pagesPerBatch * perPage;
-  var batchCount = Math.floor(focusIndex / batchSize) + 1;
-  var batches = new Array(batchCount);
-  var nextBatch = 0;
-  var sort = document.getElementById('sortSelect').value;
-
-  async function loadBatchWorker() {
-    while (true) {
-      var batchIndex = nextBatch++;
-      if (batchIndex >= batchCount) return;
-      if (shouldContinue && !shouldContinue()) return;
-      var data = await safeFetch('/api/photos/query', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          rules: [],
-          sort: sort,
-          page: batchIndex + 1,
-          per_page: batchSize,
-          folder_id: activeFolderId,
-        }),
-      }, { toast: false });
-      batches[batchIndex] = data.photos || [];
-    }
-  }
-
-  var workers = [];
-  var workerCount = Math.min(_DEEP_LINK_BATCH_CONCURRENCY, batchCount);
-  for (var workerIndex = 0; workerIndex < workerCount; workerIndex++) {
-    workers.push(loadBatchWorker());
-  }
-  await Promise.all(workers);
-  if (shouldContinue && !shouldContinue()) return null;
-
-  var loadedPhotos = [];
-  batches.forEach(function(batch) {
-    loadedPhotos = loadedPhotos.concat(batch || []);
-  });
-  // Parallel offset-paged batches can overlap when ingestion inserts a row
-  // before a boundary, or develop a gap when a row is deleted there.  Either
-  // mutation can leave the target outside the predicted prefix.  Do not
-  // advance currentPage past an inconsistent result: if we see an overlap or
-  // cannot verify the target, leave the first-page bootstrap untouched so the
-  // caller's serial fallback restarts from page 2 against one current ordering
-  // (Codex reviews r3792671672 and r3792693918).
-  var seenIds = new Set();
-  var dedupedPhotos = [];
-  var duplicatesFound = false;
-  loadedPhotos.forEach(function(p) {
-    if (!p || p.id == null) return;
-    if (seenIds.has(p.id)) { duplicatesFound = true; return; }
-    seenIds.add(p.id);
-    dedupedPhotos.push(p);
-  });
-  var targetFound = dedupedPhotos.some(function(p) { return p.id === photoId; });
-  if (duplicatesFound || !targetFound) return null;
-
-  photos = dedupedPhotos;
-  currentPage = batchCount * pagesPerBatch + 1;
-  allLoaded = photos.length >= totalPhotos;
-  renderGrid();
-  updateFilterSummary();
-
-  // loadPhotos() normally starts these non-blocking enrichments once per
-  // appended page.  Preserve that behavior without putting them back on the
-  // critical path or creating one oversized query string.
-  batches.forEach(function(batch) {
-    var refreshIds = (batch || []).map(function(p) { return p.id; });
-    if (!refreshIds.length) return;
-    loadInatStatus(refreshIds).then(function() {
-      if (!shouldContinue || shouldContinue()) refreshGridCards(refreshIds);
-    });
-    fetchColorLabels(refreshIds).then(function() {
-      if (!shouldContinue || shouldContinue()) refreshGridCards(refreshIds);
-    });
-  });
-  return getGridCard(photoId);
-}
-
 async function _runPhotoDeepLink(photoId) {
   // Snapshot the health-refresh generation BEFORE any await. If a
   // vireo:folder-health-changed event fires while this loader is awaiting
@@ -9682,7 +9589,10 @@ async function _runPhotoDeepLink(photoId) {
       loadCollectionCounts();
       photos = initData.photos || [];
       totalPhotos = initData.total || 0;
-      currentPage = 2;
+      var focusPage = parseInt(initData.focus_page, 10);
+      currentPage = (Number.isInteger(focusPage) && focusPage >= 1)
+        ? focusPage + 1
+        : 2;
       if (photos.length >= totalPhotos) allLoaded = true;
       renderGrid();
       browseDatasetReady = true;
@@ -9690,24 +9600,12 @@ async function _runPhotoDeepLink(photoId) {
       deepLinkLoaded = true;
     }
 
-    // Locate the target using the server-reported sort position.  Large,
-    // bounded requests load the same contiguous prefix the old serial scan
-    // produced, but avoid one round trip and DOM append per 50 photos.
-    // Fall back to the old scan if an older server omitted focus_index or if
-    // the library changed enough between the position read and bulk fetch
-    // that the target is not in the predicted prefix.
+    // The focused init response normally includes the full contiguous prefix
+    // through the target from one SQLite read snapshot. Fall back to the old
+    // serial scan for compatibility or if the target disappeared meanwhile.
     if (!isDeepLinkHealthCurrent()) { wasSuperseded = true; return wasSuperseded; }
     if (!isDeepLinkDatasetCurrent()) return wasSuperseded;
     var el = getGridCard(photoId);
-    if (!el && initData && Number.isInteger(initData.focus_index)) {
-      try {
-        el = await _loadDeepLinkPrefix(photoId, initData.focus_index, function() {
-          return isDeepLinkHealthCurrent() && isDeepLinkDatasetCurrent();
-        });
-      } catch (e) { /* serial fallback below */ }
-    }
-    if (!isDeepLinkHealthCurrent()) { wasSuperseded = true; return wasSuperseded; }
-    if (!isDeepLinkDatasetCurrent()) return wasSuperseded;
     if (!el) {
       // loadPhotos() honors the setup guard, so release it before the explicit
       // compatibility/reconciliation scan or it would return immediately.

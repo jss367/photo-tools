@@ -1152,7 +1152,7 @@ def test_browse_photo_id_deep_link_loads_target_folder_first_page(live_server, p
 
 
 def test_browse_photo_id_deep_link_loads_target_after_first_folder_page(live_server, page):
-    """Open in Browse bulk-loads a deep target instead of probing each page."""
+    """Open in Browse returns a deep target in one snapshot-consistent init."""
     db = live_server["db"]
     _, folder_b = live_server["data"]["folders"]
     target_id = live_server["data"]["photos"][4]  # robin2 in folder_b
@@ -1182,98 +1182,7 @@ def test_browse_photo_id_deep_link_loads_target_after_first_folder_page(live_ser
     target_card = page.locator(f'.grid-card[data-id="{target_id}"]')
     expect(target_card).to_be_visible(timeout=5000)
     assert page.evaluate("window.loading") is False
-    assert sorted(
-        (query["page"], query["per_page"]) for query in target_queries
-    ) == [(1, 500), (2, 500)]
-
-
-def test_browse_photo_id_bulk_gap_restarts_from_first_page(live_server, page):
-    """A gap-only batch race must leave the serial fallback at page two."""
-    page.goto(f"{live_server['url']}/browse")
-    page.wait_for_function("browseDatasetReady", timeout=5000)
-
-    result = page.evaluate(
-        """async () => {
-          const originalFetch = window.safeFetch;
-          const targetId = 501;
-          let calls = 0;
-          photos = [{id: -1}];
-          currentPage = 2;
-          allLoaded = false;
-          totalPhotos = 1002;
-          window.safeFetch = async function(_url, options) {
-            calls++;
-            const payload = JSON.parse(options.body);
-            if (payload.page === 1) {
-              return {photos: Array.from({length: 500}, (_, i) => ({id: i + 1}))};
-            }
-            // Model a deletion before the boundary: page 2 starts one row
-            // later, omitting the target without duplicating another id.
-            return {photos: Array.from({length: 500}, (_, i) => ({id: i + 502}))};
-          };
-          try {
-            const card = await _loadDeepLinkPrefix(targetId, 999, () => true);
-            return {
-              cardWasNull: card === null,
-              calls,
-              ids: photos.map(p => p.id),
-              currentPage,
-              allLoaded,
-            };
-          } finally {
-            window.safeFetch = originalFetch;
-          }
-        }"""
-    )
-
-    assert result == {
-        "cardWasNull": True,
-        "calls": 2,
-        "ids": [-1],
-        "currentPage": 2,
-        "allLoaded": False,
-    }
-
-
-def test_browse_photo_id_bulk_load_yields_to_new_dataset(live_server, page):
-    """An in-flight deep-link batch must not replace a newer Browse scope."""
-    page.goto(f"{live_server['url']}/browse")
-    page.wait_for_function("browseDatasetReady", timeout=5000)
-
-    result = page.evaluate(
-        """async () => {
-          const originalFetch = window.safeFetch;
-          const expectedEpoch = loadEpoch;
-          const expectedScope = browseScopeGen;
-          photos = [{id: -1}];
-          currentPage = 2;
-          allLoaded = false;
-          totalPhotos = 500;
-          window.safeFetch = async function() {
-            // Model resetAndLoad() taking ownership while the request is in
-            // flight and installing the first page of the user's new scope.
-            loadEpoch++;
-            browseScopeGen++;
-            photos = [{id: -2}];
-            currentPage = 2;
-            return {photos: Array.from({length: 500}, (_, i) => ({id: i + 1}))};
-          };
-          try {
-            const card = await _loadDeepLinkPrefix(500, 499, function() {
-              return loadEpoch === expectedEpoch && browseScopeGen === expectedScope;
-            });
-            return {
-              cardWasNull: card === null,
-              ids: photos.map(p => p.id),
-              currentPage,
-            };
-          } finally {
-            window.safeFetch = originalFetch;
-          }
-        }"""
-    )
-
-    assert result == {"cardWasNull": True, "ids": [-2], "currentPage": 2}
+    assert target_queries == []
 
 
 def test_browse_lightbox_arrows_preserve_one_to_one_zoom(live_server, page):

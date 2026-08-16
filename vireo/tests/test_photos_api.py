@@ -270,7 +270,9 @@ def test_browse_init_reports_focus_photo_index_in_requested_sort(app_and_db):
     )
 
     assert response.status_code == 200
-    assert response.get_json()["focus_index"] == 1
+    payload = response.get_json()
+    assert payload["focus_index"] == 1
+    assert payload["focus_page"] == 1
 
 
 def test_browse_init_focus_index_is_null_outside_scope(app_and_db):
@@ -290,7 +292,9 @@ def test_browse_init_focus_index_is_null_outside_scope(app_and_db):
     )
 
     assert response.status_code == 200
-    assert response.get_json()["focus_index"] is None
+    payload = response.get_json()
+    assert payload["focus_index"] is None
+    assert payload["focus_page"] == 1
 
 
 def test_browse_init_focus_index_skips_ordered_scan_when_target_on_page(
@@ -323,6 +327,7 @@ def test_browse_init_focus_index_skips_ordered_scan_when_target_on_page(
     assert response.status_code == 200
     payload = response.get_json()
     assert payload["focus_index"] is not None
+    assert payload["focus_page"] == 1
     ids_in_order = [p["id"] for p in payload["photos"]]
     assert payload["focus_index"] == ids_in_order.index(target_id)
     assert ordered_calls == []
@@ -366,8 +371,46 @@ def test_browse_init_focus_index_falls_back_when_target_off_page(
     )
 
     assert response.status_code == 200
-    assert response.get_json()["focus_index"] == 5
+    payload = response.get_json()
+    assert payload["focus_index"] == 5
+    assert payload["focus_page"] == 6
+    assert len(payload["photos"]) == 6
+    assert payload["photos"][-1]["id"] == baseline_id
     assert len(ordered_calls) == 1
+
+
+def test_browse_init_clamps_nonpositive_page_for_focus_index(app_and_db):
+    """A malformed page must not report a negative focused position."""
+    app, db = app_and_db
+    target_id = db.get_photos()[0]["id"]
+
+    response = app.test_client().get(
+        f"/api/browse/init?focus_photo_id={target_id}&page=0&per_page=50"
+    )
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["page"] == 1
+    assert payload["focus_index"] >= 0
+    assert payload["focus_page"] == 1
+
+
+def test_browse_init_focus_on_later_requested_page_returns_prefix(app_and_db):
+    """Focused init always starts its contiguous result at the first row."""
+    app, db = app_and_db
+    ordered_ids = [photo["id"] for photo in db.get_photos(sort="date")]
+    assert len(ordered_ids) >= 2
+
+    response = app.test_client().get(
+        f"/api/browse/init?focus_photo_id={ordered_ids[1]}"
+        "&page=2&per_page=1&sort=date"
+    )
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["focus_index"] == 1
+    assert payload["focus_page"] == 2
+    assert [photo["id"] for photo in payload["photos"]] == ordered_ids[:2]
 
 
 def test_dashboard_options_flags_degraded_collections(app_and_db):

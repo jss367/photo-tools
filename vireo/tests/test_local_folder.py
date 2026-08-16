@@ -2814,6 +2814,32 @@ def test_local_folder_blocker_fingerprint_tracks_residency_transitions(tmp_path,
         assert active["residency_fingerprint"] != remote["residency_fingerprint"]
         assert active["residency_fingerprint"] != ""
 
+        # Folder-health transitions do not mutate local_folders itself, but
+        # they do change whether the local-status payload reports LOCAL or
+        # LOCAL ISSUE. Include mapped folders.status values so a blocker poll
+        # refreshes that payload after disconnect and reconnect events.
+        health_db = Database(db_path)
+        health_db.conn.execute(
+            "UPDATE folders SET status='missing' WHERE id=?", (folder_id,)
+        )
+        health_db.conn.commit()
+        health_db.close()
+        missing = client.get(
+            "/api/workspaces/active/local-folders/blocker"
+        ).get_json()
+        assert missing["residency_fingerprint"] != active["residency_fingerprint"]
+
+        health_db = Database(db_path)
+        health_db.conn.execute(
+            "UPDATE folders SET status='ok' WHERE id=?", (folder_id,)
+        )
+        health_db.conn.commit()
+        health_db.close()
+        restored = client.get(
+            "/api/workspaces/active/local-folders/blocker"
+        ).get_json()
+        assert restored["residency_fingerprint"] != missing["residency_fingerprint"]
+
         discard = client.post(
             "/api/workspaces/active/local-folders/discard",
             json={"folder_ids": [folder_id], "confirm": True},

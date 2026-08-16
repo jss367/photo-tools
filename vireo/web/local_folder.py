@@ -375,12 +375,31 @@ def create_local_folder_blueprint(
                 ORDER BY root_folder_id""",
             tuple(sorted(visible)),
         ).fetchall()
+        health_rows = db.conn.execute(
+            f"""SELECT lfm.root_folder_id, lfm.folder_id,
+                       COALESCE(f.status, '') AS folder_status
+                FROM local_folder_mappings lfm
+                LEFT JOIN folders f ON f.id = lfm.folder_id
+                WHERE lfm.root_folder_id IN ({placeholders})
+                ORDER BY lfm.root_folder_id, lfm.folder_id""",
+            tuple(sorted(visible)),
+        ).fetchall()
+        health_by_root: dict[int, list[str]] = {}
+        for health_row in health_rows:
+            health_by_root.setdefault(
+                int(health_row["root_folder_id"]), []
+            ).append(
+                f"{health_row['folder_id']}:{health_row['folder_status']}"
+            )
         parts = [
-            "{root}:{state}:{activated}:{created}".format(
+            "{root}:{state}:{activated}:{created}:{health}".format(
                 root=row["root_folder_id"],
                 state=row["state"] or "",
                 activated=row["activated_at"] or "",
                 created=row["created_at"] or "",
+                health=",".join(
+                    health_by_root.get(int(row["root_folder_id"]), [])
+                ),
             )
             for row in rows
         ]

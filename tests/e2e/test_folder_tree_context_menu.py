@@ -564,6 +564,57 @@ def test_folder_tree_stale_phantom_reloads_real_folder_tree(
     expect(phantom_row).to_have_count(0, timeout=5000)
 
 
+def test_folder_tree_synthesizes_recovery_when_initial_tree_is_empty(
+    live_server, page
+):
+    """A late local-status response can populate an initially empty tree.
+
+    When every available folder is missing, Browse renders an empty tree
+    before the slower local-folder request completes. The status event must
+    still run the synthesis path so a top-level missing local root appears
+    with its recovery badge (Codex review r3792163591).
+    """
+    page.goto(f"{live_server['url']}/browse")
+    page.locator(".tree-item[data-folder-id]").first.wait_for(state="visible")
+    existing_ids = page.evaluate(
+        "() => Array.from(document.querySelectorAll("
+        "'#folderTree .tree-item[data-folder-id]'))"
+        ".map(el => Number(el.dataset.folderId))"
+    )
+    phantom_id = (max(existing_ids) if existing_ids else 0) + 995_000
+
+    page.evaluate(
+        """([data]) => {
+          window.browseFolderRows = [];
+          document.getElementById('folderTree').innerHTML = '';
+          window.vireoLocalFolderData = data;
+          window.dispatchEvent(new CustomEvent(
+            'vireo:local-folder-status-changed', {detail: {data: data}}
+          ));
+        }""",
+        [{
+            "legacy_workspace_session": False,
+            "folders": [{
+                "requested_folder_id": phantom_id,
+                "root_folder_id": phantom_id,
+                "state": "recovery",
+                "recovery_kind": "stage",
+                "visible_ancestor_folder_id": None,
+                "folder_name": "only-missing-local-root",
+                "workspace_photo_count": 23,
+            }],
+            "jobs": [],
+        }],
+    )
+
+    phantom_row = page.locator(f'.tree-item[data-folder-id="{phantom_id}"]')
+    expect(phantom_row).to_be_visible(timeout=5000)
+    expect(phantom_row.locator(".folder-local-status")).to_have_text(
+        "LOCAL ISSUE"
+    )
+    expect(phantom_row.locator(".count")).to_have_text("23")
+
+
 def test_folder_tree_filter_by_folder_fires_filter(live_server, page):
     """Clicking 'Filter by this folder' sets activeFolderId to that folder."""
     url = live_server["url"]

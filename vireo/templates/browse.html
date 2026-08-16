@@ -3624,7 +3624,6 @@ function folderLocalStatusMarkup(status) {
 }
 
 function refreshFolderLocalStatusIndicators() {
-  if (!browseFolderRows.length) return;
   // Compute statuses from real rows only. If the previously injected
   // phantoms remain in the input, folderLocalStatuses treats them as
   // existing rows and never re-emits them in ``synthetic``, so a still-

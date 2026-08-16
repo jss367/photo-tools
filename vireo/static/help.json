@@ -271,7 +271,7 @@
       "camera",
       "date"
     ],
-    "answer": "Every photo page (Browse, Map, Review, Duplicates) shares one filter bar. Type in the search box and press Enter for a text search, or open Filters for quick rating/flag/color filters and a rule builder over every metadata field — camera, lens, ISO, capture date (including “in the last N months”), species, and more. Active filters appear as chips you can remove individually; the dashed chip shows the page's fixed scope. Flags and colors multi-select into a single “is one of” rule, and typed values suggest real values from your library with live match counts."
+    "answer": "Every photo page (Browse, Map, Review, Duplicates) shares one filter bar. Start typing in the search box to filter text matches immediately. Rating, flag, and color quick filters are always visible below the search box; open Filters for a rule builder over every metadata field — camera, lens, ISO, capture date (including “in the last N months”), species, and more. Active filters appear as chips you can remove individually; the dashed chip shows the page's fixed scope. Flags and colors multi-select into a single “is one of” rule, and typed values suggest real values from your library with live match counts."
   },
   {
     "question": "How do I search photos visually?",

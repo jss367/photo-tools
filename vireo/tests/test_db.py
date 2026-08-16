@@ -18718,6 +18718,54 @@ def test_get_classifier_run_cache_hits_uses_fresh_runtime_candidates(tmp_path):
     assert hits == {p_processed, p_failed}
 
 
+def test_get_classifier_run_cache_hits_includes_noise_full_image_anchor(
+    tmp_path,
+):
+    """Noise-only photos use their cached full-image classifier run."""
+    from db import Database
+    db = Database(str(tmp_path / "test.db"))
+    fid = db.add_folder("/photos", name="photos")
+    p_noise = db.add_photo(
+        folder_id=fid, filename="noise.jpg", extension=".jpg",
+        file_size=1, file_mtime=1.0, timestamp=None, width=1, height=1,
+    )
+    p_person = db.add_photo(
+        folder_id=fid, filename="person.jpg", extension=".jpg",
+        file_size=1, file_mtime=1.0, timestamp=None, width=1, height=1,
+    )
+
+    _add_one_detection(
+        db, p_noise, detector_model="megadetector-v6", conf=0.1,
+    )
+    noise_anchor = _add_one_detection(
+        db, p_noise, detector_model="full-image", conf=0,
+    )
+    db.record_detector_run(p_noise, "megadetector-v6", box_count=1)
+    db.record_classifier_run(
+        noise_anchor, "BioCLIP-2.5", "fp-a", prediction_count=1,
+    )
+
+    db.conn.execute(
+        """INSERT INTO detections
+             (photo_id, detector_model, box_x, box_y, box_w, box_h,
+              detector_confidence, category)
+           VALUES (?, 'megadetector-v6', 0, 0, 1, 1, 0.9, 'person')""",
+        (p_person,),
+    )
+    person_anchor = _add_one_detection(
+        db, p_person, detector_model="full-image", conf=0,
+    )
+    db.record_detector_run(p_person, "megadetector-v6", box_count=1)
+    db.record_classifier_run(
+        person_anchor, "BioCLIP-2.5", "fp-a", prediction_count=1,
+    )
+
+    hits = db.get_classifier_run_cache_hits(
+        [p_noise, p_person], "BioCLIP-2.5", "fp-a",
+    )
+    assert hits == {p_noise}
+
+
 def test_fresh_preflight_reloads_omitted_contextual_weak_candidate(tmp_path):
     """Ordinary cache reuse omits weak rows that runtime later reloads."""
     from db import Database
@@ -19007,12 +19055,8 @@ def test_get_classifier_run_cache_hits_weak_ignores_foreign_detector(tmp_path):
     assert hits == {p}
 
 
-def test_get_unclassifiable_photos_flags_below_threshold_tail(tmp_path):
-    """A photo whose real detections all sit below ``detector_confidence``
-    and is NOT contextual-weak gets skipped at the ``raw_real_dets``
-    continue branch. The ETA must subtract these from remaining work
-    (Codex #1468 P2).
-    """
+def test_get_unclassifiable_photos_keeps_noise_fallback_as_work(tmp_path):
+    """Below-threshold animal noise now receives full-image inference."""
     from db import Database
     db = Database(str(tmp_path / "test.db"))
     fid = db.add_folder("/photos", name="photos")
@@ -19024,7 +19068,7 @@ def test_get_unclassifiable_photos_flags_below_threshold_tail(tmp_path):
     )
     _add_one_detection(db, p_ok, conf=0.5)
 
-    # Below threshold, not contextual weak — SKIPPED at runtime.
+    # Below threshold, not contextual weak — full-image fallback at runtime.
     p_skip = db.add_photo(
         folder_id=fid, filename="skip.jpg", extension=".jpg",
         file_size=1, file_mtime=1.0, timestamp=None, width=1, height=1,
@@ -19051,14 +19095,13 @@ def test_get_unclassifiable_photos_flags_below_threshold_tail(tmp_path):
         contextual_weak_photo_ids={p_weak_rescued},
         weak_confidence=0.12,
     )
-    assert unclassifiable == {p_skip}
+    assert unclassifiable == set()
 
 
-def test_get_unclassifiable_photos_ignores_non_animal_boxes(tmp_path):
+def test_get_unclassifiable_photos_flags_confident_non_animal_boxes(tmp_path):
     """A photo whose only above-threshold boxes are non-animal
     (person/vehicle) has no runtime-classifiable target but IS still
-    skipped at ``raw_real_dets`` (raw includes any real detection at
-    any confidence, animal or not). Verify the query flags it.
+    skipped instead of receiving a wildlife full-image fallback.
     """
     from db import Database
     db = Database(str(tmp_path / "test.db"))
@@ -19082,15 +19125,7 @@ def test_get_unclassifiable_photos_ignores_non_animal_boxes(tmp_path):
 
 
 def test_get_unclassifiable_photos_uses_fresh_detections_when_provided(tmp_path):
-    """On a reclassify run the DB can still hold pre-run detection rows
-    from a legacy detector model (the stale purge runs later in the
-    classify stage). ``fresh_detections_by_photo`` lets the caller
-    scope the "any animal >= floor?" test to the freshly detected
-    boxes the runtime will actually consult, so a photo whose fresh
-    MegaDetector rows are all below the floor doesn't slip out of the
-    preflight-unclassifiable set just because a leftover legacy row
-    is still above it (Codex #1468 P2).
-    """
+    """Fresh non-animal evidence must override a stale animal DB row."""
     from db import Database
     db = Database(str(tmp_path / "test.db"))
     fid = db.add_folder("/photos", name="photos")
@@ -19109,101 +19144,107 @@ def test_get_unclassifiable_photos_uses_fresh_detections_when_provided(tmp_path)
         db, p_still_classifiable, detector_model="megadetector-v6", conf=0.5,
     )
 
-    # A photo whose stale legacy row IS above the floor but whose fresh
-    # detections are all below it. The DB-only view would keep this
-    # photo out of the unclassifiable set; the fresh-scoped view must
-    # flag it because the runtime's ``photo_dets`` filter (which reads
-    # the fresh in-memory map) sees only below-floor boxes.
-    p_fresh_all_low = db.add_photo(
-        folder_id=fid, filename="fresh-low.jpg", extension=".jpg",
+    # A stale animal row makes the DB-only view classifiable, but the current
+    # detector map contains only a confident person box, so runtime skips it.
+    p_fresh_person = db.add_photo(
+        folder_id=fid, filename="fresh-person.jpg", extension=".jpg",
         file_size=1, file_mtime=1.0, timestamp=None, width=1, height=1,
     )
     _add_one_detection(
-        db, p_fresh_all_low, detector_model="megadetector-v5", conf=0.5,
+        db, p_fresh_person, detector_model="megadetector-v5", conf=0.5,
     )
-    _add_one_detection(
-        db, p_fresh_all_low, detector_model="megadetector-v6", conf=0.1,
+    db.conn.execute(
+        """INSERT INTO detections
+             (photo_id, detector_model, box_x, box_y, box_w, box_h,
+              detector_confidence, category)
+           VALUES (?, 'megadetector-v6', 0, 0, 1, 1, 0.9, 'person')""",
+        (p_fresh_person,),
     )
+    db.conn.commit()
 
     fresh_map = {
         p_still_classifiable: [
             {"confidence": 0.5, "category": "animal"},
         ],
-        p_fresh_all_low: [
-            {"confidence": 0.1, "category": "animal"},
+        p_fresh_person: [
+            {"confidence": 0.9, "category": "person"},
         ],
     }
 
     # Sanity: DB-only view returns nothing (both photos have >= floor rows).
     assert db.get_unclassifiable_photos(
-        [p_still_classifiable, p_fresh_all_low],
+        [p_still_classifiable, p_fresh_person],
     ) == set()
 
     unclassifiable = db.get_unclassifiable_photos(
-        [p_still_classifiable, p_fresh_all_low],
+        [p_still_classifiable, p_fresh_person],
         fresh_detections_by_photo=fresh_map,
     )
-    assert unclassifiable == {p_fresh_all_low}
+    assert unclassifiable == {p_fresh_person}
 
 
 def test_get_unclassifiable_photos_db_fallback_for_unprocessed_photos(tmp_path):
     """When ``_detect_batch`` fails for a single image on a reclassify run
     it omits that photo from both ``detections`` and ``processed_ids``,
     and the runtime falls back to ``db.get_detections()`` for it. The
-    preflight must do the same or a below-floor entry in the fresh map
-    (i.e. "no fresh animal, but only because the detector never ran")
-    would flag the photo unclassifiable and the ETA would prematurely
-    subtract inference work the runtime will actually do (Codex #1468 P2).
+    preflight must do the same when the retained DB row is a confident
+    non-animal skip.
     """
     from db import Database
     db = Database(str(tmp_path / "test.db"))
     fid = db.add_folder("/photos", name="photos")
 
-    # Detector completed successfully; fresh rows are all below the floor
-    # → runtime will skip via ``raw_real_dets`` continue, so still flag
-    # unclassifiable.
-    p_processed_low = db.add_photo(
-        folder_id=fid, filename="low.jpg", extension=".jpg",
+    # Detector completed successfully with a confident person box.
+    p_processed_person = db.add_photo(
+        folder_id=fid, filename="person.jpg", extension=".jpg",
         file_size=1, file_mtime=1.0, timestamp=None, width=1, height=1,
     )
-    _add_one_detection(
-        db, p_processed_low, detector_model="megadetector-v6", conf=0.1,
+    db.conn.execute(
+        """INSERT INTO detections
+             (photo_id, detector_model, box_x, box_y, box_w, box_h,
+              detector_confidence, category)
+           VALUES (?, 'megadetector-v6', 0, 0, 1, 1, 0.9, 'person')""",
+        (p_processed_person,),
     )
 
     # Detector RAISED on this photo (missing from ``processed_ids`` AND
     # from ``fresh_detections_by_photo``). DB still holds a prior
-    # above-floor row from a previous run, so the runtime's DB fallback
-    # WILL infer this photo — the preflight must not flag it.
+    # confident person row from a previous run, so runtime's DB fallback skips.
     p_detector_failed = db.add_photo(
         folder_id=fid, filename="failed.jpg", extension=".jpg",
         file_size=1, file_mtime=1.0, timestamp=None, width=1, height=1,
     )
-    _add_one_detection(
-        db, p_detector_failed, detector_model="megadetector-v6", conf=0.5,
+    db.conn.execute(
+        """INSERT INTO detections
+             (photo_id, detector_model, box_x, box_y, box_w, box_h,
+              detector_confidence, category)
+           VALUES (?, 'megadetector-v6', 0, 0, 1, 1, 0.8, 'person')""",
+        (p_detector_failed,),
     )
+    db.conn.commit()
 
     fresh_map = {
-        p_processed_low: [{"confidence": 0.1, "category": "animal"}],
+        p_processed_person: [{"confidence": 0.9, "category": "person"}],
         # p_detector_failed intentionally absent — detector raised.
     }
-    processed_ids = {p_processed_low}
+    processed_ids = {p_processed_person}
 
-    # Without ``fresh_processed_photo_ids``, the old behavior flags both
-    # (p_detector_failed looks like "no fresh animal above floor").
+    # Without processed IDs the missing photo looks like an empty current map,
+    # so only the explicitly present person box is predicted as a skip.
     naive = db.get_unclassifiable_photos(
-        [p_processed_low, p_detector_failed],
+        [p_processed_person, p_detector_failed],
         fresh_detections_by_photo=fresh_map,
     )
-    assert p_detector_failed in naive
+    assert naive == {p_processed_person}
 
     # With ``fresh_processed_photo_ids``, the detector-failed photo falls
-    # back to the DB predicate — DB has a >= floor row, so it's excluded.
+    # back to the DB predicate and its confident person row is also a skip.
     unclassifiable = db.get_unclassifiable_photos(
-        [p_processed_low, p_detector_failed],
+        [p_processed_person, p_detector_failed],
         fresh_detections_by_photo=fresh_map,
         fresh_processed_photo_ids=processed_ids,
     )
-    assert unclassifiable == {p_processed_low}
+    assert unclassifiable == {p_processed_person, p_detector_failed}
 
 
 def test_all_nav_ids_covers_every_page():

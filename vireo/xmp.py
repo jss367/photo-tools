@@ -237,13 +237,12 @@ def read_sync_preview_metadata(xmp_path):
         "edit_recipe": None,
     }
     try:
-        if not path.exists():
-            return empty
-    except OSError:
-        return {**empty, "status": "unreadable"}
-
-    try:
         root = ET.parse(path).getroot()
+    except FileNotFoundError:
+        # Parsing directly avoids a separate stat() before every open.  That
+        # distinction is material when a large sync review lives on SMB/NFS:
+        # one extra network round trip per photo can add minutes.
+        return empty
     except (ET.ParseError, OSError):
         return {**empty, "status": "unreadable"}
 

@@ -470,17 +470,102 @@ input[type=text], input[type=date], select, .path-input, .text-input, .model-sel
 .lightbox-img-wrap.zoomed img {
   cursor: grab;
 }
-.lightbox-zoom-badge {
+.lightbox-zoom-control {
   position: absolute;
   top: 8px;
   left: 8px;
+  z-index: 2;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+  cursor: default;
+}
+.lightbox-zoom-badge {
   background: rgba(0,0,0,0.6);
   color: var(--text-primary);
-  padding: 2px 8px;
+  border: 1px solid rgba(255,255,255,0.24);
+  padding: 3px 9px;
   border-radius: 4px;
   font-size: 11px;
-  pointer-events: none;
-  z-index: 1;
+  font-variant-numeric: tabular-nums;
+  cursor: pointer;
+}
+.lightbox-zoom-badge:hover,
+.lightbox-zoom-badge[aria-expanded="true"] {
+  background: rgba(28,31,34,0.92);
+  border-color: rgba(255,255,255,0.58);
+}
+.lightbox-zoom-badge:focus-visible,
+.lb-zoom-step:focus-visible,
+.lb-zoom-stop:focus-visible,
+.lightbox-zoom-slider:focus-visible {
+  outline: 2px solid #fff;
+  outline-offset: 2px;
+}
+.lightbox-zoom-popover {
+  display: none;
+  align-items: center;
+  gap: 7px;
+  padding: 8px;
+  border: 1px solid rgba(255,255,255,0.24);
+  border-radius: 6px;
+  background: rgba(12,14,16,0.92);
+  box-shadow: 0 8px 24px rgba(0,0,0,0.42);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+}
+.lightbox-zoom-popover.open { display: flex; }
+.lb-zoom-step {
+  width: 28px;
+  height: 28px;
+  flex: 0 0 28px;
+  padding: 0;
+  border: 1px solid rgba(255,255,255,0.35);
+  border-radius: 4px;
+  background: rgba(255,255,255,0.08);
+  color: #f4f7f8;
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+}
+.lb-zoom-step:hover { background: rgba(255,255,255,0.16); }
+.lb-zoom-step:disabled { opacity: 0.45; cursor: default; }
+.lb-zoom-track {
+  position: relative;
+  width: min(180px, 42vw);
+  padding-bottom: 17px;
+}
+.lightbox-zoom-slider {
+  display: block;
+  width: 100%;
+  margin: 0;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+.lb-zoom-stop {
+  position: absolute;
+  bottom: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: rgba(244,247,248,0.68);
+  font-size: 10px;
+  line-height: 1;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.lb-zoom-stop:hover { color: #fff; }
+.lb-zoom-stop:disabled { color: rgba(244,247,248,0.32); cursor: default; }
+.lb-zoom-stop-fit { left: 0; }
+.lb-zoom-stop-native { display: none; transform: translateX(-50%); }
+.lb-zoom-max-label {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  color: rgba(244,247,248,0.52);
+  font-size: 10px;
+  line-height: 1;
 }
 .lightbox-flag-status {
   position: absolute;
@@ -527,12 +612,13 @@ input[type=text], input[type=date], select, .path-input, .text-input, .model-sel
 .lightbox-overlay.lb-hide-chrome .lightbox-close,
 .lightbox-overlay.lb-hide-chrome .lightbox-nav,
 .lightbox-overlay.lb-hide-chrome .lightbox-actions,
-.lightbox-overlay.lb-hide-chrome .lightbox-adjust-panel {
+.lightbox-overlay.lb-hide-chrome .lightbox-adjust-panel,
+.lightbox-overlay.lb-hide-chrome .lightbox-zoom-control {
   display: none !important;
 }
 .lightbox-overlay.lb-hide-info .lightbox-filename,
 .lightbox-overlay.lb-hide-info #lightboxCounter,
-.lightbox-overlay.lb-hide-info .lightbox-zoom-badge {
+.lightbox-overlay.lb-hide-info .lightbox-zoom-control {
   display: none !important;
 }
 .lightbox-bottom-bar {
@@ -3483,7 +3569,27 @@ async function createWorkspace() {
   <div id="lightboxPrev" class="lightbox-nav" onclick="event.stopPropagation(); lightboxNav(-1);" style="position:absolute;left:12px;top:50%;transform:translateY(-50%);font-size:36px;color:rgba(255,255,255,0.5);cursor:pointer;padding:16px;user-select:none;z-index:10001;" title="Previous (←)">&#9664;</div>
   <div id="lightboxNext" class="lightbox-nav" onclick="event.stopPropagation(); lightboxNav(1);" style="position:absolute;right:12px;top:50%;transform:translateY(-50%);font-size:36px;color:rgba(255,255,255,0.5);cursor:pointer;padding:16px;user-select:none;z-index:10001;" title="Next (→)">&#9654;</div>
   <div class="lightbox-img-wrap" id="lightboxWrap" onclick="event.stopPropagation(); if (!_lbVisualTransitionPending && Math.abs(_lbZoom - 1.0) < 0.001 && !window._lightboxZoomHandled) toggleLightboxZoom(event); window._lightboxZoomHandled = false;">
-    <span class="lightbox-zoom-badge" id="lightboxZoomBadge" style="display:none;">1:1</span>
+    <div class="lightbox-zoom-control" id="lightboxZoomControl" onclick="event.stopPropagation();">
+      <button type="button" class="lightbox-zoom-badge" id="lightboxZoomBadge"
+              aria-haspopup="true" aria-expanded="false"
+              onclick="toggleLightboxZoomPopover();" title="Zoom controls">Fit</button>
+      <div class="lightbox-zoom-popover" id="lightboxZoomPopover" role="group" aria-label="Zoom controls">
+        <button type="button" class="lb-zoom-step" id="lightboxZoomOut"
+                onclick="stepLightboxZoom(-1);" aria-label="Zoom out" title="Zoom out (−)">−</button>
+        <div class="lb-zoom-track">
+          <input type="range" class="lightbox-zoom-slider" id="lightboxZoomSlider"
+                 min="0" max="1000" step="1" value="0" aria-label="Zoom level"
+                 aria-valuetext="Fit" oninput="setLightboxZoomFromSlider(this.value);">
+          <button type="button" class="lb-zoom-stop lb-zoom-stop-fit"
+                  onclick="setLightboxZoomToFit();">Fit</button>
+          <button type="button" class="lb-zoom-stop lb-zoom-stop-native" id="lightboxZoomNativeStop"
+                  onclick="setLightboxZoomToOneToOne();">1:1</button>
+          <span class="lb-zoom-max-label" id="lightboxZoomMaxLabel">400%</span>
+        </div>
+        <button type="button" class="lb-zoom-step" id="lightboxZoomIn"
+                onclick="stepLightboxZoom(1);" aria-label="Zoom in" title="Zoom in (+)">+</button>
+      </div>
+    </div>
     <div class="lightbox-transform" id="lightboxTransform">
       <img id="lightboxImg" src="" alt="">
       <canvas id="lightboxToneCanvas" class="lb-tone-canvas" aria-hidden="true"></canvas>
@@ -3684,6 +3790,13 @@ async function createWorkspace() {
 <script>
 var _lightboxPhotoList = [];  // list of {id, filename} for arrow navigation
 var _lightboxCurrentId = null;
+// `_lightboxCurrentId` advances immediately when navigation targets a new
+// photo; the visible bitmap is deliberately held on the previous frame until
+// the replacement finishes decoding. `_lightboxCommittedId` tracks that
+// visible identity — the photo the user is actually looking at — and is what
+// `lightbox:closed` reports so a close mid-navigation reconciles Browse to
+// the photo that was on screen, not the one that was still loading.
+var _lightboxCommittedId = null;
 
 var _lbZoom = 1.0;          // current zoom (1.0 = fit)
 var _lbPanX = 0;            // pan translation in CSS pixels
@@ -5811,7 +5924,7 @@ function _lbApplyViewportState(state) {
   var wrap = document.getElementById('lightboxWrap');
   if (!wrap) return false;
 
-  var maxZoom = _lbNativeZoom ? _lbNativeZoom * 4 : 4;
+  var maxZoom = _lbMaxZoom();
   var targetZoom = state.zoom || 1.0;
   if (state.oneToOne) {
     if (_lbNativeZoom) {
@@ -6206,6 +6319,7 @@ function _lbApplyInfoVisibility() {
 
 function toggleLightboxInfo() {
   _lbInfoVisible = !_lbInfoVisible;
+  if (!_lbInfoVisible) _lbSetZoomPopoverOpen(false);
   _lbPersistBool('vireo.lb.infoVisible', _lbInfoVisible);
   _lbApplyInfoVisibility();
 }
@@ -6219,6 +6333,7 @@ function _lbApplyChromeVisibility() {
 
 function toggleLightboxChrome() {
   _lbChromeVisible = !_lbChromeVisible;
+  if (!_lbChromeVisible) _lbSetZoomPopoverOpen(false);
   _lbPersistBool('vireo.lb.chromeVisible', _lbChromeVisible);
   _lbApplyChromeVisibility();
 }
@@ -7163,6 +7278,7 @@ function openLightbox(photoId, filename, photoList, options) {
     }
     if (!visibleIdentityCommitted) {
       visibleIdentityCommitted = true;
+      _lightboxCommittedId = photoId;
       try {
         document.dispatchEvent(new CustomEvent('lightbox:photochanged', {
           detail: { photoId: photoId }
@@ -7177,7 +7293,6 @@ function openLightbox(photoId, filename, photoList, options) {
   wrap.classList.toggle('zoomed', transitionZoom > 1.001);
   wrap.scrollTop = 0;
   wrap.scrollLeft = 0;
-  document.getElementById('lightboxZoomBadge').style.display = 'none';
   // Clear previous detection overlays
   var detContainer = document.getElementById('lightboxDetections');
   if (detContainer) detContainer.innerHTML = '';
@@ -7206,6 +7321,7 @@ function openLightbox(photoId, filename, photoList, options) {
   ) ? 'original' : 'full';
   _lbFullLongEdge = null;
   _lbPending1To1 = restoreWantsOneToOne;
+  _lbUpdateZoomControl();
   // The deferred-1:1 anchor is a client-space click coordinate scoped to the
   // PREVIOUS photo. Clear it on every open so a 1:1-preserving navigation (or a
   // swap still in flight from the prior photo) snaps centered instead of reusing
@@ -7523,13 +7639,112 @@ function lightboxKeyMatchesConfiguredBrowseShortcut(e) {
   return false;
 }
 
-function toggleLightboxZoom(e) {
-  // Fit to 1:1 toggle. Preserved for existing 'z' shortcut and click-to-zoom.
-  var wrap = document.getElementById('lightboxWrap');
+function _lbMaxZoom() {
+  return _lbNativeZoom ? _lbNativeZoom * 4 : 4;
+}
+
+function _lbZoomSliderPosition(zoom) {
+  var maxZoom = _lbMaxZoom();
+  if (maxZoom <= 1.001) return 0;
+  return Math.max(0, Math.min(1000, Math.log(Math.max(1, zoom)) / Math.log(maxZoom) * 1000));
+}
+
+function _lbZoomFromSliderPosition(position) {
+  var maxZoom = _lbMaxZoom();
+  if (maxZoom <= 1.001) return 1;
+  var ratio = Math.max(0, Math.min(1, Number(position) / 1000));
+  return Math.exp(Math.log(maxZoom) * ratio);
+}
+
+function _lbZoomDisplayText() {
+  if (_lbPending1To1) return 'Loading 1:1';
+  if (_lbZoom <= 1.001) return 'Fit';
+  if (_lbNativeZoom) return Math.round((_lbZoom / _lbNativeZoom) * 100) + '%';
+  var fitMultiple = Math.round(_lbZoom * 10) / 10;
+  return fitMultiple + '\u00d7 Fit';
+}
+
+function _lbNativeSliderPercent() {
+  return _lbNativeZoom ? _lbZoomSliderPosition(_lbNativeZoom) / 10 : 0;
+}
+
+function _lbNativeCoincidesWithFit() {
+  return !!_lbNativeZoom && _lbNativeZoom <= 1.001;
+}
+
+function _lbUpdateZoomControl() {
+  var badge = document.getElementById('lightboxZoomBadge');
+  var slider = document.getElementById('lightboxZoomSlider');
+  var nativeStop = document.getElementById('lightboxZoomNativeStop');
+  var fitStop = document.querySelector('.lb-zoom-stop-fit');
+  var maxLabel = document.getElementById('lightboxZoomMaxLabel');
+  var zoomOut = document.getElementById('lightboxZoomOut');
+  var zoomIn = document.getElementById('lightboxZoomIn');
+  var text = _lbZoomDisplayText();
+
+  if (badge) {
+    badge.textContent = text;
+    badge.title = 'Zoom: ' + text + '. Open zoom controls';
+  }
+  if (slider) {
+    slider.value = String(Math.round(_lbZoomSliderPosition(_lbZoom)));
+    slider.setAttribute('aria-valuetext', text);
+    slider.disabled = !!_lbVisualTransitionPending;
+  }
+  if (zoomOut) zoomOut.disabled = _lbVisualTransitionPending || _lbZoom <= 1.001;
+  if (zoomIn) zoomIn.disabled = _lbVisualTransitionPending || _lbZoom >= _lbMaxZoom() - 0.001;
+
+  var combinedFitNative = _lbNativeCoincidesWithFit();
+  if (fitStop) {
+    fitStop.textContent = combinedFitNative ? 'Fit \u00b7 1:1' : 'Fit';
+    fitStop.disabled = !!_lbVisualTransitionPending;
+  }
+  if (nativeStop) {
+    var nativePosition = _lbNativeSliderPercent();
+    nativeStop.disabled = !!_lbVisualTransitionPending;
+    // When fit and 1:1 are visually indistinguishable, combine the labels at the
+    // left edge. Otherwise keep 1:1 at least 8% along the track so a near-fit
+    // native stop remains separate and clickable without overlapping Fit.
+    nativeStop.style.display = (_lbNativeZoom && !combinedFitNative) ? 'inline-block' : 'none';
+    nativeStop.style.left = Math.max(8, nativePosition) + '%';
+  }
+  if (maxLabel) maxLabel.textContent = _lbNativeZoom ? '400%' : '4\u00d7 Fit';
+}
+
+function _lbSetZoomPopoverOpen(open) {
+  var popover = document.getElementById('lightboxZoomPopover');
+  var badge = document.getElementById('lightboxZoomBadge');
+  if (popover) popover.classList.toggle('open', !!open);
+  if (badge) badge.setAttribute('aria-expanded', open ? 'true' : 'false');
+}
+
+function toggleLightboxZoomPopover() {
+  var popover = document.getElementById('lightboxZoomPopover');
+  _lbSetZoomPopoverOpen(!(popover && popover.classList.contains('open')));
+}
+
+function setLightboxZoomFromSlider(position) {
+  if (_lbVisualTransitionPending) return;
+  _lbClearPendingViewportRestore();
+  _lbSetZoom(_lbZoomFromSliderPosition(position), null, null);
+}
+
+function stepLightboxZoom(direction) {
+  if (_lbVisualTransitionPending) return;
+  _lbClearPendingViewportRestore();
+  _lbSetZoom(_lbZoom * (direction > 0 ? 1.25 : 0.8), null, null);
+}
+
+function setLightboxZoomToFit() {
+  if (_lbVisualTransitionPending) return;
+  _lbClearPendingViewportRestore();
+  _lbSetZoom(1.0, null, null);
+}
+
+function setLightboxZoomToOneToOne(e) {
+  if (_lbVisualTransitionPending) return;
   var img = document.getElementById('lightboxImg');
   if (!img) return;
-  // Explicit user zoom toggle ('z' shortcut or click-to-zoom) supersedes any
-  // restore carried over by arrow navigation.
   _lbClearPendingViewportRestore();
 
   // If we don't know native zoom yet (e.g. dimensions fetch still pending),
@@ -7538,40 +7753,47 @@ function toggleLightboxZoom(e) {
     _lbRecomputeNativeZoom();
   }
 
-  // A deferred 1:1 leaves _lbZoom at 1 while the high-res source loads, so treat
-  // a pending 1:1 as "zoomed" too — otherwise a second toggle re-enters the
-  // zoom-in path and the image still snaps to 1:1 once it finishes loading.
-  var isZoomed = _lbZoom > 1.001 || _lbPending1To1;
-  if (isZoomed) {
-    _lbSetZoom(1.0, null, null);
-    _lbPending1To1 = false;
-    _lbPending1To1Anchor = null;
-  } else {
-    // Anchor zoom on click position (or center if no event)
-    var rect = img.getBoundingClientRect();
-    var anchorX = e && e.clientX ? e.clientX : rect.left + rect.width / 2;
-    var anchorY = e && e.clientY ? e.clientY : rect.top + rect.height / 2;
-    if (_lbNativeZoom) {
-      var desiredSource = _lbPickSourceKey(_lbNativeZoom);
-      if (desiredSource !== _lbCurrentSrcKey) {
-        _lbPending1To1 = true;
-        _lbPending1To1Anchor = { x: anchorX, y: anchorY };
-        _lbScheduleSourceSwap(_lbNativeZoom);
-        _lbApplyTransform();
-      } else {
-        _lbSetZoom(_lbNativeZoom, anchorX, anchorY);
-        _lbPending1To1 = false;
-        _lbPending1To1Anchor = null;
-      }
-    } else {
-      // Dimensions unknown. Load the high-resolution source first, then apply
-      // 1:1 after the browser has decoded it; otherwise the user sees an
-      // enlarged preview and reads that as a soft 1:1 view.
+  // Anchor zoom on click position (or center for the slider's 1:1 stop).
+  var rect = img.getBoundingClientRect();
+  var anchorX = e && e.clientX ? e.clientX : rect.left + rect.width / 2;
+  var anchorY = e && e.clientY ? e.clientY : rect.top + rect.height / 2;
+  if (_lbNativeZoom) {
+    var desiredSource = _lbPickSourceKey(_lbNativeZoom);
+    // Compare source ranks (not exact key equality) so an already-sharper
+    // current tier — e.g. /original loaded during a previous 1:1 view when
+    // the picked tier for _lbNativeZoom is /2560 — satisfies 1:1 immediately.
+    // The exact-key check would otherwise enter the deferred path, leave the
+    // badge at 'Loading 1:1' while a lower tier is fetched, and could strand
+    // _lbPending1To1 if that fetch failed.
+    if (_lbSrcRank(_lbCurrentSrcKey) < _lbSrcRank(desiredSource)) {
       _lbPending1To1 = true;
       _lbPending1To1Anchor = { x: anchorX, y: anchorY };
-      _lbScheduleSourceSwap(4);
+      _lbScheduleSourceSwap(_lbNativeZoom);
       _lbApplyTransform();
+    } else {
+      _lbSetZoom(_lbNativeZoom, anchorX, anchorY, true);
+      _lbPending1To1 = false;
+      _lbPending1To1Anchor = null;
     }
+  } else {
+    // Dimensions unknown. Load the high-resolution source first, then apply
+    // 1:1 after the browser has decoded it; otherwise the user sees an
+    // enlarged preview and reads that as a soft 1:1 view.
+    _lbPending1To1 = true;
+    _lbPending1To1Anchor = { x: anchorX, y: anchorY };
+    _lbScheduleSourceSwap(4);
+    _lbApplyTransform();
+  }
+}
+
+function toggleLightboxZoom(e) {
+  // Fit to 1:1 toggle. Preserved for the existing 'z' shortcut and image click.
+  // A deferred 1:1 leaves _lbZoom at fit while the sharp source loads, so treat
+  // that pending state as zoomed and allow a second toggle to cancel it.
+  if (_lbZoom > 1.001 || _lbPending1To1) {
+    setLightboxZoomToFit();
+  } else {
+    setLightboxZoomToOneToOne(e);
   }
 }
 
@@ -7584,6 +7806,7 @@ function toggleLightboxZoom(e) {
     if (!wrap) return;
     // Only react to wheel events over the image wrap
     if (!wrap.contains(e.target) && e.target !== wrap) return;
+    if (e.target.closest('.lightbox-zoom-control')) return;
 
     e.preventDefault();
     if (_lbVisualTransitionPending) return;
@@ -7709,6 +7932,7 @@ function toggleLightboxZoom(e) {
     var wrap = document.getElementById('lightboxWrap');
     if (!wrap || _lbZoom <= 1.001) return;
     if (e.target.tagName === 'BUTTON' || e.target.closest('button')) return;
+    if (e.target.closest('.lightbox-zoom-control')) return;
     if (!wrap.contains(e.target) && e.target !== wrap) return;
     dragging = true;
     didDrag = false;
@@ -7751,6 +7975,13 @@ function toggleLightboxZoom(e) {
 
 function closeLightbox(e) {
   if (e && e.target && e.target.tagName === 'IMG') return;
+  // Use the last committed (visible) identity, not `_lightboxCurrentId` —
+  // that advances immediately at the start of navigation while the outgoing
+  // bitmap is still on screen, so it names a photo the user never actually
+  // viewed if the incoming /full is still loading when the user closes.
+  var closedPhotoId = _lightboxCommittedId != null
+    ? _lightboxCommittedId
+    : _lightboxCurrentId;
   _lbFlushPendingAdjustmentSave();
   if (_lightboxCurrentId != null) _lbSaveViewportState(_lightboxCurrentId);
   var wasOpen = !!window._lbEscToken;
@@ -7775,12 +8006,17 @@ function closeLightbox(e) {
   if (adjustPanel) adjustPanel.classList.remove('open');
   var adjustBtn = document.getElementById('lightboxAdjustBtn');
   if (adjustBtn) adjustBtn.textContent = 'Adjust';
+  _lbSetZoomPopoverOpen(false);
   _lbApplyTransform();
   document.getElementById('lightboxOverlay').classList.remove('active');
   document.getElementById('lightboxImg').src = '';
-  document.getElementById('lightboxZoomBadge').style.display = 'none';
   _lightboxCurrentId = null;
-  try { document.dispatchEvent(new CustomEvent('lightbox:closed')); } catch(_) {}
+  _lightboxCommittedId = null;
+  try {
+    document.dispatchEvent(new CustomEvent('lightbox:closed', {
+      detail: { photoId: closedPhotoId }
+    }));
+  } catch(_) {}
   _lbSetFlagStatus(undefined);
   var detContainer = document.getElementById('lightboxDetections');
   if (detContainer) detContainer.innerHTML = '';
@@ -8355,6 +8591,20 @@ function lightboxDelete() {
       return;
     }
 
+    // Update the browse grid before touching lightbox state. Otherwise
+    // Browse's `lightbox:closed` handler still finds the deleted row in
+    // `photos` and re-selects it (loading stale detail state that this
+    // block would then null out — leaving the sidebar blank).
+    if (typeof photos !== 'undefined' && typeof renderGrid === 'function') {
+      photos = photos.filter(function(x) { return x.id !== currentId; });
+      selectedPhotos.delete(currentId);
+      if (selectedPhotoId === currentId) selectedPhotoId = null;
+      renderGrid();
+      if (typeof refreshBrowseSidebarCounts === 'function') {
+        refreshBrowseSidebarCounts();
+      }
+    }
+
     // Remove from lightbox photo list
     var idx = _lightboxPhotoList.findIndex(function(x) { return x.id === currentId; });
     _lightboxPhotoList.splice(idx, 1);
@@ -8365,17 +8615,6 @@ function lightboxDelete() {
       var nextIdx = Math.min(idx, _lightboxPhotoList.length - 1);
       var next = _lightboxPhotoList[nextIdx];
       openLightbox(next.id, next.filename, _lightboxPhotoList);
-    }
-
-    // Also update browse grid if we're on the browse page
-    if (typeof photos !== 'undefined' && typeof renderGrid === 'function') {
-      photos = photos.filter(function(x) { return x.id !== currentId; });
-      selectedPhotos.delete(currentId);
-      if (selectedPhotoId === currentId) selectedPhotoId = null;
-      renderGrid();
-      if (typeof refreshBrowseSidebarCounts === 'function') {
-        refreshBrowseSidebarCounts();
-      }
     }
 
     try {
@@ -8974,26 +9213,16 @@ function _lbApplyTransform() {
   var t = document.getElementById('lightboxTransform');
   if (!t) return;
   var metrics = _lbUpdateLayoutMetrics();
-  if (!metrics) return;
+  if (!metrics) {
+    _lbUpdateZoomControl();
+    return;
+  }
   var renderedW = metrics.w * metrics.scale;
   var renderedH = metrics.h * metrics.scale;
   var tx = (metrics.wrapW - renderedW) / 2 + _lbPanX;
   var ty = (metrics.wrapH - renderedH) / 2 + _lbPanY;
   t.style.transform = 'translate(' + tx + 'px, ' + ty + 'px) scale(' + metrics.scale + ')';
-  var badge = document.getElementById('lightboxZoomBadge');
-  if (!badge) return;
-  if (_lbPending1To1) {
-    badge.style.display = '';
-    badge.textContent = 'loading 1:1';
-  } else if (_lbZoom <= 1.001) {
-    badge.style.display = 'none';
-  } else if (_lbNativeZoom) {
-    badge.style.display = '';
-    badge.textContent = Math.round((_lbZoom / _lbNativeZoom) * 100) + '%';
-  } else {
-    badge.style.display = '';
-    badge.textContent = 'zoom';
-  }
+  _lbUpdateZoomControl();
 }
 
 function _lbOrientedPhotoDims(img) {
@@ -9106,14 +9335,32 @@ function _lbRecomputeNativeZoom() {
   _lbApplyTransform();
 }
 
-function _lbSetZoom(newZoom, anchorClientX, anchorClientY) {
+function _lbSyncSourceForZoom(targetZoom, preserveSharperSource) {
+  var desiredSource = _lbPickSourceKey(targetZoom);
+  if (preserveSharperSource && _lbSrcRank(_lbCurrentSrcKey) > _lbSrcRank(desiredSource)) {
+    // The current pixels already exceed this zoom's requirement. Cancel any
+    // queued downgrade and retain them; this is especially important for the
+    // explicit 1:1 stop, where replacing /original with a lower tier adds work
+    // and can leave a failed non-original swap stranded.
+    if (_lbSwapTimer) {
+      clearTimeout(_lbSwapTimer);
+      _lbSwapTimer = null;
+    }
+    _lbDesiredSrcKey = _lbCurrentSrcKey;
+    _lbPrimeAdjacentPhotos(_lbCurrentSrcKey);
+    return;
+  }
+  _lbScheduleSourceSwap(targetZoom);
+}
+
+function _lbSetZoom(newZoom, anchorClientX, anchorClientY, preserveSharperSource) {
   // Any zoom mutation cancels a pending "upgrade to 1:1 on original-load" intent.
   // Callers that still want it (toggleLightboxZoom's fallback path) re-set the flag
   // after calling us.
   _lbPending1To1 = false;
   _lbPending1To1Anchor = null;
   // Clamp to valid range. Max is 4x native (or 4x fit if no nativeZoom).
-  var maxZoom = _lbNativeZoom ? _lbNativeZoom * 4 : 4;
+  var maxZoom = _lbMaxZoom();
   newZoom = Math.max(1.0, Math.min(maxZoom, newZoom));
   var wrap = document.getElementById('lightboxWrap');
   var t = document.getElementById('lightboxTransform');
@@ -9128,7 +9375,7 @@ function _lbSetZoom(newZoom, anchorClientX, anchorClientY) {
     }
     wrap.classList.toggle('zoomed', _lbZoom > 1.001);
     _lbApplyTransform();
-    _lbScheduleSourceSwap();
+    _lbSyncSourceForZoom(newZoom, preserveSharperSource);
     _lbSaveViewportState(_lightboxCurrentId);
     return;
   }
@@ -9164,7 +9411,7 @@ function _lbSetZoom(newZoom, anchorClientX, anchorClientY) {
   _lbClampPan();
   wrap.classList.toggle('zoomed', _lbZoom > 1.001);
   _lbApplyTransform();
-  _lbScheduleSourceSwap();
+  _lbSyncSourceForZoom(newZoom, preserveSharperSource);
   _lbSaveViewportState(_lightboxCurrentId);
 }
 
@@ -10820,6 +11067,9 @@ function formatDuration(seconds) {
           _historySessionCount = Math.max(0, _historySessionCount - 1);
           document.getElementById('historyBadge').textContent = _historySessionCount || '';
           loadEditHistory();
+          document.dispatchEvent(new CustomEvent('vireo:edit-history-changed', {
+            detail: { operation: 'undo', result: data }
+          }));
         }
       })
       .catch(function() { if (btn) btn.disabled = false; });
@@ -10835,6 +11085,9 @@ function formatDuration(seconds) {
           _historySessionCount++;
           document.getElementById('historyBadge').textContent = _historySessionCount || '';
           loadEditHistory();
+          document.dispatchEvent(new CustomEvent('vireo:edit-history-changed', {
+            detail: { operation: 'redo', result: data }
+          }));
         }
       })
       .catch(function() { if (btn) btn.disabled = false; });

@@ -29,6 +29,7 @@ import threading
 import time
 import uuid
 import webbrowser
+from collections import OrderedDict
 from datetime import UTC, datetime
 from pathlib import Path
 from urllib.parse import quote, urlsplit
@@ -621,6 +622,149 @@ def _sync_preview_presentation(
         "before": "Current XMP value",
         "after": value or "Cleared",
     }
+
+
+# Server-side snapshot cache for /api/sync/preview. Progressive page loads
+# request the same pending-changes revision many times in a row; without a
+# cache each request re-scans the full queue and re-hashes every change,
+# making preview preparation quadratic in the queue size. Keyed by
+# (database path, workspace_id, revision) so separate catalogs whose default
+# workspace and pending rows happen to match cannot reuse each other's photo
+# paths. Only the newest revision for each catalog/workspace is retained, and
+# the remaining entries are bounded by count with LRU eviction.
+_SYNC_PREVIEW_SNAPSHOTS = OrderedDict()
+_SYNC_PREVIEW_SNAPSHOTS_LOCK = threading.Lock()
+_SYNC_PREVIEW_SNAPSHOTS_MAX = 8
+
+
+def _sync_preview_pending_fingerprint(db, ws_id):
+    """Return the per-workspace monotonic write generation for pending_changes.
+
+    A dedicated ``db_meta`` counter — ``pending_changes_version:<ws>`` —
+    is bumped by INSERT/UPDATE/DELETE triggers on ``pending_changes``
+    (see ``db.py`` next to the ``folder_health_version`` triggers).
+    Reading it is a single-row lookup and, crucially, it changes for
+    every row write including a delete of the top id followed by an
+    INSERT that reuses it — ``pending_changes.id`` is a plain
+    ``INTEGER PRIMARY KEY`` without ``AUTOINCREMENT``, so SQLite will
+    do exactly that on the next INSERT after the highest row is
+    deleted. A cheaper COUNT/MAX/SUM aggregate would stay identical
+    across such a replacement even though ``change_token``, ``value``,
+    ``change_type``, or ``photo_id`` differ, and the cached snapshot
+    would then be served to a client that had never seen the new row.
+    """
+    row = db.conn.execute(
+        "SELECT value FROM db_meta WHERE key = ?",
+        (f"pending_changes_version:{ws_id}",),
+    ).fetchone()
+    return int(row[0]) if row else 0
+
+
+def _sync_preview_build_snapshot(db, ws_id):
+    """Load pending changes, group by photo, and compute the revision hash."""
+    # Read the version counter BEFORE the row scan. If a concurrent write
+    # commits between the two reads, the stored fingerprint is one behind
+    # the actual queue state, and the next cache lookup will see a
+    # mismatched (larger) counter and rebuild. Reading the counter after
+    # the rows would risk stamping stale rows with a post-write version
+    # and serving them from cache.
+    fingerprint = _sync_preview_pending_fingerprint(db, ws_id)
+    changes = db.conn.execute(
+        """
+        SELECT pc.*, p.filename, p.folder_id, f.path AS folder_path
+        FROM pending_changes pc
+        JOIN photos p ON p.id = pc.photo_id
+        LEFT JOIN folders f ON f.id = p.folder_id
+        WHERE pc.workspace_id = ?
+        ORDER BY pc.created_at, pc.id
+        """,
+        (ws_id,),
+    ).fetchall()
+
+    revision_hash = hashlib.sha256()
+    change_type_counts = {}
+    by_photo = {}
+    for change in changes:
+        revision_hash.update(
+            (
+                f"{change['id']}\0{change['change_token'] or ''}\0"
+                f"{change['photo_id']}\0{change['change_type']}\0"
+                f"{change['value'] or ''}\n"
+            ).encode()
+        )
+        change_type = change["change_type"]
+        change_type_counts[change_type] = (
+            change_type_counts.get(change_type, 0) + 1
+        )
+        cid = change["id"]
+        pid = change["photo_id"]
+        photo = by_photo.get(pid)
+        if photo is None:
+            photo = {
+                "photo_id": pid,
+                "filename": change["filename"],
+                "folder": change["folder_path"] or "",
+                "changes": [],
+            }
+            by_photo[pid] = photo
+        photo["changes"].append({
+            "id": cid,
+            "type": change_type,
+            # ``_sync_preview_change_creates_sidecar`` and
+            # ``_sync_preview_presentation`` both read ``change_type`` and
+            # ``value`` off the row they're passed; storing them under both
+            # names lets the enrichment loop use these dicts directly
+            # without a per-request lookup back into the DB row.
+            "change_type": change_type,
+            "value": change["value"],
+        })
+
+    return {
+        "revision": revision_hash.hexdigest()[:24],
+        "all_photos": list(by_photo.values()),
+        "total_changes": len(changes),
+        "change_type_counts": change_type_counts,
+        "fingerprint": fingerprint,
+    }
+
+
+def _sync_preview_get_snapshot(db, ws_id, requested_revision):
+    """Return a cached or freshly computed snapshot of pending changes.
+
+    Progressive page loads normally arrive back-to-back with the same
+    ``requested_revision``; on cache hit a lightweight aggregate check
+    verifies the pending queue hasn't shifted since the snapshot was
+    stored. On miss (or when the queue has shifted) the full snapshot is
+    rebuilt and cached under its computed revision.
+    """
+    database_key = os.path.abspath(db._db_path)
+    if requested_revision:
+        key = (database_key, ws_id, requested_revision)
+        with _SYNC_PREVIEW_SNAPSHOTS_LOCK:
+            snapshot = _SYNC_PREVIEW_SNAPSHOTS.get(key)
+            if snapshot is not None:
+                _SYNC_PREVIEW_SNAPSHOTS.move_to_end(key)
+        if snapshot is not None:
+            if _sync_preview_pending_fingerprint(db, ws_id) == snapshot["fingerprint"]:
+                return snapshot
+            with _SYNC_PREVIEW_SNAPSHOTS_LOCK:
+                _SYNC_PREVIEW_SNAPSHOTS.pop(key, None)
+
+    snapshot = _sync_preview_build_snapshot(db, ws_id)
+    key = (database_key, ws_id, snapshot["revision"])
+    with _SYNC_PREVIEW_SNAPSHOTS_LOCK:
+        obsolete_keys = [
+            cached_key
+            for cached_key in _SYNC_PREVIEW_SNAPSHOTS
+            if cached_key[:2] == (database_key, ws_id) and cached_key != key
+        ]
+        for obsolete_key in obsolete_keys:
+            _SYNC_PREVIEW_SNAPSHOTS.pop(obsolete_key, None)
+        _SYNC_PREVIEW_SNAPSHOTS[key] = snapshot
+        _SYNC_PREVIEW_SNAPSHOTS.move_to_end(key)
+        while len(_SYNC_PREVIEW_SNAPSHOTS) > _SYNC_PREVIEW_SNAPSHOTS_MAX:
+            _SYNC_PREVIEW_SNAPSHOTS.popitem(last=False)
+    return snapshot
 
 
 def _sync_preview_change_creates_sidecar(
@@ -8323,7 +8467,68 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             found.update(row["photo_id"] for row in rows)
         return found
 
-    def _resolve_exif_place_for_photo(db, photo, api_key, grid_cache):
+    _REVERSE_GEOCODE_CACHE_LANGUAGE_KEY = "_vireo_result_language"
+
+    def _google_maps_result_language(config):
+        """Return Google's language preference for the current configuration."""
+        return "en" if config.get("google_maps_prefer_english", True) else None
+
+    def _google_place_details(place_id, api_key, language):
+        """Fetch details while preserving the wrapper's default-on API."""
+        if language == "en":
+            return places.place_details(place_id, api_key)
+        return places.place_details(place_id, api_key, language=None)
+
+    def _google_reverse_geocode(lat, lng, api_key, language):
+        """Reverse-geocode while preserving the wrapper's default-on API."""
+        if language == "en":
+            return places.reverse_geocode(lat, lng, api_key)
+        return places.reverse_geocode(lat, lng, api_key, language=None)
+
+    _REVERSE_GEOCODE_CACHE_LEGACY = object()
+
+    def _decode_cached_reverse_geocode(cached, language):
+        """Return ``(matches_language, details)`` for a cached response.
+
+        Rows written before the language field existed have no
+        ``_vireo_result_language`` key at all; treat those as compatible
+        with the current preference so a rollout does not silently
+        invalidate every previously cached lookup — and, when no API
+        key is configured, force the caller into the ``no_api_key``
+        branch instead of reusing the cached result. Post-PR writes
+        always include the key (``null`` for the opt-out preference,
+        ``"en"`` for the default), so subsequent preference changes
+        still invalidate correctly.
+        """
+        try:
+            details = json.loads(cached["response"] or "{}")
+        except (ValueError, TypeError):
+            details = {}
+        if not isinstance(details, dict):
+            details = {}
+        cached_language = details.pop(
+            _REVERSE_GEOCODE_CACHE_LANGUAGE_KEY,
+            _REVERSE_GEOCODE_CACHE_LEGACY,
+        )
+        if cached_language is _REVERSE_GEOCODE_CACHE_LEGACY:
+            return True, details
+        return cached_language == language, details
+
+    def _encode_cached_reverse_geocode(details, language):
+        """Serialize details with the requested language for cache matching.
+
+        The language key is always written — including as ``null`` for
+        the opt-out preference — so the decoder can distinguish a
+        legacy untagged row from a row explicitly written under
+        ``language=None``.
+        """
+        payload = dict(details) if isinstance(details, dict) else {}
+        payload[_REVERSE_GEOCODE_CACHE_LANGUAGE_KEY] = language
+        return json.dumps(payload)
+
+    def _resolve_exif_place_for_photo(
+        db, photo, api_key, language, grid_cache,
+    ):
         """Resolve one photo's EXIF coordinates into normalized place details.
 
         Returns ``(details, reason)`` where ``details`` is the normalized
@@ -8349,24 +8554,22 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
 
         cached = db.reverse_geocode_cache_get(lat, lng)
         if cached is not None:
-            if cached["place_id"] is None:
-                result = (None, "no_match")
+            language_matches, details = _decode_cached_reverse_geocode(
+                cached, language,
+            )
+            if language_matches:
+                if cached["place_id"] is None:
+                    result = (None, "no_match")
+                    grid_cache[grid] = result
+                    return result
+                if not details.get("place_id"):
+                    details["place_id"] = cached["place_id"]
+                if details.get("place_id"):
+                    result = (details, None)
+                else:
+                    result = (None, "no_match")
                 grid_cache[grid] = result
                 return result
-            try:
-                details = json.loads(cached["response"] or "{}")
-            except (ValueError, TypeError):
-                details = {}
-            if not isinstance(details, dict):
-                details = {}
-            if not details.get("place_id"):
-                details["place_id"] = cached["place_id"]
-            if details.get("place_id"):
-                result = (details, None)
-            else:
-                result = (None, "no_match")
-            grid_cache[grid] = result
-            return result
 
         if not api_key:
             result = (None, "no_api_key")
@@ -8374,7 +8577,9 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             return result
 
         try:
-            details = places.reverse_geocode(lat, lng, api_key)
+            details = _google_reverse_geocode(
+                lat, lng, api_key, language,
+            )
         except places.PlacesTransientError:
             app.logger.warning(
                 "bulk reverse_geocode transient failure for photo=%s lat=%s lng=%s",
@@ -8391,7 +8596,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             lat,
             lng,
             place_id=cache_place_id,
-            response_json=json.dumps(details or {}),
+            response_json=_encode_cached_reverse_geocode(details, language),
         )
         if not details or not details.get("place_id"):
             result = (None, "no_match")
@@ -8716,7 +8921,9 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
 
         assigned_ids = _location_keyword_photo_ids(db, photo_ids)
         import config as cfg
-        api_key = (cfg.load().get("google_maps_api_key", "") or "").strip()
+        maps_config = cfg.load()
+        api_key = (maps_config.get("google_maps_api_key", "") or "").strip()
+        language = _google_maps_result_language(maps_config)
 
         grid_cache = {}
         groups = {}
@@ -8737,7 +8944,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 })
                 continue
             details, reason = _resolve_exif_place_for_photo(
-                db, photo, api_key, grid_cache,
+                db, photo, api_key, language, grid_cache,
             )
             if reason is not None:
                 unresolved.append({
@@ -10116,6 +10323,54 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             "parent_chain": _walk_parent_chain(db, leaf["parent_id"]),
         }
 
+    def _serialize_photo_locations(db, photo_ids):
+        """Bulk form of :func:`_serialize_photo_location`.
+
+        Sync review can contain thousands of location changes.  Looking up
+        each leaf and then walking the same parent chain once per photo turns
+        that review into tens of thousands of SQLite queries.  Fetch leaves
+        in chunks and reuse each distinct hierarchy instead.
+        """
+        if not photo_ids:
+            return {}
+
+        leaves = {}
+        # Keep the first linked location, matching the single-photo helper's
+        # LIMIT 1 behavior without relying on a window-function result shape.
+        for start in range(0, len(photo_ids), 400):
+            chunk = photo_ids[start:start + 400]
+            placeholders = ",".join("?" for _ in chunk)
+            rows = db.conn.execute(
+                f"""
+                SELECT pk.photo_id, k.id, k.name, k.place_id, k.latitude,
+                       k.longitude, k.parent_id
+                FROM photo_keywords pk
+                JOIN keywords k ON k.id = pk.keyword_id
+                WHERE pk.photo_id IN ({placeholders})
+                  AND k.type = 'location'
+                ORDER BY pk.rowid
+                """,
+                chunk,
+            ).fetchall()
+            for row in rows:
+                leaves.setdefault(row["photo_id"], row)
+
+        chain_cache = {}
+        result = {}
+        for photo_id, leaf in leaves.items():
+            parent_id = leaf["parent_id"]
+            if parent_id not in chain_cache:
+                chain_cache[parent_id] = _walk_parent_chain(db, parent_id)
+            result[photo_id] = {
+                "keyword_id": leaf["id"],
+                "name": leaf["name"],
+                "place_id": leaf["place_id"],
+                "latitude": leaf["latitude"],
+                "longitude": leaf["longitude"],
+                "parent_chain": chain_cache[parent_id],
+            }
+        return result
+
     def _serialize_keyword(db, keyword_id):
         """Return a summary dict for a single ``type='location'`` keyword row.
 
@@ -10184,10 +10439,15 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         details = _normalize_client_place_details(body)
         if details is None:
             import config as cfg
-            key = cfg.load().get("google_maps_api_key", "")
+            maps_config = cfg.load()
+            key = maps_config.get("google_maps_api_key", "")
             if not key:
                 return _google_maps_not_configured_error()
-            details = places.place_details(place_id, key)
+            details = _google_place_details(
+                place_id,
+                key,
+                _google_maps_result_language(maps_config),
+            )
             if details is None:
                 return _google_place_not_found_error()
 
@@ -10426,10 +10686,15 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         details = _normalize_client_place_details(body)
         if details is None:
             import config as cfg
-            key = cfg.load().get("google_maps_api_key", "")
+            maps_config = cfg.load()
+            key = maps_config.get("google_maps_api_key", "")
             if not key:
                 return _google_maps_not_configured_error()
-            details = places.place_details(place_id, key)
+            details = _google_place_details(
+                place_id,
+                key,
+                _google_maps_result_language(maps_config),
+            )
             if details is None:
                 return _google_place_not_found_error()
 
@@ -10596,30 +10861,33 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         if not (math.isfinite(lat) and math.isfinite(lng)):
             return json_error("invalid coords", 400)
 
+        import config as cfg
+
+        maps_config = cfg.load()
+        language = _google_maps_result_language(maps_config)
         db = _get_db()
         cached = db.reverse_geocode_cache_get(lat, lng)
         if cached is not None:
-            if cached["place_id"] is None:
-                # Cached negative — Google previously had no match here.
-                return jsonify({"place_id": None, "summary": None})
-            try:
-                details = json.loads(cached["response"])
-            except (ValueError, TypeError):
-                details = {}
-            return jsonify({
-                "place_id": cached["place_id"],
-                "summary": _summarize_details(details),
-            })
+            language_matches, details = _decode_cached_reverse_geocode(
+                cached, language,
+            )
+            if language_matches:
+                if cached["place_id"] is None:
+                    # Cached negative — Google previously had no match here.
+                    return jsonify({"place_id": None, "summary": None})
+                return jsonify({
+                    "place_id": cached["place_id"],
+                    "summary": _summarize_details(details),
+                })
 
         # Cache miss.
-        import config as cfg
-        key = cfg.load().get("google_maps_api_key", "")
+        key = maps_config.get("google_maps_api_key", "")
         if not key:
             # Don't cache here — see docstring.
             return jsonify({"place_id": None, "summary": None})
 
         try:
-            details = places.reverse_geocode(lat, lng, key)
+            details = _google_reverse_geocode(lat, lng, key, language)
         except places.PlacesTransientError:
             # OVER_QUERY_LIMIT / REQUEST_DENIED / network blip — Google
             # may answer this later, so do NOT cache. Returning null here
@@ -10635,7 +10903,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         db.reverse_geocode_cache_put(
             lat, lng,
             place_id=cache_place_id,
-            response_json=json.dumps(details or {}),
+            response_json=_encode_cached_reverse_geocode(details, language),
         )
         if details is None:
             return jsonify({"place_id": None, "summary": None})
@@ -10680,10 +10948,15 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         details = _normalize_client_place_details(body)
         if details is None:
             import config as cfg
-            key = cfg.load().get("google_maps_api_key", "")
+            maps_config = cfg.load()
+            key = maps_config.get("google_maps_api_key", "")
             if not key:
                 return _google_maps_not_configured_error()
-            details = places.place_details(place_id, key)
+            details = _google_place_details(
+                place_id,
+                key,
+                _google_maps_result_language(maps_config),
+            )
             if details is None:
                 return _google_place_not_found_error()
 
@@ -11920,40 +12193,96 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
     def api_sync_status():
         db = _get_db()
         changes = db.get_pending_changes()
+        change_type_counts = {}
+        photo_ids = set()
+        for change in changes:
+            photo_ids.add(change["photo_id"])
+            change_type = change["change_type"]
+            change_type_counts[change_type] = (
+                change_type_counts.get(change_type, 0) + 1
+            )
         return jsonify(
             {
                 "pending_count": len(changes),
+                "pending_photo_count": len(photo_ids),
+                "change_type_counts": change_type_counts,
             }
         )
 
     @app.route("/api/sync/preview")
     def api_sync_preview():
-        """Preview pending changes with the XMP values they will replace."""
-        db = _get_db()
-        changes = db.get_pending_changes()
-        if not changes:
-            return jsonify({"photos": [], "total_changes": 0})
+        """Preview pending changes with the XMP values they will replace.
 
-        # Group by photo
-        by_photo = {}
-        for c in changes:
-            pid = c["photo_id"]
-            if pid not in by_photo:
-                photo = db.get_photo(pid)
-                folder = db.conn.execute(
-                    "SELECT path FROM folders WHERE id = ?", (photo["folder_id"],)
-                ).fetchone()
-                by_photo[pid] = {
-                    "photo_id": pid,
-                    "filename": photo["filename"],
-                    "folder": folder["path"] if folder else "",
-                    "changes": [],
-                }
-            by_photo[pid]["changes"].append({
-                "id": c["id"],
-                "type": c["change_type"],
-                "value": c["value"],
+        Supplying ``limit`` enables progressive photo pagination.  Omitting
+        it retains the original all-at-once response for compatibility with
+        existing API callers.
+        """
+        db = _get_db()
+        raw_limit = request.args.get("limit")
+        raw_offset = request.args.get("offset", "0")
+        if raw_limit is None:
+            if raw_offset != "0":
+                return json_error("offset requires limit")
+            limit = None
+            offset = 0
+        else:
+            try:
+                limit = int(raw_limit)
+                offset = int(raw_offset)
+            except (TypeError, ValueError):
+                return json_error("limit and offset must be integers")
+            if limit < 1 or limit > 200:
+                return json_error("limit must be between 1 and 200")
+            if offset < 0:
+                return json_error("offset must be non-negative")
+
+        requested_revision = request.args.get("revision")
+        snapshot = _sync_preview_get_snapshot(
+            db, db._ws_id(), requested_revision,
+        )
+        revision = snapshot["revision"]
+        if requested_revision and requested_revision != revision:
+            return json_error(
+                "pending changes changed while the review was loading",
+                409,
+                code="sync_preview_changed",
+                message="Pending changes changed. Restarting the review.",
+            )
+
+        all_photos = snapshot["all_photos"]
+        total_photos = len(all_photos)
+        total_changes = snapshot["total_changes"]
+        change_type_counts = snapshot["change_type_counts"]
+        if total_changes == 0:
+            return jsonify({
+                "photos": [],
+                "total_changes": 0,
+                "total_photos": 0,
+                "change_type_counts": {},
+                "offset": offset,
+                "next_offset": None,
+                "has_more": False,
+                "revision": revision,
             })
+
+        # Enrichment below mutates the per-change dicts (``creates_xmp_sidecar``,
+        # ``presentation``, …), so copy the slice before touching it — the
+        # underlying photos/changes lists live inside the cached snapshot and
+        # are re-served across page requests for the same revision.
+        page_slice = (
+            all_photos
+            if limit is None
+            else all_photos[offset:offset + limit]
+        )
+        page_photos = [
+            {
+                "photo_id": photo["photo_id"],
+                "filename": photo["filename"],
+                "folder": photo["folder"],
+                "changes": [dict(change) for change in photo["changes"]],
+            }
+            for photo in page_slice
+        ]
 
         import config as cfg
 
@@ -11962,8 +12291,14 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             effective_config.get("write_assigned_location_to_xmp", False)
         )
         sync_flags = bool(effective_config.get("sync_flags_to_xmp", False))
-        changes_by_id = {change["id"]: change for change in changes}
-        for photo in by_photo.values():
+        location_photo_ids = [
+            photo["photo_id"]
+            for photo in page_photos
+            if any(change["type"] == "location" for change in photo["changes"])
+        ]
+        assigned_locations = _serialize_photo_locations(db, location_photo_ids)
+        folder_accessibility = {}
+        for photo in page_photos:
             xmp_path = os.path.join(
                 photo["folder"],
                 os.path.splitext(photo["filename"])[0] + ".xmp",
@@ -11973,9 +12308,12 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             # records the photo as ``folder not accessible`` and never
             # runs any writer, so the review must not present writes
             # against it either.
-            folder_offline = bool(photo["folder"]) and not os.path.isdir(
-                photo["folder"]
-            )
+            folder = photo["folder"]
+            if folder not in folder_accessibility:
+                folder_accessibility[folder] = (
+                    not bool(folder) or os.path.isdir(folder)
+                )
+            folder_offline = not folder_accessibility[folder]
             photo["folder_offline"] = folder_offline
             if folder_offline:
                 # Skip filesystem access entirely — an unreachable XMP path
@@ -11999,9 +12337,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 not folder_offline
                 and any(change["type"] == "location" for change in photo["changes"])
             ):
-                assigned_location = _serialize_photo_location(
-                    db, photo["photo_id"],
-                )
+                assigned_location = assigned_locations.get(photo["photo_id"])
             # Map normalized-key -> original add value so a paired
             # keyword_remove can display the clean spelling the paired
             # ``write_sidecar`` will end up writing.
@@ -12015,7 +12351,6 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                         )
             keyword_add_keys = set(keyword_add_values_by_key.keys())
             for change in photo["changes"]:
-                pending = changes_by_id[change["id"]]
                 auto_includes_keyword_add = bool(
                     change["type"] in {"keyword_remove", "keyword_remove_flat"}
                     and keyword_match_key(change["value"]) in keyword_add_keys
@@ -12034,7 +12369,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     and (
                         auto_includes_keyword_add
                         or _sync_preview_change_creates_sidecar(
-                            pending,
+                            change,
                             sync_flags=sync_flags,
                             write_locations=write_locations,
                             assigned_location=assigned_location,
@@ -12046,7 +12381,6 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 change["creates_xmp_sidecar"] for change in photo["changes"]
             )
             for change in photo["changes"]:
-                pending = changes_by_id[change["id"]]
                 paired_add_value = None
                 if change["type"] == "keyword_remove" and change[
                     "paired_keyword_rename"
@@ -12055,14 +12389,14 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                         keyword_match_key(change["value"])
                     )
                 if (
-                    pending["change_type"] == "rating"
+                    change["change_type"] == "rating"
                     and not folder_offline
                     and not metadata.get("rating_writable")
                 ):
                     change["rating_requires_sidecar"] = True
                     change["presentation_without_sidecar"] = (
                         _sync_preview_presentation(
-                            pending,
+                            change,
                             metadata,
                             assigned_location=assigned_location,
                             write_locations=write_locations,
@@ -12076,7 +12410,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     )
                     change["presentation_with_sidecar"] = (
                         _sync_preview_presentation(
-                            pending,
+                            change,
                             metadata,
                             assigned_location=assigned_location,
                             write_locations=write_locations,
@@ -12095,7 +12429,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     ]
                     continue
                 change["presentation"] = _sync_preview_presentation(
-                    pending,
+                    change,
                     metadata,
                     assigned_location=assigned_location,
                     write_locations=write_locations,
@@ -12105,12 +12439,42 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     folder_offline=folder_offline,
                 )
 
+        page_end = offset + len(page_photos)
+        has_more = page_end < total_photos
         result = {
-            "photos": list(by_photo.values()),
-            "total_changes": len(changes),
+            "photos": page_photos,
+            "total_changes": total_changes,
+            "total_photos": total_photos,
+            "change_type_counts": change_type_counts,
+            "offset": offset,
+            "next_offset": page_end if has_more else None,
+            "has_more": has_more,
+            "revision": revision,
             "location_sync_enabled": write_locations,
         }
-        _attach_nested_edit_recipes(db, result)
+        # The sync dialog needs edit recipes for correctly versioned rendered
+        # thumbnails, but not the species/life-list enrichment performed by
+        # _attach_nested_edit_recipes.
+        recipe_map = db.get_photo_edit_recipes(
+            [photo["photo_id"] for photo in page_photos]
+        )
+        for photo in page_photos:
+            photo["edit_recipe"] = recipe_map.get(photo["photo_id"])
+        # A slow sidecar or network-folder read can leave the queue time to
+        # change after the snapshot was validated above. Never mark the final
+        # page complete from that stale snapshot: the client will restart the
+        # progressive review on this existing conflict response.
+        if (
+            not has_more
+            and _sync_preview_pending_fingerprint(db, db._ws_id())
+            != snapshot["fingerprint"]
+        ):
+            return json_error(
+                "pending changes changed while the review was loading",
+                409,
+                code="sync_preview_changed",
+                message="Pending changes changed. Restarting the review.",
+            )
         return jsonify(result)
 
     @app.route("/api/sync/discard", methods=["POST"])
@@ -12118,6 +12482,66 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         """Discard specific pending changes."""
         db = _get_db()
         body = request.get_json(silent=True) or {}
+        if body.get("discard_all") is True:
+            revision = body.get("revision")
+            if not isinstance(revision, str) or not revision:
+                return json_error("revision required for discard_all")
+
+            ws_id = db._ws_id()
+            try:
+                # Validate and delete under one write transaction. This keeps
+                # another request from replacing or adding a pending row
+                # between the revision check and the workspace-wide delete.
+                db.conn.execute("BEGIN IMMEDIATE")
+                snapshot = _sync_preview_get_snapshot(db, ws_id, revision)
+                if snapshot["revision"] != revision:
+                    db.conn.rollback()
+                    return json_error(
+                        "pending changes changed since they were reviewed",
+                        409,
+                        code="sync_preview_changed",
+                        message=(
+                            "Pending changes changed. Review them again before "
+                            "discarding all."
+                        ),
+                    )
+                changes = db.conn.execute(
+                    "SELECT * FROM pending_changes WHERE workspace_id = ?",
+                    (ws_id,),
+                ).fetchall()
+                db.conn.execute(
+                    "DELETE FROM pending_changes WHERE workspace_id = ?",
+                    (ws_id,),
+                )
+                if changes:
+                    items = [
+                        {
+                            "photo_id": change["photo_id"],
+                            "old_value": (
+                                f'{change["change_type"]}:{change["value"]}'
+                            ),
+                            "new_value": "",
+                        }
+                        for change in changes
+                    ]
+                    db.record_edit(
+                        "discard",
+                        f"Discarded {len(changes)} pending changes",
+                        "",
+                        items,
+                        is_batch=len(changes) > 1,
+                        _commit=False,
+                    )
+                db.conn.commit()
+            except Exception:
+                db.conn.rollback()
+                raise
+
+            if changes:
+                db._prune_edit_history()
+            log.info("Discarded all %d pending changes", len(changes))
+            return jsonify({"ok": True, "discarded": len(changes)})
+
         change_ids = body.get("change_ids", [])
         if not change_ids:
             return json_error("change_ids required")

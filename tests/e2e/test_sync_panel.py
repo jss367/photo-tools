@@ -71,6 +71,92 @@ def test_escape_closes_lightbox_before_pending_changes_overlay(live_server, page
     expect(sync_overlay).to_be_hidden()
 
 
+def test_progressive_preview_keeps_first_results_visible_after_later_failure(
+    live_server, page,
+):
+    """Completed batches remain inspectable if a later page cannot load."""
+    photo_id = live_server["data"]["photos"][0]
+
+    def route_preview(route):
+        if "offset=0" not in route.request.url:
+            route.abort()
+            return
+        route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=(
+                '{'
+                f'"photos":[{{"photo_id":{photo_id},"filename":"hawk1.jpg",'
+                '"folder":"/photos","changes":[{"id":991,"type":"rating",'
+                '"value":"5","presentation":{"field":"XMP rating",'
+                '"action":"updated","before":"3 stars","after":"5 stars"}}]}],'
+                '"total_changes":2,"total_photos":2,'
+                '"change_type_counts":{"rating":2},"offset":0,'
+                '"next_offset":1,"has_more":true,"revision":"test-revision",'
+                '"location_sync_enabled":false}'
+            ),
+        )
+
+    page.route("**/api/sync/preview?**", route_preview)
+    page.goto(f"{live_server['url']}/browse")
+    page.evaluate("void openSyncPreview()")
+
+    overlay = page.locator("#syncPreviewOverlay")
+    expect(overlay.locator(".sync-preview-thumb")).to_have_count(1)
+    expect(overlay.locator("#syncPreviewProgressText")).to_contain_text(
+        "Could not finish"
+    )
+    expect(overlay.locator(".sync-review-group-title")).to_contain_text(
+        "1 photo reviewed so far"
+    )
+    expect(overlay.locator("#syncPreviewSyncButton")).to_be_disabled()
+
+
+def test_large_preview_caps_rendered_thumbnails_until_show_more(live_server, page):
+    """A large loaded result set does not mount every thumbnail at once."""
+    page.goto(f"{live_server['url']}/browse")
+    page.evaluate(
+        """() => {
+            _syncPreviewLoading = false;
+            _syncModalOpen = true;
+            _syncPreviewDisplayLimit = 300;
+            _syncActiveFilters = new Set(['rating']);
+            _syncPreviewData = {
+                total_changes: 301,
+                total_photos: 301,
+                change_type_counts: {rating: 301},
+                location_sync_enabled: false,
+                photos: Array.from({length: 301}, (_, index) => ({
+                    photo_id: 100000 + index,
+                    filename: 'photo-' + index + '.jpg',
+                    folder: '/photos',
+                    changes: [{
+                        id: 200000 + index,
+                        type: 'rating',
+                        value: '5',
+                        presentation: {
+                            field: 'XMP rating',
+                            action: 'updated',
+                            before: '3 stars',
+                            after: '5 stars',
+                        },
+                    }],
+                })),
+            };
+            document.getElementById('syncPreviewOverlay').style.display = 'block';
+            renderSyncPreview();
+        }"""
+    )
+
+    overlay = page.locator("#syncPreviewOverlay")
+    expect(overlay.locator(".sync-preview-thumb")).to_have_count(300)
+    expect(overlay.locator(".sync-preview-thumb").first).to_have_attribute(
+        "loading", "lazy"
+    )
+    overlay.get_by_role("button", name="Show 1 more").click()
+    expect(overlay.locator(".sync-preview-thumb")).to_have_count(301)
+
+
 def test_location_changes_are_grouped_with_plain_language_delta(
     live_server, page, tmp_path,
 ):

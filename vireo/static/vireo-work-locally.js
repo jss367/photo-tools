@@ -314,11 +314,41 @@
         }).join('');
       } else {
         var volumeCount = (preflight.volumes || []).length;
-        capacity.textContent = formatBytesNav(preflight.total_bytes || 0) + ' total to copy' +
+        var summary = formatBytesNav(preflight.total_bytes || 0) + ' total to copy' +
           (volumeCount === 1
             ? ' · ' + formatBytesNav(preflight.volumes[0].after_copy_bytes || 0) + ' will remain free'
-            : ' across ' + volumeCount + ' destination disks') +
-          '. Vireo will stop before using the safety reserve.';
+            : ' across ' + volumeCount + ' destination disks');
+        var closeToReserve = (preflight.volumes || []).filter(function(volume) {
+          var reserve = Number(volume.reserve_bytes || 0);
+          var afterCopy = Number(volume.after_copy_bytes || 0);
+          // Routine successful copies do not need a safety warning. Explain
+          // the reserve only when the remaining headroom is no larger than
+          // the reserve itself (for example, the copy leaves less than 10%
+          // free on a disk with the standard 5% reserve).
+          return reserve > 0 && afterCopy - reserve <= reserve;
+        });
+        if (volumeCount === 1 && closeToReserve.length === 1) {
+          var volume = closeToReserve[0];
+          var headroom = Math.max(
+            0,
+            Number(volume.after_copy_bytes || 0) - Number(volume.reserve_bytes || 0)
+          );
+          summary += headroom > 0
+            ? '. That leaves ' + formatBytesNav(headroom) +
+              " above Vireo's " + formatBytesNav(volume.reserve_bytes || 0) +
+              ' safety reserve'
+            : ". That is exactly Vireo's " + formatBytesNav(volume.reserve_bytes || 0) +
+              ' safety reserve, with no extra headroom';
+        } else if (closeToReserve.length) {
+          summary += '. ' + closeToReserve.length + ' destination disk' +
+            (closeToReserve.length === 1
+              ? ' is close to its ' + formatBytesNav(closeToReserve[0].reserve_bytes || 0) +
+                ' safety reserve'
+              : 's are close to their safety reserves (' + closeToReserve.map(function(volume) {
+                return formatBytesNav(volume.reserve_bytes || 0);
+              }).join(', ') + ')');
+        }
+        capacity.textContent = summary + '.';
       }
     }
     if (button) button.disabled = !preflight.can_copy;
@@ -422,6 +452,10 @@
     if (!container || !modal) return;
     stageBlockedByJob = false;
     if (error) error.textContent = '';
+    var workspaceNamesById = {};
+    ((data && data.linked_workspaces) || []).forEach(function(workspace) {
+      workspaceNamesById[String(workspace.id)] = workspace.name;
+    });
     container.innerHTML = items.map(function(item) {
       var id = Number(item.requested_folder_id);
       var source = item.source_path || item.display_path || '';
@@ -430,6 +464,11 @@
       var base = item.default_local_base || '';
       var finalPath = item.default_local_path || joinPath(base, localName);
       var shared = (item.workspace_ids || []).length;
+      var sharedNames = (item.workspace_ids || []).map(function(workspaceId) {
+        return workspaceNamesById[String(workspaceId)];
+      }).filter(Boolean).map(escapeHtml);
+      var sharingMessage = 'This copy will be shared by ' + shared + ' linked workspaces' +
+        (sharedNames.length === shared ? ': ' + sharedNames.join(', ') : '') + '.';
       return '<div class="setting-row" style="display:block;padding:12px 0;">' +
         '<div style="font-size:13px;font-weight:600;color:var(--text-primary);margin-bottom:3px;">' + escapeHtml(name) + '</div>' +
         '<div style="font-family:monospace;font-size:10px;color:var(--text-dim);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-bottom:9px;" title="' + escapeAttr(source) + '">' + escapeHtml(source) + '</div>' +
@@ -440,7 +479,7 @@
         '</div>' +
         '<div style="font-size:10px;color:var(--text-dim);margin-top:5px;">Local folder: <span data-local-destination-preview="' + id + '" style="font-family:monospace;">' + escapeHtml(finalPath) + '</span></div>' +
         '<div data-local-capacity-folder="' + id + '" style="font-size:11px;color:var(--text-dim);margin-top:6px;">Calculating size and free space...</div>' +
-        (shared > 1 ? '<div style="font-size:10px;color:var(--accent);margin-top:4px;">This copy will be shared by ' + shared + ' linked workspaces.</div>' : '') +
+        (shared > 1 ? '<div style="font-size:10px;color:var(--accent);margin-top:4px;">' + sharingMessage + '</div>' : '') +
       '</div>';
     }).join('');
     modal.classList.add('open');

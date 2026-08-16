@@ -62,6 +62,238 @@ def test_browse_lightbox_arrows_navigate(live_server, page):
     expect(counter).to_contain_text(first_filename)
 
 
+def test_browse_lightbox_close_selects_current_photo(live_server, page):
+    """Closing after lightbox navigation focuses the last-viewed grid photo."""
+    page.route(
+        "**/photos/*/full",
+        lambda route: route.fulfill(
+            body=base64.b64decode(_PNG_1X1), content_type="image/png"
+        ),
+    )
+    page.goto(f"{live_server['url']}/browse")
+
+    cards = page.locator(".grid-card")
+    cards.nth(1).wait_for(state="visible")
+    second_id = int(cards.nth(1).get_attribute("data-id"))
+
+    cards.first.dblclick()
+    expect(page.locator("#lightboxOverlay")).to_have_class(
+        "lightbox-overlay active"
+    )
+    page.locator("#lightboxNext").click()
+    # Wait for the visible (committed) identity to advance, not just the
+    # navigation target. `_lightboxCurrentId` flips as soon as Next is
+    # pressed, while the outgoing bitmap is held on screen until the
+    # incoming /full decodes; if we close on the target-only signal, a slow
+    # decode races the close and returns Browse to photo 1 under the new
+    # committed-identity close semantics — Codex P2 on PR #1486.
+    page.wait_for_function(
+        "photoId => window._lightboxCommittedId === photoId", arg=second_id
+    )
+
+    page.locator(".lightbox-close").click()
+
+    expect(page.locator("#lightboxOverlay")).not_to_have_class(
+        "lightbox-overlay active"
+    )
+    assert page.evaluate("selectedPhotoId") == second_id
+    assert page.evaluate("selectedIndex") == 1
+    assert page.evaluate("selectedPhotos.size") == 0
+    expect(cards.nth(1)).to_have_class(re.compile(r"\bselected\b"))
+    expect(cards.first).not_to_have_class(re.compile(r"\bselected\b"))
+
+
+def test_browse_lightbox_close_during_navigation_returns_to_visible_photo(
+    live_server, page,
+):
+    """Closing mid-navigation focuses the still-visible photo, not the loader.
+
+    `_lightboxCurrentId` advances immediately at the start of navigation while
+    the outgoing bitmap is deliberately held on screen until the incoming
+    /full decodes. Capturing that internal target on close made Browse
+    select and scroll to a photo the user never actually saw — Codex P2 on
+    PR #1486. Track the last committed `lightbox:photochanged` identity.
+    """
+    ids = {"first": None, "second": None}
+
+    def route_full(route):
+        url = route.request.url
+        if ids["second"] is not None and f"/photos/{ids['second']}/full" in url:
+            # Park the incoming photo; the outgoing bitmap stays on screen.
+            return
+        route.fulfill(
+            body=base64.b64decode(_PNG_1X1), content_type="image/png"
+        )
+
+    page.route("**/photos/*/full", route_full)
+    page.goto(f"{live_server['url']}/browse")
+
+    cards = page.locator(".grid-card")
+    cards.nth(1).wait_for(state="visible")
+    ids["first"] = int(cards.first.get_attribute("data-id"))
+    ids["second"] = int(cards.nth(1).get_attribute("data-id"))
+
+    cards.first.dblclick()
+    expect(page.locator("#lightboxOverlay")).to_have_class(
+        "lightbox-overlay active"
+    )
+    page.wait_for_function(
+        "photoId => window._lightboxCommittedId === photoId", arg=ids["first"]
+    )
+
+    page.locator("#lightboxNext").click()
+    page.wait_for_function(
+        "photoId => window._lightboxCurrentId === photoId"
+        " && window._lbVisualTransitionPending === true",
+        arg=ids["second"],
+    )
+    # Incoming photo has not decoded; committed identity stays on photo 1.
+    assert page.evaluate("window._lightboxCommittedId") == ids["first"]
+
+    page.locator(".lightbox-close").click()
+
+    expect(page.locator("#lightboxOverlay")).not_to_have_class(
+        "lightbox-overlay active"
+    )
+    assert page.evaluate("selectedPhotoId") == ids["first"]
+    assert page.evaluate("selectedIndex") == 0
+    assert page.evaluate("selectedPhotos.size") == 0
+    expect(cards.first).to_have_class(re.compile(r"\bselected\b"))
+    expect(cards.nth(1)).not_to_have_class(re.compile(r"\bselected\b"))
+
+
+def test_browse_lightbox_delete_only_photo_does_not_reselect_it(
+    live_server, page,
+):
+    """Deleting the only lightbox photo must not re-select the deleted row.
+
+    `lightboxDelete` used to close the lightbox before removing the row from
+    `photos`, so Browse's `lightbox:closed` reconciliation would still find
+    the deleted photo, call `selectPhoto`/`loadDetail` on it, and then have
+    its own delete cleanup null `selectedPhotoId` — leaving the sidebar
+    blank or showing stale details. Codex P2 on PR #1486. Grid state must
+    be updated before the lightbox transitions.
+    """
+    page.route(
+        "**/photos/*/full",
+        lambda route: route.fulfill(
+            body=base64.b64decode(_PNG_1X1), content_type="image/png"
+        ),
+    )
+    page.goto(f"{live_server['url']}/browse")
+
+    first_card = page.locator(".grid-card").first
+    first_card.wait_for(state="visible")
+    first_id = int(first_card.get_attribute("data-id"))
+    first_filename = first_card.get_attribute("data-filename")
+    initial_count = page.evaluate("window.photos.length")
+
+    # Open the lightbox with a single-photo list so lightboxDelete takes the
+    # closeLightbox branch (rather than opening the next photo).
+    page.evaluate(
+        """([id, filename]) => openLightbox(id, filename, [{id: id, filename: filename}])""",
+        [first_id, first_filename],
+    )
+    expect(page.locator("#lightboxOverlay")).to_have_class(
+        "lightbox-overlay active"
+    )
+    page.wait_for_function(
+        "photoId => window._lightboxCommittedId === photoId", arg=first_id
+    )
+
+    observed = page.evaluate(
+        """() => {
+            const events = [];
+            document.addEventListener('lightbox:closed', event => {
+                events.push({
+                    photoId: event.detail && event.detail.photoId,
+                    photosStillHasDeleted:
+                        typeof photos !== 'undefined' &&
+                        photos.some(p => p.id === event.detail.photoId),
+                    selectedPhotoIdAtClose: selectedPhotoId,
+                });
+            }, { once: true });
+            window.lightboxDelete();
+            const callback = _deleteCallback;
+            hideDeleteModal();
+            callback({deleted: 1, failed_photo_ids: []});
+            return events[0];
+        }"""
+    )
+
+    expect(page.locator("#lightboxOverlay")).not_to_have_class(
+        "lightbox-overlay active"
+    )
+    assert observed["photoId"] == first_id
+    # When lightbox:closed fires, `photos` must already have the deleted
+    # entry filtered out; otherwise the reconciliation re-selects it.
+    assert observed["photosStillHasDeleted"] is False
+    assert page.evaluate("selectedPhotoId") is None
+    assert page.evaluate("window.photos.length") == initial_count - 1
+
+
+def test_browse_lightbox_close_skips_reload_when_photo_unchanged(
+    live_server, page,
+):
+    """Closing without navigating must not refetch the already-selected photo.
+
+    The `lightbox:closed` reconciliation used to call `selectPhoto` for the
+    returned photo unconditionally, which runs `loadDetail` and rerenders
+    the detail panel — silently discarding an unsubmitted `#locationInput`
+    draft (blur only hides suggestions; it does not save). Codex P2 on PR
+    #1486. Skip the reload when `selectedPhotoId` already matches.
+    """
+    page.route(
+        "**/photos/*/full",
+        lambda route: route.fulfill(
+            body=base64.b64decode(_PNG_1X1), content_type="image/png"
+        ),
+    )
+    page.goto(f"{live_server['url']}/browse")
+
+    first_card = page.locator(".grid-card").first
+    first_card.wait_for(state="visible")
+    first_id = int(first_card.get_attribute("data-id"))
+
+    # Focus the first photo via a normal click, which runs `loadDetail` once.
+    first_card.click()
+    page.wait_for_function(
+        "photoId => selectedPhotoId === photoId", arg=first_id
+    )
+
+    observed = page.evaluate(
+        """([id, filename]) => {
+            const calls = [];
+            const original = window.loadDetail;
+            window.loadDetail = function(photoId) {
+                calls.push(photoId);
+                return original.apply(this, arguments);
+            };
+            try {
+                openLightbox(id, filename, [{id: id, filename: filename}]);
+            } catch (err) {
+                window.loadDetail = original;
+                throw err;
+            }
+            // Committed identity is set synchronously inside openLightbox once
+            // the image commits; capture whatever is committed at close time.
+            closeLightbox();
+            window.loadDetail = original;
+            return { calls, selectedPhotoId, selectedIndex };
+        }""",
+        [first_id, first_card.get_attribute("data-filename")],
+    )
+
+    expect(page.locator("#lightboxOverlay")).not_to_have_class(
+        "lightbox-overlay active"
+    )
+    assert observed["selectedPhotoId"] == first_id
+    assert observed["selectedIndex"] == 0
+    # The pre-existing focus must survive the close: no fresh loadDetail on
+    # `lightbox:closed` for the already-selected photo.
+    assert observed["calls"] == []
+
+
 def test_lightbox_track_eye_keeps_eye_at_same_screen_position(
     live_server, page, tmp_path,
 ):
@@ -491,6 +723,344 @@ def test_browse_lightbox_filename_can_be_selected_without_resetting_zoom(
             Number(getComputedStyle(document.querySelector('.lightbox-bottom-bar')).zIndex)
         )"""
     ) is True
+
+
+def test_browse_lightbox_zoom_hud_controls_logarithmic_zoom(live_server, page):
+    """The compact zoom HUD exposes fit, 1:1, steps, and a logarithmic slider."""
+    svg = (
+        '<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1200" '
+        'viewBox="0 0 1600 1200"><rect width="1600" height="1200" fill="#274"/></svg>'
+    )
+    page.route(
+        re.compile(r"/photos/\d+/(full|original|preview)"),
+        lambda route: route.fulfill(body=svg, content_type="image/svg+xml"),
+    )
+    page.set_viewport_size({"width": 1000, "height": 800})
+    page.goto(f"{live_server['url']}/browse")
+    page.locator(".grid-card").first.dblclick()
+
+    overlay = page.locator("#lightboxOverlay")
+    badge = page.locator("#lightboxZoomBadge")
+    popover = page.locator("#lightboxZoomPopover")
+    slider = page.locator("#lightboxZoomSlider")
+    expect(overlay).to_have_class("lightbox-overlay active")
+    page.wait_for_function(
+        """() => {
+            const img = document.getElementById('lightboxImg');
+            return img && img.complete && img.naturalWidth === 1600 &&
+                !window._lbVisualTransitionPending;
+        }"""
+    )
+
+    # Make the scale deterministic: max zoom is four times native, so a
+    # logarithmic slider midpoint maps sqrt(16) to the native zoom of 4.
+    page.evaluate(
+        """() => {
+            window._lbCancelOriginalPreload();
+            window._lbScheduleSourceSwap = function() {};
+            window._lbRecomputeNativeZoom = function() {};
+            window._lbNativeZoom = 4;
+            window._lbSetZoom(1, null, null);
+        }"""
+    )
+    expect(badge).to_be_visible()
+    expect(badge).to_have_text("Fit")
+    expect(badge).to_have_attribute("aria-expanded", "false")
+
+    badge.click()
+    expect(popover).to_have_class("lightbox-zoom-popover open")
+    expect(badge).to_have_attribute("aria-expanded", "true")
+    expect(slider).to_have_attribute("aria-valuetext", "Fit")
+    expect(page.locator("#lightboxZoomNativeStop")).to_be_visible()
+
+    # Photo navigation freezes the outgoing frame until the incoming image is
+    # ready. Every zoom input, including the labelled stops, must advertise
+    # that temporarily inert state instead of appearing clickable.
+    page.evaluate(
+        """() => {
+            window._lbVisualTransitionPending = true;
+            window._lbUpdateZoomControl();
+        }"""
+    )
+    expect(page.locator(".lb-zoom-stop-fit")).to_be_disabled()
+    expect(page.locator("#lightboxZoomNativeStop")).to_be_disabled()
+    page.evaluate(
+        """() => {
+            window._lbVisualTransitionPending = false;
+            window._lbUpdateZoomControl();
+        }"""
+    )
+    expect(page.locator(".lb-zoom-stop-fit")).to_be_enabled()
+    expect(page.locator("#lightboxZoomNativeStop")).to_be_enabled()
+
+    slider.evaluate(
+        """el => {
+            el.value = '500';
+            el.dispatchEvent(new Event('input', {bubbles: true}));
+        }"""
+    )
+    assert abs(page.evaluate("window._lbZoom") - 4) < 0.01
+    expect(badge).to_have_text("100%")
+    expect(slider).to_have_attribute("aria-valuetext", "100%")
+
+    page.locator("#lightboxZoomIn").click()
+    assert abs(page.evaluate("window._lbZoom") - 5) < 0.01
+    expect(badge).to_have_text("125%")
+
+    page.locator(".lb-zoom-stop-fit").click()
+    assert abs(page.evaluate("window._lbZoom") - 1) < 0.01
+    expect(badge).to_have_text("Fit")
+
+    # The labelled 1:1 stop uses the guarded high-resolution path rather than
+    # merely enlarging a softer tier. Mark that tier current for this UI test.
+    page.evaluate(
+        """() => {
+            window._lbNativeZoom = 4;
+            window._lbCurrentSrcKey = window._lbPickSourceKey(window._lbNativeZoom);
+            window._lbSetZoom(2, null, null);
+            document.getElementById('lightboxZoomNativeStop').click();
+        }"""
+    )
+    assert abs(page.evaluate("window._lbZoom") - 4) < 0.01
+    expect(badge).to_have_text("100%")
+    expect(overlay).to_have_class("lightbox-overlay active")
+
+    page.evaluate("window.closeLightbox()")
+    expect(popover).to_have_class("lightbox-zoom-popover")
+    expect(badge).to_have_attribute("aria-expanded", "false")
+
+
+def test_browse_lightbox_zoom_hud_keeps_near_fit_native_stop_separate(
+    live_server, page
+):
+    """A near-fit native zoom keeps separate exact Fit and 1:1 actions."""
+    svg = (
+        '<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1200" '
+        'viewBox="0 0 1600 1200"><rect width="1600" height="1200" fill="#274"/></svg>'
+    )
+    page.route(
+        re.compile(r"/photos/\d+/(full|original|preview)"),
+        lambda route: route.fulfill(body=svg, content_type="image/svg+xml"),
+    )
+    page.set_viewport_size({"width": 1000, "height": 800})
+    page.goto(f"{live_server['url']}/browse")
+    page.locator(".grid-card").first.dblclick()
+
+    overlay = page.locator("#lightboxOverlay")
+    expect(overlay).to_have_class("lightbox-overlay active")
+    page.wait_for_function(
+        """() => {
+            const img = document.getElementById('lightboxImg');
+            return img && img.complete && img.naturalWidth === 1600 &&
+                !window._lbVisualTransitionPending;
+        }"""
+    )
+
+    # Put native zoom just above fit but below the track position where its 1:1
+    # label would avoid overlapping Fit. The label is visually offset to 8%,
+    # while each action retains its exact zoom target.
+    page.evaluate(
+        """() => {
+            window._lbCancelOriginalPreload();
+            window._lbScheduleSourceSwap = function() {};
+            window._lbNativeZoom = 1.05;
+            window._lbCurrentSrcKey = window._lbPickSourceKey(window._lbNativeZoom);
+            window._lbSetZoom(1, null, null);
+        }"""
+    )
+    page.locator("#lightboxZoomBadge").click()
+    fit_stop = page.locator(".lb-zoom-stop-fit")
+    native_stop = page.locator("#lightboxZoomNativeStop")
+    expect(fit_stop).to_have_text("Fit")
+    expect(native_stop).to_be_visible()
+    assert native_stop.evaluate("el => el.style.left") == "8%"
+
+    page.evaluate("() => window._lbSetZoom(1.05, null, null)")
+    fit_stop.click()
+    assert abs(page.evaluate("window._lbZoom") - 1.0) < 0.001
+    expect(page.locator("#lightboxZoomBadge")).to_have_text("Fit")
+
+    native_stop.click()
+    assert abs(page.evaluate("window._lbZoom") - 1.05) < 0.01
+    expect(page.locator("#lightboxZoomBadge")).to_have_text("100%")
+
+
+def test_browse_lightbox_zoom_toggle_returns_to_fit_near_native(live_server, page):
+    """The `z` toggle must return to exact fit from a nearby native zoom."""
+    svg = (
+        '<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1200" '
+        'viewBox="0 0 1600 1200"><rect width="1600" height="1200" fill="#274"/></svg>'
+    )
+    page.route(
+        re.compile(r"/photos/\d+/(full|original|preview)"),
+        lambda route: route.fulfill(body=svg, content_type="image/svg+xml"),
+    )
+    page.set_viewport_size({"width": 1000, "height": 800})
+    page.goto(f"{live_server['url']}/browse")
+    page.locator(".grid-card").first.dblclick()
+
+    expect(page.locator("#lightboxOverlay")).to_have_class("lightbox-overlay active")
+    page.wait_for_function(
+        """() => {
+            const img = document.getElementById('lightboxImg');
+            return img && img.complete && img.naturalWidth === 1600 &&
+                !window._lbVisualTransitionPending;
+        }"""
+    )
+
+    # A small gap between fit and native must not keep the toggle from returning
+    # to exact fit.
+    zoomed = page.evaluate(
+        """() => {
+            window._lbCancelOriginalPreload();
+            window._lbScheduleSourceSwap = function() {};
+            window._lbNativeZoom = 1.05;
+            window._lbCurrentSrcKey = window._lbPickSourceKey(window._lbNativeZoom);
+            window._lbSetZoom(window._lbNativeZoom, null, null);
+            return window._lbZoom;
+        }"""
+    )
+    assert abs(zoomed - 1.05) < 0.01
+
+    page.evaluate("() => window.toggleLightboxZoom()")
+    fit_state = page.evaluate(
+        """() => ({
+            zoom: window._lbZoom,
+            pending: window._lbPending1To1,
+        })"""
+    )
+    assert abs(fit_state["zoom"] - 1.0) < 0.001
+    assert fit_state["pending"] is False
+
+    # A pending 1:1 upgrade in the same range must also be cancellable via z.
+    page.evaluate(
+        """() => {
+            window._lbPending1To1 = true;
+            window._lbPending1To1Anchor = { x: 0, y: 0 };
+        }"""
+    )
+    page.evaluate("() => window.toggleLightboxZoom()")
+    cancelled = page.evaluate(
+        """() => ({
+            zoom: window._lbZoom,
+            pending: window._lbPending1To1,
+        })"""
+    )
+    assert abs(cancelled["zoom"] - 1.0) < 0.001
+    assert cancelled["pending"] is False
+
+
+def test_browse_lightbox_hide_chrome_also_hides_zoom_popover(live_server, page):
+    """Hide UI must close the zoom popover and hide its badge with the rest of the chrome."""
+    svg = (
+        '<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1200" '
+        'viewBox="0 0 1600 1200"><rect width="1600" height="1200" fill="#274"/></svg>'
+    )
+    page.route(
+        re.compile(r"/photos/\d+/(full|original|preview)"),
+        lambda route: route.fulfill(body=svg, content_type="image/svg+xml"),
+    )
+    page.set_viewport_size({"width": 1000, "height": 800})
+    page.goto(f"{live_server['url']}/browse")
+    page.locator(".grid-card").first.dblclick()
+
+    overlay = page.locator("#lightboxOverlay")
+    badge = page.locator("#lightboxZoomBadge")
+    popover = page.locator("#lightboxZoomPopover")
+    control = page.locator("#lightboxZoomControl")
+    expect(overlay).to_have_class("lightbox-overlay active")
+    page.wait_for_function(
+        """() => {
+            const img = document.getElementById('lightboxImg');
+            return img && img.complete && img.naturalWidth === 1600 &&
+                !window._lbVisualTransitionPending;
+        }"""
+    )
+
+    badge.click()
+    expect(popover).to_have_class("lightbox-zoom-popover open")
+    expect(badge).to_have_attribute("aria-expanded", "true")
+    expect(control).to_be_visible()
+
+    page.evaluate("() => window.toggleLightboxChrome()")
+    expect(overlay).to_have_class("lightbox-overlay active lb-hide-chrome")
+    # The persisted "Lightbox controls: Off" state must not leave the zoom
+    # popover or its badge exposed over the image.
+    expect(popover).to_have_class("lightbox-zoom-popover")
+    expect(badge).to_have_attribute("aria-expanded", "false")
+    expect(control).not_to_be_visible()
+
+    page.evaluate("() => window.toggleLightboxChrome()")
+    expect(overlay).to_have_class("lightbox-overlay active")
+    expect(control).to_be_visible()
+    # Chrome coming back must not silently reopen the popover.
+    expect(popover).to_have_class("lightbox-zoom-popover")
+    expect(badge).to_have_attribute("aria-expanded", "false")
+
+
+def test_browse_lightbox_one_to_one_reuses_sharper_current_source(live_server, page):
+    """1:1 must apply synchronously when the current source is already sharp enough."""
+    svg = (
+        '<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1200" '
+        'viewBox="0 0 1600 1200"><rect width="1600" height="1200" fill="#274"/></svg>'
+    )
+    page.route(
+        re.compile(r"/photos/\d+/(full|original|preview)"),
+        lambda route: route.fulfill(body=svg, content_type="image/svg+xml"),
+    )
+    page.set_viewport_size({"width": 1000, "height": 800})
+    page.goto(f"{live_server['url']}/browse")
+    page.locator(".grid-card").first.dblclick()
+
+    expect(page.locator("#lightboxOverlay")).to_have_class("lightbox-overlay active")
+    page.wait_for_function(
+        """() => {
+            const img = document.getElementById('lightboxImg');
+            return img && img.complete && img.naturalWidth === 1600 &&
+                !window._lbVisualTransitionPending;
+        }"""
+    )
+
+    # Simulate the case Codex flagged: /original is already loaded (e.g. from a
+    # previous 1:1 view) but _lbPickSourceKey(_lbNativeZoom) would pick a
+    # lower-rank tier. The exact-key comparison would enter the deferred path
+    # (badge stuck at 'Loading 1:1'); a rank comparison sees the current
+    # source is already sharp enough and applies zoom synchronously.
+    result = page.evaluate(
+        """() => {
+            window._lbCancelOriginalPreload();
+            window._lbNativeZoom = 1.5;
+            window._lbSetZoom(1, null, null);
+            if (window._lbSwapTimer) {
+                clearTimeout(window._lbSwapTimer);
+                window._lbSwapTimer = null;
+            }
+            window._lbCurrentSrcKey = 'original';
+            window._lbDesiredSrcKey = 'original';
+            window._lbPending1To1 = false;
+            window._lbPending1To1Anchor = null;
+            // Sanity: the picked source key for this zoom must be lower rank
+            // than 'original' or the test would trivially pass.
+            const picked = window._lbPickSourceKey(window._lbNativeZoom);
+            const pickedRank = window._lbSrcRank(picked);
+            const currentRank = window._lbSrcRank(window._lbCurrentSrcKey);
+            window.setLightboxZoomToOneToOne();
+            return {
+                pickedLowerThanCurrent: pickedRank < currentRank,
+                zoom: window._lbZoom,
+                pending: window._lbPending1To1,
+                badge: document.getElementById('lightboxZoomBadge').textContent,
+                desiredSource: window._lbDesiredSrcKey,
+                swapPending: window._lbSwapTimer !== null,
+            };
+        }"""
+    )
+    assert result["pickedLowerThanCurrent"] is True
+    assert abs(result["zoom"] - 1.5) < 0.01
+    assert result["pending"] is False
+    assert result["badge"] != "Loading 1:1"
+    assert result["desiredSource"] == "original"
+    assert result["swapPending"] is False
 
 
 def test_browse_lightbox_reserves_space_for_bottom_controls(live_server, page):

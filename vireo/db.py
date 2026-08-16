@@ -1226,6 +1226,59 @@ class Database:
                 SET value = CAST(value AS INTEGER) + 1
                 WHERE key = 'folder_health_version';
             END;
+
+            -- Per-workspace monotonic write counter for `pending_changes`.
+            -- The sync-preview cache in app.py keys its snapshot on this
+            -- version to detect row replacements — `pending_changes.id` is
+            -- a plain INTEGER PRIMARY KEY (no AUTOINCREMENT), so SQLite
+            -- will reuse the highest deleted id on the next INSERT. A
+            -- cheap COUNT/MAX/SUM aggregate can stay identical across
+            -- such a delete+insert even though `change_token`, `value`,
+            -- `change_type`, or `photo_id` differ; this counter changes
+            -- for every row write and closes that stale-hit window.
+            CREATE TRIGGER IF NOT EXISTS trg_pending_changes_version_insert
+            AFTER INSERT ON pending_changes
+            BEGIN
+                INSERT OR IGNORE INTO db_meta(key, value)
+                    VALUES ('pending_changes_version:' || NEW.workspace_id, '0');
+                UPDATE db_meta
+                SET value = CAST(value AS INTEGER) + 1
+                WHERE key = 'pending_changes_version:' || NEW.workspace_id;
+            END;
+            CREATE TRIGGER IF NOT EXISTS trg_pending_changes_version_delete
+            AFTER DELETE ON pending_changes
+            BEGIN
+                INSERT OR IGNORE INTO db_meta(key, value)
+                    VALUES ('pending_changes_version:' || OLD.workspace_id, '0');
+                UPDATE db_meta
+                SET value = CAST(value AS INTEGER) + 1
+                WHERE key = 'pending_changes_version:' || OLD.workspace_id;
+            END;
+            CREATE TRIGGER IF NOT EXISTS trg_pending_changes_version_update
+            AFTER UPDATE ON pending_changes
+            BEGIN
+                INSERT OR IGNORE INTO db_meta(key, value)
+                    VALUES ('pending_changes_version:' || NEW.workspace_id, '0');
+                UPDATE db_meta
+                SET value = CAST(value AS INTEGER) + 1
+                WHERE key = 'pending_changes_version:' || NEW.workspace_id;
+            END;
+            -- When move_folders_to_workspace() reassigns a pending_changes
+            -- row from one workspace to another, the update trigger above
+            -- only bumps the destination workspace's counter. Without this
+            -- second trigger, a cached progressive preview for the source
+            -- workspace keeps its fingerprint and continues serving the
+            -- rows that have already moved away instead of returning 409.
+            CREATE TRIGGER IF NOT EXISTS trg_pending_changes_version_update_source_ws
+            AFTER UPDATE OF workspace_id ON pending_changes
+            WHEN OLD.workspace_id IS NOT NEW.workspace_id
+            BEGIN
+                INSERT OR IGNORE INTO db_meta(key, value)
+                    VALUES ('pending_changes_version:' || OLD.workspace_id, '0');
+                UPDATE db_meta
+                SET value = CAST(value AS INTEGER) + 1
+                WHERE key = 'pending_changes_version:' || OLD.workspace_id;
+            END;
         """
         )
         cur = self.conn.cursor()
@@ -6212,6 +6265,7 @@ class Database:
                       JOIN workspace_folders wf
                         ON wf.folder_id = p.folder_id AND wf.workspace_id = ?
                      WHERE d.detector_model != 'full-image'
+                       AND d.category = 'animal'
                        AND d.detector_confidence >= ?{scope_sql}
                 )
                 SELECT COUNT(*) AS primary_dets,
@@ -6288,6 +6342,7 @@ class Database:
                       JOIN workspace_folders wf
                         ON wf.folder_id = p.folder_id AND wf.workspace_id = ?
                      WHERE d.detector_model != 'full-image'
+                       AND d.category = 'animal'
                        AND d.detector_confidence >= ?{scope_sql}
                 )
                 SELECT COUNT(*) AS pending
@@ -6372,6 +6427,7 @@ class Database:
                       JOIN workspace_folders wf
                         ON wf.folder_id = p.folder_id AND wf.workspace_id = ?
                      WHERE d.detector_model != 'full-image'
+                       AND d.category = 'animal'
                        AND d.detector_confidence >= ?{scope_sql}
                 )
                 SELECT COUNT(*) AS n
@@ -6396,13 +6452,17 @@ class Database:
 
     def count_full_image_fallback_photos(
         self, photo_ids=None, detector_model="megadetector-v6",
+        min_conf=0,
     ):
         """Count photos eligible for full-image fallback classification.
 
-        These are photos in the active workspace where the detector has
-        successfully run and found no boxes. Photos with any real detector row,
-        including below-threshold noise, are excluded to match the pipeline's
-        current runtime fallback gate.
+        These are photos in the active workspace where the detector has run
+        and produced no box the classifier could act on: either
+        ``box_count = 0`` or every non-full-image row is below ``min_conf``
+        (raw noise). Callers that want to mirror the runtime fallback gate
+        pass the workspace's ``detector_confidence``; the default of ``0``
+        preserves the pre-noise-fallback semantics where any real row
+        disqualified the photo.
         """
         ws = self._ws_id()
         scope_sql, scope_params = self._scope_clause(photo_ids)
@@ -6411,24 +6471,36 @@ class Database:
                   FROM photos p
                   JOIN workspace_folders wf
                     ON wf.folder_id = p.folder_id AND wf.workspace_id = ?
-                  JOIN detector_runs dr
+                 JOIN detector_runs dr
                     ON dr.photo_id = p.id
                    AND dr.detector_model = ?
-                   AND dr.box_count = 0
-                 WHERE NOT EXISTS (
+                 WHERE (dr.box_count = 0 OR EXISTS (
+                         SELECT 1 FROM detections consistent
+                          WHERE consistent.photo_id = p.id
+                            AND consistent.detector_model = dr.detector_model
+                       ))
+                   AND NOT EXISTS (
                          SELECT 1 FROM detections d
                           WHERE d.photo_id = p.id
                             AND d.detector_model != 'full-image'
+                            AND d.detector_confidence >= ?
                        ){scope_sql}""",
-            (ws, detector_model, *scope_params),
+            (ws, detector_model, min_conf, *scope_params),
         ).fetchone()
         return row["n"] or 0
 
     def count_full_image_classify_pending_pairs(
         self, classifier_model, labels_fingerprint,
         photo_ids=None, detector_model="megadetector-v6",
+        min_conf=0,
     ):
-        """Count fallback photos lacking a classifier run for (model, fp)."""
+        """Count fallback photos lacking a classifier run for (model, fp).
+
+        ``min_conf`` mirrors the runtime fallback gate: a photo qualifies
+        when no non-full-image detection row is at or above the threshold,
+        so a MegaDetector run that produced only noise (< ``min_conf``)
+        counts alongside truly empty ``box_count = 0`` runs.
+        """
         ws = self._ws_id()
         scope_sql, scope_params = self._scope_clause(photo_ids)
         row = self.conn.execute(
@@ -6446,12 +6518,17 @@ class Database:
                       JOIN detector_runs dr
                         ON dr.photo_id = p.id
                        AND dr.detector_model = ?
-                       AND dr.box_count = 0
                       LEFT JOIN full_anchor fa ON fa.photo_id = p.id
-                     WHERE NOT EXISTS (
+                     WHERE (dr.box_count = 0 OR EXISTS (
+                             SELECT 1 FROM detections consistent
+                              WHERE consistent.photo_id = p.id
+                                AND consistent.detector_model = dr.detector_model
+                           ))
+                       AND NOT EXISTS (
                              SELECT 1 FROM detections d
                               WHERE d.photo_id = p.id
                                 AND d.detector_model != 'full-image'
+                                AND d.detector_confidence >= ?
                            ){scope_sql}
                   )
                 SELECT COUNT(*) AS pending
@@ -6463,7 +6540,7 @@ class Database:
                  WHERE f.detection_id IS NULL
                     OR cr.detection_id IS NULL""",
             (
-                ws, detector_model, *scope_params,
+                ws, detector_model, min_conf, *scope_params,
                 classifier_model, labels_fingerprint,
             ),
         ).fetchone()
@@ -6472,8 +6549,14 @@ class Database:
     def count_full_image_classify_stale(
         self, classifier_model, labels_fingerprint,
         photo_ids=None, detector_model="megadetector-v6",
+        min_conf=0,
     ):
-        """Count fallback anchors with stale runs and no current run."""
+        """Count fallback anchors with stale runs and no current run.
+
+        ``min_conf`` mirrors ``count_full_image_fallback_photos`` so
+        photos whose only detections are noise (< ``min_conf``) join the
+        stale-anchor scope alongside the ``box_count = 0`` cases.
+        """
         ws = self._ws_id()
         scope_sql, scope_params = self._scope_clause(photo_ids)
         row = self.conn.execute(
@@ -6491,12 +6574,17 @@ class Database:
                       JOIN detector_runs dr
                         ON dr.photo_id = p.id
                        AND dr.detector_model = ?
-                       AND dr.box_count = 0
                       JOIN full_anchor fa ON fa.photo_id = p.id
-                     WHERE NOT EXISTS (
+                     WHERE (dr.box_count = 0 OR EXISTS (
+                             SELECT 1 FROM detections consistent
+                              WHERE consistent.photo_id = p.id
+                                AND consistent.detector_model = dr.detector_model
+                           ))
+                       AND NOT EXISTS (
                              SELECT 1 FROM detections d
                               WHERE d.photo_id = p.id
                                 AND d.detector_model != 'full-image'
+                                AND d.detector_confidence >= ?
                            ){scope_sql}
                   )
                 SELECT COUNT(*) AS n
@@ -6514,7 +6602,7 @@ class Database:
                             AND cr_cur.labels_fingerprint = ?
                        )""",
             (
-                ws, detector_model, *scope_params,
+                ws, detector_model, min_conf, *scope_params,
                 classifier_model, labels_fingerprint,
                 classifier_model, labels_fingerprint,
             ),
@@ -17873,11 +17961,10 @@ class Database:
         would misread as "no work to classify" when there is real work
         remaining.
 
-        Above-threshold real detections must all have matching run keys,
-        and photos where MegaDetector ran with ``box_count=0`` still count
-        through their synthetic full-image anchor. Below-threshold real
-        detections are ignored because the pipeline still skips them
-        instead of falling back.
+        Above-threshold animal detections must all have matching run keys.
+        Photos with no usable animal target and no confident non-animal box
+        count through their synthetic full-image anchor, including photos
+        whose only animal detections are below the workspace floor.
 
         ``contextual_weak_photo_ids`` marks photos the classify loop will
         rescue with a lowered ``weak_confidence`` floor. For those photos
@@ -17977,6 +18064,45 @@ class Database:
             if photo_id in fresh_processed
             and photo_id not in fresh_candidates
         )
+
+        # Ordinary processed photos with no usable animal crop now take the
+        # full-image fallback unless a confident person/vehicle box blocks it.
+        # The detect stage pre-creates those anchors before this preflight, so
+        # add the anchor ID to the same candidate map used for fresh crops.
+        fresh_full_image_ids = []
+        for photo_id in normal_ids:
+            if photo_id not in fresh_processed or photo_id in fresh_candidates:
+                continue
+            confident_non_animal = False
+            for detection in fresh_detections_by_photo.get(photo_id) or ():
+                if detection.get("detector_model") == "full-image":
+                    continue
+                if detection.get("category", "animal") == "animal":
+                    continue
+                confidence = detection.get(
+                    "confidence", detection.get("detector_confidence", 0),
+                )
+                try:
+                    if float(confidence or 0) >= min_conf:
+                        confident_non_animal = True
+                        break
+                except (TypeError, ValueError):
+                    continue
+            if not confident_non_animal:
+                fresh_full_image_ids.append(photo_id)
+        for i in range(0, len(fresh_full_image_ids), CHUNK):
+            chunk = fresh_full_image_ids[i:i + CHUNK]
+            placeholders = ",".join("?" * len(chunk))
+            rows = self.conn.execute(
+                f"""SELECT photo_id, MIN(id) AS detection_id
+                      FROM detections
+                     WHERE detector_model = 'full-image'
+                       AND photo_id IN ({placeholders})
+                     GROUP BY photo_id""",
+                chunk,
+            ).fetchall()
+            for row in rows:
+                fresh_candidates[row["photo_id"]] = {row["detection_id"]}
 
         fresh_detection_ids = {
             detection_id
@@ -18106,11 +18232,12 @@ class Database:
             ).fetchall()
             for r in rows:
                 matched.add(r["photo_id"])
-        # Full-image anchor branch applies uniformly (weak or not): the
-        # runtime falls through to a full-image classify only when a
-        # photo has no non-full-image detections at all.
-        for i in range(0, len(photo_ids), CHUNK):
-            chunk = photo_ids[i:i + CHUNK]
+        # DB-fallback ordinary photos use a full-image anchor when no real box
+        # at the workspace floor remains. Any confident animal or non-animal
+        # box blocks the fallback; contextual-weak photos use their selected
+        # weak crop instead and are intentionally excluded here.
+        for i in range(0, len(normal_db_ids), CHUNK):
+            chunk = normal_db_ids[i:i + CHUNK]
             placeholders = ",".join("?" * len(chunk))
             rows = self.conn.execute(
                 f"""WITH full_anchor AS (
@@ -18125,17 +18252,23 @@ class Database:
                       JOIN detector_runs dr
                         ON dr.photo_id = fa.photo_id
                        AND dr.detector_model = 'megadetector-v6'
-                       AND dr.box_count = 0
                       JOIN classifier_runs cr
                         ON cr.detection_id = fa.detection_id
                        AND cr.classifier_model = ?
                        AND cr.labels_fingerprint = ?
-                     WHERE NOT EXISTS (
+                     WHERE (dr.box_count = 0 OR EXISTS (
+                             SELECT 1 FROM detections consistent
+                              WHERE consistent.photo_id = fa.photo_id
+                                AND consistent.detector_model
+                                    = dr.detector_model
+                           ))
+                       AND NOT EXISTS (
                              SELECT 1 FROM detections d
                               WHERE d.photo_id = fa.photo_id
                                 AND d.detector_model != 'full-image'
+                                AND d.detector_confidence >= ?
                            )""",
-                [*chunk, classifier_model, labels_fingerprint],
+                [*chunk, classifier_model, labels_fingerprint, min_conf],
             ).fetchall()
             for r in rows:
                 matched.add(r["photo_id"])
@@ -18178,18 +18311,13 @@ class Database:
         fresh_detections_by_photo=None,
         fresh_processed_photo_ids=None,
     ):
-        """Return the SET of photo IDs the classify runtime skips at the
-        ``raw_real_dets`` continue branch.
+        """Return photo IDs the classify runtime skips without inference.
 
-        A photo is skipped when its detection state has real
-        (non-full-image) boxes but none pass the classify floor: the
-        ordinary ``detector_confidence`` for most photos, and the lower
-        ``weak_confidence`` for photos ``contextual_weak_photo_ids``
-        marks as contextual-weak rescues. The runtime never enters an
-        inference batch for these photos, so without excluding them
-        from the ETA's ``remaining_photos`` count a tail of below-
-        threshold photos can inflate a numeric ETA that the runtime
-        will actually traverse without work (Codex #1468 P2).
+        Photos with no usable animal crop normally receive full-image
+        classification. The remaining deterministic skip is a photo with no
+        eligible animal target but a confident non-animal (person/vehicle)
+        detection. Excluding that tail keeps it out of the ETA's projected
+        inference work.
 
         ``fresh_detections_by_photo`` is an in-memory ``{photo_id:
         [detection_dict, ...]}`` map (the ``detect_state["detections"]``
@@ -18199,11 +18327,8 @@ class Database:
         ``photo_dets`` filter actually sees. This matters whenever the
         current detector pass replaces the runtime candidates while older
         rows from another detector model remain in the DB. Without this
-        override, a photo
-        whose fresh MegaDetector rows are all below the floor but whose
-        pre-run rows are above it slips out of ``preflight_
-        unclassifiable_ids``, and the ETA keeps counting it as pending
-        inference work even though runtime will skip it (Codex #1468 P2).
+        override, stale rows can make the preflight choose a different crop
+        or skip outcome than runtime (Codex #1468 P2).
         Each detection dict must expose ``confidence`` (or
         ``detector_confidence``) and ``category`` (defaulting to
         ``"animal"`` when absent, matching ``_detect_batch``'s output).
@@ -18255,7 +18380,28 @@ class Database:
                     continue
             return False
 
-        def _db_unclassifiable(pool, floor, out):
+        def _fresh_has_confident_non_animal(photo_id):
+            for detection in fresh_detections_by_photo.get(photo_id) or ():
+                if detection.get("detector_model") == "full-image":
+                    continue
+                if detection.get("category", "animal") == "animal":
+                    continue
+                confidence = detection.get(
+                    "confidence", detection.get("detector_confidence", 0),
+                )
+                try:
+                    if float(confidence or 0) >= min_conf:
+                        return True
+                except (TypeError, ValueError):
+                    continue
+            return False
+
+        def _db_unclassifiable(pool, floor, out, *, contextual_weak=False):
+            animal_model_predicate = (
+                "d2.detector_model = 'megadetector-v6'"
+                if contextual_weak
+                else "d2.detector_model != 'full-image'"
+            )
             for i in range(0, len(pool), CHUNK):
                 chunk = pool[i:i + CHUNK]
                 if not chunk:
@@ -18265,16 +18411,17 @@ class Database:
                     f"""SELECT DISTINCT d.photo_id
                           FROM detections d
                          WHERE d.detector_model != 'full-image'
+                           AND d.category != 'animal'
+                           AND d.detector_confidence >= ?
                            AND d.photo_id IN ({placeholders})
                            AND NOT EXISTS (
                                  SELECT 1 FROM detections d2
                                   WHERE d2.photo_id = d.photo_id
-                                    AND d2.detector_model
-                                        != 'full-image'
+                                    AND {animal_model_predicate}
                                     AND d2.category = 'animal'
                                     AND d2.detector_confidence >= ?
                                )""",
-                    [*chunk, floor],
+                    [min_conf, *chunk, floor],
                 ).fetchall()
                 for r in rows:
                     out.add(r["photo_id"])
@@ -18284,15 +18431,13 @@ class Database:
         weak_ids = [pid for pid in photo_ids if pid in weak_photo_ids]
 
         if fresh_detections_by_photo is None:
-            # Original DB-only path. A photo is skipped when EXISTS(real
-            # detection at any confidence) AND NOT EXISTS(real animal
-            # detection >= floor). "Real" means non-full-image. The floor
-            # differs by whether the photo was selected for contextual-
-            # weak rescue.
-            for pool, floor in (
-                (normal_ids, min_conf), (weak_ids, weak_conf),
+            for pool, floor, is_weak in (
+                (normal_ids, min_conf, False),
+                (weak_ids, weak_conf, True),
             ):
-                _db_unclassifiable(pool, floor, unclassifiable)
+                _db_unclassifiable(
+                    pool, floor, unclassifiable, contextual_weak=is_weak,
+                )
             return unclassifiable
 
         # Fresh-detection path: the "photo has an animal detection >= floor?"
@@ -18333,26 +18478,19 @@ class Database:
                     )
                 ]
                 db_pool = [pid for pid in pool if pid not in fresh_pool]
-            for i in range(0, len(fresh_pool), CHUNK):
-                chunk = fresh_pool[i:i + CHUNK]
-                if not chunk:
-                    continue
-                placeholders = ",".join("?" * len(chunk))
-                rows = self.conn.execute(
-                    f"""SELECT DISTINCT d.photo_id
-                          FROM detections d
-                         WHERE d.detector_model != 'full-image'
-                           AND d.photo_id IN ({placeholders})""",
-                    chunk,
-                ).fetchall()
-                for r in rows:
-                    pid = r["photo_id"]
-                    if not _fresh_has_animal_above(
+            for pid in fresh_pool:
+                if (
+                    not _fresh_has_animal_above(
                         pid, floor, contextual_weak=is_weak,
-                    ):
-                        unclassifiable.add(pid)
+                    )
+                    and _fresh_has_confident_non_animal(pid)
+                ):
+                    unclassifiable.add(pid)
             if db_pool:
-                _db_unclassifiable(db_pool, floor, unclassifiable)
+                _db_unclassifiable(
+                    db_pool, floor, unclassifiable,
+                    contextual_weak=is_weak,
+                )
         return unclassifiable
 
     def get_labels_fingerprints(self):

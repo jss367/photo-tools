@@ -1,3 +1,5 @@
+import re
+
 from playwright.sync_api import expect
 
 
@@ -59,3 +61,67 @@ def test_review_page_title_shows_pending_count(live_server, page):
 
     title = page.locator("#title")
     expect(title).to_contain_text("pending")
+
+
+def test_review_photo_size_slider_resizes_and_persists(live_server, page):
+    """Review cards follow the photo-size control and retain its value."""
+    url = live_server["url"]
+    page.goto(f"{url}/review", timeout=5000)
+    page.locator("[data-pred-id]").first.wait_for(state="visible", timeout=5000)
+
+    slider = page.locator("#thumbSizeSlider")
+    expect(slider).to_be_visible()
+    expect(slider).to_have_value("400")
+    expect(page.locator("#thumbSizeVal")).to_have_text("400px")
+    initial_width = page.locator("[data-pred-id]").first.bounding_box()["width"]
+
+    slider.evaluate(
+        """el => {
+            el.value = '240';
+            el.dispatchEvent(new Event('input', { bubbles: true }));
+        }"""
+    )
+
+    expect(page.locator("#thumbSizeVal")).to_have_text("240px")
+    assert page.locator("#grid").evaluate(
+        "el => el.style.getPropertyValue('--card-width')"
+    ) == "240px"
+    assert page.locator("[data-pred-id]").first.bounding_box()["width"] < initial_width
+
+    page.reload()
+    page.locator("[data-pred-id]").first.wait_for(state="visible", timeout=5000)
+    expect(slider).to_have_value("240")
+    expect(page.locator("#thumbSizeVal")).to_have_text("240px")
+    assert page.locator("#grid").evaluate(
+        "el => el.style.getPropertyValue('--card-width')"
+    ) == "240px"
+
+
+def test_history_undo_refreshes_review_prediction_state(live_server, page):
+    """Undo from the shared History panel must refresh Review's local state."""
+    url = live_server["url"]
+    page.goto(f"{url}/review", timeout=5000)
+
+    card = page.locator(".card[data-pred-id]").first
+    card.wait_for(state="visible", timeout=5000)
+    pred_id = card.get_attribute("data-pred-id")
+
+    with page.expect_response(
+        lambda response: (
+            f"/api/predictions/{pred_id}/accept" in response.url
+            and response.status == 200
+        )
+    ):
+        card.locator(".btn-accept").click()
+    expect(card).to_have_class(re.compile(r"\baccepted\b"))
+
+    with page.expect_response(
+        lambda response: (
+            response.url.endswith("/api/predictions")
+            and response.status == 200
+        )
+    ):
+        page.evaluate("window.doUndo()")
+
+    expect(card).not_to_have_class(re.compile(r"\baccepted\b"))
+    expect(card.locator(".btn-accept")).to_be_visible()

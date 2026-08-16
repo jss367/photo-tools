@@ -402,6 +402,33 @@ instead of `group_id`, so per-model detail remains available for rendering.
 
 - `getVisibleItems` dedups by `card_id` (fallback to `group_id` then
   prediction id for old payload shapes during rollout).
+- **Card status and actions are aggregated across every member row**, not
+  read off whichever row won the dedup sort. Rule: the badge shows
+  *pending* — with accept/reject actions rendered — whenever *any* member
+  is pending; *accepted* (no action, undo hook only) only when every
+  member is accepted; *rejected* only when every member is rejected. The
+  aggregate is computed from the full pre-dedup row bucket for the
+  `card_id` (or `node_id` under a filter — §2 "Mutation ID from the
+  fallback view"), not from the surviving representative. Deriving
+  badge/actions from a representative row is the exact motivating bug:
+  when BioCLIP-2.5 has already auto-accepted "Blue Tit" on the burst and
+  iNat21's "Eurasian Blue Tit" arrives pending on the same photos, the
+  merged card's sort-winning row can be the accepted BioCLIP row and the
+  card would render as Accepted with no visible action — silently
+  collapsing the pending duplicate that the user needs to see and
+  resolve. The aggregate rule forces the card to surface the pending
+  action whenever any duplicate survives, and the accept path (§3) then
+  flips every pending member to accepted in one click. Symmetric for
+  reject. The rule also makes card status robust to sort-order changes
+  (confidence order vs. capture-time order vs. id order): the aggregate
+  is a set predicate over member statuses, so no ordering choice can
+  flip a mixed card between "actionable" and "already resolved". *Test
+  fixture (Phase 3):* a **mixed-status card fixture** — one card
+  containing an accepted BioCLIP row and a pending iNat21 row on the
+  same photo set renders as pending with accept/reject visible under
+  every representative-row sort order tried (species-string asc,
+  confidence desc, prediction-id asc); accepting resolves both members
+  (§3 sibling pass); the card then renders as accepted with no action.
 - The card shows: union photo count; one chip per model with that model's
   consensus confidence and vote counts (e.g.
   `BioCLIP-2.5 92% · iNat21 88%`); the display name (§4).
@@ -628,8 +655,10 @@ to `[classifier_model, labels_fingerprint, group_id, species_key]` for
 grouped rows or `[classifier_model, labels_fingerprint, "p" +
 prediction_id]` for singletons) plus the
 scope tuple, and the server treats the card as exactly that single
-node, resolving photos only from that node's members and running the
-same taxon-matched sibling pass §3 describes within the scope tuple.
+node, resolving photos only from that node's members and mutating
+strictly the node's own rows (§3 "`node_id` request" — no cross-model
+taxon-matched sibling scan, so the mutation cannot reach any other
+visible node's rows on a shared photo).
 The server resolves a `node_id` by matching those columns on stored
 rows and only then intersects the node's members with the scope tuple.
 Because node identity is intrinsic to the rows (§2, "Node identity is
@@ -728,13 +757,49 @@ union**, not just the clicked group's photos:
    from the GET is excluded from the mutation too, even if its taxon and
    photos would otherwise have joined the component.
 3. **Sibling pass, taxon-matched, per photo, within the resolved scope.**
-   For each photo in the union, find pending predictions on that photo
-   whose taxon key matches the card's `taxon_key`, from **any** classifier
-   model that was in scope for the GET (i.e., predictions the user's
-   filter would have surfaced), restricted per model to its latest
-   `labels_fingerprint` (reuse the latest-fingerprint subquery from
-   `accept_subject_species`), and accept each via the existing
-   `_accept_for_photo` primitive.
+   The pass differs by request shape, in order to honour what §2 already
+   promises for `node_id` resolution ("the server treats the card as
+   exactly that single node … without any component expansion"):
+   - **`card_id` request (unfiltered view).** For each photo in the
+     resolved component's union, find pending predictions on that photo
+     whose taxon key matches the card's `taxon_key`, from **any**
+     classifier model that was in scope for the GET (i.e., predictions
+     the user's filter would have surfaced), restricted per model to its
+     latest `labels_fingerprint` (reuse the latest-fingerprint subquery
+     from `accept_subject_species`), and accept each via the existing
+     `_accept_for_photo` primitive. This is what closes the
+     BioCLIP-vs-iNat21 duplicate on the motivating case and carries
+     acceptance across A→B→C in a transitive component.
+   - **`node_id` request (filtered view, per-node fallback).** The
+     mutation touches **only the named node's own rows** — no cross-model
+     sibling scan, no expansion onto other visible nodes, even for a
+     photo the node shares with a visible sibling node that has the same
+     taxon. Concretely: `_accept_for_photo` is called exactly on the
+     node's own `(photo_id, prediction_id)` set, and the cross-model
+     taxon-matched sibling scan of the `card_id` branch is skipped. The
+     visual contract of the per-node fallback is "each card is its own
+     click" — the client rendered visible nodes A and B as separate
+     cards precisely because a filter made component-wide expansion
+     unsafe (§2 "Why the fallback matters for privacy"), and a `node_id`
+     accept that reached across the two visible nodes on their shared
+     photo would (a) mutate a different card the user did not click and
+     (b) leave that sibling card partially resolved — its non-shared
+     rows still pending — recreating the exact duplicate-card bug the
+     design exists to eliminate, just re-cast between two visible nodes
+     instead of between two rendered cards. The sibling node B remains a
+     separately clickable card whose own accept touches only its own
+     rows; two clicks resolve two cards, symmetric with what the user
+     sees. Once every filter is cleared, subsequent Review loads issue
+     `card_id` requests again and component-wide expansion resumes.
+
+   The bifurcation only concerns the *sibling scan*: step 1's
+   `_apply_visual_to_rules` handling, step 2's per-photo enumeration
+   from the resolved membership, and step 4's undo recording all apply
+   identically to both request shapes. Under a `node_id` request, step
+   2's "resolved (filtered) component" degenerates to that one node's
+   own photos, so step 3's `_accept_for_photo` loop already visits only
+   the correct photo set — skipping the cross-model scan is the single
+   behavioural difference.
 
 - Matching is by `(photo_id, taxon_key)`, not `detection_id`. This covers
   models that classified detections from different detectors (different
@@ -1161,7 +1226,22 @@ Each phase lands as its own PR and is independently useful.
    `_apply_visual_to_rules` on the mutation path and resolves against
    the identical matched-photo-id set, and only A is resolved — V
    (on the excluded photo) and F stay pending; accepting F likewise
-   resolves only F; a **filtered-mutation shape fixture** — a POST that carries both `card_id` and `node_id` is
+   resolves only F; a **visible-sibling-node fixture** — under an
+   active filter that forces per-node fallback (e.g.
+   `currentModel = 'BioCLIP-2.5'` chip active but the taxon-key merger
+   would otherwise unite it with an iNat21 node, or a similarity re-run
+   that split one component into two visible nodes A and B), A and B
+   have the same `taxon_key` and share photo `p*`, both are visible, no
+   row is hidden; the accept POST for A's `node_id` flips only A's own
+   rows (including its row on `p*`), B's row on `p*` and all of B's
+   other rows stay pending, and a subsequent accept POST for B's
+   `node_id` flips only B's rows; the pair reaches full resolution in
+   exactly two clicks (matching the two cards the user sees) and never
+   in one; running the same scenario without a filter routes the POST
+   through `card_id` and one click accepts both nodes (regression guard
+   that the bifurcation is not a permanent loss of the transitive-merge
+   behaviour, only a scope-honest suppression while a filter is active);
+   a **filtered-mutation shape fixture** — a POST that carries both `card_id` and `node_id` is
    rejected 400; a POST that carries a `node_id` unknown to the server
    (e.g. after a re-run rewrote group IDs) is rejected 400; a stale
    POST that omits the scope tuple resolves the full-workspace card
@@ -1171,7 +1251,16 @@ Each phase lands as its own PR and is independently useful.
    colliding bucket holding two species whose *first* node's rows are
    entirely hidden by `min_confidence` (and, in a second variant, by
    the status tab): the `node_id` the client minted for the surviving
-   node still resolves on the POST and mutates exactly that node.
+   node still resolves on the POST and mutates exactly that node; a
+   **mixed-status card fixture** — an accepted BioCLIP-2.5 row and a
+   pending iNat21 row share one card (same taxon, overlapping photos);
+   under every representative-row sort order tried (species-string asc,
+   confidence desc, prediction-id asc) the aggregate rule renders the
+   card as *pending* with accept/reject visible; accepting resolves
+   both members via the `card_id` sibling pass; the card then renders
+   as *accepted* with only the undo hook (no accept/reject action),
+   guarding §2 "Client changes" against the representative-row
+   regression that would silently collapse the pending duplicate.
    This is the 400-on-a-valid-click that a positional `subset_index`
    plus a filter-scoped partition rebuild would have produced, and the
    fixture is the regression guard for keying node identity on

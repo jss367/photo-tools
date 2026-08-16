@@ -188,7 +188,10 @@ def _get_sam2_sessions(variant="sam2-small"):
     # otherwise race on the global session assignment, leaving the trio in an
     # inconsistent state where _sam2_variant_loaded says one thing but the
     # sessions belong to another variant.
-    with _sam2_session_lock:
+    with onnx_runtime.acquire_session_cache_lock(
+        _sam2_session_lock,
+        label="SAM2 session cache",
+    ):
         if (
             _encoder_session is not None
             and _decoder_session is not None

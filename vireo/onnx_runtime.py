@@ -22,6 +22,41 @@ _SESSION_CPU_THREADS_FALLBACK = OrderedDict()
 _SESSION_CPU_THREADS_FALLBACK_LIMIT = 64
 
 
+@contextlib.contextmanager
+def acquire_session_cache_lock(lock, *, label="ONNX session cache"):
+    """Acquire a model-session cache lock with bound pause/cancel support."""
+    from resource_ledger import (
+        ResourceWaitCancelled,
+        get_resource_ledger,
+        resolve_resource_cancel_check,
+    )
+
+    cancel_check = resolve_resource_cancel_check()
+    if cancel_check is not None and cancel_check():
+        raise ResourceWaitCancelled(f"Cancelled while waiting for {label}")
+    if lock.acquire(blocking=False):
+        try:
+            yield
+        finally:
+            lock.release()
+        return
+
+    # Cache-lock contention is downstream of model construction, so expose it
+    # through the same per-job resource timing as the construction lease.
+    with get_resource_ledger().track_external_wait():
+        while True:
+            if cancel_check is not None and cancel_check():
+                raise ResourceWaitCancelled(
+                    f"Cancelled while waiting for {label}",
+                )
+            if lock.acquire(timeout=0.2):
+                break
+    try:
+        yield
+    finally:
+        lock.release()
+
+
 # Substrings that identify onnxruntime load failures rooted in the file
 # bytes themselves (corrupt protobuf, truncated graph, missing external
 # data sidecar). Seeing one of these in an exception message means the

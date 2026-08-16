@@ -28,6 +28,50 @@ class _FakeSession:
         return list(self._providers)
 
 
+def test_session_cache_lock_wait_honors_bound_cancel_probe():
+    import onnx_runtime
+    import resource_ledger
+
+    lock = threading.Lock()
+    lock.acquire()
+    ledger = resource_ledger.ResourceLedger(cpu_capacity=2)
+    previous = resource_ledger._set_resource_ledger_for_tests(ledger)
+    cancelled = threading.Event()
+    finished = threading.Event()
+    outcome = []
+
+    def waiter():
+        with (
+            resource_ledger.bind_resource_owner("model-job"),
+            resource_ledger.bind_resource_cancel_check(cancelled.is_set),
+        ):
+            try:
+                with onnx_runtime.acquire_session_cache_lock(lock):
+                    pass
+            except resource_ledger.ResourceWaitCancelled:
+                outcome.append("cancelled")
+            finally:
+                finished.set()
+
+    thread = threading.Thread(target=waiter)
+    thread.start()
+    try:
+        deadline = time.monotonic() + 1.0
+        while ledger.snapshot()["waiters"] == 0 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert ledger.snapshot()["waiters"] == 1
+        cancelled.set()
+        assert finished.wait(timeout=1.0)
+        thread.join(timeout=1.0)
+        assert not thread.is_alive()
+        assert outcome == ["cancelled"]
+        assert ledger.owner_timing("model-job")["wait_count"] == 1
+    finally:
+        lock.release()
+        thread.join(timeout=1.0)
+        resource_ledger._set_resource_ledger_for_tests(previous)
+
+
 def test_acquire_gpu_if_session_uses_it_takes_lock_for_cuda_session():
     sess = _FakeSession(["CUDAExecutionProvider", "CPUExecutionProvider"])
     before = _GPU_SEMAPHORE._value

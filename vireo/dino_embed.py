@@ -278,7 +278,10 @@ def _get_dinov2_session(variant="vit-b14"):
     # on the steady-state cache hit. The slow path here serialises first
     # load and variant-swap so two concurrent acquirers don't both create
     # an ONNX session and leak the loser into VRAM.
-    with _dinov2_session_lock:
+    with onnx_runtime.acquire_session_cache_lock(
+        _dinov2_session_lock,
+        label="DINOv2 session cache",
+    ):
         if _session is not None and _variant_loaded == variant:
             return _session
 

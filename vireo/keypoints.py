@@ -89,7 +89,10 @@ def ensure_keypoint_weights(model_name, progress_callback=None):
     # don't both fetch the same weights. Locks are created lazily; the outer
     # setdefault is itself thread-safe for the dict insert.
     lock = _download_locks.setdefault(model_name, threading.Lock())
-    with lock:
+    with onnx_runtime.acquire_session_cache_lock(
+        lock,
+        label=f"{model_name} keypoint session cache",
+    ):
         if os.path.isfile(onnx_path) and os.path.isfile(config_path):
             return onnx_path
 

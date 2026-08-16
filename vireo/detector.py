@@ -118,7 +118,12 @@ def _get_session():
     if _session is not None:
         return _session
 
-    with _lock:
+    from onnx_runtime import acquire_session_cache_lock
+
+    with acquire_session_cache_lock(
+        _lock,
+        label="MegaDetector session cache",
+    ):
         if _session is None:
             if not os.path.exists(MEGADETECTOR_ONNX_PATH):
                 raise RuntimeError(

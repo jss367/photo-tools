@@ -4,6 +4,7 @@
   var data = null;
   var activeJob = null;
   var actionInFlight = false;
+  var loadGeneration = 0;
   var pendingStageItems = [];
   var stagePreflightGeneration = 0;
   var stagePreflightTimer = null;
@@ -632,10 +633,23 @@
   }
 
   async function load() {
+    var generation = ++loadGeneration;
     try {
-      data = await Vireo.api.json('/api/workspaces/active/local-folders', {}, {toast: false});
+      var nextData = await Vireo.api.json(
+        '/api/workspaces/active/local-folders', {}, {toast: false}
+      );
+      if (nextData.legacy_workspace_session) {
+        nextData.legacy = await Vireo.api.json(
+          '/api/workspaces/active/local-workspace', {}, {toast: false}
+        );
+      }
+      // Multiple callers can overlap (notably rapid folder-health events).
+      // Only the newest request may publish or trigger job/UI side effects;
+      // otherwise an older, slower response can restore obsolete ancestry
+      // and recovery badges after the current tree has rendered.
+      if (generation !== loadGeneration) return null;
+      data = nextData;
       if (data.legacy_workspace_session) {
-        data.legacy = await Vireo.api.json('/api/workspaces/active/local-workspace', {}, {toast: false});
         if (data.legacy.job) watchJob(data.legacy.job.id);
       } else if (data.jobs && data.jobs.length) {
         watchJob(data.jobs[0].id);
@@ -661,6 +675,7 @@
       scheduleBlockingJobRefresh();
       return data;
     } catch (error) {
+      if (generation !== loadGeneration) return null;
       var container = document.getElementById('localWorkspaceContent');
       if (container) container.innerHTML = '<span style="color:var(--danger);font-size:13px;">' + escapeHtml(error.message || 'Failed to read local folder status') + '</span>';
       return null;

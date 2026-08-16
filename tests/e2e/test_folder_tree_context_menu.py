@@ -641,6 +641,57 @@ def test_folder_health_change_refreshes_local_folder_status(live_server, page):
     )
 
 
+def test_local_folder_status_load_ignores_stale_response(live_server, page):
+    """An older local-status request cannot overwrite a newer response."""
+    page.goto(f"{live_server['url']}/browse")
+    page.wait_for_function("() => !!window.vireoLocalFolders")
+
+    page.evaluate(
+        """() => {
+          window.__localStatusResolvers = [];
+          window.__localStatusOriginalJson = window.Vireo.api.json;
+          window.Vireo.api.json = function(url) {
+            if (url === '/api/workspaces/active/local-folders') {
+              return new Promise(function(resolve) {
+                window.__localStatusResolvers.push(resolve);
+              });
+            }
+            return window.__localStatusOriginalJson.apply(this, arguments);
+          };
+          window.__olderLocalStatusLoad = window.vireoLocalFolders.load();
+          window.__newerLocalStatusLoad = window.vireoLocalFolders.load();
+        }"""
+    )
+    page.wait_for_function("() => window.__localStatusResolvers.length === 2")
+
+    page.evaluate(
+        """() => {
+          const payload = function(marker) {
+            return {
+              marker: marker,
+              legacy_workspace_session: false,
+              state: 'remote',
+              folder_count: 0,
+              local_folder_count: 0,
+              folders: [],
+              jobs: []
+            };
+          };
+          window.__localStatusResolvers[1](payload('newer'));
+          window.__localStatusResolvers[0](payload('older'));
+        }"""
+    )
+    page.wait_for_function(
+        "() => Promise.all([window.__olderLocalStatusLoad, "
+        "window.__newerLocalStatusLoad]).then(() => true)"
+    )
+
+    assert page.evaluate("() => window.vireoLocalFolderData.marker") == "newer"
+    page.evaluate(
+        "() => { window.Vireo.api.json = window.__localStatusOriginalJson; }"
+    )
+
+
 def test_folder_tree_filter_by_folder_fires_filter(live_server, page):
     """Clicking 'Filter by this folder' sets activeFolderId to that folder."""
     url = live_server["url"]

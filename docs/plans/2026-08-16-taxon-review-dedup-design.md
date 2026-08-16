@@ -997,7 +997,13 @@ POST the server:
    sibling scan by the same set (§3 step 3). The component is how the
    server *finds* the card and enumerates each member's rows; the
    frozen membership is what the card actually *was* when the user
-   clicked. Only their intersection is mutated.
+   clicked. Only their intersection is mutated — and before mutating,
+   the server requires the frozen membership to be a **subset** of the
+   resolved component; a frozen row that landed elsewhere means the
+   card the user clicked no longer exists as one card, and step 5
+   returns a stale-card response instead of writing a partial. See
+   "Shrinkage is a stale click, not a smaller click" below for the
+   split-component case that motivates the check.
 
 The intended cache-transition sequence is: GET emits a `name:blue tit`
 card with anchor `A`, `card_id` = base64url(JSON([`A`])), and
@@ -1023,16 +1029,55 @@ real. Reapplying the filter scope does not substitute for this —
 anchor: the anchor is an identity, not a membership. Only the frozen
 membership carries "what the card was".
 
-The symmetric shrink case needs nothing extra: if the transition moved
-the component's smallest-member anchor elsewhere, the component still
-contains `A`, so `A`'s card is still findable, and the intersection
-with `member_prediction_ids` drops any row that left.
+**Shrinkage is a stale click, not a smaller click.** The intersection
+in step 5 is a defense against growth and is safe against growth by
+construction — the mutation covers exactly the frozen membership,
+never more. It is *not* symmetrically safe against a component that
+lost members between the GET and the POST, and the two shrink
+sub-cases split on a bright line: is every frozen row still in the
+anchor's component?
 
-The one transition this cannot silently paper over is when the anchor
-node's rows are gone entirely (bucket rewrite, deletion) — that
-returns 400 as before. Cache resolution does not delete rows; it just
-changes what taxon they resolve to, so the `name:`→`taxon:` case
-never triggers this failure.
+- **Yes, only the anchor moved.** The transition changed which member
+  is the smallest, but every frozen row still resolves into the same
+  component. The intersection is a no-op, the mutation applies to the
+  whole frozen membership, and the click resolves the card the user
+  clicked. This sub-case needs nothing extra.
+- **No, the component split.** A new classify run, or any other
+  request-scope input that flips §1's per-label resolution for one
+  label but not another, can move part of the card into a different
+  component. Concretely: a new prediction row introduces a conflicting
+  `scientific_name` for one of the card's labels L1, which §1's
+  request-wide conflict rule (see §1, "Conflicts") resolves by keying
+  L1 as `name:blue tit` for the whole request, while an alternate
+  label L2 that only some members carry still resolves to `taxon:X`.
+  The anchor rebuilds under L2 into a smaller `taxon:X` component; the
+  L1-only frozen members end up in a `name:` component the POST does
+  not reach. Silently intersecting the frozen membership with the
+  smaller component would leave those members pending — the same
+  badge-disagrees-with-metadata failure the retraction rule closes
+  ("A card mutation writes every member status before it decides any
+  keyword effect" below), arriving through a different route. "Accept
+  all" cannot mean "accept the survivors of a card the user never saw".
+
+Step 5's subset check is exactly this bright line. When a frozen row
+is missing from the resolved component the server returns a stale-card
+response — same 400 shape as the anchor-gone case, with a body that
+names the current decomposition for those rows so the client reloads
+and re-renders. The user then sees the card as it now is (typically
+two smaller cards, one per current taxon key) and clicks against a
+display that matches the row set. Growth is silently excluded and
+reported (`"expanded": N`) because the excluded rows were never part
+of the click; shrinkage is refused because the missing rows *were*.
+The two directions are not symmetric, and treating them as such is
+what let the split case escape.
+
+The one shrink this cannot even reach step 5 through is when the
+anchor node's rows are gone entirely (bucket rewrite, deletion) —
+that returns 400 at step 2 as before. Cache resolution does not
+delete rows; it just changes what taxon they resolve to, and the
+`name:`↔`taxon:` transition surfaces at step 5 as either a subset
+success (the whole card moved together) or the split-and-refuse case
+above (only some members moved).
 
 **Filter semantics.** No filter may ever widen a card, but the two
 kinds of filter achieve that differently, and conflating them is what
@@ -1344,9 +1389,17 @@ union**, not just the clicked group's photos:
    resolved component ∩ member_prediction_ids ∩ scope
    ```
 
-   Rebuilding the component is still required — it resolves the anchor,
-   validates the request, and keeps a stale-but-narrower POST safe —
-   but it can only ever *shrink* the frozen membership, never add to it.
+   Rebuilding the component is still required — it resolves the anchor
+   and validates the request — and the intersection can only ever
+   *shrink* the frozen membership, never add to it. But a shrink that
+   actually loses a frozen row is not a smaller write, it is a stale
+   click: the anchor's own component and one of the card's other members'
+   component are no longer the same component, and "Accept all" on the
+   card the user saw is not the same call as "Accept all" on the anchor's
+   surviving half. The mutation is only run when the intersection equals
+   `member_prediction_ids ∩ scope`; the split-component case is refused
+   with a stale-card response (see §2, "Shrinkage is a stale click, not
+   a smaller click").
 
    **Freezing rows, not nodes.** An earlier revision froze
    `member_node_ids`. Node identity is immutable, but a node's *row set*
@@ -2413,7 +2466,27 @@ Each phase lands as its own PR and is independently useful.
    shares with a frozen member and also fails — the regression guard
    for §3 step 3's intersection, since excluding a node and then
    rediscovering its rows by photo is the same widening one step later.
-   A **row-vs-node freeze fixture** — no taxonomy transition at all:
+   A **cache-transition split-component fixture** — the same GET as
+   the frozen-membership fixture, but between the GET and the POST a
+   new classify run adds a conflicting `scientific_name` for exactly
+   one of the card's labels `L1` (the label some members carry but not
+   others), which §1's per-label conflict rule then keys as
+   `name:blue tit` for the whole request; the anchor's alternate label
+   `L2` still resolves to `taxon:13094`, so the anchor rebuilds under
+   `L2` into a smaller `taxon:13094` component that does *not* include
+   the `L1`-only frozen members. The POST returns the stale-card
+   response with the current decomposition for the missing rows, no
+   status flip is written for any member (Phase A is not entered), and
+   the client-side reload re-renders the card as two smaller cards
+   under their new taxon keys. Two negative variants: a build that
+   drops the subset check and silently applies the shrunken
+   intersection leaves the `L1`-only members `pending` and fails
+   (badge-disagrees-with-metadata on the split boundary); and a build
+   that treats the split as a 400 anchor-gone response fails the
+   fixture's assertion that the response body names the current
+   decomposition (the anchor's rows *are* still there, so the client
+   needs the new key, not just a reload prompt). A
+   **row-vs-node freeze fixture** — no taxonomy transition at all:
    between the GET and the POST a photo of a *frozen* node joins the
    selected collection (and, in a second variant, a row of that node
    changes into the active status tab), so the rebuilt node legitimately

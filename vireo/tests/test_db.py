@@ -14172,6 +14172,95 @@ def test_retire_builtin_wildlife_preserves_imported_xmp_term(tmp_path):
     ).fetchone() is None
 
 
+def test_retire_builtin_wildlife_defers_when_sidecar_unavailable(tmp_path):
+    """An unavailable sidecar must leave the retirement marker unset for retry.
+
+    When a photo's sidecar was previously imported (``xmp_mtime`` is set)
+    but is currently offline (for example, its NAS is unreachable), the
+    migration conservatively preserves the association because it cannot
+    inspect the sidecar's provenance. If the run also stamped the global
+    completion marker anyway, every subsequent startup would return early
+    and the genuinely generated Wildlife association would remain forever
+    even after the volume comes back online. The marker must therefore be
+    left unset until every candidate photo has actually been inspected,
+    so a later startup can complete the retirement once the sidecar is
+    reachable again.
+    """
+    from db import Database
+    from xmp import write_sidecar
+
+    photo_dir = tmp_path / "photos"
+    photo_dir.mkdir()
+    # Give this photo a sidecar so the initial import records a real mtime,
+    # then remove the sidecar to simulate the volume going offline.
+    xmp_path = photo_dir / "p1.xmp"
+    write_sidecar(
+        str(xmp_path),
+        flat_keywords=set(),
+        hierarchical_keywords=set(),
+    )
+    xmp_mtime = xmp_path.stat().st_mtime
+    db = Database(str(tmp_path / "test.db"))
+    ws = db.create_workspace("ws")
+    db.set_active_workspace(ws)
+    fid = db.add_folder(str(photo_dir), name="photos")
+    db.add_workspace_folder(ws, fid)
+    p1 = db.add_photo(
+        folder_id=fid, filename="p1.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+        xmp_mtime=xmp_mtime,
+    )
+    wildlife_id = db.conn.execute(
+        "INSERT INTO keywords (name, type) VALUES ('Wildlife', 'genre')"
+    ).lastrowid
+    species_id = db.add_keyword("House Sparrow", is_species=True)
+    db.tag_photo(p1, species_id)
+    db.conn.execute(
+        "INSERT INTO photo_keywords (photo_id, keyword_id) VALUES (?, ?)",
+        (p1, wildlife_id),
+    )
+    db.conn.commit()
+    db.set_meta(Database._RETIRED_WILDLIFE_GENRE_KEY, "0")
+
+    # Simulate the sidecar's volume being offline during the first run.
+    xmp_path.unlink()
+    assert db.retire_builtin_wildlife_genre() == 0
+    # Association preserved and no cleanup queued because provenance
+    # could not be inspected.
+    assert db.conn.execute(
+        "SELECT 1 FROM photo_keywords WHERE photo_id = ? AND keyword_id = ?",
+        (p1, wildlife_id),
+    ).fetchone() is not None
+    assert db.conn.execute(
+        "SELECT 1 FROM pending_changes WHERE photo_id = ?", (p1,),
+    ).fetchone() is None
+    # Marker must stay unset so a later startup re-inspects this photo.
+    assert db.get_meta(Database._RETIRED_WILDLIFE_GENRE_KEY) != "1"
+
+    # Bring the sidecar back with no Wildlife term — the previously-preserved
+    # association is now proven generated and must be retired on retry.
+    write_sidecar(
+        str(xmp_path),
+        flat_keywords=set(),
+        hierarchical_keywords=set(),
+    )
+    assert db.retire_builtin_wildlife_genre() == 1
+    assert db.conn.execute(
+        "SELECT 1 FROM photo_keywords WHERE photo_id = ? AND keyword_id = ?",
+        (p1, wildlife_id),
+    ).fetchone() is None
+    queued = db.conn.execute(
+        """SELECT change_type, value FROM pending_changes
+           WHERE photo_id = ?""",
+        (p1,),
+    ).fetchall()
+    assert [(row["change_type"], row["value"]) for row in queued] == [
+        ("keyword_remove_flat", "Wildlife"),
+    ]
+    # Now that every candidate has been inspected the marker is stamped.
+    assert db.get_meta(Database._RETIRED_WILDLIFE_GENRE_KEY) == "1"
+
+
 def test_retire_builtin_wildlife_queues_removal_in_every_owning_workspace(tmp_path):
     """A folder shared across workspaces must have the cleanup queued in each.
 

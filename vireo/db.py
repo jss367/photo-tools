@@ -3160,6 +3160,15 @@ class Database:
         the surviving user-authored tag from the sidecar; the generated DB
         association is still detached. The keyword row is retained so edit
         history, manual associations, and user-created children remain valid.
+
+        When a photo's sidecar was previously imported (``xmp_mtime`` is
+        set) but is currently unavailable (for example, its NAS is offline),
+        the association is preserved conservatively AND the run leaves the
+        catalog-wide completion marker unset so a subsequent startup — once
+        the volume returns — re-inspects that photo. Otherwise the marker
+        would freeze the migration in a partially-processed state and any
+        genuinely generated Wildlife association on the deferred photos
+        would persist forever.
         """
         if (
             not force
@@ -3242,6 +3251,7 @@ class Database:
         # detached from the DB.
         photo_workspaces = {}
         sidecar_wildlife_by_photo = {}
+        deferred_unavailable_sidecar = False
         for row in rows:
             pid = row["photo_id"]
             if pid not in sidecar_wildlife_by_photo:
@@ -3251,8 +3261,16 @@ class Database:
                     # A non-null mtime means a sidecar was imported earlier but
                     # is currently unavailable (for example, an offline NAS).
                     # Preserve rather than destroy metadata without being able
-                    # to inspect its provenance.
-                    sidecar_wildlife_by_photo[pid] = row["xmp_mtime"] is not None
+                    # to inspect its provenance, and flag the run as deferred
+                    # so the completion marker stays unset — otherwise the
+                    # catalog would be permanently frozen with this photo's
+                    # generated Wildlife association still attached, even
+                    # after the volume comes back online.
+                    if row["xmp_mtime"] is not None:
+                        sidecar_wildlife_by_photo[pid] = True
+                        deferred_unavailable_sidecar = True
+                    else:
+                        sidecar_wildlife_by_photo[pid] = False
                 else:
                     try:
                         from xmp import read_keywords
@@ -3323,9 +3341,15 @@ class Database:
                           AND photo_id IN ({photo_placeholders})""",
                     [*keyword_ids, *chunk],
                 )
-        self.set_meta(
-            self._RETIRED_WILDLIFE_GENRE_KEY, "1", _commit=False,
-        )
+        # Only stamp the completion marker if every candidate photo was
+        # actually inspected. When a previously-imported sidecar is offline
+        # we cannot tell whether its Wildlife association is generated or
+        # user-authored, so leave the marker unset and let the next startup
+        # re-inspect once the volume returns.
+        if not deferred_unavailable_sidecar:
+            self.set_meta(
+                self._RETIRED_WILDLIFE_GENRE_KEY, "1", _commit=False,
+            )
         self.conn.commit()
         return len(retired_photo_ids)
 

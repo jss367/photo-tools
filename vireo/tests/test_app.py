@@ -17725,6 +17725,134 @@ def test_selection_prediction_suggestions_recomputes_ambiguity_after_keyword_edi
     assert clean_pred in entry["acceptable_prediction_ids"]
 
 
+def test_batch_accept_revalidates_ambiguity_after_keywords_move(app_and_db):
+    """A row that turned ambiguous after render is skipped, not accepted.
+
+    The decided-status precondition cannot catch this one: when a species
+    keyword is added from Review, a second Browse tab, or an XMP sync, the
+    submitted prediction stays ``pending`` — only its *relationship* to the
+    photo's keywords changes. A status-only filter would let it through and
+    ``accept_prediction`` would tag the now-conflicting species, exactly the
+    decision the panel routes to Review instead.
+
+    The endpoint therefore re-derives ambiguity through
+    ``_ambiguous_prediction_ids``, the same helper that produced the panel's
+    ``acceptable_prediction_ids`` — one rule, two callers, so the button's
+    promise and the write's precondition cannot describe different sets.
+
+    Made-up species names again, so no local taxonomy on the test host can
+    quietly reclassify the relationship into a refinement.
+    """
+    app, db = app_and_db
+    client = app.test_client()
+    stale_photo, _ = _seed_prediction_photo(
+        db, "revalidate-a.jpg", "TestZanclusalpha", 0.9,
+    )
+    clean_photo, _ = _seed_prediction_photo(
+        db, "revalidate-b.jpg", "TestZanclusalpha", 0.85,
+    )
+    stale_pred = _prediction_id(db, stale_photo, "TestZanclusalpha")
+    clean_pred = _prediction_id(db, clean_photo, "TestZanclusalpha")
+
+    # What Browse renders: both photos are clean, so both are acceptable.
+    rendered = client.post(
+        "/api/selection/prediction-suggestions",
+        json={"photo_ids": [stale_photo, clean_photo]},
+    )
+    assert rendered.status_code == 200, rendered.get_data(as_text=True)
+    entry = next(
+        p for p in rendered.get_json()["predictions"]
+        if p["species"] == "TestZanclusalpha"
+    )
+    payload = entry["acceptable_prediction_ids"]
+    assert set(payload) == {stale_pred, clean_pred}
+    assert entry["ambiguous_prediction_ids"] == []
+
+    # Elsewhere, between render and click: a conflicting species lands on one
+    # of the two photos. Nothing touches prediction status.
+    conflict_kid = db.add_keyword("TestZanclusbeta", is_species=True)
+    db.tag_photo(stale_photo, conflict_kid)
+    assert db.get_predictions(photo_ids=[stale_photo], status="pending")
+
+    # The stale button posts the payload it rendered with.
+    resp = client.post(
+        "/api/predictions/batch-accept", json={"prediction_ids": payload},
+    )
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+    body = resp.get_json()
+    # The honest half still lands — one moved row must not strand the rest.
+    assert body["accepted"] == 1
+    assert body["skipped_ambiguous"] == 1
+    assert body["already_decided"] == 0
+
+    def _species_names(photo_id):
+        return {k["name"] for k in db.get_photo_keywords(photo_id)}
+
+    assert "TestZanclusalpha" in _species_names(clean_photo)
+    assert "TestZanclusalpha" not in _species_names(stale_photo), (
+        "a stale accept tagged a species that now conflicts with the photo's "
+        "keywords, instead of leaving it for Review"
+    )
+    statuses = {
+        row["photo_id"]: row["status"]
+        for row in db.get_predictions(photo_ids=[stale_photo, clean_photo])
+    }
+    assert statuses[stale_photo] == "pending"
+    assert statuses[clean_photo] == "accepted"
+
+    # And the panel now agrees with what the endpoint just did: the skipped
+    # row reads as ambiguous on reload, so the user is shown the Review
+    # hand-off rather than an Accept button that would be declined again.
+    reloaded = client.post(
+        "/api/selection/prediction-suggestions",
+        json={"photo_ids": [stale_photo, clean_photo]},
+    )
+    reloaded_entry = next(
+        p for p in reloaded.get_json()["predictions"]
+        if p["species"] == "TestZanclusalpha"
+    )
+    assert reloaded_entry["ambiguous_prediction_ids"] == [stale_pred]
+    assert reloaded_entry["acceptable_prediction_ids"] == []
+
+
+def test_batch_accept_skips_ambiguous_rows_with_alternatives(app_and_db):
+    """The alternative-sibling half of the rule is enforced server-side too.
+
+    The panel withholds Accept from a row whose ``(detection, model)`` has an
+    ``alternative`` sibling, because accepting picks a winner the user was
+    never asked about. A caller that submits one anyway — a hand-rolled
+    request, or a payload rendered before the alternative was recorded — must
+    hit the same wall, since both go through ``_ambiguous_prediction_ids``.
+    """
+    app, db = app_and_db
+    client = app.test_client()
+    photo_id, det_id = _seed_prediction_photo(
+        db, "revalidate-alt.jpg", "TestZanclusgamma", 0.7,
+    )
+    db.add_prediction(
+        det_id, "TestZanclusdelta", 0.3, "bioclip",
+        status="alternative", labels_fingerprint="fp1",
+    )
+    pred_id = _prediction_id(db, photo_id, "TestZanclusgamma")
+    edits_before = len(db.get_edit_history(limit=50))
+
+    resp = client.post(
+        "/api/predictions/batch-accept", json={"prediction_ids": [pred_id]},
+    )
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+    body = resp.get_json()
+    assert body["accepted"] == 0
+    assert body["skipped_ambiguous"] == 1
+    assert "TestZanclusgamma" not in {
+        k["name"] for k in db.get_photo_keywords(photo_id)
+    }
+    # A no-op must leave nothing on the undo stack: Browse gates its undo
+    # toast on ``accepted``, and an entry here would let Ctrl+Z reverse some
+    # older, unrelated edit.
+    assert len(db.get_edit_history(limit=50)) == edits_before
+    assert app is not None
+
+
 def test_predictions_api_effective_category_reflects_current_keywords(
     app_and_db,
 ):
@@ -17894,11 +18022,24 @@ def test_batch_accept_dedup_still_rejects_skipped_detection_alternatives(
         _prediction_id(db, b_photo, "Bald Eagle"),
     ]
 
-    resp = client.post(
+    # A row with an alternative sibling is ambiguous, so ``batch-accept``
+    # now declines the whole payload rather than picking a winner the panel
+    # never offered — the panel puts these in ``ambiguous_prediction_ids``.
+    # That is the endpoint's contract; the group-expansion behaviour this
+    # test exists for therefore has to be exercised one layer down, on
+    # ``accept_prediction`` itself, which Review's single-photo route still
+    # reaches with alternatives present.
+    declined = client.post(
         "/api/predictions/batch-accept",
         json={"prediction_ids": pred_ids},
     )
-    assert resp.status_code == 200, resp.get_data(as_text=True)
+    assert declined.status_code == 200, declined.get_data(as_text=True)
+    assert declined.get_json() == {
+        "ok": True, "accepted": 0, "already_decided": 0,
+        "skipped_ambiguous": 2, "species": None,
+    }
+
+    db.accept_prediction(pred_ids[0], prediction_ids=set(pred_ids))
 
     # Every submitted detection's alternative row must end up rejected —
     # the representative's accept path only rejects siblings scoped to its

@@ -10173,6 +10173,70 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             return effective_category in _EFFECTIVE_AMBIGUOUS_CATEGORIES
         return stored_category in _STORED_AMBIGUOUS_CATEGORIES
 
+    def _ambiguous_prediction_ids(db, rows):
+        """Which of ``rows`` a bare Accept must not act on.
+
+        The one definition of "ambiguous" for the pair of endpoints that
+        need it: the selection panel, which splits its payload into
+        ``acceptable_prediction_ids`` and ``ambiguous_prediction_ids``, and
+        ``batch-accept``, which re-derives the same verdict before writing.
+        Two conditions, both of which mean a bare Accept would decide
+        something the user has not been shown:
+
+        * an ``alternative`` sibling on the row's ``(detection, model)`` —
+          the classifier offered a runner-up, so accepting picks a winner on
+          the user's behalf;
+        * a disagreement/refinement against the photo's species keywords,
+          judged by ``_prediction_is_ambiguous`` on the *current* keywords
+          (see ``_effective_category_resolver`` for why the stored
+          ``category`` column cannot be trusted for this).
+
+        ``batch-accept`` recomputes rather than trusting the payload because
+        the panel's split is a snapshot: a keyword added from Review, a
+        second Browse tab, or an XMP sync between render and click makes a
+        row ambiguous while it is still ``pending``, so the decided-status
+        precondition alone cannot catch it. The panel's own refresh handles
+        mutations inside one document; only the server sees the rest. This
+        lives here — not once per endpoint — for the reason rounds 7 and 8
+        established for the status precondition and the accept scope: a rule
+        with two implementations is a rule that drifts.
+
+        ``rows`` are prediction rows carrying ``id``, ``photo_id``,
+        ``detection_id``, ``model``, ``category``, ``species``, ``group_id``
+        and ``individual``. Returns the ambiguous subset of their ids.
+        """
+        rows = list(rows)
+        if not rows:
+            return set()
+        photo_ids = list(dict.fromkeys(
+            row["photo_id"] for row in rows if row["photo_id"] is not None
+        ))
+        # Keyed by (detection, model) exactly as /api/predictions nests
+        # alternatives, so "has alternatives" means the same thing in Browse,
+        # in this check, and in Review.
+        alt_keys = {
+            (row["detection_id"], row["model"])
+            for row in db.get_predictions(
+                photo_ids=photo_ids, status="alternative",
+            )
+        }
+        effective_category_of = _effective_category_resolver(db, photo_ids)
+        ambiguous = set()
+        for row in rows:
+            # Compared on the species the accept path would actually apply
+            # (the burst consensus), not the row's own label.
+            species = _prediction_consensus_species(row)
+            effective_category = (
+                effective_category_of(row["photo_id"], species)
+                if effective_category_of is not None and species else None
+            )
+            if (
+                (row["detection_id"], row["model"]) in alt_keys
+                or _prediction_is_ambiguous(effective_category, row["category"])
+            ):
+                ambiguous.add(row["id"])
+        return ambiguous
+
     def _parse_selection_photo_ids(body):
         """Validate a selection payload's ``photo_ids``.
 
@@ -10241,22 +10305,12 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             row for row in all_pending if (row["confidence"] or 0.0) >= threshold
         ]
         below_threshold_count = len(all_pending) - len(pending)
-        # An alternative row means the classifier offered a runner-up the user
-        # should choose between. Keyed by (detection, model) exactly as
-        # /api/predictions nests them, so "has alternatives" means the same
-        # thing in Browse as it does in Review.
-        alt_keys = {
-            (row["detection_id"], row["model"])
-            for row in db.get_predictions(photo_ids=photo_ids, status="alternative")
-        }
-        # ``predictions.category`` is a snapshot from classification time —
-        # keyword edits made afterwards never touch it, so a prediction
-        # categorized ``new`` when classified may now conflict with a
-        # species keyword the user added later. Recompute the disposition
-        # against the *current* species keywords per photo so Browse routes
-        # those conflicts to Review instead of offering a bare Accept that
-        # silently adds a second, disagreeing species.
-        effective_category_of = _effective_category_resolver(db, photo_ids)
+        # Which of these rows a bare Accept must not touch — an alternative
+        # sibling, or a disagreement/refinement against the photo's *current*
+        # species keywords. Computed by the same helper ``batch-accept``
+        # re-runs before writing, so the button's promise and the endpoint's
+        # precondition cannot describe different sets.
+        ambiguous_row_ids = _ambiguous_prediction_ids(db, pending)
 
         order = {pid: i for i, pid in enumerate(photo_ids)}
         by_key = {}
@@ -10279,18 +10333,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             })
             entry["models"].add(row["model"])
             entry["confidences"].append(row["confidence"] or 0.0)
-            # Compared on the consensus species, because that is the one the
-            # Accept button would actually add to the photo.
-            effective_category = (
-                effective_category_of(row["photo_id"], species)
-                if effective_category_of is not None else None
-            )
-            ambiguous = (
-                (row["detection_id"], row["model"]) in alt_keys
-                or _prediction_is_ambiguous(
-                    effective_category, row["category"],
-                )
-            )
+            ambiguous = row["id"] in ambiguous_row_ids
             # One photo can hold several detections of the same species, or
             # the same detection classified by several models. Keep every
             # matching prediction id so the batch accept flips them all —
@@ -16535,6 +16578,18 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         The whole batch lands as ONE ``prediction_accept`` edit so a single
         undo reverses it, matching the per-photo ``changed_tag`` / ``no_tag``
         encoding ``api_accept_prediction`` already uses.
+
+        Contract: every row this endpoint accepts is one that is still
+        undecided AND still unambiguous *at the moment of the write*, judged
+        against the database rather than against whatever the caller's panel
+        believed. Both preconditions are re-derived here — statuses via
+        ``_decided_prediction_ids``, ambiguity via
+        ``_ambiguous_prediction_ids``, the same helper that produced the
+        panel's ``acceptable_prediction_ids``. Rows failing either are
+        skipped, never accepted, and counted back in ``already_decided`` and
+        ``skipped_ambiguous``. A stale payload can therefore accept less than
+        the caller asked for, but never something the caller was not shown as
+        acceptable.
         """
         db = _get_db()
         body = request.get_json(silent=True) or {}
@@ -16576,6 +16631,27 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         already_decided = _decided_prediction_ids(db, pred_ids)
         pred_ids = [pid for pid in pred_ids if pid not in already_decided]
 
+        # Re-derive ambiguity instead of trusting the payload. The decided
+        # filter above only catches rows whose *status* moved; a row can stay
+        # ``pending`` and still stop being safe to bare-accept, because
+        # ambiguity is a function of the photo's current species keywords.
+        # Add a Golden Eagle keyword from Review or a second tab after Browse
+        # rendered "Accept on 35", and the Bald Eagle row Browse listed as
+        # acceptable is now a conflict — the panel would route it to Review,
+        # but the button in the stale document still posts it. Skipping it
+        # here is what makes "Accept" mean the same thing at click time as it
+        # did at render time (``CORE_PHILOSOPHY.md``, no black boxes).
+        #
+        # Skipped rather than a 400 for the same reason ``already_decided``
+        # is: the rest of the batch is still exactly what the user asked for,
+        # and the panel refresh that follows re-renders the skipped rows in
+        # their ambiguous form, with the Review hand-off. Failing the whole
+        # call would strand 34 honest accepts on one row that moved.
+        ambiguous_ids = _ambiguous_prediction_ids(
+            db, _load_prediction_rows(db, pred_ids),
+        )
+        pred_ids = [pid for pid in pred_ids if pid not in ambiguous_ids]
+
         # Confine the whole batch to the rows the caller actually submitted.
         # ``accept_prediction`` otherwise expands a grouped (burst) accept to
         # every row in the group, tagging photos the user never selected.
@@ -16589,9 +16665,9 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         # a row the panel deliberately omitted (below threshold, ambiguous, or
         # already accepted). Row identity has no such projection to get wrong,
         # whatever column next distinguishes two rows on one photo. Note this
-        # set is built *after* the already-decided filter, so a row that was
-        # accepted or rejected elsewhere cannot be re-accepted through a
-        # sibling's group expansion either.
+        # set is built *after* both filters above, so a row that was decided
+        # elsewhere, or that has since become ambiguous, cannot be re-accepted
+        # through a sibling's group expansion either.
         submitted_pred_ids = set(pred_ids)
         # A grouped accept resolves every submitted sibling in its group in
         # one call — including each one's losing alternatives, which
@@ -16675,8 +16751,49 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             # rules out, and this count is the only signal a caller gets for
             # rows the batch deliberately left alone.
             "already_decided": len(already_decided),
+            # Rows still pending but no longer safe to bare-accept, because
+            # the photo's keywords moved after the panel rendered. Reported
+            # separately from ``already_decided`` because the user's next step
+            # differs: a decided row needs nothing, an ambiguous one needs
+            # Review. Browse turns this into a toast rather than letting the
+            # count vanish between "Accept on 35" and 33 accepts.
+            "skipped_ambiguous": len(ambiguous_ids),
             "species": species,
         })
+
+    def _load_prediction_rows(db, pred_ids):
+        """Load ``pred_ids`` in the shape ``_ambiguous_prediction_ids`` wants.
+
+        Selected by id rather than through ``get_predictions(photo_ids=...)``
+        so a submitted row is judged on its own merits: the photo-scoped query
+        also returns siblings the caller never submitted, and filters to the
+        latest ``labels_fingerprint``, which would silently drop a submitted
+        row from the check instead of judging it. Workspace scoping is already
+        settled by ``_parse_prediction_ids``, which runs first.
+
+        Chunked for the same reason every other id query here is — a legal
+        payload runs past the 999-variable limit older SQLite builds enforce.
+        """
+        if not pred_ids:
+            return []
+        ws = db._ws_id()
+        rows = []
+        for chunk in _chunked(pred_ids):
+            placeholders = ",".join("?" for _ in chunk)
+            rows.extend(db.conn.execute(
+                f"""SELECT pr.id, pr.species, pr.category, pr.detection_id,
+                           pr.classifier_model AS model, d.photo_id,
+                           pr_rev.group_id AS group_id,
+                           pr_rev.individual AS individual
+                    FROM predictions pr
+                    JOIN detections d ON d.id = pr.detection_id
+                    LEFT JOIN prediction_review pr_rev
+                      ON pr_rev.prediction_id = pr.id
+                     AND pr_rev.workspace_id = ?
+                    WHERE pr.id IN ({placeholders})""",
+                (ws, *chunk),
+            ).fetchall())
+        return rows
 
     # The one definition of "no longer actionable" for both batch prediction
     # endpoints. ``pending`` rows are the normal case; ``alternative`` rows

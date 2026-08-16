@@ -6581,19 +6581,51 @@ async function _afterPredictionMutation(photoIds, opts) {
   scheduleCollectionCountsRefresh();
   refreshActiveCollectionAfterMembershipChange();
   refreshPendingSyncBanner();
-  showUndoToast();
+  // Only when the call actually accepted something. batch-accept returns
+  // success with `accepted: 0` for a payload whose rows have all been decided
+  // or become ambiguous since the panel rendered, and records no undoable
+  // edit — so an unconditional toast would advertise, and Ctrl+Z would
+  // reverse, some older unrelated edit.
+  if (opts.accepted !== 0) showUndoToast();
+}
+
+// A stale panel can submit rows the server then declines to accept: decided
+// elsewhere, or no longer unambiguous against the photos' current keywords.
+// The refreshed panel shows the survivors, but the gap between "Accept on 35"
+// and 33 accepts has to be named, not left for the user to notice — the same
+// rule that made the button disclose its count in the first place.
+function _reportSkippedAccepts(data) {
+  if (!data) return;
+  var parts = [];
+  if (data.already_decided) {
+    parts.push(data.already_decided + ' already decided elsewhere');
+  }
+  if (data.skipped_ambiguous) {
+    parts.push(data.skipped_ambiguous +
+      ' now conflicting with keywords — resolve in Review');
+  }
+  if (!parts.length) return;
+  var accepted = data.accepted || 0;
+  showToast((accepted ? 'Accepted ' + accepted + ' photo' +
+    (accepted === 1 ? '' : 's') + '; skipped ' : 'Nothing accepted: ') +
+    parts.join(', '));
 }
 
 async function acceptDetailPredictions(predictionIds, photoId) {
   if (!predictionIds || !predictionIds.length) return;
+  var data;
   try {
-    await safeFetch('/api/predictions/batch-accept', {
+    data = await safeFetch('/api/predictions/batch-accept', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({prediction_ids: predictionIds}),
     });
   } catch(e) { return; }
-  await _afterPredictionMutation([photoId], { photoId: photoId, reloadDetail: true });
+  await _afterPredictionMutation(
+    [photoId],
+    { photoId: photoId, reloadDetail: true, accepted: (data || {}).accepted },
+  );
+  _reportSkippedAccepts(data);
 }
 
 async function rejectDetailPredictions(predictionIds, photoId) {
@@ -6766,14 +6798,18 @@ async function acceptSelectionPrediction(idx) {
   var ids = selectionPredictionAcceptableById[idx] || [];
   if (!ids.length) return;
   var selection = getActiveSelection();
+  var data;
   try {
-    await safeFetch('/api/predictions/batch-accept', {
+    data = await safeFetch('/api/predictions/batch-accept', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({prediction_ids: ids}),
     });
   } catch(e) { return; }
-  await _afterPredictionMutation(selection, {});
+  await _afterPredictionMutation(
+    selection, { accepted: (data || {}).accepted },
+  );
+  _reportSkippedAccepts(data);
 }
 
 async function loadSelectionKeywordSuggestions(ids) {

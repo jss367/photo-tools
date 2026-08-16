@@ -68,7 +68,8 @@ carries its own prediction row. Each entry returns:
 - `missing_photo_ids` — predicted but not yet keyworded
 - `prediction_ids` — the prediction rows for those photos
 - `acceptable_prediction_ids` / `acceptable_photo_count` — the unambiguous
-  rows an Accept button may act on
+  rows an Accept button may act on, split by `_ambiguous_prediction_ids`,
+  the same helper `batch-accept` re-runs before writing
 - `acceptable_keyworded_count` — how many of those photos already carry the
   keyword, so accepting them writes no tag
 - `ambiguous_prediction_ids` — the subset with alternatives or a
@@ -403,6 +404,53 @@ In both directions a re-submitted row also records a status-only edit whose
 "previous" status is a fiction, so undoing it would knock a long-decided
 prediction back to pending.
 
+**Ambiguity is revalidated, not trusted.** The status filter above only
+catches rows whose *status* moved. A row can stay `pending` and still stop
+being safe to bare-accept, because ambiguity is a function of the photo's
+current species keywords: add a Golden Eagle keyword from Review, a second
+Browse tab, or an XMP sync after Browse rendered "Accept on 35", and the Bald
+Eagle row the panel listed as acceptable is now a conflict. The panel's own
+refresh (`vireo:edit-history-changed` + `_refreshBrowseKeywordState`) covers
+mutations inside one document; only the server sees the rest.
+
+So `batch-accept` re-derives the verdict before writing, through
+`_ambiguous_prediction_ids(db, rows)` — **the same helper that produces the
+panel's `acceptable_prediction_ids`**, not a second implementation. It owns
+both halves of the rule (an `alternative` sibling on the row's
+`(detection, model)`, and `_prediction_is_ambiguous` against current
+keywords), so the button's promise and the write's precondition cannot
+describe different sets. This is the lesson the status precondition and the
+accept scope each taught earlier: a rule with two implementations is a rule
+that drifts.
+
+**The endpoint's contract.** Every row `batch-accept` accepts is one that is
+still undecided AND still unambiguous *at the moment of the write*, judged
+against the database rather than against whatever the caller's panel
+believed. Rows failing either precondition are skipped — never accepted —
+and counted back as `already_decided` and `skipped_ambiguous`. A stale
+payload can accept *less* than the caller asked for, never something the
+caller was not shown as acceptable. Skipping beats a 400: the rest of the
+batch is still exactly what the user asked for, and failing the whole call
+would strand 34 honest accepts on one row that moved.
+
+Two consequences at the caller:
+
+- Browse names the gap. `_reportSkippedAccepts` turns a non-zero
+  `already_decided` / `skipped_ambiguous` into a toast, because the distance
+  between "Accept on 35" and 33 accepts has to be spoken, not left for the
+  user to spot. The two counts stay separate because the next step differs —
+  a decided row needs nothing, an ambiguous one needs Review.
+- The undo toast is gated on `accepted`. A payload whose rows have all been
+  decided or turned ambiguous returns `accepted: 0` and records no undoable
+  edit, so an unconditional toast would advertise — and Ctrl+Z would
+  reverse — some older, unrelated edit.
+
+Because the check applies to alternatives too, a row with an `alternative`
+sibling can no longer be accepted through this endpoint at all. That matches
+what the panel offers; Review's single-photo `/api/predictions/<id>/accept`
+is the path that deliberately still accepts with alternatives on screen, and
+is where the group-expansion behaviour is now covered.
+
 ## Testing
 
 `vireo/tests/test_app.py`:
@@ -416,6 +464,14 @@ prediction back to pending.
 - Batch accept records a single undo entry.
 - Batch reject skips already-accepted and already-rejected rows, leaving the
   accept's keyword and status intact and writing no history entry.
+- `test_batch_accept_revalidates_ambiguity_after_keywords_move` — a payload
+  rendered when both photos were clean, submitted after one gained a
+  conflicting keyword: the clean row still accepts, the moved row is skipped
+  and stays pending and untagged, and a reload of the suggestions endpoint
+  agrees with what the write just did.
+- `test_batch_accept_skips_ambiguous_rows_with_alternatives` — the
+  alternative-sibling half of the same rule, and the no-op leaves nothing on
+  the undo stack.
 - The panels' invalidation lives in `_refreshBrowseKeywordState` (before its
   early returns) and in a `vireo:edit-history-changed` listener, so the
   coverage is structural rather than per-call-site.

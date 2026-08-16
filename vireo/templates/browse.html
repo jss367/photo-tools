@@ -8835,11 +8835,15 @@ async function copyFolderPath(fid) {
   }
 }
 
+var folderWorkspacesRequestSeq = 0;
+
 function hideFolderWorkspaces() {
+  folderWorkspacesRequestSeq += 1;
   document.getElementById('folderWorkspacesModal').classList.remove('open');
 }
 
 async function showFolderWorkspaces(fid) {
+  var requestSeq = ++folderWorkspacesRequestSeq;
   var modal = document.getElementById('folderWorkspacesModal');
   var path = document.getElementById('folderWorkspacesPath');
   var list = document.getElementById('folderWorkspacesList');
@@ -8853,6 +8857,7 @@ async function showFolderWorkspaces(fid) {
 
   try {
     var data = await safeFetch('/api/folders/' + fid + '/workspaces', {}, { toast: false });
+    if (requestSeq !== folderWorkspacesRequestSeq) return;
     path.textContent = data.folder && data.folder.path ? data.folder.path : '';
     list.textContent = '';
     (data.workspaces || []).forEach(function(workspace) {
@@ -8886,6 +8891,7 @@ async function showFolderWorkspaces(fid) {
       list.appendChild(empty);
     }
   } catch (err) {
+    if (requestSeq !== folderWorkspacesRequestSeq) return;
     list.textContent = '';
     var error = document.createElement('div');
     error.style.cssText = 'color:var(--danger);font-size:13px;';

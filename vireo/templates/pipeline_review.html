@@ -7421,10 +7421,25 @@ function openPipelinePhotoEditor(photoId) {
 }
 
 function grmHasPendingUserEdits() {
-  if (!grmState || !grmState.seeded) return false;
+  if (!grmState) return false;
+  // Movement and species controls remain usable while the DB seed request is
+  // in flight. We cannot diff those choices against an unknown snapshot yet,
+  // but they are still user work that same-window navigation must preserve.
+  if (!grmState.seeded) {
+    return !!((grmState.touched && grmState.touched.size) || grmState.speciesFieldTouched);
+  }
   var diff = grmComputeDiff();
   return grmFlagsDirty(diff) || diff.speciesChanged || !!grmState.speciesFieldTouched;
 }
+
+window.getLightboxBrowseDisabledHint = function() {
+  var overlay = document.getElementById('grmOverlay');
+  var groupOpen = overlay && overlay.classList.contains('open');
+  if (groupOpen && typeof isTauri === 'function' && isTauri() && grmHasPendingUserEdits()) {
+    return 'Apply or close Group Review before leaving this page';
+  }
+  return null;
+};
 
 function pipelineCollectionAcceptsManualPhotos(collection) {
   if (typeof collection.can_add_photos === 'boolean') return collection.can_add_photos;
@@ -7444,7 +7459,14 @@ async function addToCollection(photoIds) {
   var collections;
   try {
     collections = await safeFetch('/api/collections', {}, {toast: false});
-  } catch(e) { return; }
+  } catch(e) {
+    // The native Photo menu pins its selection while this asynchronous modal
+    // opens. If loading fails before there is a modal to close, release that
+    // override here so later native actions use the current page selection.
+    pipelineReviewModalPhotoIds = [];
+    window._vireoNativeMenuPhotoIdsOverride = null;
+    return;
+  }
   pipelineReviewCollections = (collections || []).filter(pipelineCollectionAcceptsManualPhotos);
   document.getElementById('pipelineCollectionTitle').textContent =
     'Add ' + ids.length + ' photo' + (ids.length === 1 ? '' : 's') + ' to Collection';

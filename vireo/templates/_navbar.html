@@ -7912,9 +7912,13 @@ function buildLightboxContextMenu(pid) {
   items.push(toggleItem('Lightbox controls', _lbChromeVisible, toggleLightboxChrome));
   items.push(toggleItem('Wildlife classification', !_lbCurrentWildlifeExcluded, lightboxToggleWildlifeExcluded));
   items.push({ separator: true });
-  items.push({ label: 'Open in Browse',
+  var browseDisabledHint = typeof window.getLightboxBrowseDisabledHint === 'function'
+    ? window.getLightboxBrowseDisabledHint(pid)
+    : null;
+  items.push({ label: 'Open in Browse', disabled: !!browseDisabledHint,
+    disabledHint: browseDisabledHint || undefined,
     onClick: function() {
-      window.location.href = '/browse?photo_id=' + encodeURIComponent(pid);
+      window.openInBrowse(pid);
     } });
   if (typeof window.buildSpeciesHighlightMenuItems === 'function') {
     items = items.concat(window.buildSpeciesHighlightMenuItems([pid], {

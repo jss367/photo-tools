@@ -695,6 +695,36 @@ def test_photo_context_menu_adds_photo_to_existing_collection(live_server, page)
     assert [member["id"] for member in members] == [photo_id]
 
 
+def test_collection_load_failure_clears_native_selection_override(live_server, page):
+    photo_ids = live_server["data"]["photos"][:4]
+    _write_grouped_pipeline_cache(live_server, photo_ids)
+
+    page.goto(f"{live_server['url']}/pipeline/review")
+    expect(page.locator(".photo-card[data-photo-id]")).to_have_count(4)
+    state = page.evaluate(
+        """async ids => {
+          const originalSafeFetch = window.safeFetch;
+          window._vireoNativeMenuPhotoIdsOverride = ids.slice(0, 2);
+          window.safeFetch = function(url) {
+            if (url === '/api/collections') return Promise.reject(new Error('offline'));
+            return originalSafeFetch.apply(this, arguments);
+          };
+          try {
+            await addToCollection();
+            return {
+              override: window._vireoNativeMenuPhotoIdsOverride,
+              modalIds: pipelineReviewModalPhotoIds.slice(),
+              modalOpen: document.getElementById('pipelineCollectionModal').classList.contains('open'),
+            };
+          } finally {
+            window.safeFetch = originalSafeFetch;
+          }
+        }""",
+        photo_ids,
+    )
+    assert state == {"override": None, "modalIds": [], "modalOpen": False}
+
+
 def test_photo_context_menu_updates_rating_and_adds_keyword(live_server, page):
     db = live_server["db"]
     photo_ids = live_server["data"]["photos"][:4]
@@ -811,6 +841,32 @@ def test_lightbox_over_group_review_suppresses_group_shortcuts(live_server, page
         "})"
     )
     assert zones == {"picks": [], "rejects": [], "removed": [], "touched": []}
+
+
+def test_lightbox_browse_uses_state_preserving_navigation_helper(live_server, page):
+    photo_ids = live_server["data"]["photos"][:4]
+    _write_grouped_pipeline_cache(live_server, photo_ids)
+
+    page.goto(f"{live_server['url']}/pipeline/review")
+    expect(page.locator(".photo-card[data-photo-id]")).to_have_count(4)
+    page.evaluate("openGroupReview(0, 0)")
+    page.wait_for_function("grmState && grmState.seeded === true")
+    photo_id = photo_ids[0]
+    page.evaluate(
+        """pid => {
+          grmMoveReject();
+          window.__lightboxBrowsePhotoId = null;
+          window.openInBrowse = id => { window.__lightboxBrowsePhotoId = id; };
+          openPipelineLightbox(pid);
+        }""",
+        photo_id,
+    )
+
+    page.locator("#lightboxImg").click(button="right")
+    page.locator(".vireo-ctx-item", has_text="Open in Browse").click()
+    assert page.evaluate("window.__lightboxBrowsePhotoId") == photo_id
+    expect(page.locator("#grmOverlay")).to_have_class(re.compile(r"\bopen\b"))
+    assert page.evaluate("grmState.rejects.has(grmState.selected)") is True
 
 
 def test_lightbox_flag_over_group_review_updates_pending_zones(live_server, page):
@@ -955,4 +1011,34 @@ def test_tauri_disables_navigation_when_group_review_is_dirty(live_server, page)
         expect(item).to_have_class(re.compile(r"\bvireo-ctx-disabled\b"))
         expect(item).to_have_attribute(
             "title", "Apply or close Group Review before leaving this page"
+        )
+
+    page.evaluate("pid => openPipelineLightbox(pid)", photo_ids[0])
+    page.locator("#lightboxImg").click(button="right")
+    lightbox_browse = page.locator(".vireo-ctx-item", has_text="Open in Browse")
+    expect(lightbox_browse).to_have_class(re.compile(r"\bvireo-ctx-disabled\b"))
+    expect(lightbox_browse).to_have_attribute(
+        "title", "Apply or close Group Review before leaving this page"
+    )
+
+
+def test_tauri_treats_unseeded_group_touches_as_dirty(live_server, page):
+    photo_ids = live_server["data"]["photos"][:4]
+    _write_grouped_pipeline_cache(live_server, photo_ids)
+
+    page.goto(f"{live_server['url']}/pipeline/review")
+    expect(page.locator(".photo-card[data-photo-id]")).to_have_count(4)
+    # Model the loading/error window before the live DB snapshot has seeded.
+    page.evaluate(
+        "window.__TAURI_INTERNALS__ = {}; openGroupReview(0, 0); "
+        "grmState.seeded = false; grmMoveReject()"
+    )
+    assert page.evaluate("grmState.touched.size") == 1
+
+    card = page.locator("#grmOverlay .grm-card[data-photo-id]").first
+    card.click(button="right")
+    menu = page.locator(".vireo-ctx-menu")
+    for label in ("Open in Browse", "Edit Photo"):
+        expect(menu.locator(".vireo-ctx-item", has_text=label)).to_have_class(
+            re.compile(r"\bvireo-ctx-disabled\b")
         )

@@ -631,6 +631,11 @@ def test_browse_lightbox_zoom_hud_keeps_near_fit_native_stop_separate(
         """() => {
             window._lbCancelOriginalPreload();
             window._lbScheduleSourceSwap = function() {};
+            // Pin _lbNativeZoom for the duration of the test — the seed
+            // fixture has no photo dims, so the async /api/photos/{id}
+            // handler's _lbRecomputeNativeZoom() would otherwise null it
+            // out between clicks and hide the 1:1 stop.
+            window._lbRecomputeNativeZoom = function() {};
             window._lbNativeZoom = 1.05;
             window._lbCurrentSrcKey = window._lbPickSourceKey(window._lbNativeZoom);
             window._lbSetZoom(1, null, null);

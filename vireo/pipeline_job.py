@@ -1596,6 +1596,21 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
             abort_event.set()
         return globals()["_should_abort"](abort_event)
 
+    def _pause_or_cancel_pending():
+        """Non-parking pause/cancel probe for ledger waits held under a lock.
+
+        The bound ``_pause_checkpoint`` probe parks on pause, so a resource
+        wait launched from a critical section (e.g. inside
+        ``acquire_photo_mask``) would keep that lock held for the entire
+        pause. Swap this probe in around such critical sections and the
+        ledger raises ``ResourceWaitCancelled`` instead, unwinding out of
+        the lock so the outer stage can park at a safe boundary.
+        """
+        probe = getattr(runner, "pause_requested", None)
+        if probe is not None and probe(job["id"]):
+            return True
+        return _cancellation_requested()
+
     def _run_pause_participant(participant, work_fn, *, pre_registered=False):
         if not pre_registered:
             pause_gate.register(participant)
@@ -2105,7 +2120,6 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                                 thumb_cache_dir=effective_thumb_cache_dir,
                                 cancel_check=cancel_check,
                                 pause_check=scan_pause_check,
-                                cancel_only_check=_cancellation_requested,
                                 register_restrict_dirs_as_roots=False,
                                 allow_photo_inserts=False,
                             )
@@ -2982,7 +2996,6 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                         permission_error_callback=_on_denied,
                         cancel_check=cancel_check,
                         pause_check=scan_pause_check,
-                        cancel_only_check=_cancellation_requested,
                     )
                 else:
                     # Scan-in-place: scan each source folder independently.
@@ -3053,7 +3066,6 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                                 permission_error_callback=_on_denied,
                                 cancel_check=cancel_check,
                                 pause_check=scan_pause_check,
-                                cancel_only_check=_cancellation_requested,
                             )
                         finally:
                             advance_scan_acc()
@@ -6858,7 +6870,14 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                     _weights_ensured[0] = True
 
                 processed = 0
-                for i, entry in enumerate(photos_to_process):
+                # ``while`` (not ``for``) so a pause that arrives mid-photo
+                # can unwind the per-photo mask lock and retry the SAME
+                # index after resume without holding the lock across the
+                # entire pause. See the pause-unwind branch of the
+                # ``except ResourceWaitCancelled`` handler below.
+                i = 0
+                while i < len(photos_to_process):
+                    entry = photos_to_process[i]
                     if _should_abort(abort):
                         break
 
@@ -6895,7 +6914,18 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                         # so the cross-variant collision in (2) is covered.
                         # Workspace isn't part of the key because photos are
                         # global in Vireo.
-                        with acquire_photo_mask(photo_id):
+                        #
+                        # ``bind_resource_cancel_check(_pause_or_cancel_pending)``
+                        # swaps the outer parking pause probe for a
+                        # non-parking one for the duration of this lock:
+                        # a pause requested while the SAM/DINOv2 inference
+                        # lease is contended raises ``ResourceWaitCancelled``
+                        # here instead of parking beneath the photo lock.
+                        # An unrelated unpaused pipeline reaching the same
+                        # photo would otherwise block for the entire pause.
+                        with bind_resource_cancel_check(
+                            _pause_or_cancel_pending,
+                        ), acquire_photo_mask(photo_id):
                             # Cache hit: a row already exists for (photo, variant)
                             # AND its stored prompt + detector still match the
                             # current primary detection AND the file is on disk.
@@ -6948,6 +6978,7 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                                             == dinov2_variant):
                                         masked += 1
                                         processed = i + 1
+                                        i += 1
                                         continue
 
                             # Past the cache check, so this photo genuinely
@@ -6973,6 +7004,7 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                                     },
                                     error_count=em_failed + em_unreadable,
                                 )
+                                i += 1
                                 continue
 
                             # First true cache miss: ensure SAM2 + DINOv2 weights
@@ -7011,8 +7043,10 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                                         photo["folder_id"],
                                     )
                                     processed = i + 1
+                                    i += 1
                                     continue
                                 processed = i + 1
+                                i += 1
                                 continue
                             if _should_abort_without_pause(abort):
                                 break
@@ -7027,6 +7061,7 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                             if mask is None:
                                 skipped += 1
                                 processed = i + 1
+                                i += 1
                                 continue
                             if _should_abort_without_pause(abort):
                                 break
@@ -7128,12 +7163,19 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                             mask_file_stage = None
                             masked += 1
                     except ResourceWaitCancelled:
-                        # Cooperative cancellation during a CPU inference
-                        # lease wait is not a per-photo mask failure. Let
-                        # it propagate so extract_masks_stage exits its
-                        # per-photo loop promptly instead of iterating
-                        # every remaining candidate.
-                        raise
+                        # The bound non-parking probe raised this because a
+                        # pause OR cancellation is pending. The per-photo
+                        # mask lock has already been released by exiting
+                        # the ``with`` above. If cancellation is what fired,
+                        # propagate to end the stage; otherwise park at a
+                        # safe outer boundary (no locks held) and retry the
+                        # same photo after resume — do NOT advance ``i``.
+                        if _cancellation_requested():
+                            raise
+                        _pause_checkpoint()
+                        if _cancellation_requested():
+                            raise
+                        continue
                     except Exception:
                         em_failed += 1
                         log.warning("Mask extraction failed for photo %s", photo_id, exc_info=True)
@@ -7159,6 +7201,7 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                         "Extracting features (SAM2 + DINOv2)",
                         rate=round(processed / max(time.time() - start_time, 0.01) * 60, 1),
                     )
+                    i += 1
 
                 if _should_abort(abort):
                     # Distinguish a user cancel from a clean completion: pin a

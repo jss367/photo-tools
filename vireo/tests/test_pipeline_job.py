@@ -14,6 +14,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from pipeline_job import (
     STAGE_WEIGHTS,
     PipelineParams,
+    _classification_eta_progress,
     _stage_fraction,
     _weighted_progress,
     run_pipeline_job,
@@ -62,6 +63,58 @@ class FakeRunner:
 
     def is_cancelled(self, job_id):
         return job_id in self.cancelled_ids
+
+
+def test_classification_eta_excludes_fast_cache_hits_from_rate():
+    """A cache-heavy prefix must not masquerade as model throughput."""
+    fields = _classification_eta_progress(
+        total=15_418,
+        seen=6_112,
+        cached_estimate=4_062,
+        cache_hits=4_157,
+        inference_attempts=913,
+        classified=913,
+        elapsed=1_480,
+    )
+
+    assert fields["eta_state"] == "ready"
+    assert fields["eta_rate_per_min"] == pytest.approx(37.0, abs=0.1)
+    assert fields["remaining_uncached"] == 9_306
+    assert fields["eta_seconds"] == pytest.approx(15_085, abs=1)
+    # The broken UI used seen / elapsed: roughly 248/min and a 37-minute ETA.
+    assert fields["eta_seconds"] > 4 * 60 * 60
+
+
+def test_classification_eta_waits_for_a_representative_uncached_batch():
+    fields = _classification_eta_progress(
+        total=1_000,
+        seen=700,
+        cached_estimate=650,
+        cache_hits=650,
+        inference_attempts=15,
+        classified=15,
+        elapsed=60,
+    )
+
+    assert fields["eta_state"] == "estimating"
+    assert fields["eta_seconds"] is None
+    assert fields["eta_rate_per_min"] is None
+
+
+def test_classification_eta_subtracts_expected_future_cache_hits():
+    fields = _classification_eta_progress(
+        total=100,
+        seen=36,
+        cached_estimate=60,
+        cache_hits=20,
+        inference_attempts=16,
+        classified=16,
+        elapsed=120,
+    )
+
+    assert fields["remaining_uncached"] == 24
+    assert fields["eta_rate_per_min"] == 8.0
+    assert fields["eta_seconds"] == 180
 
 
 def test_pipeline_params_has_skip_classify():
@@ -13378,9 +13431,10 @@ def test_collection_rerun_redoes_only_missing_work(tmp_path, monkeypatch):
         )
         runner = FakeRunner()
         job = _make_job()
-        return run_pipeline_job(job, runner, db_path, ws_id, params)
+        result = run_pipeline_job(job, runner, db_path, ws_id, params)
+        return result, runner
 
-    first = run_once()
+    first, _first_runner = run_once()
     n = len(photo_ids)
     assert first["stages"]["thumbnails"]["generated"] == n, first["stages"]
     assert first["stages"]["previews"]["generated"] == n, first["stages"]
@@ -13390,7 +13444,7 @@ def test_collection_rerun_redoes_only_missing_work(tmp_path, monkeypatch):
     assert inference_calls, "first run never invoked the classifier"
 
     inference_calls.clear()
-    second = run_once()
+    second, second_runner = run_once()
     assert second["stages"]["thumbnails"] == {
         "generated": 0, "skipped": n, "failed": 0,
     }, second["stages"]
@@ -13408,6 +13462,17 @@ def test_collection_rerun_redoes_only_missing_work(tmp_path, monkeypatch):
     assert inference_calls == [], (
         f"rerun invoked the classifier: {inference_calls}"
     )
+    eta_updates = [
+        kw["progress"]
+        for _, step_id, kw in second_runner.step_updates
+        if step_id.startswith("classify:")
+        and isinstance(kw.get("progress"), dict)
+        and kw["progress"].get("eta_kind") == "classification"
+    ]
+    assert eta_updates, "classify step never published cache-aware ETA fields"
+    assert eta_updates[-1]["cache_hits"] == n
+    assert eta_updates[-1]["classified"] == 0
+    assert eta_updates[-1]["eta_state"] == "finishing"
 
 
 # ---------------------------------------------------------------------------

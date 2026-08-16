@@ -584,6 +584,17 @@ def test_logs_page(app_and_db):
     assert resp.status_code == 200
 
 
+def test_jobs_page_uses_cache_aware_classification_eta(app_and_db):
+    """Classification must not estimate throughput from cache-hit progress."""
+    app, _ = app_and_db
+    resp = app.test_client().get('/jobs')
+
+    assert resp.status_code == 200
+    assert b"step.progress.eta_kind === 'classification'" in resp.data
+    assert b"newly classified" in resp.data
+    assert b"first uncached batch" in resp.data
+
+
 def test_storage_page_has_preview_cache_field(app_and_db):
     """Storage page renders the preview_cache_max_mb input and cache controls."""
     app, _ = app_and_db

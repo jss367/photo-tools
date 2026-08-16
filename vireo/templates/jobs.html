@@ -745,6 +745,44 @@
             importStatusLine = 'Estimating after the first transfer batch…';
           }
           html += '<div class="tree-step-throughput">' + importStatusLine + '</div>';
+        } else if (step.progress.eta_kind === 'classification') {
+          // Classification can walk cached photos far faster than it can
+          // decode and infer uncached ones. Use the backend's model-work ETA;
+          // current / elapsed would turn a cache-heavy prefix into a wildly
+          // optimistic prediction for the uncached tail.
+          var classifyParts = [];
+          var cacheHits = Number(step.progress.cache_hits) || 0;
+          var classified = Number(step.progress.classified) || 0;
+          if (cacheHits > 0) {
+            classifyParts.push(cacheHits.toLocaleString() + ' cached');
+          }
+          if (classified > 0) {
+            classifyParts.push(
+              classified.toLocaleString() + ' newly classified'
+            );
+          }
+          var classifyEtaState = step.progress.eta_state;
+          var classifyEtaSeconds = Number(step.progress.eta_seconds);
+          var classifyRate = Number(step.progress.eta_rate_per_min);
+          if (
+            classifyEtaState === 'ready'
+            && isFinite(classifyEtaSeconds)
+            && isFinite(classifyRate)
+            && classifyRate > 0
+          ) {
+            classifyParts.push('~' + Math.round(classifyRate) + '/min uncached');
+            if (classifyEtaSeconds > 0) {
+              classifyParts.push('ETA ' + formatElapsed(classifyEtaSeconds));
+            } else {
+              classifyParts.push('finishing…');
+            }
+          } else if (classifyEtaState === 'finishing') {
+            classifyParts.push('finishing…');
+          } else {
+            classifyParts.push('Estimating after the first uncached batch…');
+          }
+          html += '<div class="tree-step-throughput">' +
+            classifyParts.join(' &middot; ') + '</div>';
         } else {
           var stepSecs = (Date.now() - new Date(step.started_at).getTime()) / 1000;
           if (stepSecs > 0) {

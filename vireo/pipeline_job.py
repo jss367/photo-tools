@@ -1357,6 +1357,70 @@ STAGE_WEIGHTS = {
 }
 
 
+_CLASSIFICATION_ETA_MIN_ATTEMPTS = 16
+
+
+def _classification_eta_progress(
+    *, total, seen, cached_estimate, cache_hits, inference_attempts,
+    classified, elapsed,
+):
+    """Return step-progress fields for a cache-aware classification ETA.
+
+    ``seen / elapsed`` is not a useful inference rate: a cache-heavy prefix
+    can be walked hundreds of times faster than uncached photos are decoded
+    and sent through the model.  Estimate only from photos that actually
+    entered an inference batch, while using the preflight cache count to
+    subtract cache hits that are still expected later in the collection.
+
+    The first classifier call is deliberately flushed as a one-photo batch
+    for cancellation responsiveness and includes model warm-up.  Wait for a
+    normal batch's worth of attempts before publishing a numeric ETA.
+    """
+    total = max(int(total or 0), 0)
+    seen = min(max(int(seen or 0), 0), total)
+    cached_estimate = min(max(int(cached_estimate or 0), 0), total)
+    cache_hits = min(max(int(cache_hits or 0), 0), seen)
+    inference_attempts = max(int(inference_attempts or 0), 0)
+    classified = max(int(classified or 0), 0)
+    elapsed = max(float(elapsed or 0), 0.0)
+
+    remaining_photos = max(total - seen, 0)
+    expected_future_cache_hits = max(cached_estimate - cache_hits, 0)
+    remaining_uncached = max(
+        remaining_photos - expected_future_cache_hits, 0,
+    )
+    expected_uncached = max(total - cached_estimate, 0)
+    min_attempts = min(
+        _CLASSIFICATION_ETA_MIN_ATTEMPTS,
+        max(expected_uncached, 1),
+    )
+
+    fields = {
+        "eta_kind": "classification",
+        "eta_state": "estimating",
+        "eta_seconds": None,
+        "eta_rate_per_min": None,
+        "cache_hits": cache_hits,
+        "classified": classified,
+        "inference_attempts": inference_attempts,
+        "remaining_uncached": remaining_uncached,
+    }
+    if seen >= total:
+        fields["eta_state"] = "finishing"
+        fields["eta_seconds"] = 0
+        return fields
+    if inference_attempts < min_attempts or elapsed <= 0:
+        return fields
+
+    rate_per_sec = inference_attempts / elapsed
+    if rate_per_sec <= 0:
+        return fields
+    fields["eta_state"] = "ready"
+    fields["eta_rate_per_min"] = round(rate_per_sec * 60, 1)
+    fields["eta_seconds"] = round(remaining_uncached / rate_per_sec)
+    return fields
+
+
 def _stage_fraction(info):
     """Return a 0..1 completion fraction for one stage entry.
 
@@ -5258,18 +5322,13 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                     # predictions do (see lines ~2000-2004); the live `cached`
                     # counter reflects actual skips.
                     #
-                    # Skipped on reclassify runs (the gate below is bypassed
-                    # so every photo is re-inferred regardless of cache state)
-                    # and on multi-spec runs (the estimate would only cover
-                    # the current spec while ``total`` already spans every
-                    # spec, producing a banner that undercounts cache and
-                    # overstates remaining work — and since the UI hides the
-                    # banner once any photo lands, there's no correction
-                    # window). The single-spec case is the common one.
-                    if (
-                        not params.reclassify
-                        and len(resolved_specs_local) == 1
-                    ):
+                    # Skipped on reclassify runs because the cache gate below
+                    # is bypassed and every photo is re-inferred. In a
+                    # multi-model run each model owns its own Jobs step, so
+                    # accumulate the per-spec estimates for the stage while
+                    # retaining this spec's value for its ETA.
+                    cached_est = 0
+                    if not params.reclassify:
                         cached_est = thread_db.count_classifier_runs(
                             [p["id"] for p in photos],
                             model_name,
@@ -5314,6 +5373,10 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                     # counted once per (photo × spec) — matching ``total``.
                     photos_cached_in_spec: set = set()
                     photos_inferred_in_spec: set = set()
+                    # Includes failed inference attempts as well as successful
+                    # ones. ETA throughput is about completed model work, not
+                    # only predictions that happened to persist successfully.
+                    photos_attempted_in_spec: set = set()
                     # Per-spec tracking of photos whose per-photo iteration
                     # was actually entered in THIS spec. Used by the
                     # reclassify clear below so it never wipes predictions
@@ -5369,6 +5432,7 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                         spec_fp=spec_fp,
                         photos_cached_in_spec=photos_cached_in_spec,
                         photos_inferred_in_spec=photos_inferred_in_spec,
+                        photos_attempted_in_spec=photos_attempted_in_spec,
                     ):
                         nonlocal failed, has_flushed_in_spec
                         if not inference_batch:
@@ -5377,6 +5441,9 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                         pending = list(inference_batch)
                         inference_batch.clear()
                         has_flushed_in_spec = True
+                        photos_attempted_in_spec.update(
+                            entry["photo"]["id"] for entry in pending
+                        )
                         pre_len = len(raw_results)
                         # GPU serialisation lives inside _flush_batch around the
                         # inference call so the DB upserts/result-building afterward
@@ -5926,6 +5993,17 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                             progress={
                                 "current": processed_in_spec,
                                 "total": total,
+                                **_classification_eta_progress(
+                                    total=total,
+                                    seen=processed_in_spec,
+                                    cached_estimate=cached_est,
+                                    cache_hits=len(photos_cached_in_spec),
+                                    inference_attempts=len(
+                                        photos_attempted_in_spec
+                                    ),
+                                    classified=len(photos_inferred_in_spec),
+                                    elapsed=elapsed,
+                                ),
                             },
                         )
 

@@ -5477,16 +5477,13 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                     # photos inflates a numeric ETA the runtime will actually
                     # traverse without any inference work (Codex #1468 P2).
                     #
-                    # On a reclassify run we pass ``detect_state["detections"]``
-                    # so the "any animal >= floor?" test uses the fresh
-                    # in-memory map instead of the DB. Pre-run detection
-                    # rows from a legacy detector model can survive in
-                    # ``detections`` until the deferred stale-row purge
-                    # further down in this stage; scoping the check to
-                    # the fresh set keeps a photo whose fresh MegaDetector
-                    # rows are all below the floor (but whose stale
-                    # pre-run rows aren't) from slipping out of the
-                    # preflight-unclassifiable set (Codex #1468 P2).
+                    # Whenever detection ran, pass its in-memory map so both
+                    # this skip estimate and the cache estimate below use the
+                    # exact candidates the classify loop will consume. Rows
+                    # from another detector model can remain in the DB after
+                    # either a reclassify or an ordinary runtime-fingerprint
+                    # miss; letting those stale rows into preflight can invent
+                    # work or hide a fresh cache hit (Codex #1468 P2).
                     preflight_unclassifiable_ids: set = (
                         thread_db.get_unclassifiable_photos(
                             [p["id"] for p in photos],
@@ -5498,8 +5495,7 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                             ),
                             fresh_detections_by_photo=(
                                 detect_state["detections"]
-                                if params.reclassify
-                                and detect_state.get("ran")
+                                if detect_state.get("ran")
                                 else None
                             ),
                             # ``processed_ids`` is what ``_detect_batch``
@@ -5512,8 +5508,7 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                             # (Codex #1468 P2).
                             fresh_processed_photo_ids=(
                                 detect_state["processed_ids"]
-                                if params.reclassify
-                                and detect_state.get("ran")
+                                if detect_state.get("ran")
                                 else None
                             ),
                         )
@@ -5530,6 +5525,16 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                                 weak_confidence=(
                                     weak_detection_confidence
                                     if contextual_weak_ids
+                                    else None
+                                ),
+                                fresh_detections_by_photo=(
+                                    detect_state["detections"]
+                                    if detect_state.get("ran")
+                                    else None
+                                ),
+                                fresh_processed_photo_ids=(
+                                    detect_state["processed_ids"]
+                                    if detect_state.get("ran")
                                     else None
                                 ),
                             )

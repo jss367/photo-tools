@@ -17846,6 +17846,8 @@ class Database:
         *,
         contextual_weak_photo_ids=None,
         weak_confidence=None,
+        fresh_detections_by_photo=None,
+        fresh_processed_photo_ids=None,
     ):
         """Return the SET of photo IDs from ``photo_ids`` that the classify
         preflight would consider fully cached under
@@ -17885,6 +17887,13 @@ class Database:
         Without this, a rerun over a cached weak tail is scored as pure
         uncached work and the ETA can substantially overstate the time
         remaining (Codex #1468 P2).
+
+        When the detector stage ran, ``fresh_detections_by_photo`` and
+        ``fresh_processed_photo_ids`` scope processed photos to the exact
+        in-memory candidates the classify runtime will consume. This avoids
+        stale rows from another detector either adding uncached work or hiding
+        a fresh uncached target. Photos the detector failed to process retain
+        the DB fallback, matching the classify loop.
         """
         if not photo_ids:
             return set()
@@ -17898,12 +17907,93 @@ class Database:
         )
         normal_ids = [pid for pid in photo_ids if pid not in weak_photo_ids]
         weak_ids = [pid for pid in photo_ids if pid in weak_photo_ids]
+        fresh_processed = (
+            set(fresh_processed_photo_ids or ())
+            if fresh_detections_by_photo is not None
+            and fresh_processed_photo_ids is not None
+            else set()
+        )
+        normal_db_ids = [pid for pid in normal_ids if pid not in fresh_processed]
+        weak_db_ids = [pid for pid in weak_ids if pid not in fresh_processed]
         # Chunk to stay under SQLITE_MAX_VARIABLE_NUMBER (default 999).
         # Match the 500-element chunks used elsewhere in this file.
         CHUNK = 500
         matched = set()
-        for i in range(0, len(normal_ids), CHUNK):
-            chunk = normal_ids[i:i + CHUNK]
+
+        # For photos whose detector iteration completed, mirror the runtime's
+        # in-memory target selection rather than querying every detection row
+        # still present in the DB. Old rows can legitimately survive until a
+        # later purge and are not runtime candidates for this pass.
+        fresh_candidates: dict = {}
+        for photo_id in fresh_processed:
+            is_weak = photo_id in weak_photo_ids
+            floor = weak_conf if is_weak else min_conf
+            candidates = []
+            for detection in fresh_detections_by_photo.get(photo_id) or ():
+                if detection.get("detector_model") == "full-image":
+                    continue
+                if detection.get("category", "animal") != "animal":
+                    continue
+                if (
+                    is_weak
+                    and detection.get("detector_model") != "megadetector-v6"
+                ):
+                    continue
+                confidence = detection.get(
+                    "confidence", detection.get("detector_confidence", 0),
+                )
+                try:
+                    if float(confidence or 0) < floor:
+                        continue
+                except (TypeError, ValueError):
+                    continue
+                if detection.get("id") is not None:
+                    candidates.append(detection)
+            if is_weak and candidates:
+                candidates = sorted(
+                    candidates,
+                    key=lambda detection: (
+                        -float(
+                            detection.get(
+                                "confidence",
+                                detection.get("detector_confidence", 0),
+                            ) or 0
+                        ),
+                        detection.get("id", 0),
+                    ),
+                )[:1]
+            if candidates:
+                fresh_candidates[photo_id] = {
+                    detection["id"] for detection in candidates
+                }
+
+        fresh_detection_ids = {
+            detection_id
+            for candidate_ids in fresh_candidates.values()
+            for detection_id in candidate_ids
+        }
+        cached_fresh_detection_ids: set = set()
+        fresh_detection_ids_list = list(fresh_detection_ids)
+        for i in range(0, len(fresh_detection_ids_list), CHUNK):
+            chunk = fresh_detection_ids_list[i:i + CHUNK]
+            placeholders = ",".join("?" * len(chunk))
+            rows = self.conn.execute(
+                f"""SELECT DISTINCT detection_id
+                      FROM classifier_runs
+                     WHERE detection_id IN ({placeholders})
+                       AND classifier_model = ?
+                       AND labels_fingerprint = ?""",
+                [*chunk, classifier_model, labels_fingerprint],
+            ).fetchall()
+            cached_fresh_detection_ids.update(
+                row["detection_id"] for row in rows
+            )
+        for photo_id, candidate_ids in fresh_candidates.items():
+            if candidate_ids <= cached_fresh_detection_ids:
+                matched.add(photo_id)
+
+        for i in range(0, len(normal_db_ids), CHUNK):
+            chunk = normal_db_ids[i:i + CHUNK]
             if not chunk:
                 continue
             placeholders = ",".join("?" * len(chunk))
@@ -17975,8 +18065,8 @@ class Database:
         # phantom cache hit the overcount tracker cannot correct because
         # the runtime-selected detection has no run key of its own
         # (Codex #1468 P2).
-        for i in range(0, len(weak_ids), CHUNK):
-            chunk = weak_ids[i:i + CHUNK]
+        for i in range(0, len(weak_db_ids), CHUNK):
+            chunk = weak_db_ids[i:i + CHUNK]
             if not chunk:
                 continue
             placeholders = ",".join("?" * len(chunk))
@@ -18048,6 +18138,8 @@ class Database:
         *,
         contextual_weak_photo_ids=None,
         weak_confidence=None,
+        fresh_detections_by_photo=None,
+        fresh_processed_photo_ids=None,
     ):
         """Return ``len(get_classifier_run_cache_hits(...))``.
 
@@ -18062,6 +18154,8 @@ class Database:
             labels_fingerprint,
             contextual_weak_photo_ids=contextual_weak_photo_ids,
             weak_confidence=weak_confidence,
+            fresh_detections_by_photo=fresh_detections_by_photo,
+            fresh_processed_photo_ids=fresh_processed_photo_ids,
         ))
 
     def get_unclassifiable_photos(
@@ -18091,10 +18185,10 @@ class Database:
         that ``_detect_batch`` populated). When provided, the "any
         animal detection >= floor?" predicate is answered from this
         fresh set instead of the DB — mirroring what the runtime's
-        ``photo_dets`` filter actually sees. This matters on reclassify
-        runs, where pre-run detection rows from a legacy detector model
-        can survive in ``detections`` until the deferred stale purge
-        at ``classify_stage`` finishes. Without this override, a photo
+        ``photo_dets`` filter actually sees. This matters whenever the
+        current detector pass replaces the runtime candidates while older
+        rows from another detector model remain in the DB. Without this
+        override, a photo
         whose fresh MegaDetector rows are all below the floor but whose
         pre-run rows are above it slips out of ``preflight_
         unclassifiable_ids``, and the ETA keeps counting it as pending
@@ -18185,7 +18279,7 @@ class Database:
                 _db_unclassifiable(pool, floor, unclassifiable)
             return unclassifiable
 
-        # Reclassify path: the "photo has an animal detection >= floor?"
+        # Fresh-detection path: the "photo has an animal detection >= floor?"
         # test uses the fresh in-memory map (matching the runtime's
         # ``photo_dets`` filter), while "photo has any real detection?"
         # still reads the DB — that mirrors the runtime's ``raw_real_dets``

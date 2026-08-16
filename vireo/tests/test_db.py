@@ -18659,6 +18659,65 @@ def test_get_classifier_run_cache_hits_returns_matched_photo_ids(tmp_path):
     )
 
 
+def test_get_classifier_run_cache_hits_uses_fresh_runtime_candidates(tmp_path):
+    """Processed photos must be scored from the detector map the runtime uses.
+
+    A stale uncached row from another detector must not hide a fully cached
+    fresh MegaDetector target and make the ETA project cached work as inference.
+    Photos the current detector pass did not process retain the DB fallback.
+    """
+    from db import Database
+    db = Database(str(tmp_path / "test.db"))
+    fid = db.add_folder("/photos", name="photos")
+    p_processed = db.add_photo(
+        folder_id=fid, filename="processed.jpg", extension=".jpg",
+        file_size=1, file_mtime=1.0, timestamp=None, width=1, height=1,
+    )
+    p_failed = db.add_photo(
+        folder_id=fid, filename="failed.jpg", extension=".jpg",
+        file_size=1, file_mtime=1.0, timestamp=None, width=1, height=1,
+    )
+
+    # The processed photo retains an uncached foreign-detector row, but its
+    # actual current-run MegaDetector target is cached.
+    _add_one_detection(
+        db, p_processed, detector_model="megadetector-v5", conf=0.9,
+    )
+    fresh_detection_id = _add_one_detection(
+        db, p_processed, detector_model="megadetector-v6", conf=0.8,
+    )
+    db.record_classifier_run(
+        fresh_detection_id, "BioCLIP-2.5", "fp-a", prediction_count=1,
+    )
+
+    # This photo represents an individual detector failure: it is absent from
+    # processed_ids, so its cached DB candidate must still count.
+    failed_fallback_id = _add_one_detection(
+        db, p_failed, detector_model="megadetector-v6", conf=0.7,
+    )
+    db.record_classifier_run(
+        failed_fallback_id, "BioCLIP-2.5", "fp-a", prediction_count=1,
+    )
+
+    assert db.get_classifier_run_cache_hits(
+        [p_processed, p_failed], "BioCLIP-2.5", "fp-a",
+    ) == {p_failed}
+
+    hits = db.get_classifier_run_cache_hits(
+        [p_processed, p_failed], "BioCLIP-2.5", "fp-a",
+        fresh_detections_by_photo={
+            p_processed: [{
+                "id": fresh_detection_id,
+                "detector_model": "megadetector-v6",
+                "confidence": 0.8,
+                "category": "animal",
+            }],
+        },
+        fresh_processed_photo_ids={p_processed},
+    )
+    assert hits == {p_processed, p_failed}
+
+
 def test_get_classifier_run_cache_hits_includes_contextual_weak(tmp_path):
     """Contextual weak photos are classified with the lowered
     ``weak_detection_confidence`` floor; the preflight must apply the

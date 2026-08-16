@@ -736,6 +736,9 @@ body {
     document.getElementById('locationReviewSkip').disabled = disabled;
     document.getElementById('locationReviewPrevious').disabled = disabled || state.groups.length < 2;
     document.getElementById('locationReviewNext').disabled = disabled || state.groups.length < 2;
+    document.querySelectorAll('[data-suggestion-mode]').forEach(function(button) {
+      button.disabled = disabled;
+    });
   }
 
   function clearMapObjects() {
@@ -1238,6 +1241,7 @@ body {
   }
 
   async function setSuggestionMode(mode) {
+    if (state.isAssigning) return;
     if ((mode !== 'nature' && mode !== 'all') || mode === state.suggestionMode) return;
     var group = currentGroup();
     if (!group) return;

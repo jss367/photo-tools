@@ -358,6 +358,90 @@ def test_location_review_reports_and_resumes_batch_assignment_progress(
     assert requests[2]["photo_ids"] == synthetic_photo_ids[1000:2000]
 
 
+def test_location_review_locks_suggestion_mode_controls_during_assignment(
+    live_server, page,
+):
+    """Suggestion-mode buttons must not clear the selection mid-assignment."""
+    photo_id = live_server["data"]["photos"][0]
+    with live_server["db"].conn:
+        live_server["db"].conn.execute(
+            "UPDATE photos SET latitude = ?, longitude = ? WHERE id = ?",
+            (33.2550, -116.4050, photo_id),
+        )
+
+    page.route(
+        "**/api/config",
+        lambda route: route.fulfill(json={"google_maps_api_key": "test-key"}),
+    )
+    page.route(
+        "https://maps.googleapis.com/maps/api/js**",
+        lambda route: route.fulfill(
+            status=200,
+            content_type="application/javascript",
+            body=GOOGLE_MAPS_STUB,
+        ),
+    )
+    page.goto(f"{live_server['url']}/browse")
+    page.evaluate(
+        "photoId => sessionStorage.setItem('vireoLocationReviewSource', "
+        "JSON.stringify({photo_ids: [photoId]}))",
+        photo_id,
+    )
+    page.goto(f"{live_server['url']}/locations/review?source=selection")
+
+    nature_button = page.locator('[data-suggestion-mode="nature"]')
+    all_button = page.locator('[data-suggestion-mode="all"]')
+    expect(nature_button).to_be_enabled()
+    expect(all_button).to_be_enabled()
+
+    page.locator("#locationReviewSearch").fill("Assigned custom place")
+    page.locator("#locationReviewCustom").click()
+    expect(page.locator("#locationReviewAssign")).to_contain_text(
+        "Assign “Assigned custom place”"
+    )
+
+    page.evaluate(
+        """() => {
+          window.__locationReviewOriginalSafeFetch = window.safeFetch;
+          window.__locationReviewAssignmentPending = [];
+          window.safeFetch = function(url, opts, options) {
+            if (url !== '/api/batch/location/text') {
+              return window.__locationReviewOriginalSafeFetch(url, opts, options);
+            }
+            return new Promise(function(resolve, reject) {
+              window.__locationReviewAssignmentPending.push(
+                {resolve: resolve, reject: reject}
+              );
+            });
+          };
+          window.__settleLocationAssignment = function(result) {
+            var pending = window.__locationReviewAssignmentPending.shift();
+            if (result === 'reject') pending.reject(new Error('Synthetic interruption'));
+            else pending.resolve({ok: true, updated: result});
+          };
+        }"""
+    )
+
+    page.locator("#locationReviewAssign").click()
+    page.wait_for_function(
+        "() => window.__locationReviewAssignmentPending.length === 1"
+    )
+    expect(nature_button).to_be_disabled()
+    expect(all_button).to_be_disabled()
+
+    all_button.click(force=True)
+    expect(nature_button).to_have_attribute("aria-pressed", "true")
+    expect(all_button).to_have_attribute("aria-pressed", "false")
+    expect(page.locator("#locationReviewAssign")).to_have_text("Assigning…")
+
+    page.evaluate("window.__settleLocationAssignment('reject')")
+    expect(page.locator("#locationReviewAssign")).to_contain_text(
+        "Retry “Assigned custom place”"
+    )
+    expect(nature_button).to_be_enabled()
+    expect(all_button).to_be_enabled()
+
+
 def test_location_review_missing_google_key_links_to_settings(live_server, page):
     """The empty suggestion state explains how to enable nearby places."""
     photo_id = live_server["data"]["photos"][0]

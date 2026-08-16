@@ -81,6 +81,12 @@ def test_browse_lightbox_close_selects_current_photo(live_server, page):
         "lightbox-overlay active"
     )
     page.locator("#lightboxNext").click()
+    # Wait for the visible (committed) identity to advance, not just the
+    # navigation target. `_lightboxCurrentId` flips as soon as Next is
+    # pressed, while the outgoing bitmap is held on screen until the
+    # incoming /full decodes; if we close on the target-only signal, a slow
+    # decode races the close and returns Browse to photo 1 under the new
+    # committed-identity close semantics — Codex P2 on PR #1486.
     page.wait_for_function(
         "photoId => window._lightboxCommittedId === photoId", arg=second_id
     )

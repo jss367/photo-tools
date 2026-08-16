@@ -42,7 +42,9 @@ def test_enter_commits_timestamp_between_date_input(live_server, page):
     page.get_by_role("button", name="+ New Collection").click()
 
     modal = page.locator("#collectionModal")
-    field_select = modal.locator("#ruleRows select").first
+    field_select = modal.locator(
+        '#ruleRows select:has(option[value="timestamp"])'
+    )
     field_select.select_option("timestamp")
 
     date_input = modal.locator("#ruleRows input[type='date']").first
@@ -60,8 +62,12 @@ def test_enter_commits_timestamp_recent_days_input(live_server, page):
     page.get_by_role("button", name="+ New Collection").click()
 
     modal = page.locator("#collectionModal")
-    modal.locator("#ruleRows select").first.select_option("timestamp")
-    modal.locator("#ruleRows select").nth(1).select_option("recent_days")
+    modal.locator(
+        '#ruleRows select:has(option[value="timestamp"])'
+    ).select_option("timestamp")
+    modal.locator(
+        '#ruleRows select:has(option[value="recent_days"])'
+    ).select_option("recent_days")
 
     number_input = modal.locator("#ruleRows input[type='number']")
     expect(number_input).to_be_visible()

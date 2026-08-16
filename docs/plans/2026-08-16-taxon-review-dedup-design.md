@@ -637,13 +637,13 @@ stays for its existing non-merged callers; the card endpoint does not
 build on it.
 
 The endpoint takes the card's frozen membership on the same URL
-(`&nodes=<node_id>,…`) and intersects with it exactly as the mutation
+(`&rows=<prediction_id>,…`) and intersects with it exactly as the mutation
 does (§3 step 1). A detail view is not destructive, but a card that
 opens onto a group the user never saw in it — because the taxonomy
 cache resolved between the grid render and the click — is the same
 "covers more than the user could see" failure one surface earlier, and
 the modal is where the user decides whether to accept. Absent
-`nodes`, the endpoint returns the whole scoped component (the legacy
+`rows`, the endpoint returns the whole scoped component (the legacy
 shape) and flags `"expanded"` so the client can say so.
 
 `visual` travels on this URL too even though a non-null visual clause
@@ -728,14 +728,15 @@ POST the server:
    connected component that contains the anchor node, filtered by the
    scope tuple as §3 already specifies.
 5. **Intersects that component with the frozen membership the POST
-   carried** (`member_node_ids`, §3 step 1). The component is how the
+   carried** (`member_prediction_ids`, §3 step 1), and bounds the
+   sibling scan by the same set (§3 step 3). The component is how the
    server *finds* the card and enumerates each member's rows; the
    frozen membership is what the card actually *was* when the user
    clicked. Only their intersection is mutated.
 
 The intended cache-transition sequence is: GET emits a `name:blue tit`
 card with anchor `A`, `card_id` = base64url(JSON([`A`])), and
-`member_node_ids` = the nodes that card displayed. Background resolver
+`member_prediction_ids` = the rows that card displayed. Background resolver
 populates the cache for "blue tit" → *Cyanistes caeruleus* (iNat
 13094). User clicks Accept. POST sends `card_id` plus that membership.
 Server decodes to `A`, computes the taxon key from `A`'s rows now —
@@ -746,8 +747,10 @@ whole reason `taxon_key` is not baked into `card_id`.
 What the transition must **not** do is grow the click. The new key can
 pull in a group `B` from another model that already resolved to
 `taxon:13094` and therefore rendered as its own separate card at GET
-time. `B` is not in `member_node_ids`, so it is excluded from the
-mutation and reported back as `"expanded": 1`; the user's accept
+time. `B`'s rows are not in `member_prediction_ids`, so they are excluded
+from the mutation — by step 5's intersection *and* by the same bound on
+the per-photo sibling scan, which would otherwise rediscover them
+through the photo `B` shares with a frozen member and reported back as `"expanded": 1`; the user's accept
 resolves exactly the card they clicked, and `B` stays pending and
 visible as its own card until the next Review load merges the two for
 real. Reapplying the filter scope does not substitute for this —
@@ -758,7 +761,7 @@ membership carries "what the card was".
 The symmetric shrink case needs nothing extra: if the transition moved
 the component's smallest-member anchor elsewhere, the component still
 contains `A`, so `A`'s card is still findable, and the intersection
-with `member_node_ids` drops any node that left.
+with `member_prediction_ids` drops any row that left.
 
 The one transition this cannot silently paper over is when the anchor
 node's rows are gone entirely (bucket rewrite, deletion) — that
@@ -962,8 +965,8 @@ union**, not just the clicked group's photos:
 
 1. **Resolve the card, with the same filter scope the client rendered.**
    The mutation POST carries **either** `card_id` (unfiltered view —
-   accompanied by `member_node_ids`, the card's frozen membership,
-   below) **or**
+   accompanied by `member_prediction_ids`, the card's frozen
+   membership, below) **or**
    `node_id` (filtered view — see §2 "Mutation ID from the fallback
    view"), never both, **plus every filter `getVisibleItems` applies**
    on the way from `/api/predictions` rows to what the card actually
@@ -1004,41 +1007,71 @@ union**, not just the clicked group's photos:
    and the component still resolves under the new key.
 
    **The POST also carries the card's frozen membership**, and the
-   mutation is the *intersection* of the two. Alongside `card_id`,
-   the client sends `member_node_ids` — the `node_id`s of every row
-   the card it clicked was built from, which it already holds because
-   the server stamps `node_id` on every returned row (§2, "Payload
-   changes") and the client keeps all rows rather than collapsing them.
-   The mutated row set is then
-   `resolved component ∩ member_node_ids ∩ scope`. Rebuilding the
-   component is still required — it is how the sibling scan enumerates
-   a member's rows and how a stale-but-narrower request stays safe —
-   but it can only ever *shrink* the frozen membership, never add to
-   it. Without the intersection the cache transition below silently
-   widens the click: if the resolver resolves `name:blue tit` →
-   `taxon:13094` between the GET and the POST, a group `B` that was
-   already `taxon:13094`-keyed rendered as its **own separate card**,
-   and a POST that mutated the newly-merged component would accept or
-   reject `B`'s rows — rows the user could see on screen, but not as
-   part of the card they clicked. That is corollary 1 violated in the
-   time dimension, and the invariant wins: growth discovered at
-   mutation time is **excluded**, not silently absorbed. When the
-   server drops nodes this way it reports the count in the response so
-   the client can tell the user duplicates appeared and offer a reload
-   (`"expanded": 1`), rather than leaving a card that looks resolved
-   next to a duplicate that is not. Membership can only shrink the
-   mutation, so a tampered or replayed `member_node_ids` cannot widen
-   it either — the component and the scope tuple still bound it. For a
-   `node_id` request the frozen membership is that one node by
-   definition and the parameter is redundant. For a `node_id` request, the
-   server resolves exactly the named single node under the scope
-   tuple, without any component expansion — matching the per-node
-   fallback the filtered view rendered. Where the client sends only a
-   `prediction_id`/`group_id` (older payloads, deep-link buttons), the
-   server treats the scope as "unfiltered" and resolves the
-   full-workspace card; a stale-but-scoped POST is therefore safe
-   (narrower than what the user sees), and a stale-and-unscoped POST
-   is a legacy behavior that simply matches today's semantics.
+   mutation is the *intersection* of the two. Alongside `card_id`, the
+   client sends `member_prediction_ids` — the ids of every prediction
+   row the card it clicked was built from. It has them: the server
+   returns each row individually and the client keeps them all rather
+   than collapsing them (§2, "Payload changes"), so the displayed
+   membership is literally enumerable client-side. The mutated row set
+   is then
+
+   ```text
+   resolved component ∩ member_prediction_ids ∩ scope
+   ```
+
+   Rebuilding the component is still required — it resolves the anchor,
+   validates the request, and keeps a stale-but-narrower POST safe —
+   but it can only ever *shrink* the frozen membership, never add to it.
+
+   **Freezing rows, not nodes.** An earlier revision froze
+   `member_node_ids`. Node identity is immutable, but a node's *row set*
+   is not fixed relative to a scope: between the GET and the POST a
+   photo can join the selected collection, or a row's status can change
+   into the active tab, and the rebuilt node then contains rows that
+   were never displayed — admitted by a node-level intersection because
+   the node id matches. Node ids name a *bucket*; the invariant is about
+   *rows*. Prediction ids are the exact granularity the promise is made
+   at, they are already unique (`db.py:866`), and they need no encoding.
+   For a `node_id` request the same rule applies: the mutation is that
+   node's rows **as displayed**, so `member_prediction_ids` travels on
+   that shape too and the node id names which card was clicked rather
+   than which rows to write.
+
+   Without the intersection the cache transition below silently widens
+   the click: if the resolver resolves `name:blue tit` → `taxon:13094`
+   between the GET and the POST, a group `B` that was already
+   `taxon:13094`-keyed rendered as its **own separate card**, and a POST
+   that mutated the newly-merged component would accept or reject `B`'s
+   rows — rows the user could see on screen, but not as part of the card
+   they clicked. That is corollary 1 violated in the time dimension, and
+   the invariant wins: growth discovered at mutation time is
+   **excluded**, not silently absorbed. When the server drops rows this
+   way it reports the count in the response so the client can tell the
+   user duplicates appeared and offer a reload (`"expanded": 1`), rather
+   than leaving a card that looks resolved next to a duplicate that is
+   not. Membership can only shrink the mutation, so a tampered or
+   replayed `member_prediction_ids` cannot widen it either — the
+   component and the scope tuple still bound it.
+
+   For a `node_id` request the server resolves exactly the named single
+   node under the scope tuple, without any component expansion —
+   matching the per-node fallback the filtered view rendered.
+
+   **Legacy payload shapes keep legacy scope.** Where the client sends
+   only a `prediction_id`/`group_id` — a Review page loaded before this
+   ships, or a deep-link button — the server keeps **today's**
+   behaviour exactly: the clicked prediction plus, if grouped, its own
+   group's siblings, restricted to that prediction's
+   `classifier_model` (`db.accept_prediction` as it stands). It is not
+   reinterpreted as an unfiltered taxon card. That page rendered those
+   rows as a per-model card and offered a per-model click; upgrading the
+   payload's meaning server-side would let a stale click resolve another
+   model's rows the old UI displayed as a *separate* card — the same
+   unseen-mutation failure as the cache-transition case, arriving
+   through version skew instead of through time. Legacy shapes carry no
+   frozen membership and no scope tuple, so there is nothing to bound a
+   widened interpretation with; the only safe reading is the narrow one
+   the old UI promised. Merged-card semantics require the new payload.
 2. **Enumerate photos from the resolved (filtered) component.** The
    candidate photo set is the union of every member group's/singleton's
    photos *within the resolved card* — not the clicked group's photos, and
@@ -1058,10 +1091,28 @@ union**, not just the clicked group's photos:
      model that was in scope for the GET (i.e., predictions the user's
      filter would have surfaced), restricted per model to its latest
      `labels_fingerprint` (reuse the latest-fingerprint subquery from
-     `accept_subject_species`), and accept each via the existing
-     `_accept_for_photo` primitive. This is what closes the
-     BioCLIP-vs-iNat21 duplicate on the motivating case and carries
-     acceptance across A→B→C in a transitive component.
+     `accept_subject_species`), **and then intersected with the frozen
+     `member_prediction_ids`** before anything is written; each survivor
+     is accepted via the existing `_accept_for_photo` primitive. This is
+     what closes the BioCLIP-vs-iNat21 duplicate on the motivating case
+     and carries acceptance across A→B→C in a transitive component.
+
+     The intersection is not belt-and-braces here, it is load-bearing.
+     The scan's predicate is "same taxon, on a card photo, in scope",
+     and that predicate is evaluated against the *current* taxonomy
+     cache — so the group `B` that step 1's membership intersection
+     excluded after a `name:`→`taxon:` transition would be rediscovered
+     by this scan through the photo it shares with a frozen member, and
+     accepted anyway. Excluding a node from the component and then
+     re-admitting its rows by photo is the same widening arriving one
+     step later. Bounding the scan by the frozen row ids closes it, and
+     it costs nothing that matters: every row the scan legitimately
+     wants is a row the card displayed, so it is in
+     `member_prediction_ids` by construction. What the scan is *for*,
+     stated exactly: it enumerates the card's members from the server's
+     own data so the mutation never depends on the client's list being
+     complete; the frozen membership makes sure it never depends on it
+     being *stale*, either. Neither may extend the card (§2, card axis).
 
      **The scan is not restricted to `pending` rows** — that is
      corollary 4's second half. An earlier revision filtered the sibling
@@ -1613,18 +1664,30 @@ Each phase lands as its own PR and is independently useful.
    and `A`'s `card_id` still resolves); a **frozen-membership fixture**
    — the same transition, but a previously-separate BioCLIP-2.5 group
    `B` that already carried `taxon:13094` joins the resolved component
-   between the GET and the POST: the POST's `member_node_ids` does not
-   name `B`, so `B`'s rows stay **pending** (they were their own card on
+   between the GET and the POST: the POST's `member_prediction_ids` does
+   not name `B`'s rows, so `B`'s rows stay **pending** (they were their own card on
    screen), the clicked card's own members all resolve, and the response
-   reports `"expanded": 1`; the negative variant — the same POST with
-   the membership omitted — mutates `B` and fails, which is the
-   regression guard for §2 "Anchor lookup and cache-transition safety"
-   step 5; a **frozen-membership tampering fixture** — a POST naming
-   node ids outside the resolved component or outside the scope tuple
-   mutates nothing extra, since membership can only intersect; a
+   reports `"expanded": 1`. Two negative variants: the same POST with
+   the membership omitted mutates `B` and fails; and a build where the
+   frozen set bounds only the component intersection but **not** the
+   per-photo sibling scan re-admits `B`'s row through the photo it
+   shares with a frozen member and also fails — the regression guard
+   for §3 step 3's intersection, since excluding a node and then
+   rediscovering its rows by photo is the same widening one step later.
+   A **row-vs-node freeze fixture** — no taxonomy transition at all:
+   between the GET and the POST a photo of a *frozen* node joins the
+   selected collection (and, in a second variant, a row of that node
+   changes into the active status tab), so the rebuilt node legitimately
+   contains a row that was never displayed. The mutation must leave that
+   row untouched; a node-level freeze admits it (the node id matches)
+   and fails, which is why membership is frozen at prediction-id
+   granularity. A **frozen-membership tampering fixture** — a POST
+   naming prediction ids outside the resolved component or outside the
+   scope tuple mutates nothing extra, since membership can only
+   intersect; a
    **card-detail frozen-membership fixture** — the same transition
-   against `GET /api/predictions/card?id=…&nodes=…` returns the clicked
-   card's members only, and the `nodes`-omitted call returns the grown
+   against `GET /api/predictions/card?id=…&rows=…` returns the clicked
+   card's members only, and the `rows`-omitted call returns the grown
    component with `"expanded"` set; a
    **cache-transition-anchor-deleted fixture** — the same setup
    but with the anchor's rows deleted between the GET and the POST
@@ -1753,8 +1816,14 @@ Each phase lands as its own PR and is independently useful.
    a **filtered-mutation shape fixture** — a POST that carries both `card_id` and `node_id` is
    rejected 400; a POST that carries a `node_id` unknown to the server
    (e.g. after a re-run rewrote group IDs) is rejected 400; a stale
-   POST that omits the scope tuple resolves the full-workspace card
-   (documented legacy behavior); a POST that carries a scope narrower
+   POST that omits the scope tuple is not reinterpreted as a card at
+   all; a **legacy-payload fixture** — a bare `prediction_id`/`group_id`
+   POST (a pre-deploy Review page, or a deep-link button) resolves the
+   clicked prediction plus its own group's siblings **restricted to that
+   prediction's `classifier_model`**, exactly as `accept_prediction`
+   does today, and leaves the other model's overlapping same-taxon rows
+   pending — the guard against a stale click silently gaining
+   merged-card reach through version skew; a POST that carries a scope narrower
    than the server's full component cannot exceed the displayed
    membership; a **hidden-sibling-node fixture** — a legacy
    colliding bucket holding two species whose *first* node's rows are

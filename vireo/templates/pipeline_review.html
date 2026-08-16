@@ -7215,10 +7215,17 @@ function _grmMarkTouched(photoId) {
   if (photoId) grmState.touched.add(photoId);
 }
 
-function _grmActionTargetIds() {
+function _grmActionTargetIds(explicitIds) {
   var visible = {};
   _grmVisibleItems().forEach(function(p) { visible[p.id] = true; });
   var ids = [];
+  if (Array.isArray(explicitIds)) {
+    explicitIds.forEach(function(id) {
+      var photoId = parseInt(id, 10);
+      if (visible[photoId] && ids.indexOf(photoId) === -1) ids.push(photoId);
+    });
+    return ids;
+  }
   if (grmState.selectedIds && grmState.selectedIds.size) {
     grmState.selectedIds.forEach(function(id) {
       var photoId = parseInt(id, 10);
@@ -7236,9 +7243,9 @@ function _grmMarkTouchedMany(photoIds) {
   photoIds.forEach(function(photoId) { _grmMarkTouched(photoId); });
 }
 
-function grmMoveUp() {
+function grmMoveUp(photoIds) {
   if (grmState && grmState.applying) return false;
-  var ids = _grmActionTargetIds();
+  var ids = _grmActionTargetIds(photoIds);
   if (!ids.length) return;
   _grmMarkTouchedMany(ids);
   ids.forEach(function(photoId) {
@@ -7252,9 +7259,9 @@ function grmMoveUp() {
   grmSyncZoneCards();
 }
 
-function grmMoveDown() {
+function grmMoveDown(photoIds) {
   if (grmState && grmState.applying) return false;
-  var ids = _grmActionTargetIds();
+  var ids = _grmActionTargetIds(photoIds);
   if (!ids.length) return;
   _grmMarkTouchedMany(ids);
   ids.forEach(function(photoId) {
@@ -7268,9 +7275,9 @@ function grmMoveDown() {
   grmSyncZoneCards();
 }
 
-function grmMovePick() {
+function grmMovePick(photoIds) {
   if (grmState && grmState.applying) return false;
-  var ids = _grmActionTargetIds();
+  var ids = _grmActionTargetIds(photoIds);
   if (!ids.length) return;
   _grmMarkTouchedMany(ids);
   ids.forEach(function(photoId) {
@@ -7280,9 +7287,9 @@ function grmMovePick() {
   grmSyncZoneCards();
 }
 
-function grmMoveReject() {
+function grmMoveReject(photoIds) {
   if (grmState && grmState.applying) return false;
-  var ids = _grmActionTargetIds();
+  var ids = _grmActionTargetIds(photoIds);
   if (!ids.length) return;
   _grmMarkTouchedMany(ids);
   ids.forEach(function(photoId) {
@@ -7292,9 +7299,9 @@ function grmMoveReject() {
   grmSyncZoneCards();
 }
 
-function grmMoveCandidate() {
+function grmMoveCandidate(photoIds) {
   if (grmState && grmState.applying) return false;
-  var ids = _grmActionTargetIds();
+  var ids = _grmActionTargetIds(photoIds);
   if (!ids.length) return;
   _grmMarkTouchedMany(ids);
   ids.forEach(function(photoId) {
@@ -7304,10 +7311,10 @@ function grmMoveCandidate() {
   grmSyncZoneCards();
 }
 
-function grmRemoveFromGroup() {
+function grmRemoveFromGroup(photoIds) {
   if (grmState && grmState.applying) return false;
   if (grmState && grmState.allowRemove === false) return;
-  var ids = _grmActionTargetIds();
+  var ids = _grmActionTargetIds(photoIds);
   if (!ids.length) return;
   _grmMarkTouchedMany(ids);
   ids.forEach(function(photoId) {
@@ -7315,9 +7322,17 @@ function grmRemoveFromGroup() {
     grmState.picks.delete(photoId);
     grmState.rejects.delete(photoId);
   });
-  grmState.selected = null;
-  if (grmState.selectedIds) grmState.selectedIds.clear();
-  grmState.selectionAnchor = null;
+  if (grmState.selectedIds) {
+    ids.forEach(function(photoId) { grmState.selectedIds.delete(photoId); });
+  }
+  if (ids.indexOf(grmState.selected) !== -1) {
+    grmState.selected = grmState.selectedIds && grmState.selectedIds.size
+      ? Array.from(grmState.selectedIds)[0]
+      : null;
+  }
+  if (ids.indexOf(grmState.selectionAnchor) !== -1) {
+    grmState.selectionAnchor = grmState.selected;
+  }
   grmSyncZoneCards();
   grmRefreshSelectedLoupe();
 }
@@ -7916,9 +7931,9 @@ function buildPipelinePhotoContextMenu(photoIds, clickedPhotoId, inGroupReview) 
       title: title,
       onClick: function() {
         if (inGroupReview) {
-          if (flag === 'flagged') grmMovePick();
-          else if (flag === 'rejected') grmMoveReject();
-          else grmMoveCandidate();
+          if (flag === 'flagged') grmMovePick(photoIds);
+          else if (flag === 'rejected') grmMoveReject(photoIds);
+          else grmMoveCandidate(photoIds);
         } else {
           photoIds.forEach(function(id) { setPipelineReviewFlag(id, flag); });
         }
@@ -7929,9 +7944,9 @@ function buildPipelinePhotoContextMenu(photoIds, clickedPhotoId, inGroupReview) 
   var items = [];
   if (inGroupReview) {
     items = items.concat([
-      {label: '\u2B06  Move to Picks', onClick: function() { grmMovePick(); }},
-      {label: '\u2423  Move to Candidates', onClick: function() { grmMoveCandidate(); }},
-      {label: '\u2B07  Move to Rejects', onClick: function() { grmMoveReject(); }},
+      {label: '\u2B06  Move to Picks', onClick: function() { grmMovePick(photoIds); }},
+      {label: '\u2423  Move to Candidates', onClick: function() { grmMoveCandidate(photoIds); }},
+      {label: '\u2B07  Move to Rejects', onClick: function() { grmMoveReject(photoIds); }},
       {separator: true},
     ]);
   }
@@ -7982,7 +7997,7 @@ function buildPipelinePhotoContextMenu(photoIds, clickedPhotoId, inGroupReview) 
   }
   if (inGroupReview && grmState && grmState.allowRemove !== false) {
     items.push({separator: true});
-    items.push({label: 'Remove from Group', onClick: function() { grmRemoveFromGroup(); }});
+    items.push({label: 'Remove from Group', onClick: function() { grmRemoveFromGroup(photoIds); }});
   }
   return items;
 }

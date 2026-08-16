@@ -1245,6 +1245,37 @@ def test_group_context_menu_preserves_selection_for_collection_action(
     assert {member["id"] for member in members} == set(selected_ids)
 
 
+def test_group_context_menu_move_uses_selection_captured_when_opened(
+    live_server, page
+):
+    photo_ids = live_server["data"]["photos"][:4]
+    _write_grouped_pipeline_cache(live_server, photo_ids)
+
+    page.goto(f"{live_server['url']}/pipeline/review")
+    expect(page.locator(".photo-card[data-photo-id]")).to_have_count(4)
+    page.evaluate("openGroupReview(0, 0)")
+    page.wait_for_function("grmState && grmState.seeded === true")
+    cards = page.locator("#grmOverlay .grm-card[data-photo-id]")
+    captured_id = int(cards.nth(0).get_attribute("data-photo-id"))
+    later_id = int(cards.nth(1).get_attribute("data-photo-id"))
+
+    cards.nth(0).click(button="right")
+    menu = page.locator(".vireo-ctx-menu")
+    expect(menu).to_be_visible()
+    page.keyboard.press("ArrowRight")
+    expect(menu).to_be_visible()
+    assert page.evaluate("grmState.selected") == later_id
+
+    menu.locator(".vireo-ctx-item", has_text="Move to Rejects").click()
+    zones = page.evaluate(
+        "() => ({picks: Array.from(grmState.picks), "
+        "rejects: Array.from(grmState.rejects)})"
+    )
+    assert captured_id in zones["rejects"]
+    assert later_id not in zones["rejects"]
+    assert later_id not in zones["picks"]
+
+
 def test_lightbox_over_group_review_suppresses_group_shortcuts(live_server, page):
     """Space/Delete/Backspace pressed inside the shared lightbox must not
     reach the Group Review keydown handler on the hidden overlay beneath."""

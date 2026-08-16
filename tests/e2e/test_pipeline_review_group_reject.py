@@ -1436,19 +1436,26 @@ def test_similar_result_lightbox_preserves_scoped_read_only_mode(live_server, pa
           const originalSafeFetch = window.safeFetch;
           const calls = [];
           window.safeFetch = function(url) {
-            calls.push(url);
-            return Promise.resolve({});
+            if (url === '/api/batch/rating' ||
+                (url.startsWith('/api/photos/') &&
+                 (url.endsWith('/flag') || url.endsWith('/wildlife_excluded')))) {
+              calls.push(url);
+              return Promise.resolve({});
+            }
+            return originalSafeFetch.apply(this, arguments);
           };
           try {
             await nativeMenuSetRating(5);
             await nativeMenuSetWildlifeExcluded(true);
-            return {calls: calls};
+            await nativeMenuSetFlag('flagged');
+            await Promise.resolve();
+            return {calls: calls, flagWritesPending: _lbFlagPendingWrites};
           } finally {
             window.safeFetch = originalSafeFetch;
           }
         }"""
     )
-    assert native_write_state == {"calls": []}
+    assert native_write_state == {"calls": [], "flagWritesPending": 0}
 
     page.evaluate("grmSetApplying(false)")
     assert page.evaluate("_lbReadOnly") is False

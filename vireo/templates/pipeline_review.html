@@ -4095,12 +4095,12 @@ function setPipelineReviewFlag(photoId, flag) {
   // and closing the lightbox shows the pre-lightbox pick/reject state.
   var grmOverlay = document.getElementById('grmOverlay');
   if (grmOverlay && grmOverlay.classList.contains('open') && grmState && grmState.items) {
+    if (grmState.applying) {
+      showToast('Group Review is applying changes — wait for it to finish', 'warning');
+      return Promise.resolve(false);
+    }
     var inGroup = grmState.items.some(function(p) { return p.id === photoId; });
     if (inGroup) {
-      if (grmState.applying) {
-        showToast('Group Review is applying changes — wait for it to finish', 'warning');
-        return Promise.resolve(false);
-      }
       _grmMarkTouched(photoId);
       if (flag === 'flagged') {
         grmState.rejects.delete(photoId);

@@ -3228,13 +3228,17 @@ class Database:
 
         retired_photo_ids = [row["photo_id"] for row in associations]
         if retired_photo_ids:
-            photo_placeholders = ",".join("?" for _ in retired_photo_ids)
-            self.conn.execute(
-                f"""DELETE FROM photo_keywords
-                    WHERE keyword_id IN ({placeholders})
-                      AND photo_id IN ({photo_placeholders})""",
-                [*keyword_ids, *retired_photo_ids],
-            )
+            # Chunk to stay under SQLITE_MAX_VARIABLE_NUMBER (999 on legacy
+            # builds); this runs synchronously on startup so a large upgraded
+            # library must not overflow the single-statement bind limit.
+            for chunk in _chunks(retired_photo_ids):
+                photo_placeholders = ",".join("?" for _ in chunk)
+                self.conn.execute(
+                    f"""DELETE FROM photo_keywords
+                        WHERE keyword_id IN ({placeholders})
+                          AND photo_id IN ({photo_placeholders})""",
+                    [*keyword_ids, *chunk],
+                )
         self.set_meta(
             self._RETIRED_WILDLIFE_GENRE_KEY, "1", _commit=False,
         )

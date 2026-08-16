@@ -14060,6 +14060,53 @@ def test_retire_builtin_wildlife_cancels_unsynced_add(tmp_path):
     ).fetchone() is None
 
 
+def test_retire_builtin_wildlife_handles_photo_counts_over_bind_limit(tmp_path):
+    """Retirement must chunk the DELETE so a large upgraded library still opens.
+
+    ``retire_builtin_wildlife_genre`` runs synchronously during startup, so a
+    single DELETE binding every photo id exceeds ``SQLITE_MAX_VARIABLE_NUMBER``
+    (999 on legacy builds) and prevents the DB from opening. This asserts the
+    call succeeds when the retired-photo set spans more than one chunk.
+    """
+    from db import Database, _SQLITE_PARAM_CHUNK_SIZE
+    db = Database(str(tmp_path / "test.db"))
+    ws = db.create_workspace("ws")
+    db.set_active_workspace(ws)
+    fid = db.add_folder("/photos", name="photos")
+    db.add_workspace_folder(ws, fid)
+    wildlife_id = db.conn.execute(
+        "INSERT INTO keywords (name, type) VALUES ('Wildlife', 'genre')"
+    ).lastrowid
+    species_id = db.add_keyword("House Sparrow", is_species=True)
+
+    total = _SQLITE_PARAM_CHUNK_SIZE + 5
+    photo_ids = []
+    for idx in range(total):
+        pid = db.add_photo(
+            folder_id=fid, filename=f"p{idx}.jpg", extension=".jpg",
+            file_size=100, file_mtime=1.0,
+        )
+        photo_ids.append(pid)
+    db.conn.executemany(
+        "INSERT INTO photo_keywords (photo_id, keyword_id) VALUES (?, ?)",
+        [(pid, species_id) for pid in photo_ids],
+    )
+    db.conn.executemany(
+        "INSERT INTO photo_keywords (photo_id, keyword_id) VALUES (?, ?)",
+        [(pid, wildlife_id) for pid in photo_ids],
+    )
+    db.conn.commit()
+    db.set_meta(Database._RETIRED_WILDLIFE_GENRE_KEY, "0")
+
+    assert db.retire_builtin_wildlife_genre() == total
+
+    remaining = db.conn.execute(
+        "SELECT COUNT(*) AS c FROM photo_keywords WHERE keyword_id = ?",
+        (wildlife_id,),
+    ).fetchone()["c"]
+    assert remaining == 0
+
+
 def test_pending_keyword_removal_keys_distinguish_flat_and_hierarchical(tmp_path):
     from db import Database
     db = Database(str(tmp_path / "test.db"))

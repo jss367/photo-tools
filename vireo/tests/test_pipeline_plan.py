@@ -234,6 +234,44 @@ def test_full_image_fallback_classify_counts_track_run_keys(tmp_path):
     assert db.count_classifier_runs([pid_empty, pid_weak], "BioCLIP-2", "fp1") == 1
 
 
+def test_full_image_fallback_counts_noise_only_boxes_at_workspace_floor(
+    tmp_path,
+):
+    """Photos whose only MegaDetector rows are below the workspace
+    ``detector_confidence`` count as fallback candidates. Classify's runtime
+    now sends them through the full-image path even though ``box_count > 0``
+    and real detection rows exist, so the plan counters must broaden to
+    match — otherwise ``/api/pipeline/plan`` would call classify "already
+    done" while a full-image inference is still pending.
+    """
+    db, folder_id = _make_db(tmp_path)
+    pid_empty = db.add_photo(
+        folder_id=folder_id, filename="empty.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+    )
+    db.record_detector_run(pid_empty, "megadetector-v6", box_count=0)
+
+    pid_noise, _ = _add_photo_with_detection(
+        db, folder_id, "noise.jpg", conf=0.05,
+    )
+    db.record_detector_run(pid_noise, "megadetector-v6", box_count=1)
+
+    pid_real, _ = _add_photo_with_detection(
+        db, folder_id, "real.jpg", conf=0.9,
+    )
+    db.record_detector_run(pid_real, "megadetector-v6", box_count=1)
+
+    # Default min_conf=0 preserves the pre-noise-fallback semantics: only
+    # the truly empty run qualifies.
+    assert db.count_full_image_fallback_photos() == 1
+    # At the workspace floor both empty and noise-only runs qualify, but the
+    # confident real detection stays out.
+    assert db.count_full_image_fallback_photos(min_conf=0.2) == 2
+    assert db.count_full_image_classify_pending_pairs(
+        "BioCLIP-2", "fp1", min_conf=0.2,
+    ) == 2
+
+
 def test_count_classify_pending_excludes_recorded_runs(tmp_path):
     """The pending-pair count must mirror the classify gate exactly: a
     detection with a classifier_runs row for (model, fp) is done.

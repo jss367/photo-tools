@@ -247,7 +247,7 @@ def _import_without_new_files(params, photo_ids, new_count):
     )
 
 
-def _classify_plan(db, params, photo_ids, new_count=0):
+def _classify_plan(db, params, photo_ids, new_count=0, detector_confidence=0):
     if params.skip_classify:
         return {
             "state": "will-skip",
@@ -274,7 +274,14 @@ def _classify_plan(db, params, photo_ids, new_count=0):
     det_counts = db.count_primary_detections_in_scope(photo_ids)
     total_dets = det_counts["total_dets"]
     photos_with_dets = det_counts["photos_with_dets"]
-    full_image_fallbacks = db.count_full_image_fallback_photos(photo_ids)
+    # ``detector_confidence`` mirrors the pipeline's runtime fallback gate
+    # so photos whose only MegaDetector rows are below the classification
+    # floor are counted as fallback candidates. Without it the plan would
+    # ignore noise-only photos even though classify_stage now sends them
+    # through the full-image fallback (PR #1484).
+    full_image_fallbacks = db.count_full_image_fallback_photos(
+        photo_ids, min_conf=detector_confidence,
+    )
     classifiable_units = total_dets + full_image_fallbacks
 
     unblocked_count = sum(
@@ -323,6 +330,7 @@ def _classify_plan(db, params, photo_ids, new_count=0):
                 classifier_model=m["name"],
                 labels_fingerprint=fp,
                 photo_ids=photo_ids,
+                min_conf=detector_confidence,
             )
     # Reclassify is a user override, not a settings-change signal.
     fingerprint_outdated = stale_total > 0 and not params.reclassify
@@ -421,6 +429,7 @@ def _classify_plan(db, params, photo_ids, new_count=0):
                 classifier_model=m["name"],
                 labels_fingerprint=fp,
                 photo_ids=photo_ids,
+                min_conf=detector_confidence,
             )
         if pending:
             pending_per_model[m["name"]] = pending
@@ -1367,7 +1376,10 @@ def compute_plan(db, params, db_path):
             photo_ids = set(db.get_photo_ids())
         photo_ids = {pid for pid in photo_ids if pid not in excl}
 
-    classify = _classify_plan(db, params, photo_ids, new_count)
+    classify = _classify_plan(
+        db, params, photo_ids, new_count,
+        detector_confidence=effective_cfg.get("detector_confidence", 0.2),
+    )
     extract = _extract_plan(db, params, photo_ids, pipeline_cfg, new_count)
     eye = _eye_keypoints_plan(db, params, photo_ids, pipeline_cfg, new_count)
     previews = _previews_plan(db, params, photo_ids, new_count, effective_cfg)

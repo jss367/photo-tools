@@ -5545,14 +5545,49 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                                 photo_dets = photo_dets[:1]
                             detections_to_classify = photo_dets
                             if not detections_to_classify:
-                                # No box is usable at either the ordinary
-                                # threshold or the contextual weak-rescue
-                                # floor. Treat this the same as a true
-                                # no-detection photo and give the classifier a
-                                # full-image attempt. Raw detector output is
-                                # retained for diagnostics/cache reuse, but a
-                                # 1% noise box must not suppress classification
-                                # of an otherwise visible subject.
+                                # No animal box is usable at either the
+                                # ordinary threshold or the contextual
+                                # weak-rescue floor. Treat this the same as a
+                                # true no-detection photo and give the
+                                # classifier a full-image attempt. Raw
+                                # detector output is retained for
+                                # diagnostics/cache reuse, but a 1% noise box
+                                # must not suppress classification of an
+                                # otherwise visible subject.
+                                #
+                                # Exception: MegaDetector emitted a confident
+                                # non-animal (person/vehicle) box at or above
+                                # ``detector_confidence``. Sending the entire
+                                # human/vehicle frame to the wildlife
+                                # classifier would persist a spurious species
+                                # prediction. Skip the fallback in that case
+                                # and leave the photo without a classifier
+                                # run, matching the old raw-detection guard's
+                                # intent while still rescuing sub-threshold
+                                # animal photos.
+                                confident_non_animal = False
+                                if photo["id"] in cached_detections:
+                                    confident_non_animal = any(
+                                        d.get("detector_model") != "full-image"
+                                        and d.get("category", "animal") != "animal"
+                                        and d.get(
+                                            "confidence",
+                                            d.get("detector_confidence", 0),
+                                        ) >= detector_confidence
+                                        for d in cached_detections[photo["id"]]
+                                    )
+                                else:
+                                    confident_non_animal = any(
+                                        d["detector_model"] != "full-image"
+                                        and d["category"] != "animal"
+                                        for d in thread_db.get_detections(
+                                            photo["id"],
+                                            min_conf=detector_confidence,
+                                        )
+                                    )
+                                if confident_non_animal:
+                                    continue
+
                                 existing_full = thread_db.get_detections(
                                     photo["id"],
                                     detector_model="full-image",

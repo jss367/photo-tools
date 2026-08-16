@@ -4631,6 +4631,7 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                 # already sitting in the local store.
                 if not params.reclassify:
                     try:
+                        import config as cfg
                         from computation_cache import (
                             CacheFormatError,
                             full_image_runtime_fingerprint,
@@ -4646,10 +4647,56 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                         # being deferred by the runtime-fingerprint
                         # gate.
                         full_runtime = full_image_runtime_fingerprint()
+                        # Also broaden the anchor set to include photos
+                        # whose only detections are noise (< detector_
+                        # confidence) so cached full-image classifiers
+                        # attach on this materialize instead of forcing
+                        # the classify stage's lazy per-photo anchor
+                        # creation — which happens AFTER materialize and
+                        # re-runs inference for an answer already sitting
+                        # in the local store. The runtime fallback at
+                        # ``classify_stage`` fires under the same
+                        # predicate (no usable animal box at the strict
+                        # threshold, no confident non-animal box), so
+                        # mirror it exactly here to avoid pre-creating
+                        # anchors the fallback would refuse to use.
+                        try:
+                            _det_conf = thread_db.get_effective_config(
+                                cfg.load()
+                            ).get("detector_confidence", 0.2)
+                        except Exception:
+                            _det_conf = 0.2
+
+                        def _needs_full_image_anchor(pid):
+                            dets = this_run_detections.get(pid) or []
+                            if not dets:
+                                return True
+                            has_usable_animal = any(
+                                d.get("detector_model") != "full-image"
+                                and d.get("category", "animal") == "animal"
+                                and d.get(
+                                    "confidence",
+                                    d.get("detector_confidence", 0),
+                                ) >= _det_conf
+                                for d in dets
+                            )
+                            if has_usable_animal:
+                                return False
+                            confident_non_animal = any(
+                                d.get("detector_model") != "full-image"
+                                and d.get("category", "animal") != "animal"
+                                and d.get(
+                                    "confidence",
+                                    d.get("detector_confidence", 0),
+                                ) >= _det_conf
+                                for d in dets
+                            )
+                            return not confident_non_animal
+
                         empty_scene_ids = [
                             photo["id"] for photo in photos
                             if photo["id"] in processed_ids
-                            and not this_run_detections.get(photo["id"])
+                            and _needs_full_image_anchor(photo["id"])
                         ]
                         for photo_id in empty_scene_ids:
                             identity = thread_db.conn.execute(

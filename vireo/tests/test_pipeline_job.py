@@ -3186,6 +3186,146 @@ def test_pipeline_skips_full_image_when_only_confident_non_animal_box(
     ]
 
 
+def test_pipeline_precreates_full_image_anchor_for_noise_only_photo(
+    tmp_path, monkeypatch,
+):
+    """The detect stage must pre-create a full-image anchor for a photo whose
+    only detections are sub-threshold noise.
+
+    Without this pre-creation, the post-detect ``materialize_local_store``
+    reapply has nothing for a cached full-image classifier artifact to
+    attach to (the anchor is only created lazily during ``classify_stage``
+    later). The classify stage then re-runs the classifier for an answer
+    that is already in the local store. The runtime fallback fires under
+    the same predicate the pre-materialization anchor selection now
+    mirrors — no usable animal box at the strict threshold and no
+    confident non-animal box — so the pre-created anchor is what the
+    fallback would use.
+    """
+    import classifier as classifier_mod
+    import classify_job
+    import computation_cache as cc
+    import config as cfg
+    from db import Database
+    from PIL import Image
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cfg.CONFIG_PATH = str(tmp_path / "config.json")
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws_id = db._active_workspace_id
+    folder_path = str(tmp_path / "photos")
+    os.makedirs(folder_path, exist_ok=True)
+    folder_id = db.add_folder(folder_path)
+    photo_id = db.add_photo(
+        folder_id, "faint-warbler.jpg", ".jpg", 100, 1_000_000.0,
+    )
+    _drop_jpeg(folder_path, "faint-warbler.jpg")
+    collection_id = db.add_collection(
+        "Noise only",
+        json.dumps([{"field": "photo_ids", "value": [photo_id]}]),
+    )
+
+    model_id = _setup_fake_downloaded_model(tmp_path, monkeypatch)
+    raw_detection = {
+        "box": {"x": 0.10, "y": 0.10, "w": 0.05, "h": 0.05},
+        "confidence": 0.03,
+        "category": "animal",
+    }
+    raw_detection_id = db.write_detection_batch(
+        photo_id, "megadetector-v6", [raw_detection],
+    )[0]
+
+    def fake_detect_batch(batch, folders, runner, job, reclassify, db_,
+                          det_conf_threshold=None, already_detected_ids=None,
+                          cached_detections=None):
+        det = {
+            "id": raw_detection_id,
+            "box_x": raw_detection["box"]["x"],
+            "box_y": raw_detection["box"]["y"],
+            "box_w": raw_detection["box"]["w"],
+            "box_h": raw_detection["box"]["h"],
+            "confidence": raw_detection["confidence"],
+            "category": "animal",
+            "detector_model": "megadetector-v6",
+        }
+        return {photo_id: [det]}, 1, {photo_id}
+
+    monkeypatch.setattr(classify_job, "_detect_batch", fake_detect_batch)
+
+    # Capture the DB state at the moment the post-detect reapply runs.
+    # A pre-created full-image detection row here proves the anchor is
+    # available for cached classifier artifacts to attach to during
+    # materialize — i.e., before classify_stage would otherwise have to
+    # rerun the classifier.
+    anchors_at_reapply = []
+    original_materialize = cc.materialize_local_store
+
+    def spy_materialize(db_obj, *args, **kwargs):
+        rows = db_obj.conn.execute(
+            "SELECT detector_model, runtime_fingerprint FROM detections "
+            "WHERE photo_id = ? ORDER BY detector_model",
+            (photo_id,),
+        ).fetchall()
+        anchors_at_reapply.append([dict(r) for r in rows])
+        return original_materialize(db_obj, *args, **kwargs)
+
+    monkeypatch.setattr(cc, "materialize_local_store", spy_materialize)
+
+    def fake_prepare_image(photo, folders, detection, vireo_dir=None):
+        return Image.new("RGB", (32, 32), "white"), folder_path, str(
+            os.path.join(folder_path, photo["filename"])
+        )
+
+    monkeypatch.setattr(classify_job, "_prepare_image", fake_prepare_image)
+
+    class FakeClassifier:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def classify_batch_with_embedding(self, images, threshold=0):
+            import numpy as np
+
+            return [(
+                [{"species": "Yellow Warbler", "score": 0.87}],
+                np.zeros(512, dtype=np.float32),
+            ) for _ in images]
+
+    monkeypatch.setattr(classifier_mod, "Classifier", FakeClassifier)
+
+    result = run_pipeline_job(
+        _make_job(), FakeRunner(), db_path, ws_id,
+        PipelineParams(
+            collection_id=collection_id,
+            model_id=model_id,
+            skip_extract_masks=True,
+            skip_regroup=True,
+        ),
+    )
+
+    # The pipeline runs materialize twice: once before detect (no anchor
+    # expected yet) and once after detect (anchor must exist so cached
+    # full-image classifier runs can attach). The post-detect call is the
+    # second one — assert it saw the full-image anchor for this noise-only
+    # photo.
+    assert len(anchors_at_reapply) >= 2, (
+        f"expected pre- and post-detect materialize calls, "
+        f"saw {len(anchors_at_reapply)}"
+    )
+    post_detect_state = anchors_at_reapply[-1]
+    detector_models = {row["detector_model"] for row in post_detect_state}
+    assert "full-image" in detector_models, (
+        "detect-stage reapply must see a pre-created full-image anchor "
+        "for a noise-only photo so cached full-image classifiers can "
+        f"attach; saw {post_detect_state}"
+    )
+
+    # And the run still classifies via full-image fallback — the guard
+    # cannot regress the noise-only rescue path itself.
+    assert result["stages"]["classify"]["full_image_fallbacks"] == 1
+
+
 def test_pipeline_redownloads_taxonomy_when_existing_file_is_corrupt(
     tmp_path, monkeypatch
 ):

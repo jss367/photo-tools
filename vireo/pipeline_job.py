@@ -5829,6 +5829,18 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                                     }
                                     for d in thread_db.get_detections(
                                         photo["id"], min_conf=detection_floor,
+                                        # Contextual rescue is defined only
+                                        # from MegaDetector V6 evidence. Keep
+                                        # the detector-failure DB fallback on
+                                        # that same candidate set so a stale,
+                                        # higher-confidence foreign row cannot
+                                        # diverge from the cache preflight's
+                                        # selected crop (Codex #1468 P2).
+                                        detector_model=(
+                                            "megadetector-v6"
+                                            if is_contextual_weak
+                                            else None
+                                        ),
                                     )
                                     if d["detector_model"] != "full-image"
                                     and d["category"] == "animal"

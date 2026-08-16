@@ -20,6 +20,12 @@ inputs:
   authorized-at:
     description: RFC 3339 timestamp of the approval or exact merge command.
     required: true
+  approval-id:
+    description: Review ID when authorization came from an approval.
+    required: false
+  merge-comment-id:
+    description: Issue-comment ID when authorization came from /merge.
+    required: false
 
 outputs:
   ready:
@@ -43,6 +49,8 @@ runs:
         PR: ${{ inputs.pr }}
         APPROVED_HEAD: ${{ inputs.approved-head }}
         AUTHORIZED_AT: ${{ inputs.authorized-at }}
+        APPROVAL_ID: ${{ inputs.approval-id }}
+        MERGE_COMMENT_ID: ${{ inputs.merge-comment-id }}
       run: |
         set -euo pipefail
 
@@ -75,6 +83,43 @@ runs:
         fi
         if [[ "$head_sha" != "$APPROVED_HEAD"* ]]; then
           echo "PR #${PR} head ${head_sha} does not match approved head ${APPROVED_HEAD}."
+          exit 0
+        fi
+        if [[ -n "$APPROVAL_ID" && -n "$MERGE_COMMENT_ID" ]]; then
+          echo "PR #${PR} has ambiguous merge authorization inputs."
+          exit 0
+        elif [[ -n "$APPROVAL_ID" ]]; then
+          if ! approval=$(gh api "repos/${REPO}/pulls/${PR}/reviews/${APPROVAL_ID}"); then
+            echo "Approval ${APPROVAL_ID} no longer exists."
+            exit 0
+          fi
+          approval_state=$(jq -r '.state' <<< "$approval")
+          approval_head=$(jq -r '.commit_id' <<< "$approval")
+          approval_time=$(jq -r '.submitted_at' <<< "$approval")
+          if [[ "$approval_state" != "APPROVED" \
+            || "$approval_head" != "$head_sha" \
+            || "$approval_time" != "$AUTHORIZED_AT" ]]; then
+            echo "Approval ${APPROVAL_ID} is no longer active for PR #${PR} head ${head_sha}."
+            exit 0
+          fi
+        elif [[ -n "$MERGE_COMMENT_ID" ]]; then
+          if ! merge_comment=$(gh api "repos/${REPO}/issues/comments/${MERGE_COMMENT_ID}"); then
+            echo "Merge command ${MERGE_COMMENT_ID} no longer exists."
+            exit 0
+          fi
+          merge_body=$(jq -r '.body' <<< "$merge_comment")
+          merge_time=$(jq -r '.created_at' <<< "$merge_comment")
+          if [[ ! "$merge_body" =~ ^/merge[[:space:]]+([0-9a-fA-F]{7,40})[[:space:]]*$ ]]; then
+            echo "Merge command ${MERGE_COMMENT_ID} is no longer valid."
+            exit 0
+          fi
+          merge_head=$(tr '[:upper:]' '[:lower:]' <<< "${BASH_REMATCH[1]}")
+          if [[ "$head_sha" != "$merge_head"* || "$merge_time" != "$AUTHORIZED_AT" ]]; then
+            echo "Merge command ${MERGE_COMMENT_ID} no longer authorizes PR #${PR} head ${head_sha}."
+            exit 0
+          fi
+        else
+          echo "PR #${PR} has no live approval or merge-command authorization."
           exit 0
         fi
         if [[ "$base_ref" != "main" ]]; then

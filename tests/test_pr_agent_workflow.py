@@ -169,6 +169,12 @@ def test_merge_gate_requires_live_head_and_resolved_current_threads():
 
     assert 'if [[ "$state" != "OPEN" ]]' in action
     assert 'if [[ "$head_sha" != "$APPROVED_HEAD"* ]]' in action
+    assert 'approval_state" != "APPROVED"' in action
+    assert 'approval_head" != "$head_sha"' in action
+    assert 'approval_time" != "$AUTHORIZED_AT"' in action
+    assert "repos/${REPO}/issues/comments/${MERGE_COMMENT_ID}" in action
+    assert 'merge_time" != "$AUTHORIZED_AT"' in action
+    assert "has no live approval or merge-command authorization" in action
     assert "reviewThreads(first:100" in action
     assert ".isResolved == false and .isOutdated == false" in action
     assert 'if [[ "$unresolved" -gt 0 ]]' in action
@@ -218,8 +224,12 @@ def test_merge_is_synchronous_and_retried_only_for_the_authorized_tested_head():
     assert 'authorized_at=""' in workflow
     assert 'echo "authorized_at=${authorized_at}"' in workflow
     assert "authorized-at: ${{ github.event.review.submitted_at }}" in workflow
+    assert "approval-id: ${{ github.event.review.id }}" in workflow
     assert "authorized-at: ${{ github.event.comment.created_at }}" in workflow
+    assert "merge-comment-id: ${{ github.event.comment.id }}" in workflow
     assert "authorized-at: ${{ steps.authorization.outputs.authorized_at }}" in workflow
+    assert "approval-id: ${{ steps.authorization.outputs.approval_id }}" in workflow
+    assert "merge-comment-id: ${{ steps.authorization.outputs.merge_comment_id }}" in workflow
     assert workflow.count('--match-head-commit "$HEAD_SHA"') == 3
 
 

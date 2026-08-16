@@ -145,7 +145,8 @@ forge.
   is running, the successful workflow run retries the same head-bound merge.
   Actionable top-level or review-body feedback posted at or after that
   authorization requires a fresh approval or exact merge command before the
-  head can merge.
+  head can merge. The live gate also confirms that the exact approval remains
+  active or that the exact merge-command comment still exists unchanged.
 
 Merge calls use `gh pr merge --match-head-commit` without `--auto`, so no
 authorization remains armed across a later push. Merge jobs also skip closed

@@ -600,6 +600,7 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
           approved-head: ${{ github.event.review.commit_id }}
           authorized-at: ${{ github.event.review.submitted_at }}
+          approval-id: ${{ github.event.review.id }}
 
       - name: Squash-merge authorized head
         if: steps.ready.outputs.ready == 'true'
@@ -687,6 +688,7 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
           approved-head: ${{ needs.authorize_merge_command.outputs.approved_head }}
           authorized-at: ${{ github.event.comment.created_at }}
+          merge-comment-id: ${{ github.event.comment.id }}
 
       - name: Squash-merge authorized head
         if: steps.ready.outputs.ready == 'true'
@@ -745,6 +747,8 @@ jobs:
           fi
 
           authorized_at=""
+          approval_id=""
+          merge_comment_id=""
           reviews=$(gh api "repos/${REPO}/pulls/${pr}/reviews" --paginate --slurp | jq 'add // []')
           for actor in $HUMAN_MERGE_ACTORS; do
             latest_review=$(jq -r --arg actor "$actor" --arg head "$TESTED_HEAD" '
@@ -755,12 +759,14 @@ jobs:
                 ) ]
               | sort_by(.submitted_at)
               | last
-              | [(.state // ""), (.submitted_at // "")]
+              | [(.state // ""), (.submitted_at // ""), (.id // "")]
               | @tsv' <<< "$reviews")
-            IFS=$'\t' read -r latest_state latest_submitted_at <<< "$latest_review"
+            IFS=$'\t' read -r latest_state latest_submitted_at latest_review_id <<< "$latest_review"
             if [[ "$latest_state" == "APPROVED" \
               && "$latest_submitted_at" > "$authorized_at" ]]; then
               authorized_at="$latest_submitted_at"
+              approval_id="$latest_review_id"
+              merge_comment_id=""
             fi
           done
 
@@ -782,6 +788,8 @@ jobs:
                 created_at=$(jq -r '.created_at' <<< "$comment")
                 if [[ "$created_at" > "$authorized_at" ]]; then
                   authorized_at="$created_at"
+                  approval_id=""
+                  merge_comment_id=$(jq -r '.id' <<< "$comment")
                 fi
               fi
             fi
@@ -794,6 +802,8 @@ jobs:
           {
             echo "authorized=true"
             echo "authorized_at=${authorized_at}"
+            echo "approval_id=${approval_id}"
+            echo "merge_comment_id=${merge_comment_id}"
             echo "pr=${pr}"
             echo "head=${TESTED_HEAD}"
           } >> "$GITHUB_OUTPUT"
@@ -814,6 +824,8 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
           approved-head: ${{ steps.authorization.outputs.head }}
           authorized-at: ${{ steps.authorization.outputs.authorized_at }}
+          approval-id: ${{ steps.authorization.outputs.approval_id }}
+          merge-comment-id: ${{ steps.authorization.outputs.merge_comment_id }}
 
       - name: Squash-merge authorized tested head
         if: steps.ready.outputs.ready == 'true'

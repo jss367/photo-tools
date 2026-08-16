@@ -2415,6 +2415,7 @@ function sendReport() {
       <span class="spacer"></span>
       <label style="display:flex;align-items:center;gap:4px;" title="Thumbnail size">
         <input type="range" id="missingPhotosThumbSizeSlider" min="40" max="160" step="8" value="56"
+               data-view-preference="vireo.missingPhotos.thumbSize"
                aria-label="Thumbnail size"
                style="width:80px;accent-color:var(--accent);"
                oninput="updateMissingPhotosThumbSize(this.value)">
@@ -12681,6 +12682,9 @@ function openMissingPhotosModal(folderId, label) {
     folderId: (folderId == null ? null : folderId),
     label: label || '',
   };
+  updateMissingPhotosThumbSize(
+    document.getElementById('missingPhotosThumbSizeSlider').value
+  );
   const note = document.getElementById('missingPhotosScopeNote');
   if (_missingPhotosScope.folderId != null) {
     note.textContent = 'Showing only: ' + (_missingPhotosScope.label || 'selected folder');

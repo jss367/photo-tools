@@ -780,7 +780,8 @@
     <select class="model-selector" id="modelFilter" onchange="switchModel(this.value)" style="display:none;">
       <option value="all">All models</option>
     </select>
-    <select class="model-selector" id="sortSelect" onchange="changeSort(this.value)">
+    <select class="model-selector" id="sortSelect" onchange="changeSort(this.value)"
+            data-view-preference="vireo.review.sort">
       <option value="confidence_desc">Confidence (highest)</option>
       <option value="confidence_asc">Confidence (lowest)</option>
       <option value="species">Species (A-Z)</option>
@@ -796,6 +797,7 @@
     <label class="review-photo-size-control" for="thumbSizeSlider">
       Photo size:
       <input type="range" id="thumbSizeSlider" min="200" max="600" step="20" value="400"
+             data-view-preference="vireo.review.thumbSize"
              oninput="updateThumbSize(this.value)">
       <span class="value" id="thumbSizeVal">400px</span>
     </label>
@@ -839,7 +841,6 @@ var availableModels = [];
 var collectionPhotoIds = null;  // null = no filter
 var thumbSize = 400;
 var mode = 'review';
-var REVIEW_THUMB_SIZE_STORAGE_KEY = 'vireo.review.thumbSize';
 
 function _reviewStoredBool(key, fallback) {
   try {
@@ -1036,7 +1037,9 @@ function _predictionEpochStale(epoch) {
 }
 
 /* ---------- Bootstrap ---------- */
-restoreThumbSize();
+VireoViewPreferences.restoreAll(document.getElementById('reviewBar'));
+currentSort = document.getElementById('sortSelect').value;
+updateThumbSize(document.getElementById('thumbSizeSlider').value);
 applyReviewQueryParams();
 loadPredictions();
 loadCollectionFilter();
@@ -1992,7 +1995,7 @@ document.addEventListener('contextmenu', function(e) {
 });
 
 /* ---------- Settings ---------- */
-function updateThumbSize(val, persist) {
+function updateThumbSize(val) {
   var parsed = parseInt(val, 10);
   if (isNaN(parsed)) parsed = 400;
   thumbSize = Math.max(200, Math.min(600, parsed));
@@ -2004,15 +2007,6 @@ function updateThumbSize(val, persist) {
   var grid = document.getElementById('grid');
   if (grid) grid.style.setProperty('--card-width', thumbSize + 'px');
 
-  if (persist !== false) {
-    try { localStorage.setItem(REVIEW_THUMB_SIZE_STORAGE_KEY, String(thumbSize)); } catch (e) {}
-  }
-}
-
-function restoreThumbSize() {
-  var stored = null;
-  try { stored = localStorage.getItem(REVIEW_THUMB_SIZE_STORAGE_KEY); } catch (e) {}
-  updateThumbSize(stored === null ? 400 : stored, false);
 }
 
 /* ==================== Group Review Modal ==================== */

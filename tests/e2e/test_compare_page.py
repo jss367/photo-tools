@@ -71,6 +71,19 @@ def test_compare_page_exposes_disagreement_filters_and_sorts(live_server, page):
     expect(page.locator("#filterRow .active")).to_contain_text("Keyword vs models")
 
 
+def test_compare_sort_persists_across_navigation(live_server, page):
+    url = live_server["url"]
+    page.goto(f"{url}/id-conflicts")
+    expect(page.locator("#sortRow")).to_be_visible()
+
+    page.locator("#sortRow button", has_text="Filename").click()
+    page.goto(f"{url}/")
+    page.goto(f"{url}/id-conflicts")
+
+    expect(page.locator("#sortRow .active")).to_contain_text("Filename")
+    expect(page.locator("#sortMode")).to_have_value("filename")
+
+
 def test_compare_page_thumbnail_opens_lightbox(live_server, page):
     page.goto(f"{live_server['url']}/id-conflicts")
 

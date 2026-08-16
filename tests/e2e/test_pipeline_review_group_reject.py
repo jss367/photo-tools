@@ -2520,3 +2520,197 @@ def test_tauri_treats_unseeded_group_touches_as_dirty(live_server, page):
         expect(menu.locator(".vireo-ctx-item", has_text=label)).to_have_class(
             re.compile(r"\bvireo-ctx-disabled\b")
         )
+
+
+def test_apply_time_lightbox_read_only_refreshes_over_full_apply_lifecycle(
+    live_server, page
+):
+    """A Similar-result lightbox opened while /api/pipeline/group/apply is
+    still in flight snapshots _lbReadOnly=true. When the real request
+    settles and Group Review closes, the lightbox must re-enable — the
+    apply-time refresh hook has to survive the entire grmApply cycle, not
+    just a synthetic grmSetApplying(false) call."""
+    photo_ids = live_server["data"]["photos"][:4]
+    _write_grouped_pipeline_cache(live_server, photo_ids)
+    result_id = photo_ids[1]
+    page.route(
+        "**/api/photos/*/similar?limit=40",
+        lambda route: route.fulfill(
+            json={
+                "total_compared": 1,
+                "similar": [
+                    {
+                        "similarity": 0.91,
+                        "photo": {"id": result_id, "filename": "similar.jpg"},
+                    }
+                ],
+            }
+        ),
+    )
+
+    page.goto(f"{live_server['url']}/pipeline/review")
+    expect(page.locator(".photo-card[data-photo-id]")).to_have_count(4)
+    page.evaluate("openGroupReview(0, 0)")
+    page.wait_for_function("grmState && grmState.seeded === true")
+    page.evaluate(
+        """() => {
+          window.__originalSafeFetchForReadOnlyLifecycle = window.safeFetch;
+          window.safeFetch = function(url) {
+            if (url === '/api/pipeline/group/apply') {
+              const args = arguments;
+              return new Promise((resolve, reject) => {
+                window.__releaseReadOnlyLifecycleApply = () => {
+                  window.__originalSafeFetchForReadOnlyLifecycle
+                    .apply(window, args).then(resolve, reject);
+                };
+              });
+            }
+            return window.__originalSafeFetchForReadOnlyLifecycle
+              .apply(this, arguments);
+          };
+          grmMoveReject();
+          window.__readOnlyLifecycleSettled = false;
+          window.__readOnlyLifecycleApplyPromise = grmApply().then(
+            () => { window.__readOnlyLifecycleSettled = true; },
+            error => {
+              window.__readOnlyLifecycleApplyError = String(error);
+              window.__readOnlyLifecycleSettled = true;
+            }
+          );
+        }"""
+    )
+    page.wait_for_function(
+        "typeof window.__releaseReadOnlyLifecycleApply === 'function'"
+    )
+    assert page.evaluate("grmState.applying") is True
+
+    page.evaluate("pid => findSimilar(pid)", photo_ids[0])
+    page.locator(".similar-card").click()
+    expect(page.locator("#lightboxOverlay")).to_have_class(
+        re.compile(r"\bactive\b")
+    )
+    assert page.evaluate("_lightboxCurrentId") == result_id
+    assert page.evaluate("_lbReadOnly") is True
+    assert page.evaluate("_lbReadOnlyMessage") == (
+        "Group Review is applying changes. Wait for it to finish."
+    )
+    expect(page.locator("#lightboxDeleteBtn")).to_be_disabled()
+
+    try:
+        page.evaluate("window.__releaseReadOnlyLifecycleApply()")
+        page.wait_for_function("window.__readOnlyLifecycleSettled === true")
+        assert page.evaluate("window.__readOnlyLifecycleApplyError || null") is None
+        # Apply finished and closeGroupReview() ran; the already-open lightbox
+        # must have refreshed its read-only state so arrow-navigation doesn't
+        # keep carrying the apply-time snapshot forward.
+        assert page.evaluate("_lbReadOnly") is False
+        expect(page.locator("#lightboxDeleteBtn")).to_be_enabled()
+        expect(page.locator("#lightboxAdjustBtn")).to_be_enabled()
+        expect(page.locator("#lightboxNotWildlife")).to_be_enabled()
+    finally:
+        page.evaluate(
+            "() => { window.safeFetch = window.__originalSafeFetchForReadOnlyLifecycle; }"
+        )
+
+
+def test_native_rating_and_wildlife_writes_rejected_through_held_apply(
+    live_server, page
+):
+    """Native Photo commands route through setRatingFor/setWildlifeExcludedFor,
+    so during a fully held /api/pipeline/group/apply neither may reach the
+    server or mutate the local cache or database. Once the real request
+    settles they must both work again — no sticky lock."""
+    db = live_server["db"]
+    photo_ids = live_server["data"]["photos"][:4]
+    _write_grouped_pipeline_cache(live_server, photo_ids)
+    photo_id = photo_ids[0]
+    before_rating = db.conn.execute(
+        "SELECT rating FROM photos WHERE id = ?", (photo_id,)
+    ).fetchone()["rating"]
+    before_wildlife = db.conn.execute(
+        "SELECT wildlife_excluded FROM photos WHERE id = ?", (photo_id,)
+    ).fetchone()["wildlife_excluded"]
+    attempted_rating = next(v for v in range(6) if v != before_rating)
+
+    page.goto(f"{live_server['url']}/pipeline/review")
+    expect(page.locator(".photo-card[data-photo-id]")).to_have_count(4)
+    page.evaluate("openGroupReview(0, 0)")
+    page.wait_for_function("grmState && grmState.seeded === true")
+    page.evaluate(
+        """() => {
+          window.__originalSafeFetchForApplyRating = window.safeFetch;
+          window.__applyRatingWriteCalls = [];
+          window.safeFetch = function(url) {
+            if (url === '/api/pipeline/group/apply') {
+              const args = arguments;
+              return new Promise((resolve, reject) => {
+                window.__releaseApplyRatingLock = () => {
+                  window.__originalSafeFetchForApplyRating
+                    .apply(window, args).then(resolve, reject);
+                };
+              });
+            }
+            if (url === '/api/batch/rating' ||
+                (typeof url === 'string' &&
+                 url.indexOf('/wildlife_excluded') !== -1)) {
+              window.__applyRatingWriteCalls.push(url);
+            }
+            return window.__originalSafeFetchForApplyRating
+              .apply(this, arguments);
+          };
+          grmMoveReject();
+          window.__applyRatingSettled = false;
+          window.__applyRatingPromise = grmApply().then(
+            () => { window.__applyRatingSettled = true; },
+            error => {
+              window.__applyRatingError = String(error);
+              window.__applyRatingSettled = true;
+            }
+          );
+        }"""
+    )
+    page.wait_for_function(
+        "typeof window.__releaseApplyRatingLock === 'function'"
+    )
+    assert page.evaluate("grmState.applying") is True
+
+    blocked = page.evaluate(
+        """async args => ({
+          rating: await setRatingFor(args.photoId, args.rating),
+          wildlife: await setWildlifeExcludedFor(args.photoId, true),
+        })""",
+        {"photoId": photo_id, "rating": attempted_rating},
+    )
+    assert blocked == {"rating": False, "wildlife": False}
+    assert page.evaluate("window.__applyRatingWriteCalls") == []
+    assert db.conn.execute(
+        "SELECT rating FROM photos WHERE id = ?", (photo_id,)
+    ).fetchone()["rating"] == before_rating
+    assert db.conn.execute(
+        "SELECT wildlife_excluded FROM photos WHERE id = ?", (photo_id,)
+    ).fetchone()["wildlife_excluded"] == before_wildlife
+    cached = page.evaluate(
+        "pid => pipelineResults.photos.find(photo => photo.id === pid)",
+        photo_id,
+    )
+    assert cached["rating"] == before_rating
+    assert (cached.get("wildlife_excluded") or 0) == (before_wildlife or 0)
+
+    try:
+        page.evaluate("window.__releaseApplyRatingLock()")
+        page.wait_for_function("window.__applyRatingSettled === true")
+        assert page.evaluate("window.__applyRatingError || null") is None
+        after = page.evaluate(
+            """async args => ({
+              rating: await setRatingFor(args.photoId, args.rating),
+            })""",
+            {"photoId": photo_id, "rating": attempted_rating},
+        )
+        assert after == {"rating": True}
+        assert db.conn.execute(
+            "SELECT rating FROM photos WHERE id = ?", (photo_id,)
+        ).fetchone()["rating"] == attempted_rating
+    finally:
+        page.evaluate(
+            "() => { window.safeFetch = window.__originalSafeFetchForApplyRating; }"
+        )

@@ -10,6 +10,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = ROOT / ".github/workflows/pr-agent.yml"
+TEST_WORKFLOW = ROOT / ".github/workflows/test.yml"
 FIRE_ACTION = ROOT / ".github/actions/fire-routine/action.yml"
 MERGE_ACTION = ROOT / ".github/actions/pr-merge-ready/action.yml"
 ROUTINE_PROMPT = ROOT / "docs/pr-agent-routine-prompt.md"
@@ -17,6 +18,14 @@ ROUTINE_PROMPT = ROOT / "docs/pr-agent-routine-prompt.md"
 
 def _read(path):
     return path.read_text(encoding="utf-8")
+
+
+def test_automation_contract_inputs_run_the_python_suite():
+    test_workflow = _read(TEST_WORKFLOW)
+
+    assert 'path.startsWith(".github/actions/")' in test_workflow
+    assert 'path === ".github/workflows/pr-agent.yml"' in test_workflow
+    assert 'path === "docs/pr-agent-routine-prompt.md"' in test_workflow
 
 
 def test_review_events_are_collapsed_and_generated_feedback_is_ignored():

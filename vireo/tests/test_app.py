@@ -8734,6 +8734,61 @@ def test_batch_wildlife_excluded_skips_missing_and_out_of_workspace(app_and_db):
         assert row["wildlife_excluded"] == 1
 
 
+def test_batch_wildlife_excluded_uses_chunked_workspace_lookup(app_and_db):
+    """"Select all matching" can submit a very large ID list. The endpoint
+    must resolve workspace membership through chunked set-based SELECTs
+    rather than one query per photo, or a library-wide toggle triggers
+    tens of thousands of redundant SQLite queries and blocks the request.
+    """
+    app, db = app_and_db
+    folder_id = db.add_folder("/bulk", name="bulk")
+    db.add_workspace_folder(db._active_workspace_id, folder_id)
+    photo_ids = [
+        db.add_photo(
+            folder_id=folder_id,
+            filename=f"bulk-{i:04d}.jpg",
+            extension=".jpg",
+            file_size=100,
+            file_mtime=1.0,
+        )
+        for i in range(1500)
+    ]
+
+    executed = []
+    real_conn = db.conn
+
+    class TrackingConn:
+        def execute(self, sql, params=()):
+            executed.append(sql)
+            return real_conn.execute(sql, params)
+
+        def executemany(self, sql, seq):
+            return real_conn.executemany(sql, seq)
+
+        def __getattr__(self, name):
+            return getattr(real_conn, name)
+
+    db.conn = TrackingConn()
+    try:
+        client = app.test_client()
+        resp = client.post(
+            "/api/batch/wildlife-excluded",
+            json={"photo_ids": photo_ids, "excluded": True},
+            content_type="application/json",
+        )
+    finally:
+        db.conn = real_conn
+
+    assert resp.status_code == 200
+    assert resp.get_json()["updated"] == len(photo_ids)
+
+    workspace_lookups = [sql for sql in executed if "workspace_folders" in sql]
+    assert len(workspace_lookups) <= 4, (
+        f"expected O(N/chunk) workspace lookups for {len(photo_ids)} photos, "
+        f"got {len(workspace_lookups)}"
+    )
+
+
 def test_batch_keyword_route_accepts_existing_keyword_id(app_and_db):
     """The fill-missing-keywords button preserves pre-existing links on undo."""
     app, db = app_and_db

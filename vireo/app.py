@@ -11242,25 +11242,37 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 photo_ids.append(raw)
                 seen.add(raw)
 
-        photos_map = db.get_photos_by_ids(photo_ids)
-        accessible_ids = [
-            photo_id
-            for photo_id in photo_ids
-            if photo_id in photos_map and db._photo_in_workspace(photo_id)
-        ]
+        ws_id = db._ws_id()
+        accessible_state = {}
+        batch_size = 800
+        for i in range(0, len(photo_ids), batch_size):
+            chunk = photo_ids[i:i + batch_size]
+            placeholders = ",".join("?" for _ in chunk)
+            rows = db.conn.execute(
+                f"""SELECT p.id, COALESCE(p.wildlife_excluded, 0) AS excluded
+                    FROM photos p
+                    WHERE p.id IN ({placeholders})
+                      AND EXISTS (
+                          SELECT 1 FROM workspace_folders wf
+                          WHERE wf.folder_id = p.folder_id
+                            AND wf.workspace_id = ?
+                      )""",
+                [*chunk, ws_id],
+            ).fetchall()
+            for row in rows:
+                accessible_state[row["id"]] = int(row["excluded"])
+        accessible_ids = [pid for pid in photo_ids if pid in accessible_state]
         skipped_count = len(photo_ids) - len(accessible_ids)
 
         desired = 1 if excluded else 0
         changed_ids = [
             photo_id
             for photo_id in accessible_ids
-            if int(photos_map[photo_id]["wildlife_excluded"] or 0) != desired
+            if accessible_state[photo_id] != desired
         ]
         items = []
         for photo_id in changed_ids:
-            old_value = (
-                "1" if photos_map[photo_id]["wildlife_excluded"] else "0"
-            )
+            old_value = "1" if accessible_state[photo_id] else "0"
             db.conn.execute(
                 "UPDATE photos SET wildlife_excluded = ? WHERE id = ?",
                 (desired, photo_id),

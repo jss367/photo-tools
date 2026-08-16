@@ -299,7 +299,17 @@ def test_nonweak_session_thread_registry_is_identity_safe_and_bounded(monkeypatc
 
 
 def test_production_onnx_sessions_use_budgeted_factory():
-    """Direct session construction would bypass thread and load budgets."""
+    """Direct session construction would bypass thread and load budgets.
+
+    Detects three call shapes per module:
+      * ``ort.InferenceSession(...)`` — attribute access on any name.
+      * ``InferenceSession(...)`` — bare name imported directly.
+      * ``AnyAlias(...)`` where ``AnyAlias`` came from
+        ``from onnxruntime import InferenceSession as AnyAlias``.
+
+    Resolving aliases per module closes the ``as`` gap that would
+    otherwise let a rename bypass the budgeted factory.
+    """
     import ast
     from pathlib import Path
 
@@ -309,6 +319,24 @@ def test_production_onnx_sessions_use_budgeted_factory():
         if "tests" in path.parts or path.name == "onnx_runtime.py":
             continue
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        # Track every module-local name that resolves to
+        # ``onnxruntime.InferenceSession``. Always include the bare name so
+        # constructors accessed as ``InferenceSession(...)`` after an
+        # unaliased import still count. ``from onnxruntime.<sub> import
+        # InferenceSession`` variants are treated the same as the top-level
+        # import because they resolve to the same class.
+        aliases = {"InferenceSession"}
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ImportFrom):
+                continue
+            module = node.module or ""
+            if module != "onnxruntime" and not module.startswith(
+                "onnxruntime."
+            ):
+                continue
+            for alias in node.names:
+                if alias.name == "InferenceSession":
+                    aliases.add(alias.asname or alias.name)
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
                 continue
@@ -318,7 +346,7 @@ def test_production_onnx_sessions_use_budgeted_factory():
                 and function.attr == "InferenceSession"
             ) or (
                 isinstance(function, ast.Name)
-                and function.id == "InferenceSession"
+                and function.id in aliases
             )
             if is_constructor:
                 violations.append(f"{path.relative_to(package_root)}:{node.lineno}")

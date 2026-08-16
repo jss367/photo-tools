@@ -693,6 +693,23 @@ class ResourceLedger:
             self._active_owner_waits.pop(owner_id, None)
 
     @contextlib.contextmanager
+    def suspend_wait(self, wait_timing):
+        """Exclude a bounded interval from ``wait_timing`` under the ledger lock.
+
+        Encapsulates the (condition + clock) contract so callers outside the
+        class don't need to reach into ledger internals to bracket a
+        deliberate parking interval — the module-level
+        :func:`suspend_resource_wait_timing` delegates here.
+        """
+        with self._condition:
+            wait_timing.suspend(self._clock())
+        try:
+            yield
+        finally:
+            with self._condition:
+                wait_timing.resume(self._clock())
+
+    @contextlib.contextmanager
     def track_external_wait(self, *, owner_id=None):
         """Include a non-ledger resource wait in job timing diagnostics.
 
@@ -886,14 +903,8 @@ def suspend_resource_wait_timing():
     if wait_timing is None:
         yield
         return
-    ledger = wait_timing.ledger
-    with ledger._condition:
-        wait_timing.suspend(ledger._clock())
-    try:
+    with wait_timing.ledger.suspend_wait(wait_timing):
         yield
-    finally:
-        with ledger._condition:
-            wait_timing.resume(ledger._clock())
 
 
 @contextlib.contextmanager

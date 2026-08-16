@@ -3390,6 +3390,9 @@ def test_concurrent_scanners_preserve_inference_reserve(monkeypatch):
             # point of this test is to fail fast when the reserve is
             # bypassed and the first scanner still holds its lease.
             _deadline = time.monotonic() + 5.0
+            inference_threads = resource_ledger.cpu_inference_request(
+                ledger.cpu_capacity,
+            ).preferred
             with ledger.acquire(
                 resource_ledger.ResourceRequest(
                     cpu=resource_ledger.cpu_inference_request(
@@ -3399,7 +3402,7 @@ def test_concurrent_scanners_preserve_inference_reserve(monkeypatch):
                 ),
                 cancel_check=lambda: time.monotonic() > _deadline,
             ) as inference:
-                assert inference.cpu_permits == 8
+                assert inference.cpu_permits == inference_threads
         finally:
             release_first.set()
             t1.join(timeout=5.0)

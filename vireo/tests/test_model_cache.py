@@ -306,63 +306,33 @@ def test_uncontended_load_does_not_record_owner_timing():
         resource_ledger._set_resource_ledger_for_tests(previous)
 
 
-def test_cancelled_load_waiter_retries_instead_of_inheriting_cancel():
-    from classifier import ClassificationCancelled
+def _cancellation_exception_classes():
+    """Return every exception class ModelCache must treat as caller-local.
 
-    cache = ModelCache(idle_secs=60)
-    load_started = threading.Event()
-    release_cancel = threading.Event()
-    good_factory_called = threading.Event()
-    values = []
-
-    def cancelled_factory():
-        load_started.set()
-        release_cancel.wait(timeout=2.0)
-        raise ClassificationCancelled("classification cancelled")
-
-    def good_factory():
-        good_factory_called.set()
-        return "ok"
-
-    def cancelled_loader():
-        with pytest.raises(ClassificationCancelled):
-            with cache.acquire("k", cancelled_factory):
-                pass
-
-    def waiting_loader():
-        with cache.acquire("k", good_factory) as value:
-            values.append(value)
-
-    ta = threading.Thread(target=cancelled_loader)
-    ta.start()
-    assert load_started.wait(timeout=1.0)
-
-    tb = threading.Thread(target=waiting_loader)
-    tb.start()
-    time.sleep(0.05)
-
-    release_cancel.set()
-    ta.join(timeout=2.0)
-    tb.join(timeout=2.0)
-
-    assert not ta.is_alive()
-    assert not tb.is_alive()
-    assert good_factory_called.is_set()
-    assert values == ["ok"]
-
-
-def test_resource_wait_cancelled_load_does_not_poison_healthy_waiter():
-    """Regression: when a cold construction lease raises ``ResourceWaitCancelled``
-    (the ledger's cancel probe fired because the producer job was cancelled),
-    another uncancelled job that was already waiting for the same cache entry
-    must retry against a fresh entry rather than inherit the producer's
-    resource cancel. Without treating ``ResourceWaitCancelled`` as a
-    caller-local cancellation at the cache boundary, ``ModelCache.acquire``
-    would rethrow it verbatim and fail the healthy sibling job for no reason
-    of its own.
+    Both a ``ClassificationCancelled`` (job-level abort) and a
+    ``ResourceWaitCancelled`` (ledger probe fired for the producer only)
+    must NOT poison a sibling waiter — that waiter should retry against a
+    fresh entry. Parameterizing over both classes keeps one test body
+    and prevents the two identical shapes from drifting.
     """
+    from classifier import ClassificationCancelled
     from resource_ledger import ResourceWaitCancelled
 
+    return [ClassificationCancelled, ResourceWaitCancelled]
+
+
+@pytest.mark.parametrize("exc_class", _cancellation_exception_classes())
+def test_cancelled_load_waiter_retries_instead_of_inheriting_cancel(exc_class):
+    """A caller-local cancel from the producer must not poison an
+    uncancelled waiter: the waiter retries against a fresh entry and runs
+    its own factory rather than rethrowing the producer's exception.
+
+    Covers both cancellation shapes ModelCache must translate to a
+    caller-local retry — job-level ``ClassificationCancelled`` and the
+    ledger-level ``ResourceWaitCancelled`` raised when the producer's
+    ONNX construction lease was cancelled while a sibling job was
+    already waiting on the same cache entry.
+    """
     cache = ModelCache(idle_secs=60)
     load_started = threading.Event()
     release_cancel = threading.Event()
@@ -372,16 +342,14 @@ def test_resource_wait_cancelled_load_does_not_poison_healthy_waiter():
     def cancelled_factory():
         load_started.set()
         release_cancel.wait(timeout=2.0)
-        raise ResourceWaitCancelled(
-            "Cancelled while waiting for ONNX model construction resources"
-        )
+        raise exc_class("producer cancelled")
 
     def good_factory():
         good_factory_called.set()
         return "ok"
 
     def cancelled_loader():
-        with pytest.raises(ResourceWaitCancelled):
+        with pytest.raises(exc_class):
             with cache.acquire("k", cancelled_factory):
                 pass
 
@@ -405,11 +373,11 @@ def test_resource_wait_cancelled_load_does_not_poison_healthy_waiter():
     assert not tb.is_alive()
     assert good_factory_called.is_set(), (
         "The healthy waiter must retry against a fresh entry — its factory "
-        "should have run after the producer's ResourceWaitCancelled surfaced."
+        f"should have run after the producer's {exc_class.__name__} surfaced."
     )
     assert values == ["ok"], (
         "The healthy waiter must have received the value from its own retry "
-        "factory, not inherited the producer's ResourceWaitCancelled."
+        f"factory, not inherited the producer's {exc_class.__name__}."
     )
 
 

@@ -177,42 +177,72 @@ would violate the "works retroactively on existing prediction rows
 with no destructive migration" goal.
 
 But the read side *can* — and must — split legacy short-form group
-IDs whose photo memberships are demonstrably disjoint, before graph
-construction. Without that split, two independently-minted bursts
-that collide on `(classifier_model, labels_fingerprint, group_id)`
-share one graph node; the same-taxon overlap edge test only connects
-*distinct* nodes, so they cannot be separated by any downstream rule
-and would merge into one card even with no shared photos. The read
-path therefore partitions the rows sharing each
+IDs whose rows are demonstrably from different classify runs, before
+graph construction. Without that split, two independently-minted
+bursts that collide on `(classifier_model, labels_fingerprint,
+group_id)` share one graph node; the same-taxon overlap edge test
+only connects *distinct* nodes, so they cannot be separated by any
+downstream rule and would merge into one card even with no shared
+photos.
+
+A photo-membership partition does not work: each `predictions` row
+has exactly one `photo_id` (`db.py:865-883`), and an ordinary
+multi-photo burst has one row per distinct photo, so *no two rows in
+one burst share a photo*. A "rows share a photo iff their `photo_id`s
+coincide" rule would shatter every normal burst into single-photo
+subsets and render one card per frame instead of one card for the
+burst. The correct disambiguator has to be a signal that is
+tight-within-one-job and loose-across-jobs; `predictions.created_at`
+(`db.py:881`, `TEXT DEFAULT (datetime('now'))`) is exactly that.
+`_store_grouped_predictions` writes a job's rows in a single
+transaction, so their `created_at` values fall within milliseconds
+of each other (SQLite `datetime('now')` has second precision;
+same-transaction rows land in the same second or in two adjacent
+seconds). Two disjoint classify jobs whose short group IDs happen to
+collide are, by construction, from separate `_store_grouped_predictions`
+calls — typically minutes, hours, or days apart, never microseconds.
+
+The read path therefore partitions the rows sharing each
 `(classifier_model, labels_fingerprint, group_id)` bucket into
-photo-connected subsets — two rows land in the same subset iff their
-`photo_id`s coincide or are transitively linked through a chain of
-same-bucket rows that share photos — and appends the subset index to
-the node key: `(classifier_model, labels_fingerprint, group_id,
-subset_index)`. A single non-colliding group's rows are all in one
-photo-connected subset (the burst's own photos), so `subset_index`
-is always 0 and the key is unchanged in the common case. Two
-colliding bursts with disjoint photos fall into two subsets with
-indices 0 and 1 and become two distinct nodes; the same-taxon overlap
-edge test then correctly leaves them separate when their photos do
-not intersect. The partition is a pure read-time transform over the
-row set `/api/predictions` already fetches — no schema change, no
-new column, no backfill — and is stable across requests because the
-subset ordering is by the sorted min-photo-id of each subset.
+**time-connected subsets** — sort the bucket's rows ascending by
+`created_at` and break the sequence whenever the gap between two
+consecutive rows exceeds a threshold `T_split` (design default: 300
+seconds / 5 minutes; each run is one contiguous block, so the exact
+value is not sensitive as long as it exceeds any single
+`_store_grouped_predictions` transaction's duration and is far
+shorter than the interval between two classify jobs a user would
+run back-to-back on the same model/fingerprint). Each contiguous
+run is one subset; the subset index is assigned by chronological
+order (earliest = 0). The node key becomes `(classifier_model,
+labels_fingerprint, group_id, subset_index)`. A single
+non-colliding group's rows are all in one time-connected subset
+(the burst's own transaction), so `subset_index` is always 0 and
+the key is unchanged in the common case. Two colliding bursts from
+different runs fall into two subsets with indices 0 and 1 and become
+two distinct nodes; the same-taxon overlap edge test then correctly
+leaves them separate when their photos do not intersect (and correctly
+merges them when they do). The partition is a pure read-time
+transform over the row set `/api/predictions` already fetches — no
+schema change, no new column, no backfill — and is stable across
+requests because chronological ordering by `created_at` is total (ties
+break by `id`, itself monotone).
 
 The partition is deliberately conservative: it can only *split* rows
 apart, never combine them. In the pathological case where two
-colliding legacy bursts happen to share a photo (e.g. an overlapping
-burst boundary), they stay one node — but at that point they overlap
-on a real photo and the same-taxon overlap edge test would have
-merged them anyway, so no cross-burst mutation risk is introduced
-beyond what the intended merge already does. The one case the read
-path cannot recover is the (extremely narrow) legacy collision where
-two disjoint-burst rows on the *same* photo carry the same taxon:
-both would collapse into one subset, then one card — indistinguishable
-from a legitimate cross-model merge. This surface predates the
-feature and shrinks to zero for new rows once Phase 0 ships; it is
-documented rather than mitigated.
+colliding legacy bursts were classified within `T_split` of each other
+(e.g., a user launched two back-to-back re-runs of the same model on
+the same fingerprint within five minutes and got a group-ID
+collision), they stay one node — but this collapses at most into a
+same-model / same-fingerprint one-card view of two near-simultaneous
+runs, which is behaviorally close to what the intended merge would
+have shown on shared frames. The one case the read path cannot
+disentangle is the (extremely narrow) legacy collision where two
+disjoint runs happen to have been minted within the same `T_split`
+window *and* to share a photo carrying the same taxon: both would
+collapse into one subset, then one card — indistinguishable from a
+legitimate cross-model merge. This surface predates the feature and
+shrinks to zero for new rows once Phase 0 ships; it is documented
+rather than mitigated.
 
 The write-path fix stays. **Phase 0 (new,
 prerequisite of §2)** widens `_store_grouped_predictions` to mint
@@ -223,9 +253,15 @@ independently correct options — either lands the design's guarantees:
   (e.g. `classify-1732000000000-3`), which is unique across jobs by
   construction (`jobs.py:689,763`). Backwards-compatible string;
   read-side treats it as opaque.
-- `gid = f"g{secrets.token_hex(4)}-{group_count:04d}"` — appends 32
-  bits of entropy; collision probability under a per-job counter reset
-  is negligible even at high job volume.
+- `gid = f"g{secrets.token_hex(16)}-{group_count:04d}"` — appends 128
+  bits of entropy per group; collision probability across the entire
+  history of classify runs is effectively zero. (An earlier draft used
+  `secrets.token_hex(4)` — 32 bits — which, because
+  `_store_grouped_predictions` resets `group_count` per job, would
+  share the counter suffix across every job and thus give ~50%
+  birthday-collision probability among IDs minted at a common counter
+  value after roughly 77k draws. That is not a safe assumption at
+  catalog scale and is rejected.)
 
 The design assumes option (a) unless profiling of downstream string
 handling shows the longer key hurts. Either way, the node key stays
@@ -541,6 +577,24 @@ visual clause's match set.
 `lower(trim(species))` equality for the same taxon-key helper. Its
 detection-scoped, single-photo semantics stay unchanged.
 
+**Ordering constraint (§3 depends on §4's canonicalized keyword write).**
+Both the Review sibling pass ("Sibling pass, taxon-matched, per photo,
+within the resolved scope" above) and Compare's broadened
+`accept_subject_species` iterate over agreeing rows and route each
+through the existing `_accept_for_photo` / `accept_prediction`
+primitives. Those primitives write a keyword whose name comes from
+*each row's own* `species` value. If §3's taxon-match broadening
+landed before §4's precedence-1 keyword lookup, accepting a Blue-Tit
++ Eurasian-Blue-Tit merged card would write *both* synonym keywords
+to the photo — exactly the fragmentation this design is intended to
+prevent. §4's precedence-1 lookup therefore has to be live before
+§3's cross-variant accept fires, so every sibling accept in the loop
+resolves to the same canonical keyword regardless of which row's
+`species` string it carries. The Implementation-phases section below
+sequences the two accordingly (keyword canonicalization lands as
+Phase 4; the cross-model accept/reject and Compare broadening land as
+Phase 5, after canonicalization is in place).
+
 ### 4. Display name and keyword canonicalization
 
 **Card display name:** the resolved taxon's preferred common name from the
@@ -634,8 +688,9 @@ Each phase lands as its own PR and is independently useful.
 0. **Collision-resistant `group_id` in `_store_grouped_predictions`**
    (prerequisite of Phase 3; see §2 "Node identity"). Change the ID
    template from `f"g{job_id[-6:]}-{group_count:04d}"` to
-   `f"g{job_id}-{group_count:04d}"` (or the `secrets.token_hex(4)`
-   variant if the longer key impacts downstream string handling). Tests:
+   `f"g{job_id}-{group_count:04d}"` (or the `secrets.token_hex(16)`
+   variant — 128 bits, not the 32-bit `token_hex(4)` — if the longer
+   key impacts downstream string handling). Tests:
    the same job's group IDs remain distinct; two independently minted
    jobs' group IDs are always distinct across every combination of
    `classifier_model` × `labels_fingerprint`; existing consumers of
@@ -671,16 +726,28 @@ Each phase lands as its own PR and is independently useful.
    their disjoint bursts stay as two separate cards; **legacy-collision
    split fixture** — the same fixture built with legacy pre-Phase-0
    rows (same short suffix + counter, colliding `group_id`, same
-   taxon) but *disjoint* photo memberships resolves as two cards
-   because the read-side photo-connectivity partition (§2, "Node
-   identity") assigns them `subset_index = 0` and `subset_index = 1`
-   respectively, giving them distinct nodes with no edge between them;
-   a variant where the two legacy bursts happen to share one photo
-   collapses into one subset (documented, matches what the intended
-   merge would have done on that photo anyway); the residual
+   taxon) whose `created_at` values are separated by more than
+   `T_split` (default 5 minutes; the fixture writes the second burst's
+   rows with a synthetic `created_at` offset of one hour) resolves as
+   two cards because the read-side time-connectivity partition (§2,
+   "Node identity") assigns them `subset_index = 0` and
+   `subset_index = 1` respectively, giving them distinct nodes with
+   no edge between them; a **within-window legacy fixture** where the
+   two colliding bursts' `created_at` values fall within `T_split` of
+   each other (e.g., two back-to-back re-runs on the same
+   model/fingerprint) collapses into one subset — documented, matches
+   what a same-model near-simultaneous re-run merge would have shown
+   anyway; a **normal-burst-not-split fixture** — an ordinary
+   single-job burst of eight rows on eight distinct photos (all
+   `created_at` values within one transaction, i.e. within seconds)
+   resolves as *one* node at `subset_index = 0`, not eight (this is
+   the regression the earlier "photo-connectivity" rule would have
+   introduced by putting every single-photo row in its own subset —
+   the time-connectivity rule keeps the burst intact); the residual
    pre-Phase-0 collision surface (two disjoint-burst rows on the
-   *same* photo with the same taxon) is documented as unfixable from
-   stored rows and closed prospectively by Phase 0;
+   *same* photo with the same taxon *and* `created_at` values within
+   `T_split`) is documented as unfixable from stored rows and closed
+   prospectively by Phase 0;
    **cross-fingerprint hidden-row fixture** (groups A and C at
    fingerprint X, group B at fingerprint Y bridging them by shared
    photos, plus a singleton S with the same taxon on an unrelated
@@ -722,10 +789,37 @@ Each phase lands as its own PR and is independently useful.
    `node_id` (not `card_id`), and a fixture POST that names a
    non-existent `node_id` or that carries both `card_id` and
    `node_id` returns 400.
-4. **Cross-model accept/reject** + undo coverage. DB tests: accepting the
-   merged card (unfiltered — POST carries `card_id`) flips both models'
-   rows; undo restores both; reject mirrors; Compare's
-   `accept_subject_species` matches across name variants;
+4. **Keyword canonicalization** (taxon-matched keyword reuse) + the
+   "tags as …" transparency note. This phase lands **before** the
+   cross-model accept broadening (Phase 5) so that the accept path's
+   sibling loop cannot fragment keywords across name variants — see §3
+   "Ordering constraint" for the full rationale. DB tests:
+   **inat-id-translation fixture** — an existing "Eurasian Blue Tit"
+   keyword linked to the local *Cyanistes caeruleus* taxa row is
+   reused when a new accept's card carries the iNat id for
+   *Cyanistes caeruleus* (precedence 1 hits after `taxa.inat_id`
+   translation); a fabricated collision case where `taxa.id` for
+   taxon A equals `taxa.inat_id` for taxon B does *not* reuse
+   taxon B's keyword when accepting a card for taxon A; an unknown
+   iNat id (not in the local `taxa` table) falls through to
+   precedence 2 rather than raising or reusing an arbitrary keyword;
+   a `name:`-keyed card skips precedence 1 entirely; a
+   **variant-agreement fixture** — accepting a photo through the
+   existing per-row `accept_prediction` primitive when a
+   taxon-matched keyword ("Eurasian Blue Tit") already exists writes
+   *only* the canonical keyword even if the accepted row's `species`
+   string is "Blue Tit", so the Phase 5 sibling loop cannot introduce
+   synonym fragmentation.
+5. **Cross-model accept/reject** + undo coverage. Depends on Phase 4
+   being live so that the per-row keyword write resolves to the
+   canonical keyword — otherwise the sibling loop across "Blue Tit" /
+   "Eurasian Blue Tit" rows would tag both synonyms on the same photo,
+   the exact fragmentation §3's "Ordering constraint" describes. DB
+   tests: accepting the merged card (unfiltered — POST carries
+   `card_id`) flips both models' rows; undo restores both; reject
+   mirrors; Compare's `accept_subject_species` matches across name
+   variants and writes exactly one keyword per photo (asserting the
+   Phase 4 dependency actually holds end-to-end);
    **transitive-component accept fixture** — accepting the A-B-C card
    (POST carries `card_id`, no filter scope) flips every pending row on
    photos 1-4 for the matching taxon and leaves other taxa untouched;
@@ -759,17 +853,6 @@ Each phase lands as its own PR and is independently useful.
    (documented legacy behavior); a POST that carries a scope narrower
    than the server's full component cannot exceed the displayed
    membership.
-5. **Keyword canonicalization** (taxon-matched keyword reuse) + the
-   "tags as …" transparency note. DB tests: **inat-id-translation
-   fixture** — an existing "Eurasian Blue Tit" keyword linked to the
-   local *Cyanistes caeruleus* taxa row is reused when a new accept's
-   card carries the iNat id for *Cyanistes caeruleus* (precedence 1
-   hits after `taxa.inat_id` translation); a fabricated collision case
-   where `taxa.id` for taxon A equals `taxa.inat_id` for taxon B does
-   *not* reuse taxon B's keyword when accepting a card for taxon A;
-   an unknown iNat id (not in the local `taxa` table) falls through
-   to precedence 2 rather than raising or reusing an arbitrary
-   keyword; a `name:`-keyed card skips precedence 1 entirely.
 
 ## Test plan
 

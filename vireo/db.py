@@ -16281,6 +16281,59 @@ class Database:
             )
         self.conn.commit()
 
+    def get_prediction_states(self, photo_ids):
+        """Explain, per photo, why it may have no predictions to show.
+
+        An empty prediction list has four completely different meanings and a
+        blank panel implies only the first, so Browse needs them separated:
+        nothing has run yet, the detector ran and found no animals, detections
+        exist but were never classified, or classification ran and produced
+        nothing the user's confidence floor admits.
+
+        ``threshold`` travels with the state so the panel can split the rows
+        it already has into visible and below-the-floor, and say the hidden
+        count out loud rather than dropping those rows silently.
+        """
+        if not photo_ids:
+            return {}
+        import config as cfg
+        threshold = self.get_effective_config(cfg.load()).get(
+            "classifier_confidence", 0.0
+        ) or 0.0
+        ids = list(dict.fromkeys(int(pid) for pid in photo_ids))
+        states = {
+            pid: {
+                "detector_ran": False,
+                "detection_count": 0,
+                "classifier_ran": False,
+                "threshold": threshold,
+            }
+            for pid in ids
+        }
+        for chunk in _chunks(ids):
+            placeholders = ",".join("?" for _ in chunk)
+            for row in self.conn.execute(
+                f"""SELECT photo_id, COUNT(*) AS n FROM detector_runs
+                    WHERE photo_id IN ({placeholders}) GROUP BY photo_id""",
+                chunk,
+            ):
+                states[row["photo_id"]]["detector_ran"] = row["n"] > 0
+            for row in self.conn.execute(
+                f"""SELECT photo_id, COUNT(*) AS n FROM detections
+                    WHERE photo_id IN ({placeholders}) GROUP BY photo_id""",
+                chunk,
+            ):
+                states[row["photo_id"]]["detection_count"] = row["n"]
+            for row in self.conn.execute(
+                f"""SELECT d.photo_id AS photo_id, COUNT(*) AS n
+                    FROM classifier_runs cr
+                    JOIN detections d ON d.id = cr.detection_id
+                    WHERE d.photo_id IN ({placeholders}) GROUP BY d.photo_id""",
+                chunk,
+            ):
+                states[row["photo_id"]]["classifier_ran"] = row["n"] > 0
+        return states
+
     def get_predictions(self, photo_ids=None, model=None, status=None,
                         rules=None):
         """Get predictions with photo, detection and review info.

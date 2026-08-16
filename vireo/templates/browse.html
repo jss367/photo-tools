@@ -549,6 +549,108 @@ body.sidebar-resizing {
   font-size: 12px;
   line-height: 1.4;
 }
+/* Predictions panel — shares the selection-keyword row shape so the two
+   sections below each other read as one list, but keeps its own classes so
+   the "what the model thinks" rows stay visually distinct from the "what I
+   tagged" rows. */
+.prediction-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.prediction-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px;
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border-primary);
+  border-radius: 4px;
+}
+.prediction-row.decided { opacity: 0.6; }
+.prediction-row.ambiguous { border-color: color-mix(in srgb, var(--warning) 55%, var(--border-primary)); }
+.prediction-species {
+  min-width: 0;
+  color: var(--text-primary);
+  font-size: 13px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.prediction-meta {
+  margin-top: 2px;
+  color: var(--text-dim);
+  font-size: 11px;
+}
+.prediction-why {
+  margin-top: 2px;
+  color: var(--warning);
+  font-size: 11px;
+}
+.prediction-actions {
+  display: flex;
+  gap: 6px;
+  flex-shrink: 0;
+}
+.prediction-accept {
+  flex-shrink: 0;
+  background: var(--accent);
+  color: var(--accent-text);
+  border: none;
+  border-radius: 4px;
+  padding: 5px 8px;
+  font-size: 12px;
+  cursor: pointer;
+}
+.prediction-accept:hover { filter: brightness(1.05); }
+.prediction-reject {
+  flex-shrink: 0;
+  background: var(--bg-primary);
+  color: var(--danger);
+  border: 1px solid color-mix(in srgb, var(--danger) 60%, var(--border-secondary));
+  border-radius: 4px;
+  padding: 5px 8px;
+  font-size: 12px;
+  cursor: pointer;
+}
+.prediction-reject:hover { background: color-mix(in srgb, var(--danger) 12%, var(--bg-primary)); }
+.prediction-review-link {
+  flex-shrink: 0;
+  background: var(--bg-primary);
+  color: var(--info);
+  border: 1px solid var(--border-secondary);
+  border-radius: 4px;
+  padding: 5px 8px;
+  font-size: 12px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.prediction-review-link:hover { filter: brightness(1.1); }
+.prediction-status-tag {
+  flex-shrink: 0;
+  font-size: 11px;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.prediction-toggle {
+  align-self: flex-start;
+  background: none;
+  border: none;
+  padding: 2px 0;
+  color: var(--info);
+  font-size: 11px;
+  cursor: pointer;
+  text-align: left;
+}
+.prediction-toggle:hover { text-decoration: underline; }
+.prediction-below-threshold {
+  margin-top: 8px;
+  color: var(--text-muted);
+  font-size: 11px;
+  line-height: 1.4;
+}
 .selection-action-btn {
   width: 100%;
   background: var(--accent);
@@ -1726,6 +1828,10 @@ body.sidebar-resizing {
         <div class="selection-action-hint" id="pasteEditHint"></div>
       </div>
       <div class="detail-section">
+        <div class="detail-section-title">Predictions</div>
+        <div class="prediction-list" id="selectionPredictions"></div>
+      </div>
+      <div class="detail-section">
         <div class="detail-section-title">Keywords</div>
         <div class="selection-keyword-list" id="selectionKeywordSuggestions"></div>
       </div>
@@ -1781,6 +1887,13 @@ body.sidebar-resizing {
           <div id="locationExifSuggestion" class="location-suggestion" hidden></div>
           <div id="locationError" class="location-error" hidden></div>
         </div>
+      </div>
+
+      <!-- Predictions sit directly above Keywords: accepting one writes a
+           keyword into the box below, so cause and effect stay adjacent. -->
+      <div class="detail-section single-only">
+        <div class="detail-section-title">Predictions</div>
+        <div class="prediction-list" id="detailPredictions"></div>
       </div>
 
       <div class="detail-section">
@@ -2007,6 +2120,22 @@ var selectionKeywordKey = '';
 var selectionKeywordMissingById = {};
 var selectionKeywordPresentById = {};
 var selectionKeywordNameById = {};
+// Prediction panels. Each panel owns one sequence counter and one cache key,
+// mirroring the keyword panel above — a fast selection change must be able to
+// drop a stale response rather than paint the previous selection's rows.
+var detailPredictionSeq = 0;
+var selectionPredictionSeq = 0;
+// A photo can carry dozens of low-confidence guesses, and most users never set
+// a confidence floor. Show the strongest few and collapse the tail behind a
+// counted "show all" rather than either flooding the panel or inventing a
+// threshold the user's settings don't specify.
+var PREDICTION_COLLAPSE_AT = 5;
+var detailPredictionsExpanded = false;
+var selectionPredictionsExpanded = false;
+var _detailPredictionData = null;
+var _selectionPredictionData = null;
+var selectionPredictionKey = '';
+var selectionPredictionAcceptableById = {};
 var showDetectionBoxes = false;
 var cardFields = ["filename", "location_status", "rating", "flag", "color_label", "sharpness"]; // default, overridden by config
 var inatSubmitted = {};  // {photo_id: true}
@@ -5719,6 +5848,14 @@ function updateSelectionPanel(ids) {
     selectionKeywordRequestSeq++;
     var list = document.getElementById('selectionKeywordSuggestions');
     if (list) list.innerHTML = '';
+    // Same teardown for the prediction rows — bumping the sequence drops any
+    // in-flight selection response so it can't paint into the panel the user
+    // has just collapsed back to a single photo.
+    selectionPredictionKey = '';
+    selectionPredictionAcceptableById = {};
+    selectionPredictionSeq++;
+    var predList = document.getElementById('selectionPredictions');
+    if (predList) predList.innerHTML = '';
     if (wasVisible && selectedPhotoId) {
       loadDetail(selectedPhotoId);
     } else if (wasVisible) {
@@ -5758,9 +5895,19 @@ function updateSelectionPanel(ids) {
     if (list) {
       list.innerHTML = '<div class="selection-empty">Keyword suggestions are available for selections of 1,000 photos or fewer.</div>';
     }
+    // Say the cap out loud here too, rather than leaving an empty
+    // Predictions box that reads as "nothing predicted".
+    selectionPredictionKey = selectionIdsKey(ids);
+    selectionPredictionSeq++;
+    selectionPredictionAcceptableById = {};
+    var predList = document.getElementById('selectionPredictions');
+    if (predList) {
+      predList.innerHTML = '<div class="selection-empty">Predictions are available for selections of 1,000 photos or fewer.</div>';
+    }
     return;
   }
   loadSelectionKeywordSuggestions(ids);
+  loadSelectionPredictions(ids);
 }
 
 function updatePasteEditSection(ids) {
@@ -6107,6 +6254,376 @@ async function renderBrowseCompare() {
   if (seq !== browseCompareSeq || !isBrowseCompareOpen()) return;
   setBrowseComparePane('A', pair[0]);
   setBrowseComparePane('B', pair[1]);
+}
+
+/* ---------- Predictions panels ----------
+   Browse shows what the classifier thinks, not just what has been committed.
+   Unambiguous predictions are actionable here; anything needing Review's
+   fuller UI stays visible but routes there instead of offering an Accept
+   this panel cannot honestly carry out. */
+
+function predictionIsAmbiguous(p) {
+  return !!(
+    (p.alternatives && p.alternatives.length) ||
+    p.category === 'disagreement' ||
+    p.category === 'refinement'
+  );
+}
+
+function predictionAmbiguityReason(p) {
+  var reasons = [];
+  var altCount = (p.alternatives || []).length;
+  if (altCount) {
+    reasons.push(altCount + (altCount === 1 ? ' alternative' : ' alternatives'));
+  }
+  var existing = (p.existing_species || []).join(', ');
+  if (p.category === 'disagreement') {
+    reasons.push(existing ? 'conflicts with keyworded ' + existing : 'conflicts with existing keywords');
+  } else if (p.category === 'refinement') {
+    reasons.push(existing ? 'refines keyworded ' + existing : 'refines an existing keyword');
+  }
+  return reasons.join(' · ');
+}
+
+// An empty list has four different meanings. Collapsing them into one blank
+// panel would tell the user "no prediction" when the truth might be "nothing
+// has run yet" — see CORE_PHILOSOPHY.md, no black boxes.
+function predictionEmptyMessage(state) {
+  if (!state) return 'No predictions for this photo.';
+  if (!state.detector_ran) return 'Not yet classified — no detector has run on this photo.';
+  if (!state.detection_count) return 'Nothing detected — the detector ran and found no animals.';
+  if (!state.classifier_ran) return 'Not yet classified — detections found, but no classifier has run yet.';
+  return 'No species above threshold — classification ran and produced nothing to review.';
+}
+
+function formatPredictionConfidence(conf) {
+  if (conf == null) return 'confidence unknown';
+  return Math.round(conf * 100) + '%';
+}
+
+async function loadDetailPredictions(photoId) {
+  var list = document.getElementById('detailPredictions');
+  if (!list) return;
+  var seq = ++detailPredictionSeq;
+  list.innerHTML = '<div class="selection-empty">Loading predictions...</div>';
+  try {
+    var data = await safeFetch(
+      '/api/predictions?photo_ids=' + encodeURIComponent(photoId), {}, { toast: false },
+    );
+    if (seq !== detailPredictionSeq || window._detailPhotoId !== photoId) return;
+    renderDetailPredictions(data, photoId);
+  } catch(e) {
+    if (seq === detailPredictionSeq) {
+      list.innerHTML = '<div class="selection-empty">Could not load predictions.</div>';
+    }
+  }
+}
+
+function toggleDetailPredictions() {
+  detailPredictionsExpanded = !detailPredictionsExpanded;
+  if (_detailPredictionData) {
+    renderDetailPredictions(_detailPredictionData.data, _detailPredictionData.photoId);
+  }
+}
+
+function renderDetailPredictions(data, photoId) {
+  var list = document.getElementById('detailPredictions');
+  if (!list) return;
+  _detailPredictionData = { data: data, photoId: photoId };
+  var state = (data.photo_states || {})[String(photoId)] || null;
+  var threshold = state && state.threshold ? state.threshold : 0;
+  var rows = (data.predictions || []).filter(function(p) {
+    return p.photo_id === photoId;
+  });
+  // Below-threshold rows are summarised rather than dropped: the user set the
+  // floor, so they are entitled to know something is sitting under it.
+  var visible = rows.filter(function(p) { return (p.confidence || 0) >= threshold; });
+  var hidden = rows.length - visible.length;
+
+  if (!visible.length) {
+    list.innerHTML = '<div class="selection-empty">' +
+      escapeHtml(predictionEmptyMessage(state)) + '</div>' +
+      (hidden ? '<div class="prediction-below-threshold">' + hidden +
+        (hidden === 1 ? ' prediction' : ' predictions') + ' below your confidence threshold (' +
+        formatPredictionConfidence(threshold) + ').</div>' : '');
+    return;
+  }
+
+  // One prediction row per detection means a photo with a dozen boxes of the
+  // same bird lists that bird a dozen times. Group by species+status: the
+  // question the panel answers is "what species is in this photo", and the
+  // detection count is the interesting detail, not a reason to repeat.
+  var groups = [];
+  var groupByKey = {};
+  visible.forEach(function(p) {
+    var decided = p.status === 'accepted' || p.status === 'rejected';
+    var key = (p.species || 'Unknown').toLowerCase() + '|' + (decided ? p.status : 'pending');
+    var g = groupByKey[key];
+    if (!g) {
+      g = groupByKey[key] = {
+        species: p.species || 'Unknown', status: decided ? p.status : 'pending',
+        decided: decided, ids: [], models: {}, ambiguous: [], best: null, count: 0,
+      };
+      groups.push(g);
+    }
+    g.count++;
+    g.ids.push(p.id);
+    if (p.model) g.models[p.model] = true;
+    if (!g.best || (p.confidence || 0) > (g.best.confidence || 0)) g.best = p;
+    if (!decided && predictionIsAmbiguous(p)) g.ambiguous.push(p);
+  });
+  groups.sort(function(a, b) {
+    if (a.decided !== b.decided) return a.decided ? 1 : -1;
+    return (b.best.confidence || 0) - (a.best.confidence || 0);
+  });
+
+  var shown = detailPredictionsExpanded
+    ? groups
+    : groups.slice(0, PREDICTION_COLLAPSE_AT);
+  var collapsed = groups.length - shown.length;
+
+  var html = '';
+  shown.forEach(function(g) {
+    // A group is only safely acceptable if none of its rows is ambiguous —
+    // otherwise one Accept would silently swallow a decision the user should
+    // be making in Review.
+    var ambiguous = !g.decided && g.ambiguous.length > 0;
+    var cls = 'prediction-row' + (g.decided ? ' decided' : '') + (ambiguous ? ' ambiguous' : '');
+    var meta = formatPredictionConfidence(g.best.confidence) +
+      ' · ' + Object.keys(g.models).join(', ');
+    if (g.count > 1) meta += ' · on ' + g.count + ' detections';
+    var actions;
+    if (g.decided) {
+      actions = '<span class="prediction-status-tag">' + escapeHtml(g.status) + '</span>';
+    } else if (ambiguous) {
+      actions = '<button class="prediction-review-link" onclick="openPredictionInReview(' +
+        photoId + ')" title="This prediction needs Review\'s full decision UI">Open in Review</button>';
+    } else {
+      var idsArg = JSON.stringify(g.ids);
+      actions =
+        '<button class="prediction-accept" onclick=\'acceptDetailPredictions(' + idsArg + ',' + photoId +
+        ')\' title="Accept this species and add the keyword">Accept</button>' +
+        '<button class="prediction-reject" onclick=\'rejectDetailPredictions(' + idsArg + ',' + photoId +
+        ')\' title="Reject this prediction">Reject</button>';
+    }
+    html += '<div class="' + cls + '">' +
+      '<div style="min-width:0;">' +
+        '<div class="prediction-species">' + escapeHtml(g.species) + '</div>' +
+        '<div class="prediction-meta">' + escapeHtml(meta) + '</div>' +
+        (ambiguous ? '<div class="prediction-why">' +
+          escapeHtml(predictionAmbiguityReason(g.ambiguous[0])) + '</div>' : '') +
+      '</div>' +
+      '<div class="prediction-actions">' + actions + '</div>' +
+    '</div>';
+  });
+  // Name what is collapsed and how weak it is, so the shortened list can never
+  // be mistaken for the whole answer.
+  if (collapsed > 0) {
+    var weakest = groups[shown.length].best.confidence;
+    html += '<button class="prediction-toggle" onclick="toggleDetailPredictions()">Show ' +
+      collapsed + ' weaker species (' + formatPredictionConfidence(weakest) +
+      ' and below)</button>';
+  } else if (detailPredictionsExpanded && groups.length > PREDICTION_COLLAPSE_AT) {
+    html += '<button class="prediction-toggle" onclick="toggleDetailPredictions()">Show fewer</button>';
+  }
+  if (hidden) {
+    html += '<div class="prediction-below-threshold">' + hidden +
+      (hidden === 1 ? ' more prediction is' : ' more predictions are') +
+      ' below your confidence threshold (' + formatPredictionConfidence(threshold) + ').</div>';
+  }
+  list.innerHTML = html;
+}
+
+function openPredictionInReview(photoId) {
+  window.location.href = '/review?photo_id=' + encodeURIComponent(photoId);
+}
+
+// Accepting writes a keyword, so every surface that counts keywords has to be
+// told — the same fan-out applySelectionKeyword performs. refreshPendingSyncBanner
+// matters especially: an accept queues a pending XMP change.
+async function _afterPredictionMutation(photoIds, opts) {
+  opts = opts || {};
+  await _refreshBrowseKeywordState(photoIds);
+  selectionKeywordKey = '';
+  selectionPredictionKey = '';
+  var selection = getActiveSelection();
+  if (selection.length > 1) {
+    loadSelectionKeywordSuggestions(selection);
+    loadSelectionPredictions(selection);
+  }
+  if (opts.photoId != null && window._detailPhotoId === opts.photoId) {
+    // loadDetail re-fetches the photo AND its predictions, so asking for both
+    // would double the requests for one accept.
+    if (opts.reloadDetail) loadDetail(opts.photoId);
+    else loadDetailPredictions(opts.photoId);
+  }
+  loadKeywords();
+  scheduleCollectionCountsRefresh();
+  refreshActiveCollectionAfterMembershipChange();
+  refreshPendingSyncBanner();
+  showUndoToast();
+}
+
+async function acceptDetailPredictions(predictionIds, photoId) {
+  if (!predictionIds || !predictionIds.length) return;
+  try {
+    await safeFetch('/api/predictions/batch-accept', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({prediction_ids: predictionIds}),
+    });
+  } catch(e) { return; }
+  await _afterPredictionMutation([photoId], { photoId: photoId, reloadDetail: true });
+}
+
+async function rejectDetailPredictions(predictionIds, photoId) {
+  if (!predictionIds || !predictionIds.length) return;
+  try {
+    await safeFetch('/api/predictions/batch-reject', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({prediction_ids: predictionIds}),
+    });
+  } catch(e) { return; }
+  // A reject changes no keywords, so only the prediction rows need repainting
+  // — but it does record an edit, so the undo affordance still has to appear.
+  if (window._detailPhotoId === photoId) loadDetailPredictions(photoId);
+  selectionPredictionKey = '';
+  var selection = getActiveSelection();
+  if (selection.length > 1) loadSelectionPredictions(selection);
+  showUndoToast();
+}
+
+async function loadSelectionPredictions(ids) {
+  var list = document.getElementById('selectionPredictions');
+  if (!list) return;
+  var key = selectionIdsKey(ids);
+  if (key === selectionPredictionKey) return;
+  selectionPredictionKey = key;
+  var seq = ++selectionPredictionSeq;
+  list.innerHTML = '<div class="selection-empty">Checking predictions...</div>';
+  try {
+    var data = await safeFetch('/api/selection/prediction-suggestions', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({photo_ids: ids}),
+    }, { toast: false });
+    if (seq !== selectionPredictionSeq) return;
+    renderSelectionPredictions(
+      data.predictions || [], data.selected_count || ids.length, data,
+    );
+  } catch(e) {
+    if (seq === selectionPredictionSeq) {
+      list.innerHTML = '<div class="selection-empty">Could not load predictions.</div>';
+    }
+  }
+}
+
+function toggleSelectionPredictions() {
+  selectionPredictionsExpanded = !selectionPredictionsExpanded;
+  if (_selectionPredictionData) {
+    renderSelectionPredictions(
+      _selectionPredictionData.predictions,
+      _selectionPredictionData.selectedCount,
+      _selectionPredictionData.meta,
+    );
+  }
+}
+
+function renderSelectionPredictions(predictions, selectedCount, meta) {
+  var list = document.getElementById('selectionPredictions');
+  if (!list) return;
+  meta = meta || {};
+  _selectionPredictionData = {
+    predictions: predictions, selectedCount: selectedCount, meta: meta,
+  };
+  selectionPredictionAcceptableById = {};
+  // The floor is the user's own setting, so hidden rows get counted out loud
+  // rather than vanishing into an empty-looking panel.
+  var hidden = meta.below_threshold_count || 0;
+  var hiddenNote = hidden
+    ? '<div class="prediction-below-threshold">' + hidden +
+      (hidden === 1 ? ' prediction is' : ' predictions are') +
+      ' below your confidence threshold (' +
+      formatPredictionConfidence(meta.threshold || 0) + ').</div>'
+    : '';
+  if (!predictions.length) {
+    list.innerHTML = '<div class="selection-empty">No pending predictions on the selected photos.</div>' + hiddenNote;
+    return;
+  }
+
+  // Sorted strongest-first by the endpoint, so the collapse keeps the species
+  // most worth acting on and names the rest.
+  var shown = selectionPredictionsExpanded
+    ? predictions
+    : predictions.slice(0, PREDICTION_COLLAPSE_AT);
+  var collapsed = predictions.length - shown.length;
+
+  var html = '';
+  shown.forEach(function(p, idx) {
+    var acceptable = p.acceptable_prediction_ids || [];
+    var ambiguous = p.ambiguous_prediction_ids || [];
+    selectionPredictionAcceptableById[idx] = acceptable;
+
+    var rowMeta = 'Predicted on ' + p.predicted_count + ' of ' + selectedCount;
+    if (p.keyworded_count) rowMeta += ', already keyworded on ' + p.keyworded_count;
+    var range = p.min_confidence === p.max_confidence
+      ? formatPredictionConfidence(p.max_confidence)
+      : formatPredictionConfidence(p.min_confidence) + '–' + formatPredictionConfidence(p.max_confidence);
+    rowMeta += ' · ' + range;
+
+    // The button names the count it will actually act on. "Accept on 38" that
+    // silently accepts 35 is exactly what CORE_PHILOSOPHY.md forbids, so the
+    // ambiguous remainder is called out beside it rather than folded in.
+    var actions = '';
+    if (acceptable.length) {
+      actions += '<button class="prediction-accept" onclick="acceptSelectionPrediction(' + idx +
+        ')" title="Accept this species on the selected photos that are unambiguous">Accept on ' +
+        acceptable.length + '</button>';
+    }
+    var why = '';
+    if (ambiguous.length) {
+      why = ambiguous.length + (ambiguous.length === 1 ? ' photo needs' : ' photos need') +
+        ' review — alternatives or a conflict with existing keywords';
+      var firstAmbiguousPhoto = (p.ambiguous_photo_ids || [])[0];
+      if (!acceptable.length && firstAmbiguousPhoto != null) {
+        actions += '<button class="prediction-review-link" onclick="openPredictionInReview(' +
+          firstAmbiguousPhoto + ')">Open in Review</button>';
+      }
+    } else if (!acceptable.length) {
+      why = 'Already keyworded on every photo that predicts it';
+    }
+
+    html += '<div class="prediction-row' + (ambiguous.length ? ' ambiguous' : '') + '">' +
+      '<div style="min-width:0;">' +
+        '<div class="prediction-species">' + escapeHtml(p.species) + '</div>' +
+        '<div class="prediction-meta">' + escapeHtml(rowMeta) + '</div>' +
+        (why ? '<div class="prediction-why">' + escapeHtml(why) + '</div>' : '') +
+      '</div>' +
+      '<div class="prediction-actions">' + actions + '</div>' +
+    '</div>';
+  });
+  if (collapsed > 0) {
+    html += '<button class="prediction-toggle" onclick="toggleSelectionPredictions()">Show ' +
+      collapsed + ' more predicted species</button>';
+  } else if (selectionPredictionsExpanded && predictions.length > PREDICTION_COLLAPSE_AT) {
+    html += '<button class="prediction-toggle" onclick="toggleSelectionPredictions()">Show fewer</button>';
+  }
+  list.innerHTML = html + hiddenNote;
+}
+
+async function acceptSelectionPrediction(idx) {
+  var ids = selectionPredictionAcceptableById[idx] || [];
+  if (!ids.length) return;
+  var selection = getActiveSelection();
+  try {
+    await safeFetch('/api/predictions/batch-accept', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({prediction_ids: ids}),
+    });
+  } catch(e) { return; }
+  await _afterPredictionMutation(selection, {});
 }
 
 async function loadSelectionKeywordSuggestions(ids) {
@@ -6948,6 +7465,10 @@ async function loadDetail(id) {
     if (selectedPhotoId === id && selectedPhotos.size <= 1) {
       renderDetail(photo);
       if (detail) detail.classList.add('visible');
+      // Fetched separately from /api/photos so the panel renders the same
+      // enriched rows Review does (nested alternatives, disagreement context)
+      // instead of a second, thinner idea of what a prediction is.
+      loadDetailPredictions(id);
     }
   } catch(e) {}
 }

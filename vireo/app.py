@@ -5727,6 +5727,33 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             raise ValueError("rules must be valid JSON") from exc
         return _inject_active_visual_model(rules)
 
+    def _request_photo_ids_arg():
+        """Parse the optional ``photo_ids`` query param (comma-separated ints).
+
+        Returns None when absent so callers keep their unscoped behaviour, and
+        raises ValueError on a malformed value so a typo surfaces as a 400
+        rather than silently widening the query to the whole workspace.
+        """
+        raw = request.args.get("photo_ids")
+        if raw is None or raw.strip() == "":
+            return None
+        ids = []
+        seen = set()
+        for part in raw.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            try:
+                pid = int(part)
+            except ValueError as exc:
+                raise ValueError("photo_ids must be integers") from exc
+            if pid not in seen:
+                ids.append(pid)
+                seen.add(pid)
+        if not ids:
+            raise ValueError("photo_ids must contain at least one id")
+        return ids
+
     _VISUAL_STRENGTH_THRESHOLDS = {"broad": 0.10, "balanced": 0.15, "strict": 0.22}
     # Query-text embeddings keyed by (model, prompt): the ONNX text encode is
     # the expensive step and the same prompt is re-resolved by every surface
@@ -9940,28 +9967,9 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         """Return selected keywords and which selected photos carry each one."""
         db = _get_db()
         body = request.get_json(silent=True) or {}
-        raw_ids = body.get("photo_ids", [])
-        if not isinstance(raw_ids, list) or not raw_ids:
-            return json_error("photo_ids required")
-
-        photo_ids = []
-        seen = set()
-        for raw in raw_ids:
-            if isinstance(raw, bool) or not isinstance(raw, int):
-                return json_error("photo_ids must be integers")
-            if raw not in seen:
-                photo_ids.append(raw)
-                seen.add(raw)
-        if not photo_ids:
-            return json_error("photo_ids required")
-        if len(photo_ids) > 1000:
-            return json_error("too many photo_ids", 400)
-
-        for pid in photo_ids:
-            if not db._photo_in_workspace(pid):
-                return json_error(
-                    f"Photo {pid} does not belong to the active workspace", 403
-                )
+        photo_ids, err = _parse_selection_photo_ids(body)
+        if err is not None:
+            return err
 
         rows = []
         batch_size = 800
@@ -10019,6 +10027,170 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             "selected_count": selected_count,
             "keywords": keywords,
             "suggestions": suggestions,
+        })
+
+    def _parse_selection_photo_ids(body):
+        """Validate a selection payload's ``photo_ids``.
+
+        Returns ``(photo_ids, None)`` or ``(None, error_response)``. Shared by
+        the keyword and prediction selection panels so both enforce the same
+        cap and workspace scoping — a selection that is safe to read keywords
+        for is exactly the selection that is safe to read predictions for.
+        """
+        db = _get_db()
+        raw_ids = body.get("photo_ids", [])
+        if not isinstance(raw_ids, list) or not raw_ids:
+            return None, json_error("photo_ids required")
+
+        photo_ids = []
+        seen = set()
+        for raw in raw_ids:
+            if isinstance(raw, bool) or not isinstance(raw, int):
+                return None, json_error("photo_ids must be integers")
+            if raw not in seen:
+                photo_ids.append(raw)
+                seen.add(raw)
+        if not photo_ids:
+            return None, json_error("photo_ids required")
+        if len(photo_ids) > 1000:
+            return None, json_error("too many photo_ids", 400)
+
+        for pid in photo_ids:
+            if not db._photo_in_workspace(pid):
+                return None, json_error(
+                    f"Photo {pid} does not belong to the active workspace", 403
+                )
+        return photo_ids, None
+
+    @app.route("/api/selection/prediction-suggestions", methods=["POST"])
+    def api_selection_prediction_suggestions():
+        """Aggregate pending predictions across a selection, grouped by species.
+
+        The keyword panel next to this one answers "what have I already
+        tagged"; this answers "what does the classifier think I should tag".
+        Aggregation is by species match key rather than prediction id because
+        each selected photo carries its own prediction row.
+
+        Predictions the Browse panel must not offer a bare Accept for —
+        those with an alternative sibling, or a disagreement/refinement
+        against existing keywords — are returned separately in
+        ``ambiguous_prediction_ids`` so the button can name the count it
+        will actually act on. ``CORE_PHILOSOPHY.md`` forbids an "Accept on
+        38" that quietly accepts 35.
+        """
+        db = _get_db()
+        body = request.get_json(silent=True) or {}
+        photo_ids, err = _parse_selection_photo_ids(body)
+        if err is not None:
+            return err
+
+        # Apply the workspace's confidence floor, exactly as the single-photo
+        # panel does. Without it a real catalog fills this list with 2%-and-up
+        # noise wearing an actionable "Accept on 1" button. The hidden count
+        # is reported rather than dropped.
+        import config as cfg
+        threshold = db.get_effective_config(cfg.load()).get(
+            "classifier_confidence", 0.0
+        ) or 0.0
+        all_pending = db.get_predictions(photo_ids=photo_ids, status="pending")
+        pending = [
+            row for row in all_pending if (row["confidence"] or 0.0) >= threshold
+        ]
+        below_threshold_count = len(all_pending) - len(pending)
+        # An alternative row means the classifier offered a runner-up the user
+        # should choose between. Keyed by (detection, model) exactly as
+        # /api/predictions nests them, so "has alternatives" means the same
+        # thing in Browse as it does in Review.
+        alt_keys = {
+            (row["detection_id"], row["model"])
+            for row in db.get_predictions(photo_ids=photo_ids, status="alternative")
+        }
+
+        order = {pid: i for i, pid in enumerate(photo_ids)}
+        by_key = {}
+        for row in pending:
+            species = row["species"]
+            if not species:
+                continue
+            key = keyword_match_key(species) or species.casefold()
+            entry = by_key.setdefault(key, {
+                "species": species,
+                "models": set(),
+                "rows_by_photo": {},
+                "confidences": [],
+            })
+            entry["models"].add(row["model"])
+            entry["confidences"].append(row["confidence"] or 0.0)
+            ambiguous = (
+                (row["detection_id"], row["model"]) in alt_keys
+                or row["category"] in ("disagreement", "refinement")
+            )
+            prior = entry["rows_by_photo"].get(row["photo_id"])
+            # One photo can hold several detections of the same species. Keep
+            # the highest-confidence row as the one an Accept would act on,
+            # but let any ambiguous sibling mark the photo ambiguous.
+            if prior is None or (row["confidence"] or 0) > (prior["confidence"] or 0):
+                entry["rows_by_photo"][row["photo_id"]] = {
+                    "id": row["id"],
+                    "confidence": row["confidence"],
+                    "ambiguous": ambiguous or (prior or {}).get("ambiguous", False),
+                }
+            elif ambiguous:
+                prior["ambiguous"] = True
+
+        # Resolve "already carries this species" against linked taxa, not
+        # spelling, so a hierarchical Birds|Verdin tag counts as keyworded.
+        # Look up existing rows only — asking here must not create keywords.
+        kid_by_key = {}
+        for row in db.conn.execute(
+            "SELECT id, name FROM keywords WHERE is_species = 1 OR type = 'taxonomy'"
+        ).fetchall():
+            kid_by_key.setdefault(keyword_match_key(row["name"]), row["id"])
+
+        results = []
+        for key, entry in by_key.items():
+            predicted_ids = sorted(entry["rows_by_photo"], key=lambda p: order[p])
+            kid = kid_by_key.get(key)
+            keyworded = (
+                db.get_photos_with_equivalent_species(predicted_ids, kid)
+                if kid is not None else set()
+            )
+            missing_ids = [p for p in predicted_ids if p not in keyworded]
+            acceptable, ambiguous_ids, ambiguous_photos = [], [], []
+            for pid in missing_ids:
+                row = entry["rows_by_photo"][pid]
+                if row["ambiguous"]:
+                    ambiguous_ids.append(row["id"])
+                    ambiguous_photos.append(pid)
+                else:
+                    acceptable.append(row["id"])
+            results.append({
+                "species": entry["species"],
+                "models": sorted(entry["models"]),
+                "predicted_count": len(predicted_ids),
+                "keyworded_count": len(predicted_ids) - len(missing_ids),
+                "predicted_photo_ids": predicted_ids,
+                "missing_photo_ids": missing_ids,
+                "prediction_ids": acceptable + ambiguous_ids,
+                "acceptable_prediction_ids": acceptable,
+                "ambiguous_prediction_ids": ambiguous_ids,
+                "ambiguous_photo_ids": ambiguous_photos,
+                "min_confidence": min(entry["confidences"]),
+                "max_confidence": max(entry["confidences"]),
+            })
+        # Breadth first, then strength: the panel collapses to the top few, so
+        # a species predicted on every selected photo at 100% must outrank one
+        # predicted on the same photos at 20%.
+        results.sort(key=lambda item: (
+            -item["predicted_count"],
+            -(item["max_confidence"] or 0.0),
+            item["species"].lower(),
+        ))
+        return jsonify({
+            "selected_count": len(photo_ids),
+            "predictions": results,
+            "threshold": threshold,
+            "below_threshold_count": below_threshold_count,
         })
 
     @app.route("/api/keywords/<int:keyword_id>", methods=["PUT"])
@@ -15658,6 +15830,22 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         db = _get_db()
         collection_id = request.args.get("collection_id", None, type=int)
         status = request.args.get("status", None)
+        # Browse's detail panel asks for one photo's predictions. Reusing this
+        # route rather than adding a per-photo one keeps a single definition of
+        # "a prediction" — latest-fingerprint dedup, nested alternatives and
+        # ``existing_species`` enrichment all come along, so the Browse panel
+        # can never disagree with Review about what is pending.
+        try:
+            explicit_photo_ids = _request_photo_ids_arg()
+        except ValueError as e:
+            return json_error(str(e), 400)
+        if explicit_photo_ids is not None:
+            for pid in explicit_photo_ids:
+                if not db._photo_in_workspace(pid):
+                    return json_error(
+                        f"Photo {pid} does not belong to the active workspace",
+                        403,
+                    )
         err = _reject_visual_collection(db, collection_id)
         if err is not None:
             return err
@@ -15685,13 +15873,23 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             if collection_id:
                 photos = db.get_collection_photos(collection_id, per_page=999999)
                 photo_ids = [p["id"] for p in photos]
+                # An explicit ``photo_ids`` narrows the collection rather than
+                # replacing it, so a Browse panel opened inside a collection
+                # can't surface a photo the collection excludes.
+                if explicit_photo_ids is not None:
+                    allowed = set(photo_ids)
+                    photo_ids = [
+                        pid for pid in explicit_photo_ids if pid in allowed
+                    ]
                 preds = (
                     db.get_predictions(photo_ids=photo_ids, status=status, rules=rules)
                     if photo_ids
                     else []
                 )
             else:
-                preds = db.get_predictions(status=status, rules=rules)
+                preds = db.get_predictions(
+                    photo_ids=explicit_photo_ids, status=status, rules=rules,
+                )
 
             # Fetch alternatives to attach to their parent predictions.
             # Constrain by the returned parents' photo_ids and skip ``rules``
@@ -15770,6 +15968,15 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         response = {"predictions": results}
         if visual_info is not None:
             response["visual"] = visual_info
+        # Only the per-photo callers (Browse's detail panel) need this, and
+        # only they can afford it — Review asks for the whole workspace queue.
+        # Without it an empty list is ambiguous: "never classified" and
+        # "classified, found nothing" would render identically.
+        if explicit_photo_ids is not None:
+            response["photo_states"] = {
+                str(pid): state
+                for pid, state in db.get_prediction_states(explicit_photo_ids).items()
+            }
         return jsonify(response)
 
     @app.route("/api/predictions/compare")
@@ -16074,6 +16281,191 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             is_batch=is_batch,
         )
         return jsonify({"ok": True})
+
+    @app.route("/api/predictions/batch-accept", methods=["POST"])
+    def api_batch_accept_predictions():
+        """Accept many predictions of one species as a single action.
+
+        Browse's selection panel accepts a species across the whole selection.
+        This goes through ``accept_prediction`` rather than
+        ``/api/batch/keyword`` because a prediction has two halves: the
+        keyword tag AND the ``prediction_review`` status. Tagging alone would
+        leave every photo still pending in Review, so the same work would have
+        to be done a second time there.
+
+        The whole batch lands as ONE ``prediction_accept`` edit so a single
+        undo reverses it, matching the per-photo ``changed_tag`` / ``no_tag``
+        encoding ``api_accept_prediction`` already uses.
+        """
+        db = _get_db()
+        body = request.get_json(silent=True) or {}
+        pred_ids, err = _parse_prediction_ids(db, body)
+        if err is not None:
+            return err
+
+        replace_species = bool(body.get("replace_species"))
+        items = []
+        keyword_id = None
+        species = None
+        try:
+            for pid in pred_ids:
+                result = db.accept_prediction(
+                    pid, replace_species=replace_species, _commit=False,
+                )
+                if result is None:
+                    continue
+                # One edit row carries one ``new_value`` keyword id, which the
+                # undo handler applies to every item. Accepting a mixed bag of
+                # species through one call would therefore undo incorrectly —
+                # refuse rather than record an entry that cannot be reversed.
+                if keyword_id is None:
+                    keyword_id, species = result["keyword_id"], result["species"]
+                elif result["keyword_id"] != keyword_id:
+                    db.conn.rollback()
+                    return json_error(
+                        "prediction_ids must all resolve to one species", 400,
+                    )
+                for a in result["affected"]:
+                    if a.get("changed_tag", True):
+                        old_value = str(a["prediction_id"])
+                    else:
+                        old_value = json.dumps({
+                            "prediction_id": a["prediction_id"],
+                            "no_tag": True,
+                        })
+                    items.append({
+                        "photo_id": a["photo_id"],
+                        "old_value": old_value,
+                        "new_value": str(keyword_id),
+                    })
+            db.conn.commit()
+        except Exception:
+            db.conn.rollback()
+            raise
+
+        if items:
+            photo_count = len({item["photo_id"] for item in items})
+            desc = f'Accepted prediction: added "{species}"'
+            if photo_count > 1:
+                desc += f" to {photo_count} photos"
+            db.record_edit(
+                "prediction_accept", desc, str(keyword_id), items,
+                is_batch=photo_count > 1,
+            )
+        return jsonify({
+            "ok": True,
+            "accepted": len({item["photo_id"] for item in items}),
+            "species": species,
+        })
+
+    def _parse_prediction_ids(db, body):
+        """Validate a batch payload's ``prediction_ids``.
+
+        Returns ``(prediction_ids, None)`` or ``(None, error_response)``. Every
+        id must exist and belong to a photo in the active workspace, so a batch
+        can never reach across a workspace boundary.
+        """
+        raw_ids = body.get("prediction_ids", [])
+        if not isinstance(raw_ids, list) or not raw_ids:
+            return None, json_error("prediction_ids required")
+        pred_ids = []
+        seen = set()
+        for raw in raw_ids:
+            if isinstance(raw, bool) or not isinstance(raw, int):
+                return None, json_error("prediction_ids must be integers")
+            if raw not in seen:
+                pred_ids.append(raw)
+                seen.add(raw)
+        if len(pred_ids) > 1000:
+            return None, json_error("too many prediction_ids", 400)
+
+        placeholders = ",".join("?" for _ in pred_ids)
+        photo_by_pred = {
+            row["id"]: row["photo_id"] for row in db.conn.execute(
+                f"""SELECT pr.id, d.photo_id
+                    FROM predictions pr
+                    JOIN detections d ON d.id = pr.detection_id
+                    WHERE pr.id IN ({placeholders})""",
+                pred_ids,
+            ).fetchall()
+        }
+        for pid in pred_ids:
+            if pid not in photo_by_pred:
+                return None, json_error(f"Prediction {pid} not found", 404)
+            if not db._photo_in_workspace(photo_by_pred[pid]):
+                return None, json_error(
+                    f"Photo {photo_by_pred[pid]} does not belong to the "
+                    "active workspace", 403,
+                )
+        return pred_ids, None
+
+    @app.route("/api/predictions/batch-reject", methods=["POST"])
+    def api_batch_reject_predictions():
+        """Reject many predictions as a single undoable action.
+
+        A photo with several detections carries one prediction row per
+        detection, so Browse groups them into one species row. Dismissing that
+        row must be one Cmd-Z, not one per detection.
+        """
+        db = _get_db()
+        body = request.get_json(silent=True) or {}
+        pred_ids, err = _parse_prediction_ids(db, body)
+        if err is not None:
+            return err
+
+        ws = db._ws_id()
+        items = []
+        species = None
+        try:
+            for pid in pred_ids:
+                pred = db.conn.execute(
+                    """SELECT pr.id, pr.species, pr.detection_id,
+                              pr.classifier_model AS model,
+                              pr.labels_fingerprint, d.photo_id
+                       FROM predictions pr
+                       JOIN detections d ON d.id = pr.detection_id
+                       WHERE pr.id = ?""",
+                    (pid,),
+                ).fetchone()
+                if pred is None:
+                    continue
+                species = species or pred["species"]
+                db.update_prediction_status(pid, "rejected", _commit=False)
+                # Sibling alternatives go down with the parent, scoped by
+                # fingerprint so a new label set can't rewrite an old one's
+                # review state — same rule as the single-prediction reject.
+                for row in db.conn.execute(
+                    """SELECT pr.id FROM predictions pr
+                       JOIN prediction_review pr_rev
+                         ON pr_rev.prediction_id = pr.id
+                        AND pr_rev.workspace_id = ?
+                       WHERE pr.detection_id = ? AND pr.classifier_model = ?
+                         AND pr.labels_fingerprint = ? AND pr.id != ?
+                         AND pr_rev.status = 'alternative'""",
+                    (ws, pred["detection_id"], pred["model"],
+                     pred["labels_fingerprint"], pid),
+                ).fetchall():
+                    db.update_prediction_status(row["id"], "rejected", _commit=False)
+                items.append({
+                    "photo_id": pred["photo_id"],
+                    "old_value": "pending",
+                    "new_value": "rejected",
+                })
+            db.conn.commit()
+        except Exception:
+            db.conn.rollback()
+            raise
+
+        if items:
+            photo_count = len({item["photo_id"] for item in items})
+            desc = f'Rejected prediction "{species}"'
+            if photo_count > 1:
+                desc += f" on {photo_count} photos"
+            db.record_edit(
+                "prediction_reject", desc, "rejected", items,
+                is_batch=photo_count > 1,
+            )
+        return jsonify({"ok": True, "rejected": len(items)})
 
     @app.route("/api/predictions/<int:pred_id>/accept", methods=["POST"])
     def api_accept_prediction(pred_id):

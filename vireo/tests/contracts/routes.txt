@@ -350,6 +350,8 @@ POST         /api/predictions/<int:pred_id>/accept-subject
 POST         /api/predictions/<int:pred_id>/reject
 POST         /api/predictions/<int:pred_id>/replace-keywords
 POST         /api/predictions/<int:pred_id>/reviewed
+POST         /api/predictions/batch-accept
+POST         /api/predictions/batch-reject
 POST         /api/predictions/group/apply
 POST         /api/preview-cache/clear
 POST         /api/processes
@@ -363,6 +365,7 @@ POST         /api/remote-setup/ssh-check
 POST         /api/remote-targets/test
 POST         /api/report-issue
 POST         /api/selection/keyword-suggestions
+POST         /api/selection/prediction-suggestions
 POST         /api/settings/import
 POST         /api/setup/complete
 POST         /api/shutdown

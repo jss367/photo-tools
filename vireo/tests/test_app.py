@@ -16383,3 +16383,381 @@ def test_build_explorer_payload_always_includes_default_aves_class(db):
         "Default Aves class must remain in the selector after switching to a "
         "non-Aves class, otherwise the user has no in-page way back to Birds"
     )
+
+
+# ---------------------------------------------------------------------------
+# Predictions in Browse — see docs/plans/2026-08-16-predictions-in-browse-design.md
+# ---------------------------------------------------------------------------
+
+
+def _seed_prediction_photo(db, filename, species, confidence,
+                           model="bioclip", status="pending",
+                           labels_fingerprint="fp1", folder_id=None):
+    """Add a photo with one detection carrying one prediction."""
+    if folder_id is None:
+        folder_id = db.get_folder_tree()[0]["id"]
+    photo_id = db.add_photo(
+        folder_id=folder_id, filename=filename, extension=".jpg",
+        file_size=100, file_mtime=1.0,
+    )
+    detection_id = db.save_detections(
+        photo_id,
+        [{"box": {"x": 0.1, "y": 0.1, "w": 0.5, "h": 0.5},
+          "confidence": 0.9, "category": "animal"}],
+        detector_model="MDV6",
+    )[0]
+    db.add_prediction(
+        detection_id, species, confidence, model,
+        status=status, labels_fingerprint=labels_fingerprint,
+    )
+    return photo_id, detection_id
+
+
+def _prediction_id(db, photo_id, species):
+    return next(
+        row["id"] for row in db.get_predictions(photo_ids=[photo_id])
+        if row["species"] == species
+    )
+
+
+def test_predictions_api_accepts_photo_ids_filter(app_and_db):
+    """GET /api/predictions?photo_ids=N returns only that photo's rows.
+
+    Browse's single-photo panel needs the same enriched rows Review gets
+    (alternatives nested, latest labels_fingerprint only) without pulling
+    the whole workspace queue.
+    """
+    app, db = app_and_db
+    client = app.test_client()
+    photo_a, _ = _seed_prediction_photo(db, "eagle-a.jpg", "Bald Eagle", 0.9)
+    photo_b, _ = _seed_prediction_photo(db, "heron-b.jpg", "Great Blue Heron", 0.8)
+
+    resp = client.get(f"/api/predictions?photo_ids={photo_a}")
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+    preds = resp.get_json()["predictions"]
+    assert [p["species"] for p in preds] == ["Bald Eagle"]
+    assert all(p["photo_id"] == photo_a for p in preds)
+
+    # Sanity: without the filter both photos' predictions come back.
+    all_species = {
+        p["species"] for p in client.get("/api/predictions").get_json()["predictions"]
+    }
+    assert {"Bald Eagle", "Great Blue Heron"} <= all_species
+    assert photo_b is not None
+
+
+def test_predictions_api_photo_ids_rejects_foreign_photo(app_and_db):
+    """A photo outside the active workspace must not leak predictions."""
+    app, db = app_and_db
+    client = app.test_client()
+    photo_id, _ = _seed_prediction_photo(db, "eagle-scoped.jpg", "Bald Eagle", 0.9)
+    other_ws = db.create_workspace("Other")
+    assert client.post(f"/api/workspaces/{other_ws}/activate").status_code == 200
+
+    resp = client.get(f"/api/predictions?photo_ids={photo_id}")
+    assert resp.status_code == 403
+
+
+def test_selection_prediction_suggestions_aggregates_by_species(app_and_db):
+    """Predictions aggregate per species across the selection.
+
+    Two photos predict Bald Eagle; one already carries the keyword. The
+    panel must report both counts separately so "Accept on 1" is honest.
+    """
+    app, db = app_and_db
+    client = app.test_client()
+    photo_a, _ = _seed_prediction_photo(db, "sel-a.jpg", "Bald Eagle", 0.91)
+    photo_b, _ = _seed_prediction_photo(db, "sel-b.jpg", "Bald Eagle", 0.83)
+    photo_c, _ = _seed_prediction_photo(db, "sel-c.jpg", "Osprey", 0.72)
+
+    kid = db.add_keyword("Bald Eagle", is_species=True)
+    db.tag_photo(photo_a, kid)
+
+    resp = client.post(
+        "/api/selection/prediction-suggestions",
+        json={"photo_ids": [photo_a, photo_b, photo_c]},
+    )
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+    data = resp.get_json()
+    assert data["selected_count"] == 3
+
+    by_species = {p["species"]: p for p in data["predictions"]}
+    eagle = by_species["Bald Eagle"]
+    assert eagle["predicted_count"] == 2
+    assert eagle["keyworded_count"] == 1
+    assert eagle["missing_photo_ids"] == [photo_b]
+    assert eagle["prediction_ids"] == [_prediction_id(db, photo_b, "Bald Eagle")]
+    assert eagle["ambiguous_prediction_ids"] == []
+    assert eagle["min_confidence"] == 0.83
+    assert eagle["max_confidence"] == 0.91
+
+    osprey = by_species["Osprey"]
+    assert osprey["predicted_count"] == 1
+    assert osprey["keyworded_count"] == 0
+    assert osprey["missing_photo_ids"] == [photo_c]
+
+
+def test_selection_prediction_suggestions_marks_ambiguous(app_and_db):
+    """A prediction with an alternative sibling is reported as ambiguous.
+
+    The panel must not offer a bare Accept for it — CORE_PHILOSOPHY forbids
+    a button that silently acts on fewer photos than it names.
+    """
+    app, db = app_and_db
+    client = app.test_client()
+    photo_a, det_a = _seed_prediction_photo(db, "amb-a.jpg", "Bald Eagle", 0.55)
+    db.add_prediction(
+        det_a, "Golden Eagle", 0.45, "bioclip",
+        status="alternative", labels_fingerprint="fp1",
+    )
+    photo_b, _ = _seed_prediction_photo(db, "amb-b.jpg", "Bald Eagle", 0.95)
+
+    resp = client.post(
+        "/api/selection/prediction-suggestions",
+        json={"photo_ids": [photo_a, photo_b]},
+    )
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+    eagle = next(
+        p for p in resp.get_json()["predictions"] if p["species"] == "Bald Eagle"
+    )
+    assert eagle["predicted_count"] == 2
+    ambiguous_id = _prediction_id(db, photo_a, "Bald Eagle")
+    assert eagle["ambiguous_prediction_ids"] == [ambiguous_id]
+    # The clean subset is what an Accept button may act on.
+    assert eagle["acceptable_prediction_ids"] == [
+        _prediction_id(db, photo_b, "Bald Eagle")
+    ]
+
+
+def test_selection_prediction_suggestions_rejects_foreign_photo(app_and_db):
+    """Matches the workspace guard on /api/selection/keyword-suggestions."""
+    app, db = app_and_db
+    client = app.test_client()
+    photo_id, _ = _seed_prediction_photo(db, "ws-a.jpg", "Bald Eagle", 0.9)
+    other_ws = db.create_workspace("Other")
+    assert client.post(f"/api/workspaces/{other_ws}/activate").status_code == 200
+
+    resp = client.post(
+        "/api/selection/prediction-suggestions", json={"photo_ids": [photo_id]},
+    )
+    assert resp.status_code == 403
+
+
+def test_selection_prediction_suggestions_caps_selection(app_and_db):
+    """Same 1,000-photo cap the keyword panel uses."""
+    app, _ = app_and_db
+    client = app.test_client()
+    resp = client.post(
+        "/api/selection/prediction-suggestions",
+        json={"photo_ids": list(range(1, 1002))},
+    )
+    assert resp.status_code == 400
+    assert "too many" in resp.get_json()["error"].lower()
+
+
+def test_batch_accept_flips_status_and_tags(app_and_db):
+    """Batch accept must tag AND clear the Review queue.
+
+    Tagging alone would keyword the photos in Browse and leave them
+    pending in Review — the same work twice.
+    """
+    app, db = app_and_db
+    client = app.test_client()
+    photo_a, _ = _seed_prediction_photo(db, "acc-a.jpg", "Bald Eagle", 0.91)
+    photo_b, _ = _seed_prediction_photo(db, "acc-b.jpg", "Bald Eagle", 0.83)
+    pred_ids = [
+        _prediction_id(db, photo_a, "Bald Eagle"),
+        _prediction_id(db, photo_b, "Bald Eagle"),
+    ]
+
+    resp = client.post(
+        "/api/predictions/batch-accept", json={"prediction_ids": pred_ids},
+    )
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+    assert resp.get_json()["accepted"] == 2
+
+    statuses = {
+        row["photo_id"]: row["status"]
+        for row in db.get_predictions(photo_ids=[photo_a, photo_b])
+        if row["species"] == "Bald Eagle"
+    }
+    assert statuses == {photo_a: "accepted", photo_b: "accepted"}
+
+    for pid in (photo_a, photo_b):
+        names = {k["name"] for k in db.get_photo_keywords(pid)}
+        assert "Bald Eagle" in names
+
+
+def test_batch_accept_records_single_undo_entry(app_and_db):
+    """One Cmd-Z reverses the whole batch, not one photo at a time."""
+    app, db = app_and_db
+    client = app.test_client()
+    photo_a, _ = _seed_prediction_photo(db, "undo-a.jpg", "Bald Eagle", 0.91)
+    photo_b, _ = _seed_prediction_photo(db, "undo-b.jpg", "Bald Eagle", 0.83)
+    pred_ids = [
+        _prediction_id(db, photo_a, "Bald Eagle"),
+        _prediction_id(db, photo_b, "Bald Eagle"),
+    ]
+
+    resp = client.post(
+        "/api/predictions/batch-accept", json={"prediction_ids": pred_ids},
+    )
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+
+    accept_rows = [
+        row for row in db.get_edit_history()
+        if row["action_type"] == "prediction_accept"
+    ]
+    assert len(accept_rows) == 1
+
+    db.undo_last_edit()
+    statuses = {
+        row["photo_id"]: row["status"]
+        for row in db.get_predictions(photo_ids=[photo_a, photo_b])
+        if row["species"] == "Bald Eagle"
+    }
+    assert statuses == {photo_a: "pending", photo_b: "pending"}
+    for pid in (photo_a, photo_b):
+        names = {k["name"] for k in db.get_photo_keywords(pid)}
+        assert "Bald Eagle" not in names
+
+
+def test_batch_accept_rejects_foreign_prediction(app_and_db):
+    """Predictions outside the active workspace must not be acceptable."""
+    app, db = app_and_db
+    client = app.test_client()
+    photo_id, _ = _seed_prediction_photo(db, "acc-ws.jpg", "Bald Eagle", 0.9)
+    pred_id = _prediction_id(db, photo_id, "Bald Eagle")
+    other_ws = db.create_workspace("Other")
+    assert client.post(f"/api/workspaces/{other_ws}/activate").status_code == 200
+
+    resp = client.post(
+        "/api/predictions/batch-accept", json={"prediction_ids": [pred_id]},
+    )
+    assert resp.status_code == 403
+
+
+def test_browse_page_has_prediction_panels(app_and_db):
+    """Browse ships both prediction surfaces: single-photo and selection."""
+    app, _ = app_and_db
+    client = app.test_client()
+    html = client.get("/browse").get_data(as_text=True)
+    assert 'id="detailPredictions"' in html
+    assert 'id="selectionPredictions"' in html
+    # The empty states must stay distinguishable — an empty panel would
+    # otherwise imply "not classified" for a photo that was classified.
+    assert "Not yet classified" in html
+    assert "No species above threshold" in html
+
+
+def test_selection_prediction_suggestions_applies_confidence_threshold(app_and_db):
+    """Low-confidence noise must not arrive wearing an Accept button.
+
+    On a real catalog the unfiltered list is dominated by 2-10% guesses. The
+    floor is the user's own setting, so hidden rows are counted, not dropped.
+    """
+    app, db = app_and_db
+    client = app.test_client()
+    photo_a, _ = _seed_prediction_photo(db, "thr-a.jpg", "Bald Eagle", 0.91)
+    photo_b, _ = _seed_prediction_photo(db, "thr-b.jpg", "Black Saddlebags", 0.02)
+
+    ws_id = db.get_workspaces()[0]["id"]
+    db.update_workspace(ws_id, config_overrides={"classifier_confidence": 0.5})
+
+    resp = client.post(
+        "/api/selection/prediction-suggestions",
+        json={"photo_ids": [photo_a, photo_b]},
+    )
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+    data = resp.get_json()
+    assert [p["species"] for p in data["predictions"]] == ["Bald Eagle"]
+    assert data["below_threshold_count"] == 1
+    assert data["threshold"] == 0.5
+
+
+def test_batch_reject_flips_status_and_records_single_undo(app_and_db):
+    """Dismissing a species group is one action, not one per detection."""
+    app, db = app_and_db
+    client = app.test_client()
+    photo_a, _ = _seed_prediction_photo(db, "rej-a.jpg", "Bald Eagle", 0.91)
+    photo_b, _ = _seed_prediction_photo(db, "rej-b.jpg", "Bald Eagle", 0.83)
+    pred_ids = [
+        _prediction_id(db, photo_a, "Bald Eagle"),
+        _prediction_id(db, photo_b, "Bald Eagle"),
+    ]
+
+    resp = client.post(
+        "/api/predictions/batch-reject", json={"prediction_ids": pred_ids},
+    )
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+    assert resp.get_json()["rejected"] == 2
+
+    statuses = {
+        row["photo_id"]: row["status"]
+        for row in db.get_predictions(photo_ids=[photo_a, photo_b])
+    }
+    assert statuses == {photo_a: "rejected", photo_b: "rejected"}
+
+    reject_rows = [
+        row for row in db.get_edit_history()
+        if row["action_type"] == "prediction_reject"
+    ]
+    assert len(reject_rows) == 1
+    # Rejecting must not tag anything.
+    for pid in (photo_a, photo_b):
+        assert not db.get_photo_keywords(pid)
+
+
+def test_batch_reject_rejects_foreign_prediction(app_and_db):
+    """Same workspace guard as batch accept."""
+    app, db = app_and_db
+    client = app.test_client()
+    photo_id, _ = _seed_prediction_photo(db, "rej-ws.jpg", "Bald Eagle", 0.9)
+    pred_id = _prediction_id(db, photo_id, "Bald Eagle")
+    other_ws = db.create_workspace("Other")
+    assert client.post(f"/api/workspaces/{other_ws}/activate").status_code == 200
+
+    resp = client.post(
+        "/api/predictions/batch-reject", json={"prediction_ids": [pred_id]},
+    )
+    assert resp.status_code == 403
+
+
+def test_prediction_states_distinguish_empty_reasons(app_and_db):
+    """Four different reasons a photo shows no predictions, kept apart."""
+    app, db = app_and_db
+    folder_id = db.get_folder_tree()[0]["id"]
+    untouched = db.add_photo(
+        folder_id=folder_id, filename="state-none.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+    )
+    detected_only = db.add_photo(
+        folder_id=folder_id, filename="state-detected.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+    )
+    db.record_detector_run(detected_only, "MDV6", box_count=1)
+    db.save_detections(
+        detected_only,
+        [{"box": {"x": 0.1, "y": 0.1, "w": 0.5, "h": 0.5},
+          "confidence": 0.9, "category": "animal"}],
+        detector_model="MDV6",
+    )
+
+    states = db.get_prediction_states([untouched, detected_only])
+    assert states[untouched]["detector_ran"] is False
+    assert states[untouched]["detection_count"] == 0
+    # Detector ran and found a box, but nothing has classified it yet - that
+    # is NOT the same fact as "no prediction".
+    assert states[detected_only]["detector_ran"] is True
+    assert states[detected_only]["detection_count"] == 1
+    assert states[detected_only]["classifier_ran"] is False
+
+
+def test_review_supports_photo_id_deep_link(app_and_db):
+    """Browse routes ambiguous predictions to Review filtered to one photo."""
+    app, _ = app_and_db
+    client = app.test_client()
+    html = client.get("/review").get_data(as_text=True)
+    assert "currentPhotoIdFilter" in html
+    # The narrowing must be visible, or a one-photo queue reads as "empty".
+    assert "photoFilterPill" in html

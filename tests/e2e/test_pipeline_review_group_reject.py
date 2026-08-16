@@ -779,6 +779,7 @@ def test_lightbox_over_group_review_suppresses_group_shortcuts(live_server, page
     _write_grouped_pipeline_cache(live_server, photo_ids)
 
     page.goto(f"{live_server['url']}/pipeline/review")
+    expect(page.locator(".photo-card[data-photo-id]")).to_have_count(4)
     page.evaluate("openGroupReview(0, 0)")
     expect(page.locator("#grmOverlay")).to_have_class(re.compile(r"\bopen\b"))
     burst_ids = photo_ids[:2]
@@ -821,6 +822,7 @@ def test_lightbox_flag_over_group_review_updates_pending_zones(live_server, page
     _write_grouped_pipeline_cache(live_server, photo_ids)
 
     page.goto(f"{live_server['url']}/pipeline/review")
+    expect(page.locator(".photo-card[data-photo-id]")).to_have_count(4)
     page.evaluate("openGroupReview(0, 0)")
     expect(page.locator("#grmOverlay")).to_have_class(re.compile(r"\bopen\b"))
     burst_ids = photo_ids[:2]
@@ -852,4 +854,50 @@ def test_lightbox_flag_over_group_review_updates_pending_zones(live_server, page
     assert zones["rejects"] == [burst_ids[0]]
     assert zones["picks"] == []
     assert burst_ids[0] in zones["touched"]
+    assert _flags(db, photo_ids) == ["none"] * 4
+
+
+def test_lightbox_provisional_group_flag_does_not_poison_confirmed_cache(
+    live_server, page
+):
+    """A lightbox flag staged in Group Review must remain visibly pending
+    without mutating pipelineResults or the lightbox's confirmed flag cache."""
+    db = live_server["db"]
+    photo_ids = live_server["data"]["photos"][:4]
+    _write_grouped_pipeline_cache(live_server, photo_ids)
+
+    page.goto(f"{live_server['url']}/pipeline/review")
+    expect(page.locator(".photo-card[data-photo-id]")).to_have_count(4)
+    page.evaluate("openGroupReview(0, 0)")
+    page.wait_for_function("grmState && grmState.seeded === true")
+    photo_id = photo_ids[0]
+    page.evaluate("pid => openPipelineLightbox(pid)", photo_id)
+    expect(page.locator("#lightboxOverlay")).to_have_class(re.compile(r"\bactive\b"))
+
+    page.evaluate("pid => _lbApplyFlag(pid, 'rejected')", photo_id)
+    page.wait_for_function("_lbFlagPendingWrites === 0")
+
+    state = page.evaluate(
+        "pid => ({"
+        "confirmed: _lbConfirmedFlagFor(pid),"
+        "cached: pipelineResults.photos.find(p => p.id === pid).flag,"
+        "rejected: grmState.rejects.has(pid),"
+        "status: document.getElementById('lightboxFlagStatus').textContent,"
+        "})",
+        photo_id,
+    )
+    assert state == {
+        "confirmed": "none",
+        "cached": "none",
+        "rejected": True,
+        "status": "Rejected",
+    }
+    assert _flags(db, photo_ids) == ["none"] * 4
+
+    # Discard the group without Apply. The main grid must still reflect the
+    # confirmed database/cache value rather than the abandoned pending zone.
+    page.evaluate("closeLightbox(); closeGroupReview(); renderResults()")
+    expect(
+        page.locator(f'.photo-card[data-photo-id="{photo_id}"] .flag-rejected')
+    ).to_have_count(0)
     assert _flags(db, photo_ids) == ["none"] * 4

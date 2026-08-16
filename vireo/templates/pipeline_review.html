@@ -4067,7 +4067,11 @@ function setPipelineReviewFlag(photoId, flag) {
         grmState.rejects.delete(photoId);
       }
       grmSyncZoneCards();
-      return Promise.resolve(true);
+      // The shared lightbox needs to display this pending choice without
+      // caching it as a confirmed database write. A structured result keeps
+      // that distinction explicit while other callers retain the historical
+      // true/false write contract.
+      return Promise.resolve({provisional: true});
     }
   }
   // A group action snapshots live flags before writing its batch. Allowing a
@@ -5714,6 +5718,10 @@ function grmSyncZoneCards() {
 }
 
 function closeGroupReview() {
+  if (grmState && Array.isArray(grmState.items) &&
+      typeof window.clearLightboxProvisionalFlags === 'function') {
+    window.clearLightboxProvisionalFlags(grmState.items.map(function(photo) { return photo.id; }));
+  }
   document.getElementById('grmOverlay').classList.remove('open');
   _grmOffsets = {};
   _grmDragging = null;

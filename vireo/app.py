@@ -9164,7 +9164,9 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     ).fetchone()
                     if exists is not None:
                         continue
-                    thread_db.tag_photo(photo_id, keyword_id, _commit=False)
+                    thread_db.tag_photo(
+                        photo_id, keyword_id, source="manual", _commit=False,
+                    )
                     _queue_import_keyword_add(
                         thread_db, photo_id, keyword_name, workspace_id,
                     )
@@ -14626,7 +14628,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                             pid, old["name"], workspace_id=ws_id, _commit=False,
                         )
 
-                db.tag_photo(pid, kid, _commit=False)
+                db.tag_photo(pid, kid, source="manual", _commit=False)
                 _queue_keyword_add(pid, species, workspace_id=ws_id, _commit=False)
                 old_value = str(old_primary["id"]) if old_primary else ""
                 old_keyword_ids = [old["id"] for old in old_rows]
@@ -16535,7 +16537,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     db.update_photo_flag(pid, "flagged")
                     if pid in already_has_species:
                         continue
-                    db.tag_photo(pid, kid)
+                    db.tag_photo(pid, kid, source="manual")
                     db.queue_change(pid, "keyword_add", species)
                     added_picks.append(pid)
 
@@ -30294,7 +30296,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         if stored and stored["name"]:
             label = stored["name"]
         for pid in photo_ids:
-            db.tag_photo(pid, kid)
+            db.tag_photo(pid, kid, source="manual")
             db.queue_change(pid, "keyword_add", label)
 
         items = [{'photo_id': pid, 'old_value': '', 'new_value': str(kid)} for pid in photo_ids]
@@ -32659,7 +32661,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             had_old = set(old_rows_by_photo)
 
             for pid in newly_tagged:
-                db.tag_photo(pid, kid, _commit=False)
+                db.tag_photo(pid, kid, source="manual", _commit=False)
                 _queue_keyword_add(
                     pid, species, workspace_id=ws_id, _commit=False,
                 )

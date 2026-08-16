@@ -14194,7 +14194,7 @@ class Database:
                     from paths where a person explicitly added the keyword;
                     the stamp lives on the row, so authorship survives
                     ``_prune_edit_history`` discarding the ``keyword_add``
-                    entry. Scanner, XMP-import and model paths leave it NULL
+                    entry. Scanner and XMP-reconciliation paths leave it NULL
                     ("unknown"). An existing stamp is never downgraded: a
                     re-tag without a source keeps the recorded provenance.
             _commit: If False, skip the internal commit (caller is responsible
@@ -17955,7 +17955,9 @@ class Database:
                         )
                 changed_tag = not already_has_species
                 if changed_tag:
-                    self.tag_photo(photo_id, kid, _commit=False)
+                    self.tag_photo(
+                        photo_id, kid, source="manual", _commit=False,
+                    )
                     self.queue_change(photo_id, "keyword_add", species, _commit=False)
                 # Record every mutation, and — for regular accepts — also
                 # record status-only no-ops so the prediction-status flip
@@ -19564,7 +19566,7 @@ class Database:
                         if cancelled == 0:
                             self.queue_change(pid, 'keyword_remove', new_kw['name'])
                 for old_kid in old_kids:
-                    self.tag_photo(pid, old_kid)
+                    self.tag_photo(pid, old_kid, source='manual')
                     old_kw = self.conn.execute(
                         "SELECT name FROM keywords WHERE id = ?", (old_kid,)
                     ).fetchone()
@@ -19631,13 +19633,7 @@ class Database:
                                        (int(entry['new_value']),)).fetchone()
                 if not _skip_tag_redo:
                     self.tag_photo(
-                        pid,
-                        int(entry['new_value']),
-                        source=(
-                            'manual'
-                            if entry['action_type'] == 'keyword_add'
-                            else None
-                        ),
+                        pid, int(entry['new_value']), source='manual',
                     )
                     if kw:
                         self.queue_change(pid, 'keyword_add', kw['name'])
@@ -19743,7 +19739,7 @@ class Database:
                         if cancelled == 0:
                             self.queue_change(pid, 'keyword_remove', old_kw['name'])
                 if new_kid:
-                    self.tag_photo(pid, new_kid)
+                    self.tag_photo(pid, new_kid, source='manual')
                     new_kw = self.conn.execute(
                         "SELECT name FROM keywords WHERE id = ?", (new_kid,)
                     ).fetchone()

@@ -375,6 +375,35 @@ def test_quick_search_is_single_replaceable_clause(live_server, page):
     assert "rob" in chips and "haw" not in chips
 
 
+def test_typing_keeps_active_visual_clause(live_server, page):
+    """Editing the search box while a visual clause is active must not
+    silently convert it to a text search — the box shows the visual prompt,
+    so live-applying mid-edit would swap the clause out from under the user.
+    Switching modes stays an explicit action (Enter or the suggestion
+    dropdown)."""
+    _open_browse(page, live_server)
+    search = page.locator(".vf-search input")
+    search.fill("hawk")
+    page.wait_for_selector(".vf-search-suggest button", timeout=8000)
+    page.locator('.vf-search-suggest [data-search-kind="visual"]').click()
+    page.wait_for_selector(".vf-chip.visual", timeout=8000)
+
+    # Edit the prompt; the visual chip must survive the live-search debounce.
+    search.fill("hawk flying")
+    page.wait_for_timeout(400)
+    assert page.locator(".vf-chip.visual").count() == 1
+    chips = page.evaluate("document.querySelector('.vf-chips').textContent")
+    assert "Search:" not in chips
+
+    # Enter is the explicit switch to a text search.
+    search.press("Enter")
+    page.wait_for_function(
+        "!document.querySelector('.vf-chip.visual')", timeout=8000,
+    )
+    chips = page.evaluate("document.querySelector('.vf-chips').textContent")
+    assert "hawk flying" in chips
+
+
 def test_pause_resume_with_backslash(live_server, page):
     _open_browse(page, live_server)
     page.click(".vf-filters-btn")
@@ -474,10 +503,8 @@ def test_visual_search_error_state_is_honest(live_server, page):
     assert page.locator(".vf-chip.visual.error").count() == 1
 
     # Metadata rules still apply alongside the broken visual clause.
-    page.click(".vf-filters-btn")
     page.click('.vf-quick-rating .vf-star[data-rating="4"]')
     _wait_total(page, 1)
-    page.click(".vf-done")
 
     # The clause persists across reload and stays honestly marked.
     page.wait_for_timeout(1200)

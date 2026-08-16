@@ -644,6 +644,11 @@
       else applyQuickSearch('', { noSnapshot: true });
       return;
     }
+    // With a visual clause active the box holds its prompt for editing;
+    // live-applying here would silently convert the visual search into a
+    // text search mid-edit. While the clause is set, switching modes stays
+    // an explicit action (Enter or the suggestion dropdown).
+    if (state.visual) return;
     quickSearchTimer = setTimeout(() => {
       quickSearchTimer = null;
       applyQuickSearch(value, { noSnapshot: true });

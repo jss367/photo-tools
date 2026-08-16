@@ -362,6 +362,35 @@ def test_sync_from_xmp_does_not_restore_keyword_with_pending_removal(tmp_path):
     assert db.get_photo_keywords(pid) == []
 
 
+def test_sync_from_xmp_flat_removal_preserves_same_name_hierarchy(tmp_path):
+    """A flat-only removal must not detach a same-name nested keyword."""
+    from db import Database
+    from sync import sync_from_xmp
+    from xmp import write_sidecar
+
+    db = Database(str(tmp_path / "test.db"))
+    ws_id = db.ensure_default_workspace()
+    db.set_active_workspace(ws_id)
+    pid, xmp_path = _setup_photo_with_xmp(tmp_path, db)
+    write_sidecar(
+        xmp_path,
+        flat_keywords={"Wildlife"},
+        hierarchical_keywords={"Animals|Wildlife"},
+    )
+    flat = db.add_keyword("Wildlife")
+    parent = db.add_keyword("Animals")
+    nested = db.add_keyword("Wildlife", parent_id=parent)
+    db.tag_photo(pid, flat)
+    db.tag_photo(pid, nested)
+    db.queue_change(pid, "keyword_remove_flat", "Wildlife")
+
+    sync_from_xmp(db, [pid])
+
+    keyword_ids = {row["id"] for row in db.get_photo_keywords(pid)}
+    assert flat not in keyword_ids
+    assert nested in keyword_ids
+
+
 def test_sync_from_xmp_preserves_keyword_when_only_case_differs(tmp_path):
     """Case-only differences between DB and XMP keyword names should not drop the tag."""
     from db import Database

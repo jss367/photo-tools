@@ -1170,6 +1170,59 @@ def test_multiselect_groups_metadata_and_bulk_updates_wildlife_workflow(
     expect(include).to_be_visible()
 
 
+def test_wildlife_batch_completion_refreshes_current_selection(live_server, page):
+    """A slow batch response must not repaint controls for the old selection."""
+    page.goto(f"{live_server['url']}/browse")
+    page.locator(".grid-card").first.wait_for(state="visible")
+    page.evaluate("""
+      selectedPhotoId = null;
+      selectedPhotos.clear();
+      photos.slice(0, 2).forEach(function(photo) {
+        selectedPhotos.add(photo.id);
+      });
+      updateBatchBar();
+    """)
+    expect(
+        page.locator("#selectionWildlifeActions button", has_text="Exclude 2")
+    ).to_be_visible()
+
+    page.evaluate("""
+      window.__originalApiJson = window.Vireo.api.json;
+      window.Vireo.api.json = function(url, opts, options) {
+        if (url === '/api/batch/wildlife-excluded') {
+          return new Promise(function(resolve, reject) {
+            window.__releaseWildlifeBatch = function() {
+              window.__originalApiJson(url, opts, options).then(resolve, reject);
+            };
+          });
+        }
+        return window.__originalApiJson(url, opts, options);
+      };
+      window.__wildlifeBatchDone = false;
+      setSelectionWildlifeExcluded(true).finally(function() {
+        window.__wildlifeBatchDone = true;
+      });
+      void 0;
+    """)
+    page.wait_for_function("typeof window.__releaseWildlifeBatch === 'function'")
+
+    page.evaluate("""
+      selectedPhotos.clear();
+      photos.slice(2, 5).forEach(function(photo) {
+        selectedPhotos.add(photo.id);
+      });
+      updateBatchBar();
+    """)
+    current_action = page.locator(
+        "#selectionWildlifeActions button", has_text="Exclude 3"
+    )
+    expect(current_action).to_be_visible()
+
+    page.evaluate("window.__releaseWildlifeBatch()")
+    page.wait_for_function("window.__wildlifeBatchDone === true")
+    expect(current_action).to_be_visible()
+
+
 def test_multiselect_shrink_to_focused_photo_restores_detail(live_server, page):
     """Leaving multi-select with a focused photo must restore the detail pane."""
     url = live_server["url"]

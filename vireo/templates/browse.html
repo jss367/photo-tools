@@ -6242,7 +6242,10 @@ async function setSelectionWildlifeExcluded(excluded) {
     if (changed.has(photo.id)) photo.wildlife_excluded = excluded ? 1 : 0;
   });
   refreshGridCards(ids);
-  renderSelectionWildlifeState(ids);
+  // The selection may have changed while the batch request was in flight.
+  // Refresh the current selection so this completion cannot supersede a
+  // newer state request with counts and actions for the old photo ids.
+  renderSelectionWildlifeState(getActiveSelection());
   scheduleCollectionCountsRefresh();
   refreshActiveCollectionAfterMembershipChange();
   showUndoToast();

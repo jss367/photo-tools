@@ -337,6 +337,12 @@ def sync_from_xmp(db, photo_ids):
         # keyword instead of ignoring it and processing the rest.
         xmp_keywords = read_keywords(xmp_path)
         pending_removals = db.get_pending_keyword_removal_keys(photo_id)
+        pending_hierarchical_removals = db.get_pending_keyword_removal_keys(
+            photo_id, hierarchical=True,
+        )
+        pending_flat_only_removals = (
+            pending_removals - pending_hierarchical_removals
+        )
         xmp_keywords_by_key = {}
         for kw in xmp_keywords:
             key = keyword_match_key(kw)
@@ -356,7 +362,12 @@ def sync_from_xmp(db, photo_ids):
             db.tag_photo(photo_id, kid)
 
         for kw in db_keywords:
-            if keyword_match_key(kw["name"]) not in xmp_keywords_by_key:
+            kw_key = keyword_match_key(kw["name"])
+            preserve_hierarchy = (
+                kw["parent_id"] is not None
+                and kw_key in pending_flat_only_removals
+            )
+            if kw_key not in xmp_keywords_by_key and not preserve_hierarchy:
                 db.untag_photo(photo_id, kw["id"])
 
         # Update xmp_mtime

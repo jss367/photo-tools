@@ -35,6 +35,17 @@ class FakeRunner:
     def cancellation_requested(self, job_id):
         return job_id in self.cancelled_ids
 
+    def pause_requested(self, job_id):
+        # Tests using this stub don't exercise Pause — return False so
+        # the scanner's pause-aware code paths (added on this branch)
+        # are wired but idle.
+        return False
+
+    def wait_if_paused(self, job_id, *, publish_paused=False):
+        # No pause request → return immediately; report cancellation so
+        # callers that want cancel-through-pause behavior still see it.
+        return job_id in self.cancelled_ids
+
 
 def _make_job(job_id="import-test-1"):
     return {

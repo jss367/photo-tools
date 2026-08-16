@@ -94,6 +94,20 @@ def test_lightbox_color_description_opens_editor(live_server, page):
         "modal-overlay open"
     )
     expect(page.locator("#colorLabelDescriptionInput")).to_have_value("Waterbirds")
+    # The editor must stack above the still-open lightbox overlay (z-index
+    # 9999) or the newly added flow is invisible to the user.
+    stacking = page.evaluate(
+        """() => {
+            const modal = getComputedStyle(
+                document.getElementById('colorLabelDescriptionModal')
+            ).zIndex;
+            const lb = getComputedStyle(
+                document.getElementById('lightboxOverlay')
+            ).zIndex;
+            return { modal: Number(modal), lightbox: Number(lb) };
+        }"""
+    )
+    assert stacking["modal"] > stacking["lightbox"], stacking
 
 
 def test_lightbox_menu_sets_species_representative(live_server, page):

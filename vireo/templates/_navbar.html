@@ -1248,6 +1248,9 @@ input[type=text], input[type=date], select, .path-input, .text-input, .model-sel
   color: var(--text-dim);
   font-size: 11px;
 }
+/* Editor is reachable from the lightbox context menu, so it must stack above
+   the lightbox layers (overlay 9999, close 10000, nav 10001). */
+#colorLabelDescriptionModal { z-index: 10002; }
 
 /* ---------- Shortcuts Cheat Sheet ---------- */
 /* z-index sits above the lightbox stack (overlay 9999, close 10000, nav 10001)

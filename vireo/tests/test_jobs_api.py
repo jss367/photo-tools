@@ -5970,6 +5970,15 @@ def test_import_in_place_reports_working_copy_phase(app_and_db, tmp_path, monkey
     import scanner
 
     app, _ = app_and_db
+    runner = app._job_runner
+    observed_pause_job_ids = []
+    original_pause_requested = runner.pause_requested
+
+    def record_pause_probe(job_id):
+        observed_pause_job_ids.append(job_id)
+        return original_pause_requested(job_id)
+
+    monkeypatch.setattr(runner, "pause_requested", record_pause_probe)
     source = tmp_path / "raw-card"
     source.mkdir()
     (source / "IMG_0001.nef").write_bytes(b"fake raw data")
@@ -5989,9 +5998,11 @@ def test_import_in_place_reports_working_copy_phase(app_and_db, tmp_path, monkey
         "after_import": None,
     })
     assert resp.status_code == 200, resp.get_json()
-    job = wait_for_job_via_client(client, resp.get_json()["job_id"])
+    job_id = resp.get_json()["job_id"]
+    job = wait_for_job_via_client(client, job_id)
 
     assert job["status"] == "completed", job
+    assert job_id in observed_pause_job_ids
     assert job["progress"]["phase_label"] == "Generating working copies"
     assert job["progress"]["phase_current"] == 1
     assert job["progress"]["phase_total"] == 1

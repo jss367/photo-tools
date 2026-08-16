@@ -26660,6 +26660,9 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             def cancel_check():
                 return runner.is_cancelled(job["id"])
 
+            def pause_check():
+                return runner.pause_requested(job["id"])
+
             cancelled = False
             for idx, source in enumerate(sources, 1):
                 if cancel_check():
@@ -26717,6 +26720,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                         vireo_dir=vireo_dir,
                         thumb_cache_dir=thumb_cache_dir,
                         cancel_check=cancel_check,
+                        pause_check=pause_check,
                         # Pair companions during each scan, but defer RAW
                         # working-copy generation until every source has been
                         # cataloged. One combined pass gives the UI a truthful

@@ -3943,6 +3943,14 @@ function _lbApplyReadOnlyState() {
   });
   var panel = document.getElementById('lightboxAdjustPanel');
   if (_lbReadOnly && panel) panel.classList.remove('open');
+  var editButton = document.getElementById('lightboxEditPhoto');
+  if (editButton) {
+    var editHint = typeof window.getLightboxBrowseDisabledHint === 'function'
+      ? window.getLightboxBrowseDisabledHint(_lightboxCurrentId, true)
+      : null;
+    editButton.disabled = !!editHint;
+    editButton.title = editHint || 'Edit photo';
+  }
 }
 
 function _lbSetPhotoTransitionPending(pending) {
@@ -7410,6 +7418,7 @@ function openLightbox(photoId, filename, photoList, options) {
   _lbDeferredOverlayApply = null;
 
   _lightboxCurrentId = photoId;
+  _lbApplyReadOnlyState();
   if (photoList) _lightboxPhotoList = photoList;
   // Remember the photo being viewed so the Edit page (/edit with no id) can
   // resolve "the photo I was just looking at".
@@ -7739,6 +7748,13 @@ function openLightbox(photoId, filename, photoList, options) {
   if (editPhotoBtn) {
     editPhotoBtn.onclick = function(e) {
       if (e) e.stopPropagation();
+      var editHint = typeof window.getLightboxBrowseDisabledHint === 'function'
+        ? window.getLightboxBrowseDisabledHint(photoId, true)
+        : null;
+      if (editHint) {
+        if (typeof showToast === 'function') showToast(editHint, 'warning');
+        return false;
+      }
       // Hand the current ordered photo list to the editor so it can offer
       // Prev/Next just like the lightbox does.
       if (window.vireoEditNav) {
@@ -10404,7 +10420,15 @@ function nativeMenuOpenBrowse() {
     nativeMenuError('Open in Browse needs one selected photo.');
     return;
   }
+  var disabledHint = typeof window.getLightboxBrowseDisabledHint === 'function'
+    ? window.getLightboxBrowseDisabledHint(ids[0], true)
+    : null;
+  if (disabledHint) {
+    nativeMenuError(disabledHint);
+    return false;
+  }
   nativeMenuRoute('/browse?photo_id=' + encodeURIComponent(ids[0]));
+  return true;
 }
 
 function nativeMenuPhotoIdsForWrite() {

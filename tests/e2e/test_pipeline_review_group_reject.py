@@ -1546,20 +1546,35 @@ def test_read_only_scope_blocks_collection_and_keyword_writes(live_server, page)
         item = menu.locator(".vireo-ctx-item", has_text=label)
         expect(item).to_have_class(re.compile(r"\bvireo-ctx-disabled\b"))
         expect(item).to_have_attribute("title", "Switch to Latest review to make changes")
+    assert "Add to Highlights" not in menu.inner_text()
+    assert "Set Representative" not in menu.inner_text()
     page.keyboard.press("Escape")
 
     blocked = page.evaluate(
-        "async pid => ({ collection: await addToCollection([pid]), "
-        "keyword: batchAddKeyword([pid]), "
-        "collectionOpen: document.getElementById('pipelineCollectionModal')"
-        ".classList.contains('open'), "
-        "keywordOpen: document.getElementById('pipelineKeywordModal')"
-        ".classList.contains('open') })",
+        """async pid => {
+          window._vireoNativeMenuPhotoIdsOverride = [pid];
+          const collection = await addToCollection([pid]);
+          const collectionOverride = window._vireoNativeMenuPhotoIdsOverride;
+          window._vireoNativeMenuPhotoIdsOverride = [pid];
+          const keyword = batchAddKeyword([pid]);
+          return {
+            collection: collection,
+            keyword: keyword,
+            collectionOverride: collectionOverride,
+            keywordOverride: window._vireoNativeMenuPhotoIdsOverride,
+            collectionOpen: document.getElementById('pipelineCollectionModal')
+              .classList.contains('open'),
+            keywordOpen: document.getElementById('pipelineKeywordModal')
+              .classList.contains('open'),
+          };
+        }""",
         photo_id,
     )
     assert blocked == {
         "collection": False,
         "keyword": False,
+        "collectionOverride": None,
+        "keywordOverride": None,
         "collectionOpen": False,
         "keywordOpen": False,
     }
@@ -1715,6 +1730,33 @@ def test_tauri_disables_navigation_when_group_review_is_dirty(live_server, page)
     expect(lightbox_browse).to_have_attribute(
         "title", "Apply or close Group Review before leaving this page"
     )
+    edit_button = page.locator("#lightboxEditPhoto")
+    expect(edit_button).to_be_disabled()
+    expect(edit_button).to_have_attribute(
+        "title", "Apply or close Group Review before leaving this page"
+    )
+    original_url = page.url
+    assert page.evaluate(
+        "document.getElementById('lightboxEditPhoto').onclick()"
+    ) is False
+    assert page.url == original_url
+
+    native_state = page.evaluate(
+        """() => {
+          const originalRoute = window.nativeMenuRoute;
+          window.__nativeBrowseRoute = null;
+          window.nativeMenuRoute = path => { window.__nativeBrowseRoute = path; };
+          try {
+            return {
+              result: nativeMenuOpenBrowse(),
+              route: window.__nativeBrowseRoute,
+            };
+          } finally {
+            window.nativeMenuRoute = originalRoute;
+          }
+        }"""
+    )
+    assert native_state == {"result": False, "route": None}
 
 
 def test_popup_blocked_browse_preserves_dirty_group_review(live_server, page):

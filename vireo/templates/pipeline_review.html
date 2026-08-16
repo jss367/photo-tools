@@ -7555,6 +7555,7 @@ function pipelineCollectionAcceptsManualPhotos(collection) {
 async function addToCollection(photoIds) {
   if (pipelineReviewCollectionSubmitPromise) return false;
   if (isScopedReviewView()) {
+    window._vireoNativeMenuPhotoIdsOverride = null;
     notifyReadOnlyScopedView();
     return false;
   }
@@ -7695,6 +7696,7 @@ function confirmPipelineCollection() {
 function batchAddKeyword(photoIds) {
   if (pipelineReviewKeywordSubmitPromise) return false;
   if (isScopedReviewView()) {
+    window._vireoNativeMenuPhotoIdsOverride = null;
     notifyReadOnlyScopedView();
     return false;
   }
@@ -7858,10 +7860,10 @@ function buildPipelinePhotoContextMenu(photoIds, clickedPhotoId, inGroupReview) 
   items.push({label: one ? 'Copy Path' : 'Copy Paths',
     onClick: function() { copyPhotoPaths(photoIds); }});
   items.push({separator: true});
-  if (typeof window.buildSpeciesHighlightMenuItems === 'function') {
+  if (!scopedWriteHint && typeof window.buildSpeciesHighlightMenuItems === 'function') {
     items = items.concat(window.buildSpeciesHighlightMenuItems(photoIds, {showFetchFallback: true}));
   }
-  if (typeof window.buildSpeciesRepresentativeMenuItems === 'function') {
+  if (!scopedWriteHint && typeof window.buildSpeciesRepresentativeMenuItems === 'function') {
     items = items.concat(window.buildSpeciesRepresentativeMenuItems(photoIds, {showFetchFallback: true}));
   }
   items.push({separator: true});

@@ -578,6 +578,53 @@ def test_owner_wait_timing_uses_injected_clock():
     assert ledger.snapshot()["wait_seconds"] == 2.5
 
 
+def test_cancel_check_wrapped_in_suspend_excludes_park_from_wait_timer():
+    """Regression for the standalone scan/import wiring: a cancel_check
+    closure that internally parks (matching ``runner.is_cancelled``'s
+    behaviour on pause via ``wait_if_paused``) must not inflate the
+    ledger's active-wait timer while it is parked. The closures in
+    ``app.py`` and ``import_job.py`` wrap the parking call in
+    ``suspend_resource_wait_timing()`` for exactly this reason —
+    without the wrap, an hour-long user pause during a scan is
+    persisted as an hour of resource contention on the job's
+    diagnostics.
+    """
+    now = [10.0]
+    ledger = ResourceLedger(cpu_capacity=1, clock=lambda: now[0])
+
+    from resource_ledger import suspend_resource_wait_timing
+
+    # This closure mirrors the shape of scan_cancel_check in the
+    # standalone paths: enter a suspend context around a call that may
+    # park (here simulated by advancing the clock while inside the
+    # suspend).
+    def scan_cancel_check_shape():
+        with suspend_resource_wait_timing():
+            now[0] += 100.0  # simulate the runner.is_cancelled park
+            return False
+
+    with bind_resource_owner("paused-scan"):
+        with ledger.track_external_wait():
+            now[0] = 12.0
+            # 2 seconds of real contention before the parking probe.
+            assert ledger.owner_timing("paused-scan") == {
+                "wait_seconds": 2.0,
+                "wait_count": 1,
+            }
+            # Invoke the wrapped probe — the +100s inside the suspend
+            # must NOT contribute to wait_seconds.
+            assert scan_cancel_check_shape() is False
+            # Post-park real contention: another 1 second.
+            now[0] += 1.0
+
+    # Total real contention: 2s + 1s = 3s. The +100s park is excluded.
+    # Without the closure's suspend wrap, this would report 103s.
+    assert ledger.owner_timing("paused-scan") == {
+        "wait_seconds": 3.0,
+        "wait_count": 1,
+    }
+
+
 def test_suspended_resource_wait_excludes_parked_time():
     """A user-requested pause must not inflate contention diagnostics."""
     now = [10.0]

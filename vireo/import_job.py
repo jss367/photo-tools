@@ -1473,8 +1473,20 @@ def _catalog_scan_and_prescan(state, batch_st, db, params, scan, destination,
         scan_pause_check = None
         if runner is not None and job is not None:
             job_id = job["id"]
-            scan_cancel_check = lambda: runner.is_cancelled(job_id)  # noqa: E731
-            scan_pause_check = lambda: runner.pause_requested(job_id)  # noqa: E731
+            # ``runner.is_cancelled`` parks on Pause via
+            # ``wait_if_paused``; suspend the ledger's active-wait
+            # timer around that park so an hour-long pause during a
+            # per-batch scan does not persist as an hour of resource
+            # contention on the job's diagnostics. The context
+            # manager is a no-op when no ledger wait is active.
+            from resource_ledger import suspend_resource_wait_timing
+
+            def scan_cancel_check():
+                with suspend_resource_wait_timing():
+                    return runner.is_cancelled(job_id)
+
+            def scan_pause_check():
+                return runner.pause_requested(job_id)
         scan(
             destination, db,
             restrict_dirs=[batch_st.dest_folder],

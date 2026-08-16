@@ -25339,8 +25339,20 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             # the pause signal until the current source finishes.
             # Same wiring the in-place import path picked up in
             # 37e0e3a0 for the identical reason.
+            #
+            # ``runner.is_cancelled`` internally parks on Pause via
+            # ``wait_if_paused``. Wrap the parking call in
+            # ``suspend_resource_wait_timing`` so an hour-long pause
+            # while a scan is waiting for CPU permits does not persist
+            # as an hour of "resource contention" on the job's
+            # diagnostics. The context manager is a no-op when no
+            # ledger wait is active, so it's safe on non-pausable
+            # invocations too. Mirrors what ``_pause_checkpoint``
+            # does for pipeline participants (pipeline_job.py:1567).
             def scan_cancel_check():
-                return runner.is_cancelled(job["id"])
+                from resource_ledger import suspend_resource_wait_timing
+                with suspend_resource_wait_timing():
+                    return runner.is_cancelled(job["id"])
 
             def scan_pause_check():
                 return runner.pause_requested(job["id"])

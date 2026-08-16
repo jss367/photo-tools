@@ -4329,8 +4329,16 @@ async function updatePreviewNow() {
 
 function commitRuleOnEnter(e) {
   if (e.key !== 'Enter' || e.isComposing || e.keyCode === 229) return;
+  var t = e.currentTarget || e.target;
+  if (t && t.type === 'date') {
+    // Native date pickers use Enter to commit the highlighted date;
+    // cancelling it would close the picker without applying the selection.
+    // Defer the blur so the picker's own Enter handler runs first.
+    setTimeout(function() { t.blur(); }, 0);
+    return;
+  }
   e.preventDefault();
-  (e.currentTarget || e.target).blur();
+  t.blur();
 }
 
 function renderRuleValueInput(r, i) {

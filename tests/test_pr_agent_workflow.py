@@ -44,6 +44,7 @@ def test_review_events_are_collapsed_and_generated_feedback_is_ignored():
     )
     assert "issue_comment:\n    types: [created, edited]" in workflow
     assert "pull_request_review:\n    types: [submitted, edited, dismissed]" in workflow
+    assert "pull_request_review_comment:\n    types: [created, edited]" in workflow
     assert "(github.event.review.state != 'approved' || github.event.action == 'edited')" in workflow
 
 
@@ -62,7 +63,7 @@ def test_concurrency_is_scoped_per_task_and_never_workflow_wide():
     review_group_issue = "group: pr-agent-review-fix-${{ github.event.issue.number }}"
     review_group_pr = "group: pr-agent-review-fix-${{ github.event.pull_request.number }}"
     assert workflow.count(review_group_issue) == 1  # fix-comment-feedback only
-    assert workflow.count(review_group_pr) == 2  # fix-comments + codex-review
+    assert workflow.count(review_group_pr) == 3  # reviews + Codex + inline comments
     human_reconcile_group = "group: pr-agent-human-reconcile-${{ github.event.issue.number }}"
     assert human_reconcile_group in workflow
     human_group_idx = workflow.index(human_reconcile_group)
@@ -202,6 +203,8 @@ def test_merge_gate_requires_live_head_and_resolved_current_threads():
     assert '"$test_status" != "completed"' in action
     assert '"$test_conclusion" != "success"' in action
     assert "select(.updated_at >= $authorized_at)" in action
+    assert "select(.updated_at > $authorized_at)" in action
+    assert "repos/${REPO}/pulls/${PR}/comments" in action
     assert ".updatedAt >= $authorized_at" in action
     assert "reviews(first:100" in action
     assert "nodes { submittedAt updatedAt state body authorAssociation author { login } }" in action
@@ -220,6 +223,20 @@ def test_merge_gate_requires_live_head_and_resolved_current_threads():
     assert "printf '%s\\n' \"${title}\"" in action
     assert 'echo "${title}"' not in action
     assert "title<<PR_AGENT_TITLE" not in action
+
+
+def test_inline_comment_edits_wake_reconciliation_on_the_live_head():
+    workflow = _read(WORKFLOW)
+
+    start = workflow.index("  fix-inline-comment:")
+    end = workflow.index("\n  # Auto-fix when the Tests workflow fails", start)
+    block = workflow[start:end]
+    assert "github.event_name == 'pull_request_review_comment'" in block
+    assert "github.event.pull_request.state == 'open'" in block
+    assert "Task: address-review" in block
+    assert "Review body:" in block
+    assert "github.event.comment.body" in block
+    assert "expected-head:" not in block
 
 
 def test_routine_contract_is_state_based_quiet_and_resolves_addressed_threads():

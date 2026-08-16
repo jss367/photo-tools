@@ -285,7 +285,7 @@ def preview_destination(sources, destination, folder_template="%Y/%Y-%m-%d",
 
 def discover_source_files(
     source_dir, file_types="both", recursive=True, onerror=None,
-    cancel_check=None, progress_callback=None,
+    cancel_check=None, progress_callback=None, on_dir_walked=None,
 ):
     """Discover image files in source directory.
 
@@ -305,6 +305,17 @@ def discover_source_files(
             stop. Checked while walking so large sources remain cancellable.
         progress_callback: optional ``callback(checked, found)`` invoked every
             500 directory entries and once at completion.
+        on_dir_walked: optional ``callback(dirpath)`` invoked with the parent
+            directory of each accepted file, at the moment that file is
+            yielded. Fires while the underlying walker is still positioned
+            at that directory, so callers can baseline per-directory identity
+            during discovery rather than after it completes. Closes a window
+            where a directory walked early can be replaced later in the same
+            (multi-source) discovery pass and end up baselined at the
+            replacement identity; the pre-scan revalidation would then see
+            no change and stat the frozen filenames under the substitute.
+            Fired once per accepted file — callers should deduplicate on the
+            directory path.
 
     Returns:
         Sorted list of Path objects for matching files
@@ -446,6 +457,14 @@ def discover_source_files(
             and f.is_file()
         ):
             files.append(f)
+            if on_dir_walked is not None:
+                # The walker is paused mid-iteration of this directory
+                # tuple, so baselining the parent's identity here is as
+                # close to walk time as the caller can get without
+                # hooking safe_scan_walk itself. Fires per accepted file;
+                # the caller dedupes on the directory path so at most one
+                # ``_mount_identity`` call runs per contributing parent.
+                on_dir_walked(str(f.parent))
         if progress_callback is not None and checked % 500 == 0:
             progress_callback(checked, len(files))
     if progress_callback is not None:

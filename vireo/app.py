@@ -26727,6 +26727,25 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     cancelled = True
                     break
                 emit_discovery(source_index, source)
+                # Baseline per-parent identity inline during the walk. A
+                # directory walked early in a multi-source discovery could
+                # otherwise be replaced before ``discover_source_files``
+                # returns; capturing identity from the returned manifest
+                # after the walk completes would then stamp the
+                # replacement's identity and the pre-scan revalidation
+                # would see no change. Snapshot-mode manifests skip this
+                # (they don't walk the filesystem; per-directory identity
+                # is captured at pre-scan time by restricted_dir_identities).
+                manifest_dir_identities: dict = {}
+
+                def _baseline_manifest_dir(
+                    dirpath, _sink=manifest_dir_identities,
+                ):
+                    parent_key = str(Path(dirpath))
+                    if parent_key in _sink:
+                        return
+                    _sink[parent_key] = _mount_identity(parent_key)
+
                 try:
                     if snapshot_paths_by_root is not None:
                         manifest = sorted(
@@ -26751,6 +26770,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                             cancel_check=cancel_check,
                             progress_callback=lambda checked, found, i=source_index,
                             s=source: emit_discovery(i, s, checked, found),
+                            on_dir_walked=_baseline_manifest_dir,
                         )
                 except ScanCancelled:
                     cancelled = True
@@ -26766,24 +26786,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     source_discovery_failures.add(source)
                     manifest = []
                 source_manifests[source] = manifest
-                # Baseline the identity of each unique parent directory in
-                # the manifest. Deduplicating first bounds this to the tree
-                # depth actually observed, not the file count. Only applied
-                # to sources whose manifest came from a filesystem walk here:
-                # snapshot-mode manifests take an explicit path list captured
-                # earlier by the caller, and their per-directory identity is
-                # already captured just before scan by restricted_dir_identities
-                # and rechecked post-scan when scoping working-copy extraction.
-                # See source_manifest_dir_identities for the full rationale.
                 if snapshot_paths_by_root is None:
-                    manifest_dir_identities = {}
-                    for manifest_path in manifest:
-                        parent_key = str(Path(manifest_path).parent)
-                        if parent_key in manifest_dir_identities:
-                            continue
-                        manifest_dir_identities[parent_key] = _mount_identity(
-                            parent_key,
-                        )
                     source_manifest_dir_identities[source] = manifest_dir_identities
                 scan_acc["overall_total"] += len(manifest)
                 runner.push_event(job["id"], "progress", {

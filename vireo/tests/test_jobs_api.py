@@ -6669,6 +6669,131 @@ def test_import_in_place_rejects_replaced_nested_directory_before_scan(
     assert identity_calls[nested_key] == 2, identity_calls
 
 
+def test_import_in_place_baselines_dir_identity_during_discovery(
+    app_and_db, tmp_path, monkeypatch,
+):
+    """Per-parent identity must be captured while the walker visits, not later.
+
+    A subdirectory walked early in a multi-source or slow discovery can be
+    replaced before ``discover_source_files`` returns. If the identity
+    baseline is taken from the returned manifest after the walk completes,
+    it stamps the replacement's identity and the pre-scan revalidation sees
+    no change. Baselining inside the walk (via ``on_dir_walked``) keeps the
+    walk-time identity so the pre-scan check catches the swap. Simulated
+    here by flipping the mocked identity the moment
+    ``discover_source_files`` returns — earlier code that baselined only
+    after the return would silently accept the replacement.
+    """
+    from pathlib import Path
+
+    import ingest
+    import pipeline_job
+    import scanner
+
+    app, _ = app_and_db
+    source = tmp_path / "recursive-source"
+    nested = source / "subdir"
+    nested.mkdir(parents=True)
+    (nested / "IMG_0001.jpg").write_bytes(b"jpeg")
+
+    source_key = str(Path(source))
+    nested_key = str(Path(nested))
+
+    swap_state = {"swapped": False}
+    nested_probes_before_swap = []
+
+    def swapping_identity(path):
+        normalized = str(Path(path))
+        if normalized == nested_key:
+            nested_probes_before_swap.append(swap_state["swapped"])
+            # Before ``discover_source_files`` returns the walker sees
+            # identity ("stat", 1, 100); after it returns the subtree
+            # has been replaced. A baseline captured after the return
+            # would stamp identity ("stat", 1, 200) and match the
+            # pre-scan probe, silently accepting the replacement.
+            return (
+                "stat", 1, 200 if swap_state["swapped"] else 100,
+            )
+        if normalized == source_key:
+            return ("stat", 1, 42)
+        return ("stat", 1, hash(normalized) & 0xFFFF)
+
+    real_discover = ingest.discover_source_files
+
+    def wrapped_discover(*args, **kwargs):
+        result = real_discover(*args, **kwargs)
+        # The moment ``discover_source_files`` returns, flip identity for
+        # the nested subdir. A post-discovery baseline would sample the
+        # replacement here and match the later pre-scan probe; a
+        # walk-time baseline (via ``on_dir_walked`` fired inside
+        # ``real_discover``) already captured the pre-swap identity.
+        swap_state["swapped"] = True
+        return result
+
+    monkeypatch.setattr(
+        pipeline_job, "_load_known_mount_roots", lambda _db: set(),
+    )
+    monkeypatch.setattr(
+        pipeline_job, "_archive_mount_baseline", lambda path, known: {},
+    )
+    monkeypatch.setattr(
+        pipeline_job, "_record_known_mount_roots",
+        lambda _db, _baseline: None,
+    )
+    monkeypatch.setattr(
+        pipeline_job, "_mount_identity", swapping_identity,
+    )
+    monkeypatch.setattr(
+        ingest, "discover_source_files", wrapped_discover,
+    )
+
+    scan_calls = []
+    extractor_calls = []
+
+    def fake_scan(*_args, **_kwargs):
+        scan_calls.append(True)
+        return {"discovered": 0, "indexed": 0}
+
+    monkeypatch.setattr(scanner, "scan", fake_scan)
+    monkeypatch.setattr(
+        scanner, "_extract_working_copies",
+        lambda *args, **kwargs: extractor_calls.append((args, kwargs)),
+    )
+
+    client = app.test_client()
+    resp = client.post("/api/jobs/import-in-place", json={
+        "sources": [str(source)],
+        "after_import": None,
+    })
+    assert resp.status_code == 200, resp.get_json()
+    job = wait_for_job_via_client(client, resp.get_json()["job_id"])
+
+    assert swap_state["swapped"] is True, (
+        "the wrapped discover_source_files must have run and flipped "
+        "the swap flag before the pre-scan check"
+    )
+    assert job["status"] == "failed", job
+    assert scan_calls == [], (
+        "scanner must not run when the walk-time identity check fails"
+    )
+    assert extractor_calls == []
+    errors = list(job.get("errors") or [])
+    assert any(
+        "nested directory changed since discovery" in err
+        for err in errors
+    ), errors
+    # At least one probe against the swapped subdir must land BEFORE
+    # the swap — i.e., inside ``discover_source_files`` via the
+    # ``on_dir_walked`` callback. A post-discovery baseline would fire
+    # every probe after the swap and the pre-scan check would then
+    # match, silently accepting the replacement.
+    assert any(not was_swapped for was_swapped in nested_probes_before_swap), (
+        f"expected a pre-swap ``_mount_identity`` probe against the "
+        f"swapped subdir during discovery; got probes: "
+        f"{nested_probes_before_swap}"
+    )
+
+
 def test_import_in_place_snapshot_rejects_replaced_restricted_directory(
     app_and_db, tmp_path, monkeypatch,
 ):

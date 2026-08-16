@@ -149,6 +149,8 @@ def test_merge_gate_requires_live_head_and_resolved_current_threads():
     assert "reviewThreads(first:100" in action
     assert ".isResolved == false and .isOutdated == false" in action
     assert 'if [[ "$unresolved" -gt 0 ]]' in action
+    assert "reviewDecision" in action
+    assert '"$review_decision" == "CHANGES_REQUESTED"' in action
     assert 'gh run list --repo "$REPO" --workflow Tests' in action
     assert ".headSha == $head" in action
     assert '"$test_status" != "completed"' in action
@@ -178,8 +180,17 @@ def test_merge_is_synchronous_and_retried_only_for_the_authorized_tested_head():
     assert "merge-after-tests:" in workflow
     assert 'live_head" != "$TESTED_HEAD' in workflow
     assert ".commit_id == $head" in workflow
+    assert "sort_by(.submitted_at)" in workflow
+    assert '"$latest_state" == "APPROVED"' in workflow
     assert '"$TESTED_HEAD" == "$approved_head"*' in workflow
     assert workflow.count('--match-head-commit "$HEAD_SHA"') == 3
+
+
+def test_merge_jobs_can_read_the_exact_heads_tests_run():
+    workflow = _read(WORKFLOW)
+
+    merge_permissions = "permissions:\n      actions: read\n      contents: write\n      pull-requests: write"
+    assert workflow.count(merge_permissions) == 3
 
 
 def test_human_claude_fix_uses_a_distinct_unforgeable_reconcile_task():

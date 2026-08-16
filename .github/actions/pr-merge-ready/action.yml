@@ -45,12 +45,13 @@ runs:
         echo "ready=false" >> "$GITHUB_OUTPUT"
 
         pr_json=$(gh pr view "$PR" --repo "$REPO" \
-          --json state,headRefOid,headRefName,baseRefName,title,headRepositoryOwner,headRepository)
+          --json state,headRefOid,headRefName,baseRefName,title,reviewDecision,headRepositoryOwner,headRepository)
         state=$(jq -r '.state' <<< "$pr_json")
         head_sha=$(jq -r '.headRefOid' <<< "$pr_json")
         head_ref=$(jq -r '.headRefName' <<< "$pr_json")
         base_ref=$(jq -r '.baseRefName' <<< "$pr_json")
         title=$(jq -r '.title' <<< "$pr_json")
+        review_decision=$(jq -r '.reviewDecision' <<< "$pr_json")
         head_repo=$(jq -r '.headRepositoryOwner.login + "/" + .headRepository.name' <<< "$pr_json")
 
         {
@@ -74,6 +75,10 @@ runs:
         fi
         if [[ "$head_repo" != "$REPO" ]]; then
           echo "PR #${PR} comes from fork ${head_repo}; automatic merge is disabled."
+          exit 0
+        fi
+        if [[ "$review_decision" == "CHANGES_REQUESTED" ]]; then
+          echo "PR #${PR} currently has changes requested."
           exit 0
         fi
 

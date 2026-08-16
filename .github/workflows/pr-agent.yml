@@ -540,6 +540,7 @@ jobs:
       cancel-in-progress: false
     runs-on: ubuntu-latest
     permissions:
+      actions: read
       contents: write
       pull-requests: write
     steps:
@@ -602,6 +603,7 @@ jobs:
       cancel-in-progress: false
     runs-on: ubuntu-latest
     permissions:
+      actions: read
       contents: write
       pull-requests: write
     steps:
@@ -668,6 +670,7 @@ jobs:
       cancel-in-progress: false
     runs-on: ubuntu-latest
     permissions:
+      actions: read
       contents: write
       pull-requests: write
       issues: read
@@ -697,13 +700,16 @@ jobs:
 
           reviews=$(gh api "repos/${REPO}/pulls/${pr}/reviews" --paginate --slurp | jq 'add')
           for actor in $HUMAN_MERGE_ACTORS; do
-            approved=$(jq --arg actor "$actor" --arg head "$TESTED_HEAD" '
+            latest_state=$(jq -r --arg actor "$actor" --arg head "$TESTED_HEAD" '
               [ .[] | select(
                   .user.login == $actor
-                  and .state == "APPROVED"
                   and .commit_id == $head
-                ) ] | length' <<< "$reviews")
-            if [[ "$approved" -gt 0 ]]; then
+                  and (.state == "APPROVED" or .state == "CHANGES_REQUESTED" or .state == "DISMISSED")
+                ) ]
+              | sort_by(.submitted_at)
+              | last
+              | .state // empty' <<< "$reviews")
+            if [[ "$latest_state" == "APPROVED" ]]; then
               {
                 echo "authorized=true"
                 echo "pr=${pr}"

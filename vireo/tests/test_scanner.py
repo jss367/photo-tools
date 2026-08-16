@@ -54,6 +54,213 @@ def test_scan_discovers_folders(tmp_path):
     assert os.path.join(root, '2024', 'January') in paths
 
 
+def test_scan_uses_frozen_discovered_files_manifest(tmp_path):
+    """A pre-discovered import manifest fixes both scope and denominator.
+
+    Files that appear after the all-source discovery pass belong to a later
+    import; re-walking here would both admit them and make Overall move.
+    """
+    from db import Database
+    from scanner import scan
+
+    root = str(tmp_path / "photos")
+    _create_test_images(root, {"": ["selected.jpg", "late.jpg"]})
+    selected = os.path.join(root, "selected.jpg")
+    progress = []
+
+    db = Database(str(tmp_path / "test.db"))
+    result = scan(
+        root,
+        db,
+        discovered_files=[selected],
+        progress_callback=lambda current, total: progress.append(
+            (current, total)
+        ),
+    )
+
+    assert result["discovered"] == 1
+    assert {photo["filename"] for photo in db.get_photos(per_page=100)} == {
+        "selected.jpg",
+    }
+    assert progress
+    assert {total for _current, total in progress} == {1}
+
+
+def test_scan_raises_when_frozen_manifest_source_vanishes(tmp_path):
+    """A source that disconnects between discovery and scan must surface
+    as an error — not a silent all-zero return.
+
+    Import-in-place freezes a per-source manifest before scanning any
+    source so ``Overall`` has a stable denominator. When a removable or
+    network source drops after its manifest is captured but before
+    ``scan()`` runs, ``root_path.is_dir()`` is False. Previously that
+    branch logged a warning and returned zero counts, so the multi-source
+    coordinator saw no error, advanced past the source, and reported the
+    import successful on an incomplete set. With a frozen manifest in
+    hand, that state has to raise so the caller records the failure and
+    accounts for the promised files.
+    """
+    from db import Database
+    from scanner import scan
+
+    missing_root = str(tmp_path / "vanished_card")
+    frozen = [os.path.join(missing_root, "IMG_001.jpg")]
+    db = Database(str(tmp_path / "test.db"))
+
+    with pytest.raises(FileNotFoundError) as excinfo:
+        scan(missing_root, db, discovered_files=frozen)
+
+    assert os.path.normcase(excinfo.value.filename) == os.path.normcase(
+        missing_root
+    )
+
+
+def test_scan_without_manifest_still_tolerates_missing_root(tmp_path):
+    """Callers that don't pass a frozen manifest still get the benign
+    zero-count return when the root doesn't exist. This is the shape
+    audit/repair paths and health checks rely on: a missing root there
+    is expected state, not a hard error.
+    """
+    from db import Database
+    from scanner import scan
+
+    db = Database(str(tmp_path / "test.db"))
+    result = scan(str(tmp_path / "vanished_card"), db)
+    assert result["discovered"] == 0
+    assert result["indexed"] == 0
+
+
+def test_scan_with_empty_frozen_manifest_tolerates_missing_root(tmp_path):
+    """An empty manifest on a missing root is also benign. The vanished-
+    source guard only trips when the manifest holds work the caller
+    expected to happen; an empty list represents a source that had
+    nothing to scan in the first place.
+    """
+    from db import Database
+    from scanner import scan
+
+    db = Database(str(tmp_path / "test.db"))
+    result = scan(
+        str(tmp_path / "vanished_card"),
+        db,
+        discovered_files=[],
+    )
+    assert result["discovered"] == 0
+    assert result["indexed"] == 0
+
+
+def test_scan_with_empty_frozen_manifest_iterator_tolerates_missing_root(tmp_path):
+    """An empty manifest iterator has the same semantics as an empty list."""
+    from db import Database
+    from scanner import scan
+
+    db = Database(str(tmp_path / "test.db"))
+    result = scan(
+        str(tmp_path / "vanished_card"),
+        db,
+        discovered_files=iter(()),
+    )
+    assert result["discovered"] == 0
+    assert result["indexed"] == 0
+
+
+def test_scan_frozen_manifest_rejects_paths_in_excluded_bundle(tmp_path):
+    """Frozen paths that now resolve into an excluded bundle must be skipped.
+
+    Import-in-place freezes a per-source manifest before scanning any source
+    so ``Overall`` stays stable across multi-source imports; a later source
+    can wait minutes behind earlier ones. In that window a child dir or
+    symlink under this source may be swapped so its literal path components
+    (or a component's textual symlink target) now name an app-managed
+    library — ``Photos Library.photoslibrary`` / ``Music Library.musiclibrary``.
+    The app-level pre-scan mount-identity check only revalidates the source
+    root, so without a per-file guard the frozen path passes straight into
+    ``image_path.stat()``, which follows the replacement into the protected
+    bundle and re-trips the macOS TCC "access data from other apps" prompt
+    this repository's excluded-bundle guards exist to avoid.
+    """
+    from db import Database
+    from scanner import scan
+
+    root = str(tmp_path / "photos")
+    _create_test_images(root, {'': ['real.jpg']})
+    bundle_file = str(
+        tmp_path
+        / "photos"
+        / "Photos Library.photoslibrary"
+        / "originals"
+        / "managed.jpg"
+    )
+    os.makedirs(os.path.dirname(bundle_file), exist_ok=True)
+    Image.new('RGB', (200, 100), color='blue').save(bundle_file)
+
+    db = Database(str(tmp_path / "test.db"))
+    progress = []
+    result = scan(
+        root,
+        db,
+        discovered_files=[os.path.join(root, "real.jpg"), bundle_file],
+        progress_callback=lambda current, total: progress.append(
+            (current, total)
+        ),
+    )
+
+    assert result["discovered"] == 2
+    assert result["vanished"] == 1
+    assert progress[-1] == (2, 2)
+    assert {p['filename'] for p in db.get_photos(per_page=100)} == {'real.jpg'}
+
+
+def test_scan_frozen_manifest_rejects_paths_under_symlinked_bundle(tmp_path):
+    """A subdir replaced with a symlink into an excluded bundle after
+    discovery must not be scanned when the frozen manifest still names it.
+
+    Between discovery and scan a nested child dir can be replaced with a
+    symlink whose textual target points into ``Photos Library.photoslibrary``.
+    The frozen path's literal components do not name a bundle, but a
+    component-by-component symlink walk textually resolves into one, and
+    the later ``image_path.stat()`` would follow it and re-trip the macOS
+    TCC prompt. The per-frozen-path guard walks components textually so it
+    catches the replacement without following the symlink.
+    """
+    from db import Database
+    from scanner import scan
+
+    root = tmp_path / "photos"
+    root.mkdir()
+    (root / "Ordinary").mkdir()
+    Image.new('RGB', (200, 100), color='green').save(
+        root / "Ordinary" / "real.jpg"
+    )
+    frozen_photo = root / "Camera" / "IMG_0001.jpg"
+    frozen_photo.parent.mkdir()
+    Image.new('RGB', (200, 100), color='red').save(frozen_photo)
+
+    # Simulate the replacement: the Camera subdir is removed and replaced
+    # with a symlink pointing into an excluded bundle. os.readlink follows
+    # the textual target during is_excluded_scan_path's per-component walk;
+    # the bundle target does not need to exist for the guard to trip.
+    bundle_dir = tmp_path / "Elsewhere.photoslibrary" / "originals" / "Camera"
+    bundle_dir.mkdir(parents=True)
+    Image.new('RGB', (200, 100), color='blue').save(
+        bundle_dir / "IMG_0001.jpg"
+    )
+    shutil.rmtree(root / "Camera")
+    os.symlink(str(bundle_dir), str(root / "Camera"))
+
+    db = Database(str(tmp_path / "test.db"))
+    frozen = [
+        str(root / "Ordinary" / "real.jpg"),
+        str(root / "Camera" / "IMG_0001.jpg"),
+    ]
+    result = scan(str(root), db, discovered_files=frozen)
+
+    assert result["discovered"] == 2
+    assert result["vanished"] == 1
+    filenames = {p['filename'] for p in db.get_photos(per_page=100)}
+    assert filenames == {'real.jpg'}
+
+
 def test_scan_skips_app_managed_library_bundles(tmp_path):
     """scan() must not descend into macOS app-managed library bundles.
 

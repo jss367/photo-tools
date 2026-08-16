@@ -24,7 +24,7 @@ from import_dedup import (
     source_capture_timestamps,
     stored_metadata_key,
 )
-from scanner import compute_file_hash
+from scanner import ScanCancelled, compute_file_hash
 
 log = logging.getLogger(__name__)
 
@@ -285,6 +285,7 @@ def preview_destination(sources, destination, folder_template="%Y/%Y-%m-%d",
 
 def discover_source_files(
     source_dir, file_types="both", recursive=True, onerror=None,
+    cancel_check=None, progress_callback=None,
 ):
     """Discover image files in source directory.
 
@@ -300,6 +301,10 @@ def discover_source_files(
             and lets ``safe_to_format`` go green over a card whose files
             were never seen; the import job passes a collector that flips
             the ledger unsafe.
+        cancel_check: optional callable returning truthy when discovery should
+            stop. Checked while walking so large sources remain cancellable.
+        progress_callback: optional ``callback(checked, found)`` invoked every
+            500 directory entries and once at completion.
 
     Returns:
         Sorted list of Path objects for matching files
@@ -353,6 +358,9 @@ def discover_source_files(
     else:
         allowed = SUPPORTED_EXTENSIONS
 
+    files = []
+    checked = 0
+
     if recursive:
         # safe_scan_walk skips other-app data bundles (e.g.
         # "Photos Library.photoslibrary") without stat-following any
@@ -368,9 +376,47 @@ def discover_source_files(
         # previous Path.rglob path was likewise consumed lazily by
         # ``sorted()``.
         def _candidate_paths():
-            for dirpath, _dirnames, filenames in safe_scan_walk(
-                str(source_path), onerror=onerror,
-            ):
+            # cancel_check is threaded into safe_scan_walk itself so pause
+            # and cancel fire not just between directories but between
+            # scandir entries too. A single very large directory (a media
+            # dump with 1M+ files) would otherwise keep the walker inside
+            # its ``os.scandir`` loop for the full enumeration, so
+            # per-yield checks here can't see the cancel until every
+            # entry has been classified. The outer per-directory check
+            # below still guards the interval between yield resumption
+            # and the next scandir call.
+            #
+            # ``on_scandir_batch`` rides the same 256-entry checkpoint so
+            # a directory that streams millions of entries still emits
+            # discovery heartbeats before it finally yields. Without this
+            # the Jobs UI would show one initial phase event and then
+            # nothing until the whole enumeration finished — looking
+            # stalled during the largest single-directory case.
+            def _scandir_heartbeat():
+                if progress_callback is not None:
+                    progress_callback(checked, len(files))
+
+            walked = enumerate(safe_scan_walk(
+                str(source_path), onerror=onerror, cancel_check=cancel_check,
+                on_scandir_batch=_scandir_heartbeat,
+            ), start=1)
+            for dirs_walked, (dirpath, _dirnames, filenames) in walked:
+                if cancel_check is not None and cancel_check():
+                    raise ScanCancelled("file discovery cancelled")
+                # A source dominated by empty (or all-filtered) subtrees
+                # would otherwise never advance the outer per-candidate
+                # loop, so a discovery pass could walk thousands of
+                # directories without emitting a single heartbeat. Fire
+                # the callback periodically here so the UI stays alive
+                # during long directory-only traversals — the counts
+                # don't change (no new candidate was seen) but the
+                # heartbeat proves the walk is still making progress.
+                if (
+                    progress_callback is not None
+                    and not filenames
+                    and (dirs_walked % 64) == 0
+                ):
+                    progress_callback(checked, len(files))
                 for name in filenames:
                     yield Path(dirpath) / name
         candidates = _candidate_paths()
@@ -386,13 +432,25 @@ def discover_source_files(
         # a generator — pass it straight through to the filter so we
         # don't materialize the directory listing twice.
         candidates = safe_iter_dir(str(source_path), onerror=onerror)
-    return sorted(
-        f
-        for f in candidates
-        if f.is_file()
-        and f.suffix.lower() in allowed
-        and not f.name.startswith(".")
-    )
+    for f in candidates:
+        checked += 1
+        if cancel_check is not None and cancel_check():
+            raise ScanCancelled("file discovery cancelled")
+        # Cheap name/suffix filters run before is_file() so that a source
+        # dominated by non-image files (a home directory, a network mount)
+        # doesn't cost one filesystem stat per irrelevant entry — that's
+        # millions of remote metadata ops on the wrong kind of tree.
+        if (
+            not f.name.startswith(".")
+            and f.suffix.lower() in allowed
+            and f.is_file()
+        ):
+            files.append(f)
+        if progress_callback is not None and checked % 500 == 0:
+            progress_callback(checked, len(files))
+    if progress_callback is not None:
+        progress_callback(checked, len(files))
+    return sorted(files)
 
 
 def ingest(

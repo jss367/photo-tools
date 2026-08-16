@@ -20,6 +20,7 @@ from exif_orientation import orientation_swaps_axes as _orientation_swaps_axes
 from image_loader import (
     RAW_EXTENSIONS,
     SUPPORTED_EXTENSIONS,
+    ScanCancelled,
     extract_working_copy,
     is_excluded_scan_path,
     safe_iter_dir,
@@ -41,8 +42,9 @@ log = logging.getLogger(__name__)
 EMPTY_FILE_SHA256 = hashlib.sha256(b"").hexdigest()
 
 
-class ScanCancelled(RuntimeError):
-    """Raised when a caller cancels scanner.scan via cancel_check."""
+# ``ScanCancelled`` is defined in ``image_loader`` (where the low-level
+# walkers raise it) and re-exported here for callers that use
+# ``from scanner import ScanCancelled``.
 
 
 def _status_callback_supports_phase(status_callback):
@@ -1629,7 +1631,7 @@ _EMPTY_SCAN_COUNTS = {
 }
 
 
-def scan(root, db, progress_callback=None, incremental=False, extract_full_metadata=True, photo_callback=None, skip_paths=None, status_callback=None, recursive=True, restrict_dirs=None, restrict_files=None, vireo_dir=None, thumb_cache_dir=None, permission_error_callback=None, cancel_check=None, skip_working_copies=False, repair_missing_metadata=False, register_restrict_dirs_as_roots=True, allow_photo_inserts=True, counts=None):
+def scan(root, db, progress_callback=None, incremental=False, extract_full_metadata=True, photo_callback=None, skip_paths=None, status_callback=None, recursive=True, restrict_dirs=None, restrict_files=None, vireo_dir=None, thumb_cache_dir=None, permission_error_callback=None, cancel_check=None, skip_working_copies=False, repair_missing_metadata=False, register_restrict_dirs_as_roots=True, allow_photo_inserts=True, counts=None, discovered_files=None):
     """Walk a folder tree, discover photos, read metadata, populate database.
 
     Args:
@@ -1704,6 +1706,10 @@ def scan(root, db, progress_callback=None, incremental=False, extract_full_metad
             pass, a DB error), the return value alone would force callers
             to report zero for a run that really did catalog thousands.
             Pass a dict here to read accurate counts on any exit path.
+        discovered_files: optional frozen iterable of paths from a preceding
+            discovery pass. When supplied, scan skips its filesystem walk and
+            processes exactly this manifest. Import-in-place uses this to
+            establish a stable all-source progress denominator before work.
 
     Returns:
         dict with ``discovered`` (files the walk turned up), ``indexed``
@@ -1745,7 +1751,28 @@ def scan(root, db, progress_callback=None, incremental=False, extract_full_metad
             "Skipping other-app data bundle as scan root: %s", root_path,
         )
         return counts
+    # A frozen manifest may be any iterable, including a generator. Consume
+    # it exactly once so the missing-root guard can distinguish an empty
+    # manifest from promised work without exhausting the later work queue.
+    frozen_files = (
+        None if discovered_files is None else list(discovered_files)
+    )
     if not root_path.is_dir():
+        # A frozen manifest promised these files exist; the missing root
+        # is a source-level failure the caller must see (an SD card
+        # ejected between discovery and scan, or a network mount that
+        # dropped). Silently returning zero counts would hide the loss
+        # from ``root_errors``, so the multi-source coordinator would
+        # advance its "Overall" denominator without ever processing this
+        # source and mark the import successful on an incomplete set.
+        # Without a manifest, missing roots stay a benign no-op — an
+        # empty-manifest run wants the same shape a completed one has.
+        if frozen_files:
+            raise FileNotFoundError(
+                errno.ENOENT,
+                "scan root disappeared between discovery and scan",
+                str(root_path),
+            )
         log.warning("Root path does not exist or is not a directory: %s", root)
         return counts
 
@@ -1766,11 +1793,39 @@ def scan(root, db, progress_callback=None, incremental=False, extract_full_metad
         )
 
     # Discover all image files (incremental enumeration for progress reporting)
+    # unless the caller already froze an all-source manifest. Copy the input:
+    # scan sorts its work queue and callers may retain their source mapping.
     log.info("Discovering files in %s ...", root)
     _check_cancelled()
-    if status_callback:
+    if frozen_files is None and status_callback:
         _emit_status("Discovering files...")
-    image_files = []
+    excluded_frozen = 0
+    if frozen_files is not None:
+        # A frozen manifest was captured before any per-source scan began, so
+        # a later source can wait minutes behind earlier ones. In that window
+        # a nested child dir, mount, or symlink under this source may be
+        # replaced with (or into) a macOS app-managed library — a swap the
+        # app-level pre-scan mount-identity check cannot see, because it
+        # only revalidates the source root. Rerun the bundle guard on every
+        # frozen path here so the later ``image_path.stat()`` cannot follow
+        # a replacement into ``Photos Library.photoslibrary`` (or a sibling
+        # excluded bundle) and re-trip the TCC prompt this guard exists to
+        # avoid — or catalog files from a substituted subtree.
+        image_files = []
+        for path in frozen_files:
+            candidate = Path(path)
+            if is_excluded_scan_path(candidate):
+                excluded_frozen += 1
+                continue
+            image_files.append(candidate)
+        if excluded_frozen:
+            log.warning(
+                "Frozen manifest for %s: %d path(s) now resolve into an "
+                "excluded app-managed bundle and were skipped",
+                root, excluded_frozen,
+            )
+    else:
+        image_files = []
 
     # os.walk + onerror, not Path.rglob: rglob silently skips any
     # subdir that raises during enumeration, so a TCC-denied folder
@@ -1815,7 +1870,15 @@ def scan(root, db, progress_callback=None, incremental=False, extract_full_metad
     # ``folder_path/filename`` — re-tripping the macOS TCC prompt this guard
     # exists to avoid.
     effective_restrict_dirs = []
-    if restrict_dirs is not None:
+    if frozen_files is not None:
+        # The manifest already applied the file filters. Retain only the
+        # directory scope used by the later working-copy extraction pass;
+        # do not enumerate those directories a second time.
+        effective_restrict_dirs = [
+            d for d in (restrict_dirs or [])
+            if not is_excluded_scan_path(Path(d))
+        ]
+    elif restrict_dirs is not None:
         # Only enumerate files in the specified directories (non-recursive).
         # root is still used as the folder hierarchy root for _ensure_folder.
         restrict_files_set = set(restrict_files) if restrict_files is not None else None
@@ -1892,8 +1955,14 @@ def scan(root, db, progress_callback=None, incremental=False, extract_full_metad
             # would re-trip the macOS "access data from other apps" TCC
             # prompt for a child like ``LibraryAlias -> Photos
             # Library.photoslibrary`` before prune_scan_dirs could reject it.
+            # Pass cancel_check into safe_scan_walk so it polls between
+            # scandir entries as well: a single very large directory (a
+            # media dump with 1M+ files) can otherwise consume the whole
+            # ``os.scandir`` loop before yielding, leaving the per-yield
+            # ``_check_cancelled()`` below unreachable until the walker
+            # finishes filling its dirs/nondirs lists.
             for dirpath, _dirnames, filenames in safe_scan_walk(
-                str(root_path), onerror=_on_walk_error,
+                str(root_path), onerror=_on_walk_error, cancel_check=cancel_check,
             ):
                 _check_cancelled()
                 for name in filenames:
@@ -1948,11 +2017,16 @@ def scan(root, db, progress_callback=None, incremental=False, extract_full_metad
     image_files.sort()
     _check_cancelled()
 
-    total = len(image_files)
+    # Excluded frozen paths were part of the caller's promised manifest.
+    # Account for them as vanished work so progress still reaches that
+    # frozen denominator and import-in-place surfaces a partial-source
+    # failure instead of silently succeeding on a smaller queue.
+    total = len(image_files) + excluded_frozen
     counts["discovered"] = total
+    counts["vanished"] = excluded_frozen
     log.info("Found %d images in %s", total, root)
     if progress_callback:
-        progress_callback(0, total)
+        progress_callback(excluded_frozen, total)
 
     # Build existing photo lookup for incremental mode
     existing_photos = {}
@@ -2152,7 +2226,7 @@ def scan(root, db, progress_callback=None, incremental=False, extract_full_metad
     # First pass: determine which files need full processing (for incremental mode).
     # Handle XMP-only changes inline; collect files needing metadata extraction.
     files_to_process = []
-    processed_count = 0
+    processed_count = excluded_frozen
     # ``processed_count`` advances for every file the scan *disposes of*,
     # including ones it deliberately skips — that is what a progress bar
     # needs to reach 100%. It is NOT the number of photos indexed, and the

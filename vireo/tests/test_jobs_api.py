@@ -547,6 +547,13 @@ def test_jobs_page_returns_200(app_and_db):
     assert b'data-resume-job' in resp.data
     assert b'data-retry-import-job' in resp.data
     assert b'importRetryBody' in resp.data
+    # Import-in-place's overall counter pauses during discovery/metadata.
+    # The jobs page must not turn that pause into a growing ETA or keep
+    # rendering the previous source's filenames under the new phase.
+    assert b'step.started_at && !importInPlacePhaseActive' in resp.data
+    assert b'isRunning && !importInPlacePhaseActive' in resp.data
+    assert b'delete leafBuffers[step.id]' in resp.data
+    assert b'leafBufferSources[step.id] !== step.source_index' in resp.data
 
 
 def test_navbar_has_jobs_link(app_and_db):
@@ -5913,6 +5920,247 @@ def test_import_in_place_no_destination_required(app_and_db, tmp_path):
     assert [p["id"] for p in photos] == result["photo_ids"]
 
 
+def test_import_in_place_overall_total_is_stable_across_sources(
+    app_and_db, tmp_path,
+):
+    """Overall must not move backward when the next source is discovered.
+
+    Regression: source 1 published 1/1, then source 2 changed the same bar to
+    1/3. Discovery is now a separate phase and every processing event uses the
+    final all-source denominator.
+    """
+    app, _db = app_and_db
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    Image.new("RGB", (16, 16), "red").save(first / "one.jpg")
+    Image.new("RGB", (16, 16), "green").save(second / "two.jpg")
+    Image.new("RGB", (16, 16), "blue").save(second / "three.jpg")
+
+    with app.test_client() as client:
+        resp = client.post("/api/jobs/import-in-place", json={
+            "sources": [str(first), str(second)],
+            "after_import": None,
+        })
+        assert resp.status_code == 200, resp.get_json()
+        job_id = resp.get_json()["job_id"]
+        job = wait_for_job_via_client(client, job_id)
+
+    assert job["status"] == "completed", job
+    assert job["result"]["indexed"] == 3
+    assert job["steps"][0]["source_index"] == 2
+    progress = [
+        event["data"]
+        for event in app._job_runner.get_events(job_id)
+        if event["type"] == "progress"
+    ]
+    discovery = [
+        data for data in progress
+        if data.get("phase_label") == "Discovering sources"
+    ]
+    assert discovery
+    assert discovery[0]["phase_total"] == 2
+    assert discovery[-1]["phase_current"] == 2
+    assert all(data.get("total", 0) == 0 for data in discovery)
+
+    overall = [
+        data for data in progress
+        if data.get("total", 0) > 0
+        and data.get("phase_current") is None
+    ]
+    assert overall
+    assert {data["total"] for data in overall} == {3}
+    currents = [data["current"] for data in overall]
+    assert currents == sorted(currents)
+    assert currents[-1] == 3
+
+
+def test_import_in_place_reports_error_when_source_vanishes_after_discovery(
+    app_and_db, tmp_path,
+):
+    """A source that disappears after its manifest is frozen but before
+    ``scan()`` processes it must surface as a source failure — and the
+    Overall counter must still reach the frozen denominator so the
+    progress bar doesn't stall permanently below its promised total.
+
+    Previously ``scan()`` silently returned zero counts on a vanished
+    root, so nothing was appended to ``root_errors``, no per-source
+    error was reported, and the counter was left short of the frozen
+    total. The import was reported successful on an incomplete set.
+    """
+    import shutil
+
+    import scanner
+
+    app, _db = app_and_db
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    Image.new("RGB", (16, 16), "red").save(first / "one.jpg")
+    Image.new("RGB", (16, 16), "green").save(second / "two.jpg")
+    Image.new("RGB", (16, 16), "blue").save(second / "three.jpg")
+
+    real_scan = scanner.scan
+    removed = {"done": False}
+
+    def scan_removing_second(*args, **kwargs):
+        # After the first source's scan completes but before the second
+        # source's scan runs, unlink the second source. Its manifest was
+        # already frozen during the earlier discovery pass, so the scan
+        # call sees ``root_path.is_dir() == False`` with a non-empty
+        # discovered_files.
+        root = args[0] if args else kwargs.get("root")
+        if not removed["done"] and root == str(first):
+            result = real_scan(*args, **kwargs)
+            shutil.rmtree(second)
+            removed["done"] = True
+            return result
+        return real_scan(*args, **kwargs)
+
+    # ``scan`` is imported inside ``_run_import_in_place`` via ``from
+    # scanner import scan as do_scan`` at job-run time, so patching
+    # scanner.scan is sufficient to intercept it.
+    scanner.scan = scan_removing_second
+    try:
+        with app.test_client() as client:
+            resp = client.post("/api/jobs/import-in-place", json={
+                "sources": [str(first), str(second)],
+                "after_import": None,
+            })
+            assert resp.status_code == 200, resp.get_json()
+            job = wait_for_job_via_client(client, resp.get_json()["job_id"])
+    finally:
+        scanner.scan = real_scan
+
+    # The job terminates as ``failed`` (ok=False propagates from the
+    # scan step's aggregated errors) but the first source's photos still
+    # made it into the catalog — it is a partial import, not a total
+    # abort.
+    assert job["status"] == "failed", job
+    assert removed["done"] is True
+
+    # The second source's disappearance appears in the job's error list
+    # instead of being silently swallowed.
+    errors = list(job.get("errors") or [])
+    result_errors = list((job.get("result") or {}).get("errors") or [])
+    combined = errors + result_errors
+    assert any(str(second) in msg for msg in combined), combined
+
+    # And the overall progress counter still reaches the frozen
+    # denominator (1 file from `first` + 2 from `second` = 3) so the
+    # progress bar is not stuck at 1/3 forever. `current` is monotone
+    # non-decreasing across processing events.
+    progress = [
+        event["data"]
+        for event in app._job_runner.get_events(job["id"])
+        if event["type"] == "progress"
+    ]
+    overall = [
+        data for data in progress
+        if data.get("total", 0) > 0
+        and data.get("phase_current") is None
+    ]
+    assert overall
+    assert {data["total"] for data in overall} == {3}
+    currents = [data["current"] for data in overall]
+    assert currents == sorted(currents)
+    assert currents[-1] == 3, currents
+
+
+def test_import_in_place_reports_error_when_frozen_files_vanish(
+    app_and_db, tmp_path, monkeypatch,
+):
+    """Files promised by a frozen manifest but missing at scan time must
+    surface as a source failure.
+
+    ``scanner.scan`` classifies files that disappear between discovery
+    and processing as ``vanished`` and returns normally. Frozen manifests
+    widen the window in which that race can happen (all sources are
+    discovered up-front and later sources sit for the length of the
+    earlier scans), so a normal-looking success return can hide a
+    partial catalog. Without this guard the import job would report
+    ``completed`` and run its after-import action on the incomplete set.
+    """
+    import scanner
+
+    app, _ = app_and_db
+    source = tmp_path / "flaky-card"
+    source.mkdir()
+    Image.new("RGB", (16, 16), "red").save(source / "keeper.jpg")
+    Image.new("RGB", (16, 16), "green").save(source / "casualty.jpg")
+
+    real_scan = scanner.scan
+
+    def scan_reporting_vanished(*args, **kwargs):
+        counts = kwargs.get("counts")
+        result = real_scan(*args, **kwargs)
+        # Simulate the scanner discovering that one promised file was
+        # missing when it went to stat it. The sink is the same dict the
+        # coordinator inspects after the call, so mutating it here
+        # mirrors what a real vanished-during-scan run would leave
+        # behind.
+        if counts is not None:
+            counts["vanished"] = counts.get("vanished", 0) + 1
+        return result
+
+    monkeypatch.setattr(scanner, "scan", scan_reporting_vanished)
+
+    with app.test_client() as client:
+        resp = client.post("/api/jobs/import-in-place", json={
+            "sources": [str(source)],
+            "after_import": None,
+        })
+        assert resp.status_code == 200, resp.get_json()
+        job = wait_for_job_via_client(client, resp.get_json()["job_id"])
+
+    # ``failed`` propagates from the scan step's aggregated errors — the
+    # first source's kept photo still landed in the catalog, but the
+    # missing promised file is a partial-import signal the user must see.
+    assert job["status"] == "failed", job
+    errors = list(job.get("errors") or [])
+    result_errors = list((job.get("result") or {}).get("errors") or [])
+    combined = errors + result_errors
+    assert any(
+        str(source) in msg and "vanished" in msg for msg in combined
+    ), combined
+
+
+def test_import_in_place_stops_after_interrupted_discovery(
+    app_and_db, tmp_path, monkeypatch,
+):
+    """A transient discovery cancellation cannot feed partial manifests to scan."""
+    import ingest
+    import scanner
+
+    app, _ = app_and_db
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    scan_calls = []
+
+    def interrupt_discovery(*_args, **_kwargs):
+        raise scanner.ScanCancelled("discovery interrupted")
+
+    monkeypatch.setattr(ingest, "discover_source_files", interrupt_discovery)
+    monkeypatch.setattr(
+        scanner,
+        "scan",
+        lambda *_args, **_kwargs: scan_calls.append(True),
+    )
+
+    with app.test_client() as client:
+        resp = client.post("/api/jobs/import-in-place", json={
+            "sources": [str(first), str(second)],
+            "after_import": None,
+        })
+        assert resp.status_code == 200, resp.get_json()
+        job = wait_for_job_via_client(client, resp.get_json()["job_id"])
+
+    assert job["result"]["cancelled"] is True, job
+    assert scan_calls == []
 def test_import_in_place_reports_working_copy_phase(app_and_db, tmp_path, monkeypatch):
     """A completed file scan must not hide ongoing RAW working-copy work."""
     import scanner
@@ -6163,9 +6411,19 @@ def test_import_in_place_rejects_detached_then_remounted_source(
     monkeypatch.setattr(
         pipeline_job, "_unmounted_since_baseline", lambda _baseline: None,
     )
+    # First call is the per-source pre-scan revalidation (must pass so scan
+    # runs and the deferred scope is populated); the subsequent call is the
+    # post-scan revalidation the test is exercising.
+    changed_calls = {"count": 0}
+
+    def fake_changed(identities):
+        changed_calls["count"] += 1
+        if changed_calls["count"] == 1:
+            return None
+        return "/mnt/card" if identities else None
+
     monkeypatch.setattr(
-        pipeline_job, "_changed_mount_since_baseline",
-        lambda identities: "/mnt/card" if identities else None,
+        pipeline_job, "_changed_mount_since_baseline", fake_changed,
     )
     monkeypatch.setattr(
         scanner, "scan",
@@ -6200,7 +6458,11 @@ def test_import_in_place_rejects_replaced_local_source(
     source = tmp_path / "local-source"
     source.mkdir()
     extractor_calls = []
+    # baseline, pre-scan (unchanged so scan runs), post-scan (changed so the
+    # deferred scope is dropped). The test focuses on the post-scan check;
+    # the separate pre-scan check has its own coverage below.
     identities = iter([
+        ("stat", 1, 100),
         ("stat", 1, 100),
         ("stat", 1, 200),
     ])
@@ -6237,6 +6499,174 @@ def test_import_in_place_rejects_replaced_local_source(
 
     assert job["status"] == "completed", job
     assert extractor_calls == []
+
+
+def test_import_in_place_rejects_replaced_source_before_scan(
+    app_and_db, tmp_path, monkeypatch,
+):
+    """A source replaced between discovery and its scan must not be scanned.
+
+    Import-in-place freezes each source's manifest before scanning any of
+    them so the "Overall" denominator is stable. If a removable or network
+    source is detached and replaced at the same path while later sources
+    are still being discovered, ``root_path.is_dir()`` inside scanner.scan
+    would still be True, so the frozen list of common camera filenames
+    (``DCIM/.../IMG_0001.JPG``) would replay against the replacement
+    filesystem and catalog photos from the wrong volume. The per-source
+    mount identity captured at discovery is meant to catch exactly this;
+    it has to be checked immediately before ``do_scan`` runs, not only in
+    the post-scan working-copy revalidation.
+    """
+    import pipeline_job
+    import scanner
+
+    app, _ = app_and_db
+    source = tmp_path / "swapped-source"
+    source.mkdir()
+    scan_calls = []
+    extractor_calls = []
+    # baseline discovery captures identity 100; by the time the per-source
+    # scan is about to start, the same path resolves to a different volume.
+    identities = iter([
+        ("stat", 1, 100),
+        ("stat", 1, 200),
+    ])
+
+    monkeypatch.setattr(
+        pipeline_job, "_load_known_mount_roots", lambda _db: set(),
+    )
+    monkeypatch.setattr(
+        pipeline_job, "_archive_mount_baseline", lambda path, known: {},
+    )
+    monkeypatch.setattr(
+        pipeline_job, "_record_known_mount_roots",
+        lambda _db, _baseline: None,
+    )
+    monkeypatch.setattr(
+        pipeline_job, "_mount_identity", lambda _path: next(identities),
+    )
+
+    def fake_scan(*_args, **_kwargs):
+        scan_calls.append(True)
+        return {"discovered": 0, "indexed": 0}
+
+    monkeypatch.setattr(scanner, "scan", fake_scan)
+    monkeypatch.setattr(
+        scanner, "_extract_working_copies",
+        lambda *args, **kwargs: extractor_calls.append((args, kwargs)),
+    )
+
+    client = app.test_client()
+    resp = client.post("/api/jobs/import-in-place", json={
+        "sources": [str(source)],
+        "after_import": None,
+    })
+    assert resp.status_code == 200, resp.get_json()
+    job = wait_for_job_via_client(client, resp.get_json()["job_id"])
+
+    # A replaced source is a source-level failure, not a silently successful
+    # import against the wrong filesystem.
+    assert job["status"] == "failed", job
+    assert scan_calls == [], "scanner must not run against the replacement"
+    assert extractor_calls == []
+    errors = list(job.get("errors") or [])
+    assert any(
+        "source mount changed since discovery" in err
+        for err in errors
+    ), errors
+
+
+def test_import_in_place_rejects_replaced_nested_directory_before_scan(
+    app_and_db, tmp_path, monkeypatch,
+):
+    """A nested subdirectory replaced between discovery and scan is rejected.
+
+    The source-root identity check only sees the outermost directory's
+    inode, so a nested child dir, mount, or symlink swapped for an ordinary
+    photo subtree with the same name after discovery would slip past it —
+    ``is_excluded_scan_path`` recognizes only app-managed library bundles
+    and cannot see this swap either. Import-in-place must record the
+    identity of every parent directory in the frozen manifest at discovery
+    time and reject the source before ``do_scan`` runs any of them,
+    otherwise the frozen filenames replay against the replacement subtree
+    and catalog photos from the wrong volume.
+    """
+    from pathlib import Path
+
+    import pipeline_job
+    import scanner
+
+    app, _ = app_and_db
+    source = tmp_path / "recursive-source"
+    nested = source / "subdir"
+    nested.mkdir(parents=True)
+    (nested / "IMG_0001.jpg").write_bytes(b"jpeg")
+
+    source_key = str(Path(source))
+    nested_key = str(Path(nested))
+    identity_calls = {source_key: 0, nested_key: 0}
+
+    def changing_identity(path):
+        normalized = str(Path(path))
+        if normalized in identity_calls:
+            identity_calls[normalized] += 1
+        if normalized == nested_key:
+            # Discovery captures identity 100; by pre-scan check the nested
+            # subdir resolves to a different inode (a swap the source-root
+            # check cannot see).
+            return ("stat", 1, 100 if identity_calls[nested_key] == 1 else 200)
+        if normalized == source_key:
+            return ("stat", 1, 42)
+        return ("stat", 1, hash(normalized))
+
+    scan_calls = []
+    extractor_calls = []
+
+    monkeypatch.setattr(
+        pipeline_job, "_load_known_mount_roots", lambda _db: set(),
+    )
+    monkeypatch.setattr(
+        pipeline_job, "_archive_mount_baseline", lambda path, known: {},
+    )
+    monkeypatch.setattr(
+        pipeline_job, "_record_known_mount_roots",
+        lambda _db, _baseline: None,
+    )
+    monkeypatch.setattr(
+        pipeline_job, "_mount_identity", changing_identity,
+    )
+
+    def fake_scan(*_args, **_kwargs):
+        scan_calls.append(True)
+        return {"discovered": 0, "indexed": 0}
+
+    monkeypatch.setattr(scanner, "scan", fake_scan)
+    monkeypatch.setattr(
+        scanner, "_extract_working_copies",
+        lambda *args, **kwargs: extractor_calls.append((args, kwargs)),
+    )
+
+    client = app.test_client()
+    resp = client.post("/api/jobs/import-in-place", json={
+        "sources": [str(source)],
+        "after_import": None,
+    })
+    assert resp.status_code == 200, resp.get_json()
+    job = wait_for_job_via_client(client, resp.get_json()["job_id"])
+
+    assert job["status"] == "failed", job
+    assert scan_calls == [], (
+        "scanner must not run against the replacement subtree"
+    )
+    assert extractor_calls == []
+    errors = list(job.get("errors") or [])
+    assert any(
+        "nested directory changed since discovery" in err
+        for err in errors
+    ), errors
+    # Baseline (discovery) plus revalidation (pre-scan) — exactly two calls
+    # against the swapped subdir prove both sides of the check ran.
+    assert identity_calls[nested_key] == 2, identity_calls
 
 
 def test_import_in_place_snapshot_rejects_replaced_restricted_directory(

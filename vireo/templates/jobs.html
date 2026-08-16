@@ -313,6 +313,7 @@
   var pollTimer = null;
   var sseSource = null;
   var leafBuffers = {};
+  var leafBufferSources = {};
   var LEAF_MAX = 20;
   // Job ids the user has clicked Cancel on but the server hasn't yet
   // moved out of the active list. Tracked here so subsequent renders
@@ -644,6 +645,15 @@
     var isExpanded = isRunning || step.status === 'failed' || (step.status === 'completed' && warningCount > 0);
     if (collapsedSteps[step.id] === true) isExpanded = false;
     if (collapsedSteps[step.id] === false) isExpanded = true;
+    // Import-in-place reuses one scan step across every source. Clear the
+    // prior source's filenames as soon as the backend advances that source
+    // index, even if the step is currently collapsed.
+    if (job.type === 'import-in-place' &&
+        typeof step.source_index === 'number' &&
+        leafBufferSources[step.id] !== step.source_index) {
+      delete leafBuffers[step.id];
+      leafBufferSources[step.id] = step.source_index;
+    }
 
     var html = '<div class="tree-step" data-step-id="' + esc(step.id) + '">';
     html += '<div class="tree-step-header" data-toggle-step="' + esc(step.id) + '">';
@@ -698,8 +708,18 @@
 
     // Expanded content
     if (isExpanded) {
+      // Import-in-place publishes explicit discovery and metadata sub-phases.
+      // Its overall file counter intentionally pauses during those phases, so
+      // extrapolating current / whole-step elapsed produces a fake ETA that
+      // grows while useful work is happening. The phase counter in the card
+      // header is the truthful progress signal until file processing resumes.
+      var importInPlacePhaseActive = job.type === 'import-in-place' &&
+        job.progress && typeof job.progress.phase_current === 'number' &&
+        job.progress.phase_total > 0;
+
       // 8: Throughput + ETA for running steps
-      if (isRunning && step.progress && step.progress.current > 0 && step.started_at) {
+      if (isRunning && step.progress && step.progress.current > 0 &&
+          step.started_at && !importInPlacePhaseActive) {
         if (job.type === 'import') {
           // Import's visible counter advances while a batch is prepared,
           // before its transfer and restricted catalog scan finish. Use the
@@ -779,8 +799,11 @@
         html += '</div>';
       }
 
-      // Leaf buffer (files processed)
-      if (isRunning) {
+      // Leaf buffer (files processed). Hide stale filenames while an in-place
+      // import is in a non-file sub-phase; the current status line above then
+      // stands alone instead of looking like it applies to the previous
+      // source's leaves.
+      if (isRunning && !importInPlacePhaseActive) {
         var leaves = leafBuffers[step.id] || [];
         if (step.current_file) {
           var found = leaves.find(function(l) { return l.name === step.current_file; });
@@ -1003,6 +1026,7 @@
     selectedJobId = jobId;
     selectedSource = source;
     leafBuffers = {};
+    leafBufferSources = {};
     collapsedSteps = {};
     if (sseSource) { sseSource.close(); sseSource = null; }
     if (source === 'active') {

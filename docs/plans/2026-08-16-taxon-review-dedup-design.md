@@ -399,7 +399,8 @@ stay separate cards; two models' views of the same burst merge.
 
 **Payload changes.** Each prediction row gains `taxon_key`, `card_id`,
 `node_id` (the encoded node identity from "Node identity" above — the
-handle the client echoes back when a filter is active), and
+handle the client echoes back: as the mutation target when a filter is
+active, and as the card's frozen membership otherwise, §3 step 1), and
 `display_name` (§4). Rows are *not* collapsed server-side — the client keeps
 all rows (it already receives every group member) and dedups by `card_id`
 instead of `group_id`, so per-model detail remains available for rendering.
@@ -434,10 +435,14 @@ Four corollaries, each binding on one site:
    it to per-node cards and `node_id` handles — see "Filter semantics"
    and "Active-filter detection" below.
 3. **Every server entry point that re-expands a handle takes the same
-   scope and rebuilds its own row set.** That is both
-   `GET /api/predictions/card` ("Card detail endpoint" below) and the
-   accept/reject POST (§3, step 1). Neither may delegate to a route
-   that cannot enforce the scope.
+   scope and the card's frozen membership, and rebuilds its own row
+   set.** That is both `GET /api/predictions/card` ("Card detail
+   endpoint" below) and the accept/reject POST (§3, step 1). Neither may
+   delegate to a route that cannot enforce the scope, and neither may
+   act on more than the membership the card had when it was rendered —
+   "when they clicked" is part of the invariant, so a component that
+   grew between the GET and the click (taxonomy cache resolution, a new
+   classify run) is *found* by the rebuild but not *acted on*.
 4. **A card's status, badge and actions are an aggregate over all its
    members**, never whichever row won the dedup sort — and **an action
    the card offers applies to every one of those members**, whatever
@@ -541,10 +546,9 @@ with no defined rendering.
   mutation deliberately touches only its own node (§3 step 3), so
   resolving two visible sibling nodes in opposite directions under a
   filter and then clearing the filter produces a mixed merged card by
-  design; and (d) undo of an accept restores rows to `alternative` /
-  top-row-`pending` per `(detection, model, fingerprint)` scope
-  (`db.py:18925-18952`), which can leave a component's members
-  disagreeing. Making card actions total (§3 step 3) removes the one
+  design; and (d) undo restores each row's *prior* status (§3, "Undo
+  restores prior status, not `pending`"), and a prior status set can
+  itself be mixed. Making card actions total (§3 step 3) removes the one
   path that the *card* itself created; it does not remove (a)-(d).
 
   **Which tab a `mixed` card appears under.** The status tabs filter
@@ -632,6 +636,16 @@ component containing the anchor within that row set. The group route
 stays for its existing non-merged callers; the card endpoint does not
 build on it.
 
+The endpoint takes the card's frozen membership on the same URL
+(`&nodes=<node_id>,…`) and intersects with it exactly as the mutation
+does (§3 step 1). A detail view is not destructive, but a card that
+opens onto a group the user never saw in it — because the taxonomy
+cache resolved between the grid render and the click — is the same
+"covers more than the user could see" failure one surface earlier, and
+the modal is where the user decides whether to accept. Absent
+`nodes`, the endpoint returns the whole scoped component (the legacy
+shape) and flags `"expanded"` so the client can say so.
+
 `visual` travels on this URL too even though a non-null visual clause
 also trips the client-side fallback (so the endpoint should not be
 reachable while one is active). That is deliberate belt-and-braces: the
@@ -711,25 +725,40 @@ POST the server:
    between the GET and the POST resolves to `taxon:...`, a miss stays
    `name:...`).
 4. Runs the same card-building graph the GET runs and returns the
-   connected component that contains the anchor node. That component
-   is the card the mutation resolves against, filtered by the scope
-   tuple as §3 already specifies.
+   connected component that contains the anchor node, filtered by the
+   scope tuple as §3 already specifies.
+5. **Intersects that component with the frozen membership the POST
+   carried** (`member_node_ids`, §3 step 1). The component is how the
+   server *finds* the card and enumerates each member's rows; the
+   frozen membership is what the card actually *was* when the user
+   clicked. Only their intersection is mutated.
 
-The intended cache-transition sequence is: GET emits `name:blue tit`
-card with anchor `A`, `card_id` = base64url(JSON([`A`])). Background
-resolver populates the cache for "blue tit" → *Cyanistes caeruleus*
-(iNat 13094). User clicks Accept. POST sends `card_id`. Server decodes
-to `A`, computes taxon key from `A`'s rows now — `taxon:13094` — builds
-the graph, finds `A`'s component (which may have grown to include
-groups from another model that already resolved to `taxon:13094`
-directly), and mutates it. No 400, no lost click; the merge just
-*works*, and if the component grew during the transition the user's
-accept correctly resolves the enlarged card. The symmetric case where
-the anchor's own `taxon:`-keyed component *shrank* because a hit made
-it merge with a previously-separate group under a different anchor
-also resolves correctly: the shrunk component still contains `A`, so
-`A`'s component is still findable, and the mutation still names the
-right card.
+The intended cache-transition sequence is: GET emits a `name:blue tit`
+card with anchor `A`, `card_id` = base64url(JSON([`A`])), and
+`member_node_ids` = the nodes that card displayed. Background resolver
+populates the cache for "blue tit" → *Cyanistes caeruleus* (iNat
+13094). User clicks Accept. POST sends `card_id` plus that membership.
+Server decodes to `A`, computes the taxon key from `A`'s rows now —
+`taxon:13094` — builds the graph and finds `A`'s component. No 400 and
+no lost click: that is what recomputing the key buys, and it is the
+whole reason `taxon_key` is not baked into `card_id`.
+
+What the transition must **not** do is grow the click. The new key can
+pull in a group `B` from another model that already resolved to
+`taxon:13094` and therefore rendered as its own separate card at GET
+time. `B` is not in `member_node_ids`, so it is excluded from the
+mutation and reported back as `"expanded": 1`; the user's accept
+resolves exactly the card they clicked, and `B` stays pending and
+visible as its own card until the next Review load merges the two for
+real. Reapplying the filter scope does not substitute for this —
+`B` satisfies the same scope — and neither does any property of the
+anchor: the anchor is an identity, not a membership. Only the frozen
+membership carries "what the card was".
+
+The symmetric shrink case needs nothing extra: if the transition moved
+the component's smallest-member anchor elsewhere, the component still
+contains `A`, so `A`'s card is still findable, and the intersection
+with `member_node_ids` drops any node that left.
 
 The one transition this cannot silently paper over is when the anchor
 node's rows are gone entirely (bucket rewrite, deletion) — that
@@ -932,7 +961,9 @@ and, if grouped, its group siblings — restricted to `pr.classifier_model =
 union**, not just the clicked group's photos:
 
 1. **Resolve the card, with the same filter scope the client rendered.**
-   The mutation POST carries **either** `card_id` (unfiltered view) **or**
+   The mutation POST carries **either** `card_id` (unfiltered view —
+   accompanied by `member_node_ids`, the card's frozen membership,
+   below) **or**
    `node_id` (filtered view — see §2 "Mutation ID from the fallback
    view"), never both, **plus every filter `getVisibleItems` applies**
    on the way from `/api/predictions` rows to what the card actually
@@ -967,13 +998,39 @@ union**, not just the clicked group's photos:
    lookup and cache-transition safety"), re-runs the same
    card-building graph over the same scoped row set the GET used
    under that current taxon key, and returns the component containing
-   the anchor; it then intersects that resolved component with the
-   returned rows so mutation membership can never exceed the displayed
-   membership. Recomputing the taxon key at mutation time is what
+   the anchor. Recomputing the taxon key at mutation time is what
    makes a click safe when the background taxonomy resolver populated
    a hit between the GET and the POST — the anchor is still findable
-   and the (possibly-grown, possibly-shrunk) component still resolves
-   correctly under the new key. For a `node_id` request, the
+   and the component still resolves under the new key.
+
+   **The POST also carries the card's frozen membership**, and the
+   mutation is the *intersection* of the two. Alongside `card_id`,
+   the client sends `member_node_ids` — the `node_id`s of every row
+   the card it clicked was built from, which it already holds because
+   the server stamps `node_id` on every returned row (§2, "Payload
+   changes") and the client keeps all rows rather than collapsing them.
+   The mutated row set is then
+   `resolved component ∩ member_node_ids ∩ scope`. Rebuilding the
+   component is still required — it is how the sibling scan enumerates
+   a member's rows and how a stale-but-narrower request stays safe —
+   but it can only ever *shrink* the frozen membership, never add to
+   it. Without the intersection the cache transition below silently
+   widens the click: if the resolver resolves `name:blue tit` →
+   `taxon:13094` between the GET and the POST, a group `B` that was
+   already `taxon:13094`-keyed rendered as its **own separate card**,
+   and a POST that mutated the newly-merged component would accept or
+   reject `B`'s rows — rows the user could see on screen, but not as
+   part of the card they clicked. That is corollary 1 violated in the
+   time dimension, and the invariant wins: growth discovered at
+   mutation time is **excluded**, not silently absorbed. When the
+   server drops nodes this way it reports the count in the response so
+   the client can tell the user duplicates appeared and offer a reload
+   (`"expanded": 1`), rather than leaving a card that looks resolved
+   next to a duplicate that is not. Membership can only shrink the
+   mutation, so a tampered or replayed `member_node_ids` cannot widen
+   it either — the component and the scope tuple still bound it. For a
+   `node_id` request the frozen membership is that one node by
+   definition and the parameter is redundant. For a `node_id` request, the
    server resolves exactly the named single node under the scope
    tuple, without any component expansion — matching the per-node
    fallback the filtered view rendered. Where the client sends only a
@@ -1026,26 +1083,48 @@ union**, not just the clicked group's photos:
      buttons labelled "Accept all" / "Reject all" (§2, "Client
      changes"), so the reconciliation is stated, not silent.
 
-     *Undo semantics after a reconciling accept.* Undo of
-     `prediction_accept` does not restore each row's *prior* status: it
-     flips every `accepted`/`rejected` row in the touched
+     *Undo restores prior status, not `pending`.* A total accept makes
+     today's undo wrong. `_apply_undo`'s `prediction_accept` branch does
+     not restore what each row was before: it flips every
+     `accepted`/`rejected` row in the touched
      `(detection, classifier_model, labels_fingerprint)` scope to
-     `alternative` and promotes the top-confidence row back to `pending`
-     (`db.py:18925-18952`). So undoing an accept that reconciled a
-     rejected member returns the card to unanimously **pending**, not to
-     its former mixed state. That is the right outcome and worth stating
-     rather than discovering: undo returns the card to "undecided",
-     which is a defined, unanimous, fully actionable state, whereas
-     resurrecting the contradiction would restore a state the user's
-     click existed to eliminate. The one thing it is not is a
-     bit-for-bit inverse, so the history description for a reconciling
-     accept names the count it overrode (e.g. "Accepted 3 predictions
-     (1 previously rejected)"). No change to the undo machinery is
-     needed. `prediction_reject` remains non-undoable
-     (`_NON_UNDOABLE`, `db.py:18756`) — unchanged by this design, and
-     the reason "Reject all" is offered on a `mixed` card at all: it is
-     the only way to revise an accept-vs-reject contradiction from
-     Review.
+     `alternative` and promotes the top-confidence row to `pending`
+     (`db.py:18925-18952`). That was survivable while accept only ever
+     touched pending rows and their alternatives. Once a card action
+     spans members that were already terminal, a blanket reset **erases
+     decisions this action did not make** — undoing the accept of a
+     `{pending, accepted}` card would knock the pre-existing accepted
+     member back to pending, and undoing a reconciling accept would lose
+     the fact that a member had been rejected. Both are the status-axis
+     form of the same sampling error corollary 4 forbids, one step later
+     in time.
+
+     So the accept records **each touched row's prior status** in the
+     `prediction_accept` history item payload (`prediction_id` →
+     `pending` | `accepted` | `rejected` | `alternative`), and undo
+     restores exactly those. The capture point already exists:
+     `_accept_for_photo` records every flip *including status-only
+     no-ops* in `affected` (`db.py:17190-17193`), so the set of rows to
+     snapshot is the set the primitive already walks; what changes is
+     that the payload stores the old status alongside the id and
+     `_apply_undo` replays it row by row instead of resetting a scope.
+     Undo becomes an exact inverse: the pre-existing accepted member
+     stays accepted, a reconciled member returns to `rejected`, the
+     pending member returns to `pending`, and the sibling alternatives
+     the accept demoted (`db.py:17141-17162`) return to `alternative`
+     because that is what the snapshot recorded. Legacy history entries
+     written before this ships carry no snapshot; they keep the existing
+     blanket-reset branch, selected on the payload's shape, so no
+     migration or backfill is needed. The user-visible action
+     description still names what the click overrode (e.g. "Accepted 3
+     predictions (1 previously rejected)"), because the badge on a
+     `mixed` card promised a destructive click and the history should
+     say the same thing.
+
+     `prediction_reject` remains non-undoable (`_NON_UNDOABLE`,
+     `db.py:18756`) — unchanged by this design, and the reason "Reject
+     all" is offered on a `mixed` card at all: it is the only way to
+     revise an accept-vs-reject contradiction from Review.
    - **`node_id` request (filtered view, per-node fallback).** The
      mutation touches **only the named node's own rows** — no cross-model
      sibling scan, no expansion onto other visible nodes, even for a
@@ -1095,16 +1174,22 @@ union**, not just the clicked group's photos:
   reached even though the clicked group only covered photos 1-2. A later
   push that introduces a *new* group after accept fires does not retroactively
   join this card; that new group appears as a fresh pending card on the next
-  Review load, which is the intended behavior.
+  Review load, which is the intended behavior. A group that joins the
+  component *between* the GET and the click is treated the same way —
+  found by the rebuild, excluded by the frozen membership, reported as
+  `"expanded"`, and merged for real on the next load (step 1).
 - **Undo:** `_accept_for_photo` already records every status flip —
   including status-only no-ops — in `affected`, which feeds the
   edit-history/undo machinery. Sibling accepts go through the same
   primitive, so their flips are recorded and undoable for free. The
-  `prediction_accept` history entry therefore restores *every* member row
-  across the component to pending on undo, not just the clicked group's —
-  including a member the accept reconciled out of `rejected`, which
-  returns to `pending` rather than to `rejected` ("Undo semantics after a
-  reconciling accept", step 3).
+  `prediction_accept` history entry therefore covers *every* member row
+  across the component, not just the clicked group's, and restores each
+  one to **the status it held before the click** — pending members to
+  `pending`, a member the accept reconciled out of `rejected` to
+  `rejected`, a member that was already `accepted` to `accepted`, and
+  demoted alternatives to `alternative`. See "Undo restores prior
+  status, not `pending`" in step 3 for why the existing blanket reset
+  cannot survive a total accept and what the payload has to carry.
 
 **Reject.** Mirror logic: rejecting a card rejects all member predictions
 (all models) across the same union photo set and card taxon — including
@@ -1465,13 +1550,25 @@ Each phase lands as its own PR and is independently useful.
    POST that carries the *original* `card_id` resolves to the
    anchor's rows, computes their current taxon key as `taxon:13094`,
    and finds the anchor's component under that key without returning
-   400 — including the sub-case where a previously-separate
-   BioCLIP-2.5 group `B` that already carried `taxon:13094` is now
-   in the same component (the resolved component grew) and the
-   sub-case where the same-taxon merge shifted the component's
-   smallest-member anchor to a different node than `A` (the component
-   still contains `A`, so `A`'s component is still findable and
-   `A`'s `card_id` still resolves); a
+   400 — including the sub-case where the same-taxon merge shifted the
+   component's smallest-member anchor to a different node than `A` (the
+   component still contains `A`, so `A`'s component is still findable
+   and `A`'s `card_id` still resolves); a **frozen-membership fixture**
+   — the same transition, but a previously-separate BioCLIP-2.5 group
+   `B` that already carried `taxon:13094` joins the resolved component
+   between the GET and the POST: the POST's `member_node_ids` does not
+   name `B`, so `B`'s rows stay **pending** (they were their own card on
+   screen), the clicked card's own members all resolve, and the response
+   reports `"expanded": 1`; the negative variant — the same POST with
+   the membership omitted — mutates `B` and fails, which is the
+   regression guard for §2 "Anchor lookup and cache-transition safety"
+   step 5; a **frozen-membership tampering fixture** — a POST naming
+   node ids outside the resolved component or outside the scope tuple
+   mutates nothing extra, since membership can only intersect; a
+   **card-detail frozen-membership fixture** — the same transition
+   against `GET /api/predictions/card?id=…&nodes=…` returns the clicked
+   card's members only, and the `nodes`-omitted call returns the grown
+   component with `"expanded"` set; a
    **cache-transition-anchor-deleted fixture** — the same setup
    but with the anchor's rows deleted between the GET and the POST
    (e.g. a re-run rewrote the bucket) returns 400, the documented
@@ -1613,10 +1710,16 @@ Each phase lands as its own PR and is independently useful.
    rejected member, accepted via `card_id`: **both** end accepted, so
    the mutation cannot itself produce a mixed card, which the
    `pending`-only sibling scan of the earlier revision failed; a
-   **reconciling-accept undo fixture** — undoing that accept returns
-   every member to `pending` (not the previously-rejected member to
-   `rejected`), matching `db.py:18925-18952`, and the history
-   description names the overridden count; a **reconciling-reject
+   **prior-status undo fixture** — undoing the accept of a
+   `{pending, accepted, rejected}` card restores each member to exactly
+   the status it held before the click (pending → `pending`, the
+   reconciled member → `rejected`, the pre-existing accepted member →
+   `accepted`, demoted alternatives → `alternative`), which the current
+   blanket reset (`db.py:18925-18952`) fails on the second and third
+   assertions; a variant replays a **legacy** `prediction_accept` entry
+   with no prior-status payload and asserts it still undoes through the
+   old branch; the history description names the overridden count; a
+   **reconciling-reject
    keyword fixture** — "Reject all" on a card with an accepted member
    flips the status *and* untags that accept's species keyword via an
    undoable `keyword_remove`, while a variant where the photo carries

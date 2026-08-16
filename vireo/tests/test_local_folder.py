@@ -2408,6 +2408,7 @@ def test_local_folder_blocker_endpoint_avoids_source_walk(tmp_path, monkeypatch)
         assert response.get_json() == {
             "blocking_job": None,
             "folder_blocking_jobs": {},
+            "residency_fingerprint": "",
         }
 
     import threading
@@ -2444,6 +2445,7 @@ def test_local_folder_blocker_endpoint_avoids_source_walk(tmp_path, monkeypatch)
                         "status": "running",
                     }
                 },
+                "residency_fingerprint": "",
             }
         finally:
             release.set()
@@ -2460,6 +2462,7 @@ def test_local_folder_blocker_endpoint_avoids_source_walk(tmp_path, monkeypatch)
         assert response.get_json() == {
             "blocking_job": None,
             "folder_blocking_jobs": {},
+            "residency_fingerprint": "",
         }
     # Silence unused-variable warning when folder_id isn't referenced.
     assert folder_id
@@ -2670,3 +2673,86 @@ def test_folder_sync_proceeds_while_observational_job_runs(tmp_path, monkeypatch
         finally:
             release.set()
         wait_for_job_via_client(client, probe_id)
+
+
+def test_local_folder_blocker_fingerprint_tracks_residency_transitions(tmp_path, monkeypatch):
+    """Residency fingerprint changes across stage → active → discard.
+
+    The blocker poller compares the endpoint's payload signature to decide
+    when to run a full ``load()``. A stage/sync/discard fired from another
+    tab that starts *and* finishes between two polls leaves no active job
+    behind: both polls report ``blocking_job: None``. Without residency
+    fingerprint the signatures compare equal and the folder-tree badge
+    keeps its pre-job state. The endpoint has to expose a residency
+    fingerprint that changes across every residency transition so cross-tab
+    short jobs still trip a refresh.
+    """
+    monkeypatch.setenv("HOME", str(tmp_path))
+    from app import create_app
+
+    source = tmp_path / "nas" / "photos"
+    source.mkdir(parents=True)
+    (source / "bird.jpg").write_bytes(b"original")
+    vireo_dir = tmp_path / "vireo"
+    thumbs = vireo_dir / "thumbnails"
+    thumbs.mkdir(parents=True)
+    db_path = str(vireo_dir / "vireo.db")
+
+    db = Database(db_path)
+    workspace_id = db.create_workspace("Owner")
+    folder_id = db.add_folder(str(source), name="photos", link_to_workspace=False)
+    db.add_workspace_folder(workspace_id, folder_id)
+    db.close()
+
+    app = create_app(db_path, thumb_cache_dir=str(thumbs))
+    app.config["TESTING"] = True
+
+    with app.test_client() as client:
+        assert client.post(
+            f"/api/workspaces/{workspace_id}/activate", json={}
+        ).status_code == 200
+
+        remote = client.get(
+            "/api/workspaces/active/local-folders/blocker"
+        ).get_json()
+        assert remote["blocking_job"] is None
+        assert remote["residency_fingerprint"] == ""
+
+        stage = client.post(
+            "/api/workspaces/active/local-folders/stage",
+            json={"folder_ids": [folder_id]},
+        )
+        assert stage.status_code == 202, stage.get_json()
+        assert wait_for_job_via_client(
+            client, stage.get_json()["job_id"]
+        )["status"] == "completed"
+
+        active = client.get(
+            "/api/workspaces/active/local-folders/blocker"
+        ).get_json()
+        assert active["blocking_job"] is None
+        # A new local_folders row makes the fingerprint non-empty, so a
+        # blocker poll landing right after another tab's stage completes
+        # sees a signature change and reruns load(); the folder tree can
+        # transition from REMOTE to LOCAL without waiting for a reload.
+        assert active["residency_fingerprint"] != remote["residency_fingerprint"]
+        assert active["residency_fingerprint"] != ""
+
+        discard = client.post(
+            "/api/workspaces/active/local-folders/discard",
+            json={"folder_ids": [folder_id], "confirm": True},
+        )
+        assert discard.status_code == 202, discard.get_json()
+        assert wait_for_job_via_client(
+            client, discard.get_json()["job_id"]
+        )["status"] == "completed"
+
+        cleared = client.get(
+            "/api/workspaces/active/local-folders/blocker"
+        ).get_json()
+        assert cleared["blocking_job"] is None
+        # Discard removed the row; fingerprint returns to empty, which
+        # still differs from the active-state fingerprint so a poller that
+        # missed the job window still refreshes.
+        assert cleared["residency_fingerprint"] == ""
+        assert cleared["residency_fingerprint"] != active["residency_fingerprint"]

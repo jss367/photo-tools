@@ -156,9 +156,17 @@
 
   function blockerSignature(payload) {
     if (!payload) return '';
+    // ``residency_fingerprint`` is a short server-side digest of the
+    // ``local_folders`` rows visible to this workspace (state, activated_at,
+    // created_at per covering root). Including it here means a
+    // stage/sync/discard started and finished in another tab between two
+    // polls — both of which see no active job — still trips the signature
+    // and re-runs load(), so the folder-tree badge doesn't sit at its
+    // pre-job state until reload.
     return JSON.stringify({
       blocking_job: payload.blocking_job || null,
-      folder_blocking_jobs: payload.folder_blocking_jobs || {}
+      folder_blocking_jobs: payload.folder_blocking_jobs || {},
+      residency_fingerprint: payload.residency_fingerprint || ''
     });
   }
 

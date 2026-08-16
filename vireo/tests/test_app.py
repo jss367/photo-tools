@@ -17602,3 +17602,247 @@ def test_batch_accept_rejects_selection_beyond_photo_cap(app_and_db):
     )
     assert resp.status_code == 400, resp.get_data(as_text=True)
     assert "photos" in resp.get_json().get("error", "").lower()
+
+
+def test_selection_prediction_suggestions_recomputes_ambiguity_after_keyword_edit(
+    app_and_db,
+):
+    """A keyword added AFTER classification must route Browse to Review.
+
+    ``predictions.category`` is a classify-time snapshot — later keyword
+    edits never touch it. Without recomputing per-request, a photo with a
+    pending Zanclus prediction (category='new' when classified) that later
+    gains a conflicting keyword would surface a bare "Accept on 1" button
+    in Browse and silently add a second, disagreeing species. Species
+    names below are deliberately made up so no local taxonomy on the
+    test host can quietly reclassify the relationship.
+    """
+    app, db = app_and_db
+    client = app.test_client()
+    stale_photo, _ = _seed_prediction_photo(
+        db, "stale-cat-a.jpg", "TestZanclusalpha", 0.9,
+    )
+    clean_photo, _ = _seed_prediction_photo(
+        db, "stale-cat-b.jpg", "TestZanclusalpha", 0.85,
+    )
+    # A conflicting species is added AFTER the prediction is recorded —
+    # the stored category stays "new" but the photo now carries a
+    # different species.
+    conflict_kid = db.add_keyword("TestZanclusbeta", is_species=True)
+    db.tag_photo(stale_photo, conflict_kid)
+
+    resp = client.post(
+        "/api/selection/prediction-suggestions",
+        json={"photo_ids": [stale_photo, clean_photo]},
+    )
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+    entry = next(
+        p for p in resp.get_json()["predictions"]
+        if p["species"] == "TestZanclusalpha"
+    )
+    stale_pred = _prediction_id(db, stale_photo, "TestZanclusalpha")
+    clean_pred = _prediction_id(db, clean_photo, "TestZanclusalpha")
+    # The photo whose keyword now conflicts must route to Review, not to
+    # a bare Accept — that's the whole point of the fresh comparison.
+    assert stale_pred in entry["ambiguous_prediction_ids"]
+    assert stale_pred not in entry["acceptable_prediction_ids"]
+    assert stale_photo in entry["ambiguous_photo_ids"]
+    # The unrelated photo without a conflicting keyword still accepts
+    # cleanly — the fresh check must not over-fire onto every row.
+    assert clean_pred in entry["acceptable_prediction_ids"]
+
+
+def test_predictions_api_effective_category_reflects_current_keywords(
+    app_and_db,
+):
+    """/api/predictions returns a fresh effective_category per pending row.
+
+    Browse's single-photo panel uses ``effective_category`` alongside the
+    stored ``category`` in ``predictionIsAmbiguous`` — the stored field is
+    a classify-time snapshot, so a keyword added after classification must
+    still cause the panel to route to Review instead of offering a bare
+    Accept. When there is no keyword conflict, ``effective_category`` is
+    ``new`` and the panel offers Accept as before.
+    """
+    app, db = app_and_db
+    client = app.test_client()
+    conflicted_photo, _ = _seed_prediction_photo(
+        db, "eff-cat-conflict.jpg", "TestZanclusalpha", 0.9,
+    )
+    clean_photo, _ = _seed_prediction_photo(
+        db, "eff-cat-clean.jpg", "TestZanclusalpha", 0.9,
+    )
+    conflict_kid = db.add_keyword("TestZanclusbeta", is_species=True)
+    db.tag_photo(conflicted_photo, conflict_kid)
+
+    conflicted_resp = client.get(
+        f"/api/predictions?photo_ids={conflicted_photo}"
+    )
+    assert conflicted_resp.status_code == 200
+    conflicted_pred = next(
+        p for p in conflicted_resp.get_json()["predictions"]
+        if p["species"] == "TestZanclusalpha"
+    )
+    # Category downgraded from stored ``new`` to fresh ``conflict``
+    # because a conflicting keyword landed on the photo after
+    # classification.
+    assert conflicted_pred["effective_category"] == "conflict"
+    # ``existing_species`` is enriched whenever the effective_category
+    # flags a conflict — the panel needs the keyword name to explain WHY
+    # it's routing this prediction to Review rather than accepting inline.
+    assert "TestZanclusbeta" in conflicted_pred["existing_species"]
+
+    clean_resp = client.get(f"/api/predictions?photo_ids={clean_photo}")
+    assert clean_resp.status_code == 200
+    clean_pred = next(
+        p for p in clean_resp.get_json()["predictions"]
+        if p["species"] == "TestZanclusalpha"
+    )
+    # No conflicting keyword, so the effective category is "new" and the
+    # panel offers Accept normally.
+    assert clean_pred["effective_category"] == "new"
+
+
+def test_batch_accept_dedupes_grouped_prediction_expansion(app_and_db):
+    """Submitting every member of a burst group must not re-expand N times.
+
+    ``accept_prediction`` on a grouped prediction expands to every group
+    member whose photo is in the submitted selection. Before dedup, the
+    batch endpoint called it once per submitted member — each pass re-ran
+    the same status/tag work over every photo in the group and appended a
+    fresh round of no-op ``affected`` entries. A 5-member burst therefore
+    produced 5 + 4·5 = 25 items in the edit-history batch; a large burst
+    could time out and undo would grind through duplicate rows.
+
+    The batch must land as ONE edit with exactly one item per photo — no
+    duplicates — and every submitted prediction row must still end up
+    accepted.
+    """
+    app, db = app_and_db
+    client = app.test_client()
+    folder_id = db.get_folder_tree()[0]["id"]
+
+    def _seed_burst_member(name):
+        photo_id = db.add_photo(
+            folder_id=folder_id, filename=name, extension=".jpg",
+            file_size=100, file_mtime=1.0,
+        )
+        det_id = db.save_detections(
+            photo_id,
+            [{"box": {"x": 0.1, "y": 0.1, "w": 0.5, "h": 0.5},
+              "confidence": 0.9, "category": "animal"}],
+            detector_model="MDV6",
+        )[0]
+        db.add_prediction(
+            det_id, "Bald Eagle", 0.9, "bioclip",
+            group_id="dedup-burst-1", labels_fingerprint="fp1",
+        )
+        return photo_id
+
+    photos = [_seed_burst_member(f"dedup-{i}.jpg") for i in range(5)]
+    pred_ids = [_prediction_id(db, pid, "Bald Eagle") for pid in photos]
+
+    resp = client.post(
+        "/api/predictions/batch-accept",
+        json={"prediction_ids": pred_ids},
+    )
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+
+    accept_rows = [
+        row for row in db.get_edit_history()
+        if row["action_type"] == "prediction_accept"
+    ]
+    assert len(accept_rows) == 1
+    # One item per submitted photo — not N × N. Duplicates would inflate
+    # this count to 25 for a 5-member burst.
+    assert accept_rows[0]["item_count"] == 5
+    items = db.conn.execute(
+        "SELECT photo_id FROM edit_history_items WHERE edit_id = ?",
+        (accept_rows[0]["id"],),
+    ).fetchall()
+    photo_ids_in_edit = [row["photo_id"] for row in items]
+    assert sorted(photo_ids_in_edit) == sorted(photos)
+
+    # Every submitted prediction row must still end up accepted — dedup
+    # only skips re-expanding the same group, it does not silently drop
+    # any prediction from being marked accepted.
+    for pid in photos:
+        names = {k["name"] for k in db.get_photo_keywords(pid)}
+        assert "Bald Eagle" in names
+    remaining = [
+        row for row in db.get_predictions(photo_ids=photos, status="pending")
+        if row["species"] == "Bald Eagle"
+    ]
+    assert remaining == []
+
+
+def test_batch_accept_dedup_still_rejects_skipped_detection_alternatives(
+    app_and_db,
+):
+    """Deduping the accept loop must not leave a skipped detection's
+    alternatives pending.
+
+    Each grouped burst member has its own detection, and each detection
+    can carry its own alternative predictions. ``accept_prediction`` only
+    rejects sibling alternatives scoped to the representative's detection,
+    so a naive dedup would leave the skipped members' alternatives
+    ``pending``/``alternative`` in Review even though the parent
+    predictions were accepted via the representative's group expansion.
+    """
+    app, db = app_and_db
+    client = app.test_client()
+    folder_id = db.get_folder_tree()[0]["id"]
+
+    def _seed_grouped_with_alternative(name):
+        photo_id = db.add_photo(
+            folder_id=folder_id, filename=name, extension=".jpg",
+            file_size=100, file_mtime=1.0,
+        )
+        det_id = db.save_detections(
+            photo_id,
+            [{"box": {"x": 0.1, "y": 0.1, "w": 0.5, "h": 0.5},
+              "confidence": 0.9, "category": "animal"}],
+            detector_model="MDV6",
+        )[0]
+        db.add_prediction(
+            det_id, "Bald Eagle", 0.7, "bioclip",
+            group_id="dedup-alt-burst", labels_fingerprint="fp1",
+        )
+        db.add_prediction(
+            det_id, "Golden Eagle", 0.3, "bioclip",
+            status="alternative", labels_fingerprint="fp1",
+        )
+        return photo_id, det_id
+
+    a_photo, a_det = _seed_grouped_with_alternative("alt-a.jpg")
+    b_photo, b_det = _seed_grouped_with_alternative("alt-b.jpg")
+    pred_ids = [
+        _prediction_id(db, a_photo, "Bald Eagle"),
+        _prediction_id(db, b_photo, "Bald Eagle"),
+    ]
+
+    resp = client.post(
+        "/api/predictions/batch-accept",
+        json={"prediction_ids": pred_ids},
+    )
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+
+    # Every submitted detection's alternative row must end up rejected —
+    # the representative's accept path only rejects siblings scoped to its
+    # own detection, so a skipped detection's alternative would otherwise
+    # linger. Read the workspace-scoped status directly to bypass status
+    # filters in the higher-level helpers.
+    def _alternative_status(det_id):
+        row = db.conn.execute(
+            """SELECT COALESCE(pr_rev.status, 'pending') AS status
+               FROM predictions pr
+               LEFT JOIN prediction_review pr_rev
+                 ON pr_rev.prediction_id = pr.id
+                AND pr_rev.workspace_id = ?
+               WHERE pr.detection_id = ? AND pr.species = ?""",
+            (db._ws_id(), det_id, "Golden Eagle"),
+        ).fetchone()
+        return row["status"] if row else None
+
+    assert _alternative_status(a_det) == "rejected"
+    assert _alternative_status(b_det) == "rejected"

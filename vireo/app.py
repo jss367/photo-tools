@@ -10063,6 +10063,72 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         except (TypeError, ValueError):
             return species
 
+    def _current_species_by_photo(db, photo_ids):
+        """Return ``{photo_id: [species_keyword_name, ...]}`` for photos in scope.
+
+        Only species-rank rows are returned (linked-taxon species or unlinked
+        rows flagged ``is_species``), matching what ``accept_prediction``
+        replaces when it strips old tags. Used to recompute a pending
+        prediction's ambiguity against the *current* keywords on the photo —
+        ``predictions.category`` is only stamped at classify-time and never
+        refreshed, so a keyword added after classification leaves the stored
+        category stale and Browse would offer a bare Accept for a now-
+        conflicting prediction.
+        """
+        by_photo = {}
+        if not photo_ids:
+            return by_photo
+        for chunk in _chunked(list(photo_ids)):
+            placeholders = ",".join("?" for _ in chunk)
+            for row in db.conn.execute(
+                f"""SELECT pk.photo_id, k.name
+                    FROM photo_keywords pk
+                    JOIN keywords k ON k.id = pk.keyword_id
+                    LEFT JOIN taxa t ON t.id = k.taxon_id
+                    WHERE pk.photo_id IN ({placeholders})
+                      AND (k.is_species = 1 OR k.type = 'taxonomy')
+                      AND (t.rank = 'species' OR t.rank IS NULL)""",
+                tuple(chunk),
+            ).fetchall():
+                by_photo.setdefault(row["photo_id"], []).append(row["name"])
+        return by_photo
+
+    def _load_prediction_taxonomy():
+        """Best-effort taxonomy load for prediction/keyword comparison.
+
+        ``compare_prediction_to_keywords`` accepts ``None`` and degrades to
+        exact-text comparison, which is enough to catch the Robin/Sparrow
+        case in the finding — a missing or corrupt taxonomy file must never
+        cause the endpoint to hard-fail.
+        """
+        try:
+            from taxonomy import load_local_taxonomy
+            return load_local_taxonomy()
+        except Exception:
+            return None
+
+    def _prediction_effective_category(species, existing_species, taxonomy):
+        """Recomputed disposition for a pending prediction against current keywords.
+
+        Returns one of ``match``/``new``/``refinement``/``broader``/``conflict``
+        from ``compare_prediction_to_keywords``. Callers treat
+        ``refinement``/``broader``/``conflict`` as ambiguous — the same set
+        Browse's ``predictionIsAmbiguous`` refuses to offer a bare Accept
+        for. ``existing_species`` may include duplicates or empty strings;
+        the compare helper de-dupes at the taxon level.
+        """
+        if not species:
+            return None
+        from compare import compare_prediction_to_keywords
+        result = compare_prediction_to_keywords(
+            species, list(existing_species or []), taxonomy,
+        )
+        return result.get("category") if isinstance(result, dict) else None
+
+    _EFFECTIVE_AMBIGUOUS_CATEGORIES = frozenset(
+        {"refinement", "broader", "conflict"}
+    )
+
     def _parse_selection_photo_ids(body):
         """Validate a selection payload's ``photo_ids``.
 
@@ -10139,6 +10205,15 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             (row["detection_id"], row["model"])
             for row in db.get_predictions(photo_ids=photo_ids, status="alternative")
         }
+        # ``predictions.category`` is a snapshot from classification time —
+        # keyword edits made afterwards never touch it, so a prediction
+        # categorized ``new`` when classified may now conflict with a
+        # species keyword the user added later. Recompute the disposition
+        # against the *current* species keywords per photo so Browse routes
+        # those conflicts to Review instead of offering a bare Accept that
+        # silently adds a second, disagreeing species.
+        current_species_by_photo = _current_species_by_photo(db, photo_ids)
+        _taxonomy = _load_prediction_taxonomy()
 
         order = {pid: i for i, pid in enumerate(photo_ids)}
         by_key = {}
@@ -10161,9 +10236,15 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             })
             entry["models"].add(row["model"])
             entry["confidences"].append(row["confidence"] or 0.0)
+            effective_category = _prediction_effective_category(
+                species,
+                current_species_by_photo.get(row["photo_id"], []),
+                _taxonomy,
+            )
             ambiguous = (
                 (row["detection_id"], row["model"]) in alt_keys
                 or row["category"] in ("disagreement", "refinement")
+                or effective_category in _EFFECTIVE_AMBIGUOUS_CATEGORIES
             )
             # One photo can hold several detections of the same species, or
             # the same detection classified by several models. Keep every
@@ -16028,17 +16109,44 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         recipes_by_photo = db.get_photo_edit_recipes({
             p.get("photo_id") for p in pred_dicts if p.get("photo_id") is not None
         })
+        # Same recomputation as the selection aggregator: the stored
+        # ``category`` is a classify-time snapshot, so a keyword added
+        # after classification leaves it stale. Compare each pending
+        # prediction against the CURRENT species keywords on its photo and
+        # expose the fresh disposition as ``effective_category`` so
+        # Browse's single-photo panel can route now-conflicting predictions
+        # to Review instead of offering a bare Accept.
+        pending_photo_ids = {
+            d.get("photo_id") for d in pred_dicts
+            if d.get("status") != "alternative" and d.get("photo_id") is not None
+        }
+        current_species_by_photo = _current_species_by_photo(
+            db, pending_photo_ids,
+        )
+        _taxonomy = (
+            _load_prediction_taxonomy() if pending_photo_ids else None
+        )
         for d in pred_dicts:
             if d.get("status") == "alternative":
                 continue  # alternatives are nested, not top-level
             d["edit_recipe"] = recipes_by_photo.get(d.get("photo_id"))
-            if d.get("category") in ("disagreement", "refinement"):
+            existing_species_for_photo = current_species_by_photo.get(
+                d.get("photo_id"), [],
+            )
+            effective_category = _prediction_effective_category(
+                d.get("species"), existing_species_for_photo, _taxonomy,
+            )
+            d["effective_category"] = effective_category
+            needs_existing = (
+                d.get("category") in ("disagreement", "refinement")
+                or effective_category in _EFFECTIVE_AMBIGUOUS_CATEGORIES
+            )
+            if needs_existing:
                 keywords = db.get_photo_keywords(d["photo_id"])
-                existing_species = [
+                d["existing_species"] = [
                     k["name"] for k in keywords
                     if db.is_keyword_species(k["id"])
                 ]
-                d["existing_species"] = existing_species
             # Attach alternatives
             key = (d.get("detection_id"), d.get("model"))
             d["alternatives"] = alts_by_key.get(key, [])
@@ -16456,11 +16564,36 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             )
         pred_ids = [pid for pid in pred_ids if pid not in already_accepted]
 
+        # Deduplicate submitted grouped predictions before the accept loop.
+        # ``accept_prediction`` on a grouped prediction expands to every
+        # group member whose photo is in ``photo_ids``, so submitting N
+        # burst-group members re-runs the same status/tag work N times per
+        # group and appends N-1 rounds of no-op ``affected`` entries per
+        # photo. Keep one representative per ``(group_id, model)``;
+        # non-representative grouped predictions still need their
+        # per-detection sibling alternatives rejected below because the
+        # representative's ``accept_prediction`` only rejects siblings
+        # scoped to its own detection.
+        representative_ids = []
+        skipped_grouped_ids = []
+        seen_group_keys = set()
+        for pid in pred_ids:
+            meta = pred_meta.get(pid)
+            if meta is None or meta.get("group_id") is None:
+                representative_ids.append(pid)
+                continue
+            key = (meta["group_id"], meta["model"])
+            if key in seen_group_keys:
+                skipped_grouped_ids.append(pid)
+                continue
+            seen_group_keys.add(key)
+            representative_ids.append(pid)
+
         items = []
         keyword_id = None
         species = None
         try:
-            for pid in pred_ids:
+            for pid in representative_ids:
                 meta = pred_meta[pid]
                 if meta["group_id"] is None:
                     bucket = ("_solo", pid)
@@ -16498,6 +16631,52 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                         "old_value": old_value,
                         "new_value": str(keyword_id),
                     })
+            # ``accept_prediction`` only rejects sibling alternatives for
+            # the representative's own ``detection_id``. For every skipped
+            # grouped prediction that shared a group with a representative,
+            # still reject its per-detection sibling alternatives so
+            # submitted detections' alternatives resolve identically to the
+            # pre-dedup behavior — otherwise a skipped detection's
+            # alternative row stays ``pending``/``alternative`` in Review
+            # even though its parent prediction was accepted via the
+            # representative's group expansion. ``_parse_prediction_ids``
+            # returns just (photo_id, group_id, model), so look up the
+            # detection / fingerprint the sibling query needs here — only
+            # for the skipped subset, which is usually small.
+            if skipped_grouped_ids:
+                for chunk in _chunked(skipped_grouped_ids):
+                    placeholders = ",".join("?" for _ in chunk)
+                    sibling_metas = db.conn.execute(
+                        f"""SELECT pr.id,
+                                   pr.detection_id,
+                                   pr.classifier_model AS model,
+                                   pr.labels_fingerprint
+                            FROM predictions pr
+                            WHERE pr.id IN ({placeholders})""",
+                        tuple(chunk),
+                    ).fetchall()
+                    for meta in sibling_metas:
+                        db.conn.execute(
+                            """INSERT INTO prediction_review
+                                 (prediction_id, workspace_id,
+                                  status, reviewed_at)
+                               SELECT pr.id, ?, 'rejected', datetime('now')
+                               FROM predictions pr
+                               LEFT JOIN prediction_review pr_rev
+                                 ON pr_rev.prediction_id = pr.id
+                                AND pr_rev.workspace_id = ?
+                               WHERE pr.detection_id = ?
+                                 AND pr.classifier_model = ?
+                                 AND pr.labels_fingerprint = ?
+                                 AND pr.id != ?
+                                 AND COALESCE(pr_rev.status, 'pending')
+                                     IN ('pending', 'alternative')
+                               ON CONFLICT(prediction_id, workspace_id)
+                               DO UPDATE SET status = 'rejected',
+                                             reviewed_at = datetime('now')""",
+                            (ws, ws, meta["detection_id"], meta["model"],
+                             meta["labels_fingerprint"], meta["id"]),
+                        )
             db.conn.commit()
         except Exception:
             db.conn.rollback()

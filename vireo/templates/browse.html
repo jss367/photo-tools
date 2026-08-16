@@ -6262,11 +6262,20 @@ async function renderBrowseCompare() {
    fuller UI stays visible but routes there instead of offering an Accept
    this panel cannot honestly carry out. */
 
+// `effective_category` is the server's fresh comparison of this prediction
+// against the CURRENT species keywords on the photo. `category` is only the
+// classify-time snapshot, so a Robin keyword added AFTER a Sparrow prediction
+// leaves the stored category unchanged; without the effective check Browse
+// would offer a bare Accept that silently adds the conflicting species.
 function predictionIsAmbiguous(p) {
+  var eff = p.effective_category;
   return !!(
     (p.alternatives && p.alternatives.length) ||
     p.category === 'disagreement' ||
-    p.category === 'refinement'
+    p.category === 'refinement' ||
+    eff === 'conflict' ||
+    eff === 'refinement' ||
+    eff === 'broader'
   );
 }
 
@@ -6277,10 +6286,16 @@ function predictionAmbiguityReason(p) {
     reasons.push(altCount + (altCount === 1 ? ' alternative' : ' alternatives'));
   }
   var existing = (p.existing_species || []).join(', ');
-  if (p.category === 'disagreement') {
+  var eff = p.effective_category;
+  var isConflict = p.category === 'disagreement' || eff === 'conflict';
+  var isRefinement = p.category === 'refinement' || eff === 'refinement';
+  var isBroader = eff === 'broader';
+  if (isConflict) {
     reasons.push(existing ? 'conflicts with keyworded ' + existing : 'conflicts with existing keywords');
-  } else if (p.category === 'refinement') {
+  } else if (isRefinement) {
     reasons.push(existing ? 'refines keyworded ' + existing : 'refines an existing keyword');
+  } else if (isBroader) {
+    reasons.push(existing ? 'broader than keyworded ' + existing : 'broader than an existing keyword');
   }
   return reasons.join(' · ');
 }

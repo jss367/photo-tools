@@ -68,11 +68,16 @@ building in `/api/predictions`, (3) taxon-keyed cross-model accept/reject,
 New helper (in `taxonomy.py`, usable from both `app.py` and `db.py`):
 
 ```python
-def taxon_key_for(species, scientific_name, tax):
-    """Return a canonical merge key for a prediction.
+def taxon_key_for(label, scientific_names, tax):
+    """Return a canonical merge key for a *label*, not for one row.
 
     ('taxon', taxon_id)      when the label resolves in the taxonomy
     ('name', folded_string)  fallback — merges only identical labels
+
+    ``label`` is a folded species key; ``scientific_names`` is the set of
+    distinct non-NULL scientific names carried by that label's rows. See
+    "One key per label, not per row" below for why the second argument is
+    a set and not a row's column.
     """
 ```
 
@@ -80,7 +85,9 @@ Resolution ladder:
 
 1. `predictions.scientific_name` → `Taxonomy.lookup()` (the `_by_scientific`
    index). This column is populated at classify time from the label set's own
-   taxonomy metadata, so it is the most reliable signal when present.
+   taxonomy metadata, so it is the most reliable signal when present. It is
+   also the only rung that reads a *per-row* column, which is why it is the
+   one the canonicalization rule below has to constrain.
 2. `predictions.species` → `Taxonomy.lookup()` (common name, scientific name,
    punctuation-normalized common name).
 3. `predictions.species` → **cached** `Taxonomy.api_lookup` result only —
@@ -128,6 +135,86 @@ Rules:
 - Rank is respected implicitly: genus and species resolve to different
   `taxon_id`s, so they never merge.
 
+**One key per label, not per row.** Steps 2–4 are pure functions of the
+label: any two rows spelling the same species get the same answer out of
+them. Step 1 is not. `predictions.scientific_name` is a per-row column,
+and two rows carrying the *same* label can disagree on it — not as a
+corner case, but as the ordinary consequence of it being the strongest
+rung:
+
+- Step 1 reads what the **classifier's own label metadata** supplied at
+  write time (`item["taxonomy"]`, `classify_job.py:1313, 1327`), which is
+  a different information source from the read-time `Taxonomy` that steps
+  2–3 consult. Step 1 hitting while step 2 misses *is* the
+  alternate-common-name case this design exists to merge.
+- Stored rows are never refreshed. The non-`reclassify` reuse path
+  re-injects cached rows with `"taxonomy": None` (`classify_job.py:1577,
+  1709, 2468`) and `_store_pending_detection_prediction` returns early
+  for them after updating only group metadata
+  (`classify_job.py:2061-2099`); `add_prediction`'s `INSERT OR IGNORE`
+  (`db.py:15862`) could not have rewritten the columns anyway. A row's
+  `scientific_name` is whatever the run that *first* inserted it could
+  see.
+- What a run could see varies between runs. `load_local_taxonomy`
+  returns `None` when no taxonomy file is installed
+  (`taxonomy.py:739-758`) and `get_hierarchy` returns `{}` for a label
+  the file does not carry (`taxonomy.py:968-987`), in which case
+  `add_prediction` stores `scientific_name = NULL`
+  (`db.py:15867-15883`). Installing or updating `taxonomy.json` between
+  two runs changes the value stored for new rows and leaves old rows
+  alone — and does not change `labels_fingerprint`, which hashes the
+  label strings and nothing else (`labels_fingerprint.py:15-23`), so the
+  divergent rows stay in the same bucket.
+
+So one burst — the ordinary cached-plus-new burst of §2 — can hold a row
+that keys `taxon:13094` off its stored scientific name next to a row that
+keys `name:eurasian blue tit` off the identical label. The merge graph
+requires exactly one key per node, so a per-row ladder cannot be the
+input to it.
+
+The key is therefore resolved **per label, over the request's row set,
+before the graph is built**:
+
+1. Group the request's rows by folded species key `L` (the same
+   `_species_match_key` the node key's fourth element uses). Steps 2–3
+   run on one canonical spelling of `L` — the lexicographically smallest
+   distinct `_folded_species_key` spelling among those rows — so two
+   frames that differ only by apostrophe or case cannot reach
+   `Taxonomy.lookup` as two different strings.
+2. Collect `S(L)`, the distinct non-`NULL` folded `scientific_name`
+   values on those rows, and resolve each through `Taxonomy.lookup`. If
+   one or more resolve and they all resolve to the **same** `taxon_id`,
+   step 1 yields `('taxon', that_id)` for every row labelled `L`.
+3. If two elements of `S(L)` resolve to **different** `taxon_id`s, that
+   is a genuine conflict — a taxonomic split or lump recorded at two
+   different write times — and step 1 is skipped entirely for `L`. The
+   ladder continues at step 2, which is label-only and therefore
+   single-valued. No tie-break and no arbitrary winner: choosing one of
+   two real taxa by lexical order is exactly the guessing the rules above
+   forbid, and skipping the rung degrades to today's behavior (merge only
+   identical labels) rather than to a wrong merge.
+
+The invariant this buys is stronger than "one key per node", and it is
+what the rest of the design leans on:
+
+> The taxon key is a function of the folded species label and of the
+> request's rows for that label — never of an individual row.
+
+One key per label implies one key per node, because the node key contains
+the label (§2, "Node identity"), and therefore one key per card
+component. It also closes the same divergence *across* nodes, which a
+node-local canonicalization would not: two models' views of one burst,
+one carrying stored scientific names and one not, resolve alike and
+therefore still merge — the motivating case of the whole design.
+
+`S(L)` is read off rows the request already has in hand, so it costs no
+extra query, and the mutation path recomputes it over the same scoped row
+set before rebuilding the graph (§2, "Anchor lookup and cache-transition
+safety", step 3). A GET and its POST therefore cannot disagree about a
+card's key for any reason other than a taxonomy-cache transition — which
+that section already handles, and which the frozen membership already
+bounds.
+
 **No schema change to `predictions`.** The key is computed at read time
 from the in-memory taxonomy dict (O(1) per row) plus the cached iNat lookup
 table. The background resolver's negative cache is stored in the existing
@@ -149,7 +236,11 @@ available, and where the accept path needs the same key anyway.
 `api_predictions` (app.py:15278) computes for each returned prediction:
 
 - `taxon_key` — from §1, serialized as e.g. `"taxon:13094"` or
-  `"name:blue tit"`.
+  `"name:blue tit"`. Stamped on every row, but *resolved* once per
+  folded label over the whole returned row set (§1, "One key per label,
+  not per row") before any graph work begins — so two rows sharing a
+  label always carry byte-identical `taxon_key`s, whatever their
+  individual `scientific_name` columns say.
 - `card_id` — the merge unit, computed as follows.
 
 **Merge rule.** Build a graph whose nodes are burst groups plus singleton
@@ -296,6 +387,25 @@ construction**, and always yields exactly one node no matter how many
 species-string variants (casing, apostrophes) its individual frames
 spell. That is the property the capture-time rule claimed and did not
 actually have.
+
+*What unanimity does and does not guarantee.* `group_reviewable` and the
+node key's fourth element are the **same function** — `_species_match_key`
+— so node identity and the write-time unanimity test agree exactly, and
+have since round 2. But both are keyed on the species *label*, and
+neither says anything about `predictions.scientific_name`, which is a
+per-row column the reuse path never refreshes. A unanimous burst can
+therefore still hold rows whose stored scientific names disagree, and
+§1's ladder reads that column at its first rung. One taxon key per node
+is consequently **not** a property of the node key at all — it is
+delivered by §1's "One key per label, not per row", which resolves the
+key from the label plus the request's rows for that label and so returns
+the same answer for every row of a node by construction. Everywhere below
+that asserts a node has one taxon key is citing that rule, not this one.
+
+Splitting the bucket a fifth way — on the stored `scientific_name` — was
+considered and rejected; it would shatter exactly the cached-plus-new
+burst that is the common path, and the shards could never re-merge (see
+"Alternatives considered").
 
 On the legacy surface, this separates two pre-Phase-0 bursts that
 collided on `f"g{job_id[-6:]}-{group_count:04d}"` whenever they are
@@ -702,8 +812,10 @@ prefixed the id with the card's `taxon_key` "so distinct taxa cannot
 collide". That prefix is redundant, because a node belongs to at most
 one component per Review payload: the merge graph builds components on
 `(same taxon_key, overlapping photos)` and a node has exactly one
-`taxon_key` at a given time, so no two distinct-taxon components can
-share the same anchor node. Worse, embedding `taxon_key` made the id
+`taxon_key` at a given time — by §1's per-label resolution, which returns
+one key for every row sharing a label and so cannot hand two keys to one
+node — so no two distinct-taxon components can share the same anchor
+node. Worse, embedding `taxon_key` made the id
 brittle across taxonomy-cache transitions: §1's background resolver
 opportunistically enqueues any `name:`-fallback label the GET emits,
 and the resolver can persist a hit *between* the GET that stamped a
@@ -729,13 +841,20 @@ POST the server:
    whose rows have all been deleted or a bucket a re-run rewrote
    returns 400 — the same stale-handle response the design already
    specifies elsewhere.
-3. Computes the taxon key for that anchor node's rows *now* using §1's
-   `taxon_key_for` (which reads the current cache — a hit that landed
-   between the GET and the POST resolves to `taxon:...`, a miss stays
-   `name:...`).
-4. Runs the same card-building graph the GET runs and returns the
-   connected component that contains the anchor node, filtered by the
-   scope tuple as §3 already specifies.
+3. Rebuilds the scoped candidate row set (the scope tuple as §3
+   specifies), then computes taxon keys over it *now* using §1's
+   per-label resolution — `S(L)` gathered from that same row set, the
+   current cache read once, a hit that landed between the GET and the
+   POST resolving to `taxon:...` and a miss staying `name:...`. The
+   order matters and is load-bearing: canonicalization is a property of
+   a row *set*, so the set has to exist before any key does. Computing a
+   key from the anchor node's rows alone would reintroduce exactly the
+   per-row divergence §1 removes, one scope narrower.
+4. Runs the same card-building graph the GET runs over those rows and
+   returns the connected component that contains the anchor node. GET
+   and POST therefore canonicalize over the same scoped set and cannot
+   disagree about a key except through a cache transition, which step 5
+   bounds.
 5. **Intersects that component with the frozen membership the POST
    carried** (`member_prediction_ids`, §3 step 1), and bounds the
    sibling scan by the same set (§3 step 3). The component is how the
@@ -1005,12 +1124,13 @@ union**, not just the clicked group's photos:
    carried `rules` would re-expose it because `rules` does not
    subsume the visual clause. All three are excluded from the resolved
    component by forwarding the same predicates. For a `card_id`
-   request, the server decodes to the anchor node key, computes the
-   anchor's *current* taxon key from its stored rows (§2, "Anchor
-   lookup and cache-transition safety"), re-runs the same
-   card-building graph over the same scoped row set the GET used
-   under that current taxon key, and returns the component containing
-   the anchor. Recomputing the taxon key at mutation time is what
+   request, the server decodes to the anchor node key, rebuilds the same
+   scoped row set the GET used, computes *current* taxon keys over that
+   set with §1's per-label resolution — the anchor's key falls out of it
+   like every other row's; it is never derived from the anchor node's
+   rows alone (§2, "Anchor lookup and cache-transition safety") —
+   re-runs the same card-building graph under those keys, and returns
+   the component containing the anchor. Recomputing the taxon key at mutation time is what
    makes a click safe when the background taxonomy resolver populated
    a hit between the GET and the POST — the anchor is still findable
    and the component still resolves under the new key.
@@ -1510,9 +1630,17 @@ chips ("iNat21: Blue Tit · BioCLIP-2.5: Eurasian Blue Tit"). Unresolved
 
 **Keyword written on accept** — precedence. The precedence below is
 applied **inside `_accept_for_photo` / `accept_prediction`, keyed on
-the taxon of the row being accepted** (`taxon_key_for(row.species,
-row.scientific_name, tax)` from §1) — *not* keyed on the calling
-card. That placement is load-bearing rather than incidental:
+the taxon of the row being accepted** — *not* keyed on the calling card.
+The key comes from §1's per-label resolution, run once over the row set
+the call is already iterating (Review: the card's members plus the
+sibling scan's rows; Compare: the agreeing detection rows on the photo)
+and then looked up by each row's folded label. Resolving row-by-row
+would reintroduce §1's divergence at the write surface, which is where
+it does the most damage: two rows of one label whose stored
+`scientific_name` differs would canonicalize to two different keywords
+and write both onto the same photo — the exact duplicate-synonym bug
+this section exists to prevent. That placement is load-bearing rather
+than incidental:
 
 - It is the only level at which both call sites are covered. Review's
   sibling pass has a card; **Compare's `accept_subject_species` does
@@ -1524,8 +1652,9 @@ card. That placement is load-bearing rather than incidental:
   change, and leaves Compare's detection-scoped semantics untouched.
 - It makes the property *per row*, so it holds no matter how many
   times the loop runs or in what order: every agreeing row resolves
-  through the same taxon to the same keyword, so the loop is
-  idempotent on the keyword set by construction. Neither loop needs a
+  through the same taxon to the same keyword — guaranteed rather than
+  hoped for, since the resolution is per label over the loop's own row
+  set — so the loop is idempotent on the keyword set by construction. Neither loop needs a
   "tag once, then only flip sibling statuses" special case — which
   would otherwise be a second, separately-testable code path in each
   caller.
@@ -1587,6 +1716,14 @@ caeruleus*") on the Keywords page with a one-click merge.
   merge only on identical strings — behavior unchanged from today.
 - **Taxonomy not loaded / offline:** every key degrades to `name:`;
   Review behaves exactly as it does today. Deterministic, no errors.
+- **Mixed-provenance `scientific_name` within one label** (a burst
+  half-composed of cached rows written before `taxonomy.json` was
+  installed): the label resolves once, from the union of its rows'
+  scientific names, so the stale-`NULL` rows inherit the resolved key
+  instead of splitting off as `name:` (§1, "One key per label"). Two
+  scientific names that resolve to *different* taxa are treated as a
+  conflict, not a vote: the rung is skipped and the label falls through
+  to the label-only ladder.
 - **Alternatives** (`status="alternative"` rows): not review cards; excluded
   from card building and untouched by sibling resolution. They are
   therefore never card *members* either, which is what keeps the card
@@ -1630,6 +1767,33 @@ caeruleus*") on the Keywords page with a one-click merge.
 - **Merge only on identical photo membership** (the naive rule): silently
   fails whenever the models' groups differ by one frame, which is common;
   the feature would appear broken. Rejected in favor of overlap components.
+- **A fifth node-key component to force one taxon per node.** Two shapes,
+  both rejected. (a) *The resolved taxon key.* It is not a function of
+  immutable row columns — it moves when the taxonomy cache moves — so it
+  would undo the one property §2 "Node identity" exists to establish, and
+  every `node_id` the client holds would stop decoding across exactly the
+  background-resolver transition the anchor design was built to survive
+  ("Why the anchor alone"). (b) *The stored `scientific_name`.* That one
+  *is* immutable per row, and it is still wrong: it splits the ordinary
+  cached-plus-new burst — half the rows written before `taxonomy.json`
+  landed, half after — into two nodes, and those shards can never
+  re-merge, because every `predictions` row carries exactly one
+  `photo_id` (`db.py:865-883`) and a burst holds one row per photo, so
+  two shards of one burst are photo-disjoint and the same-taxon *plus*
+  overlapping-photos edge has nothing to join them on. That is the
+  over-splitting regression §2 rejects, arriving on the common path.
+  Canonicalizing the key (§1) instead of partitioning the node keeps
+  identity immutable and the burst whole.
+- **Resolve the taxon key at write time and freeze it** (an additive
+  `predictions.taxon_id` stamped by `add_prediction`): it does not solve
+  the divergence, it makes it permanent. The whole problem is that what a
+  run could resolve depends on when it ran; freezing the answer per row
+  pins a row written while `taxonomy.json` was absent to `name:` forever,
+  where a read-time key heals as soon as the taxonomy or the lookup cache
+  improves. It also needs the schema change §1 defers and cannot apply
+  retroactively to existing rows without a backfill, against the "works
+  on existing prediction rows with no destructive migration" goal.
+  Rejected.
 
 ## Implementation phases
 
@@ -1654,11 +1818,40 @@ Each phase lands as its own PR and is independently useful.
    `_folded_species_key`, the review-endpoint dedup path) accept the
    longer string unchanged (opaque). No schema change; no read-side
    change; safe to land ahead of the merge feature.
+
+   Same phase, same file, same "stop generating the mess" character:
+   **backfill a `NULL` `scientific_name` on the reuse path.** The
+   `_existing` branch of `_store_pending_detection_prediction`
+   (`classify_job.py:2061-2099`) currently returns after updating group
+   metadata, so a row inserted when the taxonomy could not resolve its
+   label keeps `scientific_name = NULL` through every later run that
+   *can* resolve it. Add one `UPDATE` there, guarded two ways: only when
+   the current run has a hierarchy for the label, and only when the
+   stored value **is `NULL`**. Never overwrite a non-`NULL` value — a
+   taxonomy revision that remaps a name is a decision, not a repair, and
+   silently rewriting stored classifier output would be the transparency
+   violation the "normalize labels at store time" alternative was
+   rejected for. This does not replace §1's per-label resolution (rows no
+   run revisits are never repaired, and the read path must be correct on
+   its own); it shrinks the divergent population instead of letting it
+   accumulate. Test: a row stored with `NULL` under a taxonomy-less run,
+   re-seen by a run whose taxonomy resolves the label, ends up populated;
+   a row whose stored scientific name disagrees with the current
+   taxonomy is left untouched.
 1. **Taxon key helper** (`taxonomy.py`) + unit tests: scientific-name hit,
    common-name hit, normalized hit, alternate-name via **pre-seeded lookup
    cache** (no live HTTP in the test path), unresolvable fallback,
    NULL handling, rank separation. Also: `cached_api_lookup` returns
-   `None` on miss and never opens a socket.
+   `None` on miss and never opens a socket. Per-label resolution (§1,
+   "One key per label") gets its own unit tests, since the helper now
+   takes a label and a *set*: a label whose rows carry one scientific
+   name plus several `NULL`s resolves off the populated one; two
+   scientific names resolving to the same `taxon_id` resolve to it; two
+   resolving to **different** `taxon_id`s skip the rung and fall through
+   to the label ladder rather than picking a winner; the canonical
+   spelling fed to `Taxonomy.lookup` is the same for `Say's Phoebe`,
+   `Say’s Phoebe` and `Say's phoebe`; and the function is
+   order-independent — shuffling the input rows cannot change the key.
 2. **Background taxonomy resolver** (`jobs.py::resolve_taxonomy_labels`):
    drains the enqueued-labels queue, persists hits and misses (with
    exponential-then-daily retry on misses), single-flight. Tests use a
@@ -1729,7 +1922,21 @@ Each phase lands as its own PR and is independently useful.
    `add_prediction`'s `INSERT OR IGNORE`) and half freshly inferred
    rows, all assigned one `group_id` by
    `_store_grouped_predictions`. Assert it resolves as **one** node
-   and one card; a
+   and one card; a **mixed-provenance taxon-key fixture** — the same
+   cached-plus-new burst, but now the halves disagree on
+   `predictions.scientific_name`: the cached rows carry `NULL` (stored
+   under a run with no taxonomy file) and the fresh rows carry
+   `Cyanistes caeruleus`, under a label (`Eurasian Blue Tit`) that the
+   local taxonomy's common-name index does **not** resolve, so the
+   ladder's rung 1 fires for one half and rung 4 for the other. Assert
+   every row of the burst gets the **same** `taxon_key`, the burst is
+   one node and one card, and the other model's group over the same
+   photos — all `NULL` scientific names — merges into it rather than
+   rendering separately. A per-row ladder yields `taxon:13094` and
+   `name:eurasian blue tit` inside one node and fails on the first
+   assertion; a second variant where the two stored scientific names
+   resolve to *different* taxon ids asserts the whole label falls back
+   to the label-only ladder, one key, no arbitrary winner; a
    **normal-burst-not-split fixture** — an ordinary
    single-job burst of eight rows on eight distinct photos resolves as
    *one* node, not eight (the regression the "photo-connectivity"

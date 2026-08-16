@@ -1198,9 +1198,12 @@ def test_browse_photo_id_deep_link_loads_target_after_first_folder_page(live_ser
     assert visible_range is not None
     assert int(visible_range.group(1)) >= (initial_page - 1) * paging["perPage"] + 1
     page.locator("#loadPreviousPhotosButton").click()
-    page.wait_for_function("photos.length > %d" % len(initial_ids), timeout=5000)
-    assert page.evaluate("earliestPage") > 0
-    assert page.evaluate("photos.map(function(p) { return p.id; })")[-len(initial_ids):] == initial_ids
+    page.wait_for_function("earliestPage === 1 && browseDatasetReady", timeout=5000)
+    restarted_ids = page.evaluate("photos.map(function(p) { return p.id; })")
+    assert restarted_ids
+    assert restarted_ids != initial_ids
+    assert len(restarted_ids) == len(set(restarted_ids))
+    assert target_queries[-1]["page"] == 1
 
 
 def test_browse_lightbox_arrows_preserve_one_to_one_zoom(live_server, page):

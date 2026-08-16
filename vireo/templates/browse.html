@@ -1721,7 +1721,7 @@ body.sidebar-resizing {
 
     <!-- Grid -->
     <div class="grid-container" id="gridContainer">
-      <button id="loadPreviousPhotosButton" onclick="loadPreviousPhotos()" style="display:none;position:sticky;top:8px;z-index:5;margin:8px auto;padding:7px 14px;border:1px solid var(--border-subtle);border-radius:4px;background:var(--bg-secondary);color:var(--text-secondary);cursor:pointer;">Load earlier photos</button>
+      <button id="loadPreviousPhotosButton" onclick="loadPreviousPhotos()" style="display:none;position:sticky;top:8px;z-index:5;margin:8px auto;padding:7px 14px;border:1px solid var(--border-subtle);border-radius:4px;background:var(--bg-secondary);color:var(--text-secondary);cursor:pointer;">Browse from beginning</button>
       <div class="grid" id="grid"></div>
       <div class="scroll-sentinel" id="scrollSentinel"></div>
       <div class="empty-state" id="emptyState" style="display:none;">No photos match the current filters.</div>
@@ -2043,7 +2043,6 @@ var perPage = 50;
 var loading = false;
 var allLoaded = false;
 var earliestPage = 1;
-var loadingPreviousPhotos = false;
 // True only after an authoritative response has initialized the grid, even
 // when that response contains zero photos. Health events can arrive while
 // bootstrap or a deep link is still pending; an "unaffected scope" is only
@@ -4970,7 +4969,6 @@ async function resetAndLoad(options) {
   currentPage = 1;
   allLoaded = false;
   earliestPage = 1;
-  loadingPreviousPhotos = false;
   updatePreviousPhotosButton();
   var resetLoadEpoch = ++loadEpoch;
   selectAllRequestSeq++;
@@ -5068,69 +5066,22 @@ function updatePreviousPhotosButton() {
   var btn = document.getElementById('loadPreviousPhotosButton');
   if (!btn) return;
   btn.style.display = earliestPage > 1 ? 'block' : 'none';
-  btn.disabled = loadingPreviousPhotos;
-  btn.textContent = loadingPreviousPhotos ? 'Loading earlier photos...' : 'Load earlier photos';
 }
 
 async function loadPreviousPhotos() {
-  if (loading || loadingPreviousPhotos || earliestPage <= 1) return false;
-  loadingPreviousPhotos = true;
+  if (loading || earliestPage <= 1) return false;
+  // Do not prepend an offset page read from a newer database snapshot to the
+  // focused page. Ingestion/deletion between those requests can overlap or
+  // skip the boundary. Restarting at page 1 hands control back to the normal
+  // contiguous lazy loader while keeping this user-requested transition
+  // bounded to one configured-size page.
+  earliestPage = 1;
   updatePreviousPhotosButton();
-  var epoch = loadEpoch;
-  var requestedPage = earliestPage - 1;
-  var body = {
-    rules: getBrowseRules() || [],
-    sort: document.getElementById('sortSelect').value,
-    page: requestedPage,
-    per_page: perPage,
-  };
-  if (activeFolderId) body.folder_id = activeFolderId;
-  if (activeCollectionId && dashboardCollectionScope) {
-    body.collection_id = activeCollectionId;
-  }
-
-  try {
-    var data = await safeFetch('/api/photos/query', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    });
-    if (epoch !== loadEpoch) return false;
-    var previousPhotos = data.photos || [];
-    if (!previousPhotos.length) {
-      earliestPage = 1;
-      return true;
-    }
-
-    var container = document.getElementById('gridContainer');
-    var oldHeight = container.scrollHeight;
-    photos = previousPhotos.concat(photos);
-    earliestPage = requestedPage;
-    if (selectedIndex >= 0) selectedIndex += previousPhotos.length;
-    renderGrid();
-    container.scrollTop += container.scrollHeight - oldHeight;
-    updateFilterSummary();
-
-    var refreshIds = previousPhotos.map(function(p) { return p.id; });
-    loadInatStatus(refreshIds).then(function() {
-      if (epoch === loadEpoch) refreshGridCards(refreshIds);
-    });
-    fetchColorLabels(refreshIds).then(function() {
-      if (epoch === loadEpoch) refreshGridCards(refreshIds);
-    });
-    return true;
-  } catch (e) {
-    return false;
-  } finally {
-    if (epoch === loadEpoch) {
-      loadingPreviousPhotos = false;
-      updatePreviousPhotosButton();
-    }
-  }
+  return resetAndLoad();
 }
 
 async function loadPhotos(options) {
-  if (loading || loadingPreviousPhotos) return null;
+  if (loading) return null;
   if (allLoaded) return true;
   loading = true;
   var epoch = loadEpoch;
@@ -9602,7 +9553,6 @@ async function _runPhotoDeepLink(photoId) {
     currentPage = 1;
     allLoaded = false;
     earliestPage = 1;
-    loadingPreviousPhotos = false;
     updatePreviousPhotosButton();
     // Same hazard as filterByCollection: leaving selectedPhotos populated
     // across a dataset switch leaves the batch bar armed against stale ids.

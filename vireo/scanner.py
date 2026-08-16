@@ -9,6 +9,7 @@ import logging
 import multiprocessing
 import os
 import sys
+import time
 from collections import defaultdict, deque
 from concurrent.futures import ProcessPoolExecutor, TimeoutError
 from datetime import datetime
@@ -2405,6 +2406,14 @@ def scan(root, db, progress_callback=None, incremental=False, extract_full_metad
             zip(files_to_process, paths_to_extract, strict=True),
         )
         while remaining:
+            # A standalone caller may provide a non-parking cancel probe.
+            # Do not repeatedly claim permits and construct a process pool
+            # while its independent pause probe remains true.
+            if _pause_pending():
+                _check_cancelled()
+                if _pause_pending():
+                    time.sleep(0.05)
+                continue
             with _claim_worker_count(
                 [ip for ip, _ in remaining], cancel_check=_check_cancelled,
             ) as workers:

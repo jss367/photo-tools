@@ -117,6 +117,26 @@ def test_cpu_reserve_applies_across_concurrent_flexible_claims():
     assert not thread.is_alive()
 
 
+def test_cpu_reserve_does_not_double_count_existing_inference_claim():
+    """Scanner throughput must not depend on which claimant arrives first."""
+    ledger = ResourceLedger(cpu_capacity=12)
+    inference_request = ResourceRequest(
+        cpu=CpuRequest(8, 8, 8),
+        lanes=("cpu_ml",),
+    )
+    scan_request = ResourceRequest(
+        cpu=CpuRequest(1, 8, 8),
+        cpu_reserve=8,
+        label="scanner hashing",
+    )
+
+    with ledger.acquire(inference_request) as inference:
+        assert inference.cpu_permits == 8
+        with ledger.acquire(scan_request) as scan:
+            assert scan.cpu_permits == 4
+            assert ledger.snapshot()["cpu"]["allocated"] == 12
+
+
 def test_owner_wait_timing_uses_injected_clock():
     now = [10.0]
     ledger = ResourceLedger(cpu_capacity=1, clock=lambda: now[0])

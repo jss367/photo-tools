@@ -1599,10 +1599,10 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
             # each pipeline participant explicitly so scanner/model waits are
             # attributed to the parent job's diagnostics, and so ledger waits
             # (including CPU inference on the ``cpu_ml`` lane) wake promptly
-            # on cancellation instead of blocking until the current holder
-            # releases.
+            # on cancellation or park promptly on pause instead of blocking
+            # until the current holder releases.
             with bind_resource_owner(job["id"]), bind_resource_cancel_check(
-                _cancellation_requested,
+                _pause_checkpoint,
             ):
                 _pause_checkpoint()
                 return work_fn()
@@ -7284,6 +7284,38 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                         "total": em_total_candidates,
                         "subthreshold": photos_subthreshold_only,
                     }
+            except ResourceWaitCancelled:
+                # A cancelled resource wait is a cooperative stage cancel,
+                # not a mask-processing failure. Mirror the normal abort
+                # finalizer above because this exception exits the per-photo
+                # loop before that branch is reached.
+                abort.set()
+                stages["extract_masks"]["status"] = "completed"
+                runner.update_step(
+                    job["id"], "extract_masks", status="completed",
+                    progress={"current": processed, "total": total},
+                    summary=(
+                        f"Cancelled ({processed} of {total} processed)"
+                        if total else "Cancelled"
+                    ),
+                    error_count=(
+                        em_failed + em_unreadable
+                        + em_preflight_unreadable
+                    ),
+                )
+                result["stages"]["extract_masks"] = {
+                    "masked": masked + em_preflight_masked,
+                    "skipped": skipped,
+                    "failed": em_failed,
+                    "unreadable": (
+                        em_unreadable + em_preflight_unreadable
+                    ),
+                    "total": (
+                        total + em_preflight_unreadable
+                        + em_preflight_masked
+                    ),
+                    "cancelled": True,
+                }
             except Exception as e:
                 errors.append(f"[extract_masks] Fatal: {e}")
                 log.exception("Pipeline extract-masks stage failed")

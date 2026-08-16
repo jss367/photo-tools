@@ -3044,16 +3044,19 @@ def test_scanner_reserves_capacity_for_exact_inference_claim(monkeypatch):
     monkeypatch.setattr(cfg, "get", lambda _k: 16)
     monkeypatch.setattr(scanner.os, "cpu_count", lambda: 16)
     ledger = resource_ledger.ResourceLedger(cpu_capacity=12)
+    inference_threads = resource_ledger.cpu_inference_request(
+        ledger.cpu_capacity,
+    ).preferred
     previous = resource_ledger._set_resource_ledger_for_tests(ledger)
     try:
         with scanner._claim_worker_count(list(range(100))) as workers:
-            assert workers == 4
+            assert workers == ledger.cpu_capacity - inference_threads
             with ledger.acquire(resource_ledger.ResourceRequest(
                 cpu=resource_ledger.cpu_inference_request(ledger.cpu_capacity),
                 lanes=("cpu_ml",),
             )) as inference:
-                assert inference.cpu_permits == 8
-                assert ledger.snapshot()["cpu"]["allocated"] == 12
+                assert inference.cpu_permits == inference_threads
+                assert ledger.snapshot()["cpu"]["allocated"] == ledger.cpu_capacity
     finally:
         resource_ledger._set_resource_ledger_for_tests(previous)
 
@@ -3239,6 +3242,68 @@ def test_scan_releases_cpu_permits_while_paused(tmp_path, monkeypatch):
     assert {os.path.basename(p["filename"]) for p in photos} == {
         "a.jpg", "b.jpg", "c.jpg",
     }
+
+
+def test_scan_does_not_construct_worker_pool_while_pause_remains_pending(
+    tmp_path, monkeypatch,
+):
+    """A non-parking pause probe must back off before claiming workers."""
+    import threading
+
+    import resource_ledger
+    import scanner
+    from db import Database
+
+    root = str(tmp_path / "photos")
+    filenames = [f"{letter}.jpg" for letter in "abcdefghi"]
+    _create_test_images(root, {'': filenames})
+    db = Database(str(tmp_path / "test.db"))
+    pause_active = threading.Event()
+    pause_active.set()
+    pool_pause_states = []
+
+    class ReadyFuture:
+        def __init__(self, function, path):
+            self.function = function
+            self.path = path
+
+        def result(self, timeout=None):
+            return self.function(self.path)
+
+    class FakeProcessPool:
+        def __init__(self, *args, **kwargs):
+            pool_pause_states.append(pause_active.is_set())
+            self._processes = {}
+
+        def submit(self, function, path):
+            return ReadyFuture(function, path)
+
+        def shutdown(self, wait=True, cancel_futures=False):
+            return None
+
+    def clear_pause():
+        time.sleep(0.12)
+        pause_active.clear()
+
+    monkeypatch.setattr(scanner, "ProcessPoolExecutor", FakeProcessPool)
+    ledger = resource_ledger.ResourceLedger(cpu_capacity=2)
+    previous = resource_ledger._set_resource_ledger_for_tests(ledger)
+    resume_thread = threading.Thread(target=clear_pause)
+    resume_thread.start()
+    try:
+        scanner.scan(
+            root,
+            db,
+            cancel_check=lambda: False,
+            pause_check=pause_active.is_set,
+        )
+    finally:
+        resume_thread.join(timeout=2.0)
+        resource_ledger._set_resource_ledger_for_tests(previous)
+
+    assert pool_pause_states == [False]
+    photos = db.get_photos(per_page=100)
+    assert {os.path.basename(photo["filename"]) for photo in photos} == set(filenames)
 
 
 def test_scan_pause_check_none_preserves_existing_behavior(tmp_path):

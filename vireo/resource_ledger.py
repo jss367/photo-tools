@@ -175,12 +175,15 @@ def resolve_resource_cancel_check(cancel_check=None):
 class ResourceLease:
     """An idempotently releasable allocation returned by ``ResourceLedger``."""
 
-    def __init__(self, ledger, *, cpu_permits, lanes, wait_seconds, label):
+    def __init__(
+        self, ledger, *, cpu_permits, lanes, wait_seconds, label, cpu_reserve,
+    ):
         self._ledger = ledger
         self.cpu_permits = cpu_permits
         self.lanes = lanes
         self.wait_seconds = wait_seconds
         self.label = label
+        self.cpu_reserve = cpu_reserve
         self._released = False
 
     def __enter__(self):
@@ -216,6 +219,12 @@ class ResourceLedger:
             name: int(capacity) for name, capacity in lane_capacities.items()
         }
         self._cpu_allocated = 0
+        # Flexible requests with ``cpu_reserve`` form one shared allocation
+        # class. Track their permits separately so ordinary CPU holders that
+        # already consume the reserved slice (for example, inference that
+        # acquired first) do not cause the reserve to be subtracted twice.
+        self._reserved_cpu_allocated = 0
+        self._active_cpu_reserves = []
         self._lane_allocated = {name: 0 for name in self._lane_capacities}
         self._condition = threading.Condition(threading.Lock())
         self._clock = clock or time.monotonic
@@ -256,7 +265,13 @@ class ResourceLedger:
         return self.cpu_capacity - self._cpu_allocated
 
     def _grantable_cpu(self, request):
-        return max(0, self._available_cpu() - request.cpu_reserve)
+        available = self._available_cpu()
+        if not request.cpu_reserve:
+            return available
+        reserve = max([request.cpu_reserve, *self._active_cpu_reserves])
+        unreserved_allocated = self._cpu_allocated - self._reserved_cpu_allocated
+        reserve_shortfall = max(0, reserve - unreserved_allocated)
+        return max(0, available - reserve_shortfall)
 
     def _can_grant(self, request):
         if request.cpu is not None and self._grantable_cpu(request) < request.cpu.minimum:
@@ -357,6 +372,9 @@ class ResourceLedger:
                     if request.cpu is not None:
                         cpu_permits = min(request.cpu.preferred, available)
                         self._cpu_allocated += cpu_permits
+                        if request.cpu_reserve:
+                            self._reserved_cpu_allocated += cpu_permits
+                            self._active_cpu_reserves.append(request.cpu_reserve)
                     for lane in request.lanes:
                         self._lane_allocated[lane] += 1
 
@@ -371,6 +389,7 @@ class ResourceLedger:
                         lanes=request.lanes,
                         wait_seconds=wait_seconds,
                         label=request.label,
+                        cpu_reserve=request.cpu_reserve,
                     )
 
                 if wait_started is None:
@@ -388,6 +407,9 @@ class ResourceLedger:
     def _release(self, lease):
         with self._condition:
             self._cpu_allocated -= lease.cpu_permits
+            if lease.cpu_reserve:
+                self._reserved_cpu_allocated -= lease.cpu_permits
+                self._active_cpu_reserves.remove(lease.cpu_reserve)
             for lane in lease.lanes:
                 self._lane_allocated[lane] -= 1
             self._condition.notify_all()

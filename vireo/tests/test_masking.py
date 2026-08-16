@@ -729,7 +729,7 @@ def test_ensure_sam2_weights_rejects_unknown_variant():
         masking.ensure_sam2_weights("sam2-jumbo")
 
 
-def test_generate_mask_reraises_resource_wait_cancelled():
+def test_generate_mask_reraises_resource_wait_cancelled(monkeypatch):
     """Cancellation while waiting for the CPU inference lease must escape
     ``generate_mask``'s catch-all so the extract-masks loop stops instead
     of marking every remaining photo as a mask failure.
@@ -752,37 +752,32 @@ def test_generate_mask_reraises_resource_wait_cancelled():
     mock_dec = MagicMock()
     mock_enc.get_inputs.return_value = [MagicMock(name="image")]
 
-    masking._encoder_session = mock_enc
-    masking._decoder_session = mock_dec
-    masking._sam2_variant_loaded = "sam2-small"
+    monkeypatch.setattr(masking, "_encoder_session", mock_enc)
+    monkeypatch.setattr(masking, "_decoder_session", mock_dec)
+    monkeypatch.setattr(masking, "_sam2_variant_loaded", "sam2-small")
 
-    try:
-        img = Image.new("RGB", (150, 100))
-        detection_box = {"x": 0.2, "y": 0.2, "w": 0.4, "h": 0.4}
+    img = Image.new("RGB", (150, 100))
+    detection_box = {"x": 0.2, "y": 0.2, "w": 0.4, "h": 0.4}
 
-        def raise_cancelled(_session):
-            raise ResourceWaitCancelled(
-                "Cancelled while waiting for cpu inference resources",
+    def raise_cancelled(_session):
+        raise ResourceWaitCancelled(
+            "Cancelled while waiting for cpu inference resources",
+        )
+
+    # Patch the exact symbol ``generate_mask`` uses inside its
+    # function body (imported locally via ``from pipeline_locks
+    # import acquire_inference_resources``).
+    with patch(
+        "pipeline_locks.acquire_inference_resources",
+        side_effect=raise_cancelled,
+    ):
+        with pytest.raises(ResourceWaitCancelled):
+            masking.generate_mask(
+                img, detection_box, variant="sam2-small",
             )
 
-        # Patch the exact symbol ``generate_mask`` uses inside its
-        # function body (imported locally via ``from pipeline_locks
-        # import acquire_inference_resources``).
-        with patch(
-            "pipeline_locks.acquire_inference_resources",
-            side_effect=raise_cancelled,
-        ):
-            with pytest.raises(ResourceWaitCancelled):
-                masking.generate_mask(
-                    img, detection_box, variant="sam2-small",
-                )
-    finally:
-        masking._encoder_session = None
-        masking._decoder_session = None
-        masking._sam2_variant_loaded = None
 
-
-def test_generate_mask_still_swallows_ordinary_inference_failures():
+def test_generate_mask_still_swallows_ordinary_inference_failures(monkeypatch):
     """The broad ``except Exception`` catch is retained for genuine
     mask-generation failures (torn NumPy shape, decoder blew up, etc.):
     the extract-masks loop keeps going and marks that one photo skipped.
@@ -797,19 +792,14 @@ def test_generate_mask_still_swallows_ordinary_inference_failures():
     mock_enc.get_inputs.return_value = [MagicMock(name="image")]
     mock_enc.run.side_effect = RuntimeError("simulated ONNX crash")
 
-    masking._encoder_session = mock_enc
-    masking._decoder_session = mock_dec
-    masking._sam2_variant_loaded = "sam2-small"
+    monkeypatch.setattr(masking, "_encoder_session", mock_enc)
+    monkeypatch.setattr(masking, "_decoder_session", mock_dec)
+    monkeypatch.setattr(masking, "_sam2_variant_loaded", "sam2-small")
 
-    try:
-        img = Image.new("RGB", (150, 100))
-        detection_box = {"x": 0.2, "y": 0.2, "w": 0.4, "h": 0.4}
+    img = Image.new("RGB", (150, 100))
+    detection_box = {"x": 0.2, "y": 0.2, "w": 0.4, "h": 0.4}
 
-        result = masking.generate_mask(
-            img, detection_box, variant="sam2-small",
-        )
-        assert result is None
-    finally:
-        masking._encoder_session = None
-        masking._decoder_session = None
-        masking._sam2_variant_loaded = None
+    result = masking.generate_mask(
+        img, detection_box, variant="sam2-small",
+    )
+    assert result is None

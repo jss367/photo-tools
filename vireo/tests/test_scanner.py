@@ -3058,6 +3058,85 @@ def test_scanner_reserves_capacity_for_exact_inference_claim(monkeypatch):
         resource_ledger._set_resource_ledger_for_tests(previous)
 
 
+def test_concurrent_scanners_preserve_inference_reserve(monkeypatch):
+    """The scanner path wires ``cpu_reserve`` so two scans can't drain it.
+
+    Codex flagged that ``_claim_worker_count`` capping each grant at
+    ``capacity - inference_threads`` per request left two concurrent
+    scanners free to collectively consume the reserve — a 12-permit box
+    could dish out 4+4 permits to two scans, leaving only 4 for an
+    8-permit ONNX request and pushing text search past its 5-second
+    budget. Guards the wiring in ``_claim_worker_count`` itself so a
+    future refactor cannot silently drop ``cpu_reserve``.
+    """
+    import threading
+
+    import config as cfg
+    import resource_ledger
+    import scanner
+
+    monkeypatch.setattr(cfg, "get", lambda _k: 16)
+    monkeypatch.setattr(scanner.os, "cpu_count", lambda: 16)
+    ledger = resource_ledger.ResourceLedger(cpu_capacity=12)
+    previous = resource_ledger._set_resource_ledger_for_tests(ledger)
+    try:
+        first_ready = threading.Event()
+        release_first = threading.Event()
+        second_ready = threading.Event()
+        errors = []
+
+        def first_scanner():
+            try:
+                with scanner._claim_worker_count(list(range(100))):
+                    first_ready.set()
+                    assert release_first.wait(timeout=5.0)
+            except BaseException as exc:  # pragma: no cover - diagnostic
+                errors.append(exc)
+
+        def second_scanner():
+            try:
+                assert first_ready.wait(timeout=5.0)
+                second_ready.set()
+                # Would block until the first scanner releases; we don't
+                # care about the eventual grant, only that it doesn't
+                # steal from the reserve while the first still holds it.
+                with scanner._claim_worker_count(list(range(100))):
+                    pass
+            except BaseException as exc:  # pragma: no cover - diagnostic
+                errors.append(exc)
+
+        t1 = threading.Thread(target=first_scanner)
+        t2 = threading.Thread(target=second_scanner)
+        t1.start()
+        t2.start()
+        try:
+            assert first_ready.wait(timeout=5.0)
+            assert second_ready.wait(timeout=5.0)
+            # Give the second scanner a moment to reach its acquire and
+            # block on the exhausted reserve slice.
+            time.sleep(0.1)
+
+            snapshot = ledger.snapshot()
+            # Aggregate scanner-hashing allocation must fit inside the
+            # reserve, so an 8-permit inference request can still get
+            # in immediately.
+            assert snapshot["cpu"]["allocated"] <= 4
+
+            with ledger.acquire(resource_ledger.ResourceRequest(
+                cpu=resource_ledger.cpu_inference_request(ledger.cpu_capacity),
+                lanes=("cpu_ml",),
+            )) as inference:
+                assert inference.cpu_permits == 8
+        finally:
+            release_first.set()
+            t1.join(timeout=5.0)
+            t2.join(timeout=5.0)
+
+        assert not errors, errors
+    finally:
+        resource_ledger._set_resource_ledger_for_tests(previous)
+
+
 def test_scan_releases_cpu_permits_while_paused(tmp_path, monkeypatch):
     """When ``pause_check`` reports a pending pause during hashing, the
     scanner must drop its CPU lease before parking at ``cancel_check``.

@@ -165,6 +165,56 @@ def detect_physical_core_count():
     return None
 
 
+def _cgroup_cpu_quota_cpus():
+    """Return the effective CPU count from the cgroup CFS quota, or ``None``.
+
+    Docker ``--cpus=2`` (and equivalent Kubernetes CPU limits) impose a
+    CFS bandwidth quota WITHOUT narrowing the process's CPU affinity —
+    ``os.sched_getaffinity`` and ``os.process_cpu_count`` therefore still
+    report the host's full affinity set, missing this ceiling. Read the
+    quota interfaces directly.
+
+    Prefer cgroup v2's unified ``/sys/fs/cgroup/cpu.max`` (``"<quota>
+    <period>"`` or ``"max <period>"`` for unlimited). Fall back to
+    cgroup v1's ``cpu.cfs_quota_us`` / ``cpu.cfs_period_us`` split
+    (``-1`` = unlimited). CPUs = quota / period, rounded up so a
+    fractional quota (e.g. ``--cpus=1.5``) still yields at least the
+    integer floor for whole-CPU decisions. Returns ``None`` when
+    neither interface is readable or when the quota is unlimited so the
+    caller falls back to affinity-based counts.
+    """
+    try:
+        with open("/sys/fs/cgroup/cpu.max", encoding="utf-8") as f:
+            raw = f.read().strip()
+        parts = raw.split()
+        if len(parts) == 2:
+            quota_str, period_str = parts
+            if quota_str == "max":
+                return None
+            quota = int(quota_str)
+            period = int(period_str)
+            if quota > 0 and period > 0:
+                return max(1, math.ceil(quota / period))
+    except (OSError, ValueError):
+        pass
+
+    try:
+        with open(
+            "/sys/fs/cgroup/cpu/cpu.cfs_quota_us", encoding="utf-8",
+        ) as f:
+            quota = int(f.read().strip())
+        with open(
+            "/sys/fs/cgroup/cpu/cpu.cfs_period_us", encoding="utf-8",
+        ) as f:
+            period = int(f.read().strip())
+        if quota > 0 and period > 0:
+            return max(1, math.ceil(quota / period))
+    except (OSError, ValueError):
+        pass
+
+    return None
+
+
 def process_usable_cpu_count():
     """Return the CPU count actually usable by this process, or ``None``.
 
@@ -177,27 +227,42 @@ def process_usable_cpu_count():
     and defeats both the process-wide budget and the interactive
     reserve.
 
-    Prefer ``os.process_cpu_count`` (Python 3.13+) because it honours
-    both scheduling affinity AND cgroup CPU quota on Linux. Fall back to
-    ``os.sched_getaffinity`` on older Linux (affinity only — a cgroup
-    quota below the affinity set would still oversubscribe, but this is
-    strictly better than not clamping at all). Returns ``None`` when no
-    process-scoped signal is available (Darwin/Windows on old Python),
-    in which case callers should fall back to the host counts.
+    Combine every clamp that applies to this process and take the
+    minimum:
+
+    - ``os.process_cpu_count`` (Python 3.13+) or
+      ``os.sched_getaffinity`` (Linux) for scheduling-affinity /
+      cpuset restrictions.
+    - ``_cgroup_cpu_quota_cpus`` for a Docker/Kubernetes CFS bandwidth
+      quota that leaves the affinity set alone
+      (``os.process_cpu_count`` reads affinity, not the cgroup quota
+      — verified against CPython source; a fresh Codex review flagged
+      that the earlier revision documented quota support it did not
+      actually deliver).
+
+    Returns ``None`` when no process-scoped signal is available
+    (Darwin/Windows on old Python, no cgroup, unlimited quota, etc.),
+    in which case callers fall back to the host counts.
     """
+    candidates = []
     process_cpu_count = getattr(os, "process_cpu_count", None)
     if process_cpu_count is not None:
-        try:
-            return process_cpu_count()
-        except OSError:
-            pass
-    sched_getaffinity = getattr(os, "sched_getaffinity", None)
-    if sched_getaffinity is not None:
-        try:
-            return len(sched_getaffinity(0))
-        except OSError:
-            pass
-    return None
+        with contextlib.suppress(OSError):
+            candidates.append(process_cpu_count())
+    else:
+        sched_getaffinity = getattr(os, "sched_getaffinity", None)
+        if sched_getaffinity is not None:
+            with contextlib.suppress(OSError):
+                candidates.append(len(sched_getaffinity(0)))
+
+    quota = _cgroup_cpu_quota_cpus()
+    if quota:
+        candidates.append(quota)
+
+    positive = [c for c in candidates if c and c > 0]
+    if not positive:
+        return None
+    return min(positive)
 
 
 _USABLE_CORES_UNSET = object()

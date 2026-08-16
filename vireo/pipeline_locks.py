@@ -75,6 +75,19 @@ class _GpuLockContext:
                         "Cancelled while waiting for GPU inference resources"
                     )
                 if _GPU_SEMAPHORE.acquire(timeout=0.2):
+                    # A release during the 0.2s acquire window can succeed
+                    # after the pre-acquire probe returned false but while
+                    # cancellation (or the interactive text-search
+                    # deadline) has now fired. Without this recheck the
+                    # caller would proceed into ``session.run`` holding
+                    # the semaphore despite the pending cancel. Release
+                    # and raise so the cancel wins the race.
+                    if cancel_check is not None and cancel_check():
+                        _GPU_SEMAPHORE.release()
+                        raise ResourceWaitCancelled(
+                            "Cancelled while waiting for GPU inference "
+                            "resources",
+                        )
                     return self
 
     def __exit__(self, exc_type, exc, tb):

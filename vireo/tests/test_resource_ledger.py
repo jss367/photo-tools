@@ -70,6 +70,116 @@ def test_process_usable_cpu_count_returns_positive_int():
     assert result is None or (isinstance(result, int) and result >= 1)
 
 
+def _make_open_stub(files):
+    """Return a fake ``open`` that serves in-memory contents for known paths.
+
+    Any path not present raises ``FileNotFoundError`` so the caller's
+    ``except OSError`` branch fires — mirrors a real system where the
+    cgroup interface just isn't there.
+    """
+    import io
+
+    def _fake_open(path, *args, **kwargs):
+        if path in files:
+            return io.StringIO(files[path])
+        raise FileNotFoundError(path)
+
+    return _fake_open
+
+
+def test_cgroup_cpu_quota_reads_v2_unified_interface(monkeypatch):
+    """cgroup v2 exposes ``<quota> <period>`` in ``/sys/fs/cgroup/cpu.max``."""
+    monkeypatch.setattr(
+        "builtins.open",
+        _make_open_stub({"/sys/fs/cgroup/cpu.max": "200000 100000\n"}),
+    )
+    # 200000 / 100000 = 2 CPUs (Docker --cpus=2 equivalent).
+    assert resource_ledger._cgroup_cpu_quota_cpus() == 2
+
+
+def test_cgroup_cpu_quota_v2_unlimited_returns_none(monkeypatch):
+    """``max <period>`` means unlimited — no CPU ceiling, return ``None``."""
+    monkeypatch.setattr(
+        "builtins.open",
+        _make_open_stub({"/sys/fs/cgroup/cpu.max": "max 100000\n"}),
+    )
+    assert resource_ledger._cgroup_cpu_quota_cpus() is None
+
+
+def test_cgroup_cpu_quota_v2_fractional_rounds_up(monkeypatch):
+    """``--cpus=1.5`` -> 150000/100000. Round up so a whole-CPU decision
+    doesn't accidentally treat 1.5 as 1 (which would waste headroom).
+    """
+    monkeypatch.setattr(
+        "builtins.open",
+        _make_open_stub({"/sys/fs/cgroup/cpu.max": "150000 100000\n"}),
+    )
+    assert resource_ledger._cgroup_cpu_quota_cpus() == 2
+
+
+def test_cgroup_cpu_quota_falls_back_to_v1_split(monkeypatch):
+    """cgroup v1 has separate quota and period files, and ``-1`` for
+    quota means unlimited — verify the v1 pair parses when v2 is absent
+    and unlimited surfaces as ``None`` on this legacy interface too.
+    """
+    monkeypatch.setattr(
+        "builtins.open",
+        _make_open_stub({
+            "/sys/fs/cgroup/cpu/cpu.cfs_quota_us": "400000\n",
+            "/sys/fs/cgroup/cpu/cpu.cfs_period_us": "100000\n",
+        }),
+    )
+    assert resource_ledger._cgroup_cpu_quota_cpus() == 4
+
+    monkeypatch.setattr(
+        "builtins.open",
+        _make_open_stub({
+            "/sys/fs/cgroup/cpu/cpu.cfs_quota_us": "-1\n",
+            "/sys/fs/cgroup/cpu/cpu.cfs_period_us": "100000\n",
+        }),
+    )
+    assert resource_ledger._cgroup_cpu_quota_cpus() is None
+
+
+def test_cgroup_cpu_quota_missing_files_returns_none(monkeypatch):
+    """Darwin/Windows/host-linux without cgroups: both paths raise
+    ``OSError``, and the helper returns ``None`` so the caller falls
+    back to affinity-based counts.
+    """
+    monkeypatch.setattr("builtins.open", _make_open_stub({}))
+    assert resource_ledger._cgroup_cpu_quota_cpus() is None
+
+
+def test_process_usable_cpu_count_takes_minimum_of_affinity_and_cgroup(
+    monkeypatch,
+):
+    """When a Docker container imposes a CFS quota WITHOUT narrowing the
+    process's affinity set (``docker run --cpus=2`` on a 16-core host),
+    the affinity signal reports 16 while the cgroup quota reports 2.
+    The helper must return the ``min`` so
+    ``automatic_cpu_capacity`` clamps by the true ceiling. Without this
+    combined view, a 16-core-affinity + 2-cgroup-quota container derives
+    a 12-permit budget and oversubscribes its two-CPU allocation.
+    """
+    # Simulate a host with wide affinity (16 CPUs) but a 2-CPU cgroup
+    # quota. The specific affinity source depends on the Python version,
+    # so patch both possible surfaces.
+    monkeypatch.setattr(resource_ledger.os, "process_cpu_count", lambda: 16)
+    monkeypatch.setattr(
+        "builtins.open",
+        _make_open_stub({"/sys/fs/cgroup/cpu.max": "200000 100000\n"}),
+    )
+    assert resource_ledger.process_usable_cpu_count() == 2
+
+    # And with a 4-CPU affinity + 8-CPU quota, affinity wins.
+    monkeypatch.setattr(resource_ledger.os, "process_cpu_count", lambda: 4)
+    monkeypatch.setattr(
+        "builtins.open",
+        _make_open_stub({"/sys/fs/cgroup/cpu.max": "800000 100000\n"}),
+    )
+    assert resource_ledger.process_usable_cpu_count() == 4
+
+
 @pytest.mark.parametrize("value", [True, False, 1.5, "2", None])
 def test_cpu_request_rejects_non_integer_permits(value):
     with pytest.raises(TypeError):

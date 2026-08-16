@@ -251,6 +251,91 @@ def test_gpu_inference_contention_records_live_and_completed_owner_timing():
         resource_ledger._set_resource_ledger_for_tests(previous)
 
 
+def test_gpu_acquire_race_with_cancel_releases_semaphore_and_raises():
+    """Regression: when cancellation becomes true during the
+    ``_GPU_SEMAPHORE.acquire(timeout=0.2)`` window and a release wins
+    the same window, the successful acquire path used to return without
+    rechecking cancellation. The caller then held the semaphore and
+    proceeded into ``session.run`` despite the pending cancel — for
+    interactive text search past its 5-second deadline, that means the
+    UI stalls on inference the user has already cancelled and the
+    semaphore stays held by a request whose result will be discarded.
+    Recheck after acquire; release and raise if cancel won the race.
+    """
+    from pipeline_locks import _GpuLockContext
+    from resource_ledger import ResourceWaitCancelled
+
+    # Occupy the semaphore so the pre-acquire non-blocking probe at
+    # ``_GpuLockContext.__enter__`` fails and the waiter enters the
+    # timed-polling loop.
+    _GPU_SEMAPHORE.acquire()
+    holder_released = False
+    outcome = []
+    call_count = {"n": 0}
+    cancel = threading.Event()
+
+    def counting_cancel_check():
+        call_count["n"] += 1
+        # Call #1 is the entry probe (line 61). Call #2 is inside the
+        # while loop (line 73). From call #2 onward, honour the flag —
+        # so the test can flip cancel AFTER the flag-observing probe
+        # ran but BEFORE the timed acquire returns, guaranteeing the
+        # only remaining probe to fire is the post-acquire recheck.
+        if call_count["n"] >= 2:
+            return cancel.is_set()
+        return False
+
+    def waiter():
+        try:
+            with _GpuLockContext(cancel_check=counting_cancel_check):
+                outcome.append("acquired")
+        except ResourceWaitCancelled:
+            outcome.append("cancelled")
+
+    thread = threading.Thread(target=waiter)
+    thread.start()
+    try:
+        # Wait until the waiter has called cancel_check at least twice —
+        # meaning it is now inside ``_GPU_SEMAPHORE.acquire(timeout=0.2)``
+        # (or about to enter it, with the flag observed as False on the
+        # loop probe).
+        _wait_until(lambda: call_count["n"] >= 2, timeout=2.0)
+
+        # Fire the race: cancel becomes true THEN the semaphore is
+        # released. The waiter's timed acquire will succeed shortly.
+        # Without the post-acquire recheck the waiter would return with
+        # the semaphore held; with the fix, the recheck sees cancel and
+        # unwinds.
+        cancel.set()
+        _GPU_SEMAPHORE.release()
+        holder_released = True
+
+        thread.join(timeout=2.0)
+        assert not thread.is_alive(), (
+            "waiter did not finish — check the timed-acquire loop"
+        )
+        assert outcome == ["cancelled"], (
+            f"Expected cancelled outcome (post-acquire cancel recheck), "
+            f"got {outcome!r}"
+        )
+        # Semaphore must be back to full value 1 — the released holder
+        # slot returned to it, the waiter's briefly-acquired slot was
+        # released before the raise.
+        assert _GPU_SEMAPHORE._value == 1, (
+            f"Semaphore leaked; value={_GPU_SEMAPHORE._value}"
+        )
+    finally:
+        # If the fix regressed and the waiter returned "acquired", it
+        # would hold the semaphore on the way out of its with-block —
+        # already released by ``__exit__``. But if the test aborted
+        # before joining, the waiter thread may still be blocked in
+        # ``acquire``: release once more so the module-level semaphore
+        # doesn't leak across tests.
+        if not holder_released:
+            _GPU_SEMAPHORE.release()
+        thread.join(timeout=1.0)
+
+
 def test_acquire_gpu_if_session_uses_it_defaults_to_lock_when_providers_missing():
     """A session that doesn't expose get_providers (or raises) must
     conservatively take the lock — same behavior as before this check existed.

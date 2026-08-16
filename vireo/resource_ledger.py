@@ -299,25 +299,31 @@ def _cgroup_cpu_quota_cpus():
         if value is not None:
             candidates.append(value)
 
-    # cgroup v1: /sys/fs/cgroup/cpu{path}/cpu.cfs_quota_us, walking ancestors.
+    # cgroup v1: /sys/fs/cgroup/cpu{path}/cpu.cfs_quota_us, walking
+    # ancestors. Some distros (Ubuntu, Debian, Alpine, older Fedora)
+    # co-mount the ``cpu`` and ``cpuacct`` controllers under the
+    # combined ``cpu,cpuacct`` name — /proc/self/cgroup still reports
+    # ``cpu,cpuacct`` but the mount directory is that literal string,
+    # not ``cpu``. Probe both possible mount bases so containers on
+    # those hosts still get their quota respected.
     if v1_cpu_path is not None:
         for ancestor in _ancestor_dirs(v1_cpu_path):
-            mount = "/sys/fs/cgroup/cpu" + (
-                "" if ancestor == "/" else ancestor
-            )
+            for base in ("/sys/fs/cgroup/cpu", "/sys/fs/cgroup/cpu,cpuacct"):
+                mount = base + ("" if ancestor == "/" else ancestor)
+                value = _read_cgroup_v1_pair(
+                    mount + "/cpu.cfs_quota_us",
+                    mount + "/cpu.cfs_period_us",
+                )
+                if value is not None:
+                    candidates.append(value)
+    else:
+        for base in ("/sys/fs/cgroup/cpu", "/sys/fs/cgroup/cpu,cpuacct"):
             value = _read_cgroup_v1_pair(
-                mount + "/cpu.cfs_quota_us",
-                mount + "/cpu.cfs_period_us",
+                base + "/cpu.cfs_quota_us",
+                base + "/cpu.cfs_period_us",
             )
             if value is not None:
                 candidates.append(value)
-    else:
-        value = _read_cgroup_v1_pair(
-            "/sys/fs/cgroup/cpu/cpu.cfs_quota_us",
-            "/sys/fs/cgroup/cpu/cpu.cfs_period_us",
-        )
-        if value is not None:
-            candidates.append(value)
 
     return min(candidates) if candidates else None
 

@@ -206,6 +206,59 @@ def test_cgroup_cpu_quota_falls_back_to_v1_split(monkeypatch):
     assert resource_ledger._cgroup_cpu_quota_cpus() is None
 
 
+def test_cgroup_cpu_quota_v1_reads_comounted_cpu_cpuacct(monkeypatch):
+    """Regression: on Ubuntu/Debian/Alpine/older-Fedora hosts, the
+    ``cpu`` and ``cpuacct`` controllers are co-mounted at
+    ``/sys/fs/cgroup/cpu,cpuacct`` — ``/sys/fs/cgroup/cpu`` does not
+    exist on those systems even though ``/proc/self/cgroup`` reports
+    ``cpu,cpuacct`` as the controller list. Reading only the
+    ``/sys/fs/cgroup/cpu`` path would return ``None`` for a container
+    with a CFS limit on such a host, and the ledger would fall back to
+    the affinity count. Probe the co-mounted directory too so the
+    quota is still detected.
+    """
+    monkeypatch.setattr(
+        "builtins.open",
+        _make_open_stub({
+            "/proc/self/cgroup": "9:cpu,cpuacct:/\n",
+            # /sys/fs/cgroup/cpu deliberately absent — only the
+            # co-mounted controller directory has the quota files.
+            "/sys/fs/cgroup/cpu,cpuacct/cpu.cfs_quota_us": "200000\n",
+            "/sys/fs/cgroup/cpu,cpuacct/cpu.cfs_period_us": "100000\n",
+        }),
+    )
+    assert resource_ledger._cgroup_cpu_quota_cpus() == 2
+
+
+def test_cgroup_cpu_quota_v1_comounted_nested_walks_ancestors(monkeypatch):
+    """Same ancestor-walk semantics on the co-mounted layout: a nested
+    service under ``system.slice`` on ``cpu,cpuacct`` picks up the
+    tightest cap along the chain, and the mount path for every
+    ancestor uses the co-mounted name.
+    """
+    monkeypatch.setattr(
+        "builtins.open",
+        _make_open_stub({
+            "/proc/self/cgroup": (
+                "9:cpu,cpuacct:/system.slice/vireo.service\n"
+            ),
+            "/sys/fs/cgroup/cpu,cpuacct/cpu.cfs_quota_us": "-1\n",
+            "/sys/fs/cgroup/cpu,cpuacct/cpu.cfs_period_us": "100000\n",
+            "/sys/fs/cgroup/cpu,cpuacct/system.slice"
+            "/cpu.cfs_quota_us": "400000\n",
+            "/sys/fs/cgroup/cpu,cpuacct/system.slice"
+            "/cpu.cfs_period_us": "100000\n",
+            "/sys/fs/cgroup/cpu,cpuacct/system.slice/vireo.service"
+            "/cpu.cfs_quota_us": "800000\n",
+            "/sys/fs/cgroup/cpu,cpuacct/system.slice/vireo.service"
+            "/cpu.cfs_period_us": "100000\n",
+        }),
+    )
+    # Leaf allows 8, ancestor slice caps at 4 — min wins across the
+    # ancestor chain on the co-mounted layout.
+    assert resource_ledger._cgroup_cpu_quota_cpus() == 4
+
+
 def test_cgroup_cpu_quota_v1_nested_walks_ancestors(monkeypatch):
     """v1 nested hierarchies work the same as v2 — ``vireo.service``
     under ``system.slice`` looks up the tightest quota along the chain.

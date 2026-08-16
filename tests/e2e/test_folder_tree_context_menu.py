@@ -75,6 +75,7 @@ def test_folder_tree_work_locally_copies_selected_root(live_server, page, tmp_pa
     page.goto(f"{live_server['url']}/browse")
     item = page.locator(f'.tree-item[data-folder-id="{folder_id}"]')
     item.wait_for(state="visible")
+    expect(item.locator(".folder-local-status")).to_have_count(0)
     item.click(button="right")
     page.locator(
         ".vireo-ctx-menu .vireo-ctx-item", has_text="Work Locally…"
@@ -92,12 +93,103 @@ def test_folder_tree_work_locally_copies_selected_root(live_server, page, tmp_pa
     expect(page.locator("#toastContainer")).to_contain_text(
         "Local folder update complete", timeout=15000
     )
+    local_status = item.locator(".folder-local-status")
+    expect(local_status).to_have_text("LOCAL", timeout=5000)
+    expect(local_status).to_have_attribute("aria-label", "Working locally")
     local_root = destination / "nas-source"
     assert (local_root / "bird.jpg").read_bytes() == b"original"
     catalog_path = db.conn.execute(
         "SELECT path FROM folders WHERE id=?", (folder_id,)
     ).fetchone()["path"]
     assert catalog_path == str(local_root)
+
+
+def test_folder_tree_marks_parent_when_only_descendant_is_local(
+    live_server, page, tmp_path
+):
+    """A remote ancestor distinguishes partial local coverage from full coverage."""
+    from services.local_folder import stage_folder
+
+    db = live_server["db"]
+    source = tmp_path / "trip"
+    child = source / "2026-08-01"
+    child.mkdir(parents=True)
+    (child / "bird.jpg").write_bytes(b"original")
+    workspace_id = db.create_workspace("Mixed Local Folders")
+    parent_id = db.add_folder(
+        str(source), name="trip", link_to_workspace=False
+    )
+    child_id = db.add_folder(
+        str(child), name="2026-08-01", parent_id=parent_id,
+        link_to_workspace=False,
+    )
+    db.add_workspace_folder(workspace_id, parent_id, is_root=True)
+    db.add_workspace_folder(workspace_id, child_id, is_root=False)
+    # The E2E app derives its managed-data directory from ``thumb_dir``;
+    # conftest places that directory directly under tmp_path.
+    stage_folder(db, child_id, str(tmp_path))
+
+    assert page.request.post(
+        f"{live_server['url']}/api/workspaces/{workspace_id}/activate"
+    ).ok
+    page.goto(f"{live_server['url']}/browse")
+
+    parent = page.locator(f'.tree-item[data-folder-id="{parent_id}"]')
+    expect(parent.locator(".folder-local-status")).to_have_text(
+        "SOME LOCAL", timeout=5000
+    )
+    expect(parent.locator(".folder-local-status")).to_have_attribute(
+        "aria-label", "Contains folders that are working locally"
+    )
+
+    parent.locator(".tree-toggle").click()
+    child_row = page.locator(f'.tree-item[data-folder-id="{child_id}"]')
+    expect(child_row).to_be_visible()
+    expect(child_row.locator(".folder-local-status")).to_have_text("LOCAL")
+
+
+def test_folder_tree_updates_local_operation_and_recovery_badges(live_server, page):
+    """Shared local-folder events update status without rebuilding the tree."""
+    page.goto(f"{live_server['url']}/browse")
+    item = page.locator(".tree-item[data-folder-id]").first
+    item.wait_for(state="visible")
+    folder_id = int(item.get_attribute("data-folder-id"))
+
+    def publish(payload):
+        page.evaluate(
+            """([data]) => {
+              window.vireoLocalFolderData = data;
+              window.dispatchEvent(new CustomEvent(
+                'vireo:local-folder-status-changed', {detail: {data: data}}
+              ));
+            }""",
+            [payload],
+        )
+
+    publish({
+        "legacy_workspace_session": False,
+        "folders": [{"requested_folder_id": folder_id, "state": "remote"}],
+        "jobs": [{
+            "id": "copy-job",
+            "type": "work-locally-folder-stage",
+            "folder_ids": [folder_id],
+        }],
+    })
+    badge = item.locator(".folder-local-status")
+    expect(badge).to_have_text("COPYING")
+    expect(badge).to_have_attribute("aria-label", "Copying locally")
+
+    publish({
+        "legacy_workspace_session": False,
+        "folders": [{
+            "requested_folder_id": folder_id,
+            "state": "recovery",
+            "recovery_kind": "sync",
+        }],
+        "jobs": [],
+    })
+    expect(badge).to_have_text("LOCAL ISSUE")
+    expect(badge).to_have_attribute("aria-label", "Local sync needs attention")
 
 
 def test_folder_tree_filter_by_folder_fires_filter(live_server, page):

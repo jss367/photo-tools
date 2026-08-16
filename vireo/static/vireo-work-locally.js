@@ -570,6 +570,29 @@
     container.innerHTML = html;
   }
 
+  function publishFolderStatus() {
+    window.vireoLocalFolderData = data;
+    try {
+      window.dispatchEvent(new CustomEvent('vireo:local-folder-status-changed', {
+        detail: {data: data}
+      }));
+    } catch (_error) {}
+  }
+
+  function trackStartedJob(result, type) {
+    if (!data || data.legacy_workspace_session || !result || !result.job_id) return;
+    var jobs = (data.jobs || []).filter(function(job) {
+      return job.id !== result.job_id;
+    });
+    jobs.push({
+      id: result.job_id,
+      type: type,
+      folder_ids: (result.folder_ids || []).map(Number)
+    });
+    data.jobs = jobs;
+    publishFolderStatus();
+  }
+
   function watchJob(jobId) {
     if (activeJob && activeJob.id === jobId) return;
     if (activeJob && activeJob.source) activeJob.source.close();
@@ -623,7 +646,7 @@
           }
         });
       }
-      window.vireoLocalFolderData = data;
+      publishFolderStatus();
       render();
       if (typeof loadWsFolders === 'function') loadWsFolders();
       updateStageDialogBlocker();
@@ -666,6 +689,7 @@
       if (modal) modal.classList.remove('open');
       pendingStageItems = [];
       watchJob(result.job_id);
+      trackStartedJob(result, 'work-locally-folder-stage');
     } catch (requestError) {
       if (error) error.textContent = requestError.message || 'Could not start the local copy.';
     } finally {
@@ -719,6 +743,7 @@
         })
       });
       watchJob(result.job_id);
+      trackStartedJob(result, 'work-locally-folder-sync');
     } catch (_error) {
       await load();
     } finally {
@@ -756,6 +781,7 @@
         })
       });
       watchJob(result.job_id);
+      trackStartedJob(result, 'work-locally-folder-discard');
     } catch (_error) {
       await load();
     } finally {

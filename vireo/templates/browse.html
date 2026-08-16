@@ -99,6 +99,55 @@ body.sidebar-resizing {
   color: var(--text-faint);
   font-variant-numeric: tabular-nums;
 }
+.tree-item .folder-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.folder-local-status-slot {
+  display: inline-flex;
+  flex: 0 0 auto;
+}
+.folder-local-status {
+  margin-left: 6px;
+  padding: 1px 4px;
+  border: 1px solid currentColor;
+  border-radius: 3px;
+  font-size: 8px;
+  font-weight: 700;
+  line-height: 1.2;
+  letter-spacing: 0.04em;
+  white-space: nowrap;
+}
+.folder-local-status.local {
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+}
+.folder-local-status.mixed,
+.folder-local-status.updating {
+  color: var(--warning);
+  background: color-mix(in srgb, var(--warning) 10%, transparent);
+}
+.folder-local-status.recovery {
+  color: var(--danger);
+  background: color-mix(in srgb, var(--danger) 10%, transparent);
+}
+.folder-local-status.updating::before {
+  content: '';
+  display: inline-block;
+  width: 5px;
+  height: 5px;
+  margin-right: 3px;
+  border: 1px solid currentColor;
+  border-right-color: transparent;
+  border-radius: 50%;
+  animation: folder-local-spin 0.8s linear infinite;
+}
+@keyframes folder-local-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) {
+  .folder-local-status.updating::before { animation: none; }
+}
 .tree-item .collection-name {
   min-width: 0;
   overflow: hidden;
@@ -3329,6 +3378,7 @@ function renderFolderTree(folders) {
     return total;
   }
   (byParent['root'] || []).forEach(computeRollup);
+  var localStatuses = folderLocalStatuses(folders, byParent);
 
   function buildTree(parentId, depth) {
     var children = byParent[parentId] || [];
@@ -3344,7 +3394,8 @@ function renderFolderTree(folders) {
         : '';
       html += '<div class="tree-item' + activeClass + '" onclick="filterByFolder(' + f.id + ')" data-folder-id="' + f.id + '">' +
         indent + toggle +
-        '<span>' + escapeHtml(f.name) + '</span>' +
+        '<span class="folder-name">' + escapeHtml(f.name) + '</span>' +
+        '<span class="folder-local-status-slot">' + folderLocalStatusMarkup(localStatuses[f.id]) + '</span>' +
         partialBadge +
         '<span class="count">' + rolledUp[f.id] + '</span>' +
       '</div>';
@@ -3357,6 +3408,116 @@ function renderFolderTree(folders) {
 
   document.getElementById('folderTree').innerHTML = buildTree('root', 0);
 }
+
+function folderLocalStatuses(folders, byParent) {
+  var localData = window.vireoLocalFolderData;
+  if (!localData || localData.legacy_workspace_session) return {};
+
+  var rowsById = {};
+  folders.forEach(function(folder) { rowsById[Number(folder.id)] = folder; });
+  var direct = {};
+
+  (localData.folders || []).forEach(function(item) {
+    if (!item || item.state === 'remote') return;
+    var id = Number(item.requested_folder_id || item.root_folder_id);
+    if (!rowsById[id]) return;
+    var changes = item.changes || {};
+    var changeCount = Number(changes.created || 0) +
+      Number(changes.modified || 0) + Number(changes.deleted || 0);
+    if (item.state === 'recovery' || item.changes_error) {
+      direct[id] = {
+        kind: 'recovery',
+        label: 'LOCAL ISSUE',
+        description: item.recovery_kind === 'sync'
+          ? 'Local sync needs attention'
+          : 'Local copy needs attention'
+      };
+      return;
+    }
+    direct[id] = {
+      kind: item.state === 'staging' ? 'updating' : 'local',
+      label: item.state === 'staging' ? 'COPYING' : 'LOCAL',
+      description: changeCount
+        ? 'Working locally · ' + changeCount + ' unsynced change' + (changeCount === 1 ? '' : 's')
+        : 'Working locally'
+    };
+  });
+
+  (localData.jobs || []).forEach(function(job) {
+    var jobStatus = {
+      'work-locally-folder-stage': ['COPYING', 'Copying locally'],
+      'work-locally-folder-sync': ['SYNCING', 'Syncing local changes to source storage'],
+      'work-locally-folder-discard': ['REMOVING', 'Removing the local copy']
+    }[job.type];
+    if (!jobStatus) return;
+    (job.folder_ids || []).forEach(function(rawId) {
+      var id = Number(rawId);
+      if (!rowsById[id]) return;
+      direct[id] = {
+        kind: 'updating',
+        label: jobStatus[0],
+        description: jobStatus[1]
+      };
+    });
+  });
+
+  var result = {};
+  function markDescendants(folderId, status) {
+    result[folderId] = status;
+    (byParent[folderId] || []).forEach(function(child) {
+      markDescendants(Number(child.id), status);
+    });
+  }
+  Object.keys(direct).forEach(function(rawId) {
+    markDescendants(Number(rawId), direct[rawId]);
+  });
+
+  Object.keys(direct).forEach(function(rawId) {
+    var current = rowsById[Number(rawId)];
+    var parentId = current ? current.parent_id : null;
+    var seen = {};
+    while (parentId != null && !seen[parentId]) {
+      seen[parentId] = true;
+      if (!direct[parentId]) {
+        result[parentId] = {
+          kind: 'mixed',
+          label: 'SOME LOCAL',
+          description: 'Contains folders that are working locally'
+        };
+      }
+      current = rowsById[Number(parentId)];
+      parentId = current ? current.parent_id : null;
+    }
+  });
+  return result;
+}
+
+function folderLocalStatusMarkup(status) {
+  if (!status) return '';
+  return '<span class="folder-local-status ' + status.kind + '" role="img"' +
+    ' aria-label="' + escapeAttr(status.description) + '"' +
+    ' title="' + escapeAttr(status.description) + '">' +
+    escapeHtml(status.label) + '</span>';
+}
+
+function refreshFolderLocalStatusIndicators() {
+  if (!browseFolderRows.length) return;
+  var byParent = {};
+  browseFolderRows.forEach(function(folder) {
+    var parentId = folder.parent_id || 'root';
+    if (!byParent[parentId]) byParent[parentId] = [];
+    byParent[parentId].push(folder);
+  });
+  var statuses = folderLocalStatuses(browseFolderRows, byParent);
+  document.querySelectorAll('#folderTree .tree-item[data-folder-id]').forEach(function(row) {
+    var slot = row.querySelector('.folder-local-status-slot');
+    if (slot) slot.innerHTML = folderLocalStatusMarkup(statuses[Number(row.dataset.folderId)]);
+  });
+}
+
+window.addEventListener('vireo:local-folder-status-changed', function() {
+  refreshFolderLocalStatusIndicators();
+});
 
 function toggleTree(e, el) {
   e.stopPropagation();

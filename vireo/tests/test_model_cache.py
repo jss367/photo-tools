@@ -718,3 +718,84 @@ def test_post_load_key_exception_keeps_entry_under_original_key(caplog):
     assert cache._has_entry("k")
     assert any("post_load_key callback raised" in r.message
                for r in caplog.records)
+
+
+def test_factory_uses_pure_cancel_probe_when_bound():
+    """Factory must see the pure-cancel probe, not the pause-parking one.
+
+    Regression for Codex discussion_r3790941020 — sibling of the
+    session-cache-lock-across-pause fix in commit e3693467. Previously
+    ``factory()`` ran under the pipeline's pause-aware cancel probe;
+    that probe parks on pause via ``_pause_checkpoint`` while
+    ``entry.load_lock`` is still owned by this thread, blocking any
+    unpaused peer waiting on the same cache key for the entire pause
+    window. ModelCache.acquire now rebinds the resource cancel check to
+    the pure-cancel probe (never parks) around the factory call,
+    matching what ``acquire_session_cache_lock`` does for its post-
+    acquire recheck.
+    """
+    from resource_ledger import (
+        bind_resource_cancel_check,
+        bind_resource_pure_cancel_check,
+        resolve_resource_cancel_check,
+    )
+
+    seen = {}
+
+    def parking_probe():  # pragma: no cover - must NEVER run under factory
+        seen["parking_called"] = True
+        return False
+
+    def pure_probe():
+        seen["pure_called"] = True
+        return False
+
+    cache = ModelCache(idle_secs=60)
+
+    def factory():
+        # Whatever the factory (or ``create_session`` inside it) resolves
+        # as the current probe MUST be the pure one — parking here would
+        # keep entry.load_lock held across pause.
+        seen["probe_in_factory"] = resolve_resource_cancel_check()
+        return "value"
+
+    with (
+        bind_resource_cancel_check(parking_probe),
+        bind_resource_pure_cancel_check(pure_probe),
+    ):
+        with cache.acquire("k", factory) as v:
+            assert v == "value"
+
+    assert seen["probe_in_factory"] is pure_probe
+    assert "parking_called" not in seen
+
+
+def test_factory_falls_back_to_pause_aware_probe_when_no_pure_bound():
+    """Callers without a bound pure probe keep the existing behavior.
+
+    Not every entry point sets up a pipeline participant (tests, standalone
+    scripts, one-shot CLIs). Those must keep whatever probe the caller
+    established rather than losing cancel semantics entirely.
+    """
+    from resource_ledger import (
+        bind_resource_cancel_check,
+        resolve_resource_cancel_check,
+    )
+
+    def parking_probe():
+        return False
+
+    cache = ModelCache(idle_secs=60)
+    seen = {}
+
+    def factory():
+        seen["probe_in_factory"] = resolve_resource_cancel_check()
+        return "value"
+
+    with bind_resource_cancel_check(parking_probe):
+        with cache.acquire("k", factory) as v:
+            assert v == "value"
+
+    # No pure probe bound → resolve_resource_pure_cancel_check falls back
+    # to the pause-aware probe, so the rebind is a no-op preserving it.
+    assert seen["probe_in_factory"] is parking_probe

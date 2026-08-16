@@ -206,8 +206,35 @@ class ModelCache:
 
             try:
                 if entry.value is None and entry.load_error is None:
+                    # ``factory()`` typically calls ``create_session`` which
+                    # waits for the construction CPU lease under the bound
+                    # resource cancel probe. That probe parks on pause via
+                    # ``_pause_checkpoint``; the parking would happen while
+                    # this thread still owns ``entry.load_lock``, and any
+                    # unpaused peer waiting for the same cache key would
+                    # then block for the whole pause window (Codex
+                    # discussion_r3790941020 — sibling of the
+                    # ``acquire_session_cache_lock`` fix in ``e3693467``).
+                    # Rebind the resource cancel probe to the pure-cancel
+                    # probe (never parks on pause) for the factory call,
+                    # matching the pattern the session-cache lock's
+                    # ``_post_acquire_recheck`` uses. Cancel still fires;
+                    # pause is observed at the next outer
+                    # ``_pause_checkpoint`` after ``load_lock`` is released.
+                    from resource_ledger import (
+                        bind_resource_cancel_check,
+                        resolve_resource_pure_cancel_check,
+                    )
+
+                    pure_cancel_check = resolve_resource_pure_cancel_check()
+                    factory_ctx = (
+                        bind_resource_cancel_check(pure_cancel_check)
+                        if pure_cancel_check is not None
+                        else contextlib.nullcontext()
+                    )
                     try:
-                        value = factory()
+                        with factory_ctx:
+                            value = factory()
                     except BaseException as e:
                         # Surface to this caller and any waiters under the
                         # load_lock; remove the entry so future acquires retry.

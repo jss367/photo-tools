@@ -766,6 +766,55 @@ def test_collection_load_failure_clears_native_selection_override(live_server, p
     assert state == {"override": None, "modalIds": [], "modalOpen": False}
 
 
+def test_organization_actions_release_native_selection_after_capture(live_server, page):
+    photo_ids = live_server["data"]["photos"][:4]
+    _write_grouped_pipeline_cache(live_server, photo_ids)
+
+    page.goto(f"{live_server['url']}/pipeline/review")
+    expect(page.locator(".photo-card[data-photo-id]")).to_have_count(4)
+    state = page.evaluate(
+        """async ids => {
+          const originalSafeFetch = window.safeFetch;
+          let releaseCollections;
+          window.safeFetch = function(url) {
+            if (url === '/api/collections') {
+              return new Promise(resolve => { releaseCollections = resolve; });
+            }
+            return originalSafeFetch.apply(this, arguments);
+          };
+          try {
+            window._vireoNativeMenuPhotoIdsOverride = [ids[0]];
+            const collectionOpen = addToCollection();
+            pipelineReviewContextPhotoIds = [ids[1]];
+            const whileLoading = {
+              override: window._vireoNativeMenuPhotoIdsOverride,
+              activeSelection: getActiveSelection(),
+            };
+            releaseCollections([]);
+            await collectionOpen;
+
+            window._vireoNativeMenuPhotoIdsOverride = [ids[2]];
+            batchAddKeyword();
+            return {
+              whileLoading: whileLoading,
+              collectionIds: pipelineReviewCollectionPhotoIds.slice(),
+              collectionOverride: window._vireoNativeMenuPhotoIdsOverride,
+              keywordIds: pipelineReviewKeywordPhotoIds.slice(),
+            };
+          } finally {
+            window.safeFetch = originalSafeFetch;
+          }
+        }""",
+        photo_ids,
+    )
+    assert state == {
+        "whileLoading": {"override": None, "activeSelection": [photo_ids[1]]},
+        "collectionIds": [photo_ids[0]],
+        "collectionOverride": None,
+        "keywordIds": [photo_ids[2]],
+    }
+
+
 def test_latest_collection_load_owns_modal_selection(live_server, page):
     photo_ids = live_server["data"]["photos"][:4]
     _write_grouped_pipeline_cache(live_server, photo_ids)
@@ -1477,6 +1526,66 @@ def test_older_persisted_flag_does_not_clear_newer_group_provisional_flag(
         expect(page.locator("#lightboxFlagStatus")).to_have_text("Rejected")
     finally:
         page.evaluate("window.setFlagFor = window.__originalSetFlagFor")
+
+
+def test_group_apply_waits_for_earlier_direct_flag_write(live_server, page):
+    db = live_server["db"]
+    photo_ids = live_server["data"]["photos"][:4]
+    _write_grouped_pipeline_cache(live_server, photo_ids)
+
+    page.goto(f"{live_server['url']}/pipeline/review")
+    expect(page.locator(".photo-card[data-photo-id]")).to_have_count(4)
+    photo_id = photo_ids[0]
+    page.evaluate(
+        """pid => {
+          window.__originalSafeFetchForFlagOrdering = window.safeFetch;
+          window.safeFetch = function(url, options) {
+            if (url === '/api/photos/' + pid + '/flag') {
+              const args = arguments;
+              return new Promise((resolve, reject) => {
+                window.__releaseEarlierFlagWrite = () => {
+                  window.__originalSafeFetchForFlagOrdering
+                    .apply(window, args).then(resolve, reject);
+                };
+              });
+            }
+            return window.__originalSafeFetchForFlagOrdering.apply(this, arguments);
+          };
+          window.__earlierFlagWrite = setPipelineReviewFlag(pid, 'flagged');
+        }""",
+        photo_id,
+    )
+    page.evaluate("openGroupReview(0, 0)")
+    page.wait_for_function("grmState && grmState.seeded === true")
+    page.evaluate(
+        """() => {
+          grmMoveReject();
+          window.__groupApplySettled = false;
+          window.__groupApplyPromise = grmApply().then(
+            () => { window.__groupApplySettled = true; },
+            error => {
+              window.__groupApplyError = String(error);
+              window.__groupApplySettled = true;
+            }
+          );
+        }"""
+    )
+    page.wait_for_timeout(100)
+    assert page.evaluate("window.__groupApplySettled") is False
+    assert _flags(db, photo_ids) == ["none"] * 4
+
+    try:
+        page.evaluate("window.__releaseEarlierFlagWrite()")
+        page.wait_for_function("window.__groupApplySettled === true")
+        assert page.evaluate("window.__groupApplyError || null") is None
+        assert _flags(db, photo_ids) == ["rejected", "none", "none", "none"]
+        assert page.evaluate(
+            "pid => !pipelineReviewDirectFlagWritesByPhoto[String(pid)]", photo_id
+        ) is True
+    finally:
+        page.evaluate(
+            "() => { window.safeFetch = window.__originalSafeFetchForFlagOrdering; }"
+        )
 
 
 def test_read_only_scope_lightbox_flag_does_not_mutate_cache(live_server, page):

@@ -3477,6 +3477,14 @@ function folderLocalStatuses(folders, byParent, options) {
       if (ancestorId && rowsById[ancestorId]) {
         visibleId = ancestorId;
         isFallback = true;
+      } else if (item.state === 'remote') {
+        // A purely remote workspace root that /api/folders doesn't
+        // return (unmounted, never staged) has nothing local to badge.
+        // Synthesizing a phantom here would restore every such root as
+        // a clickable zero-count folder with no local-status badge,
+        // effectively resurrecting missing remote folders in Browse
+        // (Codex review r3792082330). Skip it entirely.
+        return;
       } else {
         // A top-level workspace root that has gone missing has no
         // visible ancestor to attach the badge to. Without a synthesized
@@ -3610,26 +3618,55 @@ function folderLocalStatusMarkup(status) {
 
 function refreshFolderLocalStatusIndicators() {
   if (!browseFolderRows.length) return;
+  // Compute statuses from real rows only. If the previously injected
+  // phantoms remain in the input, folderLocalStatuses treats them as
+  // existing rows and never re-emits them in ``synthetic``, so a still-
+  // needed phantom would look identical to a stale one left behind after
+  // a recovery discard. Rebuild the input so ``synthetic`` reliably
+  // enumerates exactly the phantoms the current local-folder state
+  // requires (Codex review r3792082333).
+  var realFolders = browseFolderRows.filter(function(f) {
+    return !f.__synthetic_missing_local;
+  });
   var byParent = {};
-  browseFolderRows.forEach(function(folder) {
+  realFolders.forEach(function(folder) {
     var parentId = folder.parent_id || 'root';
     if (!byParent[parentId]) byParent[parentId] = [];
     byParent[parentId].push(folder);
   });
   var statusResult = folderLocalStatuses(
-    browseFolderRows, byParent, {wantsSynthetic: true}
+    realFolders, byParent, {wantsSynthetic: true}
   );
-  // If synthesis produced a row that isn't already in browseFolderRows,
-  // the DOM has no ``.tree-item`` slot to update — a slot-only refresh
-  // would silently drop the LOCAL ISSUE badge for a newly missing local
-  // root. Fall back to a full re-render so the phantom row is injected.
-  var needsFullRender = (statusResult.synthetic || []).some(function(row) {
-    return !browseFolderRows.some(function(f) {
-      return Number(f.id) === Number(row.id);
-    });
+  var neededPhantomIds = {};
+  (statusResult.synthetic || []).forEach(function(row) {
+    neededPhantomIds[Number(row.id)] = true;
   });
-  if (needsFullRender) {
-    renderFolderTree(browseFolderRows.slice());
+  var existingPhantomIds = {};
+  browseFolderRows.forEach(function(f) {
+    if (f.__synthetic_missing_local) existingPhantomIds[Number(f.id)] = true;
+  });
+  var newPhantomNeeded = Object.keys(neededPhantomIds).some(function(id) {
+    return !existingPhantomIds[id];
+  });
+  var stalePhantomPresent = Object.keys(existingPhantomIds).some(function(id) {
+    return !neededPhantomIds[id];
+  });
+  // A stale phantom's underlying folder is no longer flagged as a
+  // missing local session — a discard-recovery, for example, ends the
+  // session and the real folder returns to ``/api/folders``. Re-fetch
+  // so the restored row and photo count replace the zero-count
+  // ``status: 'missing'`` shell instead of leaving Browse with an
+  // orphaned clickable phantom (Codex review r3792082333).
+  if (stalePhantomPresent && typeof loadFolders === 'function') {
+    loadFolders();
+    return;
+  }
+  // A newly needed phantom means the DOM has no ``.tree-item`` slot to
+  // update — a slot-only refresh would silently drop the LOCAL ISSUE
+  // badge. Rebuild from real rows and let renderFolderTree re-inject
+  // the phantom.
+  if (newPhantomNeeded) {
+    renderFolderTree(realFolders);
     return;
   }
   var statuses = statusResult.statuses;

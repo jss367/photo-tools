@@ -385,6 +385,136 @@ def test_folder_tree_synthesizes_row_for_top_level_missing_local_root(
     )
 
 
+def test_folder_tree_does_not_synthesize_remote_only_roots(live_server, page):
+    """A purely remote missing root must not appear as a phantom tree row.
+
+    ``workspace_status()`` returns every workspace root, including remote
+    ones that ``/api/folders`` legitimately omits (never staged, or an
+    unmounted top-level source). Synthesizing a phantom for a remote item
+    would restore each such missing root as a clickable zero-count folder
+    with no local-status badge, effectively resurrecting deleted or
+    unmounted remote folders in Browse (Codex review r3792082330).
+    """
+    page.goto(f"{live_server['url']}/browse")
+    page.locator(".tree-item[data-folder-id]").first.wait_for(state="visible")
+    existing_ids = page.evaluate(
+        "() => Array.from(document.querySelectorAll("
+        "'#folderTree .tree-item[data-folder-id]'))"
+        ".map(el => Number(el.dataset.folderId))"
+    )
+    ghost_id = (max(existing_ids) if existing_ids else 0) + 998_000
+
+    page.evaluate(
+        """([data]) => {
+          window.vireoLocalFolderData = data;
+          window.dispatchEvent(new CustomEvent(
+            'vireo:local-folder-status-changed', {detail: {data: data}}
+          ));
+        }""",
+        [{
+            "legacy_workspace_session": False,
+            "folders": [{
+                "requested_folder_id": ghost_id,
+                "root_folder_id": ghost_id,
+                "state": "remote",
+                "visible_ancestor_folder_id": None,
+                "folder_name": "never-staged-nas",
+            }],
+            "jobs": [],
+        }],
+    )
+
+    # Give the event loop a chance to run refreshFolderLocalStatusIndicators.
+    page.wait_for_timeout(200)
+    ghost_row = page.locator(f'.tree-item[data-folder-id="{ghost_id}"]')
+    expect(ghost_row).to_have_count(0)
+
+
+def test_folder_tree_stale_phantom_reloads_real_folder_tree(
+    live_server, page
+):
+    """Discarding recovery on a synthesized phantom must restore the real tree.
+
+    A top-level missing local session emits a phantom top-level row so the
+    LOCAL ISSUE badge has somewhere to render. When the user later discards
+    that recovery, the next local-folder payload no longer produces a
+    phantom, but the injected row is still in ``browseFolderRows``. A
+    slot-only refresh would remove the badge and leave an orphaned
+    clickable zero-count ``status: 'missing'`` shell — Browse must instead
+    detect the stale phantom and re-fetch ``/api/folders`` so the real row
+    and count come back (Codex review r3792082333).
+    """
+    page.goto(f"{live_server['url']}/browse")
+    page.locator(".tree-item[data-folder-id]").first.wait_for(state="visible")
+    existing_ids = page.evaluate(
+        "() => Array.from(document.querySelectorAll("
+        "'#folderTree .tree-item[data-folder-id]'))"
+        ".map(el => Number(el.dataset.folderId))"
+    )
+    phantom_id = (max(existing_ids) if existing_ids else 0) + 997_000
+
+    # 1. Publish a recovery session for a missing top-level root — this
+    # synthesizes a phantom tree row that carries the LOCAL ISSUE badge.
+    page.evaluate(
+        """([data]) => {
+          window.vireoLocalFolderData = data;
+          window.dispatchEvent(new CustomEvent(
+            'vireo:local-folder-status-changed', {detail: {data: data}}
+          ));
+        }""",
+        [{
+            "legacy_workspace_session": False,
+            "folders": [{
+                "requested_folder_id": phantom_id,
+                "root_folder_id": phantom_id,
+                "state": "recovery",
+                "recovery_kind": "stage",
+                "visible_ancestor_folder_id": None,
+                "folder_name": "stale-phantom-root",
+            }],
+            "jobs": [],
+        }],
+    )
+    phantom_row = page.locator(f'.tree-item[data-folder-id="{phantom_id}"]')
+    expect(phantom_row).to_be_visible(timeout=5000)
+
+    # 2. The user discards the recovery: the local-folder payload no longer
+    # references the phantom root. Spy on /api/folders to verify the stale
+    # phantom triggers a fresh fetch, and confirm the phantom row is gone.
+    # ``safeFetch`` -> ``Vireo.api.json`` -> a closed-over ``browserFetch``
+    # (not ``Vireo.api.fetch``), so wrap ``json`` — the only spy point that
+    # observes every ``safeFetch('/api/folders')`` from ``loadFolders``.
+    page.evaluate(
+        "() => { window.__folderFetches = 0;"
+        " const original = window.Vireo.api.json;"
+        " window.Vireo.api.json = function(input, init, options) {"
+        "   const url = typeof input === 'string' ? input : (input && input.url);"
+        "   if (url && String(url).indexOf('/api/folders') !== -1) {"
+        "     window.__folderFetches++;"
+        "   }"
+        "   return original.apply(this, arguments);"
+        " }; }"
+    )
+    page.evaluate(
+        """([data]) => {
+          window.vireoLocalFolderData = data;
+          window.dispatchEvent(new CustomEvent(
+            'vireo:local-folder-status-changed', {detail: {data: data}}
+          ));
+        }""",
+        [{
+            "legacy_workspace_session": False,
+            "folders": [],
+            "jobs": [],
+        }],
+    )
+
+    page.wait_for_function(
+        "() => window.__folderFetches > 0", timeout=5000
+    )
+    expect(phantom_row).to_have_count(0, timeout=5000)
+
+
 def test_folder_tree_filter_by_folder_fires_filter(live_server, page):
     """Clicking 'Filter by this folder' sets activeFolderId to that folder."""
     url = live_server["url"]

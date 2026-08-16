@@ -6069,6 +6069,64 @@ def test_import_in_place_reports_error_when_source_vanishes_after_discovery(
     assert currents[-1] == 3, currents
 
 
+def test_import_in_place_reports_error_when_frozen_files_vanish(
+    app_and_db, tmp_path, monkeypatch,
+):
+    """Files promised by a frozen manifest but missing at scan time must
+    surface as a source failure.
+
+    ``scanner.scan`` classifies files that disappear between discovery
+    and processing as ``vanished`` and returns normally. Frozen manifests
+    widen the window in which that race can happen (all sources are
+    discovered up-front and later sources sit for the length of the
+    earlier scans), so a normal-looking success return can hide a
+    partial catalog. Without this guard the import job would report
+    ``completed`` and run its after-import action on the incomplete set.
+    """
+    import scanner
+
+    app, _ = app_and_db
+    source = tmp_path / "flaky-card"
+    source.mkdir()
+    Image.new("RGB", (16, 16), "red").save(source / "keeper.jpg")
+    Image.new("RGB", (16, 16), "green").save(source / "casualty.jpg")
+
+    real_scan = scanner.scan
+
+    def scan_reporting_vanished(*args, **kwargs):
+        counts = kwargs.get("counts")
+        result = real_scan(*args, **kwargs)
+        # Simulate the scanner discovering that one promised file was
+        # missing when it went to stat it. The sink is the same dict the
+        # coordinator inspects after the call, so mutating it here
+        # mirrors what a real vanished-during-scan run would leave
+        # behind.
+        if counts is not None:
+            counts["vanished"] = counts.get("vanished", 0) + 1
+        return result
+
+    monkeypatch.setattr(scanner, "scan", scan_reporting_vanished)
+
+    with app.test_client() as client:
+        resp = client.post("/api/jobs/import-in-place", json={
+            "sources": [str(source)],
+            "after_import": None,
+        })
+        assert resp.status_code == 200, resp.get_json()
+        job = wait_for_job_via_client(client, resp.get_json()["job_id"])
+
+    # ``failed`` propagates from the scan step's aggregated errors — the
+    # first source's kept photo still landed in the catalog, but the
+    # missing promised file is a partial-import signal the user must see.
+    assert job["status"] == "failed", job
+    errors = list(job.get("errors") or [])
+    result_errors = list((job.get("result") or {}).get("errors") or [])
+    combined = errors + result_errors
+    assert any(
+        str(source) in msg and "vanished" in msg for msg in combined
+    ), combined
+
+
 def test_import_in_place_stops_after_interrupted_discovery(
     app_and_db, tmp_path, monkeypatch,
 ):

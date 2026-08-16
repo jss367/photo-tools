@@ -26873,6 +26873,15 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                             ),
                             source,
                         )
+                    # scan() commits rows incrementally and can raise after
+                    # thousands have landed, so read counts from a sink dict
+                    # rather than the return value — the same pattern the
+                    # multi-root scan job uses. Frozen manifests widen the
+                    # window in which promised files can vanish before their
+                    # source is processed; the vanished bucket must be
+                    # surfaced as a source failure or a successful import
+                    # report would silently follow a partial catalog.
+                    source_scan_counts = {}
                     do_scan(
                         source, thread_db,
                         progress_callback=progress_cb,
@@ -26896,7 +26905,23 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                             snapshot_paths_by_root is None
                         ),
                         discovered_files=source_manifests[source],
+                        counts=source_scan_counts,
                     )
+                    vanished_count = source_scan_counts.get("vanished", 0)
+                    if vanished_count:
+                        msg = (
+                            f"[{source}] {vanished_count} file(s) vanished "
+                            "between discovery and scan; import is incomplete"
+                        )
+                        log.warning(
+                            "In-place import: %d file(s) promised by the "
+                            "frozen manifest for %s were missing at scan "
+                            "time",
+                            vanished_count, source,
+                        )
+                        root_errors.append(msg)
+                        if msg not in job["errors"]:
+                            job["errors"].append(msg)
                     # Retain extraction scope only after the scan returns and
                     # only while its paths are still valid. A selected volume
                     # can disappear after request validation; handing that

@@ -1372,6 +1372,25 @@ def _classify_photos(
     portable_model_identity = job.get("_classifier_model_identity")
     portable_taxonomy_identity = job.get("_taxonomy_identity", "no-tax")
 
+    # On a reclassify run every photo has its predictions cleared BEFORE
+    # being queued into ``batch`` (per-photo ``clear_predictions`` below
+    # at line 1442). Any subsequent ``_flush_batch`` failure therefore
+    # strands those photos empty — including the mid-loop 16-image
+    # flushes at lines 1568 / 1696, not just the tail flush at line
+    # 1735. Suspend the bound resource cancel probe around EVERY flush
+    # on a reclassify so ``acquire_inference_resources`` inside
+    # ``_flush_batch`` completes even if cancel arrived while the flush
+    # was in flight. The loop-level cancel check at line 1399 uses
+    # ``runner.is_cancelled`` directly (not the bound probe), so the
+    # loop still breaks promptly on cancel; only in-progress and tail
+    # flushes are protected. Non-reclassify flushes stay unaffected.
+    from resource_ledger import bind_resource_cancel_check
+
+    def _flush_preserving_cleared():
+        if reclassify:
+            return bind_resource_cancel_check(None)
+        return contextlib.nullcontext()
+
     def _runtime_aware_run_keys(detection_id):
         expected_runtime = None
         if portable_labels_full and portable_model_identity:
@@ -1567,7 +1586,8 @@ def _classify_photos(
 
                 if len(batch) >= _BATCH_SIZE:
                     pre_len = len(raw_results)
-                    failed += _flush_batch(batch, clf, model_type, model_name, db, raw_results, top_k=top_k)
+                    with _flush_preserving_cleared():
+                        failed += _flush_batch(batch, clf, model_type, model_name, db, raw_results, top_k=top_k)
                     _record_batch_classifier_runs(
                         db, batch, model_name, fp, raw_results, pre_len,
                         labels_fingerprint_full=job.get("_labels_fingerprint_full"),
@@ -1695,7 +1715,8 @@ def _classify_photos(
 
             if len(batch) >= _BATCH_SIZE:
                 pre_len = len(raw_results)
-                failed += _flush_batch(batch, clf, model_type, model_name, db, raw_results, top_k=top_k)
+                with _flush_preserving_cleared():
+                    failed += _flush_batch(batch, clf, model_type, model_name, db, raw_results, top_k=top_k)
                 _record_batch_classifier_runs(
                     db, batch, model_name, fp, raw_results, pre_len,
                     labels_fingerprint_full=job.get("_labels_fingerprint_full"),
@@ -1713,25 +1734,19 @@ def _classify_photos(
     # finishes the rebuild for the queued tail without picking up any new
     # photos (the cancel check at the top of the loop still blocks those).
     if batch and (not cancelled or reclassify):
-        # A reclassify-cancel tail flush is a deliberate preservation
-        # pass. CPU inference now consults the bound resource cancel
-        # probe, which is already True on this path, so leaving the
+        # A reclassify tail flush is a deliberate preservation pass.
+        # CPU inference consults the bound resource cancel probe, which
+        # is already True on this cancelled path, so leaving the
         # binding active would make ``_flush_batch`` raise
         # ``ResourceWaitCancelled`` for the whole batch, the fallback
         # per-image path would also raise, and no replacement
         # predictions would be written for the queued photos whose old
-        # predictions the loop already cleared. Suspend the binding
-        # just for this flush so inference completes; ``JobRunner``
+        # predictions the loop already cleared. The
+        # ``_flush_preserving_cleared`` helper suspends the binding on
+        # every reclassify flush so inference completes; ``JobRunner``
         # still owns any hard shutdown via the runner-side deadline.
-        from resource_ledger import bind_resource_cancel_check
-        preservation_flush = cancelled and reclassify
-        cancel_binding = (
-            bind_resource_cancel_check(None)
-            if preservation_flush
-            else contextlib.nullcontext()
-        )
         pre_len = len(raw_results)
-        with cancel_binding:
+        with _flush_preserving_cleared():
             failed += _flush_batch(batch, clf, model_type, model_name, db, raw_results, top_k=top_k)
         _record_batch_classifier_runs(
             db, batch, model_name, fp, raw_results, pre_len,

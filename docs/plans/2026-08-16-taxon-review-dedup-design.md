@@ -1213,21 +1213,56 @@ card badged "Rejected" while the photo still carries the species keyword
 that accept wrote — a card saying one thing and the photo's metadata
 another, which is the same no-black-boxes violation as the badge hole
 this section closes. So a reject that flips an `accepted` member also
-untags that member's taxon keyword on that member's photos, reusing the
-path undo already uses for the same retraction: `untag_photo` +
-`remove_pending_changes(photo_id, 'keyword_add', name)`, guarded by the
-same `no_tag` test (`db.py:18849-18866`) so a keyword the photo carried
-independently of the accept is never stripped, and by
-`get_photos_with_equivalent_species` (`db.py:17195-17197`) so a keyword
-another live, non-rejected prediction still asserts is kept. Where a
-guard keeps the keyword, the card says so ("kept 'Blue Tit' — still
-predicted on 2 photos") rather than silently disagreeing with its own
-badge. The retraction is recorded as an ordinary **`keyword_remove`**
-history entry, separate from the non-undoable `prediction_reject` status
-entry, so the destructive half of a reconciling reject is undoable
-through the existing machinery even though the status flip is not.
-Rejecting a pending member is unchanged: nothing was tagged, nothing is
-retracted.
+untags that member's taxon keyword on that member's photos, through
+`untag_photo` + `remove_pending_changes(photo_id, 'keyword_add', name)`
+and recorded as an ordinary **`keyword_remove`** history entry —
+separate from the non-undoable `prediction_reject` status entry, so the
+destructive half of a reconciling reject is undoable even though the
+status flip is not. Rejecting a pending member is unchanged: nothing
+was tagged, nothing is retracted.
+
+**Retraction requires provenance, and provenance cannot live in the
+edit log.** Stripping a keyword is only safe if we know the *accept*
+put it there; a photo can carry "Blue Tit" because the user typed it,
+because a sidecar import brought it in, or because an earlier accept on
+a different card wrote it. The obvious test is the `no_tag` bit an
+accept records when the photo already carried an equivalent species
+(`db.py:18849-18866`) — but that bit lives in a `prediction_accept`
+history item, and `_prune_edit_history` permanently deletes entries past
+`max_edit_history` (default 1000, `db.py:19542-19551`). A tag written by
+an accept and a tag merely confirmed by one become indistinguishable the
+moment their entry ages out, and `photo_keywords` itself is
+`(photo_id, keyword_id)` and nothing else (`db.py:728-732`). A bounded
+log cannot back an unbounded invariant, so this design does not ask it
+to. Two rules, split by what is actually knowable:
+
+- **Prospectively — persist provenance.** `photo_keywords` gains a
+  nullable `source TEXT` column: `'accept'` written by the accept tag
+  path, `'user'` by interactive tagging and sidecar import, `NULL` for
+  every row that predates the column. Additive, no backfill, no
+  destructive migration. (This is not the `prediction_review.group_pid`
+  column §2 rejected. That one would have bought *zero* coverage because
+  the information it needed was never written anywhere; this one records
+  something the accept path knows at write time and nothing else can
+  reconstruct.) A reject then retracts exactly the rows where
+  `source = 'accept'`, the keyword is the card's canonical taxon
+  keyword, and no other live non-rejected prediction still asserts it
+  (`get_photos_with_equivalent_species`, `db.py:17195-17197`).
+- **Retrospectively — never strip on a guess.** A `NULL`-source row is
+  left in place. The card says so instead of silently disagreeing with
+  its own badge: "Rejected — kept the 'Blue Tit' keyword on 3 photos
+  (added before Vireo tracked keyword origin)", with a one-click
+  "Remove it too" affordance. The user is the only remaining source of
+  truth once provenance is gone, so the design asks rather than picks —
+  and either way the photo's metadata and the card's badge are never
+  quietly in disagreement, which is the property this whole section is
+  protecting. The same disclosure covers the "kept because another live
+  prediction still asserts it" case ("kept 'Blue Tit' — still predicted
+  on 2 photos").
+
+Until the column exists, every row is `NULL`-source and every
+reconciling reject takes the disclosure path — correct, just chattier,
+which is the right failure direction for a metadata write.
 
 **Compare.** `accept_subject_species` swaps its
 `lower(trim(species))` equality for the same taxon-key helper. Its
@@ -1427,10 +1462,32 @@ Each phase lands as its own PR and is independently useful.
    stubbed `api_lookup` and assert (a) hits populate the cache, (b) misses
    are recorded with a retry timestamp, (c) `/api/predictions` never calls
    `api_lookup` directly.
-3. **Server-side cards**: `taxon_key`/`card_id`/`display_name` in
-   `/api/predictions`, the scope-carrying card endpoint, `review.html`
-   dedup + merged-card rendering + aggregate card status + filter
-   semantics — all four corollaries of §2's scope invariant land here. API tests: the Blue Tit fixture (two
+3. **Server-side cards, payload only**: `taxon_key`/`card_id`/`node_id`/
+   `display_name` on every `/api/predictions` row, the merge graph
+   behind them, and the scope-carrying card endpoint. `review.html` is
+   **not** switched over in this phase: it keeps dedupping on `group_id`
+   exactly as today, so the phase is additive and invisible.
+
+   **Why the renderer waits for Phase 5.** Merged rendering and the
+   card-aware mutation have to ship together. If Phase 3 started
+   collapsing two models' rows into one card while accept/reject still
+   went through today's endpoint, a click would accept only the
+   representative row's own same-model group; the other model's rows
+   would sit pending *inside* a card that now renders as resolved, and
+   clicking again would keep hitting the same representative — the
+   motivating bug made worse, not better, for the length of two phases.
+   The reverse order is not available either: §3's cross-model accept
+   must land after §4's keyword canonicalization or the sibling loop
+   fragments synonyms ("Ordering constraint"). So the split is by
+   *layer*, not by surface: the server learns cards in Phase 3, and the
+   client starts using them in Phase 5, in the same PR as the mutation
+   that can resolve them. Consequently every fixture below that asserts
+   **rendering** (merged cards, aggregate/`mixed` status, the card
+   endpoint's use by the modal) is written in Phase 3 but runs against
+   Phase 5; the API-level fixtures — which `card_id` a row gets, which
+   nodes merge — run in Phase 3.
+
+   API tests: the Blue Tit fixture (two
    models, same taxon, 8-vs-7 overlap) yields one `card_id`; different taxa
    don't merge; model filter yields per-model cards; **transitive overlap
    fixture** (three groups A/B/C forming an A-B-C chain, same taxon) yields
@@ -1594,10 +1651,22 @@ Each phase lands as its own PR and is independently useful.
    non-existent `node_id` or that carries both `card_id` and
    `node_id` returns 400.
 4. **Keyword canonicalization** (taxon-matched keyword reuse) + the
-   "tags as …" transparency note. This phase lands **before** the
+   "tags as …" transparency note + the additive
+   `photo_keywords.source` column (`'accept'` / `'user'` / `NULL`,
+   §3 "Retraction requires provenance"). The column lands here because
+   this phase already owns the accept path's keyword write, and Phase 5
+   is the first thing that can retract one — every accept made from
+   Phase 4 onward therefore carries provenance by the time a reconciling
+   reject could consume it. No backfill: pre-existing rows stay `NULL`
+   and take the "disclose, don't strip" path forever. This phase lands
+   **before** the
    cross-model accept broadening (Phase 5) so that the accept path's
    sibling loop cannot fragment keywords across name variants — see §3
-   "Ordering constraint" for the full rationale. DB tests:
+   "Ordering constraint" for the full rationale. DB tests: a
+   **provenance-write fixture** — an accept that tags a photo writes
+   `source = 'accept'`, an interactive tag and a sidecar import write
+   `'user'`, and re-accepting an already-tagged photo does not downgrade
+   an existing `'user'` row to `'accept'`;
    **inat-id-translation fixture** — an existing "Eurasian Blue Tit"
    keyword linked to the local *Cyanistes caeruleus* taxa row is
    reused when a newly accepted *row* resolves to the iNat id for
@@ -1624,7 +1693,13 @@ Each phase lands as its own PR and is independently useful.
    accept is driven by Compare's `accept_subject_species`, which has
    no card, confirming the canonicalization is keyed on the row's
    taxon rather than on a card (§4, "Keyword written on accept").
-5. **Cross-model accept/reject** + undo coverage. Depends on Phase 4
+5. **Merged-card rendering + cross-model accept/reject** + undo
+   coverage. This phase turns the client over to `card_id`: the
+   `getVisibleItems` dedup, merged-card rendering, the aggregate/`mixed`
+   status rule, the filter-semantics fallback, and the modal's use of
+   the card endpoint — §2's corollaries 2 and 4 — land here *together
+   with* the mutation that can resolve a merged card, for the reason
+   given in Phase 3. Depends on Phase 4
    being live so that the per-row keyword write resolves to the
    canonical keyword — otherwise the sibling loop across "Blue Tit" /
    "Eurasian Blue Tit" rows would tag both synonyms on the same photo,
@@ -1720,13 +1795,17 @@ Each phase lands as its own PR and is independently useful.
    with no prior-status payload and asserts it still undoes through the
    old branch; the history description names the overridden count; a
    **reconciling-reject
-   keyword fixture** — "Reject all" on a card with an accepted member
-   flips the status *and* untags that accept's species keyword via an
-   undoable `keyword_remove`, while a variant where the photo carries
-   the keyword independently (`no_tag` accept) or where another live
-   non-rejected prediction still asserts the taxon keeps the keyword and
-   surfaces the "kept" note instead of silently disagreeing with the
-   badge; a **status-totality fixture** — all seven non-empty
+   keyword fixture** — "Reject all" on a card whose accepted member
+   tagged the photo with `source = 'accept'` flips the status *and*
+   untags that keyword via an undoable `keyword_remove`; three negative
+   variants keep the keyword and surface the disclosure instead of
+   silently disagreeing with the badge — `source = 'user'`,
+   `source IS NULL` (the pruned/legacy case: assert the keyword survives
+   even after `_prune_edit_history` has deleted the original
+   `prediction_accept` entry, which is the regression guard for not
+   sourcing provenance from the bounded edit log), and another live
+   non-rejected prediction still asserting the taxon; a
+   **status-totality fixture** — all seven non-empty
    member-status sets map to a defined badge and action set.
 
 ## Test plan

@@ -1713,8 +1713,26 @@ def _classify_photos(
     # finishes the rebuild for the queued tail without picking up any new
     # photos (the cancel check at the top of the loop still blocks those).
     if batch and (not cancelled or reclassify):
+        # A reclassify-cancel tail flush is a deliberate preservation
+        # pass. CPU inference now consults the bound resource cancel
+        # probe, which is already True on this path, so leaving the
+        # binding active would make ``_flush_batch`` raise
+        # ``ResourceWaitCancelled`` for the whole batch, the fallback
+        # per-image path would also raise, and no replacement
+        # predictions would be written for the queued photos whose old
+        # predictions the loop already cleared. Suspend the binding
+        # just for this flush so inference completes; ``JobRunner``
+        # still owns any hard shutdown via the runner-side deadline.
+        from resource_ledger import bind_resource_cancel_check
+        preservation_flush = cancelled and reclassify
+        cancel_binding = (
+            bind_resource_cancel_check(None)
+            if preservation_flush
+            else contextlib.nullcontext()
+        )
         pre_len = len(raw_results)
-        failed += _flush_batch(batch, clf, model_type, model_name, db, raw_results, top_k=top_k)
+        with cancel_binding:
+            failed += _flush_batch(batch, clf, model_type, model_name, db, raw_results, top_k=top_k)
         _record_batch_classifier_runs(
             db, batch, model_name, fp, raw_results, pre_len,
             labels_fingerprint_full=job.get("_labels_fingerprint_full"),

@@ -44,7 +44,7 @@ env:
   AGENT_LABEL: claude-agent
 
 jobs:
-  # A maintainer's /claude-fix is the manual, uncapped reconciliation path.
+  # A maintainer's /claude-fix is the manual full-state reconciliation path.
   # It uses a distinct task kind instead of a field embedded next to untrusted
   # feedback, so comment text can never forge the human override.
   activate:
@@ -206,7 +206,6 @@ jobs:
           repo: ${{ github.repository }}
           pr: ${{ github.event.issue.number }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
-          max-review-fix-rounds: "2"
           payload: |
             Task: address-comment
             PR: ${{ github.event.issue.number }}
@@ -273,7 +272,6 @@ jobs:
           pr: ${{ github.event.pull_request.number }}
           expected-head: ${{ github.event.review.commit_id }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
-          max-review-fix-rounds: "2"
           payload: |
             Task: address-review
             PR: ${{ github.event.pull_request.number }}
@@ -342,7 +340,6 @@ jobs:
           pr: ${{ github.event.pull_request.number }}
           expected-head: ${{ github.event.review.commit_id }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
-          max-review-fix-rounds: "2"
           payload: |
             Task: address-codex-review
             PR: ${{ github.event.pull_request.number }}
@@ -556,7 +553,6 @@ jobs:
           pr: ${{ matrix.target.pr }}
           expected-head: ${{ matrix.target.head }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
-          max-review-fix-rounds: "2"
           payload: |
             Task: reconcile-pr-auto
             PR: ${{ matrix.target.pr }}

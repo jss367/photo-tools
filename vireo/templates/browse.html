@@ -99,6 +99,55 @@ body.sidebar-resizing {
   color: var(--text-faint);
   font-variant-numeric: tabular-nums;
 }
+.tree-item .folder-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.folder-local-status-slot {
+  display: inline-flex;
+  flex: 0 0 auto;
+}
+.folder-local-status {
+  margin-left: 6px;
+  padding: 1px 4px;
+  border: 1px solid currentColor;
+  border-radius: 3px;
+  font-size: 8px;
+  font-weight: 700;
+  line-height: 1.2;
+  letter-spacing: 0.04em;
+  white-space: nowrap;
+}
+.folder-local-status.local {
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+}
+.folder-local-status.mixed,
+.folder-local-status.updating {
+  color: var(--warning);
+  background: color-mix(in srgb, var(--warning) 10%, transparent);
+}
+.folder-local-status.recovery {
+  color: var(--danger);
+  background: color-mix(in srgb, var(--danger) 10%, transparent);
+}
+.folder-local-status.updating::before {
+  content: '';
+  display: inline-block;
+  width: 5px;
+  height: 5px;
+  margin-right: 3px;
+  border: 1px solid currentColor;
+  border-right-color: transparent;
+  border-radius: 50%;
+  animation: folder-local-spin 0.8s linear infinite;
+}
+@keyframes folder-local-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) {
+  .folder-local-status.updating::before { animation: none; }
+}
 .tree-item .collection-name {
   min-width: 0;
   overflow: hidden;
@@ -1760,11 +1809,11 @@ body.sidebar-resizing {
       <div class="detail-section">
         <div class="detail-section-title">Color Label <span class="batch-mixed" id="colorMixed" hidden>· Mixed</span></div>
         <div class="detail-colors" id="detailColors">
-          <button class="detail-color-btn" data-color="red" onclick="setColorLabel('red')" title="Red (6)"></button>
-          <button class="detail-color-btn" data-color="yellow" onclick="setColorLabel('yellow')" title="Yellow (7)"></button>
-          <button class="detail-color-btn" data-color="green" onclick="setColorLabel('green')" title="Green (8)"></button>
-          <button class="detail-color-btn" data-color="blue" onclick="setColorLabel('blue')" title="Blue (9)"></button>
-          <button class="detail-color-btn" data-color="purple" onclick="setColorLabel('purple')" title="Purple"></button>
+          <button class="detail-color-btn" data-color="red" data-color-label-control onclick="setColorLabel('red')" title="Red (6)" aria-label="Red label"></button>
+          <button class="detail-color-btn" data-color="yellow" data-color-label-control onclick="setColorLabel('yellow')" title="Yellow (7)" aria-label="Yellow label"></button>
+          <button class="detail-color-btn" data-color="green" data-color-label-control onclick="setColorLabel('green')" title="Green (8)" aria-label="Green label"></button>
+          <button class="detail-color-btn" data-color="blue" data-color-label-control onclick="setColorLabel('blue')" title="Blue (9)" aria-label="Blue label"></button>
+          <button class="detail-color-btn" data-color="purple" data-color-label-control onclick="setColorLabel('purple')" title="Purple" aria-label="Purple label"></button>
         </div>
       </div>
 
@@ -1827,6 +1876,22 @@ body.sidebar-resizing {
 </div>
 
 {% include '_work_locally_stage_modal.html' %}
+
+<!-- Folder Workspace Membership Modal -->
+<div class="modal-overlay" id="folderWorkspacesModal"
+     onclick="if(event.target===this) hideFolderWorkspaces()">
+  <div class="modal" style="width:440px;max-width:calc(100vw - 32px);">
+    <h3>Associated Workspaces</h3>
+    <div id="folderWorkspacesPath"
+         style="font-family:monospace;font-size:11px;color:var(--text-dim);overflow-wrap:anywhere;margin-bottom:14px;"></div>
+    <div id="folderWorkspacesList" style="display:flex;flex-direction:column;gap:6px;">
+      <div style="color:var(--text-secondary);font-size:13px;">Loading workspaces…</div>
+    </div>
+    <div class="modal-actions">
+      <button class="modal-btn modal-btn-cancel" onclick="hideFolderWorkspaces()">Close</button>
+    </div>
+  </div>
+</div>
 
 <!-- Collection Modal -->
 <div class="modal-overlay" id="collectionModal">
@@ -2599,7 +2664,20 @@ function renderCardField(field, p) {
       return '';
     case 'color_label':
       var cl = colorLabels[p.id];
-      if (cl) return '<span class="grid-card-color" data-color="' + cl + '" title="' + cl + '"></span>';
+      if (cl) {
+        if (!window.VireoColorLabels || !window.VireoColorLabels.isValid(cl)) return '';
+        var colorTitle = window.VireoColorLabels
+          ? window.VireoColorLabels.title(cl, cl.charAt(0).toUpperCase() + cl.slice(1))
+          : cl;
+        return '<span class="grid-card-color" data-color="' + escapeAttr(cl)
+          + '" data-color-label-control data-color-label-base-title="'
+          + escapeAttr(cl.charAt(0).toUpperCase() + cl.slice(1))
+          + '" data-color-label-base-aria="'
+          + escapeAttr(cl.charAt(0).toUpperCase() + cl.slice(1) + ' label')
+          + '" role="img" aria-label="'
+          + escapeAttr(cl.charAt(0).toUpperCase() + cl.slice(1) + ' label')
+          + '" title="' + escapeAttr(colorTitle) + '"></span>';
+      }
       return '';
     default:
       return '';
@@ -2708,6 +2786,16 @@ document.addEventListener('lightbox:renderchanged', function(e) {
   });
 });
 
+// Fold any already-loaded workspace descriptions into freshly rendered
+// color-label badges so lazily inserted cards get the same title and
+// accessible name as cards rendered after descriptions finished loading.
+function refreshColorLabelControlsIn(scope) {
+  if (!scope) return;
+  if (window.VireoColorLabels && typeof window.VireoColorLabels.refreshControls === 'function') {
+    window.VireoColorLabels.refreshControls(scope);
+  }
+}
+
 function appendGridPhotos(newPhotos, startIdx) {
   if (!newPhotos.length) return;
   var grid = document.getElementById('grid');
@@ -2719,6 +2807,7 @@ function appendGridPhotos(newPhotos, startIdx) {
   if (tail) tail.insertAdjacentHTML('beforebegin', html);
   else grid.insertAdjacentHTML('beforeend', html);
   updateGridTail();
+  refreshColorLabelControlsIn(grid);
 }
 
 /* The grid tail reserves a bounded amount of scroll space for the next photos
@@ -2769,7 +2858,10 @@ function refreshGridCards(photoIds) {
     var card = document.querySelector('.grid-card[data-id="' + id + '"]');
     if (!card) return;
     var info = card.querySelector('.grid-card-info');
-    if (info) info.innerHTML = renderCardInfo(p);
+    if (info) {
+      info.innerHTML = renderCardInfo(p);
+      refreshColorLabelControlsIn(info);
+    }
     // iNat badge lives in img-wrap (not grid-card-info), so sync it explicitly
     // when async metadata arrives after the card was appended.
     var wrap = card.querySelector('.grid-card-img-wrap');
@@ -3321,13 +3413,27 @@ async function loadFolders(opts) {
 }
 
 function renderFolderTree(folders) {
-  browseFolderRows = folders.slice();
+  var rows = folders.slice();
   var byParent = {};
-  folders.forEach(function(f) {
+  rows.forEach(function(f) {
     var pid = f.parent_id || 'root';
     if (!byParent[pid]) byParent[pid] = [];
     byParent[pid].push(f);
   });
+
+  // Ask folderLocalStatuses for any phantom top-level rows it had to
+  // synthesize because a missing local root has no visible ancestor. These
+  // rows carry the LOCAL ISSUE / SYNCING badge for a folder /api/folders no
+  // longer returns; without injecting them the badge has nowhere to
+  // render.
+  var statusResult = folderLocalStatuses(rows, byParent, {wantsSynthetic: true});
+  (statusResult.synthetic || []).forEach(function(row) {
+    if (rows.some(function(f) { return Number(f.id) === Number(row.id); })) return;
+    rows.push(row);
+    if (!byParent['root']) byParent['root'] = [];
+    byParent['root'].push(row);
+  });
+  browseFolderRows = rows;
 
   // Single post-order pass: each subtree's rollup is computed once and cached.
   // (Per-node recomputation during render would be O(n^2) on deep trees.)
@@ -3339,6 +3445,7 @@ function renderFolderTree(folders) {
     return total;
   }
   (byParent['root'] || []).forEach(computeRollup);
+  var localStatuses = statusResult.statuses;
 
   function buildTree(parentId, depth) {
     var children = byParent[parentId] || [];
@@ -3354,7 +3461,8 @@ function renderFolderTree(folders) {
         : '';
       html += '<div class="tree-item' + activeClass + '" onclick="filterByFolder(' + f.id + ')" data-folder-id="' + f.id + '">' +
         indent + toggle +
-        '<span>' + escapeHtml(f.name) + '</span>' +
+        '<span class="folder-name">' + escapeHtml(f.name) + '</span>' +
+        '<span class="folder-local-status-slot">' + folderLocalStatusMarkup(localStatuses[f.id]) + '</span>' +
         partialBadge +
         '<span class="count">' + rolledUp[f.id] + '</span>' +
       '</div>';
@@ -3367,6 +3475,269 @@ function renderFolderTree(folders) {
 
   document.getElementById('folderTree').innerHTML = buildTree('root', 0);
 }
+
+function folderLocalStatuses(folders, byParent, options) {
+  var wantsSynthetic = !!(options && options.wantsSynthetic);
+  var localData = window.vireoLocalFolderData;
+  if (!localData || localData.legacy_workspace_session) {
+    return wantsSynthetic ? {statuses: {}, synthetic: []} : {};
+  }
+
+  var rowsById = {};
+  folders.forEach(function(folder) { rowsById[Number(folder.id)] = folder; });
+  var direct = {};
+  // Job payloads report their target as the local root_folder_id, but a
+  // visible workspace folder may be covered by a shared ancestor whose
+  // root_folder_id isn't itself in this workspace's tree. Map each covering
+  // root back to the visible requested_folder_id(s) so sync/discard badges
+  // update instead of freezing on LOCAL. Each entry carries ``fallback``
+  // so job status can inherit whether the visible id is the covering root
+  // itself (direct — spread through the subtree) or a fallback anchor
+  // standing in for a hidden session (do not spread).
+  var visibleIdsByRoot = {};
+  var syntheticRoots = [];
+  var syntheticIds = {};
+
+  function recordMapping(rootId, visibleId, isFallback) {
+    if (!rootId) return;
+    if (!visibleIdsByRoot[rootId]) visibleIdsByRoot[rootId] = [];
+    for (var i = 0; i < visibleIdsByRoot[rootId].length; i++) {
+      if (visibleIdsByRoot[rootId][i].visibleId === visibleId) {
+        // A direct match on this visible id trumps a fallback mapping: a
+        // job on the covering root then propagates to the folder's own
+        // subtree instead of stopping at the fallback anchor.
+        if (!isFallback) visibleIdsByRoot[rootId][i].fallback = false;
+        return;
+      }
+    }
+    visibleIdsByRoot[rootId].push({visibleId: visibleId, fallback: isFallback});
+  }
+
+  (localData.folders || []).forEach(function(item) {
+    if (!item) return;
+    var requestedId = Number(item.requested_folder_id || item.root_folder_id);
+    var visibleId = requestedId;
+    var isFallback = false;
+    if (!rowsById[visibleId]) {
+      // The requested folder isn't in the tree — commonly because
+      // check_folder_health flipped its rebased folders.path to 'missing'
+      // when the managed local directory was unmounted or deleted, so
+      // /api/folders now excludes it. Dropping the item here loses the
+      // LOCAL ISSUE / SYNCING badge exactly when the local copy needs
+      // attention. Fall back to the nearest visible ancestor so the
+      // status surfaces on the enclosing folder instead.
+      var ancestorId = Number(item.visible_ancestor_folder_id || 0);
+      if (ancestorId && rowsById[ancestorId]) {
+        visibleId = ancestorId;
+        isFallback = true;
+      } else if (item.state === 'remote') {
+        // A purely remote workspace root that /api/folders doesn't
+        // return (unmounted, never staged) has nothing local to badge.
+        // Synthesizing a phantom here would restore every such root as
+        // a clickable zero-count folder with no local-status badge,
+        // effectively resurrecting missing remote folders in Browse
+        // (Codex review r3792082330). Skip it entirely.
+        return;
+      } else {
+        // A top-level workspace root that has gone missing has no
+        // visible ancestor to attach the badge to. Without a synthesized
+        // entry the recovery state disappears entirely — the user loses
+        // the only signal that their local copy needs attention. Emit a
+        // phantom top-level row so renderFolderTree can inject a
+        // ``.tree-item`` that carries the LOCAL ISSUE / SYNCING badge
+        // (Codex review r3792031813).
+        if (!syntheticIds[requestedId]) {
+          syntheticIds[requestedId] = true;
+          var syntheticName = String(item.folder_name || '').trim() ||
+            'Missing local folder';
+          // Seed the synthesized row with the root's real workspace photo
+          // count from workspace_status(). Hard-coding 0 made the only
+          // visible entry for a top-level missing local root read as an
+          // empty folder even when the recovery session covers hundreds of
+          // photos, which mis-cues users toward discarding it (Codex review
+          // r3792132683).
+          var syntheticCount = Number(item.workspace_photo_count || 0);
+          var syntheticRow = {
+            id: requestedId,
+            parent_id: null,
+            name: syntheticName,
+            photo_count: syntheticCount,
+            status: 'missing',
+            __synthetic_missing_local: true
+          };
+          syntheticRoots.push(syntheticRow);
+          rowsById[requestedId] = syntheticRow;
+        }
+        visibleId = requestedId;
+      }
+    }
+    var rootId = Number(item.root_folder_id || requestedId);
+    recordMapping(rootId, visibleId, isFallback);
+    if (item.state === 'remote') return;
+    var changes = item.changes || {};
+    var changeCount = Number(changes.created || 0) +
+      Number(changes.modified || 0) + Number(changes.deleted || 0);
+    if (item.state === 'recovery' || item.changes_error) {
+      direct[visibleId] = {
+        kind: 'recovery',
+        label: 'LOCAL ISSUE',
+        description: item.recovery_kind === 'sync'
+          ? 'Local sync needs attention'
+          : 'Local copy needs attention',
+        fallback: isFallback
+      };
+      return;
+    }
+    direct[visibleId] = {
+      kind: item.state === 'staging' ? 'updating' : 'local',
+      label: item.state === 'staging' ? 'COPYING' : 'LOCAL',
+      description: changeCount
+        ? 'Working locally · ' + changeCount + ' unsynced change' + (changeCount === 1 ? '' : 's')
+        : 'Working locally',
+      fallback: isFallback
+    };
+  });
+
+  (localData.jobs || []).forEach(function(job) {
+    var jobStatus = {
+      'work-locally-folder-stage': ['COPYING', 'Copying locally'],
+      'work-locally-folder-sync': ['SYNCING', 'Syncing local changes to source storage'],
+      'work-locally-folder-discard': ['REMOVING', 'Removing the local copy']
+    }[job.type];
+    if (!jobStatus) return;
+    (job.folder_ids || []).forEach(function(rawId) {
+      var id = Number(rawId);
+      var targets = [];
+      if (rowsById[id]) targets.push({visibleId: id, fallback: false});
+      (visibleIdsByRoot[id] || []).forEach(function(mapping) {
+        for (var ti = 0; ti < targets.length; ti++) {
+          if (targets[ti].visibleId === mapping.visibleId) {
+            if (!mapping.fallback) targets[ti].fallback = false;
+            return;
+          }
+        }
+        targets.push({visibleId: mapping.visibleId, fallback: mapping.fallback});
+      });
+      targets.forEach(function(target) {
+        direct[target.visibleId] = {
+          kind: 'updating',
+          label: jobStatus[0],
+          description: jobStatus[1],
+          fallback: target.fallback
+        };
+      });
+    });
+  });
+
+  var result = {};
+  function markDescendants(folderId, status) {
+    result[folderId] = status;
+    // Fallback anchors represent a hidden subtree that could not be
+    // shown. Propagating the anchor's status through unrelated visible
+    // siblings would mislabel healthy remote folders as LOCAL ISSUE /
+    // SYNCING / REMOVING (Codex review r3792031821).
+    if (status && status.fallback) return;
+    (byParent[folderId] || []).forEach(function(child) {
+      markDescendants(Number(child.id), status);
+    });
+  }
+  Object.keys(direct).forEach(function(rawId) {
+    markDescendants(Number(rawId), direct[rawId]);
+  });
+
+  Object.keys(direct).forEach(function(rawId) {
+    var current = rowsById[Number(rawId)];
+    var parentId = current ? current.parent_id : null;
+    var seen = {};
+    while (parentId != null && !seen[parentId]) {
+      seen[parentId] = true;
+      if (!direct[parentId]) {
+        result[parentId] = {
+          kind: 'mixed',
+          label: 'SOME LOCAL',
+          description: 'Contains folders that are working locally'
+        };
+      }
+      current = rowsById[Number(parentId)];
+      parentId = current ? current.parent_id : null;
+    }
+  });
+  if (wantsSynthetic) {
+    return {statuses: result, synthetic: syntheticRoots};
+  }
+  return result;
+}
+
+function folderLocalStatusMarkup(status) {
+  if (!status) return '';
+  return '<span class="folder-local-status ' + status.kind + '" role="img"' +
+    ' aria-label="' + escapeAttr(status.description) + '"' +
+    ' title="' + escapeAttr(status.description) + '">' +
+    escapeHtml(status.label) + '</span>';
+}
+
+function refreshFolderLocalStatusIndicators() {
+  // Compute statuses from real rows only. If the previously injected
+  // phantoms remain in the input, folderLocalStatuses treats them as
+  // existing rows and never re-emits them in ``synthetic``, so a still-
+  // needed phantom would look identical to a stale one left behind after
+  // a recovery discard. Rebuild the input so ``synthetic`` reliably
+  // enumerates exactly the phantoms the current local-folder state
+  // requires (Codex review r3792082333).
+  var realFolders = browseFolderRows.filter(function(f) {
+    return !f.__synthetic_missing_local;
+  });
+  var byParent = {};
+  realFolders.forEach(function(folder) {
+    var parentId = folder.parent_id || 'root';
+    if (!byParent[parentId]) byParent[parentId] = [];
+    byParent[parentId].push(folder);
+  });
+  var statusResult = folderLocalStatuses(
+    realFolders, byParent, {wantsSynthetic: true}
+  );
+  var neededPhantomIds = {};
+  (statusResult.synthetic || []).forEach(function(row) {
+    neededPhantomIds[Number(row.id)] = true;
+  });
+  var existingPhantomIds = {};
+  browseFolderRows.forEach(function(f) {
+    if (f.__synthetic_missing_local) existingPhantomIds[Number(f.id)] = true;
+  });
+  var newPhantomNeeded = Object.keys(neededPhantomIds).some(function(id) {
+    return !existingPhantomIds[id];
+  });
+  var stalePhantomPresent = Object.keys(existingPhantomIds).some(function(id) {
+    return !neededPhantomIds[id];
+  });
+  // A stale phantom's underlying folder is no longer flagged as a
+  // missing local session — a discard-recovery, for example, ends the
+  // session and the real folder returns to ``/api/folders``. Re-fetch
+  // so the restored row and photo count replace the zero-count
+  // ``status: 'missing'`` shell instead of leaving Browse with an
+  // orphaned clickable phantom (Codex review r3792082333).
+  if (stalePhantomPresent && typeof loadFolders === 'function') {
+    loadFolders();
+    return;
+  }
+  // A newly needed phantom means the DOM has no ``.tree-item`` slot to
+  // update — a slot-only refresh would silently drop the LOCAL ISSUE
+  // badge. Rebuild from real rows and let renderFolderTree re-inject
+  // the phantom.
+  if (newPhantomNeeded) {
+    renderFolderTree(realFolders);
+    return;
+  }
+  var statuses = statusResult.statuses;
+  document.querySelectorAll('#folderTree .tree-item[data-folder-id]').forEach(function(row) {
+    var slot = row.querySelector('.folder-local-status-slot');
+    if (slot) slot.innerHTML = folderLocalStatusMarkup(statuses[Number(row.dataset.folderId)]);
+  });
+}
+
+window.addEventListener('vireo:local-folder-status-changed', function() {
+  refreshFolderLocalStatusIndicators();
+});
 
 function toggleTree(e, el) {
   e.stopPropagation();
@@ -3865,6 +4236,16 @@ async function refreshBrowseAfterFolderHealthChange(detail) {
     }, 2000 * Math.pow(2, retryAttempt));
     return;
   }
+  // Folder health can change which visible ancestor represents a hidden
+  // local session. Refresh the authoritative local-folder payload after the
+  // fresh tree has rendered so recovery badges move to the correct ancestor
+  // (or synthesize a top-level row) immediately. Encoding folder health in
+  // the 15-second blocker fingerprint either misses non-mapped ancestors or
+  // makes that lightweight polling payload grow with catalog size.
+  if (window.vireoLocalFolders &&
+      typeof window.vireoLocalFolders.load === 'function') {
+    window.vireoLocalFolders.load();
+  }
   // Use the health-owned response rather than the DOM. A later unrelated
   // loadFolders() call may supersede this render while still being in flight;
   // in that window the DOM is intentionally old even though this response
@@ -4337,6 +4718,20 @@ async function updatePreviewNow() {
   }
 }
 
+function commitRuleOnEnter(e) {
+  if (e.key !== 'Enter' || e.isComposing || e.keyCode === 229) return;
+  var t = e.currentTarget || e.target;
+  if (t && t.type === 'date') {
+    // Native date pickers use Enter to commit the highlighted date;
+    // cancelling it would close the picker without applying the selection.
+    // Defer the blur so the picker's own Enter handler runs first.
+    setTimeout(function() { t.blur(); }, 0);
+    return;
+  }
+  e.preventDefault();
+  t.blur();
+}
+
 function renderRuleValueInput(r, i) {
   var p = escapeAttr(i);
   if (r.field === 'all') {
@@ -4416,15 +4811,15 @@ function renderRuleValueInput(r, i) {
       var from = Array.isArray(r.value) ? (r.value[0] || '') : '';
       var to   = Array.isArray(r.value) ? (r.value[1] || '') : '';
       return '<div style="flex:1;display:flex;gap:6px;align-items:center;">' +
-          '<input type="date" value="' + escapeAttr(from) + '" onchange="updateRule(\'' + p + '\',\'value_from\',this.value)" style="flex:1;">' +
+          '<input type="date" value="' + escapeAttr(from) + '" onchange="updateRule(\'' + p + '\',\'value_from\',this.value)" onkeydown="commitRuleOnEnter(event)" style="flex:1;">' +
           '<span style="color:var(--text-ghost);font-size:11px;">and</span>' +
-          '<input type="date" value="' + escapeAttr(to) + '" onchange="updateRule(\'' + p + '\',\'value_to\',this.value)" style="flex:1;">' +
+          '<input type="date" value="' + escapeAttr(to) + '" onchange="updateRule(\'' + p + '\',\'value_to\',this.value)" onkeydown="commitRuleOnEnter(event)" style="flex:1;">' +
         '</div>';
     }
     if (r.op === 'recent_days') {
       var n = (typeof r.value === 'number' || (typeof r.value === 'string' && r.value !== '')) ? r.value : 7;
       return '<div style="flex:1;display:flex;gap:6px;align-items:center;">' +
-          '<input type="number" min="1" value="' + escapeAttr(String(n)) + '" onchange="updateRule(\'' + p + '\',\'value\',this.value)" style="width:80px;">' +
+          '<input type="number" min="1" value="' + escapeAttr(String(n)) + '" onchange="updateRule(\'' + p + '\',\'value\',this.value)" onkeydown="commitRuleOnEnter(event)" style="width:80px;">' +
           '<span style="color:var(--text-ghost);font-size:11px;">days</span>' +
         '</div>';
     }
@@ -4433,7 +4828,9 @@ function renderRuleValueInput(r, i) {
     'noise_estimate', 'crop_complete', 'prediction_confidence'].indexOf(r.field) !== -1;
   return '<input type="' + (numeric ? 'number' : 'text') + '" value="' +
     escapeAttr(String(r.value == null ? '' : r.value)) +
-    '" onchange="updateRule(\'' + p + '\',\'value\',this.value)" placeholder="value" style="flex:1;">';
+    '" onchange="updateRule(\'' + p + '\',\'value\',this.value)"' +
+    ' onkeydown="commitRuleOnEnter(event)"' +
+    ' placeholder="value" style="flex:1;">';
 }
 
 function renderFieldOptions(selected) {
@@ -5173,6 +5570,7 @@ function renderGrid() {
   });
   grid.innerHTML = html;
   updateGridTail();
+  refreshColorLabelControlsIn(grid);
 }
 
 /* ---------- Grid dblclick delegation (XSS-safe) ---------- */
@@ -8514,6 +8912,31 @@ function scrollToCard(idx) {
   if (cards[idx]) cards[idx].scrollIntoView({ block: 'nearest', behavior: 'smooth' });
 }
 
+// Lightbox navigation has its own current-photo state. Reconcile that state
+// with Browse only when the overlay closes so returning to the grid focuses
+// the photo the user finished on, without reloading the detail panel on every
+// Previous/Next step while the lightbox is still open.
+document.addEventListener('lightbox:closed', function(event) {
+  var photoId = event && event.detail ? event.detail.photoId : null;
+  // Viewing shortcuts can open the lightbox without collapsing an existing
+  // batch. Preserve that batch instead of replacing it with the viewed photo.
+  if (photoId == null || selectedPhotos.size > 0) return;
+  var idx = photos.findIndex(function(photo) { return photo.id === photoId; });
+  if (idx < 0) return;
+  // Skip `selectPhoto` when the focused photo is already the one being
+  // returned to: it calls `loadDetail`, which refetches and rerenders the
+  // detail panel and would silently discard an unsubmitted `#locationInput`
+  // draft (its blur handler only hides suggestions, it does not save). Only
+  // reload details when lightbox navigation actually changed the photo.
+  if (selectedPhotoId === photoId) {
+    if (selectedIndex !== idx) selectedIndex = idx;
+    scrollToCard(idx);
+    return;
+  }
+  selectPhoto({ shiftKey: false, metaKey: false, ctrlKey: false }, photoId, idx);
+  scrollToCard(idx);
+});
+
 function developSelected() {
   var ids = getActiveSelection();
   if (!ids.length) return;
@@ -8672,7 +9095,11 @@ function buildPhotoContextMenu(photoIds) {
   var colorChip = function(c, icon, title) {
     return {
       label: icon,
-      title: title,
+      title: c && window.VireoColorLabels
+        ? window.VireoColorLabels.title(c, title)
+        : title,
+      color: c,
+      colorBaseTitle: title,
       onClick: function() {
         photoIds.forEach(function(id) { setColorLabelFor(id, c); });
       },
@@ -8819,6 +9246,71 @@ async function copyFolderPath(fid) {
   }
 }
 
+var folderWorkspacesRequestSeq = 0;
+
+function hideFolderWorkspaces() {
+  folderWorkspacesRequestSeq += 1;
+  document.getElementById('folderWorkspacesModal').classList.remove('open');
+}
+
+async function showFolderWorkspaces(fid) {
+  var requestSeq = ++folderWorkspacesRequestSeq;
+  var modal = document.getElementById('folderWorkspacesModal');
+  var path = document.getElementById('folderWorkspacesPath');
+  var list = document.getElementById('folderWorkspacesList');
+  path.textContent = '';
+  list.textContent = '';
+  var loading = document.createElement('div');
+  loading.style.cssText = 'color:var(--text-secondary);font-size:13px;';
+  loading.textContent = 'Loading workspaces…';
+  list.appendChild(loading);
+  modal.classList.add('open');
+
+  try {
+    var data = await safeFetch('/api/folders/' + fid + '/workspaces', {}, { toast: false });
+    if (requestSeq !== folderWorkspacesRequestSeq) return;
+    path.textContent = data.folder && data.folder.path ? data.folder.path : '';
+    list.textContent = '';
+    (data.workspaces || []).forEach(function(workspace) {
+      var row = document.createElement('div');
+      row.style.cssText = 'display:flex;align-items:center;gap:8px;padding:8px 10px;background:var(--bg-tertiary);border:1px solid var(--border-secondary);border-radius:5px;font-size:13px;';
+
+      var name = document.createElement('span');
+      name.style.cssText = 'flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;';
+      name.textContent = workspace.name;
+      name.title = workspace.name;
+      row.appendChild(name);
+
+      if (workspace.is_root) {
+        var rootBadge = document.createElement('span');
+        rootBadge.style.cssText = 'font-size:10px;color:var(--text-faint);';
+        rootBadge.textContent = 'Root';
+        row.appendChild(rootBadge);
+      }
+      if (workspace.is_active) {
+        var activeBadge = document.createElement('span');
+        activeBadge.style.cssText = 'font-size:10px;color:var(--accent);font-weight:600;';
+        activeBadge.textContent = 'Current';
+        row.appendChild(activeBadge);
+      }
+      list.appendChild(row);
+    });
+    if (!list.children.length) {
+      var empty = document.createElement('div');
+      empty.style.cssText = 'color:var(--text-secondary);font-size:13px;';
+      empty.textContent = 'This folder is not associated with any workspace.';
+      list.appendChild(empty);
+    }
+  } catch (err) {
+    if (requestSeq !== folderWorkspacesRequestSeq) return;
+    list.textContent = '';
+    var error = document.createElement('div');
+    error.style.cssText = 'color:var(--danger);font-size:13px;';
+    error.textContent = (err && err.message) || 'Could not load associated workspaces.';
+    list.appendChild(error);
+  }
+}
+
 function moveFolder(fid) {
   window.location.href = '/move?folder_id=' + encodeURIComponent(fid);
 }
@@ -8860,6 +9352,7 @@ document.addEventListener('contextmenu', function(e) {
     { separator: true },
     { label: window.VIREO_REVEAL_LABEL, onClick: function() { revealFolder(fid); } },
     { label: 'Copy Path', onClick: function() { copyFolderPath(fid); } },
+    { label: 'Show Associated Workspaces…', onClick: function() { showFolderWorkspaces(fid); } },
     { separator: true },
     { label: 'Work Locally\u2026', onClick: function() { workLocallyFolder(fid); } },
     { label: 'Move\u2026', onClick: function() { moveFolder(fid); } },

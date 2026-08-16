@@ -60,6 +60,10 @@ routine** and fill in:
 - **Triggers**: add an **API** trigger. Click **Generate token** and copy
   both the URL and the token immediately (token is shown once).
 
+The routine prompt is not synchronized from the repository. After changing
+`pr-agent-routine-prompt.md`, paste the updated contents into the existing
+routine before relying on the new behavior.
+
 Do **not** add a schedule or GitHub trigger — this routine is invoked from
 the GHA forwarder, which knows the richer set of events we care about
 (`issue_comment`, `workflow_run`, `push`) that the native GitHub trigger
@@ -109,7 +113,7 @@ The forwarder sends plain-text payloads that the routine prompt knows how to
 parse. Each payload starts with a `Task:` line, followed by structured
 context. The routine prompt enumerates the supported task kinds:
 
-- `reconcile-pr` — verified human `/claude-fix`; uncapped full-state recovery
+- `reconcile-pr` — verified human `/claude-fix`; human-initiated full-state recovery
 - `reconcile-pr-auto` — bounded full-state recovery for an orphaned conflict
 - `address-review` — non-approving review submitted on a claude-agent PR
 - `address-comment` — non-`/claude-fix`, non-👍 comment on a claude-agent PR
@@ -175,7 +179,7 @@ so unrelated task types never cancel each other. Automated review-fix firers
 (`fix-comment-feedback`, `fix-comments`, `codex-review`) share a
 `pr-agent-review-fix-<PR>` group so newer review events collapse older ones.
 The explicit human `activate` route uses a separate, non-cancellable per-PR
-lane so automated feedback cannot displace an uncapped `/claude-fix`
+lane so automated feedback cannot displace a human `/claude-fix`
 reconciliation. Conflict reconciliation uses the automated per-PR lane, so a
 stale review and conflict repair cannot edit the same head concurrently. CI-fix runs derive the
 PR number from
@@ -218,13 +222,12 @@ uses the owner's GitHub identity from treating its own output as fresh human
 feedback. Successful runs do not post top-level summaries: they push one fix
 commit, reply to the exact addressed inline threads, and resolve those threads.
 
-The forwarder and routine both stop automated review repair after two commits
-carrying the PR-specific `[pr-agent-review-fix:<number>]` marker. An explicit
-human `/claude-fix` remains available as an override through the distinct,
-non-injectable `reconcile-pr` task. The forwarder adds
-`pr-agent-needs-human` when the cap is reached. Architectural findings,
-new-subsystem changes, and material diff expansion are escalated to a human
-instead of creating another autonomous review/fix round.
+There is no fixed per-PR review/fix round cap. Each eligible review event can
+invoke the routine while the PR remains open, regardless of how many earlier
+rounds occurred. The routine escalates only a concrete finding that needs a
+maintainer decision, conflicts with repository requirements, or cannot be
+handled safely within the PR's scope; review count alone is never a reason to
+stop.
 
 ## Limits and caveats
 

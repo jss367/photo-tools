@@ -247,7 +247,10 @@ def _import_without_new_files(params, photo_ids, new_count):
     )
 
 
-def _classify_plan(db, params, photo_ids, new_count=0):
+def _classify_plan(
+    db, params, photo_ids, new_count=0, detector_confidence=0,
+    pipeline_cfg=None,
+):
     if params.skip_classify:
         return {
             "state": "will-skip",
@@ -271,10 +274,66 @@ def _classify_plan(db, params, photo_ids, new_count=0):
 
     label_resolution = _resolve_labels_for_models(models, params.labels_files, db)
 
-    det_counts = db.count_primary_detections_in_scope(photo_ids)
-    total_dets = det_counts["total_dets"]
-    photos_with_dets = det_counts["photos_with_dets"]
-    full_image_fallbacks = db.count_full_image_fallback_photos(photo_ids)
+    pipeline_cfg = pipeline_cfg or {}
+    scope_ids = (
+        list(db.get_photo_ids()) if photo_ids is None else list(photo_ids)
+    )
+    try:
+        from computation_cache import megadetector_runtime_fingerprint
+
+        detector_runtime = megadetector_runtime_fingerprint()
+    except (OSError, ValueError):
+        detector_runtime = None
+    current_detector_photo_ids = db.get_detector_run_photo_ids(
+        "megadetector-v6",
+        runtime_fingerprint=detector_runtime,
+    )
+    contextual_weak_ids = set()
+    weak_detection_confidence = pipeline_cfg.get(
+        "weak_detection_confidence", 0.12,
+    )
+    if (
+        pipeline_cfg.get("weak_detection_rescue_enabled", True)
+        and weak_detection_confidence < detector_confidence
+    ):
+        from weak_detections import contextual_weak_photo_ids
+
+        scoped_photos = db.get_photos_by_ids(scope_ids)
+        raw_mdv6_detections = db.get_detections_for_photos(
+            scope_ids,
+            min_conf=weak_detection_confidence,
+            detector_model="megadetector-v6",
+        )
+        contextual_weak_ids = contextual_weak_photo_ids(
+            scoped_photos.values(),
+            raw_mdv6_detections,
+            detector_confidence=detector_confidence,
+            weak_confidence=weak_detection_confidence,
+            max_gap=pipeline_cfg.get("burst_time_gap", 3.0),
+        )
+
+    det_counts = db.count_primary_detections_in_scope(
+        photo_ids, min_conf=detector_confidence,
+    )
+    weak_det_counts = db.count_primary_detections_in_scope(
+        contextual_weak_ids, min_conf=weak_detection_confidence,
+    )
+    total_dets = det_counts["total_dets"] + weak_det_counts["total_dets"]
+    photos_with_dets = (
+        det_counts["photos_with_dets"]
+        + weak_det_counts["photos_with_dets"]
+    )
+    # ``detector_confidence`` mirrors the pipeline's runtime fallback gate
+    # so photos whose only MegaDetector rows are below the classification
+    # floor are counted as fallback candidates. Without it the plan would
+    # ignore noise-only photos even though classify_stage now sends them
+    # through the full-image fallback (PR #1484).
+    fallback_photo_ids = (
+        set(scope_ids) - contextual_weak_ids
+    ) & current_detector_photo_ids
+    full_image_fallbacks = db.count_full_image_fallback_photos(
+        fallback_photo_ids, min_conf=detector_confidence,
+    )
     classifiable_units = total_dets + full_image_fallbacks
 
     unblocked_count = sum(
@@ -318,11 +377,19 @@ def _classify_plan(db, params, photo_ids, new_count=0):
                 classifier_model=m["name"],
                 labels_fingerprint=fp,
                 photo_ids=photo_ids,
+                min_conf=detector_confidence,
+            )
+            stale_total += db.count_primary_classify_stale(
+                classifier_model=m["name"],
+                labels_fingerprint=fp,
+                photo_ids=contextual_weak_ids,
+                min_conf=weak_detection_confidence,
             )
             stale_total += db.count_full_image_classify_stale(
                 classifier_model=m["name"],
                 labels_fingerprint=fp,
-                photo_ids=photo_ids,
+                photo_ids=fallback_photo_ids,
+                min_conf=detector_confidence,
             )
     # Reclassify is a user override, not a settings-change signal.
     fingerprint_outdated = stale_total > 0 and not params.reclassify
@@ -359,6 +426,27 @@ def _classify_plan(db, params, photo_ids, new_count=0):
                     "pending": 0,
                     "eligible": 0,
                     "new_photos": new_count,
+                    "stale": stale_total,
+                    "fingerprint_outdated": fingerprint_outdated,
+                    "fingerprint_reason": fingerprint_reason,
+                },
+            }
+        if (
+            scope_ids
+            and set(scope_ids).issubset(current_detector_photo_ids)
+            and new_count == 0
+        ):
+            return {
+                "state": "done-prior",
+                "summary": "Nothing to classify — no animal targets found",
+                "detail": {
+                    "total_dets": 0,
+                    "photos_with_dets": 0,
+                    "full_image_fallbacks": 0,
+                    "models": [m["name"] for m in models],
+                    "pending": 0,
+                    "eligible": 0,
+                    "new_photos": 0,
                     "stale": stale_total,
                     "fingerprint_outdated": fingerprint_outdated,
                     "fingerprint_reason": fingerprint_reason,
@@ -416,11 +504,19 @@ def _classify_plan(db, params, photo_ids, new_count=0):
                 classifier_model=m["name"],
                 labels_fingerprint=fp,
                 photo_ids=photo_ids,
+                min_conf=detector_confidence,
+            )
+            pending += db.count_primary_classify_pending_pairs(
+                classifier_model=m["name"],
+                labels_fingerprint=fp,
+                photo_ids=contextual_weak_ids,
+                min_conf=weak_detection_confidence,
             )
             pending += db.count_full_image_classify_pending_pairs(
                 classifier_model=m["name"],
                 labels_fingerprint=fp,
-                photo_ids=photo_ids,
+                photo_ids=fallback_photo_ids,
+                min_conf=detector_confidence,
             )
         if pending:
             pending_per_model[m["name"]] = pending
@@ -1367,7 +1463,11 @@ def compute_plan(db, params, db_path):
             photo_ids = set(db.get_photo_ids())
         photo_ids = {pid for pid in photo_ids if pid not in excl}
 
-    classify = _classify_plan(db, params, photo_ids, new_count)
+    classify = _classify_plan(
+        db, params, photo_ids, new_count,
+        detector_confidence=effective_cfg.get("detector_confidence", 0.2),
+        pipeline_cfg=pipeline_cfg,
+    )
     extract = _extract_plan(db, params, photo_ids, pipeline_cfg, new_count)
     eye = _eye_keypoints_plan(db, params, photo_ids, pipeline_cfg, new_count)
     previews = _previews_plan(db, params, photo_ids, new_count, effective_cfg)

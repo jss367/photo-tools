@@ -66,17 +66,71 @@ def test_get_color_labels(app_and_db):
     assert resp.get_json() == {str(pids[0]): 'purple'}
 
 
+def test_color_label_description_round_trip(app_and_db):
+    """The description API sets, reads, normalizes, and clears meanings."""
+    app, db = app_and_db
+    client = app.test_client()
+
+    response = client.put(
+        "/api/color-label-descriptions/red",
+        json={"description": "  Used for\nreptiles  "},
+    )
+    assert response.status_code == 200
+    assert response.get_json() == {
+        "color": "red",
+        "description": "Used for reptiles",
+    }
+    assert client.get("/api/color-label-descriptions").get_json() == {
+        "red": "Used for reptiles",
+    }
+    assert db.get_color_label_descriptions() == {"red": "Used for reptiles"}
+
+    response = client.put(
+        "/api/color-label-descriptions/red", json={"description": ""}
+    )
+    assert response.status_code == 200
+    assert response.get_json() == {"color": "red", "description": ""}
+    assert client.get("/api/color-label-descriptions").get_json() == {}
+
+
+def test_color_label_description_validation(app_and_db):
+    """The description endpoint rejects bad colors, shapes, and long text."""
+    app, _ = app_and_db
+    client = app.test_client()
+
+    assert client.put(
+        "/api/color-label-descriptions/orange", json={"description": "Mammals"}
+    ).status_code == 400
+    assert client.put(
+        "/api/color-label-descriptions/red", json={}
+    ).status_code == 400
+    for body in (42, "description", ["description"]):
+        response = client.put(
+            "/api/color-label-descriptions/red", json=body
+        )
+        assert response.status_code == 400
+        assert response.get_json()["error"] == "description required"
+    assert client.put(
+        "/api/color-label-descriptions/red", json={"description": None}
+    ).status_code == 400
+    assert client.put(
+        "/api/color-label-descriptions/red", json={"description": "x" * 121}
+    ).status_code == 400
+
+
 def test_color_label_routes_are_owned_by_domain_blueprint(app_and_db):
     """The extracted route group must not drift back into the app module."""
     app, _ = app_and_db
     endpoints = {
         rule.rule: rule.endpoint
         for rule in app.url_map.iter_rules()
-        if 'color_label' in rule.rule
+        if rule.endpoint.startswith('photo_labels.')
     }
 
     assert endpoints == {
         '/api/batch/color_label': 'photo_labels.set_labels',
+        '/api/color-label-descriptions': 'photo_labels.get_descriptions',
+        '/api/color-label-descriptions/<color>': 'photo_labels.set_description',
         '/api/photos/<int:photo_id>/color_label': 'photo_labels.set_label',
         '/api/photos/color_labels': 'photo_labels.get_labels',
     }
@@ -389,6 +443,8 @@ def test_sync_status(app_and_db):
     assert resp.status_code == 200
     data = resp.get_json()
     assert data['pending_count'] == 0
+    assert data['pending_photo_count'] == 0
+    assert data['change_type_counts'] == {}
 
     photos = db.get_photos()
     db.queue_change(photos[0]['id'], 'rating', '3')
@@ -396,6 +452,259 @@ def test_sync_status(app_and_db):
     resp = client.get('/api/sync/status')
     data = resp.get_json()
     assert data['pending_count'] == 1
+    assert data['pending_photo_count'] == 1
+    assert data['change_type_counts'] == {'rating': 1}
+
+
+def test_sync_preview_pages_photos_with_stable_summary(app_and_db):
+    """Progressive preview pages retain totals and a stable revision."""
+    app, db = app_and_db
+    photo_ids = [photo["id"] for photo in db.get_photos()[:2]]
+    assert len(photo_ids) == 2
+    for index, photo_id in enumerate(photo_ids, start=3):
+        db.queue_change(photo_id, "rating", str(index))
+
+    client = app.test_client()
+    first = client.get("/api/sync/preview?limit=1&offset=0")
+
+    assert first.status_code == 200
+    first_data = first.get_json()
+    assert first_data["total_changes"] == 2
+    assert first_data["total_photos"] == 2
+    assert first_data["change_type_counts"] == {"rating": 2}
+    assert len(first_data["photos"]) == 1
+    assert first_data["has_more"] is True
+    assert first_data["next_offset"] == 1
+    assert first_data["revision"]
+
+    second = client.get(
+        "/api/sync/preview?limit=1&offset=1&revision="
+        + first_data["revision"]
+    )
+    assert second.status_code == 200
+    second_data = second.get_json()
+    assert len(second_data["photos"]) == 1
+    assert second_data["photos"][0]["photo_id"] != first_data["photos"][0]["photo_id"]
+    assert second_data["total_changes"] == 2
+    assert second_data["total_photos"] == 2
+    assert second_data["has_more"] is False
+    assert second_data["next_offset"] is None
+
+
+def test_sync_preview_rejects_stale_progressive_revision(app_and_db):
+    """A changed pending queue cannot be mixed into an older preview."""
+    app, db = app_and_db
+    photo_ids = [photo["id"] for photo in db.get_photos()[:2]]
+    db.queue_change(photo_ids[0], "rating", "3")
+    client = app.test_client()
+    first = client.get("/api/sync/preview?limit=1&offset=0").get_json()
+
+    db.queue_change(photo_ids[1], "rating", "4")
+    stale = client.get(
+        "/api/sync/preview?limit=1&offset=1&revision=" + first["revision"]
+    )
+
+    assert stale.status_code == 409
+    assert stale.get_json()["code"] == "sync_preview_changed"
+
+
+def test_sync_preview_revalidates_after_final_page_enrichment(
+    app_and_db, tmp_path,
+):
+    """A queue write during slow final-page enrichment returns a conflict."""
+    import app as vireo_app
+
+    app, db = app_and_db
+    photo_ids = [photo["id"] for photo in db.get_photos()[:2]]
+    first_photo = db.get_photo(photo_ids[0])
+    db.conn.execute(
+        "UPDATE folders SET path = ? WHERE id = ?",
+        (str(tmp_path), first_photo["folder_id"]),
+    )
+    db.conn.commit()
+    db.queue_change(photo_ids[0], "rating", "3")
+    original_read = vireo_app.read_sync_preview_metadata
+    mutated = False
+
+    def mutate_queue_during_read(path):
+        nonlocal mutated
+        if not mutated:
+            mutated = True
+            db.queue_change(photo_ids[1], "rating", "4")
+        return original_read(path)
+
+    vireo_app.read_sync_preview_metadata = mutate_queue_during_read
+    try:
+        response = app.test_client().get(
+            "/api/sync/preview?limit=25&offset=0"
+        )
+    finally:
+        vireo_app.read_sync_preview_metadata = original_read
+
+    assert response.status_code == 409
+    assert response.get_json()["code"] == "sync_preview_changed"
+
+
+def test_sync_preview_reuses_snapshot_across_page_requests(app_and_db):
+    """Subsequent page requests skip the full pending-changes scan.
+
+    Progressive loading otherwise re-fetches and re-hashes every pending
+    change on every page request, making preview preparation quadratic in
+    queue size (Codex review, PR #1483). Once the snapshot for a revision
+    is cached, later pages must not re-query ``pending_changes``.
+    """
+    app, db = app_and_db
+    photo_ids = [photo["id"] for photo in db.get_photos()[:3]]
+    assert len(photo_ids) == 3
+    for index, photo_id in enumerate(photo_ids, start=1):
+        db.queue_change(photo_id, "rating", str(index))
+
+    client = app.test_client()
+    first = client.get("/api/sync/preview?limit=2&offset=0").get_json()
+    assert first["total_photos"] == 3
+    assert first["revision"]
+    revision = first["revision"]
+
+    import app as vireo_app
+
+    call_count = {"n": 0}
+    original_build = vireo_app._sync_preview_build_snapshot
+
+    def counting_build(*args, **kwargs):
+        call_count["n"] += 1
+        return original_build(*args, **kwargs)
+
+    vireo_app._sync_preview_build_snapshot = counting_build
+    try:
+        second = client.get(
+            f"/api/sync/preview?limit=2&offset=2&revision={revision}"
+        ).get_json()
+    finally:
+        vireo_app._sync_preview_build_snapshot = original_build
+
+    assert second["revision"] == revision
+    assert len(second["photos"]) == 1
+    # The cached snapshot serves page 2 — no re-scan of pending_changes.
+    assert call_count["n"] == 0
+
+
+def test_sync_preview_cache_isolated_by_database(app_and_db, tmp_path):
+    """Matching workspace revisions from separate catalogs never cross-read.
+
+    Workspace IDs and pending-change IDs restart in every catalog. A cache
+    keyed only by ``(workspace_id, revision)`` can therefore return filenames
+    and folders from another database in the same process.
+    """
+    import app as vireo_app
+    from db import Database
+
+    _app, first_db = app_and_db
+    first_photo = first_db.get_photos()[0]
+    first_db.queue_change(first_photo["id"], "rating", "3")
+    first_snapshot = vireo_app._sync_preview_get_snapshot(
+        first_db, first_db._ws_id(), None,
+    )
+
+    second_db = Database(str(tmp_path / "second-catalog.db"))
+    try:
+        second_ws = second_db.ensure_default_workspace()
+        second_db.set_active_workspace(second_ws)
+        second_folder = second_db.add_folder(
+            str(tmp_path / "second-photos"), name="second-photos",
+        )
+        second_db.add_workspace_folder(second_ws, second_folder)
+        second_photo = second_db.add_photo(
+            folder_id=second_folder,
+            filename="second.jpg",
+            extension=".jpg",
+            file_size=10,
+            file_mtime=1.0,
+        )
+        second_db.queue_change(second_photo, "rating", "3")
+        second_snapshot = vireo_app._sync_preview_get_snapshot(
+            second_db, second_ws, first_snapshot["revision"],
+        )
+    finally:
+        second_db.close()
+
+    assert second_snapshot["all_photos"][0]["filename"] == "second.jpg"
+    assert second_snapshot["all_photos"][0]["folder"] == str(
+        tmp_path / "second-photos"
+    )
+
+
+def test_sync_preview_cache_evicts_obsolete_workspace_revision(app_and_db):
+    """A changed queue replaces, rather than accumulates, its old snapshot."""
+    import app as vireo_app
+
+    _app, db = app_and_db
+    ws_id = db._ws_id()
+    database_key = os.path.abspath(db._db_path)
+    photos = db.get_photos()[:2]
+    db.queue_change(photos[0]["id"], "rating", "3")
+    first_snapshot = vireo_app._sync_preview_get_snapshot(db, ws_id, None)
+
+    db.queue_change(photos[1]["id"], "rating", "4")
+    second_snapshot = vireo_app._sync_preview_get_snapshot(db, ws_id, None)
+
+    assert second_snapshot["revision"] != first_snapshot["revision"]
+    with vireo_app._SYNC_PREVIEW_SNAPSHOTS_LOCK:
+        workspace_keys = [
+            key
+            for key in vireo_app._SYNC_PREVIEW_SNAPSHOTS
+            if key[:2] == (database_key, ws_id)
+        ]
+    assert workspace_keys == [
+        (database_key, ws_id, second_snapshot["revision"])
+    ]
+
+
+def test_sync_preview_detects_top_id_replacement(app_and_db):
+    """A delete+insert that reuses the top pending_changes.id must not hit cache.
+
+    ``pending_changes.id`` is a plain INTEGER PRIMARY KEY (no
+    AUTOINCREMENT), so SQLite reuses the highest deleted id on the
+    next INSERT. A COUNT/MAX/SUM aggregate fingerprint would stay
+    identical across such a replacement and the client would receive
+    the stale cached snapshot (Codex review, PR #1483). The per-workspace
+    ``pending_changes_version`` counter must bump on both the DELETE and
+    the INSERT so the second request rebuilds against the new row.
+    """
+    app, db = app_and_db
+    photo_ids = [photo["id"] for photo in db.get_photos()[:2]]
+    assert len(photo_ids) == 2
+    original_token = db.queue_change(photo_ids[0], "rating", "3")
+    assert original_token is not None
+
+    client = app.test_client()
+    first = client.get("/api/sync/preview?limit=1&offset=0").get_json()
+    assert first["total_photos"] == 1
+    first_change = first["photos"][0]["changes"][0]
+    original_id = first_change["id"]
+
+    # Replace the sole pending row with a different change on a different
+    # photo. Same value and same change_type keep the aggregate identical
+    # (count=1, max_id=sum_id, and the reused id preserves both). Only a
+    # write-generation counter — not the aggregate — will notice.
+    db.conn.execute("DELETE FROM pending_changes WHERE id = ?", (original_id,))
+    db.conn.commit()
+    reused_token = db.queue_change(photo_ids[1], "rating", "3")
+    assert reused_token is not None
+    reused_id = db.conn.execute(
+        "SELECT id FROM pending_changes WHERE change_token = ?",
+        (reused_token,),
+    ).fetchone()[0]
+    # Precondition for the regression: SQLite reused the deleted top id.
+    # The whole point of this test is to exercise that reuse, so bail out
+    # loudly if the platform's SQLite ever changes and we're no longer
+    # testing what we think we are.
+    assert reused_id == original_id
+
+    second = client.get("/api/sync/preview?limit=1&offset=0").get_json()
+    assert second["total_photos"] == 1
+    served_change = second["photos"][0]
+    assert served_change["photo_id"] == photo_ids[1]
+    assert second["revision"] != first["revision"]
 
 
 def test_sync_preview_describes_location_keyword_as_xmp_delta(
@@ -1377,6 +1686,44 @@ def test_sync_discard_records_history(app_and_db):
     history = db.get_edit_history()
     assert len(history) == 1
     assert history[0]['action_type'] == 'discard'
+    assert db.get_pending_changes() == []
+
+
+def test_sync_discard_all_rejects_stale_preview_revision(app_and_db):
+    """Discard All never removes changes that appeared after the review."""
+    app, db = app_and_db
+    photos = db.get_photos()[:2]
+    db.queue_change(photos[0]["id"], "rating", "3")
+    client = app.test_client()
+    revision = client.get("/api/sync/preview").get_json()["revision"]
+
+    db.queue_change(photos[1]["id"], "rating", "4")
+    response = client.post(
+        "/api/sync/discard",
+        json={"discard_all": True, "revision": revision},
+    )
+
+    assert response.status_code == 409
+    assert response.get_json()["code"] == "sync_preview_changed"
+    assert len(db.get_pending_changes()) == 2
+
+
+def test_sync_discard_all_uses_reviewed_revision(app_and_db):
+    """A current reviewed revision atomically clears the whole workspace."""
+    app, db = app_and_db
+    photos = db.get_photos()[:2]
+    db.queue_change(photos[0]["id"], "rating", "3")
+    db.queue_change(photos[1]["id"], "rating", "4")
+    client = app.test_client()
+    revision = client.get("/api/sync/preview").get_json()["revision"]
+
+    response = client.post(
+        "/api/sync/discard",
+        json={"discard_all": True, "revision": revision},
+    )
+
+    assert response.status_code == 200
+    assert response.get_json()["discarded"] == 2
     assert db.get_pending_changes() == []
 
 

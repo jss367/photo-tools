@@ -148,6 +148,28 @@ def contextual_weak_runs(
     return runs
 
 
+def contextual_weak_photo_ids(
+    photos,
+    detections_by_photo,
+    *,
+    detector_confidence=0.20,
+    weak_confidence=0.12,
+    max_gap=3.0,
+):
+    """Return photo IDs selected for contextual weak-box classification."""
+    return {
+        photo_id
+        for run in contextual_weak_runs(
+            photos,
+            detections_by_photo,
+            detector_confidence=detector_confidence,
+            weak_confidence=weak_confidence,
+            max_gap=max_gap,
+        )
+        for photo_id in run["photo_ids"]
+    }
+
+
 def _normalized_species(name):
     return " ".join(str(name or "").strip().casefold().split())
 

@@ -234,6 +234,98 @@ def test_full_image_fallback_classify_counts_track_run_keys(tmp_path):
     assert db.count_classifier_runs([pid_empty, pid_weak], "BioCLIP-2", "fp1") == 1
 
 
+def test_full_image_fallback_counts_noise_only_boxes_at_workspace_floor(
+    tmp_path,
+):
+    """Photos whose only MegaDetector rows are below the workspace
+    ``detector_confidence`` count as fallback candidates. Classify's runtime
+    now sends them through the full-image path even though ``box_count > 0``
+    and real detection rows exist, so the plan counters must broaden to
+    match — otherwise ``/api/pipeline/plan`` would call classify "already
+    done" while a full-image inference is still pending.
+    """
+    db, folder_id = _make_db(tmp_path)
+    pid_empty = db.add_photo(
+        folder_id=folder_id, filename="empty.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+    )
+    db.record_detector_run(pid_empty, "megadetector-v6", box_count=0)
+
+    pid_noise, _ = _add_photo_with_detection(
+        db, folder_id, "noise.jpg", conf=0.05,
+    )
+    db.record_detector_run(pid_noise, "megadetector-v6", box_count=1)
+
+    pid_real, _ = _add_photo_with_detection(
+        db, folder_id, "real.jpg", conf=0.9,
+    )
+    db.record_detector_run(pid_real, "megadetector-v6", box_count=1)
+
+    # Default min_conf=0 preserves the pre-noise-fallback semantics: only
+    # the truly empty run qualifies.
+    assert db.count_full_image_fallback_photos() == 1
+    # At the workspace floor both empty and noise-only runs qualify, but the
+    # confident real detection stays out.
+    assert db.count_full_image_fallback_photos(min_conf=0.2) == 2
+    assert db.count_full_image_classify_pending_pairs(
+        "BioCLIP-2", "fp1", min_conf=0.2,
+    ) == 2
+
+
+def test_full_image_fallback_counts_reject_torn_detector_run(tmp_path):
+    db, folder_id = _make_db(tmp_path)
+    photo_id = db.add_photo(
+        folder_id=folder_id, filename="torn.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+    )
+    db.record_detector_run(photo_id, "megadetector-v6", box_count=1)
+
+    assert db.count_full_image_fallback_photos(min_conf=0.2) == 0
+    assert db.count_full_image_classify_pending_pairs(
+        "BioCLIP-2", "fp1", min_conf=0.2,
+    ) == 0
+    assert db.count_full_image_classify_stale(
+        "BioCLIP-2", "fp1", min_conf=0.2,
+    ) == 0
+
+
+def test_classify_plan_excludes_stale_runtime_noise_fallback(
+    tmp_path, monkeypatch,
+):
+    from pipeline_plan import compute_plan
+
+    db, folder_id = _make_db(tmp_path)
+    photo_id, _ = _add_photo_with_detection(
+        db, folder_id, "stale-noise.jpg", conf=0.05,
+    )
+    db.record_detector_run(
+        photo_id, "megadetector-v6", box_count=1,
+        runtime_fingerprint="old-runtime",
+    )
+
+    import labels as labels_mod
+    import models as models_mod
+
+    monkeypatch.setattr(models_mod, "get_models", lambda: [
+        {"id": "m1", "name": "BioCLIP-2",
+         "model_str": "hf-hub:imageomics/bioclip-2",
+         "model_type": "bioclip", "downloaded": True,
+         "weights_path": _tol_weights(tmp_path)},
+    ])
+    monkeypatch.setattr(labels_mod, "get_active_labels", lambda: [])
+    monkeypatch.setattr(labels_mod, "get_saved_labels", lambda: [])
+    monkeypatch.setattr(
+        "computation_cache.megadetector_runtime_fingerprint",
+        lambda: "current-runtime",
+    )
+
+    classify = compute_plan(
+        db, _params(model_ids=["m1"]), str(tmp_path / "test.db"),
+    )["stages"]["Classify"]
+    assert classify["state"] == "will-run"
+    assert classify["detail"]["full_image_fallbacks"] == 0
+
+
 def test_count_classify_pending_excludes_recorded_runs(tmp_path):
     """The pending-pair count must mirror the classify gate exactly: a
     detection with a classifier_runs row for (model, fp) is done.
@@ -314,6 +406,51 @@ def test_primary_classify_counts_ignore_secondary_detections(tmp_path):
     assert db.count_primary_detections_in_scope()["total_dets"] == 1
     assert db.count_primary_classify_pending_pairs("BioCLIP-2", "fp1") == 0
     assert db.count_primary_classify_stale("BioCLIP-2", "fp1") == 0
+
+
+def test_primary_classify_counts_ignore_confident_non_animal_boxes(
+    tmp_path, monkeypatch,
+):
+    """Person and vehicle boxes suppress fallback but are not crop targets."""
+    db, folder_id = _make_db(tmp_path)
+    photo_id = db.add_photo(
+        folder_id=folder_id, filename="hiker.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+    )
+    db.save_detections(
+        photo_id,
+        [{"box": {"x": 0.1, "y": 0.1, "w": 0.5, "h": 0.5},
+          "confidence": 0.95, "category": "person"}],
+        detector_model="megadetector-v6",
+    )
+    db.record_detector_run(photo_id, "megadetector-v6", box_count=1)
+
+    assert db.count_primary_detections_in_scope()["total_dets"] == 0
+    assert db.count_primary_classify_pending_pairs("BioCLIP-2", "fp1") == 0
+    assert db.count_full_image_fallback_photos(min_conf=0.2) == 0
+
+    import labels as labels_mod
+    import models as models_mod
+    from pipeline_plan import compute_plan
+
+    monkeypatch.setattr(models_mod, "get_models", lambda: [
+        {"id": "m1", "name": "BioCLIP-2",
+         "model_str": "hf-hub:imageomics/bioclip-2",
+         "model_type": "bioclip", "downloaded": True,
+         "weights_path": _tol_weights(tmp_path)},
+    ])
+    monkeypatch.setattr(labels_mod, "get_active_labels", lambda: [])
+    monkeypatch.setattr(labels_mod, "get_saved_labels", lambda: [])
+    monkeypatch.setattr(
+        "computation_cache.megadetector_runtime_fingerprint",
+        lambda: "current-runtime",
+    )
+
+    plan = compute_plan(db, _params(model_ids=["m1"]), str(tmp_path / "test.db"))
+    classify = plan["stages"]["Classify"]
+    assert classify["state"] == "done-prior"
+    assert classify["detail"]["eligible"] == 0
+    assert classify["detail"]["pending"] == 0
 
 
 def test_count_photos_pending_masks(tmp_path):
@@ -1100,6 +1237,64 @@ def test_classify_plan_done_prior_for_full_image_fallback(tmp_path, monkeypatch)
     assert classify["detail"]["full_image_fallbacks"] == 1
     assert classify["detail"]["eligible"] == 1
     assert classify["detail"]["pending"] == 0
+
+
+def test_classify_plan_tracks_contextual_weak_crop_instead_of_fallback(
+    tmp_path, monkeypatch,
+):
+    """A bracketed weak animal is classified by its crop, not full image."""
+    from labels_fingerprint import TOL_SENTINEL
+    from pipeline_plan import compute_plan
+
+    db, folder_id = _make_db(tmp_path)
+    detection_ids = []
+    for index, confidence in enumerate((0.9, 0.18, 0.9)):
+        photo_id = db.add_photo(
+            folder_id=folder_id,
+            filename=f"bird{index}.jpg",
+            extension=".jpg",
+            file_size=100,
+            file_mtime=1.0 + index,
+            timestamp=f"2026-07-18T08:36:3{index}",
+        )
+        detection_id = db.save_detections(
+            photo_id,
+            [{"box": {"x": 0.1, "y": 0.1, "w": 0.5, "h": 0.5},
+              "confidence": confidence, "category": "animal"}],
+            detector_model="megadetector-v6",
+        )[0]
+        db.record_detector_run(photo_id, "megadetector-v6", box_count=1)
+        detection_ids.append(detection_id)
+
+    import labels as labels_mod
+    import models as models_mod
+
+    monkeypatch.setattr(models_mod, "get_models", lambda: [
+        {"id": "m1", "name": "BioCLIP-2",
+         "model_str": "hf-hub:imageomics/bioclip-2",
+         "model_type": "bioclip", "downloaded": True,
+         "weights_path": _tol_weights(tmp_path)},
+    ])
+    monkeypatch.setattr(labels_mod, "get_active_labels", lambda: [])
+    monkeypatch.setattr(labels_mod, "get_saved_labels", lambda: [])
+
+    plan = compute_plan(db, _params(model_ids=["m1"]), str(tmp_path / "test.db"))
+    classify = plan["stages"]["Classify"]
+    assert classify["detail"]["total_dets"] == 3
+    assert classify["detail"]["full_image_fallbacks"] == 0
+    assert classify["detail"]["pending"] == 3
+
+    for detection_id in detection_ids:
+        db.record_classifier_run(
+            detection_id, "BioCLIP-2", TOL_SENTINEL, prediction_count=1,
+        )
+
+    rerun = compute_plan(
+        db, _params(model_ids=["m1"]), str(tmp_path / "test.db"),
+    )["stages"]["Classify"]
+    assert rerun["state"] == "done-prior"
+    assert rerun["detail"]["pending"] == 0
+    assert rerun["detail"]["full_image_fallbacks"] == 0
 
 
 def test_classify_plan_exposes_pending_and_eligible_blocked_only(tmp_path, monkeypatch):

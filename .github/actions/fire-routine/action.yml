@@ -11,6 +11,26 @@ inputs:
   payload:
     description: Plain-text payload sent as the `text` field
     required: true
+  repo:
+    description: Repository containing the PR, in owner/name form.
+    required: false
+  pr:
+    description: PR number to verify immediately before firing the routine.
+    required: false
+  expected-head:
+    description: >-
+      Optional full or abbreviated head SHA associated with the triggering
+      event. The routine is not fired if the PR has moved to another head.
+    required: false
+  github-token:
+    description: GitHub token used for the live PR-state check.
+    required: false
+  max-review-fix-rounds:
+    description: >-
+      Optional cap on prior commits carrying this PR's automated review-fix
+      marker. Zero disables the workflow-level cap (for explicit human runs).
+    required: false
+    default: "0"
   allow-missing:
     description: Exit successfully when routine credentials are missing.
     required: false
@@ -26,8 +46,62 @@ runs:
         ROUTINE_TOKEN: ${{ inputs.token }}
         ROUTINE_PAYLOAD: ${{ inputs.payload }}
         ALLOW_MISSING: ${{ inputs.allow-missing }}
+        REPO: ${{ inputs.repo }}
+        PR: ${{ inputs.pr }}
+        EXPECTED_HEAD: ${{ inputs.expected-head }}
+        MAX_REVIEW_FIX_ROUNDS: ${{ inputs.max-review-fix-rounds }}
+        GH_TOKEN: ${{ inputs.github-token }}
       run: |
         set -euo pipefail
+
+        # Event payloads describe the PR when an event was queued, not when
+        # this forwarder finally runs. Re-read live state immediately before
+        # consuming a routine invocation. This makes stale review deliveries
+        # and all queued work for merged/closed PRs silent no-ops.
+        if [[ -n "${PR}" ]]; then
+          if [[ -z "${REPO}" || -z "${GH_TOKEN}" ]]; then
+            echo "::error::repo and github-token are required when pr is set."
+            exit 1
+          fi
+
+          pr_json=$(gh pr view "${PR}" --repo "${REPO}" \
+            --json state,headRefOid,headRepositoryOwner,headRepository)
+          state=$(jq -r '.state' <<< "${pr_json}")
+          current_head=$(jq -r '.headRefOid' <<< "${pr_json}")
+          head_repo=$(jq -r '.headRepositoryOwner.login + "/" + .headRepository.name' <<< "${pr_json}")
+
+          if [[ "${state}" != "OPEN" ]]; then
+            echo "PR #${PR} is ${state}; skipping stale routine fire."
+            exit 0
+          fi
+          if [[ "${head_repo}" != "${REPO}" ]]; then
+            echo "PR #${PR} comes from fork ${head_repo}; skipping routine fire."
+            exit 0
+          fi
+          if [[ -n "${EXPECTED_HEAD}" && "${current_head}" != "${EXPECTED_HEAD}"* ]]; then
+            echo "PR #${PR} moved from ${EXPECTED_HEAD} to ${current_head}; skipping stale routine fire."
+            exit 0
+          fi
+
+          if [[ "${MAX_REVIEW_FIX_ROUNDS}" -gt 0 ]]; then
+            prior_rounds=$(gh api --paginate "repos/${REPO}/pulls/${PR}/commits" \
+              | jq -s --arg marker "[pr-agent-review-fix:${PR}]" '
+                  [ .[][] | select(.commit.message | contains($marker)) ]
+                  | length')
+            if [[ "${prior_rounds}" -ge "${MAX_REVIEW_FIX_ROUNDS}" ]]; then
+              echo "PR #${PR} already used ${prior_rounds} automated review-fix rounds; human review required."
+              gh label create pr-agent-needs-human --repo "${REPO}" \
+                --color B60205 \
+                --description "Automated PR repair stopped; human review required" \
+                || true
+              gh pr edit "${PR}" --repo "${REPO}" \
+                --add-label pr-agent-needs-human
+              exit 0
+            fi
+          fi
+
+          ROUTINE_PAYLOAD="${ROUTINE_PAYLOAD}"$'\n'"Expected head: ${current_head}"
+        fi
 
         if [[ -z "${ROUTINE_URL}" || -z "${ROUTINE_TOKEN}" ]]; then
           if [[ "${ALLOW_MISSING}" == "true" ]]; then

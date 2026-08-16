@@ -1,0 +1,123 @@
+name: Check PR merge readiness
+description: >-
+  Verify live PR state, approved head, repository/base constraints, child PRs,
+  and resolution of every current review thread before enabling auto-merge.
+
+inputs:
+  repo:
+    description: Repository in owner/name form.
+    required: true
+  pr:
+    description: Pull request number.
+    required: true
+  token:
+    description: GitHub token with read access to the PR.
+    required: true
+  approved-head:
+    description: Full or abbreviated head SHA authorized by the human reviewer.
+    required: true
+
+outputs:
+  ready:
+    description: "'true' only when every merge precondition is satisfied."
+    value: ${{ steps.check.outputs.ready }}
+  head-sha:
+    description: Current full PR head SHA.
+    value: ${{ steps.check.outputs.head_sha }}
+  title:
+    description: Current PR title.
+    value: ${{ steps.check.outputs.title }}
+
+runs:
+  using: composite
+  steps:
+    - id: check
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        REPO: ${{ inputs.repo }}
+        PR: ${{ inputs.pr }}
+        APPROVED_HEAD: ${{ inputs.approved-head }}
+      run: |
+        set -euo pipefail
+
+        echo "ready=false" >> "$GITHUB_OUTPUT"
+
+        pr_json=$(gh pr view "$PR" --repo "$REPO" \
+          --json state,headRefOid,headRefName,baseRefName,title,headRepositoryOwner,headRepository)
+        state=$(jq -r '.state' <<< "$pr_json")
+        head_sha=$(jq -r '.headRefOid' <<< "$pr_json")
+        head_ref=$(jq -r '.headRefName' <<< "$pr_json")
+        base_ref=$(jq -r '.baseRefName' <<< "$pr_json")
+        title=$(jq -r '.title' <<< "$pr_json")
+        head_repo=$(jq -r '.headRepositoryOwner.login + "/" + .headRepository.name' <<< "$pr_json")
+
+        {
+          echo "head_sha=${head_sha}"
+          echo "title<<PR_AGENT_TITLE"
+          echo "${title}"
+          echo "PR_AGENT_TITLE"
+        } >> "$GITHUB_OUTPUT"
+
+        if [[ "$state" != "OPEN" ]]; then
+          echo "PR #${PR} is ${state}; merge authorization is stale."
+          exit 0
+        fi
+        if [[ "$head_sha" != "$APPROVED_HEAD"* ]]; then
+          echo "PR #${PR} head ${head_sha} does not match approved head ${APPROVED_HEAD}."
+          exit 0
+        fi
+        if [[ "$base_ref" != "main" ]]; then
+          echo "PR #${PR} targets ${base_ref}, not main."
+          exit 0
+        fi
+        if [[ "$head_repo" != "$REPO" ]]; then
+          echo "PR #${PR} comes from fork ${head_repo}; automatic merge is disabled."
+          exit 0
+        fi
+
+        child_count=$(gh pr list --repo "$REPO" --base "$head_ref" --state open \
+          --json number --jq 'length')
+        if [[ "$child_count" -gt 0 ]]; then
+          echo "PR #${PR} still has ${child_count} open child PR(s)."
+          exit 0
+        fi
+
+        owner="${REPO%/*}"
+        name="${REPO#*/}"
+        cursor=""
+        unresolved=0
+        while :; do
+          after=""
+          if [[ -n "$cursor" ]]; then
+            after=", after: \"$cursor\""
+          fi
+          data=$(gh api graphql -f query="
+            query(\$owner:String!, \$name:String!, \$pr:Int!) {
+              repository(owner:\$owner, name:\$name) {
+                pullRequest(number:\$pr) {
+                  reviewThreads(first:100${after}) {
+                    nodes { isResolved isOutdated }
+                    pageInfo { hasNextPage endCursor }
+                  }
+                }
+              }
+            }" -F owner="$owner" -F name="$name" -F pr="$PR")
+
+          page_unresolved=$(jq '
+            [ .data.repository.pullRequest.reviewThreads.nodes[]
+              | select(.isResolved == false and .isOutdated == false) ]
+            | length' <<< "$data")
+          unresolved=$((unresolved + page_unresolved))
+          has_next=$(jq -r '.data.repository.pullRequest.reviewThreads.pageInfo.hasNextPage' <<< "$data")
+          cursor=$(jq -r '.data.repository.pullRequest.reviewThreads.pageInfo.endCursor' <<< "$data")
+          [[ "$has_next" == "true" && -n "$cursor" && "$cursor" != "null" ]] || break
+        done
+
+        if [[ "$unresolved" -gt 0 ]]; then
+          echo "PR #${PR} has ${unresolved} unresolved current review thread(s)."
+          exit 0
+        fi
+
+        echo "ready=true" >> "$GITHUB_OUTPUT"
+        echo "PR #${PR} is merge-ready at ${head_sha}."

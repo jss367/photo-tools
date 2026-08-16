@@ -7838,6 +7838,127 @@ def test_accept_prediction_commit_false_preserves_caller_transaction_on_error(
     db.conn.rollback()
 
 
+def _review_status(db, prediction_id):
+    """The stored review status for one prediction row (None if untouched)."""
+    row = db.conn.execute(
+        """SELECT status FROM prediction_review
+           WHERE prediction_id = ? AND workspace_id = ?""",
+        (prediction_id, db._ws_id()),
+    ).fetchone()
+    return row["status"] if row else None
+
+
+def test_accept_prediction_out_of_scope_row_mutates_nothing(tmp_path):
+    """An excluded ``prediction_id`` must leave the database untouched.
+
+    The scope limits exist to make this call a no-op outside the caller's
+    submitted rows, so the *decision* has to come before every mutation, not
+    just before the status flip. This method used to reject the entry row's
+    alternatives up front — so a caller passing a row its own scope excluded
+    still silently resolved that detection's other predictions while the
+    return value reported no accepts. Same class of bug the row-identity
+    scope fix was meant to close, surviving inside its own remedy.
+    """
+    from db import Database
+    db = Database(str(tmp_path / "test.db"))
+    fid = db.add_folder("/photos")
+    pid = db.add_photo(
+        folder_id=fid, filename="elk.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+    )
+    det_id = db.save_detections(pid, [
+        {"box": {"x": 0.1, "y": 0.2, "w": 0.3, "h": 0.4},
+         "confidence": 0.9, "category": "animal"},
+    ], detector_model="MDV6")[0]
+    # One detection, two rows from the same model/label set: a top-1 and its
+    # losing alternative. Accepting the top-1 is what rejects the sibling.
+    db.add_prediction(det_id, "Elk", 0.9, "bioclip")
+    db.add_prediction(det_id, "Mule Deer", 0.4, "bioclip")
+    rows = db.conn.execute(
+        "SELECT id, species FROM predictions WHERE detection_id = ?", (det_id,),
+    ).fetchall()
+    top = next(r["id"] for r in rows if r["species"] == "Elk")
+    sibling = next(r["id"] for r in rows if r["species"] == "Mule Deer")
+
+    # Submitted scope names some *other* row, so the entry row is excluded.
+    result = db.accept_prediction(top, prediction_ids=[sibling + 10_000])
+
+    assert result["accepted_prediction_ids"] == []
+    assert result["affected"] == []
+    assert _review_status(db, top) != "accepted"
+    assert _review_status(db, sibling) != "rejected", (
+        "an out-of-scope accept resolved the entry row's sibling"
+    )
+    # ``add_keyword`` is a write too — a no-op accept must not invent the
+    # species row either.
+    assert db.conn.execute(
+        "SELECT 1 FROM keywords WHERE name = 'Elk' COLLATE NOCASE"
+    ).fetchone() is None
+    assert result["keyword_id"] is None
+    assert db.get_pending_changes() == []
+
+
+def test_accept_prediction_grouped_leaves_out_of_scope_entry_row_alone(tmp_path):
+    """A grouped accept resolves only the members its scope allows.
+
+    The entry row is just the row the caller happened to name; when the
+    submitted id list excludes it but includes a sibling group member, the
+    entry row's own detection must stay undecided. Rejecting its alternatives
+    would drop that photo out of Review's queue on the strength of a decision
+    the user never made about it.
+    """
+    from db import Database
+    db = Database(str(tmp_path / "test.db"))
+    fid = db.add_folder("/photos")
+
+    def _seed(filename, alt=False):
+        photo_id = db.add_photo(
+            folder_id=fid, filename=filename, extension=".jpg",
+            file_size=100, file_mtime=1.0,
+        )
+        det_id = db.save_detections(photo_id, [
+            {"box": {"x": 0.1, "y": 0.2, "w": 0.3, "h": 0.4},
+             "confidence": 0.9, "category": "animal"},
+        ], detector_model="MDV6")[0]
+        db.add_prediction(
+            det_id, "Elk", 0.9, "bioclip", group_id="burst-scope",
+        )
+        if alt:
+            db.add_prediction(det_id, "Mule Deer", 0.4, "bioclip")
+        return photo_id, det_id
+
+    photo_a, det_a = _seed("a.jpg", alt=True)
+    photo_b, _ = _seed("b.jpg")
+
+    def _pred(det_id, species):
+        return db.conn.execute(
+            """SELECT id FROM predictions
+               WHERE detection_id = ? AND species = ?""",
+            (det_id, species),
+        ).fetchone()["id"]
+
+    pred_a = _pred(det_a, "Elk")
+    alt_a = _pred(det_a, "Mule Deer")
+    pred_b = db.conn.execute(
+        """SELECT pr.id FROM predictions pr
+           JOIN detections d ON d.id = pr.detection_id
+           WHERE d.photo_id = ? AND pr.species = 'Elk'""",
+        (photo_b,),
+    ).fetchone()["id"]
+
+    # Entry row is A, but only B was submitted.
+    result = db.accept_prediction(pred_a, prediction_ids=[pred_b])
+
+    assert result["accepted_prediction_ids"] == [pred_b]
+    assert _review_status(db, pred_b) == "accepted"
+    assert _review_status(db, pred_a) != "accepted"
+    assert _review_status(db, alt_a) != "rejected", (
+        "the grouped accept resolved the out-of-scope entry row's "
+        "alternative"
+    )
+    assert {a["photo_id"] for a in result["affected"]} == {photo_b}
+
+
 def test_get_existing_detection_photo_ids(tmp_path):
     """get_existing_detection_photo_ids shim returns photo IDs where the default
     detector model has run (delegates to get_detector_run_photo_ids)."""

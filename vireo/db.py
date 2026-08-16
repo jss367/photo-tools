@@ -17304,6 +17304,13 @@ class Database:
         whose intent really is "these photos" (highlight confirm, accept
         subject), where the row set is chosen by this method.
 
+        Both limits are settled before the first write, so a call whose scope
+        excludes every candidate row is a true no-op: no keyword row is
+        created, no sibling alternative is rejected, no status is flipped. It
+        returns ``accepted_prediction_ids: []`` with ``keyword_id`` set to the
+        existing keyword for the resolved species (``None`` when no such
+        keyword exists yet).
+
         The returned ``accepted_prediction_ids`` lists every prediction row
         this call marked accepted, so a caller looping over a submitted batch
         can skip rows a previous grouped accept already covered instead of
@@ -17364,11 +17371,14 @@ class Database:
             fingerprints. Review state is workspace-scoped, so we upsert each
             row rather than UPDATE the base predictions table.
 
-            Run per accepted row, not once for the entry row: a grouped accept
-            decides every member's detection, so leaving the other members'
-            alternatives at 'alternative' would keep photos in Review's queue
-            that this call already settled — and would make it unsafe for a
-            batch caller to skip a submitted row that a grouped accept covered.
+            Run per accepted row, and only for rows this call accepts: a
+            grouped accept decides every member's detection, so leaving the
+            other members' alternatives at 'alternative' would keep photos in
+            Review's queue that this call already settled — and would make it
+            unsafe for a batch caller to skip a submitted row that a grouped
+            accept covered. Equally, a row the caller's scope excludes must
+            not have its alternatives resolved, so this never runs for the
+            entry row before scope is settled.
             """
             row = self.conn.execute(
                 """SELECT detection_id, classifier_model, labels_fingerprint
@@ -17401,8 +17411,6 @@ class Database:
                 )
 
         try:
-            _reject_siblings_of(prediction_id)
-
             # For grouped predictions, derive consensus from individual votes
             species = pred["species"]
             if pred["group_id"] and pred["individual"]:
@@ -17414,6 +17422,78 @@ class Database:
                     species = best
                 except Exception:
                     pass
+
+            # Settle scope before the first write.
+            #
+            # ``limited_photo_ids`` / ``limited_pred_ids`` exist to make this
+            # call a no-op outside the caller's submitted scope, so *every*
+            # mutation — sibling rejection, keyword creation, status flips —
+            # has to sit behind that decision rather than beside it. This
+            # method used to reject the entry row's alternatives up front,
+            # which silently resolved rows the caller never submitted while
+            # the return value truthfully reported no accepts. The row set is
+            # therefore computed from reads only; nothing below writes until
+            # it is non-empty.
+            def _in_scope(photo_id, this_pred_id):
+                photo_allowed = (
+                    limited_photo_ids is None
+                    or photo_id in limited_photo_ids
+                )
+                # The row-level limit, checked independently: a group
+                # member's photo being in scope does not make every row
+                # that member carries in scope.
+                row_allowed = (
+                    limited_pred_ids is None
+                    or this_pred_id in limited_pred_ids
+                )
+                return photo_allowed and row_allowed
+
+            # If grouped, accept every prediction in the group (in this
+            # workspace) that survives the caller's scope.
+            if pred["group_id"]:
+                group_preds = self.conn.execute(
+                    """SELECT pr.id, d.photo_id
+                       FROM predictions pr
+                       JOIN prediction_review pr_rev
+                         ON pr_rev.prediction_id = pr.id AND pr_rev.workspace_id = ?
+                       JOIN detections d ON d.id = pr.detection_id
+                       JOIN photos ph ON ph.id = d.photo_id
+                       JOIN workspace_folders wf
+                         ON wf.folder_id = ph.folder_id AND wf.workspace_id = ?
+                       WHERE pr_rev.group_id = ? AND pr.classifier_model = ?""",
+                    (ws, ws, pred["group_id"], pred["model"]),
+                ).fetchall()
+                targets = [
+                    (gp["photo_id"], gp["id"])
+                    for gp in group_preds
+                    if _in_scope(gp["photo_id"], gp["id"])
+                ]
+            elif _in_scope(pred["photo_id"], prediction_id):
+                targets = [(pred["photo_id"], prediction_id)]
+            else:
+                targets = []
+
+            if not targets:
+                # Nothing this caller submitted is acceptable here, so leave
+                # the database exactly as it was and report no changes.
+                # ``add_keyword`` is a write too (it creates the species row),
+                # so it also waits behind the scope decision; the read-only
+                # lookup keeps ``keyword_id``/``species`` meaningful for
+                # callers reconciling one batch's species without inventing a
+                # keyword for an accept that never happened.
+                display = normalize_keyword_display(species)
+                existing = self.conn.execute(
+                    """SELECT id, name FROM keywords
+                       WHERE name = ? COLLATE NOCASE
+                       ORDER BY id LIMIT 1""",
+                    (display,),
+                ).fetchone()
+                return {
+                    "species": existing["name"] if existing else display,
+                    "keyword_id": existing["id"] if existing else None,
+                    "affected": [],
+                    "accepted_prediction_ids": [],
+                }
 
             kid = self.add_keyword(species, is_species=True, _commit=False)
             # Re-read the stored keyword name so the queued sidecar changes,
@@ -17438,9 +17518,10 @@ class Database:
 
             def _accept_for_photo(photo_id, this_pred_id):
                 accepted_pred_ids.append(this_pred_id)
-                if this_pred_id != prediction_id:
-                    # The entry row's siblings were already resolved above.
-                    _reject_siblings_of(this_pred_id)
+                # Every accepted row resolves its own detection's losers,
+                # including the entry row. Doing it here rather than up front
+                # is what keeps an out-of-scope entry row untouched.
+                _reject_siblings_of(this_pred_id)
                 self.update_prediction_status(this_pred_id, "accepted", _commit=False)
                 old_species = []
                 already_has_species = photo_id in self.get_photos_with_equivalent_species(
@@ -17750,52 +17831,8 @@ class Database:
                         "changed_tag": False,
                     })
 
-            # If grouped, accept all predictions in the group (in this workspace).
-            if pred["group_id"]:
-                group_preds = self.conn.execute(
-                    """SELECT pr.id, d.photo_id
-                       FROM predictions pr
-                       JOIN prediction_review pr_rev
-                         ON pr_rev.prediction_id = pr.id AND pr_rev.workspace_id = ?
-                       JOIN detections d ON d.id = pr.detection_id
-                       JOIN photos ph ON ph.id = d.photo_id
-                       JOIN workspace_folders wf
-                         ON wf.folder_id = ph.folder_id AND wf.workspace_id = ?
-                       WHERE pr_rev.group_id = ? AND pr.classifier_model = ?""",
-                    (ws, ws, pred["group_id"], pred["model"]),
-                ).fetchall()
-                for gp in group_preds:
-                    if (
-                        limited_photo_ids is not None
-                        and gp["photo_id"] not in limited_photo_ids
-                    ):
-                        continue
-                    # The row-level limit, checked independently: a group
-                    # member's photo being in scope does not make every row
-                    # that member carries in scope.
-                    if (
-                        limited_pred_ids is not None
-                        and gp["id"] not in limited_pred_ids
-                    ):
-                        continue
-                    _accept_for_photo(gp["photo_id"], gp["id"])
-            else:
-                if (
-                    limited_photo_ids is not None
-                    and pred["photo_id"] not in limited_photo_ids
-                ) or (
-                    limited_pred_ids is not None
-                    and prediction_id not in limited_pred_ids
-                ):
-                    if _commit:
-                        self.conn.commit()
-                    return {
-                        "species": species,
-                        "keyword_id": kid,
-                        "affected": [],
-                        "accepted_prediction_ids": [],
-                    }
-                _accept_for_photo(pred["photo_id"], prediction_id)
+            for target_photo_id, target_pred_id in targets:
+                _accept_for_photo(target_photo_id, target_pred_id)
 
             if _commit:
                 self.conn.commit()
@@ -17863,7 +17900,11 @@ class Database:
                     photo_ids=[target["photo_id"]],
                     _commit=False,
                 )
-                if accepted is not None:
+                # A row whose grouped scope excluded this photo accepts
+                # nothing, so it must not be reported as an accepted id (nor
+                # supply the returned keyword, which is None when the species
+                # keyword does not exist yet).
+                if accepted and accepted["accepted_prediction_ids"]:
                     result = accepted
                     accepted_ids.append(row["id"])
                     affected.extend(accepted["affected"])

@@ -16616,7 +16616,15 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 handled.add(pid)
                 if result is None:
                     continue
-                handled.update(result.get("accepted_prediction_ids", ()))
+                accepted_now = result.get("accepted_prediction_ids", ())
+                handled.update(accepted_now)
+                if not accepted_now:
+                    # A no-op accept (nothing in this row's scope) changed
+                    # nothing, so it carries no species to reconcile against
+                    # the batch's — and its ``keyword_id`` may be None because
+                    # no keyword was created. Folding it into the check below
+                    # would 400 a perfectly uniform batch.
+                    continue
                 # One edit row carries one ``new_value`` keyword id, which the
                 # undo handler applies to every item. Accepting a mixed bag of
                 # species through one call would therefore undo incorrectly —

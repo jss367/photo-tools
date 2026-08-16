@@ -242,15 +242,27 @@ the panel names the real cause:
 | Condition | Rendering |
 |---|---|
 | `detector_ran = false` | Not yet classified — no detector has run on this photo. |
-| `classifier_ran = false`, `detection_count = 0` | Nothing detected — the detector ran and found no animals. |
-| `classifier_ran = false`, `detection_count > 0` | Not yet classified — detections found, but no classifier has run yet. |
-| `classifier_ran = true`, rows exist but all below `threshold` | No species above threshold — every prediction is below your confidence floor. |
-| `classifier_ran = true`, no rows at all | Classification ran and produced no species for this photo. |
+| `detector_ran = true`, `classifier_ran = false`, `detection_count = 0` | Nothing detected — the detector ran and found no animals. |
+| `detector_ran = true`, `classifier_ran = false`, `detection_count > 0` | Not yet classified — detections found, but no classifier has run yet. |
+| `detector_ran = true`, `classifier_ran = true`, rows exist but all below `threshold` | No species above threshold — every prediction is below your confidence floor. |
+| `detector_ran = true`, `classifier_ran = true`, no rows at all | Classification ran and produced no species for this photo. |
+
+The five conditions are mutually exclusive and exhaustive, so each row names
+exactly one cause on its own — no reader (or reimplementation) has to infer a
+fallthrough order to get the right message. `detector_ran = true` is stated
+explicitly rather than implied by `classifier_ran`, because the two are
+recorded independently: a photo can carry classifier rows from an earlier
+label set while the current detector run is still pending, and "nothing
+detected" would then be a claim no run supports.
 
 The last two must stay apart: blaming the threshold when the classifier
 emitted nothing names a cause that never fired. `classifier_ran` is therefore
 tested *before* `detection_count` — once the classifier has run, the reason
 is a classifier fact.
+
+`predictionEmptyMessage` (`browse.html`) evaluates them in the order above —
+`detector_ran`, then `classifier_ran`, then `detection_count` — which matches
+the table but is not what makes it correct.
 
 `detection_count` counts only real detections — `detector_model =
 'full-image'` synthetic anchors and rows below the workspace
@@ -269,18 +281,31 @@ A **Predictions** section above the existing Keywords section in
 `selectionPanel`, reading like the keyword rows already there:
 
 ```text
-Bald Eagle — predicted on 38 of 40, keyworded on 0     [Accept on 38]
+Bald Eagle — predicted on 38 of 40     [Accept on 38]
 ```
+
+Here both keyworded counts are zero — no selected photo already carries the
+species, so every one of the 38 gets a tag. The row therefore states no
+keyworded subset at all: a "keyworded on 0" clause would be noise on a row
+where nothing is keyworded.
 
 Where some predictions are ambiguous, the button covers only the clean
-subset and the row says so:
+subset and the row says so. The keyworded subset is disclosed on the same
+row, because the two splits are independent: ambiguity decides *which* photos
+the button touches, `acceptable_keyworded_count` decides *what accepting does*
+to the ones it touches.
 
 ```text
-Bald Eagle — predicted on 38 of 40     [Accept on 35 · 3 need review]
+Bald Eagle — predicted on 38 of 40, already keyworded on 2     [Accept on 35]
+3 photos need review · 2 already carry the keyword — accepting only
+clears them from Review
 ```
 
-A button labelled "Accept on 38" that quietly acts on 35 is precisely what
-the UI-transparency rule forbids.
+So "Accept on 35" here means 33 photos get the keyword and 2 are cleared out
+of Review with no tag written. A button labelled "Accept on 38" that quietly
+acts on 35 is precisely what the UI-transparency rule forbids — and so is an
+"Accept on 35" that folds tag writes and status-only accepts into one
+undifferentiated number.
 
 ## Data flow
 

@@ -1001,7 +1001,22 @@
     pop.hidden = !shouldOpen;
     $('.vf-filters-btn').classList.toggle('open', shouldOpen);
     $('.vf-filters-btn').setAttribute('aria-expanded', String(shouldOpen));
-    if (shouldOpen) renderRules();
+    if (shouldOpen) {
+      renderRules();
+      // The popover sits `top: calc(100% + 8px)` below the whole bar. On
+      // short viewports (and below 900px where the always-visible quick
+      // filters wrap into extra rows) the default 72vh cap can extend past
+      // the viewport; the surrounding .content-area has overflow:hidden,
+      // so the sticky footer would be clipped and unreachable. Measure the
+      // popover's actual top after showing it and pin max-height to what's
+      // left, with a floor so ultra-short viewports still show usable
+      // content (Codex review r3791819941).
+      const rect = pop.getBoundingClientRect();
+      const available = Math.max(240, window.innerHeight - rect.top - 12);
+      pop.style.maxHeight = `${available}px`;
+    } else {
+      pop.style.maxHeight = '';
+    }
   }
 
   function fieldAvailable(field) {
@@ -1368,6 +1383,17 @@
       }
     });
     window.addEventListener('resize', updateChipOverflow);
+    // Recompute the popover height cap on resize so the sticky footer
+    // remains reachable if the viewport shrinks while the popover is open
+    // (Codex review r3791819941).
+    window.addEventListener('resize', () => {
+      const pop = $('.vf-popover');
+      if (pop && !pop.hidden) {
+        const rect = pop.getBoundingClientRect();
+        const available = Math.max(240, window.innerHeight - rect.top - 12);
+        pop.style.maxHeight = `${available}px`;
+      }
+    });
   }
 
   function expressionSummary() {
@@ -1560,6 +1586,19 @@
           state.ready = true;
           render();
           if (state.muted) refreshWouldMatch();
+          // Enable the search box (disabled in the template until now so
+          // keystrokes during registry/workspace fetch weren't dropped or
+          // overwritten by the restore). If a value slipped in anyway —
+          // browser bfcache restore, autofill — replay it so what's shown
+          // matches what's applied (Codex review r3791819940).
+          const searchInput = $('.vf-search input');
+          if (searchInput) {
+            searchInput.disabled = false;
+            const typed = searchInput.value.trim();
+            const group = quickSearchGroup();
+            const active = group ? group._qs_text : (state.visual ? state.visual.prompt : '');
+            if (typed && typed !== active) scheduleQuickSearch();
+          }
           return true;
         };
         if (fromUrl) {

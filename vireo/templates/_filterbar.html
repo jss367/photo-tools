@@ -6,7 +6,10 @@
   <div class="vf-primary">
     <div class="vf-search">
       <span class="vf-search-icon" aria-hidden="true">⌕</span>
-      <input type="search" autocomplete="off" spellcheck="false"
+      <!-- Disabled until VireoFilter.init() finishes so keystrokes typed
+           during registry/workspace fetch aren't silently dropped or
+           overwritten by the restore (Codex review r3791819940). -->
+      <input type="search" autocomplete="off" spellcheck="false" disabled
              placeholder="Search photos…" aria-label="Search photos">
       <kbd>⌘F</kbd>
       <div class="vf-search-suggest" role="listbox" hidden></div>

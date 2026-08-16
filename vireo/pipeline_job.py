@@ -7668,6 +7668,32 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                     result["stages"]["eye_keypoints"] = {
                         "processed": processed["count"], "total": total,
                     }
+            except ResourceWaitCancelled:
+                # ``detect_eye_keypoints_stage`` catches ``ResourceWaitCancelled``
+                # per-photo in ``pipeline.py`` today, so this outer handler is
+                # currently unreachable from the per-photo inference path. Keep
+                # it as defense-in-depth: a future regression in that inner
+                # handler — or a fresh call site inside this outer ``try``
+                # (e.g. a cache-lock guard reached before the download loop) —
+                # would otherwise get caught below as ``Exception`` and be
+                # recorded as "[eye_keypoints] Fatal", inflating the failure
+                # count for what was actually a cooperative cancel. Mirror the
+                # ``extract_masks`` handler at line ~7293 so the summary lines
+                # up with the other stages' cancel outcomes.
+                abort.set()
+                stages["eye_keypoints"]["status"] = "completed"
+                summary = (
+                    f"Cancelled ({processed['count']} of {total} processed)"
+                    if total else "Cancelled"
+                )
+                runner.update_step(
+                    job["id"], "eye_keypoints",
+                    status="completed", summary=summary,
+                )
+                result["stages"]["eye_keypoints"] = {
+                    "processed": processed["count"], "total": total,
+                    "cancelled": True,
+                }
             except Exception as e:
                 errors.append(f"[eye_keypoints] Fatal: {e}")
                 log.exception("Pipeline eye-keypoints stage failed")

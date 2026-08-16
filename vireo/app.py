@@ -16391,16 +16391,28 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         """
         db = _get_db()
         body = request.get_json(silent=True) or {}
-        pred_ids, photo_by_pred, err = _parse_prediction_ids(db, body)
+        pred_ids, pred_meta, err = _parse_prediction_ids(db, body)
         if err is not None:
             return err
 
-        # Confine grouped accepts to the submitted selection: without this,
-        # accepting a species for one group member expands to every other
-        # photo in the burst — including photos the user never selected in
-        # Browse. ``accept_prediction`` already honours ``photo_ids`` when
-        # limiting a grouped accept.
-        submitted_photo_ids = list({int(pid) for pid in photo_by_pred.values()})
+        # Confine each grouped accept to the photos that submitted a
+        # prediction in the SAME ``(group_id, classifier_model)`` bucket.
+        # A batch-wide photo union would let one submitted (photo_A, model_X)
+        # accept expand to (photo_B, model_X) whenever B appears in the batch
+        # via a different bucket — even though B's model_X row was hidden
+        # (below threshold, already accepted, or simply not chosen). That
+        # would silently accept a prediction the panel never showed, and its
+        # status-only edit would make Undo reset a previously accepted
+        # prediction to pending. Non-grouped predictions land in their own
+        # ``(None, model, photo_id)`` bucket so they never share a photo set.
+        photos_by_bucket = {}
+        for pid in pred_ids:
+            meta = pred_meta[pid]
+            if meta["group_id"] is None:
+                bucket = ("_solo", pid)
+            else:
+                bucket = (meta["group_id"], meta["model"])
+            photos_by_bucket.setdefault(bucket, set()).add(meta["photo_id"])
 
         # Make a repeat submission a no-op rather than a second accept. A
         # double-clicked Accept button or a stale panel would otherwise
@@ -16409,10 +16421,10 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         # "previous" status is a fiction — undoing it would knock a
         # long-accepted prediction back to pending while keeping the keyword.
         ws = db._ws_id()
-        # Chunked: ``_parse_prediction_ids`` now admits up to 25,000 ids, far
-        # past the 999-variable limit older SQLite builds enforce. Every other
-        # IN-clause query in this module goes through ``_chunked`` for the same
-        # reason (see ``_SQL_PARAM_CHUNK``).
+        # Chunked: ``_parse_prediction_ids`` now admits well past the
+        # 999-variable limit older SQLite builds enforce. Every other
+        # IN-clause query in this module goes through ``_chunked`` for the
+        # same reason (see ``_SQL_PARAM_CHUNK``).
         already_accepted = set()
         for chunk in _chunked(pred_ids):
             placeholders = ",".join("?" for _ in chunk)
@@ -16432,10 +16444,16 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         species = None
         try:
             for pid in pred_ids:
+                meta = pred_meta[pid]
+                if meta["group_id"] is None:
+                    bucket = ("_solo", pid)
+                else:
+                    bucket = (meta["group_id"], meta["model"])
+                allowed_photo_ids = sorted(photos_by_bucket[bucket])
                 result = db.accept_prediction(
                     pid,
                     replace_species=replace_species,
-                    photo_ids=submitted_photo_ids,
+                    photo_ids=allowed_photo_ids,
                     _commit=False,
                 )
                 if result is None:
@@ -16491,13 +16509,14 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
     def _parse_prediction_ids(db, body):
         """Validate a batch payload's ``prediction_ids``.
 
-        Returns ``(prediction_ids, photo_by_pred, None)`` or
-        ``(None, None, error_response)``. ``photo_by_pred`` maps each
-        prediction id to its parent photo id — callers pass those photo ids to
-        ``accept_prediction`` so a grouped accept stays scoped to the submitted
-        photos rather than expanding to every burst-group member. Every id must
-        exist and belong to a photo in the active workspace, so a batch can
-        never reach across a workspace boundary.
+        Returns ``(prediction_ids, pred_meta, None)`` or
+        ``(None, None, error_response)``. ``pred_meta`` maps each prediction
+        id to ``{"photo_id", "group_id", "model"}``. ``batch-accept`` uses the
+        ``(group_id, classifier_model)`` triple to scope each grouped accept
+        to just the photos that submitted a prediction for the same bucket —
+        so the batch-wide photo union can't quietly tag a hidden burst-group
+        member. Every id must exist and belong to a photo in the active
+        workspace, so a batch can never reach across a workspace boundary.
         """
         raw_ids = body.get("prediction_ids", [])
         if not isinstance(raw_ids, list) or not raw_ids:
@@ -16510,47 +16529,65 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             if raw not in seen:
                 pred_ids.append(raw)
                 seen.add(raw)
-        # The selection endpoint caps at 1,000 photos, but a single photo can
-        # emit many prediction rows for one species — several detections, or
-        # the same detection classified by multiple models. Codex flagged that
-        # capping this at 1,000 prediction ids rejected valid payloads: 501
-        # photos × 2 models emits 1,002 acceptable ids, so the panel's own
-        # Accept button 400ed. Cap high enough that every payload the selection
-        # endpoint can produce is accepted (1,000 photos × 25 rows per photo
-        # comfortably covers real wildlife catalogs) while still shutting the
-        # door on a runaway request.
-        if len(pred_ids) > 25000:
+        # Raw upper bound on prediction ids — kept high because the semantic
+        # constraint is *photos* (checked below against the same 1,000-photo
+        # cap the selection endpoint enforces), and the suggestions endpoint
+        # is uncapped per photo. A tight id cap made the panel's own Accept
+        # button 400 whenever detections-per-photo × models-per-detection
+        # crossed the threshold (Codex flagged the 25,000 cap: 1,000 photos ×
+        # 26 detections × 1 model = 26,000 ids). This limit is a runaway
+        # guard against a garbage payload, not the enforcement of any user
+        # constraint.
+        if len(pred_ids) > 200000:
             return None, None, json_error("too many prediction_ids", 400)
 
-        # Chunked for the same reason the cap was raised: a 25,000-id payload
-        # is legal now, and a single IN clause that wide exceeds the
+        # Chunked because a legal payload can now be well past the
         # 999-variable limit older SQLite builds enforce. ``_SQL_PARAM_CHUNK``
         # is the module-wide convention for exactly this.
-        photo_by_pred = {}
+        ws = db._ws_id()
+        pred_meta = {}
         for chunk in _chunked(pred_ids):
             placeholders = ",".join("?" for _ in chunk)
-            photo_by_pred.update({
-                row["id"]: row["photo_id"] for row in db.conn.execute(
-                    f"""SELECT pr.id, d.photo_id
-                        FROM predictions pr
-                        JOIN detections d ON d.id = pr.detection_id
-                        WHERE pr.id IN ({placeholders})""",
-                    chunk,
-                ).fetchall()
-            })
+            for row in db.conn.execute(
+                f"""SELECT pr.id,
+                          pr.classifier_model AS model,
+                          d.photo_id,
+                          pr_rev.group_id AS group_id
+                    FROM predictions pr
+                    JOIN detections d ON d.id = pr.detection_id
+                    LEFT JOIN prediction_review pr_rev
+                      ON pr_rev.prediction_id = pr.id
+                     AND pr_rev.workspace_id = ?
+                    WHERE pr.id IN ({placeholders})""",
+                (ws, *chunk),
+            ).fetchall():
+                pred_meta[row["id"]] = {
+                    "photo_id": row["photo_id"],
+                    "model": row["model"],
+                    "group_id": row["group_id"],
+                }
         for pid in pred_ids:
-            if pid not in photo_by_pred:
+            if pid not in pred_meta:
                 return None, None, json_error(f"Prediction {pid} not found", 404)
-        # One workspace query per distinct photo, not per prediction id: with
-        # 25,000 ids allowed, several rows on one photo must not cost several
-        # round trips each.
-        for photo_id in dict.fromkeys(photo_by_pred.values()):
+
+        # Match the selection endpoint's photo cap: the two panels feeding
+        # this route (single-photo and multi-select) resolve to at most
+        # 1,000 photos apiece, so the batch route enforces the same bound
+        # semantically rather than via an arbitrary id count.
+        distinct_photo_ids = list(dict.fromkeys(
+            meta["photo_id"] for meta in pred_meta.values()
+        ))
+        if len(distinct_photo_ids) > 1000:
+            return None, None, json_error("too many photos in selection", 400)
+        # One workspace query per distinct photo, not per prediction id:
+        # several rows on one photo must not cost several round trips each.
+        for photo_id in distinct_photo_ids:
             if not db._photo_in_workspace(photo_id):
                 return None, None, json_error(
                     f"Photo {photo_id} does not belong to the "
                     "active workspace", 403,
                 )
-        return pred_ids, photo_by_pred, None
+        return pred_ids, pred_meta, None
 
     @app.route("/api/predictions/batch-reject", methods=["POST"])
     def api_batch_reject_predictions():
@@ -16562,7 +16599,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         """
         db = _get_db()
         body = request.get_json(silent=True) or {}
-        pred_ids, _photo_by_pred, err = _parse_prediction_ids(db, body)
+        pred_ids, _pred_meta, err = _parse_prediction_ids(db, body)
         if err is not None:
             return err
 

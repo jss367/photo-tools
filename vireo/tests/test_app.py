@@ -17432,3 +17432,135 @@ def test_batch_accept_admits_payload_larger_than_1000(app_and_db):
         if row["action_type"] == "prediction_accept"
     ]
     assert len(accept_rows) == 1
+
+
+def test_batch_accept_grouped_scopes_photos_per_model_bucket(app_and_db):
+    """A grouped accept must only touch photos that submitted that model.
+
+    Codex flagged a batch-wide photo union: when one species bucket
+    contains predictions from multiple classifier models, passing every
+    submitted photo id to every ``accept_prediction`` call leaks the
+    grouped accept onto rows the user never selected. If photo A submits
+    only model X and photo B submits only model Y, accepting A's model-X
+    prediction with ``photo_ids=[A, B]`` would tag B's model-X row too
+    (even though the panel hid it), and its status-only edit would let
+    Undo reset a previously accepted prediction to pending.
+
+    The fix keys the allowed photo set on the ``(group_id, model)`` bucket
+    each prediction belongs to.
+    """
+    app, db = app_and_db
+    client = app.test_client()
+    folder_id = db.get_folder_tree()[0]["id"]
+
+    def _seed_grouped_two_models(filename):
+        photo_id = db.add_photo(
+            folder_id=folder_id, filename=filename, extension=".jpg",
+            file_size=100, file_mtime=1.0,
+        )
+        det_id = db.save_detections(
+            photo_id,
+            [{"box": {"x": 0.1, "y": 0.1, "w": 0.5, "h": 0.5},
+              "confidence": 0.9, "category": "animal"}],
+            detector_model="MDV6",
+        )[0]
+        # Same species from two different classifier models, both in the
+        # same burst group — the batch endpoint sees them as one species
+        # bucket, so any per-model scoping bug shows up here.
+        db.add_prediction(
+            det_id, "Bald Eagle", 0.9, "bioclip",
+            group_id="burst-mm",
+        )
+        db.add_prediction(
+            det_id, "Bald Eagle", 0.8, "inat21",
+            group_id="burst-mm",
+        )
+        return photo_id
+
+    photo_a = _seed_grouped_two_models("mm-a.jpg")
+    photo_b = _seed_grouped_two_models("mm-b.jpg")
+
+    # Submit A's bioclip row and B's inat21 row only — mimicking a panel
+    # that has legitimately hidden the other model on each photo.
+    pred_a_bioclip = next(
+        row["id"] for row in db.get_predictions(photo_ids=[photo_a])
+        if row["species"] == "Bald Eagle" and row["model"] == "bioclip"
+    )
+    pred_b_inat = next(
+        row["id"] for row in db.get_predictions(photo_ids=[photo_b])
+        if row["species"] == "Bald Eagle" and row["model"] == "inat21"
+    )
+    pred_b_bioclip = next(
+        row["id"] for row in db.get_predictions(photo_ids=[photo_b])
+        if row["species"] == "Bald Eagle" and row["model"] == "bioclip"
+    )
+    pred_a_inat = next(
+        row["id"] for row in db.get_predictions(photo_ids=[photo_a])
+        if row["species"] == "Bald Eagle" and row["model"] == "inat21"
+    )
+
+    resp = client.post(
+        "/api/predictions/batch-accept",
+        json={"prediction_ids": [pred_a_bioclip, pred_b_inat]},
+    )
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+
+    statuses = {
+        (row["photo_id"], row["model"]): row["status"]
+        for row in db.get_predictions(photo_ids=[photo_a, photo_b])
+    }
+    # Submitted rows flip to accepted.
+    assert statuses[(photo_a, "bioclip")] == "accepted"
+    assert statuses[(photo_b, "inat21")] == "accepted"
+    # Unsubmitted "other-model" rows must stay pending — the bug was that
+    # the batch-wide photo union let each accept leak onto the other
+    # photo's same-model row.
+    assert statuses[(photo_b, "bioclip")] == "pending", (
+        "Photo B's bioclip prediction was never submitted and must not be "
+        "swept up by A's bioclip accept."
+    )
+    assert statuses[(photo_a, "inat21")] == "pending", (
+        "Photo A's inat21 prediction was never submitted and must not be "
+        "swept up by B's inat21 accept."
+    )
+    # And unused ids are still resolvable (regression guard: the seeding
+    # helper actually stored both models).
+    assert pred_a_inat != pred_b_inat
+    assert pred_a_bioclip != pred_b_bioclip
+
+
+def test_batch_accept_rejects_selection_beyond_photo_cap(app_and_db):
+    """Enforce the same 1,000-photo cap the selection endpoint uses.
+
+    The two Browse panels that feed this route resolve to at most 1,000
+    photos apiece (``_parse_selection_photo_ids``). The batch route now
+    validates the resolved photo count so the semantic constraint holds
+    at both ends of the request path.
+    """
+    app, db = app_and_db
+    client = app.test_client()
+    folder_id = db.get_folder_tree()[0]["id"]
+
+    pred_ids = []
+    for i in range(1001):
+        photo_id = db.add_photo(
+            folder_id=folder_id, filename=f"cap-{i}.jpg", extension=".jpg",
+            file_size=100, file_mtime=1.0,
+        )
+        det_id = db.save_detections(
+            photo_id,
+            [{"box": {"x": 0.1, "y": 0.1, "w": 0.5, "h": 0.5},
+              "confidence": 0.9, "category": "animal"}],
+            detector_model="MDV6",
+        )[0]
+        db.add_prediction(det_id, "Bald Eagle", 0.9, "bioclip")
+        pred_ids.append(
+            _prediction_id(db, photo_id, "Bald Eagle")
+        )
+
+    resp = client.post(
+        "/api/predictions/batch-accept",
+        json={"prediction_ids": pred_ids},
+    )
+    assert resp.status_code == 400, resp.get_data(as_text=True)
+    assert "photos" in resp.get_json().get("error", "").lower()

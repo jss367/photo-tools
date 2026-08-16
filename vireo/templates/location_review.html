@@ -1449,9 +1449,10 @@ body {
   }
 
   function representativeGroupLocations(group) {
-    var center = {lat: Number(group.center.lat), lng: Number(group.center.lng)};
+    var centerLat = Number(group.center.lat);
+    var centerLng = Number(group.center.lng);
     var positions = (group.photos || []).map(function(photo) {
-      return {lat: Number(photo.latitude), lng: Number(photo.longitude)};
+      return {lat: Number(photo.latitude), lng: Number(photo.longitude), isPhoto: true};
     }).filter(function(position) {
       return Number.isFinite(position.lat) && Number.isFinite(position.lng);
     });
@@ -1463,10 +1464,15 @@ body {
       seen[key] = true;
       unique.push(position);
     });
+    // Flag the arithmetic center as a real photo position only when it lines
+    // up with a photo — otherwise an area that only contains this synthetic
+    // sample must not be shown "at the photos" (see regionChoiceFromResult).
+    var centerKey = centerLat.toFixed(5) + ',' + centerLng.toFixed(5);
+    var center = {lat: centerLat, lng: centerLng, isPhoto: !!seen[centerKey]};
     if (!unique.length) return [center];
     var farthestFromCenter = unique.slice().sort(function(a, b) {
-      return distanceBetween(center.lat, center.lng, b.lat, b.lng)
-        - distanceBetween(center.lat, center.lng, a.lat, a.lng);
+      return distanceBetween(centerLat, centerLng, b.lat, b.lng)
+        - distanceBetween(centerLat, centerLng, a.lat, a.lng);
     })[0];
     var farthestFromEdge = unique.slice().sort(function(a, b) {
       return distanceBetween(farthestFromCenter.lat, farthestFromCenter.lng, b.lat, b.lng)
@@ -1476,13 +1482,16 @@ body {
     var sampleSeen = {};
     return samples.filter(function(position) {
       var key = position.lat.toFixed(5) + ',' + position.lng.toFixed(5);
-      if (sampleSeen[key]) return false;
-      sampleSeen[key] = true;
+      if (sampleSeen[key]) {
+        if (position.isPhoto) sampleSeen[key].isPhoto = true;
+        return false;
+      }
+      sampleSeen[key] = position;
       return true;
     });
   }
 
-  function regionChoiceFromResult(result, center) {
+  function regionChoiceFromResult(result, center, sampleIsPhoto) {
     var matchedType = Object.keys(AREA_TYPES).find(function(type) {
       return (result.types || []).indexOf(type) !== -1;
     });
@@ -1498,7 +1507,11 @@ body {
     choice.category = 'areas';
     choice.place_type = matchedType;
     choice.area_scope = details.scope;
-    choice.relationship = 'at_photos';
+    // Only claim "at the photos" when the geocoded sample was an actual
+    // photo coordinate. Areas reached solely via the synthetic group center
+    // may contain none of the photos and belong under "Broader areas" or
+    // "Nearby places" instead.
+    if (sampleIsPhoto) choice.relationship = 'at_photos';
     choice.address_components = result.address_components || [];
     choice.distance_m = distanceBetween(center.lat, center.lng, choice.latitude, choice.longitude);
     return choice;
@@ -1515,7 +1528,8 @@ body {
       {location: location, radius: radius, keyword: 'state park wildlife refuge nature preserve hiking area'},
       {location: location, radius: radius},
     ];
-    var geocodeLocations = representativeGroupLocations(group).map(function(position) {
+    var geocodeSamples = representativeGroupLocations(group);
+    var geocodeLocations = geocodeSamples.map(function(position) {
       return new google.maps.LatLng(position.lat, position.lng);
     });
     var payloads = await Promise.all([
@@ -1550,13 +1564,23 @@ body {
 
     var regionSeen = {};
     var regionChoices = [];
-    payloads[1].forEach(function(results) {
+    payloads[1].forEach(function(results, sampleIndex) {
+      var sample = geocodeSamples[sampleIndex];
+      var sampleIsPhoto = !!(sample && sample.isPhoto);
       results.forEach(function(result) {
-        var choice = regionChoiceFromResult(result, center);
+        var choice = regionChoiceFromResult(result, center, sampleIsPhoto);
         if (!choice) return;
         var key = candidateKey(choice);
-        if (regionSeen[key]) return;
-        regionSeen[key] = true;
+        if (regionSeen[key]) {
+          // A later sample that IS a photo position upgrades an area we
+          // first saw via the synthetic center so it can still surface as
+          // "at the photos" when a real photo actually falls in it.
+          if (sampleIsPhoto && regionSeen[key].relationship !== 'at_photos') {
+            regionSeen[key].relationship = 'at_photos';
+          }
+          return;
+        }
+        regionSeen[key] = choice;
         regionChoices.push(choice);
       });
     });

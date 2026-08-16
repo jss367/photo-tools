@@ -103,11 +103,29 @@ GOOGLE_MAPS_STUB = """
             geometry: {location: new LatLng(lat, lng)}
           };
         }
-        callback([
+        var results = [
           area('garrieux', 'Garrieux', 'neighborhood', 42.810, 2.940),
           area('saint-hippolyte', 'Saint-Hippolyte', 'locality', 42.810, 2.940),
           area('pyrenees-orientales', 'Pyrénées-Orientales', 'administrative_area_level_2', 42.810, 2.940)
-        ], 'OK');
+        ];
+        // Emit a neighborhood that only shows up for geocode samples that
+        // are NOT real photo positions — the synthetic group center. The
+        // test opts in by setting ``__locationReviewCenterOnlyPhotos`` to
+        // the real photo coordinates so the stub can tell them apart.
+        var photoPositions = window.__locationReviewCenterOnlyPhotos;
+        if (photoPositions && photoPositions.length) {
+          var matchesPhoto = photoPositions.some(function(p) {
+            return Math.abs(request.location.lat() - p[0]) < 0.0001 &&
+                   Math.abs(request.location.lng() - p[1]) < 0.0001;
+          });
+          if (!matchesPhoto) {
+            results.push(area(
+              'midtown-only', 'Midtown Only', 'neighborhood',
+              request.location.lat(), request.location.lng()
+            ));
+          }
+        }
+        callback(results, 'OK');
         return;
       }
       if (!window.__locationReviewIncludeRegions) {
@@ -1631,6 +1649,66 @@ def test_location_review_groups_hamlets_and_keeps_a_selection_across_filters(
     )
     expect(page.locator(".location-review-candidate", has_text="Nearby Park")).to_be_visible()
     expect(page.locator(".location-review-candidate", has_text="Nearby General Store")).to_have_count(0)
+
+
+def test_location_review_does_not_mark_center_only_areas_as_at_photos(
+    live_server, page,
+):
+    """Areas reached only via the synthetic group center are kept out of 'At the photos'."""
+    photo_ids = live_server["data"]["photos"][:2]
+    # Cluster both photos into one group (750m radius) so the synthetic
+    # arithmetic center lands between them rather than on either photo.
+    photo_a = (42.810, 2.940)
+    photo_b = (42.814, 2.944)
+    with live_server["db"].conn:
+        live_server["db"].conn.execute(
+            "UPDATE photos SET latitude = ?, longitude = ? WHERE id = ?",
+            (photo_a[0], photo_a[1], photo_ids[0]),
+        )
+        live_server["db"].conn.execute(
+            "UPDATE photos SET latitude = ?, longitude = ? WHERE id = ?",
+            (photo_b[0], photo_b[1], photo_ids[1]),
+        )
+
+    page.add_init_script(
+        "window.__locationReviewCenterOnlyPhotos = "
+        f"[[{photo_a[0]}, {photo_a[1]}], [{photo_b[0]}, {photo_b[1]}]]"
+    )
+    page.route(
+        "**/api/config",
+        lambda route: route.fulfill(json={"google_maps_api_key": "test-key"}),
+    )
+    page.route(
+        "https://maps.googleapis.com/maps/api/js**",
+        lambda route: route.fulfill(
+            status=200,
+            content_type="application/javascript",
+            body=GOOGLE_MAPS_STUB,
+        ),
+    )
+    page.goto(f"{live_server['url']}/browse")
+    page.evaluate(
+        "ids => sessionStorage.setItem('vireoLocationReviewSource', "
+        "JSON.stringify({photo_ids: ids}))",
+        photo_ids,
+    )
+    page.goto(f"{live_server['url']}/locations/review?source=selection")
+
+    at_photos = page.locator('[data-candidate-group="at"]')
+    # Real-photo positions confirm Garrieux, so it stays "At the photos".
+    expect(
+        at_photos.locator(".location-review-candidate", has_text="Garrieux")
+    ).to_be_visible()
+    # The synthetic center-only neighborhood must not surface as "At the photos".
+    expect(
+        at_photos.locator(".location-review-candidate", has_text="Midtown Only")
+    ).to_have_count(0)
+    # It should still surface as a nearby option.
+    midtown = page.locator(".location-review-candidate", has_text="Midtown Only")
+    expect(midtown).to_be_visible()
+    expect(midtown.locator(".location-review-candidate-detail")).not_to_contain_text(
+        "At photo coordinates"
+    )
 
 
 def test_location_review_color_codes_place_types(live_server, page):

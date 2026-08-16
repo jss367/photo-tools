@@ -5726,7 +5726,34 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                                 # One best weak crop is enough to validate the
                                 # bridge. Classifying every low-confidence box
                                 # would multiply work and false-positive risk.
-                                photo_dets = photo_dets[:1]
+                                #
+                                # Explicit ``detector_confidence DESC, id ASC``
+                                # tie-break so the runtime picks the same
+                                # detection the preflight's cache-hit query
+                                # picks. ``cached_detections`` comes back from
+                                # ``_detect_batch`` in raw detector/NMS output
+                                # order — no ID tie-break — while
+                                # ``get_classifier_run_cache_hits`` ranks by
+                                # ``detector_confidence DESC, id ASC``. Without
+                                # this sort, two equal-confidence weak boxes
+                                # can leave runtime inferring the higher-ID box
+                                # while the preflight marked the photo cached
+                                # via a portable-cache run on the lower-ID box;
+                                # the overcount tracker then can't correct it
+                                # because the runtime-selected detection has
+                                # no run key of its own (Codex #1468 P2).
+                                photo_dets = sorted(
+                                    photo_dets,
+                                    key=lambda d: (
+                                        -float(
+                                            d.get(
+                                                "confidence",
+                                                d.get("detector_confidence", 0),
+                                            ) or 0
+                                        ),
+                                        d.get("id", 0),
+                                    ),
+                                )[:1]
                             detections_to_classify = photo_dets
                             if not detections_to_classify:
                                 # Distinguish "no eligible detection at the

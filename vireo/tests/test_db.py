@@ -14060,6 +14060,52 @@ def test_retire_builtin_wildlife_cancels_unsynced_add(tmp_path):
     ).fetchone() is None
 
 
+def test_retire_builtin_wildlife_queues_removal_in_every_owning_workspace(tmp_path):
+    """A folder shared across workspaces must have the cleanup queued in each.
+
+    ``get_pending_changes()`` and the sync panel are per-workspace, so queueing
+    the removal in only one owning workspace hides it from the others; the
+    migration marks itself complete and the stale ``Wildlife`` term stays in
+    the sidecar for the unqueued workspaces indefinitely.
+    """
+    from db import Database
+    db = Database(str(tmp_path / "test.db"))
+    ws1 = db.create_workspace("alpha")
+    ws2 = db.create_workspace("beta")
+    db.set_active_workspace(ws1)
+    fid = db.add_folder("/photos", name="photos")
+    db.add_workspace_folder(ws1, fid)
+    db.add_workspace_folder(ws2, fid)
+    p1 = db.add_photo(
+        folder_id=fid, filename="p1.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+    )
+    wildlife_id = db.conn.execute(
+        "INSERT INTO keywords (name, type) VALUES ('Wildlife', 'genre')"
+    ).lastrowid
+    species_id = db.add_keyword("House Sparrow", is_species=True)
+    db.tag_photo(p1, species_id)
+    db.conn.execute(
+        "INSERT INTO photo_keywords (photo_id, keyword_id) VALUES (?, ?)",
+        (p1, wildlife_id),
+    )
+    db.conn.commit()
+    db.set_meta(Database._RETIRED_WILDLIFE_GENRE_KEY, "0")
+
+    assert db.retire_builtin_wildlife_genre() == 1
+
+    queued_ws = {
+        row["workspace_id"]
+        for row in db.conn.execute(
+            """SELECT workspace_id FROM pending_changes
+               WHERE photo_id = ? AND change_type = 'keyword_remove_flat'
+                 AND value = 'Wildlife' COLLATE NOCASE""",
+            (p1,),
+        ).fetchall()
+    }
+    assert queued_ws == {ws1, ws2}
+
+
 def test_retire_builtin_wildlife_handles_photo_counts_over_bind_limit(tmp_path):
     """Retirement must chunk the DELETE so a large upgraded library still opens.
 

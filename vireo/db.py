@@ -3176,9 +3176,8 @@ class Database:
                 "SELECT MIN(id) AS id FROM workspaces"
             ).fetchone()
             fallback_workspace = fallback_row["id"] if fallback_row else None
-        associations = self.conn.execute(
-            f"""SELECT DISTINCT pk.photo_id,
-                       COALESCE(MIN(wf.workspace_id), ?) AS workspace_id
+        rows = self.conn.execute(
+            f"""SELECT DISTINCT pk.photo_id, wf.workspace_id
                 FROM photo_keywords pk
                 JOIN photos p ON p.id = pk.photo_id
                 LEFT JOIN workspace_folders wf ON wf.folder_id = p.folder_id
@@ -3191,14 +3190,24 @@ class Database:
                       WHERE species_pk.photo_id = pk.photo_id
                         AND (species_k.type = 'taxonomy'
                              OR species_k.is_species = 1)
-                  )
-                GROUP BY pk.photo_id""",
-            [fallback_workspace, *keyword_ids],
+                  )""",
+            keyword_ids,
         ).fetchall()
 
-        for association in associations:
-            photo_id = association["photo_id"]
-            workspace_id = association["workspace_id"]
+        # Group owning workspaces per photo. get_pending_changes() and the
+        # sync panel are per-workspace, so if a photo's folder belongs to
+        # multiple workspaces the sidecar cleanup must be queued in each
+        # of them or the stale term stays in XMP for the unqueued owners
+        # even after the migration marks itself complete.
+        photo_workspaces = {}
+        for row in rows:
+            pid = row["photo_id"]
+            ws = row["workspace_id"]
+            bucket = photo_workspaces.setdefault(pid, set())
+            if ws is not None:
+                bucket.add(ws)
+
+        for photo_id, ws_ids in photo_workspaces.items():
             # A pending add means the generated term has not reached the
             # sidecar yet. Cancel every workspace copy rather than stacking a
             # removal behind it.
@@ -3208,25 +3217,32 @@ class Database:
                      AND value = 'Wildlife' COLLATE NOCASE""",
                 (photo_id,),
             ).rowcount
-            if pending_add == 0:
+            if pending_add:
+                continue
+            target_ws_ids = (
+                ws_ids
+                if ws_ids
+                else ({fallback_workspace} if fallback_workspace is not None else set())
+            )
+            for ws_id in target_ws_ids:
                 existing_remove = self.conn.execute(
                     """SELECT 1 FROM pending_changes
-                       WHERE photo_id = ?
+                       WHERE photo_id = ? AND workspace_id = ?
                          AND change_type IN ('keyword_remove', 'keyword_remove_flat')
                          AND value = 'Wildlife' COLLATE NOCASE
                        LIMIT 1""",
-                    (photo_id,),
+                    (photo_id, ws_id),
                 ).fetchone()
-                if existing_remove is None and workspace_id is not None:
+                if existing_remove is None:
                     self.queue_change(
                         photo_id,
                         "keyword_remove_flat",
                         "Wildlife",
-                        workspace_id=workspace_id,
+                        workspace_id=ws_id,
                         _commit=False,
                     )
 
-        retired_photo_ids = [row["photo_id"] for row in associations]
+        retired_photo_ids = list(photo_workspaces.keys())
         if retired_photo_ids:
             # Chunk to stay under SQLITE_MAX_VARIABLE_NUMBER (999 on legacy
             # builds); this runs synchronously on startup so a large upgraded
@@ -3243,7 +3259,7 @@ class Database:
             self._RETIRED_WILDLIFE_GENRE_KEY, "1", _commit=False,
         )
         self.conn.commit()
-        return len(associations)
+        return len(retired_photo_ids)
 
     _SPECIES_HIGHLIGHTS_BACKFILL_KEY = "species_highlights_from_preferences_backfill"
     _SPECIES_REPRESENTATIVES_BACKFILL_KEY = "species_representatives_from_preferences_backfill"

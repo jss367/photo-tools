@@ -9959,6 +9959,67 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             "suggestions": suggestions,
         })
 
+    @app.route("/api/selection/wildlife-state", methods=["POST"])
+    def api_selection_wildlife_state():
+        """Aggregate wildlife_excluded state across the full selection.
+
+        The browse panel may hold IDs that are not yet loaded into the
+        client-side grid (e.g. after "Select all matching"), so the counts
+        must be derived server-side or the batch include/exclude controls
+        would silently omit off-page photos and hide the buttons that
+        should still be available for them.
+        """
+        db = _get_db()
+        body = request.get_json(silent=True) or {}
+        raw_ids = body.get("photo_ids", [])
+        if not isinstance(raw_ids, list):
+            return json_error("photo_ids required")
+
+        photo_ids = []
+        seen = set()
+        for raw in raw_ids:
+            if isinstance(raw, bool) or not isinstance(raw, int):
+                return json_error("photo_ids must be integers")
+            if raw not in seen:
+                photo_ids.append(raw)
+                seen.add(raw)
+        if not photo_ids:
+            return jsonify({
+                "selected_count": 0,
+                "included_count": 0,
+                "excluded_count": 0,
+            })
+
+        ws_id = db._ws_id()
+        included = 0
+        excluded = 0
+        batch_size = 800
+        for i in range(0, len(photo_ids), batch_size):
+            chunk = photo_ids[i:i + batch_size]
+            placeholders = ",".join("?" for _ in chunk)
+            rows = db.conn.execute(
+                f"""SELECT COALESCE(p.wildlife_excluded, 0) AS excluded
+                    FROM photos p
+                    WHERE p.id IN ({placeholders})
+                      AND EXISTS (
+                          SELECT 1 FROM workspace_folders wf
+                          WHERE wf.folder_id = p.folder_id
+                            AND wf.workspace_id = ?
+                      )""",
+                [*chunk, ws_id],
+            ).fetchall()
+            for row in rows:
+                if row["excluded"]:
+                    excluded += 1
+                else:
+                    included += 1
+
+        return jsonify({
+            "selected_count": included + excluded,
+            "included_count": included,
+            "excluded_count": excluded,
+        })
+
     @app.route("/api/keywords/<int:keyword_id>", methods=["PUT"])
     def api_update_keyword(keyword_id):
         db = _get_db()

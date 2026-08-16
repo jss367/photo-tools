@@ -362,6 +362,7 @@ POST         /api/remote-setup/ssh-check
 POST         /api/remote-targets/test
 POST         /api/report-issue
 POST         /api/selection/keyword-suggestions
+POST         /api/selection/wildlife-state
 POST         /api/settings/import
 POST         /api/setup/complete
 POST         /api/shutdown

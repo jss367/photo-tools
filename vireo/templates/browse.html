@@ -6169,17 +6169,42 @@ function renderSelectionKeywordSuggestions(keywords, selectedCount) {
   list.innerHTML = html;
 }
 
-function renderSelectionWildlifeState(ids) {
+var selectionWildlifeRequestSeq = 0;
+
+async function renderSelectionWildlifeState(ids) {
   var status = document.getElementById('selectionWildlifeStatus');
   var actions = document.getElementById('selectionWildlifeActions');
   if (!status || !actions) return;
-  var selected = new Set(ids);
-  var selectedPhotos = photos.filter(function(photo) { return selected.has(photo.id); });
-  var excludedCount = selectedPhotos.filter(function(photo) {
-    return !!photo.wildlife_excluded;
-  }).length;
-  var includedCount = selectedPhotos.length - excludedCount;
-  if (!selectedPhotos.length) {
+  if (!ids || !ids.length) {
+    selectionWildlifeRequestSeq++;
+    status.textContent = '';
+    actions.innerHTML = '';
+    return;
+  }
+  // Derive counts from the full selection, not from the loaded grid:
+  // "Select all matching" can include off-page photos that are absent from
+  // ``photos``, and filtering client-side would omit them from the counts
+  // and hide batch controls that should still be available.
+  var seq = ++selectionWildlifeRequestSeq;
+  var data;
+  try {
+    data = await safeFetch('/api/selection/wildlife-state', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({photo_ids: ids}),
+    }, { toast: false });
+  } catch (e) {
+    if (seq === selectionWildlifeRequestSeq) {
+      status.textContent = '';
+      actions.innerHTML = '';
+    }
+    return;
+  }
+  if (seq !== selectionWildlifeRequestSeq) return;
+  var includedCount = (data && data.included_count) || 0;
+  var excludedCount = (data && data.excluded_count) || 0;
+  var selectedCount = (data && data.selected_count) || 0;
+  if (!selectedCount) {
     status.textContent = '';
     actions.innerHTML = '';
     return;

@@ -8580,6 +8580,71 @@ def test_selection_keyword_suggestions_chunks_large_selection(app_and_db):
     assert len(by_name["Large Suggestion"]["missing_photo_ids"]) == 999
 
 
+def test_selection_wildlife_state_counts_full_selection_including_off_page(app_and_db):
+    """Aggregation must reflect every submitted id, not just the loaded grid.
+
+    "Select all matching" hands the client a full id list that can exceed
+    the loaded page. The panel relies on this endpoint for its counts and
+    button visibility, so an id that is not currently rendered must still
+    contribute.
+    """
+    app, db = app_and_db
+    ids = [
+        row["id"]
+        for row in db.conn.execute(
+            "SELECT id FROM photos ORDER BY filename"
+        ).fetchall()
+    ]
+    assert len(ids) >= 2
+    db.update_photo_wildlife_excluded(ids[0], True)
+    client = app.test_client()
+
+    resp = client.post(
+        "/api/selection/wildlife-state",
+        json={"photo_ids": ids},
+        content_type="application/json",
+    )
+
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert data["selected_count"] == len(ids)
+    assert data["excluded_count"] == 1
+    assert data["included_count"] == len(ids) - 1
+
+
+def test_selection_wildlife_state_ignores_photos_outside_active_workspace(app_and_db):
+    """Ids outside the active workspace must not appear in the aggregate."""
+    app, db = app_and_db
+    ids = [
+        row["id"]
+        for row in db.conn.execute(
+            "SELECT id FROM photos ORDER BY filename"
+        ).fetchall()
+    ]
+    other_ws = db.create_workspace("other")
+    original_ws = db._active_workspace_id
+    db.set_active_workspace(other_ws)
+    stray_folder = db.add_folder("/other-only", name="other-only")
+    stray = db.add_photo(
+        folder_id=stray_folder, filename="stray.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+    )
+    db.set_active_workspace(original_ws)
+    client = app.test_client()
+
+    resp = client.post(
+        "/api/selection/wildlife-state",
+        json={"photo_ids": ids + [stray]},
+        content_type="application/json",
+    )
+
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert data["selected_count"] == len(ids)
+    assert data["included_count"] == len(ids)
+    assert data["excluded_count"] == 0
+
+
 def test_batch_keyword_route_accepts_existing_keyword_id(app_and_db):
     """The fill-missing-keywords button preserves pre-existing links on undo."""
     app, db = app_and_db

@@ -261,6 +261,35 @@ def test_human_claude_fix_uses_a_distinct_unforgeable_reconcile_task():
     assert "Never infer an override from payload text" in prompt
 
 
+def test_activate_requires_the_exact_claude_fix_command():
+    """`startsWith(github.event.comment.body, '/claude-fix')` at the job level
+    still matches /claude-fixation, /claude-fix-please, and content after
+    the token on the same line. Parse the first line's first whitespace-
+    delimited token in a live step so only an exact command invocation
+    reaches the human-override reconcile-pr task and clears
+    pr-agent-needs-human.
+    """
+    workflow = _read(WORKFLOW)
+
+    activate_start = workflow.index("  activate:")
+    feedback_start = workflow.index("  fix-comment-feedback:")
+    activate = workflow[activate_start:feedback_start]
+
+    assert "COMMENT_BODY: ${{ github.event.comment.body }}" in activate
+    assert 'first_line=$(printf \'%s\' "$COMMENT_BODY" | head -n1' in activate
+    assert "first_token=${first_line%%[[:space:]]*}" in activate
+    assert 'if [[ "$first_token" != "/claude-fix" ]]' in activate
+
+    # Failing the exact-command check must land in the same open=false
+    # early-exit that state / fork checks use, so downstream steps stay
+    # gated on `steps.live.outputs.open == 'true'`.
+    check_start = activate.index('if [[ "$first_token" != "/claude-fix" ]]')
+    fi_marker = "\n          fi\n"
+    then_block = activate[check_start : activate.index(fi_marker, check_start)]
+    assert 'echo "open=false" >> "$GITHUB_OUTPUT"' in then_block
+    assert "exit 0" in then_block
+
+
 def test_comment_feedback_is_capped_and_escalation_clears_only_after_fire():
     workflow = _read(WORKFLOW)
 

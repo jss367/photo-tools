@@ -67,7 +67,23 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
           PR: ${{ github.event.issue.number }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
         run: |
+          # Require an exact /claude-fix command as the first token on the
+          # first line, not just any comment that starts with the string
+          # /claude-fix. The job-level `startsWith` still matches prefixes
+          # like /claude-fixation / /claude-fix-please and content after the
+          # token on the same line; without a stricter parse those bodies
+          # would fire the human-override reconcile-pr task and clear
+          # pr-agent-needs-human, defeating the escalation safeguard.
+          first_line=$(printf '%s' "$COMMENT_BODY" | head -n1 | tr -d '\r')
+          first_token=${first_line%%[[:space:]]*}
+          if [[ "$first_token" != "/claude-fix" ]]; then
+            echo "open=false" >> "$GITHUB_OUTPUT"
+            echo "Comment first token '${first_token}' is not an exact /claude-fix command; ignoring."
+            exit 0
+          fi
+
           pr_json=$(gh pr view "$PR" --repo "$REPO" \
             --json state,headRefOid,headRepositoryOwner,headRepository)
           state=$(jq -r '.state' <<< "$pr_json")

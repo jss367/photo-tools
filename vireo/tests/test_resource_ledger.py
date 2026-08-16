@@ -378,6 +378,115 @@ def test_cgroup_cpu_quota_v1_nested_walks_ancestors(monkeypatch):
     assert resource_ledger._cgroup_cpu_quota_cpus() == 2
 
 
+def test_cgroup_cpu_quota_v2_delegated_subtree_uses_mount_root(monkeypatch):
+    """Regression: a container with a delegated cgroup subtree has
+    ``/proc/self/cgroup`` reporting the FULL cgroup path (e.g.
+    ``/docker/<id>``) while ``/proc/self/mountinfo`` shows that
+    subtree mounted AS the root of ``/sys/fs/cgroup``. Concatenating
+    ``/sys/fs/cgroup`` + ``/docker/<id>`` + ``/cpu.max`` probes a file
+    that does not exist in the container's mount namespace; the
+    effective file is at ``/sys/fs/cgroup/cpu.max``.
+
+    Prior to the mount-root translation the quota lookup returned
+    ``None`` for these containers, and ``automatic_cpu_capacity`` fell
+    back to the affinity count — which for a Docker container using
+    ``--cpuset-cpus`` alongside ``--cpus`` still reports the wider
+    cpuset. Result: derived CPU budget exceeds the enforced quota.
+    """
+    monkeypatch.setattr(
+        "builtins.open",
+        _make_open_stub({
+            "/proc/self/cgroup": "0::/docker/abc123\n",
+            "/proc/self/mountinfo": (
+                # Mount root is /docker/abc123, mount point is
+                # /sys/fs/cgroup — the effective cpu.max is at
+                # /sys/fs/cgroup/cpu.max, NOT
+                # /sys/fs/cgroup/docker/abc123/cpu.max.
+                "27 25 0:22 /docker/abc123 /sys/fs/cgroup "
+                "rw,nosuid,nodev,noexec - cgroup2 cgroup2 "
+                "rw,nsdelegate\n"
+            ),
+            "/sys/fs/cgroup/cpu.max": "200000 100000\n",
+        }),
+    )
+    # 200000 / 100000 = 2 CPUs — the container's enforced ceiling.
+    assert resource_ledger._cgroup_cpu_quota_cpus() == 2
+
+
+def test_cgroup_cpu_quota_v2_delegated_subtree_walks_ancestors_within_mount(
+    monkeypatch,
+):
+    """A container with a nested cgroup inside its delegated subtree
+    (e.g. ``/docker/abc/svc``) must walk ancestors DOWN TO the mount
+    point, not past it. Walking above the mount would leak into the
+    host's cgroup files (or read nothing) — neither matches the
+    "tightest along the chain" semantic for a process confined to the
+    delegated subtree.
+    """
+    monkeypatch.setattr(
+        "builtins.open",
+        _make_open_stub({
+            "/proc/self/cgroup": "0::/docker/abc/svc\n",
+            "/proc/self/mountinfo": (
+                "27 25 0:22 /docker/abc /sys/fs/cgroup "
+                "rw,nosuid,nodev,noexec - cgroup2 cgroup2 rw\n"
+            ),
+            # svc is 4 CPUs
+            "/sys/fs/cgroup/svc/cpu.max": "400000 100000\n",
+            # The mount point (the ancestor above svc INSIDE the mount)
+            # is 2 CPUs — the tightest.
+            "/sys/fs/cgroup/cpu.max": "200000 100000\n",
+        }),
+    )
+    assert resource_ledger._cgroup_cpu_quota_cpus() == 2
+
+
+def test_cgroup_cpu_quota_v1_delegated_subtree_uses_mount_root(monkeypatch):
+    """Same delegated-subtree translation for cgroup v1. A container
+    with a v1 cpu controller exposed at ``/sys/fs/cgroup/cpu`` whose
+    mount root is ``/docker/<id>`` reads its quota from that mount
+    point, not from ``/sys/fs/cgroup/cpu/docker/<id>``.
+    """
+    monkeypatch.setattr(
+        "builtins.open",
+        _make_open_stub({
+            "/proc/self/cgroup": (
+                "3:cpu,cpuacct:/docker/abc123\n"
+            ),
+            "/proc/self/mountinfo": (
+                "27 25 0:22 /docker/abc123 /sys/fs/cgroup/cpu,cpuacct "
+                "rw - cgroup cgroup rw,cpu,cpuacct\n"
+            ),
+            "/sys/fs/cgroup/cpu,cpuacct/cpu.cfs_quota_us": "200000\n",
+            "/sys/fs/cgroup/cpu,cpuacct/cpu.cfs_period_us": "100000\n",
+        }),
+    )
+    assert resource_ledger._cgroup_cpu_quota_cpus() == 2
+
+
+def test_cgroup_cpu_quota_mountinfo_absent_preserves_legacy_behavior(
+    monkeypatch,
+):
+    """Without ``/proc/self/mountinfo`` (missing or unreadable) the
+    helper falls back to the historical ``/sys/fs/cgroup{path}`` layout.
+    Guarantees the pre-parser test corpus still describes real behavior
+    on any Linux where mountinfo is available but the delegated-subtree
+    edge case doesn't apply.
+    """
+    monkeypatch.setattr(
+        "builtins.open",
+        _make_open_stub({
+            "/proc/self/cgroup": "0::/system.slice/vireo.service\n",
+            # No /proc/self/mountinfo — parser returns [], []; the
+            # helper falls back to ("/", "/sys/fs/cgroup").
+            "/sys/fs/cgroup/system.slice/vireo.service/cpu.max": (
+                "200000 100000\n"
+            ),
+        }),
+    )
+    assert resource_ledger._cgroup_cpu_quota_cpus() == 2
+
+
 def test_cgroup_cpu_quota_missing_files_returns_none(monkeypatch):
     """Darwin/Windows/host-linux without cgroups: both paths raise
     ``OSError``, and the helper returns ``None`` so the caller falls

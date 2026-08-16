@@ -277,6 +277,93 @@ def _process_cgroup_paths():
     return v2_path, v1_cpu_path
 
 
+def _parse_cgroup_mounts():
+    """Return ``(v2_mounts, v1_cpu_mounts)`` parsed from mountinfo.
+
+    ``v2_mounts`` is a list of ``(mount_root, mount_point)`` tuples for
+    every ``cgroup2`` mount visible to this process. ``v1_cpu_mounts``
+    is the same for cgroup v1 ``cpu`` (or co-mounted ``cpu,cpuacct``)
+    controllers. Empty lists on any parse failure.
+
+    ``mountinfo`` fields are space-separated; column 4 (index 3) is the
+    mount ROOT — the subtree within the source filesystem exposed at
+    the mount point (column 5, index 4). In a container with a
+    delegated cgroup subtree the mount root is not ``/`` — it is
+    something like ``/docker/<id>``, and the process's own cgroup path
+    (from ``/proc/self/cgroup``) is likewise ``/docker/<id>``. The
+    effective ``cpu.max`` file lives at ``<mount_point> +
+    strip_prefix(process_cgroup_path, mount_root)`` — NOT at
+    ``<mount_point> + process_cgroup_path``. Prior to this parser the
+    quota lookup concatenated the wrong pieces and silently missed
+    every quota-limited container that delegated its subtree, letting
+    the CPU budget size from the host / affinity count instead.
+
+    Format reference: proc(5) — "Mount options" section.
+    """
+    v2_mounts = []
+    v1_cpu_mounts = []
+    try:
+        with open("/proc/self/mountinfo", encoding="utf-8") as f:
+            for line in f:
+                # Line shape:
+                #   <id> <parent> <maj:min> <root> <mnt> <opts> ... - <fs> <src> <sopts>
+                # The optional-fields section between column 6 and the
+                # literal " - " separator makes fixed indexing after
+                # column 6 unsafe; split at " - " to separate.
+                try:
+                    left, right = line.rstrip("\n").split(" - ", 1)
+                except ValueError:
+                    continue
+                left_fields = left.split()
+                right_fields = right.split()
+                if len(left_fields) < 5 or len(right_fields) < 1:
+                    continue
+                mount_root = left_fields[3]
+                mount_point = left_fields[4]
+                fs_type = right_fields[0]
+                if fs_type == "cgroup2":
+                    v2_mounts.append((mount_root, mount_point))
+                elif fs_type == "cgroup":
+                    # v1 super_options carry the controller list, e.g.
+                    # ``rw,cpu,cpuacct``. Only interested in the cpu
+                    # controller (or its co-mounted alias).
+                    sopts = right_fields[2] if len(right_fields) >= 3 else ""
+                    controllers = set(sopts.split(","))
+                    if "cpu" in controllers:
+                        v1_cpu_mounts.append((mount_root, mount_point))
+    except OSError:
+        return [], []
+    return v2_mounts, v1_cpu_mounts
+
+
+def _resolve_cgroup_fs_path(mount_root, mount_point, process_cgroup_path):
+    """Translate a process cgroup path into a filesystem path within a mount.
+
+    The process's cgroup path is expressed relative to the cgroup
+    hierarchy root; the mount root is the subtree of that hierarchy
+    actually exposed at ``mount_point``. Return the filesystem path of
+    the process's cgroup within this mount, or ``None`` when the mount
+    does not include the process's cgroup at all.
+    """
+    if not process_cgroup_path.startswith("/"):
+        return None
+    # Normalise trailing slashes so equality comparisons work.
+    mount_root_norm = mount_root.rstrip("/") or "/"
+    process_norm = process_cgroup_path.rstrip("/") or "/"
+    if mount_root_norm == "/":
+        # Full hierarchy exposed — process path applies as-is.
+        rel = "" if process_norm == "/" else process_norm
+    elif process_norm == mount_root_norm:
+        # Process cgroup IS the mount root — the mount is the leaf.
+        rel = ""
+    elif process_norm.startswith(mount_root_norm + "/"):
+        rel = process_norm[len(mount_root_norm):]
+    else:
+        # Process cgroup is not under this mount's exposed subtree.
+        return None
+    return mount_point + rel
+
+
 def _ancestor_dirs(path):
     """Yield ``path`` and each parent directory down to ``/``.
 
@@ -299,6 +386,32 @@ def _ancestor_dirs(path):
         parent = normalized.rsplit("/", 1)[0] or "/"
         yield parent
         if parent == "/":
+            break
+        normalized = parent
+
+
+def _ancestor_dirs_within_mount(fs_path, mount_point):
+    """Yield ``fs_path`` and each parent directory down to ``mount_point``.
+
+    Bounds the walk to the mount subtree — a container with a
+    delegated cgroup subtree exposes only files at or below
+    ``mount_point``. Walking up past that boundary would probe
+    directories not visible to this mount namespace and read either
+    the host's quotas (mount-namespace leakage) or nothing at all;
+    neither is what "the tightest quota along the chain" means for a
+    process confined to the delegated subtree.
+    """
+    if not fs_path or not fs_path.startswith("/"):
+        return
+    normalized_mount = mount_point.rstrip("/") or "/"
+    normalized = fs_path.rstrip("/") or "/"
+    yield normalized
+    while normalized != normalized_mount:
+        parent = normalized.rsplit("/", 1)[0] or "/"
+        if len(parent) < len(normalized_mount):
+            break
+        yield parent
+        if parent == normalized_mount:
             break
         normalized = parent
 
@@ -329,16 +442,30 @@ def _cgroup_cpu_quota_cpus():
     affinity-based counts.
     """
     v2_path, v1_cpu_path = _process_cgroup_paths()
+    v2_mounts, v1_cpu_mounts = _parse_cgroup_mounts()
 
     candidates = []
 
-    # cgroup v2: /sys/fs/cgroup{path}/cpu.max, walking ancestors.
+    # cgroup v2: walk each cgroup2 mount and each ancestor. The mount
+    # ROOT (from ``mountinfo``) is not necessarily ``/`` — a container
+    # with a delegated cgroup subtree exposes only that subtree at
+    # ``/sys/fs/cgroup``. ``_resolve_cgroup_fs_path`` translates the
+    # process's own cgroup path into the correct filesystem path within
+    # this mount (returns None when the process's cgroup is outside
+    # the exposed subtree — skip that mount).
     if v2_path is not None:
-        for ancestor in _ancestor_dirs(v2_path):
-            mount = "/sys/fs/cgroup" + ("" if ancestor == "/" else ancestor)
-            value = _read_cgroup_v2_max(mount + "/cpu.max")
-            if value is not None:
-                candidates.append(value)
+        # Fall back to a synthetic ``/`` mount root when mountinfo is
+        # unavailable so pre-parser behavior is preserved: probe
+        # ``/sys/fs/cgroup{path}/cpu.max`` and its ancestors.
+        mounts = v2_mounts or [("/", "/sys/fs/cgroup")]
+        for mount_root, mount_point in mounts:
+            fs_path = _resolve_cgroup_fs_path(mount_root, mount_point, v2_path)
+            if fs_path is None:
+                continue
+            for ancestor in _ancestor_dirs_within_mount(fs_path, mount_point):
+                value = _read_cgroup_v2_max(ancestor + "/cpu.max")
+                if value is not None:
+                    candidates.append(value)
     else:
         # No /proc/self/cgroup — fall back to the root file so at least
         # a non-nested container is still detected.
@@ -346,20 +473,28 @@ def _cgroup_cpu_quota_cpus():
         if value is not None:
             candidates.append(value)
 
-    # cgroup v1: /sys/fs/cgroup/cpu{path}/cpu.cfs_quota_us, walking
-    # ancestors. Some distros (Ubuntu, Debian, Alpine, older Fedora)
-    # co-mount the ``cpu`` and ``cpuacct`` controllers under the
-    # combined ``cpu,cpuacct`` name — /proc/self/cgroup still reports
-    # ``cpu,cpuacct`` but the mount directory is that literal string,
-    # not ``cpu``. Probe both possible mount bases so containers on
-    # those hosts still get their quota respected.
+    # cgroup v1: analogous logic per cpu controller mount. Some distros
+    # (Ubuntu, Debian, Alpine, older Fedora) co-mount the ``cpu`` and
+    # ``cpuacct`` controllers under the combined ``cpu,cpuacct`` name.
+    # ``_parse_cgroup_mounts`` handles both since it filters on the
+    # ``cpu`` super-option. Fall back to the historical
+    # ``/sys/fs/cgroup/cpu`` / ``/sys/fs/cgroup/cpu,cpuacct`` bases
+    # when mountinfo is unavailable.
     if v1_cpu_path is not None:
-        for ancestor in _ancestor_dirs(v1_cpu_path):
-            for base in ("/sys/fs/cgroup/cpu", "/sys/fs/cgroup/cpu,cpuacct"):
-                mount = base + ("" if ancestor == "/" else ancestor)
+        mounts = v1_cpu_mounts or [
+            ("/", "/sys/fs/cgroup/cpu"),
+            ("/", "/sys/fs/cgroup/cpu,cpuacct"),
+        ]
+        for mount_root, mount_point in mounts:
+            fs_path = _resolve_cgroup_fs_path(
+                mount_root, mount_point, v1_cpu_path,
+            )
+            if fs_path is None:
+                continue
+            for ancestor in _ancestor_dirs_within_mount(fs_path, mount_point):
                 value = _read_cgroup_v1_pair(
-                    mount + "/cpu.cfs_quota_us",
-                    mount + "/cpu.cfs_period_us",
+                    ancestor + "/cpu.cfs_quota_us",
+                    ancestor + "/cpu.cfs_period_us",
                 )
                 if value is not None:
                     candidates.append(value)

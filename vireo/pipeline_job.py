@@ -1531,6 +1531,17 @@ def _classification_eta_progress(
         fields["eta_state"] = "finishing"
         fields["eta_seconds"] = 0
         return fields
+    # When preflight determines every remaining photo is cached or
+    # unclassifiable (expected_uncached collapses to zero), no inference
+    # batch will ever fire — the "Estimating after the first uncached
+    # batch…" state below would then never resolve and the Jobs page
+    # would linger on that message throughout a fully cached or fully
+    # skipped traversal. Return the finishing signal directly instead
+    # (Codex #1468 P2).
+    if expected_uncached <= 0:
+        fields["eta_state"] = "finishing"
+        fields["eta_seconds"] = 0
+        return fields
     if inference_attempts < min_attempts or elapsed <= 0:
         return fields
 

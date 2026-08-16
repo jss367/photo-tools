@@ -300,6 +300,79 @@ def test_classification_eta_elapsed_is_inference_active_seconds_only():
     assert inference_only_fields["eta_seconds"] == 300
 
 
+def test_classification_eta_finishing_when_preflight_leaves_no_uncached_work():
+    """When preflight determines the entire remaining collection is either
+    cached or unclassifiable, ``expected_uncached`` collapses to zero and
+    the runtime will never enter an inference batch. In that state the
+    "Estimating after the first uncached batch…" placeholder can never
+    resolve, so the Jobs page would linger on it throughout the traversal.
+    ``_classification_eta_progress`` must instead return ``eta_state ==
+    "finishing"`` so the UI shows the correct signal from tick zero
+    (Codex #1468 P2).
+    """
+    # Fully cached: 100 photos, preflight said all 100 are cached, no
+    # inference has run yet.
+    fully_cached = _classification_eta_progress(
+        total=100,
+        seen=0,
+        cached_estimate=100,
+        cache_hits=0,
+        inference_attempts=0,
+        classified=0,
+        elapsed=0.0,
+    )
+    assert fully_cached["eta_state"] == "finishing"
+    assert fully_cached["eta_seconds"] == 0
+
+    # Fully unclassifiable: 100 photos, preflight said all 100 will be
+    # skipped at the raw_real_dets branch, no inference will run.
+    fully_unclassifiable = _classification_eta_progress(
+        total=100,
+        seen=0,
+        cached_estimate=0,
+        cache_hits=0,
+        inference_attempts=0,
+        classified=0,
+        elapsed=0.0,
+        unclassifiable_estimate=100,
+        unclassifiable_seen=0,
+    )
+    assert fully_unclassifiable["eta_state"] == "finishing"
+    assert fully_unclassifiable["eta_seconds"] == 0
+
+    # Mix that leaves no uncached work: 40 cached + 60 unclassifiable.
+    fully_covered = _classification_eta_progress(
+        total=100,
+        seen=10,
+        cached_estimate=40,
+        cache_hits=10,
+        inference_attempts=0,
+        classified=0,
+        elapsed=0.0,
+        unclassifiable_estimate=60,
+        unclassifiable_seen=0,
+    )
+    assert fully_covered["eta_state"] == "finishing"
+    assert fully_covered["eta_seconds"] == 0
+
+    # A genuinely uncached tail still waits for the first representative
+    # batch — the finishing early-return must not swallow the estimating
+    # state when there is real inference work ahead.
+    uncached_tail = _classification_eta_progress(
+        total=100,
+        seen=0,
+        cached_estimate=50,
+        cache_hits=0,
+        inference_attempts=0,
+        classified=0,
+        elapsed=0.0,
+        unclassifiable_estimate=10,
+        unclassifiable_seen=0,
+    )
+    assert uncached_tail["eta_state"] == "estimating"
+    assert uncached_tail["eta_seconds"] is None
+
+
 def test_classification_eta_unclassifiable_seen_capped_at_estimate():
     """The seen count for unclassifiable photos should not exceed the
     preflight estimate — an unexpected extra skip cannot make future

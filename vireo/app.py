@@ -26687,6 +26687,19 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             # next source added more files. Freezing these manifests makes the
             # total stable and also excludes files that arrive mid-import.
             source_manifests = {}
+            # Per-source dict of directory-path → mount identity captured at
+            # discovery time. Discovery walks each source and produces a
+            # frozen list of files, but only the source root's identity is
+            # baselined earlier (source_mount_identities). Later sources can
+            # wait minutes behind earlier ones, and in that window a nested
+            # child dir or symlink under an already-discovered source may be
+            # swapped for an ordinary photo subtree with the same name — a
+            # replacement is_excluded_scan_path cannot recognize and the
+            # source-root check does not see. Recording an identity per
+            # unique parent directory of the manifest lets the scan loop
+            # reject the source before scanner.stat()s the frozen filenames
+            # under the replacement.
+            source_manifest_dir_identities = {}
             source_discovery_failures = set()
             cancelled = False
 
@@ -26753,6 +26766,25 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     source_discovery_failures.add(source)
                     manifest = []
                 source_manifests[source] = manifest
+                # Baseline the identity of each unique parent directory in
+                # the manifest. Deduplicating first bounds this to the tree
+                # depth actually observed, not the file count. Only applied
+                # to sources whose manifest came from a filesystem walk here:
+                # snapshot-mode manifests take an explicit path list captured
+                # earlier by the caller, and their per-directory identity is
+                # already captured just before scan by restricted_dir_identities
+                # and rechecked post-scan when scoping working-copy extraction.
+                # See source_manifest_dir_identities for the full rationale.
+                if snapshot_paths_by_root is None:
+                    manifest_dir_identities = {}
+                    for manifest_path in manifest:
+                        parent_key = str(Path(manifest_path).parent)
+                        if parent_key in manifest_dir_identities:
+                            continue
+                        manifest_dir_identities[parent_key] = _mount_identity(
+                            parent_key,
+                        )
+                    source_manifest_dir_identities[source] = manifest_dir_identities
                 scan_acc["overall_total"] += len(manifest)
                 runner.push_event(job["id"], "progress", {
                     "current": 0,
@@ -26870,6 +26902,27 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                                 f"({changed_source_mount}); refusing to "
                                 "replay frozen manifest against replacement "
                                 "filesystem"
+                            ),
+                            source,
+                        )
+                    # The source-root check above cannot see a nested
+                    # directory, mount, or symlink that was replaced with an
+                    # ordinary photo subtree after discovery: the root's own
+                    # inode stayed the same. Revalidate every parent
+                    # directory of the frozen manifest here, so the scanner
+                    # cannot stat the frozen filenames under a substituted
+                    # subtree and catalog the wrong files.
+                    changed_manifest_dir = _changed_mount_since_baseline(
+                        source_manifest_dir_identities.get(source, {}),
+                    )
+                    if changed_manifest_dir is not None:
+                        raise FileNotFoundError(
+                            errno_mod.ENOENT,
+                            (
+                                "nested directory changed since discovery "
+                                f"({changed_manifest_dir}); refusing to "
+                                "replay frozen manifest against replacement "
+                                "subtree"
                             ),
                             source,
                         )

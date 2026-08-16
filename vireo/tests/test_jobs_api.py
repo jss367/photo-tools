@@ -6576,6 +6576,99 @@ def test_import_in_place_rejects_replaced_source_before_scan(
     ), errors
 
 
+def test_import_in_place_rejects_replaced_nested_directory_before_scan(
+    app_and_db, tmp_path, monkeypatch,
+):
+    """A nested subdirectory replaced between discovery and scan is rejected.
+
+    The source-root identity check only sees the outermost directory's
+    inode, so a nested child dir, mount, or symlink swapped for an ordinary
+    photo subtree with the same name after discovery would slip past it —
+    ``is_excluded_scan_path`` recognizes only app-managed library bundles
+    and cannot see this swap either. Import-in-place must record the
+    identity of every parent directory in the frozen manifest at discovery
+    time and reject the source before ``do_scan`` runs any of them,
+    otherwise the frozen filenames replay against the replacement subtree
+    and catalog photos from the wrong volume.
+    """
+    from pathlib import Path
+
+    import pipeline_job
+    import scanner
+
+    app, _ = app_and_db
+    source = tmp_path / "recursive-source"
+    nested = source / "subdir"
+    nested.mkdir(parents=True)
+    (nested / "IMG_0001.jpg").write_bytes(b"jpeg")
+
+    source_key = str(Path(source))
+    nested_key = str(Path(nested))
+    identity_calls = {source_key: 0, nested_key: 0}
+
+    def changing_identity(path):
+        normalized = str(Path(path))
+        if normalized in identity_calls:
+            identity_calls[normalized] += 1
+        if normalized == nested_key:
+            # Discovery captures identity 100; by pre-scan check the nested
+            # subdir resolves to a different inode (a swap the source-root
+            # check cannot see).
+            return ("stat", 1, 100 if identity_calls[nested_key] == 1 else 200)
+        if normalized == source_key:
+            return ("stat", 1, 42)
+        return ("stat", 1, hash(normalized))
+
+    scan_calls = []
+    extractor_calls = []
+
+    monkeypatch.setattr(
+        pipeline_job, "_load_known_mount_roots", lambda _db: set(),
+    )
+    monkeypatch.setattr(
+        pipeline_job, "_archive_mount_baseline", lambda path, known: {},
+    )
+    monkeypatch.setattr(
+        pipeline_job, "_record_known_mount_roots",
+        lambda _db, _baseline: None,
+    )
+    monkeypatch.setattr(
+        pipeline_job, "_mount_identity", changing_identity,
+    )
+
+    def fake_scan(*_args, **_kwargs):
+        scan_calls.append(True)
+        return {"discovered": 0, "indexed": 0}
+
+    monkeypatch.setattr(scanner, "scan", fake_scan)
+    monkeypatch.setattr(
+        scanner, "_extract_working_copies",
+        lambda *args, **kwargs: extractor_calls.append((args, kwargs)),
+    )
+
+    client = app.test_client()
+    resp = client.post("/api/jobs/import-in-place", json={
+        "sources": [str(source)],
+        "after_import": None,
+    })
+    assert resp.status_code == 200, resp.get_json()
+    job = wait_for_job_via_client(client, resp.get_json()["job_id"])
+
+    assert job["status"] == "failed", job
+    assert scan_calls == [], (
+        "scanner must not run against the replacement subtree"
+    )
+    assert extractor_calls == []
+    errors = list(job.get("errors") or [])
+    assert any(
+        "nested directory changed since discovery" in err
+        for err in errors
+    ), errors
+    # Baseline (discovery) plus revalidation (pre-scan) — exactly two calls
+    # against the swapped subdir prove both sides of the check ran.
+    assert identity_calls[nested_key] == 2, identity_calls
+
+
 def test_import_in_place_snapshot_rejects_replaced_restricted_directory(
     app_and_db, tmp_path, monkeypatch,
 ):

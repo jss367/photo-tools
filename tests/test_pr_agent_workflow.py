@@ -44,7 +44,7 @@ def test_review_events_are_collapsed_and_generated_feedback_is_ignored():
     )
     assert "issue_comment:\n    types: [created, edited]" in workflow
     assert "pull_request_review:\n    types: [submitted, edited, dismissed]" in workflow
-    assert "pull_request_review_comment:\n    types: [created, edited]" in workflow
+    assert "pull_request_review_comment:\n    types: [edited]" in workflow
     assert "(github.event.review.state != 'approved' || github.event.action == 'edited')" in workflow
 
 
@@ -232,6 +232,7 @@ def test_inline_comment_edits_wake_reconciliation_on_the_live_head():
     end = workflow.index("\n  # Auto-fix when the Tests workflow fails", start)
     block = workflow[start:end]
     assert "github.event_name == 'pull_request_review_comment'" in block
+    assert "pull_request_review_comment:\n    types: [created, edited]" not in workflow
     assert "github.event.pull_request.state == 'open'" in block
     assert "Task: address-review" in block
     assert "Review body:" in block

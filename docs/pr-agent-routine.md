@@ -133,8 +133,10 @@ forge.
   and relevant top-level feedback.
 - Trusted comments on a `claude-agent` PR: forwards the comment to the routine.
 - Trusted non-approval reviews on a `claude-agent` PR: forwards the review.
-- Created or edited trusted inline review comments: wakes state reconciliation,
-  including edits to resolved or outdated threads.
+- Edited trusted inline review comments: wakes state reconciliation, including
+  edits to resolved or outdated threads. New inline comments already arrive
+  through the submitted-review route, so created-comment events are not
+  subscribed separately and routine-authored replies cannot self-trigger.
 - Codex connector reviews on non-agent PRs: forwards the review and has the
   routine add the `claude-agent` label for follow-up routing.
 - Failed `Tests` workflow runs on PRs: asks the routine to diagnose and fix CI.

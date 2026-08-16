@@ -15,7 +15,7 @@ on:
   pull_request_review:
     types: [submitted, edited, dismissed]
   pull_request_review_comment:
-    types: [created, edited]
+    types: [edited]
   push:
     branches: [main]
   workflow_run:

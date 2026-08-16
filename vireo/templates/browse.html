@@ -1592,7 +1592,8 @@ body.sidebar-resizing {
     <div class="filter-bar browse-filter-shell">
       {% include '_filterbar.html' %}
       <div class="browse-view-controls">
-        <select id="sortSelect" onchange="applyFilters()" title="Sort order">
+        <select id="sortSelect" onchange="applyFilters()" title="Sort order"
+                data-view-preference="vireo.browse.sort">
           <option value="date">Capture date (oldest)</option>
           <option value="date_desc">Capture date (newest)</option>
           <option value="name">Filename (A-Z)</option>
@@ -1604,6 +1605,7 @@ body.sidebar-resizing {
         </select>
         <label style="display:flex;align-items:center;gap:4px;" title="Thumbnail size">
           <input type="range" id="thumbSizeSlider" min="120" max="400" step="20" value="220"
+                 data-view-preference="vireo.browse.thumbSize"
                  style="width:80px;accent-color:var(--accent);"
                  oninput="updateThumbSize(this.value)">
           <span style="font-size:10px;color:var(--text-faint);">&#9638;</span>
@@ -2582,7 +2584,7 @@ var _cfgPromise = (async function() {
 function applyBrowseConfig(cfg) {
   if (!cfg) return;
   if (cfg.photos_per_page) perPage = cfg.photos_per_page;
-  if (cfg.browse_thumb_default) {
+  if (cfg.browse_thumb_default && VireoViewPreferences.read('vireo.browse.thumbSize') === null) {
     var slider = document.getElementById('thumbSizeSlider');
     if (slider) {
       slider.value = cfg.browse_thumb_default;
@@ -3003,6 +3005,8 @@ function clearActiveSelectionAndDetail() {
 // re-fetch. Initialize here so the pre-await snapshot reads the same ``0``
 // the rest of the script sees (Codex review r3686317674).
 var folderHealthRefreshSeq = 0;
+VireoViewPreferences.restoreAll(document.querySelector('.browse-view-controls'));
+updateThumbSize(document.getElementById('thumbSizeSlider').value);
 bootstrapBrowse();
 
 async function bootstrapBrowse() {

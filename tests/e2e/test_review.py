@@ -97,6 +97,19 @@ def test_review_photo_size_slider_resizes_and_persists(live_server, page):
     ) == "240px"
 
 
+def test_review_sort_persists_across_navigation(live_server, page):
+    url = live_server["url"]
+    page.goto(f"{url}/review", timeout=5000)
+    page.locator("[data-pred-id]").first.wait_for(state="visible", timeout=5000)
+
+    page.locator("#sortSelect").select_option("confidence_asc")
+    page.goto(f"{url}/")
+    page.goto(f"{url}/review", timeout=5000)
+    page.locator("[data-pred-id]").first.wait_for(state="visible", timeout=5000)
+
+    expect(page.locator("#sortSelect")).to_have_value("confidence_asc")
+
+
 def test_history_undo_refreshes_review_prediction_state(live_server, page):
     """Undo from the shared History panel must refresh Review's local state."""
     url = live_server["url"]

@@ -382,7 +382,8 @@ body { padding-bottom: 36px; }
     </div>
     <div class="control">
       <label for="sortMode">Sort</label>
-      <select id="sortMode" onchange="setSort(this.value)">
+      <select id="sortMode" onchange="setSort(this.value)"
+              data-view-preference="vireo.compare.sort">
         <option value="review_priority">Review priority</option>
       </select>
     </div>
@@ -470,6 +471,10 @@ var SORTS = [
   { id: 'newest', label: 'Newest' },
   { id: 'oldest', label: 'Oldest' },
 ];
+var savedSort = VireoViewPreferences.read('vireo.compare.sort');
+if (SORTS.some(function(sort) { return sort.id === savedSort; })) {
+  activeSort = savedSort;
+}
 
 var EXCLUDES = [
   { id: 'rejected', label: 'Hide rejects' },
@@ -769,6 +774,7 @@ function toggleExclude(id) {
 
 function setSort(sort) {
   activeSort = sort;
+  VireoViewPreferences.write('vireo.compare.sort', sort);
   renderCompare();
 }
 

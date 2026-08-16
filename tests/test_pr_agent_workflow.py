@@ -164,6 +164,11 @@ def test_routine_fire_rechecks_live_pr_state_and_expected_head():
     assert 'echo "fired=false" >> "$GITHUB_OUTPUT"' in action
     assert 'echo "fired=true" >> "$GITHUB_OUTPUT"' in action
 
+    # Review objects stay attached to their original commit even after edits.
+    # Review routes therefore let the forwarder bind its verified live head;
+    # event-bound heads remain only on sources whose subject is a specific run.
+    assert "expected-head: ${{ github.event.review.commit_id }}" not in _read(WORKFLOW)
+
 
 def test_only_humans_can_authorize_a_head_bound_merge():
     workflow = _read(WORKFLOW)

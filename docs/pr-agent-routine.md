@@ -154,7 +154,9 @@ forge.
 
 Created and edited comments and reviews are wakeups. Merge authorization is
 ordered against comment and review update timestamps, so adding feedback to an
-older item still requires reconciliation and fresh authorization.
+older item still requires reconciliation and fresh authorization. Review
+wakeups bind to the live PR head at fire time rather than the review object's
+historical commit.
 
 Merge calls use `gh pr merge --match-head-commit` without `--auto`, so no
 authorization remains armed across a later push. Merge jobs also skip closed

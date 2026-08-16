@@ -271,7 +271,6 @@ jobs:
           allow-missing: "true"
           repo: ${{ github.repository }}
           pr: ${{ github.event.pull_request.number }}
-          expected-head: ${{ github.event.review.commit_id }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
           payload: |
             Task: address-review
@@ -340,7 +339,6 @@ jobs:
           allow-missing: "true"
           repo: ${{ github.repository }}
           pr: ${{ github.event.pull_request.number }}
-          expected-head: ${{ github.event.review.commit_id }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
           payload: |
             Task: address-codex-review

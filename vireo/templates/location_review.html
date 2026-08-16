@@ -741,6 +741,11 @@ body {
     });
   }
 
+  function hasPartialAssignmentProgress() {
+    return !!(state.assignment && state.assignment.completed > 0
+      && state.assignment.completed < state.assignment.total);
+  }
+
   function clearMapObjects() {
     if (state.mapMode === 'google') {
       state.photoMarkers.forEach(function(marker) { marker.setMap(null); });
@@ -966,6 +971,13 @@ body {
   function selectChoice(choice) {
     if (state.isAssigning) return;
     var choiceKey = candidateKey(choice);
+    if (hasPartialAssignmentProgress() && state.assignment.choiceKey !== choiceKey) {
+      showToast('Finish or retry the pending assignment — ' +
+        formatNumber(state.assignment.completed) + ' of ' +
+        formatNumber(state.assignment.total) + ' photos already got “' +
+        state.selectedChoice.name + '”. Reload to abandon.', 'error');
+      return;
+    }
     if (state.assignment && state.assignment.choiceKey !== choiceKey) {
       state.assignment = null;
       resetAssignmentProgress();
@@ -1467,13 +1479,19 @@ body {
       renderCurrentGroup();
     } catch (e) {
       state.isAssigning = false;
-      setAssignmentNavigationDisabled(false);
       button.disabled = false;
       if (assignment.completed) {
         var remaining = total - assignment.completed;
         updateAssignmentProgress(assignment.completed, total, true);
         button.textContent = 'Retry ' + formatNumber(remaining) + ' remaining';
+        // Keep group navigation and suggestion-mode locked while a partial
+        // assignment is pending. Skip/Prev/Next would otherwise drop
+        // state.assignment silently: Skip splices the group as "skipped
+        // without changes" even though committed chunks already changed
+        // photos, and Prev/Next runs renderCurrentGroup() which nulls the
+        // offset so a later Retry reprocesses the committed chunks.
       } else {
+        setAssignmentNavigationDisabled(false);
         resetAssignmentProgress();
         button.textContent = 'Retry “' + choice.name + '”';
       }
@@ -1481,7 +1499,7 @@ body {
   }
 
   function moveGroup(direction) {
-    if (state.isAssigning || state.groups.length < 2) return;
+    if (state.isAssigning || hasPartialAssignmentProgress() || state.groups.length < 2) return;
     state.currentIndex = (state.currentIndex + direction + state.groups.length) % state.groups.length;
     renderCurrentGroup();
   }
@@ -1493,7 +1511,7 @@ body {
     renderCandidates();
   });
   document.getElementById('locationReviewSkip').addEventListener('click', function() {
-    if (state.isAssigning) return;
+    if (state.isAssigning || hasPartialAssignmentProgress()) return;
     var group = currentGroup();
     if (!group) return;
     state.skippedGroups.push(group);

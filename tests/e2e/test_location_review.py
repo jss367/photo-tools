@@ -333,7 +333,11 @@ def test_location_review_reports_and_resumes_batch_assignment_progress(
     expect(page.locator("#locationReviewAssignmentStatus")).to_have_text(
         "1,000 of 2,501 assigned · 1,501 remaining"
     )
-    expect(page.locator("#locationReviewSkip")).to_be_enabled()
+    # Skip / Prev / Next stay locked while a partial assignment is pending so
+    # the committed chunks cannot be silently dropped: skipping would splice
+    # the group as "skipped without changes" and navigating away would clear
+    # state.assignment so a later retry reprocesses committed chunks.
+    expect(page.locator("#locationReviewSkip")).to_be_disabled()
 
     page.locator("#locationReviewAssign").click()
     page.wait_for_function(
@@ -440,6 +444,140 @@ def test_location_review_locks_suggestion_mode_controls_during_assignment(
     )
     expect(nature_button).to_be_enabled()
     expect(all_button).to_be_enabled()
+
+
+def test_location_review_partial_assignment_locks_navigation_and_choice(
+    live_server, page,
+):
+    """After a chunk failure with committed chunks, nav and choice-change are locked."""
+    photo_id = live_server["data"]["photos"][0]
+    other_photo_ids = list(range(2000, 2010))
+    preview = {
+        "total": len(other_photo_ids) + 1,
+        "reviewable": len(other_photo_ids) + 1,
+        "unresolved": [],
+        "skipped": [],
+        "groups": [
+            {
+                "photo_ids": list(range(1, 1501)),
+                "photos": [{
+                    "id": photo_id,
+                    "filename": "batch-example.jpg",
+                    "latitude": 33.255,
+                    "longitude": -116.405,
+                    "timestamp": "2026-08-04T10:17:00",
+                }],
+                "count": 1500,
+                "center": {"lat": 33.255, "lng": -116.405},
+                "bounds": {
+                    "south": 33.255, "west": -116.405,
+                    "north": 33.255, "east": -116.405,
+                },
+                "spread_m": 0,
+                "captured_from": "2026-08-04T10:17:00",
+                "captured_to": "2026-08-04T10:17:00",
+            },
+            {
+                "photo_ids": other_photo_ids,
+                "photos": [{
+                    "id": photo_id,
+                    "filename": "other-group.jpg",
+                    "latitude": 40.0,
+                    "longitude": -105.0,
+                    "timestamp": "2026-08-04T10:20:00",
+                }],
+                "count": len(other_photo_ids),
+                "center": {"lat": 40.0, "lng": -105.0},
+                "bounds": {
+                    "south": 40.0, "west": -105.0,
+                    "north": 40.0, "east": -105.0,
+                },
+                "spread_m": 0,
+                "captured_from": "2026-08-04T10:20:00",
+                "captured_to": "2026-08-04T10:20:00",
+            },
+        ],
+    }
+
+    page.route("https://unpkg.com/**", _stub_leaflet)
+    page.goto(f"{live_server['url']}/browse")
+    page.evaluate(
+        "photoId => sessionStorage.setItem('vireoLocationReviewSource', "
+        "JSON.stringify({photo_ids: [photoId]}))",
+        photo_id,
+    )
+    page.route(
+        "**/api/location-review/preview",
+        lambda route: route.fulfill(json=preview),
+    )
+    page.goto(f"{live_server['url']}/locations/review?source=selection")
+    expect(page.locator("#locationReviewGroupTitle")).to_have_text("1,500 photos")
+
+    # First, assign a keyword-like custom choice so we have something selected.
+    page.locator("#locationReviewSearch").fill("First location")
+    page.locator("#locationReviewCustom").click()
+    page.evaluate(
+        """() => {
+          window.__originalSafeFetch = window.safeFetch;
+          window.__pending = [];
+          window.safeFetch = function(url, opts, options) {
+            if (url !== '/api/batch/location/text') {
+              return window.__originalSafeFetch(url, opts, options);
+            }
+            return new Promise(function(resolve, reject) {
+              window.__pending.push({resolve: resolve, reject: reject});
+            });
+          };
+          window.__settle = function(result) {
+            var pending = window.__pending.shift();
+            if (result === 'reject') pending.reject(new Error('boom'));
+            else pending.resolve({ok: true, updated: result});
+          };
+        }"""
+    )
+
+    page.locator("#locationReviewAssign").click()
+    page.wait_for_function("() => window.__pending.length === 1")
+    page.evaluate("window.__settle(1000)")  # First chunk commits.
+    page.wait_for_function("() => window.__pending.length === 1")
+    page.evaluate("window.__settle('reject')")  # Second chunk fails.
+
+    # Partial progress: nav & suggestion-mode locked until retry completes.
+    expect(page.locator("#locationReviewAssign")).to_contain_text("Retry 500 remaining")
+    expect(page.locator("#locationReviewSkip")).to_be_disabled()
+    expect(page.locator("#locationReviewNext")).to_be_disabled()
+    expect(page.locator("#locationReviewPrevious")).to_be_disabled()
+    expect(page.locator('[data-suggestion-mode="nature"]')).to_be_disabled()
+    expect(page.locator('[data-suggestion-mode="all"]')).to_be_disabled()
+
+    # Attempting to select a different candidate is refused so the committed
+    # chunks are not silently orphaned. The custom-name button funnels through
+    # selectChoice(), so it's the easiest UI path to trigger a choice change.
+    page.evaluate(
+        """() => {
+          window.__toasts = [];
+          var original = window.showToast;
+          window.showToast = function(message, kind) {
+            window.__toasts.push({message: message, kind: kind});
+            return original ? original(message, kind) : null;
+          };
+        }"""
+    )
+    page.locator("#locationReviewSearch").fill("Different location")
+    page.locator("#locationReviewCustom").click()
+    toasts = page.evaluate("window.__toasts")
+    assert toasts, "expected a warning toast when changing choice mid-partial"
+    assert "First location" in toasts[0]["message"]
+    # The selected choice must be unchanged (button text still describes the
+    # in-flight retry for the original choice).
+    expect(page.locator("#locationReviewAssign")).to_contain_text("Retry 500 remaining")
+
+    # Retrying completes the group and unlocks navigation for the next one.
+    page.locator("#locationReviewAssign").click()
+    page.wait_for_function("() => window.__pending.length === 1")
+    page.evaluate("window.__settle(500)")
+    expect(page.locator("#locationReviewGroupTitle")).to_have_text("10 photos")
+    expect(page.locator("#locationReviewSkip")).to_be_enabled()
 
 
 def test_location_review_missing_google_key_links_to_settings(live_server, page):

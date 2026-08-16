@@ -35609,7 +35609,11 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             img.close()
         return send_file(cache_path, mimetype="image/jpeg")
 
-    app.register_blueprint(create_photo_labels_blueprint(_get_db, json_error))
+    app.register_blueprint(
+        create_photo_labels_blueprint(
+            _get_db, json_error, settings_write_lock=_settings_write_lock
+        )
+    )
     app.register_blueprint(create_photo_review_blueprint(_get_db, json_error))
 
     # --- /api/v1/* aliases over the stable subset of /api/* ---

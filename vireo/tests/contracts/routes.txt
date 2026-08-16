@@ -33,6 +33,7 @@ GET          /api/classify/readiness
 GET          /api/collections
 GET          /api/collections/<int:collection_id>/photo-ids
 GET          /api/collections/<int:collection_id>/photos
+GET          /api/color-label-descriptions
 GET          /api/computation-cache
 GET          /api/computation-cache/export
 GET          /api/config
@@ -398,6 +399,7 @@ POST         /api/workspaces/active/local-workspace/sync
 POST         /api/workspaces/active/new-images/snapshot
 POST,PUT     /api/photos/<int:photo_id>/edit-recipe
 PUT          /api/collections/<int:collection_id>
+PUT          /api/color-label-descriptions/<color>
 PUT          /api/keywords/<int:keyword_id>
 PUT          /api/move-rules/<int:rule_id>
 PUT          /api/processes/<int:process_id>

@@ -8,6 +8,12 @@ class PhotoLabelService:
     def labels_for_photos(self, photo_ids):
         return self.db.get_color_labels_for_photos(photo_ids)
 
+    def descriptions(self):
+        return self.db.get_color_label_descriptions()
+
+    def set_description(self, color, description):
+        return self.db.set_color_label_description(color, description)
+
     def set_label(self, photo_id, color):
         photo = self.db.get_photo(photo_id)
         if photo is None:

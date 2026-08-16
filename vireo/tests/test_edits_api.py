@@ -66,17 +66,71 @@ def test_get_color_labels(app_and_db):
     assert resp.get_json() == {str(pids[0]): 'purple'}
 
 
+def test_color_label_description_round_trip(app_and_db):
+    """The description API sets, reads, normalizes, and clears meanings."""
+    app, db = app_and_db
+    client = app.test_client()
+
+    response = client.put(
+        "/api/color-label-descriptions/red",
+        json={"description": "  Used for\nreptiles  "},
+    )
+    assert response.status_code == 200
+    assert response.get_json() == {
+        "color": "red",
+        "description": "Used for reptiles",
+    }
+    assert client.get("/api/color-label-descriptions").get_json() == {
+        "red": "Used for reptiles",
+    }
+    assert db.get_color_label_descriptions() == {"red": "Used for reptiles"}
+
+    response = client.put(
+        "/api/color-label-descriptions/red", json={"description": ""}
+    )
+    assert response.status_code == 200
+    assert response.get_json() == {"color": "red", "description": ""}
+    assert client.get("/api/color-label-descriptions").get_json() == {}
+
+
+def test_color_label_description_validation(app_and_db):
+    """The description endpoint rejects bad colors, shapes, and long text."""
+    app, _ = app_and_db
+    client = app.test_client()
+
+    assert client.put(
+        "/api/color-label-descriptions/orange", json={"description": "Mammals"}
+    ).status_code == 400
+    assert client.put(
+        "/api/color-label-descriptions/red", json={}
+    ).status_code == 400
+    for body in (42, "description", ["description"]):
+        response = client.put(
+            "/api/color-label-descriptions/red", json=body
+        )
+        assert response.status_code == 400
+        assert response.get_json()["error"] == "description required"
+    assert client.put(
+        "/api/color-label-descriptions/red", json={"description": None}
+    ).status_code == 400
+    assert client.put(
+        "/api/color-label-descriptions/red", json={"description": "x" * 121}
+    ).status_code == 400
+
+
 def test_color_label_routes_are_owned_by_domain_blueprint(app_and_db):
     """The extracted route group must not drift back into the app module."""
     app, _ = app_and_db
     endpoints = {
         rule.rule: rule.endpoint
         for rule in app.url_map.iter_rules()
-        if 'color_label' in rule.rule
+        if rule.endpoint.startswith('photo_labels.')
     }
 
     assert endpoints == {
         '/api/batch/color_label': 'photo_labels.set_labels',
+        '/api/color-label-descriptions': 'photo_labels.get_descriptions',
+        '/api/color-label-descriptions/<color>': 'photo_labels.set_description',
         '/api/photos/<int:photo_id>/color_label': 'photo_labels.set_label',
         '/api/photos/color_labels': 'photo_labels.get_labels',
     }

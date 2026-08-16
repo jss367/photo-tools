@@ -17967,6 +17967,17 @@ class Database:
                     detection["id"] for detection in candidates
                 }
 
+        # Cached detector reuse loads rows at the ordinary workspace floor.
+        # A contextual-weak target can therefore be absent from the in-memory
+        # map even though the classify loop will explicitly reload its MDv6
+        # weak row from the DB. Route those omitted weak photos through the
+        # same DB fallback here (Codex #1468 P2).
+        weak_db_ids.extend(
+            photo_id for photo_id in weak_ids
+            if photo_id in fresh_processed
+            and photo_id not in fresh_candidates
+        )
+
         fresh_detection_ids = {
             detection_id
             for candidate_ids in fresh_candidates.values()
@@ -18226,10 +18237,15 @@ class Database:
         # Chunk to stay under SQLITE_MAX_VARIABLE_NUMBER (default 999).
         CHUNK = 500
 
-        def _fresh_has_animal_above(photo_id, floor):
+        def _fresh_has_animal_above(photo_id, floor, *, contextual_weak=False):
             dets = fresh_detections_by_photo.get(photo_id) or ()
             for d in dets:
                 if d.get("category", "animal") != "animal":
+                    continue
+                if (
+                    contextual_weak
+                    and d.get("detector_model") != "megadetector-v6"
+                ):
                     continue
                 conf = d.get("confidence", d.get("detector_confidence", 0))
                 try:
@@ -18295,13 +18311,28 @@ class Database:
             set(fresh_processed_photo_ids)
             if fresh_processed_photo_ids is not None else None
         )
-        for pool, floor in ((normal_ids, min_conf), (weak_ids, weak_conf)):
+        for pool, floor, is_weak in (
+            (normal_ids, min_conf, False),
+            (weak_ids, weak_conf, True),
+        ):
             if processed is None:
                 fresh_pool = pool
                 db_pool: list = []
             else:
-                fresh_pool = [pid for pid in pool if pid in processed]
-                db_pool = [pid for pid in pool if pid not in processed]
+                # Runtime reloads a contextual-weak row from the DB when the
+                # ordinary-threshold detector map omitted it. Keep that same
+                # fallback instead of treating an empty fresh entry as a skip.
+                fresh_pool = [
+                    pid for pid in pool
+                    if pid in processed
+                    and (
+                        not is_weak
+                        or _fresh_has_animal_above(
+                            pid, floor, contextual_weak=True,
+                        )
+                    )
+                ]
+                db_pool = [pid for pid in pool if pid not in fresh_pool]
             for i in range(0, len(fresh_pool), CHUNK):
                 chunk = fresh_pool[i:i + CHUNK]
                 if not chunk:
@@ -18316,7 +18347,9 @@ class Database:
                 ).fetchall()
                 for r in rows:
                     pid = r["photo_id"]
-                    if not _fresh_has_animal_above(pid, floor):
+                    if not _fresh_has_animal_above(
+                        pid, floor, contextual_weak=is_weak,
+                    ):
                         unclassifiable.add(pid)
             if db_pool:
                 _db_unclassifiable(db_pool, floor, unclassifiable)

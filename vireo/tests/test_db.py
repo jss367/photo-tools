@@ -18718,6 +18718,46 @@ def test_get_classifier_run_cache_hits_uses_fresh_runtime_candidates(tmp_path):
     assert hits == {p_processed, p_failed}
 
 
+def test_fresh_preflight_reloads_omitted_contextual_weak_candidate(tmp_path):
+    """Ordinary cache reuse omits weak rows that runtime later reloads."""
+    from db import Database
+    db = Database(str(tmp_path / "test.db"))
+    fid = db.add_folder("/photos", name="photos")
+    photo_id = db.add_photo(
+        folder_id=fid, filename="weak.jpg", extension=".jpg",
+        file_size=1, file_mtime=1.0, timestamp=None, width=1, height=1,
+    )
+    weak_detection_id = _add_one_detection(
+        db, photo_id, detector_model="megadetector-v6", conf=0.15,
+    )
+    db.record_classifier_run(
+        weak_detection_id, "BioCLIP-2.5", "fp-a", prediction_count=1,
+    )
+
+    # _detect_batch's ordinary-threshold reuse path records the photo as
+    # processed but supplies an empty map entry. The classify loop then reloads
+    # this contextual-weak MDv6 row from the DB, so both preflights must agree.
+    fresh_map = {photo_id: []}
+    processed_ids = {photo_id}
+    weak_ids = {photo_id}
+
+    hits = db.get_classifier_run_cache_hits(
+        [photo_id], "BioCLIP-2.5", "fp-a",
+        contextual_weak_photo_ids=weak_ids,
+        weak_confidence=0.12,
+        fresh_detections_by_photo=fresh_map,
+        fresh_processed_photo_ids=processed_ids,
+    )
+    assert hits == {photo_id}
+    assert db.get_unclassifiable_photos(
+        [photo_id],
+        contextual_weak_photo_ids=weak_ids,
+        weak_confidence=0.12,
+        fresh_detections_by_photo=fresh_map,
+        fresh_processed_photo_ids=processed_ids,
+    ) == set()
+
+
 def test_get_classifier_run_cache_hits_includes_contextual_weak(tmp_path):
     """Contextual weak photos are classified with the lowered
     ``weak_detection_confidence`` floor; the preflight must apply the

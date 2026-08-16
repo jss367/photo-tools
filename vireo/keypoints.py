@@ -19,6 +19,7 @@ import threading
 
 import numpy as np
 import onnx_runtime
+from resource_ledger import ResourceWaitCancelled
 
 log = logging.getLogger(__name__)
 
@@ -123,6 +124,12 @@ def ensure_keypoint_weights(model_name, progress_callback=None):
                 tmp = final_path + ".download"
                 shutil.copy2(cached, tmp)
                 os.replace(tmp, final_path)
+        except ResourceWaitCancelled:
+            # A bound cancel probe firing mid-download is a cooperative
+            # cancellation, not a download failure — pipeline_job.py finalizes
+            # it as "cancelled" instead of surfacing a scary user-visible
+            # "Failed to download" error.
+            raise
         except Exception as e:
             raise RuntimeError(
                 f"Failed to download {model_name} weights: {e}. "

@@ -838,6 +838,15 @@ body {
     group.photos = group.photos.filter(function(photo) { return photo.id !== photoId; });
     group.photo_ids = group.photo_ids.filter(function(id) { return id !== photoId; });
     group.count = group.photos.length;
+    // If an assignment is in flight, or a partial batch is waiting for retry,
+    // rebuilding the UI here would null state.assignment and re-enable Skip /
+    // Prev / Next — orphaning the already-committed chunks. Update the group
+    // quietly instead; the pending assignment will refresh the group when it
+    // finishes or is explicitly abandoned.
+    if (state.isAssigning || hasPartialAssignmentProgress()) {
+      if (group.count) refreshGroupMetadata(group);
+      return;
+    }
     if (!group.count) {
       state.groups.splice(state.currentIndex, 1);
       if (state.currentIndex >= state.groups.length) state.currentIndex = Math.max(0, state.groups.length - 1);
@@ -1270,7 +1279,11 @@ body {
   }
 
   async function setSuggestionMode(mode) {
-    if (state.isAssigning) return;
+    // Guard against programmatic calls (keyboard shortcuts, tests) that can
+    // bypass the disabled attribute. Switching mode nulls state.selectedChoice,
+    // which would leave the pending Retry button unable to resume the
+    // captured choice on a partial assignment.
+    if (state.isAssigning || hasPartialAssignmentProgress()) return;
     if ((mode !== 'nature' && mode !== 'all') || mode === state.suggestionMode) return;
     var group = currentGroup();
     if (!group) return;
@@ -1449,10 +1462,23 @@ body {
     });
   }
 
+  function lightboxIsOpen() {
+    var overlay = document.getElementById('lightboxOverlay');
+    return !!(overlay && overlay.classList.contains('active'));
+  }
+
   async function assignCurrentGroup() {
     var group = currentGroup();
     var choice = state.selectedChoice;
     if (!group || !choice) return;
+    // A lightbox opened before the assignment starts (e.g. keyboard-tabbed to
+    // the Assign button while a preview was still on screen) sits outside
+    // openPhotoPreview()'s new guard. Close it so a mid-assignment delete
+    // cannot fire lightbox:photodeleted and reset state.assignment while
+    // committed chunks are still in flight.
+    if (lightboxIsOpen() && typeof closeLightbox === 'function') {
+      try { closeLightbox(); } catch (_) {}
+    }
     var button = document.getElementById('locationReviewAssign');
     var choiceKey = candidateKey(choice);
     var total = group.photo_ids.length;

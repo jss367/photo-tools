@@ -526,6 +526,7 @@ def test_browse_lightbox_zoom_hud_controls_logarithmic_zoom(live_server, page):
         """() => {
             window._lbCancelOriginalPreload();
             window._lbScheduleSourceSwap = function() {};
+            window._lbRecomputeNativeZoom = function() {};
             window._lbNativeZoom = 4;
             window._lbSetZoom(1, null, null);
         }"""
@@ -539,6 +540,26 @@ def test_browse_lightbox_zoom_hud_controls_logarithmic_zoom(live_server, page):
     expect(badge).to_have_attribute("aria-expanded", "true")
     expect(slider).to_have_attribute("aria-valuetext", "Fit")
     expect(page.locator("#lightboxZoomNativeStop")).to_be_visible()
+
+    # Photo navigation freezes the outgoing frame until the incoming image is
+    # ready. Every zoom input, including the labelled stops, must advertise
+    # that temporarily inert state instead of appearing clickable.
+    page.evaluate(
+        """() => {
+            window._lbVisualTransitionPending = true;
+            window._lbUpdateZoomControl();
+        }"""
+    )
+    expect(page.locator(".lb-zoom-stop-fit")).to_be_disabled()
+    expect(page.locator("#lightboxZoomNativeStop")).to_be_disabled()
+    page.evaluate(
+        """() => {
+            window._lbVisualTransitionPending = false;
+            window._lbUpdateZoomControl();
+        }"""
+    )
+    expect(page.locator(".lb-zoom-stop-fit")).to_be_enabled()
+    expect(page.locator("#lightboxZoomNativeStop")).to_be_enabled()
 
     slider.evaluate(
         """el => {

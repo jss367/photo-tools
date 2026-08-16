@@ -556,6 +556,7 @@ input[type=text], input[type=date], select, .path-input, .text-input, .model-sel
   white-space: nowrap;
 }
 .lb-zoom-stop:hover { color: #fff; }
+.lb-zoom-stop:disabled { color: rgba(244,247,248,0.32); cursor: default; }
 .lb-zoom-stop-fit { left: 0; }
 .lb-zoom-stop-native { display: none; transform: translateX(-50%); }
 .lb-zoom-max-label {
@@ -7690,9 +7691,13 @@ function _lbUpdateZoomControl() {
   if (zoomIn) zoomIn.disabled = _lbVisualTransitionPending || _lbZoom >= _lbMaxZoom() - 0.001;
 
   var combinedFitNative = _lbNativeCoincidesWithFit();
-  if (fitStop) fitStop.textContent = combinedFitNative ? 'Fit \u00b7 1:1' : 'Fit';
+  if (fitStop) {
+    fitStop.textContent = combinedFitNative ? 'Fit \u00b7 1:1' : 'Fit';
+    fitStop.disabled = !!_lbVisualTransitionPending;
+  }
   if (nativeStop) {
     var nativePosition = _lbNativeSliderPercent();
+    nativeStop.disabled = !!_lbVisualTransitionPending;
     // When fit and 1:1 are visually indistinguishable, combine the labels at the
     // left edge instead of stacking two controls on top of each other.
     nativeStop.style.display = (_lbNativeZoom && !combinedFitNative) ? 'inline-block' : 'none';

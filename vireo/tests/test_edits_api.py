@@ -389,6 +389,8 @@ def test_sync_status(app_and_db):
     assert resp.status_code == 200
     data = resp.get_json()
     assert data['pending_count'] == 0
+    assert data['pending_photo_count'] == 0
+    assert data['change_type_counts'] == {}
 
     photos = db.get_photos()
     db.queue_change(photos[0]['id'], 'rating', '3')
@@ -396,6 +398,60 @@ def test_sync_status(app_and_db):
     resp = client.get('/api/sync/status')
     data = resp.get_json()
     assert data['pending_count'] == 1
+    assert data['pending_photo_count'] == 1
+    assert data['change_type_counts'] == {'rating': 1}
+
+
+def test_sync_preview_pages_photos_with_stable_summary(app_and_db):
+    """Progressive preview pages retain totals and a stable revision."""
+    app, db = app_and_db
+    photo_ids = [photo["id"] for photo in db.get_photos()[:2]]
+    assert len(photo_ids) == 2
+    for index, photo_id in enumerate(photo_ids, start=3):
+        db.queue_change(photo_id, "rating", str(index))
+
+    client = app.test_client()
+    first = client.get("/api/sync/preview?limit=1&offset=0")
+
+    assert first.status_code == 200
+    first_data = first.get_json()
+    assert first_data["total_changes"] == 2
+    assert first_data["total_photos"] == 2
+    assert first_data["change_type_counts"] == {"rating": 2}
+    assert len(first_data["photos"]) == 1
+    assert first_data["has_more"] is True
+    assert first_data["next_offset"] == 1
+    assert first_data["revision"]
+
+    second = client.get(
+        "/api/sync/preview?limit=1&offset=1&revision="
+        + first_data["revision"]
+    )
+    assert second.status_code == 200
+    second_data = second.get_json()
+    assert len(second_data["photos"]) == 1
+    assert second_data["photos"][0]["photo_id"] != first_data["photos"][0]["photo_id"]
+    assert second_data["total_changes"] == 2
+    assert second_data["total_photos"] == 2
+    assert second_data["has_more"] is False
+    assert second_data["next_offset"] is None
+
+
+def test_sync_preview_rejects_stale_progressive_revision(app_and_db):
+    """A changed pending queue cannot be mixed into an older preview."""
+    app, db = app_and_db
+    photo_ids = [photo["id"] for photo in db.get_photos()[:2]]
+    db.queue_change(photo_ids[0], "rating", "3")
+    client = app.test_client()
+    first = client.get("/api/sync/preview?limit=1&offset=0").get_json()
+
+    db.queue_change(photo_ids[1], "rating", "4")
+    stale = client.get(
+        "/api/sync/preview?limit=1&offset=1&revision=" + first["revision"]
+    )
+
+    assert stale.status_code == 409
+    assert stale.get_json()["code"] == "sync_preview_changed"
 
 
 def test_sync_preview_describes_location_keyword_as_xmp_delta(

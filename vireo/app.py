@@ -10179,6 +10179,54 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             "parent_chain": _walk_parent_chain(db, leaf["parent_id"]),
         }
 
+    def _serialize_photo_locations(db, photo_ids):
+        """Bulk form of :func:`_serialize_photo_location`.
+
+        Sync review can contain thousands of location changes.  Looking up
+        each leaf and then walking the same parent chain once per photo turns
+        that review into tens of thousands of SQLite queries.  Fetch leaves
+        in chunks and reuse each distinct hierarchy instead.
+        """
+        if not photo_ids:
+            return {}
+
+        leaves = {}
+        # Keep the first linked location, matching the single-photo helper's
+        # LIMIT 1 behavior without relying on a window-function result shape.
+        for start in range(0, len(photo_ids), 400):
+            chunk = photo_ids[start:start + 400]
+            placeholders = ",".join("?" for _ in chunk)
+            rows = db.conn.execute(
+                f"""
+                SELECT pk.photo_id, k.id, k.name, k.place_id, k.latitude,
+                       k.longitude, k.parent_id
+                FROM photo_keywords pk
+                JOIN keywords k ON k.id = pk.keyword_id
+                WHERE pk.photo_id IN ({placeholders})
+                  AND k.type = 'location'
+                ORDER BY pk.rowid
+                """,
+                chunk,
+            ).fetchall()
+            for row in rows:
+                leaves.setdefault(row["photo_id"], row)
+
+        chain_cache = {}
+        result = {}
+        for photo_id, leaf in leaves.items():
+            parent_id = leaf["parent_id"]
+            if parent_id not in chain_cache:
+                chain_cache[parent_id] = _walk_parent_chain(db, parent_id)
+            result[photo_id] = {
+                "keyword_id": leaf["id"],
+                "name": leaf["name"],
+                "place_id": leaf["place_id"],
+                "latitude": leaf["latitude"],
+                "longitude": leaf["longitude"],
+                "parent_chain": chain_cache[parent_id],
+            }
+        return result
+
     def _serialize_keyword(db, keyword_id):
         """Return a summary dict for a single ``type='location'`` keyword row.
 
@@ -12001,33 +12049,94 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
     def api_sync_status():
         db = _get_db()
         changes = db.get_pending_changes()
+        change_type_counts = {}
+        photo_ids = set()
+        for change in changes:
+            photo_ids.add(change["photo_id"])
+            change_type = change["change_type"]
+            change_type_counts[change_type] = (
+                change_type_counts.get(change_type, 0) + 1
+            )
         return jsonify(
             {
                 "pending_count": len(changes),
+                "pending_photo_count": len(photo_ids),
+                "change_type_counts": change_type_counts,
             }
         )
 
     @app.route("/api/sync/preview")
     def api_sync_preview():
-        """Preview pending changes with the XMP values they will replace."""
+        """Preview pending changes with the XMP values they will replace.
+
+        Supplying ``limit`` enables progressive photo pagination.  Omitting
+        it retains the original all-at-once response for compatibility with
+        existing API callers.
+        """
         db = _get_db()
-        changes = db.get_pending_changes()
-        if not changes:
-            return jsonify({"photos": [], "total_changes": 0})
+        raw_limit = request.args.get("limit")
+        raw_offset = request.args.get("offset", "0")
+        if raw_limit is None:
+            if raw_offset != "0":
+                return json_error("offset requires limit")
+            limit = None
+            offset = 0
+        else:
+            try:
+                limit = int(raw_limit)
+                offset = int(raw_offset)
+            except (TypeError, ValueError):
+                return json_error("limit and offset must be integers")
+            if limit < 1 or limit > 200:
+                return json_error("limit must be between 1 and 200")
+            if offset < 0:
+                return json_error("offset must be non-negative")
+
+        changes = db.conn.execute(
+            """
+            SELECT pc.*, p.filename, p.folder_id, f.path AS folder_path
+            FROM pending_changes pc
+            JOIN photos p ON p.id = pc.photo_id
+            LEFT JOIN folders f ON f.id = p.folder_id
+            WHERE pc.workspace_id = ?
+            ORDER BY pc.created_at, pc.id
+            """,
+            (db._ws_id(),),
+        ).fetchall()
+
+        revision_hash = hashlib.sha256()
+        change_type_counts = {}
+        for change in changes:
+            revision_hash.update(
+                (
+                    f"{change['id']}\0{change['change_token'] or ''}\0"
+                    f"{change['photo_id']}\0{change['change_type']}\0"
+                    f"{change['value'] or ''}\n"
+                ).encode()
+            )
+            change_type = change["change_type"]
+            change_type_counts[change_type] = (
+                change_type_counts.get(change_type, 0) + 1
+            )
+        revision = revision_hash.hexdigest()[:24]
+        requested_revision = request.args.get("revision")
+        if requested_revision and requested_revision != revision:
+            return json_error(
+                "pending changes changed while the review was loading",
+                409,
+                code="sync_preview_changed",
+                message="Pending changes changed. Restarting the review.",
+            )
 
         # Group by photo
         by_photo = {}
         for c in changes:
             pid = c["photo_id"]
             if pid not in by_photo:
-                photo = db.get_photo(pid)
-                folder = db.conn.execute(
-                    "SELECT path FROM folders WHERE id = ?", (photo["folder_id"],)
-                ).fetchone()
                 by_photo[pid] = {
                     "photo_id": pid,
-                    "filename": photo["filename"],
-                    "folder": folder["path"] if folder else "",
+                    "filename": c["filename"],
+                    "folder": c["folder_path"] or "",
                     "changes": [],
                 }
             by_photo[pid]["changes"].append({
@@ -12035,6 +12144,26 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 "type": c["change_type"],
                 "value": c["value"],
             })
+
+        all_photos = list(by_photo.values())
+        total_photos = len(all_photos)
+        if not changes:
+            return jsonify({
+                "photos": [],
+                "total_changes": 0,
+                "total_photos": 0,
+                "change_type_counts": {},
+                "offset": offset,
+                "next_offset": None,
+                "has_more": False,
+                "revision": revision,
+            })
+
+        page_photos = (
+            all_photos
+            if limit is None
+            else all_photos[offset:offset + limit]
+        )
 
         import config as cfg
 
@@ -12044,7 +12173,14 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         )
         sync_flags = bool(effective_config.get("sync_flags_to_xmp", False))
         changes_by_id = {change["id"]: change for change in changes}
-        for photo in by_photo.values():
+        location_photo_ids = [
+            photo["photo_id"]
+            for photo in page_photos
+            if any(change["type"] == "location" for change in photo["changes"])
+        ]
+        assigned_locations = _serialize_photo_locations(db, location_photo_ids)
+        folder_accessibility = {}
+        for photo in page_photos:
             xmp_path = os.path.join(
                 photo["folder"],
                 os.path.splitext(photo["filename"])[0] + ".xmp",
@@ -12054,9 +12190,12 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             # records the photo as ``folder not accessible`` and never
             # runs any writer, so the review must not present writes
             # against it either.
-            folder_offline = bool(photo["folder"]) and not os.path.isdir(
-                photo["folder"]
-            )
+            folder = photo["folder"]
+            if folder not in folder_accessibility:
+                folder_accessibility[folder] = (
+                    not bool(folder) or os.path.isdir(folder)
+                )
+            folder_offline = not folder_accessibility[folder]
             photo["folder_offline"] = folder_offline
             if folder_offline:
                 # Skip filesystem access entirely — an unreachable XMP path
@@ -12080,9 +12219,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 not folder_offline
                 and any(change["type"] == "location" for change in photo["changes"])
             ):
-                assigned_location = _serialize_photo_location(
-                    db, photo["photo_id"],
-                )
+                assigned_location = assigned_locations.get(photo["photo_id"])
             # Map normalized-key -> original add value so a paired
             # keyword_remove can display the clean spelling the paired
             # ``write_sidecar`` will end up writing.
@@ -12186,12 +12323,27 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     folder_offline=folder_offline,
                 )
 
+        page_end = offset + len(page_photos)
+        has_more = page_end < total_photos
         result = {
-            "photos": list(by_photo.values()),
+            "photos": page_photos,
             "total_changes": len(changes),
+            "total_photos": total_photos,
+            "change_type_counts": change_type_counts,
+            "offset": offset,
+            "next_offset": page_end if has_more else None,
+            "has_more": has_more,
+            "revision": revision,
             "location_sync_enabled": write_locations,
         }
-        _attach_nested_edit_recipes(db, result)
+        # The sync dialog needs edit recipes for correctly versioned rendered
+        # thumbnails, but not the species/life-list enrichment performed by
+        # _attach_nested_edit_recipes.
+        recipe_map = db.get_photo_edit_recipes(
+            [photo["photo_id"] for photo in page_photos]
+        )
+        for photo in page_photos:
+            photo["edit_recipe"] = recipe_map.get(photo["photo_id"])
         return jsonify(result)
 
     @app.route("/api/sync/discard", methods=["POST"])

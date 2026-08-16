@@ -3066,6 +3066,7 @@ def run_classify_job(
         try:
             from classifier_cache import acquire_cached_classifier
             from computation_cache import taxonomy_identity
+            from resource_ledger import ResourceWaitCancelled
 
             classifier_cache_handle = acquire_cached_classifier(
                 model_type=model_type,
@@ -3087,7 +3088,16 @@ def run_classify_job(
                 cancel_check=lambda: runner.is_cancelled(job["id"]),
             )
             clf = classifier_cache_handle.__enter__()
-        except ClassificationCancelled:
+        except (ClassificationCancelled, ResourceWaitCancelled):
+            # Two cancellation shapes reach here: ``ClassificationCancelled``
+            # from ``ModelCache``'s waiter-local cancel probe, and
+            # ``ResourceWaitCancelled`` from the ONNX construction lease
+            # inside ``create_session`` (``onnx_runtime.py:337``) when
+            # the job-bound resource cancel probe fires mid-load. Both
+            # mean the same thing to this job: cancel arrived before
+            # inference could start. Finalize the step tree the same
+            # way so JobRunner does not persist ``load_model`` as still
+            # running with the later steps stuck at ``pending``.
             runner.update_step(
                 job["id"], "load_model",
                 status="cancelled", summary="Cancelled",

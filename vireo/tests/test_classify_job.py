@@ -1110,6 +1110,124 @@ def test_reclassify_skips_purge_when_cancelled_during_model_load(tmp_path, monke
     )
 
 
+def test_reclassify_finalizes_steps_on_resource_wait_cancel_during_load(
+    tmp_path, monkeypatch,
+):
+    """Regression: when a classify job is cancelled during a cold ONNX
+    model construction (``onnx_runtime.create_session``'s bound
+    resource cancel probe fires), ``acquire_cached_classifier`` raises
+    ``ResourceWaitCancelled`` — NOT ``ClassificationCancelled``. Without
+    catching both shapes in ``run_classify_job``, the exception escapes
+    to ``JobRunner`` which marks the top-level cancelled but leaves
+    ``load_model`` at "running" and later steps at "pending" instead
+    of finalizing them.
+
+    Sibling to ``test_reclassify_skips_purge_when_cancelled_during_model_load``:
+    the pre-purge gate + purge-preserving semantics from that test
+    apply to this cancellation shape too.
+    """
+    import config as cfg
+    from classify_job import ClassifyParams, run_classify_job
+    from db import Database
+    from resource_ledger import ResourceWaitCancelled
+
+    monkeypatch.setattr(cfg, "CONFIG_PATH", str(tmp_path / "config.json"))
+
+    db_path = str(tmp_path / "test.db")
+    db = Database(db_path)
+    ws = db.ensure_default_workspace()
+    db.set_active_workspace(ws)
+    folder_id = db.add_folder("/tmp/p", name="p")
+    pid = db.add_photo(
+        folder_id, "a.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+    )
+    det_id = db.save_detections(pid, [
+        {"box": {"x": 0, "y": 0, "w": 1, "h": 1},
+         "confidence": 0.9, "category": "animal"},
+    ], detector_model="megadetector-v6")[0]
+    db.add_prediction(
+        det_id, species="Robin", confidence=0.9,
+        model="BioCLIP", labels_fingerprint="legacy",
+    )
+
+    coll_id = db.add_collection(
+        "c", '[{"field":"photo_ids","value":[' + str(pid) + ']}]',
+    )
+
+    runner = FakeRunner()
+
+    fake_weights = tmp_path / "weights"
+    fake_weights.mkdir()
+    (fake_weights / "tol_embeddings.npy").write_bytes(b"stub")
+    (fake_weights / "tol_classes.json").write_bytes(b"[]")
+    import classify_job as cj
+    monkeypatch.setattr(cj, "get_active_model", lambda: {
+        "id": "BioCLIP",
+        "name": "BioCLIP",
+        "model_str": "hf-hub:imageomics/bioclip",
+        "weights_path": str(fake_weights),
+        "model_type": "bioclip",
+        "downloaded": True,
+    })
+
+    # Simulate the exact failure Codex flagged: cold-load lease cancel
+    # surfaces as ``ResourceWaitCancelled`` from inside
+    # ``acquire_cached_classifier`` — not ``ClassificationCancelled``.
+    import classifier_cache
+    def _cancelled_acquire(*args, **kwargs):
+        raise ResourceWaitCancelled(
+            "Cancelled while waiting for ONNX model construction resources",
+        )
+    monkeypatch.setattr(
+        classifier_cache, "acquire_cached_classifier", _cancelled_acquire,
+    )
+
+    job = _make_job()
+    params = ClassifyParams(
+        collection_id=coll_id,
+        labels_files=None,
+        labels_file=None,
+        model_id=None,
+        model_name="BioCLIP",
+        grouping_window=0,
+        similarity_threshold=0.99,
+        reclassify=True,
+    )
+
+    # Must NOT raise: the cancellation shape must be caught locally so
+    # JobRunner sees a normal return and finalizes step rows.
+    result = run_classify_job(job, runner, db_path, ws, params)
+
+    assert result["predictions_stored"] == 0
+    assert result["detected"] == 0
+
+    finals = _final_step_statuses(runner)
+    assert finals.get("load_model") == "cancelled", (
+        f"load_model must finalize cancelled on ResourceWaitCancelled "
+        f"during cold load, got {finals.get('load_model')!r}"
+    )
+    for step_id in ("detect", "classify", "finalize"):
+        assert finals.get(step_id) == "cancelled", (
+            f"Step {step_id!r} must finalize cancelled when the cold "
+            f"ONNX construction lease is cancelled, got "
+            f"{finals.get(step_id)!r}"
+        )
+
+    # Preservation semantics from the ClassificationCancelled path
+    # apply here too: the reclassify purge must not have run.
+    db2 = Database(db_path)
+    db2.set_active_workspace(ws)
+    preds_after = db2.conn.execute(
+        "SELECT COUNT(*) AS n FROM predictions WHERE detection_id=?",
+        (det_id,),
+    ).fetchone()["n"]
+    assert preds_after == 1, (
+        "Reclassify purge must not run when the cold construction "
+        "lease is cancelled — cached prediction was destroyed."
+    )
+
+
 def test_classify_photos_surfaces_cached_full_image_predictions(tmp_path):
     """When a photo has no real detections and the full-image synthetic
     detection is gated by classifier_runs, the cached top prediction

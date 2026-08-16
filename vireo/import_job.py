@@ -1484,21 +1484,34 @@ def _catalog_scan_and_prescan(state, batch_st, db, params, scan, destination,
         # ``scan()`` raise ``ScanCancelled``, and the surrounding
         # handler would reclassify every landed entry as failed while
         # the bytes remain on disk uncataloged.
+        #
+        # Simply omitting ``cancel_check`` is not enough: ``JobRunner``
+        # binds ``cancellation_requested`` as the process-wide resource
+        # cancel probe, so scanner's ``_claim_worker_count`` still
+        # resolves that probe through ``ResourceLedger.acquire`` and
+        # raises ``ResourceWaitCancelled`` even when permits are
+        # immediately available. Suppress the binding just for this
+        # scan by re-binding to ``None`` — same shape as classify_job's
+        # preservation pass in 4be1fa9b / ccd44bc4. ``JobRunner`` still
+        # owns hard shutdown via its own deadline. The pause probe is
+        # kept, so a user Pause still unwinds the scan pool cleanly.
+        from resource_ledger import bind_resource_cancel_check
         scan_pause_check = None
         if runner is not None and job is not None:
             job_id = job["id"]
 
             def scan_pause_check():
                 return runner.pause_requested(job_id)
-        scan(
-            destination, db,
-            restrict_dirs=[batch_st.dest_folder],
-            restrict_files=landed_paths,
-            vireo_dir=params.vireo_dir,
-            thumb_cache_dir=params.thumb_cache_dir,
-            skip_working_copies=True,
-            pause_check=scan_pause_check,
-        )
+        with bind_resource_cancel_check(None):
+            scan(
+                destination, db,
+                restrict_dirs=[batch_st.dest_folder],
+                restrict_files=landed_paths,
+                vireo_dir=params.vireo_dir,
+                thumb_cache_dir=params.thumb_cache_dir,
+                skip_working_copies=True,
+                pause_check=scan_pause_check,
+            )
     except Exception as e:  # scan failure fails the whole batch
         # Each entry was already booked into copied or
         # skipped_duplicate — reclassify (roll back origin, add

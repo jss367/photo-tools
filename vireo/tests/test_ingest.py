@@ -118,6 +118,177 @@ def test_discover_source_files_recursive(tmp_path):
     assert files[0].name == "IMG_001.jpg"
 
 
+def test_discover_source_files_reports_progress_and_honors_cancel(tmp_path):
+    from scanner import ScanCancelled
+
+    src = tmp_path / "sd_card"
+    _create_test_files(str(src), ["one.jpg", "two.jpg"])
+    progress = []
+
+    files = discover_source_files(
+        str(src),
+        progress_callback=lambda checked, found: progress.append(
+            (checked, found)
+        ),
+    )
+    assert len(files) == 2
+    assert progress[-1] == (2, 2)
+
+    with pytest.raises(ScanCancelled):
+        discover_source_files(str(src), cancel_check=lambda: True)
+
+
+def test_discover_source_files_cancels_during_empty_directory_walk(tmp_path):
+    """Cancellation must fire during the directory walk itself, not just
+    after a candidate file is yielded. A large hierarchy of empty (or
+    all-filtered) directories yields no filenames, so a per-candidate
+    check alone would leave pause/cancel stuck until the entire walk
+    finishes on giant sources like a home directory.
+    """
+    from scanner import ScanCancelled
+
+    src = tmp_path / "sd_card"
+    # Empty directories only — no filenames will be yielded, and no
+    # file candidate will ever reach the per-candidate cancel check.
+    for i in range(10):
+        (src / f"empty_{i}" / "deeper").mkdir(parents=True)
+
+    calls = {"n": 0}
+
+    def cancel_after_first_dir():
+        calls["n"] += 1
+        return calls["n"] >= 2
+
+    with pytest.raises(ScanCancelled):
+        discover_source_files(str(src), cancel_check=cancel_after_first_dir)
+    # cancel_check was polled while walking directories even though the
+    # tree contained no matching files.
+    assert calls["n"] >= 2
+
+
+def test_discover_source_files_reports_progress_during_empty_directory_walk(
+    tmp_path,
+):
+    """A source dominated by empty (or all-filtered) directories must
+    still emit discovery heartbeats while the walk is in progress. The
+    outer per-candidate loop only advances when the walker yields a
+    filename, so without a heartbeat inside the walk itself the caller
+    would see a single completion callback with no way to know the
+    traversal is alive during long empty-hierarchy passes.
+    """
+    src = tmp_path / "sd_card"
+    # 200 top-level subdirectories, each with a nested "deeper" child.
+    # ``safe_scan_walk`` will visit ~401 directories without yielding a
+    # single filename, so the per-candidate loop never advances. The
+    # in-generator heartbeat is the only signal the walk is progressing.
+    for i in range(200):
+        (src / f"empty_{i}" / "deeper").mkdir(parents=True)
+
+    calls = []
+
+    files = discover_source_files(
+        str(src),
+        progress_callback=lambda checked, found: calls.append(
+            (checked, found)
+        ),
+    )
+    assert files == []
+    # Every heartbeat during the walk reports (0, 0) — no candidate
+    # files have been seen yet. The final completion callback is also
+    # (0, 0). We need at least one intermediate heartbeat *before* the
+    # completion call so the caller sees the traversal is alive.
+    assert len(calls) >= 2, (
+        "discover_source_files did not emit any progress heartbeat "
+        "while walking an empty-directory hierarchy; the per-candidate "
+        "loop never ticks in this shape, so the caller would appear "
+        "stalled until completion. calls=" + repr(calls)
+    )
+    assert all(call == (0, 0) for call in calls), calls
+
+
+def test_discover_source_files_reports_progress_during_single_large_directory(
+    tmp_path, monkeypatch,
+):
+    """A source dominated by ONE extremely large directory must still emit
+    discovery heartbeats while ``safe_scan_walk`` is buffering that
+    directory's ``os.scandir`` iterator. ``os.walk``-style semantics
+    classify every child into the ``dirs``/``nondirs`` lists before
+    yielding the tuple, so the outer per-candidate loop cannot tick until
+    the whole enumeration finishes. Without an in-scandir heartbeat the
+    Jobs UI would emit one initial phase event and then look stalled for
+    the entire directory scan.
+    """
+    from types import SimpleNamespace
+
+    import image_loader
+
+    root = tmp_path / "sd_card"
+    root.mkdir()
+
+    real_scandir = image_loader.os.scandir
+
+    class LongScandir:
+        def __init__(self, entries):
+            self.entries = entries
+
+        def __iter__(self):
+            return iter(self.entries)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    # 1024 fake non-image entries — enough to cross several 256-entry
+    # in-scandir checkpoints. The safe_scan_walk loop only yields the
+    # (dirpath, dirs, nondirs) tuple after enumerating all of them, so a
+    # caller-side per-yield heartbeat would fire exactly once.
+    fake_entries = [
+        SimpleNamespace(
+            name=f"blob_{i:04d}.dat",
+            path=str(root / f"blob_{i:04d}.dat"),
+            is_symlink=lambda: False,
+            is_dir=lambda follow_symlinks=True: False,
+        )
+        for i in range(1024)
+    ]
+
+    def fake_scandir(path):
+        if path == str(root):
+            return LongScandir(fake_entries)
+        return real_scandir(path)
+
+    monkeypatch.setattr(image_loader.os, "scandir", fake_scandir)
+
+    calls = []
+
+    files = discover_source_files(
+        str(root),
+        progress_callback=lambda checked, found: calls.append(
+            (checked, found)
+        ),
+    )
+    # None of the fake entries have image suffixes, so the file list stays
+    # empty; what matters is the heartbeat cadence during the walk.
+    assert files == []
+    # A single non-empty directory never triggers the outer empty-directory
+    # heartbeat (that guard only fires when the yielded ``filenames`` list
+    # is empty), so any (0, 0) call MUST have come from the in-scandir
+    # heartbeat riding the 256-entry checkpoint. Without that hook the
+    # walker would buffer all 1024 entries into a single yielded tuple and
+    # the caller would see nothing until the outer per-candidate loop
+    # started incrementing ``checked``.
+    zero_progress_calls = [call for call in calls if call == (0, 0)]
+    assert zero_progress_calls, (
+        "discover_source_files did not emit any (checked=0, found=0) "
+        "heartbeat while safe_scan_walk was still buffering a single "
+        "large directory; the outer per-candidate loop cannot advance "
+        "in this shape, so the caller would appear stalled for the "
+        "whole enumeration. calls=" + repr(calls)
+    )
+
+
 def test_discover_source_files_non_recursive(tmp_path):
     src = tmp_path / "sd_card"
     _create_test_files(str(src), ["top.jpg"])
@@ -258,10 +429,13 @@ def test_discover_source_files_recursive_streams_candidates(
 
     events = []
 
-    def tracking_walk(top, onerror=None):
+    def tracking_walk(top, onerror=None, cancel_check=None, on_scandir_batch=None):
         # Yield one filename per tuple so each name's emission is its own
         # observable event in `events`.
-        for dirpath, _dirnames, filenames in real_walk(top, onerror=onerror):
+        for dirpath, _dirnames, filenames in real_walk(
+            top, onerror=onerror, cancel_check=cancel_check,
+            on_scandir_batch=on_scandir_batch,
+        ):
             for name in filenames:
                 events.append(("yield", name))
                 yield dirpath, [], [name]
@@ -289,6 +463,49 @@ def test_discover_source_files_recursive_streams_candidates(
         "running the image filter — see the streaming requirement in "
         "ingest.discover_source_files. Event order: " + repr(events)
     )
+
+
+def test_discover_source_files_skips_stat_for_non_matching_extensions(
+    tmp_path, monkeypatch
+):
+    """Non-image entries must be rejected by the extension/hidden-name
+    check before ``Path.is_file()`` runs. Sources like a home directory or
+    a network mount can contain millions of non-image files; statting each
+    one adds a filesystem round-trip per entry and, on remote mounts, can
+    turn discovery into a multi-hour operation. The cheap name/suffix
+    checks have to filter first.
+    """
+    from pathlib import Path
+
+    real_is_file = Path.is_file
+    is_file_names = []
+
+    def tracking_is_file(self):
+        is_file_names.append(self.name)
+        return real_is_file(self)
+
+    monkeypatch.setattr(Path, "is_file", tracking_is_file)
+
+    src = tmp_path / "src"
+    _create_test_files(
+        str(src),
+        [
+            "keep.jpg",
+            "skip.txt",
+            "skip.log",
+            ".hidden.jpg",
+            "another.raw.bak",
+        ],
+    )
+
+    files = discover_source_files(str(src), file_types="both")
+    assert {f.name for f in files} == {"keep.jpg"}
+
+    # Only entries that passed the cheap filters are worth statting.
+    assert "skip.txt" not in is_file_names
+    assert "skip.log" not in is_file_names
+    assert ".hidden.jpg" not in is_file_names
+    assert "another.raw.bak" not in is_file_names
 
 
 def test_discover_source_files_rejects_excluded_source_before_statting(

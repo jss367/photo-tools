@@ -26485,7 +26485,10 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 )
 
         def _run_import_in_place(job):
+            import errno as errno_mod
+
             import config as cfg
+            from ingest import discover_source_files
             from pipeline_job import (
                 _archive_mount_baseline,
                 _changed_mount_since_baseline,
@@ -26521,7 +26524,13 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             seen_photo_ids = set()
             indexed_paths = set()
             root_errors = []
-            scan_acc = {"prior": 0, "last_current": 0, "last_total": 0}
+            scan_acc = {
+                "prior": 0,
+                "last_current": 0,
+                "last_total": 0,
+                "overall_total": 0,
+                "source_index": 0,
+            }
             working_copy_scope = []
             working_copy_scope_baselines = {}
             working_copy_scope_identities = {}
@@ -26612,7 +26621,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 scan_acc["last_current"] = current
                 scan_acc["last_total"] = total
                 cum_current = scan_acc["prior"] + current
-                cum_total = scan_acc["prior"] + total
+                cum_total = scan_acc["overall_total"]
                 job["progress"]["current"] = cum_current
                 job["progress"]["total"] = cum_total
                 runner.update_step(
@@ -26624,9 +26633,25 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     "total": cum_total,
                     "current_file": job["progress"].get("current_file", ""),
                     "phase": "Importing in place",
+                    # Explicitly clear a completed discovery/metadata phase.
+                    # JobRunner mirrors progress by merging keys, so omitting
+                    # these would leave the old phase active for poll clients.
+                    "phase_current": None,
+                    "phase_total": None,
+                    "phase_label": None,
                 })
 
             def status_cb(message, phase_current=None, phase_total=None, phase_label=None):
+                visible_phase_label = phase_label
+                if (
+                    phase_label
+                    and phase_label != "Generating working copies"
+                    and len(sources) > 1
+                ):
+                    visible_phase_label = (
+                        f"{phase_label} — source "
+                        f"{scan_acc['source_index']} of {len(sources)}"
+                    )
                 job["progress"]["current_file"] = message
                 step_update = {"current_file": message}
                 if (
@@ -26646,10 +26671,10 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     "current": job["progress"].get("current", 0),
                     "total": job["progress"].get("total", 0),
                     "current_file": message,
-                    "phase": phase_label or message,
+                    "phase": visible_phase_label or message,
                     "phase_current": phase_current,
                     "phase_total": phase_total,
-                    "phase_label": phase_label,
+                    "phase_label": visible_phase_label,
                 })
 
             def advance_scan_acc():
@@ -26663,11 +26688,160 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             def pause_check():
                 return runner.pause_requested(job["id"])
 
+            # Discover every source before processing any of them. Previously
+            # each scan discovered its source just-in-time, so the UI called a
+            # partial denominator "Overall" and then moved backward when the
+            # next source added more files. Freezing these manifests makes the
+            # total stable and also excludes files that arrive mid-import.
+            source_manifests = {}
+            # Per-source dict of directory-path → mount identity captured at
+            # discovery time. Discovery walks each source and produces a
+            # frozen list of files, but only the source root's identity is
+            # baselined earlier (source_mount_identities). Later sources can
+            # wait minutes behind earlier ones, and in that window a nested
+            # child dir or symlink under an already-discovered source may be
+            # swapped for an ordinary photo subtree with the same name — a
+            # replacement is_excluded_scan_path cannot recognize and the
+            # source-root check does not see. Recording an identity per
+            # unique parent directory of the manifest lets the scan loop
+            # reject the source before scanner.stat()s the frozen filenames
+            # under the replacement.
+            source_manifest_dir_identities = {}
+            source_discovery_failures = set()
             cancelled = False
-            for idx, source in enumerate(sources, 1):
+
+            def emit_discovery(source_index, source, checked=0, found=0):
+                source_name = os.path.basename(os.path.normpath(source)) or source
+                message = (
+                    f"Discovering source {source_index} of {len(sources)}: "
+                    f"{source_name}"
+                )
+                if checked:
+                    message += f" ({found:,} files found)"
+                runner.update_step(job["id"], "scan", current_file=message)
+                runner.push_event(job["id"], "progress", {
+                    "current": 0,
+                    "total": 0,
+                    "current_file": message,
+                    "phase": message,
+                    "phase_current": source_index - 1,
+                    "phase_total": len(sources),
+                    "phase_label": "Discovering sources",
+                })
+
+            for source_index, source in enumerate(sources, 1):
                 if cancel_check():
                     cancelled = True
                     break
+                emit_discovery(source_index, source)
+                try:
+                    if snapshot_paths_by_root is not None:
+                        manifest = sorted(
+                            Path(path)
+                            for path in snapshot_paths_by_root[source]
+                            if path in snapshot_eligible
+                        )
+                    else:
+                        def discovery_onerror(exc):
+                            if exc.errno in (errno_mod.EPERM, errno_mod.EACCES):
+                                raise exc
+                            log.warning(
+                                "Import-in-place discovery error at %s: %s",
+                                exc.filename, exc,
+                            )
+
+                        manifest = discover_source_files(
+                            source,
+                            file_types="both",
+                            recursive=recursive,
+                            onerror=discovery_onerror,
+                            cancel_check=cancel_check,
+                            progress_callback=lambda checked, found, i=source_index,
+                            s=source: emit_discovery(i, s, checked, found),
+                        )
+                except ScanCancelled:
+                    cancelled = True
+                    break
+                except Exception as exc:
+                    log.exception(
+                        "In-place import discovery failed for source %s", source,
+                    )
+                    msg = f"[{source}] discovery failed: {exc}"
+                    root_errors.append(msg)
+                    if msg not in job["errors"]:
+                        job["errors"].append(msg)
+                    source_discovery_failures.add(source)
+                    manifest = []
+                source_manifests[source] = manifest
+                # Baseline the identity of each unique parent directory in
+                # the manifest. Deduplicating first bounds this to the tree
+                # depth actually observed, not the file count. Only applied
+                # to sources whose manifest came from a filesystem walk here:
+                # snapshot-mode manifests take an explicit path list captured
+                # earlier by the caller, and their per-directory identity is
+                # already captured just before scan by restricted_dir_identities
+                # and rechecked post-scan when scoping working-copy extraction.
+                # See source_manifest_dir_identities for the full rationale.
+                if snapshot_paths_by_root is None:
+                    manifest_dir_identities = {}
+                    for manifest_path in manifest:
+                        parent_key = str(Path(manifest_path).parent)
+                        if parent_key in manifest_dir_identities:
+                            continue
+                        manifest_dir_identities[parent_key] = _mount_identity(
+                            parent_key,
+                        )
+                    source_manifest_dir_identities[source] = manifest_dir_identities
+                scan_acc["overall_total"] += len(manifest)
+                runner.push_event(job["id"], "progress", {
+                    "current": 0,
+                    "total": 0,
+                    "current_file": (
+                        f"Discovered {len(manifest):,} files in source "
+                        f"{source_index} of {len(sources)}"
+                    ),
+                    "phase": "Discovering sources",
+                    "phase_current": source_index,
+                    "phase_total": len(sources),
+                    "phase_label": "Discovering sources",
+                })
+
+            # Publish the overall denominator only after every source has
+            # contributed. From this event onward it never changes.
+            job["progress"]["current"] = 0
+            job["progress"]["total"] = scan_acc["overall_total"]
+            runner.update_step(
+                job["id"], "scan",
+                progress={
+                    "current": 0,
+                    "total": scan_acc["overall_total"],
+                },
+                current_file="",
+            )
+            runner.push_event(job["id"], "progress", {
+                "current": 0,
+                "total": scan_acc["overall_total"],
+                "current_file": "",
+                "phase": "Importing in place",
+                "phase_current": None,
+                "phase_total": None,
+                "phase_label": None,
+            })
+
+            for idx, source in enumerate(sources, 1):
+                # Discovery can observe a transient pause request and raise
+                # ScanCancelled before the runner settles into its paused
+                # state. Keep the local outcome authoritative even if the
+                # runner is resumed before this loop checks again; later
+                # sources do not have frozen manifests in that case.
+                if cancelled or cancel_check():
+                    cancelled = True
+                    break
+                if source in source_discovery_failures:
+                    continue
+                scan_acc["source_index"] = idx
+                scan_acc["last_current"] = 0
+                scan_acc["last_total"] = len(source_manifests[source])
                 restricted_files = None
                 restricted_dirs = None
                 restricted_dir_identities = {}
@@ -26699,13 +26873,75 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     f"Importing source {idx} of {len(sources)}: {source}"
                     if len(sources) > 1 else "Importing in place"
                 )
+                runner.update_step(
+                    job["id"], "scan",
+                    current_file=phase,
+                    source_index=idx,
+                )
                 runner.push_event(job["id"], "progress", {
                     "current": job["progress"].get("current", 0),
                     "total": job["progress"].get("total", 0),
                     "current_file": phase,
                     "phase": phase,
+                    "phase_current": None,
+                    "phase_total": None,
+                    "phase_label": None,
                 })
                 try:
+                    # Revalidate the source's mount identity before replaying
+                    # its frozen manifest. Between discovery and scan a
+                    # removable/network source (or a local directory) can be
+                    # detached and replaced at the same path while later
+                    # sources are still being discovered; ``root_path.is_dir()``
+                    # inside scanner.scan would still be true, so common camera
+                    # filenames such as ``DCIM/.../IMG_0001.JPG`` would be
+                    # cataloged from the wrong volume. The post-scan check that
+                    # already gates working-copy extraction runs too late to
+                    # prevent that catalog contamination — do the check here.
+                    changed_source_mount = _changed_mount_since_baseline(
+                        source_mount_identities.get(str(Path(source)), {}),
+                    )
+                    if changed_source_mount is not None:
+                        raise FileNotFoundError(
+                            errno_mod.ENOENT,
+                            (
+                                "source mount changed since discovery "
+                                f"({changed_source_mount}); refusing to "
+                                "replay frozen manifest against replacement "
+                                "filesystem"
+                            ),
+                            source,
+                        )
+                    # The source-root check above cannot see a nested
+                    # directory, mount, or symlink that was replaced with an
+                    # ordinary photo subtree after discovery: the root's own
+                    # inode stayed the same. Revalidate every parent
+                    # directory of the frozen manifest here, so the scanner
+                    # cannot stat the frozen filenames under a substituted
+                    # subtree and catalog the wrong files.
+                    changed_manifest_dir = _changed_mount_since_baseline(
+                        source_manifest_dir_identities.get(source, {}),
+                    )
+                    if changed_manifest_dir is not None:
+                        raise FileNotFoundError(
+                            errno_mod.ENOENT,
+                            (
+                                "nested directory changed since discovery "
+                                f"({changed_manifest_dir}); refusing to "
+                                "replay frozen manifest against replacement "
+                                "subtree"
+                            ),
+                            source,
+                        )
+                    # scan() commits rows incrementally and can raise after
+                    # thousands have landed, so read counts from a sink dict
+                    # rather than the return value — the same pattern the
+                    # multi-root scan job uses. Frozen manifests widen the
+                    # window in which promised files can vanish before their
+                    # source is processed; the vanished bucket must be
+                    # surfaced as a source failure or a successful import
+                    # report would silently follow a partial catalog.
+                    source_scan_counts = {}
                     do_scan(
                         source, thread_db,
                         progress_callback=progress_cb,
@@ -26729,7 +26965,24 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                         register_restrict_dirs_as_roots=(
                             snapshot_paths_by_root is None
                         ),
+                        discovered_files=source_manifests[source],
+                        counts=source_scan_counts,
                     )
+                    vanished_count = source_scan_counts.get("vanished", 0)
+                    if vanished_count:
+                        msg = (
+                            f"[{source}] {vanished_count} file(s) vanished "
+                            "between discovery and scan; import is incomplete"
+                        )
+                        log.warning(
+                            "In-place import: %d file(s) promised by the "
+                            "frozen manifest for %s were missing at scan "
+                            "time",
+                            vanished_count, source,
+                        )
+                        root_errors.append(msg)
+                        if msg not in job["errors"]:
+                            job["errors"].append(msg)
                     # Retain extraction scope only after the scan returns and
                     # only while its paths are still valid. A selected volume
                     # can disappear after request validation; handing that
@@ -26787,6 +27040,41 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                     root_errors.append(msg)
                     if msg not in job["errors"]:
                         job["errors"].append(msg)
+                    # Advance the counter past this source's frozen
+                    # manifest so the overall denominator is still
+                    # reached even when the scan failed — a source that
+                    # disconnected after discovery (scanner raises
+                    # FileNotFoundError on the missing root) would
+                    # otherwise leave the progress bar permanently below
+                    # its promised total. scan_acc["last_total"] holds
+                    # this source's frozen size; the ``finally`` block
+                    # below rolls it into ``prior`` via advance_scan_acc.
+                    if scan_acc["last_current"] < scan_acc["last_total"]:
+                        scan_acc["last_current"] = scan_acc["last_total"]
+                        # Emit a progress event now so the bar visibly
+                        # moves past this source instead of only jumping
+                        # once a later source's photo_cb re-publishes.
+                        # The frozen denominator is preserved; ``current``
+                        # advances by the failed source's manifest size.
+                        cum_current = (
+                            scan_acc["prior"] + scan_acc["last_current"]
+                        )
+                        cum_total = scan_acc["overall_total"]
+                        job["progress"]["current"] = cum_current
+                        job["progress"]["total"] = cum_total
+                        runner.update_step(
+                            job["id"], "scan",
+                            progress={"current": cum_current, "total": cum_total},
+                        )
+                        runner.push_event(job["id"], "progress", {
+                            "current": cum_current,
+                            "total": cum_total,
+                            "current_file": job["progress"].get("current_file", ""),
+                            "phase": "Importing in place",
+                            "phase_current": None,
+                            "phase_total": None,
+                            "phase_label": None,
+                        })
                 finally:
                     try:
                         _invalidate_new_images_after_scan(thread_db, source)

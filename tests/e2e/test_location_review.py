@@ -580,6 +580,126 @@ def test_location_review_partial_assignment_locks_navigation_and_choice(
     expect(page.locator("#locationReviewSkip")).to_be_enabled()
 
 
+def test_location_review_partial_assignment_blocks_photo_preview(
+    live_server, page,
+):
+    """Lightbox open is refused mid-partial so a delete can't drop committed chunks.
+
+    Without this guard the lightbox 'photodeleted' handler would call
+    renderCurrentGroup(), nulling state.assignment and unlocking navigation
+    even though earlier chunks already changed photos on disk.
+    """
+    photo_id = live_server["data"]["photos"][0]
+    preview = {
+        "total": 1500,
+        "reviewable": 1500,
+        "unresolved": [],
+        "skipped": [],
+        "groups": [
+            {
+                "photo_ids": list(range(1, 1501)),
+                "photos": [{
+                    "id": photo_id,
+                    "filename": "batch-example.jpg",
+                    "latitude": 33.255,
+                    "longitude": -116.405,
+                    "timestamp": "2026-08-04T10:17:00",
+                }],
+                "count": 1500,
+                "center": {"lat": 33.255, "lng": -116.405},
+                "bounds": {
+                    "south": 33.255, "west": -116.405,
+                    "north": 33.255, "east": -116.405,
+                },
+                "spread_m": 0,
+                "captured_from": "2026-08-04T10:17:00",
+                "captured_to": "2026-08-04T10:17:00",
+            },
+        ],
+    }
+
+    page.route("https://unpkg.com/**", _stub_leaflet)
+    page.goto(f"{live_server['url']}/browse")
+    page.evaluate(
+        "photoId => sessionStorage.setItem('vireoLocationReviewSource', "
+        "JSON.stringify({photo_ids: [photoId]}))",
+        photo_id,
+    )
+    page.route(
+        "**/api/location-review/preview",
+        lambda route: route.fulfill(json=preview),
+    )
+    page.goto(f"{live_server['url']}/locations/review?source=selection")
+    expect(page.locator("#locationReviewGroupTitle")).to_have_text("1,500 photos")
+
+    page.locator("#locationReviewSearch").fill("Partial location")
+    page.locator("#locationReviewCustom").click()
+    page.evaluate(
+        """() => {
+          window.__originalSafeFetch = window.safeFetch;
+          window.__pending = [];
+          window.safeFetch = function(url, opts, options) {
+            if (url !== '/api/batch/location/text') {
+              return window.__originalSafeFetch(url, opts, options);
+            }
+            return new Promise(function(resolve, reject) {
+              window.__pending.push({resolve: resolve, reject: reject});
+            });
+          };
+          window.__settle = function(result) {
+            var pending = window.__pending.shift();
+            if (result === 'reject') pending.reject(new Error('boom'));
+            else pending.resolve({ok: true, updated: result});
+          };
+          window.__toasts = [];
+          var originalToast = window.showToast;
+          window.showToast = function(message, kind) {
+            window.__toasts.push({message: message, kind: kind});
+            return originalToast ? originalToast(message, kind) : null;
+          };
+        }"""
+    )
+
+    page.locator("#locationReviewAssign").click()
+    page.wait_for_function("() => window.__pending.length === 1")
+    page.evaluate("window.__settle(1000)")  # First chunk commits.
+    page.wait_for_function("() => window.__pending.length === 1")
+    page.evaluate("window.__settle('reject')")  # Second chunk fails.
+
+    expect(page.locator("#locationReviewAssign")).to_contain_text("Retry 500 remaining")
+
+    # Attempting to open a photo via the thumbnail must be refused while a
+    # partial assignment is pending. Otherwise 'lightbox:photodeleted' would
+    # call renderCurrentGroup() and silently orphan the committed chunks.
+    page.locator(
+        f'.location-review-thumb[data-photo-id="{photo_id}"]'
+    ).click()
+
+    expect(page.locator("#lightboxOverlay")).not_to_have_class(
+        "lightbox-overlay active"
+    )
+    toasts = page.evaluate("window.__toasts")
+    assert toasts, "expected a warning toast when opening a photo mid-partial"
+    assert "pending assignment" in toasts[-1]["message"]
+    assert "Partial location" in toasts[-1]["message"]
+
+    # Partial-assignment state must survive the blocked click intact — the
+    # retry button still points at the in-flight remainder and every nav
+    # control stays locked.
+    expect(page.locator("#locationReviewAssign")).to_contain_text("Retry 500 remaining")
+    expect(page.locator("#locationReviewSkip")).to_be_disabled()
+    expect(page.locator("#locationReviewNext")).to_be_disabled()
+    expect(page.locator("#locationReviewPrevious")).to_be_disabled()
+
+    # Retrying completes the group; only then should the lightbox open again.
+    page.locator("#locationReviewAssign").click()
+    page.wait_for_function("() => window.__pending.length === 1")
+    page.evaluate("window.__settle(500)")
+    expect(page.locator("#locationReviewEmptyTitle")).to_have_text(
+        "All locations reviewed"
+    )
+
+
 def test_location_review_missing_google_key_links_to_settings(live_server, page):
     """The empty suggestion state explains how to enable nearby places."""
     photo_id = live_server["data"]["photos"][0]

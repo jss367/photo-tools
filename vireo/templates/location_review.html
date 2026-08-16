@@ -761,6 +761,23 @@ body {
   function openPhotoPreview(photo) {
     var group = currentGroup();
     if (!photo || !group || typeof openLightbox !== 'function') return;
+    // While an assignment is in flight or a partial batch is waiting for
+    // retry, opening the lightbox lets the user delete a photo; the
+    // 'lightbox:photodeleted' handler then runs renderCurrentGroup() which
+    // nulls state.assignment and unlocks navigation, silently orphaning the
+    // committed chunks. Keep the preview closed until the pending
+    // assignment resolves.
+    if (hasPartialAssignmentProgress()) {
+      showToast('Finish or retry the pending assignment before opening a photo — ' +
+        formatNumber(state.assignment.completed) + ' of ' +
+        formatNumber(state.assignment.total) + ' photos already got “' +
+        state.selectedChoice.name + '”. Reload to abandon.', 'error');
+      return;
+    }
+    if (state.isAssigning) {
+      showToast('Assignment in progress — finish or wait before opening a photo.', 'error');
+      return;
+    }
     openLightbox(photo.id, photo.filename || '', group.photos.slice());
   }
 

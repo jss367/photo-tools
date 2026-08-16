@@ -15779,6 +15779,35 @@ def test_sync_discard_reports_true_count(app_and_db):
     assert db.get_pending_changes() == []
 
 
+def test_sync_discard_chunks_large_change_sets(app_and_db):
+    """Selective discard keeps its history lookup below SQLite's bind limit."""
+    from db import _SQLITE_PARAM_CHUNK_SIZE
+
+    app, db = app_and_db
+    client = app.test_client()
+    pid = db.conn.execute("SELECT id FROM photos LIMIT 1").fetchone()["id"]
+    total = _SQLITE_PARAM_CHUNK_SIZE + 5
+    db.conn.executemany(
+        """INSERT INTO pending_changes
+           (photo_id, change_type, value, change_token, workspace_id)
+           VALUES (?, 'rating', '4', ?, ?)""",
+        [
+            (pid, f"discard-large-{idx}", db._ws_id())
+            for idx in range(total)
+        ],
+    )
+    db.conn.commit()
+    change_ids = [row["id"] for row in db.get_pending_changes()]
+
+    resp = client.post(
+        "/api/sync/discard", json={"change_ids": change_ids},
+    )
+
+    assert resp.status_code == 200
+    assert resp.get_json()["discarded"] == total
+    assert db.get_pending_changes() == []
+
+
 def test_sync_discard_clears_sibling_workspace_flat_removals(app_and_db):
     """Selective and discard-all choices coordinate a shared sidecar."""
     app, db = app_and_db

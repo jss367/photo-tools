@@ -12697,12 +12697,18 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         if not change_ids:
             return json_error("change_ids required")
 
-        # Look up changes before deleting so we can record what was discarded
-        placeholders = ",".join("?" for _ in change_ids)
-        changes = db.conn.execute(
-            f"SELECT * FROM pending_changes WHERE id IN ({placeholders}) AND workspace_id = ?",
-            list(change_ids) + [db._ws_id()],
-        ).fetchall()
+        # Look up changes before deleting so we can record what was discarded.
+        # Keep each IN clause below SQLite's bound-parameter limit, just as
+        # clear_pending does for the subsequent delete.
+        from db import _chunks  # noqa: PLC0415
+        changes = []
+        for chunk in _chunks(change_ids):
+            placeholders = ",".join("?" for _ in chunk)
+            changes.extend(db.conn.execute(
+                f"SELECT * FROM pending_changes "
+                f"WHERE id IN ({placeholders}) AND workspace_id = ?",
+                list(chunk) + [db._ws_id()],
+            ).fetchall())
 
         db.clear_pending(
             change_ids, clear_equivalent_flat_removals=True,

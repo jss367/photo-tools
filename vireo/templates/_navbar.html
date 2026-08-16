@@ -7661,11 +7661,7 @@ function _lbNativeSliderPercent() {
 }
 
 function _lbNativeCoincidesWithFit() {
-  // Below this slider position the standalone 1:1 stop would overlap the fit
-  // stop, so the HUD combines the two labels and the fit action must satisfy
-  // the 1:1 half \u2014 otherwise native zooms in the 1.001\u2013~1.128 range have no
-  // labeled path to exact 1:1.
-  return !!_lbNativeZoom && _lbNativeSliderPercent() < 8;
+  return !!_lbNativeZoom && _lbNativeZoom <= 1.001;
 }
 
 function _lbUpdateZoomControl() {
@@ -7699,9 +7695,10 @@ function _lbUpdateZoomControl() {
     var nativePosition = _lbNativeSliderPercent();
     nativeStop.disabled = !!_lbVisualTransitionPending;
     // When fit and 1:1 are visually indistinguishable, combine the labels at the
-    // left edge instead of stacking two controls on top of each other.
+    // left edge. Otherwise keep 1:1 at least 8% along the track so a near-fit
+    // native stop remains separate and clickable without overlapping Fit.
     nativeStop.style.display = (_lbNativeZoom && !combinedFitNative) ? 'inline-block' : 'none';
-    nativeStop.style.left = nativePosition + '%';
+    nativeStop.style.left = Math.max(8, nativePosition) + '%';
   }
   if (maxLabel) maxLabel.textContent = _lbNativeZoom ? '400%' : '4\u00d7 Fit';
 }
@@ -7733,14 +7730,6 @@ function stepLightboxZoom(direction) {
 function setLightboxZoomToFit() {
   if (_lbVisualTransitionPending) return;
   _lbClearPendingViewportRestore();
-  // When the HUD has combined the Fit and 1:1 labels (native zoom too close
-  // to fit for a standalone stop), route through the labelled 1:1 path so the
-  // fit action honors the 1:1 half of the label instead of silently landing
-  // slightly short of native pixels.
-  if (_lbNativeCoincidesWithFit()) {
-    setLightboxZoomToOneToOne();
-    return;
-  }
   _lbSetZoom(1.0, null, null);
 }
 
@@ -7774,7 +7763,7 @@ function setLightboxZoomToOneToOne(e) {
       _lbScheduleSourceSwap(_lbNativeZoom);
       _lbApplyTransform();
     } else {
-      _lbSetZoom(_lbNativeZoom, anchorX, anchorY);
+      _lbSetZoom(_lbNativeZoom, anchorX, anchorY, true);
       _lbPending1To1 = false;
       _lbPending1To1Anchor = null;
     }
@@ -7794,14 +7783,7 @@ function toggleLightboxZoom(e) {
   // A deferred 1:1 leaves _lbZoom at fit while the sharp source loads, so treat
   // that pending state as zoomed and allow a second toggle to cancel it.
   if (_lbZoom > 1.001 || _lbPending1To1) {
-    // Drive the zoom-out branch to exact fit directly rather than through
-    // setLightboxZoomToFit(): in the near-fit native range where the HUD
-    // combines the Fit and 1:1 labels, that helper redirects back to 1:1
-    // and the toggle can neither return to fit nor cancel a pending 1:1
-    // source upgrade. _lbSetZoom clears _lbPending1To1 for us.
-    if (_lbVisualTransitionPending) return;
-    _lbClearPendingViewportRestore();
-    _lbSetZoom(1.0, null, null);
+    setLightboxZoomToFit();
   } else {
     setLightboxZoomToOneToOne(e);
   }
@@ -9330,7 +9312,25 @@ function _lbRecomputeNativeZoom() {
   _lbApplyTransform();
 }
 
-function _lbSetZoom(newZoom, anchorClientX, anchorClientY) {
+function _lbSyncSourceForZoom(targetZoom, preserveSharperSource) {
+  var desiredSource = _lbPickSourceKey(targetZoom);
+  if (preserveSharperSource && _lbSrcRank(_lbCurrentSrcKey) > _lbSrcRank(desiredSource)) {
+    // The current pixels already exceed this zoom's requirement. Cancel any
+    // queued downgrade and retain them; this is especially important for the
+    // explicit 1:1 stop, where replacing /original with a lower tier adds work
+    // and can leave a failed non-original swap stranded.
+    if (_lbSwapTimer) {
+      clearTimeout(_lbSwapTimer);
+      _lbSwapTimer = null;
+    }
+    _lbDesiredSrcKey = _lbCurrentSrcKey;
+    _lbPrimeAdjacentPhotos(_lbCurrentSrcKey);
+    return;
+  }
+  _lbScheduleSourceSwap(targetZoom);
+}
+
+function _lbSetZoom(newZoom, anchorClientX, anchorClientY, preserveSharperSource) {
   // Any zoom mutation cancels a pending "upgrade to 1:1 on original-load" intent.
   // Callers that still want it (toggleLightboxZoom's fallback path) re-set the flag
   // after calling us.
@@ -9352,7 +9352,7 @@ function _lbSetZoom(newZoom, anchorClientX, anchorClientY) {
     }
     wrap.classList.toggle('zoomed', _lbZoom > 1.001);
     _lbApplyTransform();
-    _lbScheduleSourceSwap();
+    _lbSyncSourceForZoom(newZoom, preserveSharperSource);
     _lbSaveViewportState(_lightboxCurrentId);
     return;
   }
@@ -9388,7 +9388,7 @@ function _lbSetZoom(newZoom, anchorClientX, anchorClientY) {
   _lbClampPan();
   wrap.classList.toggle('zoomed', _lbZoom > 1.001);
   _lbApplyTransform();
-  _lbScheduleSourceSwap();
+  _lbSyncSourceForZoom(newZoom, preserveSharperSource);
   _lbSaveViewportState(_lightboxCurrentId);
 }
 

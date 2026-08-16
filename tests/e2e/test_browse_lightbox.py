@@ -598,8 +598,10 @@ def test_browse_lightbox_zoom_hud_controls_logarithmic_zoom(live_server, page):
     expect(badge).to_have_attribute("aria-expanded", "false")
 
 
-def test_browse_lightbox_zoom_hud_fit_stop_reaches_exact_native(live_server, page):
-    """When native zoom sits just above fit, the combined Fit stop still snaps to 1:1."""
+def test_browse_lightbox_zoom_hud_keeps_near_fit_native_stop_separate(
+    live_server, page
+):
+    """A near-fit native zoom keeps separate exact Fit and 1:1 actions."""
     svg = (
         '<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1200" '
         'viewBox="0 0 1600 1200"><rect width="1600" height="1200" fill="#274"/></svg>'
@@ -622,11 +624,9 @@ def test_browse_lightbox_zoom_hud_fit_stop_reaches_exact_native(live_server, pag
         }"""
     )
 
-    # Put native zoom just above the identity threshold but well below the
-    # slider position (~8%) where the standalone 1:1 stop appears. That range
-    # (roughly 1.001–1.128) is the gap the Codex review flagged: the dedicated
-    # 1:1 stop is hidden, so the fit stop's label has to combine and its click
-    # has to land on exact native pixels.
+    # Put native zoom just above fit but below the track position where its 1:1
+    # label would avoid overlapping Fit. The label is visually offset to 8%,
+    # while each action retains its exact zoom target.
     page.evaluate(
         """() => {
             window._lbCancelOriginalPreload();
@@ -638,16 +638,23 @@ def test_browse_lightbox_zoom_hud_fit_stop_reaches_exact_native(live_server, pag
     )
     page.locator("#lightboxZoomBadge").click()
     fit_stop = page.locator(".lb-zoom-stop-fit")
-    expect(fit_stop).to_have_text("Fit · 1:1")
-    expect(page.locator("#lightboxZoomNativeStop")).to_be_hidden()
+    native_stop = page.locator("#lightboxZoomNativeStop")
+    expect(fit_stop).to_have_text("Fit")
+    expect(native_stop).to_be_visible()
+    assert native_stop.evaluate("el => el.style.left") == "8%"
 
+    page.evaluate("() => window._lbSetZoom(1.05, null, null)")
     fit_stop.click()
+    assert abs(page.evaluate("window._lbZoom") - 1.0) < 0.001
+    expect(page.locator("#lightboxZoomBadge")).to_have_text("Fit")
+
+    native_stop.click()
     assert abs(page.evaluate("window._lbZoom") - 1.05) < 0.01
     expect(page.locator("#lightboxZoomBadge")).to_have_text("100%")
 
 
 def test_browse_lightbox_zoom_toggle_returns_to_fit_near_native(live_server, page):
-    """The `z` toggle must return to exact fit even when the HUD combines Fit and 1:1."""
+    """The `z` toggle must return to exact fit from a nearby native zoom."""
     svg = (
         '<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1200" '
         'viewBox="0 0 1600 1200"><rect width="1600" height="1200" fill="#274"/></svg>'
@@ -669,9 +676,8 @@ def test_browse_lightbox_zoom_toggle_returns_to_fit_near_native(live_server, pag
         }"""
     )
 
-    # Native zoom in the combined-stop range: the HUD collapses the standalone
-    # 1:1 stop into the Fit label, so setLightboxZoomToFit() routes back to
-    # 1:1. The `z` toggle must not inherit that routing.
+    # A small gap between fit and native must not keep the toggle from returning
+    # to exact fit.
     zoomed = page.evaluate(
         """() => {
             window._lbCancelOriginalPreload();
@@ -679,14 +685,10 @@ def test_browse_lightbox_zoom_toggle_returns_to_fit_near_native(live_server, pag
             window._lbNativeZoom = 1.05;
             window._lbCurrentSrcKey = window._lbPickSourceKey(window._lbNativeZoom);
             window._lbSetZoom(window._lbNativeZoom, null, null);
-            return {
-                zoom: window._lbZoom,
-                combined: window._lbNativeCoincidesWithFit(),
-            };
+            return window._lbZoom;
         }"""
     )
-    assert abs(zoomed["zoom"] - 1.05) < 0.01
-    assert zoomed["combined"] is True
+    assert abs(zoomed - 1.05) < 0.01
 
     page.evaluate("() => window.toggleLightboxZoom()")
     fit_state = page.evaluate(
@@ -795,10 +797,14 @@ def test_browse_lightbox_one_to_one_reuses_sharper_current_source(live_server, p
     result = page.evaluate(
         """() => {
             window._lbCancelOriginalPreload();
-            window._lbScheduleSourceSwap = function() {};
             window._lbNativeZoom = 1.5;
-            window._lbCurrentSrcKey = 'original';
             window._lbSetZoom(1, null, null);
+            if (window._lbSwapTimer) {
+                clearTimeout(window._lbSwapTimer);
+                window._lbSwapTimer = null;
+            }
+            window._lbCurrentSrcKey = 'original';
+            window._lbDesiredSrcKey = 'original';
             window._lbPending1To1 = false;
             window._lbPending1To1Anchor = null;
             // Sanity: the picked source key for this zoom must be lower rank
@@ -812,6 +818,8 @@ def test_browse_lightbox_one_to_one_reuses_sharper_current_source(live_server, p
                 zoom: window._lbZoom,
                 pending: window._lbPending1To1,
                 badge: document.getElementById('lightboxZoomBadge').textContent,
+                desiredSource: window._lbDesiredSrcKey,
+                swapPending: window._lbSwapTimer !== null,
             };
         }"""
     )
@@ -819,6 +827,8 @@ def test_browse_lightbox_one_to_one_reuses_sharper_current_source(live_server, p
     assert abs(result["zoom"] - 1.5) < 0.01
     assert result["pending"] is False
     assert result["badge"] != "Loading 1:1"
+    assert result["desiredSource"] == "original"
+    assert result["swapPending"] is False
 
 
 def test_browse_lightbox_reserves_space_for_bottom_controls(live_server, page):

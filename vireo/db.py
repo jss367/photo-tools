@@ -3150,8 +3150,9 @@ class Database:
         sidecar removal is queued. Flat-only is important: a user may have a
         real hierarchy such as ``Wildlife|Birds|House Sparrow``; retiring the
         generated flat term must not delete that hierarchy. A not-yet-synced
-        pending add is simply cancelled. The keyword row is retained so edit
-        history, manual associations, and user-created children remain valid.
+        pending add proves the association was explicitly user-authored and is
+        preserved. The keyword row is retained so edit history, manual
+        associations, and user-created children remain valid.
         """
         if (
             not force
@@ -3182,6 +3183,13 @@ class Database:
                 JOIN photos p ON p.id = pk.photo_id
                 LEFT JOIN workspace_folders wf ON wf.folder_id = p.folder_id
                 WHERE pk.keyword_id IN ({placeholders})
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM pending_changes pending_add
+                      WHERE pending_add.photo_id = pk.photo_id
+                        AND pending_add.change_type = 'keyword_add'
+                        AND pending_add.value = 'Wildlife' COLLATE NOCASE
+                  )
                   AND EXISTS (
                       SELECT 1
                       FROM photo_keywords species_pk
@@ -3208,17 +3216,6 @@ class Database:
                 bucket.add(ws)
 
         for photo_id, ws_ids in photo_workspaces.items():
-            # A pending add means the generated term has not reached the
-            # sidecar yet. Cancel every workspace copy rather than stacking a
-            # removal behind it.
-            pending_add = self.conn.execute(
-                """DELETE FROM pending_changes
-                   WHERE photo_id = ? AND change_type = 'keyword_add'
-                     AND value = 'Wildlife' COLLATE NOCASE""",
-                (photo_id,),
-            ).rowcount
-            if pending_add:
-                continue
             target_ws_ids = (
                 ws_ids
                 if ws_ids

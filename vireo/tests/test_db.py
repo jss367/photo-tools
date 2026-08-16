@@ -14030,8 +14030,8 @@ def test_retire_builtin_wildlife_preserves_manual_tag_during_mixed_cleanup(tmp_p
     ]
 
 
-def test_retire_builtin_wildlife_cancels_unsynced_add(tmp_path):
-    """An unsynced generated add is cancelled instead of followed by remove."""
+def test_retire_builtin_wildlife_preserves_unsynced_manual_add(tmp_path):
+    """A pending add proves Wildlife was explicitly added by the user."""
     from db import Database
     db = Database(str(tmp_path / "test.db"))
     ws = db.create_workspace("ws")
@@ -14053,11 +14053,20 @@ def test_retire_builtin_wildlife_cancels_unsynced_add(tmp_path):
     db.conn.commit()
     db.set_meta(Database._RETIRED_WILDLIFE_GENRE_KEY, "0")
 
-    assert db.retire_builtin_wildlife_genre() == 1
+    assert db.retire_builtin_wildlife_genre() == 0
 
     assert db.conn.execute(
-        "SELECT 1 FROM pending_changes WHERE photo_id = ?", (p1,),
-    ).fetchone() is None
+        "SELECT 1 FROM photo_keywords WHERE photo_id = ? AND keyword_id = ?",
+        (p1, wildlife_id),
+    ).fetchone() is not None
+    pending = db.conn.execute(
+        """SELECT change_type, value FROM pending_changes
+           WHERE photo_id = ?""",
+        (p1,),
+    ).fetchall()
+    assert [(row["change_type"], row["value"]) for row in pending] == [
+        ("keyword_add", "Wildlife"),
+    ]
 
 
 def test_retire_builtin_wildlife_queues_removal_in_every_owning_workspace(tmp_path):

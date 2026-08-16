@@ -9968,6 +9968,14 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         must be derived server-side or the batch include/exclude controls
         would silently omit off-page photos and hide the buttons that
         should still be available for them.
+
+        Any submitted IDs that are missing or outside the active workspace
+        are reported as ``missing_count`` so the panel can surface an
+        incomplete selection instead of implying the counts cover
+        everything the user picked. Without that signal the state endpoint
+        and the batch endpoint disagree on what "the selection" means and
+        the panel can show actions for a subset that then fail when
+        applied to the full list.
         """
         db = _get_db()
         body = request.get_json(silent=True) or {}
@@ -9985,9 +9993,11 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 seen.add(raw)
         if not photo_ids:
             return jsonify({
+                "requested_count": 0,
                 "selected_count": 0,
                 "included_count": 0,
                 "excluded_count": 0,
+                "missing_count": 0,
             })
 
         ws_id = db._ws_id()
@@ -10014,10 +10024,13 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 else:
                     included += 1
 
+        accessible = included + excluded
         return jsonify({
-            "selected_count": included + excluded,
+            "requested_count": len(photo_ids),
+            "selected_count": accessible,
             "included_count": included,
             "excluded_count": excluded,
+            "missing_count": len(photo_ids) - accessible,
         })
 
     @app.route("/api/keywords/<int:keyword_id>", methods=["PUT"])
@@ -11200,7 +11213,17 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
 
     @app.route("/api/batch/wildlife-excluded", methods=["POST"])
     def api_batch_wildlife_excluded():
-        """Include or exclude a selection from wildlife processing."""
+        """Include or exclude a selection from wildlife processing.
+
+        Missing or out-of-workspace IDs are skipped rather than rejecting
+        the entire batch so the endpoint stays consistent with
+        ``/api/selection/wildlife-state``: the state endpoint aggregates
+        over the accessible subset, and this endpoint applies the change
+        to the same subset instead of failing when the panel-supplied
+        selection contains a stray ID. The count of skipped IDs is
+        returned so the caller can surface it in the same transparent way
+        as the state endpoint's ``missing_count``.
+        """
         db = _get_db()
         body = request.get_json(silent=True) or {}
         raw_ids = body.get("photo_ids", [])
@@ -11220,18 +11243,17 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 seen.add(raw)
 
         photos_map = db.get_photos_by_ids(photo_ids)
-        if len(photos_map) != len(photo_ids):
-            return json_error("One or more photos were not found", 404)
-        try:
-            for photo_id in photo_ids:
-                db._verify_photo_in_workspace(photo_id)
-        except ValueError as exc:
-            return json_error(str(exc), 403)
+        accessible_ids = [
+            photo_id
+            for photo_id in photo_ids
+            if photo_id in photos_map and db._photo_in_workspace(photo_id)
+        ]
+        skipped_count = len(photo_ids) - len(accessible_ids)
 
         desired = 1 if excluded else 0
         changed_ids = [
             photo_id
-            for photo_id in photo_ids
+            for photo_id in accessible_ids
             if int(photos_map[photo_id]["wildlife_excluded"] or 0) != desired
         ]
         items = []
@@ -11271,6 +11293,7 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
             "updated": len(changed_ids),
             "wildlife_excluded": excluded,
             "photo_ids": changed_ids,
+            "skipped_count": skipped_count,
         })
 
     @app.route("/api/batch/keyword-remove", methods=["POST"])

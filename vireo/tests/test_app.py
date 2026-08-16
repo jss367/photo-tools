@@ -8643,6 +8643,95 @@ def test_selection_wildlife_state_ignores_photos_outside_active_workspace(app_an
     assert data["selected_count"] == len(ids)
     assert data["included_count"] == len(ids)
     assert data["excluded_count"] == 0
+    # The out-of-workspace id must be reported as missing so the panel can
+    # surface an incomplete selection instead of implying the counts cover
+    # every submitted id.
+    assert data["missing_count"] == 1
+    assert data["requested_count"] == len(ids) + 1
+
+
+def test_selection_wildlife_state_reports_missing_photo_ids(app_and_db):
+    """Unknown ids appear in ``missing_count`` so the panel stays honest
+    about how much of the selection its counts describe.
+    """
+    app, db = app_and_db
+    ids = [
+        row["id"]
+        for row in db.conn.execute(
+            "SELECT id FROM photos ORDER BY filename"
+        ).fetchall()
+    ]
+    unknown = max(ids) + 12345
+    client = app.test_client()
+
+    resp = client.post(
+        "/api/selection/wildlife-state",
+        json={"photo_ids": ids + [unknown]},
+        content_type="application/json",
+    )
+
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert data["selected_count"] == len(ids)
+    assert data["missing_count"] == 1
+    assert data["requested_count"] == len(ids) + 1
+
+
+def test_batch_wildlife_excluded_skips_missing_and_out_of_workspace(app_and_db):
+    """The batch endpoint applies to accessible photos and reports the
+    rest as ``skipped_count`` instead of rejecting the whole selection.
+
+    The panel derives its counts from the same subset via
+    ``/api/selection/wildlife-state``; rejecting a partial selection here
+    made those counts and actions disagree — the user would see an
+    Exclude button then get a 404/403 on submit.
+    """
+    app, db = app_and_db
+    ids = [
+        row["id"]
+        for row in db.conn.execute(
+            "SELECT id FROM photos ORDER BY filename"
+        ).fetchall()
+    ]
+    other_ws = db.create_workspace("other-batch")
+    original_ws = db._active_workspace_id
+    db.set_active_workspace(other_ws)
+    stray_folder = db.add_folder("/batch-stray", name="batch-stray")
+    stray = db.add_photo(
+        folder_id=stray_folder, filename="batch-stray.jpg", extension=".jpg",
+        file_size=100, file_mtime=1.0,
+    )
+    db.set_active_workspace(original_ws)
+    unknown = max(ids + [stray]) + 999
+
+    client = app.test_client()
+    resp = client.post(
+        "/api/batch/wildlife-excluded",
+        json={
+            "photo_ids": ids + [stray, unknown],
+            "excluded": True,
+        },
+        content_type="application/json",
+    )
+
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert data["ok"] is True
+    assert data["updated"] == len(ids)
+    assert sorted(data["photo_ids"]) == sorted(ids)
+    assert data["skipped_count"] == 2
+
+    # The stray photo in the other workspace and the unknown id must not
+    # have been mutated.
+    stray_state = db.conn.execute(
+        "SELECT wildlife_excluded FROM photos WHERE id = ?", (stray,)
+    ).fetchone()
+    assert stray_state["wildlife_excluded"] == 0
+    for photo_id in ids:
+        row = db.conn.execute(
+            "SELECT wildlife_excluded FROM photos WHERE id = ?", (photo_id,)
+        ).fetchone()
+        assert row["wildlife_excluded"] == 1
 
 
 def test_batch_keyword_route_accepts_existing_keyword_id(app_and_db):

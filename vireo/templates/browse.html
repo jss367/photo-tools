@@ -6204,18 +6204,30 @@ async function renderSelectionWildlifeState(ids) {
   var includedCount = (data && data.included_count) || 0;
   var excludedCount = (data && data.excluded_count) || 0;
   var selectedCount = (data && data.selected_count) || 0;
-  if (!selectedCount) {
+  var missingCount = (data && data.missing_count) || 0;
+  if (!selectedCount && !missingCount) {
     status.textContent = '';
     actions.innerHTML = '';
     return;
   }
-  if (excludedCount === 0) {
-    status.textContent = 'All selected photos are included in wildlife processing.';
+  var statusText;
+  if (!selectedCount) {
+    statusText = '';
+  } else if (excludedCount === 0) {
+    statusText = 'All accessible photos are included in wildlife processing.';
   } else if (includedCount === 0) {
-    status.textContent = 'All selected photos are excluded from wildlife processing.';
+    statusText = 'All accessible photos are excluded from wildlife processing.';
   } else {
-    status.textContent = includedCount + ' included · ' + excludedCount + ' excluded';
+    statusText = includedCount + ' included · ' + excludedCount + ' excluded';
   }
+  // Surface missing IDs the same way the state endpoint reports them so
+  // the panel never implies its counts cover the full user selection when
+  // some photos are unavailable in the active workspace.
+  if (missingCount > 0) {
+    var missingText = missingCount + ' unavailable in this workspace';
+    statusText = statusText ? statusText + ' · ' + missingText : missingText;
+  }
+  status.textContent = statusText;
   var html = '';
   if (includedCount > 0) {
     html += '<button class="selection-keyword-remove" onclick="setSelectionWildlifeExcluded(true)">Exclude ' + includedCount + '</button>';
@@ -6248,6 +6260,14 @@ async function setSelectionWildlifeExcluded(excluded) {
   renderSelectionWildlifeState(getActiveSelection());
   scheduleCollectionCountsRefresh();
   refreshActiveCollectionAfterMembershipChange();
+  // The batch endpoint skips missing/out-of-workspace IDs instead of
+  // rejecting the whole selection; tell the user how many were skipped
+  // so a partial apply is never invisible.
+  var skipped = (data && data.skipped_count) || 0;
+  if (skipped > 0 && typeof showToast === 'function') {
+    showToast('Skipped ' + skipped + ' photo' + (skipped === 1 ? '' : 's') +
+              ' not accessible in this workspace.', 'warning');
+  }
   showUndoToast();
 }
 

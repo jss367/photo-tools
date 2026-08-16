@@ -19461,7 +19461,12 @@ class Database:
                     if touched:
                         self.conn.commit()
             elif entry['action_type'] == 'keyword_remove':
-                self.tag_photo(pid, int(entry['new_value']))
+                # Undo is an explicit request to restore the removed tag.
+                # Stamp the recreated association so durable authorship does
+                # not disappear merely because untagging deleted the row.
+                self.tag_photo(
+                    pid, int(entry['new_value']), source='manual',
+                )
                 kw = self.conn.execute("SELECT name FROM keywords WHERE id = ?",
                                        (int(entry['new_value']),)).fetchone()
                 if kw:
@@ -19564,7 +19569,15 @@ class Database:
                 kw = self.conn.execute("SELECT name FROM keywords WHERE id = ?",
                                        (int(entry['new_value']),)).fetchone()
                 if not _skip_tag_redo:
-                    self.tag_photo(pid, int(entry['new_value']))
+                    self.tag_photo(
+                        pid,
+                        int(entry['new_value']),
+                        source=(
+                            'manual'
+                            if entry['action_type'] == 'keyword_add'
+                            else None
+                        ),
+                    )
                     if kw:
                         self.queue_change(pid, 'keyword_add', kw['name'])
                 if entry['action_type'] == 'keyword_add':

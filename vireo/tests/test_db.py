@@ -6034,17 +6034,24 @@ def test_undo_last_edit_flag(tmp_path):
 
 
 def test_undo_last_edit_keyword_add(tmp_path):
-    """undo_last_edit removes keyword that was added."""
+    """Undo removes a manual add; redo restores its durable provenance."""
     db, pids = _make_db_with_photos(tmp_path)
     pid = pids[0]
     kid = db.add_keyword('Eagle')
-    db.tag_photo(pid, kid)
+    db.tag_photo(pid, kid, source="manual")
     db.record_edit('keyword_add', 'Added keyword "Eagle"', str(kid),
                    [{'photo_id': pid, 'old_value': '', 'new_value': str(kid)}])
 
     db.undo_last_edit()
     keywords = db.get_photo_keywords(pid)
     assert not any(k['name'] == 'Eagle' for k in keywords)
+
+    db.redo_last_undo()
+    source = db.conn.execute(
+        "SELECT source FROM photo_keywords WHERE photo_id = ? AND keyword_id = ?",
+        (pid, kid),
+    ).fetchone()
+    assert source["source"] == "manual"
 
 
 def test_undo_last_edit_keyword_remove(tmp_path):
@@ -6061,6 +6068,11 @@ def test_undo_last_edit_keyword_remove(tmp_path):
     db.undo_last_edit()
     keywords = db.get_photo_keywords(pid)
     assert any(k['id'] == kid for k in keywords)
+    source = db.conn.execute(
+        "SELECT source FROM photo_keywords WHERE photo_id = ? AND keyword_id = ?",
+        (pid, kid),
+    ).fetchone()
+    assert source["source"] == "manual"
 
 
 def test_undo_last_edit_batch(tmp_path):

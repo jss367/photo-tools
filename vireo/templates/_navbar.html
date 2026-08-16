@@ -10820,6 +10820,9 @@ function formatDuration(seconds) {
           _historySessionCount = Math.max(0, _historySessionCount - 1);
           document.getElementById('historyBadge').textContent = _historySessionCount || '';
           loadEditHistory();
+          document.dispatchEvent(new CustomEvent('vireo:edit-history-changed', {
+            detail: { operation: 'undo', result: data }
+          }));
         }
       })
       .catch(function() { if (btn) btn.disabled = false; });
@@ -10835,6 +10838,9 @@ function formatDuration(seconds) {
           _historySessionCount++;
           document.getElementById('historyBadge').textContent = _historySessionCount || '';
           loadEditHistory();
+          document.dispatchEvent(new CustomEvent('vireo:edit-history-changed', {
+            detail: { operation: 'redo', result: data }
+          }));
         }
       })
       .catch(function() { if (btn) btn.disabled = false; });

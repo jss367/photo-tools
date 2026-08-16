@@ -17838,42 +17838,74 @@ class Database:
                 rejected.add(key)
         return accepted, rejected
 
-    def count_classifier_runs(self, photo_ids, classifier_model, labels_fingerprint):
-        """Count distinct photos in `photo_ids` where EVERY runtime-classifiable
-        target has a classifier_runs row matching the given
+    def get_classifier_run_cache_hits(
+        self,
+        photo_ids,
+        classifier_model,
+        labels_fingerprint,
+        *,
+        contextual_weak_photo_ids=None,
+        weak_confidence=None,
+    ):
+        """Return the SET of photo IDs from ``photo_ids`` that the classify
+        preflight would consider fully cached under
         (classifier_model, labels_fingerprint).
 
         Used by the streaming pipeline's classify stage to pre-flight how
-        many photos will hit the cache vs. require fresh inference.
+        many photos will hit the cache vs. require fresh inference — and,
+        because ``_classification_eta_progress`` reconciles the estimate
+        from observed misses, also to know WHICH photos the preflight
+        expected to be cached. Only observed misses on preflight-expected
+        photos deflate the projected cache hits; misses on photos the
+        preflight never counted are unrelated to the estimate and must
+        not scale it down (Codex #1468 P2).
 
-        Photo-scoped to match runtime accounting: the classify loop keeps its
-        ``cached`` bucket photo-scoped (see pipeline_job.py — a photo lands
-        there only if every processed detection is a cache hit; the moment
-        any detection runs fresh inference it is promoted to ``count``).
-        So the preflight only counts a photo as cached when NO qualifying
-        detection would need fresh inference — otherwise a multi-subject
-        photo with one cached and one uncached detection would inflate
-        ``cached_estimate`` up to ``total`` and the banner would misread as
-        "no work to classify" when there is real work remaining.
+        Photo-scoped to match runtime accounting: the classify loop keeps
+        its ``cached`` bucket photo-scoped (see pipeline_job.py — a photo
+        lands there only if every processed detection is a cache hit; the
+        moment any detection runs fresh inference it is promoted to
+        ``count``). So the preflight only counts a photo as cached when
+        NO qualifying detection would need fresh inference — otherwise a
+        multi-subject photo with one cached and one uncached detection
+        would inflate ``cached_estimate`` up to ``total`` and the banner
+        would misread as "no work to classify" when there is real work
+        remaining.
 
         Above-threshold real detections must all have matching run keys,
         and photos where MegaDetector ran with ``box_count=0`` still count
         through their synthetic full-image anchor. Below-threshold real
         detections are ignored because the pipeline still skips them
         instead of falling back.
+
+        ``contextual_weak_photo_ids`` marks photos the classify loop will
+        rescue with a lowered ``weak_confidence`` floor. For those photos
+        the runtime picks one qualifying weak-threshold detection to
+        classify, so the preflight counts the photo when at least one of
+        its weak-threshold animal detections carries a matching run key.
+        Without this, a rerun over a cached weak tail is scored as pure
+        uncached work and the ETA can substantially overstate the time
+        remaining (Codex #1468 P2).
         """
         if not photo_ids:
-            return 0
+            return set()
         import config as cfg
         min_conf = self.get_effective_config(cfg.load()).get(
             "detector_confidence", 0.2,
         )
+        weak_photo_ids = set(contextual_weak_photo_ids or ())
+        weak_conf = (
+            float(weak_confidence) if weak_confidence is not None else min_conf
+        )
+        normal_ids = [pid for pid in photo_ids if pid not in weak_photo_ids]
+        weak_ids = [pid for pid in photo_ids if pid in weak_photo_ids]
         # Chunk to stay under SQLITE_MAX_VARIABLE_NUMBER (default 999).
         # Match the 500-element chunks used elsewhere in this file.
         CHUNK = 500
         matched = set()
-        for i in range(0, len(photo_ids), CHUNK):
-            chunk = photo_ids[i:i + CHUNK]
+        for i in range(0, len(normal_ids), CHUNK):
+            chunk = normal_ids[i:i + CHUNK]
+            if not chunk:
+                continue
             placeholders = ",".join("?" * len(chunk))
             # A photo counts as fully cached iff it has at least one
             # above-threshold real detection AND every above-threshold real
@@ -17918,6 +17950,40 @@ class Database:
             ).fetchall()
             for r in rows:
                 matched.add(r["photo_id"])
+        # Contextual-weak photos: the runtime classifies a single
+        # weak-threshold detection per photo (photo_dets[:1] in the
+        # classify loop). Mirror that by counting the photo whenever at
+        # least one of its weak-threshold animal detections carries a
+        # matching run key. This may optimistically count a photo whose
+        # picked detection turns out uncached — the pipeline's overcount
+        # tracker (photos_cache_overcounted_in_spec) then reconciles it
+        # via observed misses, which is only accurate because those
+        # misses are now scoped to preflight-expected photos.
+        for i in range(0, len(weak_ids), CHUNK):
+            chunk = weak_ids[i:i + CHUNK]
+            if not chunk:
+                continue
+            placeholders = ",".join("?" * len(chunk))
+            rows = self.conn.execute(
+                f"SELECT DISTINCT d.photo_id "
+                f"FROM detections d "
+                f"JOIN classifier_runs cr ON cr.detection_id = d.id "
+                f"  AND cr.classifier_model = ? "
+                f"  AND cr.labels_fingerprint = ? "
+                f"WHERE d.detector_model != 'full-image' "
+                f"  AND d.category = 'animal' "
+                f"  AND d.detector_confidence >= ? "
+                f"  AND d.photo_id IN ({placeholders})",
+                [classifier_model, labels_fingerprint, weak_conf, *chunk],
+            ).fetchall()
+            for r in rows:
+                matched.add(r["photo_id"])
+        # Full-image anchor branch applies uniformly (weak or not): the
+        # runtime falls through to a full-image classify only when a
+        # photo has no non-full-image detections at all.
+        for i in range(0, len(photo_ids), CHUNK):
+            chunk = photo_ids[i:i + CHUNK]
+            placeholders = ",".join("?" * len(chunk))
             rows = self.conn.execute(
                 f"""WITH full_anchor AS (
                         SELECT photo_id, MIN(id) AS detection_id
@@ -17945,7 +18011,31 @@ class Database:
             ).fetchall()
             for r in rows:
                 matched.add(r["photo_id"])
-        return len(matched)
+        return matched
+
+    def count_classifier_runs(
+        self,
+        photo_ids,
+        classifier_model,
+        labels_fingerprint,
+        *,
+        contextual_weak_photo_ids=None,
+        weak_confidence=None,
+    ):
+        """Return ``len(get_classifier_run_cache_hits(...))``.
+
+        Retained as a thin count-only shim so callers that don't need the
+        photo-id set (or preexisting tests) keep working; the id set is
+        the newer surface the pipeline uses to scope its overcount
+        tracker.
+        """
+        return len(self.get_classifier_run_cache_hits(
+            photo_ids,
+            classifier_model,
+            labels_fingerprint,
+            contextual_weak_photo_ids=contextual_weak_photo_ids,
+            weak_confidence=weak_confidence,
+        ))
 
     def get_labels_fingerprints(self):
         """Return all rows from the labels_fingerprints sidecar.

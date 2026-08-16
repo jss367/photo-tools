@@ -5355,18 +5355,42 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                     # ``remaining_uncached`` doesn't collapse to zero on
                     # collections dominated by these rows.
                     #
+                    # We keep the full preflight-cached photo id set (not
+                    # just its count) so overcount attribution can be
+                    # scoped: recording an overcount for a photo the
+                    # preflight never counted would deflate the projected
+                    # cache-hit rate for unrelated photos and prematurely
+                    # inflate ``remaining_uncached`` (Codex #1468 P2).
+                    # Contextual-weak photos use the lower
+                    # ``weak_detection_confidence`` floor to match the
+                    # runtime cache-hit predicate; otherwise the cached
+                    # weak tail is omitted from ``cached_est`` and the
+                    # ETA overstates remaining time (Codex #1468 P2).
+                    #
                     # Skipped on reclassify runs because the cache gate below
                     # is bypassed and every photo is re-inferred. In a
                     # multi-model run each model owns its own Jobs step, so
                     # accumulate the per-spec estimates for the stage while
                     # retaining this spec's value for its ETA.
                     cached_est = 0
+                    preflight_cached_ids: set = set()
                     if not params.reclassify:
-                        cached_est = thread_db.count_classifier_runs(
-                            [p["id"] for p in photos],
-                            model_name,
-                            spec_fp,
+                        preflight_cached_ids = (
+                            thread_db.get_classifier_run_cache_hits(
+                                [p["id"] for p in photos],
+                                model_name,
+                                spec_fp,
+                                contextual_weak_photo_ids=(
+                                    contextual_weak_ids
+                                ),
+                                weak_confidence=(
+                                    weak_detection_confidence
+                                    if contextual_weak_ids
+                                    else None
+                                ),
+                            )
                         )
+                        cached_est = len(preflight_cached_ids)
                         stages["classify"]["cached_estimate"] = (
                             stages["classify"].get("cached_estimate", 0) + cached_est
                         )
@@ -5889,10 +5913,24 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                                         # Reconcile the preflight's cache
                                         # estimate: it counted this photo based
                                         # solely on the run key existing, but
-                                        # runtime will actually infer.
-                                        photos_cache_overcounted_in_spec.add(
-                                            photo["id"],
-                                        )
+                                        # runtime will actually infer. Only
+                                        # record the overcount when the
+                                        # preflight actually counted this
+                                        # photo — otherwise a multi-detection
+                                        # photo whose other detection lacked
+                                        # any run key was never in
+                                        # ``cached_est`` to begin with, and
+                                        # treating this fall-through as a
+                                        # failed preflight prediction would
+                                        # deflate the projection for
+                                        # unrelated cache-heavy tails
+                                        # (Codex #1468 P2).
+                                        if (
+                                            photo["id"] in preflight_cached_ids
+                                        ):
+                                            photos_cache_overcounted_in_spec.add(
+                                                photo["id"],
+                                            )
                                     elif (
                                         model_name, spec_fp,
                                     ) in rejected_keys:
@@ -5911,10 +5949,19 @@ def run_pipeline_job(job, runner, db_path, workspace_id, params,
                                         # zero after the first uncached batch
                                         # and the UI reports "finishing…"
                                         # while most photos still need
-                                        # inference (Codex #1468 P2).
-                                        photos_cache_overcounted_in_spec.add(
-                                            photo["id"],
-                                        )
+                                        # inference (Codex #1468 P2). Same
+                                        # preflight-membership guard: an
+                                        # unrelated detection without any
+                                        # run key on this photo means the
+                                        # preflight never counted it, so
+                                        # this branch isn't a preflight
+                                        # miss to reconcile.
+                                        if (
+                                            photo["id"] in preflight_cached_ids
+                                        ):
+                                            photos_cache_overcounted_in_spec.add(
+                                                photo["id"],
+                                            )
 
                                 img, folder_path, image_path = _prepare_image(
                                     photo, folders,

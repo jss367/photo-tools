@@ -8531,7 +8531,6 @@ def test_get_classifier_run_key_gate_splits_accepted_and_rejected(tmp_path):
     the pipeline can't reconcile the two views and ``_classification_eta_progress``
     prematurely collapses ``remaining_uncached`` to zero.
     """
-    from db import Database
     db, pids = _make_workspace_with_photos(tmp_path, [{}])
     det_id = db.save_detections(pids[0], [
         {"box": {"x": 0, "y": 0, "w": 1, "h": 1},
@@ -18610,6 +18609,133 @@ def test_count_classifier_runs_ignores_non_animal_detections(tmp_path):
     assert db.count_classifier_runs(
         [p1, p2], "BioCLIP-2.5", "fp-a",
     ) == 1
+
+
+def test_get_classifier_run_cache_hits_returns_matched_photo_ids(tmp_path):
+    """The pipeline needs the SET (not just the count) so it can scope
+    its overcount tracker to preflight-expected photos — recording a
+    fall-through miss on a photo the preflight never counted would
+    deflate the projected cache-hit rate for unrelated tails
+    (Codex #1468 P2).
+    """
+    from db import Database
+    db = Database(str(tmp_path / "test.db"))
+    fid = db.add_folder("/photos", name="photos")
+    p_cached = db.add_photo(
+        folder_id=fid, filename="cached.jpg", extension=".jpg",
+        file_size=1, file_mtime=1.0, timestamp=None, width=1, height=1,
+    )
+    p_partial = db.add_photo(
+        folder_id=fid, filename="partial.jpg", extension=".jpg",
+        file_size=1, file_mtime=1.0, timestamp=None, width=1, height=1,
+    )
+    p_none = db.add_photo(
+        folder_id=fid, filename="none.jpg", extension=".jpg",
+        file_size=1, file_mtime=1.0, timestamp=None, width=1, height=1,
+    )
+
+    d_cached = _add_one_detection(db, p_cached)
+    db.record_classifier_run(
+        d_cached, "BioCLIP-2.5", "fp-a", prediction_count=1,
+    )
+
+    # Multi-detection: one has a run key, the other doesn't. Preflight
+    # must NOT count p_partial — the runtime will infer the uncached one.
+    d_partial_a = _add_one_detection(db, p_partial)
+    _ = _add_one_detection(db, p_partial)
+    db.record_classifier_run(
+        d_partial_a, "BioCLIP-2.5", "fp-a", prediction_count=1,
+    )
+
+    _ = _add_one_detection(db, p_none)
+
+    hits = db.get_classifier_run_cache_hits(
+        [p_cached, p_partial, p_none], "BioCLIP-2.5", "fp-a",
+    )
+    assert hits == {p_cached}, (
+        "Only the fully-cached photo should be reported; scoping the "
+        "overcount tracker to this set is what keeps Codex #1468 P2's "
+        "unrelated-photo deflation from happening."
+    )
+
+
+def test_get_classifier_run_cache_hits_includes_contextual_weak(tmp_path):
+    """Contextual weak photos are classified with the lowered
+    ``weak_detection_confidence`` floor; the preflight must apply the
+    same floor for these IDs or the cached weak tail is scored as pure
+    uncached work and the ETA overstates remaining time (Codex #1468 P2).
+    """
+    from db import Database
+    db = Database(str(tmp_path / "test.db"))
+    fid = db.add_folder("/photos", name="photos")
+    # Both photos carry only a weak-confidence detection. Under the
+    # normal 0.2 threshold neither has any qualifying detection, so the
+    # legacy preflight would omit both from ``cached_est``. Under the
+    # weak 0.12 floor only ``p_weak_cached`` has a matching run key.
+    p_weak_cached = db.add_photo(
+        folder_id=fid, filename="weak_cached.jpg", extension=".jpg",
+        file_size=1, file_mtime=1.0, timestamp=None, width=1, height=1,
+    )
+    p_weak_uncached = db.add_photo(
+        folder_id=fid, filename="weak_uncached.jpg", extension=".jpg",
+        file_size=1, file_mtime=1.0, timestamp=None, width=1, height=1,
+    )
+    d_weak_cached = _add_one_detection(db, p_weak_cached, conf=0.15)
+    db.record_classifier_run(
+        d_weak_cached, "BioCLIP-2.5", "fp-a", prediction_count=1,
+    )
+    _ = _add_one_detection(db, p_weak_uncached, conf=0.15)
+
+    # Legacy path (no weak args): both photos below the normal floor,
+    # neither counted. This is the buggy behavior the fix corrects.
+    assert db.get_classifier_run_cache_hits(
+        [p_weak_cached, p_weak_uncached], "BioCLIP-2.5", "fp-a",
+    ) == set()
+
+    # With contextual weak args the cached weak photo is counted.
+    hits = db.get_classifier_run_cache_hits(
+        [p_weak_cached, p_weak_uncached],
+        "BioCLIP-2.5", "fp-a",
+        contextual_weak_photo_ids={p_weak_cached, p_weak_uncached},
+        weak_confidence=0.12,
+    )
+    assert hits == {p_weak_cached}
+
+
+def test_get_classifier_run_cache_hits_weak_scoped_per_photo(tmp_path):
+    """``contextual_weak_photo_ids`` must apply only to the listed IDs.
+    A regular photo without an above-threshold cached detection should
+    still be excluded even if the weak floor would have qualified it.
+    """
+    from db import Database
+    db = Database(str(tmp_path / "test.db"))
+    fid = db.add_folder("/photos", name="photos")
+    p_normal_weak_only = db.add_photo(
+        folder_id=fid, filename="normal.jpg", extension=".jpg",
+        file_size=1, file_mtime=1.0, timestamp=None, width=1, height=1,
+    )
+    p_weak = db.add_photo(
+        folder_id=fid, filename="weak.jpg", extension=".jpg",
+        file_size=1, file_mtime=1.0, timestamp=None, width=1, height=1,
+    )
+    d_normal_low = _add_one_detection(db, p_normal_weak_only, conf=0.15)
+    db.record_classifier_run(
+        d_normal_low, "BioCLIP-2.5", "fp-a", prediction_count=1,
+    )
+    d_weak = _add_one_detection(db, p_weak, conf=0.15)
+    db.record_classifier_run(
+        d_weak, "BioCLIP-2.5", "fp-a", prediction_count=1,
+    )
+
+    # Only p_weak is in the contextual weak set; p_normal_weak_only stays
+    # gated by the ordinary detector_confidence floor.
+    hits = db.get_classifier_run_cache_hits(
+        [p_normal_weak_only, p_weak],
+        "BioCLIP-2.5", "fp-a",
+        contextual_weak_photo_ids={p_weak},
+        weak_confidence=0.12,
+    )
+    assert hits == {p_weak}
 
 
 def test_all_nav_ids_covers_every_page():

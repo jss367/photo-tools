@@ -1723,6 +1723,15 @@ body.sidebar-resizing {
 
     <!-- Grid -->
     <div class="grid-container" id="gridContainer">
+      <!-- A photo deep link paints the page holding the target, not the pages
+           before it. A bare button would leave the truncated grid reading as
+           the whole folder, so the banner states how many photos are missing
+           and where the grid actually starts (CORE_PHILOSOPHY.md: no black
+           boxes). -->
+      <div id="loadPreviousPhotosBanner" style="display:none;position:sticky;top:8px;z-index:5;margin:8px auto;padding:8px 14px;max-width:640px;border:1px solid var(--border-subtle);border-radius:4px;background:var(--bg-secondary);color:var(--text-secondary);font-size:13px;text-align:center;">
+        <span id="loadPreviousPhotosText"></span>
+        <button id="loadPreviousPhotosButton" onclick="loadPreviousPhotos()" style="margin-left:10px;padding:5px 12px;border:1px solid var(--border-subtle);border-radius:3px;background:var(--bg-tertiary);color:var(--text-primary);font-size:12px;font-weight:600;cursor:pointer;">Browse from beginning</button>
+      </div>
       <div class="grid" id="grid"></div>
       <div class="scroll-sentinel" id="scrollSentinel"></div>
       <div class="empty-state" id="emptyState" style="display:none;">No photos match the current filters.</div>
@@ -2043,6 +2052,7 @@ var currentPage = 1;
 var perPage = 50;
 var loading = false;
 var allLoaded = false;
+var earliestPage = 1;
 // True only after an authoritative response has initialized the grid, even
 // when that response contains zero photos. Health events can arrive while
 // bootstrap or a deep link is still pending; an "unaffected scope" is only
@@ -2068,7 +2078,10 @@ var colorLabels = {};    // {photo_id: color_string}
 // rendering "everything is uncoloured" for a still-loading selection.
 var colorLabelsFetched = new Set();
 var colorLabelGen = 0;   // bumped on local edits; guards against stale fetch responses
-var loadEpoch = 0;       // bumped on any grid reset; guards against stale loadPhotos responses
+// Generation counter for the grid window (photos/currentPage/earliestPage/
+// allLoaded). Never compare it directly — go through claimBrowseWindow() /
+// observeBrowseWindow() so every async path guards the same way.
+var loadEpoch = 0;
 var selectAllRequestSeq = 0; // bumped to ignore stale async select-all responses
 // rating/flag/color/date/keyword filter state now lives in VireoFilter
 // (the universal filter bar); Browse keeps only page-scope state.
@@ -2824,7 +2837,9 @@ var SKEL_POOL = 300;
 function updateGridTail() {
   var grid = document.getElementById('grid');
   var tail = document.getElementById('gridTail');
-  var remaining = allLoaded ? 0 : totalPhotos - photos.length;
+  // Photos before the loaded window are reached with "Browse from beginning",
+  // not by scrolling down — they must not inflate the downward runway.
+  var remaining = allLoaded ? 0 : totalPhotos - loadedWindowOffset() - photos.length;
   var cards = grid.getElementsByClassName('grid-card');
   var lastCard = cards.length ? cards[cards.length - 1] : null;
   if (remaining <= 0 || !lastCard) {
@@ -3033,6 +3048,14 @@ async function bootstrapBrowse() {
   // finally-region guard to release the load lock the concurrent health
   // refresh's ``loadPhotos`` still owned (Codex review r3686191138).
   var bootstrapHealthSeq = folderHealthRefreshSeq;
+  // The sort <select> is in the DOM before init resolves, so the user can
+  // change it (or edit a restored filter) while /api/browse/init is pending.
+  // applyFilters() → resetAndLoad() then claims the window and starts its own
+  // loadPhotos(); this bootstrap must not paint its now-abandoned dataset over
+  // that, nor release the ``loading`` mutex the newer load holds — the same
+  // stale-window hazard the deep-link loader guards against (Codex review
+  // r3792769108).
+  var bootstrapWindowIsCurrent = claimBrowseWindow();
   // Parse URL scope params BEFORE the first await. A folder-health event that
   // fires while ``_cfgPromise`` is still pending runs
   // refreshBrowseAfterFolderHealthChange(), which calls resetAndLoad() from
@@ -3104,18 +3127,25 @@ async function bootstrapBrowse() {
     }
 
     if (!healthChangedDuringInit) {
-      // Populate everything from a single response
-      photos = data.photos || [];
-      totalPhotos = data.total || 0;
-      currentPage = 2; // next page to load
-      if (photos.length >= totalPhotos) allLoaded = true;
-
+      // The sidebar trees are scope-independent, so render them even if a
+      // newer load owns the grid — otherwise a sort change during init would
+      // leave Browse with no folder/keyword/collection lists at all.
       renderFolderTree(data.folders || []);
       renderKeywordTree(data.keywords || []);
       renderCollectionList(data.collections || []);
-      renderGrid();
-      browseDatasetReady = true;
-      updateFilterSummary();
+      if (bootstrapWindowIsCurrent()) {
+        // Populate everything from a single response
+        photos = data.photos || [];
+        totalPhotos = data.total || 0;
+        currentPage = 2; // next page to load
+        earliestPage = 1; // bootstrap always starts at the top of the dataset
+        if (photos.length >= totalPhotos) allLoaded = true;
+
+        renderGrid();
+        updatePreviousPhotosButton();
+        browseDatasetReady = true;
+        updateFilterSummary();
+      }
       loadSummary();
     }
     refreshPendingSyncBanner();
@@ -3312,8 +3342,10 @@ async function bootstrapBrowse() {
   // still holds, letting the newly-rearmed observer fire a second page-1
   // request against the same ``loadEpoch``; both responses append and the
   // grid ends up with duplicated cards and off-by-one pagination
-  // (Codex review r3685627307).
-  if (!healthChangedDuringInit) {
+  // (Codex review r3685627307). The same reasoning applies when a filter or
+  // sort change claimed the window mid-init: its loadPhotos owns ``loading``
+  // and releases it in its own finally.
+  if (!healthChangedDuringInit && bootstrapWindowIsCurrent()) {
     loading = false;
     if (bootstrapSucceeded) {
       rearmInfiniteScrollObserver();
@@ -4957,6 +4989,37 @@ async function saveCollection() {
 }
 
 /* ---------- Photo Loading ---------- */
+
+/* Browse's grid window is four variables that only make sense together:
+   ``photos``, ``currentPage``, ``earliestPage`` and ``allLoaded`` describe one
+   contiguous slice of one dataset. Any async path that writes them has to
+   prove, after every await, that no newer load has taken the window over in
+   the meantime — otherwise a response from an abandoned dataset paints into a
+   window that has since changed (unscoped workspace rows appended to a
+   folder-scoped grid, an ``earliestPage`` banner counting photos from a
+   dataset that is no longer on screen). ``loadEpoch`` is that generation
+   counter; these two helpers are the only supported way to use it, so every
+   guard is written the same way instead of re-deriving the comparison at each
+   call site (Codex reviews r3792693920 and r3792769108).
+
+     claimBrowseWindow()   — take ownership. Advances loadEpoch, which
+                             invalidates every load already in flight. Use
+                             when about to replace the dataset: reset, folder
+                             switch, deep link, bootstrap.
+     observeBrowseWindow() — follow the current owner without displacing it.
+                             Use when extending a window somebody else already
+                             claimed (loadPhotos appending the next page).
+
+   Both return a zero-arg predicate; call it after each await, before touching
+   window state, releasing ``loading``, or rendering. */
+function claimBrowseWindow() {
+  return observeBrowseWindow(++loadEpoch);
+}
+function observeBrowseWindow(epoch) {
+  var claimedEpoch = (epoch === undefined) ? loadEpoch : epoch;
+  return function() { return loadEpoch === claimedEpoch; };
+}
+
 async function resetAndLoad(options) {
   var preserveAnchor = !!(options && options.preserveAnchor);
   // Callers that need the current collection scope to survive a reset
@@ -4970,7 +5033,9 @@ async function resetAndLoad(options) {
   photos = [];
   currentPage = 1;
   allLoaded = false;
-  var resetLoadEpoch = ++loadEpoch;
+  earliestPage = 1;
+  updatePreviousPhotosButton();
+  var resetWindowIsCurrent = claimBrowseWindow();
   selectAllRequestSeq++;
   loading = false;
   // Dataset is about to change; any prior selection (multi-select Set or
@@ -4993,7 +5058,7 @@ async function resetAndLoad(options) {
   document.getElementById('gridContainer').scrollTop = 0;
 
   function resetRequestIsCurrent() {
-    if (resetLoadEpoch !== loadEpoch) return false;
+    if (!resetWindowIsCurrent()) return false;
     if (activeCollectionId == null) return true;
     if (dashboardCollectionScope) return true;
     // Explicitly preserved collection: the reset is still current as long as
@@ -5062,11 +5127,52 @@ function buildCurrentBrowseParams() {
   return params;
 }
 
+/* How many photos of the current dataset sit before ``photos[0]``. Normally 0
+   — Browse loads a contiguous prefix — but a ?photo_id=... deep link starts at
+   the target's page, so everything that reasons about how much of the dataset
+   is on screen (tail runway, allLoaded gate, position readout) has to add it
+   back. */
+function loadedWindowOffset() {
+  return Math.max(0, (earliestPage - 1) * perPage);
+}
+
+function updatePreviousPhotosButton() {
+  var banner = document.getElementById('loadPreviousPhotosBanner');
+  if (!banner) return;
+  var offset = loadedWindowOffset();
+  if (earliestPage <= 1 || offset <= 0) {
+    banner.style.display = 'none';
+    return;
+  }
+  var textEl = document.getElementById('loadPreviousPhotosText');
+  if (textEl) {
+    textEl.textContent = offset === 1
+      ? '1 earlier photo isn’t loaded — this grid starts at #2.'
+      : offset.toLocaleString() + ' earlier photos aren’t loaded — ' +
+        'this grid starts at #' + (offset + 1).toLocaleString() + '.';
+  }
+  banner.style.display = 'block';
+}
+
+async function loadPreviousPhotos() {
+  if (loading || earliestPage <= 1) return false;
+  // Do not prepend an offset page read from a newer database snapshot to the
+  // focused page. Ingestion/deletion between those requests can overlap or
+  // skip the boundary. Restarting at page 1 hands control back to the normal
+  // contiguous lazy loader while keeping this user-requested transition
+  // bounded to one configured-size page.
+  earliestPage = 1;
+  updatePreviousPhotosButton();
+  return resetAndLoad();
+}
+
 async function loadPhotos(options) {
   if (loading) return null;
   if (allLoaded) return true;
   loading = true;
-  var epoch = loadEpoch;
+  // Extends the window its caller (resetAndLoad / bootstrap / deep link /
+  // the intersection observer) already owns — observe, never claim.
+  var windowIsCurrent = observeBrowseWindow();
   var loadSucceeded = false;
   var showLoading = !(options && options.silent) && photos.length === 0;
   var loadingState = document.getElementById('loadingState');
@@ -5120,7 +5226,7 @@ async function loadPhotos(options) {
 
   try {
     var data = await safeFetch(url, fetchOptions);
-    if (epoch !== loadEpoch) return null;  // grid was reset mid-flight; drop stale response
+    if (!windowIsCurrent()) return null;  // grid was reset mid-flight; drop stale response
     totalPhotos = data.total;
     if (window.VireoFilter && VireoFilter.setResultTotal) VireoFilter.setResultTotal(totalPhotos);
     if (window.VireoFilter && VireoFilter.setVisualInfo) {
@@ -5136,7 +5242,10 @@ async function loadPhotos(options) {
     } else {
       photos = photos.concat(data.photos);
       currentPage += chunk;
-      if (photos.length >= totalPhotos) allLoaded = true;
+      // A deep-link window starts partway in, so it is exhausted when it
+      // reaches the end of the dataset — not when it holds ``totalPhotos``
+      // rows, which it never would.
+      if (loadedWindowOffset() + photos.length >= totalPhotos) allLoaded = true;
     }
 
     if (firstNewIdx === 0) renderGrid();
@@ -5151,20 +5260,20 @@ async function loadPhotos(options) {
     if (data.photos.length > 0) {
       var refreshIds = data.photos.map(function(p) { return p.id; });
       loadInatStatus(refreshIds).then(function() {
-        if (epoch === loadEpoch) refreshGridCards(refreshIds);
+        if (windowIsCurrent()) refreshGridCards(refreshIds);
       });
       fetchColorLabels(refreshIds).then(function() {
-        if (epoch === loadEpoch) refreshGridCards(refreshIds);
+        if (windowIsCurrent()) refreshGridCards(refreshIds);
       });
     }
     loadSucceeded = true;
   } catch(e) {
-    if (epoch !== loadEpoch) return null;
+    if (!windowIsCurrent()) return null;
     if (showLoading && loadingState) {
       loadingState.textContent = 'Error loading photos.';
     }
   } finally {
-    if (epoch === loadEpoch) {
+    if (windowIsCurrent()) {
       loading = false;
       if (showLoading && loadingState) loadingState.style.display = 'none';
       // Re-check the scan depth live (not a load-start snapshot): a stale
@@ -5482,6 +5591,7 @@ function reloadBrowseResults(options) {
 
 function updateScrollPosition() {
   var el = document.getElementById('filterSummary');
+  var positionOffset = loadedWindowOffset();
   if (photos.length === 0) {
     el.textContent = totalPhotos + ' photos';
     return;
@@ -5503,8 +5613,14 @@ function updateScrollPosition() {
   if (lastCard.offsetTop + lastCard.offsetHeight < scrollTop) {
     var frac = Math.min(1, (scrollTop + viewHeight / 2) / Math.max(1, container.scrollHeight));
     var skeletonCount = document.querySelectorAll('#gridTail .skel-card').length;
-    var representedPhotos = Math.min(totalPhotos, photos.length + skeletonCount);
-    var approx = Math.max(1, Math.min(representedPhotos, Math.round(frac * representedPhotos)));
+    var representedPhotos = Math.min(
+      totalPhotos - positionOffset,
+      photos.length + skeletonCount
+    );
+    var approx = positionOffset + Math.max(
+      1,
+      Math.min(representedPhotos, Math.round(frac * representedPhotos))
+    );
     el.textContent = '≈' + approx.toLocaleString() + ' of ' + totalPhotos.toLocaleString();
     return;
   }
@@ -5523,7 +5639,8 @@ function updateScrollPosition() {
       break;
     }
   }
-  el.textContent = first + '–' + last + ' of ' + totalPhotos.toLocaleString();
+  el.textContent = (positionOffset + first) + '–' +
+    (positionOffset + last) + ' of ' + totalPhotos.toLocaleString();
 }
 
 /* ---------- iNaturalist ---------- */
@@ -5781,7 +5898,7 @@ async function selectAllMatchingPhotos() {
   selectedPhotoId = null;
   selectedIndex = -1;
   var requestSeq = ++selectAllRequestSeq;
-  var requestEpoch = loadEpoch;
+  var windowIsCurrent = observeBrowseWindow();
 
 
   var url;
@@ -5809,7 +5926,7 @@ async function selectAllMatchingPhotos() {
   showToast('Selecting all matching photos...');
   try {
     var data = await safeFetch(url, fetchOpts, { toast: false });
-    if (requestSeq !== selectAllRequestSeq || requestEpoch !== loadEpoch) return;
+    if (requestSeq !== selectAllRequestSeq || !windowIsCurrent()) return;
     selectedPhotos.clear();
     (data.photo_ids || data.ids || []).forEach(function(id) { selectedPhotos.add(id); });
     renderGrid();
@@ -9503,6 +9620,7 @@ async function _runPhotoDeepLink(photoId) {
   // Prevent the IntersectionObserver from triggering loadPhotos() while deep-link is loading
   loading = true;
   var deepLinkLoaded = false;
+  var isDeepLinkDatasetCurrent = null;
   try {
     applyBrowseConfig(await _cfgPromise);
     if (!isDeepLinkHealthCurrent()) { wasSuperseded = true; return wasSuperseded; }
@@ -9517,6 +9635,18 @@ async function _runPhotoDeepLink(photoId) {
       return wasSuperseded;
     }
 
+    // Take ownership of the grid window BEFORE clearing it. A sort change or
+    // folder click that happened while /api/photos/<id> was pending already
+    // ran resetAndLoad(), which advanced loadEpoch and started its own
+    // loadPhotos(). Merely snapshotting the epoch that reset installed would
+    // leave that in-flight load valid: it would land after this deep link had
+    // claimed the target folder and append its unscoped workspace rows into
+    // the folder-scoped grid (and, once earliestPage is set below, leave the
+    // "N earlier photos aren't loaded" banner counting against a dataset that
+    // is no longer on screen). Claiming discards every load started before
+    // this point (Codex review r3792769108).
+    var deepLinkWindowIsCurrent = claimBrowseWindow();
+
     // Navigate to the photo's folder
     activeFolderId = photo.folder_id;
     activeKeyword = null;
@@ -9525,6 +9655,8 @@ async function _runPhotoDeepLink(photoId) {
     photos = [];
     currentPage = 1;
     allLoaded = false;
+    earliestPage = 1;
+    updatePreviousPhotosButton();
     // Same hazard as filterByCollection: leaving selectedPhotos populated
     // across a dataset switch leaves the batch bar armed against stale ids.
     selectedPhotos.clear();
@@ -9533,14 +9665,34 @@ async function _runPhotoDeepLink(photoId) {
     closeDetail();
     document.getElementById('grid').innerHTML = '';
 
-    // Load pages until the target photo is found or all pages exhausted
-    // (bootstrapBrowse was skipped, so we also need folder/keyword trees)
+    // A folder click, sort change, or filter edit calls resetAndLoad(), which
+    // advances loadEpoch (and scope changes also advance browseScopeGen).
+    // Snapshot the scope generation alongside the window claim above so a
+    // later user selection cannot be overwritten by this deep-link response.
+    var deepLinkScopeGen = browseScopeGen;
+    var deepLinkFolderId = photo.folder_id;
+    var deepLinkSort = document.getElementById('sortSelect').value;
+    isDeepLinkDatasetCurrent = function() {
+      return deepLinkWindowIsCurrent() &&
+        browseScopeGen === deepLinkScopeGen &&
+        activeFolderId === deepLinkFolderId &&
+        document.getElementById('sortSelect').value === deepLinkSort;
+    };
+
+    // bootstrapBrowse was skipped, so load the target folder's first page and
+    // the shared folder/keyword/collection trees before locating the photo.
     var missingSnapshotVersionAtInitStart =
       typeof _missingFoldersSnapshotVersion !== 'undefined'
         ? _missingFoldersSnapshotVersion
         : null;
-    var initData = await safeFetch('/api/browse/init?folder_id=' + photo.folder_id + '&per_page=' + perPage + '&sort=' + document.getElementById('sortSelect').value, {}, { toast: false });
+    var initParams = new URLSearchParams();
+    initParams.set('folder_id', photo.folder_id);
+    initParams.set('per_page', perPage);
+    initParams.set('sort', deepLinkSort);
+    initParams.set('focus_photo_id', photoId);
+    var initData = await safeFetch('/api/browse/init?' + initParams.toString(), {}, { toast: false });
     if (!isDeepLinkHealthCurrent()) { wasSuperseded = true; return wasSuperseded; }
+    if (!isDeepLinkDatasetCurrent()) return wasSuperseded;
     if (initData) {
       // Seed the navbar's missing-folder snapshot from init's workspace-scoped
       // view so the first /api/folders/missing observation has a baseline to
@@ -9563,6 +9715,7 @@ async function _runPhotoDeepLink(photoId) {
           'deep-link-reconcile',
           initData.folder_health_version);
         if (!isDeepLinkHealthCurrent()) { wasSuperseded = true; return wasSuperseded; }
+        if (!isDeepLinkDatasetCurrent()) return wasSuperseded;
       }
       renderFolderTree(initData.folders || []);
       renderKeywordTree(initData.keywords || []);
@@ -9570,24 +9723,35 @@ async function _runPhotoDeepLink(photoId) {
       loadCollectionCounts();
       photos = initData.photos || [];
       totalPhotos = initData.total || 0;
-      currentPage = 2;
-      if (photos.length >= totalPhotos) allLoaded = true;
+      var focusPage = parseInt(initData.focus_page, 10);
+      var hasFocusPage = Number.isInteger(focusPage) && focusPage >= 1;
+      earliestPage = hasFocusPage ? focusPage : 1;
+      currentPage = hasFocusPage ? focusPage + 1 : 2;
+      if (loadedWindowOffset() + photos.length >= totalPhotos) allLoaded = true;
       renderGrid();
+      updatePreviousPhotosButton();
       browseDatasetReady = true;
       document.getElementById('loadingState').style.display = 'none';
       deepLinkLoaded = true;
     }
 
-    // Keep loading pages until we find the photo or run out. The setup guard
-    // above intentionally blocks IntersectionObserver-driven loads, but
-    // loadPhotos() also honors it; clear it before this explicit paging pass
-    // or a target beyond the first page spins in a resolved Promise loop.
-    // Same freshness guard as above — don't release ``loading`` if a health
-    // refresh took ownership while init was in flight.
+    // The focused init response normally includes the bounded page containing
+    // the target from one SQLite read snapshot. Later pages remain lazy so a
+    // deep target cannot force Browse to render every preceding card. Fall
+    // back to the old serial scan for compatibility or if the target vanished.
     if (!isDeepLinkHealthCurrent()) { wasSuperseded = true; return wasSuperseded; }
-    loading = false;
-    var el = await loadUntilPhotoRendered(photoId);
+    if (!isDeepLinkDatasetCurrent()) return wasSuperseded;
+    var el = getGridCard(photoId);
+    if (!el) {
+      // loadPhotos() honors the setup guard, so release it before the explicit
+      // compatibility/reconciliation scan or it would return immediately.
+      loading = false;
+      el = await loadUntilPhotoRendered(photoId, function() {
+        return isDeepLinkHealthCurrent() && isDeepLinkDatasetCurrent();
+      });
+    }
     if (!isDeepLinkHealthCurrent()) { wasSuperseded = true; return wasSuperseded; }
+    if (!isDeepLinkDatasetCurrent()) return wasSuperseded;
 
     // Update folder tree active state
     document.querySelectorAll('#folderTree .tree-item').forEach(function(el) {
@@ -9642,7 +9806,8 @@ async function _runPhotoDeepLink(photoId) {
   // ``loading`` here would let a second page-1 request race against the
   // same loadEpoch, producing duplicate cards and off-by-one pagination
   // (Codex review r3686696351).
-  if (isDeepLinkHealthCurrent()) {
+  if (isDeepLinkHealthCurrent() &&
+      (!isDeepLinkDatasetCurrent || isDeepLinkDatasetCurrent())) {
     loading = false;
     if (deepLinkLoaded) {
       rearmInfiniteScrollObserver();

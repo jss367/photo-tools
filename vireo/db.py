@@ -7864,6 +7864,64 @@ class Database:
         """
         return [row["id"] for row in self.conn.execute(query, params).fetchall()]
 
+    def get_photo_position(
+        self,
+        photo_id,
+        folder_id=None,
+        collection_id=None,
+        sort="date",
+    ):
+        """Return a photo's zero-based position without materializing all IDs."""
+        conditions = ["wf.workspace_id = ?"]
+        params = [self._ws_id()]
+
+        if folder_id is not None:
+            subtree = self.get_folder_subtree_ids(folder_id)
+            placeholders = ",".join("?" for _ in subtree)
+            conditions.append(f"p.folder_id IN ({placeholders})")
+            params.extend(subtree)
+        if collection_id is not None:
+            parts = self._build_collection_query(collection_id)
+            if parts is None:
+                raise ValueError("collection not found in active workspace")
+            coll_folder_join, coll_join_clause, coll_where, coll_params = parts
+            coll_subquery = (
+                "SELECT DISTINCT p.id FROM photos p "
+                f"{coll_folder_join} {coll_join_clause} {coll_where}"
+            )
+            conditions.append(f"p.id IN ({coll_subquery})")
+            params.extend(coll_params)
+
+        sort_map = {
+            "date": _PHOTO_DATE_ASC_ORDER,
+            "date_desc": _PHOTO_DATE_DESC_ORDER,
+            "name": "p.filename ASC, p.id ASC",
+            "name_desc": "p.filename DESC, p.id ASC",
+            "rating": "p.rating DESC, p.filename ASC, p.id ASC",
+            "sharpness": "p.sharpness DESC, p.filename ASC, p.id ASC",
+            "sharpness_asc": "p.sharpness ASC, p.filename ASC, p.id ASC",
+            "quality": "p.quality_score DESC, p.filename ASC, p.id ASC",
+        }
+        order = sort_map.get(sort, _PHOTO_DATE_ASC_ORDER)
+        where = "WHERE " + " AND ".join(conditions)
+        row = self.conn.execute(
+            f"""
+            SELECT position
+            FROM (
+                SELECT p.id,
+                       ROW_NUMBER() OVER (ORDER BY {order}) - 1 AS position
+                FROM photos p
+                JOIN workspace_folders wf ON wf.folder_id = p.folder_id
+                JOIN folders f ON f.id = p.folder_id
+                    AND f.status IN ('ok', 'partial')
+                {where}
+            ) ordered_photos
+            WHERE id = ?
+            """,
+            params + [photo_id],
+        ).fetchone()
+        return int(row["position"]) if row is not None else None
+
     def count_filtered_photos(
         self,
         folder_id=None,

@@ -5909,12 +5909,13 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         """Combined endpoint for browse page initial load — one request instead of five."""
         import config as cfg
         db = _get_db()
-        page = request.args.get("page", 1, type=int)
+        page = max(1, request.args.get("page", 1, type=int))
         default_per_page = cfg.load().get("photos_per_page", 50)
         per_page = max(1, min(request.args.get("per_page", default_per_page, type=int), _MAX_PER_PAGE))
         sort = request.args.get("sort", "date")
         folder_id = request.args.get("folder_id", None, type=int)
         collection_id = request.args.get("collection_id", None, type=int)
+        focus_photo_id = request.args.get("focus_photo_id", None, type=int)
 
         # Keep the combined first-paint payload on one SQLite read snapshot.
         # Independent SELECT snapshots can straddle a background folder-health
@@ -5972,6 +5973,8 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
         if visual_first_paint:
             photos = []
             total = 0
+            focus_index = None
+            focus_page = page
         else:
             try:
                 photos = db.get_photos(
@@ -5995,6 +5998,62 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 except ValueError as exc:
                     db.conn.rollback()
                     return json_error(str(exc), 400)
+            # Photo deep links need the target's position in the exact sort
+            # order used by this first paint. Returning the zero-based index
+            # and its bounded page from this read snapshot avoids probing
+            # serial 50-photo pages until the target happens to appear. Keep
+            # the extra ordered-id query opt-in so ordinary Browse loads retain
+            # their existing cost.
+            #
+            # When the target is already in the first-page ``photos`` fetched
+            # above (the common case — Highlights and most native actions open
+            # a photo whose sorted position is on page 1), compute the index
+            # from that page directly.  Materializing every folder ID would
+            # add O(folder size) latency and memory to the critical first
+            # paint on the documented 100K- and 1M-photo libraries, even when
+            # a lookup was never necessary (Codex review r3792637103).
+            focus_index = None
+            focus_page = page
+            if focus_photo_id is not None:
+                local_index = None
+                for offset, row in enumerate(photos):
+                    if row["id"] == focus_photo_id:
+                        local_index = offset
+                        break
+                if local_index is not None:
+                    focus_index = (page - 1) * per_page + local_index
+                else:
+                    try:
+                        focus_index = db.get_photo_position(
+                            focus_photo_id,
+                            folder_id=folder_id,
+                            collection_id=collection_id,
+                            sort=sort,
+                        )
+                    except ValueError as exc:
+                        db.conn.rollback()
+                        return json_error(str(exc), 400)
+                # Return only the bounded page containing the target from the
+                # same SQLite read snapshot as its position and total. Sending
+                # every preceding row can freeze Browse for a focus deep in a
+                # million-photo folder; independent parallel offset requests,
+                # meanwhile, allow ingestion/deletion to create overlaps,
+                # gaps, and stale totals. One target page avoids both failure
+                # modes, and ordinary lazy paging resumes after it.
+                if focus_index is not None:
+                    focus_page = focus_index // per_page + 1
+                    if focus_page != page:
+                        try:
+                            photos = db.get_photos(
+                                folder_id=folder_id,
+                                collection_id=collection_id,
+                                page=focus_page,
+                                per_page=per_page,
+                                sort=sort,
+                            )
+                        except ValueError as exc:
+                            db.conn.rollback()
+                            return json_error(str(exc), 400)
         folders = db.get_folder_tree()
         keywords = db.get_keyword_tree()
         collections = db.get_collections()
@@ -6054,6 +6113,8 @@ def create_app(db_path, thumb_cache_dir=None, api_token=None):
                 "collections": collection_dicts,
                 "missing_folder_ids": missing_folder_ids,
                 "folder_health_version": folder_health_version,
+                "focus_index": focus_index,
+                "focus_page": focus_page,
             }
         )
         # End the read transaction after every value in the response has been

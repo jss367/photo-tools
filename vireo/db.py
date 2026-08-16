@@ -36,7 +36,103 @@ AUTO_MATCH_REVIEW_MARKER = "__vireo_auto_match__"
 # provenance-neutral writer has to say so explicitly. See
 # ``test_keyword_provenance_contract.py``, which pins that inventory.
 KEYWORD_SOURCE_MANUAL = "manual"
+# Written by the prediction-accept path (PR #1479 Phase 4). Nothing in this
+# module writes it yet; it is declared here so the lattice below has its
+# middle element and both PRs share one ordering instead of two.
+KEYWORD_SOURCE_ACCEPT = "accept"
 KEYWORD_SOURCE_UNKNOWN = None
+
+# Provenance is a lattice, weakest first: NULL < 'accept' < 'manual'.
+#
+# The rule the lattice exists to state once: **when two associations for the
+# same (photo, keyword) converge, the survivor takes the stronger claim,
+# never the weaker.** Associations converge in more places than they are
+# created — a duplicate merge folds losers onto a winner, a keyword
+# rename/curation-merge repoints rows onto a canonical keyword, RAW/JPEG
+# companion pairing copies a companion's keywords onto the primary, and every
+# ``tag_photo`` re-tag lands on a row that may already exist. Each of those is
+# a place where a hand-added keyword can quietly decay into an unattributed
+# row that ``retire_builtin_wildlife_genre()`` then reads as generated and
+# deletes. ``COALESCE(new, old)`` is not the rule — it is only accidentally
+# equal to it while the column is set-or-NULL, and it downgrades 'manual' to
+# 'accept' the moment a third value exists.
+#
+# So the fold is expressed once, here, and every convergence point uses it:
+# ``keyword_source_max`` in Python, ``keyword_source_max_sql`` /
+# ``KEYWORD_SOURCE_CONFLICT_SQL`` in SQL.
+# ``test_keyword_provenance_contract.py`` enumerates the call sites and fails
+# on a new one that does not.
+KEYWORD_SOURCE_PRECEDENCE = (
+    KEYWORD_SOURCE_UNKNOWN,
+    KEYWORD_SOURCE_ACCEPT,
+    KEYWORD_SOURCE_MANUAL,
+)
+_KEYWORD_SOURCE_RANK = {
+    value: rank for rank, value in enumerate(KEYWORD_SOURCE_PRECEDENCE)
+}
+# A stamp this build does not recognise still means "somebody deliberately
+# claimed this row", so it must outrank "no stamp at all" — but it never
+# outranks an explicit 'manual', which is the one value with a delete-safety
+# guarantee attached.
+_KEYWORD_SOURCE_UNRECOGNIZED_RANK = 1
+
+
+def keyword_source_rank(source):
+    """Position of ``source`` in the provenance lattice (higher = stronger)."""
+    if source is None:
+        return _KEYWORD_SOURCE_RANK[KEYWORD_SOURCE_UNKNOWN]
+    return _KEYWORD_SOURCE_RANK.get(source, _KEYWORD_SOURCE_UNRECOGNIZED_RANK)
+
+
+def keyword_source_max(*sources):
+    """Return the strongest of ``sources``: the fold for converging rows.
+
+    Ties keep the first argument, so callers pass the incoming/stronger
+    candidate first when they want it to win a same-rank tie.
+    """
+    best = KEYWORD_SOURCE_UNKNOWN
+    best_rank = keyword_source_rank(KEYWORD_SOURCE_UNKNOWN)
+    for source in sources:
+        rank = keyword_source_rank(source)
+        if rank > best_rank:
+            best, best_rank = source, rank
+    return best
+
+
+def keyword_source_rank_sql(expr):
+    """SQL for ``keyword_source_rank(expr)``, from the same ordering."""
+    whens = " ".join(
+        f"WHEN {expr} = '{value}' THEN {rank}"
+        for rank, value in enumerate(KEYWORD_SOURCE_PRECEDENCE)
+        if value is not None
+    )
+    return (
+        f"(CASE WHEN {expr} IS NULL THEN "
+        f"{_KEYWORD_SOURCE_RANK[KEYWORD_SOURCE_UNKNOWN]} {whens} "
+        f"ELSE {_KEYWORD_SOURCE_UNRECOGNIZED_RANK} END)"
+    )
+
+
+def keyword_source_max_sql(left, right):
+    """SQL for ``keyword_source_max(left, right)``.
+
+    ``left`` and ``right`` are SQL expressions and are each substituted twice
+    (once to rank, once to yield the value), so pass column references,
+    literals, or scalar subqueries bound with *named* parameters — positional
+    ``?`` would have to be supplied twice in an order the caller cannot see.
+    """
+    return (
+        f"(CASE WHEN {keyword_source_rank_sql(left)} >= "
+        f"{keyword_source_rank_sql(right)} THEN {left} ELSE {right} END)"
+    )
+
+
+# The upsert clause every ``INSERT INTO photo_keywords`` must end with: an
+# existing row keeps its provenance unless the incoming row's is stronger.
+KEYWORD_SOURCE_CONFLICT_SQL = (
+    "ON CONFLICT(photo_id, keyword_id) DO UPDATE SET source = "
+    + keyword_source_max_sql("excluded.source", "photo_keywords.source")
+)
 
 _SQLITE_PARAM_CHUNK_SIZE = 800
 _MISSING_PHOTOS_PROGRESS_INTERVAL = 200
@@ -3257,7 +3353,9 @@ class Database:
         # fact at the earliest moment the migration can observe it.
         self.conn.execute(
             f"""UPDATE photo_keywords
-                SET source = 'manual'
+                SET source = {keyword_source_max_sql(
+                    "photo_keywords.source", f"'{KEYWORD_SOURCE_MANUAL}'",
+                )}
                 WHERE keyword_id IN ({placeholders})
                   AND (source IS NULL OR source <> 'manual')
                   AND (
@@ -3564,8 +3662,11 @@ class Database:
 
         if sidecar_manual_pairs:
             self.conn.executemany(
-                "UPDATE photo_keywords SET source = 'manual' "
-                "WHERE photo_id = ? AND keyword_id = ?",
+                "UPDATE photo_keywords SET source = "
+                + keyword_source_max_sql(
+                    "photo_keywords.source", f"'{KEYWORD_SOURCE_MANUAL}'",
+                )
+                + " WHERE photo_id = ? AND keyword_id = ?",
                 sidecar_manual_pairs,
             )
             self.conn.commit()
@@ -6041,24 +6142,23 @@ class Database:
             # Carry every loser's durable provenance onto the winner,
             # including keyword IDs the winner already has. merge_metadata()
             # omits overlaps from keyword_ids_to_add, but a manual loser must
-            # still upgrade an unknown winner association.
+            # still upgrade a weaker winner association — so this loop is
+            # driven by what the losers carry, not by what needs adding.
+            # tag_photo's upsert folds against the winner's own stamp, so a
+            # weak loser can never pull a stronger winner down.
             loser_keyword_sources = {}
             for chunk in _chunks(loser_ids):
                 loser_placeholders = ",".join("?" * len(chunk))
                 rows = self.conn.execute(
-                    f"""SELECT keyword_id, MAX(source) AS source
+                    f"""SELECT keyword_id, source
                         FROM photo_keywords
-                        WHERE photo_id IN ({loser_placeholders})
-                        GROUP BY keyword_id""",
+                        WHERE photo_id IN ({loser_placeholders})""",
                     chunk,
                 ).fetchall()
                 for row in rows:
-                    previous = loser_keyword_sources.get(row["keyword_id"])
-                    loser_keyword_sources[row["keyword_id"]] = (
-                        KEYWORD_SOURCE_MANUAL
-                        if previous == KEYWORD_SOURCE_MANUAL
-                        or row["source"] == KEYWORD_SOURCE_MANUAL
-                        else KEYWORD_SOURCE_UNKNOWN
+                    kw_id = row["keyword_id"]
+                    loser_keyword_sources[kw_id] = keyword_source_max(
+                        row["source"], loser_keyword_sources.get(kw_id),
                     )
             for kw_id, merged_source in loser_keyword_sources.items():
                 self.tag_photo(
@@ -11672,15 +11772,13 @@ class Database:
                                 ) from inner_err
                     # Re-point photo_keywords from old → canonical, carrying
                     # each association's durable provenance with it. On a
-                    # conflict the canonical row keeps whichever side is
-                    # 'manual' rather than silently dropping the stamp.
+                    # conflict the canonical row keeps the stronger of the two
+                    # claims rather than silently dropping a stamp.
                     self.conn.execute(
-                        """INSERT INTO photo_keywords (photo_id, keyword_id, source)
+                        f"""INSERT INTO photo_keywords (photo_id, keyword_id, source)
                            SELECT photo_id, ?, source
                            FROM photo_keywords WHERE keyword_id = ?
-                           ON CONFLICT(photo_id, keyword_id) DO UPDATE SET
-                             source = COALESCE(excluded.source,
-                                               photo_keywords.source)""",
+                           {KEYWORD_SOURCE_CONFLICT_SQL}""",
                         (canonical_id, keyword_id),
                     )
                     self.conn.execute(
@@ -14131,18 +14229,26 @@ class Database:
         # Preserve durable authorship before collapsing association conflicts.
         # UPDATE OR IGNORE below leaves the destination row untouched when a
         # photo already carries both keywords; without this fold, deleting the
-        # source would also delete its only ``source='manual'`` stamp.
+        # source would also delete its only ``source='manual'`` stamp. The
+        # fold runs in both directions — a weaker destination is raised to the
+        # source's claim, and a stronger destination keeps its own.
+        src_source_sql = (
+            "(SELECT src_pk.source FROM photo_keywords src_pk "
+            "WHERE src_pk.photo_id = dst_pk.photo_id "
+            "AND src_pk.keyword_id = :src_id)"
+        )
         self.conn.execute(
-            """UPDATE photo_keywords AS dst_pk
-               SET source = 'manual'
-               WHERE dst_pk.keyword_id = ?
+            f"""UPDATE photo_keywords AS dst_pk
+               SET source = {keyword_source_max_sql(
+                   "dst_pk.source", src_source_sql,
+               )}
+               WHERE dst_pk.keyword_id = :dst_id
                  AND EXISTS (
                      SELECT 1 FROM photo_keywords src_pk
                      WHERE src_pk.photo_id = dst_pk.photo_id
-                       AND src_pk.keyword_id = ?
-                       AND src_pk.source = 'manual'
+                       AND src_pk.keyword_id = :src_id
                  )""",
-            (dst_id, src_id),
+            {"dst_id": dst_id, "src_id": src_id},
         )
         # Move photo associations (ignore if already exists for dst_id),
         # then drop the leftovers. Non-conflicting rows carry their source
@@ -14250,16 +14356,17 @@ class Database:
                     ``KEYWORD_SOURCE_UNKNOWN``, and they must do it
                     explicitly — the contract test enumerates them.
 
-                    An existing stamp is never downgraded: re-tagging with
-                    ``KEYWORD_SOURCE_UNKNOWN`` keeps a recorded ``'manual'``.
+                    An existing stamp is never downgraded: the upsert stores
+                    the lattice max of the existing and incoming values, so
+                    re-tagging with ``KEYWORD_SOURCE_UNKNOWN`` keeps a
+                    recorded ``'manual'`` (and a future ``'accept'`` re-tag
+                    would too).
             _commit: If False, skip the internal commit (caller is responsible
                      for committing the transaction).
         """
         self.conn.execute(
             "INSERT INTO photo_keywords (photo_id, keyword_id, source) "
-            "VALUES (?, ?, ?) "
-            "ON CONFLICT(photo_id, keyword_id) DO UPDATE SET "
-            "source = COALESCE(excluded.source, photo_keywords.source)",
+            "VALUES (?, ?, ?) " + KEYWORD_SOURCE_CONFLICT_SQL,
             (photo_id, keyword_id, source),
         )
         if _commit:

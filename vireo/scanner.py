@@ -16,7 +16,11 @@ from datetime import datetime
 from pathlib import Path
 
 import imagehash
-from db import KEYWORD_SOURCE_UNKNOWN, commit_with_retry
+from db import (
+    KEYWORD_SOURCE_CONFLICT_SQL,
+    KEYWORD_SOURCE_UNKNOWN,
+    commit_with_retry,
+)
 from exif_orientation import orientation_swaps_axes as _orientation_swaps_axes
 from image_loader import (
     RAW_EXTENSIONS,
@@ -552,11 +556,11 @@ def _pair_raw_jpeg_companions(db, vireo_dir=None, thumb_cache_dir=None):
             # Move the association's provenance with it: pairing a RAW with
             # its camera JPEG must not turn the user's hand-added keywords
             # into "unknown" rows a retirement pass would treat as generated.
+            # The shared conflict clause keeps whichever side's claim is
+            # stronger when the primary already carries the keyword.
             db.conn.execute(
                 "INSERT INTO photo_keywords (photo_id, keyword_id, source) "
-                "VALUES (?, ?, ?) "
-                "ON CONFLICT(photo_id, keyword_id) DO UPDATE SET "
-                "source = COALESCE(excluded.source, photo_keywords.source)",
+                "VALUES (?, ?, ?) " + KEYWORD_SOURCE_CONFLICT_SQL,
                 (primary["id"], kw["keyword_id"], kw["source"]),
             )
 

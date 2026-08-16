@@ -72,6 +72,81 @@ def test_session_cache_lock_wait_honors_bound_cancel_probe():
         resource_ledger._set_resource_ledger_for_tests(previous)
 
 
+def test_session_cache_lock_acquire_race_with_cancel_releases_and_raises():
+    """Regression: when cancellation becomes true during the 0.2s
+    ``lock.acquire(timeout=0.2)`` window inside
+    ``acquire_session_cache_lock`` and the previous holder releases in
+    the same window, the acquire succeeds and the caller used to
+    proceed with the lock held despite the pending cancel. For an
+    already-cancelled eye-keypoint participant waiting on
+    ``_download_locks``, that meant a fresh multi-hundred-megabyte
+    download would start if the previous holder exited with only one
+    of the two required files on disk. Recheck the probe after
+    acquire; release the lock and raise if cancel won the race.
+    Matches the same fix already applied to the GPU semaphore's
+    ``_GpuLockContext``.
+    """
+    import onnx_runtime
+    import resource_ledger
+
+    lock = threading.Lock()
+    lock.acquire()
+    holder_released = False
+    ledger = resource_ledger.ResourceLedger(cpu_capacity=2)
+    previous = resource_ledger._set_resource_ledger_for_tests(ledger)
+    outcome = []
+    call_count = {"n": 0}
+    cancel = threading.Event()
+
+    def counting_cancel_check():
+        call_count["n"] += 1
+        # Call #1 is the entry probe (line 34). Call #2 is inside the
+        # while loop (line 48). From call #2 onward, honour the flag —
+        # so the test can flip cancel after the flag-observing probe
+        # ran but before the timed acquire returns, guaranteeing the
+        # only remaining probe to fire is the post-acquire recheck.
+        if call_count["n"] >= 2:
+            return cancel.is_set()
+        return False
+
+    def waiter():
+        with resource_ledger.bind_resource_cancel_check(
+            counting_cancel_check,
+        ):
+            try:
+                with onnx_runtime.acquire_session_cache_lock(lock):
+                    outcome.append("acquired")
+            except resource_ledger.ResourceWaitCancelled:
+                outcome.append("cancelled")
+
+    thread = threading.Thread(target=waiter)
+    thread.start()
+    try:
+        _wait_until(lambda: call_count["n"] >= 2, timeout=2.0)
+        cancel.set()
+        lock.release()
+        holder_released = True
+
+        thread.join(timeout=2.0)
+        assert not thread.is_alive(), (
+            "waiter did not finish — check the timed-acquire loop"
+        )
+        assert outcome == ["cancelled"], (
+            f"Expected cancelled outcome (post-acquire cancel recheck), "
+            f"got {outcome!r}"
+        )
+        # The lock must be free — the recheck released it before raising.
+        assert lock.acquire(blocking=False), (
+            "Lock was not released on the cancel-race path — leaked"
+        )
+        lock.release()
+    finally:
+        if not holder_released:
+            lock.release()
+        thread.join(timeout=1.0)
+        resource_ledger._set_resource_ledger_for_tests(previous)
+
+
 def test_acquire_gpu_if_session_uses_it_takes_lock_for_cuda_session():
     sess = _FakeSession(["CUDAExecutionProvider", "CPUExecutionProvider"])
     before = _GPU_SEMAPHORE._value

@@ -50,6 +50,20 @@ def acquire_session_cache_lock(lock, *, label="ONNX session cache"):
                     f"Cancelled while waiting for {label}",
                 )
             if lock.acquire(timeout=0.2):
+                # A release during the 0.2s acquire window can succeed
+                # while cancellation (or the interactive text-search
+                # deadline) has just fired. Without this recheck an
+                # already-cancelled eye-keypoint participant that woke
+                # here would kick off a fresh multi-hundred-megabyte
+                # download when the previous holder exited with only
+                # one file on disk. Release and raise so the cancel
+                # wins the race, matching the GPU-lease recheck in
+                # ``pipeline_locks._GpuLockContext``.
+                if cancel_check is not None and cancel_check():
+                    lock.release()
+                    raise ResourceWaitCancelled(
+                        f"Cancelled while waiting for {label}",
+                    )
                 break
     try:
         yield
